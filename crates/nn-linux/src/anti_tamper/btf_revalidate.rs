@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
@@ -901,11 +900,14 @@ pub fn resolve_tracepoint_fields_from(roots: &[&str], fs_magic: u64) -> Tracepoi
 /// file mounted over one path is caught whatever its root is).
 fn read_format_file(path: &str, fs_magic: u64) -> std::io::Result<String> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    // lot 353 (re-check 1 of #563, the ratchet's mini-hunt): beneath the
+    // `/sys` root the start anchored, tracefs crossed within the deadline
+    // (a by-path open walked the `/sys` mounted now); a temporary root (the
+    // tests') by path
+    let file = antitamper_bpf::kernel_roots::open_crossing(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?;
     match crate::fs_type::magic_of_file(&file) {
         Some(m) if m == fs_magic => {}
         Some(m) => {
@@ -1946,6 +1948,7 @@ fn name_at(strings: &[u8], off: u32) -> Result<&str, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     const UPSTREAM_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 310\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\n\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:16;\tsize:4;\tsigned:1;\n";
     const RHEL9_EXEC_FORMAT: &str = "name: sched_process_exec\nID: 295\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\tfield:unsigned char common_preempt_lazy_count;\toffset:8;\tsize:1;\tsigned:0;\n\n\tfield:__data_loc char[] filename;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t pid;\toffset:16;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:20;\tsize:4;\tsigned:1;\n";

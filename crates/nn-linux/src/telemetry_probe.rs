@@ -1463,7 +1463,14 @@ async fn run_round(
         return;
     };
     let file = probe_file(&nonce);
-    if let Err(e) = antitamper_bpf::kernel_roots::write(&file, b"nn-telemetry-probe\n") {
+    // lot 353 (re-check 1 of #563): the probe file, the pins and the deny
+    // self-test's targets are walked by path — each off the runtime's
+    // worker (a mount over them that does not answer holds a thread, never
+    // a worker the status answers on)
+    let written = crate::runtime::off_the_runtime(|| {
+        antitamper_bpf::kernel_roots::write(&file, b"nn-telemetry-probe\n")
+    });
+    if let Err(e) = written {
         warn!(error = %e, path = %file.display(), "telemetry probe: cannot write the probe file — round skipped");
         return;
     }
@@ -1483,7 +1490,7 @@ async fn run_round(
     // Lot 302: the program-id list and the links, once: the deny hooks'
     // plan now, the attach checks at the end (the agent's own cost)
     let view_started = Instant::now();
-    let view = AttachView::read(env);
+    let view = crate::runtime::off_the_runtime(|| AttachView::read(env));
     let links = view.deny_links();
     let mut checks_cost = view_started.elapsed();
     {
@@ -1504,7 +1511,9 @@ async fn run_round(
         }));
     }
     // Lot 302: the deny self-test's targets and plan (none in a window)
-    let deny_run = (!window_before).then(|| prepare_deny(probe, env, &exe, links.as_deref()));
+    let deny_run = (!window_before).then(|| {
+        crate::runtime::off_the_runtime(|| prepare_deny(probe, env, &exe, links.as_deref()))
+    });
     let planned: Vec<Result<(), String>> = deny_run
         .as_ref()
         .map(|d| d.planned.clone())

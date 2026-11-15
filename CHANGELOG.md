@@ -1006,6 +1006,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     is no longer a High at every boot. **The watchdog's holds are never
     dropped** (removed once all signed). The FUSE abort re-reads the mount
     first.
+  - Re-check 1 of #563 (§47.1): **the open sensor's rule refresh** places
+    the `/proc/` and `/sys/` carve-outs beneath the anchored roots
+    (`kernel_roots::walk_root`) and runs on a thread of its own, its build
+    bounded (10 s; a build that does not answer is the degradation
+    `open_sensor_rules`, the rules written stay) — it walked `/proc` from `/`
+    on a runtime worker, the lab's one `FUSE_STATX`, which stopped a
+    one-worker runtime. **The periodic by-path walks run off the workers**
+    (the link self-check, the telemetry probe, the installer window's
+    close, the shutdown identity, the program images, the watchdog
+    exemption); the admin socket's look is bounded (2 s). The canary's
+    writer and the tracefs reads beneath the anchored roots; WSL2's
+    exemption on WSL's kernel only. The ratchet refuses walks from `/`,
+    `*at` and `AT_FDCWD` calls on a view path, slices of view paths and
+    their items, view-returning functions, and cross-file calls handing a
+    view path (the re-check's four plants). Named: the watchdog's ping and
+    hold by path, `/proc/1/root` by path in the file responses, the probe's
+    exec by path, the systemd watch's blocking pool.
 - Lot 354 (pre-alpha Phase 9, part 1): the docs match the code, the
   operator's help, the protocol version.
   - **README figures checked by a test.** `xtask/tests/readme_figures.rs`

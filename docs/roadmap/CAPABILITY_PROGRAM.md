@@ -11309,6 +11309,35 @@ number in parentheses is a lab PR.
       self-test files and an audit-log read — its caller not found (the
       trace lost the event); the open sensor's mount check, routed after
       f3, was not it.
+  - Re-check 1 of #563: open — that `FUSE_STATX` was the open sensor's rule
+    refresh (every 60 s, on a runtime worker), walking the mass-write
+    carve-out `/proc/` from `/`: a one-worker runtime (a 1-vCPU host) stopped
+    whole, and the X6 chain came back; the canary writer opened
+    `/proc/1/root` by path; the ratchet missed four planted shapes; WSL2's
+    exemption could be named by any root. Done: `kernel_roots::walk_root`
+    (a view's walk starts at its anchored root, no mount crossed), the
+    refresher a thread of its own (`PumpThread::every`) with its build
+    bounded (`build_bounded`, 10 s, unjudged → `open_sensor_rules`), the
+    start's build bounded (else `sys_enter_openat`); the other periodic
+    by-path walks in `off_the_runtime`, the admin socket's look bounded;
+    the canary root and the tracefs reads anchored; WSL's exemption on a
+    kernel whose release names Microsoft; the ratchet's root-walk,
+    `*at`/`AT_FDCWD`, slice, view-returning and cross-file rules.
+  - Lab of re-check 1 (debian13, our own guest under a lease, clean before,
+    purged and powered off after; a cold boot with ONE vCPU, so the
+    agent's runtime has one worker; a FUSE over `/proc` laid in PID 1's
+    namespace that never answers the agent, 180 s): round r2b (this round's
+    tree): `nproc` 1; a FUSE over `/proc` that never answers the agent
+    (`EIO` to others), 180 s, laid in PID 1's namespace. No agent thread
+    sent it a request (`stalled=0`, 0 threads); `nn-admin status` answered
+    at 15/45/75/105/135/165/178 s, no ping failed, the same pid, no restart;
+    the rule refresh ran under the mount (one `rules refreshed`, none
+    unjudged); the signed chains took rows (audit +11, heartbeat +7), no
+    signing error; `mount_over_protected` (High) signed during the mount and
+    cleared after it. The deny self-test's step that opens a target's
+    `/proc/<pid>/mem` (the probe's child, by path) failed under the FUSE and
+    was signed as a `deny_selftest` degradation, as a step that cannot judge
+    is.
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

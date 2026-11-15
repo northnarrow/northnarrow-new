@@ -208,17 +208,22 @@ pub fn write_canary_checked(path: &str, body: &[u8]) -> Result<std::fs::File> {
     missing.reverse();
     let canonical = std::fs::canonicalize(&existing)
         .map_err(|e| anyhow!("canonicalising {}: {e}", existing.display()))?;
-    write_beneath(&host_root(), &canonical, &missing, &name, body)
+    let root = host_root().map_err(|e| anyhow!("writing canary {path:?}: the root: {e}"))?;
+    write_beneath(root, &canonical, &missing, &name, body)
         .map_err(|e| anyhow!("writing canary {path:?}: {e}"))
 }
 
 /// The host's root as PID 1 sees it, or `/` when that view cannot be
-/// reached (no `CAP_SYS_PTRACE`, as in tests).
-fn host_root() -> PathBuf {
-    if antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok() {
-        PathBuf::from("/proc/1/root")
-    } else {
-        PathBuf::from("/")
+/// reached (no `CAP_SYS_PTRACE`, as in tests). Lot 353 (re-check 1 of
+/// #563, N3): `/proc/1/root` opened beneath the `/proc` root the start
+/// anchored (the magic link followed as the kernel resolves it) — it was
+/// opened by path, and a canary's deploy under a FUSE over `/proc` held
+/// its handler on the FUSE.
+fn host_root() -> std::io::Result<std::fs::File> {
+    match antitamper_bpf::kernel_roots::open("/proc/1/root", libc::O_PATH | libc::O_DIRECTORY) {
+        Ok(f) => Ok(f),
+        Err(_) => antitamper_bpf::kernel_roots::walk_root(Path::new("/"))
+            .map(|(start, _)| start.file().try_clone())?,
     }
 }
 
@@ -226,7 +231,7 @@ fn host_root() -> PathBuf {
 /// of `dir` (canonical, so free of symlinks unless one was put in since),
 /// then `missing` (created), to `name`.
 fn write_beneath(
-    root: &Path,
+    root: std::fs::File,
     dir: &Path,
     missing: &[std::ffi::OsString],
     name: &std::ffi::OsStr,
@@ -257,8 +262,7 @@ fn write_beneath(
             // SAFETY: a fresh fd returned by openat.
             Ok(unsafe { OwnedFd::from_raw_fd(fd) })
         };
-    // The root itself is followed: `/proc/1/root` is a link to PID 1's root.
-    let mut cur = open_dir(libc::AT_FDCWD, &cstr(root.as_os_str())?, 0)?;
+    let mut cur = OwnedFd::from(root);
     for comp in dir.components() {
         if let std::path::Component::Normal(c) = comp {
             cur = open_dir(cur.as_raw_fd(), &cstr(c)?, libc::O_NOFOLLOW)?;
@@ -506,7 +510,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, home.join("sub")).unwrap();
         let missing = [std::ffi::OsString::from("sub")];
         let r = write_beneath(
-            Path::new("/"),
+            std::fs::File::open("/").unwrap(),
             &canonical,
             &missing,
             std::ffi::OsStr::new("c.txt"),
@@ -519,7 +523,7 @@ mod tests {
         std::fs::rename(&home, tmp.path().join("home.real")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &home).unwrap();
         let r = write_beneath(
-            Path::new("/"),
+            std::fs::File::open("/").unwrap(),
             &canonical,
             &[],
             std::ffi::OsStr::new("c.txt"),

@@ -93,8 +93,23 @@ const PATH_CALLS: &[&str] = &[
     "libc::chown(",
     "libc::readlink(",
     "libc::opendir(",
-    "libc::openat(libc::AT_FDCWD,",
-    "libc::statx(libc::AT_FDCWD,",
+    // lot 353 (re-check 1 of #563, N2 C): the `*at` calls, whatever their
+    // directory — an absolute path ignores it (`fstatat(AT_FDCWD,
+    // c"/proc/1", …)`)
+    "libc::openat(",
+    "libc::statx(",
+    "libc::fstatat(",
+    "libc::fstatat64(",
+    "libc::faccessat(",
+    "libc::readlinkat(",
+    "libc::fchmodat(",
+    "libc::fchownat(",
+    "libc::mkdirat(",
+    "libc::unlinkat(",
+    "libc::renameat(",
+    "libc::linkat(",
+    "libc::utimensat(",
+    "libc::name_to_handle_at(",
 ];
 
 /// The `Path` methods that walk their receiver.
@@ -175,27 +190,58 @@ fn names_a_view(text: &str) -> bool {
 }
 
 /// The constants of `code` whose value is a path under `/proc` or `/sys`.
+/// Lot 353 (re-check 1 of #563, N2 D): or holds one — a slice of them
+/// (`&[&str]`, `&[(&str, …)]`), its item written over several lines — and
+/// the `static`s alike.
 fn view_constants(code: &BTreeMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
     for text in code.values() {
-        for line in text.lines() {
-            let t = line.trim_start();
-            let t = t.strip_prefix("pub ").unwrap_or(t);
-            let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
-            let Some(rest) = t.strip_prefix("const ") else {
+        for (at, _) in text
+            .match_indices("const ")
+            .chain(text.match_indices("static "))
+        {
+            let before = text[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
                 continue;
-            };
+            }
+            let rest = &text[at..];
+            let rest = rest.split_once(' ').map_or(rest, |(_, r)| r);
+            let rest = rest.strip_prefix("mut ").unwrap_or(rest);
             let Some((name, value)) = rest.split_once(':') else {
                 continue;
             };
-            if value.contains("&str") && names_a_view(value) {
-                out.push(name.trim().to_string());
+            let name = name.trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            let item = &value[..item_end(value)];
+            if item.contains("&str") && names_a_view(item) {
+                out.push(name.to_string());
             }
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// Where the item `text` starts ends: its `;` outside brackets.
+fn item_end(text: &str) -> usize {
+    let mut depth = 0i32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return i;
+                }
+            }
+            ';' if depth == 0 => return i,
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 /// Whether `word` occurs in `text` as a whole identifier.
@@ -336,12 +382,16 @@ fn top_level_split(text: &str) -> Vec<&str> {
 /// proc_root.join("1")`, `identify(&dir.join("exe"), …)` — to a fixpoint:
 /// a walk by path of such a parameter is a walk of the view, whatever the
 /// parameter is named.
-fn view_params(text: &str, constants: &[String]) -> BTreeMap<usize, Vec<String>> {
+fn view_params(
+    text: &str,
+    constants: &[String],
+    seed: &BTreeMap<usize, Vec<String>>,
+) -> BTreeMap<usize, Vec<String>> {
     let fns: Vec<(usize, &str, String, Vec<String>)> = fn_bodies(text)
         .into_iter()
         .filter_map(|(at, body)| signature(body).map(|(n, p)| (at, body, n, p)))
         .collect();
-    let mut out: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut out: BTreeMap<usize, Vec<String>> = seed.clone();
     loop {
         let mut grew = false;
         for (_, body, _, _) in &fns {
@@ -352,6 +402,7 @@ fn view_params(text: &str, constants: &[String]) -> BTreeMap<usize, Vec<String>>
             let mut tainted = constants.to_vec();
             tainted.extend(out.get(&base).cloned().unwrap_or_default());
             tainted.extend(view_locals(body, &tainted));
+            let scopes = scope_taint(body, &tainted);
             for (callee_at, _, name, params) in &fns {
                 for pat in [format!("{name}("), format!("{name}::<")] {
                     for (at, _) in body.match_indices(&pat) {
@@ -376,7 +427,10 @@ fn view_params(text: &str, constants: &[String]) -> BTreeMap<usize, Vec<String>>
                             if param == "self" || param.is_empty() {
                                 continue;
                             }
-                            if names_view_path(arg, &tainted) {
+                            let in_scope = scopes
+                                .iter()
+                                .any(|(span, t)| span.contains(&at) && names_view_path(arg, t));
+                            if names_view_path(arg, &tainted) || in_scope {
                                 let e = out.entry(*callee_at).or_default();
                                 if !e.contains(param) {
                                     e.push(param.clone());
@@ -428,8 +482,430 @@ fn view_locals(body: &str, constants: &[String]) -> Vec<String> {
     }
 }
 
+/// Lot 353 (re-check 1 of #563, N2 D): the names `body` binds to the items
+/// of an expression naming a view path (one of `names`, a literal), each
+/// with where they are bound: a `for` loop's pattern (its body), and the
+/// parameters of the closures of the statement that iterates it
+/// (`.iter()`, `.into_iter()`: that statement).
+fn iterated(body: &str, names: &[String]) -> Vec<(std::ops::Range<usize>, Vec<String>)> {
+    let idents = |pat: &str| -> Vec<String> {
+        pat.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty() && *w != "mut" && *w != "ref" && *w != "_")
+            .filter(|w| {
+                w.chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase() || c == '_')
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (at, _) in body.match_indices("for ") {
+        if body[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &body[at + 4..];
+        let Some(inn) = rest.find(" in ") else {
+            continue;
+        };
+        let Some(brace) = rest[inn..].find('{').map(|b| inn + b) else {
+            continue;
+        };
+        if names_view_path(&rest[inn + 4..brace], names) {
+            let open = at + 4 + brace;
+            let end = open + support::matching_brace(&body[open..]);
+            out.push((open..end, idents(&rest[..inn])));
+        }
+    }
+    for it in [".iter()", ".into_iter()"] {
+        for (at, _) in body.match_indices(it) {
+            let rcv = receiver(body, at);
+            if rcv.is_empty() || !names_view_path(rcv, names) {
+                continue;
+            }
+            let end = at + item_end(&body[at..]);
+            let params: Vec<String> = closure_params(&body[at..end])
+                .iter()
+                .flat_map(|p| idents(p))
+                .collect();
+            if !params.is_empty() {
+                out.push((at..end, params));
+            }
+        }
+    }
+    out
+}
+
+/// Each scope of [`iterated`] with what is tainted in it: `tainted`, the
+/// names it binds to the items, and the locals it binds from those.
+fn scope_taint(body: &str, tainted: &[String]) -> Vec<(std::ops::Range<usize>, Vec<String>)> {
+    iterated(body, tainted)
+        .into_iter()
+        .map(|(span, names)| {
+            let mut t = tainted.to_vec();
+            t.extend(names);
+            let locals = view_locals(&body[span.clone()], &t);
+            t.extend(locals);
+            (span, t)
+        })
+        .collect()
+}
+
+/// The `(` of the call `at` is an argument of: the nearest unmatched one
+/// before it, within its statement.
+fn enclosing_open(text: &str, at: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        match b[i] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' if depth > 0 => depth -= 1,
+            b'(' => return Some(i),
+            b'[' => return None,
+            b';' | b'{' | b'}' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The name of the function called at the `(` `open` (`libc::openat`,
+/// `open_dir`, `File::open`).
+fn callee(text: &str, open: usize) -> &str {
+    let start = text[..open]
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':' || c == '.'))
+        .map_or(0, |i| i + 1);
+    &text[start..open]
+}
+
+/// The module name of the file `f` (`mod.rs`: its directory's).
+fn module_of(f: &str) -> String {
+    let stem = Path::new(f)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stem == "mod" {
+        Path::new(f)
+            .parent()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        stem
+    }
+}
+
+/// The view constants of the file `f`: `constants`, and the functions that
+/// return a view path — by their name in their own file, by their module
+/// path elsewhere (`response::host_path`: another file's `host_path` is
+/// not it).
+fn constants_of(f: &str, constants: &[String], returning: &[(String, String)]) -> Vec<String> {
+    let mut out = constants.to_vec();
+    for (rf, name) in returning {
+        if NOT_VIEWS.contains(&name.as_str()) {
+            continue;
+        }
+        out.push(if rf == f {
+            name.clone()
+        } else {
+            format!("{}::{name}", module_of(rf))
+        });
+    }
+    out
+}
+
+/// A `pub fn` another file may call: its file, offset and parameters.
+type Callee = (String, usize, Vec<String>);
+
+/// Lot 353 (re-check 1 of #563, N2 A): the parameters, by file and by
+/// function offset, that a call in another file hands a path under a view
+/// — `crate::host_hardening::stat_it(Path::new("/proc/1/status"))` taints
+/// `stat_it`'s parameter in `host_hardening.rs`. A call is matched by its
+/// module path's last segment and the function's name (a `pub fn` of the
+/// file of that module); what it hands over is a literal under a view or
+/// a constant of one (a parameter named `proc` is the callee file's own).
+fn cross_file_params(
+    code: &BTreeMap<String, String>,
+    constants: &[String],
+) -> BTreeMap<String, BTreeMap<usize, Vec<String>>> {
+    // (module, function) -> (file, offset, parameters)
+    let mut public: BTreeMap<(String, String), Vec<Callee>> = BTreeMap::new();
+    for (f, text) in code {
+        let module = module_of(f);
+        for (at, body) in fn_bodies(text) {
+            let head = text[..at].trim_end();
+            if !(head.ends_with("pub") || head.ends_with("pub(crate)")) {
+                continue;
+            }
+            if let Some((name, params)) = signature(body) {
+                public
+                    .entry((module.clone(), name))
+                    .or_default()
+                    .push((f.clone(), at, params));
+            }
+        }
+    }
+    let mut out: BTreeMap<String, BTreeMap<usize, Vec<String>>> = BTreeMap::new();
+    // a literal or a constant handed over — or an item of a list of them,
+    // a parameter the file's own calls hand one, a local bound to those:
+    // the names the code gives a path (`proc`, `sys`) are the callee
+    // file's own business
+    let hands_a_view = |arg: &str, tainted: &[String]| {
+        names_a_view(arg)
+            || arg.contains("c\"/proc")
+            || arg.contains("c\"/sys")
+            || tainted.iter().any(|c| has_word(arg, c))
+    };
+    let strict = |t: Vec<String>| -> Vec<String> {
+        t.into_iter()
+            .filter(|n| !VIEW_NAMES.contains(&n.as_str()))
+            .collect()
+    };
+    {
+        for text in code.values() {
+            let params = view_params(text, constants, &BTreeMap::new());
+            for (base, body) in fn_bodies(text) {
+                let mut tainted = constants.to_vec();
+                tainted.extend(strict(params.get(&base).cloned().unwrap_or_default()));
+                tainted.extend(strict(view_locals(body, &tainted)));
+                let scopes: Vec<_> = scope_taint(body, &tainted)
+                    .into_iter()
+                    .map(|(span, t)| (span, strict(t)))
+                    .collect();
+                for (at, _) in body.match_indices("::") {
+                    let rest = &body[at + 2..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !rest[name.len()..].starts_with('(') {
+                        continue;
+                    }
+                    let module: String = body[..at]
+                        .chars()
+                        .rev()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    let Some(callees) = public.get(&(module, name.clone())) else {
+                        continue;
+                    };
+                    let open = at + 2 + name.len();
+                    let args = call_args(body, open);
+                    let inner = args.get(1..args.len().saturating_sub(1)).unwrap_or("");
+                    for (i, arg) in top_level_split(inner).into_iter().enumerate() {
+                        let scoped = scopes
+                            .iter()
+                            .any(|(span, t)| span.contains(&at) && hands_a_view(arg, t));
+                        if !hands_a_view(arg, &tainted) && !scoped {
+                            continue;
+                        }
+                        for (cf, cat, cparams) in callees {
+                            let Some(param) = cparams.get(i).filter(|p| *p != "self") else {
+                                continue;
+                            };
+                            let e = out.entry(cf.clone()).or_default().entry(*cat).or_default();
+                            if !e.contains(param) {
+                                e.push(param.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lot 353 (re-check 1 of #563, N3): the functions of `code` that return a
+/// path under a view (`fn host_root() -> PathBuf { … PathBuf::from(
+/// "/proc/1/root") … }`, a literal outside a reader's call): a walk by
+/// path of what they return is a walk of the view. The path is one the
+/// function builds (`PathBuf::from`, `Path::new` of a view literal).
+fn view_returning_fns(code: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (f, text) in code {
+        if f == KERNEL_ROOTS {
+            continue; // its own reads
+        }
+        for (_, body) in fn_bodies(text) {
+            let Some(brace) = body.find('{') else {
+                continue;
+            };
+            let ret = body[..brace].split_once("->").map_or("", |(_, r)| r);
+            if !(ret.contains("PathBuf") || ret.contains("&Path") || ret.contains("Path>")) {
+                continue;
+            }
+            let mut rest = body[brace..].to_string();
+            for r in READERS {
+                while let Some(at) = rest.find(r) {
+                    let Some(open) = rest[at..].find('(').map(|o| at + o) else {
+                        break;
+                    };
+                    let end = open + call_args(&rest, open).len();
+                    rest.replace_range(at..end, "");
+                }
+            }
+            let built = ["PathBuf::from(", "Path::new(", "PathBuf::from(format!("]
+                .iter()
+                .any(|c| {
+                    ["\"/proc", "\"/sys"]
+                        .iter()
+                        .any(|v| rest.contains(&format!("{c}{v}")))
+                });
+            if built {
+                if let Some((name, _)) = signature(body) {
+                    out.push((f.clone(), name));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Lot 353 (re-check 1 of #563, N2 B): the walks that start at `/` by path
+/// in one file's production code — an open of the literal `/` (`c"/"`,
+/// `"/"`) as a directory to walk from: such a walk crosses whatever is
+/// mounted on `/proc` or `/sys` now, `kernel_roots::walk_root` starts a
+/// view's at its anchored root.
+fn root_walks(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_of = |at: usize| text[..at].matches('\n').count();
+    let mut out = std::collections::BTreeSet::new();
+    for lit in ["c\"/\"", "\"/\"", "\"/\\0\"", "b\"/\\0\""] {
+        for (at, _) in text.match_indices(lit) {
+            // the literal itself, not the end of a longer one
+            if text[..at].ends_with('\\') || text[..at].ends_with('"') {
+                continue;
+            }
+            let mut i = at;
+            while let Some(open) = enclosing_open(text, i) {
+                let name = callee(text, open);
+                let last = name.rsplit([':', '.']).next().unwrap_or(name);
+                if last.contains("open") {
+                    let n = line_of(at);
+                    out.insert(format!(
+                        "{}: {}",
+                        n + 1,
+                        lines.get(n).map_or("", |l| l.trim())
+                    ));
+                    break;
+                }
+                i = open;
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The parameter lists of the closures in `stmt` (`|p|`, `|(a, b)|`,
+/// `move |x: &str|`), each parameter without its type.
+fn closure_params(stmt: &str) -> Vec<String> {
+    let b = stmt.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'|' || b.get(i + 1) == Some(&b'|') {
+            i += if b[i] == b'|' { 2 } else { 1 };
+            continue;
+        }
+        let before = stmt[..i].trim_end();
+        let opens = before.ends_with('(') || before.ends_with(',') || before.ends_with("move");
+        let Some(close) = stmt[i + 1..].find('|').map(|c| i + 1 + c) else {
+            break;
+        };
+        if opens {
+            for p in top_level_split(&stmt[i + 1..close]) {
+                out.push(p.split(':').next().unwrap_or("").to_string());
+            }
+            i = close + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The by-path calls ([`PATH_CALLS`]) and methods ([`PATH_METHODS`]) in
+/// `body[span]` whose path names a view (`tainted`), each told at its offset.
+fn path_uses(
+    body: &str,
+    span: std::ops::Range<usize>,
+    tainted: &[String],
+    flag: &mut dyn FnMut(usize),
+) {
+    let within = |at: usize| span.contains(&at);
+    for call in PATH_CALLS {
+        for (at, _) in body.match_indices(call).filter(|(at, _)| within(*at)) {
+            let before = &body[at.saturating_sub(16)..at];
+            if READERS
+                .iter()
+                .any(|r| before.ends_with(r.trim_end_matches(':')))
+                || READERS.iter().any(|r| before.contains(r))
+            {
+                continue;
+            }
+            let open = at + call.find('(').unwrap_or(call.len() - 1);
+            let args = call_args(body, open);
+            // an `*at` call's directory is a descriptor, not a path: its
+            // path arguments are the rest (re-check 1 of #563, N2 C)
+            let args =
+                if call.ends_with("at(") || call.ends_with("at64(") || *call == "libc::statx(" {
+                    let inner = args.get(1..args.len().saturating_sub(1)).unwrap_or("");
+                    top_level_split(inner)
+                        .into_iter()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    args.to_string()
+                };
+            if names_view_path(&args, tainted) {
+                flag(at);
+            }
+        }
+    }
+    for method in PATH_METHODS {
+        for (at, _) in body.match_indices(method).filter(|(at, _)| within(*at)) {
+            let rcv = receiver(body, at);
+            // an open file's own metadata asks no path (`fstat`)
+            let last = rcv.rsplit(['.', ':', '&']).next().unwrap_or(rcv);
+            if *method == ".metadata()" && FILE_HANDLES.contains(&last) {
+                continue;
+            }
+            // a `Metadata` or a `FileType` asks nothing either
+            if rcv.chars().all(|c| c.is_alphanumeric() || c == '_') && VALUE_NAMES.contains(&rcv) {
+                continue;
+            }
+            if names_view_path(rcv, tainted) {
+                flag(at);
+            }
+        }
+    }
+}
+
 /// Rule 1's violations in one file's production code: `line: text`.
 fn walks(text: &str, constants: &[String]) -> Vec<String> {
+    walks_with(text, constants, &BTreeMap::new())
+}
+
+/// [`walks`], with the parameters other files' calls hand a view path
+/// (`seed`, by function offset: [`cross_file_params`]).
+fn walks_with(
+    text: &str,
+    constants: &[String],
+    seed: &BTreeMap<usize, Vec<String>>,
+) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let line_of = |at: usize| text[..at].matches('\n').count();
     let mut out = std::collections::BTreeSet::new();
@@ -441,46 +917,26 @@ fn walks(text: &str, constants: &[String]) -> Vec<String> {
             lines.get(n).map_or("", |l| l.trim())
         ));
     };
-    let params = view_params(text, constants);
+    let params = view_params(text, constants, seed);
     for (base, body) in fn_bodies(text) {
         let mut tainted = constants.to_vec();
         tainted.extend(params.get(&base).cloned().unwrap_or_default());
         tainted.extend(view_locals(body, &tainted));
-        for call in PATH_CALLS {
-            for (at, _) in body.match_indices(call) {
-                let before = &body[at.saturating_sub(16)..at];
-                if READERS
-                    .iter()
-                    .any(|r| before.ends_with(r.trim_end_matches(':')))
-                    || READERS.iter().any(|r| before.contains(r))
-                {
-                    continue;
-                }
-                let open = at + call.find('(').unwrap_or(call.len() - 1);
-                let args = call_args(body, open);
-                if names_view_path(args, &tainted) {
+        // lot 353 (re-check 1 of #563, N2 B, N3): any call whose directory
+        // is `AT_FDCWD` — a closure or a helper around `openat` — opens its
+        // path by path
+        for (at, _) in body.match_indices("libc::AT_FDCWD") {
+            if let Some(open) = enclosing_open(body, at) {
+                if names_view_path(call_args(body, open), &tainted) {
                     flag(base + at);
                 }
             }
         }
-        for method in PATH_METHODS {
-            for (at, _) in body.match_indices(method) {
-                let rcv = receiver(body, at);
-                // an open file's own metadata asks no path (`fstat`)
-                let last = rcv.rsplit(['.', ':', '&']).next().unwrap_or(rcv);
-                if *method == ".metadata()" && FILE_HANDLES.contains(&last) {
-                    continue;
-                }
-                // a `Metadata` or a `FileType` asks nothing either
-                if rcv.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    && VALUE_NAMES.contains(&rcv)
-                {
-                    continue;
-                }
-                if names_view_path(rcv, &tainted) {
-                    flag(base + at);
-                }
-            }
+        path_uses(body, 0..body.len(), &tainted, &mut |at| flag(base + at));
+        // lot 353 (re-check 1 of #563, N2 D): the items of a list of view
+        // paths, within the loop or the statement that binds them
+        for (span, t) in scope_taint(body, &tainted) {
+            path_uses(body, span, &t, &mut |at| flag(base + at));
         }
     }
     for (call, _) in THIRD_PARTY {
@@ -642,6 +1098,8 @@ const NOT_VIEWS: &[&str] = &[
     "PIN_DIR",
     "PIN_ROOT",
     "UNIT",
+    // the bpffs pin root it prepares (`/sys/fs/bpf/northnarrow`)
+    "prepare_pin_root",
 ];
 
 /// The files whose walks by path stay, how many, and why: each takes the
@@ -654,6 +1112,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "a forked child's allocation-free count of its own threads: beneath the /proc root the \
          process anchored (`kernel_roots::proc_root_fd`, openat), by path only in a process \
          that anchored none",
+    ),
+    (
+        "crates/nn-linux/src/fs_type.rs",
+        1,
+        "`magic_of_path`'s statfs by path is the branch of a path under no view (automounts \
+         followed): a path under one is opened beneath its anchored root first \
+         (`kernel_roots::view_of`, `open_crossing`) — the re-check of #563's cross-file rule \
+         sees the tracefs roots handed to it",
     ),
     (
         "crates/nn-linux/src/worker/spawn.rs",
@@ -690,13 +1156,27 @@ fn no_kernel_view_is_walked_by_path() {
         .into_iter()
         .filter(|c| !NOT_VIEWS.contains(&c.as_str()))
         .collect();
+    let returning = view_returning_fns(&code);
     assert!(
         constants.iter().any(|c| c == "MOUNTINFO_HOST"),
         "the scan finds the view constants: {constants:?}"
     );
+    // re-check 1 of #563 (N2 D): a slice of view prefixes, over lines,
+    // in another crate
+    assert!(
+        constants
+            .iter()
+            .any(|c| c == "MASS_WRITE_CARVEOUT_PREFIXES"),
+        "the scan finds the slices of view paths: {constants:?}"
+    );
+    let cross = cross_file_params(&code, &constants);
     let mut found = Vec::new();
     for (f, text) in code.iter().filter(|(f, _)| f.as_str() != KERNEL_ROOTS) {
-        let w = walks(text, &constants);
+        let w = walks_with(
+            text,
+            &constants_of(f, &constants, &returning),
+            &cross.get(f).cloned().unwrap_or_default(),
+        );
         match KNOWN.iter().find(|(k, _, _)| k == f) {
             Some((_, n, _)) if w.len() == *n => {}
             Some((_, n, _)) => found.push(format!(
@@ -855,6 +1335,161 @@ fn a_planted_walk_of_a_view_is_found() {
     assert_eq!(view_constants(&code), vec!["TAINTED".to_string()]);
 }
 
+/// Lot 353 (re-check 1 of #563, N2 B): the opens of `/` that stay, by
+/// file, and why — none walks from it.
+const ROOT_OPENS: &[(&str, usize, &str)] = &[(
+    "crates/nn-linux/src/sandbox/mod.rs",
+    1,
+    "the Landlock measurement opens `/` to see whether the domain refuses it, and closes it: \
+     nothing is opened below it",
+)];
+
+/// Lot 353 (re-check 1 of #563, N1, N2 B): no walk starts at `/` by path
+/// outside `kernel_roots` (`walk_root`): the open sensor's rule refresh
+/// opened `/`, then `proc` below it, and the `fstat` of the FUSE mounted
+/// over `/proc` held it.
+#[test]
+fn no_walk_starts_at_the_root_by_path() {
+    let code = scan_code(&repo_root());
+    let mut found = Vec::new();
+    for (f, text) in code.iter().filter(|(f, _)| f.as_str() != KERNEL_ROOTS) {
+        let w = root_walks(text);
+        match ROOT_OPENS.iter().find(|(k, _, _)| k == f) {
+            Some((_, n, _)) if w.len() == *n => {}
+            Some((_, n, _)) => found.push(format!(
+                "{f}: {} opens of `/`, {n} known (lower the pin when one goes): {w:?}",
+                w.len()
+            )),
+            None => found.extend(w.into_iter().map(|l| format!("{f}:{l}"))),
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "a walk from `/` by path crosses the /proc or /sys mounted now: start it with \
+         antitamper_bpf::kernel_roots::walk_root (a view's walk starts at its anchored root):\n{}",
+        found.join("\n")
+    );
+}
+
+/// Lot 353 (re-check 1 of #563, N2): each of the four shapes the
+/// re-check planted, and the two walks it found (N1's carve-out walk, N3's
+/// canary root), fail the rules.
+#[test]
+fn the_re_check_s_planted_shapes_are_found() {
+    // B: a component walk from `/` through a closure (N1's shape)
+    let b = "pub fn rev563_walk() -> i32 {\n    let open = |at: libc::c_int, n: &std::ffi::CStr| \
+             unsafe { libc::openat(at, n.as_ptr(), libc::O_PATH) };\n    let root = \
+             open(libc::AT_FDCWD, c\"/\");\n    open(root, c\"proc\")\n}\n";
+    assert!(!root_walks(b).is_empty(), "B: {b}");
+    let n1 = "fn place_carveout(path: &Path) -> std::io::Result<CarveoutPlace> {\n    let open = \
+              |at: libc::c_int, name: &std::ffi::CStr| -> std::io::Result<std::fs::File> {\n        \
+              let fd = unsafe {\n            libc::openat(\n                at,\n                \
+              name.as_ptr(),\n                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,\n            \
+              )\n        };\n        todo!()\n    };\n    let mut cur = open(libc::AT_FDCWD, \
+              c\"/\")?;\n    todo!()\n}\n";
+    assert!(!root_walks(n1).is_empty(), "N1: {n1}");
+    for clean in [
+        "fn f() {\n    let (start, names) = kernel_roots::walk_root(Path::new(\"/\"))?;\n}\n",
+        "fn f() {\n    let ok = path.starts_with(\"/\");\n    let r = libc::mount(std::ptr::null(), \
+         c\"/\".as_ptr(), std::ptr::null(), 0, std::ptr::null());\n}\n",
+        "fn f() {\n    let x = Path::new(\"/proc/\");\n    let y = \"a/\";\n}\n",
+    ] {
+        assert!(root_walks(clean).is_empty(), "{clean}");
+    }
+    // C: fstatat (and any `*at` call) with a view path, whatever the dirfd
+    let c = "pub fn rev563_fstatat() -> i32 {\n    let mut st: libc::stat = unsafe { \
+             std::mem::zeroed() };\n    unsafe { libc::fstatat(libc::AT_FDCWD, \
+             c\"/proc/1\".as_ptr(), &mut st, 0) }\n}\n";
+    assert!(!walks(c, &[]).is_empty(), "C: {c}");
+    let c2 = "fn f(dir: &File) {\n    unsafe { libc::statx(dir.as_raw_fd(), c\"/sys/x\".as_ptr(), \
+              0, 0, &mut sx) };\n}\n";
+    assert!(!walks(c2, &[]).is_empty(), "C (statx): {c2}");
+    // D: a slice constant of view prefixes, over several lines, walked
+    let d_code = BTreeMap::from([(
+        "x.rs".to_string(),
+        "pub const REV563_PREFIXES: &[&str] = &[\n    \"/proc/\",\n];\npub fn rev563_prefixes() \
+         -> usize {\n    REV563_PREFIXES.iter().filter(|p| \
+         std::path::Path::new(p).exists()).count()\n}\n"
+            .to_string(),
+    )]);
+    let d_consts = view_constants(&d_code);
+    assert_eq!(d_consts, vec!["REV563_PREFIXES".to_string()]);
+    assert!(
+        !walks(&d_code["x.rs"], &d_consts).is_empty(),
+        "D (a closure)"
+    );
+    let d2 =
+        "fn g() {\n    for p in REV563_PREFIXES {\n        let _ = std::fs::metadata(p);\n    \
+              }\n}\n";
+    assert!(!walks(d2, &d_consts).is_empty(), "D (a for loop)");
+    // the items of a list that names no view are not
+    let d3 = "fn g() {\n    for p in OTHER {\n        let _ = std::fs::metadata(p);\n    }\n    \
+              let n = OTHER.iter().filter(|p| Path::new(p).exists()).count();\n}\n";
+    assert!(walks(d3, &d_consts).is_empty(), "{d3}");
+    // A: a helper in another file handed a view path
+    let a_code = BTreeMap::from([
+        (
+            "crates/nn-linux/src/host_hardening.rs".to_string(),
+            "pub fn rev563_stat_it(p: &std::path::Path) -> bool {\n    \
+             std::fs::metadata(p).is_ok()\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/own_dropins.rs".to_string(),
+            "pub fn rev563_call() -> bool {\n    \
+             crate::host_hardening::rev563_stat_it(std::path::Path::new(\"/proc/1/status\"))\n}\n"
+                .to_string(),
+        ),
+    ]);
+    let cross = cross_file_params(&a_code, &[]);
+    let hh = "crates/nn-linux/src/host_hardening.rs";
+    assert!(
+        walks(&a_code[hh], &[]).is_empty(),
+        "alone, the helper is clean"
+    );
+    assert!(
+        !walks_with(
+            &a_code[hh],
+            &[],
+            &cross.get(hh).cloned().unwrap_or_default()
+        )
+        .is_empty(),
+        "A: {cross:?}"
+    );
+    // N3: the canary's root, a function returning `/proc/1/root`, opened
+    // by path through a helper around `openat`
+    let n3_code = BTreeMap::from([(
+        "x.rs".to_string(),
+        "fn write_checked() {\n    write_beneath(&host_root(), &canonical);\n}\nfn host_root() -> \
+         PathBuf {\n    if antitamper_bpf::kernel_roots::metadata(\"/proc/1/root/\").is_ok() {\n        \
+         PathBuf::from(\"/proc/1/root\")\n    } else {\n        PathBuf::from(\"/\")\n    }\n}\nfn \
+         write_beneath(root: &Path, dir: &Path) {\n    let open_dir = |at: libc::c_int, name: \
+         &CString| unsafe { libc::openat(at, name.as_ptr(), 0) };\n    let mut cur = \
+         open_dir(libc::AT_FDCWD, &cstr(root.as_os_str())?, 0)?;\n}\n"
+            .to_string(),
+    )]);
+    let n3_consts = constants_of("x.rs", &[], &view_returning_fns(&n3_code));
+    assert_eq!(n3_consts, vec!["host_root".to_string()]);
+    assert_eq!(
+        constants_of("y.rs", &[], &view_returning_fns(&n3_code)),
+        vec!["x::host_root".to_string()],
+        "elsewhere by its module path"
+    );
+    assert!(
+        !walks(&n3_code["x.rs"], &n3_consts).is_empty(),
+        "N3: the root opened by path"
+    );
+    // a function that reads a view through a reader and returns another
+    // path is not one
+    let not = BTreeMap::from([(
+        "x.rs".to_string(),
+        "fn f() -> PathBuf {\n    let t = kernel_roots::read_text(\"/proc/self/cgroup\");\n    \
+         PathBuf::from(\"/etc\")\n}\n"
+            .to_string(),
+    )]);
+    assert!(view_returning_fns(&not).is_empty());
+}
+
 /// The shared readers and the function each one's body must read through.
 const ROUTED: &[(&str, &str, &str)] = &[
     (
@@ -939,6 +1574,65 @@ const OFF_THE_RUNTIME: &[(&str, &str, &[&str])] = &[
             "round(&mut w, Path::new(\"/\"), &known)",
         ],
     ),
+    // lot 353 (re-check 1 of #563): the other periodic tasks of the
+    // runtime that walk a path by path (the pins under `/sys/fs/bpf`,
+    // `/run/northnarrow`, the system's bin directories): each tick's walk
+    // off the worker — a mount there that does not answer holds a thread,
+    // never a worker the status answers on
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "\"BPF self-defence: link self-check armed\"",
+        &["off_the_runtime(|| live_links(own.pin_root.as_deref()))"],
+    ),
+    (
+        "crates/nn-linux/src/telemetry_probe.rs",
+        "async fn run_round(",
+        &[
+            "off_the_runtime(|| {",
+            "kernel_roots::write(&file,",
+            "off_the_runtime(|| AttachView::read(env))",
+        ],
+    ),
+    (
+        "crates/nn-linux/src/telemetry_probe.rs",
+        "off_the_runtime(|| AttachView::read(env))",
+        &["off_the_runtime(|| prepare_deny("],
+    ),
+    (
+        "agent/src/boot/tasks.rs",
+        "let installer_ticker = installer_override.clone();",
+        &["off_the_runtime(|| {", "installer_ticker.close_if_expired("],
+    ),
+    (
+        "agent/src/boot/tasks.rs",
+        "pub(crate) fn spawn_shutdown_exe_refresh()",
+        &["off_the_runtime(|| {", "refresh_shutdown_exe(root)"],
+    ),
+    (
+        "agent/src/boot/tasks.rs",
+        "pub(crate) fn spawn_program_images_refresh()",
+        &["off_the_runtime(nn_linux::program_images::refresh)"],
+    ),
+    (
+        "agent/src/boot/tasks.rs",
+        "let mut tick_once = || {",
+        &["resolve_verified_watchdog_pid(&pidfile, &expected_exe)"],
+    ),
+    (
+        "agent/src/boot/tasks.rs",
+        "nn_linux::runtime::off_the_runtime(&mut tick_once);",
+        &["off_the_runtime(&mut tick_once)"],
+    ),
+    (
+        "agent/src/admin/socket_watch.rs",
+        "pub fn path_state_within(",
+        &["looks", ".run(\"the admin socket's path\""],
+    ),
+    (
+        "agent/src/admin/socket_watch.rs",
+        "pub fn check(&mut self",
+        &["path_state_within(&self.looks, &self.path, self.bound)"],
+    ),
     (
         "agent/src/boot/mod.rs",
         "forbid_core_dumps();",
@@ -979,6 +1673,55 @@ fn the_rounds_run_off_the_runtime_and_the_starts_anchor_the_views() {
     assert!(
         off < round,
         "the kernel-state round runs inside off_the_runtime"
+    );
+}
+
+/// Lot 353 (re-check 1 of #563, N1): the open sensor's rules are built
+/// from the host only through `build_bounded` (a helper thread with a
+/// deadline), at the start and in the refresher — which runs on a thread of
+/// its own (`PumpThread::every`), never a task of the runtime: a FUSE over
+/// `/proc` held its build on a runtime worker every minute.
+#[test]
+fn the_open_sensor_rules_are_built_off_the_runtime() {
+    let code = scan_code(&repo_root());
+    let build = "RuleSet::build(&RuleInputs::from_host(";
+    let users: Vec<&String> = code
+        .iter()
+        .filter(|(_, t)| t.contains(build))
+        .map(|(f, _)| f)
+        .collect();
+    assert_eq!(
+        users,
+        vec!["crates/nn-linux/src/sensors/open_sensor.rs"],
+        "the host's rules are built in the open sensor only"
+    );
+    let os = &code["crates/nn-linux/src/sensors/open_sensor.rs"];
+    assert_eq!(os.matches(build).count(), 1, "once: in build_bounded");
+    let b = body(os, "open_sensor.rs", "pub fn build_bounded(");
+    assert!(
+        b.contains(build) && b.contains("reader.run("),
+        "built on the reader's helper thread:\n{b}"
+    );
+    let fim = &code["agent/src/boot/fim.rs"];
+    let at = fim
+        .find("let refresher = northnarrow_agent::sensors::pump::PumpThread::every(")
+        .expect("the refresher is a thread of its own");
+    let window: String = fim[at..].lines().take(40).collect::<Vec<_>>().join("\n");
+    assert!(
+        window.contains("refresh_rules.next(&BUILD_READER)"),
+        "its build bounded:\n{window}"
+    );
+    assert!(
+        window.contains("register_pump_thread(\"open_sensor_rules\""),
+        "registered as a thread (a finished one stops the agent)"
+    );
+    assert!(
+        !fim.contains("register_pump_handle(\"open_sensor_rules\""),
+        "never a task of the runtime"
+    );
+    assert!(
+        fim.contains("build_bounded(&BUILD_READER, extras)"),
+        "the start's build bounded too"
     );
 }
 

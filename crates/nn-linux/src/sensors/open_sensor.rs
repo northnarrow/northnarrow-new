@@ -442,7 +442,8 @@ impl RuleSet {
     }
 
     /// Lot 283c: a daemon's data directory, tagged with its index in the
-    /// list. Placed as a carve-out is (walked from `/`, no symbolic link
+    /// list. Placed as a carve-out is (walked from `/` — a view's from its
+    /// anchored root, [`place_carveout`] —, no symbolic link
     /// followed: one refuses it); a missing directory whose parent exists
     /// is a rule under that parent by its name, one missing deeper waits
     /// for the next refresh (a rule higher up would tag a wider tree).
@@ -475,7 +476,8 @@ impl RuleSet {
     /// One mass-write carve-out: a directory rule (its subtree), or, while
     /// it is missing, a rule under its nearest existing ancestor by the
     /// first missing name. External audit POS-010 (lab PR 198): the path
-    /// is walked from `/` without following a symbolic link. `metadata`
+    /// is walked from `/` (lot 353: one under `/proc` or `/sys` from its
+    /// view's anchored root) without following a symbolic link. `metadata`
     /// followed them, every minute: a user who replaced the directory of a
     /// signed carve-out under their home (`~/.claude/`) with a link to `~`
     /// or `/` moved the carve-out to that tree (in a sticky directory such
@@ -609,68 +611,48 @@ enum CarveoutPlace {
     Link(PathBuf),
 }
 
-/// Walk `path` from `/`, one component at a time, each opened `O_PATH |
-/// O_NOFOLLOW` below the last and checked on its own fd (no window
-/// between the check and the inode taken).
+/// Walk `path` one component at a time, each opened `O_PATH | O_NOFOLLOW`
+/// below the last and checked on its own fd (no window between the check
+/// and the inode taken). Lot 353 (re-check 1 of #563, N1): the walk starts
+/// where [`antitamper_bpf::kernel_roots::walk_root`] says — a carve-out
+/// under `/proc` or `/sys` (the mass-write ones, `"/sys/"` and `"/proc/"`)
+/// at the root of its view the start anchored, crossing no mount below it
+/// (`EXDEV`: skipped), any other from `/`. It walked `/proc/` from `/`:
+/// the `fstat` of a FUSE root mounted over `/proc` held the refresh (and,
+/// on a host with one runtime worker, the whole runtime) for as long as
+/// the mount stayed. The carve-out keys the kernel's own `/proc`, never
+/// what is mounted over it now (a write there is counted).
 fn place_carveout(path: &Path) -> std::io::Result<CarveoutPlace> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Component;
-
-    let open = |at: libc::c_int, name: &std::ffi::CStr| -> std::io::Result<std::fs::File> {
-        // SAFETY: openat on a NUL-terminated name; the fd is ours on success.
-        let fd = unsafe {
-            libc::openat(
-                at,
-                name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: a fresh fd returned by openat.
-        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    let (mut cur, names) = match antitamper_bpf::kernel_roots::walk_root(path) {
+        Ok(start) => start,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return Ok(CarveoutPlace::NotDir),
+        Err(e) => return Err(e),
     };
-    let mut names = Vec::new();
-    for c in path.components() {
-        match c {
-            Component::Normal(n) => names.push(n),
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir | Component::Prefix(_) => return Ok(CarveoutPlace::NotDir),
-        }
-    }
-    let mut cur = open(libc::AT_FDCWD, c"/")?;
-    let mut walked = PathBuf::from("/");
     for (i, n) in names.iter().enumerate() {
-        walked.push(n);
-        let c = CString::new(n.as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let next = match open(cur.as_raw_fd(), &c) {
+        let next = match cur.step(n) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = n.to_str() else {
                     return Ok(CarveoutPlace::NotDir);
                 };
                 return Ok(CarveoutPlace::Missing {
-                    parent: cur.metadata()?,
+                    parent: cur.file().metadata()?,
                     name: name.to_string(),
                     direct: i + 1 == names.len(),
                 });
             }
             Err(e) => return Err(e),
         };
-        let m = next.metadata()?;
+        let m = next.file().metadata()?;
         if m.file_type().is_symlink() {
-            return Ok(CarveoutPlace::Link(walked));
+            return Ok(CarveoutPlace::Link(next.at().to_path_buf()));
         }
         if !m.is_dir() {
             return Ok(CarveoutPlace::NotDir);
         }
         cur = next;
     }
-    Ok(CarveoutPlace::Dir(cur.metadata()?))
+    Ok(CarveoutPlace::Dir(cur.file().metadata()?))
 }
 
 /// External audit POS-010 (lab PR 198): a WARN for each carve-out `next`
@@ -1970,21 +1952,101 @@ impl DepthCapLog {
     }
 }
 
-/// Rebuild the rules from the host (new homes, runtime directories, paths
-/// created since) and write the difference against what the maps hold
-/// (`current`); `None` when nothing changed. The caller keeps
-/// [`Applied::in_maps`] as the next `current`.
-pub fn refresh(
-    maps: &mut OpenSensorMaps,
-    current: &RuleSet,
+/// Lot 353 (re-check 1 of #563, N1): how often the rules are rebuilt from
+/// the host ([`RuleRefresh`]).
+pub const REFRESH_EVERY: Duration = Duration::from_secs(60);
+
+/// Lot 353 (re-check 1 of #563, N1): how long a build of the rules from
+/// the host is waited for ([`build_bounded`]). The build reads `/etc/passwd`
+/// and walks every home, `/run/user`, the own-data trees and the daemons'
+/// directories by path: on any host it answers in milliseconds; a file
+/// system mounted on one of those paths that does not answer (a FUSE)
+/// holds it until the daemon cares to.
+pub const BUILD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Lot 353 (re-check 1 of #563, N1): the reader of the rules' builds — one
+/// unanswered at a time: while a build is held, the next is unjudged at
+/// once, no thread made.
+pub static BUILD_READER: std::sync::LazyLock<crate::state_read::TimedReader> =
+    std::sync::LazyLock::new(|| crate::state_read::TimedReader::new(BUILD_DEADLINE, 1));
+
+/// Lot 353 (re-check 1 of #563, N1): the rules built from the host
+/// ([`RuleSet::build`] of [`RuleInputs::from_host`]) on a helper thread of
+/// `reader`, waited for at most its deadline — `Err(why)` past it, or at
+/// once while an earlier build has not answered. The build ran on a
+/// runtime worker every minute: a FUSE over `/proc` held it (and every
+/// task on a host with one worker — the status, the admin socket) for as
+/// long as the mount stayed.
+pub fn build_bounded(
+    reader: &crate::state_read::TimedReader,
     extras: &OpenSensorExtras,
-) -> Option<Applied> {
-    let next = RuleSet::build(&RuleInputs::from_host(extras));
-    if next == *current {
+) -> std::result::Result<RuleSet, String> {
+    let extras = extras.clone();
+    reader.run("the file-open sensor's rules", move || {
+        RuleSet::build(&RuleInputs::from_host(&extras))
+    })
+}
+
+/// Lot 353 (re-check 1 of #563, N1): the source of the degradation a rule
+/// refresh that did not answer holds ([`RuleRefresh::next`]).
+pub const RULES_UNJUDGED: &str = "open_sensor_rules";
+
+/// Lot 353 (re-check 1 of #563, N1): the degradation's text.
+pub const RULES_UNJUDGED_DETAIL: &str = "the file-open sensor's rules were not rebuilt: their \
+     build did not answer (a mount that does not answer on a path it walks?) — the rules \
+     last written stay in force; new homes, logins and replaced directories are not keyed";
+
+/// Lot 353 (re-check 1 of #563, N1): the rules' periodic rebuild. A build
+/// that does not answer within the deadline is a refresh not judged: the
+/// rules last written stay in force, and it is a degradation
+/// ([`RULES_UNJUDGED`], listed by the status, signed in the chain) until a
+/// build answers again.
+#[derive(Debug)]
+pub struct RuleRefresh {
+    extras: OpenSensorExtras,
+    unjudged: crate::state_read::Condition,
+}
+
+impl RuleRefresh {
+    pub fn new(extras: OpenSensorExtras) -> Self {
+        RuleRefresh {
+            extras,
+            unjudged: crate::state_read::Condition::new(RULES_UNJUDGED),
+        }
+    }
+
+    /// The host's rules now ([`build_bounded`]); `None` when the build did
+    /// not answer (the degradation then holds, the reason logged).
+    pub fn next(&mut self, reader: &crate::state_read::TimedReader) -> Option<RuleSet> {
+        match build_bounded(reader, &self.extras) {
+            Ok(set) => {
+                self.unjudged.ended();
+                Some(set)
+            }
+            Err(why) => {
+                warn!(detail = %why, "file-open sensor: the rules' refresh did not answer");
+                self.unjudged.holds(RULES_UNJUDGED_DETAIL.to_string());
+                None
+            }
+        }
+    }
+
+    /// Whether the last refresh was not judged.
+    pub fn unjudged(&self) -> bool {
+        self.unjudged.holding()
+    }
+}
+
+/// Write the difference between `next` (the rules rebuilt from the host:
+/// new homes, runtime directories, paths created since) and what the maps
+/// hold (`current`); `None` when nothing changed. The caller keeps
+/// [`Applied::in_maps`] as the next `current`.
+pub fn refresh(maps: &mut OpenSensorMaps, current: &RuleSet, next: &RuleSet) -> Option<Applied> {
+    if next == current {
         return None;
     }
-    warn_refused_carveouts(Some(current), &next);
-    let applied = maps.apply(&next, Some(current));
+    warn_refused_carveouts(Some(current), next);
+    let applied = maps.apply(next, Some(current));
     info!(
         inodes = next.inodes.len(),
         children = next.children.len(),
@@ -3677,5 +3739,140 @@ mod tests {
         };
         let cap = fe.capability.unwrap();
         assert!(cap.namespaced && !cap.effective);
+    }
+
+    /// A FUSE file system mounted over `target` in the caller's user and
+    /// mount namespaces (uid and gid 0 mapped there), whose daemon never
+    /// answers: its descriptor, which aborts the connection when dropped.
+    fn fuse_over(target: &Path) -> Option<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        let fuse = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+            .ok()?;
+        let opts = std::ffi::CString::new(format!(
+            "fd={},rootmode=40000,user_id=0,group_id=0",
+            fuse.as_raw_fd()
+        ))
+        .ok()?;
+        let t = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).ok()?;
+        // SAFETY: NUL-terminated strings; the options name our descriptor.
+        let ok = unsafe {
+            libc::mount(
+                c"nntest".as_ptr(),
+                t.as_ptr(),
+                c"fuse".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                opts.as_ptr().cast(),
+            )
+        } == 0;
+        ok.then_some(fuse)
+    }
+
+    /// Lot 353 (re-check 1 of #563, N1, named; the re-check's probe 3): a
+    /// FUSE mounted over `/proc` that never answers. The rule refresh's
+    /// carve-outs `/proc/` and `/sys/` are placed at once, beneath the
+    /// roots the start anchored (the kernel's `/proc` and `/sys`, never the
+    /// FUSE: a write under it is counted) — the walk from `/` was held by
+    /// the `fstat` of the FUSE root. And a refresh whose build a second
+    /// FUSE holds (over a daemon's directory it walks by path) is
+    /// unjudged within the deadline, on its own thread
+    /// ([`PumpThread::every`]), while a runtime with one worker keeps
+    /// answering.
+    #[test]
+    fn a_fuse_over_proc_does_not_hold_the_rule_refresh() {
+        let _ = antitamper_bpf::kernel_roots::init();
+        let want = |p: &str| antitamper_bpf::kernel_roots::symlink_metadata(p).map(|m| key_of(&m));
+        let (Ok(proc_key), Ok(sys_key)) = (want("/proc"), want("/sys")) else {
+            eprintln!("skipped: the views are not anchored here");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        std::fs::create_dir(&held).unwrap();
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let rc = crate::anchored::testing::in_userns(|| {
+            let w = |p: &str, s: String| std::fs::write(p, s).is_ok();
+            if !(w("/proc/self/setgroups", "deny".into())
+                && w("/proc/self/uid_map", format!("0 {uid} 1"))
+                && w("/proc/self/gid_map", format!("0 {gid} 1")))
+            {
+                return 99;
+            }
+            let Some(over_proc) = fuse_over(Path::new("/proc")) else {
+                return 99; // no FUSE in a user namespace here
+            };
+            // 1. the carve-outs, at once, the kernel's own views
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let key = |p: &str| match place_carveout(Path::new(p)) {
+                    Ok(CarveoutPlace::Dir(m)) => Some(key_of(&m)),
+                    _ => None,
+                };
+                let _ = tx.send((key("/proc/"), key("/sys/")));
+            });
+            match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok((Some(p), Some(s))) if p == proc_key && s == sys_key => {}
+                Ok(_) => return 10,  // placed elsewhere, or not placed
+                Err(_) => return 11, // held by the FUSE over /proc
+            }
+            // 2. a build held by a FUSE over a daemon's directory: unjudged,
+            // off the runtime, which answers meanwhile
+            let Some(over_dir) = fuse_over(&held) else {
+                return 12;
+            };
+            let reader = crate::state_read::TimedReader::new(Duration::from_millis(500), 1);
+            let mut refresh = RuleRefresh::new(OpenSensorExtras {
+                carveout: Vec::new(),
+                unit_dirs: vec![format!("{}/data", held.display())],
+            });
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let answered = rt.block_on(async move {
+                let Ok(t) = crate::sensors::pump::PumpThread::every(
+                    "rules_test",
+                    Duration::from_millis(50),
+                    move || {
+                        let built = refresh.next(&reader).is_some();
+                        let _ = rtx.send((built, refresh.unjudged()));
+                    },
+                ) else {
+                    return None;
+                };
+                // the one worker answers ten 20 ms timers while the
+                // refresh is held
+                let started = Instant::now();
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let took = started.elapsed();
+                Some((t, took))
+            });
+            let Some((t, took)) = answered else {
+                return 13;
+            };
+            if took > Duration::from_secs(1) {
+                return 14; // the runtime was held
+            }
+            let first = rrx.recv_timeout(Duration::from_secs(3));
+            t.stop();
+            drop(over_dir);
+            drop(over_proc);
+            match first {
+                Ok((false, true)) => 0,
+                Ok(_) => 15,  // judged although its build was held
+                Err(_) => 16, // the refresher itself was held
+            }
+        });
+        match rc {
+            None | Some(99) => eprintln!("skipped: no user namespace with FUSE here"),
+            Some(rc) => assert_eq!(rc, 0, "the child failed (see the codes)"),
+        }
     }
 }

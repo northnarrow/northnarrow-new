@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use nn_proto::admin_signed_payload::OverlayKind;
 use northnarrow_agent::admin_socket;
@@ -65,8 +65,8 @@ fn start_open_sensor(
     posture: &PostureMachine,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
-        refresh, spawn_pump, take_ringbuf, warn_refused_carveouts, DepthCapLog, OpenSensorMaps,
-        RuleHealth, RuleInputs, RuleSet, RULE_CAPACITY,
+        build_bounded, refresh, spawn_pump, take_ringbuf, warn_refused_carveouts, DepthCapLog,
+        OpenSensorMaps, RuleHealth, RuleRefresh, BUILD_READER, REFRESH_EVERY, RULE_CAPACITY,
     };
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
@@ -90,7 +90,19 @@ fn start_open_sensor(
         open_sensor_on_tracepoint(sensor, "its file_open observer is not attached");
         return;
     }
-    let rules = RuleSet::build(&RuleInputs::from_host(extras));
+    // Lot 353 (re-check 1 of #563, N1): built on a helper thread with a
+    // deadline — a mount that does not answer on a path the build walks (a
+    // home, a daemon's directory) never holds the start; then every open
+    // still reaches userland through `sys_enter_openat`.
+    let rules = match build_bounded(&BUILD_READER, extras) {
+        Ok(r) => r,
+        Err(why) => {
+            warn!(detail = %why, "file-open sensor: its rules' build did not answer — keeping sys_enter_openat");
+            open_tracepoint_fallback(sensor);
+            open_sensor_on_tracepoint(sensor, &format!("its rules' build did not answer ({why})"));
+            return;
+        }
+    };
     warn_refused_carveouts(None, &rules);
     let mut maps = match OpenSensorMaps::take(sensor.ebpf_mut()) {
         Ok(m) => m,
@@ -177,14 +189,19 @@ fn start_open_sensor(
     );
     // New homes, runtime directories (logins) and paths created since:
     // re-registered every minute, against what the maps really hold.
-    let extras = extras.clone();
-    let refresher = tokio::spawn(async move {
-        let mut current = applied.in_maps;
-        let mut depth_cap = DepthCapLog::default();
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.tick().await;
-        loop {
-            tick.tick().await;
+    // Lot 353 (re-check 1 of #563, N1): on a thread of its own, the build
+    // bounded ([`RuleRefresh`]) — it ran on a runtime worker, and a FUSE over
+    // `/proc` held it for as long as the mount stayed: on a host with one
+    // worker, the status and the admin socket with it. A build that does
+    // not answer is a refresh not judged (a degradation while it lasts).
+    let mut refresh_rules = RuleRefresh::new(extras.clone());
+    let mut current = applied.in_maps;
+    let mut depth_cap = DepthCapLog::default();
+    let refresh_log = audit_log.clone();
+    let refresher = northnarrow_agent::sensors::pump::PumpThread::every(
+        "open_sensor_rules",
+        REFRESH_EVERY,
+        move || {
             depth_cap.sample(&maps);
             // the review of #547 (F6): the uids' shares of the tasks'
             // buffers recounted when opens lost their task's buffer
@@ -198,13 +215,27 @@ fn start_open_sensor(
                     );
                 }
             }
-            if let Some(applied) = refresh(&mut maps, &current, &extras) {
-                report_open_rules(&mut health, &applied, audit_log.as_ref(), false);
+            let Some(next) = refresh_rules.next(&BUILD_READER) else {
+                return;
+            };
+            if let Some(applied) = refresh(&mut maps, &current, &next) {
+                report_open_rules(&mut health, &applied, refresh_log.as_ref(), false);
                 current = applied.in_maps;
             }
+        },
+    );
+    match refresher {
+        Ok(t) => sensor.register_pump_thread("open_sensor_rules", t),
+        Err(e) => {
+            // the rules written stay in force; the refresh is what is lost
+            error!(error = %e, "file-open sensor: its rules' refresher did not start — the rules stay as written at the start");
+            attest_degraded_at(
+                audit_log.as_ref(),
+                &format!("file-open sensor rules' refresher did not start: {e}"),
+                true,
+            );
         }
-    });
-    sensor.register_pump_handle("open_sensor_rules", refresher);
+    }
 }
 
 /// External audit SNS-007: the outcome of a rule write, said once per

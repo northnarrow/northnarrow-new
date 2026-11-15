@@ -1227,6 +1227,115 @@ pub fn open_crossing<P: AsRef<Path>>(path: P, flags: i32) -> io::Result<File> {
     with_file(path, flags, Ok).unwrap_or_else(|| open_path(path, flags))
 }
 
+/// Lot 353 (re-check 1 of #563, N1): one directory of a walk one name at a
+/// time ([`walk_root`]), and the path it stands for.
+#[derive(Debug)]
+pub struct WalkDir {
+    dir: File,
+    at: PathBuf,
+    in_view: bool,
+}
+
+impl WalkDir {
+    /// The one name `name` below this directory, opened `O_PATH |
+    /// O_NOFOLLOW` (a symbolic link is the link itself, never followed).
+    /// Beneath a view's anchored root it crosses no mount and no magic link
+    /// (`RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`): a mount
+    /// below the root — the kernel's, or one laid there — is `EXDEV`, never
+    /// walked into, so what it opens is the view's own file system and its
+    /// `fstat` is the kernel's answer. Elsewhere it is an `openat`. A name
+    /// that is not one component (`..`, `.`, a `/`) is `EINVAL`.
+    pub fn step(&self, name: &std::ffi::OsStr) -> io::Result<WalkDir> {
+        let b = name.as_bytes();
+        if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let flags = libc::O_PATH | libc::O_NOFOLLOW;
+        let rel = Path::new(name);
+        let dir = if self.in_view {
+            openat2(&self.dir, rel, flags, NO_CROSSING)?
+        } else {
+            openat(&self.dir, rel, flags)?
+        };
+        Ok(WalkDir {
+            dir,
+            at: self.at.join(name),
+            in_view: self.in_view,
+        })
+    }
+
+    /// The open directory (or the link, or the file, a step reached).
+    pub fn file(&self) -> &File {
+        &self.dir
+    }
+
+    /// The path this directory stands for.
+    pub fn at(&self) -> &Path {
+        &self.at
+    }
+
+    /// Whether the walk is beneath a view's anchored root.
+    pub fn in_view(&self) -> bool {
+        self.in_view
+    }
+}
+
+/// Lot 353 (re-check 1 of #563, N1): where a walk of `path` one name at a
+/// time starts, and the names left to walk ([`WalkDir::step`] each). A
+/// path under `/proc`, `/sys` or the cgroup2 hierarchy starts at the root
+/// of its view the start anchored — a mount laid over the view since (a
+/// FUSE over `/proc` that never answers) is never walked: the open
+/// sensor's rule refresh walked the mass-write carve-out `/proc/` from
+/// `/`, and the `fstat` of the FUSE root it reached held a runtime worker
+/// for as long as the mount stayed. Any other path starts at `/`. A view
+/// the start refused is an error at once; a `..` on the way is
+/// `InvalidInput`. `path` is taken from `/` (a relative one too).
+pub fn walk_root(path: &Path) -> io::Result<(WalkDir, Vec<OsString>)> {
+    let mut names = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(n) => names.push(n.to_os_string()),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: a `..` on the way — not walked", path.display()),
+                ))
+            }
+        }
+    }
+    let abs: PathBuf = std::iter::once(std::ffi::OsStr::new("/"))
+        .chain(names.iter().map(OsString::as_os_str))
+        .collect();
+    if let Some((view, rel)) = view_of(&abs) {
+        let root = view.root.as_ref().map_err(|why| not_anchored(&abs, why))?;
+        let rest = rel
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(n) => Some(n.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        return Ok((
+            WalkDir {
+                dir: root.try_clone()?,
+                at: view.at.clone(),
+                in_view: true,
+            },
+            rest,
+        ));
+    }
+    let dir = open_path(Path::new("/"), libc::O_PATH | libc::O_DIRECTORY)?;
+    Ok((
+        WalkDir {
+            dir,
+            at: PathBuf::from("/"),
+            in_view: false,
+        },
+        names,
+    ))
+}
+
 /// Lot 353: the device (`major:minor`, the kernel's encoding: `major << 20
 /// | minor`), inode and mode of the open `f` as the kernel has them cached
 /// (`statx` with `AT_STATX_DONT_SYNC`): a FUSE inode — a FUSE mounted over
@@ -1276,6 +1385,86 @@ pub fn cgroup_root() -> Result<(File, &'static Path), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 353 (re-check 1 of #563, N1): a walk of a view's path starts at
+    /// the root the start anchored — the same inode as the view's root —,
+    /// one of any other path at `/`; a step crosses no mount below a view,
+    /// follows no link, and takes one name only.
+    #[test]
+    fn a_view_s_walk_starts_at_its_anchored_root() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(unanchored().is_empty(), "{:?}", unanchored());
+        let (start, names) = walk_root(Path::new("/proc/self")).unwrap();
+        assert!(start.in_view());
+        assert_eq!(start.at(), Path::new("/proc"));
+        assert_eq!(names, vec![OsString::from("self")]);
+        let root = symlink_metadata("/proc").unwrap();
+        let m = start.file().metadata().unwrap();
+        assert_eq!((m.dev(), m.ino()), (root.dev(), root.ino()));
+        // `/proc/self` is a link: the step is the link itself
+        let link = start.step(std::ffi::OsStr::new("self")).unwrap();
+        assert!(link.file().metadata().unwrap().file_type().is_symlink());
+        assert_eq!(link.at(), Path::new("/proc/self"));
+        let (sys, names) = walk_root(Path::new("/sys/")).unwrap();
+        assert!(sys.in_view() && names.is_empty());
+        // another path: from `/`, every name left
+        let (slash, names) = walk_root(Path::new("/etc/hostname")).unwrap();
+        assert!(!slash.in_view());
+        assert_eq!(slash.at(), Path::new("/"));
+        assert_eq!(
+            names,
+            vec![OsString::from("etc"), OsString::from("hostname")]
+        );
+        // relative: from `/` as well; a `..` is not walked
+        let (_, names) = walk_root(Path::new("proc/self")).unwrap();
+        assert_eq!(
+            names,
+            vec![OsString::from("self")],
+            "a relative view path is the view's"
+        );
+        assert_eq!(
+            walk_root(Path::new("/proc/../etc")).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for bad in ["..", ".", "a/b", ""] {
+            assert_eq!(
+                start
+                    .step(std::ffi::OsStr::new(bad))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EINVAL),
+                "{bad:?}"
+            );
+        }
+        // a mount below the view (binfmt_misc, securityfs, a cgroup v1
+        // controller, where the host has one) is never crossed
+        for below in [
+            "/proc/sys/fs/binfmt_misc",
+            "/sys/kernel/security",
+            "/sys/kernel/tracing",
+        ] {
+            let p = Path::new(below);
+            let Ok(m) = std::fs::metadata(p) else {
+                continue;
+            };
+            let Ok(parent) = std::fs::metadata(p.parent().unwrap()) else {
+                continue;
+            };
+            if m.dev() == parent.dev() {
+                continue; // not a mount here
+            }
+            let (mut cur, names) = walk_root(p).unwrap();
+            let (last, up) = names.split_last().unwrap();
+            for n in up {
+                cur = cur.step(n).unwrap();
+            }
+            assert_eq!(
+                cur.step(last).unwrap_err().raw_os_error(),
+                Some(libc::EXDEV),
+                "{below}"
+            );
+        }
+    }
 
     /// Lot 353 (named): a state file of `/proc` is read beneath the root the
     /// start took, as by path.

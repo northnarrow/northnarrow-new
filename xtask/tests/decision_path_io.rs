@@ -211,8 +211,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
         // builds' `debug-deny-detach` / `debug-deny-budget-spent` files;
         // lot 353 (the review of #563): 32 → 33, the round's own image
         // read beneath the anchored /proc root (`kernel_roots::current_exe`,
-        // std's read of /proc/self/exe by path held the round on a FUSE)
-        33,
+        // std's read of /proc/self/exe by path held the round on a FUSE);
+        // re-check 1 of #563: 33 → 36, no new I/O — three `off_the_runtime(`
+        // around the round's existing reads (the probe file's write, the
+        // attach view, the deny self-test's plan), so a mount that does not
+        // answer holds the round's thread, not a runtime worker
+        36,
         "the probe's own task (its marker files, sleeps, child processes; R13, lab PR 271: in \
          debug-trigger builds the lab's `debug-probe-blind` file, read once a round; lot 280c: \
          the attach checks' reads, the child's reap off the runtime; lot 302: the deny \

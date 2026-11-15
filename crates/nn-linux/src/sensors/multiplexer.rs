@@ -962,7 +962,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     }
 
     /// Tappa 9 C8 — register a spawned telemetry task (the FIM and net
-    /// drains, the open-sensor pump and its rule refresher) with the
+    /// drains; lot 353: the open sensor's rule refresher is a thread,
+    /// [`Self::register_pump_thread`]) with the
     /// multiplexer so `Drop` aborts it alongside the sensor pumps, and
     /// [`Self::finished_pumps`] reports it if it ends.
     pub fn register_pump_handle(&mut self, label: &'static str, handle: JoinHandle<()>) {

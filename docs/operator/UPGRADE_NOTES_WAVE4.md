@@ -2841,8 +2841,9 @@ and the signed log showed a clean `agent_stop` `sigint`.
   appended field; an older agent's reply reads as 0), and the watchdog
   records `signed_records_failed` (High) in its hold once per episode
   lasting 30 s at a ping, with an ERROR of its own.
-- **Every read of `/proc` and `/sys` is routed** (the ratchet no longer
-  missed them): the known-program judgement's process walk and link
+- **Every read of `/proc` and `/sys` the ratchet sees is routed** (the
+  ratchet no longer missed them; re-check 1 found two walks it did not see,
+  below): the known-program judgement's process walk and link
   descriptors, the admin socket's re-bind chmod (WDG-007), the quarantine's
   restore and its listed-shells read and its emptying, the kill response's
   descendant walk (the `procfs` crate is gone from the product code), the
@@ -2908,14 +2909,74 @@ and the signed log showed a clean `agent_stop` `sigint`.
   connection in the mount tables read again is not aborted. Left: the
   moments between that read and the abort's write.
 
-Measured and left (the lab, debian13): under a FUSE over `/proc` that
-never answers the agent, one runtime worker still sends one `FUSE_STATX` of
-the `/proc` root about 30 s after the mount — every round, its caller not
-found (the agent's ptrace protection hides the thread's stack, a trace of
-its calls lost the event); that worker is held while the FUSE stays, the
-status was lost once (one ping failed), the agent was not restarted and its
-signed records kept flowing. The watchdog's FUSE abort covers a FUSE over
-`/proc` that holds an agent its SIGKILL cannot end.
+- **The open sensor's rule refresh never walks the `/proc` or `/sys`
+  mounted now, and never runs on the runtime** (re-check 1 of #563). The
+  mass-write carve-outs `/proc/` and `/sys/` — and any carve-out or daemon
+  directory under a view — are placed beneath the roots the start anchored
+  (`kernel_roots::walk_root`: the walk starts at the view's root and
+  crosses no mount below it): they key the kernel's own `/proc` and `/sys`,
+  never a file system mounted over them since (a write there is counted).
+  The refresh, every minute, runs on a thread of its own, and its build of
+  the rules from the host runs on a helper thread waited for at most 10 s.
+  A build that does not answer (a mount on a home, `/run/user` or a
+  daemon's directory that does not answer) is a refresh not judged: the
+  rules last written stay in force, and a degradation `open_sensor_rules`
+  stands (in `nn-admin status`, signed) until a build answers again; while
+  one build is held, the next is not judged at once. The start's build is
+  bounded the same way: one that does not answer keeps `sys_enter_openat`
+  for the run (every open reaches userland). This was the one `FUSE_STATX`
+  of the `/proc` root the lab measured about 30 s after the mount, whose
+  caller round 1 did not find: on a host with one runtime worker (the
+  workers follow the CPUs: a 1-vCPU host) it stopped the whole runtime —
+  the status, the admin socket — and the watchdog's stuck recovery
+  restarted the agent under the mount.
+- **The other periodic tasks that walk a path by path run off the
+  runtime's workers:** the BPF link self-check (every 10 s, the pins under
+  `/sys/fs/bpf`), the telemetry probe's round (its probe file, its view of
+  the links, the deny self-test's targets), the trusted-installer window's
+  close, the `systemd-shutdown` identity refresh, the program images'
+  refresh (the system's bin directories) and the watchdog exemption's
+  refresh (its pidfile, its binary, the pins): a mount there that does not
+  answer holds that task's thread, never a worker the status answers on.
+  The admin socket's watch looks at its path on a helper thread with a 2 s
+  deadline (the look runs in the socket's own serve loop): a look that does
+  not answer is logged, and nothing is bound again.
+- **The canary's writer** opens PID 1's root (`/proc/1/root`) beneath the
+  anchored `/proc` root, the magic link followed as the kernel resolves it:
+  a canary's deploy no longer walks the `/proc` mounted now. The tracepoint
+  offsets' tracefs reads (the `format` files, the roots' file system type)
+  open beneath the anchored `/sys` root, tracefs crossed within the
+  deadline.
+- **WSL2's exemption holds on WSL's kernel only** (its release, `uname`,
+  names Microsoft). On any other kernel a tmpfs whose source root is named
+  `/wsl/…` over `binfmt_misc`'s `status` is a `mount_over_protected`
+  (High), as any other mount there.
+- **The ratchet** (`xtask/tests/kernel_views.rs`) also refuses: a walk
+  that starts at `/` by path outside `kernel_roots` (an open of `/` to walk
+  from: the refresh's shape); an `*at` call (`openat`, `fstatat`, `statx`…)
+  whose path names a view, whatever its directory, and any call whose
+  directory is `AT_FDCWD` (a closure or a helper around `openat`); a
+  constant or static that holds a view path, over several lines (a slice of
+  prefixes), and the items a `for` loop or a closure binds from one; a
+  function that builds and returns a view path, by its module path in the
+  other files; a parameter another file's call hands a view literal or
+  constant (`module::function(…)`). It fails on the four shapes the re-check
+  planted. It is lexical: a path that reaches a by-path call through a
+  struct field, a `Vec` filled by `push`, a function imported and called
+  bare, or a closure handed to a helper is not followed.
+
+Measured (the lab, debian13, 6.12, one vCPU: the agent's runtime with one
+worker): round r2b (this round's tree): `nproc` 1; a FUSE over `/proc` that
+never answers the agent (`EIO` to others), 180 s, laid in PID 1's namespace.
+No agent thread sent it a request (`stalled=0`, 0 threads); `nn-admin
+status` answered at 15/45/75/105/135/165/178 s, no ping failed, the same
+pid, no restart; the rule refresh ran under the mount (one `rules
+refreshed`, none unjudged); the signed chains took rows (audit +11,
+heartbeat +7), no signing error; `mount_over_protected` (High) signed during
+the mount and cleared after it. The deny self-test's step that opens a
+target's `/proc/<pid>/mem` (the probe's child, by path) failed under the
+FUSE and was signed as a `deny_selftest` degradation, as a step that cannot
+judge is.
 
 Not done here (recorded): a worker is still executed through
 `/proc/self/fd/<image>` (`execve`, on the worker supervisor's own thread —
@@ -2932,6 +2993,38 @@ requests, not only the agent's; an `nn-kview-open` thread stuck in a FUSE
 stop; a rotation's lift of the state directory's `+i` opens the directory
 by its path (a FUSE over the agent's own directories is the watchdog's to
 abort).
+
+Not done here either (re-check 1 of #563, recorded):
+- **The watchdog reaches the agent and writes its records by path.** It
+  pings the agent (`connect` of `/run/northnarrow/admin.sock`) and appends
+  its hold records (`/run/northnarrow/watchdog.hold`) by path, on its
+  single-threaded runtime. A file system mounted over `/run/northnarrow`
+  that does not answer holds the watchdog itself — its pings, its wait for
+  the agent's death, its records — for as long as it stays: no abort covers
+  the watchdog's own process. One that answers receives the records the
+  watchdog writes there. With a bind over a signed log file as well (each
+  append there fails `EXDEV`), the agent's `signed_log` degradation and its
+  `signed_records_failed` stay in the agent's memory and are signed once a
+  chain takes rows again: a run that ends first (a reboot, which also
+  clears `/run`) loses them, and the `mount_over_protected` of the mount
+  over `/run/northnarrow` is not signed meanwhile. Root only.
+- **The responses that change a file on the host walk `/proc/1/root` by
+  path** (`on_host_path`, `host_path`: the quarantine, a file capability's
+  removal, an account's lock, the share's subuid check, the copy-on-write
+  journal, the entropy sampler). Under a FUSE over `/proc` that does not
+  answer, such a response waits for as long as the mount stays, on its own
+  thread (not the runtime's). The ratchet does not see it: the path is
+  handed to a closure.
+- **The telemetry probe's child and the deny self-test's target are
+  started by path** (`execve` of the agent's own image and of the target):
+  a mount over their directories that does not answer holds that round's
+  task until the exec resolves.
+- **The systemd watch's `spawn_blocking`** (every 2 s, with a deadline)
+  leaves one blocking thread held per tick under a file system over
+  `/run/systemd` that does not answer: the runtime's blocking pool is
+  bounded (512), so after some 17 minutes every `spawn_blocking` caller
+  (the heartbeat, the anchors, the bus loss recorder) waits.
+
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 
 - **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)

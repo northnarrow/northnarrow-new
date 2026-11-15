@@ -162,9 +162,36 @@ pub enum PathState {
     Unreadable(io::Error),
 }
 
+/// Lot 353 (re-check 1 of #563): how long the watch's look at the path
+/// waits ([`path_state`]).
+pub const LOOK_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Look at `path` (never through a link).
 pub fn path_state(path: &Path, bound: SocketId) -> PathState {
-    match fs::symlink_metadata(path) {
+    state_of(fs::symlink_metadata(path), bound)
+}
+
+/// Lot 353 (re-check 1 of #563): [`path_state`] on a helper thread of
+/// `looks`, waited for at most its deadline ([`LOOK_DEADLINE`]) — the look
+/// runs in the admin socket's own serve loop, and a file system mounted
+/// over `/run/northnarrow` that does not answer (a FUSE) held it: the
+/// status stopped answering. A look that does not answer is `Unreadable`
+/// (logged, nothing bound again); while one is held, the next is at once.
+pub fn path_state_within(
+    looks: &nn_linux::state_read::TimedReader,
+    path: &Path,
+    bound: SocketId,
+) -> PathState {
+    let p = path.to_path_buf();
+    let looked = looks
+        .run("the admin socket's path", move || fs::symlink_metadata(&p))
+        .map_err(|why| io::Error::new(io::ErrorKind::TimedOut, why))
+        .and_then(|r| r);
+    state_of(looked, bound)
+}
+
+fn state_of(looked: io::Result<fs::Metadata>, bound: SocketId) -> PathState {
+    match looked {
         Ok(m) => {
             let t = m.file_type();
             if t.is_socket() && SocketId::of(&m) == bound {
@@ -199,6 +226,8 @@ pub struct SocketWatch {
     unsigned: u32,
     /// The last "still not bound" warning.
     last_retry_log: Option<Instant>,
+    /// Lot 353 (re-check 1 of #563): its looks at the path, bounded.
+    looks: nn_linux::state_read::TimedReader,
 }
 
 impl SocketWatch {
@@ -210,6 +239,7 @@ impl SocketWatch {
             last_signed: None,
             unsigned: 0,
             last_retry_log: None,
+            looks: nn_linux::state_read::TimedReader::new(LOOK_DEADLINE, 1),
         }
     }
 
@@ -220,7 +250,7 @@ impl SocketWatch {
         if is_retired(&self.path) {
             return None;
         }
-        let what = match path_state(&self.path, self.bound) {
+        let what = match path_state_within(&self.looks, &self.path, self.bound) {
             PathState::Ours => return None,
             PathState::Unreadable(e) => {
                 if self.retry_log_due() {

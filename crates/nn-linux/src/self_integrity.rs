@@ -852,6 +852,10 @@ fn refused_views(why: Vec<String>) -> Vec<Finding> {
 /// binfmt_misc mounted at `/proc/sys/fs/binfmt_misc`, at every boot of a
 /// supported platform (`KERNEL_COMPATIBILITY.md`). A tmpfs or a FUSE over
 /// `/proc` or `/sys` themselves is at a view's own point, never here.
+/// Lot 353 (re-check 1 of #563, N5): that tmpfs only on WSL's kernel
+/// ([`on_wsl`]) — any root could name a directory of its own tmpfs `/wsl/…`
+/// and bind it there, hiding `status` (and swallowing the `-1` that clears
+/// the handlers) on any host.
 fn canonical_below_view(m: &Mount, parent: Option<&Mount>) -> bool {
     const BINFMT: &str = "/proc/sys/fs/binfmt_misc";
     match (m.fstype.as_str(), m.mount_point.as_str()) {
@@ -859,9 +863,43 @@ fn canonical_below_view(m: &Mount, parent: Option<&Mount>) -> bool {
         ("tmpfs", p) if p == format!("{BINFMT}/status") => {
             m.root.starts_with("/wsl/")
                 && parent.is_some_and(|p| p.fstype == "binfmt_misc" && p.mount_point == BINFMT)
+                && on_wsl()
         }
         _ => false,
     }
+}
+
+/// Lot 353 (re-check 1 of #563, N5): whether the running kernel is WSL's —
+/// its release (`uname(2)`) names Microsoft (`…-microsoft-standard-WSL2`,
+/// WSL1's `…-Microsoft`). The release is the kernel's own: no sysctl sets
+/// it, and nothing bound over a file of `/proc` changes what `uname`
+/// answers.
+fn on_wsl() -> bool {
+    if let Some(w) = WSL_FOR_TESTS.with(std::cell::Cell::get) {
+        return w;
+    }
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        // SAFETY: `utsname` is plain old data, valid when zeroed; the
+        // kernel fills it.
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: `u` is writable for its size.
+        if unsafe { libc::uname(&mut u) } != 0 {
+            return false;
+        }
+        // SAFETY: the kernel NUL-terminates `release` within the array.
+        let release = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) };
+        release
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("microsoft")
+    })
+}
+
+thread_local! {
+    /// A test's answer for [`on_wsl`] on its own thread (only the tests of
+    /// this module set it).
+    static WSL_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Which namespace a [`MountWatch`] baseline was read from.
@@ -3102,6 +3140,7 @@ mod tests {
 125 116 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:23 - cgroup2 cgroup2 rw,nsdelegate
 136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
 ";
+        WSL_FOR_TESTS.with(|w| w.set(Some(true)));
         assert_eq!(mount_findings(wsl, &[]), Vec::new(), "WSL's own mounts");
         for (extra, why) in [
             (
@@ -3137,6 +3176,36 @@ mod tests {
             1,
             "only PID 1's table"
         );
+        WSL_FOR_TESTS.with(|w| w.set(None));
+    }
+
+    /// Lot 353 (re-check 1 of #563, N5): the exemption of WSL's tmpfs over
+    /// `binfmt_misc`'s `status` holds on WSL's kernel only — on any other
+    /// kernel, the same table (a root's own tmpfs, a directory of it named
+    /// `/wsl/…`, bound there) is a mount below the view, High.
+    #[test]
+    fn the_wsl_exemption_holds_on_wsl_s_kernel_only() {
+        let forged = "\
+85 77 8:32 / / rw,relatime shared:9 - ext4 /dev/sda1 rw
+116 85 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
+117 85 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+124 117 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
+136 124 0:63 /wsl/x /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs tmpfs rw
+";
+        WSL_FOR_TESTS.with(|w| w.set(Some(false)));
+        let f = mount_findings(forged, &[]);
+        WSL_FOR_TESTS.with(|w| w.set(None));
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(
+            f[0].detail.contains("/proc/sys/fs/binfmt_misc/status"),
+            "{}",
+            f[0].detail
+        );
+        WSL_FOR_TESTS.with(|w| w.set(Some(true)));
+        let f = mount_findings(forged, &[]);
+        WSL_FOR_TESTS.with(|w| w.set(None));
+        assert!(f.is_empty(), "on WSL's kernel: {f:?}");
     }
 
     /// External audit NN-AUD-098: the tracefs a stock host mounts (and the

@@ -424,6 +424,29 @@ const STATICS: &[Kept] = &[
          bounded once for it (STALLED_MAX); the tests make their own TimedReader",
     ),
     kept(
+        "crates/nn-linux/src/sensors/open_sensor.rs",
+        "BUILD_READER",
+        Process,
+        "lot 353 (re-check 1 of #563): the reader of the file-open sensor's rule builds, with a \
+         deadline, one unanswered at a time: one sensor per agent process, and a build a mount \
+         leaves blocked is the process's helper thread, bounded once for it; the tests make \
+         their own TimedReader",
+    ),
+    kept(
+        "crates/nn-linux/src/self_integrity.rs",
+        "WSL",
+        HostFact,
+        "lot 353 (re-check 1 of #563, N5): whether the running kernel is WSL's (its release, \
+         `uname`), read once",
+    ),
+    kept(
+        "crates/nn-linux/src/self_integrity.rs",
+        "WSL_FOR_TESTS",
+        Scratch,
+        "lot 353 (re-check 1 of #563, N5): a test's answer for `on_wsl` on its own thread, set \
+         and cleared within the test; never set outside the module's tests",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/task_free.rs",
         "ATTACHED",
         Kernel,

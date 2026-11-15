@@ -130,9 +130,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/canary/path_policy.rs",
-        2,
-        "PID 1's root (`/proc/1/root`), the host's view the agent reads its own paths through, \
-         tested for and joined: no caller's path",
+        // re-check 1 of #563 (N3): 2 → 1, the root opened beneath the
+        // anchored /proc root at once (no separate test of it)
+        1,
+        "PID 1's root (`/proc/1/root`), the host's view the agent writes its canaries through, \
+         opened beneath the anchored /proc root: no caller's path",
     ),
     (
         "crates/nn-linux/src/response/mod.rs",

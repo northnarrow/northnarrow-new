@@ -1945,11 +1945,14 @@ impl BpfGuard {
                 if guard.stopping() {
                     return;
                 }
-                let live: HashSet<u32> = live_links(own.pin_root.as_deref())
-                    .into_iter()
-                    .filter(|(_, prog)| *prog != 0)
-                    .map(|(id, _)| id)
-                    .collect();
+                // lot 353 (re-check 1 of #563): the pins walked by path
+                // (`/sys/fs/bpf`) — off the runtime's worker
+                let live: HashSet<u32> =
+                    crate::runtime::off_the_runtime(|| live_links(own.pin_root.as_deref()))
+                        .into_iter()
+                        .filter(|(_, prog)| *prog != 0)
+                        .map(|(id, _)| id)
+                        .collect();
                 for id in &ids {
                     // re-read per link: the stop can begin during the walk
                     if guard.stopping() {
