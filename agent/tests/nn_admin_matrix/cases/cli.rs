@@ -82,7 +82,13 @@ fn parse(path: Vec<String>) -> Node {
             }
             "options" => {
                 let t = line.trim_start();
-                let t = t.split_once(", ").map(|(_, b)| b).unwrap_or(t);
+                // `-h, --help`: the long form after a short one. Lot 354: only
+                // then — an option's help may hold ", " too ("Path of this
+                // install's agent id, which …"), and was read as no option.
+                let t = match t.split_once(", ") {
+                    Some((short, long)) if short.len() == 2 && short.starts_with('-') => long,
+                    _ => t,
+                };
                 if let Some(rest) = t.strip_prefix("--") {
                     let mut it = rest.split_whitespace();
                     let flag = format!("--{}", it.next().unwrap());

@@ -174,8 +174,8 @@ struct Cli {
 enum Cmd {
     /// Generate a fresh Ed25519 keypair, install the public half
     /// into the agent's admin.pub, and write the private half to
-    /// disk for the admin to safeguard. NB: V1 has no air-gapped
-    /// split flow — keep the private key on a hardware token or
+    /// disk for the admin to safeguard. There is no offline signing
+    /// flow yet: keep the private key on a hardware token or
     /// removable medium and use `nn-admin unlock --key` only on
     /// machines you trust.
     Init {
@@ -200,10 +200,10 @@ enum Cmd {
     /// tables back clear; otherwise exit 9 with what is still in place (the
     /// posture stays COMBAT).
     ///
-    /// V1.1 will add a split offline flow; for now this command
-    /// must run on a host with both the private key and a route
-    /// to the agent's admin socket. An agent older than lab PR 217
-    /// needs the nn-admin of its own release.
+    /// This command must run on a host with both the private key and
+    /// a route to the agent's admin socket (an offline signing flow is
+    /// planned). Use the nn-admin of the agent's own release.
+    // An agent older than lab PR 217 needs the nn-admin of its release.
     Unlock {
         /// Path to the hex-encoded private key file written by
         /// `nn-admin init`. Its admin.pub line needs the `unlock` role.
@@ -218,7 +218,7 @@ enum Cmd {
     /// Print current posture + network isolation state. Add --json
     /// to get a machine-readable response for scripting. Without --key the
     /// agent answers the posture, the isolation, the last admin action and
-    /// the COMBAT stage and lock (external audit ASK-009); --key signs the
+    /// the COMBAT stage and lock; --key signs the
     /// request and adds the telemetry: ring drops and rejected records, the
     /// response mode (detect-only), the COMBAT evidence gaps.
     Status {
@@ -234,7 +234,8 @@ enum Cmd {
         agent_id_file: PathBuf,
     },
 
-    /// Lab PR 218: this boot's signed capability manifest — kernel, BTF,
+    // Lab PR 218.
+    /// This boot's signed capability manifest — kernel, BTF,
     /// active LSMs, deny hooks and their self-test, each sensor's attach
     /// point, host hardening, degradations, the trust level — with the row
     /// of the audit chain that signs it. A key with `audit-read` or
@@ -251,7 +252,8 @@ enum Cmd {
         socket: PathBuf,
     },
 
-    /// Host hardening checks (Tappa 10.8): kernel lockdown, module
+    // Tappa 10.8.
+    /// Host hardening checks: kernel lockdown, module
     /// signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA,
     /// BPF LSM, single bpffs mount — the settings that keep root from
     /// rewriting the kernel at runtime, which is the only way around the
@@ -262,7 +264,8 @@ enum Cmd {
         json: bool,
     },
 
-    /// Tappa 9.0.b — read the last N persisted detections
+    // Tappa 9.0.b.
+    /// Read the last N persisted detections
     /// (newest-first) over the admin socket. Requires a key carrying
     /// the low-privilege `telemetry-read` role — read-only telemetry,
     /// no COMBAT/control authority. The records stream as JSONL on
@@ -307,7 +310,8 @@ enum Cmd {
         socket: PathBuf,
     },
 
-    /// Tappa 9.0.c — change a persisted detection's triage status over
+    // Tappa 9.0.c.
+    /// Change a persisted detection's triage status over
     /// the admin socket. Requires a key carrying the `triage` role
     /// (which also subsumes `telemetry-read`, so a triage key can both
     /// read detections and re-status them). Event-sourced: the agent
@@ -338,16 +342,17 @@ enum Cmd {
     /// Parse the installed admin.pub, count valid keys, print
     /// fingerprints. Local-only — does not touch the agent socket.
     VerifyKeys {
+        /// The admin.pub file to read.
         #[arg(long, default_value = DEFAULT_PUB_PATH)]
         path: PathBuf,
     },
 
-    /// Tappa 8 A9 — signed agent shutdown (design §10).
+    // Tappa 8 A9 (design §10).
+    /// Stop the agent with a signed request (two keys).
     ///
     /// Submits a 2-of-N quorum-signed shutdown request. The agent
-    /// verifies through every Tappa 8 layer (nonce binding,
-    /// timestamp skew, agent_id binding, signature verify,
-    /// distinct-key tally, role check), atomically writes the
+    /// verifies it (the challenge, the time, this install's agent id,
+    /// the signatures, two distinct keys, the role), atomically writes the
     /// watchdog's shutdown-authorisation marker, replies Success,
     /// then exits cleanly. The watchdog (when present) reads the
     /// marker on the agent's pidfd POLLIN and stands down rather
@@ -356,11 +361,10 @@ enum Cmd {
     /// BOTH keys are required — the quorum requires two distinct
     /// admin keys installed in admin.pub, at least one of them with
     /// the `shutdown` role; the other may be any installed key,
-    /// whatever its roles (design §3.3), so every installed key is a
-    /// control credential. Same key for both args fails server-side as
-    /// QuorumNotMet { required: 2, provided: 1 } because the
-    /// server tallies distinct fingerprints. The `--agent-id-file`
-    /// path defaults to the design's canonical location; override
+    /// whatever its roles, so every installed key is a
+    /// control credential. The same key for both is refused by the agent
+    /// ("quorum not met": it counts distinct fingerprints). The
+    /// `--agent-id-file` path defaults to the installed location; override
     /// only if `nn-admin` is run on a host where the file lives
     /// elsewhere (e.g., SSH-forwarded socket with a separate
     /// copy of the file).
@@ -374,7 +378,7 @@ enum Cmd {
         /// key as both arms will be rejected by the agent.
         #[arg(long = "cosign-key")]
         cosign_key: PathBuf,
-        /// Path to the agent's per-install UUID file (design §6.5).
+        /// Path to the agent's per-install UUID file.
         /// nn-admin reads this to bind the signed payload to the
         /// specific agent install — a captured signature from
         /// agent-A cannot be replayed against agent-B.
@@ -382,20 +386,19 @@ enum Cmd {
         agent_id_file: PathBuf,
         /// Grace period (seconds) the operator gives the agent
         /// to drain in-flight work before the watchdog's
-        /// stand-down deadline expires. Capped at 300 s per
-        /// design §10.2.
+        /// stand-down deadline expires. Capped at 300 s.
         #[arg(long = "grace-secs", default_value_t = DEFAULT_GRACE_SECS)]
         grace_secs: u32,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
 
-    /// Tappa 8 A10 — production signed force-posture (design
-    /// §4 + §12.2).
+    // Tappa 8 A10 (design §4, §12.2).
+    /// Set the agent's posture with a signed request.
     ///
-    /// Drives the agent's posture state machine to `target` via
-    /// the full Tappa 8 verify path (nonce binding, timestamp
-    /// skew, agent_id binding, signature verify, role check).
+    /// Drives the agent's posture state machine to `target` once the
+    /// agent verified the request (the challenge, the time, this
+    /// install's agent id, the signature, the role).
     /// 1-of-N quorum — only `--key` is required. The admin.pub
     /// line for that key MUST include the `force-posture` role, and
     /// also `unlock` to leave COMBAT.
@@ -405,9 +408,9 @@ enum Cmd {
     /// COMBAT release") than a force-posture COMBAT → anything;
     /// use unlock when releasing COMBAT.
     ///
-    /// Distinct from `nn-admin debug force-posture` (the
-    /// integration-test path gated by the `debug-trigger` Cargo
-    /// feature). Both subcommands stay; production uses this one.
+    // Distinct from `nn-admin debug force-posture` (the
+    // integration-test path gated by the `debug-trigger` Cargo
+    // feature). Both subcommands stay; production uses this one.
     ForcePosture {
         /// Target posture state.
         #[arg(value_enum)]
@@ -416,26 +419,27 @@ enum Cmd {
         /// `force-posture` required in admin.pub).
         #[arg(long)]
         key: PathBuf,
-        /// Path to the agent's per-install UUID file (design §6.5).
+        /// Path to the agent's per-install UUID file.
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
         agent_id_file: PathBuf,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
 
-    /// Tappa 8 A13 — atomically add or revoke an admin key in
-    /// `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both
+    // Tappa 8 A13 (design §7.2, §7.3).
+    /// Atomically add or revoke an admin key in
+    /// `/etc/northnarrow/admin.pub`. Both
     /// `add` and `revoke` need a 2-of-N quorum signed by two
     /// distinct installed admin keys, at least one of them carrying
     /// the `rotate-keys` role; the other may be any installed key,
-    /// whatever its roles (design §3.3) — custody every installed
+    /// whatever its roles — custody every installed
     /// key as a control credential. `add` grants only roles one of
     /// the two signers holds. On
     /// success the agent rewrites the file via tmpfile +
     /// `rename(2)` and reloads its in-memory key set so the next
     /// challenge already sees the change.
     ///
-    /// Operator workflow per design §7.2:
+    /// Adding a key:
     ///   1. `nn-admin init --priv-out new.key --bootstrap-only`
     ///      on a trusted host.
     ///   2. Transfer the **public** key (out-of-band).
@@ -446,13 +450,13 @@ enum Cmd {
         sub: RotateKeysCmd,
     },
 
-    /// Tappa 8 A12 — read or verify the tamper-evident audit log
-    /// (design §9). Two subcommands: `read` streams entries from
-    /// the on-disk JSONL log, `verify` runs the SHA-256 hash
-    /// chain + per-entry Ed25519 signature recomputation through
-    /// `northnarrow_agent::audit::verify_chain`.
+    // Tappa 8 A12 (design §9).
+    /// Read or verify the tamper-evident audit log. Two subcommands:
+    /// `read` streams entries from the on-disk JSONL log, `verify`
+    /// recomputes its SHA-256 hash chain and every entry's Ed25519
+    /// signature.
     ///
-    /// `audit verify` exits 8 (per design §5.3) on a broken chain,
+    /// `audit verify` exits 8 on a broken chain,
     /// 0 on success — distinct from the other admin commands so
     /// CI can act on chain integrity specifically. An empty /
     /// missing log file is "0 entries, success" (not an error).
@@ -461,8 +465,9 @@ enum Cmd {
         sub: AuditCmd,
     },
 
-    /// External audit NN-AUD-112 (lab PR 160) — verify every signed chain
-    /// in full, offline: the audit log and the canary chains (hashes,
+    // External audit NN-AUD-112 (lab PR 160).
+    /// Verify every signed chain in full, offline: the audit log and the
+    /// canary chains (hashes,
     /// signatures, links, row numbers), the rotating logs with their
     /// archives, manifest and checkpoints, then the files against the
     /// signed head anchor. Exits 8 when a chain is broken or shorter than
@@ -473,7 +478,8 @@ enum Cmd {
         sub: ChainCmd,
     },
 
-    /// R12c-2 — the agent's signed heartbeat (a beat every 30 s). `heartbeat
+    // R12c-2.
+    /// The agent's signed heartbeat (a beat every 30 s). `heartbeat
     /// export` prints the newest lines of its chain as on disk (for an SSH
     /// forced command on the agent's host); `heartbeat watch`, run on
     /// ANOTHER host, verifies them with the agent's public key and alerts
@@ -484,40 +490,45 @@ enum Cmd {
         sub: HeartbeatCmd,
     },
 
-    /// Tappa 9 C6 — FIM operator surface. `fim baseline` queues
+    // Tappa 9 C6 (§13 Q6).
+    /// File integrity monitoring. `fim baseline` queues
     /// a re-compute of the watched-paths SHA-256 baseline
-    /// (signed payload, single-sig `fim-manage` role per §13 Q6).
+    /// (a key with the `fim-manage` role), `fim status` prints the
+    /// watched paths and the baseline's state, and
     /// `fim report [--since <unix-ts>]` reads the chained drift
-    /// log (signed payload, single-sig `fim-read` role).
+    /// log (a key with the `fim-read` role).
     Fim {
         #[command(subcommand)]
         sub: FimCmd,
     },
 
-    /// Tappa 9.5 K6 — deception canary operator surface.
-    /// `canary deploy` installs a new canary (File / Process /
+    // Tappa 9.5 K6 (§12 Q7).
+    /// Deception canaries. `canary deploy` installs a new canary (File / Process /
     /// Network / Credential variants), `canary list` streams the
     /// chained registry log, `canary burn` permanently retires a
     /// canary, `canary refresh` re-renders the on-disk artefact.
     /// Authorisation: `canary-read` for `list`; `canary-manage`
-    /// for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in).
+    /// for `deploy` / `burn` / `refresh`. The key `install.sh` writes
+    /// has neither role (docs/operator/COMBAT_RECOVERY.md §1.1 adds one
+    /// that has).
     Canary {
         #[command(subcommand)]
         sub: CanaryCmd,
     },
 
-    /// Tappa 10 N7 — network observability operator surface.
-    /// `net flows` reads the chained netflow log,
+    // Tappa 10 N7 (§13 Q6).
+    /// Network observation. `net flows` reads the chained netflow log,
     /// `net listeners` snapshots active listeners,
     /// `net resolve <ip>` looks up DNS attribution,
     /// `net fingerprint --flow-id <hex>` dumps JA3/JA4.
-    /// All four are `Role::NetRead` (1-of-N quorum per §13 Q6).
+    /// All four need a key with the `net-read` role.
     Net {
         #[command(subcommand)]
         sub: NetCmd,
     },
 
-    /// Lot 276 — the export of the signed chains as OCSF 1.9.0 records (a
+    // Lot 276.
+    /// The export of the signed chains as OCSF 1.9.0 records (a
     /// JSONL file, syslog over TLS), turned on by a signed `export.local`
     /// (docs/operator/EXPORT.md). `export status` shows it (signed: give
     /// --key); `export verify`, run where the records arrive, checks each
@@ -528,13 +539,14 @@ enum Cmd {
         sub: ExportCmd,
     },
 
-    /// FIM-009 self-upgrade (§15.1) — arm the trusted-installer
-    /// override for an in-place agent upgrade. Submits a 1-of-N (M=1)
-    /// quorum-signed grant; the admin.pub line for `--key` MUST carry
-    /// the `trusted-installer` role. While the window is open the
-    /// agent's FS pin is suspended (so install.sh can replace the
-    /// protected binary) AND a write to the agent's OWN systemd units
-    /// is downgraded from kill to an audit Log. The window is bounded
+    // FIM-009 self-upgrade (§15.1).
+    /// Open a trusted-installer window, for an upgrade, an uninstall or a
+    /// restart of the agent. Submits a grant signed by one key; the
+    /// admin.pub line for `--key` MUST carry the `trusted-installer`
+    /// role. While the window is open the agent's file protection is
+    /// suspended (so install.sh can replace the protected binaries), the
+    /// units may be stopped, and a write to the agent's own systemd units
+    /// is recorded, not answered with a kill. The window is bounded
     /// by --window-secs (clamped to the agent's 600 s ceiling) and by
     /// the next agent restart. Operator flow: grant → install.sh →
     /// `systemctl restart` → signed `fim baseline`.
@@ -548,7 +560,7 @@ enum Cmd {
         /// and restart the unit.
         #[arg(long = "window-secs", default_value_t = DEFAULT_TRUSTED_INSTALLER_WINDOW_SECS)]
         window_secs: u32,
-        /// Path to the agent's per-install UUID file (design §6.5) —
+        /// Path to the agent's per-install UUID file —
         /// binds the signed grant to this specific agent install.
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
         agent_id_file: PathBuf,
@@ -564,7 +576,8 @@ enum Cmd {
         for_installer: bool,
     },
 
-    /// External audit CMB-016 — undo what the response layer did:
+    // External audit CMB-016.
+    /// Undo what the response layer did:
     /// `response status` lists the processes the agent holds in its
     /// containment scopes, the quarantine vault and the COMBAT stage
     /// (`audit-read`); `response release` returns a
@@ -576,22 +589,25 @@ enum Cmd {
         sub: ResponseCmd,
     },
 
-    /// Lab PR 222 — undo what ransomware rewrote, from the copy-on-first-
-    /// write journal (`remediate ransomware`, `response-manage`). The agent
+    // Lab PR 222.
+    /// Undo what ransomware rewrote, from the copy-on-first-write
+    /// journal (`remediate ransomware`, `response-manage`). The agent
     /// restores and signs one `cow_restore` row per file.
     Remediate {
         #[command(subcommand)]
         sub: RemediateCmd,
     },
 
-    /// Tappa 10.8 — operator configuration the agent loads only when an
+    // Tappa 10.8.
+    /// Operator configuration the agent loads only when an
     /// admin key signed it (`config overlay set|sign|status`).
     Config {
         #[command(subcommand)]
         sub: ConfigCmd,
     },
 
-    /// Lab PR 236 — the signed per-rule response policy
+    // Lab PR 236.
+    /// The signed per-rule response policy
     /// (`rule-policy.local`): which rules enforce, alert, audit or are off,
     /// their exemptions. `show` the policy in force, `set` a new one
     /// (signed, applied at once), `test` a candidate on sample events.
@@ -621,10 +637,13 @@ enum RemediateCmd {
     /// original is written beside it (`<name>.nn-restored-<entry>`).
     /// `--dry-run` only reports the plan.
     Ransomware {
+        /// The process whose tree's writes are undone.
         #[arg(long)]
         pid: Option<u32>,
+        /// Undo the copies taken since this time (Unix seconds or RFC 3339).
         #[arg(long)]
         since: Option<String>,
+        /// Only report what would be restored; change nothing.
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
         /// A key with `response-manage`.
@@ -658,6 +677,7 @@ enum ResponseCmd {
     /// the process that was moved). During an open COMBAT episode the
     /// ladder may contain it again.
     Release {
+        /// The contained process (`nn-admin response status` lists them).
         #[arg(long)]
         pid: u32,
         /// A key with `response-manage`.
@@ -731,21 +751,26 @@ enum OverlayCmd {
     /// upgrades and hosts where the agent is stopped; with the agent
     /// running, use `set`.
     Sign {
+        /// The overlay's kind (the list `config overlay set --help` gives).
         kind: String,
+        /// The overlay content to sign.
         #[arg(long)]
         file: PathBuf,
         #[arg(long)]
         key: PathBuf,
+        /// Optional second signer.
         #[arg(long = "cosign-key")]
         cosign_key: Option<PathBuf>,
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
         agent_id_file: PathBuf,
+        /// Where to write the signature (default: `<file>.sig`).
         #[arg(long)]
         out: Option<PathBuf>,
     },
     /// Which overlays are present and whether each one would be loaded at
     /// the next agent start (exit 1 if any present overlay is not).
     Status {
+        /// The directory that holds the overlays.
         #[arg(long, default_value = "/etc/northnarrow")]
         dir: PathBuf,
         #[arg(long = "admin-pub", default_value = DEFAULT_PUB_PATH)]
@@ -767,6 +792,7 @@ enum PolicyCmd {
     /// holds), else the built-in defaults, and the held responses (exit 1
     /// when a present file would not be loaded).
     Show {
+        /// The signed policy file.
         #[arg(long, default_value = nn_core::decision::rule_policy::DEFAULT_LOCAL)]
         file: PathBuf,
         #[arg(long = "admin-pub", default_value = DEFAULT_PUB_PATH)]
@@ -782,10 +808,12 @@ enum PolicyCmd {
     /// running agent, which applies it at once (a signed audit row). A bad
     /// line refuses the file; the policy in force stays.
     Set {
+        /// The new policy (`rule-policy.local` text).
         #[arg(long)]
         file: PathBuf,
         #[arg(long)]
         key: PathBuf,
+        /// Optional second signer.
         #[arg(long = "cosign-key")]
         cosign_key: Option<PathBuf>,
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
@@ -828,7 +856,7 @@ enum RotateKeysCmd {
         #[arg(long = "new-pubkey")]
         new_pubkey: String,
         /// Comma-separated role allowlist for the new key. At
-        /// least one role required. Maps to design §3.2 roles. Each
+        /// least one role required. Each
         /// role must be held by one of the signing keys (`all` only
         /// by a key holding `all`).
         #[arg(long = "new-roles", default_value = "unlock,audit-read")]
@@ -876,7 +904,7 @@ enum AuditCmd {
     /// operator's identity. `client_pid`/`client_uid` come from the
     /// kernel (SO_PEERCRED); `client_comm` is the name the connecting
     /// process gave itself, which any process chooses; `client_exe`
-    /// (rows from lab PR 179 on) is the program the kernel says it ran.
+    /// (in rows of recent releases) is the program the kernel says it ran.
     ///
     /// A line that is not an audit row (cut, not JSON, not UTF-8, over
     /// 16 MiB) is skipped and named on stderr with its line number; every
@@ -899,9 +927,9 @@ enum AuditCmd {
         json: bool,
     },
 
-    /// Replay the chain in `--from <path>` through
-    /// [`northnarrow_agent::audit::verify_chain_file`]. Loads the
-    /// verifying key either from `--agent-pubkey <hex>` (off-host
+    // Through `northnarrow_agent::audit::verify_chain_file`.
+    /// Verify the chain in `--from <path>`: every row's hash link and
+    /// signature. Loads the verifying key either from `--agent-pubkey <hex>` (off-host
     /// verification with the pubkey conveyed out-of-band) or from
     /// the local `--agent-sig-key <path>` (default
     /// /etc/northnarrow/agent.sig.key — zero-config on the agent
@@ -926,7 +954,8 @@ enum AuditCmd {
         /// 0400 — usually requires sudo.
         #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
         agent_sig_key: PathBuf,
-        /// External audit NN-AUD-108: an `entry_hash` the chain must still
+        // External audit NN-AUD-108.
+        /// An `entry_hash` the chain must still
         /// hold (a head recorded earlier: a `chain.head` journal line
         /// forwarded off the host, or `chain verify` output kept there).
         /// Exit 8 when it is gone: rows were cut from the end.
@@ -1058,11 +1087,10 @@ enum ChainCmd {
 
 #[derive(Subcommand, Debug)]
 enum FimCmd {
-    /// Queue a baseline (re)compute. Signed payload, single-sig
-    /// `fim-manage` role per §13 Q6. V1.0 semantics: success
-    /// schedules the recompute for the next agent restart
-    /// (lazy — baseline is a "snapshot of trust" workflow op,
-    /// not a security gate).
+    /// Queue a baseline (re)compute: a signed request, a key with the
+    /// `fim-manage` role. Success schedules the recompute for the next
+    /// agent restart (a baseline is a "snapshot of trust", not a
+    /// security gate).
     Baseline {
         /// Path to the operator's `fim-manage`-role admin
         /// private key.
@@ -1098,9 +1126,9 @@ enum FimCmd {
     /// Print the in-process FIM status snapshot: watched-paths
     /// summary (effective / added / disabled-default counts),
     /// baseline + drift chain row counts, last baseline ts,
-    /// token-bucket state for the §6.5 hierarchical rate-limiter
-    /// (`high_remaining/cap` + `medium_remaining/cap`). Read-only,
-    /// signed payload, single-sig `fim-read` role.
+    /// the rate limiter's state (`high_remaining/cap` +
+    /// `medium_remaining/cap`). Read-only: a signed request, a key with
+    /// the `fim-read` role.
     Status {
         /// Path to the operator's `fim-read`-role admin
         /// private key.
@@ -1147,9 +1175,9 @@ enum CanaryCmd {
     },
 
     /// Permanently retire a canary by id (`canary-manage` role).
-    /// File / credential artefacts are unlinked, network
-    /// listeners closed, process canaries terminated. The K3
-    /// detector stops firing for the burned id immediately.
+    /// The agent stops watching it and the canary rules stop firing
+    /// for the burned id at once. A decoy file stays on disk: remove
+    /// it yourself.
     Burn {
         /// The per-canary stable id printed by `canary deploy`
         /// or `canary list`.
@@ -1164,10 +1192,10 @@ enum CanaryCmd {
     },
 
     /// Re-render a canary's on-disk artefact (`canary-manage`
-    /// role). §12 Q2 MANUAL lock-in: no auto-refresh; the
-    /// operator must run this explicitly when a canary's bytes
-    /// would otherwise grow stale.
+    /// role). Nothing refreshes a canary on its own: run this
+    /// when a canary's bytes would otherwise grow stale.
     Refresh {
+        /// The canary's id, printed by `canary deploy` or `canary list`.
         #[arg(long = "canary-id")]
         canary_id: String,
         #[arg(long)]
@@ -1187,15 +1215,18 @@ enum CanaryCmd {
 #[derive(Subcommand, Debug)]
 enum CanaryDeployKindCmd {
     /// Plain file canary. The server creates a placeholder file
-    /// at `--path` (current K4 template renders sentinel bytes).
+    /// at `--path` (sentinel bytes).
     File {
         /// Absolute on-disk path the canary file should occupy.
         #[arg(long)]
         path: String,
     },
-    /// Process canary. The server materialises a fake binary at
-    /// `--path` and advertises `--fake-arg0` as its argv[0].
+    /// Process canary: an executable no one should run. The agent
+    /// registers `--path` and `--fake-arg0` and creates no file: place
+    /// the decoy binary at `--path` yourself (a copy of `/bin/true` is
+    /// enough); its exec trips NN-L-CANARY-002.
     Process {
+        /// Absolute path of the decoy executable (placed by the operator).
         #[arg(long)]
         path: String,
         /// What the canary binary should report as argv[0]
@@ -1209,17 +1240,21 @@ enum CanaryDeployKindCmd {
     /// agent opens no listener, and a connection from another host is
     /// not seen. Refused when a listener on this host serves the port.
     Network {
+        /// The decoy address (`0.0.0.0` or `::`: any address of this host).
         #[arg(long = "bind-addr")]
         bind_addr: String,
+        /// The decoy port.
         #[arg(long = "bind-port")]
         bind_port: u16,
     },
     /// Credential canary. Same shape as `file` plus a required
-    /// `--cred-family` selecting which K4 template renders the
+    /// `--cred-family` selecting which template renders the
     /// fake credential bytes (e.g. "aws", "docker", "kube").
     Credential {
+        /// Absolute on-disk path the fake credential file should occupy.
         #[arg(long)]
         path: String,
+        /// The kind of credential the file imitates.
         #[arg(long = "cred-family")]
         cred_family: String,
     },
@@ -1292,8 +1327,8 @@ enum NetCmd {
     /// from the rules by the per-uid pacing, pending connects evicted,
     /// the network rings' drops, the network rules that cannot fire in
     /// this build or are blind (a resolver on DNS over TLS), and the rows
-    /// no DNS or TLS reader sees into (DoT, QUIC). Signed since external
-    /// audit ASK-009: give --key (without it the agent withholds them).
+    /// no DNS or TLS reader sees into (DoT, QUIC). A signed read: give
+    /// --key (without it the agent withholds them).
     Status {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
@@ -1520,11 +1555,73 @@ impl From<ForcePostureTargetArg> for nn_model::posture_types::PostureKind {
     }
 }
 
+/// Lot 354: the help of the options many commands share, in one place. An
+/// option with one of these ids that declares no help of its own gets
+/// this one (`every_option_and_command_has_help`).
+const COMMON_OPTION_HELP: [(&str, &str); 8] = [
+    ("socket", "Path of the agent's admin socket"),
+    (
+        "agent_id_file",
+        "Path of this install's agent id, which binds a signed request to this agent",
+    ),
+    (
+        "json",
+        "Print JSON instead of text (one object per line where the command streams records)",
+    ),
+    (
+        "key",
+        "Path of the admin private key that signs the request; its admin.pub line needs the \
+         role this command names",
+    ),
+    (
+        "cosign_key",
+        "Path of a second, distinct admin private key that co-signs the request",
+    ),
+    (
+        "admin_pub",
+        "Path of the installed admin public keys (admin.pub)",
+    ),
+    (
+        "audit_log",
+        "Path of the agent's signed audit log, read to check what it loaded",
+    ),
+    (
+        "agent_sig_key",
+        "Path of the agent's audit signing key (or its public half), to verify the audit log",
+    ),
+];
+
+fn with_common_help(cmd: clap::Command) -> clap::Command {
+    cmd.mut_args(|a| {
+        if a.get_help().is_some() || a.get_long_help().is_some() {
+            return a;
+        }
+        match COMMON_OPTION_HELP.iter().find(|(id, _)| a.get_id() == *id) {
+            Some((_, help)) => a.help(*help),
+            None => a,
+        }
+    })
+    .mut_subcommands(with_common_help)
+}
+
+/// nn-admin's command line, the shared options' help applied.
+fn command() -> clap::Command {
+    with_common_help(<Cli as clap::CommandFactory>::command())
+}
+
+/// [`Cli::parse`], over [`command`].
+fn parse_cli() -> Cli {
+    let mut cmd = command();
+    let mut matches = cmd.clone().get_matches();
+    <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|e| e.format(&mut cmd).exit())
+}
+
 /// The command line, on `host`: what nn-admin reads of the host it runs on
 /// and of the agent it administers (R10, lab PR 259: the agent's
 /// [`AdminHost`], which the `nn-admin` binary passes to [`crate::main`]).
 pub fn run<H: AdminHost>(host: &H) -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     match cli.cmd {
         Cmd::Init {
             priv_out,
@@ -2276,7 +2373,7 @@ fn exit_from_force_posture(
     outcome: ForcePostureOutcome,
     target: nn_model::posture_types::PostureKind,
 ) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         ForcePostureOutcome::Success => {
             println!(
@@ -2429,7 +2526,7 @@ fn exit_from_force_posture(
 }
 
 fn exit_from_shutdown(outcome: ShutdownOutcome, grace_secs: u32) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         ShutdownOutcome::Success => {
             // Two-line UX per design §10.5: collect-confirmation
@@ -2582,7 +2679,7 @@ fn families_line(v4: bool, v6: bool) -> String {
 }
 
 fn exit_from_unlock(outcome: UnlockOutcome) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         UnlockOutcome::Success {
             message,
@@ -3886,7 +3983,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
         );
         return;
     }
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     // Lot 341 (alpha 2/4): the human summary first, then the details.
     for line in summary_lines(out, tty) {
         println!("{line}");
@@ -4326,9 +4423,21 @@ fn print_verify_keys(out: &VerifyKeysOutcome) -> ExitCode {
     }
 }
 
-/// Wrap `s` in an ANSI SGR colour code when stdout is a terminal,
+/// Lot 354: colour only on a terminal, and never with `NO_COLOR` set to a
+/// non-empty value (https://no-color.org). Every colour decision of
+/// nn-admin goes through here (`colour_decisions_go_through_colour_on`).
+fn colour_on(is_terminal: bool) -> bool {
+    colour_on_with(is_terminal, std::env::var_os("NO_COLOR").as_deref())
+}
+
+fn colour_on_with(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// Wrap `s` in an ANSI SGR colour code when `tty` (from [`colour_on`]),
 /// otherwise return it unchanged. Keeping this inline avoids a
-/// `colored` / `owo-colors` dependency for one call site.
+/// `colored` / `owo-colors` dependency for one call site. The colour only
+/// decorates: `s` carries the whole message either way.
 fn colorize(s: &str, sgr: &str, tty: bool) -> String {
     if tty {
         format!("\x1b[{sgr}m{s}\x1b[0m")
@@ -4368,7 +4477,7 @@ fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<nn_proto::admin_signed_payload
 /// timestamp/agentid/unknown-op all under exit 5, distinct
 /// security failures get 2/4/6/7 per design §5.3).
 fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         RotateKeysOutcome::Success => {
             println!("{}", colorize(&format!("{op_label}: success"), "32", tty));
@@ -4442,7 +4551,7 @@ fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode
 /// 4=rate-limited, 5=transport/clock/agent-id/unknown-op,
 /// 6=quorum, 7=role).
 fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         FimBaselineOutcome::Success => {
             println!("{}", colorize("fim baseline: success", "32", tty));
@@ -5122,7 +5231,7 @@ fn warn_harmful_dropins(
     key: &std::path::Path,
     agent_id_file: &std::path::Path,
 ) {
-    let tty = std::io::stderr().is_terminal();
+    let tty = colour_on(std::io::stderr().is_terminal());
     match crate::admin_cli::run_telemetry_status(socket, key, agent_id_file) {
         Ok(Ok(status)) => {
             let lines = harmful_dropin_lines(status.degradations.as_deref().unwrap_or_default());
@@ -5163,7 +5272,7 @@ fn exit_from_trusted_installer_grant(
     outcome: TrustedInstallerGrantOutcome,
     window_secs: u32,
 ) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         TrustedInstallerGrantOutcome::Success => {
             println!(
@@ -5392,7 +5501,7 @@ fn exit_from_fim_status(outcome: FimStatusOutcome) -> ExitCode {
 /// 6=quorum, 7=role) so operator scripts can branch on `$?`
 /// across the FIM + canary surfaces.
 fn exit_from_canary_deploy(outcome: CanaryDeployOutcome) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         CanaryDeployOutcome::Success { canary_id } => {
             println!(
@@ -5518,7 +5627,7 @@ fn exit_from_canary_list(outcome: CanaryListOutcome) -> ExitCode {
 /// server-side (deploys go via the server; burns reference an
 /// id the operator typed).
 fn exit_from_canary_burn(outcome: CanaryBurnOutcome) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         CanaryBurnOutcome::Success => {
             println!("{}", colorize("canary burn: success", "32", tty));
@@ -5578,7 +5687,7 @@ fn exit_from_canary_burn(outcome: CanaryBurnOutcome) -> ExitCode {
 /// as [`exit_from_canary_burn`] (both ops are
 /// `canary-manage`-role mutations keyed by canary_id).
 fn exit_from_canary_refresh(outcome: CanaryRefreshOutcome) -> ExitCode {
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         CanaryRefreshOutcome::Success => {
             println!("{}", colorize("canary refresh: success", "32", tty));
@@ -5766,7 +5875,7 @@ fn exit_from_detections(outcome: NetJsonlOutcome) -> ExitCode {
 /// Success prints the id + new status; `NotFound` gets a precise hint.
 fn exit_from_detection_set_status(outcome: DetectionSetStatusOutcome) -> ExitCode {
     let op = "detection-set-status";
-    let tty = std::io::stdout().is_terminal();
+    let tty = colour_on(std::io::stdout().is_terminal());
     match outcome {
         DetectionSetStatusOutcome::Success { id, new_status } => {
             println!(
@@ -6802,5 +6911,91 @@ mod grant_warning_tests {
             vec!["/etc/systemd/system/system.slice.d/99-x.conf sets MemoryMax=4K"]
         );
         assert!(super::harmful_dropin_lines(&[]).is_empty());
+    }
+}
+
+/// Lot 354 (pre-alpha, the operator's help): every command and every option
+/// of nn-admin says what it is, and nn-admin's colours obey `NO_COLOR`.
+#[cfg(test)]
+mod help_text_tests {
+    use super::{colorize, colour_on_with, command};
+    use std::ffi::OsStr;
+
+    /// `(path, what is missing)` for every command and argument under `cmd`.
+    fn missing_help(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+        if !path.is_empty() && cmd.get_about().is_none() && cmd.get_long_about().is_none() {
+            out.push(format!("{path}: no about"));
+        }
+        for arg in cmd.get_arguments() {
+            let id = arg.get_id().as_str();
+            if matches!(id, "help" | "version") {
+                continue;
+            }
+            if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                out.push(format!("{path} {id}: no help"));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" {
+                continue;
+            }
+            missing_help(sub, format!("{path} {name}").trim(), out);
+        }
+    }
+
+    #[test]
+    fn every_option_and_command_has_help() {
+        let mut missing = Vec::new();
+        missing_help(&command(), "", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "nn-admin options or commands without help:\n  {}",
+            missing.join("\n  ")
+        );
+        // the shared help reaches an option that declared none
+        let mut cmd = command();
+        let status = cmd.find_subcommand_mut("status").expect("status");
+        let socket = status
+            .get_arguments()
+            .find(|a| a.get_id() == "socket")
+            .expect("--socket");
+        assert_eq!(
+            socket.get_help().map(ToString::to_string).as_deref(),
+            Some("Path of the agent's admin socket")
+        );
+    }
+
+    #[test]
+    fn colour_obeys_no_color_and_a_terminal() {
+        assert!(colour_on_with(true, None));
+        assert!(colour_on_with(true, Some(OsStr::new(""))));
+        assert!(!colour_on_with(true, Some(OsStr::new("1"))));
+        assert!(!colour_on_with(true, Some(OsStr::new("yes"))));
+        assert!(!colour_on_with(false, None));
+        // the colour only decorates: the text is the message either way
+        assert_eq!(colorize("unlock: success", "32", false), "unlock: success");
+        assert!(colorize("unlock: success", "32", true).contains("unlock: success"));
+    }
+
+    /// Every colour decision goes through `colour_on`: no other
+    /// `is_terminal()` call in nn-admin's sources decides a colour.
+    #[test]
+    fn colour_decisions_go_through_colour_on() {
+        for (name, text) in [
+            ("cli.rs", include_str!("cli.rs")),
+            ("admin_cli.rs", include_str!("admin_cli.rs")),
+        ] {
+            for (n, line) in text.lines().enumerate() {
+                let needle = concat!("()", ".is_terminal()");
+                if line.contains(needle) && !line.trim_start().starts_with("//") {
+                    assert!(
+                        line.contains("colour_on(std::io::std"),
+                        "{name}:{}: a colour decided without colour_on (NO_COLOR): {line}",
+                        n + 1
+                    );
+                }
+            }
+        }
     }
 }

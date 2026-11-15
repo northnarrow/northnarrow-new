@@ -27,7 +27,8 @@ the system account `northnarrow-scan` that `install.sh` creates (no home, no
 shell) and `uninstall.sh` removes; see
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md>.
 A release tree installs only when its tarball's provenance attestation
-verifies (section 5.1). A tree built from source has no `MANIFEST.sha256`:
+verifies or, on a host with no attestation verifier, when the tarball
+matches a `SHA256SUMS` signed by the release key (section 5.1). A tree built from source has no `MANIFEST.sha256`:
 `install.sh` installs it only with `--source-tree` (or `--allow-unverified`),
 e.g. `sudo ./deploy/install.sh --source-tree --upgrade --grant-key <admin.key>`.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
@@ -374,8 +375,15 @@ logs under `/var/lib/northnarrow` `0600`. A log shipper that reads
 existing group; `NN_AUDIT_GROUP` too) gives both files that group, and
 every later upgrade keeps it. On a package install, open a
 trusted-installer window and `chgrp GROUP` the two files yourself. The window with no
-hooks attached is the few seconds between step 4 and the new agent's
-boot; it is the same window a reboot has.
+hooks attached runs from step 4 to the new agent's boot; it is the same
+window a reboot has, and it is open only inside the signed trusted-installer
+window `--grant-key` opens. Measured (pre-alpha checks, November 2026, on
+6.8 and 6.12 guests): the pin root absent for about 6 s, the agent's LSM
+programs incomplete or absent for about 6 to 15 s, the watchdog absent for
+about 18 s; the start-in-cgroup tracker, the sysctl judge and the module
+files' write history stay attached throughout (their pins are beside the pin
+root). A make-before-break upgrade, which keeps the old programs until the
+new ones are attached, is planned after the alpha.
 
 The lab verifies this path on every nightly (`nn-lab.sh upgrade-check`):
 refusal without the flag, pid change, new audit entry, identity files
@@ -575,6 +583,11 @@ The lab verifies `uninstall.sh --purge --yes` leaves no binary, unit, pin,
 NorthNarrow program, config, state or bait behind — and every foreign LSM
 program in place — then reinstalls (`nn-lab.sh uninstall-check`).
 
+**Exit codes**: 0 removed; 1 refused or failed; 2 an unknown argument; 3
+reboot to finish (a wedged agent, below); 4 removed, with processes the agent
+had contained left thawed and listed (below) — the table of every exit code
+is in [`NN_ADMIN.md`](NN_ADMIN.md) §4.
+
 **What remains after `--purge`** (lot 350; the pre-alpha's state diff on
 five distributions, before and after): nothing of NorthNarrow on disk, in
 systemd or in the kernel's BPF objects — no file, unit, slice, account,
@@ -614,7 +627,7 @@ missing and how to fix it:
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
 | nftables | `nft` installed in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, root's and writable by nobody else — the one the agent runs; a copy in `/usr/local` is not used (external audit ATP-014, lab PR 176) | a BlockOutbound verdict and the COMBAT soft egress block (INVESTIGATE) are nftables rules: without `nft` the offender is not contained while the agent analyses it — the agent records a signed `subsystem_degraded` at boot, and each episode records the failure and shortens INVESTIGATE to 10 s. Reported with `--without-nftables` when the install manifest records it (lab PR 165). A WARN like the other rows: the refusal is the installer's (Prerequisites, above) |
 | cgroup v1 controllers | `cgroup_no_v1=all` on the kernel command line (or no `freezer`, `devices`, `net_cls`, `net_prio`, `perf_event` enabled) | lot 273b: on a host whose systemd runs the unified hierarchy, root can still mount a v1 hierarchy of these controllers and freeze the agent through a v1 `freezer`. The running agent refuses every write to a v1 hierarchy outside a window there (section 3.7); the boot option refuses the mount itself, before the agent runs |
-| Release verified at install | `provenance` `checksums` or `attested` in `install-manifest.json` | only these rest on something outside the installed tree (section 5.1); `manifest`, `source-tree`, `unverified` and `package` are reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
+| Release verified at install | `provenance` `attested`, or `signed-checksums` accepted with no flag, in `install-manifest.json` | only these say the release is the project's (section 5.1); `checksums`, `manifest`, `source-tree`, `unverified` and `package`, and `signed-checksums` accepted with a flag, are a WARN, reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
 22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and
@@ -1353,14 +1366,19 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | `northnarrow-<ver>-x86_64-linux.tar.gz` | the release tree: binaries, eBPF object + provenance stamp, `deploy/` (install/uninstall/units), `configs/`, operator docs, licences. Extract and run `sudo ./deploy/install.sh` (or `--upgrade`) unchanged — every preflight still applies. |
 | `northnarrow_<ver>-<rel>_amd64.deb`, `northnarrow-<ver>-<rel>.x86_64.rpm` | the same binaries as distribution packages (section 6); the `.rpm` is signed (section 6.1) |
 | `RPM-GPG-KEY-northnarrow.asc` | the public key the `.rpm` is signed with (a copy of `deploy/release/RPM-GPG-KEY-northnarrow.asc` at the tag) |
-| `northnarrow-<ver>-x86_64-linux.{agent,watchdog}.sbom.cdx.json` | CycloneDX SBOMs of the two daemons (the agent one covers `nn-admin` too) |
+| `northnarrow-<ver>-x86_64-linux.{agent,watchdog,scan}.sbom.cdx.json` | CycloneDX SBOMs, three files: the agent (it covers `nn-admin` too), the watchdog, the scanner. They do not cover the eBPF object's own crates (`agent-ebpf`, aya-ebpf among them), built from a lockfile of their own (`agent-ebpf/Cargo.lock`) and embedded in the agent |
 | `SHA256SUMS` | checksums of the files above |
+| `SHA256SUMS.asc` | a detached OpenPGP signature of `SHA256SUMS` by the same release key as the `.rpm` (releases from `v0.1.0-alpha` on): the check without `gh` below, and the one `install.sh` makes itself on a host without `gh attestation` (§5.1) |
 
 The tarball, the packages and the SBOMs carry a SLSA build-provenance
 attestation signed by GitHub's OIDC identity for this repository and
 workflow (`SHA256SUMS` and the key file do not: their files are listed in
-`SHA256SUMS`, which itself is not signed — the attestation is what says
-where a file was built). Verify before installing:
+`SHA256SUMS`, which is signed from `v0.1.0-alpha` on, `SHA256SUMS.asc`).
+Verify before installing, one of two ways.
+
+**With `gh` (the attestation).** `gh attestation` needs gh **2.49 or newer**:
+the gh of Ubuntu 24.04 is 2.45 and has no `attestation` command (install gh
+from GitHub's own packages, or verify without it, below):
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -1368,6 +1386,41 @@ gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/n
   --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
   --deny-self-hosted-runners
 ```
+
+**Without `gh` (the signed tag and the signed checksums).** The release tag
+is signed with the maintainer's SSH key listed in `.github/allowed_signers`,
+and `SHA256SUMS` with the release's OpenPGP key committed at the tag
+(`deploy/release/RPM-GPG-KEY-northnarrow.asc`). Take both from the
+repository at the tag — never from the release page, whose copy could be
+swapped together with the files — then check the files against the
+checksums:
+
+```sh
+git clone https://github.com/northnarrow/northnarrow-new && cd northnarrow-new
+git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v<ver>   # "Good \"git\" signature"
+git show v<ver>:deploy/release/RPM-GPG-KEY-northnarrow.asc > ../nn-release-key.asc
+cd .. && gpg --show-keys nn-release-key.asc                  # the key's fingerprint: compare it with §6.1 and the README
+gpg --dearmor < nn-release-key.asc > nn-release-key.gpg
+gpgv --keyring ./nn-release-key.gpg SHA256SUMS.asc SHA256SUMS   # "Good signature"
+sha256sum -c --ignore-missing SHA256SUMS                       # the files you downloaded: OK
+```
+
+The fingerprint must be `BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D`,
+the one §6.1 and the README publish. With `--ignore-missing`, check that
+the tarball's own line says `OK`: a file you did not download is skipped,
+not checked.
+
+This proves the files are the ones the release workflow signed for that tag
+(the key lives only in the tag-restricted `release-signing` environment); the
+attestation also names the runner and the workflow run. `install.sh` makes
+the same check itself (§5.1): with `SHA256SUMS` and `SHA256SUMS.asc` next to
+the tarball, and no attestation verifier on the host, it installs with no
+flag, recorded as `signed-checksums`.
+`install.sh`'s checks run from the tree they verify: they catch a corrupted
+or partly swapped download, not a tarball swapped whole, which brings its own
+`install.sh`, key and fingerprint. Only the check above, with the key and
+fingerprint taken from the repository at the signed tag (on GitHub, not the
+tarball's copy of these docs), covers that.
 
 The attestation binds the file digest to the exact commit, workflow and
 runner that produced it; a tarball rebuilt elsewhere, or modified after
@@ -1393,6 +1446,12 @@ kani) by version with `--locked` (external audit SUP-002, SUP-005).
 
 ### 5.1 `install.sh` verifies the release itself
 
+`install.sh`'s checks run from the tree they verify: they catch a corrupted
+or partly swapped download, not a tarball swapped whole, which brings its own
+`install.sh`, key and fingerprint. Only the check above, with the key and
+fingerprint taken from the repository at the signed tag (on GitHub, not the
+tarball's copy of these docs), covers that.
+
 The manual commands above stay valid, but since lab PR 21 the installer
 performs the checks and refuses to touch the host when one fails — and
 since lab PR 220 (static review of `baf4c25` P0 C-45 / G-07) a release
@@ -1403,7 +1462,17 @@ tree installs only when step 4 verifies:
    extracted tree. A corrupted or edited tree is refused.
 2. **SHA256SUMS** — if the tarball is next to the tree (`../<tree>.tar.gz`,
    or `--tarball FILE`) and `SHA256SUMS` is next to it (or `--sums FILE`),
-   the tarball hash is checked against it. The line is found by the
+   the tarball hash is checked against it. When `SHA256SUMS.asc` is next to
+   `SHA256SUMS` (lot 354), its signature is checked first, with `gpgv`,
+   against the tree's copy of the committed release key
+   (`deploy/release/RPM-GPG-KEY-northnarrow.asc`), and only a signature by
+   the key whose fingerprint `install.sh` pins counts (the one §6.1
+   publishes): a key file swapped in the tree does not make another key's
+   signature pass. A bad signature, a signature by another key, or a
+   release key missing from the tree is a **refusal whatever the flags**,
+   like a tarball that does not match. The hash is then read from the
+   signed copy. `gpgv` comes with apt on Debian and Ubuntu; without it the
+   signature is not checked, and the level stays `checksums`. The line is found by the
    tarball's exact name (a leading `*`, binary mode, allowed); a file that
    lists the name with two different checksums is refused (external audit
    DEP-016, lab PR 194: the name used to be a regular expression, so a
@@ -1428,10 +1497,14 @@ tree installs only when step 4 verifies:
    northnarrow/northnarrow-new`) and pass `--attestation <bundle.jsonl>`
    (gh, or cosign: cosign is used only with that bundle, and its path has
    no automated test yet). `--require-attestation` is accepted and is the
-   default.
+   default. **On a host with no attestation verifier** (no gh 2.49+, no
+   cosign with a bundle: Ubuntu 24.04's gh 2.45), a tarball that matched a
+   `SHA256SUMS` whose signature verified in step 2 installs with no flag,
+   at `signed-checksums`. A verifier that ran and refused is not overruled
+   by the signature: that is still a refusal.
 
-The strongest level reached — `attested`, `checksums`, `manifest`,
-`source-tree` or `unverified` — is written with the SHA-256 of every
+The strongest level reached — `attested`, `signed-checksums`, `checksums`,
+`manifest`, `source-tree` or `unverified` — is written with the SHA-256 of every
 installed binary and of the eBPF object to
 `/etc/northnarrow/install-manifest.json`, which the anti-tamper hook
 protects like the rest of `/etc/northnarrow`.
@@ -1441,20 +1514,33 @@ used to step down on their own: a tree without `MANIFEST.sha256` installed
 as a "source tree", so removing that one file from an altered release
 turned every check off; and an unsigned `SHA256SUMS` next to the tarball
 was enough for `checksums` — whoever swaps the tarball swaps it too. A level
-below `attested` now needs an explicit flag. The flag is **logged**: a
-WARNING on the terminal and a line in the system log (`auth.warning`, tag
+below `attested` and `signed-checksums` now needs an explicit flag. The
+flag is **logged**: a WARNING on the terminal and a line in the system log
+(`auth.warning`, tag
 `northnarrow-install`: `journalctl -t northnarrow-install`); it is
 **recorded** in the manifest (`verify_override`, and `attestation.failure`
 says why the attestation did not verify) and **reported** by `nn-admin
 host-check` (§3.1: anything below `attested` is a WARN, `checksums`
-included):
+included; `signed-checksums` reached with no flag is OK):
 
 | Situation | Without a flag | Flag that accepts it | Recorded as |
 |---|---|---|---|
-| The attestation did not verify (or no verifier), the tarball matched `SHA256SUMS` | refused | `--allow-unverified` | `checksums` |
+| No attestation verifier, the tarball matched a `SHA256SUMS` whose `SHA256SUMS.asc` verified | **installed** | — | `signed-checksums` |
+| The attestation verifier ran and refused, the tarball matched a signed `SHA256SUMS` | refused | `--allow-unverified` | `signed-checksums` |
+| The attestation did not verify (or no verifier), the tarball matched an unsigned `SHA256SUMS` (no `SHA256SUMS.asc`, or no `gpgv`) | refused | `--allow-unverified` | `checksums` |
+| `SHA256SUMS.asc` is not a good signature by the pinned release key, or the key is missing from the tree; or the tarball does not match `SHA256SUMS` | refused | none | — |
 | Only the tree's own `MANIFEST.sha256` checked (no tarball next to it) — it travels inside the tree it vouches for | refused | `--allow-unverified` (`--allow-manifest-only`, its former name, still accepted) | `manifest` |
 | No `MANIFEST.sha256` (a build from source, the lab, a developer) | refused | `--source-tree` or `--allow-unverified` | `source-tree` |
 | Every release check skipped | — | `--no-verify` (development only) | `unverified` |
+
+**What `--allow-unverified` means.** Nothing proved that the tree is the
+project's release: the flag accepts it anyway, and says so in the terminal,
+the system log, the install manifest and `nn-admin host-check`. Use it only
+for a tree you built yourself, for the lab, or for a download you verified
+by hand on a host where `install.sh` cannot check it (no `gpgv`, no
+`SHA256SUMS.asc`). Do **not** use it to get past a
+refusal of a download you have not verified: a refusal of the attestation or
+of the checksums is exactly what a swapped or corrupted release looks like.
 
 `--allow-unverified` is for the lab and for development, where nothing
 attested exists: the lab installs its synced source tree with
@@ -1464,8 +1550,8 @@ branch, not a `v*` tag — with `--allow-unverified` after checking that
 it is refused without. `--source-tree` only permits a missing
 `MANIFEST.sha256`: on a tree that has one, it is ignored and the tree is
 verified as a release. Keep the tarball next to the extracted tree (or
-pass `--tarball`), with `gh` or an offline bundle, and a release installs
-with no flag. `--require-attestation` with `--allow-unverified` or
+pass `--tarball`), with `SHA256SUMS` and `SHA256SUMS.asc` beside it, or
+with `gh` or an offline bundle, and a release installs with no flag. `--require-attestation` with `--allow-unverified` or
 `--no-verify` is a usage error (exit 2).
 
 **At every boot the agent closes the loop**: it hashes its own executable,
@@ -1493,6 +1579,17 @@ INFO. A host restored from a backup without the manifest is refused until
 `install.sh` runs again; `uninstall.sh --purge` resets the chain. Limit:
 deleting the audit chain as well makes the install look new — that shows
 as a chain restarting from genesis in `nn-admin audit verify`.
+
+**A start refused for missing deny hooks** (exit 78, "refusing to start:
+the deny hooks did not attach … missing: …", on a kernel whose hook has an
+unexpected shape) is fail-closed the other way: the deny hooks that did
+attach **stay attached and pinned** — the agent's files stay protected — but
+no agent runs to open a window, so they stay until the next boot or until a
+start succeeds. On that kernel the start succeeds only with
+`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` in the service manager's environment (the
+same way as below; the agent records it as a weakening variable and runs
+without the missing hook), or after a reboot into a supported kernel
+([`KERNEL_COMPATIBILITY.md`](KERNEL_COMPATIBILITY.md)).
 
 **Recovering from a refused boot** (mismatch, unreadable or removed
 manifest). The refused agent loaded and pinned nothing (lab PR 262; its
@@ -1547,6 +1644,12 @@ over a package's unit, or the tmpfs `/run/systemd/transient` and
 of kind `unit_shadowed`, `systemctl mask` included.
 
 ## 6. Distribution packages (`.deb` / `.rpm`)
+
+The `.deb` is tested in our lab (Ubuntu 24.04, Debian 13: install, remove
+and purge). The `.rpm` is built and signed by the release workflow, and
+its signature checked by a self-test there, but it has **not been tested in
+our lab** yet: there is no Fedora or RHEL-family guest. Prefer the tarball
+on those distributions for the alpha, and report what you see.
 
 The packages install the package layout: binaries in `/usr/bin`, units in
 `/usr/lib/systemd/system`, and in `/usr/share/northnarrow` the data tree

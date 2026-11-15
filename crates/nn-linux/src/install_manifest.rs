@@ -55,8 +55,8 @@ pub struct InstallManifest {
     pub version: String,
     #[serde(default)]
     pub installed_at: String,
-    /// `attested` | `checksums` | `manifest` | `source-tree` | `unverified`
-    /// | `package`.
+    /// `attested` | `signed-checksums` (lot 354) | `checksums` | `manifest` |
+    /// `source-tree` | `unverified` | `package`.
     pub provenance: String,
     /// External audit DEP-007: the `install.sh` flag that accepted a level
     /// below `attested` (lab PR 220: `--allow-unverified`, its former name

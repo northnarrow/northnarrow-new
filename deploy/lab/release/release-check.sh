@@ -44,10 +44,14 @@ T0=$(date "+%F %T")
 # verifies. The tarball of a CI run is attested (if at all) for its branch,
 # not for a v* tag: refused with nothing installed, then installed with
 # --allow-unverified, which is logged and recorded with the level reached.
+# Lot 354: a tag's tarball installs with no flag at "attested" (gh 2.49+ on
+# the guest) or, with SHA256SUMS.asc next to SHA256SUMS and no attestation
+# verifier, at "signed-checksums".
 prov=checksums
 if (cd "$tree" && sudo ./deploy/install.sh --tarball "/opt/nn-release/$tgz" --sums /opt/nn-release/SHA256SUMS >/tmp/nn-release-install.log 2>&1); then
-    prov=attested   # a tag's tarball
-    check "install.sh verifies the tag attestation and installs the tree" sudo grep -q '"provenance": "attested"' /etc/northnarrow/install-manifest.json
+    prov=$(sudo sed -n 's/^  "provenance": "\([^"]*\)",$/\1/p' /etc/northnarrow/install-manifest.json)
+    check "install.sh verifies the tag release ($prov) and installs the tree" \
+        bash -c '[ "$1" = attested ] || { [ "$1" = signed-checksums ] && [ -s /opt/nn-release/SHA256SUMS.asc ]; }' _ "$prov"
 else
     check "install.sh refuses the tree without a tag attestation" grep -q "REFUSED — the release's SLSA provenance attestation did not verify" /tmp/nn-release-install.log
     check "install.sh verifies and installs the tree (--allow-unverified)" \

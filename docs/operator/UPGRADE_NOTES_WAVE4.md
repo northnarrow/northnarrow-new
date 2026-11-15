@@ -1646,16 +1646,9 @@ EXPERIMENTAL, off by default; [the design, §3](https://github.com/northnarrow/n
 - **A cloud agent's uninstaller is the switch-off it is** (BUG-86): `sh
   /usr/local/qcloud/YunJing/uninst.sh` is NN-L-EVA-002, no longer registered
   as the agent's own process starting.
-- Residual, declared: a renamed copy of the tool (`cp /usr/bin/systemctl
-  /tmp/x`), a command read from a file or standard input (`nft -f`,
-  `iptables-restore`), D-Bus (`busctl`, as before), a pkill or killall
-  regular expression beyond a part of the name, or a part less than half of
-  it, a symbolic link to a tool given to killall. The kernel's `task_kill`
-  reports to NN-L-EVA-003 only SIGINT, QUIT, ABRT, KILL, TERM, STOP and
-  TSTP to a registered tool's process, and never one from PID 1 or from
-  another registered tool: a SEGV, ALRM, SYS, XCPU, USR1 or real-time
-  signal that ends a tool, sent by a command line this reader does not
-  name, is not recorded (lot 330 is to report every default-fatal signal).
+- Residual, declared: some ways to stop a listed tool are not recognised
+  by these tables, and only some of the signals that end a registered tool
+  are recorded (lot 330 is to report every default-fatal signal).
 
 ## 33. The exec environment's check complete (lot 325)
 
@@ -1912,11 +1905,9 @@ are judged as before; `CHANGELOG.md` has the detail.
   never silence — `nn-admin status` shows "shell copies: N running images
   compared, M execs not compared". The dynamic loader is recorded with the
   shells: a renamed copy of `ld-linux-x86-64.so.2` running bash is the
-  loader, its operand the program. Residuals: a copy that differs from the installed
-  file by one byte (an appended byte changes its length) or is patched in
-  a sample, a shell rebuilt or downloaded, under another name; a
-  container's own shells (only the host's are recorded; on overlayfs the
-  hook's identity is not `stat`'s, so a container's copy is not compared).
+  loader, its operand the program. Residuals: a shell that is not byte-identical to an
+  installed one, and a container's own shells, are judged by name only. A
+  behaviour-based check, independent of identity, is the next lot's.
   A behaviour-based check, independent of identity, is the next lot's.
 - **R006 reads socat's addresses as socat does** (BUG-112). The
   distribution's socat whose address runs a shell is killed in more
@@ -1975,13 +1966,10 @@ are judged as before; `CHANGELOG.md` has the detail.
     (a) and deletions (d) keep the trust their lineage gives.
 
   Expect an assessment of a backup job that encrypts with a packaged tool
-  in bulk and deletes the originals. **Open (lot 331)**: the LOTL shape of
-  an encryption tool then `rm` (`gpg --encrypt-files *; rm *`) is decisive
-  in the unit tests but was NOT reproduced live on Ubuntu 24.04 (lab r3,
-  r4: no NN-L-IMP-001, in one inline and one interactive session); `ccrypt
-  -r` (renames) was, on Debian 13. Residual: an encryptor that forks a
-  process per file and a deletion by a process of another session; a tool
-  no table names.
+  in bulk and deletes the originals. **Open (lot 331)**: the shape of an encryption tool followed by
+  deletions is decisive in the unit tests but not yet confirmed live on
+  every tested system. Encryption that does not show these shapes may be
+  seen only by weaker signals (KNOWN_LIMITATIONS).
 
 ## 37. The `alpha` profile, the install's start, a wedged uninstall (lot 341)
 
@@ -2719,3 +2707,59 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 | A sudo or su further up covers what runs below `su bob` / `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session) | the session check | a hop below that ran as another user as a barrier (a decision of its own) |
 | `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
 | A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |
+
+## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
+
+- **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)
+  carries version 2, and a decoder refuses a version 1 envelope as
+  `ProtocolVersionUnsupported` (`OLDEST_PROTOCOL_VERSION`): the formats
+  changed since version 1 was set (the status reply grew by appended
+  fields), and an old envelope would be misread. From now on a change to a
+  frame the tests pin raises the version
+  (`a_pinned_frame_changes_only_with_a_new_protocol_version`, and
+  `xtask/tests/protocol_history.rs` for a row edited in place).
+  - **No effect at run time today.** The live admin socket speaks bare
+    frames, as before: no running peer sends or reads the envelope, so the
+    agent, the watchdog and `nn-admin` exchange exactly what they did.
+  - **An older `nn-admin` against a newer agent** gets no version message.
+    A reply that grew by appended fields is read without them (the extra
+    bytes are ignored); a request or reply one side does not know is a
+    protocol error, exit 5 ([`NN_ADMIN.md`](NN_ADMIN.md)). Use the
+    `nn-admin` of the agent's release.
+  - **The upgrade from rc1 works.** `install.sh --upgrade` opens its window
+    with the installed `nn-admin`, against the installed agent (one
+    release), and then replaces both binaries together; the packages
+    replace `nn-admin` with the agent too. An `nn-admin` kept elsewhere (a
+    copy on an administrator's machine) must be updated with them.
+- **The help.** `nn-admin`'s commands and options are described for an
+  operator (no lot, review or design references), the shared options have
+  one help text, and `install.sh --help` lists its package-hook options and
+  its exit codes. A script that parsed the help text sees new wording; the
+  options, the output of the commands and the exit codes are unchanged.
+  `nn-admin` writes no colour when `NO_COLOR` is set (non-empty).
+- **`install.sh --upgrade`** names each side's build on its UPGRADE line:
+  `installed: northnarrow-agent 0.0.1 (sha256 …) → new: northnarrow-agent
+  0.0.1 (build v0.0.1-…, sha256 …)`, and says when the two binaries are the
+  same build. The "UPGRADE complete" line carries the new build too.
+- **A release's `SHA256SUMS` is signed** (`SHA256SUMS.asc`, the `.rpm`'s
+  release key) from the first tag after this change: the check without
+  `gh` of [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §5.
+  A tag release without it is not published.
+- **`install.sh` checks that signature itself.** With `SHA256SUMS.asc` next
+  to `SHA256SUMS`, it verifies it with `gpgv` against the tree's copy of the
+  release key and the fingerprint it pins
+  (`BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D`), then reads the
+  tarball's checksum from that signed copy. On a host with no attestation
+  verifier (Ubuntu 24.04's gh 2.45) the release installs with no flag,
+  recorded as `signed-checksums`, a new level in `install-manifest.json`
+  (`nn-admin host-check`: OK; with the flag that accepted it: WARN). A bad
+  signature, a signature by another key, or a release key missing from the
+  tree is refused whatever the flags (`--no-verify` aside). A verifier that
+  ran and refused (gh not logged in, no network) is not overruled by the
+  signature. *Action:* keep `SHA256SUMS` and `SHA256SUMS.asc` next to the
+  tarball; a tester who used `--allow-unverified` after the manual check no
+  longer needs it. A tool that reads `provenance` sees the new value.
+- **The journal** names an absent optional kernel field's own effect (it
+  named the DNS decoder for every field that was not btrfs's, a hook's
+  argument or the move guard's).
+
