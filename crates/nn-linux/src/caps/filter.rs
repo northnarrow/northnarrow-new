@@ -10,9 +10,12 @@
 //! - review of #482 (R14c-1): a file opened for writing — `open` and
 //!   `openat` with `O_WRONLY`, `O_RDWR`, `O_CREAT` or `O_TRUNC`, `creat`,
 //!   and `openat2` whatever it asks (its flags are in user memory, which a
-//!   filter cannot read; nothing the decision thread runs uses it — the
-//!   kernel-state round's CPU watch does, on another thread, lot 349's
-//!   `own_cpus`, which reads the cgroup tree `RESOLVE_NO_XDEV`). `SYS_PTRACE` with
+//!   filter cannot read — the kernel-state round's CPU watch uses it, on
+//!   another thread, lot 349's `own_cpus`, which reads the cgroup tree
+//!   `RESOLVE_NO_XDEV`; lot 353's reads beneath the kernel's views' anchored
+//!   roots, `antitamper_bpf::kernel_roots`, try it on this thread too and,
+//!   refused, walk one name at a time with `openat`, whose flags this filter
+//!   judges: fix round 5 of #563, the process facts it read as nothing). `SYS_PTRACE` with
 //!   uid 0 opens another root process's `/proc/<pid>/mem` for writing, and
 //!   uid 0 owns the keys, `/etc/ld.so.preload` and the units: the decision
 //!   writes no file (the canary is the writer's, the detections go by a

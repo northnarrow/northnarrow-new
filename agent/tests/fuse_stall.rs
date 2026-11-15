@@ -14,6 +14,14 @@
 //! Each must keep making progress for the whole run; a loop held on the
 //! FUSE stops its count, and the test names it.
 //!
+//! Fix round 5 (the KVM suites of #563): the decision's loop runs as the
+//! decision thread runs — in its role, under its seccomp filter, which
+//! refuses `openat2` — and a third FUSE, mounted below `/proc` over the
+//! directory of the process whose `exe … sha256` facts it reads, holds
+//! what crosses into it. On 92de8ac5 that loop read nothing at all (every
+//! read beneath the anchored roots failed with the filter's `EPERM`); a
+//! walk from the root that crossed mounts would be held on the FUSE below.
+//!
 //! A test binary of its own, with this one test: the run forks (the user
 //! namespace), and a fork while other tests' threads hold a lock (the
 //! allocator's, a registry's) left the child waiting on it for ever.
@@ -170,8 +178,11 @@ fn run_loops(dir: &Path) -> i32 {
         northnarrow_agent::audit::AuditLog::open(&dir.join("audit.log"), key, [0u8; 16]).unwrap();
 
     // the mounts: a FUSE over `/proc` and one over the socket's directory,
-    // each answering the first lookup and holding the rest
-    let (Some(proc_fuse), Some(run_fuse)) = (
+    // each answering the first lookup and holding the rest — and, first,
+    // one below `/proc` over the sleeper's directory (fix round 5)
+    let below = PathBuf::from(format!("/proc/{sleeper_pid}"));
+    let (Some(below_fuse), Some(proc_fuse), Some(run_fuse)) = (
+        nn_linux::fuse_testing::smart_fuse_over(&below, 1),
         nn_linux::fuse_testing::smart_fuse_over(Path::new("/proc"), 1),
         nn_linux::fuse_testing::smart_fuse_over(&run, 1),
     ) else {
@@ -184,7 +195,8 @@ fn run_loops(dir: &Path) -> i32 {
     let stop = Arc::new(AtomicBool::new(false));
     let runtime = Progress::new("the runtime's one worker (a task's ticks)");
     let status = Progress::new("the admin socket's serve loop (STATUS answered)");
-    let decision = Progress::new("the decision's process facts (uid, cgroup, exe … sha256)");
+    let decision =
+        Progress::new("the decision's process facts (uid, cgroup, exe … sha256), under its filter");
     let signing = Progress::new("the signed audit appends");
     let refresh = Progress::new("the open sensor's rule refresh (answered or unjudged)");
     let entropy = Progress::new("the entropy sampler (nn-slow-work)");
@@ -214,17 +226,30 @@ fn run_loops(dir: &Path) -> i32 {
         t0,
         &stop,
         Duration::from_millis(50),
-        move || {
-            use nn_core::decision::rule_policy::ActorFacts;
-            let facts = northnarrow_agent::decision_host_linux::ProcFacts::default();
-            let me = std::process::id();
-            let uid = facts.uid(me);
-            let _ = facts.cgroup(me);
-            // the open of `/proc/<pid>/exe` (re-check 2's R2-2): an image of
-            // the system tree, its owner not root in this namespace
-            let _ = facts.trusted_exe(sleeper_pid);
-            let _ = facts.started_in_cgroup(me);
-            uid.is_some()
+        {
+            let mut entered = false;
+            move || {
+                use nn_core::decision::rule_policy::ActorFacts;
+                // fix round 5: the decision thread's role and filter (no
+                // `openat2`), taken on the loop's thread at its first round
+                if !std::mem::replace(&mut entered, true) {
+                    let e = nn_linux::caps::enter(nn_linux::caps::Role::Decision);
+                    assert!(
+                        e.as_ref().is_ok_and(|e| e.filter == Some(Ok(()))),
+                        "the decision's filter: {e:?}"
+                    );
+                }
+                let facts = northnarrow_agent::decision_host_linux::ProcFacts::default();
+                let me = std::process::id();
+                let uid = facts.uid(me);
+                let _ = facts.cgroup(me);
+                // the open of `/proc/<pid>/exe` (re-check 2's R2-2): an
+                // image of the system tree, its owner not root in this
+                // namespace — its directory now under the FUSE below `/proc`
+                let _ = facts.trusted_exe(sleeper_pid);
+                let _ = facts.started_in_cgroup(me);
+                uid.is_some()
+            }
         },
     );
     let audit = std::sync::Mutex::new(audit);
@@ -301,6 +326,7 @@ fn run_loops(dir: &Path) -> i32 {
     // the connections aborted: what they held fails and ends
     drop(run_fuse);
     drop(proc_fuse);
+    drop(below_fuse);
     let _ = sleeper.kill();
     rt.shutdown_timeout(Duration::from_secs(2));
     rc

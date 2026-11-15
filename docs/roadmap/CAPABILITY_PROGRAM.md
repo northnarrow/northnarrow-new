@@ -11378,6 +11378,27 @@ number in parentheses is a lab PR.
     `namespace_tests_in_ci`); §47.1 states exactly what is not covered,
     each item to be closed by the mount refusal, lot 357 (coordinator's
     decision). No lab this round.
+  - Fix round 5 of #563 (the PR's KVM suites, 22.04 and 24.04): open —
+    four tests of `cgroup_join_privileged_e2e` failed, two causes. (1) The
+    decision thread's seccomp filter refuses `openat2` (R14c-1): every read
+    beneath the anchored roots failed there with `EPERM`, no exemption by
+    executable matched, and a debugger's attach or a `process_vm_writev`
+    into an exempt process tainted its mark but was not signed. (2) The
+    bpffs at `/sys/fs/bpf` is a mount below `/sys`: the tracker's pin
+    directories, made and removed by their parent beneath the `/sys` root,
+    were refused (`EXDEV`) — a planted directory left, the debug plant never
+    made. Done: refused or missing `openat2`, `kernel_roots` walks one name
+    at a time, no mount crossed (each step's mount from the kernel's cache,
+    nothing asked of a FUSE); `/sys/fs/bpf` anchored as a view of its own.
+    Named: `the_decision_thread_reads_the_kernel_s_views_under_its_filter`
+    (caps), `a_walk_without_openat2_crosses_no_mount_and_follows_no_magic_link`,
+    `a_pin_directory_s_parent_is_beneath_the_bpffs_root` (kernel_roots), the
+    FUSE harness's decision loop in its role under its filter with a FUSE
+    below `/proc` (stalled with the walk crossing mounts, read nothing on
+    92de8ac5). Lab (ubuntu2404, 6.8, installed as CI installs, then
+    `test-one cgroup_join_privileged_e2e`): 92de8ac5 12 passed, 4 failed —
+    the CI's four; with the fix 16 passed, 0 failed. Uninstalled
+    (`--purge`), no pin left, powered off.
 - **Lot 356 — a window's held BPF load is always signed, never
   rate-limited (pre-alpha F3-8; C23; no level change).**
   - What was open (P2, every kernel): `bpf_held_load`, the record of a

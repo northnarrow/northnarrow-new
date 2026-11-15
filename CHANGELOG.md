@@ -1056,6 +1056,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     directories, `trusted_exe` and `ran_host_file` on the decision thread,
     the ratchet's bypasses — each to be closed by the mount refusal, lot
     357.
+  - Fix round 5 of #563 (§47.2): **the decision thread reads the views
+    under its filter, and the bpffs is a view of its own.** The decision
+    thread's seccomp filter refuses `openat2` (R14c-1): every read beneath
+    the anchored roots failed there with `EPERM` — no process fact (uid,
+    cgroup, `exe … sha256`), so no exemption by executable matched and an
+    injection into an exempt process was not signed (the KVM suites'
+    `EXEMPTION REVOKED`). Refused, `kernel_roots` now walks one name at a
+    time (`openat` `O_PATH`, each step's mount read from the kernel's cache:
+    a mount below the root is `EXDEV` before anything is asked of it; the
+    file reopened through its checked descriptor). `/sys/fs/bpf`, a mount
+    below `/sys` that the `/sys` root does not cross, is anchored as its
+    own view: the start-in-cgroup tracker's pin directories beside the pin
+    root are made and removed again (a planted one was left, the debug
+    plant never made).
 - Lot 356 (pre-alpha F3-8, P2): **a window's held BPF load is always
   signed, never rate-limited.** `bpf_held_load` (a program the content
   judge refuses outside a trusted-installer window, loaded inside one and

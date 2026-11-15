@@ -309,6 +309,79 @@ fn the_decision_thread_writes_no_file_and_signals_no_other_process() {
     let _ = child.wait();
 }
 
+/// Lot 353 (fix round 5, the KVM suites of #563; named): under its own
+/// filter, which refuses `openat2` whatever it asks, the decision thread
+/// reads the kernel's views beneath the roots the start anchored — a
+/// process's facts (its uid, its cgroup, its executable and that image's
+/// digest: an exemption by executable), its links, a directory of `/proc`
+/// and one of `/sys` — as the rest of the process reads them, and opens no
+/// file for writing through them. On 92de8ac5 every one failed with the
+/// filter's `EPERM`: no exemption by executable matched, and the privileged
+/// suites' injection into an exempt process was never signed
+/// (`EXEMPTION REVOKED`).
+#[test]
+fn the_decision_thread_reads_the_kernel_s_views_under_its_filter() {
+    use crate::decision_host_linux::ProcFacts;
+    use antitamper_bpf::kernel_roots as kr;
+    use nn_core::decision::rule_policy::ActorFacts;
+    assert!(kr::init().is_empty(), "{:?}", kr::init());
+    let mut child = std::process::Command::new("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let kid = child.id();
+    let me = std::process::id();
+    // the answers of a thread with no filter
+    let facts = ProcFacts::default();
+    let want = (facts.uid(me), facts.cgroup(me), facts.trusted_exe(kid));
+    // (no fact printed: a uid)
+    assert!(
+        want.0.is_some() && want.1.is_some() && want.2.is_some(),
+        "no facts to compare here"
+    );
+    let want_link = kr::read_link(format!("/proc/{kid}/exe")).unwrap();
+    let want_names = kr::read_dir(format!("/proc/{kid}/task")).unwrap();
+    std::thread::spawn(move || {
+        let e = enter(Role::Decision).unwrap();
+        assert_eq!(e.filter, Some(Ok(())), "{}", e.line());
+        let facts = ProcFacts::default();
+        let got = (facts.uid(me), facts.cgroup(me), facts.trusted_exe(kid));
+        assert!(
+            got == want,
+            "the decision's facts under its filter are not the unfiltered thread's"
+        );
+        assert_eq!(
+            kr::read_link(format!("/proc/{kid}/exe")).unwrap(),
+            want_link
+        );
+        assert_eq!(
+            kr::read_dir(format!("/proc/{kid}/task")).unwrap(),
+            want_names
+        );
+        // its own status through procfs's link of names (`thread-self`)
+        assert!(kr::read_text("/proc/thread-self/status")
+            .unwrap()
+            .contains("Seccomp:\t2"));
+        assert!(kr::metadata("/sys/kernel").unwrap().is_dir());
+        // through them still no file opened for writing (the filter's
+        // `openat` rule refuses the walk's open)
+        for (p, flags) in [
+            (format!("/proc/{kid}/mem"), libc::O_RDWR),
+            (format!("/proc/{me}/oom_score_adj"), libc::O_WRONLY),
+        ] {
+            assert_eq!(
+                kr::open(&p, flags).map(drop).map_err(|e| e.raw_os_error()),
+                Err(Some(libc::EPERM)),
+                "{p}"
+            );
+        }
+    })
+    .join()
+    .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn the_filter_lists_every_refused_call_with_its_x32_twin() {
     let names: Vec<&str> = filter::refused().iter().map(|r| r.1).collect();

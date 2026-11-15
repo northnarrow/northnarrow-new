@@ -39,6 +39,11 @@
 //! - A magic link on the path (`ELOOP`: `/proc/<pid>/root/…`, `/proc/self/fd/N`)
 //!   is resolved from the view's root as the kernel resolves it (`openat`):
 //!   the namespace's mount over `/proc` is still not walked.
+//! - Fix round 5 (the KVM suites of #563): the bpffs at `/sys/fs/bpf` — a
+//!   mount below `/sys`, where the agent makes and removes its pin
+//!   directories — is a view of its own ([`bpf_view`]); a thread whose
+//!   seccomp filter refuses `openat2` (the decision thread's) walks one
+//!   name at a time instead, no mount crossed ([`openat_walked`]).
 //! - A path under no view is not this module's ([`view_of`] says `None`).
 
 use std::ffi::{CString, OsString};
@@ -63,6 +68,10 @@ pub const CGROUP_SUPER_MAGIC: u64 = 0x0027_e0eb;
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
 /// `FUSE_SUPER_MAGIC` (`fs/fuse/inode.c`).
 pub const FUSE_SUPER_MAGIC: u64 = 0x6573_5546;
+/// `BPF_FS_MAGIC`.
+pub const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
+/// Where the bpffs is mounted (its view's root).
+pub const BPF_ROOT: &str = "/sys/fs/bpf";
 
 /// The kernel's own file systems a view's path may cross into below its
 /// root (`include/uapi/linux/magic.h`): the views themselves, securityfs,
@@ -80,7 +89,7 @@ pub const KERNEL_MAGICS: &[(u64, &str)] = &[
     (0x7363_6673, "securityfs"),
     (0x6462_6720, "debugfs"),
     (0x7472_6163, "tracefs"),
-    (0xcafe_4a11, "bpf"),
+    (BPF_FS_MAGIC, "bpf"),
     (0x6165_676c, "pstore"),
     (0x6573_5543, "fusectl"),
     (0x6265_6570, "configfs"),
@@ -112,6 +121,8 @@ pub enum Kind {
     Proc,
     Sys,
     Cgroup,
+    /// Lot 353 (fix round 5): the bpffs at [`BPF_ROOT`] ([`bpf_view`]).
+    Bpf,
 }
 
 /// One view: where it is mounted and the descriptor of its root opened at
@@ -140,13 +151,15 @@ impl View {
     }
 }
 
-/// The three views.
+/// The views.
 #[derive(Debug)]
 pub struct Views {
     proc: View,
     sys: View,
     /// `None` on a host without a cgroup2 hierarchy (cgroup v1 only).
     cgroup: Option<View>,
+    /// `None` on a host with no bpffs at [`BPF_ROOT`] ([`bpf_view`]).
+    bpf: Option<View>,
 }
 
 static VIEWS: OnceLock<Views> = OnceLock::new();
@@ -247,18 +260,23 @@ pub fn proc_root_fd() -> Option<std::os::fd::RawFd> {
 /// Why each view the start could not anchor is not, one line each.
 pub fn unanchored() -> Vec<String> {
     let v = views();
-    [Some(&v.proc), Some(&v.sys), v.cgroup.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|view| {
-            view.refused().map(|why| {
-                format!(
-                    "{}: not anchored at the start ({why}) — its kernel state is not read",
-                    view.at.display()
-                )
-            })
+    [
+        Some(&v.proc),
+        Some(&v.sys),
+        v.cgroup.as_ref(),
+        v.bpf.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|view| {
+        view.refused().map(|why| {
+            format!(
+                "{}: not anchored at the start ({why}) — its kernel state is not read",
+                view.at.display()
+            )
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// How many walks below a root did not answer in time, and how many paths
@@ -301,14 +319,21 @@ impl Views {
         }
         let unified_only = proc.root.as_ref().ok().is_some_and(cgroup2_alone);
         let cgroup = cgroup_view(table.as_deref(), unified_only);
-        Views { proc, sys, cgroup }
+        let bpf = bpf_view();
+        Views {
+            proc,
+            sys,
+            cgroup,
+            bpf,
+        }
     }
 
-    /// The view `path` is under (the cgroup2 one before `/sys`).
+    /// The view `path` is under (the cgroup2 one and the bpffs before
+    /// `/sys`).
     pub fn view_of(&self, path: &Path) -> Option<&View> {
-        if let Some(c) = &self.cgroup {
-            if path.starts_with(&c.at) {
-                return Some(c);
+        for v in [&self.cgroup, &self.bpf].into_iter().flatten() {
+            if path.starts_with(&v.at) {
+                return Some(v);
             }
         }
         [&self.proc, &self.sys]
@@ -460,6 +485,34 @@ fn cgroup_view(table: Option<&str>, unified_only: bool) -> Option<View> {
     }
 }
 
+/// Lot 353 (fix round 5, the KVM suites of #563): the bpffs at
+/// [`BPF_ROOT`], a mount of its own below `/sys` that a path beneath the
+/// `/sys` root does not cross (`EXDEV`): the start-in-cgroup tracker makes
+/// and removes its pin directories there by their parent, the bpffs root,
+/// and on 92de8ac5 every one was refused — a planted directory beside the
+/// pin root was never removed, the debug build's plant never made. Its own
+/// view, anchored at the start: the bpffs on top at [`BPF_ROOT`] then, the
+/// one the pins made by path reach (aya's `BPF_OBJ_PIN`; a second bpffs
+/// stacked there is the integrity round's finding, `bpffs_mount`). None
+/// when no bpffs is mounted there (sysfs's own directory, or none: the
+/// agent pins nothing); refused when another file system covers it.
+fn bpf_view() -> Option<View> {
+    let at = Path::new(BPF_ROOT);
+    let view = |root| {
+        Some(View {
+            kind: Kind::Bpf,
+            at: at.to_path_buf(),
+            root,
+        })
+    };
+    match anchor(at, &[BPF_FS_MAGIC, SYSFS_MAGIC]) {
+        Ok((f, BPF_FS_MAGIC)) => view(Ok(f)),
+        Ok(_) => None,
+        Err(why) if why.contains("No such file") => None,
+        Err(why) => view(Err(why)),
+    }
+}
+
 /// `path` opened `O_PATH | O_DIRECTORY` and its file system's type, which
 /// must be one of `magics` — on a helper thread, waited for at most
 /// [`OPEN_DEADLINE`] (the open of a covered root asks nothing, its
@@ -595,9 +648,9 @@ const NO_CROSSING: u64 =
 const CROSSING: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
 
 /// `rel` opened beneath `dir` with `flags` (plus `O_CLOEXEC | O_NOCTTY`)
-/// and `resolve`. A kernel without `openat2` (before 5.6, or a filter that
-/// refuses it): `openat`, and a file on another device than `dir` is a
-/// mount crossed (`EXDEV`) when `resolve` forbids one.
+/// and `resolve`. Where `openat2` cannot be called — a kernel without it
+/// (`ENOSYS`), a seccomp filter that refuses it (`EPERM`) — the walk it
+/// would do, one name at a time ([`openat_walked`]).
 fn openat2(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File> {
     let c = CString::new(rel.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -630,17 +683,148 @@ fn openat2(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File>
         return Ok(unsafe { File::from_raw_fd(fd as i32) });
     }
     let e = io::Error::last_os_error();
-    if e.raw_os_error() != Some(libc::ENOSYS) {
-        return Err(e);
+    match e.raw_os_error() {
+        Some(libc::ENOSYS | libc::EPERM) => openat_walked(dir, rel, flags, resolve),
+        _ => Err(e),
     }
-    let f = openat(dir, rel, flags)?;
-    if resolve & libc::RESOLVE_NO_XDEV != 0 {
-        use std::os::unix::fs::MetadataExt;
-        if f.metadata()?.dev() != dir.metadata()?.dev() {
-            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+}
+
+/// Lot 353 (fix round 5, the KVM suites of #563): `rel` opened beneath
+/// `dir` as `openat2` would open it, where it cannot be called: a kernel
+/// without it (`ENOSYS`), or a seccomp filter that refuses it (`EPERM`) —
+/// the decision thread's (R14c-1: a filter cannot read the call's flags,
+/// so it refuses every `openat2`), and the helper threads that thread
+/// starts, which inherit it. On 92de8ac5 every path under a view failed
+/// there with `EPERM`: the decision's process facts (uid, cgroup, `exe …
+/// sha256`) were never read, no exemption by executable matched, and an
+/// injection into an exempt process was not signed. An `EPERM` of the
+/// open itself (an LSM's) refuses the walk's open again.
+///
+/// A walk that may cross mounts (`resolve` without `RESOLVE_NO_XDEV`: a
+/// crossing's, on a helper thread with a deadline) is an `openat`. One that
+/// may not goes one name at a time: each opened `O_PATH | O_NOFOLLOW` from
+/// the one before and its mount read ([`mount_of`]: nothing asked of a FUSE
+/// root reached, only the kernel's cached answer), refused (`EXDEV`) when it
+/// is not `dir`'s — before any name is looked up in it; a symbolic link to
+/// follow is followed from its directory when its target is names alone
+/// (procfs's `self`), any other (a magic link, a `..`) is `ELOOP`, which
+/// the callers resolve from the root as they resolve a magic link; a `..`
+/// of `rel` is `EXDEV` (`RESOLVE_BENEATH`). The file is
+/// then opened with `flags` through its checked descriptor
+/// (`/proc/self/fd/N` beneath the anchored `/proc` root: the inode checked,
+/// no name looked up again), or, before `/proc` is anchored, by its name in
+/// its checked parent, the file opened checked again.
+fn openat_walked(dir: &File, rel: &Path, flags: i32, resolve: u64) -> io::Result<File> {
+    if resolve & libc::RESOLVE_NO_XDEV == 0 {
+        return openat(dir, rel, flags);
+    }
+    let err = io::Error::from_raw_os_error;
+    let mut todo = std::collections::VecDeque::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(n) => todo.push_back(n.to_os_string()),
+            Component::CurDir => {}
+            _ => return Err(err(libc::EXDEV)),
         }
     }
-    Ok(f)
+    if todo.is_empty() {
+        return openat(dir, Path::new("."), flags);
+    }
+    let (mount, _) = mount_of(dir)?;
+    let is = |mode: u32, kind: libc::mode_t| mode & libc::S_IFMT == kind;
+    let (path_only, nofollow) = (flags & libc::O_PATH != 0, flags & libc::O_NOFOLLOW != 0);
+    let mut parent: Option<File> = None;
+    let mut links = 0;
+    while let Some(name) = todo.pop_front() {
+        let at = parent.as_ref().unwrap_or(dir);
+        let file = openat(at, Path::new(&name), libc::O_PATH | libc::O_NOFOLLOW)?;
+        let (m, mode) = mount_of(&file)?;
+        if m != mount {
+            return Err(err(libc::EXDEV));
+        }
+        let last = todo.is_empty();
+        if is(mode, libc::S_IFLNK) && !(last && path_only && nofollow) {
+            // a link of names alone, followed from its directory (procfs's
+            // `self`, `mounts`); a magic link (an absolute target, a
+            // `socket:[N]`), a `..`, a ninth link: the caller's
+            links += 1;
+            let names = (links <= 8)
+                .then(|| link_of(&file).ok())
+                .flatten()
+                .and_then(|t| relative_names(&t))
+                .ok_or_else(|| err(libc::ELOOP))?;
+            for n in names.into_iter().rev() {
+                todo.push_front(n);
+            }
+            continue;
+        }
+        if !last {
+            parent = Some(file);
+            continue;
+        }
+        if path_only {
+            if flags & libc::O_DIRECTORY != 0 && !is(mode, libc::S_IFDIR) {
+                return Err(err(libc::ENOTDIR));
+            }
+            return Ok(file);
+        }
+        let flags = flags & !libc::O_NOFOLLOW;
+        if let Some(proc) = VIEWS.get().and_then(|v| v.proc.root.as_ref().ok()) {
+            return openat(
+                proc,
+                Path::new(&format!("self/fd/{}", file.as_raw_fd())),
+                flags,
+            );
+        }
+        let f = openat(at, Path::new(&name), flags | libc::O_NOFOLLOW)?;
+        if mount_of(&f)?.0 != mount {
+            return Err(err(libc::EXDEV));
+        }
+        return Ok(f);
+    }
+    Err(err(libc::ENOENT))
+}
+
+/// The names of a symbolic link's target made of names alone — relative,
+/// no `.` or `..`, none naming a kernel object (`socket:[N]`, `mnt:[N]`:
+/// a magic link's) — or `None`.
+fn relative_names(target: &Path) -> Option<Vec<OsString>> {
+    let mut names = Vec::new();
+    for c in target.components() {
+        match c {
+            Component::Normal(n) if !n.as_bytes().contains(&b':') => names.push(n.to_os_string()),
+            _ => return None,
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// The mount of the open `f` (its id; its device on a kernel before 5.8,
+/// which has none) and its mode, as the kernel has them cached: `statx`
+/// with `AT_STATX_DONT_SYNC` and no attribute asked — a FUSE root a walk
+/// reached is never asked anything, so its daemon cannot hold the caller.
+fn mount_of(f: &File) -> io::Result<(u64, u32)> {
+    // SAFETY: `statx` is plain old data, valid when zeroed.
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the fd is live, the empty path NUL-terminated, `sx` writable.
+    let rc = unsafe {
+        libc::statx(
+            f.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC | libc::AT_SYMLINK_NOFOLLOW,
+            0,
+            &mut sx,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let id = if sx.stx_mask & libc::STATX_MNT_ID != 0 {
+        sx.stx_mnt_id
+    } else {
+        (u64::from(sx.stx_dev_major) << 20) | u64::from(sx.stx_dev_minor)
+    };
+    Ok((id, u32::from(sx.stx_mode)))
 }
 
 /// `rel` opened beneath `dir` with plain `openat` (magic links followed).
@@ -757,6 +941,7 @@ fn crossing<T: Send + 'static>(
                         Kind::Proc => "/proc",
                         Kind::Sys => "/sys",
                         Kind::Cgroup => "the cgroup2 root",
+                        Kind::Bpf => BPF_ROOT,
                     }
                 ),
             ));
@@ -2061,5 +2246,186 @@ mod tests {
         let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").unwrap();
         assert_eq!(possible_cpus(), Ok(cpu_count(text.trim()).unwrap()));
         assert_eq!(possible_cpus().unwrap(), aya::util::nr_cpus().unwrap());
+    }
+
+    /// Lot 353 (fix round 5, the KVM suites of #563; named): a path below
+    /// `/sys/fs/bpf` is beneath the bpffs's own anchored root — the pin
+    /// directories' parent opens there, never a mount crossed below `/sys`
+    /// (`EXDEV`). On 92de8ac5 it was the `/sys` view's: the tracker's pin
+    /// directories beside the pin root were neither made nor removed by
+    /// their parent (a planted one was left, the debug build's plant never
+    /// made). Where no bpffs is mounted at `/sys/fs/bpf` (WSL2's kernel), it
+    /// is no view.
+    #[test]
+    fn a_pin_directory_s_parent_is_beneath_the_bpffs_root() {
+        let c = CString::new(BPF_ROOT).unwrap();
+        // SAFETY: `statfs` is plain old data; the path is NUL-terminated.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        let bpffs =
+            unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0 && st.f_type as u64 == BPF_FS_MAGIC;
+        let below = format!("{BPF_ROOT}/northnarrow-cgroup-join-v2_3");
+        let Some((view, rel)) = view_of(Path::new(&below)) else {
+            panic!("{below}: under no view");
+        };
+        if !bpffs {
+            assert_eq!(view.kind(), Kind::Sys, "no bpffs here: the /sys view's");
+            eprintln!("skipped: no bpffs mounted at {BPF_ROOT} here");
+            return;
+        }
+        assert_eq!(
+            (view.kind(), rel.as_path(), view.refused()),
+            (Kind::Bpf, Path::new("northnarrow-cgroup-join-v2_3"), None)
+        );
+        assert!(metadata(BPF_ROOT).unwrap().is_dir());
+        // the parent of a pin directory: the bpffs root, opened beneath its
+        // view — refused by its mode to another user, never a crossing
+        match open(BPF_ROOT, libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(_) => {}
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
+        }
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            let d = format!("{BPF_ROOT}/nn-test-353-{}", std::process::id());
+            create_dir(&d).unwrap();
+            assert!(is_dir(&d));
+            remove_dir(&d).unwrap();
+            assert!(!exists(&d).unwrap());
+        }
+    }
+
+    /// Lot 353 (fix round 5, the KVM suites of #563; named): where
+    /// `openat2` cannot be called (the decision thread's filter refuses it:
+    /// `EPERM`), the walk one name at a time opens what `openat2` would — a
+    /// file, a directory, a link of names alone followed (`self`), a link
+    /// itself with `O_NOFOLLOW` — and refuses what it refuses: a mount
+    /// below the root (`EXDEV`, before any name is looked up in it; here a
+    /// tmpfs over `/proc/sys/kernel`), a magic link to follow (`ELOOP`), a
+    /// `..` (`EXDEV`). And a tmpfs over `/sys/fs/bpf` at the start is not
+    /// taken for the bpffs. In a user and mount namespace of a child
+    /// (skipped where the host refuses one).
+    #[test]
+    fn a_walk_without_openat2_crosses_no_mount_and_follows_no_magic_link() {
+        let _ = views();
+        // SAFETY: fork; the child mounts in namespaces of its own and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = walked_child();
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(rc) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 | 99 => {}
+            rc => panic!("the child failed with {rc}"),
+        }
+    }
+
+    /// The child of
+    /// [`a_walk_without_openat2_crosses_no_mount_and_follows_no_magic_link`]:
+    /// 0 when it holds, 99 when the host refuses the namespaces.
+    fn walked_child() -> i32 {
+        let tmpfs = |target: &std::ffi::CStr| {
+            // SAFETY: NUL-terminated strings, no data.
+            unsafe {
+                libc::mount(
+                    c"none".as_ptr(),
+                    target.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            }
+        };
+        // SAFETY: the child's own namespaces; no data.
+        let refused = unsafe {
+            libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                || libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+        };
+        if refused {
+            return 99;
+        }
+        let views = Views::open();
+        let Ok(root) = views.proc.root.as_ref() else {
+            return 98;
+        };
+        let walk = |rel: &str, flags: i32| {
+            openat_walked(root, Path::new(rel), flags | libc::O_CLOEXEC, NO_CROSSING)
+        };
+        let errno = |r: io::Result<File>| r.err().and_then(|e| e.raw_os_error());
+        let read = |r: io::Result<File>| r.ok().and_then(|f| read_file_bounded(&f, 1 << 16).ok());
+        // a file, as by path; a link of names alone followed
+        if read(walk("sys/kernel/osrelease", READ_FLAGS))
+            != std::fs::read("/proc/sys/kernel/osrelease").ok()
+        {
+            return 10;
+        }
+        if !read(walk("self/status", READ_FLAGS))
+            .is_some_and(|b| String::from_utf8_lossy(&b).contains("\nPid:\t"))
+        {
+            return 11;
+        }
+        // a directory; a file is not one
+        if walk("sys/kernel", libc::O_PATH | libc::O_DIRECTORY).is_err()
+            || errno(walk(
+                "sys/kernel/osrelease",
+                libc::O_PATH | libc::O_DIRECTORY,
+            )) != Some(libc::ENOTDIR)
+        {
+            return 12;
+        }
+        // a magic link: the link itself with O_NOFOLLOW, never followed
+        let Ok(exe) = std::fs::read_link("/proc/self/exe") else {
+            return 13;
+        };
+        if walk("self/exe", libc::O_PATH | libc::O_NOFOLLOW)
+            .and_then(|f| link_of(&f))
+            .ok()
+            != Some(exe)
+            || errno(walk("self/exe", READ_FLAGS)) != Some(libc::ELOOP)
+        {
+            return 14;
+        }
+        // a magic link whose target is no path (`pipe:[N]`): never taken
+        // for names
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is writable for two descriptors.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0
+            || errno(walk(&format!("self/fd/{}", fds[0]), READ_FLAGS)) != Some(libc::ELOOP)
+        {
+            return 15;
+        }
+        // a `..`: not beneath
+        if errno(walk("sys/../self/status", READ_FLAGS)) != Some(libc::EXDEV) {
+            return 19;
+        }
+        // a mount below the root: refused at its root
+        if tmpfs(c"/proc/sys/kernel") != 0 {
+            return 99;
+        }
+        if std::fs::read("/proc/sys/kernel/osrelease").is_ok() {
+            return 16; // the cover did not take
+        }
+        if errno(walk("sys/kernel/osrelease", READ_FLAGS)) != Some(libc::EXDEV)
+            || errno(walk("sys/kernel", libc::O_PATH)) != Some(libc::EXDEV)
+        {
+            return 17;
+        }
+        // a tmpfs over /sys/fs/bpf at the start: refused, never the bpffs
+        if tmpfs(c"/sys/fs/bpf") == 0
+            && !bpf_view().is_some_and(|v| v.refused().is_some_and(|w| w.contains("tmpfs")))
+        {
+            return 18;
+        }
+        0
     }
 }

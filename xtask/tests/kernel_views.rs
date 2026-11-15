@@ -1570,8 +1570,10 @@ fn test_module(f: &Path) -> bool {
 
 /// The constants that name bpffs (`/sys/fs/bpf`: its pins are opened by
 /// path through the bpf(2) object calls, a file system of its own the
-/// integrity round watches — `PROTECTED_MOUNT_PREFIXES`, `MOUNT_WATCHED`)
-/// and the kernel's BTF directory's watch: not views read here.
+/// integrity round watches — `PROTECTED_MOUNT_PREFIXES`, `MOUNT_WATCHED`;
+/// the agent's own file operations there go beneath its anchored root,
+/// `kernel_roots`' bpffs view since fix round 5 of #563) and the kernel's
+/// BTF directory's watch: not views read here.
 const NOT_VIEWS: &[&str] = &[
     "BPFFS_MOUNT",
     "BPFFS_ROOT",

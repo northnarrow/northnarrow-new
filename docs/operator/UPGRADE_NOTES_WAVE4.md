@@ -3148,6 +3148,42 @@ agent's own directories.
   closed by the mount refusal, lot 357 (no mount over a view left to hold
   such a read).
 
+### 47.2 Fix round 5 of #563: the decision thread's reads, the bpffs's view
+
+- **The decision thread reads the kernel's views under its own filter.**
+  Its seccomp filter refuses `openat2` whatever it asks (R14c-1: a filter
+  cannot read the call's flags), and every read beneath the anchored roots
+  failed there with `EPERM`: the process facts of a rule's exemptions (a
+  process's uid, its cgroup, its executable and that image's digest) were
+  never read — no exemption by executable matched, and a debugger's attach
+  or a `process_vm_writev` into an exempt process tainted its mark but was
+  never signed (`EXEMPTION REVOKED`). Where `openat2` is refused (`EPERM`)
+  or missing (`ENOSYS`), `kernel_roots` now walks one name at a time:
+  `openat` with `O_PATH | O_NOFOLLOW`, each step's mount read from the
+  kernel's cache (`statx`, `AT_STATX_DONT_SYNC`, nothing asked: a FUSE root
+  reached is never asked anything) and refused (`EXDEV`) when it is not the
+  root's — before any name is looked up in it; a link of names alone
+  (procfs's `self`, `thread-self`) followed from its directory, a magic link
+  `ELOOP` (resolved from the root, as before), a `..` refused; the file then
+  opened through its checked descriptor (`/proc/self/fd/N` beneath the
+  anchored `/proc` root). The filter's own rules still judge every open:
+  nothing is opened for writing that way (`/proc/<pid>/mem` read-write is
+  still `EPERM`). The FUSE harness runs the decision's loop in its role,
+  under its filter, with a FUSE below `/proc` over the directory of the
+  process it reads.
+- **`/sys/fs/bpf` is a view of its own.** The bpffs is a mount below
+  `/sys`, which a path beneath the `/sys` root does not cross (`EXDEV`): the
+  start-in-cgroup tracker's pin directories beside the pin root
+  (`/sys/fs/bpf/northnarrow-cgroup-join-v2_<n>`) are made and removed by
+  their parent, the bpffs root, and every one was refused — a planted
+  directory there was left (`an old tracker pin directory NOT removed`)
+  and never signed as removed, a new generation's plant (the debug build's)
+  never made. The start anchors the bpffs on top at `/sys/fs/bpf` (the one
+  the pins made by path reach; a second bpffs stacked there is the
+  integrity round's `bpffs_mount`); a host with no bpffs there has no such
+  view (the agent pins nothing), and another file system over it at the
+  start is refused and named with the other views (`kernel_views`).
+
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 
 - **`PROTOCOL_VERSION` is 2.** The admin envelope (`VersionedAdminMessage`)
