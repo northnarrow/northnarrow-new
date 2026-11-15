@@ -1442,7 +1442,10 @@ impl<H: DecisionHost> DefenseDetector<H> {
             let script = id.runs.mentioned().unwrap_or_default().to_string();
             let staged = |s: &str| crate::decision::rules::is_staging_path(s);
             let unlinked = exe.ends_with(" (deleted)") || exe.starts_with("/memfd:");
-            (staged(&exe) || staged(&script) || unlinked).then(|| {
+            // lot 355: a program of a user's image (an AppImage's) is that
+            // image's, not staged; a script it names is judged by its path
+            let staged_exe = self.lineage.staged_image_as(p, as_of, &exe);
+            (staged_exe || staged(&script) || unlinked).then(|| {
                 (
                     p,
                     if script.is_empty() {

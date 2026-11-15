@@ -37,8 +37,13 @@ pub struct MountEntry {
     /// The directory of that filesystem mounted here (`/` for its root).
     pub root: PathBuf,
     pub mount_point: PathBuf,
+    /// Lot 355: the mount's own options (`ro`, `nosuid`, …), field 6.
+    pub options: OsString,
     pub fstype: OsString,
     pub source: OsString,
+    /// Lot 355: the superblock's options (`ro`, `user_id=1000`, …), the last
+    /// field.
+    pub super_options: OsString,
 }
 
 impl MountEntry {
@@ -51,6 +56,32 @@ impl MountEntry {
     pub fn same_dev(&self, other: &MountEntry) -> bool {
         self.major == other.major && self.minor == other.minor
     }
+
+    /// Lot 355: the superblock is read-only (`ro` among its options): no
+    /// mount of it writes, whatever the mount's own options.
+    pub fn read_only_super(&self) -> bool {
+        has_option(&self.super_options, b"ro")
+    }
+
+    /// Lot 355: the value of the superblock's option `name=` (`user_id`),
+    /// when it is there once.
+    pub fn super_option(&self, name: &str) -> Option<&[u8]> {
+        let mut found = self
+            .super_options
+            .as_bytes()
+            .split(|b| *b == b',')
+            .filter_map(|o| o.strip_prefix(name.as_bytes())?.strip_prefix(b"="));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+}
+
+/// `option` is one of the comma-separated `options`.
+fn has_option(options: &OsStr, option: &[u8]) -> bool {
+    options
+        .as_bytes()
+        .split(|b| *b == b',')
+        .any(|o| o == option)
 }
 
 /// A line that is not in the kernel's shape.
@@ -165,8 +196,10 @@ fn parse_line(line: &[u8]) -> Result<MountEntry, &'static str> {
         minor,
         root,
         mount_point,
+        options: OsString::from_vec(unescape_bytes(fields[5])),
         fstype: OsString::from_vec(unescape_bytes(fields[sep + 1])),
         source: OsString::from_vec(unescape_bytes(fields[sep + 2])),
+        super_options: OsString::from_vec(unescape_bytes(fields[sep + 3])),
     })
 }
 
@@ -534,5 +567,29 @@ mod tests {
             "the same path, another filesystem"
         );
         assert_eq!(t.parent_of(&t.entries[1]), Some(root));
+    }
+
+    /// Lot 355: a mount's own options and its superblock's are read apart:
+    /// an AppImage's mount is `ro` in both, its user is the super option
+    /// `user_id=` (once), and a `ro` bind of a writable superblock is not a
+    /// read-only superblock.
+    #[test]
+    fn mount_and_super_options_are_read_apart() {
+        let t = parse(
+            b"61 30 0:52 / /tmp/.mount_App1x ro,nosuid,nodev,relatime shared:9 - fuse.App.AppImage App.AppImage ro,user_id=1000,group_id=1000\n\
+              62 30 0:53 / /tmp/m ro,nosuid - fuse.x x rw,user_id=1000,user_id=0\n",
+        );
+        assert!(t.malformed.is_empty(), "{:?}", t.malformed);
+        let (app, bind) = (&t.entries[0], &t.entries[1]);
+        assert_eq!(app.options, OsStr::new("ro,nosuid,nodev,relatime"));
+        assert!(app.read_only_super());
+        assert_eq!(app.super_option("user_id"), Some(&b"1000"[..]));
+        assert_eq!(app.super_option("group_id"), Some(&b"1000"[..]));
+        assert_eq!(app.super_option("user"), None, "a prefix is no name");
+        assert!(!bind.read_only_super(), "a ro mount of a rw superblock");
+        assert_eq!(bind.super_option("user_id"), None, "named twice: not known");
+        // an option that only starts like `ro` is not it
+        let t = parse(b"63 30 0:54 / /tmp/n rw - fuse.x x rw,rootmode=40000,user_id=1000\n");
+        assert!(!t.entries[0].read_only_super());
     }
 }

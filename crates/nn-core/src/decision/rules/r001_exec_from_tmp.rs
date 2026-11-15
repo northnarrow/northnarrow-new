@@ -38,7 +38,9 @@ impl Rule for R001ExecFromTmp {
             return None;
         };
         // Review 61: the file the kernel executed, not the caller's string.
-        let filename = exe.path_or(filename);
+        // Lot 355: a file of a user's program image (an AppImage's) is the
+        // image's, not staged in its mount point's directory.
+        let filename = crate::decision::rules::staging_judged_path(exe, filename)?;
         if !filename.starts_with("/tmp/") {
             return None;
         }
@@ -92,11 +94,31 @@ mod tests {
     /// Lab PR 166: the payload's forked children die with it.
     #[test]
     fn r001_kills_the_process_tree() {
-        for uid in [0, 998, 1000] {
+        for (case, uid) in [0, 998, 1000].into_iter().enumerate() {
             let v = R001ExecFromTmp
                 .evaluate(&spawn_as(uid, "payload", "/tmp/payload"))
                 .expect("fires");
-            assert_eq!(v.action, ResponseAction::KillProcessTree, "uid {uid}");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "case {case}");
+        }
+    }
+
+    /// Lot 355: a file of a user's program image (an AppImage's program,
+    /// served at its runtime's `/tmp/.mount_*`, `USER_IMAGE` by the exec
+    /// pump) is the image's: R001, R002 and R003 judge it as the image, not
+    /// as staged in the mount point's directory. Unmarked, the same path
+    /// fires.
+    #[test]
+    fn a_user_image_s_program_is_not_staged() {
+        use crate::decision::rules::testutil::spawn_exe;
+        use crate::decision::rules::{R002ExecFromDevShm, R003ExecFromVarTmp};
+        use common::wire::exe::exe_flags::USER_IMAGE;
+        let rules: [&dyn Rule; 3] = [&R001ExecFromTmp, &R002ExecFromDevShm, &R003ExecFromVarTmp];
+        for (rule, dir) in rules.iter().zip(["/tmp", "/dev/shm", "/var/tmp"]) {
+            let app = format!("{dir}/.mount_k355ab/AppRun");
+            let marked = spawn_exe("AppRun", &app, &app, USER_IMAGE);
+            assert!(rule.evaluate(&marked).is_none(), "{dir}");
+            let staged = spawn_exe("AppRun", &app, &app, 0);
+            assert!(rule.evaluate(&staged).is_some(), "{dir}");
         }
     }
 

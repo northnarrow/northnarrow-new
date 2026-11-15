@@ -518,6 +518,12 @@ struct Entry {
     /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
     /// known — read from `/proc`, a later exec, an older eBPF object.
     fork_parent: u32,
+    /// Lot 355: the exec's file is a file of a user's program image (the
+    /// exec pump's `exe_flags::USER_IMAGE`: an AppImage's, served at its
+    /// runtime's `/tmp/.mount_*`), judged as that image, never as staged.
+    /// A fork runs its parent's; `false` for every entry no exec of its own
+    /// gave (the start's scan, an orphan read from `/proc`).
+    user_image: bool,
 }
 
 /// Lot 340 (the review of #552, F1): one hop of a whole lineage
@@ -1217,7 +1223,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (0, None),
             0,
-            (None, 0, None),
+            (None, 0, None, false),
         );
     }
 
@@ -1248,7 +1254,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
-            (image, fork_parent, image),
+            (image, fork_parent, image, false),
         );
     }
 
@@ -1266,7 +1272,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (0, None),
             uid,
-            (None, ppid, None),
+            (None, ppid, None, false),
         );
     }
 
@@ -1311,7 +1317,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         else {
             return false;
         };
-        use common::wire::exe::exe_flags::{KNOWN, PROC_EXE, ROOT_DIR};
+        use common::wire::exe::exe_flags::{KNOWN, PROC_EXE, ROOT_DIR, USER_IMAGE};
         // lot 310: the file's identity (the LSM program's, or the exec
         // pump's from `/proc` in tracepoint mode), kept only when no user
         // could have unlinked the image (its directory root's only: the
@@ -1353,7 +1359,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *timestamp_ns,
             (*start_ns, None),
             *uid,
-            (image, fork_parent, exec_file),
+            (image, fork_parent, exec_file, exe.has(USER_IMAGE)),
         );
         let _ = filename;
         true
@@ -1386,7 +1392,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             spawn_ns,
             (start_ns, None),
             uid,
-            (None, 0, None),
+            (None, 0, None, false),
         );
     }
 
@@ -1476,6 +1482,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image: parent.image,
             exec_file: parent.exec_file,
             fork_parent: k.parent,
+            user_image: parent.user_image,
         })
     }
 
@@ -1558,7 +1565,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 0,
                 (start_ns, Some(ticks)),
                 uid.unwrap_or(0),
-                (image, 0, image),
+                (image, 0, image, false),
             );
             seeded += 1;
         }
@@ -1615,7 +1622,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
-        (image, fork_parent, exec_file): (Option<FileId>, u32, Option<FileId>),
+        (image, fork_parent, exec_file, user_image): (Option<FileId>, u32, Option<FileId>, bool),
     ) {
         if pid == 0 {
             return;
@@ -1634,6 +1641,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image,
             exec_file,
             fork_parent,
+            user_image,
         };
         let mut s = self.inner.state.write();
         // Lab PR 267 (R12a): an exec the cache already holds (its time and
@@ -1914,7 +1922,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
                     e.uid,
-                    (e.image, e.fork_parent, e.exec_file),
+                    (e.image, e.fork_parent, e.exec_file, e.user_image),
                 );
                 if orphan {
                     orphans += 1;
@@ -2009,6 +2017,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             exec_file: first.exec_file,
             // no exec of its own: no fork parent recorded for one
             fork_parent: 0,
+            // lot 355: its image read from `/proc`: not known to be a user's
+            user_image: false,
         })
     }
 
@@ -2148,6 +2158,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image: parent.image,
             exec_file: parent.exec_file,
             fork_parent: 0,
+            user_image: parent.user_image,
         })
     }
 
@@ -4176,6 +4187,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         }
         let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
+    }
+
+    /// Lot 355: `pid` ran, as of `as_of`, the file `path` of a user's
+    /// program image (an AppImage's: `exe_flags::USER_IMAGE` on its exec,
+    /// or its forker's for a fork) — the exec the spawn cache holds for that
+    /// time, when that exec's image is `path` (the review of #564, F7: a
+    /// path read elsewhere — a flow's row — and an exec of another file
+    /// the cache missed are not paired). `false` when not known: a process
+    /// `/proc` shows, one the cache does not hold then. The staging
+    /// judgements of a flow or an ancestor by its image path
+    /// ([`Self::image_path_as`]) read it beside that path
+    /// ([`Self::staged_image_as`]).
+    pub fn runs_user_image(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let of_path = |e: &Entry| e.user_image && e.exe.as_os_str() == path;
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => of_path(&e),
+            CachedAt::Absent if !self.judged_from_proc(pid, as_of) => self
+                .fork_entry(pid, as_of.time(), 0)
+                .is_some_and(|e| of_path(&e)),
+            CachedAt::Absent | CachedAt::LaterOnly => false,
+        }
+    }
+
+    /// Lot 355: `path`, the image `pid` ran as of `as_of`, is a staged
+    /// image: under a staging directory
+    /// ([`crate::decision::rules::is_staging_path`]) and not a file of a
+    /// user's program image ([`Self::runs_user_image`]).
+    pub fn staged_image_as(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
+        crate::decision::rules::is_staging_path(path) && !self.runs_user_image(pid, as_of, path)
     }
 
     /// R-F: whether a pid the spawn cache does not hold may be read from
@@ -7303,7 +7346,7 @@ mod tests {
             spawn_ns,
             (start_ns, None),
             uid,
-            (None, ppid, None),
+            (None, ppid, None, false),
         );
     }
 
@@ -8001,7 +8044,7 @@ mod tests {
             0,
             (3, Some(0)),
             0,
-            (None, 0, None),
+            (None, 0, None, false),
         );
         t.ingest_first_exec(271, 270, "/home/alice/x.sh", 25, 0);
         assert!(admin(271));
@@ -8015,7 +8058,7 @@ mod tests {
             0,
             (3, Some(0)),
             1000,
-            (None, 0, None),
+            (None, 0, None, false),
         );
         t.ingest_first_exec(281, 280, "/home/alice/payload", 26, 0);
         assert!(!admin(281));
@@ -8034,7 +8077,7 @@ mod tests {
                 0,
                 (3, Some(0)),
                 uid,
-                (image, 0, image),
+                (image, 0, image, false),
             )
         };
         seeded(300, 50, "/usr/bin/sudo", 1000);
@@ -8226,7 +8269,7 @@ mod tests {
             0,
             (3, Some(0)),
             1001,
-            (None, 0, None),
+            (None, 0, None, false),
         );
         t.ingest_first_exec(501, 500, "/home/alice/payload", 120, 0);
         assert!(!admin(501));
@@ -9290,6 +9333,7 @@ mod tests {
             image: None,
             exec_file: None,
             fork_parent: 0,
+            user_image: false,
         };
         let exact = e(4_003_217_000, None);
         let seeded = e(4_000_000_000, Some(400));

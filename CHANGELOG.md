@@ -1134,6 +1134,62 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`: a flood of
     refused handles on one CPU, then 64 window loads there, each signed with
     its program id).
+- Lot 355 (pre-alpha): **an AppImage's program is judged by its image, not
+  by its runtime's `/tmp` mount.** An AppImage serves its image read-only at
+  `/tmp/.mount_*` and runs its programs from there: every launch on a
+  desktop was R001 High, then NN-L-CHAIN-002 or -005 Critical ("would have:
+  KillProcessTree") once the program or its zygote's child connected, and
+  NN-L-NET-008 High — lot 352's lab, an Electron-style app and Chrome for
+  Testing's headless shell; the same programs run from the home drew
+  NN-L-NET-007 Medium only.
+  - The exec pumps (`nn_linux::sensors::app_image`) mark such an exec
+    `exe_flags::USER_IMAGE` when the kernel's state ties the mount to the
+    image file the user ran: a read-only FUSE superblock the exec's user
+    mounted, on no FUSE mount, entered by the process that had just
+    executed the image file (the user's own regular file outside the
+    staging directories and the system trees, still that file) by a path
+    under the mount point, with a daemon of that image file (device and
+    inode) started since, not stopped or traced, holding `/dev/fuse` and
+    the image file itself, and no other regular file a staged image could
+    be served from; later execs of the mount's files while that mount and
+    daemon are there. The LSM program's exec check, which the posture
+    judges, is read the same way.
+  - One door for "staged": `rules::staging_judged_path` /
+    `rules::is_staged_exec` for an exec, `AuthSessionTracker::staged_image_as`
+    (the spawn cache's `user_image`, a fork's its forker's) for a flow or an
+    ancestor — R001..R003, the chains' staging precursor (CHAIN-002, -005,
+    -007, the late completions too), the posture's exec arm, NN-L-NET-008,
+    the transfer-tool and impair rules' staged-ancestor tests; ratchet
+    `xtask/tests/staged_images.rs`. `MountEntry` keeps the mount's and the
+    superblock's options.
+  - Still judged: an AppImage itself in a staging directory, or a legit
+    one made to serve a file staged there (`TARGET_APPIMAGE`), another
+    user's, one installed in a system tree, one extracted; a writable FUSE
+    mount; `squashfuse` serving a downloaded file, whatever AppImage runs
+    meanwhile; a mount over a FUSE mount; tracepoint mode; and everything
+    the program then does (its credential read is NN-L-FIM-017 as for any
+    user program). Residual: `docs/operator/UPGRADE_NOTES_WAVE4.md` §49.
+  - The review of #564:
+    - the type-2 runtime's documented `TARGET_APPIMAGE` made a user's legit
+      image serve a squashfs staged in `/tmp`, whose programs were then
+      the image's (no R001..R003, CHAIN-002/005/007, posture staging,
+      NN-L-NET-008): the daemon must now hold the image file itself open
+      (device and inode, by its descriptors) and no other regular file
+      under a staging directory, unlinked, on a memory or FUSE filesystem,
+      or a `memfd` (each descriptor's filesystem read from its `fdinfo`,
+      a FUSE file never `stat`ed);
+    - a traced daemon (`TracerPid:`, a `PTRACE_SEIZE` leaves it running)
+      ties nothing; the image's path is never read through a FUSE mount;
+    - the pump reads the mount table only for an exec on an anonymous
+      device (FUSE's) that may tie, keeps its record by pid in the order
+      noted (no scan of it per check or per eviction);
+    - NN-L-NET-008, the transfer-tool and impair tests read the spawn
+      cache's mark only when the cache's image is the path they judge;
+    - ratchet `staged_images.rs` counts the prefixes' constants, a cut
+      (`strip_prefix("/tmp/")`), a prefix without its slash or on a `Path`,
+      and the door's own file outside its items; the ratchets' scan leaves
+      `cfg(all(test, …))` items out (`proc_links.rs`'s pin lowered);
+    - the residual (§49) says the swap needs no mount namespace.
 - Lot 354 (pre-alpha Phase 9, part 1): the docs match the code, the
   operator's help, the protocol version.
   - **README figures checked by a test.** `xtask/tests/readme_figures.rs`

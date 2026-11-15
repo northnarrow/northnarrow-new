@@ -94,9 +94,12 @@ const INTERACTIVE_VARS: &[&str] = &["PYTHONSTARTUP", "ENV", "NODE_REPL_EXTERNAL_
 /// first MiB loaded its `sitecustomize` unseen).
 const MAX_ENVIRON: u64 = 1 << 20;
 
-/// The exec pump's step: `event`'s process read under `/proc`.
+/// The exec pump's step: `event`'s process read under `/proc`. Lot 355:
+/// then an exec of an AppImage's program marked as its image's
+/// ([`super::app_image`]).
 pub fn read(event: &mut Event) {
-    read_under(Path::new("/proc"), event)
+    read_under(Path::new("/proc"), event);
+    super::app_image::read(event);
 }
 
 /// [`read`] with the processes under `proc_root` (a fixture tree in tests).
@@ -271,7 +274,7 @@ fn environ_loads(dir: &Path, interactive: bool) -> bool {
 
 /// The process runs in PID 1's mount namespace (`/proc/<pid>/ns/mnt` the
 /// same as `/proc/1/ns/mnt`). Not readable: not known, so no.
-fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
+pub(super) fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
     let ns = |d: &Path| antitamper_bpf::kernel_roots::read_link(d.join("ns/mnt")).ok();
     match (ns(dir), ns(&proc_root.join("1"))) {
         (Some(a), Some(b)) => a == b,
@@ -282,7 +285,7 @@ fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
 /// The re-check 1 of #560 (H(b)): the process's root directory
 /// (`/proc/<pid>/root`, followed) is PID 1's — the same device and inode:
 /// not a chroot. Not readable: not known, so no.
-fn same_root(proc_root: &Path, dir: &Path) -> bool {
+pub(super) fn same_root(proc_root: &Path, dir: &Path) -> bool {
     let id = |d: &Path| {
         antitamper_bpf::kernel_roots::metadata(d.join("root"))
             .ok()

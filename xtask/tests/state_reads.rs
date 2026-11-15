@@ -67,6 +67,11 @@ const PROC_ENTRIES: &[&str] = &[
 const PROC: &str = "a process's own /proc entry, read as bytes: a failed read is the process \
                     gone or unknown, and the caller answers unknown (no identity, start, \
                     exemption or ancestor), never an emptied protection";
+/// Lot 355: the exec pump's AppImage tie reads PID 1's mount table; one it
+/// cannot read ties nothing.
+const APPIMG: &str = "PID 1's mount table, read for the AppImage tie (lot 355): unreadable, no \
+                      filesystem is tied to an image and the exec is judged staged, as before \
+                      (the stricter side), never an emptied protection";
 /// Why a kernel-written ASCII file may default.
 const KNOB: &str = "written by the kernel in ASCII (/proc/sys, /sys, meminfo, /proc/stat, fdinfo, \
                     the boot id, the agent's own /proc/self): no user writes it; unreadable, the \
@@ -686,6 +691,31 @@ const KNOWN: &[(&str, &str, &str)] = &[
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "mountinfo::read(&proc_root.join(\"1/mountinfo\"))",
+        APPIMG,
+    ),
+    (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "read_state(dir.join(\"status\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "read_state(dir.join(\"fdinfo\").join(fd))",
         PROC,
     ),
     (
