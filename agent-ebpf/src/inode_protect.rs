@@ -57,6 +57,7 @@ use aya_ebpf::{
 
 use northnarrow_common::cgroup_limits::same_value;
 use northnarrow_common::fail_open::hook;
+use northnarrow_common::ptrace_read;
 use northnarrow_common::wire::{
     fs_protect_denied_op, fs_protect_init_may, fs_protect_init_may_open, fs_protect_required,
     fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
@@ -272,10 +273,26 @@ pub(crate) fn override_active() -> bool {
 
 /// `(caller tgid << 8) | op` → monotonic ns of the last task-denial record
 /// for that caller and operation (1 s dedup: a `while true; kill` loop
-/// from one shell is one record per second); a refused read-mode ptrace
-/// access by caller and target ([`emit_task_read_denial`], 60 s).
+/// from one shell is one record per second).
 #[map]
 static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// The re-check 2 of #567 (point 2): a refused read-mode ptrace access's
+/// last record by caller IMAGE and target
+/// (`northnarrow_common::ptrace_read::seen_key`) → monotonic ns, one an
+/// hour ([`emit_task_read_denial`]). By image, not by process: a
+/// short-lived tool (`pidof`, `lsof`) is a new process at each run.
+#[map]
+static PTRACE_READ_SEEN: LruHashMap<[u64; 2], u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// The re-check 2 of #567 (point 2): the packaged `systemd-journald`'s
+/// images (the kernel's `(dev, ino)`, as `mm->exe_file` gives them) → the
+/// cgroup id of `systemd-journald.service`, written by the agent at its
+/// start and at each 10 s re-read (`nn_linux::journald_identity`). Its
+/// refused reads of the agent's `/proc/<pid>/exe` are not recorded; they
+/// stay refused.
+#[map]
+pub static PTRACE_READ_QUIET: HashMap<InodeKey, u64> = HashMap::with_max_entries(4, 0);
 
 /// Budget for task-denial records, per CPU: `[window start (ns), records
 /// in the window]`. A loop of fresh `/bin/kill` processes defeats the
@@ -295,13 +312,6 @@ static TASK_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1
 
 const TASK_DENIAL_PER_SEC: u64 = 50;
 const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;
-/// The re-check of #567 (b): a refused read-mode ptrace access, once a
-/// minute per caller and target.
-const PTRACE_READ_DEDUP_NS: u64 = 60_000_000_000;
-/// [`TASK_DENIAL_SEEN`]'s keys by caller and target: bit 63 set, the
-/// operation in bits 48–55, the caller in 24–47, the target in 0–23 (pid
-/// numbers end below 2^22) — never a `(caller << 8) | op` key's.
-const SEEN_BY_TARGET: u64 = 1 << 63;
 /// The budget's window.
 const TASK_DENIAL_WINDOW_NS: u64 = 1_000_000_000;
 
@@ -429,18 +439,50 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// The re-check of #567 (b): a refused read-mode ptrace access to one of
 /// the agent's processes (`FS_OP_PTRACE_READ`: its `/proc/<pid>/ns/*` for
 /// `nsenter` or `systemctl bind`, `exe`, `fd/` …), `target_ino` = target
-/// tgid, `target_dev` = the ptrace mode — through [`emit_limited`], deduped
-/// by caller and target over a minute (journald reads the agent's
-/// `/proc/<pid>/exe` for the log lines it takes, all day).
+/// tgid, `target_dev` = the ptrace mode. The re-check 2 of #567 (point 2,
+/// `northnarrow_common::ptrace_read`): not recorded for the packaged
+/// journald in its unit's cgroup ([`PTRACE_READ_QUIET`]; journald reads the
+/// agent's `/proc/<pid>/exe` for every line it takes, all day), recorded
+/// once an hour per caller image and target ([`PTRACE_READ_SEEN`]) for
+/// every other caller — behind the self-test's bypass and the
+/// non-decisive records' budget ([`limited_budget`]). The refusal never
+/// depends on the record.
 #[inline(always)]
 pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
-    emit_limited(
-        FS_OP_PTRACE_READ,
-        InodeKey {
-            dev: mode as u64,
-            ino: target_tgid as u64,
+    let key = InodeKey {
+        dev: mode as u64,
+        ino: target_tgid as u64,
+    };
+    if caller_is_self_test() {
+        emit_denial(FS_OP_PTRACE_READ, key);
+        return;
+    }
+    let exe = match unsafe { crate::bpf_defense::caller_exe_key() } {
+        Some(k) => k,
+        None => InodeKey { dev: 0, ino: 0 },
+    };
+    let journald = unsafe { PTRACE_READ_QUIET.get(&exe) }.copied();
+    let cgroup = unsafe { aya_ebpf::helpers::generated::bpf_get_current_cgroup_id() };
+    if ptrace_read::quiet(journald, cgroup) {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid);
+    match PTRACE_READ_SEEN.get_ptr_mut(&seen) {
+        Some(last) => unsafe {
+            if !ptrace_read::due(Some(*last), now) {
+                return;
+            }
+            *last = now;
         },
-    );
+        None => {
+            let _ = PTRACE_READ_SEEN.insert(&seen, &now, 0);
+        }
+    }
+    if !limited_budget(FS_OP_PTRACE_READ, now) {
+        return;
+    }
+    emit_denial(FS_OP_PTRACE_READ, key);
 }
 
 /// [`emit_denial`] behind the per-caller dedup and the per-CPU budget of
@@ -457,22 +499,10 @@ pub(crate) fn emit_limited(operation: u8, key: InodeKey) {
     }
     let now = unsafe { bpf_ktime_get_ns() };
     let caller = (bpf_get_current_pid_tgid() >> 32) as u64;
-    // the re-check of #567 (b): a read-mode ptrace refusal by caller and
-    // target (its record's `ino`), once a minute
-    let (seen, dedup_ns) = if operation == FS_OP_PTRACE_READ {
-        (
-            SEEN_BY_TARGET
-                | (operation as u64) << 48
-                | (caller & 0xff_ffff) << 24
-                | (key.ino & 0xff_ffff),
-            PTRACE_READ_DEDUP_NS,
-        )
-    } else {
-        ((caller << 8) | operation as u64, TASK_DENIAL_DEDUP_NS)
-    };
+    let seen = (caller << 8) | operation as u64;
     match TASK_DENIAL_SEEN.get_ptr_mut(&seen) {
         Some(last) => unsafe {
-            if now.wrapping_sub(*last) < dedup_ns {
+            if now.wrapping_sub(*last) < TASK_DENIAL_DEDUP_NS {
                 return;
             }
             *last = now;

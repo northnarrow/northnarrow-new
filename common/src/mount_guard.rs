@@ -318,6 +318,154 @@ pub const fn umount_takes_held(s: Option<Spread>, held_root: bool, parent_held_l
     }
 }
 
+// ── An unmount's subtree (the re-check 2 of #567, N3) ────────────────────
+
+/// How many steps [`umount_below`] takes through the subtree of an
+/// unmounted mount, in the kernel's order (`next_mnt()`, the order
+/// `umount_tree()` collects it in): each step reads one mount — a child,
+/// the next sibling, or the parent on the way back up.
+pub const SUBTREE_MAX: u32 = 32;
+
+/// [`below_of`]: the unmount of this mount takes a held mount with it.
+pub const BELOW_TAKES: u8 = 1;
+/// [`below_of`]: this mount's parent is in a peer group — its unmount
+/// propagates.
+pub const BELOW_REACHES: u8 = 2;
+
+/// The re-check 2 of #567 (N3): the mounts below an unmounted mount, as
+/// `sb_umount` reads them (`struct mount`'s `mnt_mounts`, `mnt_child` and
+/// `mnt_parent`; a pointer in the eBPF hook, an index in the host's
+/// tests). A lazy unmount (`MNT_DETACH`) calls the hook once, for the top:
+/// the kernel then takes the whole subtree (`umount_tree()`) and propagates
+/// the unmount of each of its mounts to the peers and slaves of that
+/// mount's parent, with no other LSM call.
+pub trait Tree {
+    type M: Copy + PartialEq;
+    /// Its first child (`mnt_mounts`); `None`: it has none.
+    fn first_child(&self, m: Self::M) -> Option<Self::M>;
+    /// The child of its parent after it (`mnt_child`); `None`: the last.
+    fn next_sibling(&self, m: Self::M) -> Option<Self::M>;
+    /// Its parent (`mnt_parent`).
+    fn parent(&self, m: Self::M) -> Self::M;
+    /// [`below_of`] this mount: [`BELOW_TAKES`], [`BELOW_REACHES`].
+    fn below(&self, m: Self::M) -> u8;
+}
+
+/// What [`umount_below`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Below {
+    /// Every mount below the unmounted one read: none takes a held mount.
+    Clear,
+    /// One of them takes a held mount with it.
+    Takes,
+    /// More than [`SUBTREE_MAX`] steps: not read whole. `reaches`: a mount
+    /// read sits under a parent in a peer group.
+    Unread { reaches: bool },
+}
+
+/// The re-check 2 of #567 (N3): the subtree of the mount `top` an unmount
+/// takes, read in the kernel's order up to [`SUBTREE_MAX`] steps, each
+/// mount below `top` asked [`Tree::below`]. `mount --rbind /sys /mnt/s;
+/// umount -l /mnt/s` judged only the top (a copy, at a place nothing is
+/// held at); the kernel took the host's childless `/sys/fs/bpf` and
+/// `/sys/fs/cgroup` through the copies below it — in every slave namespace
+/// too, the agent's own included: the bpffs lost its last mount.
+#[inline(always)]
+pub fn umount_below<T: Tree>(t: &T, top: T::M) -> Below {
+    let mut at = top;
+    // `at`'s subtree is read: its next sibling, or back up to its parent
+    let mut back = false;
+    let mut reaches = false;
+    let mut i = 0;
+    while i < SUBTREE_MAX {
+        let mut next = None;
+        if !back {
+            next = t.first_child(at);
+            back = next.is_none();
+        }
+        if back {
+            if at == top {
+                return Below::Clear;
+            }
+            next = t.next_sibling(at);
+            match next {
+                Some(_) => back = false,
+                None => {
+                    at = t.parent(at);
+                    if at == top {
+                        return Below::Clear;
+                    }
+                }
+            }
+        }
+        if let Some(n) = next {
+            at = n;
+            let v = t.below(n);
+            if v & BELOW_TAKES != 0 {
+                return Below::Takes;
+            }
+            reaches |= v & BELOW_REACHES != 0;
+        }
+        i += 1;
+    }
+    Below::Unread { reaches }
+}
+
+/// [`umount_below`]'s verdict: taken — or not read whole, when the subtree
+/// can reach a held mount: it is in a guarded namespace (`guarded`: a
+/// copy may lie below the mounts read, behind private ones), or a mount
+/// read sits under a parent in a peer group. A container runtime's old
+/// root (`pivot_root`, then `umount2(MNT_DETACH)`: every mount a slave or
+/// private, in a namespace of its own) is let through, however many
+/// mounts it has.
+pub const fn below_takes_held(b: Below, guarded: bool) -> bool {
+    match b {
+        Below::Takes => true,
+        Below::Unread { reaches } => guarded || reaches,
+        Below::Clear => false,
+    }
+}
+
+/// The re-check 2 of #567 (N3): what the unmount of one mount below the
+/// unmounted one takes, as the unmount of the top is judged — read lazily,
+/// only as far as needed:
+/// - `held_root`: its root is a held mount's ([`MG_HOLD`]), a copy of one
+///   or the mount itself; any other mount takes nothing held with it;
+/// - `held_by_id`: it is a held mount ([`HELD_BY_ID`], asked in a guarded
+///   namespace only);
+/// - `group`: its parent's peer group (0: none, its unmount propagates
+///   nowhere);
+/// - `held_at_place`: a held mount sits at its place under that group
+///   ([`held_by_place`]);
+/// - a group `MOUNT_GROUPS` does not hold (`known`: a regroup since the
+///   refresh): taken when the parent is a copy of a held mount
+///   (`parent_held_like`, as [`umount_takes_held`] decides an undecided
+///   walk).
+#[inline(always)]
+pub fn below_of(
+    held_root: bool,
+    held_by_id: impl FnOnce() -> bool,
+    group: u32,
+    held_at_place: impl FnOnce() -> bool,
+    known: impl FnOnce() -> bool,
+    parent_held_like: impl FnOnce() -> bool,
+) -> u8 {
+    let reaches = if group != 0 { BELOW_REACHES } else { 0 };
+    if !held_root {
+        return reaches;
+    }
+    if held_by_id() {
+        return BELOW_TAKES;
+    }
+    if group == 0 {
+        return 0;
+    }
+    if held_at_place() || (!known() && parent_held_like()) {
+        return BELOW_TAKES;
+    }
+    BELOW_REACHES
+}
+
 /// Where a change to the mount `m` lands: in a guarded namespace (its
 /// guard and reach: judged there), propagated into one (`(0,
 /// REACH_OTHER_NS)`, [`group_reaches`]), or nowhere guarded (`None`: let
@@ -2360,6 +2508,294 @@ mod tests {
         // gives one slaves: a master is shared)
         let g = Graph::new(2).slave(0, 1).guard(1, 1);
         assert!(!takes(&g, true, true));
+    }
+
+    /// The re-check 2 of #567 (N3): a test tree of mounts — each one's
+    /// parent, its children in the kernel's order, its own peer group,
+    /// whether its root is a held mount's and whether it is held by its
+    /// id — the `(group, place)` keys a held mount is registered under
+    /// (its place a name here), the groups `MOUNT_GROUPS` holds, and the
+    /// mounts that are copies of a held one (`parent_held_like`).
+    struct Mnt {
+        parent: usize,
+        kids: Vec<usize>,
+        group: u32,
+        place: &'static str,
+        held_root: bool,
+        held_id: bool,
+    }
+
+    struct Forest {
+        m: Vec<Mnt>,
+        places: Vec<(u32, &'static str)>,
+        known: Vec<u32>,
+        like: Vec<usize>,
+        guarded: bool,
+    }
+
+    impl Forest {
+        fn new() -> Forest {
+            Forest {
+                m: Vec::new(),
+                places: Vec::new(),
+                known: Vec::new(),
+                like: Vec::new(),
+                guarded: false,
+            }
+        }
+        /// A mount under `parent` (itself for the first, a namespace's
+        /// root) at `place`, in `group`; its index.
+        fn mount(&mut self, parent: usize, place: &'static str, group: u32) -> usize {
+            let i = self.m.len();
+            let parent = if self.m.is_empty() { i } else { parent };
+            self.m.push(Mnt {
+                parent,
+                kids: Vec::new(),
+                group,
+                place,
+                held_root: false,
+                held_id: false,
+            });
+            if parent != i {
+                self.m[parent].kids.push(i);
+            }
+            i
+        }
+        fn held_root(&mut self, x: usize) -> &mut Self {
+            self.m[x].held_root = true;
+            self
+        }
+    }
+
+    impl Tree for Forest {
+        type M = usize;
+        fn first_child(&self, m: usize) -> Option<usize> {
+            self.m[m].kids.first().copied()
+        }
+        fn next_sibling(&self, m: usize) -> Option<usize> {
+            let p = self.m[m].parent;
+            let k = &self.m[p].kids;
+            k.get(k.iter().position(|x| *x == m)? + 1).copied()
+        }
+        fn parent(&self, m: usize) -> usize {
+            self.m[m].parent
+        }
+        fn below(&self, m: usize) -> u8 {
+            let me = &self.m[m];
+            let group = self.m[me.parent].group;
+            below_of(
+                me.held_root,
+                || self.guarded && me.held_id,
+                group,
+                || self.places.contains(&(group, me.place)),
+                || self.known.contains(&group),
+                || self.like.contains(&me.parent),
+            )
+        }
+    }
+
+    /// The re-check 2 of #567 (N3), its probes (`unshare -Urm`, 6.18):
+    /// `mount --rbind /sys /mnt/s; umount -l /mnt/s` — the copy's top is at
+    /// a place nothing is held at, which is all the hook judged; the kernel
+    /// took the host's childless `/sys/fs/bpf` and `/sys/fs/cgroup` through
+    /// the copies below it, the copy of `/sys` being a peer of the host's
+    /// (group 10, under which both are held): the bpffs lost its last
+    /// mount. In a slave namespace (the agent's) the copies went too: the
+    /// same keys (a held mount is registered under its parent's master
+    /// group as well). A raw namespace's `umount -l /` the same, from its
+    /// root. Now the subtree is read: refused.
+    #[test]
+    fn a_lazy_unmount_of_an_rbind_copy_takes_the_held_mounts_beneath_it() {
+        let mut f = Forest::new();
+        let root = f.mount(0, "/", 1);
+        let sys = f.mount(root, "sys", 10);
+        let bpf = f.mount(sys, "bpf", 11);
+        let cg = f.mount(sys, "cgroup", 12);
+        let mnt_s = f.mount(root, "s", 10);
+        let security = f.mount(mnt_s, "security", 13);
+        let c_cg = f.mount(mnt_s, "cgroup", 12);
+        let c_bpf = f.mount(mnt_s, "bpf", 11);
+        f.held_root(sys).held_root(bpf).held_root(cg);
+        f.held_root(mnt_s).held_root(c_cg).held_root(c_bpf);
+        f.places = vec![(1, "sys"), (10, "bpf"), (10, "cgroup")];
+        f.known = vec![1, 10, 11, 12];
+        f.like = vec![root, sys];
+        // what the hook judged on its own: the top, at /mnt/s under `/`'s
+        // group — no held mount there
+        assert!(!f.places.contains(&(f.m[f.m[mnt_s].parent].group, f.m[mnt_s].place)));
+        assert_eq!(umount_below(&f, mnt_s), Below::Takes);
+        assert!(below_takes_held(umount_below(&f, mnt_s), false));
+        // the copy of /sys's own children read in the kernel's order: the
+        // first held one decides (securityfs first, then the cgroup2)
+        assert_eq!(f.below(security), BELOW_REACHES);
+        assert_eq!(f.below(c_cg), BELOW_TAKES);
+        // a raw namespace's root (a peer of the host's `/`): its `/sys`, at
+        // the host's place under group 1, is taken at the first step
+        let mut r = Forest::new();
+        let raw = r.mount(0, "/", 1);
+        let raw_sys = r.mount(raw, "sys", 10);
+        let _raw_bpf = r.mount(raw_sys, "bpf", 11);
+        r.held_root(raw).held_root(raw_sys).held_root(_raw_bpf);
+        r.places = vec![(1, "sys"), (10, "bpf")];
+        r.known = vec![1, 10];
+        assert_eq!(umount_below(&r, raw), Below::Takes);
+        // with `--make-rslave` (every copy a slave: no group) nothing
+        // propagates — the careful chroot's lazy unmount goes through
+        let mut s = Forest::new();
+        let root = s.mount(0, "/", 1);
+        let copy = s.mount(root, "s", 0);
+        let c_bpf = s.mount(copy, "bpf", 0);
+        let c_cg = s.mount(copy, "cgroup", 0);
+        s.held_root(copy).held_root(c_bpf).held_root(c_cg);
+        s.places = vec![(10, "bpf"), (10, "cgroup")];
+        s.known = vec![1, 10];
+        assert_eq!(umount_below(&s, copy), Below::Clear);
+        assert!(!below_takes_held(umount_below(&s, copy), true));
+        // a mount with no mount below it: one step, nothing read
+        assert_eq!(umount_below(&s, c_bpf), Below::Clear);
+    }
+
+    /// N3's variants: a held mount below in a guarded namespace (by its
+    /// id), a regrouped copy (a group the map does not hold: taken when its
+    /// parent is a copy of a held mount, as an undecided unmount is), a
+    /// chroot's own sysfs with its cgroup2 (a new mount at `$T/sys`: let
+    /// through, the lab's chroot case), a deep subtree read in the kernel's
+    /// order (children before siblings, back up through the parents).
+    #[test]
+    fn a_held_mount_anywhere_below_is_found_and_a_chroots_is_not() {
+        // by id, in a guarded namespace only
+        let mut f = Forest::new();
+        let root = f.mount(0, "/", 0);
+        let x = f.mount(root, "x", 0);
+        let held = f.mount(x, "h", 0);
+        f.held_root(held);
+        f.m[held].held_id = true;
+        assert_eq!(umount_below(&f, x), Below::Clear, "another namespace");
+        f.guarded = true;
+        assert_eq!(umount_below(&f, x), Below::Takes);
+        // a regrouped raw copy of /sys (group 228, not followed yet): taken
+        // under a copy of a held mount, let through under a chroot's sysfs
+        let mut g = Forest::new();
+        let root = g.mount(0, "/", 1);
+        let t = g.mount(root, "T", 300);
+        let chroot_sys = g.mount(t, "sys", 301);
+        let chroot_cg = g.mount(chroot_sys, "cgroup", 0);
+        let raw_sys = g.mount(root, "sys", 228);
+        let raw_bpf = g.mount(raw_sys, "bpf", 0);
+        g.held_root(chroot_sys).held_root(chroot_cg);
+        g.held_root(raw_sys).held_root(raw_bpf);
+        g.known = vec![1];
+        g.like = vec![raw_sys];
+        assert_eq!(umount_below(&g, t), Below::Clear, "the chroot's");
+        assert_eq!(umount_below(&g, raw_sys), Below::Takes);
+        // deep: the held copy is the last of a walk that goes down, along
+        // and back up
+        let mut d = Forest::new();
+        let root = d.mount(0, "/", 1);
+        let top = d.mount(root, "top", 5);
+        let a = d.mount(top, "a", 5);
+        let a1 = d.mount(a, "a1", 5);
+        let _a11 = d.mount(a1, "a11", 5);
+        let _a2 = d.mount(a, "a2", 5);
+        let b = d.mount(top, "b", 5);
+        let held = d.mount(b, "bpf", 0);
+        d.held_root(held);
+        d.places = vec![(5, "bpf")];
+        d.known = vec![5];
+        assert_eq!(umount_below(&d, top), Below::Takes);
+        d.places.clear();
+        assert_eq!(umount_below(&d, top), Below::Clear);
+        // the walk never leaves the subtree: the top's siblings are not read
+        let sib = d.mount(root, "sibling", 5);
+        let sib_held = d.mount(sib, "bpf", 0);
+        d.held_root(sib_held);
+        d.places = vec![(5, "bpf")];
+        d.m[held].held_root = false;
+        assert_eq!(umount_below(&d, top), Below::Clear);
+        assert_eq!(umount_below(&d, root), Below::Takes);
+    }
+
+    /// N3, the bound: a subtree wider than [`SUBTREE_MAX`] steps. A
+    /// container runtime's old root after `pivot_root` (every mount a slave:
+    /// no group) is let through in its own namespace; in a guarded one it
+    /// is refused — 32 private mounts can hide a copy of `/sys` below them
+    /// there; in another namespace a subtree read in a peer group is
+    /// refused, one read private is let through (the named residual: a
+    /// copy hidden behind more than 32 private mounts of a namespace that
+    /// is not guarded).
+    #[test]
+    fn a_subtree_wider_than_the_walk_fails_closed_where_it_can_reach() {
+        let wide = |group: u32, hidden: bool| {
+            let mut f = Forest::new();
+            let root = f.mount(0, "/", 1);
+            let top = f.mount(root, "old", group);
+            for _ in 0..SUBTREE_MAX {
+                f.mount(top, "decoy", group);
+            }
+            if hidden {
+                let copy = f.mount(top, "s", 10);
+                let bpf = f.mount(copy, "bpf", 11);
+                f.held_root(copy).held_root(bpf);
+                f.places = vec![(10, "bpf")];
+                f.known = vec![10];
+            }
+            (f, top)
+        };
+        let (f, top) = wide(0, false);
+        assert_eq!(umount_below(&f, top), Below::Unread { reaches: false });
+        assert!(!below_takes_held(umount_below(&f, top), false));
+        assert!(below_takes_held(umount_below(&f, top), true));
+        let (f, top) = wide(0, true);
+        assert_eq!(umount_below(&f, top), Below::Unread { reaches: false });
+        assert!(below_takes_held(umount_below(&f, top), true), "guarded");
+        assert!(
+            !below_takes_held(umount_below(&f, top), false),
+            "the named residual"
+        );
+        let (f, top) = wide(7, false);
+        assert_eq!(umount_below(&f, top), Below::Unread { reaches: true });
+        assert!(below_takes_held(umount_below(&f, top), false));
+        // 31 children and the top's final step back: read whole
+        let mut f = Forest::new();
+        let root = f.mount(0, "/", 1);
+        let top = f.mount(root, "old", 0);
+        for _ in 0..SUBTREE_MAX - 1 {
+            f.mount(top, "m", 0);
+        }
+        assert_eq!(umount_below(&f, top), Below::Clear);
+        f.mount(top, "m", 0);
+        assert_eq!(umount_below(&f, top), Below::Unread { reaches: false });
+    }
+
+    /// N3: what one mount below takes, read lazily — nothing more than its
+    /// root's flags for a mount that is no held mount's copy.
+    #[test]
+    fn one_mount_below_is_judged_as_the_top_is() {
+        let never = || -> bool { panic!("read") };
+        assert_eq!(below_of(false, never, 0, never, never, never), 0);
+        assert_eq!(
+            below_of(false, never, 9, never, never, never),
+            BELOW_REACHES
+        );
+        assert_eq!(below_of(true, || true, 0, never, never, never), BELOW_TAKES);
+        assert_eq!(below_of(true, || false, 0, never, never, never), 0);
+        assert_eq!(
+            below_of(true, || false, 9, || true, never, never),
+            BELOW_TAKES
+        );
+        assert_eq!(
+            below_of(true, || false, 9, || false, || true, never),
+            BELOW_REACHES,
+            "a known group: its keys decide"
+        );
+        assert_eq!(
+            below_of(true, || false, 9, || false, || false, || true),
+            BELOW_TAKES
+        );
+        assert_eq!(
+            below_of(true, || false, 9, || false, || false, || false),
+            BELOW_REACHES
+        );
     }
 
     /// N1: the `mount(2)` calls that change a propagation, in the kernel's

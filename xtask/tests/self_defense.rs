@@ -287,7 +287,10 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
         .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),"));
     // no other inode refusal writes the ring without a budget (lot 356:
     // but the sole traces' writer, `emit_sole_trace` — a window's held load
-    // alone, which `kernel_halves.rs` keeps to `hold`)
+    // alone, which `kernel_halves.rs` keeps to `hold`; the re-check 2 of
+    // #567: the read-mode ptrace refusal's record, behind `limited_budget`
+    // and its own dedup by image —
+    // `a_read_mode_refusal_is_recorded_by_image_and_never_unrefused`)
     let mut callers: Vec<&str> = i
         .match_indices("emit_denial(")
         .map(|(at, _)| {
@@ -303,9 +306,10 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
             "fn emit_attempt",
             "fn emit_denial",
             "fn emit_limited",
-            "fn emit_sole_trace"
+            "fn emit_sole_trace",
+            "fn emit_task_read_denial"
         ],
-        "emit_denial called from outside the two budgets and the sole traces' writer"
+        "emit_denial called from outside the budgets and the sole traces' writer"
     );
 }
 
@@ -387,7 +391,8 @@ fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
         &["return minor_budget();", "TASK_DENIAL_RATE"],
     )
     .unwrap();
-    // the mark decides no verdict: read by the two emitters only
+    // the mark decides no verdict: read by the emitters only (the re-check
+    // 2 of #567: the read-mode ptrace refusal's record is a third)
     let root = repo_root();
     let mut files = Vec::new();
     support::rs_files(&root.join("agent-ebpf/src"), &mut files);
@@ -410,9 +415,10 @@ fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
         [
             "fn caller_is_self_test",
             "fn emit_attempt",
-            "fn emit_limited"
+            "fn emit_limited",
+            "fn emit_task_read_denial"
         ],
-        "the self-test's mark read outside the two emitters"
+        "the self-test's mark read outside the emitters"
     );
     // the agent marks the child before it may begin, and clears the mark
     // once it is reaped
@@ -425,6 +431,53 @@ fn the_deny_self_test_s_refusals_take_no_room_of_the_budgets() {
             "stdin.write_all(&go)",
             "reap(pid, CHILD_TIMEOUT)",
             "m.set(0)",
+        ],
+    )
+    .unwrap();
+}
+
+/// The re-check 2 of #567 (point 2): a refused read-mode ptrace access of
+/// the agent's processes is recorded once an hour per caller IMAGE and
+/// target (a dedup by process and minute gave journald alone about 2,880
+/// Low records a day), never for the packaged journald in its unit's
+/// cgroup — and refused whatever the record (`northnarrow_common::
+/// ptrace_read`, whose host tests run the day).
+#[test]
+fn a_read_mode_refusal_is_recorded_by_image_and_never_unrefused() {
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    in_order(
+        body(&i, "emit_task_read_denial"),
+        &[
+            "if caller_is_self_test() {",
+            "emit_denial(FS_OP_PTRACE_READ, key);",
+            "return;",
+            "crate::bpf_defense::caller_exe_key()",
+            "PTRACE_READ_QUIET.get(&exe)",
+            "bpf_get_current_cgroup_id()",
+            "if ptrace_read::quiet(journald, cgroup) {",
+            "return;",
+            "ptrace_read::seen_key(exe.dev, exe.ino, target_tgid)",
+            "PTRACE_READ_SEEN.get_ptr_mut(&seen)",
+            "if !ptrace_read::due(Some(*last), now) {",
+            "PTRACE_READ_SEEN.insert(&seen, &now, 0)",
+            "if !limited_budget(FS_OP_PTRACE_READ, now) {",
+            "emit_denial(FS_OP_PTRACE_READ, key);",
+        ],
+    )
+    .unwrap();
+    // no dedup by the caller's process for it any more
+    assert!(!body(&i, "emit_task_read_denial").contains("bpf_get_current_pid_tgid"));
+    assert!(!body(&i, "emit_limited").contains("FS_OP_PTRACE_READ"));
+    let r = code("common/src/ptrace_read.rs");
+    assert!(r.contains("pub const DEDUP_NS: u64 = 3_600_000_000_000;"));
+    // the refusal is the hook's, after the record, whatever it did
+    let p = code("agent-ebpf/src/ptrace_check.rs");
+    in_order(
+        body(&p, "try_ptrace_access_check"),
+        &[
+            "if mode & PTRACE_MODE_NOAUDIT == 0 {",
+            "crate::inode_protect::emit_task_read_denial(mode, target_tgid);",
+            "-EPERM",
         ],
     )
     .unwrap();

@@ -463,6 +463,9 @@ pub mod program_images;
 pub mod sysctl_cgroup;
 /// Lot 273d: the global sysctls that abort or starve the agent.
 pub mod sysctl_guard;
+/// The re-check 2 of #567: the packaged journald's identity, whose
+/// refused reads of the agent's `/proc/<pid>/exe` are not recorded.
+pub mod journald_identity;
 /// Lot 310: the identities of systemd's packaged executor, for R004.
 pub mod systemd_executor;
 pub mod systemd_reload;

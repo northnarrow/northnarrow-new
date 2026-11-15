@@ -502,6 +502,14 @@ const STATICS: &[Kept] = &[
         "the inodes this boot registered in the pinned PROTECTED_INODES",
     ),
     kept(
+        "crates/nn-linux/src/journald_identity.rs",
+        "KERNEL",
+        Kernel,
+        "the re-check 2 of #567: the ptrace guard's PTRACE_READ_QUIET map of the one eBPF object \
+         and the packaged journald's identity last read (its images, its unit's cgroup), written \
+         to it at the start and at each 10 s read",
+    ),
+    kept(
         "crates/nn-linux/src/systemd_executor.rs",
         "KERNEL",
         Kernel,

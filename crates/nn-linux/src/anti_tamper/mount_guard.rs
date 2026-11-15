@@ -109,7 +109,7 @@ const PINNED_MAPS: [&str; 5] = [PROTECTED_MAP, CONF_MAP, HELD_MAP, NS_MAP, GROUP
 
 /// The offsets the programs read: without every one the guard is not
 /// attached.
-const OFFSETS: [&str; 20] = [
+const OFFSETS: [&str; 22] = [
     "PATH_MNT_OFFSET",
     "VFSMOUNT_MNT_ROOT_OFFSET",
     "MOUNT_MNT_OFFSET",
@@ -123,6 +123,9 @@ const OFFSETS: [&str; 20] = [
     // the review of #567 (F1): the mounts held by their id
     "MOUNT_MNT_ID_OFFSET",
     "MOUNT_MNT_GROUP_ID_OFFSET",
+    // the re-check 2 of #567 (N3): an unmount's subtree, mount by mount
+    "MOUNT_MNT_MOUNTS_OFFSET",
+    "MOUNT_MNT_CHILD_OFFSET",
     "TASK_STRUCT_NSPROXY_OFFSET",
     "NSPROXY_MNT_NS_OFFSET",
     "MNT_NAMESPACE_INUM_OFFSET",

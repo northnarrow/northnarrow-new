@@ -115,10 +115,16 @@ impl DecisionHost for LinuxHost {
     }
 }
 
-/// [`ProcFacts::trusted_exe`]'s work, on its helper thread.
-fn trusted_exe_now(root: &Path, hashes: &Mutex<HashCache>, pid: u32) -> Option<(String, [u8; 32])> {
+/// [`ProcFacts::trusted_exe`]'s work, on its helper thread. The re-check 2
+/// of #567: `proc_root`, a name the kernel views' ratchet knows
+/// (`xtask/tests/kernel_views.rs`): a by-path read of it here is caught.
+fn trusted_exe_now(
+    proc_root: &Path,
+    hashes: &Mutex<HashCache>,
+    pid: u32,
+) -> Option<(String, [u8; 32])> {
     use std::os::unix::fs::MetadataExt;
-    let link = root.join(pid.to_string()).join("exe");
+    let link = proc_root.join(pid.to_string()).join("exe");
     let path = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
     let path_s = path.to_str()?.to_string();
     if !crate::posture::lineage::in_system_tree(&path_s) {
@@ -187,9 +193,10 @@ fn hash_file(hashes: &Mutex<HashCache>, f: &mut std::fs::File, key: FileKey) -> 
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────
 
 /// [`ActorFacts`] read from a `/proc` (the host's, or an empty one in the
-/// golden replay).
+/// golden replay). The re-check 2 of #567: `proc_root`, a name the kernel
+/// views' ratchet knows (it was `root`, which it did not).
 pub struct ProcFacts {
-    root: PathBuf,
+    proc_root: PathBuf,
     hashes: Arc<Mutex<HashCache>>,
 }
 
@@ -228,7 +235,7 @@ struct FileKey {
 impl ProcFacts {
     pub fn new(proc_root: impl Into<PathBuf>) -> Self {
         Self {
-            root: proc_root.into(),
+            proc_root: proc_root.into(),
             hashes: Arc::new(Mutex::new(HashCache::default())),
         }
     }
@@ -249,7 +256,7 @@ fn root_only(m: &std::fs::Metadata) -> bool {
 impl ActorFacts for ProcFacts {
     fn uid(&self, pid: u32) -> Option<u32> {
         let s =
-            crate::state_read::read_state(self.root.join(pid.to_string()).join("status")).ok()?;
+            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("status")).ok()?;
         s.lines()
             .find_map(|l| l.strip_prefix("Uid:"))
             .and_then(|r| r.split_whitespace().next())
@@ -258,17 +265,18 @@ impl ActorFacts for ProcFacts {
 
     fn cgroup(&self, pid: u32) -> Option<String> {
         let s =
-            crate::state_read::read_state(self.root.join(pid.to_string()).join("cgroup")).ok()?;
+            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
         // lot 312 (review of #543, F7): the one reader of a cgroup text
         nn_core::response::cgroup::unified_path(&s).map(str::to_string)
     }
 
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
         // Lot 357: off the decision thread, bounded ([`EXE_READER`])
-        let (root, hashes) = (self.root.clone(), Arc::clone(&self.hashes));
+        let proc_root = self.proc_root.clone();
+        let hashes = Arc::clone(&self.hashes);
         EXE_READER
             .run(&format!("the image of pid {pid}"), move || {
-                trusted_exe_now(&root, &hashes, pid)
+                trusted_exe_now(&proc_root, &hashes, pid)
             })
             .ok()
             .flatten()
@@ -277,13 +285,13 @@ impl ActorFacts for ProcFacts {
     /// Lot 277: the kernel's marks ([`crate::cgroup_join`]); not known
     /// without the boot's tracker (a test, a tool, a kernel without it).
     fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
-        crate::cgroup_join::started_in_cgroup(&self.root, pid)
+        crate::cgroup_join::started_in_cgroup(&self.proc_root, pid)
     }
 
     /// Lot 281: the injection taint in the same marks; not known without
     /// the boot's tracker.
     fn injected(&self, pid: u32) -> Option<nn_core::decision::rule_policy::Injected> {
-        crate::cgroup_join::injected(&self.root, pid)
+        crate::cgroup_join::injected(&self.proc_root, pid)
     }
 
     /// Lot 353 (re-check 4 of #563): the file `fact` is read from, read
@@ -292,7 +300,7 @@ impl ActorFacts for ProcFacts {
     /// `/proc/<pid>` (`EXDEV`, a file system not the kernel's), a read that
     /// did not answer within its deadline.
     fn unread(&self, pid: u32, fact: ExemptionFact) -> Option<String> {
-        let dir = self.root.join(pid.to_string());
+        let dir = self.proc_root.join(pid.to_string());
         let (at, r) = match fact {
             ExemptionFact::Uid => {
                 let at = dir.join("status");

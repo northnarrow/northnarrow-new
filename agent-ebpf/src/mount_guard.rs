@@ -46,6 +46,7 @@ use northnarrow_common::mount_guard::{
     MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
     MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
     umount_spread, umount_takes_held, Spread, HELD_UNDER, PLACE_ANY_GROUP, REACH_OTHER_NS,
+    below_of, below_takes_held, umount_below, Tree,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
@@ -54,8 +55,8 @@ use crate::btf_offsets::{
     CRED_CAP_EFFECTIVE_OFFSET, CRED_USER_NS_OFFSET, DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET,
     FS_CONTEXT_SB_FLAGS_MASK_OFFSET, FS_CONTEXT_SB_FLAGS_OFFSET,
     DENTRY_D_PARENT_OFFSET, FILE_SYSTEM_TYPE_NAME_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
-    MNT_NAMESPACE_INUM_OFFSET, MOUNT_MNT_GROUP_ID_OFFSET, MOUNT_MNT_ID_OFFSET,
-    MOUNT_MNT_MOUNTPOINT_OFFSET,
+    MNT_NAMESPACE_INUM_OFFSET, MOUNT_MNT_CHILD_OFFSET, MOUNT_MNT_GROUP_ID_OFFSET,
+    MOUNT_MNT_ID_OFFSET, MOUNT_MNT_MOUNTPOINT_OFFSET, MOUNT_MNT_MOUNTS_OFFSET,
     MOUNT_MNT_NS_OFFSET, MOUNT_MNT_OFFSET, MOUNT_MNT_PARENT_OFFSET, MOUNT_MNT_SHARE_OFFSET,
     MOUNT_MNT_SLAVE_LIST_OFFSET, MOUNT_MNT_SLAVE_OFFSET, NSPROXY_MNT_NS_OFFSET,
     PATH_DENTRY_OFFSET, PATH_MNT_OFFSET, PF_KTHREAD, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
@@ -222,6 +223,10 @@ pub struct Offs {
     mnt_slave: u16,
     mnt_id: u16,
     mnt_group_id: u16,
+    /// The re-check 2 of #567 (N3): the children (`mnt_mounts`) and the
+    /// place in the parent's list (`mnt_child`).
+    mnt_mounts: u16,
+    mnt_child: u16,
     /// btrfs: `(vfs_inode, root, anon_dev)`, `vfs_inode` 0 when unknown.
     btrfs_vfs: u16,
     btrfs_root: u16,
@@ -280,6 +285,8 @@ impl Offs {
         o.mnt_slave = (off_opt!(MOUNT_MNT_SLAVE_OFFSET)? & 0xfff) as u16;
         o.mnt_id = (off_opt!(MOUNT_MNT_ID_OFFSET)? & 0xfff) as u16;
         o.mnt_group_id = (off_opt!(MOUNT_MNT_GROUP_ID_OFFSET)? & 0xfff) as u16;
+        o.mnt_mounts = (off_opt!(MOUNT_MNT_MOUNTS_OFFSET)? & 0xfff) as u16;
+        o.mnt_child = (off_opt!(MOUNT_MNT_CHILD_OFFSET)? & 0xfff) as u16;
         Some(o)
     }
 }
@@ -508,6 +515,79 @@ unsafe fn target_of(o: &Offs, real: *const u8) -> Option<(u8, u8)> {
     target_reach(&Kernel(o), real)
 }
 
+/// The re-check 2 of #567 (N3): the mounts below an unmounted one
+/// (`common::mount_guard::Tree`) — its children (`mnt_mounts`, a
+/// `list_head` whose entries are the children's `mnt_child`), each asked
+/// what its unmount takes (`common::mount_guard::below_of`): by its id in
+/// a guarded namespace (`by_id`), by its place under its parent's group.
+/// A link that cannot be read (NULL) ends its list.
+struct Subtree<'a> {
+    o: &'a Offs,
+    by_id: bool,
+}
+
+impl Subtree<'_> {
+    /// The mount whose `mnt_child` link is `n`, `None` at the end of the
+    /// list whose head is `head`.
+    #[inline(always)]
+    fn child_at(&self, head: *const u8, n: *const u8) -> Option<*const u8> {
+        if n.is_null() || n == head {
+            None
+        } else {
+            Some((n as usize).wrapping_sub(self.o.mnt_child as usize) as *const u8)
+        }
+    }
+}
+
+impl Tree for Subtree<'_> {
+    type M = *const u8;
+    #[inline(always)]
+    fn first_child(&self, m: *const u8) -> Option<*const u8> {
+        let head = unsafe { m.add(self.o.mnt_mounts as usize) };
+        self.child_at(head, unsafe { peek_ptr(head) })
+    }
+    #[inline(always)]
+    fn next_sibling(&self, m: *const u8) -> Option<*const u8> {
+        let parent = self.parent(m);
+        let head = unsafe { parent.add(self.o.mnt_mounts as usize) };
+        self.child_at(head, unsafe { peek_ptr(m.add(self.o.mnt_child as usize)) })
+    }
+    #[inline(always)]
+    fn parent(&self, m: *const u8) -> *const u8 {
+        unsafe { peek_ptr(m.add(self.o.mnt_parent as usize)) }
+    }
+    #[inline(always)]
+    fn below(&self, m: *const u8) -> u8 {
+        let o = self.o;
+        let parent = self.parent(m);
+        let group = unsafe { peek_u32(parent.add(o.mnt_group_id as usize)) };
+        let mnt = (m as usize).wrapping_add(o.mount_mnt as usize) as *const u8;
+        let (root, _) = unsafe { mount_root_flags(o, mnt) };
+        below_of(
+            root & MG_HOLD != 0,
+            || self.by_id && unsafe { held_flags(o, m) } & HELD_REFUSE != 0,
+            group,
+            || unsafe {
+                let (dev, ino) = place_key(o, m, group);
+                MOUNT_HELD.get(&InodeKey { dev, ino }).is_some()
+            },
+            || unsafe { MOUNT_GROUPS.get(&group).is_some() },
+            || unsafe { parent_held_like(o, parent) },
+        )
+    }
+}
+
+/// [`held_by_place`]'s key of the mount `m`'s place (its mountpoint's
+/// parent directory and name) under the peer group `group`.
+#[inline(always)]
+unsafe fn place_key(o: &Offs, m: *const u8, group: u32) -> (u64, u64) {
+    let place = peek_ptr(m.add(o.mnt_mountpoint as usize));
+    let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
+    let mut name = NameKey::NONE;
+    name_of(o, place, &mut name);
+    held_by_place(group, dir.dev, dir.ino, &name)
+}
+
 /// The re-check of #567 (N1): a mount is a copy of a held one — its
 /// namespace's root, or sitting where a held mount sits (its place under
 /// any group, `PLACE_ANY_GROUP`): a raw namespace's `/sys`, not a chroot's
@@ -518,11 +598,7 @@ unsafe fn parent_held_like(o: &Offs, m: *const u8) -> bool {
     if up.is_null() || up == m {
         return true;
     }
-    let place = peek_ptr(m.add(o.mnt_mountpoint as usize));
-    let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
-    let mut name = NameKey::NONE;
-    name_of(o, place, &mut name);
-    let (dev, ino) = held_by_place(PLACE_ANY_GROUP, dir.dev, dir.ino, &name);
+    let (dev, ino) = place_key(o, m, PLACE_ANY_GROUP);
     MOUNT_HELD.get(&InodeKey { dev, ino }).is_some()
 }
 
@@ -1014,10 +1090,34 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
     let (flags, key) = mount_root_flags(o, mnt);
     // the namespace the unmounted mount is in
     let guard = guard_of(o, real);
+    // The re-check 2 of #567 (N3): what the kernel takes below the mount —
+    // a lazy unmount (`MNT_DETACH`) calls this hook once, for the top, and
+    // `umount_tree()` then takes the whole subtree, propagating the unmount
+    // of each mount to the peers and slaves of its parent (`mount --rbind
+    // /sys /mnt/s; umount -l /mnt/s` took the host's childless
+    // `/sys/fs/bpf`, in every slave namespace too: the bpffs's last mount).
+    // Read first, while one state enters the walk.
+    let below = below_takes_held(
+        umount_below(
+            &Subtree {
+                o,
+                by_id: guard != 0,
+            },
+            real,
+        ),
+        guard != 0,
+    );
     let mut q = query(MG_OP_UMOUNT, &c, guard);
     q.reaches = false;
     let mut reach = reach_in(guard);
-    if guard != 0 {
+    if below {
+        q.held = true;
+        if guard == 0 {
+            q.reaches = true;
+            reach = REACH_OTHER_NS;
+        }
+    }
+    if guard != 0 && !q.held {
         // The review of #567 (F1): the mount itself, by its id — a copy of
         // `/`, `/run` or `/sys` (a backup's bind, a chroot's sysfs or its
         // `--bind /run`) is another mount, unmounted unjudged.
@@ -1045,11 +1145,7 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
             peek_u32(parent.add(o.mnt_group_id as usize))
         };
         if group != 0 {
-            let place = peek_ptr(real.add(o.mnt_mountpoint as usize));
-            let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
-            let mut name = NameKey::NONE;
-            name_of(o, place, &mut name);
-            let (dev, ino) = held_by_place(group, dir.dev, dir.ino, &name);
+            let (dev, ino) = place_key(o, real, group);
             let mut hit = MOUNT_HELD.get(&InodeKey { dev, ino }).is_some();
             // Re-check N1: a parent in a group the map does not hold (one
             // regrouped since the refresh, its places keyed under its old

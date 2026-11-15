@@ -60,6 +60,10 @@ pub mod fork_record;
 pub mod kernel_taint;
 pub mod module_judge;
 pub mod mount_guard;
+/// The re-check 2 of #567: when a refused read-mode ptrace access of the
+/// agent's processes is recorded — the eBPF record's rule, tested here.
+/// NOT `std`-gated.
+pub mod ptrace_read;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 pub mod sysctl_judge;

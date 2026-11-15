@@ -207,6 +207,9 @@ const PTRACE_OVERRIDE_MAP_NAME: &str = "PTRACE_OVERRIDE";
 const TASK_KILL_PROGRAM: &str = "task_kill";
 pub(crate) const TASK_KILL_HOOK: &str = "task_kill";
 const PTRACE_PROGRAM: &str = "ptrace_access_check";
+/// The re-check 2 of #567 (point 2): the packaged journald's images and
+/// its unit's cgroup (`nn_linux::journald_identity`).
+const PTRACE_READ_QUIET_MAP_NAME: &str = "PTRACE_READ_QUIET";
 pub(crate) const PTRACE_HOOK: &str = "ptrace_access_check";
 
 /// Populate `PROTECTED_PIDS` and attach the two Tappa 7 LSM hooks.
@@ -463,6 +466,24 @@ fn attach_reporting(
             "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
         );
         deny.missing_hook(PTRACE_PROGRAM, format!("{e:#}"));
+    } else {
+        // The re-check 2 of #567 (point 2): the packaged journald's
+        // identity, whose refused reads of the agent are not recorded (they
+        // stay refused); read again every 10 s (`journald_identity::refresh`)
+        match ebpf
+            .take_map(PTRACE_READ_QUIET_MAP_NAME)
+            .ok_or_else(|| anyhow!("map {PTRACE_READ_QUIET_MAP_NAME} missing from eBPF object"))
+            .and_then(|m| {
+                aya::maps::HashMap::try_from(m)
+                    .with_context(|| format!("{PTRACE_READ_QUIET_MAP_NAME} is not a HashMap"))
+            }) {
+            Ok(map) => crate::journald_identity::install_kernel_map(map),
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "anti-tamper: journald's refused reads of the agent are recorded (its identity \
+                 is not in the kernel)"
+            ),
+        }
     }
 
     // Lot 273: the unit cgroups of the agent and of the live watchdog (and
