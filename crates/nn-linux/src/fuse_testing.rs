@@ -55,6 +55,44 @@ pub fn in_userns(body: impl FnOnce() -> i32) -> Option<i32> {
     }
 }
 
+/// Lot 353 (re-check 3 of #563): a namespace test's outcome, its skip
+/// refused under CI. `Some(rc)` of a child that ran; `None` — the host
+/// refused the namespaces, or the child lacked a prerequisite in them
+/// (FUSE, an anchored view…: it exits 99, its line on stderr) — is a skip
+/// on a developer's host and a FAILURE when `CI` is set (every CI runner
+/// sets it): the CI test job is set up to have them (ci.yml's user
+/// namespaces step), and a test that skips there protects nothing — the
+/// harness of #563 "passed" there in 0.00 s.
+pub fn ran(rc: Option<i32>) -> Option<i32> {
+    ran_under(std::env::var_os("CI").is_some(), rc)
+}
+
+/// [`ran`] with the `CI` flag given (its test).
+fn ran_under(ci: bool, rc: Option<i32>) -> Option<i32> {
+    if rc.is_none() {
+        missing_under(
+            ci,
+            "no user and mount namespace here, or a prerequisite in it (the child's line above)",
+        );
+    }
+    rc
+}
+
+/// A namespace test's prerequisite missing before its child (a view not
+/// anchored here): named and skipped on a developer's host, a failure under
+/// CI, as [`ran`].
+pub fn missing(why: &str) {
+    missing_under(std::env::var_os("CI").is_some(), why);
+}
+
+fn missing_under(ci: bool, why: &str) {
+    assert!(
+        !ci,
+        "{why}: under CI this test must run, never skip (CI is set; ci.yml's test job enables unprivileged user namespaces)"
+    );
+    eprintln!("skipped: {why}");
+}
+
 /// A FUSE mounted over `target` (in the caller's namespaces, uid 0 mapped)
 /// whose daemon thread answers `INIT` and the first `answered` lookups
 /// (`ENOENT`), then holds every request. Dropped, the daemon stops and
@@ -163,5 +201,28 @@ fn serve(mut dev: File, answered: usize, stop: &AtomicBool) {
             // everything else: never answered
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lot 353 (re-check 3 of #563, R3-4): under CI a namespace test that
+    /// cannot run fails; on a developer's host it is skipped. At 5da316c1
+    /// every one of them printed "skipped" and passed in CI, in 0.00 s.
+    #[test]
+    fn a_namespace_test_that_cannot_run_fails_under_ci() {
+        assert_eq!(ran_under(false, Some(3)), Some(3));
+        assert_eq!(ran_under(true, Some(0)), Some(0));
+        assert_eq!(
+            ran_under(false, None),
+            None,
+            "skipped on a developer's host"
+        );
+        let refused = std::panic::catch_unwind(|| ran_under(true, None));
+        assert!(refused.is_err(), "under CI a skip is a failure");
+        assert!(std::panic::catch_unwind(|| missing_under(true, "a view")).is_err());
+        missing_under(false, "a view");
     }
 }

@@ -3785,7 +3785,7 @@ mod tests {
         let _ = antitamper_bpf::kernel_roots::init();
         let want = |p: &str| antitamper_bpf::kernel_roots::symlink_metadata(p).map(|m| key_of(&m));
         let (Ok(proc_key), Ok(sys_key)) = (want("/proc"), want("/sys")) else {
-            eprintln!("skipped: the views are not anchored here");
+            crate::fuse_testing::missing("the views are not anchored here");
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -3870,9 +3870,8 @@ mod tests {
                 Err(_) => 16, // the refresher itself was held
             }
         });
-        match rc {
-            None | Some(99) => eprintln!("skipped: no user namespace with FUSE here"),
-            Some(rc) => assert_eq!(rc, 0, "the child failed (see the codes)"),
+        if let Some(rc) = crate::fuse_testing::ran(rc) {
+            assert_eq!(rc, 0, "the child failed (see the codes)");
         }
     }
 }

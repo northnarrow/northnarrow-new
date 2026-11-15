@@ -11208,9 +11208,10 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
-- **Lot 353 — the pre-alpha's Phase 3, case X6 (P1): a mount cannot stall
-  the agent; stuck restarts are named and a loop is signed (C14, C23; no
-  level changes).**
+- **Lot 353 — the pre-alpha's Phase 3, case X6 (P1): a FUSE over `/proc`,
+  `/sys` or the cgroup root does not stall the agent's critical loops
+  (mounts over the agent's own directories: lot 357); stuck restarts are
+  named and a loop is signed (C14, C23; no level changes).**
   - What was open: a FUSE over `/sys/fs/cgroup` that never answered the
     agent's threads held the integrity and kernel-state rounds in the
     kernel on the runtime's workers (5.15: `LOOKUP`, `OPENDIR`), the cgroup
@@ -11367,6 +11368,16 @@ number in parentheses is a lab PR.
     it. As in r2b, the deny self-test's step that opens a target's
     `/proc/<pid>/mem` from the probe's child (another process, by path) failed
     under the FUSE and was signed as a `deny_selftest` degradation.
+  - Re-check 3 of #563: open — the namespace tests (the FUSE harness, the
+    watchdog's `by_path_bounds`, nn-linux's anchored, chain, open sensor and
+    caps tests) skipped in CI in 0.00 s (no capabilities in an unprivileged
+    user namespace on the runner); the integrity round, the watchdog's
+    markers and the `bpf-foreign` write by path in our own directories,
+    outside the census. Done: the CI test job enables the namespaces and a
+    namespace test fails instead of skipping under CI (ratchet
+    `namespace_tests_in_ci`); §47.1 states exactly what is not covered,
+    each item to be closed by the mount refusal, lot 357 (coordinator's
+    decision). No lab this round.
 - **Lot 356 — a window's held BPF load is always signed, never
   rate-limited (pre-alpha F3-8; C23; no level change).**
   - What was open (P2, every kernel): `bpf_held_load`, the record of a

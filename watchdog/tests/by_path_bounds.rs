@@ -58,6 +58,23 @@ fn in_userns(body: impl FnOnce() -> i32) -> Option<i32> {
     }
 }
 
+/// Lot 353 (re-check 3 of #563, R3-4): `Some(rc)` of a child that ran;
+/// `None` (the namespaces refused, or FUSE in them: the child's 99) is a
+/// skip on a developer's host and a FAILURE under CI (`CI` set): ci.yml's
+/// test job enables unprivileged user namespaces, and a test that skips
+/// there protects nothing (it "passed" in 0.00 s). As
+/// `nn_linux::fuse_testing::ran`, of which the watchdog has no dependency.
+fn ran(rc: Option<i32>) -> Option<i32> {
+    if rc.is_none() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no user and mount namespace with FUSE here: under CI this test must run, never skip"
+        );
+        eprintln!("skipped: no user and mount namespace with FUSE here");
+    }
+    rc
+}
+
 /// A FUSE over `target` whose daemon never reads: every request waits.
 /// Its descriptor (the only one): dropped, the connection is aborted.
 fn never_answering_fuse(target: &Path) -> Option<std::fs::File> {
@@ -94,8 +111,8 @@ fn the_ping_is_bounded_under_a_fuse_over_the_socket_s_directory() {
         // SAFETY: alarm has no preconditions; a held ping ends the child.
         unsafe { libc::alarm(30) };
         let Some(fuse) = never_answering_fuse(&run) else {
-            eprintln!("skipped: FUSE refused in this namespace");
-            return 0;
+            eprintln!("missing here: FUSE refused in this namespace");
+            return 99;
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -130,8 +147,7 @@ fn the_ping_is_bounded_under_a_fuse_over_the_socket_s_directory() {
         }
         0
     });
-    match rc {
-        None => eprintln!("skipped: no user namespace here"),
-        Some(rc) => assert_eq!(rc, 0, "the ping was not bounded (see the child's line)"),
+    if let Some(rc) = ran(rc) {
+        assert_eq!(rc, 0, "the ping was not bounded (see the child's line)");
     }
 }

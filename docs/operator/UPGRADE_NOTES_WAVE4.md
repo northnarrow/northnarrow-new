@@ -2745,7 +2745,10 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   about 1 MiB more kernel memory); the exec record grew 16 bytes, the TCP
   connect record 24. The eBPF object and the agent are rebuilt together.
 
-## 47. A mount cannot stall the agent; stuck restarts are named and a loop is signed (lot 353)
+## 47. A FUSE over `/proc`, `/sys` or the cgroup root does not stall the agent's critical loops; stuck restarts are named and a loop is signed (lot 353)
+
+What this lot covers, and what it does not (mounts over the agent's own
+directories: lot 357), is stated exactly at the end of §47.1.
 
 The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
 `/sys/fs/cgroup` that never answered the agent's threads. The integrity
@@ -2994,15 +2997,18 @@ the record and the read (pre-existing); `waiting` counts every process's
 requests, not only the agent's; an `nn-kview-open` thread stuck in a FUSE
 `STATFS` at a start under the mount keeps the agent from exiting at a later
 stop; a rotation's lift of the state directory's `+i` opens the directory
-by its path (a FUSE over the agent's own directories is the watchdog's to
-abort).
+by its path (a FUSE over the agent's own directories: to be closed by the
+mount refusal, lot 357; the watchdog's abort comes only after a failed
+SIGKILL).
 
 Re-check 2 of #563 (fix round 3) — what re-check 1 recorded, and what the
 second re-check found, systematically: a census of every `/proc`, `/sys`
 and own-directory path of the agent, the watchdog, nn-linux, nn-core and
 the start, by thread, and every by-path use on a thread whose stall stops
-the detection, the status or the signing moved off it or beneath the
-anchored roots:
+the detection, the status or the signing that the census found moved off
+it or beneath the anchored roots (re-check 3 found three by-path steps in
+our own directories it missed, and two stay on the decision thread: the
+end of this section):
 - **The decision thread never opens `/proc/<pid>/exe` by path**: a rule's
   `exe … sha256` exemption opens the image beneath the anchored `/proc`
   root (the magic link followed). The account database (`passwd`,
@@ -3035,8 +3041,9 @@ anchored roots:
   its hold and shutdown-marker records on a helper within 2 s, one
   unanswered step at most per path (the next fails at once, a ping
   failure): a mount over `/run/northnarrow` that does not answer no longer
-  holds the watchdog, whose stuck recovery then aborts a FUSE covering the
-  agent's directories.
+  holds the ping or those records. It still holds the watchdog's other
+  by-path steps there (the stuck marker's removal, the respawn's reads:
+  below). Its FUSE abort runs only when the stuck recovery's SIGKILL failed.
 - **No exec walks a view**: a worker is executed by its image's descriptor
   (`execveat(fd, "", …, AT_EMPTY_PATH)` in the child, argv and environment
   made before the fork; the exec sensor names it `/dev/fd/<n>`, which R004
@@ -3059,7 +3066,12 @@ anchored roots:
   answering the first lookup and holding the rest, the runtime on one
   worker: the serve loop (STATUS through a second name of the socket, past
   its check), the decision's process facts, the signed appends, the rule
-  refresh and the entropy sampler each keep going for 14 s.
+  refresh and the entropy sampler each keep going for 14 s. In CI too since
+  re-check 3: the CI test job enables unprivileged user namespaces, and
+  under CI a namespace test that cannot run fails instead of skipping
+  (`nn_linux::fuse_testing::ran`; `xtask/tests/namespace_tests_in_ci.rs`
+  holds every such test to it). At 5da316c1 this test and the watchdog's
+  `by_path_bounds` were skipped there and "passed" in 0.00 s.
 - Measured (the lab): debian13, 6.12 (our own guest under a lease, clean
   before, purged and powered off after), a cold boot with ONE vCPU (the
   agent's runtime on one worker), round r3b: a FUSE over `/proc` laid in PID
@@ -3077,14 +3089,64 @@ anchored roots:
   `/proc/<pid>/mem` from the probe's child (another process, by path) failed
   under the FUSE and was signed as a `deny_selftest` degradation.
 
-Not done here (recorded, out of this census's paths: host files, neither a
-view nor the agent's own directories): the decision's `exe … sha256`
-exemption checks the image's path and its parents in the agent's mount
-namespace by path, and the lineage's `ran_host_file` reads a packaged
-program's file at its path (FIM-005/-019 with `logrotate` only): a FUSE over
-a system directory that does not answer holds the decision there. The
-watchdog's respawn reads the dead agent's pidfile by path, after its stuck
-recovery's abort of a covering FUSE.
+Re-check 3 of #563 (fix round 4): **what this lot covers, exactly.**
+
+**Covered** (each by a test that runs in CI): a FUSE over `/proc`, `/sys` or
+the cgroup2 root — the case X6 — does not stall the agent's critical loops:
+the runtime's workers and the admin socket's serve loop, the decision's
+process facts, the signed appends, the open sensor's rule refresh, the
+entropy sampler (`agent/tests/fuse_stall.rs`); nor the watchdog's ping and
+its record appends under a FUSE over `/run/northnarrow`
+(`watchdog/tests/by_path_bounds.rs`).
+
+**Not covered** — a mount over the agent's own directories (or, for the
+decision thread, over a system directory) still holds these. Each is **to
+be closed by the mount refusal, lot 357**: a BPF-LSM refusal, in the host's
+mount namespace, of a mount over `/proc`, `/sys`, the cgroup root and the
+agent's own directories.
+- **The integrity round reads our directories by path before it signs.**
+  `/etc/northnarrow` (the overlays, `read_dir`) and
+  `/run/northnarrow/watchdog.pid` (the limits) are read by path before the
+  round's findings are signed; the watchdog's holds and the rejected
+  shutdowns there are taken and removed by path (`rename`, `remove_file`)
+  after. A FUSE over either directory (root) holds the round for as long as
+  it stays — off the runtime, with no stall watch, silently: nothing is
+  signed meanwhile, that mount's own `mount_over_protected` included. To be
+  closed by the mount refusal, lot 357.
+- **The watchdog's stuck marker and the shutdown marker, by path.** After a
+  stuck signal the watchdog removes its marker
+  (`/run/northnarrow/watchdog.stuck`) by path, unbounded, on its one
+  thread; its respawn checks the shutdown marker (with `admin.pub` and
+  `agent_id`) and reads the dead agent's pidfile and argv by path. A FUSE
+  over `/run/northnarrow` holds the whole watchdog: no stuck recovery, no
+  respawn, no `sd_notify`. The FUSE abort does not come before these: it
+  runs only after a **failed** SIGKILL (`recovery_failed`); an agent the
+  stuck recovery's SIGKILL ended is respawned through these reads with no
+  abort before them. To be closed by the mount refusal, lot 357.
+- **`bpf-foreign` is written by path every round.** The kernel-state round
+  writes `/run/northnarrow/bpf-foreign` (`atomic_file::replace`: remove,
+  create, rename by path) at the end of every round (5 s), off the runtime:
+  a FUSE over `/run/northnarrow` holds the round that signs the taint,
+  livepatch, root-cgroup program and foreign BPF findings. To be closed by
+  the mount refusal, lot 357.
+- **`trusted_exe` and `ran_host_file`, on the decision thread.** A rule's
+  `exe … sha256` exemption checks the image's path and its parents by path
+  in the agent's mount namespace; the lineage's `ran_host_file`
+  (FIM-005/-019 with `logrotate` only) reads a packaged program's file at
+  its path. A FUSE over a system directory (root) holds the decision there.
+  To be closed by the mount refusal, lot 357 — for these two only if its
+  list takes the system directories an exemption or a packaged program
+  names; otherwise on a bounded reader, as the account database's.
+- **The ratchet's bypasses.** `xtask/tests/kernel_views.rs` is lexical and
+  does not see: a helper returning a view path as `&'static str` (or
+  `CStr`, `OsStr`); `std::fs` or one of its functions imported under
+  another name (`use std::fs as disk`, `use std::fs::read as slurp`);
+  libc's `*64` calls (`open64`); a `String` built from `"/proc/"` and read
+  in another file. `decision_path_io` does not scan nn-linux's decision
+  hosts (`decision_host_linux.rs`, `accounts.rs`, `canary_host_linux.rs`). A
+  by-path read of a view written in one of these shapes passes both. To be
+  closed by the mount refusal, lot 357 (no mount over a view left to hold
+  such a read).
 
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 

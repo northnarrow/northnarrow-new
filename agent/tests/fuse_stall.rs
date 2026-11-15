@@ -98,8 +98,8 @@ fn run_loops(dir: &Path) -> i32 {
     use std::os::unix::fs::FileTypeExt;
     let _ = antitamper_bpf::kernel_roots::init();
     if antitamper_bpf::kernel_roots::symlink_metadata("/proc/self").is_err() {
-        eprintln!("skipped: /proc not anchored here");
-        return 0;
+        eprintln!("missing here: /proc not anchored");
+        return 99;
     }
     // the admin socket, its directory and a second name of it (a hard link
     // reaches the same socket: the client's way in once the FUSE hides the
@@ -158,8 +158,8 @@ fn run_loops(dir: &Path) -> i32 {
         .arg("60")
         .spawn()
     else {
-        eprintln!("skipped: no /usr/bin/sleep");
-        return 0;
+        eprintln!("missing here: no /usr/bin/sleep");
+        return 99;
     };
     let sleeper_pid = sleeper.id();
     // the audit log the signing loop appends to (its directory anchored)
@@ -175,9 +175,9 @@ fn run_loops(dir: &Path) -> i32 {
         nn_linux::fuse_testing::smart_fuse_over(Path::new("/proc"), 1),
         nn_linux::fuse_testing::smart_fuse_over(&run, 1),
     ) else {
-        eprintln!("skipped: FUSE refused in this namespace");
+        eprintln!("missing here: FUSE refused in this namespace");
         let _ = sleeper.kill();
-        return 0;
+        return 99;
     };
 
     let t0 = Instant::now();
@@ -318,8 +318,9 @@ fn run_loops(dir: &Path) -> i32 {
 fn the_critical_loops_keep_going_under_a_fuse_that_answers_one_lookup() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
-    match nn_linux::fuse_testing::in_userns(move || run_loops(&path)) {
-        None => eprintln!("skipped: no user namespace here"),
-        Some(rc) => assert_eq!(rc, 0, "loops stalled (bits, in order: runtime, status, decision, signing, refresh, entropy): {rc:#b}"),
+    // under CI a run that cannot happen here fails (`fuse_testing::ran`)
+    let rc = nn_linux::fuse_testing::in_userns(move || run_loops(&path));
+    if let Some(rc) = nn_linux::fuse_testing::ran(rc) {
+        assert_eq!(rc, 0, "loops stalled (bits, in order: runtime, status, decision, signing, refresh, entropy): {rc:#b}");
     }
 }

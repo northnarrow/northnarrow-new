@@ -946,8 +946,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
-- Lot 353 (pre-alpha Phase 3, case X6, P1): **a mount cannot stall the
-  agent; stuck restarts are named and a loop is signed**
+- Lot 353 (pre-alpha Phase 3, case X6, P1): **a FUSE over `/proc`, `/sys`
+  or the cgroup root does not stall the agent's critical loops; stuck
+  restarts are named and a loop is signed** (mounts over the agent's own
+  directories: lot 357)
   (`UPGRADE_NOTES_WAVE4.md` §47). A FUSE over `/sys/fs/cgroup` that never
   answered held the integrity and kernel-state rounds in the kernel, on the
   runtime's workers; the admin socket stopped answering, the watchdog
@@ -1043,6 +1045,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     helpers, closures handed a view, callables and transitive returns, and
     fails on the re-check's plants; a harness test (`agent/tests/fuse_stall.rs`)
     runs the critical loops under a FUSE that answers one lookup.
+  - Re-check 3 of #563 (§47.1): **the namespace tests run in CI.** The CI
+    test job enables unprivileged user namespaces (AppArmor's restriction
+    lifted on the runner), and under CI a test that runs in a user and
+    mount namespace fails instead of skipping (`fuse_testing::ran`; the
+    ratchet `xtask/tests/namespace_tests_in_ci.rs`): the FUSE harness and
+    the watchdog's `by_path_bounds` had "passed" there in 0.00 s. §47.1 now
+    states what the lot does not cover — the integrity round's, the
+    watchdog's markers' and `bpf-foreign`'s by-path steps in our own
+    directories, `trusted_exe` and `ran_host_file` on the decision thread,
+    the ratchet's bypasses — each to be closed by the mount refusal, lot
+    357.
 - Lot 356 (pre-alpha F3-8, P2): **a window's held BPF load is always
   signed, never rate-limited.** `bpf_held_load` (a program the content
   judge refuses outside a trusted-installer window, loaded inside one and

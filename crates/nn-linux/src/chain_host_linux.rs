@@ -372,8 +372,8 @@ mod tests {
             }
             0
         });
-        match rc {
-            None | Some(99) => eprintln!("skipped: no user and mount namespace here"),
+        match crate::fuse_testing::ran(rc) {
+            None => {}
             Some(rc) => {
                 assert_eq!(rc, 0, "the child failed");
                 let text = fs::read_to_string(&audit_path).unwrap();

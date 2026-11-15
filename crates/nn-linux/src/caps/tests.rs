@@ -491,9 +491,10 @@ fn a_role_s_effective_set_is_exactly_its_own_and_the_core_s_comes_back() {
         }
         0
     });
-    match rc {
-        None | Some(98) => eprintln!("no user namespace with every capability here: skipped"),
-        Some(rc) => assert_eq!(rc, 0, "check {rc} failed"),
+    // 98: a namespace without every capability (lot 353: under CI a
+    // failure, `fuse_testing::ran`)
+    if let Some(rc) = crate::fuse_testing::ran(rc.filter(|&c| c != 98)) {
+        assert_eq!(rc, 0, "check {rc} failed");
     }
 }
 

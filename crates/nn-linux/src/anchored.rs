@@ -497,8 +497,8 @@ mod tests {
                 _ => 14,
             }
         });
-        match rc {
-            None | Some(99) => eprintln!("skipped: no user and mount namespace here"),
+        match crate::fuse_testing::ran(rc) {
+            None => {}
             Some(rc) => {
                 assert_eq!(rc, 0, "the child failed");
                 assert_eq!(

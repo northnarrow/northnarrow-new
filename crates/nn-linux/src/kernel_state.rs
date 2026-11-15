@@ -797,7 +797,7 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
             // (`antitamper_bpf::kernel_roots`) — and the round runs off the
             // runtime's worker all the same: a read that blocks never holds
             // the admin socket's tasks (its STATUS) or the others.
-            let found = crate::runtime::off_the_runtime(|| {
+            let w = crate::runtime::off_the_runtime(|| {
                 // lot 304: the cross-view first — the root's programs are
                 // told by its enumeration of this round and the loads its
                 // hook saw
@@ -839,9 +839,9 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
                     c.quota_round(objects(&w.signed), objects(&w.held));
                     c.write_status();
                 }
-                w.signed
+                w
             });
-            for f in found {
+            for f in w.signed {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;
                 }
