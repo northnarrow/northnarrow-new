@@ -17,7 +17,7 @@ use support::repo_root;
 /// Every row of `PINNED_FRAMES_AT_VERSION`, as it was recorded. Never edit
 /// a row: a version's frames are history. Append a row when
 /// `PROTOCOL_VERSION` moves.
-const HISTORY: [(u16, &str); 2] = [
+const HISTORY: [(u16, &str); 3] = [
     (
         1,
         "e9acc80ae2d89bd2a65f21b5a336c6e1ca2bd3edde7c43006a322b112e6f35f3",
@@ -25,6 +25,10 @@ const HISTORY: [(u16, &str); 2] = [
     (
         2,
         "c503c86c903c2fa3257d9c1a318aa3fcb885b04a5b345ca325b992dff2fcadfb",
+    ),
+    (
+        3,
+        "9cf9c1dabab1d292d83d0c69661faf81ce3cb582d21044b0cc1e314ce4e29739",
     ),
 ];
 

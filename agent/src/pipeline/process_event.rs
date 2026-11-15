@@ -497,8 +497,14 @@ pub(crate) fn process_event(
                 None => at001.evaluate(&event),
             };
             // Review 75: a loop of denied attempts is logged and stored
-            // within the rule's budget for that uid.
+            // within the rule's budget for that uid. Lot 356 (pre-alpha
+            // F3-8): a sole trace — the only record of what was let through
+            // (a window's held load, the kernel-state round's findings) — is
+            // logged and stored whatever the budget: a flood of root's
+            // refusals spent it, and the held load's record was a held count
+            // naming no program.
             let admit = match &verdict {
+                Some(v) if operation.is_sole_trace() => budget_admit_sole_trace(&v.rule_id, *uid),
                 Some(v) => budget_admit(&v.rule_id, *uid, &event),
                 None => Admit::Record {
                     suppressed_before: 0,
@@ -522,6 +528,9 @@ pub(crate) fn process_event(
                     | nn_model::FsProtectOperation::BpfUnseen
                     | nn_model::FsProtectOperation::BpfBaseline
                     | nn_model::FsProtectOperation::CpuConfined
+                    // the review of #565 (F2): and its summary of the
+                    // findings its quota held back
+                    | nn_model::FsProtectOperation::SoleTraceSummary
             );
             // Lot 290: a load the signed per-loader opt-out let through.
             let loader_opted_out = *operation == nn_model::FsProtectOperation::BpfProgOptOut;
@@ -625,6 +634,26 @@ pub(crate) fn process_event(
                             "not refused: the agent runs on fewer CPUs than it should, read by \
                              the kernel-state round's CPU watch"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::SoleTraceSummary {
+                            // the review of #565 (F2): the counts in the
+                            // signed record
+                            let s = common::wire::SoleTraceSummary::of(*target_dev, *target_ino);
+                            format!(
+                                "not refused: {} findings of the kernel-state round past its \
+                                 quota of {} per kind, counted (unseen {}, baseline {}, root \
+                                 cgroup/sysctl {}, taint {}, cpus {}; {} carried from an \
+                                 earlier round) — held back: {}; each carried into the next \
+                                 round and listed in /run/northnarrow/bpf-foreign",
+                                s.total(),
+                                s.quota,
+                                s.unseen,
+                                s.baseline,
+                                s.root_prog,
+                                s.taint,
+                                s.cpus,
+                                s.carried,
+                                comm
+                            )
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootProg {
                             "not refused: found on the root cgroup's cgroup/sysctl slot by the \
                              kernel-state round"
@@ -1048,6 +1077,25 @@ fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
     admit
 }
 
+/// Lot 356 (pre-alpha F3-8): a sole trace's admission
+/// (`FsProtectOperation::is_sole_trace`) — logged and stored past the
+/// (rule, uid) budget, never counted as held; it carries the count held
+/// since the pair's last record ([`detection_budget::admit_unspent`]). The
+/// review of #565 (F2): it spends none of the pair's tokens — root makes
+/// BPF objects at will, so the round's findings are bounded by its quota
+/// per kind (`nn_linux::kernel_state::ROUND_QUOTA`, the rest in one
+/// summary record), the held loads by the held set; their records took
+/// uid 0's tokens, and root's next decisive refusals became held counts.
+fn budget_admit_sole_trace(rule: &str, uid: u32) -> Admit {
+    // the review of #565 (F2): no token taken — bounded by the round's
+    // quota and the held set, a flood of them no longer spends the uid's
+    // budget (root's: the round's records are uid 0's) and leaves its
+    // decisive refusals their records
+    Admit::Record {
+        suppressed_before: detection_budget::admit_unspent(rule, uid),
+    }
+}
+
 /// R12c (lab PR 270): [`detection_budget::admit_acted`] — an acting
 /// decision is always recorded; the WARN when its (rule, uid) runs out of
 /// budget for journal lines.
@@ -1207,6 +1255,261 @@ mod tests {
         assert!(
             !held.iter().any(|h| h.uid == uid),
             "an acting decision counted held: {held:?}"
+        );
+    }
+
+    /// Lot 356 (pre-alpha F3-8): a sole trace is the only record of what
+    /// was let through — a window's held load, its outliving, the
+    /// kernel-state round's findings — and was logged and stored within
+    /// NN-L-AT-001's budget for the uid: 150 refused uses of a held program
+    /// by root spent it (burst 100), and the next window load's record was
+    /// a held count whose sample named a process, not the program. Now
+    /// each is recorded, naming its program, and none is counted held.
+    #[test]
+    fn a_sole_trace_is_recorded_past_the_uid_s_budget_and_names_its_program() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        let judge = |e: Event| {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                e,
+            )
+        };
+        // a uid of this test's own (the budget is the process's)
+        let uid = 976;
+        use nn_model::FsProtectOperation as Op;
+        let verdict = (8u64 << 32) | 2; // a kprobe calling bpf_send_signal
+        let denial = |pid: u32, op: Op, dev: u64, ino: u64| Event::FsProtectDenial {
+            pid,
+            uid,
+            comm: "racer".to_string(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1_000 + u64::from(pid),
+        };
+        // 150 refused uses (BPF_PROG_RUN) of held program 196, new processes
+        for i in 0..150u32 {
+            judge(denial(
+                930_000 + i,
+                Op::BpfHeldUse,
+                common::wire::bpf_held_dev(10, verdict),
+                196,
+            ));
+        }
+        // then the window's load of program 213, its outliving, and one of
+        // each of the round's findings
+        judge(denial(
+            931_000,
+            Op::BpfHeldLoad,
+            common::wire::bpf_held_dev(0, verdict),
+            213,
+        ));
+        judge(denial(
+            931_001,
+            Op::BpfHeldLoad,
+            common::wire::bpf_held_dev(common::wire::BPF_HELD_OUTLIVED, verdict),
+            213,
+        ));
+        let found = [
+            Op::KernelTaint,
+            Op::SysctlRootProg,
+            Op::BpfUnseen,
+            Op::BpfBaseline,
+            Op::CpuConfined,
+        ];
+        for (i, op) in found.iter().enumerate() {
+            judge(denial(931_010 + i as u32, *op, 0, 1));
+        }
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let of =
+            |pid: u32| -> Vec<_> { records.iter().filter(|r| r.principal.pid == pid).collect() };
+        let uses = records
+            .iter()
+            .filter(|r| (930_000..930_150).contains(&r.principal.pid))
+            .count();
+        assert!(uses < 150, "the uses did not spend the budget ({uses})");
+        let load = of(931_000);
+        assert_eq!(load.len(), 1, "the held load's record: {records:#?}");
+        assert!(
+            load[0]
+                .response
+                .contains("program id 213 loaded inside a trusted-installer window"),
+            "{}",
+            load[0].response
+        );
+        let outlived = of(931_001);
+        assert_eq!(outlived.len(), 1, "the outliving's record");
+        assert!(
+            outlived[0].response.contains("program id 213, held"),
+            "{}",
+            outlived[0].response
+        );
+        for (i, op) in found.iter().enumerate() {
+            assert_eq!(of(931_010 + i as u32).len(), 1, "{op:?} not recorded");
+        }
+        // the held count is the uses' alone (at most: another test of this
+        // binary may take the process's counts first)
+        let held: u64 = northnarrow_agent::detection_budget::take_held()
+            .iter()
+            .filter(|h| h.uid == uid)
+            .map(|h| h.count)
+            .sum();
+        assert!(
+            held <= 150 - uses as u64,
+            "a sole trace counted held ({held})"
+        );
+    }
+
+    /// The review of #565 (F2): the round's findings spent the budget of
+    /// NN-L-AT-001 for uid 0 (the round's records are uid 0's): root made
+    /// BPF objects at will, and its next decisive refusals were held counts
+    /// naming nothing. A sole trace now takes no token — bounded by the
+    /// round's quota, the rest in its summary record — so after 300 of
+    /// them a refused unlink of the same uid is recorded by name, and the
+    /// summary is recorded with its counts.
+    #[test]
+    fn a_flood_of_sole_traces_leaves_the_uid_s_decisive_refusals_their_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+        let journal = ActionJournal::memory();
+        let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+        let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+        let dispatcher = Dispatcher::start(
+            exec.clone(),
+            journal.clone(),
+            Followups {
+                sink: Some(sink.clone()),
+                cow: cow.clone(),
+            },
+            None,
+        );
+        let engine = RuleEngine::with_default_rules();
+        let correlation = CorrelationBuffer::with_default_capacity();
+        let posture = PostureMachine::new();
+        let ladder = northnarrow_agent::combat::CombatLadder::new(
+            Box::new(northnarrow_agent::combat::SystemActuator::new(
+                exec.clone(),
+                None,
+                true,
+                journal.clone(),
+            )),
+            Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+            Box::new(northnarrow_agent::combat::NoProtectedProcs),
+            northnarrow_agent::combat::LadderConfig::default(),
+        );
+        let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+        let stopping = HostStopping::default();
+        let systemd = SystemdSnapshot::default();
+        let judge = |e: Event| {
+            process_event(
+                &engine,
+                &exec,
+                &correlation,
+                &posture,
+                &ladder,
+                None,
+                Some(&sink),
+                &expected,
+                &stopping,
+                &systemd,
+                &cow,
+                &dispatcher,
+                e,
+            )
+        };
+        // a uid of this test's own (the budget is the process's)
+        let uid = 977;
+        use nn_model::FsProtectOperation as Op;
+        let event = |pid: u32, op: Op, dev: u64, ino: u64| Event::FsProtectDenial {
+            pid,
+            uid,
+            comm: "kernel".to_string(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 1_000 + u64::from(pid),
+        };
+        // ten rounds of a flood at the quota: 32 unseen objects and the
+        // summary each
+        for i in 0..300u32 {
+            judge(event(940_000 + i, Op::BpfUnseen, 0, u64::from(i)));
+        }
+        let summary = common::wire::SoleTraceSummary {
+            unseen: 11_968,
+            quota: 32,
+            ..Default::default()
+        };
+        judge(event(
+            941_000,
+            Op::SoleTraceSummary,
+            summary.target_dev(),
+            summary.target_ino(),
+        ));
+        // then a decisive refusal of the same uid
+        judge(event(941_001, Op::Unlink, 2049, 77));
+        dispatcher.stop(Duration::from_secs(10));
+        let records = sink.queued_for_test();
+        let of =
+            |pid: u32| -> Vec<_> { records.iter().filter(|r| r.principal.pid == pid).collect() };
+        let unseen = records
+            .iter()
+            .filter(|r| (940_000..940_300).contains(&r.principal.pid))
+            .count();
+        assert_eq!(unseen, 300, "every sole trace recorded");
+        let s = of(941_000);
+        assert_eq!(s.len(), 1, "the summary's record");
+        assert!(
+            s[0].response
+                .contains("11968 findings of the kernel-state round past its quota of 32"),
+            "{}",
+            s[0].response
+        );
+        assert_eq!(
+            of(941_001).len(),
+            1,
+            "the refused unlink held back by the sole traces"
         );
     }
 

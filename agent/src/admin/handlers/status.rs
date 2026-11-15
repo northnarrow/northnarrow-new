@@ -135,6 +135,8 @@ fn telemetry_status(
         // lot 313 (the review of #549, F1): the exec pump's content check
         program_copy_compared_total: Some(nn_linux::program_images::counts().0),
         program_copy_skipped_total: Some(nn_linux::program_images::counts().1),
+        // the review of #565 (F2): the kernel-state round's quota
+        kernel_state_held_back: Some(nn_linux::kernel_state::held_back_counts()),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

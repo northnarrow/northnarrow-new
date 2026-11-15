@@ -1097,7 +1097,11 @@ fn a_window_s_forbidden_load_is_signed_at_its_load() {
             "if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {",
             "emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_FULL, verdict, id);",
             "return false;",
-            "emit_held(FS_OP_BPF_HELD_LOAD, 0, verdict, id);",
+            // lot 356 (pre-alpha F3-8): through no budget, or refused
+            "crate::inode_protect::emit_sole_trace(",
+            "FS_OP_BPF_HELD_LOAD,",
+            "if !signed {",
+            "return false;",
             "true",
         ],
     )

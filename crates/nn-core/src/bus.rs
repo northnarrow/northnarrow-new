@@ -229,7 +229,10 @@ pub const SPECS: [QueueSpec; QUEUES] = [
 /// hide — it waits for room like the FIM records, outside the opens' cap.
 pub fn when_full(event: &Event) -> WhenFull {
     match Priority::of_event(event) {
-        Priority::P0 if !matches!(event, Event::FsProtectDenial { .. }) => WhenFull::Backpressure,
+        // lot 356: a sole trace waits for room as the rare tamper events do
+        Priority::P0 if !matches!(event, Event::FsProtectDenial { .. }) || sole_trace(event) => {
+            WhenFull::Backpressure
+        }
         Priority::P2 if !matches!(event, Event::FileOpen { .. }) || guarded_write_open(event) => {
             WhenFull::Backpressure
         }
@@ -264,11 +267,29 @@ pub fn guarded_write_open(event: &Event) -> bool {
 /// (a module load, an exploit post-condition, a signal to a security tool,
 /// a sensor flood — the last two carried by pumps of other classes) never
 /// wait behind them.
+///
+/// Lot 356 (pre-alpha F3-8): but a sole trace ([`sole_trace`]: a window's
+/// held load, the kernel-state round's findings) — one of the rare ones:
+/// never capped, it takes the reserve and waits for room ([`when_full`]).
+/// The review of #565 (F2): rare by its source's bound, not by nature —
+/// root makes BPF objects at will, so the kernel-state round names at most
+/// `nn_linux::kernel_state::ROUND_QUOTA` (half this reserve) of each kind
+/// and signs the rest in one summary record; a held load is one per id of
+/// the held set.
 pub fn floods_p0(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::FsProtectDenial { .. } | Event::BpfSyscall { .. }
-    )
+    match event {
+        Event::FsProtectDenial { .. } => !sole_trace(event),
+        Event::BpfSyscall { .. } => true,
+        _ => false,
+    }
+}
+
+/// Lot 356 (pre-alpha F3-8): a record that is the only trace of something
+/// the agent let through (`FsProtectOperation::is_sole_trace`): never
+/// capped ([`floods_p0`]), never dropped on a full queue ([`when_full`]),
+/// never coalesced by the bus — each names its program or finding.
+pub fn sole_trace(event: &Event) -> bool {
+    matches!(event, Event::FsProtectDenial { operation, .. } if operation.is_sole_trace())
 }
 
 /// The P0 slots only the rare tamper events take ([`floods_p0`]).
@@ -1676,6 +1697,42 @@ mod tests {
         };
         assert!(floods_p0(&bpf));
         assert_eq!(when_full(&bpf), WhenFull::Backpressure);
+        // lot 356 (pre-alpha F3-8): a sole trace — a window's held load, the
+        // kernel-state round's findings — is one of the rare ones: never
+        // capped, it waits for room; a held program's refused use, repeated
+        // at will, still floods
+        for op in [
+            nn_model::FsProtectOperation::BpfHeldLoad,
+            nn_model::FsProtectOperation::KernelTaint,
+            nn_model::FsProtectOperation::SysctlRootProg,
+            nn_model::FsProtectOperation::BpfUnseen,
+            nn_model::FsProtectOperation::BpfBaseline,
+            nn_model::FsProtectOperation::CpuConfined,
+        ] {
+            let sole = Event::FsProtectDenial {
+                pid: 1,
+                uid: 0,
+                comm: String::new(),
+                target_dev: 0,
+                target_ino: 7,
+                operation: op,
+                timestamp_ns: 0,
+            };
+            assert_eq!(class_of(&sole), EventClass::Tamper);
+            assert!(sole_trace(&sole) && !floods_p0(&sole), "{op:?}");
+            assert_eq!(when_full(&sole), WhenFull::Backpressure, "{op:?}");
+        }
+        let use_ = Event::FsProtectDenial {
+            pid: 1,
+            uid: 0,
+            comm: String::new(),
+            target_dev: 0,
+            target_ino: 7,
+            operation: nn_model::FsProtectOperation::BpfHeldUse,
+            timestamp_ns: 0,
+        };
+        assert!(!sole_trace(&use_) && floods_p0(&use_));
+        assert_eq!(when_full(&use_), WhenFull::Wait { max_ns: P0_WAIT_NS });
         // second review, R-E: a write-open of a CRITICAL or PERSIST file
         // waits for room; a read of it, or a write of another file, is an
         // open a full P2 drops

@@ -2267,6 +2267,36 @@ itself. No finding raises the posture (the kernel's record, like lot 280b's).
 state, and every load the hook saw since the start with its loader and
 type: the host's inventory of foreign BPF.
 
+The review of #565 (F2): every finding of the kernel-state round is a sole
+trace (no budget, no cap), and root makes BPF objects at will — 20,000 tiny
+programs loaded faster than the hook's seen map keeps them were thousands
+of High records a round, each taking the bus's reserve of the rare tamper
+events and (until then) uid 0's record budget. A round now signs at most
+`ROUND_QUOTA` (32) findings of each kind by name — ranked by what the
+object can do (`bpf_prog_class::reach`): a held program (a signal or write
+helper or kfunc in its load), an fmod_ret and the link of a hidden program
+first, then the types run in the kernel or on the host's traffic (kprobe,
+tracing, LSM, struct_ops, ext, syscall, XDP, tc), then the others, socket
+filters and cgroup_skb last, a proven known system program after all — and
+the rest in ONE `sole_trace_summary` record with each kind's count and,
+in its `comm`, each kind's highest-ranked, first and last held back (High;
+Medium when all are the start's baseline). The re-check of #565: a held
+program's records (its outliving, the program found unseen) are never
+under the quota (R1), and what a round holds back is carried into the next,
+first in its rank, until a round names it (R2). Nothing is dropped
+silently: the counts are in the signed records and in `nn-admin status
+--key` (`kernel_state_held_back`), each object held back is listed in
+`bpf-foreign` as `suppressed` until it is named or gone. One kind's flood
+never holds back another kind's finding. Residuals: an unseen program's
+content is not read (the enumeration reads no instructions), so its rank
+is its type's — only a held program's load was judged for a signal or
+write call; past 1,024 carried findings the lowest-ranked are counted and
+listed, never named one by one; a sustained flood of one rank delays the
+named records of that rank and below (each kind's first 32 a round); the
+cross-view's sets of the objects signed and of the loads seen grow with
+what root loads (an object's key, a few dozen bytes, kept for the agent's
+life).
+
 **Operator notes.**
 - `bpftool prog|map|link show` outside a window stops at the first
   NorthNarrow object (its `*_GET_FD_BY_ID` refused, bpftool gives up the
@@ -2402,7 +2432,10 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   R2: the kprobes and lockdown switches, the refused renices and sysctl
   writes, `sigio`, the opt-outs' and the exempt-cgroup and code-injection
   records) spend a per-CPU budget of their own (`MINOR_DENIAL_RATE`, 50 a
-  second; `RING_DROPS` `minor_denial_rate`, signed, not a security ring),
+  second; `RING_DROPS` `minor_denial_rate`, signed, not a security ring;
+  lot 356: never a sole trace, `wire::is_sole_trace` — a window's held load
+  and the kernel-state round's findings, the only trace of what was let
+  through, spend no budget at all),
   whether signed at each attempt or rate-limited per caller; the decisive
   ones keep lot 293's attempt budget (`bpf_map`, `bpf_link` and the file
   refusals) and the task denials' (signals, ptraces, kexecs, cgroup moves,
@@ -2730,7 +2763,17 @@ program's tail call. Before 6.9 the window's load was not kept at all.
 Now:
 - on every kernel the window's forbidden load is held (before 6.9 at its
   `bpf_prog` handle, with the calibrated scan; from 6.9 from the load
-  hook's verdict) and signed at once (`bpf_held_load`, High, not refused);
+  hook's verdict) and signed at once (`bpf_held_load`, High, not refused;
+  lot 356, pre-alpha F3-8: a sole trace, `wire::is_sole_trace`, through no
+  budget — it spent the non-decisive refusals' per-CPU one, and a flood of
+  refused uses of an earlier held program held it back, the program never
+  named — and a load whose record the ring has no room for is refused,
+  counted, `held_load_unsigned`; the review of #565, F1: its id stays held
+  — the program has its id before the hook runs, and a handle taken by id
+  in between keeps it: let go, its runs and attaches after the window were
+  let through and nothing named it; held, they are refused and signed, and
+  the round signs it once after the window, `BPF_HELD_OUTLIVED`; the
+  round releases the id once no longer loaded);
 - every run or attach of a held id outside a window, by a caller outside
   the family and not a fresh instance, is refused and signed
   (`bpf_held_use`, the use and the id), in every mode: the `bpf` hook

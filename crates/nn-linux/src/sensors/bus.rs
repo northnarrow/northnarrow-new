@@ -161,6 +161,10 @@ struct Coalescer {
 /// A denial's coalescing key, its operation, its time and its uid.
 type DenialOf = (DenialKey, nn_model::FsProtectOperation, u64, u32);
 
+/// The key a denial is coalesced under; `None` for any other event and
+/// (lot 356, pre-alpha F3-8) for a sole trace (`core_bus::sole_trace`: a
+/// window's held load, the kernel-state round's findings) — each is queued
+/// and judged on its own, never counted into another.
 fn denial_key(event: &Event) -> Option<DenialOf> {
     let Event::FsProtectDenial {
         pid,
@@ -174,6 +178,9 @@ fn denial_key(event: &Event) -> Option<DenialOf> {
     else {
         return None;
     };
+    if operation.is_sole_trace() {
+        return None;
+    }
     let key = DenialKey {
         pid: *pid,
         op: std::mem::discriminant(operation),
@@ -3508,6 +3515,74 @@ mod tests {
                 .iter()
                 .any(|f| f["target"]["cmd"] == common::wire::bpf_cmd_name(BPF_MAP_CREATE)));
             assert!(floods.iter().any(|f| f["target"]["target_ino"] == 2));
+        })
+        .await
+    }
+
+    /// Lot 356 (pre-alpha F3-8): a sole trace — a window's held load, the
+    /// kernel-state round's findings — is never coalesced into another nor
+    /// capped: each is queued, whatever the uid sent before it. A held
+    /// program's refused uses still are (repeats coalesced, new processes
+    /// capped).
+    #[tokio::test]
+    async fn a_sole_trace_is_never_coalesced_nor_capped() {
+        within(async {
+            let (tx, mut rx) = channel_capped(SPECS, 2);
+            let held = |pid: u32, op: nn_model::FsProtectOperation, ino: u64| Event::FsProtectDenial {
+                pid,
+                uid: 0,
+                comm: "loader".into(),
+                target_dev: 9,
+                target_ino: ino,
+                operation: op,
+                timestamp_ns: 5,
+            };
+            use nn_model::FsProtectOperation as Op;
+            // the flood of refused uses first: one process's repeats, then
+            // new processes on the same program
+            let mut batch: Vec<Event> = (0..5).map(|_| held(10, Op::BpfHeldUse, 213)).collect();
+            batch.extend((0..5).map(|i| held(100 + i, Op::BpfHeldUse, 213)));
+            tx.send_batch(batch).await.unwrap();
+            // then, the same uid, the sole traces: the same key five times
+            // over, and one of each other kind
+            let mut sole: Vec<Event> = (0..5).map(|_| held(10, Op::BpfHeldLoad, 214)).collect();
+            for op in [
+                Op::KernelTaint,
+                Op::SysctlRootProg,
+                Op::BpfUnseen,
+                Op::BpfBaseline,
+                Op::CpuConfined,
+            ] {
+                sole.extend((0..3).map(|_| held(0, op, 7)));
+            }
+            tx.send_batch(sole).await.unwrap();
+            for _ in 0..2 {
+                tx.send(held(10, Op::BpfHeldLoad, 214)).await.unwrap();
+            }
+            let got: Vec<Event> = std::iter::from_fn(|| rx.try_recv())
+                .map(|r| r.envelope.event)
+                .collect();
+            let n = |op: Op| {
+                got.iter()
+                    .filter(|e| matches!(e, Event::FsProtectDenial { operation, .. } if *operation == op))
+                    .count()
+            };
+            assert_eq!(n(Op::BpfHeldLoad), 7, "every held load queued: {got:#?}");
+            for op in [
+                Op::KernelTaint,
+                Op::SysctlRootProg,
+                Op::BpfUnseen,
+                Op::BpfBaseline,
+                Op::CpuConfined,
+            ] {
+                assert_eq!(n(op), 3, "{op:?}");
+            }
+            // the refused uses: pid 10's first (its repeats coalesced), and
+            // the cap's two of the new processes' on that program
+            assert_eq!(n(Op::BpfHeldUse), 2, "{got:#?}");
+            let snap = rx.stats().snapshot();
+            assert_eq!(snap[0].capped, 4);
+            assert_eq!(snap[0].coalesced, 4);
         })
         .await
     }
