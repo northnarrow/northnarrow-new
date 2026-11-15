@@ -50,7 +50,7 @@ pub fn store(path: &Path, content: &str, sig: &OverlaySignature) -> Result<PathB
 
 fn inode_key(path: &Path) -> Option<common::wire::InodeKey> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(path).ok()?;
     Some(common::wire::InodeKey {
         dev: crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
         ino: m.ino(),

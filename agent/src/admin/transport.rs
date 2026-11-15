@@ -955,7 +955,7 @@ pub(super) fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> 
         .ok()
         .map(|s| s.trim_end_matches('\n').to_string())
         .filter(|s| !s.is_empty());
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+    let exe = antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
     if let PeerPidfd::Open(fd) = &pidfd {

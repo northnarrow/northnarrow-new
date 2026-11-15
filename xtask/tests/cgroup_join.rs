@@ -502,7 +502,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
     in_order(
         body(&cj, "prepare_pins"),
         &[
-            "std::fs::read_to_string(STATE_PATH)",
+            "antitamper_bpf::kernel_roots::read_to_string(STATE_PATH)",
             "if debug_reset() {",
             "verify_state(st)",
             "let p = plan(",
@@ -529,7 +529,8 @@ fn the_agent_asks_the_marks_where_it_decides() {
     in_order(
         body(&cj, "freeze_pinned"),
         &[
-            "std::fs::read_to_string(format!(\"/proc/self/fdinfo/{fd}\"))",
+            // lot 353: beneath the `/proc` root the agent's start anchored
+            "antitamper_bpf::kernel_roots::read_to_string(format!(\"/proc/self/fdinfo/{fd}\"))",
             "match fdinfo_frozen(&info) {\n            Some(true) => continue,\n            Some(false) => {}",
             "libc::SYS_bpf,\n                MAP_FREEZE,",
             "freeze_outcome(errno)",

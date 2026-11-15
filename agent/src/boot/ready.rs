@@ -54,7 +54,7 @@ pub(crate) fn arm(
             manifest_version: manifest::MANIFEST_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             kernel: manifest::kernel_release(),
-            btf: std::path::Path::new("/sys/kernel/btf/vmlinux").exists(),
+            btf: antitamper_bpf::kernel_roots::metadata("/sys/kernel/btf/vmlinux").is_ok(),
             btf_offsets_resolved: resolved.map_or(0, |r| r.values.len()),
             btf_offsets_drifted: resolved.map_or(0, |r| r.drifted.len()),
             btf_offsets_absent: resolved

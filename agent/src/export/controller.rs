@@ -225,7 +225,7 @@ fn now_rfc3339() -> String {
 
 /// The host's name for RFC 5424 and OCSF's `device` (`-` if none fits).
 fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|h| h.trim().to_string())
         .filter(|h| nn_proto::ipc::hostname_ok(h))
@@ -326,7 +326,11 @@ fn note_json(n: &Note) -> serde_json::Value {
 
 /// The chain's bytes after `c` (how far a sink is behind).
 fn behind(src: &Source, c: &Cursor) -> u64 {
-    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let size = |p: &std::path::Path| {
+        antitamper_bpf::kernel_roots::metadata(p)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
     if !src.chain.rotates() {
         return size(&src.active).saturating_sub(c.end);
     }

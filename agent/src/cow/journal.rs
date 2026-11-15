@@ -53,7 +53,7 @@ pub enum Record {
 /// else `p` (tests, a run without `CAP_SYS_PTRACE`).
 pub fn host_view(p: &Path) -> PathBuf {
     static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *REACHABLE.get_or_init(|| std::fs::metadata("/proc/1/root/").is_ok()) {
+    if *REACHABLE.get_or_init(|| antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok()) {
         crate::response::host_path(p)
     } else {
         p.to_path_buf()
@@ -80,7 +80,7 @@ fn open_dir(p: &Path) -> io::Result<OwnedFd> {
 /// Create `p` 0700, or check the existing one: a directory (not a link)
 /// owned by the agent's uid with no group or other access.
 fn ensure_private_dir(p: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(p) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(p) {
         Ok(m) => {
             if !m.file_type().is_dir() {
                 bail!(
@@ -125,7 +125,7 @@ fn read_index(p: &Path) -> io::Result<Vec<u8>> {
     if REPLAY_READ_FAILS.with(|f| f.replace(false)) {
         return Err(io::Error::from_raw_os_error(libc::EIO));
     }
-    std::fs::read(p)
+    antitamper_bpf::kernel_roots::read_all(p)
 }
 
 /// A scope's journal, open.
@@ -171,7 +171,7 @@ impl Journal {
         let objects = open_dir(&host.join("objects"))?;
         let evidence = open_dir(&host.join("evidence"))?;
         let mut index = Self::open_index(&root)?;
-        let (mut lines, torn) = std::fs::read(host.join("index.jsonl"))
+        let (mut lines, torn) = antitamper_bpf::kernel_roots::read_all(host.join("index.jsonl"))
             .map(|b| {
                 let lines = b.iter().filter(|c| **c == b'\n').count() as u64;
                 (lines, b.last().is_some_and(|c| *c != b'\n'))
@@ -256,7 +256,9 @@ impl Journal {
 
     /// The device of the journal's filesystem.
     pub fn dev(&self) -> Option<u64> {
-        std::fs::metadata(&self.host).ok().map(|m| m.dev())
+        antitamper_bpf::kernel_roots::metadata(&self.host)
+            .ok()
+            .map(|m| m.dev())
     }
 
     pub fn object_name(id: u64) -> CString {

@@ -142,9 +142,18 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
-        2,
+        3,
         "PID 1's root (`/proc/1/root`), the host's view the agent checks its own files through: \
-         no caller's path",
+         no caller's path; lot 353: `\"proc\"` is the file system type of the kernel's view at \
+         `/proc` in the mount check (`KERNEL_VIEWS`), no path segment",
+    ),
+    (
+        "antitamper-bpf/src/kernel_roots.rs",
+        3,
+        "lot 353: `\"proc\"` is procfs's name in the table of the kernel's file systems \
+         (`KERNEL_MAGICS`), no path segment, and `starts_with(\"/proc\")` asks whether a path is \
+         under the `/proc` view at all (before the views are anchored); the module resolves the \
+         magic links of `/proc` as the kernel does, matching none",
     ),
     (
         "crates/nn-linux/src/impact/entropy.rs",

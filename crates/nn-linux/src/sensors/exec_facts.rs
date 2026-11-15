@@ -114,11 +114,11 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     };
     let dir = proc_root.join(pid.to_string());
     let image = dir.join("exe");
-    let Ok(meta) = std::fs::metadata(&image) else {
+    let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&image) else {
         return;
     };
     let now = (kernel_dev(meta.dev()), meta.ino());
-    let link = std::fs::read_link(&image).ok();
+    let link = antitamper_bpf::kernel_roots::read_link(&image).ok();
     // LSM mode: the image is still the exec's own (else the process
     // executed something else since, or is another one: no `ROOT_DIR`)
     let own = !exe.has(exe_flags::KNOWN) || now == (exe.dev, exe.ino);
@@ -224,7 +224,8 @@ fn executed_path(link: &Path, unlinked: bool) -> PathBuf {
 
 /// `dir` is root's and writable by no one else.
 fn dir_is_root_only(dir: &Path) -> bool {
-    std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+    antitamper_bpf::kernel_roots::metadata(dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
 }
 
 /// The process's environment loads code into it: one of [`LOADING_VARS`]
@@ -269,7 +270,7 @@ fn environ_loads(dir: &Path, interactive: bool) -> bool {
 /// The process runs in PID 1's mount namespace (`/proc/<pid>/ns/mnt` the
 /// same as `/proc/1/ns/mnt`). Not readable: not known, so no.
 fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
-    let ns = |d: &Path| std::fs::read_link(d.join("ns/mnt")).ok();
+    let ns = |d: &Path| antitamper_bpf::kernel_roots::read_link(d.join("ns/mnt")).ok();
     match (ns(dir), ns(&proc_root.join("1"))) {
         (Some(a), Some(b)) => a == b,
         _ => false,
@@ -281,7 +282,7 @@ fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
 /// not a chroot. Not readable: not known, so no.
 fn same_root(proc_root: &Path, dir: &Path) -> bool {
     let id = |d: &Path| {
-        std::fs::metadata(d.join("root"))
+        antitamper_bpf::kernel_roots::metadata(d.join("root"))
             .ok()
             .map(|m| (m.dev(), m.ino()))
     };
@@ -294,7 +295,7 @@ fn same_root(proc_root: &Path, dir: &Path) -> bool {
 /// The process's standard input is a file, a pipe or a socket: not a
 /// terminal, not `/dev/null`, not closed.
 fn stdin_is_a_program(dir: &Path) -> bool {
-    let Ok(target) = std::fs::read_link(dir.join("fd/0")) else {
+    let Ok(target) = antitamper_bpf::kernel_roots::read_link(dir.join("fd/0")) else {
         return false;
     };
     let t = target.to_string_lossy();

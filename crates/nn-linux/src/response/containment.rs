@@ -57,7 +57,7 @@ pub fn origin_of(pid: u32) -> Option<String> {
 /// aside and treated as empty, with a warning.
 pub fn load(cfg: &ExecutorConfig) -> Vec<Contained> {
     let path = &cfg.containment_file;
-    match fs::read_to_string(path) {
+    match antitamper_bpf::kernel_roots::read_to_string(path) {
         Ok(s) => match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(e) => {
@@ -78,7 +78,7 @@ pub fn load(cfg: &ExecutorConfig) -> Vec<Contained> {
 fn store(cfg: &ExecutorConfig, entries: &[Contained]) -> std::io::Result<()> {
     let path = &cfg.containment_file;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        antitamper_bpf::kernel_roots::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_string_pretty(entries).map_err(std::io::Error::other)?;
@@ -205,7 +205,8 @@ pub(crate) fn release_to_origin(
         .cgroup_root
         .join(rec.origin.trim_start_matches('/'))
         .join("cgroup.procs");
-    if !dest.exists() {
+    // lot 353: beneath the cgroup2 root the agent's start anchored
+    if antitamper_bpf::kernel_roots::metadata(&dest).is_err() {
         warn!(pid, origin = %nn_model::log_escape::Escaped(&rec.origin), "the cgroup it came from is gone — left contained");
         return Ok(Release::Skipped("the cgroup it came from is gone"));
     }

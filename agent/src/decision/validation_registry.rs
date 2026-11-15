@@ -40,7 +40,8 @@ fn repo_path(rel: &str) -> PathBuf {
 }
 
 fn read(rel: &str) -> String {
-    std::fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    antitamper_bpf::kernel_roots::read_to_string(repo_path(rel))
+        .unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
 /// A registry file: its `# version:` line and its rows, keyed by the

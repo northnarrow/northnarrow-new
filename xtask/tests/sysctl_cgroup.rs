@@ -251,7 +251,11 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
     .unwrap();
     in_order(
         body(&s, "open_root_cgroup"),
-        &["cgroup2_root(&table)", "if ino != ROOT_CGROUP_INO {"],
+        // lot 353: the cgroup2 root the agent's start anchored
+        &[
+            "antitamper_bpf::kernel_roots::cgroup_root()?",
+            "if ino != ROOT_CGROUP_INO {",
+        ],
     )
     .unwrap();
     // in the anti-tamper attach: after the tracker, before the BPF guard

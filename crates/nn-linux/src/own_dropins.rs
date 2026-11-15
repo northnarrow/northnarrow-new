@@ -97,7 +97,7 @@ fn changed_since(meta: &std::fs::Metadata, since: SystemTime) -> bool {
 /// when it cannot be read: the round then judges none.
 pub fn install_time() -> Option<SystemTime> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata("/proc/self/exe").ok()?;
+    let meta = antitamper_bpf::kernel_roots::metadata("/proc/self/exe").ok()?;
     let secs = u64::try_from(meta.ctime()).ok()?;
     Some(
         SystemTime::UNIX_EPOCH
@@ -176,7 +176,7 @@ fn flag_set(v: &str) -> bool {
 /// An exploit guard's task budget below its default, the host's
 /// `pid_max` (a value that does not parse weakens too).
 fn tasks_below_default(v: &str) -> bool {
-    let pid_max = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+    let pid_max = antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/pid_max")
         .ok()
         .and_then(|t| t.trim().parse::<u64>().ok())
         .unwrap_or(32_768);
@@ -357,7 +357,8 @@ pub fn nn_settings(roots: &[&Path]) -> Vec<NnSetting> {
 /// `path` is a regular file with one name (`lstat`: a symlink is not).
 pub fn regular_with_one_name(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1)
+    antitamper_bpf::kernel_roots::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_file() && m.nlink() == 1)
 }
 
 /// Why an entry of our directories is quarantined whatever its directives
@@ -375,7 +376,7 @@ fn shape_harm(
 ) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     if meta.file_type().is_symlink() {
-        let to = std::fs::read_link(from)
+        let to = antitamper_bpf::kernel_roots::read_link(from)
             .map(|t| t.display().to_string())
             .unwrap_or_else(|_| "?".to_string());
         return Some(format!(
@@ -475,12 +476,12 @@ pub fn harmful(
                 if from.extension().and_then(|x| x.to_str()) != Some("conf") {
                     continue;
                 }
-                let Ok(meta) = std::fs::symlink_metadata(&from) else {
+                let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(&from) else {
                     continue;
                 };
                 let regular = meta.file_type().is_file();
                 let bytes = if regular {
-                    std::fs::read(&from).ok()
+                    antitamper_bpf::kernel_roots::read_all(&from).ok()
                 } else {
                     None
                 };
@@ -535,7 +536,7 @@ pub fn harmful(
                     }
                     format!(
                         "symlink -> {}\n",
-                        std::fs::read_link(&from)
+                        antitamper_bpf::kernel_roots::read_link(&from)
                             .map(|t| t.display().to_string())
                             .unwrap_or_default()
                     )
@@ -576,7 +577,10 @@ pub fn preinstall_harmful(
     };
     harmful(roots, host, pass, known, &mut |p| regular_with_one_name(p))
         .into_iter()
-        .filter(|h| std::fs::symlink_metadata(&h.from).is_ok_and(|m| !changed_since(&m, installed)))
+        .filter(|h| {
+            antitamper_bpf::kernel_roots::symlink_metadata(&h.from)
+                .is_ok_and(|m| !changed_since(&m, installed))
+        })
         .collect()
 }
 
@@ -611,8 +615,8 @@ fn move_one(h: Harmful, quarantine: &Path, now: u64) -> Moved {
         })
         .collect();
     let to = quarantine.join(format!("{now}-{name}"));
-    let moved = std::fs::create_dir_all(quarantine)
-        .and_then(|()| std::fs::write(&to, &h.keep))
+    let moved = antitamper_bpf::kernel_roots::create_dir_all(quarantine)
+        .and_then(|()| antitamper_bpf::kernel_roots::write(&to, &h.keep))
         .and_then(|()| std::fs::remove_file(&h.from));
     match moved {
         Ok(()) => Moved {
@@ -790,7 +794,7 @@ impl<'a, M: InodeMap> Protector<'a, M> {
     pub fn protect(&mut self, path: &Path) -> bool {
         use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
         use std::os::unix::fs::MetadataExt;
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
+        let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(path) else {
             return false;
         };
         if !meta.file_type().is_file() || meta.nlink() != 1 {

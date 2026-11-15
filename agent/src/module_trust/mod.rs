@@ -220,14 +220,16 @@ struct Controller {
 
 /// The running kernel's release.
 fn release() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !s.contains('/'))
 }
 
 fn mtime(p: &str) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+    antitamper_bpf::kernel_roots::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 /// The package database's change stamp (dpkg's status, rpm's database).
@@ -473,7 +475,8 @@ pub fn start(kernel: Option<kernel::Kernel>) -> Result<std::thread::JoinHandle<(
     let release = release().ok_or_else(|| "the running kernel's release unreadable".to_string())?;
     let tree = std::fs::canonicalize(Path::new("/lib/modules").join(&release))
         .map_err(|e| format!("/lib/modules/{release}: {e}"))?;
-    let root = std::fs::metadata(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
+    let root = antitamper_bpf::kernel_roots::metadata(&tree)
+        .map_err(|e| format!("{}: {e}", tree.display()))?;
     kernel
         .set_tree(scan::key_of(&root))
         .map_err(|e| format!("{e:#}"))?;

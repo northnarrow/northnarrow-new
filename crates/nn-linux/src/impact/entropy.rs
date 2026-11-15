@@ -45,7 +45,7 @@ pub struct FsSampler;
 /// The host's view of `p` (`/proc/1/root`), or `p` where it cannot be
 /// reached (tests).
 fn host_view(p: &Path) -> PathBuf {
-    if std::fs::metadata("/proc/1/root/").is_ok() {
+    if antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok() {
         crate::response::host_path(p)
     } else {
         p.to_path_buf()
@@ -198,7 +198,8 @@ pub fn sample_copies_dir(
 /// tree (`0777`) is where an encryptor walks.
 fn shared_dir(dir: &Path, host: &dyn Fn(&Path) -> PathBuf) -> bool {
     let shared = libc::S_ISVTX | libc::S_IWOTH;
-    std::fs::metadata(host(dir)).is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
+    antitamper_bpf::kernel_roots::metadata(host(dir))
+        .is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
 }
 
 /// Whose copies count in a directory (lab PR 238).
@@ -300,7 +301,7 @@ impl CopyScan<'_> {
             // Its original is gone: a copy still waiting for its deletion
             // (or a `.bak` kept beside its file) is not one.
             let gone = matches!(
-                std::fs::symlink_metadata((self.host)(&dir.join(stem))),
+                antitamper_bpf::kernel_roots::symlink_metadata((self.host)(&dir.join(stem))),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound
             );
             if gone {

@@ -451,7 +451,7 @@ pub fn harden_self() -> Result<()> {
 /// agent's atomic pidfile writer emits `<pid>\n`); rejects
 /// anything that isn't a single positive `u32`.
 pub fn read_pid_from_file(path: &Path) -> Result<u32> {
-    let raw = std::fs::read_to_string(path)
+    let raw = antitamper_bpf::kernel_roots::read_to_string(path)
         .with_context(|| format!("reading PID file {}", path.display()))?;
     let trimmed = raw.trim();
     trimmed.parse::<u32>().with_context(|| {
@@ -470,13 +470,15 @@ pub fn read_pid_from_file(path: &Path) -> Result<u32> {
 /// (the watchdog registers itself in PROTECTED_PIDS first).
 pub fn runs_binary(pid: u32, bin: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let want = std::fs::metadata(bin).with_context(|| format!("stat {}", bin.display()))?;
+    let want = antitamper_bpf::kernel_roots::metadata(bin)
+        .with_context(|| format!("stat {}", bin.display()))?;
     let exe = format!("/proc/{pid}/exe");
-    let got = std::fs::metadata(&exe).with_context(|| format!("stat {exe}"))?;
+    let got =
+        antitamper_bpf::kernel_roots::metadata(&exe).with_context(|| format!("stat {exe}"))?;
     if (got.dev(), got.ino()) == (want.dev(), want.ino()) {
         return Ok(());
     }
-    let runs = std::fs::read_link(&exe)
+    let runs = antitamper_bpf::kernel_roots::read_link(&exe)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| String::from("?"));
     Err(anyhow!("pid {pid} runs {runs}, not {}", bin.display()))
@@ -1321,7 +1323,8 @@ pub fn parse_proc_cmdline(bytes: &[u8]) -> Vec<OsString> {
 /// survives the respawn.
 pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<OsString>> {
     let path = format!("/proc/{pid}/cmdline");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let bytes =
+        antitamper_bpf::kernel_roots::read_all(&path).with_context(|| format!("reading {path}"))?;
     let mut argv = parse_proc_cmdline(&bytes);
     if argv.is_empty() {
         return Err(anyhow!(
@@ -1932,7 +1935,7 @@ pub struct ShutdownCheck<'a> {
 /// the agent is respawned.
 pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
     use nn_proto::shutdown_marker as sm;
-    let raw = match std::fs::read(c.marker) {
+    let raw = match antitamper_bpf::kernel_roots::read_all(c.marker) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
@@ -1955,7 +1958,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
     // reads it — a byte that is not UTF-8, even in a comment, failed the
     // whole file here and every signed marker was refused (the agent
     // relaunched after an authorised stop)
-    let keys = match std::fs::read(c.admin_pub).map(|body| {
+    let keys = match antitamper_bpf::kernel_roots::read_all(c.admin_pub).map(|body| {
         nn_proto::admin_quorum::parse_admin_pub_lenient(&String::from_utf8_lossy(&body)).keys
     }) {
         Ok(k) if !k.is_empty() => k,
@@ -1968,7 +1971,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
         }
         Err(e) => return refuse(c, &raw, format!("{}: {e}", c.admin_pub.display())),
     };
-    let agent_id = match std::fs::read_to_string(c.agent_id_file)
+    let agent_id = match antitamper_bpf::kernel_roots::read_to_string(c.agent_id_file)
         .map_err(|e| e.to_string())
         .and_then(|body| sm::parse_agent_id(&body))
     {
@@ -1976,7 +1979,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
         Err(e) => return refuse(c, &raw, format!("{}: {e}", c.agent_id_file.display())),
     };
     let honoured_path = c.marker.with_file_name(file_name_of(sm::HONOURED_PATH));
-    let honoured = std::fs::read_to_string(&honoured_path).unwrap_or_default();
+    let honoured = antitamper_bpf::kernel_roots::read_to_string(&honoured_path).unwrap_or_default();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2074,17 +2077,18 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 pub fn process_start_unix(pid: u32) -> Option<u64> {
     // lot 311 (N6): read as bytes — the `(comm)` field is the process's own
     // choice and need not be UTF-8; the fields after it are ASCII
-    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let stat = antitamper_bpf::kernel_roots::read_all(format!("/proc/{pid}/stat")).ok()?;
     let stat = String::from_utf8_lossy(&stat);
     // Fields after the parenthesised comm, which may contain spaces.
     let rest = stat.rsplit_once(')')?.1;
     let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
-    let btime: u64 = String::from_utf8_lossy(&std::fs::read("/proc/stat").ok()?)
-        .lines()
-        .find_map(|l| l.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
+    let btime: u64 =
+        String::from_utf8_lossy(&antitamper_bpf::kernel_roots::read_all("/proc/stat").ok()?)
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
     // SAFETY: sysconf has no preconditions.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if hz <= 0 {
@@ -2838,6 +2842,246 @@ pub fn stuck_recovery_failed_record(
             "the agent did not answer (or its event loop stood still) and could not be stopped: \
              {} — still protected, its pidfile kept, still supervised",
             bounded(error, 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): the
+/// [`nn_proto::watchdog_hold::REASON_STUCK_UNRESPONSIVE`] record — the stuck
+/// recovery named before its SIGINT: `what` failed (the STATUS pings the
+/// agent did not answer, how many, for how long; or its event loop that
+/// stood still).
+pub fn stuck_unresponsive_record(
+    agent_pid: u32,
+    what: &str,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_STUCK_UNRESPONSIVE.to_string(),
+        detail: format!(
+            "{} — stuck recovery: SIGINT, SIGKILL after {} s",
+            bounded(what, 400),
+            STUCK_RECOVERY_HARDKILL_GRACE.as_secs()
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 353: what the STATUS pings that tripped the stuck recovery said —
+/// `pings` in a row failed, the first `failing_secs` ago, the last with
+/// `last`.
+pub fn unanswered_pings(pings: u32, failing_secs: u64, last: &str) -> String {
+    format!(
+        "the agent did not answer {pings} STATUS pings in a row (every {} s, each waited {} s), \
+         failing for {failing_secs} s; the last: {}",
+        STATUS_PING_INTERVAL.as_secs(),
+        STATUS_PING_TIMEOUT.as_secs(),
+        bounded(last, 200)
+    )
+}
+
+/// Lot 353: where the watchdog leaves the stuck marker the agent reads at
+/// the recovery's SIGINT (next to the hold records `holds`:
+/// [`nn_proto::watchdog_hold::STUCK_PATH`] with the default paths).
+pub fn stuck_marker_path(holds: &Path) -> PathBuf {
+    holds.with_file_name(file_name_of(nn_proto::watchdog_hold::STUCK_PATH))
+}
+
+/// Lot 353: leave `record` as the one stuck marker at `path` (replaced;
+/// created 0600, never through a symlink).
+pub fn leave_stuck_marker(path: &Path, record: &nn_proto::watchdog_hold::HoldRecord) -> Result<()> {
+    let line = serde_json::to_string(record).context("serialising the stuck marker")? + "\n";
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => {}
+    }
+    append_line(path, &line).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6 on 6.12): a FUSE mount a stuck agent
+/// may wait on — over the kernel's views (`/proc`, `/sys`, the cgroup tree:
+/// at or below them) or over the agent's own directories (at or above
+/// them, never `/`) — and its connection's id (`/sys/fs/fuse/connections`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveringFuse {
+    pub mount_point: String,
+    pub fstype: String,
+    pub source: String,
+    pub conn: u32,
+}
+
+/// The agent's own directories a FUSE must not cover.
+const OWN_DIRS: &[&str] = &[
+    "/etc/northnarrow",
+    "/var/lib/northnarrow",
+    "/run/northnarrow",
+];
+
+/// A mount table's octal escapes (`\040`) undone.
+fn unescape_mount(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Lot 353: the FUSE mounts of a `mountinfo` text that cover a path the
+/// agent depends on ([`CoveringFuse`]); a user's FUSE elsewhere (a home, a
+/// `/run/user` mount, `/var/lib/lxcfs`) is not one.
+pub fn covering_fuse(mountinfo: &str) -> Vec<CoveringFuse> {
+    let mut out: Vec<CoveringFuse> = Vec::new();
+    for line in mountinfo.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        let Some(dash) = f.iter().position(|x| *x == "-") else {
+            continue;
+        };
+        let (Some(dev), Some(mp), Some(fstype), Some(source)) =
+            (f.get(2), f.get(4), f.get(dash + 1), f.get(dash + 2))
+        else {
+            continue;
+        };
+        if !(*fstype == "fuse" || *fstype == "fuseblk" || fstype.starts_with("fuse.")) {
+            continue;
+        }
+        let mp = unescape_mount(mp);
+        let below = |v: &str| mp == v || mp.starts_with(&format!("{v}/"));
+        let above = |d: &str| mp != "/" && (d == mp || d.starts_with(&format!("{mp}/")));
+        if !(below("/proc") || below("/sys") || OWN_DIRS.iter().any(|d| below(d) || above(d))) {
+            continue;
+        }
+        let Some(("0", minor)) = dev.split_once(':') else {
+            continue;
+        };
+        let Ok(conn) = minor.parse::<u32>() else {
+            continue;
+        };
+        if out.iter().any(|c| c.conn == conn) {
+            continue;
+        }
+        out.push(CoveringFuse {
+            mount_point: mp,
+            fstype: fstype.to_string(),
+            source: unescape_mount(source),
+            conn,
+        });
+    }
+    out
+}
+
+/// The FUSE control file system (`fusectl`).
+pub const FUSE_CONNECTIONS: &str = "/sys/fs/fuse/connections";
+
+/// Lot 353: the requests the FUSE connection `conn` has waiting (sent to its
+/// daemon, not answered), from `connections` (`/sys/fs/fuse/connections`).
+pub fn fuse_waiting(connections: &Path, conn: u32) -> Option<u64> {
+    antitamper_bpf::kernel_roots::read_to_string(connections.join(conn.to_string()).join("waiting"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Lot 353: abort the FUSE connection `conn` — its waiting requests fail
+/// (`ECONNABORTED`), the threads held in them return.
+pub fn abort_fuse(connections: &Path, conn: u32) -> std::io::Result<()> {
+    antitamper_bpf::kernel_roots::write(connections.join(conn.to_string()).join("abort"), "1")
+}
+
+/// Lot 353: the [`nn_proto::watchdog_hold::REASON_FUSE_ABORTED`] record.
+pub fn fuse_aborted_record(
+    agent_pid: u32,
+    f: &CoveringFuse,
+    waiting: u64,
+    outcome: &std::result::Result<(), String>,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_FUSE_ABORTED.to_string(),
+        detail: format!(
+            "the agent did not end after SIGKILL (a thread held in a FUSE request): {} ({}, \
+             source {}, connection {}, {waiting} requests waiting) over a path the agent \
+             depends on — {}",
+            bounded(&f.mount_point, 200),
+            bounded(&f.fstype, 60),
+            bounded(&f.source, 120),
+            f.conn,
+            match outcome {
+                Ok(()) => "its connection aborted".to_string(),
+                Err(e) => format!("its connection NOT aborted: {}", bounded(e, 200)),
+            }
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): the stuck recoveries of the last
+/// [`nn_proto::watchdog_hold::RESTART_LOOP_WINDOW_SECS`] — at
+/// [`nn_proto::watchdog_hold::RESTART_LOOP_RECOVERIES`] of them the agent
+/// is in a restart loop (a mount over a path it reads held for long, a
+/// starved host): recorded once, then counted afresh.
+#[derive(Debug, Default)]
+pub struct RestartLoop {
+    at: std::collections::VecDeque<u64>,
+}
+
+impl RestartLoop {
+    /// A stuck recovery at `at` (unix seconds): `Some(n)` when it makes the
+    /// `n`th within the window (the loop), the count then started over.
+    pub fn note(&mut self, at: u64) -> Option<usize> {
+        use nn_proto::watchdog_hold::{RESTART_LOOP_RECOVERIES, RESTART_LOOP_WINDOW_SECS};
+        while self
+            .at
+            .front()
+            .is_some_and(|t| at.saturating_sub(*t) >= RESTART_LOOP_WINDOW_SECS)
+        {
+            self.at.pop_front();
+        }
+        self.at.push_back(at);
+        if self.at.len() < RESTART_LOOP_RECOVERIES {
+            return None;
+        }
+        let n = self.at.len();
+        self.at.clear();
+        Some(n)
+    }
+}
+
+/// Lot 353: the [`nn_proto::watchdog_hold::REASON_AGENT_RESTART_LOOP`]
+/// record: `n` stuck recoveries within the window, the last for `last`.
+pub fn restart_loop_record(
+    agent_pid: u32,
+    n: usize,
+    last: &str,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_AGENT_RESTART_LOOP.to_string(),
+        detail: format!(
+            "{n} stuck recoveries within {} min — the agent is restarted again and again and \
+             blind meanwhile; the last: {}",
+            nn_proto::watchdog_hold::RESTART_LOOP_WINDOW_SECS / 60,
+            bounded(last, 300)
         ),
         unit_state: None,
     }
@@ -3873,6 +4117,147 @@ mod tests {
         let long = format!("Result={}\n", "é".repeat(300));
         let s = unit_state_from_show(&long).unwrap();
         assert!(s.len() <= 256 && s.starts_with("Result="), "{}", s.len());
+    }
+
+    /// Lot 353 (named, pre-alpha Phase 3 X6): the stuck recovery names
+    /// which ping failed and for how long, in the hold record and in the
+    /// marker the agent reads at its SIGINT (replaced, never through a
+    /// link) — which names that agent's stop `stuck_unresponsive`.
+    #[test]
+    fn the_stuck_recovery_names_its_cause() {
+        use nn_proto::watchdog_hold as wh;
+        let why = unanswered_pings(2, 31, "STATUS ping timed out after 2s");
+        assert!(
+            why.contains("did not answer 2 STATUS pings in a row"),
+            "{why}"
+        );
+        assert!(why.contains("failing for 31 s"), "{why}");
+        assert!(why.contains("STATUS ping timed out after 2s"), "{why}");
+        let rec = stuck_unresponsive_record(4242, &why, 1_800_000_000);
+        assert_eq!(rec.reason, wh::REASON_STUCK_UNRESPONSIVE);
+        assert!(
+            rec.detail.contains("SIGINT, SIGKILL after 5 s"),
+            "{}",
+            rec.detail
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let holds = dir.path().join("watchdog.hold");
+        let marker = stuck_marker_path(&holds);
+        assert_eq!(marker, dir.path().join("watchdog.stuck"));
+        assert_eq!(
+            stuck_marker_path(Path::new(wh::HOLD_PATH)),
+            Path::new(wh::STUCK_PATH)
+        );
+        std::fs::write(&marker, "an older marker\n").unwrap();
+        leave_stuck_marker(&marker, &rec).unwrap();
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(text.lines().count(), 1, "replaced: {text}");
+        assert_eq!(
+            wh::stuck_marker_names(&text, 4242, 1_800_000_010).as_deref(),
+            Some(rec.detail.as_str())
+        );
+        assert_eq!(wh::stuck_marker_names(&text, 4243, 1_800_000_010), None);
+        // never through a link planted at the marker's name
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "kept\n").unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
+        leave_stuck_marker(&marker, &rec).unwrap();
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "kept\n");
+    }
+
+    /// Lot 353 (named, pre-alpha Phase 3 X6 on 6.12): the FUSE mounts a
+    /// stuck agent may be held in — over `/proc`, `/sys` (the cgroup tree) or
+    /// our own directories — are found with their connection; a user's FUSE
+    /// elsewhere (a home's sshfs, `/run/user`'s gvfs, lxcfs's own directory)
+    /// never is, nor a block device's mount. The record names the mount, its
+    /// source, the connection and the outcome.
+    #[test]
+    fn only_a_fuse_over_a_path_the_agent_depends_on_may_be_aborted() {
+        let table = "\
+24 1 8:1 / / rw - ext4 /dev/sda1 rw
+27 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw
+900 27 0:91 / /sys/fs/cgroup rw,nosuid,nodev - fuse.nnf03 nnf03 rw,user_id=0,group_id=0
+901 24 0:92 / /home/u/mnt rw - fuse.sshfs u@h:/ rw
+902 24 0:93 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw
+903 24 0:94 / /var/lib/lxcfs rw - fuse.lxcfs lxcfs rw
+904 26 0:95 / /proc/sys/kernel rw - fuse x rw
+905 24 0:96 / /etc rw - fuse.etcfs etcfs rw
+906 24 0:97 / /var/lib/northnarrow/x\\040y rw - fuse.z z rw
+907 24 8:17 / /sys/fs/ext rw - fuseblk /dev/sdb1 rw
+908 24 0:98 / / rw - fuse.rootfs r rw
+";
+        let found = covering_fuse(table);
+        let points: Vec<(&str, u32)> = found
+            .iter()
+            .map(|f| (f.mount_point.as_str(), f.conn))
+            .collect();
+        assert_eq!(
+            points,
+            [
+                ("/sys/fs/cgroup", 91),
+                ("/proc/sys/kernel", 95),
+                ("/etc", 96),
+                ("/var/lib/northnarrow/x y", 97),
+            ]
+        );
+        assert_eq!(found[0].fstype, "fuse.nnf03");
+        assert_eq!(found[0].source, "nnf03");
+        let rec = fuse_aborted_record(4242, &found[0], 2, &Ok(()), 1_800_000_000);
+        assert_eq!(rec.reason, nn_proto::watchdog_hold::REASON_FUSE_ABORTED);
+        assert!(
+            rec.detail.contains(
+                "/sys/fs/cgroup (fuse.nnf03, source nnf03, connection 91, 2 requests waiting)"
+            ) && rec.detail.ends_with("its connection aborted"),
+            "{}",
+            rec.detail
+        );
+        let refused = fuse_aborted_record(4242, &found[0], 2, &Err("EACCES".into()), 1);
+        assert!(
+            refused.detail.ends_with("NOT aborted: EACCES"),
+            "{}",
+            refused.detail
+        );
+        // the control files read and written where the kernel puts them
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("91")).unwrap();
+        std::fs::write(d.path().join("91/waiting"), "2\n").unwrap();
+        std::fs::write(d.path().join("91/abort"), "").unwrap();
+        assert_eq!(fuse_waiting(d.path(), 91), Some(2));
+        assert_eq!(fuse_waiting(d.path(), 92), None);
+        abort_fuse(d.path(), 91).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("91/abort")).unwrap(),
+            "1"
+        );
+    }
+
+    /// Lot 353 (named): three stuck recoveries within ten minutes are a
+    /// restart loop, recorded once and then counted afresh; spread wider
+    /// they are not one.
+    #[test]
+    fn repeated_stuck_recoveries_are_a_restart_loop() {
+        let mut l = RestartLoop::default();
+        let t = 1_800_000_000;
+        assert_eq!(l.note(t), None);
+        assert_eq!(l.note(t + 60), None);
+        assert_eq!(l.note(t + 120), Some(3));
+        assert_eq!(l.note(t + 180), None, "counted afresh");
+        let mut spread = RestartLoop::default();
+        assert_eq!(spread.note(t), None);
+        assert_eq!(spread.note(t + 400), None);
+        assert_eq!(spread.note(t + 800), None, "the first is out of the window");
+        assert_eq!(spread.note(t + 900), Some(3));
+        let rec = restart_loop_record(4242, 3, "the agent did not answer", t);
+        assert_eq!(
+            rec.reason,
+            nn_proto::watchdog_hold::REASON_AGENT_RESTART_LOOP
+        );
+        assert!(
+            rec.detail.starts_with("3 stuck recoveries within 10 min"),
+            "{}",
+            rec.detail
+        );
     }
 
     /// External audit DEP-004: a hold leaves one JSON line per hold where

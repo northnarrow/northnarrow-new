@@ -1040,12 +1040,15 @@ enum Found {
 /// `rsync -a`). A file whose birth time is not known is reported, never
 /// moved.
 fn find_file(dir: RawFd, want: &FileId) -> Found {
-    let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{dir}")) else {
+    // lot 353: through the `/proc` root the agent's start anchored
+    let Ok(rd) =
+        antitamper_bpf::kernel_roots::read_dir_max(format!("/proc/self/fd/{dir}"), 100_000)
+    else {
         return Found::Nothing;
     };
     let mut unsure = None;
-    for ent in rd.take(100_000).filter_map(|e| e.ok()) {
-        let Some(name) = ent.file_name().to_str().map(str::to_string) else {
+    for ent in rd {
+        let Some(name) = ent.to_str().map(str::to_string) else {
             continue;
         };
         let Ok(st) = fstatat_nofollow(dir, &name) else {

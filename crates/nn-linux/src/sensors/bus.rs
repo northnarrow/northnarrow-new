@@ -507,7 +507,8 @@ async fn slot<'a>(
 /// The boot's id (`/proc/sys/kernel/random/boot_id`), the envelopes'
 /// process keys' first part; zeros when it cannot be read.
 fn read_boot_id() -> [u8; 16] {
-    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let text = antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap_or_default();
     parse_boot_id(&text).unwrap_or([0; 16])
 }
 

@@ -291,7 +291,8 @@ impl DropTrigger {
         {
             self.read_at = Some(now);
             let was = self.on;
-            self.on = std::fs::read_to_string(DEBUG_RING_DROP).is_ok_and(|t| drops(label, &t));
+            self.on = antitamper_bpf::kernel_roots::read_to_string(DEBUG_RING_DROP)
+                .is_ok_and(|t| drops(label, &t));
             if self.on != was {
                 tracing::warn!(
                     pump = label,

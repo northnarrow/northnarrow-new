@@ -946,6 +946,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 353 (pre-alpha Phase 3, case X6, P1): **a mount cannot stall the
+  agent; stuck restarts are named and a loop is signed**
+  (`UPGRADE_NOTES_WAVE4.md` §47). A FUSE over `/sys/fs/cgroup` that never
+  answered held the integrity and kernel-state rounds in the kernel, on the
+  runtime's workers; the admin socket stopped answering, the watchdog
+  restarted the agent, and the log said `agent_stop` `sigint`.
+  - **Kernel views anchored at the start** (`antitamper_bpf::kernel_roots`):
+    `/proc`, `/sys` and the cgroup2 root opened once and checked to be the
+    kernel's (`fstatfs`, on a helper thread with a deadline); every read of
+    them opened beneath those roots (`openat2`, `RESOLVE_BENEATH |
+    RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`) — the shared readers
+    (`state_read`, `mountinfo`, `config_read`), the posture's process table,
+    the integrity and kernel-state rounds, the CPU watch, the sysctl judge's
+    root, the cgroup floors and guards, the responses' cgroups. A mount
+    below a view is read only when it is the kernel's, within 2 s; a FUSE,
+    tmpfs or disk below `/proc` or `/sys` is refused. A view covered at the
+    start is not read (`kernel_views` degradation). A ratchet
+    (`xtask/tests/kernel_views.rs`) forbids a path walk of `/proc` or `/sys`
+    outside it.
+  - **The two rounds run off the runtime's workers** (`off_the_runtime`).
+  - **`mount_over_protected` covers the kernel's views** (a mount at
+    `/proc`, `/sys`, `/sys/fs/cgroup` of another file system, or below
+    `/proc`/`/sys` of a file system not the kernel's), names the mount's
+    source, and is signed High.
+  - **The watchdog's stuck recovery names its cause**
+    (`stuck_unresponsive`: which ping failed, how many, for how long), the
+    agent's stop is `stuck_unresponsive` (not clean: `heartbeat watch`
+    DEGRADED), and three recoveries within 10 minutes are
+    `agent_restart_loop` (High, a status degradation);
+    `stuck_recovery_failed` is High.
+  - **The watchdog aborts a FUSE holding an agent SIGKILL cannot end**
+    (6.12: a FUSE request already read waits uninterruptibly): only one over
+    `/proc`, `/sys` or the agent's own directories with requests waiting,
+    signed `fuse_aborted` (High).
+  - The CPU count (`kernel_roots::available_parallelism`) and the mount
+    roots (`MountEntry::root_key`, cached `statx`) no longer walk or ask a
+    FUSE mounted over the cgroup tree.
 - Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
   - **F1 — a log truncated back to its signed baseline's exact content was
     dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written

@@ -127,7 +127,7 @@ pub const WATCHDOG_COMM: &str = "northnarrow-wat";
 /// pidfile writer emits `<pid>\n`); rejects multi-line content
 /// because the canonical writer never produces such bytes.
 pub fn read_watchdog_pid_optional(path: &Path) -> Option<u32> {
-    let raw = match std::fs::read_to_string(path) {
+    let raw = match antitamper_bpf::kernel_roots::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             info!(
@@ -1252,10 +1252,12 @@ const SHUTDOWN_EXE_PATHS: &[&str] = &[
 fn shutdown_exe_key() -> Option<InodeKey> {
     use std::os::unix::fs::MetadataExt;
     SHUTDOWN_EXE_PATHS.iter().find_map(|p| {
-        std::fs::metadata(p).ok().map(|m| InodeKey {
-            dev: filesystem::stat_dev_to_kernel_dev(m.dev()),
-            ino: m.ino(),
-        })
+        antitamper_bpf::kernel_roots::metadata(p)
+            .ok()
+            .map(|m| InodeKey {
+                dev: filesystem::stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+            })
     })
 }
 
@@ -1408,10 +1410,12 @@ impl ExeIdentity {
     /// The file at `path` (symlinks followed).
     pub fn of_file(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|m| Self {
-            dev: m.dev(),
-            ino: m.ino(),
-        })
+        antitamper_bpf::kernel_roots::metadata(path)
+            .ok()
+            .map(|m| Self {
+                dev: m.dev(),
+                ino: m.ino(),
+            })
     }
 
     /// The program `pid` runs; `None` when it is gone or unreadable.

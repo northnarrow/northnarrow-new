@@ -77,20 +77,21 @@ pub fn tainted(root: &Path) -> Result<u64, String> {
 /// (disabled)`, `name (in transition)`.
 pub fn livepatches(root: &Path) -> Vec<String> {
     let dir = root.join(LIVEPATCH_DIR.trim_start_matches('/'));
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    // lot 353: beneath the `/sys` root the agent's start anchored
+    let Ok(entries) = antitamper_bpf::kernel_roots::read_dir(&dir) else {
         return Vec::new();
     };
     let flag = |p: &Path, f: &str| {
-        std::fs::read_to_string(p.join(f))
+        antitamper_bpf::kernel_roots::read_to_string(p.join(f))
             .ok()
             .map(|t| t.trim() == "1")
     };
     let mut out: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            let p = e.path();
+        .into_iter()
+        .filter(|n| antitamper_bpf::kernel_roots::is_dir(dir.join(n)))
+        .map(|n| {
+            let name = n.to_string_lossy().to_string();
+            let p = dir.join(&n);
             match (flag(&p, "enabled"), flag(&p, "transition")) {
                 (_, Some(true)) => format!("{name} (in transition)"),
                 (Some(false), _) => format!("{name} (disabled)"),
@@ -440,32 +441,42 @@ pub fn spawn(tx: BusSender, mut cross: Option<crate::bpf_crossview::CrossView>) 
         let agent_start = crate::known_system_prog::agent_start_ns();
         loop {
             tick.tick().await;
-            // lot 304: the cross-view first — the root's programs are told
-            // by its enumeration of this round and the loads its hook saw
-            let crossed = match cross.as_mut() {
-                Some(c) => crossview_round(c, &mut failing, agent_start),
-                None => Vec::new(),
-            };
-            let mut found = {
-                let known = |id: u32| match cross.as_ref() {
-                    Some(c) => known_within(
-                        id,
-                        common::bpf_prog_class::KnownLink::RootCgroupSysctl,
-                        c.watch.program(id),
-                        agent_start,
-                        c.watch.seen().get(&id).copied(),
-                    ),
-                    None => Err("no BPF cross-view on this host".to_string()),
+            // Lot 353 (pre-alpha Phase 3, X6): the round's reads are the
+            // kernel's files, read beneath the roots the start anchored
+            // (`antitamper_bpf::kernel_roots`) — and the round runs off the
+            // runtime's worker all the same: a read that blocks never holds
+            // the admin socket's tasks (its STATUS) or the others.
+            let found = crate::runtime::off_the_runtime(|| {
+                // lot 304: the cross-view first — the root's programs are
+                // told by its enumeration of this round and the loads its
+                // hook saw
+                let crossed = match cross.as_mut() {
+                    Some(c) => crossview_round(c, &mut failing, agent_start),
+                    None => Vec::new(),
                 };
-                round(&mut w, Path::new("/"), &known)
-            };
-            found.extend(crossed);
-            // lot 349: the agent's own CPUs — the re-check of #558 (F7): a
-            // read of this round that did not answer makes it unjudged
-            found.extend(
-                crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)
-                    .map(Finding::Cpus),
-            );
+                let mut found = {
+                    let known = |id: u32| match cross.as_ref() {
+                        Some(c) => known_within(
+                            id,
+                            common::bpf_prog_class::KnownLink::RootCgroupSysctl,
+                            c.watch.program(id),
+                            agent_start,
+                            c.watch.seen().get(&id).copied(),
+                        ),
+                        None => Err("no BPF cross-view on this host".to_string()),
+                    };
+                    round(&mut w, Path::new("/"), &known)
+                };
+                found.extend(crossed);
+                // lot 349: the agent's own CPUs — the re-check of #558
+                // (F7): a read of this round that did not answer makes it
+                // unjudged
+                found.extend(
+                    crate::own_cpus::round(&mut cpus, &crate::state_read::ROUND_READER)
+                        .map(Finding::Cpus),
+                );
+                found
+            });
             for f in found {
                 if tx.send(event_of(&f, monotonic_ns())).await.is_err() {
                     return;

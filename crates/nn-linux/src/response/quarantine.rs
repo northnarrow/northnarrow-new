@@ -207,7 +207,7 @@ impl ExeHandle {
     /// `x (deleted)` was "nothing on disk to quarantine", and NEUTRALIZE
     /// left it runnable.
     pub fn of_pid(pid: u32) -> std::io::Result<Option<Self>> {
-        match fs::File::open(format!("/proc/{pid}/exe")) {
+        match antitamper_bpf::kernel_roots::open(format!("/proc/{pid}/exe"), libc::O_RDONLY) {
             Ok(f) => {
                 let uid = fsuid_of(pid);
                 Self::from_file(f).map(|h| Some(h.with_offender_uid(uid)))
@@ -269,7 +269,8 @@ impl ExeHandle {
     /// shows it (a ` (deleted)` suffix kept): what the logs and the vault's
     /// record name when no name can be verified ([`Self::current_path`]).
     fn shown_path(&self) -> Option<PathBuf> {
-        fs::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd())).ok()
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .ok()
     }
 
     /// Where the inode is now, verified: the name the agent's own
@@ -792,7 +793,9 @@ fn write_restored(plaintext: &[u8], out_path: &Path, cfg: &ExecutorConfig) -> st
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(p)
     })?;
-    if let Ok(real) = fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+    if let Ok(real) =
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+    {
         let real = match real.strip_prefix("/proc/1/root") {
             Ok(rel) => Path::new("/").join(rel),
             Err(_) => real,

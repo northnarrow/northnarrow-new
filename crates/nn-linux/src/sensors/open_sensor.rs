@@ -352,7 +352,7 @@ pub fn home_roots(passwd: &str) -> Vec<PathBuf> {
 /// symbolic link followed at its last component) owned by `owner` (any
 /// owner for `None`).
 fn owned_dir(dir: &Path, owner: Option<u32>) -> Option<std::fs::Metadata> {
-    std::fs::symlink_metadata(dir)
+    antitamper_bpf::kernel_roots::symlink_metadata(dir)
         .ok()
         .filter(|m| m.is_dir() && owner.is_none_or(|o| m.uid() == o))
 }
@@ -397,14 +397,14 @@ impl RuleSet {
             if is_shared_system_dir(&real) {
                 continue;
             }
-            if let Ok(m) = std::fs::metadata(&real) {
+            if let Ok(m) = antitamper_bpf::kernel_roots::metadata(&real) {
                 if m.is_dir() {
                     *set.inodes.entry(key_of(&m)).or_default() |= TREE_HOME;
                 }
             }
         }
         for (dir, uid) in &inputs.runtime {
-            if let Ok(m) = std::fs::metadata(dir) {
+            if let Ok(m) = antitamper_bpf::kernel_roots::metadata(dir) {
                 let k = key_of(&m);
                 *set.inodes.entry(k).or_default() |= TREE_RUNTIME;
                 set.runtime.insert(k, *uid);
@@ -523,7 +523,7 @@ impl RuleSet {
         } else {
             rule
         });
-        if let Ok(m) = std::fs::metadata(path) {
+        if let Ok(m) = antitamper_bpf::kernel_roots::metadata(path) {
             // A path that turned out to be a directory gets the tree bits.
             let b = if m.is_dir() { tree_bits } else { file_bits };
             if b == 0 {
@@ -534,9 +534,10 @@ impl RuleSet {
             // The kernel looks a file's own rule up only in directories
             // marked as holding some (the file's real parent).
             if !m.is_dir() {
-                let parent = std::fs::canonicalize(path)
-                    .ok()
-                    .and_then(|real| real.parent().and_then(|p| std::fs::metadata(p).ok()));
+                let parent = std::fs::canonicalize(path).ok().and_then(|real| {
+                    real.parent()
+                        .and_then(|p| antitamper_bpf::kernel_roots::metadata(p).ok())
+                });
                 if let Some(pm) = parent {
                     *self.inodes.entry(key_of(&pm)).or_default() |= DIR_HAS_FILES;
                 }
@@ -550,7 +551,7 @@ impl RuleSet {
         let mut missing = path;
         let mut parent = path.parent();
         while let Some(p) = parent {
-            if let Ok(m) = std::fs::metadata(p) {
+            if let Ok(m) = antitamper_bpf::kernel_roots::metadata(p) {
                 let Some(name) = missing.file_name().and_then(|n| n.to_str()) else {
                     return;
                 };
@@ -1412,7 +1413,7 @@ fn comm_of(r: &OpenRecordRaw) -> String {
 /// opened, read by path. Only when the path still names the opened inode:
 /// a replaced or vanished file yields `None`, and the rule only reports.
 fn owner_of(path: &str, opened: InodeKey) -> Option<u32> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = antitamper_bpf::kernel_roots::metadata(path).ok()?;
     let found = InodeKey {
         dev: stat_dev_to_kernel_dev(meta.dev()),
         ino: meta.ino(),
@@ -1436,8 +1437,8 @@ fn reader_dac_capable(pid: u32) -> bool {
         return false;
     }
     match (
-        std::fs::read_link(format!("/proc/{pid}/ns/user")),
-        std::fs::read_link("/proc/1/ns/user"),
+        antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/ns/user")),
+        antitamper_bpf::kernel_roots::read_link("/proc/1/ns/user"),
     ) {
         (Ok(reader), Ok(init)) => reader == init,
         _ => false,

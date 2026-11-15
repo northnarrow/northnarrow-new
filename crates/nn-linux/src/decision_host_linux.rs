@@ -208,7 +208,7 @@ impl ActorFacts for ProcFacts {
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
         use std::os::unix::fs::MetadataExt;
         let link = self.root.join(pid.to_string()).join("exe");
-        let path = std::fs::read_link(&link).ok()?;
+        let path = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
         let path_s = path.to_str()?.to_string();
         if !crate::posture::lineage::in_system_tree(&path_s) {
             return None;
@@ -219,13 +219,13 @@ impl ActorFacts for ProcFacts {
             return None;
         }
         // The opened file is the one at the path it names now.
-        let at_path = std::fs::symlink_metadata(&path).ok()?;
+        let at_path = antitamper_bpf::kernel_roots::symlink_metadata(&path).ok()?;
         if at_path.dev() != m.dev() || at_path.ino() != m.ino() {
             return None;
         }
         let mut dir = path.parent();
         while let Some(d) = dir {
-            if !root_only(&std::fs::symlink_metadata(d).ok()?) {
+            if !root_only(&antitamper_bpf::kernel_roots::symlink_metadata(d).ok()?) {
                 return None;
             }
             dir = d.parent();

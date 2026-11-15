@@ -244,7 +244,7 @@ pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>) {
         if let Some(why) = antitamper_bpf::pin_root_refusal_at(&dir) {
             return Plan::New { why, first: false };
         }
-        let state = std::fs::read_to_string(STATE_PATH)
+        let state = antitamper_bpf::kernel_roots::read_to_string(STATE_PATH)
             .ok()
             .and_then(|t| State::parse(&t));
         plan(
@@ -285,7 +285,7 @@ fn freeze(name: &str, md: &MapData) -> Result<(), String> {
         map_fd: u32,
     }
     let fd = md.fd().as_fd().as_raw_fd();
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+    let info = antitamper_bpf::kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .map_err(|e| format!("{name}: its fdinfo: {e}"))?;
     match crate::cgroup_join::fdinfo_frozen(&info) {
         Some(true) => return Ok(()),

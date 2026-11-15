@@ -125,7 +125,8 @@ pub struct Mismatch {
 /// offset. Never panics; never reads kernel memory (BTF is a static
 /// description). See [`RevalidateOutcome`] for how the caller acts.
 pub fn revalidate_offsets() -> RevalidateOutcome {
-    let data = match fs::read(VMLINUX_BTF) {
+    // lot 353: beneath the `/sys` root the agent's start anchored
+    let data = match antitamper_bpf::kernel_roots::read_all(VMLINUX_BTF) {
         Ok(d) => d,
         Err(e) => {
             return RevalidateOutcome::SkippedNoBtf {
@@ -377,7 +378,8 @@ pub fn resolve_fields_from(
     path: &std::path::Path,
     queries: &[(&str, &[&str])],
 ) -> Result<Vec<Result<usize, String>>, String> {
-    let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let data = antitamper_bpf::kernel_roots::read_all(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let btf = Btf::parse(&data).map_err(|e| e.to_string())?;
     Ok(queries
         .iter()
@@ -390,7 +392,7 @@ pub fn resolve_fields_from(
 /// `/sys/kernel/btf/vmlinux`). Powers `northnarrow-agent --btf-check`
 /// and the computed kernel matrix (multi-kernel, level 2).
 pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
-    let data = match fs::read(path) {
+    let data = match antitamper_bpf::kernel_roots::read_all(path) {
         Ok(d) => d,
         Err(e) => {
             return ResolveOutcome::SkippedNoBtf {
@@ -407,7 +409,8 @@ pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
     let dir = (path.file_name() == Some(std::ffi::OsStr::new("vmlinux")))
         .then(|| path.parent())
         .flatten();
-    let modules = |m: &str| dir.and_then(|d| fs::read(d.join(m)).ok());
+    let modules =
+        |m: &str| dir.and_then(|d| antitamper_bpf::kernel_roots::read_all(d.join(m)).ok());
     resolve_with(
         &btf,
         REVALIDATE,

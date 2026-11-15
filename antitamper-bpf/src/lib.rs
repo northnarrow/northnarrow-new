@@ -79,6 +79,11 @@ pub mod config_read;
 /// Lot 273c/273d: the host's drop-ins judged by their value for our units
 /// (the agent's integrity round, its reloads, the watchdog's).
 pub mod host_dropins;
+/// Lot 353: the kernel's views (`/proc`, `/sys`, the cgroup2 hierarchy)
+/// read beneath descriptors of their roots taken at the start — a mount
+/// laid over them since cannot hold a reader.
+#[cfg(target_os = "linux")]
+pub mod kernel_roots;
 /// systemd over its private socket, served by PID 1: what it reports the
 /// host and our units as, and its reload (external audit EBPF-001; lot
 /// 273c; lot 273d: here, so that the watchdog reads our units' properties
@@ -229,7 +234,7 @@ pub fn prepare_pin_root() -> Option<&'static Path> {
     // already required root to get this far. The directory itself
     // (`lstat`): a link created after the check above is not chmodded
     // through.
-    if let Ok(meta) = std::fs::symlink_metadata(root) {
+    if let Ok(meta) = crate::kernel_roots::symlink_metadata(root) {
         if meta.is_dir() && (meta.permissions().mode() & 0o7777) != PIN_ROOT_MODE {
             if let Err(e) =
                 std::fs::set_permissions(root, std::fs::Permissions::from_mode(PIN_ROOT_MODE))
@@ -263,9 +268,9 @@ pub fn pin_root_refusal() -> Option<String> {
 
 /// [`pin_root_refusal`] for `root`, whatever filesystem holds it.
 pub fn pin_root_refusal_at(root: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(root).ok()?;
+    let meta = crate::kernel_roots::symlink_metadata(root).ok()?;
     if meta.file_type().is_symlink() {
-        let target = std::fs::read_link(root)
+        let target = crate::kernel_roots::read_link(root)
             .map(|t| t.display().to_string())
             .unwrap_or_else(|_| "?".to_string());
         return Some(format!(
@@ -306,7 +311,8 @@ fn is_bpffs(p: &Path) -> bool {
 /// missing or unreadable — both shouldn't happen for our own PID.
 pub fn read_self_comm() -> Result<String> {
     // lot 311 (N6): read as bytes — a `comm` need not be UTF-8
-    let raw = std::fs::read("/proc/self/comm").context("reading /proc/self/comm")?;
+    let raw =
+        crate::kernel_roots::read_all("/proc/self/comm").context("reading /proc/self/comm")?;
     Ok(String::from_utf8_lossy(&raw)
         .trim_end_matches('\n')
         .to_string())
@@ -326,11 +332,13 @@ pub fn read_self_comm() -> Result<String> {
 /// race, not a security primitive.
 pub fn read_proc_comm(pid: u32) -> Option<String> {
     // lot 311 (N6): read as bytes — a `comm` need not be UTF-8
-    std::fs::read(format!("/proc/{pid}/comm")).ok().map(|s| {
-        String::from_utf8_lossy(&s)
-            .trim_end_matches('\n')
-            .to_string()
-    })
+    crate::kernel_roots::read_all(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| {
+            String::from_utf8_lossy(&s)
+                .trim_end_matches('\n')
+                .to_string()
+        })
 }
 
 /// bpffs pin paths for one LSM hook. Keeps the path key the

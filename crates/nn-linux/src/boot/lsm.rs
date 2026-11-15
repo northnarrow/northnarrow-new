@@ -67,7 +67,7 @@ pub fn parse(list: &str) -> BpfLsm {
 /// Read the active LSM list under `root` (`/` on a host).
 pub fn read_in(root: &Path) -> BpfLsm {
     let path = root.join(ACTIVE_LSM_REL);
-    match std::fs::read_to_string(&path) {
+    match antitamper_bpf::kernel_roots::read_to_string(&path) {
         Ok(body) => parse(&body),
         Err(e) => BpfLsm::Unknown {
             why: format!("{}: {e}", path.display()),

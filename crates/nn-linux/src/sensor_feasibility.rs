@@ -112,7 +112,7 @@ pub fn run() -> i32 {
     }
     let _ = fs::remove_dir_all(PIN_DIR);
     let mut rep = Report {
-        kernel: fs::read_to_string("/proc/sys/kernel/osrelease")
+        kernel: antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/osrelease")
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "unknown".into()),
         ..Report::default()
@@ -553,7 +553,7 @@ fn attach_symbol(prog: &mut KProbe, symbol: &str) -> Result<String, String> {
 /// `symbol.isra.0`, `symbol.constprop.0`, … listed in `/proc/kallsyms`.
 fn kallsyms_variants(symbol: &str) -> Vec<String> {
     let prefix = format!("{symbol}.");
-    let mut out: Vec<String> = fs::read_to_string("/proc/kallsyms")
+    let mut out: Vec<String> = antitamper_bpf::kernel_roots::read_to_string("/proc/kallsyms")
         .map(|t| {
             t.lines()
                 .filter_map(|l| l.split_whitespace().nth(2))
@@ -653,7 +653,10 @@ fn memfd_with_true() -> Result<File> {
     }
     let mut rw = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
     rw.write_all(&fs::read(TRUE_BIN)?)?;
-    let ro = File::open(format!("/proc/self/fd/{}", rw.as_raw_fd()))?;
+    let ro = antitamper_bpf::kernel_roots::open(
+        format!("/proc/self/fd/{}", rw.as_raw_fd()),
+        libc::O_RDONLY,
+    )?;
     drop(rw);
     Ok(ro)
 }

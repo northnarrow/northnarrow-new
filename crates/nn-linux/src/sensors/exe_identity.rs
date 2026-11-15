@@ -217,7 +217,7 @@ fn fallback_exec_path(pid: u32, filename: &str, cut: bool) -> Option<String> {
     if filename.starts_with('/') && !cut {
         return Some(lexically_normal(filename));
     }
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+    antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }

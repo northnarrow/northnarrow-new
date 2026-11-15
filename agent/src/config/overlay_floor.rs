@@ -373,6 +373,11 @@ fn verify(lines: &[&[u8]], key: &VerifyingKey) -> (RollbackFloor, Option<String>
 
 /// [`crate::audit::verify_entry`] over `region` (entry `start` first), on
 /// several threads from `parallel_from` entries — a boot after a long run.
+///
+/// Lot 353 (pre-alpha Phase 3, X6): the threads are the CPUs of the
+/// process's affinity — never `std::thread::available_parallelism`, whose
+/// cgroup quota read walks `/sys/fs/cgroup` by path: a FUSE mounted over it
+/// held the start there.
 fn check_all(
     region: &[Result<AuditEntry, String>],
     start: usize,
@@ -383,9 +388,7 @@ fn check_all(
         Ok(e) => crate::audit::verify_entry(start + i, e, key).map_err(|e| e.to_string()),
         Err(_) => Ok(()),
     };
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(8);
+    let threads = verify_threads().min(8);
     if region.len() < parallel_from || threads < 2 {
         return region
             .iter()
@@ -472,6 +475,27 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The CPUs this process may run on (`sched_getaffinity`), at least 1.
+fn verify_threads() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `cpu_set_t` is plain old data, valid when zeroed; the
+        // kernel fills it for this thread.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `set` is writable for its size.
+        if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) }
+            == 0
+        {
+            // SAFETY: `set` was filled above.
+            return (unsafe { libc::CPU_COUNT(&set) } as usize).max(1);
+        }
+        1
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

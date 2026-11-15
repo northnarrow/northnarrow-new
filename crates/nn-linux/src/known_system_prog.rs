@@ -163,7 +163,7 @@ pub fn judge(
 /// regular file owned by `owner` (root) and writable by no one else, links
 /// followed.
 pub fn packaged(root: &Path, path: &str, owner: u32) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(root.join(path.trim_start_matches('/'))).ok()?;
     (m.is_file() && m.uid() == owner && m.permissions().mode() & 0o022 == 0)
         .then(|| (m.dev(), m.ino()))
 }
@@ -223,12 +223,14 @@ impl LinkInfo {
 fn held_link(pdir: &Path, id: u32, link: KnownLink) -> Option<u32> {
     let fds = std::fs::read_dir(pdir.join("fd")).ok()?;
     for fd in fds.flatten() {
-        let is_link = std::fs::read_link(fd.path())
+        let is_link = antitamper_bpf::kernel_roots::read_link(fd.path())
             .is_ok_and(|t| t.as_os_str().as_encoded_bytes() == b"anon_inode:bpf_link");
         if !is_link {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(pdir.join("fdinfo").join(fd.file_name())) else {
+        let Ok(text) =
+            antitamper_bpf::kernel_roots::read_to_string(pdir.join("fdinfo").join(fd.file_name()))
+        else {
             continue;
         };
         let l = parse_link_fdinfo(&text);
@@ -295,7 +297,10 @@ fn holders_by(
         let Some(link_id) = held_link(&pdir, id, link) else {
             continue;
         };
-        let (Ok(exe), Some(uid)) = (std::fs::metadata(pdir.join("exe")), real_uid(&pdir)) else {
+        let (Ok(exe), Some(uid)) = (
+            antitamper_bpf::kernel_roots::metadata(pdir.join("exe")),
+            real_uid(&pdir),
+        ) else {
             continue;
         };
         let comm = crate::state_read::read_state(pdir.join("comm"))

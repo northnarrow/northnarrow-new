@@ -859,7 +859,7 @@ fn leaf_bytes(name: &str) -> Option<Vec<u8>> {
 /// the same characters, and that file is the one.
 fn fs_path(path: &str) -> std::borrow::Cow<'_, Path> {
     use std::os::unix::ffi::OsStringExt;
-    if !path.contains('\\') || std::fs::symlink_metadata(path).is_ok() {
+    if !path.contains('\\') || antitamper_bpf::kernel_roots::symlink_metadata(path).is_ok() {
         return std::borrow::Cow::Borrowed(Path::new(path));
     }
     let mut decoded = false;
@@ -2013,7 +2013,8 @@ pub fn process_drift(
     // a file's. A directory is never hashed, so only an event without
     // content needs the look.
     if content.is_none() && !child_read {
-        ident.is_dir = std::fs::symlink_metadata(fs_path(&path)).is_ok_and(|m| m.is_dir());
+        ident.is_dir = antitamper_bpf::kernel_roots::symlink_metadata(fs_path(&path))
+            .is_ok_and(|m| m.is_dir());
     }
     let new_sha256 = content.as_ref().map(|c| c.sha256.clone());
     let new_size = content.as_ref().map(|c| c.size);
@@ -2469,12 +2470,12 @@ fn read_login_unit_writer(fe: &FimEvent, writer_start: u64, proc_root: &Path, ho
     if !is_writer() {
         return;
     }
-    let Ok(image) = std::fs::metadata(dir.join("exe")) else {
+    let Ok(image) = antitamper_bpf::kernel_roots::metadata(dir.join("exe")) else {
         return;
     };
     let id = (image.dev(), image.ino());
     let packaged = uw::UTMP_IMAGES.iter().any(|p| {
-        std::fs::metadata(host_root.join(p.trim_start_matches('/')))
+        antitamper_bpf::kernel_roots::metadata(host_root.join(p.trim_start_matches('/')))
             .is_ok_and(|m| (m.dev(), m.ino()) == id)
     });
     if !packaged {
@@ -2561,7 +2562,7 @@ struct FileIdent {
 /// either.
 fn child_ident(child: &str, moved_in: bool, path_map: &InodePathMap) -> FileIdent {
     use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::symlink_metadata(fs_path(child)) else {
+    let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(fs_path(child)) else {
         return FileIdent {
             key: None,
             is_dir: false,
@@ -2661,7 +2662,7 @@ fn comm_to_string(comm: &[u8]) -> String {
 /// and size-delta check on top so a stale resolution alone can't
 /// silence a real truncation.
 fn resolve_pid_exe(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/exe"))
+    antitamper_bpf::kernel_roots::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -2976,7 +2977,7 @@ struct ChangeMark {
 
 fn change_mark(path: &str) -> Option<ChangeMark> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(fs_path(path)).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(fs_path(path)).ok()?;
     Some(ChangeMark {
         ino: m.ino(),
         ctime: m.ctime(),

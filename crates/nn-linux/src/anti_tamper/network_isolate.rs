@@ -322,7 +322,7 @@ impl NetworkIsolator {
     ) -> String {
         use nn_core::config::overlay_auth::Verified;
         let Some(gate) = &self.gate else {
-            return match std::fs::read_to_string(path) {
+            return match antitamper_bpf::kernel_roots::read_to_string(path) {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(

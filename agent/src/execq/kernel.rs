@@ -519,7 +519,7 @@ pub fn point_roots<'a>(
         if kind == 0 {
             continue;
         }
-        let Ok(st) = std::fs::metadata(path) else {
+        let Ok(st) = antitamper_bpf::kernel_roots::metadata(path) else {
             continue;
         };
         if !st.is_dir() {
@@ -541,7 +541,9 @@ pub fn point_roots<'a>(
 /// device), mount id `id`.
 #[cfg(test)]
 pub(crate) fn tmp_mount_line(id: u32) -> String {
-    let dev = std::fs::metadata("/tmp").unwrap().dev();
+    let dev = antitamper_bpf::kernel_roots::metadata("/tmp")
+        .unwrap()
+        .dev();
     format!(
         "{id} 1 {}:{} / /tmp rw - tmpfs tmpfs rw\n",
         libc::major(dev),

@@ -399,7 +399,7 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
         {
             return true;
         }
-        let Ok(cmdline) = std::fs::read(base.join("cmdline")) else {
+        let Ok(cmdline) = antitamper_bpf::kernel_roots::read_all(base.join("cmdline")) else {
             return false;
         };
         nn_core::posture::lineage::ExecIdentity::of_exec(&exe.to_string_lossy(), &argv_of(&cmdline))
@@ -415,8 +415,9 @@ fn package_transaction_running(proc_root: &std::path::Path) -> bool {
 /// transaction unlinks dnf's interpreter, which is still python.
 fn image_path(proc_pid: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::MetadataExt;
-    let exe = std::fs::read_link(proc_pid.join("exe")).unwrap_or_default();
-    let unlinked = std::fs::metadata(proc_pid.join("exe")).is_ok_and(|m| m.nlink() == 0);
+    let exe = antitamper_bpf::kernel_roots::read_link(proc_pid.join("exe")).unwrap_or_default();
+    let unlinked =
+        antitamper_bpf::kernel_roots::metadata(proc_pid.join("exe")).is_ok_and(|m| m.nlink() == 0);
     executed_path(exe, unlinked)
 }
 

@@ -1203,7 +1203,7 @@ pub fn check_decoy(path: &Path, expected_sha256: Option<&str>) -> DecoyCheck {
         found_sha256,
         key,
     };
-    let lmeta = match std::fs::symlink_metadata(path) {
+    let lmeta = match antitamper_bpf::kernel_roots::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return found(DecoyState::Missing, None, None)

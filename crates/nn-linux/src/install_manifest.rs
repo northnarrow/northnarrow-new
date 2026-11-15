@@ -193,7 +193,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// the running agent binary, `ebpf_object_sha` the hash embedded at
 /// build time (`NN_EBPF_OBJECT_SHA`).
 pub fn check(manifest_path: &Path, own_exe: &Path, ebpf_object_sha: &str) -> IntegrityOutcome {
-    let text = match std::fs::read_to_string(manifest_path) {
+    let text = match antitamper_bpf::kernel_roots::read_to_string(manifest_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return IntegrityOutcome::NoManifest {
@@ -325,7 +325,7 @@ pub enum InstallProfile {
 /// older than the field name none; the integrity verdict on the same file
 /// is [`check`]'s.
 pub fn install_profile(manifest_path: &Path, own_exe: &Path) -> InstallProfile {
-    let text = match std::fs::read_to_string(manifest_path) {
+    let text = match antitamper_bpf::kernel_roots::read_to_string(manifest_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return InstallProfile::None,
         Err(e) => return InstallProfile::Invalid(format!("unreadable: {e}")),

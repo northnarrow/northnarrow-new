@@ -253,7 +253,7 @@ fn builder_exec(root: &Path, event: &Event) -> Option<Builder> {
     let path = INITRAMFS_BUILDERS
         .iter()
         .find(|b| b.rsplit('/').next() == Some(name))?;
-    let m = std::fs::metadata(root.join(path.trim_start_matches('/'))).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(root.join(path.trim_start_matches('/'))).ok()?;
     ((stat_dev_to_kernel_dev(m.dev()), m.ino()) == (exe.dev, exe.ino)).then_some(Builder {
         start_ns: *start_ns,
         path,
@@ -325,9 +325,9 @@ fn interpreter(
     }
     let dir = proc.join(pid.to_string());
     let link = dir.join("exe");
-    let image = std::fs::read_link(&link)
+    let image = antitamper_bpf::kernel_roots::read_link(&link)
         .ok()
-        .zip(std::fs::metadata(&link).ok());
+        .zip(antitamper_bpf::kernel_roots::metadata(&link).ok());
     // after the image: still the exec's process (a pid is reused only once
     // it is reaped), with its memory
     let stat = crate::state_read::read_state(dir.join("stat")).ok();
@@ -377,7 +377,7 @@ fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
         .split(|b| *b == b' ' || *b == b'\t')
         .find(|w| !w.is_empty())?;
     let rel = std::ffi::OsStr::from_bytes(path.strip_prefix(b"/").unwrap_or(path));
-    let m = std::fs::metadata(root.join(rel)).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(root.join(rel)).ok()?;
     Some((
         String::from_utf8_lossy(path).into_owned(),
         (stat_dev_to_kernel_dev(m.dev()), m.ino()),
@@ -398,7 +398,7 @@ pub fn package_manager(proc: &Path, pid: u32) -> Option<String> {
             return None;
         }
         let dir = proc.join(p.to_string());
-        if let Ok(exe) = std::fs::read_link(dir.join("exe")) {
+        if let Ok(exe) = antitamper_bpf::kernel_roots::read_link(dir.join("exe")) {
             let exe = exe.to_string_lossy().into_owned();
             if PACKAGE_MANAGER_EXES.contains(&exe.as_str()) && real_uid(&dir) == Some(0) {
                 return Some(exe);
@@ -449,7 +449,7 @@ fn program(root: &Path, exe: &ExeIdentity) -> Result<(), String> {
     }
     let kmod: Vec<_> = KMOD_PATHS
         .iter()
-        .filter_map(|p| std::fs::metadata(root.join(p)).ok())
+        .filter_map(|p| antitamper_bpf::kernel_roots::metadata(root.join(p)).ok())
         .map(|m| (stat_dev_to_kernel_dev(m.dev()), m.ino()))
         .collect();
     // two files, not one under two names (a merged /usr): neither is the

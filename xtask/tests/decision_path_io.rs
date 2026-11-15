@@ -50,6 +50,14 @@ use support::{is_test_file, matching_brace, production, repo_root, rs_files, str
 const MARKERS: &[&str] = &[
     ".await",
     "std::fs::",
+    // lot 353: the standard library's path calls beneath the kernel's views'
+    // anchored roots (`antitamper_bpf::kernel_roots`) — blocking I/O all the
+    // same, counted as the calls they stand for
+    "kernel_roots::",
+    "kernel_roots::read",
+    "kernel_roots::write",
+    "kernel_roots::metadata",
+    "kernel_roots::symlink_metadata",
     "fs::read",
     "fs::write",
     "fs::metadata",
@@ -156,7 +164,11 @@ const OFF_PATH: &[(&str, &[&str], &str)] = &[
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "agent/src/run_loop.rs",
-        13,
+        // lot 353: 13 → 17, the lab's `debug-walk-on-workers` trigger
+        // (debug-trigger builds only: its file read and removed, the CPU
+        // count, the path walked by every runtime worker — rc2's stall,
+        // reproduced)
+        17,
         "the event loop's task, not the decision thread: the lab builds' trigger files read \
          and the stall's sleep (`debug_*`, debug-trigger builds; R12c: the crash between an \
          action's intent and its outcome), the thread scope and the dispatcher's stop run off \
@@ -269,11 +281,6 @@ const KNOWN: &[(&str, usize, &str)] = &[
         3,
         "the per-rule policy's exemption facts (a process's uid, cgroup, executable digest \
          from /proc), read once per process and cached — the next step after R-F",
-    ),
-    (
-        "crates/nn-core/src/posture/host.rs",
-        1,
-        "the posture host's trait: the production host's file read, named once",
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",

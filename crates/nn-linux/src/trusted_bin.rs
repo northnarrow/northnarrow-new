@@ -149,7 +149,9 @@ impl Lookup {
     /// The tree at `root`, judged against the owner of `root` itself (root
     /// for the host's `/`).
     pub fn under(root: &Path) -> Self {
-        let owner = fs::metadata(root).map(|m| m.uid()).unwrap_or(0);
+        let owner = antitamper_bpf::kernel_roots::metadata(root)
+            .map(|m| m.uid())
+            .unwrap_or(0);
         Self::new(root, owner)
     }
 
@@ -184,7 +186,7 @@ impl Lookup {
                 searched.push(canon);
             }
             let found = self.host_path(dir).join(name);
-            match fs::symlink_metadata(&found) {
+            match antitamper_bpf::kernel_roots::symlink_metadata(&found) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     refused.push(format!("{}: {e}", found.display()));
@@ -232,7 +234,8 @@ impl Lookup {
                 exe.display()
             ));
         }
-        let meta = fs::metadata(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        let meta = antitamper_bpf::kernel_roots::metadata(&exe)
+            .map_err(|e| format!("{}: {e}", exe.display()))?;
         if !meta.is_file() {
             return Err(format!("{} is not a regular file", exe.display()));
         }
@@ -249,7 +252,8 @@ impl Lookup {
         for start in [parent, found_dir.as_path()] {
             let mut dir = start;
             loop {
-                let meta = fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let meta = antitamper_bpf::kernel_roots::metadata(dir)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
                 self.owned_and_closed(dir, &meta)?;
                 if dir == root {
                     break;

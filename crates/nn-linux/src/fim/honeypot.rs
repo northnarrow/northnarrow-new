@@ -134,7 +134,7 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
         // External audit FIMR-009: judged without following a link. A link
         // to an existing file was "present", and the restore wrote through
         // a dangling one.
-        match fs::symlink_metadata(p) {
+        match antitamper_bpf::kernel_roots::symlink_metadata(p) {
             Ok(m) if m.file_type().is_file() => {
                 present += 1;
                 continue;
@@ -144,7 +144,7 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
                 // Removes the link itself (or an empty directory), never
                 // what it points to.
                 let removed = if m.is_dir() {
-                    fs::remove_dir(p)
+                    antitamper_bpf::kernel_roots::remove_dir(p)
                 } else {
                     fs::remove_file(p)
                 };
@@ -179,7 +179,9 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
 /// parent is created at [`BAIT_DIR_MODE`]; an existing one keeps its mode.
 fn create_bait(path: &Path, template: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && fs::symlink_metadata(parent).is_err() {
+        if !parent.as_os_str().is_empty()
+            && antitamper_bpf::kernel_roots::symlink_metadata(parent).is_err()
+        {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(BAIT_DIR_MODE)
@@ -206,7 +208,7 @@ pub const BOOT_ID_FILE: &str = "last_boot_id";
 
 /// The kernel's boot id, `None` when it cannot be read.
 pub fn current_boot_id() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -217,7 +219,8 @@ pub fn current_boot_id() -> Option<String> {
 /// (first run, an unreadable one) counts as a reboot: the `/run` baits are
 /// then missing as after one.
 pub fn boot_changed(state_dir: &Path, now: &str) -> bool {
-    fs::read_to_string(state_dir.join(BOOT_ID_FILE)).map_or(true, |last| last.trim() != now)
+    antitamper_bpf::kernel_roots::read_to_string(state_dir.join(BOOT_ID_FILE))
+        .map_or(true, |last| last.trim() != now)
 }
 
 /// Record `now` in `state_dir`: a temporary created exclusively, then

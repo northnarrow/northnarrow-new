@@ -822,8 +822,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let Ok(dir) = H::read_dir(&self.proc_root) else {
             return;
         };
-        for e in dir.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+        for name in dir {
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
                 continue;
             };
             // the boot's scan (and its rescans): the processes running now
@@ -1350,8 +1350,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
                         .fold(self.cgroup_root.clone(), |d, c| d.join(c)),
                 )
             })?;
-        for e in H::read_dir(&dir).ok()? {
-            if e.ok()?.file_type().ok()?.is_dir() {
+        for name in H::read_dir(&dir).ok()? {
+            if H::is_dir(&dir.join(name)) {
                 return None;
             }
         }

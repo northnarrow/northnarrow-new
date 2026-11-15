@@ -2719,3 +2719,78 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 | A sudo or su further up covers what runs below `su bob` / `sudo -u bob` (an administrator's `sudo -i`, `su bob`, then a root payload of bob's: the administrator's session) | the session check | a hop below that ran as another user as a barrier (a decision of its own) |
 | `is_credential_reader` trusts any direct child of an authentication binary — sudo's askpass helper in `/home` or `/tmp` included — for SensitiveFileAccess and the service-uid credential read (reads its DAC already allows, or under an LPE that root's own exclusion already silences) | the posture triggers | only a child whose image is in a root-owned system tree (`in_system_tree`): sshd's login shell keeps it, an askpass helper in a home loses it |
 | A sudo session older than the agent's start: its caller is not read (`/proc` shows sudo as root once it has authenticated); an askpass helper root through an LPE at an agent restart, inside sudo's timeout | the session check | needs an agent restart, which a user cannot cause |
+
+## 47. A mount cannot stall the agent; stuck restarts are named and a loop is signed (lot 353)
+
+The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
+`/sys/fs/cgroup` that never answered the agent's threads. The integrity
+round's read of the agent's own `memory.max` and the kernel-state round's
+open of the cgroup root waited in the kernel — on the runtime's worker
+threads, with every thread that looked up the same names behind them — and
+the admin socket stopped answering the watchdog. Its stuck recovery
+(SIGINT, SIGKILL after 5 s) restarted an agent that had recorded nothing,
+and the signed log showed a clean `agent_stop` `sigint`.
+
+- **The kernel's views are read beneath the roots the agent's start
+  anchored.** `/proc`, `/sys` and the cgroup2 root are opened once, at the
+  start, and checked to be the kernel's own file systems
+  (`antitamper_bpf::kernel_roots`); every read of them — the shared state
+  readers, the mount table, the process table, the integrity and kernel-
+  state rounds, the cgroup floors and guards, the responses' cgroups — is
+  opened beneath those roots, crossing no mount (`openat2`,
+  `RESOLVE_NO_XDEV`). A mount laid over a view since is not walked: the
+  agent keeps reading the real files. A path that crosses a mount below a
+  view is read only when that mount is one of the kernel's file systems
+  (securityfs, tracefs, binfmt_misc, a cgroup v1 controller…), within a
+  2-second deadline; **a FUSE, a tmpfs or a disk's file system mounted below
+  `/proc` or `/sys` is refused** (the read fails: "not the kernel's").
+  Nothing is crossed below the cgroup2 root.
+- **A view already covered when the agent starts is not read** (a restart
+  under the mount): its reads fail at once, naming why, and the start signs
+  a `kernel_views` degradation.
+- **The integrity and kernel-state rounds run off the runtime's worker
+  threads**: a read that blocks never holds the admin socket's tasks.
+- **A mount over the kernel's views is signed High.** `mount_over_protected`
+  now also covers a mount at `/proc`, `/sys` or `/sys/fs/cgroup` of another
+  file system than theirs, and a mount below `/proc` or `/sys` of a file
+  system not the kernel's; the detail names the mount, its file system and
+  its source. **Every `mount_over_protected` row carries `"severity":
+  "high"`** (the R003 bind over `/etc` included). A host that mounts its own
+  non-kernel file system below `/proc` or `/sys` in PID 1's namespace (none
+  of the supported distributions does; containers' masks are in their own
+  namespaces) now has this row.
+- **The watchdog's stuck recovery names its cause.** Before its SIGINT it
+  records which ping failed, how many in a row and for how long
+  (`stuck_unresponsive`, signed by the agent at its next round) and leaves a
+  marker (`/run/northnarrow/watchdog.stuck`) the agent reads at that SIGINT:
+  the stop is `stuck_unresponsive` — its `agent_stop` row, its heartbeat
+  stop beat, a non-zero exit — and `heartbeat watch` says `DEGRADED`,
+  naming the stuck recovery. An operator's SIGINT is still a clean `sigint`.
+- **A restart loop is signed High.** Three stuck recoveries within 10
+  minutes are `agent_restart_loop` (High), a degradation in `nn-admin
+  status`, and `DEGRADED: … (a restart loop)` in the watchdog unit's status.
+- **A stuck recovery that fails is signed High** (`stuck_recovery_failed`,
+  once per stuck signal — at most one a minute — and the unit's status says
+  `DEGRADED` meanwhile; the watchdog holds no key, the next agent signs it).
+- **The watchdog aborts a FUSE holding the agent.** When the stuck
+  recovery's SIGKILL cannot end the agent (a thread of it waiting,
+  uninterruptibly, on a FUSE request its daemon never answers — 6.12), the
+  watchdog aborts that FUSE connection (`/sys/fs/fuse/connections/<id>/abort`)
+  and records `fuse_aborted` (High: the mount, its source, the connection,
+  the outcome): only a FUSE mounted over `/proc`, `/sys` (the cgroup tree)
+  or the agent's own directories (at or above them, never `/`), in the
+  agent's or PID 1's mount table, whose connection has requests waiting —
+  never a user's FUSE elsewhere. Self-protection: enforced under every
+  profile, `alpha` included.
+- **The agent counts its CPUs without walking the cgroup tree**
+  (`kernel_roots::available_parallelism`: the runtime's workers, the audit
+  log's parallel check): std's count reads the cgroup's `cpu.max` by path.
+  A mount's root (the open sensor's and the exec quarantine's mount rounds)
+  is read beneath the views and from the kernel's cache, never asking a FUSE
+  mounted over its point.
+
+Not done here (P3, recorded): the signed logs are opened through
+`/proc/self/fd/<dir>/<name>` (`anchored`, review entry 44), a walk of
+`/proc` — a FUSE over the whole `/proc` would hold their appends; a
+cgroup2 subtree bound over the cgroup root before the agent's first start
+is the cgroup2 file system and is read (the re-check of #558, N3).

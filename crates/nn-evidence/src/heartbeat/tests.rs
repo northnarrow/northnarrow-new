@@ -1519,6 +1519,45 @@ fn a_late_beat_is_measured_within_the_agent_s_bounds() {
     }
 }
 
+/// Lot 353 (named, pre-alpha Phase 3 X6): a stop the watchdog's stuck
+/// recovery made — its SIGINT, after STATUS pings the agent did not
+/// answer — is no clean stop: followed by the next start it is DEGRADED,
+/// and the alert says it was the stuck recovery. A plain SIGINT stays
+/// clean.
+#[test]
+fn a_stuck_recovery_stop_is_degraded_and_named() {
+    assert!(!CLEAN_STOP_REASONS.contains(&STUCK_STOP_REASON));
+    let run = |reason: &str| {
+        let mut c = Chain::new();
+        c.push(beat(1, 0));
+        let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+            .state
+            .unwrap();
+        let mut stop = beat(2, 10);
+        stop.kind = BeatKind::Stop;
+        stop.stop_reason = Some(reason.to_string());
+        c.push(stop);
+        let mut start = beat(3, 20);
+        start.kind = BeatKind::Start;
+        start.run = "bbbbbbbbbbbbbbbb".into();
+        c.push(start);
+        check(Ok(&c.lines()), &c.pk, Some(&s), at(21), &cfg())
+    };
+    let r = run(STUCK_STOP_REASON);
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert!(
+        r.alerts[0].detail().contains(
+            "stopped at beat 2 (stuck_unresponsive) and started again: not a clean stop — the \
+             watchdog's stuck recovery"
+        ),
+        "{r:?}"
+    );
+    assert!(
+        run("sigint").alerts.is_empty(),
+        "an operator's SIGINT stays clean"
+    );
+}
+
 /// BUG01 (the triage's case beside it): a stop beat that is not the newest
 /// was followed by the next run's start, and STOPPED never named its
 /// reason. A reason that is not a clean stop's (a pump that exited, a

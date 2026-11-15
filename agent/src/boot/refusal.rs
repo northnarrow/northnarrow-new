@@ -435,7 +435,7 @@ fn in_dir(dir: &File, name: &OsStr) -> PathBuf {
 
 /// What sits at `path`, named without following it or reading it.
 fn what_is(path: &Path) -> &'static str {
-    match std::fs::symlink_metadata(path).map(|m| m.file_type()) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(path).map(|m| m.file_type()) {
         Ok(t) if t.is_symlink() => "a symbolic link",
         Ok(t) if t.is_dir() => "a directory",
         Ok(t) if t.is_file() => "a regular file",
@@ -503,7 +503,7 @@ impl FallbackDir {
                 pmeta.mode() & 0o7777
             ));
         }
-        let up = std::fs::symlink_metadata(in_dir(&parent, OsStr::new("..")))
+        let up = antitamper_bpf::kernel_roots::symlink_metadata(in_dir(&parent, OsStr::new("..")))
             .map_err(|e| format!("lstat {}/..: {e}", pid_dir.display()))?;
         if up.dev() != pmeta.dev() {
             return Err(format!(
@@ -654,8 +654,11 @@ impl FallbackDir {
     fn remove(&self, name: &OsStr) -> std::io::Result<()> {
         let at = in_dir(&self.dir, name);
         match std::fs::remove_file(&at) {
-            Err(e) if std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir()) => {
-                std::fs::remove_dir(&at).map_err(|_| e)
+            Err(e)
+                if antitamper_bpf::kernel_roots::symlink_metadata(&at)
+                    .is_ok_and(|m| m.is_dir()) =>
+            {
+                antitamper_bpf::kernel_roots::remove_dir(&at).map_err(|_| e)
             }
             r => r,
         }

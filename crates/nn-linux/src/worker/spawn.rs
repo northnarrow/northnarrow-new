@@ -88,10 +88,25 @@ fn yield_first() -> io::Result<()> {
     // SAFETY: a static NUL-terminated path; a local descriptor written
     // from a static buffer and closed.
     unsafe {
-        let fd = libc::open(
-            c"/proc/self/oom_score_adj".as_ptr(),
-            libc::O_WRONLY | libc::O_CLOEXEC,
-        );
+        // lot 353: beneath the `/proc` root the core's start anchored (no
+        // mount laid over `/proc` since is walked; no allocation)
+        let anchored = match antitamper_bpf::kernel_roots::proc_root_fd().filter(|fd| *fd > IPC_FD)
+        {
+            Some(proc) => libc::openat(
+                proc,
+                c"self/oom_score_adj".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            ),
+            None => -1,
+        };
+        let fd = if anchored >= 0 {
+            anchored
+        } else {
+            libc::open(
+                c"/proc/self/oom_score_adj".as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }

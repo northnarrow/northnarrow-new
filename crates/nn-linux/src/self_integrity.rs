@@ -55,6 +55,10 @@ pub const BASE_SECS: u64 = 30;
 /// lab PR 241).
 pub const AUDIT_OP: &str = crate::audit::INTEGRITY_DRIFT_OP;
 
+/// Lot 353: the degradation's source when the watchdog recorded a restart
+/// loop of stuck recoveries (`agent_restart_loop`).
+pub const RESTART_LOOP_DEGRADATION: &str = "agent_restart_loop";
+
 /// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
 /// watchdog's `OnFailure=` handler too — masked or overridden, systemd's
 /// giving up on the watchdog would leave no record.
@@ -488,7 +492,7 @@ pub fn unit_shadows(roots: &[&Path]) -> Vec<Finding> {
         let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
         for root in roots {
             let path = root.join(unit);
-            if std::fs::symlink_metadata(&path).is_err() {
+            if antitamper_bpf::kernel_roots::symlink_metadata(&path).is_err() {
                 continue;
             }
             let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -737,9 +741,60 @@ fn mounts_over_protected(
                 kind: "tracefs_mount",
                 detail: format!("{mp} ({fstype}, source root {root})"),
             });
+        } else if let Some(f) = over_kernel_view(m) {
+            out.push(f);
         }
     }
     out
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): the kernel's views the agent reads —
+/// each mount point and the file systems that are its own there (a tmpfs
+/// at `/sys/fs/cgroup` is a hybrid or legacy cgroup host's).
+pub const KERNEL_VIEWS: &[(&str, &[&str])] = &[
+    ("/proc", &["proc"]),
+    ("/sys", &["sysfs"]),
+    ("/sys/fs/cgroup", &["cgroup2", "tmpfs"]),
+];
+
+/// Lot 353: a mount over one of the kernel's views ([`KERNEL_VIEWS`]) of
+/// another file system than its own, or below `/proc` or `/sys` of a file
+/// system not the kernel's (`antitamper_bpf::kernel_roots::KERNEL_MAGICS`:
+/// securityfs, tracefs, binfmt_misc, a cgroup v1 controller… are) — a FUSE
+/// over `/sys/fs/cgroup` that does not answer, a tmpfs copy over
+/// `/proc/sys/kernel`. A `mount_over_protected`, naming the mount, its file
+/// system and its source. The agent reads beneath the roots its start
+/// anchored and is not held by it; every other reader of the host is.
+/// Another mount namespace's mounts (a container's own cgroupfs and
+/// `/proc` masks) are not in the table read.
+fn over_kernel_view(m: &Mount) -> Option<Finding> {
+    let (mp, fstype) = (m.mount_point.as_str(), m.fstype.as_str());
+    let source = m.entry.source.to_string_lossy();
+    let named = |what: String| Finding {
+        kind: "mount_over_protected",
+        detail: format!(
+            "{mp} ({fstype}, source {source}, source root {}) {what}",
+            m.root
+        ),
+    };
+    if let Some((view, own)) = KERNEL_VIEWS.iter().find(|(v, _)| *v == mp) {
+        return (!own.contains(&fstype)).then(|| {
+            named(format!(
+                "over the kernel's view {view}, which is {}: a reader of the host walks into it",
+                own.join(" or ")
+            ))
+        });
+    }
+    let below = ["/proc/", "/sys/"].iter().find(|v| mp.starts_with(*v))?;
+    let kernel = antitamper_bpf::kernel_roots::KERNEL_MAGICS
+        .iter()
+        .any(|(_, name)| *name == fstype);
+    (!kernel).then(|| {
+        named(format!(
+            "below the kernel's view {}, not one of the kernel's file systems",
+            below.trim_end_matches('/')
+        ))
+    })
 }
 
 /// Which namespace a [`MountWatch`] baseline was read from.
@@ -970,7 +1025,8 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
 }
 
 fn read_trim(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
+    // lot 353: a kernel file beneath the view's root the start anchored
+    antitamper_bpf::kernel_roots::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
 }
@@ -1015,7 +1071,7 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
             }
         }
     }
-    if let Some(x) = std::fs::read_to_string("/proc/self/limits")
+    if let Some(x) = antitamper_bpf::kernel_roots::read_to_string("/proc/self/limits")
         .ok()
         .as_deref()
         .and_then(core_limit)
@@ -1126,6 +1182,21 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "the watchdog found the agent's event loop standing still while its \
                              admin socket answered",
                         ),
+                        // Lot 353 (pre-alpha Phase 3, X6): the stuck
+                        // recovery named, and the loop it can turn into.
+                        wh::REASON_STUCK_UNRESPONSIVE => (
+                            "stuck_unresponsive",
+                            "the watchdog's stuck recovery stopped an agent that did not answer",
+                        ),
+                        wh::REASON_AGENT_RESTART_LOOP => (
+                            "agent_restart_loop",
+                            "the watchdog's stuck recovery restarted the agent again and again",
+                        ),
+                        wh::REASON_FUSE_ABORTED => (
+                            "fuse_aborted",
+                            "the watchdog found the agent held in a FUSE request over a path it \
+                             depends on and aborted that FUSE connection",
+                        ),
                         wh::REASON_HOLD_RETRY => (
                             "watchdog_hold",
                             "the holding watchdog tried to start the agent again",
@@ -1175,6 +1246,18 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
             Finding { kind, detail }
         })
         .collect()
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): the detail of the stuck marker the
+/// watchdog left at `path` before its stuck recovery's SIGINT, when it
+/// names this agent (`pid`) and is fresh at `now` (unix seconds) — the
+/// SIGINT then stops the agent as `stuck_unresponsive`, never as an
+/// operator's `sigint`. The marker is removed (read once); one that names
+/// another agent, or is stale, names nothing.
+pub fn take_stuck_marker(path: &Path, pid: u32, now: u64) -> Option<String> {
+    let text = crate::state_read::read_state(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    nn_proto::watchdog_hold::stuck_marker_names(&text, pid, now)
 }
 
 /// Lab PR 216 (static review TD-10): the watchdog the agent had verified
@@ -1277,7 +1360,7 @@ fn parse_mem_total(meminfo: &str) -> Option<u64> {
 }
 
 fn mem_total_bytes() -> Option<u64> {
-    parse_mem_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    parse_mem_total(&antitamper_bpf::kernel_roots::read_to_string("/proc/meminfo").ok()?)
 }
 
 /// The agent's own cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
@@ -1353,7 +1436,7 @@ pub fn relax_oom_score_adj() {
     };
     let memory_max = memory_max.unwrap_or_default();
     let mem_total = mem_total.unwrap_or_default();
-    match std::fs::write(path, to.to_string()) {
+    match antitamper_bpf::kernel_roots::write(path, to.to_string()) {
         Ok(()) => warn!(
             memory_max,
             mem_total,
@@ -1820,8 +1903,8 @@ impl Checker {
     /// This round's mount findings ([`mount_round`] on the live files).
     fn read_mounts(&mut self) -> Vec<Finding> {
         mount_round(
-            std::fs::read(MOUNTINFO_HOST),
-            || std::fs::read(MOUNTINFO_OWN),
+            crate::mountinfo::read_bytes(Path::new(MOUNTINFO_HOST)),
+            || crate::mountinfo::read_bytes(Path::new(MOUNTINFO_OWN)),
             &self.own_files,
             &mut self.mounts,
         )
@@ -1868,8 +1951,20 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
-        if f.kind == "own_dropin_weakening" {
+        // lot 353: a mount over the agent's paths or the kernel's views it
+        // reads (pre-alpha R003, X6) is High too
+        if f.kind == "own_dropin_weakening"
+            || f.kind == "mount_over_protected"
+            || f.kind == "agent_restart_loop"
+            || f.kind == "fuse_aborted"
+            || f.kind == "stuck_recovery_failed"
+        {
             extra["severity"] = "high".into();
+        }
+        // lot 353: a restart loop is a degradation of the agent's status
+        // (`nn-admin status`) for the rest of this run
+        if f.kind == "agent_restart_loop" {
+            crate::boot::degradation::report(RESTART_LOOP_DEGRADATION, &f.detail);
         }
         if reappeared > 0 {
             extra["reappeared"] = reappeared.into();
@@ -1965,7 +2060,7 @@ impl Checker {
         // offline) is a credential for whoever is root here. Seen through
         // PID 1's mount namespace when it can be reached (the unit's own
         // view of /root is read-only, not hidden, so either works).
-        let root = if std::fs::metadata("/proc/1/root/").is_ok() {
+        let root = if antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok() {
             Path::new("/proc/1/root")
         } else {
             Path::new("/")
@@ -1990,9 +2085,9 @@ impl Checker {
             let in_unit = now
                 .iter()
                 .any(|(n, v)| n == LIMIT_CGROUP && v == AGENT_UNIT_CGROUP);
-            let unit_exists = Path::new("/sys/fs/cgroup")
-                .join(AGENT_UNIT_CGROUP.trim_start_matches('/'))
-                .is_dir();
+            let unit_exists = antitamper_bpf::kernel_roots::is_dir(
+                Path::new("/sys/fs/cgroup").join(AGENT_UNIT_CGROUP.trim_start_matches('/')),
+            );
             if in_unit || unit_exists {
                 // External audit DEP-005: the same test the boot took
                 // (`relax_oom_score_adj`); unreadable is "binds", as there.
@@ -2158,7 +2253,13 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     tokio::spawn(async move {
         // the watchdog registers a few seconds after the agent
         tokio::time::sleep(Duration::from_secs(15)).await;
-        checker.round(true);
+        // Lot 353 (pre-alpha Phase 3, X6): the round's reads of the kernel's
+        // files go beneath the roots the start anchored
+        // (`antitamper_bpf::kernel_roots`), and the round runs off the
+        // runtime's worker: its read of the agent's own `memory.max`
+        // through a FUSE mounted over `/sys/fs/cgroup` held a worker, and
+        // the admin socket stopped answering the watchdog.
+        crate::runtime::off_the_runtime(|| checker.round(true));
         loop {
             let nap = jittered(Duration::from_secs(BASE_SECS));
             let t0 = std::time::Instant::now();
@@ -2179,7 +2280,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
                     false,
                 );
             }
-            checker.round(false);
+            crate::runtime::off_the_runtime(|| checker.round(false));
         }
     });
 }
@@ -2249,6 +2350,104 @@ mod tests {
             },
         );
         assert!(f.detail.contains("no watchdog is verified"), "{}", f.detail);
+    }
+
+    /// Lot 353 (named, pre-alpha Phase 3 X6): the watchdog's stuck recovery
+    /// and its restart loop are signed under their own kinds — the loop
+    /// High, and a degradation of the agent's status — naming what failed.
+    #[test]
+    fn a_stuck_recovery_and_a_restart_loop_are_signed() {
+        use nn_proto::watchdog_hold as wh;
+        let dir = tempfile::tempdir().unwrap();
+        let holds = dir.path().join("watchdog.hold");
+        let rec = |reason: &str, detail: &str| wh::HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 4242,
+            reason: reason.to_string(),
+            detail: detail.to_string(),
+            unit_state: None,
+        };
+        std::fs::write(
+            &holds,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&rec(
+                    wh::REASON_STUCK_UNRESPONSIVE,
+                    "the agent did not answer 2 STATUS pings in a row"
+                ))
+                .unwrap(),
+                serde_json::to_string(&rec(wh::REASON_AGENT_RESTART_LOOP, "3 stuck recoveries"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let f = watchdog_holds(&holds);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert_eq!(f[0].kind, "stuck_unresponsive");
+        assert!(
+            f[0].detail.contains("did not answer 2 STATUS pings"),
+            "{}",
+            f[0].detail
+        );
+        assert_eq!(f[1].kind, "agent_restart_loop");
+        let (c, path) = checker_with_log(dir.path());
+        for x in &f {
+            c.record_detected(x, true, 0);
+        }
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let row = |kind: &str| {
+            rows.iter()
+                .find(|r| r["extra"]["kind"] == kind)
+                .unwrap_or_else(|| panic!("{kind}: {rows:?}"))
+                .clone()
+        };
+        assert_eq!(row("agent_restart_loop")["extra"]["severity"], "high");
+        assert!(row("stuck_unresponsive")["extra"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("STATUS pings"));
+        let now = crate::boot::degradation::snapshot();
+        assert!(
+            now.iter().any(
+                |d| d.starts_with(RESTART_LOOP_DEGRADATION) && d.contains("3 stuck recoveries")
+            ),
+            "{now:?}"
+        );
+    }
+
+    /// Lot 353 (named): the stuck marker names the SIGINT of the agent it
+    /// names, fresh — read once (removed); another agent's, or a stale one,
+    /// names nothing.
+    #[test]
+    fn the_stuck_marker_names_only_its_own_agent_s_fresh_stop() {
+        use nn_proto::watchdog_hold as wh;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watchdog.stuck");
+        let write = |pid: u32, at: u64| {
+            let r = wh::HoldRecord {
+                at,
+                agent_pid: pid,
+                reason: wh::REASON_STUCK_UNRESPONSIVE.to_string(),
+                detail: "the agent did not answer 2 STATUS pings in a row".to_string(),
+                unit_state: None,
+            };
+            std::fs::write(&path, serde_json::to_string(&r).unwrap()).unwrap();
+        };
+        let now = 1_800_000_100;
+        write(4242, now - 3);
+        assert!(take_stuck_marker(&path, 4242, now).is_some_and(|d| d.contains("2 STATUS pings")));
+        assert!(!path.exists(), "read once");
+        assert_eq!(take_stuck_marker(&path, 4242, now), None, "none left");
+        write(4243, now - 3);
+        assert_eq!(take_stuck_marker(&path, 4242, now), None, "another agent's");
+        write(4242, now - wh::STUCK_MARKER_MAX_AGE_SECS - 1);
+        assert_eq!(take_stuck_marker(&path, 4242, now), None, "stale");
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(take_stuck_marker(&path, 4242, now), None);
     }
 
     #[test]
@@ -2593,6 +2792,96 @@ mod tests {
             .starts_with("/etc/systemd/system/northnarrow-agent.service"));
     }
 
+    /// Lot 353 (named, pre-alpha Phase 3 X6): a FUSE mounted over the
+    /// cgroup2 root — the one that held the agent's threads — is a
+    /// `mount_over_protected` naming the mount, its file system and its
+    /// source; so is one over `/proc` or `/sys`, and a file system not the
+    /// kernel's below them.
+    #[test]
+    fn a_mount_over_the_kernel_s_views_is_a_mount_over_protected() {
+        let host = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+25 24 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+26 24 0:23 / /proc rw,nosuid,nodev,noexec,relatime shared:3 - proc proc rw
+27 25 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate
+";
+        assert!(mount_findings(host, &[]).is_empty(), "the stock views");
+        let fuse = format!(
+            "{host}900 27 0:91 / /sys/fs/cgroup rw,nosuid,nodev,relatime shared:500 - fuse.nnf03 nnf03 rw,user_id=0,group_id=0,allow_other\n"
+        );
+        let f = mount_findings(&fuse, &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert_eq!(
+            f[0].detail,
+            "/sys/fs/cgroup (fuse.nnf03, source nnf03, source root /) over the kernel's view \
+             /sys/fs/cgroup, which is cgroup2 or tmpfs: a reader of the host walks into it"
+        );
+        for (line, at) in [
+            ("901 26 0:92 / /proc rw - fuse.x x rw", "/proc (fuse.x, source x"),
+            ("902 24 8:1 /srv/sys /sys rw - ext4 /dev/sda1 rw", "/sys (ext4, source /dev/sda1"),
+            (
+                "903 26 0:93 / /proc/sys/kernel rw - tmpfs tmpfs rw",
+                "/proc/sys/kernel (tmpfs, source tmpfs, source root /) below the kernel's view /proc",
+            ),
+            (
+                "904 27 0:94 / /sys/fs/cgroup/system.slice rw - fuse.y y rw",
+                "/sys/fs/cgroup/system.slice (fuse.y, source y, source root /) below the kernel's \
+                 view /sys",
+            ),
+            (
+                "905 26 8:1 /tmp/stat /proc/stat rw - ext4 /dev/sda1 rw",
+                "/proc/stat (ext4, source /dev/sda1, source root /tmp/stat) below",
+            ),
+        ] {
+            let f = mount_findings(format!("{host}{line}\n"), &[]);
+            assert_eq!(f.len(), 1, "{line}: {f:?}");
+            assert_eq!(f[0].kind, "mount_over_protected", "{line}");
+            assert!(f[0].detail.starts_with(at), "{line}: {}", f[0].detail);
+        }
+    }
+
+    /// Lot 353 (no false positive): the kernel's own mounts below the views
+    /// on stock hosts — Ubuntu and Debian's securityfs, pstore, bpffs,
+    /// debugfs, tracefs, fusectl, configfs, efivarfs, binfmt_misc behind
+    /// systemd's autofs, an NFS server's nfsd, a hybrid host's tmpfs and v1
+    /// controllers — and a container host's own mounts (Docker's overlays,
+    /// its network namespaces, a kubelet's tmpfs: a container's cgroupfs
+    /// and `/proc` masks are in its own namespace, not this table) are not
+    /// drift.
+    #[test]
+    fn the_kernel_s_own_mounts_below_the_views_are_not_drift() {
+        let host = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+25 24 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+26 24 0:23 / /proc rw,nosuid,nodev,noexec,relatime shared:3 - proc proc rw
+28 25 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:5 - securityfs securityfs rw
+29 25 0:27 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:6 - tmpfs tmpfs ro,mode=755
+30 29 0:28 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec,relatime shared:7 - cgroup2 cgroup2 rw,nsdelegate
+31 29 0:29 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:8 - cgroup cgroup rw,xattr,name=systemd
+32 29 0:33 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,memory
+33 25 0:30 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:9 - pstore pstore rw
+34 25 0:31 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:10 - efivarfs efivarfs rw
+35 25 0:32 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:11 - bpf bpf rw,mode=700
+36 26 0:34 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct
+37 25 0:12 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:14 - debugfs debugfs rw
+38 25 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:15 - tracefs tracefs rw
+39 25 0:35 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:16 - fusectl fusectl rw
+40 25 0:36 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:17 - configfs configfs rw
+41 36 0:37 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:18 - binfmt_misc binfmt_misc rw
+42 26 0:38 / /proc/fs/nfsd rw,relatime shared:19 - nfsd nfsd rw
+50 24 0:40 / /var/lib/docker/overlay2/abc/merged rw,relatime shared:30 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+51 24 0:4 net:[4026532300] /run/docker/netns/1a2b rw shared:31 - nsfs nsfs rw
+52 24 0:41 / /var/lib/kubelet/pods/p/volumes/kubernetes.io~projected/t rw,relatime shared:32 - tmpfs tmpfs rw
+53 24 0:42 / /var/lib/lxcfs rw,nosuid,nodev,relatime shared:33 - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other
+";
+        assert!(
+            mount_findings(host, &[]).is_empty(),
+            "{:?}",
+            mount_findings(host, &[])
+        );
+    }
+
     /// External audit NN-AUD-098: the tracefs a stock host mounts (and the
     /// debugfs automount) is not drift; a tmpfs over it, a file mounted
     /// over one `format`, or a tracefs subtree bound at the root is.
@@ -2606,8 +2895,11 @@ mod tests {
 95 35 0:60 / /sys/kernel/tracing rw,relatime shared:60 - tmpfs tmpfs rw
 96 35 0:61 /f /sys/kernel/tracing/events/sched/sched_process_exec/format rw shared:61 - tmpfs tmpfs rw
 97 37 0:12 /instances/x /sys/kernel/debug/tracing rw shared:62 - tracefs tracefs rw
-98 24 8:1 / /sys/kernel/tracing-not rw shared:63 - ext4 /dev/sda1 rw
+98 24 0:62 / /sys/kernel/tracing-not rw shared:63 - configfs configfs rw
 ";
+        // lot 353: the sibling of the tracefs root is a kernel file system
+        // here (an ext4 below /sys is a `mount_over_protected` of its own
+        // now: `a_mount_over_the_kernel_s_views_is_a_mount_over_protected`)
         let f = mount_findings(mi, &[]);
         let kinds: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
         assert_eq!(
@@ -3255,6 +3547,35 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Lot 353 (named): a mount over the agent's paths or the kernel's
+    /// views is signed High (pre-alpha R003 and X6), with the mount and its
+    /// source in the record.
+    #[test]
+    fn a_mount_over_protected_is_signed_high() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, path) = checker_with_log(dir.path());
+        let f = finding(
+            "mount_over_protected",
+            "/sys/fs/cgroup (fuse.nnf03, source nnf03, source root /) over the kernel's view",
+        );
+        c.record_detected(&f, false, 0);
+        let row: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(row["op"], AUDIT_OP);
+        assert_eq!(row["extra"]["kind"], "mount_over_protected");
+        assert_eq!(row["extra"]["severity"], "high");
+        assert!(row["extra"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("source nnf03"));
     }
 
     /// External audit NN-AUD-114: an environment variable is a property of

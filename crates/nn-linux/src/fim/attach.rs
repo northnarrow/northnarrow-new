@@ -404,7 +404,7 @@ pub fn populate_watched_paths(
         // every write a record reports comes after it (an append landing
         // between the watch and a later read was measured in it, and its
         // record then read "no growth": NN-L-FIM-005 High)
-        let watched_size = std::fs::symlink_metadata(path)
+        let watched_size = antitamper_bpf::kernel_roots::symlink_metadata(path)
             .ok()
             .filter(|m| m.is_file() && m.ino() == key.ino)
             .map(|m| m.len());
@@ -542,7 +542,7 @@ pub struct PathWatchPlan {
 /// Plan the watches of `path` ([`PathWatchPlan`]). `Err` when the path
 /// itself cannot be `lstat`ed.
 pub fn plan_path_watches(path: &Path) -> std::io::Result<PathWatchPlan> {
-    let meta = std::fs::symlink_metadata(path)?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
     let mut plan = PathWatchPlan {
         own: InodeKey {
             dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -721,7 +721,7 @@ pub fn take_watched_paths_map(ebpf: &mut Ebpf) -> Result<WatchedPathsHandle> {
 /// return its kernel-form `InodeKey` for cross-checking against
 /// `WATCHED_PATHS` map dumps. Used in privileged e2e tests.
 pub fn key_for_path(path: &Path) -> Result<InodeKey> {
-    let meta = std::fs::symlink_metadata(path)
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)
         .with_context(|| format!("symlink_metadata({})", path.display()))?;
     Ok(InodeKey {
         dev: stat_dev_to_kernel_dev(meta.dev()),

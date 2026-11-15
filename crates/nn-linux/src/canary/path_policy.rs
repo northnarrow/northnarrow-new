@@ -154,7 +154,7 @@ pub fn check_canary_path(path: &str) -> Result<PathBuf> {
         }
         probe = dir.parent();
     }
-    if let Ok(meta) = std::fs::symlink_metadata(p) {
+    if let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(p) {
         if meta.file_type().is_symlink() {
             return Err(anyhow!("canary path {path:?} is a symlink — refusing"));
         }
@@ -215,7 +215,7 @@ pub fn write_canary_checked(path: &str, body: &[u8]) -> Result<std::fs::File> {
 /// The host's root as PID 1 sees it, or `/` when that view cannot be
 /// reached (no `CAP_SYS_PTRACE`, as in tests).
 fn host_root() -> PathBuf {
-    if std::fs::metadata("/proc/1/root/").is_ok() {
+    if antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok() {
         PathBuf::from("/proc/1/root")
     } else {
         PathBuf::from("/")

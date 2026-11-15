@@ -67,7 +67,7 @@ const MANAGER_PATHS: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/syste
 /// on Ubuntu 26.04 recorded `64769` (stat's 253:1) where the exec carried
 /// `265289729`, and the unlinked executor's launch was killed.
 fn file_id(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| {
+    antitamper_bpf::kernel_roots::metadata(path).ok().map(|m| {
         (
             crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
             m.ino(),
@@ -78,7 +78,7 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
 /// [`file_id`] of a file `owner` owns that no one else may write (`0` on
 /// the host; a test's own uid in its tree).
 fn trusted_file_id(path: &Path, owner: u32) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
+    let m = antitamper_bpf::kernel_roots::metadata(path).ok()?;
     (m.is_file() && m.uid() == owner && m.mode() & 0o022 == 0).then(|| {
         (
             crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
@@ -91,7 +91,7 @@ fn trusted_file_id(path: &Path, owner: u32) -> Option<(u64, u64)> {
 /// tree), without the ` (deleted)` the kernel adds to an unlinked file:
 /// `/usr/lib/systemd/systemd-executor`.
 fn link_target(path: &Path, root: &Path) -> Option<String> {
-    let t = std::fs::read_link(path).ok()?;
+    let t = antitamper_bpf::kernel_roots::read_link(path).ok()?;
     let t = t.to_string_lossy();
     let t = t.strip_suffix(" (deleted)").unwrap_or(&t);
     let rel = Path::new(t).strip_prefix(root).ok()?;
@@ -291,7 +291,7 @@ fn held_by_user_managers(
     managers: &[(u64, u64)],
 ) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    let ns = |d: &Path| std::fs::read_link(d.join("ns/mnt")).ok();
+    let ns = |d: &Path| antitamper_bpf::kernel_roots::read_link(d.join("ns/mnt")).ok();
     let Some(init_ns) = ns(&proc_root.join("1")) else {
         return out;
     };

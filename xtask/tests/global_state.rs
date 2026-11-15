@@ -354,6 +354,34 @@ const STATICS: &[Kept] = &[
          per object",
     ),
     kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "VIEWS",
+        Process,
+        "lot 353: the descriptors of the kernel's views' roots (/proc, /sys, the cgroup2 root) \
+         the process anchored at its start, before any mount laid over them — one start per \
+         process; the tests build their own `Views`",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "WALKS",
+        Process,
+        "lot 353: the helper threads a path crossing a mount below a view holds blocked are the \
+         process's, bounded once for it (WALKS_MAX)",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "STALLED",
+        Telemetry,
+        "lot 353: the process's count of reads crossing a mount below a view that did not answer",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
+        "REFUSED",
+        Telemetry,
+        "lot 353: the process's count of view paths refused for reaching a file system not the \
+         kernel's",
+    ),
+    kept(
         "crates/nn-linux/src/state_read.rs",
         "ROUND_READER",
         Process,

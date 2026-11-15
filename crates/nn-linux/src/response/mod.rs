@@ -309,7 +309,7 @@ pub fn on_host_path<T>(
     op: impl Fn(&std::path::Path) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *REACHABLE.get_or_init(|| std::fs::metadata("/proc/1/root/").is_ok()) {
+    if *REACHABLE.get_or_init(|| antitamper_bpf::kernel_roots::metadata("/proc/1/root/").is_ok()) {
         op(&host_path(path))
     } else {
         op(path)

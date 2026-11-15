@@ -386,7 +386,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                 "BTF_OFFSETS map armed with runtime-resolved kernel offsets"
             );
         } else {
-            let btf = std::path::Path::new("/sys/kernel/btf/vmlinux").exists();
+            let btf = antitamper_bpf::kernel_roots::metadata("/sys/kernel/btf/vmlinux").is_ok();
             warn!(
                 vmlinux_btf = btf,
                 "{}",
@@ -1349,9 +1349,10 @@ fn btf_offsets_unarmed_warning(vmlinux_btf: bool, with_net: bool) -> &'static st
 /// patch wants CAP_SYS_ADMIN (CAP_PERFMON is not enough there): say so,
 /// with the fix, instead of a bare "Permission denied".
 fn perf_attach_hint(what: &str) -> String {
-    let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".into());
+    let paranoid =
+        antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into());
     format!(
         "{what} (kernel.perf_event_paranoid={paranoid}; if this is EACCES under the hardened \
          unit on a Debian-family kernel, the unit needs CAP_SYS_ADMIN there — install.sh \
@@ -2210,11 +2211,15 @@ mod module_path_tests {
         use nn_core::decision::rules::module_provenance::Provenance;
         let host = tempfile::tempdir().unwrap();
         let info = host.path().join("var/lib/dpkg/info");
-        std::fs::create_dir_all(&info).unwrap();
-        std::fs::write(host.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
+        antitamper_bpf::kernel_roots::create_dir_all(&info).unwrap();
+        antitamper_bpf::kernel_roots::write(
+            host.path().join("var/lib/dpkg/status"),
+            "Package: x\n",
+        )
+        .unwrap();
         let owners = ModuleOwners::new(host.path());
         let mut mounts = crate::sensors::open_sensor::MountTable::load();
-        let m = std::fs::metadata("/").unwrap();
+        let m = antitamper_bpf::kernel_roots::metadata("/").unwrap();
         let mut raw = ModuleLoadRaw::zeroed();
         raw.root_dev = crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev());
         raw.root_ino = m.ino();
@@ -2234,15 +2239,19 @@ mod module_path_tests {
         let e = placed(&raw, load(rk), &mut mounts, &owners);
         assert!(matches!(&e, Event::ModuleLoad { path: Some(p), .. } if p == rk));
         // the database now lists it: the rule reads the pump's answer
-        std::fs::write(info.join("rk.list"), format!("{rk}\n")).unwrap();
+        antitamper_bpf::kernel_roots::write(info.join("rk.list"), format!("{rk}\n")).unwrap();
         assert_eq!(owners.of(rk), Provenance::Unowned, "asked by the pump");
         // a cut path is not asked about
         raw.path_truncated = 1;
         let cut = "/lib/modules/x/k269-cut.ko";
         let _ = placed(&raw, load(cut), &mut mounts, &owners);
-        std::fs::write(info.join("cut.list"), format!("{cut}\n")).unwrap();
+        antitamper_bpf::kernel_roots::write(info.join("cut.list"), format!("{cut}\n")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::write(host.path().join("var/lib/dpkg/status"), "Package: cut\n").unwrap();
+        antitamper_bpf::kernel_roots::write(
+            host.path().join("var/lib/dpkg/status"),
+            "Package: cut\n",
+        )
+        .unwrap();
         assert_eq!(
             owners.of(cut),
             Provenance::Package,
@@ -2255,7 +2264,7 @@ mod module_path_tests {
     #[test]
     fn a_module_path_is_put_on_its_mount_point() {
         let mut mounts = crate::sensors::open_sensor::MountTable::load();
-        let m = std::fs::metadata("/").unwrap();
+        let m = antitamper_bpf::kernel_roots::metadata("/").unwrap();
         let root = (
             crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
             m.ino(),

@@ -1022,7 +1022,7 @@ pub(crate) fn lsm_hook_absent(err: &anyhow::Error, hook: &str) -> bool {
 /// target, which a registration by `stat` would have write-denied — a
 /// `fim_baseline.jsonl -> /etc/passwd` made `/etc/passwd` unwritable.
 fn own_entry_meta(path: &Path) -> std::io::Result<std::fs::Metadata> {
-    let meta = std::fs::symlink_metadata(path)?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         warn!(
             link = %link_at(path).unwrap_or_else(|| path.display().to_string()),
@@ -1063,7 +1063,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     // name, a second key file).
     // External audit ATP-007: the directory itself (`lstat`); a link is not
     // registered (`attach` refuses the start for it).
-    match std::fs::symlink_metadata(etc_dir) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(etc_dir) {
         Ok(meta) if meta.is_dir() => {
             let key = InodeKey {
                 dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -1275,7 +1275,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
         let dir = state_dir.join(sub);
         // External audit ATP-007: the sub-directory itself, never a link's
         // target (`refuse_linked_state_dir` already refused one at boot).
-        match std::fs::symlink_metadata(&dir) {
+        match antitamper_bpf::kernel_roots::symlink_metadata(&dir) {
             Ok(meta) if meta.is_dir() => {
                 let key = InodeKey {
                     dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -1435,7 +1435,7 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
                 continue;
             }
         }
-        let meta = match std::fs::metadata(&path) {
+        let meta = match antitamper_bpf::kernel_roots::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Review 26: the list spans both install layouts, so the
@@ -1502,7 +1502,7 @@ pub(crate) fn register_bpffs_pins(ebpf: &mut Ebpf, pin_root: &Path) -> Result<us
         paths.push(entry.path());
     }
     for path in &paths {
-        let meta = match std::fs::symlink_metadata(path) {
+        let meta = match antitamper_bpf::kernel_roots::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, path = %path.display(), "anti-tamper FS: cannot stat a bpffs pin — not protected");
@@ -1932,7 +1932,8 @@ fn ensure_quarantine_dirs(dir: &Path) -> Result<()> {
             return Err(anyhow!("{link}: the vault is not created through a link"));
         }
     }
-    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    let is_dir =
+        |p: &Path| antitamper_bpf::kernel_roots::symlink_metadata(p).is_ok_and(|m| m.is_dir());
     if is_dir(&vault) {
         return Ok(());
     }
@@ -1972,9 +1973,9 @@ fn state_dir_own_entries() -> Vec<PathBuf> {
 /// `"<path> -> <target>"` when `path` itself is a symbolic link (its final
 /// component; `lstat`), else `None`.
 fn link_at(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path).ok()?;
     meta.file_type().is_symlink().then(|| {
-        let target = std::fs::read_link(path)
+        let target = antitamper_bpf::kernel_roots::read_link(path)
             .map(|t| t.display().to_string())
             .unwrap_or_else(|_| "?".to_string());
         format!("{} -> {target}", path.display())
@@ -1993,7 +1994,7 @@ fn link_at(path: &Path) -> Option<String> {
 /// [`attach`] before the registration. A missing directory is fine: the
 /// attach creates it.
 pub fn refuse_linked_state_dir(dir: &Path) -> Result<()> {
-    let links: Vec<String> = match std::fs::symlink_metadata(dir) {
+    let links: Vec<String> = match antitamper_bpf::kernel_roots::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(anyhow!(e).context(format!("lstat {}", dir.display()))),
         Ok(m) if m.file_type().is_symlink() => link_at(dir).into_iter().collect(),
@@ -2180,8 +2181,8 @@ pub(crate) fn release_runtime_inodes(pin_root: &Path, keys: &[(u64, u64)]) -> Re
 /// rename or setattr by a foreign caller outside the trusted-installer
 /// window (the start-in-cgroup tracker's registered pins).
 pub(crate) fn register_agent_file(ebpf: &mut Ebpf, path: &Path) -> Result<()> {
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let meta = antitamper_bpf::kernel_roots::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         return Err(anyhow!("{} is not a regular file", path.display()));
     }

@@ -37,6 +37,11 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
+    abort_fuse, covering_fuse, fuse_aborted_record, fuse_waiting, leave_stuck_marker,
+    restart_loop_record, stuck_marker_path, stuck_unresponsive_record, unanswered_pings,
+    CoveringFuse, RestartLoop, FUSE_CONNECTIONS,
+};
+use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
     log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, process_start_unix,
     register_own_cgroup, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
@@ -96,6 +101,12 @@ async fn main() -> ExitCode {
         bpffs_root = %cli.bpffs_root.display(),
         "watchdog starting"
     );
+    // Lot 353 (pre-alpha Phase 3, X6): the kernel's views anchored now —
+    // the cgroup floors' reads and writes go beneath these roots, so a
+    // mount laid over `/sys/fs/cgroup` later cannot hold this one thread.
+    for line in antitamper_bpf::kernel_roots::init() {
+        warn!(target: "watchdog", detail = %line, "kernel views: a root not anchored at the start");
+    }
 
     let holds = hold_record_path(&cli.shutdown_marker);
     let bpffs_root = cli.bpffs_root.clone();
@@ -295,7 +306,10 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     // External audit WDG-007: `None` while no agent runs (from its death to
     // the next one), so the ping task neither pings a dead agent's socket
     // nor reads a hold's missing socket as a removal.
-    let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<u32>(4);
+    // Lot 353: a signal carries what failed (the stuck marker's detail)
+    let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<(u32, String)>(4);
+    // Lot 353: the stuck recoveries of the last window (a restart loop)
+    let mut restart_loop = RestartLoop::default();
     let (current_agent, agent_watch) = tokio::sync::watch::channel(Some(agent_pid));
     let ping_socket = cli.admin_socket.clone();
     let ping_holds = hold_record_path(&cli.shutdown_marker);
@@ -329,7 +343,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
             // to the normal layer-2 evict + respawn path below.
             // We synthesise an `AgentDied(Ok(()))` outcome so
             // the existing match arm handles the rest.
-            Some(stuck_pid) = stuck_rx.recv() => {
+            Some((stuck_pid, stuck_why)) = stuck_rx.recv() => {
                 if stuck_pid != agent_pid {
                     SelectOutcome::StaleStuck(stuck_pid)
                 } else {
@@ -349,6 +363,11 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     )
                     .await
                 };
+                // Lot 353 (pre-alpha Phase 3, X6): stuck recoveries again
+                // and again — a restart loop, signed High by the agent
+                if let Some(n) = restart_loop.note(unix_now()) {
+                    restart_loop_tripped(&cli, agent_pid, n, &stuck_why);
+                }
                 // Lab PR 216 (static review C-44 / G-05): a death is what
                 // the agent's own pidfd says, never a failed recovery.
                 match (stuck_verdict(&agent_pidfd), recovery) {
@@ -720,7 +739,7 @@ fn debug_refuse_recovery(agent_pidfile: &std::path::Path) -> bool {
 /// and drop the stuck signals raised against the previous one.
 fn new_generation(
     current: &tokio::sync::watch::Sender<Option<u32>>,
-    stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
+    stuck_rx: &mut tokio::sync::mpsc::Receiver<(u32, String)>,
     pid: u32,
 ) {
     current.send_replace(Some(pid));
@@ -773,6 +792,68 @@ fn recovery_failed(cli: &Cli, agent_pid: u32, error: &str) {
             "could not record the failed recovery for the agent's audit chain"
         );
     }
+    // Lot 353 (pre-alpha Phase 3, X6 on 6.12): an agent that SIGKILL cannot
+    // end waits in the kernel; a FUSE request its daemon never answers is
+    // such a wait, and only the connection's abort ends it. Self-protection:
+    // only a FUSE over /proc, /sys (the cgroup tree) or our own directories,
+    // with requests waiting — never a user's FUSE elsewhere.
+    let aborted = abort_holding_fuse(&path, agent_pid);
+    if aborted > 0 {
+        sd_notify_status(&format!(
+            "DEGRADED: agent pid {agent_pid} held in a FUSE request over a path it depends on — \
+             {aborted} FUSE connection(s) aborted"
+        ));
+    }
+}
+
+/// Lot 353: abort each FUSE connection over a path the agent depends on
+/// (its namespace's mounts and PID 1's) that has requests waiting; each
+/// one, aborted or not, a hold record the agent signs High
+/// (`fuse_aborted`). Returns how many were aborted.
+fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
+    let connections = std::path::Path::new(FUSE_CONNECTIONS);
+    let mut found: Vec<CoveringFuse> = Vec::new();
+    for table in [
+        format!("/proc/{agent_pid}/mountinfo"),
+        "/proc/1/mountinfo".to_string(),
+    ] {
+        if let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&table) {
+            for f in covering_fuse(&text) {
+                if !found.iter().any(|x| x.conn == f.conn) {
+                    found.push(f);
+                }
+            }
+        }
+    }
+    let mut aborted = 0;
+    for f in found {
+        let Some(waiting) = fuse_waiting(connections, f.conn).filter(|w| *w > 0) else {
+            continue;
+        };
+        let outcome = abort_fuse(connections, f.conn).map_err(|e| e.to_string());
+        error!(
+            target: "watchdog.tamper",
+            agent_pid,
+            mount_point = %f.mount_point,
+            fstype = %f.fstype,
+            source = %f.source,
+            connection = f.conn,
+            waiting,
+            aborted = outcome.is_ok(),
+            "the agent is held in a FUSE request over a path it depends on — aborting that FUSE \
+             connection (self-protection)"
+        );
+        if outcome.is_ok() {
+            aborted += 1;
+        }
+        if let Err(e) = record_hold(
+            holds,
+            &fuse_aborted_record(agent_pid, &f, waiting, &outcome, unix_now()),
+        ) {
+            warn!(target: "watchdog.tamper", error = %e, "could not record the FUSE abort");
+        }
+    }
+    aborted
 }
 
 /// One full respawn cycle: spawn the agent, wait for its
@@ -880,7 +961,7 @@ async fn hold(
     backend: &RespawnBackend,
     sigint: &mut Signal,
     sigterm: &mut Signal,
-    stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
+    stuck_rx: &mut tokio::sync::mpsc::Receiver<(u32, String)>,
     held: Hold,
     agent_bin: &std::path::Path,
     retry: &mut HoldRetry,
@@ -1099,7 +1180,7 @@ async fn sleep_or_signal(
 async fn run_ping_loop(
     socket_path: PathBuf,
     holds: PathBuf,
-    stuck_tx: tokio::sync::mpsc::Sender<u32>,
+    stuck_tx: tokio::sync::mpsc::Sender<(u32, String)>,
     mut agent: tokio::sync::watch::Receiver<Option<u32>>,
 ) {
     // External audit WDG-009: `Delay`, so a stall never fires two pings
@@ -1118,6 +1199,9 @@ async fn run_ping_loop(
     // Lab PR 216: a stuck signal was sent for this agent; its next healthy
     // answer clears the DEGRADED line a failed recovery leaves.
     let mut signalled = false;
+    // Lot 353: since when the pings fail, and the last failure's words
+    let mut failing_since: Option<std::time::Instant> = None;
+    let mut last_failure = String::new();
     loop {
         tick.tick().await;
         // External audit WDG-002: timeouts against the previous agent do
@@ -1125,6 +1209,7 @@ async fn run_ping_loop(
         let current = *agent.borrow_and_update();
         if current != watching {
             tracker.reset();
+            failing_since = None;
             watching = current;
             ask_progress = true;
             signalled = false;
@@ -1141,6 +1226,7 @@ async fn run_ping_loop(
         .await
         {
             Ok(progress) => {
+                failing_since = None;
                 if ask_progress && progress == LoopProgress::Unreported {
                     info!(
                         target: "watchdog.status_ping",
@@ -1152,30 +1238,34 @@ async fn run_ping_loop(
                 }
                 tracker.record_answer(progress)
             }
-            Err(e) => match classify_ping_error(&e) {
-                PingFailure::SocketAbsent => tracker.record_socket_absent(),
-                PingFailure::NotTheAgent => {
-                    warn!(
-                        target: "watchdog.tamper",
-                        error = %e,
-                        socket = %socket_path.display(),
-                        agent_pid,
-                        "a process that is not the agent serves the admin socket — not \
-                         counted as an answer"
-                    );
-                    tracker.record_socket_absent()
+            Err(e) => {
+                failing_since.get_or_insert_with(std::time::Instant::now);
+                last_failure = format!("{e:#}");
+                match classify_ping_error(&e) {
+                    PingFailure::SocketAbsent => tracker.record_socket_absent(),
+                    PingFailure::NotTheAgent => {
+                        warn!(
+                            target: "watchdog.tamper",
+                            error = %e,
+                            socket = %socket_path.display(),
+                            agent_pid,
+                            "a process that is not the agent serves the admin socket — not \
+                             counted as an answer"
+                        );
+                        tracker.record_socket_absent()
+                    }
+                    PingFailure::Unresponsive => {
+                        warn!(
+                            target: "watchdog.status_ping",
+                            error = %e,
+                            socket = %socket_path.display(),
+                            consecutive = tracker.consecutive_timeouts(),
+                            "STATUS ping failed"
+                        );
+                        tracker.record_timeout()
+                    }
                 }
-                PingFailure::Unresponsive => {
-                    warn!(
-                        target: "watchdog.status_ping",
-                        error = %e,
-                        socket = %socket_path.display(),
-                        consecutive = tracker.consecutive_timeouts(),
-                        "STATUS ping failed"
-                    );
-                    tracker.record_timeout()
-                }
-            },
+            }
         };
         match outcome {
             PingOutcome::Ok => {
@@ -1215,15 +1305,18 @@ async fn run_ping_loop(
                     "the agent's event loop stands still while its admin socket answers — \
                      signalling the main loop for stuck recovery"
                 );
-                if let Err(e) = record_hold(
-                    &holds,
-                    &event_loop_stalled_record(agent_pid, pings, since_last_ms, unix_now()),
-                ) {
+                let stalled =
+                    event_loop_stalled_record(agent_pid, pings, since_last_ms, unix_now());
+                if let Err(e) = record_hold(&holds, &stalled) {
                     warn!(target: "watchdog.tamper", error = %e, "could not record the stalled event loop");
                 }
+                // Lot 353: the recovery's SIGINT named for the agent
+                let why = stalled.detail.clone();
+                leave_marker(&holds, agent_pid, &why);
                 tracker.reset();
+                failing_since = None;
                 signalled = true;
-                if stuck_tx.send(agent_pid).await.is_err() {
+                if stuck_tx.send((agent_pid, why)).await.is_err() {
                     info!(
                         target: "watchdog.status_ping",
                         "main loop dropped stuck channel; ping task exiting"
@@ -1273,9 +1366,25 @@ async fn run_ping_loop(
                     "STATUS ping threshold tripped (timeouts, or the admin socket gone after \
                      the agent answered) — signalling main loop for stuck recovery"
                 );
+                // Lot 353 (pre-alpha Phase 3, X6): which ping failed and for
+                // how long — a hold record the agent signs, and the marker
+                // that names the recovery's SIGINT (`stuck_unresponsive`)
+                let why = unanswered_pings(
+                    u32::from(tracker.consecutive_timeouts()).max(1),
+                    failing_since.map_or(0, |t| t.elapsed().as_secs()),
+                    &last_failure,
+                );
+                if let Err(e) = record_hold(
+                    &holds,
+                    &stuck_unresponsive_record(agent_pid, &why, unix_now()),
+                ) {
+                    warn!(target: "watchdog.tamper", error = %e, "could not record the stuck recovery");
+                }
+                leave_marker(&holds, agent_pid, &why);
                 tracker.reset();
+                failing_since = None;
                 signalled = true;
-                if stuck_tx.send(agent_pid).await.is_err() {
+                if stuck_tx.send((agent_pid, why)).await.is_err() {
                     // Main loop has dropped the receiver. Exit
                     // cleanly — no listener.
                     info!(
@@ -1286,6 +1395,53 @@ async fn run_ping_loop(
                 }
             }
         }
+    }
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): the stuck marker that names the
+/// recovery's SIGINT for the agent (`why`: what failed), next to the hold
+/// records — a WARN when it cannot be left (the stop is then `sigint`, the
+/// hold record still names the recovery).
+fn leave_marker(holds: &std::path::Path, agent_pid: u32, why: &str) {
+    let path = stuck_marker_path(holds);
+    if let Err(e) = leave_stuck_marker(
+        &path,
+        &stuck_unresponsive_record(agent_pid, why, unix_now()),
+    ) {
+        warn!(
+            target: "watchdog.tamper",
+            error = %e,
+            path = %path.display(),
+            "could not leave the stuck marker — the agent's stop will not name the recovery"
+        );
+    }
+}
+
+/// Lot 353 (pre-alpha Phase 3, X6): `n` stuck recoveries within the window
+/// — an ERROR, `DEGRADED` in `systemctl status`, and a hold record the
+/// agent signs High (`agent_restart_loop`) and keeps as a degradation of
+/// its status.
+fn restart_loop_tripped(cli: &Cli, agent_pid: u32, n: usize, last: &str) {
+    error!(
+        target: "watchdog.tamper",
+        agent_pid,
+        recoveries = n,
+        last,
+        "the agent is in a restart loop: stuck recoveries again and again (a mount over a path \
+         it reads, a starved host?) — it is blind meanwhile"
+    );
+    sd_notify_status(&format!(
+        "DEGRADED: {n} stuck recoveries of the agent within {} min (a restart loop)",
+        nn_proto::watchdog_hold::RESTART_LOOP_WINDOW_SECS / 60
+    ));
+    let path = hold_record_path(&cli.shutdown_marker);
+    if let Err(e) = record_hold(&path, &restart_loop_record(agent_pid, n, last, unix_now())) {
+        warn!(
+            target: "watchdog.tamper",
+            error = %e,
+            path = %path.display(),
+            "could not record the restart loop for the agent's audit chain"
+        );
     }
 }
 

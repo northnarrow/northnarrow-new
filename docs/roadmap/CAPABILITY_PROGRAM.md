@@ -11208,6 +11208,58 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 353 — the pre-alpha's Phase 3, case X6 (P1): a mount cannot stall
+  the agent; stuck restarts are named and a loop is signed (C14, C23; no
+  level changes).**
+  - What was open: a FUSE over `/sys/fs/cgroup` that never answered the
+    agent's threads held the integrity and kernel-state rounds in the
+    kernel on the runtime's workers (5.15: `LOOKUP`, `OPENDIR`), the cgroup
+    guard's `statfs` uninterruptibly (6.12: `STATFS`, SIGKILL could not end
+    the agent), the mount rounds' root keys (`GETATTR`/`STATX`) and std's
+    CPU count (`cpu.max` by path); the admin socket stopped answering, the
+    watchdog's stuck recovery restarted the agent (or failed, 6.12, the
+    agent down while the FUSE stayed), and the log said `sigint`.
+  - Done: the kernel's views read beneath roots anchored at the start
+    (`antitamper_bpf::kernel_roots`, `openat2` with `RESOLVE_NO_XDEV`; a
+    crossing below a root only into the kernel's file systems, bounded; a
+    view covered at the start refused, `kernel_views`), every path read of
+    the agent's, nn-linux's, antitamper-bpf's and the watchdog's production
+    code through it, the rounds off the runtime, a ratchet
+    (`xtask/tests/kernel_views.rs`); `mount_over_protected` covers the views
+    and is High; the stuck recovery names its cause (`stuck_unresponsive`,
+    the stop no clean `sigint`), a restart loop is `agent_restart_loop`
+    (High, a status degradation), `stuck_recovery_failed` High, and the
+    watchdog aborts a FUSE over `/proc`, `/sys` or our directories holding an
+    agent SIGKILL cannot end (`fuse_aborted`, High).
+  - Lab (our own guests, one at a time under a lease, clean before, purged
+    and powered off after; the X6 FUSE: a FUSE over the cgroup2 root that
+    never answers the agent's threads and gives every other process `EIO`):
+    - ubuntu2204 (5.15.0-202), the final tree (r4): held 180 s, no request
+      of the agent reached it (0 of the agent's threads; 75 of others), the
+      agent kept its pid, `nn-admin status` answered at 20/60/100/140/175 s,
+      the watchdog saw no ping fail; `mount_over_protected` High signed
+      within a round, naming `fuse.nnf03` and its source, and cleared after.
+      (r1, before every reader was routed: two of the agent's threads
+      reached it, the admin socket stopped at 60 s, and the restart was
+      signed `stuck_unresponsive`, its stop no `sigint`.)
+    - debian13 (6.12.116), the final tree (r5): the same — 0 of the agent's
+      threads (489 of others), same pid, status answered, no ping failure,
+      the record High and cleared. (r2, r3: one `FUSE_STATX` of the open
+      sensor's mount roots, which `root_key` no longer asks.)
+    - debian13, rc2's stall forced (r6, the lab's `debug-walk-on-workers`:
+      every runtime worker walks a path under the FUSE by itself): the
+      workers held, the status lost at 30 and 60 s; the stuck recovery
+      signed `stuck_unresponsive` ("did not answer 2 STATUS pings in a row
+      … failing for 29 s"), the stop `stuck_unresponsive`; SIGKILL could not
+      end the agent (`stuck_recovery_failed`, High); the watchdog aborted the
+      FUSE's connection (`fuse_aborted`, High, naming the mount, its source
+      and the connection); the agent exited and was respawned (a new pid
+      answering) within 90 s, the FUSE gone. ubuntu2204 (5.15, r7): the
+      same chain — the status lost, `stuck_unresponsive` ("… failing for
+      30 s"), SIGKILL could not end the agent there either (the request
+      already read by the daemon), `stuck_recovery_failed` and
+      `fuse_aborted` High, respawned within 90 s.
+  - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**
   - What was open (two pre-existing P2 the review of #559 found, and its

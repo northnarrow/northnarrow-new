@@ -105,7 +105,7 @@ pub fn record_line(
     cap: u64,
     protection: &dyn crate::chainlog::ProtectionManager,
 ) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match antitamper_bpf::kernel_roots::symlink_metadata(path) {
         Ok(_) => Ok(append_line(path, rules_removed, cap)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             protection.with_mutable_dir(&mut || Ok(append_line(path, rules_removed, cap)?))

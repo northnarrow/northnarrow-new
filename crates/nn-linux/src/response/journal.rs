@@ -593,7 +593,9 @@ impl ActionJournal {
         match held {
             Ok(held) => Some(held),
             // a file the chain keeps, gone: removed — the head not held
-            Err(_) if kept && std::fs::symlink_metadata(&path).is_err() => Some(false),
+            Err(_) if kept && antitamper_bpf::kernel_roots::symlink_metadata(&path).is_err() => {
+                Some(false)
+            }
             Err(_) => None,
         }
     }

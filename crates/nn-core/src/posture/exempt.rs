@@ -605,8 +605,10 @@ mod lot315 {
             }
             out
         }
-        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
-            std::fs::read_dir(path)
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<Vec<std::ffi::OsString>> {
+            std::fs::read_dir(path)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect()
         }
         fn is_dir(path: &Path) -> bool {
             path.is_dir()

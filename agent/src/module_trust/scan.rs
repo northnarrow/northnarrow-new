@@ -92,7 +92,7 @@ pub fn walk(tree: &Path, max: usize) -> (Vec<TreeFile>, usize) {
             continue;
         };
         for e in rd.flatten() {
-            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            let Ok(m) = antitamper_bpf::kernel_roots::symlink_metadata(e.path()) else {
                 continue;
             };
             if m.is_dir() {
@@ -336,7 +336,7 @@ pub fn parse_rpm_dump(text: &str, prefixes: &[String]) -> HashMap<String, (u32, 
 /// The content of `file` hashed as rpm recorded it, compared.
 pub fn rpm_digest_matches(file: &Path, algo: u32, want: &str) -> bool {
     use sha2::Digest;
-    let Ok(bytes) = std::fs::read(file) else {
+    let Ok(bytes) = antitamper_bpf::kernel_roots::read_all(file) else {
         return false;
     };
     let got = match algo {

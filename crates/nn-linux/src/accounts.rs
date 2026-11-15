@@ -42,9 +42,11 @@ struct Table {
 static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
 
 pub(crate) fn stamp(path: &str) -> Stamp {
-    crate::response::on_host_path(Path::new(path), |p| std::fs::metadata(p))
-        .ok()
-        .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
+    crate::response::on_host_path(Path::new(path), |p| {
+        antitamper_bpf::kernel_roots::metadata(p)
+    })
+    .ok()
+    .map(|m| (m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
 }
 
 fn read(path: &str) -> String {

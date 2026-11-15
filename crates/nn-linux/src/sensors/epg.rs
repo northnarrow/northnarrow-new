@@ -271,7 +271,7 @@ pub fn status() -> nn_proto::admin_protocol::ExploitGuardStatus {
 
 /// `/proc/sys/kernel/pid_max`.
 pub fn pid_max() -> Option<u32> {
-    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/pid_max")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
@@ -289,7 +289,7 @@ pub fn task_map_entries(requested: Option<u32>, pid_max: Option<u32>) -> u32 {
 
 /// `/proc/sys/kernel/threads-max`.
 pub fn threads_max() -> Option<u32> {
-    std::fs::read_to_string("/proc/sys/kernel/threads-max")
+    antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/threads-max")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
@@ -412,7 +412,7 @@ pub fn resolved_layout() -> Result<ResolvedLayout, String> {
 
 /// `/proc/sys/kernel/cap_last_cap`.
 pub fn cap_last_cap() -> Result<u32, String> {
-    let s = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+    let s = antitamper_bpf::kernel_roots::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|e| format!("/proc/sys/kernel/cap_last_cap: {e}"))?;
     parse_cap_last_cap(&s)
 }

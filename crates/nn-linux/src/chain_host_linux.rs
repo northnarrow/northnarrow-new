@@ -79,7 +79,7 @@ impl ChainHost for LinuxHost {
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
             Some(libc::EINVAL) | Some(libc::ENOSYS) => {
-                if std::fs::symlink_metadata(to).is_ok() {
+                if antitamper_bpf::kernel_roots::symlink_metadata(to).is_ok() {
                     return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
                 }
                 std::fs::rename(from, to)

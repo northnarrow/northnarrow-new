@@ -12,7 +12,6 @@
 //! moves the PID back to the cgroup root.
 
 use std::collections::HashSet;
-use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -200,7 +199,7 @@ fn ensure_throttled_cgroup(dir: &Path, cfg: &ExecutorConfig) -> std::io::Result<
         .join(&cfg.cgroup_slice)
         .join("cgroup.subtree_control");
     for c in ["+cpu", "+io", "+memory"] {
-        if let Err(e) = fs::write(&subtree, c) {
+        if let Err(e) = antitamper_bpf::kernel_roots::write(&subtree, c) {
             // External audit CMB-013: a limit this controller would set
             // will be missing — said where an operator sees it.
             warn!(controller = c, error = %e, "throttle: enabling the controller failed; its limit will not apply");
@@ -228,7 +227,7 @@ fn write_throttle_limits(dir: &Path) -> std::io::Result<Applied> {
 /// The limits the scope `dir` holds, each only where it is the value the
 /// throttle asks for (lot 312, BUG-123).
 fn read_back(dir: &Path) -> Applied {
-    let read = |knob: &str| fs::read_to_string(dir.join(knob)).ok();
+    let read = |knob: &str| antitamper_bpf::kernel_roots::read_to_string(dir.join(knob)).ok();
     Applied {
         cpu_max_pct: read("cpu.max")
             .as_deref()
@@ -285,11 +284,11 @@ fn parse_memory_high(s: &str) -> Option<u64> {
 ///   missing knob, so we have to short-circuit on file existence
 ///   first.
 fn write_if_present(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if !path.exists() {
+    if antitamper_bpf::kernel_roots::metadata(path).is_err() {
         warn!(path = %path.display(), "controller knob missing; skipping");
         return Ok(());
     }
-    match fs::write(path, bytes) {
+    match antitamper_bpf::kernel_roots::write(path, bytes) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             warn!(path = %path.display(), "controller knob missing; skipping");
