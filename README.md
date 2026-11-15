@@ -183,7 +183,7 @@ against it on every `cargo test` by
 | Rules | **95** rules the agent can record: 87 in the engine, 8 issued outside it (anti-tamper, exploit guard, exec policy and its environment checks, exec quarantine). Strongest test per rule: an end-to-end test or a lab script for 35, unit tests only for 55, no proof yet for 5 (the experimental exec-policy and quarantine records) | [`RULE_CATALOGUE.md`](docs/detection/RULE_CATALOGUE.md) |
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
 | Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2). The eBPF object holds **117** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of them (November 2026, the pre-alpha release candidate) | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
-| Host tests | more than **5,400** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
+| Host tests | more than **5,500** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
 | Privileged suites | run as root in 5 KVM guests every night. The nightly on `main` was green on 6 of 12 nights from 22 Oct to 2 Nov, and red again on 3 Nov on Ubuntu 26.04 only; every red night was traced to a lab-harness race or a test fixture, both fixed in #487. The five-guest dispatch of the gate on that fix: 87 suites and 103 tests on each guest, 0 failed ([run 41590801439](https://github.com/northnarrow/northnarrow-new/actions/runs/41590801439)) | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
 | Event bus | in the lab's file-open flood (EXP-13), anti-tamper denials lost: 3,699 before the priority bus, **0** after | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) |
@@ -346,9 +346,10 @@ sudo ./deploy/uninstall.sh [--purge] --grant-key <admin.key>   # the only order 
 <details>
 <summary><b>What the installer checks, and where to read next</b></summary>
 
-The installer never downgrades its checks by itself. A release tree installs only when the SLSA
-provenance attestation of its tarball verifies (with `gh`, or an offline bundle) and the tree
-matches the tarball. A tree without `MANIFEST.sha256` is refused unless `--source-tree` is given,
+The installer never downgrades its checks by itself. A release tree installs only when the tree
+matches the tarball and the SLSA provenance attestation of its tarball verifies (with `gh`, or an
+offline bundle) or, on a host with no attestation verifier, the tarball matches a `SHA256SUMS`
+whose `SHA256SUMS.asc` is a good signature by the release key (`gpgv`). A tree without `MANIFEST.sha256` is refused unless `--source-tree` is given,
 and anything less needs `--allow-unverified` (lab and development only). Each flag is logged,
 recorded in `/etc/northnarrow/install-manifest.json` and reported by `nn-admin host-check`.
 

@@ -11236,6 +11236,19 @@ number in parentheses is a lab PR.
     those the pre-alpha's Phase 3 measured on a release build; they are run
     again in the next lab round. `SHA256SUMS.asc` is first produced by the
     next tag.
+  - The review of #562 (fix round): the four limitation sentences that
+    read as ways around open residuals restated as behaviour (what is not
+    recorded, what the operator can do); `install.sh` checks
+    `SHA256SUMS.asc` itself with `gpgv` against the tree's copy of the
+    committed release key and its pinned fingerprint, a new level
+    `signed-checksums` that installs with no flag on a host with no
+    attestation verifier (Ubuntu 24.04), fail-closed on a bad signature,
+    another key, a missing key or a mismatch (throwaway-key tests); the
+    protocol history copied in `xtask/tests/protocol_history.rs` (an edit
+    in place fails); the `NO_COLOR` ratchet over every binary and every
+    tracked shell script; the README's test floor within 200 of the count.
+    Lab: none (the signed path is covered by the install tests with
+    throwaway keys; no signed release exists yet).
   - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**

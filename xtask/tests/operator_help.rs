@@ -4,8 +4,9 @@
 //! golden` checks against the binary), of `install.sh` and of
 //! `uninstall.sh` names no lot, review, audit finding, design section or
 //! development stage; every option the scripts accept is in their help; and
-//! the scripts print no colour (so `NO_COLOR` holds for them; nn-admin's
-//! colours go through one `NO_COLOR`-aware helper, its own unit test).
+//! the scripts print no colour (so `NO_COLOR` holds for them), and every
+//! binary's colour obeys `NO_COLOR` (nn-admin's one helper, the daemons'
+//! log layer).
 
 use std::fs;
 use std::process::Command;
@@ -175,30 +176,124 @@ fn every_option_of_the_scripts_is_in_their_help() {
     }
 }
 
-/// The scripts an operator runs write no ANSI colour, so nothing they say
-/// is carried by a colour and `NO_COLOR` holds for them as it is.
+/// The review of #562 (R2): no tracked shell script writes an ANSI colour
+/// (every `*.sh` and every file whose `#!` names a shell: the install and
+/// uninstall scripts, the package hooks, the release and lab scripts), so
+/// nothing they say is carried by a colour and `NO_COLOR` holds for them as
+/// it is.
 #[test]
 fn the_scripts_print_no_colour() {
-    for script in ["deploy/install.sh", "deploy/uninstall.sh"] {
-        let text = read(script);
+    let mut scripts = Vec::new();
+    for rel in support::tracked_files() {
+        let Ok(text) = fs::read_to_string(repo_root().join(&rel)) else {
+            continue;
+        };
+        let first = text.lines().next().unwrap_or("");
+        let shell = first.starts_with("#!")
+            && ["sh", "bash", "dash"]
+                .iter()
+                .any(|s| first.ends_with(&format!("/{s}")) || first.ends_with(&format!(" {s}")));
+        if !rel.ends_with(".sh") && !shell {
+            continue;
+        }
         for (n, line) in text.lines().enumerate() {
             for esc in [
                 "\\033[",
                 "\\e[",
                 "\\x1b[",
+                "\\x1B[",
                 "\\u001b[",
                 "tput setaf",
+                "tput setab",
                 "tput bold",
+                "tput sgr",
             ] {
                 assert!(
                     !line.contains(esc),
-                    "{script}:{}: prints a colour ({esc}): {line}",
+                    "{rel}:{}: prints a colour ({esc}): {line}",
                     n + 1
                 );
             }
         }
+        scripts.push(rel);
+    }
+    for needed in [
+        "deploy/install.sh",
+        "deploy/uninstall.sh",
+        "deploy/release/pkg/postinst.sh",
+        "deploy/release/mk-tarball.sh",
+    ] {
+        assert!(scripts.iter().any(|s| s == needed), "{needed} not scanned");
+    }
+    for script in ["deploy/install.sh", "deploy/uninstall.sh"] {
         assert!(!script_help(script).contains('\u{1b}'), "{script} --help");
     }
+}
+
+/// The review of #562 (R2): in every binary's production code (every
+/// product tree, comments and tests left out), a terminal check decides a
+/// colour only next to `NO_COLOR` (nn-admin's `colour_on`, the daemons'
+/// `stdout_ansi`), whatever its spelling (`.is_terminal()`,
+/// `IsTerminal::is_terminal(…)`); an escape sequence is written only by
+/// nn-admin's `colorize`; and a tracing fmt layer takes its colour from
+/// `stdout_ansi` or has none.
+#[test]
+fn every_binary_s_colour_obeys_no_color() {
+    let root = repo_root();
+    let code = support::product_code(&root);
+    assert!(code.len() > 100, "{} files", code.len());
+    let (mut checks, mut escapes, mut layers) = (0, 0, 0);
+    let mut problems = Vec::new();
+    for (rel, text) in &code {
+        for (n, line) in text.lines().enumerate() {
+            let at = format!("{rel}:{}", n + 1);
+            if line.contains("is_terminal(") {
+                checks += 1;
+                if !line.contains("colour_on(") && !line.contains("\"NO_COLOR\"") {
+                    problems.push(format!("{at}: a terminal check without NO_COLOR: {line}"));
+                }
+            }
+            let lower = line.to_ascii_lowercase();
+            // an escape that opens a control sequence (`ESC [`) or an
+            // operating-system command (`ESC ]`); a byte table holding 0x1b
+            // is no output
+            if ["\\x1b", "\\u{1b}", "\\u{001b}", "\\033"]
+                .iter()
+                .any(|e| lower.contains(&format!("{e}[")) || lower.contains(&format!("{e}]")))
+            {
+                escapes += 1;
+                let colorize = rel == "crates/nn-admin/src/cli.rs"
+                    && line.trim() == "format!(\"\\x1b[{sgr}m{s}\\x1b[0m\")";
+                if !colorize {
+                    problems.push(format!("{at}: an escape sequence outside colorize: {line}"));
+                }
+            }
+            if let Some(i) = line.find(".with_ansi(") {
+                layers += 1;
+                let arg = &line[i + ".with_ansi(".len()..];
+                if !arg.starts_with("false)")
+                    && !arg.starts_with("nn_model::log_escape::stdout_ansi())")
+                {
+                    problems.push(format!("{at}: a colour not from stdout_ansi: {line}"));
+                }
+            }
+        }
+        let mut from = 0;
+        while let Some(i) = text[from..].find("tracing_subscriber::fmt()") {
+            let start = from + i;
+            let end = text[start..].find(';').map_or(text.len(), |j| start + j);
+            if !text[start..end].contains(".with_ansi(") {
+                let line = text[..start].lines().count() + 1;
+                problems.push(format!("{rel}:{line}: a fmt layer with the default colour"));
+            }
+            from = end;
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(
+        checks >= 10 && escapes == 1 && layers >= 2,
+        "{checks} {escapes} {layers}"
+    );
 }
 
 #[test]

@@ -2726,11 +2726,23 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   carries version 2, and a decoder refuses a version 1 envelope as
   `ProtocolVersionUnsupported` (`OLDEST_PROTOCOL_VERSION`): the formats
   changed since version 1 was set (the status reply grew by appended
-  fields), and an old envelope would be misread. The live admin socket still
-  speaks bare frames, as before: `nn-admin` and the agent must come from the
-  same release (an `nn-admin` of another release may misread the replies).
-  From now on a change to a frame the tests pin raises the version
-  (`a_pinned_frame_changes_only_with_a_new_protocol_version`).
+  fields), and an old envelope would be misread. From now on a change to a
+  frame the tests pin raises the version
+  (`a_pinned_frame_changes_only_with_a_new_protocol_version`, and
+  `xtask/tests/protocol_history.rs` for a row edited in place).
+  - **No effect at run time today.** The live admin socket speaks bare
+    frames, as before: no running peer sends or reads the envelope, so the
+    agent, the watchdog and `nn-admin` exchange exactly what they did.
+  - **An older `nn-admin` against a newer agent** gets no version message.
+    A reply that grew by appended fields is read without them (the extra
+    bytes are ignored); a request or reply one side does not know is a
+    protocol error, exit 5 ([`NN_ADMIN.md`](NN_ADMIN.md)). Use the
+    `nn-admin` of the agent's release.
+  - **The upgrade from rc1 works.** `install.sh --upgrade` opens its window
+    with the installed `nn-admin`, against the installed agent (one
+    release), and then replaces both binaries together; the packages
+    replace `nn-admin` with the agent too. An `nn-admin` kept elsewhere (a
+    copy on an administrator's machine) must be updated with them.
 - **The help.** `nn-admin`'s commands and options are described for an
   operator (no lot, review or design references), the shared options have
   one help text, and `install.sh --help` lists its package-hook options and
@@ -2745,6 +2757,20 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   release key) from the first tag after this change: the check without
   `gh` of [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §5.
   A tag release without it is not published.
+- **`install.sh` checks that signature itself.** With `SHA256SUMS.asc` next
+  to `SHA256SUMS`, it verifies it with `gpgv` against the tree's copy of the
+  release key and the fingerprint it pins
+  (`BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D`), then reads the
+  tarball's checksum from that signed copy. On a host with no attestation
+  verifier (Ubuntu 24.04's gh 2.45) the release installs with no flag,
+  recorded as `signed-checksums`, a new level in `install-manifest.json`
+  (`nn-admin host-check`: OK; with the flag that accepted it: WARN). A bad
+  signature, a signature by another key, or a release key missing from the
+  tree is refused whatever the flags (`--no-verify` aside). A verifier that
+  ran and refused (gh not logged in, no network) is not overruled by the
+  signature. *Action:* keep `SHA256SUMS` and `SHA256SUMS.asc` next to the
+  tarball; a tester who used `--allow-unverified` after the manual check no
+  longer needs it. A tool that reads `provenance` sees the new value.
 - **The journal** names an absent optional kernel field's own effect (it
   named the DNS decoder for every field that was not btrfs's, a hook's
   argument or the move guard's).

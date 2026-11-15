@@ -27,7 +27,8 @@ the system account `northnarrow-scan` that `install.sh` creates (no home, no
 shell) and `uninstall.sh` removes; see
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md>.
 A release tree installs only when its tarball's provenance attestation
-verifies (section 5.1). A tree built from source has no `MANIFEST.sha256`:
+verifies or, on a host with no attestation verifier, when the tarball
+matches a `SHA256SUMS` signed by the release key (section 5.1). A tree built from source has no `MANIFEST.sha256`:
 `install.sh` installs it only with `--source-tree` (or `--allow-unverified`),
 e.g. `sudo ./deploy/install.sh --source-tree --upgrade --grant-key <admin.key>`.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
@@ -626,7 +627,7 @@ missing and how to fix it:
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
 | nftables | `nft` installed in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, root's and writable by nobody else — the one the agent runs; a copy in `/usr/local` is not used (external audit ATP-014, lab PR 176) | a BlockOutbound verdict and the COMBAT soft egress block (INVESTIGATE) are nftables rules: without `nft` the offender is not contained while the agent analyses it — the agent records a signed `subsystem_degraded` at boot, and each episode records the failure and shortens INVESTIGATE to 10 s. Reported with `--without-nftables` when the install manifest records it (lab PR 165). A WARN like the other rows: the refusal is the installer's (Prerequisites, above) |
 | cgroup v1 controllers | `cgroup_no_v1=all` on the kernel command line (or no `freezer`, `devices`, `net_cls`, `net_prio`, `perf_event` enabled) | lot 273b: on a host whose systemd runs the unified hierarchy, root can still mount a v1 hierarchy of these controllers and freeze the agent through a v1 `freezer`. The running agent refuses every write to a v1 hierarchy outside a window there (section 3.7); the boot option refuses the mount itself, before the agent runs |
-| Release verified at install | `provenance` `checksums` or `attested` in `install-manifest.json` | only these rest on something outside the installed tree (section 5.1); `manifest`, `source-tree`, `unverified` and `package` are reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
+| Release verified at install | `provenance` `attested`, or `signed-checksums` accepted with no flag, in `install-manifest.json` | only these say the release is the project's (section 5.1); `checksums`, `manifest`, `source-tree`, `unverified` and `package`, and `signed-checksums` accepted with a flag, are a WARN, reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
 22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and
@@ -1367,13 +1368,13 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | `RPM-GPG-KEY-northnarrow.asc` | the public key the `.rpm` is signed with (a copy of `deploy/release/RPM-GPG-KEY-northnarrow.asc` at the tag) |
 | `northnarrow-<ver>-x86_64-linux.{agent,watchdog,scan}.sbom.cdx.json` | CycloneDX SBOMs, three files: the agent (it covers `nn-admin` too), the watchdog, the scanner. They do not cover the eBPF object's own crates (`agent-ebpf`, aya-ebpf among them), built from a lockfile of their own (`agent-ebpf/Cargo.lock`) and embedded in the agent |
 | `SHA256SUMS` | checksums of the files above |
-| `SHA256SUMS.asc` | a detached OpenPGP signature of `SHA256SUMS` by the same release key as the `.rpm` (releases from `v0.1.0-alpha` on): the check without `gh` below |
+| `SHA256SUMS.asc` | a detached OpenPGP signature of `SHA256SUMS` by the same release key as the `.rpm` (releases from `v0.1.0-alpha` on): the check without `gh` below, and the one `install.sh` makes itself on a host without `gh attestation` (§5.1) |
 
 The tarball, the packages and the SBOMs carry a SLSA build-provenance
 attestation signed by GitHub's OIDC identity for this repository and
 workflow (`SHA256SUMS` and the key file do not: their files are listed in
-`SHA256SUMS`, which itself is not signed — the attestation is what says
-where a file was built). Verify before installing, one of two ways.
+`SHA256SUMS`, which is signed from `v0.1.0-alpha` on, `SHA256SUMS.asc`).
+Verify before installing, one of two ways.
 
 **With `gh` (the attestation).** `gh attestation` needs gh **2.49 or newer**:
 the gh of Ubuntu 24.04 is 2.45 and has no `attestation` command (install gh
@@ -1398,19 +1399,23 @@ checksums:
 git clone https://github.com/northnarrow/northnarrow-new && cd northnarrow-new
 git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag v<ver>   # "Good \"git\" signature"
 git show v<ver>:deploy/release/RPM-GPG-KEY-northnarrow.asc > ../nn-release-key.asc
-cd .. && gpg --show-keys nn-release-key.asc                  # the key's fingerprint, to compare out of band
+cd .. && gpg --show-keys nn-release-key.asc                  # the key's fingerprint: compare it with §6.1 and the README
 gpg --dearmor < nn-release-key.asc > nn-release-key.gpg
 gpgv --keyring ./nn-release-key.gpg SHA256SUMS.asc SHA256SUMS   # "Good signature"
-sha256sum -c SHA256SUMS                                        # every file: OK
+sha256sum -c --ignore-missing SHA256SUMS                       # the files you downloaded: OK
 ```
+
+The fingerprint must be `BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D`,
+the one §6.1 and the README publish. With `--ignore-missing`, check that
+the tarball's own line says `OK`: a file you did not download is skipped,
+not checked.
 
 This proves the files are the ones the release workflow signed for that tag
 (the key lives only in the tag-restricted `release-signing` environment); the
-attestation also names the runner and the workflow run. `install.sh` still
-looks for the attestation: without a verifier it refuses, and after the
-check above a tester installs with `--allow-unverified`, recorded as
-`checksums` (§5.1) — a `WARN` in `nn-admin host-check`, which is expected
-then.
+attestation also names the runner and the workflow run. `install.sh` makes
+the same check itself (§5.1): with `SHA256SUMS` and `SHA256SUMS.asc` next to
+the tarball, and no attestation verifier on the host, it installs with no
+flag, recorded as `signed-checksums`.
 
 The attestation binds the file digest to the exact commit, workflow and
 runner that produced it; a tarball rebuilt elsewhere, or modified after
@@ -1446,7 +1451,17 @@ tree installs only when step 4 verifies:
    extracted tree. A corrupted or edited tree is refused.
 2. **SHA256SUMS** — if the tarball is next to the tree (`../<tree>.tar.gz`,
    or `--tarball FILE`) and `SHA256SUMS` is next to it (or `--sums FILE`),
-   the tarball hash is checked against it. The line is found by the
+   the tarball hash is checked against it. When `SHA256SUMS.asc` is next to
+   `SHA256SUMS` (lot 354), its signature is checked first, with `gpgv`,
+   against the tree's copy of the committed release key
+   (`deploy/release/RPM-GPG-KEY-northnarrow.asc`), and only a signature by
+   the key whose fingerprint `install.sh` pins counts (the one §6.1
+   publishes): a key file swapped in the tree does not make another key's
+   signature pass. A bad signature, a signature by another key, or a
+   release key missing from the tree is a **refusal whatever the flags**,
+   like a tarball that does not match. The hash is then read from the
+   signed copy. `gpgv` comes with apt on Debian and Ubuntu; without it the
+   signature is not checked, and the level stays `checksums`. The line is found by the
    tarball's exact name (a leading `*`, binary mode, allowed); a file that
    lists the name with two different checksums is refused (external audit
    DEP-016, lab PR 194: the name used to be a regular expression, so a
@@ -1471,10 +1486,14 @@ tree installs only when step 4 verifies:
    northnarrow/northnarrow-new`) and pass `--attestation <bundle.jsonl>`
    (gh, or cosign: cosign is used only with that bundle, and its path has
    no automated test yet). `--require-attestation` is accepted and is the
-   default.
+   default. **On a host with no attestation verifier** (no gh 2.49+, no
+   cosign with a bundle: Ubuntu 24.04's gh 2.45), a tarball that matched a
+   `SHA256SUMS` whose signature verified in step 2 installs with no flag,
+   at `signed-checksums`. A verifier that ran and refused is not overruled
+   by the signature: that is still a refusal.
 
-The strongest level reached — `attested`, `checksums`, `manifest`,
-`source-tree` or `unverified` — is written with the SHA-256 of every
+The strongest level reached — `attested`, `signed-checksums`, `checksums`,
+`manifest`, `source-tree` or `unverified` — is written with the SHA-256 of every
 installed binary and of the eBPF object to
 `/etc/northnarrow/install-manifest.json`, which the anti-tamper hook
 protects like the rest of `/etc/northnarrow`.
@@ -1484,17 +1503,21 @@ used to step down on their own: a tree without `MANIFEST.sha256` installed
 as a "source tree", so removing that one file from an altered release
 turned every check off; and an unsigned `SHA256SUMS` next to the tarball
 was enough for `checksums` — whoever swaps the tarball swaps it too. A level
-below `attested` now needs an explicit flag. The flag is **logged**: a
-WARNING on the terminal and a line in the system log (`auth.warning`, tag
+below `attested` and `signed-checksums` now needs an explicit flag. The
+flag is **logged**: a WARNING on the terminal and a line in the system log
+(`auth.warning`, tag
 `northnarrow-install`: `journalctl -t northnarrow-install`); it is
 **recorded** in the manifest (`verify_override`, and `attestation.failure`
 says why the attestation did not verify) and **reported** by `nn-admin
 host-check` (§3.1: anything below `attested` is a WARN, `checksums`
-included):
+included; `signed-checksums` reached with no flag is OK):
 
 | Situation | Without a flag | Flag that accepts it | Recorded as |
 |---|---|---|---|
-| The attestation did not verify (or no verifier), the tarball matched `SHA256SUMS` | refused | `--allow-unverified` | `checksums` |
+| No attestation verifier, the tarball matched a `SHA256SUMS` whose `SHA256SUMS.asc` verified | **installed** | — | `signed-checksums` |
+| The attestation verifier ran and refused, the tarball matched a signed `SHA256SUMS` | refused | `--allow-unverified` | `signed-checksums` |
+| The attestation did not verify (or no verifier), the tarball matched an unsigned `SHA256SUMS` (no `SHA256SUMS.asc`, or no `gpgv`) | refused | `--allow-unverified` | `checksums` |
+| `SHA256SUMS.asc` is not a good signature by the pinned release key, or the key is missing from the tree; or the tarball does not match `SHA256SUMS` | refused | none | — |
 | Only the tree's own `MANIFEST.sha256` checked (no tarball next to it) — it travels inside the tree it vouches for | refused | `--allow-unverified` (`--allow-manifest-only`, its former name, still accepted) | `manifest` |
 | No `MANIFEST.sha256` (a build from source, the lab, a developer) | refused | `--source-tree` or `--allow-unverified` | `source-tree` |
 | Every release check skipped | — | `--no-verify` (development only) | `unverified` |
@@ -1503,7 +1526,8 @@ included):
 project's release: the flag accepts it anyway, and says so in the terminal,
 the system log, the install manifest and `nn-admin host-check`. Use it only
 for a tree you built yourself, for the lab, or for a download you verified
-by hand (the check without `gh` above). Do **not** use it to get past a
+by hand on a host where `install.sh` cannot check it (no `gpgv`, no
+`SHA256SUMS.asc`). Do **not** use it to get past a
 refusal of a download you have not verified: a refusal of the attestation or
 of the checksums is exactly what a swapped or corrupted release looks like.
 
@@ -1515,8 +1539,8 @@ branch, not a `v*` tag — with `--allow-unverified` after checking that
 it is refused without. `--source-tree` only permits a missing
 `MANIFEST.sha256`: on a tree that has one, it is ignored and the tree is
 verified as a release. Keep the tarball next to the extracted tree (or
-pass `--tarball`), with `gh` or an offline bundle, and a release installs
-with no flag. `--require-attestation` with `--allow-unverified` or
+pass `--tarball`), with `SHA256SUMS` and `SHA256SUMS.asc` beside it, or
+with `gh` or an offline bundle, and a release installs with no flag. `--require-attestation` with `--allow-unverified` or
 `--no-verify` is a usage error (exit 2).
 
 **At every boot the agent closes the loop**: it hashes its own executable,

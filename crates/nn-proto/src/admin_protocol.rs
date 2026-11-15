@@ -43,13 +43,18 @@
 //! a newer peer may send what this build cannot decode, and an older
 //! version named a format this build would misread.
 //!
-//! Lot 354: the version moves with the wire format. The frames pinned byte
-//! for byte by `encoded_frames_are_pinned` are recorded per version in the
-//! tests' `PINNED_FRAMES_AT_VERSION`, and
+//! Lot 354: the version moves with the pinned frames. The frames pinned
+//! byte for byte by `encoded_frames_are_pinned` are recorded per version in
+//! the tests' `PINNED_FRAMES_AT_VERSION`, and
 //! `a_pinned_frame_changes_only_with_a_new_protocol_version` fails when a
-//! pinned frame changes while `PROTOCOL_VERSION` stays. Version 2 marks the
-//! formats that changed since version 1 was set (the status reply has grown
-//! by appended fields since the frames were first pinned).
+//! pinned frame changes while `PROTOCOL_VERSION` stays; a copy of the table
+//! in `xtask/tests/protocol_history.rs` fails when one of its rows is
+//! edited in place. A change the six pinned frames do not show (a field
+//! appended inside a telemetry struct the pinned status reply leaves
+//! `None`) does not move the version. Version 2 marks the formats that
+//! changed since version 1 was set (the status reply has grown by appended
+//! fields since the frames were first pinned). The live admin socket speaks
+//! bare frames ([`encode_frame`]): the version has no effect on it today.
 //!
 //! The decoder [`decode_versioned_frame`] rejects anything that is not a
 //! well-formed v1 envelope, and reads the `version` before the message: a
@@ -4748,7 +4753,9 @@ mod tests {
     }
 
     /// Lot 354: the digest of the pinned frames at every PROTOCOL_VERSION,
-    /// oldest first. The rows are history: never edit one, append one. Row
+    /// oldest first. The rows are history: never edit one, append one (and
+    /// its copy in `xtask/tests/protocol_history.rs`, which fails on a row
+    /// edited in place). Row
     /// 1 is the frames as lab PR 240 first pinned them (the status reply was
     /// 0x4b bytes long then); row 2 the frames when the version moved to
     /// mark the formats changed since.

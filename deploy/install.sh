@@ -133,8 +133,10 @@ REQUIRE_ATTESTATION_FLAG=0
 # is one. Lab PR 220 (static review of baf4c25 P0 C-45 / G-07): a release
 # tree installs only when its SLSA provenance attestation verifies — an
 # unsigned SHA256SUMS next to the tarball, or the tree's own MANIFEST.sha256,
-# proves nothing about where it was built. --allow-unverified accepts less
-# (and a source tree); --allow-manifest-only is its former, narrower name.
+# proves nothing about where it was built. Lot 354: a SHA256SUMS whose
+# SHA256SUMS.asc is a good signature by the release key is accepted too
+# ("signed-checksums"). --allow-unverified accepts less (and a source
+# tree); --allow-manifest-only is its former, narrower name.
 # The flag that accepted the lower level is logged (stderr and the system
 # log, auth.warning), recorded in the install manifest (verify_override) and
 # reported by `nn-admin host-check`.
@@ -222,11 +224,14 @@ while [[ $# -gt 0 ]]; do
             echo "  --admin-key-out PATH   fresh install: where to write the bootstrap admin PRIVATE key"
             echo "                         (default /root/northnarrow-admin.key; never under $ETC_DIR) — move it offline"
             echo "  --tarball FILE         the release tarball this tree was extracted from (default: ../<tree>.tar.gz)"
-            echo "  --sums FILE            SHA256SUMS of the release (default: next to the tarball)"
+            echo "  --sums FILE            SHA256SUMS of the release (default: next to the tarball); its signature,"
+            echo "                         FILE.asc, is read next to it"
             echo "  --attestation BUNDLE   offline Sigstore bundle for the tarball (gh attestation download)"
-            echo "  A release tree installs only when the tarball's SLSA provenance attestation verifies (gh 2.49+,"
-            echo "  or cosign with --attestation) and the tree is the tarball's (--require-attestation: the default)."
-            echo "  --allow-unverified     install a tree whose attestation did not verify, or a build from source"
+            echo "  A release tree installs only when the tree is the tarball's and the tarball's SLSA provenance"
+            echo "  attestation verifies (gh 2.49+, or cosign with --attestation; recorded as 'attested') or, with no"
+            echo "  attestation verifier on the host, SHA256SUMS.asc next to SHA256SUMS is a good signature by the"
+            echo "  release key (gpgv; recorded as 'signed-checksums') (--require-attestation: the default)."
+            echo "  --allow-unverified     install a tree neither check verified, or a build from source"
             echo "                         (lab, development): logged, recorded as 'checksums', 'manifest' or"
             echo "                         'source-tree' with the flag (--allow-manifest-only: its former name)."
             echo "                         It means: nothing proved this tree is the project's release. Do not use it"
@@ -244,7 +249,7 @@ while [[ $# -gt 0 ]]; do
             echo "                         it the run lists them and is refused, nothing changed)"
             echo "  --audit-group GROUP    existing group that may read $ETC_DIR/audit.log and chain_heads.json"
             echo "                         besides root (a log shipper; NN_AUDIT_GROUP too). Kept by later upgrades"
-            echo "  The flag that accepted a level below 'attested' is logged (auth.warning), recorded in the"
+            echo "  The flag that accepted a lower level is logged (auth.warning), recorded in the"
             echo "  install manifest and reported by nn-admin host-check."
             echo "  --without-nftables     install on a host without nft (nftables): the agent's per-process"
             echo "                         outbound block then cannot work (recorded in the install manifest)"
@@ -439,7 +444,9 @@ COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 #   1. MANIFEST.sha256 inside the tree (every file hashed by mk-tarball)
 #      — catches a corrupted or edited tree;
 #   2. SHA256SUMS of the release against the tarball — catches a
-#      swapped tarball;
+#      swapped tarball; with SHA256SUMS.asc next to it, the signature of
+#      SHA256SUMS by the release key first (lot 354) — catches a swapped
+#      SHA256SUMS;
 #   3. the tree is the tarball's: its MANIFEST.sha256 is the one inside the
 #      tarball (lab PR 220) — catches an edited tree, manifest rewritten,
 #      next to a genuine tarball;
@@ -452,7 +459,7 @@ COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 # the agent re-checks the installed hashes at every boot. A source tree
 # (no MANIFEST.sha256: the lab, a developer build) is "source-tree" and
 # needs --source-tree or --allow-unverified; a release tree below
-# "attested" needs --allow-unverified (external audit DEP-007, lab PR 220:
+# "attested" and "signed-checksums" needs --allow-unverified (external audit DEP-007, lab PR 220:
 # require_provenance_floor).
 REPO_SLUG="northnarrow/northnarrow-new"
 SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
@@ -460,6 +467,19 @@ SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
 # workflow at a v* tag. --signer-workflow accepted any ref, so the artefacts
 # of a workflow_dispatch run on a branch verified as well.
 SIGNER_IDENTITY_REGEX='^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v'
+# Lot 354 (the review of #562): SHA256SUMS.asc, the detached signature of
+# SHA256SUMS the release's tag job makes (release.yml, rpm-sign), is a level
+# of its own, "signed-checksums": a host whose gh has no `attestation`
+# command (Ubuntu 24.04's 2.45) installs a verified release without
+# --allow-unverified. The key is the tree's copy of the committed release
+# key, and only a signature whose primary key has this fingerprint counts,
+# so a key file swapped in the tree does not make another key's signature
+# pass. The README and the install guide (§6.1) publish the same
+# fingerprint; xtask/tests/supply_chain.rs keeps them equal to the
+# committed key's.
+RELEASE_KEY_FPR=BBBBEB6F5566A1CE99AE8379C66AE018C1727C8D
+RELEASE_KEY="$REPO_ROOT/deploy/release/RPM-GPG-KEY-northnarrow.asc"
+SUMS_SIGNED=0
 PROVENANCE="source-tree"
 TARBALL_SHA256=""
 ATTEST_METHOD="none"
@@ -488,6 +508,37 @@ sums_expected() {
         }' "$2"
 }
 # <<< sums_expected
+# >>> sums_signature (run by xtask/tests/install_scripts.rs)
+# Lot 354: whether SIG is a good detached signature of SUMS by the release
+# key KEY (the tree's armoured copy of the committed key) whose primary
+# fingerprint is FPR. gpgv reads a keyring holding KEY alone, under a home
+# of its own (WORK), so no key the host trusts counts. KEY is dearmoured
+# here, without gpg: a host may have gpgv only (apt depends on it). gpgv's
+# status lines and messages are left in WORK/gpgv.status and WORK/gpgv.err.
+# Exit 0 a good signature by FPR's key; 1 a bad signature, a signature by
+# another key, or none; 2 KEY missing or not one armoured key; 3 no gpgv.
+sums_signature() {   # <sums> <sig> <key> <fpr> <work dir>
+    local sums=$1 sig=$2 key=$3 fpr=$4 work=$5
+    command -v gpgv >/dev/null 2>&1 || return 3
+    [[ -s "$key" ]] || return 2
+    LC_ALL=C awk '
+        { sub(/\r$/, ""); sub(/[ \t]+$/, "") }
+        /^-----BEGIN PGP PUBLIC KEY BLOCK-----$/ { blocks++; body = 1; hdr = 1; next }
+        /^-----END PGP PUBLIC KEY BLOCK-----$/ { if (body) ended++; body = 0; next }
+        body && hdr { if ($0 == "") hdr = 0; next }
+        body && /^=/ { next }
+        body { print }
+        END { exit (blocks == 1 && ended == 1) ? 0 : 1 }' "$key" > "$work/key.b64" || return 2
+    base64 -d "$work/key.b64" > "$work/key.gpg" 2>/dev/null || return 2
+    [[ -s "$work/key.gpg" ]] || return 2
+    gpgv --homedir "$work" --keyring "$work/key.gpg" --status-fd 1 "$sig" "$sums" \
+        > "$work/gpgv.status" 2> "$work/gpgv.err" || return 1
+    LC_ALL=C awk -v fpr="$fpr" '
+        $1 == "[GNUPG:]" && $2 == "VALIDSIG" && toupper($NF) == toupper(fpr) { good = 1 }
+        $1 == "[GNUPG:]" && ($2 == "BADSIG" || $2 == "ERRSIG") { bad = 1 }
+        END { exit (good && !bad) ? 0 : 1 }' "$work/gpgv.status" || return 1
+}
+# <<< sums_signature
 # Lab PR 220: an accepted lower level is not only a line on the terminal —
 # the system log (auth.warning, tag northnarrow-install) has it too, next to
 # the install manifest's verify_override and `nn-admin host-check`.
@@ -559,24 +610,60 @@ verify_release() {
     esac
     sums=${SUMS:-"$(dirname "$tgz")/SHA256SUMS"}
     if [[ -f "$sums" ]]; then
-        local expected
+        local expected work sums_src=$sums
+        # Lot 354: one private copy of SHA256SUMS is both the file whose
+        # signature is checked and the file the checksum is read from, so
+        # the file next to the tarball cannot change between the two.
+        work=$(mktemp -d)
+        if ! cp -- "$sums_src" "$work/SHA256SUMS"; then
+            rm -rf "$work"
+            echo "install.sh: REFUSED — $sums_src could not be read" >&2
+            exit 1
+        fi
+        sums=$work/SHA256SUMS
+        if [[ -f "$sums_src.asc" ]]; then
+            rc=0
+            cp -- "$sums_src.asc" "$work/SHA256SUMS.asc" || rc=1
+            (( rc )) || sums_signature "$sums" "$work/SHA256SUMS.asc" "$RELEASE_KEY" "$RELEASE_KEY_FPR" "$work" || rc=$?
+            case $rc in
+                0) SUMS_SIGNED=1
+                   echo "install.sh: $(basename "$sums_src").asc is a good signature by the release key $RELEASE_KEY_FPR" ;;
+                1) echo "install.sh: REFUSED — $sums_src.asc is not a good signature of $(basename "$sums_src") by the release key" >&2
+                   echo "install.sh: $RELEASE_KEY_FPR (the key in $RELEASE_KEY):" >&2
+                   tail -n 3 "$work/gpgv.err" 2>/dev/null | sed 's/^/install.sh:   /' >&2
+                   echo "install.sh: SHA256SUMS or its signature was altered, or they are not this release's: download them again" >&2
+                   rm -rf "$work"
+                   exit 1 ;;
+                2) echo "install.sh: REFUSED — $(basename "$sums_src").asc is next to $(basename "$sums_src"), but the release key is missing from" >&2
+                   echo "install.sh: the tree or is not one armoured key ($RELEASE_KEY): the tree was altered" >&2
+                   rm -rf "$work"
+                   exit 1 ;;
+                *) echo "install.sh: gpgv not found: $(basename "$sums_src").asc is not checked (install the gpgv package)" >&2 ;;
+            esac
+        fi
         rc=0
         expected=$(sums_expected "$(basename "$tgz")" "$sums") || rc=$?
+        rm -rf "$work"
         case $rc in
             0) ;;
-            1) echo "install.sh: REFUSED — $(basename "$tgz") is not listed in $sums" >&2
+            1) echo "install.sh: REFUSED — $(basename "$tgz") is not listed in $sums_src" >&2
                exit 1 ;;
-            3) echo "install.sh: REFUSED — $sums lists $(basename "$tgz") more than once, with different checksums" >&2
+            3) echo "install.sh: REFUSED — $sums_src lists $(basename "$tgz") more than once, with different checksums" >&2
                exit 1 ;;
-            *) echo "install.sh: REFUSED — $sums could not be read (awk exit $rc)" >&2
+            *) echo "install.sh: REFUSED — $sums_src could not be read (awk exit $rc)" >&2
                exit 1 ;;
         esac
         if [[ "$expected" != "$TARBALL_SHA256" ]]; then
             echo "install.sh: REFUSED — tarball sha256 $TARBALL_SHA256 does not match SHA256SUMS ($expected)" >&2
             exit 1
         fi
-        echo "install.sh: tarball matches SHA256SUMS ($TARBALL_SHA256)"
-        PROVENANCE="checksums"
+        if (( SUMS_SIGNED )); then
+            echo "install.sh: tarball matches the signed SHA256SUMS ($TARBALL_SHA256)"
+            PROVENANCE="signed-checksums"
+        else
+            echo "install.sh: tarball matches SHA256SUMS ($TARBALL_SHA256)"
+            PROVENANCE="checksums"
+        fi
     else
         echo "install.sh: SHA256SUMS not found next to the tarball — pass --sums to verify it" >&2
     fi
@@ -612,6 +699,8 @@ verify_release() {
     if (( ATTEST_VERIFIED )); then
         echo "install.sh: SLSA provenance attestation verified ($ATTEST_METHOD, signer $SIGNER_WORKFLOW)"
         PROVENANCE="attested"
+    elif (( SUMS_SIGNED )) && [[ $ATTEST_METHOD == none ]]; then
+        echo "install.sh: no attestation verifier here: the signed SHA256SUMS is enough (provenance 'signed-checksums')"
     fi
 }
 
@@ -619,18 +708,30 @@ verify_release() {
 # for — whoever edits the tree can rewrite it. Lab PR 220 (static review of
 # baf4c25 P0 C-45 / G-07): so does an unsigned SHA256SUMS next to the
 # tarball — whoever swaps the tarball swaps it too. A release tree installs
-# at "attested" only; "checksums" and "manifest" need --allow-unverified,
-# which is logged and recorded. Separate from verify_release so the verifier
+# at "attested", or at "signed-checksums" (lot 354: SHA256SUMS signed by
+# the release key) when no attestation verifier is there: a verifier that
+# ran and refused is not overruled by the signature. "checksums" and
+# "manifest" need --allow-unverified, which is logged and recorded. Separate from verify_release so the verifier
 # itself stays a verifier.
 require_provenance_floor() {
     case $PROVENANCE in
         checksums|manifest) ;;
+        signed-checksums) [[ $ATTEST_METHOD == none ]] && return 0 ;;
         *) return 0 ;;
     esac
     if (( REQUIRE_ATTESTATION )); then
         echo "install.sh: REFUSED — the release's SLSA provenance attestation did not verify ($ATTEST_FAILURE)." >&2
-        echo "install.sh: $([[ $PROVENANCE == checksums ]] && echo "SHA256SUMS is not signed: it proves the tarball is the one it lists, not" || echo "Only the tree's own MANIFEST.sha256 was checked: it proves nothing about") where the release was built." >&2
-        echo "install.sh: Keep the tarball next to the tree (or --tarball FILE), with gh 2.49+ (online) or an offline" >&2
+        if [[ $PROVENANCE == signed-checksums ]]; then
+            echo "install.sh: SHA256SUMS.asc verified, but a verifier that ran and refused is not overruled by it:" >&2
+            echo "install.sh: fix what it said above (gh auth login, the network), or pass the offline bundle." >&2
+        elif [[ $PROVENANCE == checksums ]]; then
+            echo "install.sh: SHA256SUMS was checked without its signature (no SHA256SUMS.asc next to it, or no gpgv):" >&2
+            echo "install.sh: it proves the tarball is the one it lists, not where the release was built." >&2
+        else
+            echo "install.sh: Only the tree's own MANIFEST.sha256 was checked: it proves nothing about where the release was built." >&2
+        fi
+        echo "install.sh: Keep the tarball next to the tree (or --tarball FILE), with SHA256SUMS and SHA256SUMS.asc next" >&2
+        echo "install.sh: to it (checked with gpgv against the release key), or with gh 2.49+ (online) or an offline" >&2
         echo "install.sh: bundle (gh attestation download <tarball> --repo $REPO_SLUG; --attestation FILE, gh or" >&2
         echo "install.sh: cosign), see docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5.1 — or re-run with" >&2
         echo "install.sh: --allow-unverified (logged, recorded as '$PROVENANCE')." >&2

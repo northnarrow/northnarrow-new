@@ -101,9 +101,10 @@ Something that is not on this page is worth a report:
   lists them. *Workaround:* they are pinned in that crate's own lock file,
   `agent-ebpf/Cargo.lock`, in the source tree at the release tag.
 - **`gh attestation verify` needs gh 2.49 or newer.** Ubuntu 24.04 ships
-  gh 2.45, which has no `gh attestation` command. *Workaround:*
-  [INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §5 gives a
-  way to verify a release without it.
+  gh 2.45, which has no `gh attestation` command. *Workaround:* keep
+  `SHA256SUMS` and `SHA256SUMS.asc` next to the tarball: `install.sh` then
+  checks the signed checksums with `gpgv` and installs with no flag
+  ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §5).
 - **One architecture.** x86_64 only: no ARM64.
 - **The tarball is not byte-reproducible.** A rebuild gives a different
   file, because file times are kept on purpose (a staleness check needs
@@ -135,18 +136,18 @@ analysis is in the
   start are recorded (High for the risky types); on kernels from 6.9 their
   later use is not judged. *For you:* install on a fresh VM.
 - **Some BPF paths are not judged.** An XDP or tc program attached through
-  netlink, and the program values of some map types, are not judged. A
-  narrow timing gap in the check of a program's use remains: an attempt
-  that loses it is refused and signed, one that wins it leaves no record of
-  its own, but the program's load is still recorded High.
+  netlink, and the program values of some map types, are not judged. In
+  rare cases the use of a loaded program is not judged on its own; its
+  load is still recorded High. *For you:* treat a High BPF load record you
+  did not cause as an incident.
 - **An allowed tracing tool can read everything.** With
   `--allow-bpf-tools`, any root process that runs a named program may load
   tracing programs (for BCC that is any root Python script), and a tracing
   program can read the memory of every process, the agent's keys included.
   *For you:* use the opt-out on a test VM only.
 - **Mounts are recorded, not refused.** A mount over the agent's
-  configuration, state, unit or binary directories (for example a copy of
-  `/etc` mounted over `/etc`) is not refused: refusing it would also break
+  configuration, state, unit or binary directories is not refused:
+  refusing it would also break
   the mounts of systemd and container runtimes. It is a signed
   `integrity_drift` (`mount_over_protected`) within one integrity round
   (about 30 s).
@@ -173,7 +174,7 @@ analysis is in the
   loss end the agent without asking. The watchdog brings it back, and the
   next start records how the previous run ended (`previous_run` with
   `"ended":"abrupt"` in its signed `agent_boot` entry).
-- **Starving the agent.** Heavy CPU load from root processes can slow the
+- **The agent's CPU time.** Heavy CPU load from root processes can slow the
   agent: its unit has no raised CPU weight yet. A stall of more than 15 s is
   a signed `agent_stalled` record. A confinement of the agent to fewer CPUs
   through cgroups is recorded (`cpu_confined`, High, and the `own_cpus`
@@ -210,25 +211,23 @@ analysis is in the
   by the other rules (where it runs from, what it opens, where it
   connects).
 - **Ransomware detection looks for shapes.** It looks for mass rewrites,
-  renames to known extensions and high-entropy writes. Encryption done file
-  by file with ordinary tools, spread over many short processes, done
-  slowly, or of very small files (under 4 KiB), may be seen only by weaker
-  signals, or not at all.
+  renames to known extensions and high-entropy writes. Encryption that
+  does not show those shapes may be seen only by weaker signals, or not at
+  all. *For you:* keep backups off the host; detection does not replace
+  them.
 - **Ancestry is followed to a limit.** The agent follows a process's
-  ancestors to a fixed depth. Behind a very long chain of wrapper
-  processes, it judges what it can see.
-- **Security tools switched off.** The `NN-L-EVA-*` rules know the usual
-  commands for the tools in their table. Other ways to switch a tool off (a
-  command they do not list, a renamed copy, a reload with an edited
-  configuration) may leave no record.
+  ancestors to a fixed depth.
+- **Security tools switched off.** The `NN-L-EVA-*` rules recognise only
+  the commands in their table. Other ways to stop a security tool may leave
+  no record. *For you:* also check from each tool's own status and logs
+  that it still runs.
 - **Not watched by file integrity.** udev rule directories and initramfs
   hook directories are not watched: a new file there leaves no file
   integrity record. What such a file runs later is judged by the process
   rules.
 - **Some exemptions are wider than they should be.** A few exemptions for
   package managers and developer tools (npm under a system prefix, go,
-  database initialisation) trust the tool by identity, and part of that
-  trust can reach code the tool runs for the user. They are listed in
+  database initialisation) trust the tool by identity. They are listed in
   [UPGRADE_NOTES_WAVE4.md](UPGRADE_NOTES_WAVE4.md) §34 and §39 and will be
   narrowed.
 - **A TLS fingerprint is not an identity.** `NN-L-NET-003_BadJa3` records a

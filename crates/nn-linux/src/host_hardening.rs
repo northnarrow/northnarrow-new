@@ -424,8 +424,13 @@ pub const INSTALL_MANIFEST_REL: &str = "etc/northnarrow/install-manifest.json";
 /// `checksums` (the tarball against an unsigned `SHA256SUMS`, swapped with
 /// the tarball as easily) is a warning now, like `manifest` (the tree
 /// vouching for itself) and `source-tree`, `unverified` and `package`, which
-/// verified nothing on this host. The agent boots at every level (a lab or
-/// a developer host must keep working), so the level is reported here.
+/// verified nothing on this host. Lot 354: `signed-checksums` (the tarball
+/// against a `SHA256SUMS` whose `SHA256SUMS.asc` is a good signature by the
+/// release key, on a host with no attestation verifier) is OK too: the key
+/// lives only in the release's tag job. Accepted with a flag (a verifier ran
+/// and refused), it is a warning. The agent boots at every level (a
+/// lab or a developer host must keep working), so the level is reported
+/// here.
 fn install_provenance(root: &Path) -> Check {
     let path = root.join(INSTALL_MANIFEST_REL);
     let (status, value) = match std::fs::read_to_string(&path) {
@@ -439,6 +444,7 @@ fn install_provenance(root: &Path) -> Check {
             Ok(m) => {
                 let status = match m.provenance.as_str() {
                     "attested" => Status::Ok,
+                    "signed-checksums" if m.verify_override.is_none() => Status::Ok,
                     _ => Status::Warn,
                 };
                 let mut value = m.provenance.clone();
@@ -457,7 +463,7 @@ fn install_provenance(root: &Path) -> Check {
         name: "release verified at install",
         status,
         value,
-        fix: "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built",
+        fix: "install from the release tarball (next to the tree, or `--tarball`) with `SHA256SUMS` and `SHA256SUMS.asc` beside it (`signed-checksums`), or with `gh` or `cosign` for its tag-bound attestation (`attested`); install.sh refuses less without `--allow-unverified`: `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built",
     }
 }
 
@@ -1285,7 +1291,8 @@ mod tests {
     }
 
     /// External audit DEP-007, lab PR 220: anything below `attested` is a
-    /// warning, and the flag that accepted it is named.
+    /// warning, and the flag that accepted it is named. Lot 354:
+    /// `signed-checksums` reached with no flag is OK.
     #[test]
     fn install_provenance_warns_below_attested() {
         let d = tempfile::tempdir().unwrap();
@@ -1293,6 +1300,8 @@ mod tests {
         assert_eq!(install_provenance(r).status, Status::Unknown);
         for (prov, flag, status) in [
             ("attested", None, Status::Ok),
+            ("signed-checksums", None, Status::Ok),
+            ("signed-checksums", Some("--allow-unverified"), Status::Warn),
             ("checksums", Some("--allow-unverified"), Status::Warn),
             ("checksums", None, Status::Warn),
             ("manifest", Some("--allow-manifest-only"), Status::Warn),

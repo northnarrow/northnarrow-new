@@ -72,6 +72,10 @@ fn figures_before(text: &str, noun: &str) -> Vec<usize> {
     out
 }
 
+/// How far below the count the README's floor of test functions may stay
+/// (the review of #562: it was 1,000, so a floor long behind still passed).
+const TESTS_MARGIN: usize = 200;
+
 const FAMILIES: [&str; 4] = ["process", "fim", "net", "other"];
 
 /// The ids of the rule catalogue (`crates/nn-core/src/decision/catalogue`),
@@ -402,13 +406,13 @@ fn readme_problems(readme: &str, c: &Counted) -> Vec<String> {
             problems.push(format!("the README does not say, word for word: {p}"));
         }
     }
-    // The test functions: a floor in hundreds ("more than **5,400**"),
-    // below the count and less than 1,000 under it — a figure that grows
-    // with every change is not pinned exactly, but it is never false and
-    // never far behind.
+    // The test functions: a floor in hundreds ("more than **5,500**"),
+    // below the count and less than TESTS_MARGIN under it — a figure that
+    // grows with every change is not pinned exactly, but it is never false
+    // ("more than" the count itself is false too) and never far behind.
     let floor: Vec<usize> = figures_before(readme, " test functions");
     match floor.as_slice() {
-        [f] if *f <= c.tests && c.tests - f < 1_000 && f.is_multiple_of(100) => {
+        [f] if *f < c.tests && c.tests - f < TESTS_MARGIN && f.is_multiple_of(100) => {
             if !readme.contains(&format!("more than **{}** test functions", thousands(*f))) {
                 problems.push(format!(
                     "the README states {f} test functions, not as \"more than **{}** test functions\"",
@@ -419,7 +423,7 @@ fn readme_problems(readme: &str, c: &Counted) -> Vec<String> {
         _ => problems.push(format!(
             "the README's test functions {floor:?}: write \"more than **{}** test functions\" \
              ({} counted)",
-            thousands(c.tests / 100 * 100),
+            thousands((c.tests - 1) / 100 * 100),
             c.tests
         )),
     }
@@ -532,16 +536,31 @@ fn the_checker_refuses_stale_figures() {
             .any(|p| p.contains("93 rules")),
         "a stray figure accepted"
     );
+    // the floor the README states, one TESTS_MARGIN (rounded up to a
+    // hundred) behind it, and one at or above the count
+    let floor = figures_before(&good, " test functions");
+    assert_eq!(floor.len(), 1, "{floor:?}");
+    let stated = format!("more than **{}** test functions", thousands(floor[0]));
+    let behind = (c.tests - TESTS_MARGIN) / 100 * 100;
     let far = good.replace(
-        "more than **5,400** test functions",
-        "more than **3,600** test functions",
+        &stated,
+        &format!("more than **{}** test functions", thousands(behind)),
     );
-    if c.tests >= 4_600 {
-        assert!(
-            !readme_problems(&far, &c).is_empty(),
-            "a floor far behind accepted"
-        );
-    }
+    assert!(
+        !readme_problems(&far, &c).is_empty(),
+        "a floor {behind}, more than {TESTS_MARGIN} behind {}, accepted",
+        c.tests
+    );
+    let above = c.tests.div_ceil(100) * 100;
+    let false_floor = good.replace(
+        &stated,
+        &format!("more than **{}** test functions", thousands(above)),
+    );
+    assert!(
+        !readme_problems(&false_floor, &c).is_empty(),
+        "a floor {above} at or above the count {} accepted",
+        c.tests
+    );
 }
 
 /// The case names of the table under `heading` (up to the next heading of

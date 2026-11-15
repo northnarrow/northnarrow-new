@@ -84,17 +84,49 @@ shows. Never replace the list with a fixed one.
 them.
 
 **Install** ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md)
-§1). Verify the release first
-([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §5); the
-installer checks it again itself before it changes anything. From the
-release tarball:
+§1). These commands work on Ubuntu 24.04 as it ships (its gh 2.45 has no
+`gh attestation`; git, gpg, gpgv and curl are there). Download the tarball,
+`SHA256SUMS` and its signature `SHA256SUMS.asc` into one directory:
 
 ```sh
-sha256sum -c SHA256SUMS
-tar xzf northnarrow-<ver>-x86_64-linux.tar.gz
-cd northnarrow-<ver>-x86_64-linux
+ver=<ver>                            # the release you test, e.g. 0.1.0-alpha
+base=https://github.com/northnarrow/northnarrow-new/releases/download/v$ver
+curl -fLO "$base/northnarrow-$ver-x86_64-linux.tar.gz"
+curl -fLO "$base/SHA256SUMS"
+curl -fLO "$base/SHA256SUMS.asc"
+```
+
+Verify them with the key committed at the release tag, never with a copy
+from the release page
+([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §5, "Without
+`gh`"):
+
+```sh
+git clone https://github.com/northnarrow/northnarrow-new && cd northnarrow-new
+git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag "v$ver"   # Good "git" signature
+git show "v$ver:deploy/release/RPM-GPG-KEY-northnarrow.asc" > ../nn-release-key.asc
+cd .. && gpg --show-keys nn-release-key.asc     # BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D
+gpg --dearmor < nn-release-key.asc > nn-release-key.gpg
+gpgv --keyring ./nn-release-key.gpg SHA256SUMS.asc SHA256SUMS     # Good signature
+sha256sum -c --ignore-missing SHA256SUMS                          # northnarrow-<ver>-…tar.gz: OK
+```
+
+Then install. Leave the three files where they are, next to the extracted
+tree: the installer checks the signature and the tarball again itself,
+with `gpgv`, before it changes anything, and installs with no flag:
+
+```sh
+tar xzf "northnarrow-$ver-x86_64-linux.tar.gz"
+cd "northnarrow-$ver-x86_64-linux"
 sudo ./deploy/install.sh            # alpha profile, started now and at every boot
 ```
+
+It prints `tarball matches the signed SHA256SUMS`, and records the
+release as `signed-checksums` (`nn-admin host-check`: OK). With gh 2.49 or
+newer on the machine, it also verifies the release's attestation and
+records `attested`; when gh cannot (not logged in: `gh auth login`; no
+network), that is a refusal. Do not add `--allow-unverified` to get past a
+refusal: it says the download is not proven to be the release.
 
 Keep the extracted tree: the uninstaller is in it. From the `.deb`
 instead:
@@ -255,9 +287,10 @@ done
 sudo python3 -c 'import glob, os; [os.rename(f, f + ".locked") for f in glob.glob("/srv/nn-demo-rename/*.txt")]'
 ```
 
-Expected: `NN-L-IMP-002_RenameExtensionBurst` (High). The counter is per
-process: a shell loop of `mv` is one process per file and does not draw
-it.
+Expected: `NN-L-IMP-002_RenameExtensionBurst` (High). Run the rename as
+written: other ways of renaming the same files may be judged by other
+rules, or not at all
+([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md#detection-coverage)).
 
 Clean up: `sudo rm -rf /srv/nn-demo-rename`
 
