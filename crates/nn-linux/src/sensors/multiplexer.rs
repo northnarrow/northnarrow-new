@@ -559,8 +559,8 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             // function signature. Without BTF this fails the start, like
             // the anti-tamper deny hooks do (review 53): BTF is a hard
             // prerequisite, see docs/operator/KERNEL_COMPATIBILITY.md.
-            let btf =
-                Btf::from_sys_fs().with_context(|| "loading vmlinux BTF for net fexit programs")?;
+            let btf = antitamper_bpf::kernel_roots::vmlinux_btf()
+                .with_context(|| "loading vmlinux BTF for net fexit programs")?;
             attach_kprobe(&mut ebpf, "inet_csk_listen_start", "inet_csk_listen_start")?;
             attach_fexit(&mut ebpf, "tcp_close", &btf)?;
             attach_kprobe(&mut ebpf, "udp_sendmsg_outbound", "udp_sendmsg")?;
@@ -1178,7 +1178,7 @@ pub const FORK_PARENT_DEGRADED: &str = "the exec records carry no fork parent: n
 fn attach_fork_parent(ebpf: &mut Ebpf) {
     const PROGRAM: &str = "fork_parent_record";
     let attached = (|| -> Result<(), String> {
-        let btf = Btf::from_sys_fs().map_err(|e| format!("BTF: {e}"))?;
+        let btf = antitamper_bpf::kernel_roots::vmlinux_btf().map_err(|e| format!("BTF: {e}"))?;
         let p: &mut BtfTracePoint = ebpf
             .program_mut(PROGRAM)
             .ok_or_else(|| format!("program {PROGRAM} missing from the eBPF object"))?

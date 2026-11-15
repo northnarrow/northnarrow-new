@@ -86,8 +86,9 @@ impl LossWatch {
         let map = self.map.as_ref()?;
         let mut sum = 0u64;
         for slot in self.slots {
-            let per_cpu = map.get(slot, 0).ok()?;
-            sum = sum.saturating_add(per_cpu.iter().sum::<u64>());
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            let per_cpu = antitamper_bpf::per_cpu::sum(map, *slot).ok()?;
+            sum = sum.saturating_add(per_cpu);
         }
         Some(sum)
     }
@@ -228,9 +229,8 @@ pub fn total() -> u64 {
 fn read_map(map: &PerCpuArray<MapData, u64>) -> Vec<Option<u64>> {
     (0..RING_DROP_SLOTS)
         .map(|slot| {
-            map.get(&slot, 0)
-                .ok()
-                .map(|per_cpu| per_cpu.iter().sum::<u64>())
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            antitamper_bpf::per_cpu::sum(map, slot).ok()
         })
         .collect()
 }
@@ -369,11 +369,11 @@ const PACKAGE_MANAGER_SCRIPTS: &[&str] = &[
 /// a package manager. An unprivileged user running `dpkg -l` does not
 /// count, so a user cannot open the exemption for their own flood.
 fn package_transaction_running(proc_root: &std::path::Path) -> bool {
-    let Ok(dir) = std::fs::read_dir(proc_root) else {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let Ok(dir) = antitamper_bpf::kernel_roots::read_dir(proc_root) else {
         return false;
     };
-    dir.flatten().any(|e| {
-        let name = e.file_name();
+    dir.into_iter().any(|name| {
         let Some(pid) = name
             .to_str()
             .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))

@@ -161,7 +161,72 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// Anchor the views (once; later calls return the same answer): the
 /// reasons a view is not anchored, one line each — empty when all are.
 pub fn init() -> Vec<String> {
-    unanchored()
+    let mut why = unanchored();
+    // lot 353 (the review of #563, F2): read once now, beneath the root
+    if let Err(e) = possible_cpus() {
+        why.push(format!("/sys/devices/system/cpu/possible: {e}"));
+    }
+    why
+}
+
+/// Lot 353 (the review of #563, the lab's FUSE over `/proc`): this
+/// process's executable (`/proc/self/exe`), read beneath the `/proc` root
+/// the start anchored — `std::env::current_exe` reads it by path, and the
+/// telemetry probe's round, asking it on a runtime worker, was held by a
+/// FUSE over `/proc` (the status stopped answering behind it).
+pub fn current_exe() -> io::Result<PathBuf> {
+    read_link("/proc/self/exe")
+}
+
+/// Lot 353 (the review of #563, F2): the number of possible CPUs (the
+/// length of a per-CPU map's value), read once — at [`init`] — from
+/// `/sys/devices/system/cpu/possible` beneath the `/sys` root the start
+/// anchored. aya's `nr_cpus()` reads that file by path once per thread:
+/// every fresh runtime or blocking thread that read a per-CPU map walked
+/// the `/sys` mounted now, and a FUSE over it held the thread.
+pub fn possible_cpus() -> Result<usize, String> {
+    static CPUS: OnceLock<Result<usize, String>> = OnceLock::new();
+    CPUS.get_or_init(|| {
+        let text = read_text("/sys/devices/system/cpu/possible").map_err(|e| e.to_string())?;
+        cpu_count(text.trim()).ok_or_else(|| format!("not a CPU list: {:?}", text.trim()))
+    })
+    .clone()
+}
+
+/// The number of CPUs in a kernel CPU list (`0-3,8,10-11`).
+pub fn cpu_count(list: &str) -> Option<usize> {
+    let mut n = 0usize;
+    for part in list.split(',') {
+        let part = part.trim();
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (a.parse::<usize>().ok()?, b.parse::<usize>().ok()?);
+                if b < a {
+                    return None;
+                }
+                n = n.checked_add(b - a + 1)?;
+            }
+            None => {
+                part.parse::<usize>().ok()?;
+                n = n.checked_add(1)?;
+            }
+        }
+    }
+    (n > 0).then_some(n)
+}
+
+/// Lot 353 (the review of #563, F2): the kernel's BTF
+/// (`/sys/kernel/btf/vmlinux`), read beneath the `/sys` root the start
+/// anchored — aya's `Btf::from_sys_fs` reads it by path, and a start under
+/// a FUSE over `/sys` waited for it with no deadline. A `/sys` the start
+/// refused is an error at once.
+pub fn vmlinux_btf() -> Result<aya::Btf, aya::BtfError> {
+    const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
+    let data = read_all(VMLINUX).map_err(|error| aya::BtfError::FileError {
+        path: PathBuf::from(VMLINUX),
+        error,
+    })?;
+    aya::Btf::parse(&data, aya::Endianness::default())
 }
 
 /// The views, anchored at the first call.
@@ -212,17 +277,30 @@ pub fn unanswered() -> usize {
 
 impl Views {
     fn open() -> Views {
-        let proc = View {
+        let mut proc = View {
             kind: Kind::Proc,
             at: PathBuf::from("/proc"),
             root: anchor(Path::new("/proc"), &[PROC_SUPER_MAGIC]).map(|(f, _)| f),
         };
-        let sys = View {
+        // lot 353 (the review of #563, F3): the mounts this process sees,
+        // read beneath the /proc root just anchored
+        let table = proc.root.as_ref().ok().and_then(own_mounts);
+        let mut sys = View {
             kind: Kind::Sys,
             at: PathBuf::from("/sys"),
             root: anchor(Path::new("/sys"), &[SYSFS_MAGIC]).map(|(f, _)| f),
         };
-        let cgroup = cgroup_view();
+        if let Some(t) = &table {
+            for v in [&mut proc, &mut sys] {
+                if v.root.is_ok() {
+                    if let Some(why) = shadowed(t, &v.at.to_string_lossy()) {
+                        v.root = Err(why);
+                    }
+                }
+            }
+        }
+        let unified_only = proc.root.as_ref().ok().is_some_and(cgroup2_alone);
+        let cgroup = cgroup_view(table.as_deref(), unified_only);
         Views { proc, sys, cgroup }
     }
 
@@ -244,10 +322,97 @@ impl Views {
     }
 }
 
+/// Lot 353 (the review of #563, F3): the mount table of this process
+/// (`/proc/self/mountinfo`), read beneath the `/proc` root `proc`.
+fn own_mounts(proc: &File) -> Option<String> {
+    let f = openat2(
+        proc,
+        Path::new("self/mountinfo"),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        NO_CROSSING,
+    )
+    .ok()?;
+    String::from_utf8(read_file_bounded(&f, STATE_MAX).ok()?).ok()
+}
+
+/// One line of a mount table: (id, parent, `major:minor`, root, mount
+/// point, file system type).
+fn mount_line(l: &str) -> Option<(&str, &str, &str, &str, &str, &str)> {
+    let (left, right) = l.split_once(" - ")?;
+    let mut f = left.split(' ');
+    let (id, parent, dev, root, point) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+    let fstype = right.split(' ').next()?;
+    Some((id, parent, dev, root, point, fstype))
+}
+
+/// Lot 353 (the review of #563, F3): why the mount on top at the view
+/// point `point` of the mount table `table` is not the view, if it is not:
+/// a directory of a file system bound over it (its source root other than
+/// `/`: a cgroup2 subtree over the hierarchy's root, `/proc/sys` over
+/// `/proc`), or a file system stacked over another mounted at the same
+/// point (a tmpfs over the cgroup2 root, another proc over `/proc`) — a
+/// bind of the same mount onto itself is the same view.
+pub fn shadowed(table: &str, point: &str) -> Option<String> {
+    let at: Vec<_> = table
+        .lines()
+        .filter_map(mount_line)
+        .filter(|m| m.4 == point)
+        .collect();
+    let top = at.last()?;
+    let (_, parent, dev, root, _, fstype) = *top;
+    if root != "/" {
+        return Some(format!(
+            "{point}: the mount there is a directory of a {fstype} (source root {root}) bound \
+             over the view's root — a mount over it"
+        ));
+    }
+    let below = at.iter().rev().skip(1).find(|m| m.0 == parent)?;
+    (below.2 != dev || below.3 != root).then(|| {
+        format!(
+            "{point}: a {fstype} mounted over the {} there — a mount over it",
+            below.5
+        )
+    })
+}
+
+/// Lot 353 (the review of #563, F3): this process is in the cgroup2
+/// hierarchy alone — `/proc/self/cgroup` (read beneath the `/proc` root
+/// `proc`) names no cgroup v1 hierarchy: a unified host, whose cgroup2
+/// root is mounted at `/sys/fs/cgroup` (the kernel's word, whatever is
+/// mounted there now).
+fn cgroup2_alone(proc: &File) -> bool {
+    let Ok(f) = openat2(
+        proc,
+        Path::new("self/cgroup"),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        NO_CROSSING,
+    ) else {
+        return false;
+    };
+    let Ok(text) =
+        read_file_bounded(&f, STATE_MAX).map(|b| String::from_utf8_lossy(&b).into_owned())
+    else {
+        return false;
+    };
+    unified_hierarchy_only(&text)
+}
+
+/// Whether a `/proc/<pid>/cgroup` text names the cgroup2 hierarchy alone
+/// (its `0::` line, no v1 hierarchy's).
+pub fn unified_hierarchy_only(text: &str) -> bool {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty()).peekable();
+    lines.peek().is_some() && lines.all(|l| l.starts_with("0::"))
+}
+
 /// The cgroup2 hierarchy's view: `/sys/fs/cgroup` on a unified host, its
 /// `unified` directory on a hybrid one (a tmpfs at `/sys/fs/cgroup`), none
-/// on a legacy host; a root that is neither is refused.
-fn cgroup_view() -> Option<View> {
+/// on a legacy host; a root that is neither is refused. Lot 353 (the
+/// review of #563, F3): refused too — never taken for a cgroup v1 host —
+/// a mount at `/sys/fs/cgroup` that is not the view ([`shadowed`] in the
+/// mount table `table`), and a tmpfs there with no `unified` below it on a
+/// host whose processes are in the cgroup2 hierarchy alone
+/// (`unified_only`): a mount over its cgroup2 root.
+fn cgroup_view(table: Option<&str>, unified_only: bool) -> Option<View> {
     let at = Path::new("/sys/fs/cgroup");
     let refused = |why: String| {
         Some(View {
@@ -256,6 +421,9 @@ fn cgroup_view() -> Option<View> {
             root: Err(why),
         })
     };
+    if let Some(why) = table.and_then(|t| shadowed(t, "/sys/fs/cgroup")) {
+        return refused(why);
+    }
     match anchor(at, &[CGROUP2_SUPER_MAGIC, TMPFS_MAGIC]) {
         Ok((f, CGROUP2_SUPER_MAGIC)) => Some(View {
             kind: Kind::Cgroup,
@@ -268,8 +436,17 @@ fn cgroup_view() -> Option<View> {
                 Ok((f, _)) => Some(View {
                     kind: Kind::Cgroup,
                     at: unified.to_path_buf(),
-                    root: Ok(f),
+                    root: match table.and_then(|t| shadowed(t, "/sys/fs/cgroup/unified")) {
+                        Some(why) => Err(why),
+                        None => Ok(f),
+                    },
                 }),
+                Err(_) if unified_only => refused(format!(
+                    "{}: a tmpfs, with no cgroup2 hierarchy below it, on a host whose processes \
+                     are in the cgroup2 hierarchy alone (/proc/self/cgroup names no v1 \
+                     hierarchy) — a mount over its cgroup2 root",
+                    at.display()
+                )),
                 Err(why) if why.contains("No such file") => None,
                 Err(why) => Some(View {
                     kind: Kind::Cgroup,
@@ -850,6 +1027,38 @@ pub fn read_dir_max<P: AsRef<Path>>(path: P, max: usize) -> io::Result<Vec<OsStr
     names_of(open_path(path, flags)?, max)
 }
 
+/// Lot 353 (the review of #563, F2): `chmod` of the file `f` refers to —
+/// an `O_PATH` descriptor too, which `fchmod` refuses — through its
+/// `/proc/self/fd` entry beneath the `/proc` root the start anchored (the
+/// directory opened crossing no mount), never through the `/proc` mounted
+/// now. `Err` when that root is not anchored: the caller's fallback.
+pub fn chmod_fd(f: &File, mode: u32) -> io::Result<()> {
+    let dir = open("/proc/self/fd", libc::O_PATH | libc::O_DIRECTORY)?;
+    let name = CString::new(f.as_raw_fd().to_string())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: a live directory fd and a NUL-terminated name; the magic link
+    // is followed to the file `f` refers to.
+    if unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Lot 353 (the review of #563, F2): the file `f` refers to (an `O_PATH`
+/// descriptor too) opened again with `flags`, through its `/proc/self/fd`
+/// entry beneath the `/proc` root the start anchored, as [`chmod_fd`].
+pub fn reopen_fd(f: &File, flags: i32) -> io::Result<File> {
+    let dir = open("/proc/self/fd", libc::O_PATH | libc::O_DIRECTORY)?;
+    openat(&dir, Path::new(&f.as_raw_fd().to_string()), flags)
+}
+
+/// The names in the open directory `f` (not `.` and `..`): lot 353, the
+/// listing of a directory a caller opened beneath a descriptor of its own
+/// (the signed logs' anchored directories).
+pub fn dir_names(f: File) -> io::Result<Vec<OsString>> {
+    names_of(f, usize::MAX)
+}
+
 /// The entries of the open directory `f`.
 fn names_of(f: File, max: usize) -> io::Result<Vec<OsString>> {
     use std::os::fd::IntoRawFd;
@@ -1392,5 +1601,174 @@ mod tests {
         let e = anchor(d.path(), &[PROC_SUPER_MAGIC]).unwrap_err();
         assert!(e.contains("not the kernel's"), "{e}");
         assert!(anchor(Path::new("/proc"), &[PROC_SUPER_MAGIC]).is_ok());
+    }
+
+    /// Lot 353 (the review of #563, F3, its probe's tables): the mount on
+    /// top at a view point that is not the view — a tmpfs stacked over the
+    /// cgroup2 root, a cgroup2 subtree bound over it, `/proc/sys` bound
+    /// over `/proc`, another proc over `/proc` — is refused at the start; a
+    /// view as mounted (and a bind of it onto itself) is not, nor a hybrid
+    /// host's tmpfs at `/sys/fs/cgroup`.
+    #[test]
+    fn a_mount_over_a_view_s_root_is_not_taken_for_the_view() {
+        let base = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+25 24 0:22 / /sys rw,nosuid shared:2 - sysfs sysfs rw
+26 24 0:23 / /proc rw,nosuid shared:3 - proc proc rw
+27 25 0:26 / /sys/fs/cgroup rw,nosuid shared:4 - cgroup2 cgroup2 rw,nsdelegate
+";
+        for p in ["/proc", "/sys", "/sys/fs/cgroup"] {
+            assert_eq!(shadowed(base, p), None, "{p}");
+        }
+        let with = |extra: &str| format!("{base}{extra}");
+        let tmpfs = with("900 27 0:91 / /sys/fs/cgroup rw shared:500 - tmpfs tmpfs rw\n");
+        assert!(shadowed(&tmpfs, "/sys/fs/cgroup")
+            .unwrap()
+            .contains("tmpfs mounted over the cgroup2"));
+        let subtree =
+            with("901 27 0:26 /user.slice /sys/fs/cgroup rw shared:501 - cgroup2 cgroup2 rw\n");
+        assert!(shadowed(&subtree, "/sys/fs/cgroup")
+            .unwrap()
+            .contains("source root /user.slice"));
+        let procsys = with("903 26 0:23 /sys /proc rw shared:503 - proc proc rw\n");
+        assert!(shadowed(&procsys, "/proc").is_some());
+        let other_proc = with("904 26 0:95 / /proc rw shared:504 - proc proc rw\n");
+        assert!(shadowed(&other_proc, "/proc")
+            .unwrap()
+            .contains("proc mounted over the proc"));
+        let self_bind = with("905 27 0:26 / /sys/fs/cgroup ro shared:505 - cgroup2 cgroup2 rw\n");
+        assert_eq!(
+            shadowed(&self_bind, "/sys/fs/cgroup"),
+            None,
+            "the same view"
+        );
+        let hybrid = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+25 24 0:22 / /sys rw,nosuid shared:2 - sysfs sysfs rw
+30 25 0:27 / /sys/fs/cgroup ro shared:5 - tmpfs tmpfs ro,mode=755
+31 30 0:28 / /sys/fs/cgroup/unified rw shared:6 - cgroup2 cgroup2 rw
+";
+        assert_eq!(shadowed(hybrid, "/sys/fs/cgroup"), None);
+        assert_eq!(shadowed(hybrid, "/sys/fs/cgroup/unified"), None);
+    }
+
+    /// Lot 353 (the review of #563, F3): a start under a tmpfs laid over a
+    /// unified host's cgroup2 root does not take the host for a cgroup v1
+    /// one (rc2: no view, no degradation, the floors "restored" into the
+    /// tmpfs): the cgroup view is refused, naming why, and its paths fail.
+    /// In a user and mount namespace of a child, skipped where the host
+    /// refuses one or is not unified.
+    #[test]
+    fn a_start_under_a_tmpfs_over_the_cgroup2_root_refuses_the_view() {
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+            || !unified_hierarchy_only(&own)
+        {
+            return; // not a unified host
+        }
+        // SAFETY: fork; the child mounts in namespaces of its own and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let rc = (|| {
+                // SAFETY: the child's own namespaces; no data.
+                let refused = unsafe {
+                    libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
+                        || libc::mount(
+                            std::ptr::null(),
+                            c"/".as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_REC | libc::MS_PRIVATE,
+                            std::ptr::null(),
+                        ) != 0
+                };
+                if refused {
+                    return 99;
+                }
+                // the table as it was before the cover (no stack in it: a
+                // cgroup2 root unmounted, then a tmpfs mounted alone)
+                let before = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+                // SAFETY: NUL-terminated strings, no data.
+                if unsafe {
+                    libc::mount(
+                        c"none".as_ptr(),
+                        c"/sys/fs/cgroup".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    )
+                } != 0
+                {
+                    return 99;
+                }
+                // the kernel's word on the hierarchies alone refuses it
+                let Some(alone) = cgroup_view(Some(&before), true) else {
+                    return 10; // taken for a cgroup v1 host
+                };
+                match alone.refused() {
+                    Some(why) if why.contains("cgroup2 hierarchy alone") => {}
+                    _ => return 11,
+                }
+                // and the start as it is (the stack in its table)
+                let views = Views::open();
+                match views.cgroup().and_then(View::refused) {
+                    Some(why) if why.contains("a mount over") => {}
+                    _ => return 12,
+                }
+                match with_file_in(
+                    &views,
+                    Path::new("/sys/fs/cgroup/x"),
+                    READ_FLAGS,
+                    |_| Ok(()),
+                ) {
+                    Some(Err(_)) => 0,
+                    _ => 13,
+                }
+            })();
+            // SAFETY: _exit in the child.
+            unsafe { libc::_exit(rc) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(libc::WIFEXITED(status), "child status {status:#x}");
+        match libc::WEXITSTATUS(status) {
+            0 | 99 => {}
+            rc => panic!("the child failed with {rc}"),
+        }
+    }
+
+    /// Lot 353 (the review of #563, F3): a unified host is told by the
+    /// kernel's word on this process's hierarchies, not by what is mounted
+    /// at `/sys/fs/cgroup` — a tmpfs there no longer makes it a v1 host.
+    #[test]
+    fn a_unified_host_is_told_by_its_processes_hierarchies() {
+        assert!(unified_hierarchy_only(
+            "0::/system.slice/northnarrow-agent.service\n"
+        ));
+        assert!(!unified_hierarchy_only(
+            "12:memory:/x\n1:name=systemd:/x\n0::/x\n"
+        ));
+        assert!(!unified_hierarchy_only(""));
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let unified = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+        if unified {
+            assert!(unified_hierarchy_only(&own), "{own}");
+        }
+    }
+
+    /// Lot 353 (the review of #563, F2): the CPU count read once beneath
+    /// the anchored /sys root is the kernel's possible CPUs (aya's count).
+    #[test]
+    fn the_possible_cpus_are_read_beneath_the_root() {
+        assert_eq!(cpu_count("0-3"), Some(4));
+        assert_eq!(cpu_count("0-3,8,10-11"), Some(7));
+        assert_eq!(cpu_count("0"), Some(1));
+        assert_eq!(cpu_count(""), None);
+        assert_eq!(cpu_count("3-1"), None);
+        assert_eq!(cpu_count("x"), None);
+        let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").unwrap();
+        assert_eq!(possible_cpus(), Ok(cpu_count(text.trim()).unwrap()));
+        assert_eq!(possible_cpus().unwrap(), aya::util::nr_cpus().unwrap());
     }
 }

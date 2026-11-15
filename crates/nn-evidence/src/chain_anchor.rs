@@ -51,7 +51,6 @@
 //! numbered anything. On the host that cannot be told from the real past;
 //! the journal heads forwarded off the host can.
 
-use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,7 +64,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
-use crate::chain_host::{ChainHost, ChainSigner};
+use crate::chain_host::{ChainHost, ChainSigner, Open};
 
 /// Pre-image prefix of a numbered `audit.log` row.
 pub const AUDIT_DOMAIN_V2: &[u8] = b"northnarrow/audit/v2\0";
@@ -707,7 +706,7 @@ impl HeadsStore {
         text.resize(SLOT_BYTES as usize - 1, b' ');
         text.push(b'\n');
         let f = K::Host::open_with_mode_nofollow(
-            OpenOptions::new().write(true).create(true).truncate(false),
+            Open::new().write(true).create(true).truncate(false),
             HEADS_FILE_MODE,
             path,
         )
@@ -1305,12 +1304,12 @@ impl<K: ChainSigner> Anchor<K> {
 
     /// Create the file if missing: directly, or inside the `+i` dance.
     fn ensure_file(&self) -> Result<()> {
-        if std::fs::symlink_metadata(&self.file).is_ok() {
+        if K::Host::symlink_metadata(&self.file).is_ok() {
             return Ok(());
         }
         let create = |path: &Path| -> Result<()> {
             match K::Host::open_with_mode(
-                OpenOptions::new().write(true).create_new(true),
+                Open::new().write(true).create_new(true),
                 HEADS_FILE_MODE,
                 path,
             ) {
@@ -1585,7 +1584,7 @@ pub mod small_order {
 #[cfg(test)]
 pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
     use std::io::Write;
-    let mut f = OpenOptions::new().append(true).open(path).unwrap();
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     f.write_all(bytes).unwrap();
 }
 
@@ -1594,6 +1593,7 @@ mod tests {
     use super::*;
     use crate::audit::{AuditEntryDraft, AuditLog};
     use crate::chain_host::testing::{PortableHost, TestKey};
+    use std::fs::OpenOptions;
     use tempfile::TempDir;
 
     fn draft(n: u32) -> AuditEntryDraft {

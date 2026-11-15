@@ -879,26 +879,38 @@ fn collect_descendants_capped(
 
 /// Build the `ppid → [(child_pid, start ticks), ...]` adjacency map from
 /// /proc.
+///
+/// Lot 353 (the review of #563, F2): beneath the `/proc` root the start
+/// anchored (`kernel_roots`, the state reader) — the `procfs` crate walked
+/// the `/proc` mounted now, and a FUSE over it held the kill response's
+/// descendant walk.
 fn build_ppid_map() -> std::io::Result<HashMap<u32, Vec<(u32, u64)>>> {
     let mut map: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
-    let processes = match procfs::process::all_processes() {
-        Ok(it) => it,
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "procfs::all_processes failed: {e}"
-            )))
-        }
-    };
-    for proc in processes.flatten() {
-        let stat = match proc.stat() {
-            Ok(s) => s,
-            Err(_) => continue, // race: process exited mid-walk; skip
+    let names = antitamper_bpf::kernel_roots::read_dir("/proc")
+        .map_err(|e| std::io::Error::other(format!("listing /proc failed: {e}")))?;
+    for name in names {
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
         };
-        map.entry(stat.ppid as u32)
-            .or_default()
-            .push((stat.pid as u32, stat.starttime));
+        // race: a process that exited mid-walk is skipped
+        let Ok(stat) = crate::state_read::read_state(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((ppid, start)) = ppid_and_start(&stat) else {
+            continue;
+        };
+        map.entry(ppid).or_default().push((pid, start));
     }
     Ok(map)
+}
+
+/// The parent (field 4) and the start ticks (field 22) of a
+/// `/proc/<pid>/stat` line — after the last `)`, whatever the `comm`.
+fn ppid_and_start(stat: &str) -> Option<(u32, u64)> {
+    let mut f = stat.rsplit_once(')')?.1.split_whitespace();
+    let ppid = f.nth(1)?.parse().ok()?;
+    let start = f.nth(17)?.parse().ok()?;
+    Some((ppid, start))
 }
 
 #[cfg(test)]
@@ -2099,6 +2111,26 @@ mod bug122 {
                 None,
                 Some(PROTECTED),
             ]
+        );
+    }
+
+    /// Lot 353 (the review of #563, F2): the walk's own parse of `stat` —
+    /// the parent and the start, past a `comm` with spaces and parens —
+    /// and the map it builds from the anchored /proc holds this process
+    /// under its parent with the kernel's start.
+    #[test]
+    fn the_descendant_walk_reads_proc_beneath_its_anchored_root() {
+        let line = "4242 (a) b (c)) S 17 4242 4242 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 98765 1 1";
+        assert_eq!(ppid_and_start(line), Some((17, 98765)));
+        assert_eq!(ppid_and_start("garbage"), None);
+        let me = std::process::id();
+        let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
+        let (ppid, start) = ppid_and_start(&stat).unwrap();
+        let map = build_ppid_map().unwrap();
+        assert!(
+            map.get(&ppid)
+                .is_some_and(|kids| kids.contains(&(me, start))),
+            "this process under its parent"
         );
     }
 }

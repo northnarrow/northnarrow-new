@@ -213,7 +213,7 @@ fn execute() -> Result<bool> {
             bail!("vmlinux BTF unparseable: {e}")
         }
     }
-    let btf = Btf::from_sys_fs().context("loading the vmlinux BTF")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf().context("loading the vmlinux BTF")?;
 
     // Lot 332: the budget, and the kprobe for kernels whose program info
     // has no count.

@@ -98,7 +98,7 @@ fn read_chain_tail_bounded<H: ChainHost>(
 ) -> ChainTail {
     let active = H::anchor(active);
     let mut files: Vec<PathBuf> = vec![active.clone()];
-    files.extend(crate::chainlog::archives_newest_first(&active));
+    files.extend(crate::chainlog::archives_newest_first_in::<H>(&active));
 
     let mut rows: Vec<String> = Vec::new();
     let mut used = 0usize;

@@ -363,6 +363,40 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "antitamper-bpf/src/kernel_roots.rs",
+        "CPUS",
+        HostFact,
+        "lot 353 (the review of #563, F2): the host's possible CPUs, read once beneath the \
+         anchored /sys root (aya re-read them by path on every fresh thread)",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "FAILING",
+        Process,
+        "lot 353 (the review of #563, F1): the process's signed logs whose appends fail now — \
+         one agent's evidence, told to its status and to the watchdog",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "UNSIGNED_SINCE_MS",
+        Process,
+        "lot 353: when the oldest failing signed append of the process began (FAILING's), for \
+         the watchdog's LoopProgress",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "TELL_DEGRADATIONS",
+        Process,
+        "lot 353: the agent process's start turned its signing degradations on (a test \
+         process leaves them off)",
+    ),
+    kept(
+        "crates/nn-linux/src/chain_host_linux.rs",
+        "EPOCH",
+        Process,
+        "lot 353: the process's clock origin of UNSIGNED_SINCE_MS",
+    ),
+    kept(
+        "antitamper-bpf/src/kernel_roots.rs",
         "WALKS",
         Process,
         "lot 353: the helper threads a path crossing a mount below a view holds blocked are the \
@@ -776,6 +810,11 @@ const START_CALLS: &[(&str, &str)] = &[
     (
         "loop_progress::start",
         "fixes the event loop's heartbeat origin at the process's start",
+    ),
+    (
+        "chain_host_linux::tell_degradations",
+        "lot 353 (the review of #563, F1): the agent process's failing signed appends are \
+         degradations of its status from its start (a test process leaves them off)",
     ),
     ("loop_progress::tick", "one round of the event loop"),
     (

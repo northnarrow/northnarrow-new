@@ -368,7 +368,8 @@ fn system_user(dir: &Path) -> bool {
 /// The environment of the process `dir`, read whole, holds none of
 /// [`LOADER_VARS`] (set, empty or not).
 fn loader_free(dir: &Path) -> bool {
-    let Ok(f) = std::fs::File::open(dir.join("environ")) else {
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    let Ok(f) = antitamper_bpf::kernel_roots::open(dir.join("environ"), libc::O_RDONLY) else {
         return false;
     };
     let mut env = Vec::new();

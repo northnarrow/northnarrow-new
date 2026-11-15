@@ -189,7 +189,7 @@ pub fn install(
     // The review of #547 (F4): a failed exec's candidate is freed with the
     // exec's file (LSM `file_free_security`); without it, at the task's next
     // exec or end only — logged, the guard runs.
-    let failed = aya::Btf::from_sys_fs()
+    let failed = antitamper_bpf::kernel_roots::vmlinux_btf()
         .map_err(anyhow::Error::from)
         .and_then(|btf| {
             antitamper_bpf::attach_transient(ebpf, FAILED_EXEC_PROGRAM, "file_free_security", &btf)

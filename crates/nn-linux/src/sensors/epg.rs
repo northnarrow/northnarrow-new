@@ -567,7 +567,8 @@ fn attach_inner(ebpf: &mut Ebpf, v: Variant) -> Result<(RingBuf<MapData>, Exploi
     // Unarmed first: the programs do nothing until every one is attached.
     let mut map = take_config(ebpf)?;
     write_config(&mut map, config)?;
-    let btf = Btf::from_sys_fs().map_err(|e| format!("vmlinux BTF: {e}"))?;
+    let btf =
+        antitamper_bpf::kernel_roots::vmlinux_btf().map_err(|e| format!("vmlinux BTF: {e}"))?;
     match v {
         Variant::Lite => {
             for (prog, tp) in LITE_TP_BTF {
@@ -722,8 +723,9 @@ impl ExploitGuard {
 fn read_counters(map: &PerCpuArray<MapData, u64>) -> [u64; counter::SLOTS as usize] {
     let mut out = [0u64; counter::SLOTS as usize];
     for (i, o) in out.iter_mut().enumerate() {
-        if let Ok(per_cpu) = map.get(&(i as u32), 0) {
-            *o = per_cpu.iter().fold(0u64, |a, v| a.wrapping_add(*v));
+        // lot 353 (#563 F2): no per-thread read of /sys by path
+        if let Ok(v) = antitamper_bpf::per_cpu::sum(map, i as u32) {
+            *o = v;
         }
     }
     out

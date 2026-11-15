@@ -108,6 +108,12 @@ pub const REASON_AGENT_RESTART_LOOP: &str = "agent_restart_loop";
 /// only, with requests waiting. The detail names the mount, its source and
 /// the connection; the agent signs it High (`fuse_aborted`).
 pub const REASON_FUSE_ABORTED: &str = "fuse_aborted";
+/// Lot 353 (the review of #563, F1): the agent answered its pings, but its
+/// `LoopProgress` reply said its signed records had been failing for the
+/// time the detail gives (an append that cannot reach its log: a mount
+/// over a path it writes, a full disk) — the watchdog's record, signed by
+/// the next agent that can sign, High.
+pub const REASON_SIGNED_RECORDS_FAILED: &str = "signed_records_failed";
 /// Lot 353: how many stuck recoveries make a restart loop…
 pub const RESTART_LOOP_RECOVERIES: usize = 3;
 /// …within this many seconds.

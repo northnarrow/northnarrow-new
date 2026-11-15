@@ -11259,6 +11259,56 @@ number in parentheses is a lab PR.
       30 s"), SIGKILL could not end the agent there either (the request
       already read by the daemon), `stuck_recovery_failed` and
       `fuse_aborted` High, respawned within 90 s.
+  - The review of #563 (round 1): what was still open — every signed append
+    opened its log through `/proc/self/fd/<dir>/<name>` (a FUSE over `/proc`
+    held the audit lock and the High record of that mount, a tmpfs lost
+    every signed record silently), reads of `/proc`/`/sys` the ratchet did
+    not see (the known-program walk, the socket re-bind chmod, the
+    quarantine, the kill walk's `procfs` crate, aya's per-thread CPU count,
+    the BTF loads), a tmpfs or cgroup2 subtree over the cgroup2 root
+    unrecorded and taken for cgroup v1 at a restart, WSL2's
+    `binfmt_misc/status` tmpfs a High at every boot, the watchdog's holds
+    removed unsigned. Done: the anchored names resolved beneath the held
+    directory fds (`nn_linux::anchored`, `openat2`/`renameat2`/`unlinkat`),
+    every chain writer's file operation its host's (`ChainHost::open`,
+    `symlink_metadata`, `read_dir_names`, `remove_file`), a signing failure a
+    degradation and the watchdog's (`LoopProgress.unsigned_ms`,
+    `signed_records_failed` High); the reads routed (`kernel_roots::chmod_fd`,
+    `reopen_fd`, `vmlinux_btf`, `antitamper_bpf::per_cpu`), the ratchet a
+    per-function and same-file taint of view paths plus third-party calls and
+    per-CPU receivers (38 sites at the review's head); stacked or bound
+    mounts at a view point High, refused at the start (`/proc/self/cgroup`
+    tells a unified host); the WSL mount exempted by type, point, parent and
+    source in PID 1's table; the holds removed only once signed; the FUSE
+    abort re-reads the mount first.
+  - Lab of the review round (debian13, 6.12.116, our own guest under a
+    lease, clean before, purged and powered off after; the mounts laid in
+    PID 1's namespace, the observer in a private one):
+    - f1 (FUSE over `/proc` 120 s, the round's first tree): the agent kept
+      its pid, `nn-admin status` answered at 15/45/75/105/118 s, no ping
+      failed; `mount_over_protected` (High) signed during the mount and
+      cleared; 2 runtime workers reached the FUSE (`FUSE_LOOKUP "1"`: the
+      systemd executor's listing of PID 1's descriptors; one `FUSE_STATX` of
+      the root). A tmpfs over `/proc` 60 s: the record High and cleared, no
+      signing error, no ping failure. X6 again (a FUSE over the cgroup2 root
+      180 s): 0 agent threads, same pid, status answered, High and cleared.
+    - f2 (the FUSE answering the agent with errors, 90 s): 2 agent requests
+      (`STATX` of the root at 32.8 s; `LOOKUP "self"`: the telemetry probe's
+      `current_exe`); then never answering: the probe's round held on
+      `current_exe`, the status lost at 15 and 45 s, the stuck recovery
+      restarted the agent (named) — routed since.
+    - f3/f4 (the final tree but one, two rounds): the signed chains kept
+      taking rows under the FUSE (audit +13/+14, heartbeat +5/+5), the
+      record High and cleared, no signing error, same pid; 1 runtime worker
+      held (`FUSE_STATX` of the root at 32–33 s), the status lost once at
+      45 s (1 ping failed), no restart. A tmpfs over `/proc`: High, audit
+      +7/+9, heartbeat +3/+3, no ping failure.
+    - f5/f6 (a trace of the agent's path calls, the install allowing bpf
+      tools): the one `FUSE_STATX` of the root at 28.5 s again, from a
+      runtime worker whose last traced calls were the telemetry probe's
+      self-test files and an audit-log read — its caller not found (the
+      trace lost the event); the open sensor's mount check, routed after
+      f3, was not it.
   - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**

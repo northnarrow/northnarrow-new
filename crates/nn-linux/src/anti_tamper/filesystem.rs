@@ -2496,14 +2496,32 @@ impl StateDirProtection {
     }
 }
 
-/// Lot 296: `path` resolves outside `dir` (both resolved: a log's path is
-/// anchored through `/proc/self/fd/<n>`, the directory it was opened in).
-/// `false` when either does not resolve: the caller's own check decides.
+/// Lot 296: `path` is outside `dir`. Lot 353 (the review of #563, F1): a
+/// log's path is its own again (its name resolved beneath the directory the
+/// writer anchored, never through `/proc/self/fd/<n>`), so it is told by
+/// its names — no `canonicalize`, which walked the path from `/` (and
+/// `/proc`, where a FUSE held the rotation's locks): under `dir` with no
+/// `..`, and no symbolic link at its last name (a link in the directory to
+/// a file elsewhere is not the directory's). A name that does not resolve
+/// is the caller's own check.
 fn outside_dir(path: &Path, dir: &Path) -> bool {
-    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
-        (Ok(p), Ok(d)) => !p.starts_with(&d),
-        _ => false,
+    use std::path::Component;
+    if !path.starts_with(dir) || path.components().any(|c| c == Component::ParentDir) {
+        return true;
     }
+    crate::anchored::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// The `PROTECTED_INODES` key of the file at `path`, its name resolved
+/// beneath its anchored directory (lot 353: never by a path walked from
+/// `/`).
+fn key_of(path: &Path) -> Result<InodeKey> {
+    let meta = crate::anchored::symlink_metadata(path)
+        .with_context(|| format!("symlink_metadata({})", path.display()))?;
+    Ok(InodeKey {
+        dev: crate::fim::attach::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    })
 }
 
 impl crate::chainlog::ProtectionManager for StateDirProtection {
@@ -2532,7 +2550,7 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
             );
             return Ok(());
         }
-        let key = crate::fim::attach::key_for_path(path)?;
+        let key = key_of(path)?;
         // at-authz-1: rotated chain logs are integrity files — WRITE+MUTATE.
         self.inodes
             .lock()
@@ -2540,7 +2558,7 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
     }
 
     fn release(&self, path: &Path) -> Result<()> {
-        let key = crate::fim::attach::key_for_path(path)?;
+        let key = key_of(path)?;
         let mut inodes = self.inodes.lock();
         // An archive sealed before review 81 may have no key: nothing to drop.
         if inodes.contains(key) {
@@ -2556,9 +2574,11 @@ mod tests {
     use tempfile::TempDir;
 
     /// Lot 296: the state directory's protection registers its own files
-    /// only — one named through the anchor of its directory
-    /// (`/proc/self/fd/<n>`, as the chain logs name theirs) is inside; a
-    /// test agent's log in a directory of its own, or a link out, is not.
+    /// only — one named through the anchor of its directory (as the chain
+    /// logs name theirs; lot 353: its own path, resolved beneath the
+    /// anchored descriptor — it was `/proc/self/fd/<n>`) is inside; a test
+    /// agent's log in a directory of its own, a `..` out, or a link out, is
+    /// not.
     #[test]
     fn only_the_state_directory_s_files_are_its_to_register() {
         let state = TempDir::new().unwrap();
@@ -2572,18 +2592,18 @@ mod tests {
         assert!(!outside_dir(&inside, state.path()));
         assert!(outside_dir(&elsewhere, state.path()));
         // anchored, as the writers name their files
-        let fd = std::fs::File::open(&sub).unwrap();
-        let anchored = PathBuf::from(format!(
-            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
-            fd.as_raw_fd()
-        ));
+        let anchored = crate::anchored::anchor(&inside);
+        assert!(crate::anchored::is_anchored(&anchored));
         assert!(!outside_dir(&anchored, state.path()));
-        let fd2 = std::fs::File::open(other.path()).unwrap();
-        let anchored2 = PathBuf::from(format!(
-            "/proc/self/fd/{}/actions.jsonl.manifest.jsonl",
-            fd2.as_raw_fd()
-        ));
+        let anchored2 = crate::anchored::anchor(&elsewhere);
         assert!(outside_dir(&anchored2, state.path()));
+        // a `..` out of the directory is not its file
+        let up = state
+            .path()
+            .join("..")
+            .join(other.path().file_name().unwrap())
+            .join("actions.jsonl.manifest.jsonl");
+        assert!(outside_dir(&up, state.path()));
         // a link in the directory to a file elsewhere is not its file
         let link = sub.join("link.jsonl");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();

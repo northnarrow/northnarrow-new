@@ -194,7 +194,8 @@ fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
         return None;
     }
     let mut env = Vec::new();
-    std::fs::File::open(dir.join("environ"))
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    antitamper_bpf::kernel_roots::open(dir.join("environ"), libc::O_RDONLY)
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(&mut env))
         .ok()?;
     // after the read: still the exec's process, still with its memory
@@ -237,7 +238,8 @@ fn dir_is_root_only(dir: &Path) -> bool {
 /// is gone: its identity is the argv's).
 fn environ_loads(dir: &Path, interactive: bool) -> bool {
     use std::io::Read;
-    let Ok(f) = std::fs::File::open(dir.join("environ")) else {
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    let Ok(f) = antitamper_bpf::kernel_roots::open(dir.join("environ"), libc::O_RDONLY) else {
         return false;
     };
     let mut env = Vec::new();

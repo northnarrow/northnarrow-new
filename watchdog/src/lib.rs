@@ -2208,8 +2208,71 @@ pub enum LoopProgress {
     /// connection), or not asked. The status answer alone counts.
     Unreported,
     /// The loop has gone round `iterations` times (0: not entered yet, the
-    /// agent is starting), the last round `since_last_ms` ago.
-    Reported { iterations: u64, since_last_ms: u64 },
+    /// agent is starting), the last round `since_last_ms` ago; its signed
+    /// records failing for `unsigned_ms` (lot 353; 0: they are written).
+    Reported {
+        iterations: u64,
+        since_last_ms: u64,
+        unsigned_ms: u64,
+    },
+}
+
+/// Lot 353 (the review of #563, F1): how long the agent's signed records
+/// fail, at a ping, before the watchdog records it (a failure the next
+/// append ends is not one).
+pub const SIGNED_RECORDS_FAILED_AFTER_MS: u64 = 30_000;
+
+/// Lot 353 (the review of #563, F1): the agent's signed records failing,
+/// as its `LoopProgress` tells — a signing failure is never silent. Once
+/// per episode (at a ping that finds it failing for at least
+/// [`SIGNED_RECORDS_FAILED_AFTER_MS`]) the watchdog logs an ERROR and
+/// records `signed_records_failed` in its hold, which the next agent that
+/// can sign signs, High; an episode ends when the agent says its records
+/// are written again.
+#[derive(Debug, Default)]
+pub struct SigningWatch {
+    told: bool,
+}
+
+impl SigningWatch {
+    /// The record to write for `progress`, the reply of the agent
+    /// `agent_pid`, at `at` (unix seconds): `Some` when a failure begins.
+    pub fn observe(
+        &mut self,
+        progress: &LoopProgress,
+        agent_pid: u32,
+        at: u64,
+    ) -> Option<nn_proto::watchdog_hold::HoldRecord> {
+        let ms = match progress {
+            LoopProgress::Reported { unsigned_ms, .. } => *unsigned_ms,
+            LoopProgress::Unreported => 0,
+        };
+        if ms < SIGNED_RECORDS_FAILED_AFTER_MS {
+            if ms == 0 {
+                self.told = false;
+            }
+            return None;
+        }
+        if std::mem::replace(&mut self.told, true) {
+            return None;
+        }
+        Some(nn_proto::watchdog_hold::HoldRecord {
+            at,
+            agent_pid,
+            reason: nn_proto::watchdog_hold::REASON_SIGNED_RECORDS_FAILED.to_string(),
+            detail: format!(
+                "the agent's signed records had been failing for {} s at a STATUS ping (its \
+                 status names the log and the error: signed_log)",
+                ms / 1000
+            ),
+            unit_state: None,
+        })
+    }
+
+    /// The watch starts over (another agent).
+    pub fn reset(&mut self) {
+        self.told = false;
+    }
 }
 
 /// Lab PR 216: answers in a row with the event loop standing still before
@@ -2456,6 +2519,7 @@ impl StatusPingTracker {
             LoopProgress::Reported {
                 iterations,
                 since_last_ms,
+                ..
             } if iterations > 0 => (iterations, since_last_ms),
             _ => {
                 self.last_iterations = None;
@@ -2635,6 +2699,7 @@ pub async fn ping_agent(
         Ok(LoopProgress::Reported {
             iterations: p.iterations,
             since_last_ms: p.since_last_ms,
+            unsigned_ms: p.unsigned_ms,
         })
     };
 
@@ -2983,6 +3048,22 @@ pub fn covering_fuse(mountinfo: &str) -> Vec<CoveringFuse> {
         });
     }
     out
+}
+
+/// Lot 353 (the review of #563, F6): whether the covering FUSE `f` is
+/// still mounted where it was, on the same connection, in one of the mount
+/// tables `tables` read again right before its abort. The connection's id
+/// is the anonymous minor of the mount's device, which the kernel gives the
+/// next FUSE mounted once this one is gone (the lowest free): a FUSE
+/// unmounted since, its minor reused by a user's FUSE elsewhere, is not in
+/// the tables at that point — that connection is not aborted. Left: the
+/// moments between this read and the abort's write.
+pub fn still_covering<S: AsRef<str>>(tables: &[S], f: &CoveringFuse) -> bool {
+    tables.iter().any(|t| {
+        covering_fuse(t.as_ref())
+            .iter()
+            .any(|x| x.conn == f.conn && x.mount_point == f.mount_point)
+    })
 }
 
 /// The FUSE control file system (`fusectl`).
@@ -5299,6 +5380,7 @@ mod tests {
         let at = |iterations| LoopProgress::Reported {
             iterations,
             since_last_ms: 31_000,
+            unsigned_ms: 0,
         };
         let mut t = StatusPingTracker::new();
         assert_eq!(t.record_answer(at(10)), PingOutcome::Ok, "the baseline");
@@ -5382,6 +5464,7 @@ mod tests {
                 AdminMessage::LoopProgressResponse(LoopProgressResponse {
                     iterations: 77,
                     since_last_ms: 1_500,
+                    unsigned_ms: 45_000,
                 }),
             ] {
                 let mut header = [0u8; 4];
@@ -5403,7 +5486,8 @@ mod tests {
             got,
             LoopProgress::Reported {
                 iterations: 77,
-                since_last_ms: 1_500
+                since_last_ms: 1_500,
+                unsigned_ms: 45_000,
             }
         );
         let asked = mock.await.unwrap();
@@ -5563,5 +5647,60 @@ mod tests {
         assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
         assert_eq!(t.record_ok(), PingOutcome::Ok);
         assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+    }
+
+    /// Lot 353 (the review of #563, F1): a signing failure the agent tells
+    /// in its `LoopProgress` is recorded once per episode, after
+    /// [`SIGNED_RECORDS_FAILED_AFTER_MS`], as `signed_records_failed` for
+    /// the next agent to sign; a short one is not, and one that ends lets
+    /// the next be recorded again.
+    #[test]
+    fn a_signing_failure_the_agent_tells_is_recorded_once_per_episode() {
+        let at = |unsigned_ms| LoopProgress::Reported {
+            iterations: 9,
+            since_last_ms: 10,
+            unsigned_ms,
+        };
+        let mut w = SigningWatch::default();
+        assert!(w.observe(&at(0), 7, 1).is_none());
+        assert!(w.observe(&at(5_000), 7, 1).is_none(), "a short failure");
+        let rec = w
+            .observe(&at(SIGNED_RECORDS_FAILED_AFTER_MS), 7, 1_800_000_000)
+            .expect("recorded");
+        assert_eq!(
+            rec.reason,
+            nn_proto::watchdog_hold::REASON_SIGNED_RECORDS_FAILED
+        );
+        assert_eq!((rec.agent_pid, rec.at), (7, 1_800_000_000));
+        assert!(rec.detail.contains("30 s"), "{}", rec.detail);
+        assert!(w.observe(&at(90_000), 7, 2).is_none(), "once per episode");
+        assert!(w.observe(&LoopProgress::Unreported, 7, 2).is_none());
+        assert!(w.observe(&at(0), 7, 3).is_none(), "the episode ends");
+        assert!(w.observe(&at(60_000), 7, 4).is_some(), "a new one");
+    }
+
+    /// Lot 353 (the review of #563, F6): a covering FUSE is aborted only
+    /// while the tables read again show it at its point on its connection —
+    /// one unmounted since, its minor reused by a user's FUSE elsewhere, is
+    /// not.
+    #[test]
+    fn a_reused_fuse_connection_is_not_aborted() {
+        let over_proc = "60 1 0:63 / /proc rw - fuse.x x rw\n";
+        let f = covering_fuse(over_proc).pop().expect("covering");
+        assert_eq!(f.conn, 63);
+        assert!(still_covering(&[over_proc], &f));
+        let reused = "61 1 0:63 / /home/u/mnt rw - fuse.sshfs u@h: rw\n";
+        assert!(!still_covering(&[reused], &f), "the minor reused elsewhere");
+        assert!(
+            !still_covering::<&str>(&[], &f),
+            "no table: nothing aborted"
+        );
+        let moved = "62 1 0:64 / /proc rw - fuse.x x rw\n";
+        assert!(!still_covering(&[moved], &f), "another connection now");
+        let elsewhere = "63 1 0:63 / /sys/kernel/x rw - fuse.y y rw\n";
+        assert!(
+            !still_covering(&[elsewhere], &f),
+            "the minor reused by another covering FUSE: not the mount read"
+        );
     }
 }

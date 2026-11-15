@@ -669,11 +669,10 @@ impl BudgetSpender {
     /// Each budget's window restarted at `now_ns` (`CLOCK_MONOTONIC`, the
     /// programs' clock) with every one of its records spent, on every CPU.
     pub fn spend(&self, now_ns: u64) -> Result<(), String> {
-        let cpus = aya::util::nr_cpus().map_err(|(w, e)| format!("{w}: {e}"))?;
+        // lot 353 (#563 F2): no per-thread read of /sys by path
         for m in self.0.lock().iter_mut() {
-            let values = aya::maps::PerCpuValues::try_from(vec![[now_ns, BUDGET_PER_SEC]; cpus])
+            antitamper_bpf::per_cpu::set(m, 0, [now_ns, BUDGET_PER_SEC], 0)
                 .map_err(|e| e.to_string())?;
-            m.set(0, values, 0).map_err(|e| e.to_string())?;
         }
         Ok(())
     }

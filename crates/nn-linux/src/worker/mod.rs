@@ -81,7 +81,8 @@ impl SelfImage {
 
     /// `path` (the lab harness: the agent's binary from a test).
     pub fn open(path: &Path) -> io::Result<Self> {
-        let f = std::fs::File::open(path)?;
+        // lot 353 (#563): `/proc/self/exe` beneath the anchored /proc root
+        let f = antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)?;
         // SAFETY: F_DUPFD_CLOEXEC on a descriptor we own.
         let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, IMAGE_FD_MIN) };
         if fd < 0 {

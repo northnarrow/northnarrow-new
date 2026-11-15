@@ -749,7 +749,7 @@ mod tests {
         let p = nn_linux::state_read::testing::sleeper_with_non_utf8_comm(30);
         let pid = p.pid();
         assert_eq!(tgid_of(pid as i32), Some(pid));
-        let start = super::super::trust::proc_start_ticks(std::path::Path::new("/proc"), pid);
+        let start = crate::cow::start_of(pid);
         assert!(start.is_some(), "its start unread");
         assert!(super::super::store::alive(super::super::trust::ProcId {
             pid,

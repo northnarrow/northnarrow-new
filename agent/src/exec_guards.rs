@@ -106,7 +106,7 @@ impl ExecGuards for AgentExecGuards {
         // candidates (a plain hash now) and the exec policy's notes for its
         // post-commit check are removed when their task is freed.
         if self.execq_kernel.is_some() || self.execpol_kernel.is_some() {
-            let attached = aya::Btf::from_sys_fs()
+            let attached = antitamper_bpf::kernel_roots::vmlinux_btf()
                 .map_err(anyhow::Error::from)
                 .and_then(|btf| nn_linux::sensors::task_free::ensure(ebpf, &btf));
             if let Err(e) = attached {

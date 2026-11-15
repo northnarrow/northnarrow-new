@@ -163,11 +163,6 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_all(host.join(\"index.jsonl\"))",
         OWN,
     ),
-    (
-        "agent/src/cow/trust.rs",
-        "fs::read(proc_root.join(pid.to_string()).join(\"stat\"))",
-        PROC,
-    ),
     ("agent/src/decision/golden.rs", "read_to_string(&path)", LAB),
     (
         "agent/src/decision/validation_registry.rs",
@@ -471,7 +466,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ("crates/nn-linux/src/own_cpus.rs", "read_state(p)", CPUS),
     (
         "crates/nn-linux/src/known_system_prog.rs",
-        "read_to_string(pdir.join(\"fdinfo\").join(fd.file_name()))",
+        "read_to_string(pdir.join(\"fdinfo\").join(&fd))",
         KNOB,
     ),
     (
@@ -598,6 +593,14 @@ const KNOWN: &[(&str, &str, &str)] = &[
     (
         "crates/nn-linux/src/response/kill.rs",
         "read_to_string(task.join(t).join(\"children\"))",
+        PROC,
+    ),
+    // lot 353 (the review of #563, F2): the descendant walk's `stat`s,
+    // beneath the anchored /proc root (the procfs crate skipped them alike):
+    // a process gone mid-walk is not a parent of anyone
+    (
+        "crates/nn-linux/src/response/kill.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
         PROC,
     ),
     (
@@ -782,7 +785,7 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     // lot 353: the agent's and PID 1's mount tables, searched for a FUSE
     // holding a stuck agent: unreadable, none is found and none aborted
-    ("watchdog/src/main.rs", "read_to_string(&table)", PROC),
+    ("watchdog/src/main.rs", "read_to_string(t)", PROC),
     // lot 353: the watchdog's stuck marker, read at a SIGINT: unreadable,
     // the stop is an operator's `sigint` (the hold record still names the
     // recovery, signed at the next start)

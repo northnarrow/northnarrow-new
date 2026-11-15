@@ -206,7 +206,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| unlock: the signed unlock got no reply — an agent older than this nn-admin (before lab PR 217) does not know it: unlock it with the nn-admin of its own release: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| unlock: the signed unlock got no reply — an agent older than this nn-admin (before lab PR 217) does not know it: unlock it with the nn-admin of its own release: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -276,7 +276,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| unlock: unexpected reply to the signed unlock: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 217 does not know it: use the nn-admin of its release)
+| unlock: unexpected reply to the signed unlock: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 217 does not know it: use the nn-admin of its release)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -466,7 +466,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -585,7 +585,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -714,7 +714,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -833,7 +833,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -962,7 +962,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| export status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -1081,7 +1081,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| export status: unexpected server reply to StatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"Status":{}}
@@ -1466,7 +1466,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -1536,7 +1536,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -1791,7 +1791,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -1861,7 +1861,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2111,7 +2111,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2181,7 +2181,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| net status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2421,7 +2421,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2491,7 +2491,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| net status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2746,7 +2746,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| export status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -2816,7 +2816,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| export status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3071,7 +3071,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| export status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3141,7 +3141,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| export status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| export status: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3453,7 +3453,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| capabilities: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| capabilities: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3523,7 +3523,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| capabilities: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| capabilities: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3793,7 +3793,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| capabilities: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| capabilities: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -3863,7 +3863,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| capabilities: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
+| capabilities: unexpected reply to TelemetryStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 213 has no signed telemetry verb: run `status` without --key)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -4105,7 +4105,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| detections: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| detections: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -4386,7 +4386,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| detections: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| detections: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -4681,7 +4681,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| detection-set-status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| detection-set-status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -4962,7 +4962,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| shutdown: unexpected server reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| shutdown: unexpected server reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5032,7 +5032,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| shutdown: unexpected server reply to ShutdownRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| shutdown: unexpected server reply to ShutdownRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5242,7 +5242,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| force-posture: unexpected server reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| force-posture: unexpected server reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5312,7 +5312,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| force-posture: unexpected server reply to ForcePostureRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| force-posture: unexpected server reply to ForcePostureRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5522,7 +5522,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| rotate-keys add: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| rotate-keys add: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5592,7 +5592,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| rotate-keys add: unexpected reply to RotateKeysAddRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| rotate-keys add: unexpected reply to RotateKeysAddRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5802,7 +5802,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| rotate-keys revoke: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| rotate-keys revoke: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -5872,7 +5872,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| rotate-keys revoke: unexpected reply to RotateKeysRevokeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| rotate-keys revoke: unexpected reply to RotateKeysRevokeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -6082,7 +6082,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| fim baseline: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| fim baseline: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -6152,7 +6152,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| fim baseline: unexpected reply to FimBaselineRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| fim baseline: unexpected reply to FimBaselineRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -6394,7 +6394,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| fim report: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| fim report: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -6678,7 +6678,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| fim status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| fim status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -6958,7 +6958,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| canary deploy: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| canary deploy: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -7270,7 +7270,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| canary list: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| canary list: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -7550,7 +7550,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| canary burn: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| canary burn: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -7830,7 +7830,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| canary refresh: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| canary refresh: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -8142,7 +8142,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net flows: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net flows: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -8454,7 +8454,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net listeners: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net listeners: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -8764,7 +8764,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net resolve: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net resolve: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9076,7 +9076,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| net fingerprint: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| net fingerprint: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9359,7 +9359,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| trusted-installer-grant: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| trusted-installer-grant: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9429,7 +9429,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| trusted-installer-grant: unexpected reply to TrustedInstallerGrantRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| trusted-installer-grant: unexpected reply to TrustedInstallerGrantRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9663,7 +9663,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response status: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9733,7 +9733,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response status: unexpected reply to ResponseStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response status: unexpected reply to ResponseStatusRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -9958,7 +9958,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response release: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response release: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10028,7 +10028,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response release: unexpected reply to ResponseReleaseRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response release: unexpected reply to ResponseReleaseRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10253,7 +10253,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response restore: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response restore: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10323,7 +10323,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| response restore: unexpected reply to ResponseRestoreRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| response restore: unexpected reply to ResponseRestoreRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10571,7 +10571,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| remediate ransomware: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| remediate ransomware: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10641,7 +10641,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| remediate ransomware: unexpected reply to RemediateRansomwareRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 222 has no remediate verb)
+| remediate ransomware: unexpected reply to RemediateRansomwareRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 222 has no remediate verb)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10851,7 +10851,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| remediate ransomware: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| remediate ransomware: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -10921,7 +10921,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| remediate ransomware: unexpected reply to RemediateRansomwareRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 }) (an agent older than lab PR 222 has no remediate verb)
+| remediate ransomware: unexpected reply to RemediateRansomwareRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 }) (an agent older than lab PR 222 has no remediate verb)
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -11146,7 +11146,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| config overlay set: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| config overlay set: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -11216,7 +11216,7 @@ exit: 5
 --- stdout
 (empty)
 --- stderr
-| config overlay set: unexpected reply to ConfigOverlaySetRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| config overlay set: unexpected reply to ConfigOverlaySetRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -11442,7 +11442,7 @@ exit: 5
 --- stdout
 | policy set: 1 enforce, 0 alert, 0 audit, 0 off, 0 exemptions on 0 rules, ransomware COMBAT without corroboration off
 --- stderr
-| config overlay set: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| config overlay set: unexpected reply to ChallengeRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}
@@ -11512,7 +11512,7 @@ exit: 5
 --- stdout
 | policy set: 1 enforce, 0 alert, 0 audit, 0 off, 0 exemptions on 0 rules, ransomware COMBAT without corroboration off
 --- stderr
-| config overlay set: unexpected reply to ConfigOverlaySetRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5 })
+| config overlay set: unexpected reply to ConfigOverlaySetRequest: LoopProgressResponse(LoopProgressResponse { iterations: 3, since_last_ms: 5, unsigned_ms: 0 })
 --- agent
 connection 1
 > {"ChallengeRequest":{}}

@@ -49,6 +49,13 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "coverage_last: keyed by `CoverageCause`, an enum — one entry per variant",
     ),
     (
+        "crates/nn-linux/src/chain_host_linux.rs",
+        1,
+        "lot 353 (the review of #563, F1): FAILING — the process's signed logs whose appends \
+         fail now, keyed by their file (a handful, fixed by the command line), each removed when \
+         its appends work again",
+    ),
+    (
         "crates/nn-core/src/posture/lineage.rs",
         1,
         "exited: the cached processes the sweep found gone, a subset of the spawn cache \

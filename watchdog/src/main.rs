@@ -812,16 +812,21 @@ fn recovery_failed(cli: &Cli, agent_pid: u32, error: &str) {
 /// (`fuse_aborted`). Returns how many were aborted.
 fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
     let connections = std::path::Path::new(FUSE_CONNECTIONS);
+    // the agent's mount table and PID 1's, beneath the anchored /proc root
+    let tables = || -> Vec<String> {
+        [
+            format!("/proc/{agent_pid}/mountinfo"),
+            "/proc/1/mountinfo".to_string(),
+        ]
+        .iter()
+        .filter_map(|t| antitamper_bpf::kernel_roots::read_to_string(t).ok())
+        .collect()
+    };
     let mut found: Vec<CoveringFuse> = Vec::new();
-    for table in [
-        format!("/proc/{agent_pid}/mountinfo"),
-        "/proc/1/mountinfo".to_string(),
-    ] {
-        if let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(&table) {
-            for f in covering_fuse(&text) {
-                if !found.iter().any(|x| x.conn == f.conn) {
-                    found.push(f);
-                }
+    for text in tables() {
+        for f in covering_fuse(&text) {
+            if !found.iter().any(|x| x.conn == f.conn) {
+                found.push(f);
             }
         }
     }
@@ -830,6 +835,19 @@ fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
         let Some(waiting) = fuse_waiting(connections, f.conn).filter(|w| *w > 0) else {
             continue;
         };
+        // lot 353 (the review of #563, F6): the connection id is a reusable
+        // minor — the mount read again right before its abort
+        if !northnarrow_watchdog::still_covering(&tables(), &f) {
+            info!(
+                target: "watchdog.tamper",
+                agent_pid,
+                mount_point = %f.mount_point,
+                connection = f.conn,
+                "a covering FUSE is gone from its mount point since it was read — its \
+                 connection (a reusable id) is not aborted"
+            );
+            continue;
+        }
         let outcome = abort_fuse(connections, f.conn).map_err(|e| e.to_string());
         error!(
             target: "watchdog.tamper",
@@ -1202,6 +1220,8 @@ async fn run_ping_loop(
     // Lot 353: since when the pings fail, and the last failure's words
     let mut failing_since: Option<std::time::Instant> = None;
     let mut last_failure = String::new();
+    // Lot 353 (the review of #563, F1): the agent's signed records failing
+    let mut signing = northnarrow_watchdog::SigningWatch::default();
     loop {
         tick.tick().await;
         // External audit WDG-002: timeouts against the previous agent do
@@ -1209,6 +1229,7 @@ async fn run_ping_loop(
         let current = *agent.borrow_and_update();
         if current != watching {
             tracker.reset();
+            signing.reset();
             failing_since = None;
             watching = current;
             ask_progress = true;
@@ -1235,6 +1256,23 @@ async fn run_ping_loop(
                          lab PR 216) — its STATUS answer alone counts"
                     );
                     ask_progress = false;
+                }
+                if let Some(rec) = signing.observe(&progress, agent_pid, unix_now()) {
+                    error!(
+                        target: "watchdog.tamper",
+                        agent_pid,
+                        detail = %rec.detail,
+                        "the agent's SIGNED RECORDS FAIL — its evidence is not written (a mount \
+                         over a path it writes, a full disk?); recorded for the next agent to sign"
+                    );
+                    if let Err(e) = record_hold(&holds, &rec) {
+                        warn!(
+                            target: "watchdog.tamper",
+                            error = %e,
+                            path = %holds.display(),
+                            "could not record the agent's failing signed records"
+                        );
+                    }
                 }
                 tracker.record_answer(progress)
             }

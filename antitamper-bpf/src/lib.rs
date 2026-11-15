@@ -84,6 +84,11 @@ pub mod host_dropins;
 /// laid over them since cannot hold a reader.
 #[cfg(target_os = "linux")]
 pub mod kernel_roots;
+/// Lot 353 (the review of #563, F2): the per-CPU arrays read and written
+/// with the CPU count read once beneath the anchored `/sys` root (aya's
+/// `nr_cpus` read it by path on every fresh thread).
+#[cfg(target_os = "linux")]
+pub mod per_cpu;
 /// systemd over its private socket, served by PID 1: what it reports the
 /// host and our units as, and its reload (external audit EBPF-001; lot
 /// 273c; lot 273d: here, so that the watchdog reads our units' properties

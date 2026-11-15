@@ -563,7 +563,8 @@ fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Optio
 /// `path` (an `environ`) read into `env`: at most [`MAX_ENVIRON`] + 1
 /// bytes.
 fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
-    std::fs::File::open(path)
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)
         .and_then(|f| f.take(MAX_ENVIRON + 1).read_to_end(env))
         .map(drop)
 }
@@ -585,7 +586,8 @@ fn read_environ(path: &Path, env: &mut Vec<u8>) -> std::io::Result<()> {
 /// process, gone by the end of the read).
 fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
     let task = proc.join(format!("{pid}/task"));
-    let threads = match std::fs::read_dir(&task) {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let threads = match antitamper_bpf::kernel_roots::read_dir(&task) {
         Ok(threads) => threads,
         // reaped since: no thread of it runs
         Err(_) if pidfd_exited(fd) => return None,
@@ -599,11 +601,7 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
         crate::state_read::read_state(task.join(tid).join("stat"))
             .is_ok_and(|stat| has_memory(&stat))
     };
-    let Some(tid) = threads
-        .filter_map(Result::ok)
-        .map(|thread| thread.file_name())
-        .find(|tid| runs(tid))
-    else {
+    let Some(tid) = threads.into_iter().find(|tid| runs(tid)) else {
         // none seen running: the process's exit, or threads that each made
         // the next and exited between the listing and their stat (DC-B)
         if pidfd_exited(fd) {

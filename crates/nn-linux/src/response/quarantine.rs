@@ -222,7 +222,9 @@ impl ExeHandle {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         // SAFETY: geteuid(2) takes no argument and cannot fail.
         let me = unsafe { libc::geteuid() };
-        Self::from_file(fs::File::open(path)?).map(|h| h.with_offender_uid(Some(me)))
+        // lot 353 (#563): a path under /proc beneath the anchored root
+        Self::from_file(antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)?)
+            .map(|h| h.with_offender_uid(Some(me)))
     }
 
     /// Lot 312 (review F1): the uid the offender acted as ([`Self::of_pid`]
@@ -672,20 +674,19 @@ fn restore_in_place(
             "the file was written since it was emptied — not overwritten",
         ));
     }
-    let via = format!("/proc/self/fd/{}", held.as_raw_fd());
+    // Lot 353 (the review of #563, F2): the held inode reached through the
+    // /proc root the start anchored, never the /proc mounted now.
     if m.mode() & 0o7777 != mode {
-        fs::set_permissions(&via, fs::Permissions::from_mode(mode))?;
+        antitamper_bpf::kernel_roots::chmod_fd(&held, mode)?;
     }
     if emptied {
-        let mut w = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&via)?;
+        let mut w = antitamper_bpf::kernel_roots::reopen_fd(&held, libc::O_WRONLY)?;
         w.write_all(&plaintext)?;
         w.sync_all()?;
     }
     // read back: the inode holds what was taken, with its mode
-    let now = fs::read(&via)?;
+    let mut now = Vec::new();
+    antitamper_bpf::kernel_roots::reopen_fd(&held, libc::O_RDONLY)?.read_to_end(&mut now)?;
     let mode_now = held.metadata()?.mode() & 0o7777;
     let sha = hex::encode(Sha256::digest(&now));
     if Some(sha.as_str()) != meta["sha256"].as_str() || mode_now != mode {
@@ -1110,10 +1111,8 @@ fn listed_shells(path: &Path) -> std::io::Result<Vec<PathBuf>> {
         };
         return Err(std::io::Error::other(format!("{kind}, not a regular file")));
     }
-    let f = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(format!("/proc/self/fd/{}", at.as_raw_fd()))?;
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let f = antitamper_bpf::kernel_roots::reopen_fd(&at, libc::O_RDONLY | libc::O_NONBLOCK)?;
     let mut bytes = Vec::new();
     f.take(MAX_SHELLS_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_SHELLS_BYTES {
@@ -1413,11 +1412,11 @@ fn neutralize_in_place(
         "no name of it verified"
     };
     if id.nlink == 1 || own {
-        let emptied = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(format!("/proc/self/fd/{}", handle.file.as_raw_fd()));
+        // lot 353 (#563 F2): beneath the anchored /proc root
+        let emptied = antitamper_bpf::kernel_roots::reopen_fd(
+            &handle.file,
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_NONBLOCK,
+        );
         if let Err(e) = &emptied {
             warn!(error = %e, "quarantine: emptying the held binary failed");
         }

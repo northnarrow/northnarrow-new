@@ -497,7 +497,7 @@ pub(crate) fn start(
                 // (dev,ino) → path. Per-step failures are logged
                 // WARN inside the helpers — the agent still boots
                 // (degrade-not-fail posture matches anti_tamper).
-                let btf = match aya::Btf::from_sys_fs() {
+                let btf = match antitamper_bpf::kernel_roots::vmlinux_btf() {
                     Ok(b) => Some(b),
                     Err(e) => {
                         warn!(

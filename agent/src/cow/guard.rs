@@ -54,7 +54,7 @@ use super::identity::FileId;
 use super::index::{FileState, Method, PostWrite, Refusal, Reservation};
 use super::journal::{host_view, Journal};
 use super::store::{now_ms, Stats, Store};
-use super::trust::{proc_start_ticks, ProcId, TrustFilter, WriterInfo};
+use super::trust::{ProcId, TrustFilter, WriterInfo};
 use crate::posture::lineage::AuthSessionTracker;
 
 /// Extra time the backstop gives a copier past its deadline.
@@ -259,7 +259,13 @@ impl Runtime {
             })
             .collect();
         let rt = Arc::new(Self {
-            trust: TrustFilter::new(&cfg.trusted_writers, tracker),
+            // lot 353 (#563 F2): /proc read beneath the anchored root
+            trust: TrustFilter::new(&cfg.trusted_writers, tracker).with_reads(
+                super::trust::ProcReads {
+                    read_link: |p| antitamper_bpf::kernel_roots::read_link(p),
+                    read: |p| antitamper_bpf::kernel_roots::read_all(p),
+                },
+            ),
             group,
             pending: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
@@ -635,7 +641,7 @@ impl Runtime {
             return self.allow_fast(fd, read_at, &s.allowed_read_only);
         }
         let tgid = tgid_of(ev.tid).unwrap_or(ev.tid as u32);
-        let start = proc_start_ticks(Path::new("/proc"), tgid).unwrap_or(0);
+        let start = crate::cow::start_of(tgid).unwrap_or(0);
         let writer = ProcId { pid: tgid, start };
         let info = self.trust.evaluate(tgid, start);
         // Lot 315 (bug hunt 1.4, F6): the file is its device, inode number

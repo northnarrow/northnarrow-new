@@ -288,7 +288,7 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
         },
     );
 
-    let btf = Btf::from_sys_fs().context("loading the vmlinux BTF")?;
+    let btf = antitamper_bpf::kernel_roots::vmlinux_btf().context("loading the vmlinux BTF")?;
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
     let mut ebpf = EbpfLoader::new()
         .btf(None)

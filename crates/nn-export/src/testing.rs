@@ -5,7 +5,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
-use nn_evidence::chain_host::{ChainHost, ChainSigner};
+use nn_evidence::chain_host::{ChainHost, ChainSigner, Open};
 
 /// Plain `std`, as nn-evidence's own tests' host.
 pub(crate) struct TestHost;
@@ -17,15 +17,11 @@ impl ChainHost for TestHost {
     fn is_symlink_refusal(_err: &io::Error) -> bool {
         false
     }
-    fn open_with_mode(options: &mut OpenOptions, _mode: u32, path: &Path) -> io::Result<File> {
-        options.open(path)
+    fn open_with_mode(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+        options.std().open(path)
     }
-    fn open_with_mode_nofollow(
-        options: &mut OpenOptions,
-        _mode: u32,
-        path: &Path,
-    ) -> io::Result<File> {
-        options.open(path)
+    fn open_with_mode_nofollow(options: Open, _mode: u32, path: &Path) -> io::Result<File> {
+        options.std().open(path)
     }
     fn create_dir_all_with_mode(dir: &Path, _mode: u32) -> io::Result<()> {
         std::fs::create_dir_all(dir)

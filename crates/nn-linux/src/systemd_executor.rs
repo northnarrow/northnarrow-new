@@ -269,11 +269,14 @@ pub fn seed(images: &ExecutorImages) -> usize {
 /// names an install path, ` (deleted)` or not), read through the
 /// descriptor: files root owns that no one else may write.
 fn held_executors(pid_dir: &Path, root: &Path, owner: u32) -> Vec<(u64, u64)> {
-    let Ok(fds) = std::fs::read_dir(pid_dir.join("fd")) else {
+    // lot 353 (the review of #563, F2; the lab's FUSE over /proc: this
+    // listing of PID 1's descriptors held a runtime worker): beneath the
+    // anchored /proc root
+    let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(pid_dir.join("fd")) else {
         return Vec::new();
     };
-    fds.flatten()
-        .map(|fd| fd.path())
+    fds.into_iter()
+        .map(|fd| pid_dir.join("fd").join(fd))
         .filter(|held| {
             link_target(held, root).is_some_and(|t| EXECUTOR_PATHS.contains(&t.as_str()))
         })
@@ -295,11 +298,11 @@ fn held_by_user_managers(
     let Some(init_ns) = ns(&proc_root.join("1")) else {
         return out;
     };
-    let Ok(dir) = std::fs::read_dir(proc_root) else {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    let Ok(dir) = antitamper_bpf::kernel_roots::read_dir(proc_root) else {
         return out;
     };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
+    for name in dir {
         if name == "1"
             || !name
                 .to_str()
@@ -307,7 +310,7 @@ fn held_by_user_managers(
         {
             continue;
         }
-        let pid_dir = entry.path();
+        let pid_dir = proc_root.join(&name);
         let is_manager = file_id(&pid_dir.join("exe")).is_some_and(|id| managers.contains(&id))
             && ns(&pid_dir).is_some_and(|n| n == init_ns);
         if is_manager {

@@ -174,6 +174,9 @@ pub fn main() -> Result<()> {
     // mount laid over them later is never walked; one already there is
     // refused and signed below as a degradation.
     let _ = antitamper_bpf::kernel_roots::init();
+    // lot 353 (the review of #563, F1): this process's failing signed
+    // appends are degradations of its status
+    nn_linux::chain_host_linux::tell_degradations();
     northnarrow_agent::loop_progress::start();
     // R14a (plan §3.5): the binary this process runs, opened now, before
     // anything else: the workers start from this descriptor

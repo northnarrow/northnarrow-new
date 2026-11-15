@@ -124,9 +124,8 @@ pub fn total() -> Option<u64> {
 fn read_map(map: &PerCpuArray<MapData, u64>) -> Vec<Option<u64>> {
     (0..FAIL_OPEN_SLOTS)
         .map(|slot| {
-            map.get(&slot, 0)
-                .ok()
-                .map(|per_cpu| per_cpu.iter().sum::<u64>())
+            // lot 353 (#563 F2): no per-thread read of /sys by path
+            antitamper_bpf::per_cpu::sum(map, slot).ok()
         })
         .collect()
 }

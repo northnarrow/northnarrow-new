@@ -19,7 +19,7 @@ use super::identity::FileId;
 use super::index::{Entry, FileState, JournalIndex, Method, PostWrite, Refusal, Reservation};
 use super::journal::{host_view, Journal, Record};
 use super::restore::{beside_name, decide, pick, Context, Current, Plan, Selector};
-use super::trust::{proc_start_ticks, ProcId};
+use super::trust::ProcId;
 use crate::audit::{AuditEntryDraft, AuditLog};
 
 /// Milliseconds since the Unix epoch.
@@ -809,7 +809,8 @@ pub fn alive(p: ProcId) -> bool {
     if p.pid == 0 {
         return false;
     }
-    match proc_start_ticks(Path::new("/proc"), p.pid) {
+    // lot 353 (#563 F2): beneath the anchored /proc root
+    match crate::cow::start_of(p.pid) {
         Some(s) => p.start == 0 || s == p.start,
         None => false,
     }
@@ -1821,7 +1822,7 @@ mod tests {
         #[test]
         fn bug93_a_running_writer_of_the_tree_skips_the_file() {
             let me = std::process::id();
-            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let start = crate::cow::start_of(me).unwrap();
             let running = ProcId { pid: me, start };
             let l = lab();
             std::fs::write(l.scope.join("plan.txt"), b"original").unwrap();
@@ -2124,7 +2125,7 @@ mod tests {
         #[test]
         fn bug93_a_running_tree_writer_without_a_copy_keeps_both() {
             let me = std::process::id();
-            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let start = crate::cow::start_of(me).unwrap();
             let running = ProcId { pid: me, start };
             let l = lab();
             std::fs::write(l.scope.join("deck.odp"), b"original").unwrap();
@@ -2155,7 +2156,7 @@ mod tests {
         #[test]
         fn bug93_a_running_tree_writer_keeps_the_renamed_copy_in_place() {
             let me = std::process::id();
-            let start = crate::cow::trust::proc_start_ticks(Path::new("/proc"), me).unwrap();
+            let start = crate::cow::start_of(me).unwrap();
             let running = ProcId { pid: me, start };
             let l = lab();
             std::fs::write(l.scope.join("plan.ods"), b"original").unwrap();

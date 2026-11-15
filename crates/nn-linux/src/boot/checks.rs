@@ -472,8 +472,8 @@ pub fn install_manifest(
     manifest: &Path,
     audit_log: &Path,
 ) -> Result<ManifestCheck, BootOrderError> {
-    let own_exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+    let own_exe = antitamper_bpf::kernel_roots::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
     let allow = std::env::var(install_manifest::ALLOW_UNVERIFIED_ENV).ok();
     install_manifest_for(boot, manifest, &own_exe, audit_log, allow.as_deref())
 }

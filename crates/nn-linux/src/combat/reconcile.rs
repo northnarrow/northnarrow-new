@@ -25,7 +25,7 @@
 //! the mode, the state directory's dance (nn-linux, R09).
 
 use std::io::Write;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
 pub use nn_core::combat::reconcile::{attest, draft, StaleChain};
@@ -51,13 +51,11 @@ pub fn append_line(path: &Path, rules_removed: usize, cap: u64) -> std::io::Resu
         "rules_torn_down": rules_removed,
     });
     let anchored = crate::anchored::anchor(path);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&anchored)?;
+    let mut f = crate::anchored::open(
+        &anchored,
+        libc::O_RDWR | libc::O_CREAT | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        crate::chainlog::STATE_LOG_FILE_MODE,
+    )?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
         let what = if meta.file_type().is_fifo() {
@@ -105,7 +103,7 @@ pub fn record_line(
     cap: u64,
     protection: &dyn crate::chainlog::ProtectionManager,
 ) -> anyhow::Result<()> {
-    match antitamper_bpf::kernel_roots::symlink_metadata(path) {
+    match crate::anchored::symlink_metadata(&crate::anchored::anchor(path)) {
         Ok(_) => Ok(append_line(path, rules_removed, cap)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             protection.with_mutable_dir(&mut || Ok(append_line(path, rules_removed, cap)?))

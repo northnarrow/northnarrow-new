@@ -73,9 +73,8 @@ fn fold(inserted: u64, removed: u64, prev_forgotten_min: u64) -> FlowSockOccupan
 /// Per-CPU sums of the two slots; `None` when a slot cannot be read.
 fn read(map: &PerCpuArray<MapData, u64>) -> Option<(u64, u64)> {
     let sum = |slot: u32| {
-        map.get(&slot, 0)
-            .ok()
-            .map(|v| v.iter().fold(0u64, |a, b| a.wrapping_add(*b)))
+        // lot 353 (#563 F2): no per-thread read of /sys by path
+        antitamper_bpf::per_cpu::sum(map, slot).ok()
     };
     Some((
         sum(flow_sock_slot::INSERTED)?,

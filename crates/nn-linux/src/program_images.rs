@@ -282,7 +282,8 @@ fn same_over(
     id: Option<(u64, u64)>,
     ranges: &[(u64, u64)],
 ) -> bool {
-    let Ok(fb) = std::fs::File::open(b) else {
+    // lot 353 (#563, the lab's FUSE over /proc): beneath the anchored root
+    let Ok(fb) = antitamper_bpf::kernel_roots::open(b, libc::O_RDONLY) else {
         return false;
     };
     let Ok(mb) = fb.metadata() else {
@@ -470,7 +471,10 @@ fn identify(
     uid: u32,
     bounds: &Bounds,
 ) -> Result<Option<ProgramKind>, Unverified> {
-    let file = std::fs::File::open(path).map_err(|_| Unverified::Unreadable)?;
+    // lot 353 (#563, the lab's FUSE over /proc): `/proc/<pid>/exe`
+    // beneath the anchored root
+    let file = antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)
+        .map_err(|_| Unverified::Unreadable)?;
     let m = file.metadata().map_err(|_| Unverified::Unreadable)?;
     let id = (
         crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),

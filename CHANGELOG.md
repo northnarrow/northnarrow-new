@@ -983,6 +983,29 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - The CPU count (`kernel_roots::available_parallelism`) and the mount
     roots (`MountEntry::root_key`, cached `statx`) no longer walk or ask a
     FUSE mounted over the cgroup tree.
+  - The review of #563 (§47.1): **no signed record walks `/proc`** — the
+    anchored names are resolved beneath the directories' descriptors
+    (`openat2`/`renameat2`/`unlinkat`, `nn_linux::anchored`) by every chain
+    writer (through `ChainHost`'s new `open`, `symlink_metadata`,
+    `read_dir_names`, `remove_file`), the flat chains, the COMBAT log and a
+    refused start's fallback chain: a FUSE over `/proc` held every signed
+    append under the audit lock, a tmpfs made them all fail silently. **A
+    signing failure is a degradation** (`signed_log`) and the watchdog's
+    (`LoopProgress.unsigned_ms`, `signed_records_failed` High). **Every
+    `/proc`/`/sys` read routed** (known-program walk, socket re-bind chmod,
+    quarantine, kill's walk without the `procfs` crate, copy-on-write trust,
+    ring-drop/package/systemd/kmod scans, the exec checks' `/proc/<pid>/exe`
+    and `environ`, the mount table's watch, `current_exe` (the telemetry
+    probe's round); per-CPU maps through
+    `antitamper_bpf::per_cpu`, the BTF through `kernel_roots::vmlinux_btf`),
+    the ratchet a per-function and same-file taint of view paths plus
+    third-party calls (it fails on all 38 sites of the review's head). **A mount stacked or
+    bound over `/proc`, `/sys` or the cgroup2 root** is High and not
+    anchored; a tmpfs over a unified host's cgroup2 root is refused at the
+    start, never taken for cgroup v1. **WSL2's `binfmt_misc/status` tmpfs**
+    is no longer a High at every boot. **The watchdog's holds are never
+    dropped** (removed once all signed). The FUSE abort re-reads the mount
+    first.
 - Lot 351 (the review of #559): two pre-existing P2 and #559's P3s.
   - **F1 — a log truncated back to its signed baseline's exact content was
     dropped as a no-op** (no drift row, no NN-L-FIM-005: the lines written

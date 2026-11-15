@@ -810,7 +810,8 @@ impl OpenSensorMaps {
     /// External audit EBPF-011: classifications whose walk stopped at the
     /// depth cap since the sensor loaded (all CPUs).
     pub fn depth_capped_total(&self) -> Result<u64> {
-        Ok(self.depth_capped.get(&0, 0)?.iter().sum())
+        // lot 353 (#563 F2): no per-thread read of /sys by path
+        Ok(antitamper_bpf::per_cpu::sum(&self.depth_capped, 0)?)
     }
 
     /// The review of #547 (F6): opens judged in a run's own buffer because
@@ -819,7 +820,7 @@ impl OpenSensorMaps {
     /// loaded (all CPUs). Also published for `nn-admin status`
     /// ([`per_call_total`]).
     pub fn per_call_total(&self) -> Result<u64> {
-        let n = self.task_counters.get(&0, 0)?.iter().sum();
+        let n = antitamper_bpf::per_cpu::sum(&self.task_counters, 0)?;
         PER_CALL_TOTAL.store(n, std::sync::atomic::Ordering::Relaxed);
         Ok(n)
     }
@@ -1244,7 +1245,9 @@ impl MountTable {
     pub fn load_from(source: &Path) -> Self {
         let mut t = MountTable {
             source: source.to_path_buf(),
-            watch: std::fs::File::open(source).ok(),
+            // lot 353 (#563, the lab's FUSE over /proc): beneath the
+            // anchored root
+            watch: antitamper_bpf::kernel_roots::open(source, libc::O_RDONLY).ok(),
             ..MountTable::default()
         };
         t.refresh();
@@ -1301,18 +1304,19 @@ impl MountTable {
     }
 
     /// Whether the mount point `mp` still shows the filesystem root `root`
-    /// (read without following a link).
+    /// (read without following a link). Lot 353 (the review of #563, the
+    /// lab's FUSE over `/proc`): opened as the mount roots are
+    /// (`MountEntry::root_key`: beneath the views, a crossing bounded) and
+    /// its identity read from the kernel's cache (`AT_STATX_DONT_SYNC`) —
+    /// the open by path and `metadata` of `/proc` asked the FUSE mounted
+    /// over it (`FUSE_STATX`) and held a runtime worker.
     fn still_shows(mp: &Path, root: (u64, u64)) -> bool {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(mp)
-            .and_then(|f| f.metadata())
-            .is_ok_and(|m| {
-                let k = key_of(&m);
-                (k.dev, k.ino) == root
-            })
+        antitamper_bpf::kernel_roots::open_crossing(
+            mp,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+        .and_then(|f| antitamper_bpf::kernel_roots::stat_cached(&f))
+        .is_ok_and(|(dev, ino, _)| (dev, ino) == root)
     }
 
     /// Absolute path of `rel` (mount-relative, starting with `/`) under

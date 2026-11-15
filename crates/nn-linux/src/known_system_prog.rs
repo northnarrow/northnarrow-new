@@ -221,15 +221,15 @@ impl LinkInfo {
 /// The link of program `id` (kind `link`) that the process at `pdir`
 /// (`/proc/<pid>`) holds, if any: its BPF link descriptors' fdinfo.
 fn held_link(pdir: &Path, id: u32, link: KnownLink) -> Option<u32> {
-    let fds = std::fs::read_dir(pdir.join("fd")).ok()?;
-    for fd in fds.flatten() {
-        let is_link = antitamper_bpf::kernel_roots::read_link(fd.path())
+    // lot 353 (the review of #563, F2): beneath the anchored /proc root
+    let fds = antitamper_bpf::kernel_roots::read_dir(pdir.join("fd")).ok()?;
+    for fd in fds {
+        let is_link = antitamper_bpf::kernel_roots::read_link(pdir.join("fd").join(&fd))
             .is_ok_and(|t| t.as_os_str().as_encoded_bytes() == b"anon_inode:bpf_link");
         if !is_link {
             continue;
         }
-        let Ok(text) =
-            antitamper_bpf::kernel_roots::read_to_string(pdir.join("fdinfo").join(fd.file_name()))
+        let Ok(text) = antitamper_bpf::kernel_roots::read_to_string(pdir.join("fdinfo").join(&fd))
         else {
             continue;
         };
@@ -282,15 +282,16 @@ fn holders_by(
     clk_tck: u64,
     read_stat: &dyn Fn(&Path) -> Option<String>,
 ) -> Vec<Holder> {
-    let Ok(dir) = std::fs::read_dir(proc) else {
+    // lot 353 (the review of #563, F2): beneath the anchored /proc root
+    let Ok(dir) = antitamper_bpf::kernel_roots::read_dir(proc) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+    for name in dir {
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        let pdir = e.path();
+        let pdir = proc.join(&name);
         let Some(start) = start_ns_by(&pdir, clk_tck, read_stat) else {
             continue;
         };

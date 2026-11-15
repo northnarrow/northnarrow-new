@@ -208,8 +208,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
         // 24 → 32, the deny self-test's round — the protected file opened
         // for the child (`prepare_deny`), the target ended off the runtime
         // (`DenyRun::finish`), the child's plan read (`run_child`), the lab
-        // builds' `debug-deny-detach` / `debug-deny-budget-spent` files
-        32,
+        // builds' `debug-deny-detach` / `debug-deny-budget-spent` files;
+        // lot 353 (the review of #563): 32 → 33, the round's own image
+        // read beneath the anchored /proc root (`kernel_roots::current_exe`,
+        // std's read of /proc/self/exe by path held the round on a FUSE)
+        33,
         "the probe's own task (its marker files, sleeps, child processes; R13, lab PR 271: in \
          debug-trigger builds the lab's `debug-probe-blind` file, read once a round; lot 280c: \
          the attach checks' reads, the child's reap off the runtime; lot 302: the deny \

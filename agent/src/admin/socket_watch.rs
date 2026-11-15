@@ -23,7 +23,6 @@
 use std::fs::{self, OpenOptions, Permissions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,21 +131,20 @@ fn restrict(path: &Path) -> io::Result<SocketId> {
             "the path no longer holds the socket just bound",
         ));
     }
-    let mode = Permissions::from_mode(0o600);
-    match fs::set_permissions(format!("/proc/self/fd/{}", f.as_raw_fd()), mode.clone()) {
-        Ok(()) => {}
-        // No /proc: chmod by name, then check it is still that socket.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::set_permissions(path, mode)?;
-            let after = fs::symlink_metadata(path)?;
-            if SocketId::of(&after) != SocketId::of(&m) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "the path changed while its mode was set",
-                ));
-            }
+    // Lot 353 (the review of #563, F2): through the /proc root the start
+    // anchored, never the /proc mounted now (a FUSE over it held the
+    // re-bind of WDG-007).
+    if antitamper_bpf::kernel_roots::chmod_fd(&f, 0o600).is_err() {
+        // No anchored /proc: chmod by name, then check it is still that
+        // socket.
+        fs::set_permissions(path, Permissions::from_mode(0o600))?;
+        let after = fs::symlink_metadata(path)?;
+        if SocketId::of(&after) != SocketId::of(&m) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the path changed while its mode was set",
+            ));
         }
-        Err(e) => return Err(e),
     }
     Ok(SocketId::of(&m))
 }

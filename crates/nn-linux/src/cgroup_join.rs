@@ -2087,10 +2087,7 @@ fn debug_self_inject() {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
-        let r = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(format!("/proc/{pid}/mem"));
+        let r = antitamper_bpf::kernel_roots::open(format!("/proc/{pid}/mem"), libc::O_RDWR);
         info!(
             pid,
             opened = r.is_ok(),

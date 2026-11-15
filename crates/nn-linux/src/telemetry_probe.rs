@@ -1467,7 +1467,7 @@ async fn run_round(
         warn!(error = %e, path = %file.display(), "telemetry probe: cannot write the probe file — round skipped");
         return;
     }
-    let exe = match std::env::current_exe() {
+    let exe = match antitamper_bpf::kernel_roots::current_exe() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "telemetry probe: current_exe unknown — round skipped");
