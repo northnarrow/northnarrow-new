@@ -21,7 +21,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted hooks (map size).
-pub const FAIL_OPEN_SLOTS: u32 = 33;
+pub const FAIL_OPEN_SLOTS: u32 = 34;
 
 /// Slot of each deny hook in `DENY_FAIL_OPEN`: the agent's `DENY_HOOKS`,
 /// then its optional deny hooks, then the `bpf` hook (an observer that
@@ -77,6 +77,9 @@ pub mod hook {
     pub const MOVE_MOUNT: u32 = 30;
     pub const SB_UMOUNT: u32 = 31;
     pub const SB_PIVOTROOT: u32 = 32;
+    /// The review of #567 (F3): a super block's reconfigure let through
+    /// because a read of it or of the caller failed.
+    pub const SB_REMOUNT: u32 = 33;
 }
 
 /// LSM hook names, indexed by slot (the names `DENY_HOOKS` uses).
@@ -116,6 +119,7 @@ pub const FAIL_OPEN_HOOKS: [&str; FAIL_OPEN_SLOTS as usize] = [
     "move_mount",
     "sb_umount",
     "sb_pivotroot",
+    "sb_remount",
 ];
 
 #[cfg(test)]
@@ -160,11 +164,12 @@ mod tests {
             (hook::MOVE_MOUNT, "move_mount"),
             (hook::SB_UMOUNT, "sb_umount"),
             (hook::SB_PIVOTROOT, "sb_pivotroot"),
+            (hook::SB_REMOUNT, "sb_remount"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");
             assert_eq!(FAIL_OPEN_HOOKS[i], *name);
         }
-        assert_eq!(hook::SB_PIVOTROOT + 1, FAIL_OPEN_SLOTS);
+        assert_eq!(hook::SB_REMOUNT + 1, FAIL_OPEN_SLOTS);
     }
 }

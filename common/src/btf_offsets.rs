@@ -555,6 +555,27 @@ pub const MOUNT_MNT_NS_OFFSET: usize = 232;
 pub const MOUNT_MNT_SHARE_OFFSET: usize = 176;
 pub const MOUNT_MNT_SLAVE_LIST_OFFSET: usize = 192;
 pub const MOUNT_MNT_SLAVE_OFFSET: usize = 208;
+/// The review of #567 (F1): `struct mount.mnt_id` — the mounts held are the
+/// mounts themselves (their id, field 1 of `mountinfo`), not their root's
+/// dentry: a copy of `/` or `/sys` (a backup's bind, a chroot's sysfs) is
+/// another mount. Ubuntu's 6.8.0-149: byte 300 (5.15.0-203: 292, 6.18:
+/// 308). Optional: without it the guard is not attached.
+pub const MOUNT_MNT_ID_OFFSET: usize = 300;
+/// The review of #567 (F1): `struct mount.mnt_group_id` — the peer group of
+/// an unmounted mount's parent, to which the kernel propagates the
+/// unmount (`shared:N` of `mountinfo`). Ubuntu's 6.8.0-149: byte 312
+/// (5.15.0-203: 296, 6.18: 320). Optional: without it the guard is not
+/// attached.
+pub const MOUNT_MNT_GROUP_ID_OFFSET: usize = 312;
+/// The review of #567 (F3, finalrd's `remount,exec /run` at shutdown):
+/// `struct fs_context.sb_flags` and `.sb_flags_mask`, read by the fentry on
+/// `reconfigure_super()` — a reconfigure that makes a held file system
+/// read-only is told from one that changes another option (the
+/// `sb_remount` hook does not see the new options). 6.18: bytes 136 and
+/// 140. Optional: without them every reconfigure of a held super block is
+/// refused.
+pub const FS_CONTEXT_SB_FLAGS_OFFSET: usize = 136;
+pub const FS_CONTEXT_SB_FLAGS_MASK_OFFSET: usize = 140;
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
@@ -1796,6 +1817,40 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    // The review of #567 (F1): appended (slots 148–149).
+    OffsetSpec {
+        name: "MOUNT_MNT_ID_OFFSET",
+        struct_name: "mount",
+        field_path: &["mnt_id"],
+        expected: MOUNT_MNT_ID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "MOUNT_MNT_GROUP_ID_OFFSET",
+        struct_name: "mount",
+        field_path: &["mnt_group_id"],
+        expected: MOUNT_MNT_GROUP_ID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    // The review of #567 (F3): appended (slots 150–151).
+    OffsetSpec {
+        name: "FS_CONTEXT_SB_FLAGS_OFFSET",
+        struct_name: "fs_context",
+        field_path: &["sb_flags"],
+        expected: FS_CONTEXT_SB_FLAGS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "FS_CONTEXT_SB_FLAGS_MASK_OFFSET",
+        struct_name: "fs_context",
+        field_path: &["sb_flags_mask"],
+        expected: FS_CONTEXT_SB_FLAGS_MASK_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1979,16 +2034,21 @@ pub mod slot {
     pub const MOUNT_MNT_SHARE_OFFSET: u32 = 145;
     pub const MOUNT_MNT_SLAVE_LIST_OFFSET: u32 = 146;
     pub const MOUNT_MNT_SLAVE_OFFSET: u32 = 147;
-    // enum slots 148–149 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 150;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 151;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 152;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 153;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 154;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 155;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 156;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 157;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 158;
+    // The review of #567: appended (slots 148–149).
+    pub const MOUNT_MNT_ID_OFFSET: u32 = 148;
+    pub const MOUNT_MNT_GROUP_ID_OFFSET: u32 = 149;
+    pub const FS_CONTEXT_SB_FLAGS_OFFSET: u32 = 150;
+    pub const FS_CONTEXT_SB_FLAGS_MASK_OFFSET: u32 = 151;
+    // enum slots 152–153 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 154;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 155;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 156;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 157;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 158;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 159;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 160;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 161;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 162;
     // Lot 322: `sys_enter_execve.envp` and `sys_enter_execveat.envp` (lab
     // PR 226, slots 140–141) are no longer read: the environment is read
     // from the exec's own registers (`PT_REGS_R10_OFFSET`).
@@ -2144,6 +2204,10 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("MOUNT_MNT_SHARE_OFFSET", 145),
     ("MOUNT_MNT_SLAVE_LIST_OFFSET", 146),
     ("MOUNT_MNT_SLAVE_OFFSET", 147),
+    ("MOUNT_MNT_ID_OFFSET", 148),
+    ("MOUNT_MNT_GROUP_ID_OFFSET", 149),
+    ("FS_CONTEXT_SB_FLAGS_OFFSET", 150),
+    ("FS_CONTEXT_SB_FLAGS_MASK_OFFSET", 151),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -2504,24 +2568,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 150),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 151),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 152),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 153),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 154),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 155),
-    ("TP_IOURING_CREATE_FD_OFFSET", 156),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 157),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 158),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 154),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 155),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 156),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 157),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 158),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 159),
+    ("TP_IOURING_CREATE_FD_OFFSET", 160),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 161),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 162),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 148), ("ITER_IOVEC_VALUE", 149)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 152), ("ITER_IOVEC_VALUE", 153)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 148;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 152;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 149;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 153;
 
 // ───────────────────────────────────────
 //  LSM hook prototypes (lab PR 164).
@@ -2591,20 +2655,20 @@ pub const HOOK_ARGS: &[HookArgSpec] = &[
 
 /// Hook-argument slots follow the tracepoint slots.
 pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
-    ("INODE_SETATTR_DENTRY_ARG", 159),
-    ("INODE_SETXATTR_DENTRY_ARG", 160),
-    ("INODE_REMOVEXATTR_DENTRY_ARG", 161),
+    ("INODE_SETATTR_DENTRY_ARG", 163),
+    ("INODE_SETXATTR_DENTRY_ARG", 164),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 165),
 ];
 
 /// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
 /// 6.9.
-pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 159;
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 163;
 /// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
 /// 1 from 5.12. The attribute name follows it.
-pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 160;
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 164;
 /// Slot of the position of `inode_removexattr`'s dentry (as
 /// `inode_setxattr`).
-pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 161;
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 165;
 
 /// Upper bound on a resolved position: every hook the agent attaches has
 /// at most six arguments. The eBPF reader bounds the slot value by it.
@@ -2695,6 +2759,8 @@ pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
     check("bpf_lsm_move_mount", 1, "path"),
     check("bpf_lsm_sb_umount", 0, "vfsmount"),
     check("bpf_lsm_sb_pivotroot", 1, "path"),
+    // The review of #567 (F3): `(sb, mnt_opts)`, unchanged since 5.1.
+    check("bpf_lsm_sb_remount", 0, "super_block"),
 ];
 
 /// Lot 273: a kernel function an anti-tamper `fexit` program reads the
@@ -2854,8 +2920,8 @@ mod tests {
     fn revalidate_table_is_complete() {
         assert_eq!(
             REVALIDATE.len(),
-            147,
-            "REVALIDATE must cover all 147 offsets"
+            151,
+            "REVALIDATE must cover all 151 offsets"
         );
     }
 
@@ -2947,7 +3013,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 162);
+        assert_eq!(BTF_OFFSETS_SLOTS, 166);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -2987,6 +3053,11 @@ mod tests {
         assert_eq!(slot::MOUNT_MNT_SHARE_OFFSET, 145);
         assert_eq!(slot::MOUNT_MNT_SLAVE_LIST_OFFSET, 146);
         assert_eq!(slot::MOUNT_MNT_SLAVE_OFFSET, 147);
+        // the review of #567: appended after lot 357's
+        assert_eq!(slot::MOUNT_MNT_ID_OFFSET, 148);
+        assert_eq!(slot::MOUNT_MNT_GROUP_ID_OFFSET, 149);
+        assert_eq!(slot::FS_CONTEXT_SB_FLAGS_OFFSET, 150);
+        assert_eq!(slot::FS_CONTEXT_SB_FLAGS_MASK_OFFSET, 151);
     }
 
     /// Tracepoint slots follow the enum slots and match TRACEPOINT_FIELDS
@@ -3007,10 +3078,11 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        // lot 357: nine offset slots before them (139–147)
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 150);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 153);
-        assert_eq!(slot::TP_IOURING_CREATE_FLAGS_OFFSET, 158);
+        // lot 357: nine offset slots before them (139–147), the review of
+        // #567 four more (148–151)
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 154);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 157);
+        assert_eq!(slot::TP_IOURING_CREATE_FLAGS_OFFSET, 162);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 
@@ -3031,15 +3103,15 @@ mod tests {
             assert!(spec.compiled < HOOK_ARG_MAX);
             assert!(spec.func.starts_with("bpf_lsm_"));
         }
-        // lot 357: nine offset slots before them
-        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 159);
-        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 160);
-        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 161);
-        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 159));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 160));
+        // lot 357: nine offset slots before them, the review of #567 four more
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 163);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 164);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 165);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 163));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 164));
         assert_eq!(
             HOOK_ARG_SLOT_TABLE[2],
-            ("INODE_REMOVEXATTR_DENTRY_ARG", 161)
+            ("INODE_REMOVEXATTR_DENTRY_ARG", 165)
         );
         // a position and the argument after it stay below the bound
         assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));
@@ -3068,8 +3140,9 @@ mod tests {
             );
         }
         // lot 293: + `bpf_lsm_file_send_sigiotask`'s task
-        // lot 357: + the mount guard's five paths and mount
-        assert_eq!(HOOK_ARG_CHECKS.len(), 39);
+        // lot 357: + the mount guard's five paths and mount; the review of
+        // #567: + `sb_remount`'s super block
+        assert_eq!(HOOK_ARG_CHECKS.len(), 40);
     }
 
     /// Lot 273: the cgroup move guard reads the return value at the slot

@@ -42,6 +42,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     offsets (`path.mnt`, `vfsmount.mnt_root`, `mount.mnt`, `.mnt_parent`,
     `.mnt_mountpoint`) signs the guard's absence; the start goes on and the
     by-path defences remain. Fail-open slots 29–32.
+  - **The review of #567** (§51.1): the mounts held are the mounts
+    themselves, by their id (`MOUNT_HELD`; offsets `mount.mnt_id`,
+    `.mnt_group_id`): a backup's bind of `/` and a chroot's setup and
+    teardown are let through, an unmount the kernel would propagate onto a
+    held mount is refused; the agent's and the watchdog's own mount
+    namespaces are judged as PID 1's (`MOUNT_GUARD_NS`, dropped at their
+    exit by the role watch) and their tables read by the integrity round; a
+    fifth hook, `sb_remount`, refuses a reconfigure of a view's super block
+    (proc's `subset=pid`, `hidepid`) and a read-only one of a held file
+    system (mount(2) and fsconfig alike; the new flags read by an `fentry`
+    on `reconfigure_super`, so finalrd's `remount,exec /run` at shutdown
+    passes), and a read-only or `noexec` bind remount of a held
+    mount is refused; `mount_attrs_changed` compares the super block's
+    options; `state_fs_read_only` and `mount_not_canonical` (the mounts
+    made before the guard) are signed High; systemd-shutdown and its
+    helpers finish a shutdown unjudged; an unmount of the tracefs, debugfs
+    or securityfs is recorded (`FS_OP_MOUNT_NOTED`, Low); a clone of a
+    subdirectory never passes as the kernel's own mount; only the binaries
+    that exist are points (`/usr/local` on NFS); overlay roots' file keys
+    reconciled. Fail-open slot 33.
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

@@ -741,6 +741,14 @@ pub(crate) fn process_event(
                                 )),
                                 common::mount_guard::why_name(why)
                             )
+                        } else if *operation == nn_model::FsProtectOperation::MountNoted {
+                            // the review of #567 (F6)
+                            let (_, op, _, _, _) = common::mount_guard::record_of(*target_dev);
+                            format!(
+                                "not refused: {} of a kernel file system the agent reads, \
+                                 recorded",
+                                common::mount_guard::op_name(op)
+                            )
                         } else if *operation == nn_model::FsProtectOperation::MountWindow {
                             let (_, op, _, _, _) = common::mount_guard::record_of(*target_dev);
                             format!(

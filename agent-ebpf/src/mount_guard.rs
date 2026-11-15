@@ -1,6 +1,8 @@
-//! Lot 357 — the mount guard: `sb_mount`, `move_mount`, `sb_umount` and
-//! `sb_pivotroot`. A mount on, over or below the paths the agent depends on
-//! is refused in PID 1's mount namespace.
+//! Lot 357 — the mount guard: `sb_mount`, `move_mount`, `sb_umount`,
+//! `sb_pivotroot` and (the review of #567, F3) `sb_remount`. A mount on,
+//! over or below the paths the agent depends on is refused in PID 1's
+//! mount namespace, the agent's own and the watchdog's
+//! ([`MOUNT_GUARD_NS`]); a reconfigure of a super block they hold, in any.
 //!
 //! The decision is `northnarrow_common::mount_guard::decide` (the host's
 //! tests judge it); this file reads what it weighs from the kernel's own
@@ -15,9 +17,14 @@
 //!
 //! The protected points are the agent's (`MOUNT_PROTECTED`, by device and
 //! inode as `stat(2)` gives them in PID 1's root: the views, the agent's
-//! directories, binaries and units, the directories above them), written
-//! before the hooks attach; `MOUNT_GUARD_CONF` carries PID 1's mount and
-//! user namespaces (0 = not armed: every hook lets through). A read that
+//! directories, binaries and units, the directories above them; and the
+//! super blocks they are on, `(s_dev, 0)` with `MG_SB`), written before the
+//! hooks attach. The mounts held (no unmount, no move away) are mounts, by
+//! their id (`MOUNT_HELD`, the review of #567 F1): a copy of one (a
+//! backup's bind of `/`, a chroot's sysfs) is another mount.
+//! `MOUNT_GUARD_CONF` carries PID 1's mount and user namespaces (0 = not
+//! armed: every hook lets through), and the agent's and the watchdog's
+//! mount namespaces, which [`vacate`] drops at their exit. A read that
 //! fails lets the operation through, counted (`DENY_FAIL_OPEN`).
 //!
 //! A refusal is signed at each attempt (`FS_OP_MOUNT`, the attempt budget);
@@ -27,27 +34,33 @@
 use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, generated},
-    macros::{lsm, map},
-    maps::{Array, HashMap},
-    programs::LsmContext,
+    macros::{fentry, lsm, map},
+    maps::{Array, HashMap, LruHashMap},
+    programs::{FEntryContext, LsmContext},
 };
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::mount_guard::{
-    decide, fnv16, is_view_magic, mount_op, record_dev, view_of, NameKey, Point, Query, Verdict,
-    DEPTH_DEEPER, MAX_STACK, MAX_WALK, MG_HOLD, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD,
-    MG_OP_PASS, MG_OP_PIVOT, MG_OP_UMOUNT, MG_OWN, MG_VIEW, REACH_OTHER_NS,
+    decide, fnv16, held_by_id, held_by_place, is_view_magic, mount_op, reach_in, record_dev,
+    view_of, NameKey, Point, Query, Verdict, DEPTH_DEEPER, HELD_REFUSE, MAX_STACK, MAX_WALK,
+    MG_HOLD, MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT,
+    MG_OP_REMOUNT, MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC,
+    MS_RDONLY, GUARD_HOST, REACH_OTHER_NS,
 };
-use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_WINDOW};
+use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
 use crate::btf_offsets::{
     BTRFS_INODE_ROOT_OFFSET, BTRFS_INODE_VFS_INODE_OFFSET, BTRFS_ROOT_ANON_DEV_OFFSET,
     CRED_CAP_EFFECTIVE_OFFSET, CRED_USER_NS_OFFSET, DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET,
+    FS_CONTEXT_SB_FLAGS_MASK_OFFSET, FS_CONTEXT_SB_FLAGS_OFFSET,
     DENTRY_D_PARENT_OFFSET, FILE_SYSTEM_TYPE_NAME_OFFSET, INODE_I_INO_OFFSET, INODE_I_SB_OFFSET,
-    MNT_NAMESPACE_INUM_OFFSET, MOUNT_MNT_MOUNTPOINT_OFFSET, MOUNT_MNT_NS_OFFSET, MOUNT_MNT_OFFSET,
-    MOUNT_MNT_PARENT_OFFSET, MOUNT_MNT_SHARE_OFFSET, MOUNT_MNT_SLAVE_LIST_OFFSET,
-    MOUNT_MNT_SLAVE_OFFSET, NSPROXY_MNT_NS_OFFSET, PATH_DENTRY_OFFSET, PATH_MNT_OFFSET,
-    QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
-    SUPER_BLOCK_S_TYPE_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_NSPROXY_OFFSET,
+    MNT_NAMESPACE_INUM_OFFSET, MOUNT_MNT_GROUP_ID_OFFSET, MOUNT_MNT_ID_OFFSET,
+    MOUNT_MNT_MOUNTPOINT_OFFSET,
+    MOUNT_MNT_NS_OFFSET, MOUNT_MNT_OFFSET, MOUNT_MNT_PARENT_OFFSET, MOUNT_MNT_SHARE_OFFSET,
+    MOUNT_MNT_SLAVE_LIST_OFFSET, MOUNT_MNT_SLAVE_OFFSET, NSPROXY_MNT_NS_OFFSET,
+    PATH_DENTRY_OFFSET, PATH_MNT_OFFSET, PF_KTHREAD, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
+    SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, SUPER_BLOCK_S_TYPE_OFFSET,
+    TASK_STRUCT_COMM_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
+    TASK_STRUCT_NSPROXY_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_TGID_OFFSET,
     USER_NAMESPACE_INUM_OFFSET, VFSMOUNT_MNT_ROOT_OFFSET,
 };
 
@@ -59,19 +72,79 @@ const CAP_SYS_ADMIN: u64 = 1 << 21;
 
 /// Entries of [`MOUNT_PROTECTED`]: the views, the agent's directories,
 /// binaries, units and drop-in directories, and the directories above them
-/// (some sixty on a host).
-pub const MOUNT_PROTECTED_MAX: u32 = 256;
+/// (some sixty on a host), and the super blocks they are on.
+pub const MOUNT_PROTECTED_MAX: u32 = 512;
 
 /// The protected points, by device and inode → `MG_ON` / `MG_OWN` /
-/// `MG_VIEW` / `MG_HOLD`. Pinned by name with the hooks: a restarted agent
-/// registers into the map the pinned programs read (as `PROTECTED_INODES`).
+/// `MG_VIEW` / `MG_HOLD`; the super blocks, `(s_dev, 0)` → `MG_SB` (and
+/// the views' own `MG_VIEW`). Pinned by name with the hooks: a restarted
+/// agent registers into the map the pinned programs read (as
+/// `PROTECTED_INODES`).
 #[map]
 pub static MOUNT_PROTECTED: HashMap<InodeKey, u8> = HashMap::pinned(MOUNT_PROTECTED_MAX, 0);
 
-/// Slot 0: PID 1's mount namespace (its `ns.inum`), slot 1: PID 1's user
-/// namespace. 0 in slot 0: not armed, every hook lets through. Pinned.
+/// Entries of [`MOUNT_HELD`]: in each of three namespaces, the mounts the
+/// protected points resolve through, by id and by place.
+pub const MOUNT_HELD_MAX: u32 = 512;
+
+/// The review of #567 (F1): the mounts held — no unmount, no move away —
+/// by their id (`common::mount_guard::held_by_id`), and by their place
+/// under their parent's peer groups, for an unmount that propagates there
+/// (`held_by_place`) → `HELD_REFUSE` or `MG_NOTE`, the namespace in the
+/// high nibble. Pinned.
 #[map]
-pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(2, 0);
+pub static MOUNT_HELD: HashMap<InodeKey, u8> = HashMap::pinned(MOUNT_HELD_MAX, 0);
+
+/// The review of #567 (F2): the mount namespaces judged as PID 1's, by
+/// their `ns.inum` → `GUARD_HOST` / `GUARD_AGENT` / `GUARD_WATCHDOG`. The
+/// agent's and the watchdog's go at their exit ([`vacate`]): before the
+/// kernel frees the number, which the next namespace (a unit's sandbox
+/// being set up) would otherwise take judged. Pinned.
+#[map]
+pub static MOUNT_GUARD_NS: HashMap<u64, u8> = HashMap::pinned(8, 0);
+
+/// The review of #567 (the cross-model check): the peer groups through
+/// which a change made in another namespace reaches a guarded one — the
+/// own group (`shared:N`) and the master's (`master:N`) of each mount of
+/// PID 1's, the agent's and the watchdog's namespaces that holds a
+/// protected point or is a view → a bit per namespace. One look-up replaces
+/// the walk of the peers and slaves, which failed closed (a host with many
+/// containers sharing one group had their mounts judged). Pinned.
+#[map]
+pub static MOUNT_GROUPS: HashMap<u32, u8> = HashMap::pinned(MOUNT_HELD_MAX, 0);
+
+/// The review of #567 (F3): the new flags of a super block's reconfigure in
+/// flight, by `pid_tgid` → `sb_flags | sb_flags_mask << 32` — written by
+/// [`mount_guard_reconfigure`] at `reconfigure_super()`'s entry, read and
+/// dropped by `sb_remount`, which that function calls next and which does
+/// not see them. Pinned with it.
+#[map]
+pub static MOUNT_RECONF: LruHashMap<u64, u64> = LruHashMap::pinned(1024, 0);
+
+/// Slot 0: PID 1's mount namespace (its `ns.inum`), slot 1: PID 1's user
+/// namespace, slot 2: the agent's mount namespace, slot 3: the
+/// watchdog's (the keys [`vacate`] drops from [`MOUNT_GUARD_NS`]). 0 in
+/// slot 0: not armed, every hook lets through. Pinned.
+#[map]
+pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(4, 0);
+
+/// The review of #567 (F2): the agent (role slot 1 of
+/// `bpf_defense::ROLE_TGIDS`) or the watchdog (slot 0) exits — its mount
+/// namespace is no longer judged as PID 1's. Called by `role_exit`, at
+/// `sched_process_exit`, before the kernel drops the exiting task's
+/// namespaces (`exit_task_namespaces`): the number cannot have been freed
+/// for another namespace yet.
+#[inline(always)]
+pub(crate) fn vacate(role_slot: u32) {
+    let conf_slot = if role_slot == 1 { 2 } else { 3 };
+    if let Some(v) = MOUNT_GUARD_CONF.get_ptr_mut(conf_slot) {
+        let inum = unsafe { *v };
+        if inum != 0 {
+            let _ = MOUNT_GUARD_NS.remove(&inum);
+            unsafe { *v = 0 };
+        }
+    }
+}
 
 /// A kernel `u64`, 0 when unreadable, without a branch on the result (the
 /// helper writes zeros on a fault; see `task_scratch::peek_u64`).
@@ -127,6 +200,8 @@ pub struct Offs {
     mnt_share: u16,
     mnt_slave_list: u16,
     mnt_slave: u16,
+    mnt_id: u16,
+    mnt_group_id: u16,
     /// btrfs: `(vfs_inode, root, anon_dev)`, `vfs_inode` 0 when unknown.
     btrfs_vfs: u16,
     btrfs_root: u16,
@@ -183,16 +258,26 @@ impl Offs {
         o.mnt_share = (off_opt!(MOUNT_MNT_SHARE_OFFSET)? & 0xfff) as u16;
         o.mnt_slave_list = (off_opt!(MOUNT_MNT_SLAVE_LIST_OFFSET)? & 0xfff) as u16;
         o.mnt_slave = (off_opt!(MOUNT_MNT_SLAVE_OFFSET)? & 0xfff) as u16;
+        o.mnt_id = (off_opt!(MOUNT_MNT_ID_OFFSET)? & 0xfff) as u16;
+        o.mnt_group_id = (off_opt!(MOUNT_MNT_GROUP_ID_OFFSET)? & 0xfff) as u16;
         Some(o)
     }
 }
 
-/// The caller: (in PID 1's mount namespace, `CAP_SYS_ADMIN` in PID 1's
-/// user namespace, PID 1's mount namespace's `inum`). `None`: the guard is
-/// not armed, or an offset is unknown (the agent attaches the hooks only
-/// with every one resolved).
+/// The caller, as the hooks weigh it.
+#[derive(Clone, Copy)]
+struct Caller {
+    /// The guarded namespace it runs in (`GUARD_HOST`, `GUARD_AGENT`,
+    /// `GUARD_WATCHDOG`), 0 for another one.
+    guard: u8,
+    /// `CAP_SYS_ADMIN` in PID 1's user namespace.
+    privileged: bool,
+}
+
+/// The caller. `None`: the guard is not armed, or an offset is unknown
+/// (the agent attaches the hooks only with every one resolved).
 #[inline(always)]
-unsafe fn caller(hook: u32) -> Option<(bool, bool, u64)> {
+unsafe fn caller(hook: u32) -> Option<Caller> {
     let host_mnt = *MOUNT_GUARD_CONF.get(0)?;
     if host_mnt == 0 {
         return None;
@@ -213,7 +298,11 @@ unsafe fn caller(hook: u32) -> Option<(bool, bool, u64)> {
         return None;
     }
     let mnt_ns = peek_ptr(nsproxy.add(o_mnt_ns & 0xfff));
-    let host = peek_u32(mnt_ns.add(o_mnt_inum & 0xfff)) as u64 == host_mnt;
+    let inum = peek_u32(mnt_ns.add(o_mnt_inum & 0xfff)) as u64;
+    let guard = match MOUNT_GUARD_NS.get(&inum) {
+        Some(g) => *g,
+        None => 0,
+    };
     let (Some(o_cred), Some(o_cap), Some(o_user_ns), Some(o_user_inum)) = (
         off_opt!(TASK_STRUCT_CRED_OFFSET),
         off_opt!(CRED_CAP_EFFECTIVE_OFFSET),
@@ -227,64 +316,101 @@ unsafe fn caller(hook: u32) -> Option<(bool, bool, u64)> {
     let cap = peek_u64(cred.add(o_cap & 0xfff));
     let user_ns = peek_ptr(cred.add(o_user_ns & 0xfff));
     let user_inum = peek_u32(user_ns.add(o_user_inum & 0xfff)) as u64;
-    Some((
-        host,
-        cap & CAP_SYS_ADMIN != 0 && user_inum == host_user,
-        host_mnt,
-    ))
+    Some(Caller {
+        guard,
+        privileged: cap & CAP_SYS_ADMIN != 0 && user_inum == host_user,
+    })
 }
 
-/// How many peers of a mount, and slaves of each, [`reaches_host`] reads.
-const PEERS: u32 = 4;
-const SLAVES: u32 = 2;
-
-/// The coordinator's propagation point: whether what is done to the mount
-/// `real` (a `struct mount`) is copied into PID 1's mount namespace — a
-/// peer of it there (its `mnt_share` ring), or a slave there of it or of a
-/// peer (`mnt_slave_list`). A ring or a list longer than the hook reads is
-/// taken as reaching it (fail closed: the namespace is root's, and it chose
-/// the size).
+/// `systemd-shutdown` at the end of a shutdown (the review of #567, F4):
+/// PID 1 itself, or a helper it forked (`(sd-umount)`, `(sd-remount)` —
+/// PID 1's child), PID 1's comm being `systemd-shutdown`'s (only PID 1 sets
+/// its own) and the caller running the file the agent recorded
+/// (`task_kill::SHUTDOWN_EXE`: a comm set by `ptrace` of PID 1 is not
+/// enough, nor a copy of the program run elsewhere with a preload — its
+/// parent is not PID 1 running it).
 #[inline(always)]
-unsafe fn reaches_host(o: &Offs, real: *const u8, host_mnt: u64) -> bool {
-    let ns_of = |m: *const u8| -> u64 {
-        peek_u32(peek_ptr(m.add(o.mnt_ns as usize)).add(o.mnt_ns_inum as usize)) as u64
-    };
-    let mut p = real;
-    let mut i = 0u32;
-    while i < PEERS {
-        if ns_of(p) == host_mnt {
-            return true;
-        }
-        // its slaves
-        let head = p.add(o.mnt_slave_list as usize);
-        let mut n = peek_ptr(head);
-        let mut j = 0u32;
-        while j < SLAVES {
-            if n.is_null() || n == head {
-                break;
-            }
-            let slave = (n as usize).wrapping_sub(o.mnt_slave as usize) as *const u8;
-            if ns_of(slave) == host_mnt {
-                return true;
-            }
-            n = peek_ptr(n);
-            j += 1;
-        }
-        if !(n.is_null() || n == head) {
-            // more slaves than read
-            return true;
-        }
-        // the next peer
-        let next = peek_ptr(p.add(o.mnt_share as usize));
-        let peer = (next as usize).wrapping_sub(o.mnt_share as usize) as *const u8;
-        if next.is_null() || peer == real {
+unsafe fn shutdown_stage() -> bool {
+    let task = bpf_get_current_task() as *const u8;
+    let leader = if (bpf_get_current_pid_tgid() >> 32) == 1 {
+        task
+    } else {
+        let parent = peek_ptr(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)));
+        if parent.is_null() || peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET))) != 1 {
             return false;
         }
-        p = peer;
-        i += 1;
+        parent
+    };
+    let comm = leader.add(off!(TASK_STRUCT_COMM_OFFSET));
+    if peek_u64(comm) != crate::task_kill::SHUTDOWN_COMM_LO
+        || peek_u64(comm.add(8)) != crate::task_kill::SHUTDOWN_COMM_HI
+    {
+        return false;
     }
-    // more peers than read
-    true
+    let want = match crate::task_kill::SHUTDOWN_EXE.get(0) {
+        Some(k) if k.ino != 0 => *k,
+        _ => return false,
+    };
+    match crate::bpf_defense::caller_exe_key() {
+        Some(k) => k.dev == want.dev && k.ino == want.ino,
+        None => false,
+    }
+}
+
+/// A kernel thread (`PF_KTHREAD`): the emergency remount of `SysRq-u`.
+#[inline(always)]
+unsafe fn kernel_thread() -> bool {
+    let task = bpf_get_current_task() as *const u8;
+    peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET))) & PF_KTHREAD != 0
+}
+
+/// The guarded namespace a mount (a `struct mount`) belongs to — the
+/// namespace that owns the target, never the caller's (the review of #567,
+/// the cross-model check: an `O_PATH` descriptor of
+/// `/proc/<pid>/root/…`, or a path through it, names a mount of another
+/// namespace) — `GUARD_HOST`, `GUARD_AGENT`, `GUARD_WATCHDOG`, or 0.
+#[inline(always)]
+unsafe fn guard_of(o: &Offs, real: *const u8) -> u8 {
+    let inum = peek_u32(peek_ptr(real.add(o.mnt_ns as usize)).add(o.mnt_ns_inum as usize)) as u64;
+    match MOUNT_GUARD_NS.get(&inum) {
+        Some(g) => *g,
+        None => 0,
+    }
+}
+
+/// The coordinator's propagation point: what is done to the mount `real`
+/// is copied into a guarded namespace — its peer group is one of a
+/// guarded mount's own or master groups ([`MOUNT_GROUPS`]). A mount in no
+/// peer group propagates nothing.
+#[inline(always)]
+unsafe fn reaches_guarded(o: &Offs, real: *const u8) -> bool {
+    let group = peek_u32(real.add(o.mnt_group_id as usize));
+    group != 0 && MOUNT_GROUPS.get(&group).is_some()
+}
+
+/// Where a change to the mount `real` lands: in a guarded namespace (its
+/// guard, judged there), propagated into one (`REACH_OTHER_NS`), or
+/// nowhere guarded (`None`: let through unread).
+#[inline(always)]
+unsafe fn target_of(o: &Offs, real: *const u8) -> Option<(u8, u8)> {
+    let g = guard_of(o, real);
+    if g != 0 {
+        Some((g, reach_in(g)))
+    } else if reaches_guarded(o, real) {
+        Some((0, REACH_OTHER_NS))
+    } else {
+        None
+    }
+}
+
+/// The `MOUNT_HELD` flags of a mount (a `struct mount`) by its id.
+#[inline(always)]
+unsafe fn held_flags(o: &Offs, real: *const u8) -> u8 {
+    let (dev, ino) = held_by_id(peek_u32(real.add(o.mnt_id as usize)));
+    match MOUNT_HELD.get(&InodeKey { dev, ino }) {
+        Some(f) => *f,
+        None => 0,
+    }
 }
 
 /// A dentry's inode key, as `stat(2)` gives it (a btrfs subvolume's
@@ -497,6 +623,7 @@ fn answer(verdict: Verdict, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 
         Verdict::Allow => return 0,
         Verdict::Refuse(w) => (FS_OP_MOUNT, w, -EPERM),
         Verdict::Window(w) => (FS_OP_MOUNT_WINDOW, w, 0),
+        Verdict::Noted(w) => (FS_OP_MOUNT_NOTED, w, 0),
     };
     crate::inode_protect::emit_attempt(
         operation,
@@ -514,19 +641,37 @@ fn answer(verdict: Verdict, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 
     ret
 }
 
-/// A query with nothing read but the caller.
+/// A query with nothing read but the caller and where its target is
+/// (`guard`: the target's guarded namespace, 0 for a change that
+/// propagates into one).
 #[inline(always)]
-fn query(op: u8, host: bool, privileged: bool) -> Query {
+fn query(op: u8, c: &Caller, guard: u8) -> Query {
     Query {
         op,
-        host,
-        reaches: false,
-        privileged,
+        host: guard != 0,
+        reaches: guard == 0,
+        privileged: c.privileged,
         init: (bpf_get_current_pid_tgid() >> 32) == 1,
         window: crate::inode_protect::override_active(),
         point: Point::EMPTY,
         fstype: NameKey::NONE,
         held: false,
+        noted: false,
+        shutdown: false,
+        kernel: false,
+        src_root: true,
+        restrict: false,
+    }
+}
+
+/// The reach a record carries: the guarded namespace's own, or
+/// `REACH_OTHER_NS` for a change that propagates into one.
+#[inline(always)]
+fn reach_of_caller(c: &Caller) -> u8 {
+    if c.guard != 0 {
+        reach_in(c.guard)
+    } else {
+        REACH_OTHER_NS
     }
 }
 
@@ -546,10 +691,10 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
     if op == MG_OP_PASS {
         return 0;
     }
-    let Some((host, privileged, host_mnt)) = caller(hook::SB_MOUNT) else {
+    let Some(c) = caller(hook::SB_MOUNT) else {
         return 0;
     };
-    if !privileged {
+    if !c.privileged {
         return 0;
     }
     let Some(o) = Offs::load() else {
@@ -557,18 +702,45 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
         return 0;
     };
     let path: *const u8 = ctx.arg(1);
-    if !host && !path_reaches(o, path, host_mnt) {
+    if path.is_null() {
+        crate::fail_open::bump(hook::SB_MOUNT);
         return 0;
     }
-    let reach = if host { 0 } else { REACH_OTHER_NS };
+    let mnt = peek_ptr(path.add(o.path_mnt as usize));
+    if mnt.is_null() {
+        crate::fail_open::bump(hook::SB_MOUNT);
+        return 0;
+    }
+    let real = real_mount(o, mnt);
+    // the namespace that owns the target, not the caller's
+    let Some((guard, reach)) = target_of(o, real) else {
+        return 0;
+    };
+    if op == MG_OP_REMOUNT_BIND {
+        // the review of #567 (F3): one mount's flags, in its own namespace
+        // only (they never propagate)
+        if guard == 0 || flags & (MS_RDONLY | MS_NOEXEC) == 0 {
+            return 0;
+        }
+        let (rflags, key) = mount_root_flags(o, mnt);
+        if held_flags(o, real) & HELD_REFUSE == 0 || rflags & MG_HOLD == 0 {
+            return 0;
+        }
+        let mut q = query(MG_OP_REMOUNT_BIND, &c, guard);
+        q.held = true;
+        q.restrict = true;
+        q.shutdown = shutdown_stage();
+        return answer(decide(&q), MG_OP_REMOUNT_BIND, key, &q.point, reach);
+    }
     // One decision shape for the verifier: a bind, and an old-API move
     // made elsewhere (judged where it lands), are a mount whose type is not
     // known (`decide`'s own arms for them); the record keeps the operation.
-    let mut q = query(MG_OP_MOUNT, host, privileged);
-    q.reaches = !host;
-    if op == MG_OP_MOVE_OLD && host {
-        // refused whatever it moves: the target's key for the record only
+    let mut q = query(MG_OP_MOUNT, &c, guard);
+    if op == MG_OP_MOVE_OLD && guard != 0 {
+        // refused whatever it moves (but systemd-shutdown's switch to
+        // /run/initramfs): the target's key for the record only
         q.op = MG_OP_MOVE_OLD;
+        q.shutdown = shutdown_stage();
         let key = key_of(o, peek_ptr(path.add(o.path_dentry as usize)));
         return answer(decide(&q), op, key, &q.point, reach);
     }
@@ -583,18 +755,6 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
     answer(decide(&q), op, key, &q.point, reach)
 }
 
-/// In another namespace: whether the mount `path` names (where a new mount
-/// attaches) reaches PID 1's — judged first, so that a container's own
-/// mounts (private, or slaves) cost one look at their mount.
-#[inline(always)]
-unsafe fn path_reaches(o: &Offs, path: *const u8, host_mnt: u64) -> bool {
-    if path.is_null() {
-        return false;
-    }
-    let mnt = peek_ptr(path.add(o.path_mnt as usize));
-    !mnt.is_null() && reaches_host(o, real_mount(o, mnt), host_mnt)
-}
-
 /// `int move_mount(const struct path *from_path, const struct path
 /// *to_path)`: `move_mount(2)` — a detached mount (`fsmount`, `open_tree`)
 /// attached at `to_path`, or an attached one moved there.
@@ -605,10 +765,10 @@ pub fn mount_guard_move_mount(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
-    let Some((host, privileged, host_mnt)) = caller(hook::MOVE_MOUNT) else {
+    let Some(c) = caller(hook::MOVE_MOUNT) else {
         return 0;
     };
-    if !privileged {
+    if !c.privileged {
         return 0;
     }
     let Some(o) = Offs::load() else {
@@ -617,40 +777,53 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
     };
     let from: *const u8 = ctx.arg(0);
     let to: *const u8 = ctx.arg(1);
-    if from.is_null() {
+    if from.is_null() || to.is_null() {
         crate::fail_open::bump(hook::MOVE_MOUNT);
         return 0;
     }
     let from_mnt = peek_ptr(from.add(o.path_mnt as usize));
     let from_dentry = peek_ptr(from.add(o.path_dentry as usize));
-    if from_mnt.is_null() || from_dentry.is_null() {
+    let to_mnt = peek_ptr(to.add(o.path_mnt as usize));
+    if from_mnt.is_null() || from_dentry.is_null() || to_mnt.is_null() {
         crate::fail_open::bump(hook::MOVE_MOUNT);
         return 0;
     }
-    if !host && !path_reaches(o, to, host_mnt) {
-        return 0;
-    }
-    let reach = if host { 0 } else { REACH_OTHER_NS };
-    let mut q = query(MG_OP_MOVE_MOUNT, host, privileged);
-    q.reaches = !host;
-    // An attached mount moved away: its root's protection.
+    // An attached mount moved away: a held one, by its id (the review of
+    // #567, F1: a copy of it is another mount), in the namespace it is in
+    // (a move out of a shared parent is the kernel's EINVAL: only a
+    // guarded namespace's own moves take a held mount away)
     let real = real_mount(o, from_mnt);
     let parent = peek_ptr(real.add(o.mnt_parent as usize));
-    // (a move out of a shared parent is the kernel's EINVAL: only the
-    // host's own moves take a protected mount away)
-    if host && !parent.is_null() && parent != real {
+    let from_guard = guard_of(o, real);
+    if from_guard != 0 && !parent.is_null() && parent != real {
         let key = key_of(o, from_dentry);
-        if flags_at(&key) & MG_HOLD != 0 {
+        if held_flags(o, real) & HELD_REFUSE != 0 && flags_at(&key) & MG_HOLD != 0 {
+            let mut q = query(MG_OP_MOVE_MOUNT, &c, from_guard);
             q.held = true;
-            return answer(decide(&q), MG_OP_MOVE_MOUNT, key, &q.point, reach);
+            q.shutdown = shutdown_stage();
+            return answer(
+                decide(&q),
+                MG_OP_MOVE_MOUNT,
+                key,
+                &q.point,
+                reach_in(from_guard),
+            );
         }
     }
+    // where it lands: the namespace that owns the target
+    let Some((guard, reach)) = target_of(o, real_mount(o, to_mnt)) else {
+        return 0;
+    };
+    let mut q = query(MG_OP_MOVE_MOUNT, &c, guard);
     let mut key = InodeKey { dev: 0, ino: 0 };
     if !point_of(o, to, hook::MOVE_MOUNT, &mut q, &mut key) {
         return 0;
     }
-    // the detached mount's own file system: the kernel's, not a string
+    // the detached mount's own file system: the kernel's, not a string;
+    // and its root its file system's (not a clone of a subdirectory)
     fstype_of(o, from_dentry, &mut q.fstype);
+    let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
+    q.src_root = !root.is_null() && peek_ptr(root.add(o.d_parent as usize)) == root;
     answer(decide(&q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
 }
 
@@ -663,10 +836,10 @@ pub fn mount_guard_sb_umount(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
-    let Some((host, privileged, host_mnt)) = caller(hook::SB_UMOUNT) else {
+    let Some(c) = caller(hook::SB_UMOUNT) else {
         return 0;
     };
-    if !privileged {
+    if !c.privileged {
         return 0;
     }
     let Some(o) = Offs::load() else {
@@ -678,21 +851,65 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
         crate::fail_open::bump(hook::SB_UMOUNT);
         return 0;
     }
+    let real = real_mount(o, mnt);
     let (flags, key) = mount_root_flags(o, mnt);
-    if flags & MG_HOLD == 0 {
+    // the namespace the unmounted mount is in
+    let guard = guard_of(o, real);
+    let mut q = query(MG_OP_UMOUNT, &c, guard);
+    q.reaches = false;
+    let mut reach = reach_in(guard);
+    if guard != 0 {
+        // The review of #567 (F1): the mount itself, by its id — a copy of
+        // `/`, `/run` or `/sys` (a backup's bind, a chroot's sysfs or its
+        // `--bind /run`) is another mount, unmounted unjudged.
+        let held = held_flags(o, real);
+        let root_magic = magic_of(o, peek_ptr(mnt.add(o.mnt_root as usize))) as u32;
+        if held & HELD_REFUSE != 0 && flags & MG_HOLD != 0 {
+            q.held = true;
+        } else if held & MG_NOTE != 0 && is_view_magic(root_magic) {
+            // (its root still a kernel file system's: an id another mount
+            // took since is not the one noted)
+            q.noted = true;
+        }
+    }
+    if !q.held {
+        // An unmount propagates: the kernel takes the mount at the same
+        // place of every peer of the parent's group, and of their slaves,
+        // with no other LSM call — held when one there is (its place under
+        // that group, `held_by_place`): an rbind copy of `/sys` unmounted
+        // takes the host's childless `/sys/fs/cgroup`, a raw namespace's
+        // copy its peer's. A parent in no peer group propagates nothing.
+        let parent = peek_ptr(real.add(o.mnt_parent as usize));
+        let group = if parent.is_null() || parent == real {
+            0
+        } else {
+            peek_u32(parent.add(o.mnt_group_id as usize))
+        };
+        if group != 0 {
+            let place = peek_ptr(real.add(o.mnt_mountpoint as usize));
+            let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
+            let mut name = NameKey::NONE;
+            name_of(o, place, &mut name);
+            let (dev, ino) = held_by_place(group, dir.dev, dir.ino, &name);
+            if MOUNT_HELD.get(&InodeKey { dev, ino }).is_some() {
+                q.held = true;
+                if guard == 0 {
+                    q.reaches = true;
+                    reach = REACH_OTHER_NS;
+                }
+            }
+        }
+    }
+    if !q.held && !q.noted {
         return 0;
     }
-    let mut q = query(MG_OP_UMOUNT, host, privileged);
-    q.held = true;
-    if !host {
-        // an unmount propagates to the peers of the mount's parent
-        let parent = peek_ptr(real_mount(o, mnt).add(o.mnt_parent as usize));
-        if parent.is_null() || !reaches_host(o, parent, host_mnt) {
-            return 0;
-        }
-        q.reaches = true;
-    }
-    let reach = if host { 0 } else { REACH_OTHER_NS };
+    // The cross-model check (C): PID 1's own exemption holds for its own
+    // namespace's mounts, never for one of the agent's directories nor for
+    // a mount of the agent's or the watchdog's namespace (`systemctl bind`'s
+    // worker and PID 1 there are judged); the end of a shutdown is
+    // `shutdown`.
+    q.init = q.init && guard == GUARD_HOST && flags & MG_OWN == 0;
+    q.shutdown = shutdown_stage();
     answer(decide(&q), MG_OP_UMOUNT, key, &q.point, reach)
 }
 
@@ -705,10 +922,10 @@ pub fn mount_guard_sb_pivotroot(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
-    let Some((host, privileged, _)) = caller(hook::SB_PIVOTROOT) else {
+    let Some(c) = caller(hook::SB_PIVOTROOT) else {
         return 0;
     };
-    if !host || !privileged {
+    if c.guard == 0 || !c.privileged {
         // a pivot changes its own namespace's root only
         return 0;
     }
@@ -722,6 +939,85 @@ unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
     } else {
         key_of(o, peek_ptr(new_root.add(o.path_dentry as usize)))
     };
-    let q = query(MG_OP_PIVOT, host, privileged);
-    answer(decide(&q), MG_OP_PIVOT, key, &q.point, 0)
+    let mut q = query(MG_OP_PIVOT, &c, c.guard);
+    q.shutdown = shutdown_stage();
+    answer(decide(&q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
+}
+
+/// `SB_RDONLY` (`include/linux/fs.h`): the super block's read-only flag.
+const SB_RDONLY: u64 = 1;
+
+/// `int reconfigure_super(struct fs_context *fc)` (fentry): the new flags
+/// of the reconfigure (`fc->sb_flags`, `fc->sb_flags_mask`), for the
+/// `sb_remount` that follows on this task. Observe only.
+#[fentry(function = "reconfigure_super")]
+pub fn mount_guard_reconfigure(ctx: FEntryContext) -> i32 {
+    let fc: *const u8 = ctx.arg(0);
+    if fc.is_null() {
+        return 0;
+    }
+    let (Some(o_flags), Some(o_mask)) = (
+        off_opt!(FS_CONTEXT_SB_FLAGS_OFFSET),
+        off_opt!(FS_CONTEXT_SB_FLAGS_MASK_OFFSET),
+    ) else {
+        return 0;
+    };
+    let flags = unsafe { peek_u32(fc.add(o_flags & 0xfff)) } as u64;
+    let mask = unsafe { peek_u32(fc.add(o_mask & 0xfff)) } as u64;
+    let _ = MOUNT_RECONF.insert(&bpf_get_current_pid_tgid(), &(flags | mask << 32), 0);
+    0
+}
+
+/// `int sb_remount(struct super_block *sb, void *mnt_opts)`: the review of
+/// #567 (F3) — a super block reconfigured, through `reconfigure_super()`:
+/// `mount(2)`'s `MS_REMOUNT` (after `sb_mount`) and `fsconfig(2)`'s
+/// `FSCONFIG_CMD_RECONFIGURE` on an `fspick(2)` descriptor alike (the
+/// emergency remount too, a kernel thread's). proc's `subset=pid` and
+/// `hidepid`, a read-only state file system: refused for a held super
+/// block, whatever namespace asks (it is the same super block).
+#[lsm(hook = "sb_remount")]
+pub fn mount_guard_sb_remount(ctx: LsmContext) -> i32 {
+    unsafe { try_sb_remount(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_sb_remount(ctx: &LsmContext) -> i32 {
+    let Some(c) = caller(hook::SB_REMOUNT) else {
+        return 0;
+    };
+    if !c.privileged {
+        return 0;
+    }
+    let Some(o) = Offs::load() else {
+        crate::fail_open::bump(hook::SB_REMOUNT);
+        return 0;
+    };
+    let sb: *const u8 = ctx.arg(0);
+    if sb.is_null() {
+        crate::fail_open::bump(hook::SB_REMOUNT);
+        return 0;
+    }
+    let dev = peek_u32(sb.add(o.s_dev as usize)) as u64;
+    let key = InodeKey { dev, ino: 0 };
+    if flags_at(&key) & MG_SB == 0 {
+        return 0;
+    }
+    let mut q = query(MG_OP_REMOUNT, &c, c.guard);
+    q.held = true;
+    q.shutdown = shutdown_stage();
+    q.kernel = kernel_thread();
+    // made read-only — or its new flags unread (the fentry not attached):
+    // taken as such
+    let me = bpf_get_current_pid_tgid();
+    q.restrict = match MOUNT_RECONF.get(&me) {
+        Some(v) => {
+            let v = *v;
+            let _ = MOUNT_RECONF.remove(&me);
+            (v >> 32) & SB_RDONLY != 0 && v & SB_RDONLY != 0
+        }
+        None => true,
+    };
+    // the view the super block is, for the record
+    q.point.magic = peek_u64(sb.add(o.s_magic as usize)) as u32;
+    answer(decide(&q), MG_OP_REMOUNT, key, &q.point, reach_of_caller(&c))
 }

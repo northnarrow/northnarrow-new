@@ -11354,6 +11354,52 @@ number in parentheses is a lab PR.
     counting as the host's view.
   - Not covered in a guest: a kernel without `move_mount` (all supported
     kernels have it); a slave of a slave of a child's peer group.
+  - Fix round 1 (the independent review of #567, the adversarial
+    brainstorm, the cross-model check): the mounts held are mounts, by id
+    (`MOUNT_HELD`), an unmount's propagation judged by place under the
+    parent's peer group; the target mount's own namespace judged
+    (`mnt_ns`), the agent's and the watchdog's among the guarded ones
+    (`MOUNT_GUARD_NS`, dropped at their exit by the role watch), a change
+    made elsewhere judged when its peer group reaches one (`MOUNT_GROUPS`,
+    one look-up, re-read every 30 s); `sb_remount` (a fifth hook) refuses a
+    view's reconfigure and a held file system's read-only one (mount(2) and
+    fsconfig; the flags read by an `fentry` on `reconfigure_super`), `sb_mount` a
+    read-only or `noexec` bind remount of a held mount; systemd-shutdown
+    and its helpers, a kernel thread's remount exempt, PID 1's own
+    exemption scoped to its namespace; the mounts made before the guard
+    judged against the canonical layout (`mount_not_canonical`, High, and a
+    degradation); `state_fs_read_only`; the tracefs/debugfs/securityfs
+    unmount recorded; a clone of a subdirectory refused; only the binaries
+    that exist and the agent's library directories are points; overlay
+    file keys reconciled. Found by its own lab: the allow-list check,
+    inlined into the decision, stopped matching on 5.15 (every kernel's own
+    mount refused): kept out of line, with a ratchet. Mutation: 44 mutants
+    of the new decision, points, rounds and attrs, 44 caught by a named test
+    after three tests were added for the first survivors. Lab: each guest with the lot's tree installed as an operator (alpha profile),
+    the round's probe of 106 cases and a cold boot. ubuntu2204
+    (5.15.0-203, util-linux 2.37): `verifier-check` 123 programs, 116
+    OK, 0 failing, `mount_guard_move_mount` 567,031 (56.7 %), `sb_mount`
+    474,396, `sb_umount` 84,820, `sb_remount` 26,969, the fentry 132;
+    ubuntu2404 (6.8.0-149, 2.39): 123, 120 OK, 0 failing, `move_mount`
+    180,428; ubuntu2604 (7.0.0-43, 2.41): 123, 118 OK, 0 failing,
+    `move_mount` 291,642. On each: 69 refused cases (on 6.8 and 7.0 64
+    `EPERM` with one High each, on 5.15 63 — `MOVE_MOUNT_BENEATH` does
+    not exist there —; `nsenter` into the agent and the watchdog and two
+    `systemctl bind` into the agent refused by the ptrace guard,
+    unsigned; a clone of securityfs' `apparmor/` refused), 9 from inside
+    the agent's own namespace entered through a child of it (each
+    `EPERM`, 9 High "made in the agent's own mount namespace"; a former
+    agent's namespace no longer judged), 37 allowed (35 without a
+    record: a backup's bind and rbind of `/`, debootstrap, schroot,
+    arch-chroot, a chroot's cgroup2, an rbind of `/sys`, finalrd's
+    `remount,exec /run`, the kernel's own mounts back, nspawn, podman,
+    ten podman containers with a privileged and a host-network one,
+    snapd; the window's two Low), two unmounts noted Low, a window's
+    mount in the agent's namespace signed by the integrity round; the
+    cold boot: agent and watchdog active, five guard links, no guard
+    record, no ext4 recovery. An earlier round of the same tree had one
+    High at each poweroff (finalrd), closed by reading the reconfigure's
+    flags.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

@@ -1524,8 +1524,13 @@ pub const FS_OP_MOUNT: u8 = 49;
 /// window's mounts spend the minor budget, never a decisive record's.
 pub const FS_OP_MOUNT_WINDOW: u8 = 50;
 
+/// The review of #567 (F6): NOT a refusal — an unmount of the tracefs,
+/// debugfs or securityfs the agent reads, let through and recorded (the
+/// fields as [`FS_OP_MOUNT`]'s). Minor.
+pub const FS_OP_MOUNT_NOTED: u8 = 51;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_MOUNT_WINDOW;
+pub const FS_OP_LAST: u8 = FS_OP_MOUNT_NOTED;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1583,6 +1588,8 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_EXEMPT_INJECT
             // lot 357: a mount the window let through
             | FS_OP_MOUNT_WINDOW
+            // the review of #567: an unmount let through and recorded
+            | FS_OP_MOUNT_NOTED
     )
 }
 
@@ -2898,6 +2905,7 @@ mod tests {
             FS_OP_SOLE_TRACE_SUMMARY,
             FS_OP_MOUNT,
             FS_OP_MOUNT_WINDOW,
+            FS_OP_MOUNT_NOTED,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

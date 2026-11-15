@@ -465,6 +465,24 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // The review of #567 (F6): not refused — the tracefs, debugfs
+            // or securityfs the agent reads, unmounted.
+            FsProtectOperation::MountNoted => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) made {} (let through and recorded, not refused). \
+                     The agent reads the tracepoint formats, the kprobes switch or the lockdown \
+                     state there: until the kernel's own file system is mounted back, those \
+                     reads find nothing.",
+                    mount_text(*target_dev, *target_ino)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -1087,6 +1105,50 @@ mod tests {
         assert_eq!(v.severity, Severity::Low);
         assert!(v.reasoning.contains("umount(2)"), "{}", v.reasoning);
         assert!(v.reasoning.contains("the signed window let it through"));
+        assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    /// The review of #567 (F2, F3, F6): a refusal in the agent's own
+    /// namespace and a super block's remount say so; an unmount of the
+    /// tracefs the agent reads is Low, recorded, never a refusal.
+    #[test]
+    fn a_mount_in_the_agents_namespace_and_a_noted_unmount_say_what_they_are() {
+        use common::mount_guard::{
+            record_dev, MG_OP_REMOUNT, MG_OP_UMOUNT, MG_WHY_REMOUNT_SB, MG_WHY_UMOUNT_NOTED,
+            REACH_AGENT_NS,
+        };
+        let mut e = denial(FsProtectOperation::Mount);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(
+                0x16,
+                MG_OP_REMOUNT,
+                MG_WHY_REMOUNT_SB,
+                1,
+                REACH_AGENT_NS << 4,
+            );
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        for words in [
+            "remount of a super block",
+            "made in the agent's own mount namespace",
+            "subset=pid",
+            "the kernel refused it",
+        ] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        let mut e = denial(FsProtectOperation::MountNoted);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x0c, MG_OP_UMOUNT, MG_WHY_UMOUNT_NOTED, 5, 0);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert!(
+            v.reasoning.contains("let through and recorded"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("in the tracefs"), "{}", v.reasoning);
         assert!(!v.reasoning.contains("the kernel refused it"));
     }
 

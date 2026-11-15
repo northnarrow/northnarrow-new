@@ -1240,6 +1240,9 @@ pub enum FsProtectOperation {
     /// Lot 357: NOT a refusal — what [`Self::Mount`] refuses, let through by
     /// the signed trusted-installer window (the fields as its).
     MountWindow,
+    /// The review of #567 (F6): NOT a refusal — an unmount of the tracefs,
+    /// debugfs or securityfs the agent reads, let through and recorded.
+    MountNoted,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1298,6 +1301,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_SOLE_TRACE_SUMMARY => Self::SoleTraceSummary,
             crate::wire::FS_OP_MOUNT => Self::Mount,
             crate::wire::FS_OP_MOUNT_WINDOW => Self::MountWindow,
+            crate::wire::FS_OP_MOUNT_NOTED => Self::MountNoted,
             other => Self::Unknown(other),
         }
     }
@@ -1354,6 +1358,7 @@ impl FsProtectOperation {
             Self::SoleTraceSummary => "sole_trace_summary",
             Self::Mount => "mount",
             Self::MountWindow => "mount_window",
+            Self::MountNoted => "mount_noted",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2220,6 +2225,12 @@ mod tests {
                 crate::wire::FS_OP_MOUNT_WINDOW,
                 FsProtectOperation::MountWindow,
                 "mount_window",
+            ),
+            // the review of #567 (F6)
+            (
+                crate::wire::FS_OP_MOUNT_NOTED,
+                FsProtectOperation::MountNoted,
+                "mount_noted",
             ),
         ];
         for (byte, op, name) in cases {

@@ -861,7 +861,8 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // one (let through, held: the review of #558, F1).
             // The review of #565 (F2): nor any sole trace — the round's
             // summary of the findings its quota held back included.
-            // Lot 357: nor a mount the signed window let through.
+            // Lot 357: nor a mount the signed window let through, nor (the
+            // review of #567) an unmount let through and recorded.
             if known_probe {
                 // lot 340: refused, recorded Low by NN-L-AT-001; no trigger
             } else if !matches!(
@@ -877,6 +878,7 @@ impl<H: DecisionHost> TriggerDetector<H> {
                     | nn_model::FsProtectOperation::CpuConfined
                     | nn_model::FsProtectOperation::BpfHeldLoad
                     | nn_model::FsProtectOperation::MountWindow
+                    | nn_model::FsProtectOperation::MountNoted
             ) && !operation.is_sole_trace()
             {
                 hits.push(if *operation == nn_model::FsProtectOperation::Sigio {
@@ -3263,8 +3265,9 @@ mod tests {
         // lot 356: the held load and the kernel-state round's five findings
         // are sole traces; the review of #565 (F2): and the round's summary;
         // lot 357: a mount the window let through, one more minor (the
-        // refused mount is decisive)
-        assert_eq!((minor, sole), (18, 7));
+        // refused mount is decisive); the review of #567: an unmount let
+        // through and recorded, one more
+        assert_eq!((minor, sole), (19, 7));
         use common::wire as w;
         for decisive in [
             w::FS_OP_UNLINK,
@@ -3301,6 +3304,7 @@ mod tests {
             w::FS_OP_CGROUP_JOIN,
             w::FS_OP_BPF_HELD_USE,
             w::FS_OP_MOUNT_WINDOW,
+            w::FS_OP_MOUNT_NOTED,
         ] {
             assert!(w::is_minor_denial(minor), "{minor}");
         }

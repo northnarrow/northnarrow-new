@@ -2940,7 +2940,7 @@ where it starts.
   kernel resolves after the hook: in the host's namespace it is refused,
   whatever it moves. `move_mount(2)` names the mount, and is judged by it.
 - **`pivot_root(2)`** in the host's namespace is refused.
-- **Let through:** a remount and a change of propagation (they cover
+- **Let through:** a change of propagation (it covers
   nothing; `systemd` makes `/` shared at every boot); an unmount by PID 1
   (systemd-shutdown's last pass, after the agent has stopped); everything
   inside the signed trusted-installer window, recorded when it is what the
@@ -2969,23 +2969,76 @@ where it starts.
   `crate::mount_attrs`). A lazy unmount (`MNT_DETACH`) goes through
   `sb_umount` like any other.
 
+### The review of #567
+
+- **The mounts held are mounts (F1).** `MOUNT_HELD` holds, by
+  `struct mount.mnt_id`, the mounts the protected points resolve through in
+  each guarded namespace (read from that namespace's table, never opened:
+  a FUSE on the way cannot stall the registration). The root's dentry
+  (`MG_HOLD`) stays a second condition, against a reused id. A copy (a
+  bind of `/`, a chroot's sysfs: the host's super block, the same root
+  dentry) is another mount. An unmount propagates, with no other LSM call,
+  to the mount at the same place of every peer of the parent's group and
+  their slaves: each held mount is registered by its place (the
+  mountpoint's parent directory and name) under its parent's own group and
+  its master's, and the hook looks up the unmounted mount's place under
+  its parent's group (`mount.mnt_group_id`) — an rbind copy of `/sys`
+  unmounted without `rslave` would take the host's childless
+  `/sys/fs/cgroup`: refused; a parent in no group propagates nothing.
+- **The agent's and the watchdog's namespaces (F2).** `MOUNT_GUARD_NS`
+  (inum → host, agent, watchdog) replaces the one inum compare. The
+  namespace judged is the target mount's (`mount.mnt_ns`), never
+  `current`'s (the cross-model check: `/proc/<pid>/root`, an `O_PATH`
+  descriptor as `move_mount`'s `to_dfd`). A change made elsewhere reaches a
+  guarded namespace when its target mount's peer group
+  (`mount.mnt_group_id`) is in `MOUNT_GROUPS`: the own and master groups of
+  the guarded mounts that hold a protected point or are views, re-read
+  every 30 s — one look-up where a walk of four peers and two slaves failed
+  closed. The agent's namespace is
+  added once its role is claimed (`ROLE_TGIDS`), the watchdog's by the
+  agent's watchdog refresh once the watchdog holds its role; `role_exit`
+  (`sched_process_exit`, before `exit_task_namespaces`) removes them. An
+  inum is otherwise the first free one again: the next unit's sandbox,
+  being set up with its binds, would be judged as the agent's.
+- **Super blocks (F3).** `sb_remount` (called by `reconfigure_super()`,
+  for `mount(2)`'s remount and `fsconfig`'s reconfigure; a bind remount
+  does not reach it) refuses for a `(s_dev, 0)` key with `MG_SB`: the
+  super blocks of the held mounts, in whatever namespace asks. The hook
+  has no `fs_context`: an `fentry` on `reconfigure_super()` stashes the
+  new `sb_flags`/`sb_flags_mask` by task (`MOUNT_RECONF`, pinned), and the
+  hook refuses a view's reconfigure always, another's when it sets
+  `SB_RDONLY` (or when nothing was stashed: fail closed). `sb_mount` refuses `MS_REMOUNT | MS_BIND` with
+  `MS_RDONLY` or `MS_NOEXEC` of a held mount in its own namespace.
+- **Exemptions.** systemd-shutdown at the end of a shutdown: PID 1 whose
+  comm is systemd-shutdown's and whose image is the recorded file, or its
+  child running that file; a kernel thread for a remount.
+- **The audit at arming.** `not_canonical` judges each mount of the
+  guarded namespaces over a protected point, below the agent's
+  directories or below a view, by type, point and root; the start signs
+  each, the integrity round's first read too (High).
+
 ### Residual
 
-- A slave of a slave (a host mount two masters away from a child's peer
-  group) is not read; four peers and two slaves each are, more is taken
-  as reaching the host.
-- `mount_setattr(2)` is observed (≤ one integrity round), not refused; a
-  remount read-only of a protected file system (`MS_REMOUNT`) is a denial
-  of service, not a view, and is let through.
+- A change reaches a guarded namespace through one group (the target's
+  is a guarded mount's own or master group); two masters deep is not
+  followed. An unmount's propagation is judged the same way (the parent's
+  group against the held mounts' places).
+- `mount_setattr(2)` is observed (≤ one integrity round), not refused.
+- A held file system's writable reconfigure passes (its options are the
+  operator's: `size=` of `/run`, finalrd's `exec`); only read-only is
+  refused there.
 - An old-API bind's source is not judged (where it lands is).
 - Mounts made before the agent's start (or inside a window) are the
-  start's check (`mounts_over`) and the watch's.
+  arming's audit (`not_canonical`), the start's check (`mounts_over`) and
+  the watch's.
+- The watchdog's namespace is guarded from the agent's refresh (≤ 30 s
+  after the watchdog starts).
 - No boot self-test: the agent holds no `CAP_SYS_ADMIN`, so its own attempt
   is outside the guard's scope; the lab proves the hooks.
 - Behaviour an operator meets: `mount --move` in the host's namespace on
   util-linux before 2.39 (Ubuntu 22.04) is refused; a runtime
   `systemd-sysext`/`systemd-confext refresh` (an overlay over `/usr` or
   `/etc`) is refused outside a window; a separate `/var`'s mount unit
-  cannot unmount it at shutdown (systemd-shutdown's own pass, PID 1,
-  does).
+  cannot unmount it at shutdown (systemd-shutdown's own pass, PID 1 and
+  its helpers, does).
 

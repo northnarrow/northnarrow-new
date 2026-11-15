@@ -654,15 +654,15 @@ fn is_unit_sandbox(m: &Mount, mounts: &[Mount], sandbox: &[String]) -> bool {
 
 /// The directories the agent's unit makes writable (and so binds onto
 /// themselves in its own namespace).
-fn unit_sandbox_dirs() -> Vec<String> {
+fn unit_sandbox_dirs(unit: &str) -> Vec<String> {
     // every ReadWritePaths= line (lot 273d: our drop-in directories on a
     // second one)
-    let mut out: Vec<String> = unit_directives(AGENT_UNIT, "ReadWritePaths")
+    let mut out: Vec<String> = unit_directives(unit, "ReadWritePaths")
         .into_iter()
         .flat_map(str::split_whitespace)
         .map(|d| d.trim_start_matches(['-', '+']).to_string())
         .collect();
-    if let Some(rt) = unit_directive(AGENT_UNIT, "RuntimeDirectory") {
+    if let Some(rt) = unit_directive(unit, "RuntimeDirectory") {
         out.extend(rt.split_whitespace().map(|d| format!("/run/{d}")));
     }
     out
@@ -716,8 +716,19 @@ fn mounts_over_protected(
     extra_files: &[String],
     sandbox: &[String],
 ) -> Vec<Finding> {
+    mounts_over_protected_in(mounts, mounts, extra_files, sandbox)
+}
+
+/// [`mounts_over_protected`] on `judged`, a part of the table `mounts`
+/// (where a sandbox mount's parent is found).
+fn mounts_over_protected_in(
+    judged: &[Mount],
+    mounts: &[Mount],
+    extra_files: &[String],
+    sandbox: &[String],
+) -> Vec<Finding> {
     let mut out = Vec::new();
-    for m in mounts {
+    for m in judged {
         let (mp, root, fstype) = (&m.mount_point, &m.root, m.fstype.as_str());
         if covers_protected(mp, extra_files) {
             if !sandbox.is_empty() && is_unit_sandbox(m, mounts, sandbox) {
@@ -742,6 +753,63 @@ fn mounts_over_protected(
     out
 }
 
+/// The review of #567 (F2): the watchdog the pidfile names, while it is
+/// one (its comm, as `prctl` sets it: another process's namespace is not
+/// read for it).
+fn watchdog_of(pidfile: &Path) -> Option<u32> {
+    let pid = read_trim(pidfile)?.parse::<u32>().ok()?;
+    let comm = read_trim(Path::new(&format!("/proc/{pid}/comm")))?;
+    (comm == crate::anti_tamper::WATCHDOG_COMM).then_some(pid)
+}
+
+/// The directories the agent writes its state, its run files and its
+/// configuration in.
+const STATE_DIRS: [&str; 3] = [
+    "/var/lib/northnarrow",
+    "/run/northnarrow",
+    "/etc/northnarrow",
+];
+
+/// The review of #567 (F3): a state, run or config directory on a
+/// read-only file system (its super block or its mount: `statvfs`'s
+/// `ST_RDONLY`), in the agent's own view — what the mount guard refuses to
+/// make so (a remount) but the kernel may (`errors=remount-ro`), or a
+/// window let through: the agent's records, state and audit chain are not
+/// written there, signed while they still can be elsewhere (the uplink,
+/// the journal).
+fn read_only_state() -> Vec<Finding> {
+    STATE_DIRS
+        .iter()
+        .filter_map(|d| {
+            let c = std::ffi::CString::new(*d).ok()?;
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a zeroed out-buffer.
+            if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+                return None;
+            }
+            (st.f_flag & libc::ST_RDONLY != 0).then(|| Finding {
+                kind: "state_fs_read_only",
+                detail: format!(
+                    "{d} is on a read-only file system: the agent's writes there (records, \
+                     state, the audit chain) fail"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The review of #567: the drift kinds signed High (the rest are the
+/// audit chain's default).
+fn high_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "own_dropin_weakening"
+            | "mount_attrs_changed"
+            | "mount_not_canonical"
+            | "state_fs_read_only"
+    )
+}
+
 /// Which namespace a [`MountWatch`] baseline was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountSource {
@@ -749,6 +817,19 @@ enum MountSource {
     Host,
     /// The agent's own ([`MOUNTINFO_OWN`]).
     Own,
+    /// The review of #567 (F2): the watchdog's (`/proc/<pid>/mountinfo`).
+    Watchdog,
+}
+
+impl MountSource {
+    /// The words a finding of another namespace than PID 1's starts with.
+    fn prefix(self) -> &'static str {
+        match self {
+            MountSource::Host => "",
+            MountSource::Own => "in the agent's own mount namespace: ",
+            MountSource::Watchdog => "in the watchdog's mount namespace: ",
+        }
+    }
 }
 
 /// External audit EVD-014 (lab PR 180): how each watched path resolved
@@ -762,6 +843,21 @@ pub struct MountWatch {
     /// Lot 357: the attributes of the mounts the watched paths resolve
     /// through ([`crate::mount_attrs`]).
     attrs: crate::mount_attrs::AttrWatch,
+    /// The brainstorm's 3rd point (the review of #567): the mount guard's
+    /// protected points, against which the mounts already there at the
+    /// first read are judged (`mount_not_canonical`); `None`: not judged.
+    audit_points: Option<Vec<(String, u8)>>,
+}
+
+impl MountWatch {
+    /// A watch whose first read judges the mounts already there against
+    /// the canonical layout of `points` (the mount guard's).
+    pub fn auditing(points: Vec<(String, u8)>) -> Self {
+        MountWatch {
+            audit_points: Some(points),
+            ..Default::default()
+        }
+    }
 }
 
 /// One round of the mount check. `primary` is [`MOUNTINFO_HOST`]; when it
@@ -794,12 +890,55 @@ pub fn mount_round<T: AsRef<[u8]>>(
             }
         },
     };
-    let mounts = parse_mountinfo(text.as_ref());
+    mount_round_on(text.as_ref(), source, own_files, watch, None, "")
+}
+
+/// The review of #567 (F2): one round of the mount check on a guarded
+/// namespace's own table — the agent's (its unit's `ProtectSystem=strict`)
+/// or the watchdog's, each its own baseline. A mount `host` shows too (the
+/// same mount point, device, root and type: the host's, propagated into
+/// the unit's namespace) is the host round's finding, not this one's.
+pub fn mount_round_in(
+    text: &[u8],
+    whose: &str,
+    own_files: &[String],
+    watch: &mut MountWatch,
+    host: &[u8],
+) -> Vec<Finding> {
+    let source = if whose == "watchdog" {
+        MountSource::Watchdog
+    } else {
+        MountSource::Own
+    };
+    let host = parse_mountinfo(host);
+    mount_round_on(text, source, own_files, watch, Some(&host), source.prefix())
+}
+
+fn mount_round_on(
+    text: &[u8],
+    source: MountSource,
+    own_files: &[String],
+    watch: &mut MountWatch,
+    host: Option<&[Mount]>,
+    prefix: &str,
+) -> Vec<Finding> {
+    let mounts = parse_mountinfo(text);
+    let hosts = |m: &Mount| {
+        host.is_some_and(|h| {
+            h.iter().any(|x| {
+                x.mount_point == m.mount_point
+                    && x.dev == m.dev
+                    && x.root == m.root
+                    && x.fstype == m.fstype
+            })
+        })
+    };
     let watched: Vec<String> = MOUNT_WATCHED
         .iter()
         .map(|p| p.to_string())
         .chain(own_files.iter().cloned())
         .collect();
+    let first_read = watch.source != Some(source);
     if watch.source != Some(source) {
         if watch.source.is_some() {
             warn!(
@@ -823,10 +962,38 @@ pub fn mount_round<T: AsRef<[u8]>>(
     }
     let sandbox = match source {
         MountSource::Host => Vec::new(),
-        MountSource::Own => unit_sandbox_dirs(),
+        MountSource::Own => unit_sandbox_dirs(AGENT_UNIT),
+        MountSource::Watchdog => unit_sandbox_dirs(WATCHDOG_UNIT),
     };
-    let mut out = mounts_over_protected(&mounts, own_files, &sandbox);
-    out.extend(malformed_over_protected(text.as_ref(), own_files));
+    let mine: Vec<Mount> = mounts.iter().filter(|m| !hosts(m)).cloned().collect();
+    let mut out = mounts_over_protected_in(&mine, &mounts, own_files, &sandbox);
+    if source != MountSource::Watchdog && host.is_none() {
+        out.extend(malformed_over_protected(text, own_files));
+    }
+    // The brainstorm's 3rd point (the review of #567): at the first read,
+    // the mounts already there that are not the canonical ones (an fstab
+    // line, a `.mount` unit, the initramfs) — what is over the agent's own
+    // paths is a `mount_over_protected` already
+    if first_read {
+        if let Some(points) = &watch.audit_points {
+            let entries: Vec<crate::mountinfo::MountEntry> =
+                mine.iter().map(|m| m.entry.clone()).collect();
+            for f in crate::anti_tamper::mount_guard::not_canonical(&entries, points) {
+                let mp = f.split(" (").next().unwrap_or("");
+                if covers_protected(mp, own_files) {
+                    continue;
+                }
+                out.push(Finding {
+                    kind: "mount_not_canonical",
+                    detail: format!(
+                        "{f} — already there when the agent started: made before the mount \
+                         guard attached (an fstab line, a .mount unit, the initramfs), it is \
+                         taken for the host's own"
+                    ),
+                });
+            }
+        }
+    }
     // Lot 357 (the coordinator's mount_setattr point): a mount a watched
     // path resolves through made read-only, or its propagation changed —
     // no LSM hook refuses `mount_setattr(2)`; signed High
@@ -837,7 +1004,7 @@ pub fn mount_round<T: AsRef<[u8]>>(
     out.extend(
         watch
             .attrs
-            .round(text.as_ref(), &ids)
+            .round(text, &ids)
             .into_iter()
             .map(|(mp, what)| Finding {
                 kind: "mount_attrs_changed",
@@ -853,7 +1020,11 @@ pub fn mount_round<T: AsRef<[u8]>>(
         &watched,
         &watch.chains,
         own_files,
+        &hosts,
     ));
+    for f in &mut out {
+        f.detail = format!("{prefix}{}", f.detail);
+    }
     out
 }
 
@@ -864,6 +1035,7 @@ fn hidden_by_mounts(
     watched: &[String],
     base: &BTreeMap<String, Vec<Mount>>,
     own_files: &[String],
+    hosts: &dyn Fn(&Mount) -> bool,
 ) -> Vec<Finding> {
     // (new?, mount id, mount point) -> (mount, paths)
     let mut by_mount: BTreeMap<(bool, u64, String), (Mount, Vec<String>)> = BTreeMap::new();
@@ -883,6 +1055,8 @@ fn hidden_by_mounts(
         let (new, m) = match now.get(same) {
             // Already reported as a mount over the protected path itself.
             Some(m) if covers_protected(&m.mount_point, own_files) => continue,
+            // the host's, propagated: the host round's finding
+            Some(m) if hosts(m) => continue,
             Some(m) => (true, (*m).clone()),
             None => (false, before[same].clone()),
         };
@@ -1723,6 +1897,10 @@ struct Checker {
     limits: LimitWatch,
     /// External audit EVD-014: how the watched paths resolved at start.
     mounts: MountWatch,
+    /// The review of #567 (F2): the agent's own namespace's, and the
+    /// watchdog's (with the pid it was read for).
+    own_mounts: MountWatch,
+    watchdog_mounts: (Option<u32>, MountWatch),
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
@@ -1842,14 +2020,53 @@ impl Checker {
         }
     }
 
-    /// This round's mount findings ([`mount_round`] on the live files).
+    /// This round's mount findings ([`mount_round`] on the live files);
+    /// the review of #567 (F2): and the agent's own namespace's and the
+    /// watchdog's ([`mount_round_in`]), where the agent and the watchdog
+    /// read their paths; the review of #567 (F3): a state, run or config
+    /// directory on a read-only file system.
     fn read_mounts(&mut self) -> Vec<Finding> {
-        mount_round(
-            std::fs::read(MOUNTINFO_HOST),
+        let host = std::fs::read(MOUNTINFO_HOST);
+        let host_copy = host.as_ref().ok().cloned();
+        let mut out = mount_round(
+            host,
             || std::fs::read(MOUNTINFO_OWN),
             &self.own_files,
             &mut self.mounts,
-        )
+        );
+        if let Some(host) = &host_copy {
+            if let Ok(own) = std::fs::read(MOUNTINFO_OWN) {
+                out.extend(mount_round_in(
+                    &own,
+                    "agent",
+                    &self.own_files,
+                    &mut self.own_mounts,
+                    host,
+                ));
+            }
+            match watchdog_of(&self.watchdog_pidfile) {
+                Some(pid) => {
+                    if self.watchdog_mounts.0 != Some(pid) {
+                        self.watchdog_mounts = (
+                            Some(pid),
+                            MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+                        );
+                    }
+                    if let Ok(wd) = std::fs::read(format!("/proc/{pid}/mountinfo")) {
+                        out.extend(mount_round_in(
+                            &wd,
+                            "watchdog",
+                            &self.own_files,
+                            &mut self.watchdog_mounts.1,
+                            host,
+                        ));
+                    }
+                }
+                None => self.watchdog_mounts.0 = None,
+            }
+        }
+        out.extend(read_only_state());
+        out
     }
 
     /// A one-shot finding, reported once.
@@ -1893,7 +2110,7 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
-        if f.kind == "own_dropin_weakening" || f.kind == "mount_attrs_changed" {
+        if high_kind(f.kind) {
             extra["severity"] = "high".into();
         }
         if reappeared > 0 {
@@ -2128,12 +2345,11 @@ pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
         at_boot = false,
         "INTEGRITY DRIFT — the agent's runtime state changed outside the agent"
     );
-    append_entry(
-        audit_log,
-        AUDIT_OP,
-        serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false }),
-        "detected",
-    );
+    let mut extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false });
+    if high_kind(f.kind) {
+        extra["severity"] = "high".into();
+    }
+    append_entry(audit_log, AUDIT_OP, extra, "detected");
 }
 
 /// Start the check (from `main`, once the audit log exists). R09c (lab PR
@@ -2159,7 +2375,9 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         active: ActiveSet::default(),
         overlay_gate: overlay_gate.map(|g| g as Arc<dyn nn_core::config::overlay_auth::Vouch>),
         limits: LimitWatch::default(),
-        mounts: MountWatch::default(),
+        mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+        own_mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+        watchdog_mounts: (None, MountWatch::default()),
         watchdog_pidfile,
         own_files,
         audit_log,
@@ -2730,6 +2948,93 @@ mod tests {
         assert_eq!(mount_findings(own, &[]).len(), 5);
     }
 
+    /// The review of #567 (F2): the agent's own namespace (its unit's
+    /// `ProtectSystem=strict`) and the watchdog's are watched every round,
+    /// besides PID 1's — a FUSE or a tmpfs laid there, where the agent and
+    /// the watchdog read their paths, is a finding naming that namespace;
+    /// the unit's own binds and what the host's table shows too (the host
+    /// round's finding) are not.
+    #[test]
+    fn a_mount_in_the_agents_or_the_watchdogs_own_namespace_is_reported() {
+        let own = "\
+400 380 8:2 / / ro,relatime shared:200 master:1 - ext4 /dev/sda2 rw
+401 400 0:25 / /run rw,nosuid,nodev shared:201 master:2 - tmpfs tmpfs rw
+402 400 8:3 / /var ro,relatime shared:202 master:3 - ext4 /dev/sda3 rw
+403 401 0:25 /northnarrow /run/northnarrow rw,nosuid,nodev shared:203 master:2 - tmpfs tmpfs rw
+404 402 8:3 /lib/northnarrow /var/lib/northnarrow rw,relatime shared:204 master:3 - ext4 /dev/sda3 rw
+405 400 8:2 /etc/northnarrow /etc/northnarrow rw,relatime shared:205 master:1 - ext4 /dev/sda2 rw
+";
+        let mut w = MountWatch::default();
+        assert!(
+            mount_round_in(own.as_bytes(), "agent", &[], &mut w, HOST_MI.as_bytes()).is_empty()
+        );
+        // root enters the namespace (a child of the agent's, setns) and
+        // lays a FUSE over the config directory
+        let fused = format!("{own}410 405 0:70 / /etc/northnarrow rw - fuse.x x rw\n");
+        let f = mount_round_in(fused.as_bytes(), "agent", &[], &mut w, HOST_MI.as_bytes());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(
+            f[0].detail
+                .starts_with("in the agent's own mount namespace: /etc/northnarrow (fuse.x"),
+            "{f:?}"
+        );
+        // a mount the host's table shows too is the host round's
+        let host = format!("{HOST_MI}31 26 0:71 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let both = format!("{own}411 403 0:71 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let mut w = MountWatch::default();
+        assert!(mount_round_in(own.as_bytes(), "agent", &[], &mut w, host.as_bytes()).is_empty());
+        assert!(
+            mount_round_in(both.as_bytes(), "agent", &[], &mut w, host.as_bytes()).is_empty(),
+            "propagated from the host"
+        );
+        // the watchdog's: its unit's own binds (ReadWritePaths=/run/northnarrow)
+        let wd = "\
+500 480 8:2 / / ro,relatime shared:300 master:1 - ext4 /dev/sda2 rw
+501 500 0:25 / /run rw,nosuid,nodev shared:301 master:2 - tmpfs tmpfs rw
+502 501 0:25 /northnarrow /run/northnarrow rw,nosuid,nodev shared:302 master:2 - tmpfs tmpfs rw
+";
+        let mut w = MountWatch::default();
+        assert!(
+            mount_round_in(wd.as_bytes(), "watchdog", &[], &mut w, HOST_MI.as_bytes()).is_empty()
+        );
+        let over = format!("{wd}510 502 0:72 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let f = mount_round_in(over.as_bytes(), "watchdog", &[], &mut w, HOST_MI.as_bytes());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(
+            f[0].detail
+                .starts_with("in the watchdog's mount namespace: /run/northnarrow (tmpfs"),
+            "{f:?}"
+        );
+    }
+
+    /// The brainstorm's 3rd point: at the first read, a mount already
+    /// there over a directory above the agent's paths (an fstab tmpfs over
+    /// /var/lib) is `mount_not_canonical`, High; the host's own layout is
+    /// not; a later round does not repeat it.
+    #[test]
+    fn a_mount_made_before_the_agent_started_is_signed_at_the_first_read() {
+        let points = crate::anti_tamper::mount_guard::protected_points(None, &|_| true);
+        let mut w = MountWatch::auditing(points.clone());
+        assert!(round(HOST_MI, &mut w).is_empty());
+        let fstab = format!("{HOST_MI}40 27 0:80 / /var/lib rw - tmpfs tmpfs rw\n");
+        let mut w = MountWatch::auditing(points);
+        let f = round(&fstab, &mut w);
+        assert!(
+            f.iter()
+                .any(|(k, d)| *k == "mount_not_canonical" && d.contains("/var/lib (tmpfs")),
+            "{f:?}"
+        );
+        assert!(high_kind("mount_not_canonical"));
+        assert!(high_kind("state_fs_read_only"));
+        assert!(
+            !round(&fstab, &mut w)
+                .iter()
+                .any(|(k, _)| *k == "mount_not_canonical"),
+            "once, at the first read"
+        );
+    }
+
     /// External audit EVD-014 (lab PR 180): a mount laid after the start
     /// over a directory above a watched path hides it; the mounts crossed
     /// since the start and unrelated mounts are not drift.
@@ -2950,7 +3255,7 @@ mod tests {
 
     #[test]
     fn the_unit_sandbox_is_the_shipped_units_writable_paths() {
-        let d = unit_sandbox_dirs();
+        let d = unit_sandbox_dirs(AGENT_UNIT);
         for p in [
             "/run/northnarrow",
             "/var/lib/northnarrow",
@@ -3260,6 +3565,8 @@ mod tests {
             overlay_gate: None,
             limits: LimitWatch::default(),
             mounts: MountWatch::default(),
+            own_mounts: MountWatch::default(),
+            watchdog_mounts: (None, MountWatch::default()),
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),

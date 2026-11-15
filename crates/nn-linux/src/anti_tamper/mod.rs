@@ -659,6 +659,13 @@ fn attach_reporting(
             );
         }
     }
+    // The review of #567 (F2): the agent's role is claimed now — its own
+    // mount namespace is judged as PID 1's (the role's liveness watch drops
+    // it at the agent's exit).
+    if let Some(why) = mount_guard::guard_own_namespace(ebpf) {
+        warn!(reason = %why, "anti-tamper mount guard: the agent's namespace not guarded");
+        report.degraded.push(why);
+    }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.
     if let Some(root) = pin_root {

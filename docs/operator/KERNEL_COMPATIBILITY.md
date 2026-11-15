@@ -1243,11 +1243,18 @@ unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`.
 ## The mount guard (lot 357)
 
 **What it needs.** The LSM hooks `sb_mount`, `move_mount` (5.2+),
-`sb_umount` and `sb_pivotroot`, in the BPF LSM since 5.7, their arguments
-checked at boot (`HOOK_ARG_CHECKS`); five optional offsets resolved from
-the kernel's BTF (`path.mnt`, `vfsmount.mnt_root`, `mount.mnt`,
-`mount.mnt_parent`, `mount.mnt_mountpoint`), and the namespace and
-credential offsets the agent already resolves. Not a deny hook of the
+`sb_umount`, `sb_pivotroot` and `sb_remount` (the review of #567: called
+by `reconfigure_super()`, so by `mount(2)`'s remount and by
+`fsconfig(FSCONFIG_CMD_RECONFIGURE)` alike, on every supported kernel), in
+the BPF LSM since 5.7, their arguments checked at boot
+(`HOOK_ARG_CHECKS`); the optional offsets resolved from the kernel's BTF
+(`path.mnt`, `vfsmount.mnt_root`, `mount.mnt`, `mount.mnt_parent`,
+`mount.mnt_mountpoint`, the propagation's four, and `mount.mnt_id` and
+`mount.mnt_group_id`: 5.15.0-203 bytes 292 and 296, 6.8.0-149 300 and 312, 6.18 308 and
+320), and the namespace and credential offsets the agent already
+resolves. The agent's and the watchdog's own namespaces are guarded only
+with the BPF self-defence's liveness watch (`role_exit`), which drops
+them at their exit. Not a deny hook of the
 count: where a hook is absent, an offset unknown or a program refused by
 the verifier, that part of the guard is not attached, the boot signs the
 degradation and the start goes on (the by-path defences and the signed
@@ -1269,6 +1276,13 @@ is one boolean with early returns.
 function with the resolved path) is inlined on 5.15.0-203 and 6.18 (absent
 from their BTF and kallsyms): no `fentry` either. The integrity round
 signs its effect instead (`mount_attrs_changed`).
+
+**As measured, the fix round of #567** (the same guests and setup): the
+six programs (the five hooks and the `reconfigure_super` fentry) pass the
+verifier on 5.15.0-203 (`mount_guard_move_mount` 567,031, 56.7 %, the
+highest; 123 programs, 116 OK, 0 failing), 6.8.0-149 (180,428; 120 OK) and
+7.0.0-43 (291,642; 118 OK); every refused case `EPERM` with its record,
+every allowed one silent, on the three (`UPGRADE_NOTES_WAVE4.md` §51.1).
 
 **As measured** (our lab guests, lot 357, the lot's tree, the agent
 installed as an operator with the alpha profile):

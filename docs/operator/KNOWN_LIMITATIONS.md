@@ -145,20 +145,31 @@ analysis is in the
   tracing programs (for BCC that is any root Python script), and a tracing
   program can read the memory of every process, the agent's keys included.
   *For you:* use the opt-out on a test VM only.
-- **Mounts are refused in the host's namespace only.** A mount on, over or
+- **Mounts are refused in the guarded namespaces only.** A mount on, over or
   below the agent's directories, binaries, units, `/proc`, `/sys`, the
-  cgroup root or the bpffs is refused in PID 1's mount namespace (lot 357,
-  the mount guard), and so are an unmount or a move of their mounts and
-  `pivot_root` — and so is one made in another namespace that propagates
-  into the host's (a raw `unshare(CLONE_NEWNS)`, a container's `rshared`
-  bind of a host directory). `mount_setattr(2)` (read-only, propagation)
-  has no kernel hook: it is not refused, it is a signed `integrity_drift`
+  cgroup root or the bpffs is refused in PID 1's mount namespace and in the
+  agent's and the watchdog's own (lot 357, the mount guard, and the review
+  of #567), and so are an unmount or a move of the mounts themselves,
+  `pivot_root`, a remount of their super blocks and a read-only bind
+  remount — and so is one made in another namespace that propagates into a
+  guarded one (a raw `unshare(CLONE_NEWNS)`, a container's `rshared` bind
+  of a host directory, an unmount of an rbind copy that the kernel carries
+  onto a held mount). `mount_setattr(2)` (read-only, propagation) has no
+  kernel hook: it is not refused, it is a signed `integrity_drift`
   (`mount_attrs_changed`, High) within one integrity round (about 30 s), as
   is any mount on a kernel where the guard is not attached (a signed
-  degradation). *For you:* on Ubuntu 22.04,
-  `mount --move` in the host's namespace is refused (util-linux 2.37 names
-  the source by a string only); a runtime `systemd-sysext refresh` or
-  `systemd-confext refresh` needs a trusted-installer window.
+  degradation). The watchdog's namespace is guarded from the agent's
+  watchdog refresh, up to 30 s after the watchdog starts. A propagation
+  chain two masters deep, built after the start, is not followed. *For
+  you:* on Ubuntu 22.04, `mount --move` in the host's namespace is refused
+  (util-linux 2.37 names the source by a string only); a runtime
+  `systemd-sysext refresh` or `systemd-confext refresh`, a
+  `mount -o remount` of `/proc`, `/sys`, the cgroup root or the bpffs, a
+  read-only remount of `/`, `/run` or the agent's file systems and
+  `systemctl soft-reboot` need a trusted-installer window; an rbind of
+  `/sys` or `/` is made `rslave` before its `umount -R`; an ostree host
+  (binds of `/var`) or a host whose `/` is a tmpfs signs its layout as not
+  canonical at each start (`mount_not_canonical`).
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is

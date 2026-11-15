@@ -73,6 +73,11 @@ const APPIMG: &str = "PID 1's mount table, read for the AppImage tie (lot 355): 
                       filesystem is tied to an image and the exec is judged staged, as before \
                       (the stricter side), never an emptied protection";
 /// Why a kernel-written ASCII file may default.
+const MNTTABLE: &str =
+    "a mount table of PID 1's, the agent's own or the watchdog's namespace (the \
+     review of #567, F2): PID 1's unreadable is the round's `mountinfo_unreadable` finding (its \
+     result handed on); the agent's and the watchdog's are rounds of their own, skipped while \
+     unreadable (a watchdog gone: the next pid's) — no default taken for a state";
 const KNOB: &str = "written by the kernel in ASCII (/proc/sys, /sys, meminfo, /proc/stat, fdinfo, \
                     the boot id, the agent's own /proc/self): no user writes it; unreadable, the \
                     built-in value applies (a bound, a new boot, no finding)";
@@ -624,6 +629,28 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/self_integrity.rs",
         "read_state(\"/proc/self/status\")",
         KNOB,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "fs::read(MOUNTINFO_HOST)",
+        MNTTABLE,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/mount_guard.rs",
+        "read_to_string(\"/proc/self/maps\")",
+        "the agent's own mappings (the review of #567): unreadable, no library directory is \
+         added to the mount guard's points — the binaries', units' and directories' points \
+         remain; no state is defaulted",
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "fs::read(MOUNTINFO_OWN)",
+        MNTTABLE,
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "fs::read(format!(\"/proc/{pid}/mountinfo\"))",
+        MNTTABLE,
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",

@@ -19,11 +19,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A mount's attributes in a `mountinfo` line: its per-mount options
-/// (field 6) and its optional fields (propagation), in the table's order.
+/// (field 6) and its optional fields (propagation), in the table's order;
+/// the review of #567 (F3): and its super block's options (the last
+/// field: proc's `subset=pid` and `hidepid`, a file system read-only),
+/// which `mount_setattr(2)` never changes but a reconfigure does.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attrs {
     pub options: String,
     pub propagation: String,
+    pub super_options: String,
 }
 
 /// `id → (mount point, attributes)` of a `mountinfo` text (a line not in
@@ -48,6 +52,7 @@ pub fn attrs_of(text: &[u8]) -> BTreeMap<u64, (String, Attrs)> {
                 Attrs {
                     options: f[5].to_string(),
                     propagation: f[6..sep].join(" "),
+                    super_options: f.get(sep + 3).map(|x| x.to_string()).unwrap_or_default(),
                 },
             ),
         );
@@ -82,6 +87,12 @@ impl AttrWatch {
                     let mut what = Vec::new();
                     if b.options != a.options {
                         what.push(format!("options {} → {}", b.options, a.options));
+                    }
+                    if b.super_options != a.super_options {
+                        what.push(format!(
+                            "super block options {} → {}",
+                            b.super_options, a.super_options
+                        ));
                     }
                     if b.propagation != a.propagation {
                         let shown = |p: &str| {
@@ -156,6 +167,31 @@ mod tests {
         let again = TABLE.replace("25 1 0:22", "99 1 0:22");
         let ids2: BTreeSet<u64> = [1, 99].into_iter().collect();
         assert!(w.round(again.as_bytes(), &ids2).is_empty());
+    }
+
+    /// The review of #567 (F3): a super block reconfigured (proc's
+    /// `subset=pid`, a state file system read-only) is reported, though
+    /// field 6 is unchanged; a per-mount change still is.
+    #[test]
+    fn a_super_blocks_options_changed_are_reported() {
+        let ids: BTreeSet<u64> = [1, 26].into_iter().collect();
+        let mut w = AttrWatch::default();
+        let table = TABLE.to_string();
+        assert!(w.round(table.as_bytes(), &ids).is_empty(), "the baseline");
+        let subset = table.replace("- proc proc rw", "- proc proc rw,subset=pid");
+        let f = w.round(subset.as_bytes(), &ids);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].0, "/proc");
+        assert!(
+            f[0].1.contains("super block options rw → rw,subset=pid"),
+            "{f:?}"
+        );
+        assert!(!f[0].1.contains("options rw,nosuid"), "{f:?}");
+        // the root file system read-only at its super block
+        let ro = subset.replace("- ext4 /dev/sda1 rw", "- ext4 /dev/sda1 ro");
+        let f = w.round(ro.as_bytes(), &ids);
+        assert_eq!(f[0].0, "/");
+        assert!(f[0].1.contains("super block options rw → ro"), "{f:?}");
     }
 
     #[test]

@@ -38,11 +38,36 @@
 //!   the hook sees only as the caller's string — `move_mount(2)`, which
 //!   util-linux 2.39 and later uses, is judged by the mount itself.
 //!
-//! Let through: a remount and a change of propagation (they cover nothing),
-//! an unmount by PID 1 (systemd-shutdown's last pass, after the agent), and
-//! everything inside the signed trusted-installer window, recorded
-//! (`FS_OP_MOUNT_WINDOW`, Low) when the window let through what it refuses
-//! outside one.
+//! - the review of #567 (F3): a reconfigure of the super block of a view or
+//!   of a file system the agent's paths are on ([`MG_SB`]: `mount -o
+//!   remount`, `fsconfig(FSCONFIG_CMD_RECONFIGURE)`, both through the
+//!   kernel's `reconfigure_super()` and its `sb_remount` hook) — proc's
+//!   `subset=pid` and `hidepid`, a read-only state file system — whatever
+//!   namespace makes it (a super block is the host's in every one of them);
+//!   and a bind remount (`MS_REMOUNT | MS_BIND`) that makes a held mount
+//!   read-only or `noexec`.
+//!
+//! The namespaces judged as PID 1's (the review of #567, F2): PID 1's, the
+//! agent's own and the watchdog's (`ProtectSystem=strict` gives each unit
+//! a namespace of its own, the one it reads its paths through), each while
+//! its process lives — the exit of the agent or the watchdog drops its
+//! namespace before the kernel can free its number for another one.
+//!
+//! The mounts held (no unmount, no move away) are the mounts themselves —
+//! by their id, in each of those namespaces — that the protected paths
+//! resolve through (the review of #567, F1): a copy of `/`, `/run` or `/sys`
+//! (a backup's bind, a chroot's sysfs) is another mount, and its unmount is
+//! the caller's own business.
+//!
+//! Let through: a change of propagation (it covers nothing; the integrity
+//! round signs it), an unmount by PID 1, and by `systemd-shutdown` and the
+//! helpers it forks at the end of a shutdown (their unmounts and read-only
+//! remounts, its pivot to `/run/initramfs`), a remount by a kernel thread
+//! (the emergency remount), and everything inside the signed
+//! trusted-installer window, recorded (`FS_OP_MOUNT_WINDOW`, Low) when the
+//! window let through what it refuses outside one. An unmount of the
+//! tracefs, debugfs or securityfs the agent reads is let through and
+//! recorded ([`MG_NOTE`], `FS_OP_MOUNT_NOTED`).
 
 /// `MS_REMOUNT` (`include/uapi/linux/mount.h`).
 pub const MS_REMOUNT: u64 = 32;
@@ -81,8 +106,67 @@ pub const MG_OWN: u8 = 2;
 /// mount on it is refused, one below it unless it is the kernel's own
 /// ([`ALLOWED_KERNEL_MOUNTS`]).
 pub const MG_VIEW: u8 = 4;
-/// The mount whose root is this point is neither unmounted nor moved away.
+/// The mount whose root is this point is neither unmounted nor moved away
+/// — when it is also one of the mounts held by their id ([`HELD_REFUSE`]).
 pub const MG_HOLD: u8 = 8;
+/// On a `(device, 0)` key: the super block of a view or of a file system
+/// the agent's paths are on — not reconfigured (the review of #567, F3).
+/// The device is the super block's own (`super_block.s_dev`, field 3 of
+/// `mountinfo`), never a btrfs subvolume's.
+pub const MG_SB: u8 = 16;
+
+// ── The mounts held, by their id (the `MOUNT_HELD` map, F1) ──────────────
+
+/// `MOUNT_HELD`'s key of a mount by its id (`struct mount.mnt_id`, field 1
+/// of `mountinfo`, `statx`'s `stx_mnt_id`): `(HELD_BY_ID | id, 0)`.
+pub const HELD_BY_ID: u64 = 1 << 62;
+/// `MOUNT_HELD`'s key of a mount by the place it sits at and its parent's
+/// peer group: an unmount propagates — the kernel takes, without another
+/// LSM call, the mount at the same place (the same mountpoint dentry) of
+/// every peer of the unmounted mount's parent, and of their slaves (a
+/// copy's unmount in an rbind of `/sys` takes the host's childless
+/// `/sys/fs/cgroup`). Registered for each held mount under its parent's
+/// own peer group (`shared:N`) and its master's (`master:N`):
+/// `(HELD_BY_PLACE | group, mix(the place's parent directory, its name))`.
+pub const HELD_BY_PLACE: u64 = 1 << 63;
+/// A held mount: no unmount, no move away.
+pub const HELD_REFUSE: u8 = 1;
+/// The tracefs, debugfs or securityfs the agent reads: an unmount is let
+/// through and recorded (the review of #567, F6).
+pub const MG_NOTE: u8 = 2;
+/// `MOUNT_HELD`'s value: the namespace an entry belongs to, in the high
+/// nibble (each namespace's entries are replaced on their own).
+pub const HELD_NS_SHIFT: u8 = 4;
+
+/// [`HELD_BY_ID`]'s key of a mount id.
+pub const fn held_by_id(mnt_id: u32) -> (u64, u64) {
+    (HELD_BY_ID | mnt_id as u64, 0)
+}
+
+/// [`HELD_BY_PLACE`]'s key of a peer group and a place: the key of the
+/// mountpoint's parent directory (as `stat(2)` gives it), and the
+/// mountpoint's name ([`NameKey`]: its length and hash).
+pub const fn held_by_place(group: u32, dir_dev: u64, dir_ino: u64, name: &NameKey) -> (u64, u64) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let parts = [dir_dev, dir_ino, name.len as u64, name.h];
+    let mut i = 0;
+    while i < 4 {
+        h ^= parts[i];
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h ^= h >> 29;
+        i += 1;
+    }
+    (HELD_BY_PLACE | group as u64, h)
+}
+
+// ── The namespaces judged as PID 1's (`MOUNT_GUARD_NS`, F2) ──────────────
+
+/// `MOUNT_GUARD_NS`'s value of PID 1's mount namespace.
+pub const GUARD_HOST: u8 = 1;
+/// Of the agent's own (its unit's `ProtectSystem=strict`).
+pub const GUARD_AGENT: u8 = 2;
+/// Of the watchdog's.
+pub const GUARD_WATCHDOG: u8 = 3;
 
 /// How many ancestors of a mount's point the hook reads for an
 /// [`MG_OWN`] or [`MG_VIEW`] one. The agent's directories refuse a new
@@ -115,7 +199,9 @@ pub const fn is_view_magic(magic: u32) -> bool {
 
 // ── Operations ─────────────────────────────────────────────────────────
 
-/// Not judged: a remount, a change of propagation.
+/// Not judged by `sb_mount`: a change of propagation, and a remount of a
+/// super block (`MS_REMOUNT` without `MS_BIND`: `sb_remount` judges it,
+/// as it judges `fsconfig(FSCONFIG_CMD_RECONFIGURE)`).
 pub const MG_OP_PASS: u8 = 0;
 /// `mount(2)` of a new file system.
 pub const MG_OP_MOUNT: u8 = 1;
@@ -130,6 +216,16 @@ pub const MG_OP_MOVE_MOUNT: u8 = 4;
 pub const MG_OP_UMOUNT: u8 = 5;
 /// `pivot_root(2)`.
 pub const MG_OP_PIVOT: u8 = 6;
+/// A super block reconfigured (`sb_remount`: `mount(2)`'s `MS_REMOUNT`,
+/// `fsconfig(2)`'s `FSCONFIG_CMD_RECONFIGURE`).
+pub const MG_OP_REMOUNT: u8 = 7;
+/// `mount(2)` with `MS_REMOUNT | MS_BIND`: one mount's flags changed.
+pub const MG_OP_REMOUNT_BIND: u8 = 8;
+
+/// `MS_RDONLY`, `MS_NOEXEC`: the flags of a bind remount that make a held
+/// mount refuse the agent's writes, or its binaries' exec at a restart.
+pub const MS_RDONLY: u64 = 1;
+pub const MS_NOEXEC: u64 = 8;
 
 /// The operation of a `mount(2)` call, in the kernel's own order
 /// (`path_mount`: a remount first, then a bind, then a propagation change,
@@ -137,7 +233,11 @@ pub const MG_OP_PIVOT: u8 = 6;
 /// kernel has dropped `MS_MGC_VAL`).
 pub const fn mount_op(flags: u64) -> u8 {
     if flags & MS_REMOUNT != 0 {
-        MG_OP_PASS
+        if flags & MS_BIND != 0 {
+            MG_OP_REMOUNT_BIND
+        } else {
+            MG_OP_PASS
+        }
     } else if flags & MS_BIND != 0 {
         MG_OP_BIND
     } else if flags & MS_PROPAGATION != 0 {
@@ -165,6 +265,14 @@ pub const MG_WHY_MOVE_AWAY: u8 = 5;
 pub const MG_WHY_UMOUNT: u8 = 6;
 /// The root pivoted.
 pub const MG_WHY_PIVOT: u8 = 7;
+/// The super block of a view, or of a file system the agent's paths are
+/// on, reconfigured.
+pub const MG_WHY_REMOUNT_SB: u8 = 8;
+/// A held mount made read-only or `noexec` by a bind remount.
+pub const MG_WHY_REMOUNT_RESTRICT: u8 = 9;
+/// An unmount of the tracefs, debugfs or securityfs the agent reads (let
+/// through, recorded).
+pub const MG_WHY_UMOUNT_NOTED: u8 = 10;
 
 /// A dentry name or a file-system type as the hook compares it: its length
 /// and a 64-bit FNV-1a hash of its first 15 bytes, zero-padded to 16 (the
@@ -222,7 +330,12 @@ impl NameKey {
 
     /// The key of a name (the allow list, the tests).
     pub const fn of(name: &str) -> NameKey {
-        let b = name.as_bytes();
+        NameKey::of_bytes(name.as_bytes())
+    }
+
+    /// The key of a name's bytes (a path component, as the kernel's
+    /// dentry holds it).
+    pub const fn of_bytes(b: &[u8]) -> NameKey {
         let mut buf = [0u8; 16];
         let mut i = 0;
         while i < b.len() && i < NAME_MAX as usize {
@@ -332,7 +445,7 @@ const fn k(s: &str) -> NameKey {
 /// view. `hugetlbfs` (`/dev/hugepages`), `mqueue` (`/dev/mqueue`) and
 /// WSL's tmpfs over `binfmt_misc/status` (a file of binfmt_misc, which no
 /// view is) are below no protected point and never refused.
-pub const ALLOWED_KERNEL_MOUNTS: [AllowedMount; 18] = [
+pub const ALLOWED_KERNEL_MOUNTS: [AllowedMount; 19] = [
     // systemd's automount point, then the real mount on it on access
     allowed(
         "autofs",
@@ -386,6 +499,11 @@ pub const ALLOWED_KERNEL_MOUNTS: [AllowedMount; 18] = [
     allowed("selinuxfs", SYSFS_MAGIC, 0, [k("selinux"), k("fs"), N], 2),
     allowed("smackfs", SYSFS_MAGIC, 0, [k("smackfs"), k("fs"), N], 2),
     allowed("resctrl", SYSFS_MAGIC, 0, [k("resctrl"), k("fs"), N], 2),
+    // the review of #567 (F1): the unified hierarchy at its canonical point
+    // of a sysfs — a chroot's `mount -t sysfs` (the host's super block) then
+    // `mount -t cgroup2` below it (the host's own /sys/fs/cgroup is a view:
+    // a mount over it stays refused)
+    allowed("cgroup2", SYSFS_MAGIC, 0, [k("cgroup"), k("fs"), N], 2),
     // A hybrid or legacy host: the tmpfs at /sys/fs/cgroup holds the
     // unified hierarchy and the v1 controllers (by any name: `cpu,cpuacct`,
     // `name=systemd`'s `systemd`).
@@ -395,7 +513,7 @@ pub const ALLOWED_KERNEL_MOUNTS: [AllowedMount; 18] = [
 
 /// The type of each of [`ALLOWED_KERNEL_MOUNTS`] (the documentation's and
 /// the tests'; the hook compares the hashed key).
-pub const ALLOWED_KERNEL_MOUNT_TYPES: [&str; 18] = [
+pub const ALLOWED_KERNEL_MOUNT_TYPES: [&str; 19] = [
     "autofs",
     "binfmt_misc",
     "binfmt_misc",
@@ -413,12 +531,13 @@ pub const ALLOWED_KERNEL_MOUNT_TYPES: [&str; 18] = [
     "smackfs",
     "resctrl",
     "cgroup2",
+    "cgroup2",
     "cgroup",
 ];
 
 /// Where each of [`ALLOWED_KERNEL_MOUNTS`] is (the documentation's and the
 /// tests' name; never read by the hook).
-pub const ALLOWED_KERNEL_MOUNT_PATHS: [&str; 18] = [
+pub const ALLOWED_KERNEL_MOUNT_PATHS: [&str; 19] = [
     "/proc/sys/fs/binfmt_misc",
     "/proc/sys/fs/binfmt_misc",
     "/proc/sys/fs/binfmt_misc",
@@ -435,15 +554,25 @@ pub const ALLOWED_KERNEL_MOUNT_PATHS: [&str; 18] = [
     "/sys/fs/selinux",
     "/sys/fs/smackfs",
     "/sys/fs/resctrl",
+    "/sys/fs/cgroup",
     "/sys/fs/cgroup/unified",
     "/sys/fs/cgroup/<controller>",
 ];
 
 /// Whether a new mount of `fstype` at `point` is one of the kernel's own
 /// ([`ALLOWED_KERNEL_MOUNTS`]). An unknown type (an old-API bind's) never
-/// is.
-pub fn allowed_kernel_mount(fstype: &NameKey, point: &Point) -> bool {
-    if fstype.len == NAME_UNREAD || fstype.len == NAME_ANY {
+/// is, nor a mount whose root is not its file system's (`src_root` false:
+/// an `open_tree(OPEN_TREE_CLONE)` of a subdirectory of the kernel's own
+/// type — securityfs' `apparmor/` moved onto `/sys/kernel/security`, the
+/// review of #567, F6).
+///
+/// Out of line on purpose: inlined into [`decide`], the BPF back end
+/// specialised its loop by the point's depth and the hooks' allow-list
+/// stopped matching on the lab's 5.15 guest (every kernel's own mount
+/// refused); as its own function, as lot 357 shipped it, it matches.
+#[inline(never)]
+pub fn allowed_kernel_mount(fstype: &NameKey, point: &Point, src_root: bool) -> bool {
+    if !src_root || fstype.len == NAME_UNREAD || fstype.len == NAME_ANY {
         return false;
     }
     let mut i = 0;
@@ -482,7 +611,7 @@ fn names_match(want: &[NameKey; 3], got: &[NameKey; 3], depth: u8) -> bool {
 /// bind) is refused, or `None`. `host`: made in PID 1's namespace — from
 /// another one, a view's file system is below a view only when it is one of
 /// PID 1's views' own ([`Point::host_view_sb`]).
-pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool) -> Option<u8> {
+pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool, src_root: bool) -> Option<u8> {
     if point.flags & (MG_ON | MG_OWN | MG_VIEW) != 0 {
         return Some(MG_WHY_ON);
     }
@@ -491,7 +620,7 @@ pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool) -> Option<u8> 
     }
     let in_view =
         (is_view_magic(point.magic) && (host || point.host_view_sb)) || point.below & MG_VIEW != 0;
-    if in_view && !allowed_kernel_mount(fstype, point) {
+    if in_view && !allowed_kernel_mount(fstype, point, src_root) {
         return Some(MG_WHY_BELOW_VIEW);
     }
     None
@@ -502,7 +631,11 @@ pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool) -> Option<u8> 
 pub struct Query {
     /// [`MG_OP_MOUNT`] … [`MG_OP_PIVOT`], or [`MG_OP_PASS`].
     pub op: u8,
-    /// The caller runs in PID 1's mount namespace.
+    /// The target is in a guarded mount namespace — PID 1's, the agent's
+    /// or the watchdog's: the namespace that owns the target mount (the
+    /// cross-model check: a path through `/proc/<pid>/root`, an `O_PATH`
+    /// descriptor of one, names another namespace's mount than the
+    /// caller's), the caller's own for a pivot and a remount.
     pub host: bool,
     /// The coordinator's propagation point: the mount the operation
     /// changes (the target's mount; for an unmount, the parent of the mount
@@ -512,7 +645,10 @@ pub struct Query {
     pub reaches: bool,
     /// The caller holds `CAP_SYS_ADMIN` in PID 1's user namespace.
     pub privileged: bool,
-    /// The caller is PID 1.
+    /// The caller is PID 1 — for an unmount, and only of a mount of
+    /// PID 1's own namespace that is not one of the agent's directories
+    /// (the cross-model check: `systemctl bind`'s worker and PID 1 itself
+    /// are judged in the agent's and the watchdog's namespaces).
     pub init: bool,
     /// The signed trusted-installer window is open.
     pub window: bool,
@@ -523,9 +659,27 @@ pub struct Query {
     /// detached mount's own file system for `move_mount(2)`, none for a
     /// bind.
     pub fstype: NameKey,
-    /// The mount unmounted, or moved by `move_mount(2)` while attached, is
-    /// a protected one ([`MG_HOLD`] at its root).
+    /// The mount unmounted, or moved by `move_mount(2)` while attached, or
+    /// remounted by a bind remount, is a held one (by its id,
+    /// [`HELD_REFUSE`], and [`MG_HOLD`] at its root); for a remount
+    /// ([`MG_OP_REMOUNT`]), the super block is a held one ([`MG_SB`]).
     pub held: bool,
+    /// The mount unmounted is the tracefs, debugfs or securityfs the agent
+    /// reads ([`MG_NOTE`]).
+    pub noted: bool,
+    /// `systemd-shutdown` at the end of a shutdown: PID 1 running it (the
+    /// kill guard's identity: its comm and the file the agent recorded),
+    /// or a helper it forked (`(sd-umount)`, `(sd-remount)`: PID 1's child
+    /// running that file).
+    pub shutdown: bool,
+    /// A kernel thread (`PF_KTHREAD`: the emergency remount of `SysRq-u`).
+    pub kernel: bool,
+    /// The new mount's root is its file system's root: a new file system,
+    /// or a detached mount that is not a clone of a subdirectory.
+    pub src_root: bool,
+    /// A bind remount asks for read-only or `noexec`; a super block's
+    /// reconfigure makes it read-only, or its new flags could not be read.
+    pub restrict: bool,
 }
 
 /// What the hook does.
@@ -537,37 +691,75 @@ pub enum Verdict {
     /// Let through by the trusted-installer window, recorded
     /// (`FS_OP_MOUNT_WINDOW`).
     Window(u8),
+    /// Let through and recorded, Low (`FS_OP_MOUNT_NOTED`): an unmount of
+    /// a kernel file system the agent reads.
+    Noted(u8),
 }
 
 /// The mount guard's decision.
 ///
-/// In another mount namespace (a container, `unshare -m`, a unit's
-/// sandbox) only what propagates into the host's (`reaches`) is judged, as
-/// it would be there: a mount on, over or below a protected point, an
-/// unmount of a protected mount (an unmount propagates to the peers of its
-/// parent), a bind or move that lands on one. A pivot changes that
-/// namespace's root only, and an old-API move there is judged by where it
-/// lands.
+/// In a guarded namespace ([`Query::host`]: PID 1's, the agent's, the
+/// watchdog's) everything below is judged; in another one (a container,
+/// `unshare -m`, a unit's sandbox) only what propagates into a guarded one
+/// (`reaches`), as it would be there: a mount on, over or below a
+/// protected point, an unmount of a held mount (an unmount propagates to
+/// the peers of its parent), a bind or move that lands on one. A pivot
+/// changes that namespace's root only, and an old-API move there is judged
+/// by where it lands. A super block's reconfigure is judged in every
+/// namespace: the super block is the same one.
 pub fn decide(q: &Query) -> Verdict {
-    if !q.privileged || !(q.host || q.reaches) {
+    if !q.privileged {
         return Verdict::Allow;
     }
-    let why = match q.op {
-        MG_OP_PIVOT if !q.host => None,
-        MG_OP_MOVE_OLD if !q.host => point_refusal(&q.point, &NameKey::NONE, false),
-        MG_OP_PIVOT => Some(MG_WHY_PIVOT),
-        MG_OP_UMOUNT => {
-            if q.held && !q.init {
-                Some(MG_WHY_UMOUNT)
-            } else {
-                None
-            }
+    let why = if q.op == MG_OP_REMOUNT {
+        // a view's super block: any option (proc's subset=pid, hidepid);
+        // the file system of the agent's paths: made read-only, or options
+        // not read (`restrict`: the hook could not tell) — finalrd's
+        // `remount,exec /run` at shutdown, a `remount,commit=` pass
+        if q.held && !(q.shutdown || q.kernel) && (is_view_magic(q.point.magic) || q.restrict) {
+            Some(MG_WHY_REMOUNT_SB)
+        } else {
+            None
         }
-        MG_OP_MOVE_OLD => Some(MG_WHY_MOVE_OLD),
-        MG_OP_MOVE_MOUNT if q.held => Some(MG_WHY_MOVE_AWAY),
-        MG_OP_MOVE_MOUNT | MG_OP_MOUNT => point_refusal(&q.point, &q.fstype, q.host),
-        MG_OP_BIND => point_refusal(&q.point, &NameKey::NONE, q.host),
-        _ => None,
+    } else if !(q.host || q.reaches) {
+        None
+    } else {
+        match q.op {
+            MG_OP_PIVOT if !q.host => None,
+            MG_OP_MOVE_OLD if !q.host => point_refusal(&q.point, &NameKey::NONE, false, false),
+            // systemd-shutdown's switch to /run/initramfs (dracut)
+            MG_OP_PIVOT | MG_OP_MOVE_OLD if q.shutdown => None,
+            MG_OP_PIVOT => Some(MG_WHY_PIVOT),
+            MG_OP_MOVE_OLD => Some(MG_WHY_MOVE_OLD),
+            MG_OP_UMOUNT => {
+                if q.init || q.shutdown {
+                    None
+                } else if q.held {
+                    Some(MG_WHY_UMOUNT)
+                } else if q.noted && q.host {
+                    return Verdict::Noted(MG_WHY_UMOUNT_NOTED);
+                } else {
+                    None
+                }
+            }
+            MG_OP_MOVE_MOUNT if q.held => {
+                if q.shutdown {
+                    None
+                } else {
+                    Some(MG_WHY_MOVE_AWAY)
+                }
+            }
+            MG_OP_MOVE_MOUNT | MG_OP_MOUNT => {
+                point_refusal(&q.point, &q.fstype, q.host, q.src_root)
+            }
+            MG_OP_BIND => point_refusal(&q.point, &NameKey::NONE, q.host, false),
+            // one mount's flags: only in its own namespace (they never
+            // propagate)
+            MG_OP_REMOUNT_BIND if q.host && q.held && q.restrict && !q.shutdown => {
+                Some(MG_WHY_REMOUNT_RESTRICT)
+            }
+            _ => None,
+        }
     };
     match why {
         None => Verdict::Allow,
@@ -611,7 +803,24 @@ pub const fn record_dev(dev: u64, op: u8, why: u8, view: u8, stack: u8) -> u64 {
 /// there, or more peers or slaves than the hook reads). 0: made in PID 1's.
 pub const REACH_OTHER_NS: u8 = 1;
 
-/// A record's reach (0 or [`REACH_OTHER_NS`]).
+/// A record's high nibble of `stack`: made in the agent's own mount
+/// namespace ([`GUARD_AGENT`], the review of #567, F2).
+pub const REACH_AGENT_NS: u8 = GUARD_AGENT;
+/// Made in the watchdog's ([`GUARD_WATCHDOG`]).
+pub const REACH_WATCHDOG_NS: u8 = GUARD_WATCHDOG;
+
+/// The reach of a change made in a guarded namespace ([`GUARD_HOST`] …):
+/// 0 for PID 1's, else the namespace's own.
+pub const fn reach_in(guard: u8) -> u8 {
+    match guard {
+        GUARD_AGENT => REACH_AGENT_NS,
+        GUARD_WATCHDOG => REACH_WATCHDOG_NS,
+        _ => 0,
+    }
+}
+
+/// A record's reach (0, [`REACH_OTHER_NS`], [`REACH_AGENT_NS`],
+/// [`REACH_WATCHDOG_NS`]).
 pub const fn reach_of(target_dev: u64) -> u8 {
     (target_dev >> 60) as u8
 }
@@ -619,7 +828,9 @@ pub const fn reach_of(target_dev: u64) -> u8 {
 /// The reach's words in a record.
 pub const fn reach_name(reach: u8) -> &'static str {
     match reach {
-        REACH_OTHER_NS => "made in another mount namespace whose change reaches PID 1's (a peer or a master of one of its mounts, or more peers or slaves than the hook reads)",
+        REACH_OTHER_NS => "made in another mount namespace whose change reaches PID 1's, the agent's or the watchdog's (a peer or a master of one of its mounts, or more peers or slaves than the hook reads)",
+        REACH_AGENT_NS => "made in the agent's own mount namespace",
+        REACH_WATCHDOG_NS => "made in the watchdog's own mount namespace",
         _ => "made in PID 1's mount namespace",
     }
 }
@@ -644,6 +855,8 @@ pub const fn op_name(op: u8) -> &'static str {
         MG_OP_MOVE_MOUNT => "move_mount(2)",
         MG_OP_UMOUNT => "umount(2)",
         MG_OP_PIVOT => "pivot_root(2)",
+        MG_OP_REMOUNT => "remount of a super block (mount(2) MS_REMOUNT, or fsconfig(2) FSCONFIG_CMD_RECONFIGURE)",
+        MG_OP_REMOUNT_BIND => "mount(2) -o remount,bind",
         _ => "mount operation",
     }
 }
@@ -658,6 +871,9 @@ pub const fn why_name(why: u8) -> &'static str {
         MG_WHY_MOVE_AWAY => "a protected mount moved away",
         MG_WHY_UMOUNT => "a protected mount unmounted",
         MG_WHY_PIVOT => "the root pivoted in the host's namespace",
+        MG_WHY_REMOUNT_SB => "the super block of a kernel view or of a file system the agent's paths are on, reconfigured (proc's subset=pid or hidepid hide what the agent reads; a read-only state file system refuses its writes)",
+        MG_WHY_REMOUNT_RESTRICT => "a mount that holds the agent's paths made read-only or noexec",
+        MG_WHY_UMOUNT_NOTED => "an unmount of a kernel file system the agent reads (the tracefs, debugfs or securityfs), let through and recorded",
         _ => "a mount refused",
     }
 }
@@ -695,6 +911,11 @@ mod tests {
                 NameKey::of(fstype)
             },
             held: false,
+            noted: false,
+            shutdown: false,
+            kernel: false,
+            src_root: true,
+            restrict: false,
         }
     }
 
@@ -730,9 +951,16 @@ mod tests {
         assert_eq!(mount_op(MS_BIND), MG_OP_BIND);
         assert_eq!(mount_op(MS_BIND | (1 << 14)), MG_OP_BIND);
         assert_eq!(mount_op(MS_MOVE), MG_OP_MOVE_OLD);
-        // a remount first, a bind remount too
-        assert_eq!(mount_op(MS_REMOUNT | MS_BIND), MG_OP_PASS);
+        // a remount first: a bind remount is one mount's flags (judged
+        // here, the review of #567 F3); a super block's remount goes to
+        // `sb_remount` (judged there, with fsconfig's reconfigure)
+        assert_eq!(mount_op(MS_REMOUNT | MS_BIND), MG_OP_REMOUNT_BIND);
+        assert_eq!(
+            mount_op(MS_REMOUNT | MS_BIND | MS_RDONLY),
+            MG_OP_REMOUNT_BIND
+        );
         assert_eq!(mount_op(MS_REMOUNT), MG_OP_PASS);
+        assert_eq!(mount_op(MS_REMOUNT | MS_RDONLY), MG_OP_PASS);
         // then a bind, before a propagation change
         assert_eq!(mount_op(MS_BIND | (1 << 18)), MG_OP_BIND);
         for p in [1 << 17, 1 << 18, 1 << 19, 1 << 20] {
@@ -1372,12 +1600,26 @@ mod tests {
             record_of(d),
             (0xffff_ffff, MG_OP_PIVOT, MG_WHY_PIVOT, 0, 0xf)
         );
-        for op in 1..=6 {
+        for op in 1..=8 {
             assert_ne!(op_name(op), "mount operation");
         }
-        for why in 1..=7 {
+        for why in 1..=10 {
             assert_ne!(why_name(why), "a mount refused");
         }
+        // the review of #567 (F2): the agent's and the watchdog's own
+        // namespaces are named in the record
+        for (guard, reach) in [
+            (GUARD_HOST, 0),
+            (GUARD_AGENT, REACH_AGENT_NS),
+            (GUARD_WATCHDOG, REACH_WATCHDOG_NS),
+        ] {
+            assert_eq!(reach_in(guard), reach);
+            let d = record_dev(0x803, MG_OP_MOUNT, MG_WHY_ON, 0, reach << 4);
+            assert_eq!(reach_of(d), reach);
+        }
+        assert!(reach_name(REACH_AGENT_NS).contains("the agent's own"));
+        assert!(reach_name(REACH_WATCHDOG_NS).contains("the watchdog's own"));
+        assert_ne!(reach_name(REACH_AGENT_NS), reach_name(0));
         assert_eq!(view_of(PROC_SUPER_MAGIC), 1);
         assert_eq!(view_name(view_of(BPF_FS_MAGIC)), "the bpffs");
     }
@@ -1403,6 +1645,270 @@ mod tests {
         ] {
             assert!(is_view_magic(m));
             assert_eq!(view_name(view_of(m)), v);
+        }
+    }
+
+    // ── the review of #567 ──
+
+    /// F3: a super block's reconfigure (proc's `subset=pid`, `hidepid`, a
+    /// read-only state file system; `mount -o remount` and fsconfig's
+    /// reconfigure alike) is refused for a held super block, in whatever
+    /// namespace (the super block is the host's); not for another one.
+    #[test]
+    fn a_held_super_blocks_remount_is_refused_in_every_namespace() {
+        // a read-only remount (or one whose flags were not read)
+        let sb = |held| Query {
+            held,
+            restrict: true,
+            ..host(MG_OP_REMOUNT, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&sb(true)), Verdict::Refuse(MG_WHY_REMOUNT_SB));
+        // from a container that holds the host's root file system by a bind
+        assert_eq!(
+            decide(&Query {
+                host: false,
+                ..sb(true)
+            }),
+            Verdict::Refuse(MG_WHY_REMOUNT_SB)
+        );
+        // another super block (a container's own proc, /boot, /home)
+        assert_eq!(decide(&sb(false)), Verdict::Allow);
+        assert_eq!(
+            decide(&Query {
+                host: false,
+                ..sb(false)
+            }),
+            Verdict::Allow
+        );
+        // an unprivileged caller: the kernel's own EPERM
+        assert_eq!(
+            decide(&Query {
+                privileged: false,
+                ..sb(true)
+            }),
+            Verdict::Allow
+        );
+        // the window lets it through, recorded
+        assert_eq!(
+            decide(&Query {
+                window: true,
+                ..sb(true)
+            }),
+            Verdict::Window(MG_WHY_REMOUNT_SB)
+        );
+    }
+
+    /// F4 and F3: `systemd-shutdown` (and the helpers it forks) unmounts,
+    /// remounts read-only, moves the API mounts and pivots to
+    /// `/run/initramfs` at the end of a shutdown; the emergency remount is
+    /// a kernel thread's. PID 1 at any other time pivots and moves judged,
+    /// and nobody mounts over a protected point unjudged.
+    #[test]
+    fn systemd_shutdown_and_the_kernel_finish_a_shutdown_unjudged() {
+        let at_end = |q: Query| Query {
+            shutdown: true,
+            ..q
+        };
+        // (a read-only remount: the one that is refused outside a shutdown)
+        let held = |op| Query {
+            held: true,
+            restrict: true,
+            ..host(op, Point::EMPTY, "")
+        };
+        for q in [
+            held(MG_OP_UMOUNT),
+            held(MG_OP_REMOUNT),
+            held(MG_OP_MOVE_MOUNT),
+            host(MG_OP_MOVE_OLD, Point::EMPTY, ""),
+            host(MG_OP_PIVOT, Point::EMPTY, ""),
+        ] {
+            assert!(matches!(decide(&q), Verdict::Refuse(_)), "{q:?}");
+            assert_eq!(decide(&at_end(q)), Verdict::Allow, "{q:?}");
+        }
+        assert_eq!(
+            decide(&Query {
+                kernel: true,
+                ..held(MG_OP_REMOUNT)
+            }),
+            Verdict::Allow
+        );
+        // a kernel thread is no exemption elsewhere
+        assert!(matches!(
+            decide(&Query {
+                kernel: true,
+                ..host(MG_OP_PIVOT, Point::EMPTY, "")
+            }),
+            Verdict::Refuse(_)
+        ));
+        // never a mount over a protected point
+        let over = host(MG_OP_MOUNT, view_root(MG_OWN | MG_HOLD, 0xef53), "tmpfs");
+        assert_eq!(decide(&at_end(over)), Verdict::Refuse(MG_WHY_ON));
+        // PID 1 outside the final stage (`systemctl soft-reboot`'s pivot)
+        assert_eq!(
+            decide(&Query {
+                init: true,
+                ..host(MG_OP_MOVE_OLD, Point::EMPTY, "")
+            }),
+            Verdict::Refuse(MG_WHY_MOVE_OLD)
+        );
+    }
+
+    /// F3: a bind remount (`MS_REMOUNT | MS_BIND`) that makes a held mount
+    /// read-only or `noexec` is refused in its own namespace; one that
+    /// asks neither, one of another mount, one elsewhere is not.
+    #[test]
+    fn a_bind_remount_restricting_a_held_mount_is_refused() {
+        let q = Query {
+            held: true,
+            restrict: true,
+            ..host(MG_OP_REMOUNT_BIND, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&q), Verdict::Refuse(MG_WHY_REMOUNT_RESTRICT));
+        for allowed in [
+            Query {
+                restrict: false,
+                ..q
+            },
+            Query { held: false, ..q },
+            // per-mount flags never propagate: only the caller's own
+            // namespace's mounts change
+            Query {
+                host: false,
+                reaches: true,
+                ..q
+            },
+            Query {
+                shutdown: true,
+                ..q
+            },
+        ] {
+            assert_eq!(decide(&allowed), Verdict::Allow, "{allowed:?}");
+        }
+    }
+
+    /// F6: an unmount of the tracefs, debugfs or securityfs the agent
+    /// reads is let through and recorded; a held one is refused; PID 1's
+    /// and another namespace's are not recorded.
+    #[test]
+    fn an_unmount_of_a_kernel_file_system_the_agent_reads_is_recorded() {
+        let q = Query {
+            noted: true,
+            ..host(MG_OP_UMOUNT, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&q), Verdict::Noted(MG_WHY_UMOUNT_NOTED));
+        assert_eq!(decide(&Query { init: true, ..q }), Verdict::Allow);
+        assert_eq!(
+            decide(&Query {
+                host: false,
+                reaches: true,
+                ..q
+            }),
+            Verdict::Allow
+        );
+        assert_eq!(
+            decide(&Query { held: true, ..q }),
+            Verdict::Refuse(MG_WHY_UMOUNT)
+        );
+    }
+
+    /// F6: the kernel's own type at its canonical point passes only as a
+    /// whole file system — a clone of one of its subdirectories (securityfs'
+    /// `apparmor/` moved onto `/sys/kernel/security`) is refused.
+    #[test]
+    fn a_clone_of_a_subdirectory_never_passes_as_the_kernels_mount() {
+        let p = plain(SYSFS_MAGIC, &["security", "kernel"]);
+        let whole = host(MG_OP_MOVE_MOUNT, p, "securityfs");
+        assert_eq!(decide(&whole), Verdict::Allow);
+        assert_eq!(
+            decide(&Query {
+                src_root: false,
+                ..whole
+            }),
+            Verdict::Refuse(MG_WHY_BELOW_VIEW)
+        );
+        assert!(!allowed_kernel_mount(&NameKey::of("securityfs"), &p, false));
+    }
+
+    /// F1: the keys of the mounts held are their ids (and, for an unmount
+    /// that propagates, their place and their parent's peer group), never
+    /// a real inode's key.
+    #[test]
+    fn the_held_mounts_keys_never_meet_an_inodes() {
+        let (d, i) = held_by_id(4242);
+        assert_eq!((d & !HELD_BY_ID, i), (4242, 0));
+        assert_ne!(d & HELD_BY_ID, 0);
+        let cg = NameKey::of("cgroup");
+        let (d2, _) = held_by_place(7, 0x16, 33, &cg);
+        assert_ne!(d2 & HELD_BY_PLACE, 0);
+        assert_eq!(d2 & 0xffff_ffff, 7);
+        // a real device is 32 bits (MKDEV): never a tag
+        assert_eq!(u32::MAX as u64 & (HELD_BY_ID | HELD_BY_PLACE), 0);
+        assert_ne!(held_by_id(7).0, held_by_place(7, 0, 0, &cg).0);
+        // another group, directory or name is another place
+        let k = held_by_place(7, 0x16, 33, &cg);
+        assert_ne!(k, held_by_place(8, 0x16, 33, &cg));
+        assert_ne!(k, held_by_place(7, 0x17, 33, &cg));
+        assert_ne!(k, held_by_place(7, 0x16, 34, &cg));
+        assert_ne!(k, held_by_place(7, 0x16, 33, &NameKey::of("bpf")));
+        assert_eq!(k, held_by_place(7, 0x16, 33, &NameKey::of("cgroup")));
+    }
+
+    /// F1: a chroot's setup on the host's super blocks (`mount -t sysfs`
+    /// at `$T/sys`, then `mount -t cgroup2` at `$T/sys/fs/cgroup`) mounts
+    /// the kernel's own type at its canonical point: allowed; another type
+    /// there, or anything over the host's own cgroup root, is not.
+    #[test]
+    fn a_chroots_cgroup2_on_the_hosts_sysfs_is_the_kernels_own() {
+        let p = plain(SYSFS_MAGIC, &["cgroup", "fs"]);
+        assert_eq!(decide(&host(MG_OP_MOUNT, p, "cgroup2")), Verdict::Allow);
+        assert_eq!(
+            decide(&host(MG_OP_MOUNT, p, "tmpfs")),
+            Verdict::Refuse(MG_WHY_BELOW_VIEW)
+        );
+        let own = view_root(MG_VIEW | MG_HOLD, CGROUP2_SUPER_MAGIC);
+        assert_eq!(
+            decide(&host(MG_OP_MOUNT, own, "cgroup2")),
+            Verdict::Refuse(MG_WHY_ON)
+        );
+    }
+
+    /// F3 and finalrd (Ubuntu's shutdown pivot root: `mount -o
+    /// remount,exec /run`): a held file system's reconfigure that keeps it
+    /// writable passes; made read-only, or its flags unread, it is refused;
+    /// a view's is refused whatever its options.
+    #[test]
+    fn only_a_read_only_remount_of_the_agents_file_systems_is_refused() {
+        let q = |magic, restrict| Query {
+            held: true,
+            restrict,
+            point: Point {
+                magic,
+                ..Point::EMPTY
+            },
+            ..host(MG_OP_REMOUNT, Point::EMPTY, "")
+        };
+        assert_eq!(
+            decide(&q(TMPFS_MAGIC, false)),
+            Verdict::Allow,
+            "remount,exec /run"
+        );
+        assert_eq!(
+            decide(&q(0xef53, false)),
+            Verdict::Allow,
+            "remount,commit=60 /"
+        );
+        assert_eq!(decide(&q(0xef53, true)), Verdict::Refuse(MG_WHY_REMOUNT_SB));
+        for view in [
+            PROC_SUPER_MAGIC,
+            SYSFS_MAGIC,
+            CGROUP2_SUPER_MAGIC,
+            BPF_FS_MAGIC,
+        ] {
+            assert_eq!(
+                decide(&q(view, false)),
+                Verdict::Refuse(MG_WHY_REMOUNT_SB),
+                "{view:x}"
+            );
         }
     }
 }

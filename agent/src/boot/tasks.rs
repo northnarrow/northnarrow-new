@@ -349,6 +349,17 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         let bpffs_root = northnarrow_agent::anti_tamper::prepare_pin_root();
         loop {
             tick.tick().await;
+            // The review of #567 (the cross-model check): the mount guard's
+            // held mounts and peer groups followed (a propagation change, an
+            // automounted tracefs)
+            if let Some(root) = bpffs_root {
+                if let Err(e) = northnarrow_agent::anti_tamper::mount_guard::refresh(root) {
+                    debug!(
+                        error = format!("{e:#}"),
+                        "anti-tamper mount guard: refresh skipped"
+                    );
+                }
+            }
             let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
             let new_pid = match &resolution {
                 WatchdogResolution::Verified { pid, .. } => Some(*pid),
@@ -360,6 +371,13 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 // same PID).
                 if let WatchdogResolution::Verified { pid, start_ticks } = &resolution {
                     exempt.set_watchdog(*pid, *start_ticks);
+                    // the review of #567: its mount namespace's held mounts
+                    // and peer groups followed too (quietly: its findings
+                    // were signed at its registration)
+                    if let Some(root) = bpffs_root {
+                        let _ =
+                            northnarrow_agent::anti_tamper::mount_guard::guard_watchdog(root, *pid);
+                    }
                 }
                 continue; // no change — stay quiet on the hot path
             }
@@ -415,6 +433,36 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     p,
                     &cgroup_keys,
                 );
+                // The review of #567 (F2): its mount namespace judged as
+                // PID 1's, its held mounts registered; a mount there that is
+                // not the canonical one is signed (the brainstorm's 3rd point).
+                if let Some(root) = bpffs_root {
+                    match northnarrow_agent::anti_tamper::mount_guard::guard_watchdog(root, p) {
+                        Ok(g) => {
+                            info!(
+                                watchdog_pid = p,
+                                watchdog_mnt_ns = g.mnt_ns,
+                                "anti-tamper mount guard: the watchdog's mount namespace is \
+                                 judged as PID 1's"
+                            );
+                            let log = audit.get().and_then(|l| l.as_ref());
+                            for f in g.not_canonical {
+                                northnarrow_agent::self_integrity::report_event(
+                                    log,
+                                    &northnarrow_agent::self_integrity::Finding {
+                                        kind: "mount_not_canonical",
+                                        detail: format!("in the watchdog's mount namespace: {f}"),
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            watchdog_pid = p,
+                            error = format!("{e:#}"),
+                            "anti-tamper mount guard: the watchdog's mount namespace NOT guarded"
+                        ),
+                    }
+                }
             }
             match &resolution {
                 WatchdogResolution::Verified {

@@ -2969,8 +2969,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 
 ## 51. A mount on, over or below the agent's paths is refused (lot 357)
 
-- **What changes.** In PID 1's mount namespace, for root (`CAP_SYS_ADMIN`
-  in PID 1's user namespace), the agent's kernel hooks now refuse
+- **What changes.** In PID 1's mount namespace — and in the agent's and the
+  watchdog's own (§51.1) — for root (`CAP_SYS_ADMIN` in PID 1's user
+  namespace), the agent's kernel hooks now refuse
   (`EPERM`, signed High: NN-L-AT-001, operation `mount`):
   - a mount on or over `/proc`, `/sys`, `/sys/fs/cgroup`, `/sys/fs/bpf`,
     `/etc/northnarrow`, `/var/lib/northnarrow`, `/run/northnarrow`, the
@@ -2986,8 +2987,12 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     any mount inside the tracefs, the debugfs or the securityfs —
     `/proc/<pid>/…` (a tmpfs over `/proc/<agent>/fd` fed the agent false
     facts) and a cgroup directory are never one;
-  - an unmount (lazy too) or a move of one of those mounts, a move through
-    `mount(2)`'s `MS_MOVE`, `pivot_root`.
+  - an unmount (lazy too) or a move of one of those mounts — the mounts
+    themselves, by their id, not a copy of one (§51.1) —, a move through
+    `mount(2)`'s `MS_MOVE`, `pivot_root`;
+  - a remount of the super block of a view or of a file system the agent's
+    paths are on, and a bind remount making one of those mounts read-only
+    or `noexec` (§51.1).
 - **Also from another mount namespace whose change reaches the host's**
   (a raw `unshare(CLONE_NEWNS)` keeps the shared peer groups: a mount there
   is copied into the host's view): judged as in the host's. A container,
@@ -3000,8 +3005,8 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 - **What does not change.** Containers, `unshare -m`, systemd's sandboxes
   of its units, snapd's and the container runtimes' mounts elsewhere
   (`/var/lib/docker`, `/snap`, `/run/netns`, `/run/user`…) are not judged;
-  nor are remounts, propagation changes, PID 1's unmounts (the last pass of
-  a shutdown) or an unprivileged caller's mount (the kernel refuses it).
+  nor are propagation changes, PID 1's unmounts, systemd-shutdown's last
+  pass (§51.1) or an unprivileged caller's mount (the kernel refuses it).
   The mount watch (`integrity_drift` `mount_over_protected`) stays: it
   signs a mount the guard does not see (one propagated from another
   namespace, one on a kernel without the guard).
@@ -3018,8 +3023,193 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     refused.
   - A separate `/var` (or `/usr`) partition: its mount unit cannot unmount
     it at shutdown (refused, the unit is marked failed); systemd-shutdown's
-    own pass (PID 1) unmounts or remounts it read-only as before.
+    own pass (PID 1 and the helpers it forks) unmounts or remounts it
+    read-only as before.
   - A kernel without the hooks (`sb_mount`, `move_mount`, `sb_umount`,
-    `sb_pivotroot`) or the offsets they read: the start signs
+    `sb_pivotroot`, `sb_remount`) or the offsets they read: the start signs
     `mount guard not attached` (a degradation, not a refused start) and the
     mount watch alone records such mounts.
+
+### 51.1 The review of #567: the mounts themselves, the units' namespaces, remounts
+
+- **The mounts held are mounts (F1).** The guard used to recognise a
+  protected mount by its root's dentry, so the unmount of any copy of `/`,
+  `/run` or `/sys` was refused. It now holds the mounts the protected paths
+  resolve through, by their id, in each namespace it guards. A backup's
+  `mount --bind / /mnt/snap`, a chroot's `mount -t proc`, `mount -t sysfs`
+  (the host's super block), `mount -t cgroup2` below it, its `--bind /run`
+  and `--bind /sys`, and their teardown (debootstrap, pbuilder, schroot,
+  arch-chroot, live-build, diskimage-builder) are let through, with no
+  record. What is still refused is an unmount the kernel would propagate
+  onto a held mount: an `rbind` of `/sys` that was not made `rslave`
+  first, unmounted with `umount -R`, takes the host's childless
+  `/sys/fs/cgroup` and `/sys/fs/bpf` with it. Make the copy `rslave` (or
+  `private`) before unmounting it, as the distributions' guides do.
+- **The agent's and the watchdog's own namespaces (F2).** Their units'
+  `ProtectSystem=strict` gives each a mount namespace of its own: the one
+  they read their paths through. Once the agent holds its role (the BPF
+  self-defence's liveness watch), its namespace is judged as PID 1's;
+  the watchdog's is, from the agent's watchdog refresh (at most 30 s after
+  the watchdog starts). Each is dropped at the process's exit, before the
+  kernel can give its number to another namespace. Records name it
+  (`made in the agent's own mount namespace`). The integrity round also
+  reads both namespaces' mount tables, besides PID 1's.
+- **Remounts (F3).** A reconfigure of the super block of `/proc`, `/sys`,
+  the cgroup root or the bpffs is refused whatever its options (proc's
+  `subset=pid`, `hidepid=`); one of a file system the agent's state, run,
+  configuration or binaries are on is refused when it makes it read-only —
+  `mount -o remount` and `fsconfig(FSCONFIG_CMD_RECONFIGURE)` (util-linux
+  2.39 and later) alike, both through the kernel's `sb_remount` hook, the
+  new flags read at `reconfigure_super()` by an `fentry` (without it,
+  every such reconfigure is refused, signed). A writable one passes:
+  Ubuntu's finalrd remounts `/run` `exec` at every shutdown; `size=` of
+  `/run` and `commit=` of `/` pass. A bind remount
+  (`mount -o remount,bind`) that makes one of the held mounts read-only or
+  `noexec` is refused too. util-linux 2.39 and later make a bind remount
+  with `mount_setattr(2)`, which has no hook: the integrity round signs it
+  (`mount_attrs_changed`, High), and now compares the super block's
+  options as well. A state, run or configuration directory found on a
+  read-only file system is signed High (`state_fs_read_only`). Exempt: a
+  kernel thread (`SysRq-u`'s emergency remount) and systemd-shutdown at the
+  end of a shutdown.
+- **systemd-shutdown (F4).** PID 1 running systemd-shutdown (the kill
+  guard's identity: its comm and the file the agent recorded) and the
+  helpers it forks (`(sd-umount)`, `(sd-remount)`) unmount, remount
+  read-only, move the API mounts and pivot to `/run/initramfs` (dracut)
+  unjudged. PID 1 at any other time is judged for a pivot or a move:
+  `systemctl soft-reboot` needs a window.
+- **Mounts made before the guard attached.** At arming, every mount of
+  PID 1's and the agent's namespaces (the watchdog's at its refresh) that
+  covers a protected path or a directory above one, or lies below the
+  agent's directories or a view, is judged against the canonical layout by
+  its type, point and root: a view holds its own type whole, `/` anything
+  but a FUSE, a directory above the agent's paths no memory, FUSE or
+  stacking file system and no bind of another directory (a subvolume and a
+  unit's bind of a directory onto itself are canonical). Each other one is
+  a signed degradation of the start and a High of the integrity round's
+  first read (`mount_not_canonical`). An ostree host's binds of `/var` and
+  a NixOS impermanence host's `/` on tmpfs are named so: known false
+  positives.
+- **The tracefs, debugfs and securityfs the agent reads.** Their unmount is
+  let through and recorded Low (`mount_noted`). A clone of a subdirectory
+  of the kernel's own type moved onto its canonical point (securityfs'
+  `apparmor/` onto `/sys/kernel/security`) is refused.
+- **`/usr/local`.** Only the agent's binaries and units that exist are
+  points. With the package (`/usr/bin`), an NFS or automounted
+  `/usr/local` (an HPC host) is the host's business; with `install.sh`
+  (`/usr/local/bin`), a mount over `/usr/local` hides the agent and is
+  refused: install the package on such a host.
+- **The agent's libraries.** The directories of the shared libraries the
+  agent has mapped (`libc`, `libgcc_s`, the loader: `/usr/lib/<triplet>`,
+  `/usr/lib64`) are points too: a mount over one would swap what the
+  agent's or the watchdog's restart loads.
+- **Overlay root.** On an overlay of layers on more than one file system
+  (without `xino`), `stat(2)` gives a file the layer's device and the hook
+  reads the overlay's: the agent's binaries and units are registered under
+  both.
+- **Which namespace is judged (the cross-model check).** The namespace
+  that owns the target mount, never the caller's: a path through
+  `/proc/<pid>/root`, or an `O_PATH` descriptor of one passed to
+  `move_mount(2)`, names a mount of another namespace, and is judged there.
+  A change made elsewhere is judged when it propagates into a guarded
+  namespace: its target mount's peer group is the own group or the
+  master's group of a mount there that holds a protected point or is a
+  view (`MOUNT_GROUPS`, one look-up; the walk of four peers and two slaves
+  it replaces refused when a group was larger, on a host with many
+  containers). The groups, the held mounts and their super blocks are read
+  again every 30 s (a propagation change, an automounted tracefs, a mount
+  a window left). A chain two masters deep is not followed: building one
+  needs a propagation change on a guarded mount, which the integrity round
+  signs.
+- **PID 1 (the cross-model check).** Its exemption is an unmount of a mount
+  of its own namespace that is not one of the agent's directories. In the
+  agent's and the watchdog's namespaces PID 1 and its helpers are judged:
+  `systemctl bind northnarrow-agent.service … /run/northnarrow` (and
+  `mount-image`) fail at entering the agent's namespace (the ptrace guard,
+  signed) and would be refused there.
+- **The units' drop-in directories.** `install.sh` and the agent's
+  `ExecStartPre=+` lines make `/etc/systemd/system/<unit>.service.d`,
+  `/run/systemd/system/<unit>.service.d` and their `system.control`
+  twins for the agent and the watchdog; they are the agent's own
+  directories (no new file, no mount on or below them, outside a window;
+  lots 273d and 330), and every drop-in found there at a start or a round
+  is judged (`own_dropin_*`). A drop-in with `InaccessiblePaths=`,
+  `TemporaryFileSystem=`, `BindPaths=` or `ExecStartPre=` is refused at its
+  write.
+- **A self-test of the guard at the start is not possible**: the agent's
+  unit filters `mount(2)` (`SystemCallFilter=`), and every other mount
+  call checks `CAP_SYS_ADMIN` before the hook. The lab proves the hooks;
+  the start signs what was not attached.
+- **The persistence vector of a mount made before the guard.** `/etc/fstab`
+  is in the FIM watch set (`fim-paths.v1`; a change is a Medium drift, no
+  rule of its own), and a `.mount` or `.automount` unit in
+  `/etc/systemd/system`, `/lib/systemd/system` or `/usr/lib/systemd/system`
+  is NN-L-FIM-009 (High). Not watched: `/run/systemd/system` and
+  `/run/systemd/transient` (runtime units), the generator directories
+  (`/etc/systemd/system-generators`, `/usr/lib/systemd/system-generators`,
+  `/usr/local/lib/systemd/system-generators`) and the automounter's maps
+  (`/etc/auto.master`, `/etc/auto.master.d`) — the next items below.
+- **What the kernel source says (verified on 5.15, 6.1, 6.5, 6.8, 6.12,
+  7.3, 7.4-rc2; systemd v247–v262):**
+  - a mount through `/proc/<pid>/root` into another namespace is the
+    kernel's `EINVAL` (`check_mnt`, `may_use_mount` from 6.15); the guard
+    judges the target's own namespace anyway (the hook runs first). The
+    real ways in are `setns(2)` (no LSM hook before 7.4: what is mounted
+    after it in the agent's or the watchdog's namespace is judged, and
+    opening their namespace is the ptrace guard's refusal),
+    `MOVE_MOUNT_SET_GROUP` and shared propagation (the peer groups);
+  - `move_mount`'s hook does not see its flags: `MOVE_MOUNT_SET_GROUP` and
+    `MOVE_MOUNT_BENEATH` onto a protected mount are refused by their
+    target (the protected mount's root), recorded as `move_mount(2)`
+    without the flag; `SET_GROUP` onto another mount gives it a group the
+    next refresh follows;
+  - `MS_REMOUNT | MS_BIND` reaches `sb_mount` only, `fsconfig`'s
+    reconfigure `sb_remount` (and `fs_context_parse_param`) only, and
+    `sb_remount` does not see the new options: every reconfigure of a held
+    super block is refused there, whatever the options;
+  - `mount_setattr(2)`, `open_tree_attr(2)` and `fsmount(2)`'s attributes
+    have no LSM hook up to 7.4-rc2: observed by the integrity round (High
+    within one round); a control at the system call would decide on the
+    caller's string, not done;
+  - btrfs: the hooks key a dentry by its subvolume's `anon_dev` and inode,
+    as `stat(2)` does — unique across subvolumes; the super block keys are
+    `s_dev` on both sides (not measured on a btrfs guest);
+  - systemd's live mounts (`systemctl bind`, `mount-image`, v248+) are made
+    by a grandchild of PID 1 (or of the `(sd-mount-in-ns)` worker, v257+)
+    after `setns(2)`: no exemption is tied to PID 1 there; the shutdown one
+    is PID 1 running systemd-shutdown;
+  - procfs: since 5.8 each mount is its own super block; the host's
+    `/proc` remount is refused. A private procfs instance for the agent
+    (`ProtectProc=`/`ProcSubset=` in its unit) would change what it sees:
+    not done, named.
+- **Public techniques, checked:** an overmount of `/proc/<pid>` (MITRE
+  T1564.013): refused; a `/proc` remount with `hidepid=`: refused; the
+  bpffs or a tracefs overmounted: refused; `mount_setattr(2)`: signed
+  High (not refused); `kernel.ftrace_enabled=0` and
+  `/sys/kernel/debug/kprobes/enabled=0`: refused by the sysctl guard
+  (lot 280b); the agent's BPF maps written: the BPF guard; runc's
+  redirected procfs writes (CVE-2025-52881): the agent does not write
+  `/proc/sys`; io_uring: no mount operation.
+- **Later (named for the backlog):** a device-mapper table swap and raw
+  block-device writes below a mounted file system; an overlay's upper
+  directory written directly; `systemctl soft-reboot` (systemd 254 and
+  later) and the guard's keys across it; the time sources (`machine-id`,
+  the RTC, PTP).
+- **The next items** (the adversarial review's persistence knobs, outside
+  the mount guard; what the FIM watch set covers today):
+  - `binfmt_misc`'s `register` (an interpreter for the ELF magic runs at
+    every exec, the agent's restart included): not watched — neither the
+    write to `/proc/sys/fs/binfmt_misc/register` nor `/etc/binfmt.d`,
+    `/usr/lib/binfmt.d`, `/run/binfmt.d`.
+  - `kernel.core_pattern` and `kernel.modprobe`: not in the sysctl guard's
+    list, and `/etc/sysctl.conf` and `/etc/sysctl.d` are not watched.
+  - `/etc/ld.so.preload`: watched, NN-L-FIM-022 (Critical); `/etc/ld.so.conf`
+    and `/etc/ld.so.conf.d`: not watched.
+  - The CA store (`/etc/ssl/certs`, `/usr/local/share/ca-certificates`,
+    `/etc/pki/ca-trust`) that the uplink trusts: not watched.
+  - `/etc/resolv.conf`: watched (`fim-paths.v1`, a Medium drift), no rule
+    of its own; `/etc/hosts` and `/etc/nsswitch.conf` likewise.
+  - An overlay's upper and work directories (an overlay root or `/usr`):
+    a change there changes what a protected path shows with no mount;
+    not watched.
+
