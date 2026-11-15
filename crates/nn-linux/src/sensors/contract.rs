@@ -465,8 +465,18 @@ pub const SOURCES: [SourceContract; 16] = [
                      record, a move into an exempt cgroup, code-injection access: 50 a second \
                      per CPU in a budget of their own, after the per-caller dedup where they \
                      had one (they never take a decisive record's room; every refusal holds); \
-                     not a loss",
+                     not a loss; (lot 356) a refused use of a held program too, never its load",
                 counter: "minor_denial_rate",
+            },
+            KernelBudget {
+                allows: "(lot 356, pre-alpha F3-8) none for a sole trace — a trusted-installer \
+                     window's load the content judge refuses outside one (bpf_held_load) is \
+                     signed through no budget, one record per held program; when the ring has \
+                     no room for it the load is refused (fail closed) and counted, its id kept \
+                     held (the review of #565: a handle taken by id before the refusal keeps \
+                     its runs and attaches refused); not a loss (the load's descriptor was never \
+                     handed out; the lost reservation is fs_protect's)",
+                counter: "held_load_unsigned",
             },
         ],
         overhead: FS_PROTECT_OVERHEAD,

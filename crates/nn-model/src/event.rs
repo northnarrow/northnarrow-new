@@ -1224,6 +1224,12 @@ pub enum FsProtectOperation {
     /// has no room for): `target_dev` the use, reason and type
     /// (`common::wire::bpf_held_of`), `target_ino` the program id.
     BpfHeldUse,
+    /// The review of #565 (F2): NOT a refusal — the kernel-state round's
+    /// findings past its quota of named records per kind, one record per
+    /// round with their counts (`common::wire::SoleTraceSummary::of`
+    /// `target_dev`, `target_ino`); each object listed in the cross-view's
+    /// status file.
+    SoleTraceSummary,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1279,6 +1285,7 @@ impl FsProtectOperation {
             crate::wire::FS_OP_CPU_CONFINED => Self::CpuConfined,
             crate::wire::FS_OP_BPF_HELD_LOAD => Self::BpfHeldLoad,
             crate::wire::FS_OP_BPF_HELD_USE => Self::BpfHeldUse,
+            crate::wire::FS_OP_SOLE_TRACE_SUMMARY => Self::SoleTraceSummary,
             other => Self::Unknown(other),
         }
     }
@@ -1332,8 +1339,27 @@ impl FsProtectOperation {
             Self::CpuConfined => "cpu_confined",
             Self::BpfHeldLoad => "bpf_held_load",
             Self::BpfHeldUse => "bpf_held_use",
+            Self::SoleTraceSummary => "sole_trace_summary",
             Self::Unknown(_) => "unknown",
         }
+    }
+
+    /// Lot 356 (pre-alpha F3-8): `common::wire::is_sole_trace` of this
+    /// operation — the only trace of something the agent let through (a
+    /// window's held load or its outliving, the kernel-state round's
+    /// findings): never held back by a budget, the bus's cap or its
+    /// coalescing, always recorded.
+    pub const fn is_sole_trace(&self) -> bool {
+        matches!(
+            self,
+            Self::BpfHeldLoad
+                | Self::KernelTaint
+                | Self::SysctlRootProg
+                | Self::BpfUnseen
+                | Self::BpfBaseline
+                | Self::CpuConfined
+                | Self::SoleTraceSummary
+        )
     }
 }
 
@@ -2168,6 +2194,12 @@ mod tests {
                 FsProtectOperation::BpfHeldUse,
                 "bpf_held_use",
             ),
+            // the review of #565 (F2)
+            (
+                crate::wire::FS_OP_SOLE_TRACE_SUMMARY,
+                FsProtectOperation::SoleTraceSummary,
+                "sole_trace_summary",
+            ),
         ];
         for (byte, op, name) in cases {
             assert_eq!(FsProtectOperation::from_wire(byte), op);
@@ -2178,6 +2210,18 @@ mod tests {
             FsProtectOperation::from_wire(crate::wire::FS_OP_LAST + 1),
             FsProtectOperation::Unknown(crate::wire::FS_OP_LAST + 1)
         );
+    }
+
+    /// Lot 356: the model's sole traces are the wire's, byte for byte.
+    #[test]
+    fn the_sole_traces_are_the_wire_s() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                FsProtectOperation::from_wire(byte).is_sole_trace(),
+                crate::wire::is_sole_trace(byte),
+                "{byte}"
+            );
+        }
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
 

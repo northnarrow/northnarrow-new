@@ -266,6 +266,11 @@ pub struct StatusOutcome {
     /// compared (the second's budget spent).
     pub program_copy_compared_total: Option<u64>,
     pub program_copy_skipped_total: Option<u64>,
+    /// The review of #565 (F2): the kernel-state round's findings its quota
+    /// held back since the agent's start, per kind
+    /// (`StatusResponse::kernel_state_held_back`; `None` from an older
+    /// agent or the unsigned reply).
+    pub kernel_state_held_back: Option<Vec<(String, u64)>>,
     pub execq_script_refused_total: Option<u64>,
     /// Lab PR 267 (R12a): the priority event bus and the loss counters by
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
@@ -551,6 +556,7 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         open_sensor_per_call_total: resp.open_sensor_per_call_total,
         program_copy_compared_total: resp.program_copy_compared_total,
         program_copy_skipped_total: resp.program_copy_skipped_total,
+        kernel_state_held_back: resp.kernel_state_held_back,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,
@@ -3977,6 +3983,7 @@ mod tests {
                     open_sensor_per_call_total: Some(25),
                     program_copy_compared_total: Some(26),
                     program_copy_skipped_total: Some(27),
+                    kernel_state_held_back: Some(vec![("bpf_unseen".to_string(), 12_000)]),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
@@ -4007,6 +4014,11 @@ mod tests {
         assert_eq!(out.open_sensor_per_call_total, Some(25));
         assert_eq!(out.program_copy_compared_total, Some(26));
         assert_eq!(out.program_copy_skipped_total, Some(27));
+        // the review of #565 (F2): the round's quota's counts
+        assert_eq!(
+            out.kernel_state_held_back,
+            Some(vec![("bpf_unseen".to_string(), 12_000)])
+        );
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

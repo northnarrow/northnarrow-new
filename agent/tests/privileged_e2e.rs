@@ -1435,6 +1435,19 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// The ring-drop sampler's journal lines (`nn_linux::sensors::ring_drops::
+/// drop_warning`), whatever their message: each carries its counter
+/// (`ring=`) and `dropped_since_last_sample=`. The re-check of #565: the
+/// review's F4 gave the budgets' and the refused loads' counters their own
+/// wording (records HELD BACK, loads REFUSED — no "events DROPPED"), and a
+/// filter on the loss message alone found none of them.
+#[cfg(feature = "debug-trigger")]
+fn ring_drop_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| l.contains("dropped_since_last_sample="))
+        .collect()
+}
+
 #[cfg(feature = "debug-trigger")]
 fn read_agent_log(path: &Path) -> String {
     strip_ansi(&std::fs::read_to_string(path).unwrap_or_default())
@@ -2082,10 +2095,7 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
         std::thread::sleep(wait);
     }
     let text = read_agent_log(&log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         !drops.iter().any(|l| l.contains("fs_protect")),
         "the denial ring filled during the loop: {drops:#?}"
@@ -2241,10 +2251,7 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
     // round, every 10 s), and none of the decisive budget's
     std::thread::sleep(Duration::from_secs(12));
     let text = read_agent_log(&log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         drops.iter().any(|l| l.contains("minor_denial_rate")),
         "the handle loop was not held back by its own budget: {drops:#?}"
@@ -2254,6 +2261,256 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
             .iter()
             .any(|l| l.contains("fs_protect") || l.contains("\"denial_rate\"")),
         "a decisive record or the ring lost: {drops:#?}"
+    );
+
+    let mut run = fx.enforce_run.take().expect("enforce run");
+    if let Err(e) =
+        common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
+    {
+        let tail = log_tail(&run.log);
+        fx.enforce_run = Some(run);
+        panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
+    }
+}
+
+/// Lot 356 (pre-alpha F3-8): `n` loads, on CPU `cpu`, in a child of its
+/// own process group, of a kprobe program that calls `bpf_send_signal` —
+/// the content judge refuses it outside a trusted-installer window and
+/// holds it inside one. The ids of the programs loaded (the descriptors
+/// closed at once: no program outlives the window), and the errno of each
+/// load refused.
+#[cfg(feature = "debug-trigger")]
+fn fork_held_loads(cpu: usize, n: usize) -> (Vec<u32>, Vec<i32>) {
+    /// `struct bpf_insn` as one word: code, regs, off, imm.
+    const fn insn(code: u8, dst: u8, imm: i32) -> u64 {
+        code as u64 | (dst as u64) << 8 | (imm as u32 as u64) << 32
+    }
+    const BPF_PROG_TYPE_KPROBE: u32 = 2;
+    const BPF_FUNC_SEND_SIGNAL: i32 = 109;
+    let prog: [u64; 4] = [
+        insn(0xb7, 1, libc::SIGUSR1), // r1 = SIGUSR1
+        insn(0x85, 0, BPF_FUNC_SEND_SIGNAL),
+        insn(0xb7, 0, 0), // r0 = 0
+        insn(0x95, 0, 0), // exit
+    ];
+    let license = *b"GPL\0";
+    assert!(n <= 512, "at most 512 loads");
+    let mut fds = [0i32; 2];
+    // SAFETY: a valid out-array of two descriptors.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let mut out = vec![0i32; 2 * n];
+    // SAFETY: the child makes raw system calls on buffers allocated before
+    // the fork, and ends with `_exit`; the parent reads the pipe.
+    unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            libc::close(fds[0]);
+            libc::setpgid(0, 0);
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            let mut loaded = [0i32; 512];
+            for i in 0..n {
+                let mut attr = [0u32; 32];
+                attr[0] = BPF_PROG_TYPE_KPROBE;
+                attr[1] = prog.len() as u32;
+                let insns = prog.as_ptr() as u64;
+                attr[2] = insns as u32;
+                attr[3] = (insns >> 32) as u32;
+                let lic = license.as_ptr() as u64;
+                attr[4] = lic as u32;
+                attr[5] = (lic >> 32) as u32;
+                // prog_name (byte 48)
+                attr[12] = u32::from_le_bytes(*b"nn_h");
+                attr[13] = u32::from_le_bytes(*b"eld\0");
+                let fd = libc::syscall(
+                    libc::SYS_bpf,
+                    ::common::bpf_cmd::BPF_PROG_LOAD as libc::c_long,
+                    attr.as_mut_ptr(),
+                    std::mem::size_of_val(&attr) as u32,
+                );
+                if fd < 0 {
+                    out[n + i] = *libc::__errno_location();
+                    continue;
+                }
+                loaded[i] = fd as i32;
+                // struct bpf_prog_info: type, then id
+                let mut info = [0u32; 32];
+                let mut a = [0u32; 32];
+                a[0] = fd as u32;
+                a[1] = std::mem::size_of_val(&info) as u32;
+                let p = info.as_mut_ptr() as u64;
+                a[2] = p as u32;
+                a[3] = (p >> 32) as u32;
+                if libc::syscall(
+                    libc::SYS_bpf,
+                    ::common::bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as libc::c_long,
+                    a.as_mut_ptr(),
+                    std::mem::size_of_val(&a) as u32,
+                ) == 0
+                {
+                    out[i] = info[1] as i32;
+                }
+            }
+            for fd in &loaded[..n] {
+                if *fd > 0 {
+                    libc::close(*fd);
+                }
+            }
+            let bytes = std::mem::size_of_val(&out[..]);
+            let w = libc::write(fds[1], out.as_ptr() as *const libc::c_void, bytes);
+            libc::_exit(if w == bytes as isize { 0 } else { 9 });
+        }
+        libc::close(fds[1]);
+        let mut status = 0;
+        let bytes = std::mem::size_of_val(&out[..]);
+        let mut got = 0usize;
+        while got < bytes {
+            let r = libc::read(
+                fds[0],
+                (out.as_mut_ptr() as *mut u8).add(got) as *mut libc::c_void,
+                bytes - got,
+            );
+            if r <= 0 {
+                break;
+            }
+            got += r as usize;
+        }
+        libc::close(fds[0]);
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 && got == bytes,
+            "the loader child: status {status}, {got} of {bytes} bytes"
+        );
+    }
+    let ids = out[..n]
+        .iter()
+        .filter(|id| **id > 0)
+        .map(|id| *id as u32)
+        .collect();
+    let refused = out[n..].iter().filter(|e| **e != 0).copied().collect();
+    (ids, refused)
+}
+
+/// Lot 356 (pre-alpha F3-8): a window's held load — a program the content
+/// judge refuses outside a trusted-installer window, loaded inside one and
+/// held — was signed through the per-CPU budget of the non-decisive
+/// refusals. A flood of them on a CPU (here refused handles on one of the
+/// agent's maps, as the lab's refused uses of a held program did) spent it,
+/// and a window load on that CPU in the same second was held, its record a
+/// `minor_denial_rate` count naming no program: the lab lost it 1 time in
+/// 3 on 6.8. A sole trace now, it spends no budget: 64 such loads on that
+/// CPU at once (past the 50 a second the budget has, whatever the flood
+/// left of it) are each held and signed, naming their program, and none is
+/// refused for want of room.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_flood_of_minor_refusals_never_hides_a_held_load() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as root (sudo -E cargo test …, docs/integration-test-runbook.md)"
+    );
+    let _eni = EniIptablesGuard::install();
+    let mut fx = GuardFixture::new();
+    let run = fx.spawn("held", true).unwrap_or_else(|e| panic!("{e}"));
+    let run = fx.enforce_run.insert(run);
+    wait_ready(run).unwrap_or_else(|e| panic!("{e}"));
+    let log = run.log.clone();
+    let reg = wait_for_log_line(&log, &["own objects registered"], GUARD_LOG_TIMEOUT)
+        .unwrap_or_else(|| panic!("no BPF self-defence registration line\n{}", log_tail(&log)));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard did not start in enforce mode: {reg}"
+    );
+    // One of the agent's maps, read in a window (outside one a read handle
+    // on its maps is refused too), then the window let close.
+    const ID_WINDOW_SECS: u32 = 5;
+    fx.grant_window("held", ID_WINDOW_SECS)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let map_id = common::raw_bpf::own_ids()
+        .unwrap_or_else(|e| panic!("the agent's own ids: {e}\n{}", log_tail(&log)))
+        .into_iter()
+        .find_map(|(kind, id)| (kind == 1).then_some(id))
+        .expect("OWN_BPF_IDS lists none of the agent's maps");
+    std::thread::sleep(Duration::from_secs(u64::from(ID_WINDOW_SECS) + 2));
+    // outside a window, the content judge refuses the program
+    let (ids, refused) = fork_held_loads(0, 1);
+    assert!(
+        ids.is_empty() && refused == [libc::EPERM],
+        "a kprobe calling bpf_send_signal loaded outside a window: {ids:?} {refused:?}"
+    );
+
+    // The flood on CPU 0, 1.5 s: far past the 50 records a second its
+    // budget has there; it ends before the window (inside one, a write
+    // handle is refused as decisive).
+    let mut until: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut until) };
+    until.tv_nsec += 500_000_000;
+    until.tv_sec += 1 + until.tv_nsec / 1_000_000_000;
+    until.tv_nsec %= 1_000_000_000;
+    let flooder = fork_handle_flooder(0, map_id, until);
+    assert!(flooder > 0, "fork failed");
+    let mut status = 0;
+    // SAFETY: our own child.
+    assert_eq!(unsafe { libc::waitpid(flooder, &mut status, 0) }, flooder);
+    match libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)) {
+        Some(0) => {}
+        Some(1) => panic!("a handle on the agent's map {map_id} was granted in enforce mode"),
+        other => panic!("the flooder could not drop to nobody with CAP_BPF: {other:?}"),
+    }
+    // At once the window, and on CPU 0 the loads: 64, in well under the
+    // second the flood's budget window has left.
+    const HELD: usize = 64;
+    fx.grant_window("held", 10)
+        .unwrap_or_else(|e| panic!("{e}\n{}", log_tail(&log)));
+    let (ids, refused) = fork_held_loads(0, HELD);
+    assert!(
+        refused.is_empty() && ids.len() == HELD,
+        "window loads refused: {refused:?} ({} loaded)\n{}",
+        ids.len(),
+        log_tail(&log)
+    );
+    // every one held and signed, naming its program — at its load (the
+    // `target_dev`'s use is 0), not found later outliving the window
+    for id in &ids {
+        let needle = format!("prog_id={id} ");
+        let line = wait_for_log_line(&log, &["BPF HELD", &needle], Duration::from_secs(20))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the held load of program {id} left no record behind the flood on its CPU\n{}",
+                    log_tail(&log)
+                )
+            });
+        let dev: u64 = line
+            .split("target_dev=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no target_dev in {line}"));
+        assert_eq!(
+            ::common::wire::bpf_held_of(dev).0,
+            0,
+            "program {id}'s record is not its load's: {line}"
+        );
+    }
+    // the flood was held back in its own budget; no held load was refused
+    // for want of room, and the ring lost nothing (the sampler's round,
+    // every 10 s)
+    std::thread::sleep(Duration::from_secs(12));
+    let text = read_agent_log(&log);
+    let drops = ring_drop_lines(&text);
+    assert!(
+        drops.iter().any(|l| l.contains("minor_denial_rate")),
+        "the flood was not held back by its own budget: {drops:#?}"
+    );
+    assert!(
+        !drops
+            .iter()
+            .any(|l| l.contains("held_load_unsigned") || l.contains("fs_protect")),
+        "a held load refused unsigned, or the ring lost: {drops:#?}"
     );
 
     let mut run = fx.enforce_run.take().expect("enforce run");
@@ -2301,10 +2558,7 @@ fn assert_decisive_record_after_flood(
     // the sampler's round, every 10 s
     std::thread::sleep(Duration::from_secs(12));
     let text = read_agent_log(log);
-    let drops: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("ring-buffer events DROPPED"))
-        .collect();
+    let drops = ring_drop_lines(&text);
     assert!(
         drops.iter().any(|l| l.contains("minor_denial_rate")),
         "the flood was not held back by its own budget: {drops:#?}"

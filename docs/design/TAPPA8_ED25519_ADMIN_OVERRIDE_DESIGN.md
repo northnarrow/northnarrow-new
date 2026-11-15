@@ -387,6 +387,9 @@ pub struct VersionedAdminMessage {
     above holds only while a format stays decodable. A change to a frame
     the tests pin raises the version (the ratchet
     `a_pinned_frame_changes_only_with_a_new_protocol_version`).
+  - *The review of #565 (lot 356, F2).* `PROTOCOL_VERSION` is 3 and the
+    decoder accepts 3..=3: the status reply grew by
+    `kernel_state_held_back`, which a version 2 reply lacks.
 
 ### 6.3 Signed-payload structure (NEW)
 

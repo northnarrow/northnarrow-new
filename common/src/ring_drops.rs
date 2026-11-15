@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 31;
+pub const RING_DROP_SLOTS: u32 = 32;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -103,6 +103,17 @@ pub mod ring_slot {
     /// record used, not missing, and is not counted; a record goes at its
     /// process's exit (`common::fork_record`).
     pub const FORK_RECORD_LOST: u32 = 30;
+    /// Lot 356 (pre-alpha F3-8): a trusted-installer window's load that the
+    /// content judge refuses outside one, refused because the `fs_protect`
+    /// ring had no room for its record (`wire::FS_OP_BPF_HELD_LOAD`, a sole
+    /// trace: no budget holds it back). Fail closed; the lost reservation
+    /// itself is counted in [`FS_PROTECT`], a security ring. Counted and
+    /// signed, not a loss: the load's descriptor was never handed out, and
+    /// (the review of #565, F1) its id stays held — a handle taken by id
+    /// before the refusal keeps the program, but its runs and attaches
+    /// outside a window are refused and signed, and the kernel-state round
+    /// signs it once after the window (`BPF_HELD_OUTLIVED`).
+    pub const HELD_LOAD_UNSIGNED: u32 = 31;
 }
 
 /// Human names, indexed by slot.
@@ -138,6 +149,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "denial_rate",
     "minor_denial_rate",
     "fork_record_lost",
+    "held_load_unsigned",
 ];
 
 #[cfg(test)]
@@ -192,7 +204,11 @@ mod tests {
             RING_DROP_NAMES[ring_slot::FORK_RECORD_LOST as usize],
             "fork_record_lost"
         );
-        assert_eq!(ring_slot::FORK_RECORD_LOST + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::HELD_LOAD_UNSIGNED as usize],
+            "held_load_unsigned"
+        );
+        assert_eq!(ring_slot::HELD_LOAD_UNSIGNED + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -232,6 +248,7 @@ mod tests {
             (ring_slot::DENIAL_RATE, "denial_rate"),
             (ring_slot::MINOR_DENIAL_RATE, "minor_denial_rate"),
             (ring_slot::FORK_RECORD_LOST, "fork_record_lost"),
+            (ring_slot::HELD_LOAD_UNSIGNED, "held_load_unsigned"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

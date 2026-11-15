@@ -285,7 +285,9 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
     let c = code("agent-ebpf/src/cgroup_files.rs");
     assert!(body(&c, "sign")
         .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),"));
-    // no other inode refusal writes the ring without a budget
+    // no other inode refusal writes the ring without a budget (lot 356:
+    // but the sole traces' writer, `emit_sole_trace` — a window's held load
+    // alone, which `kernel_halves.rs` keeps to `hold`)
     let mut callers: Vec<&str> = i
         .match_indices("emit_denial(")
         .map(|(at, _)| {
@@ -297,8 +299,13 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
     callers.dedup();
     assert_eq!(
         callers,
-        ["fn emit_attempt", "fn emit_denial", "fn emit_limited"],
-        "emit_denial called from outside the two budgets"
+        [
+            "fn emit_attempt",
+            "fn emit_denial",
+            "fn emit_limited",
+            "fn emit_sole_trace"
+        ],
+        "emit_denial called from outside the two budgets and the sole traces' writer"
     );
 }
 

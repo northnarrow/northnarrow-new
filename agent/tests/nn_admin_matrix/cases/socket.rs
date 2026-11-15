@@ -358,6 +358,8 @@ pub fn full_status() -> StatusResponse {
     // lot 313 (the review of #549, F1): the exec pump's content check
     v["program_copy_compared_total"] = json!(3);
     v["program_copy_skipped_total"] = json!(1);
+    // the review of #565 (F2): the kernel-state round's quota held some back
+    v["kernel_state_held_back"] = json!([["bpf_unseen", 12000], ["bpf_baseline", 3]]);
     serde_json::from_value(v).unwrap()
 }
 

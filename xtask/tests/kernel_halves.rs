@@ -133,7 +133,7 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     // the unbudgeted writer is the module's own: the compiler keeps every
     // other module out of it
     assert!(
-        i.contains("\nfn emit_denial(operation: u8, key: InodeKey) {"),
+        i.contains("\nfn emit_denial(operation: u8, key: InodeKey) -> bool {"),
         "emit_denial is visible outside inode_protect"
     );
     // the BPF guard's refusals: behind the attempt budget
@@ -241,6 +241,487 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     let sec = &r[r.find("pub const SECURITY_RINGS").unwrap()..];
     let sec = &sec[..sec.find("];").unwrap()];
     assert!(!sec.contains("MINOR_DENIAL_RATE"), "{sec}");
+}
+
+/// `code` without its `use` statements (an import names a constant
+/// without using it).
+fn without_uses(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(at) = ["\nuse ", "\npub use ", "\npub(crate) use "]
+        .iter()
+        .filter_map(|u| rest.find(u))
+        .min()
+    {
+        out.push_str(&rest[..at + 1]);
+        rest = &rest[at + 1..];
+        rest = &rest[rest.find(';').map_or(rest.len(), |p| p + 1)..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Lot 356 (pre-alpha F3-8): a trusted-installer window's held load was a
+/// "minor" record: 50 refused uses of a held program on a CPU spent the
+/// budget it shared with them, and the next window load's record there that
+/// second was a count (`minor_denial_rate`) naming no program. The sole
+/// traces (`wire::is_sole_trace`) spend no budget: in the kernel the held
+/// load is written by `hold` alone, through the unbudgeted writer
+/// `emit_sole_trace`, and a load whose record the ring cannot take is
+/// refused (counted; the review of #565, F1: its id stays held). No other
+/// function of the eBPF programs names a sole trace's operation, and no
+/// other calls that writer.
+#[test]
+fn a_held_load_is_signed_through_no_budget_or_refused() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let (mut named, mut writers) = (Vec::new(), Vec::new());
+    for f in &files {
+        let c = without_uses(&code(&f.strip_prefix(&root).unwrap().display().to_string()));
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
+        for op in [
+            "FS_OP_BPF_HELD_LOAD",
+            "FS_OP_KERNEL_TAINT",
+            "FS_OP_SYSCTL_ROOT_PROG",
+            "FS_OP_BPF_UNSEEN",
+            "FS_OP_BPF_BASELINE",
+            "FS_OP_CPU_CONFINED",
+        ] {
+            named.extend(
+                callers(&c, op)
+                    .into_iter()
+                    .map(|f| format!("{rel}: {f} {op}")),
+            );
+        }
+        writers.extend(
+            callers(&c, "emit_sole_trace(")
+                .into_iter()
+                .map(|f| format!("{rel}: {f}")),
+        );
+    }
+    named.sort();
+    writers.sort();
+    assert_eq!(
+        named,
+        ["agent-ebpf/src/bpf_defense.rs: fn hold FS_OP_BPF_HELD_LOAD"],
+        "a sole trace's operation named outside `hold`"
+    );
+    assert_eq!(
+        writers,
+        [
+            "agent-ebpf/src/bpf_defense.rs: fn hold",
+            "agent-ebpf/src/inode_protect.rs: fn emit_sole_trace",
+        ],
+        "the unbudgeted writer called outside `hold`"
+    );
+    let b = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&b, "hold"),
+        &[
+            "if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {",
+            "emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_FULL, verdict, id);",
+            "return false;",
+            "let signed = crate::inode_protect::emit_sole_trace(",
+            "FS_OP_BPF_HELD_LOAD,",
+            "dev: bpf_held_dev(0, verdict),",
+            "ino: id as u64,",
+            "if !signed {",
+            "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::HELD_LOAD_UNSIGNED);",
+            "return false;",
+            "true",
+        ],
+    )
+    .unwrap();
+    // the refused uses keep the minor budget (a caller repeats them at will)
+    in_order(
+        body(&b, "emit_held"),
+        &["crate::inode_protect::emit_attempt(", "operation,"],
+    )
+    .unwrap();
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    let w = body(&i, "emit_sole_trace");
+    assert!(w.contains("emit_denial(operation, key)"), "{w}");
+    for budget in ["budget", "RATE", "caller_is_self_test", "SEEN"] {
+        assert!(!w.contains(budget), "emit_sole_trace spends {budget}: {w}");
+    }
+    assert!(i.contains("pub(crate) fn emit_sole_trace(operation: u8, key: InodeKey) -> bool {"));
+    // the wire: the sole traces are not minor
+    let wire = code("common/src/wire/mod.rs");
+    let minor = body(&wire, "is_minor_denial");
+    let sole = body(&wire, "is_sole_trace");
+    for op in [
+        "FS_OP_BPF_HELD_LOAD",
+        "FS_OP_KERNEL_TAINT",
+        "FS_OP_SYSCTL_ROOT_PROG",
+        "FS_OP_BPF_UNSEEN",
+        "FS_OP_BPF_BASELINE",
+        "FS_OP_CPU_CONFINED",
+    ] {
+        assert!(!minor.contains(op), "{op} still minor:\n{minor}");
+        assert!(sole.contains(op), "{op} not a sole trace:\n{sole}");
+    }
+}
+
+/// The review of #565 (F1): a window's held load whose record the ring had
+/// no room for was refused AND its id removed from the held set. The kernel
+/// gives a program its id before the `bpf_prog` hook runs, so a handle taken
+/// by id in between kept the refused program alive, un-held: after the
+/// window its runs and attaches were let through, and no `BPF_HELD_OUTLIVED`
+/// named it (the round walks the held ids only). Now the id stays held: no
+/// eBPF program removes a held id — the kernel-state round alone releases
+/// the ids no longer loaded (`stale_held`).
+#[test]
+fn a_held_load_refused_for_want_of_room_keeps_its_id_held() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let mut removers = Vec::new();
+    for f in &files {
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
+        let c = code(&rel);
+        for needle in ["PROG_CONTENT_HELD.remove", "PROG_CONTENT_HELD .remove"] {
+            removers.extend(
+                callers(&c, needle)
+                    .into_iter()
+                    .map(|f| format!("{rel}: {f}")),
+            );
+        }
+    }
+    assert!(
+        removers.is_empty(),
+        "an eBPF program removes a held id: {removers:?}"
+    );
+    let b = code("agent-ebpf/src/bpf_defense.rs");
+    let h = body(&b, "hold");
+    let refused = &h[h
+        .find("if !signed {")
+        .expect("the record not written: refused")..];
+    let open = refused.find('{').unwrap();
+    let refused = &refused[..open + support::matching_brace(&refused[open..])];
+    in_order(
+        refused,
+        &[
+            "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::HELD_LOAD_UNSIGNED);",
+            "return false;",
+        ],
+    )
+    .unwrap();
+    assert!(!refused.contains("PROG_CONTENT_HELD"), "{refused}");
+    // the userland round still releases what is no longer loaded
+    let x = code("crates/nn-linux/src/bpf_crossview.rs");
+    in_order(
+        body(&x, "round"),
+        &[
+            "let gone = stale_held(&ids, &en.progs);",
+            "self.parts.release_held(&gone);",
+        ],
+    )
+    .unwrap();
+}
+
+/// The review of #565 (F2): the kernel-state round sends its findings
+/// only through its quota — the findings held back counted for `nn-admin
+/// status`, marked `suppressed` for the cross-view's status file, which is
+/// written after the quota — and the cross-view no longer writes the status
+/// itself nor logs each finding before the quota. Its re-check (R2): the
+/// quota is the one across rounds (what it held back carried into the
+/// next), a carried finding is counted once, and the ones it names are no
+/// longer `suppressed`; (R1) the cross-view marks a held program's findings
+/// before the quota.
+#[test]
+fn the_kernel_state_round_signs_through_its_quota() {
+    let k = code("crates/nn-linux/src/kernel_state.rs");
+    let spawn = body(&k, "spawn");
+    in_order(
+        spawn,
+        &[
+            "let mut quota = Quota::default();",
+            "loop {",
+            "let w = quota.apply(found, ROUND_QUOTA);",
+            "log_round(&w.signed, &w.held);",
+            "count_held_back(&w.held[w.again..]);",
+            "c.quota_round(objects(&w.signed), objects(&w.held));",
+            "c.write_status();",
+            "for f in w.signed {",
+            "tx.send(event_of(&f, monotonic_ns()))",
+        ],
+    )
+    .unwrap();
+    assert_eq!(spawn.matches("tx.send(").count(), 1, "{spawn}");
+    assert_eq!(spawn.matches("within_quota(").count(), 0, "{spawn}");
+    let x = code("crates/nn-linux/src/bpf_crossview.rs");
+    in_order(
+        body(&x, "round"),
+        &[
+            "found.extend(outlived(",
+            "mark_held(&mut found, &held);",
+            "self.watch.last = Some(foreign);",
+            "Ok(found)",
+        ],
+    )
+    .unwrap();
+    let cr = body(&k, "crossview_round");
+    assert!(!cr.contains("warn!(finding"), "{cr}");
+    let round = body(&x, "round");
+    assert!(!round.contains("render_status"), "{round}");
+    assert!(
+        round.contains("self.watch.last = Some(foreign);"),
+        "{round}"
+    );
+    // the status reply carries the counts
+    let st = code("agent/src/admin/handlers/status.rs");
+    assert!(
+        st.contains("kernel_state_held_back: Some(nn_linux::kernel_state::held_back_counts()),")
+    );
+}
+
+/// The names a `use` statement of `code` renames (`as`) that the ratchets
+/// look for by name: an `FS_OP_*` constant, the denial ring, a writer of it
+/// (the mini-hunt of #565, F3: an alias of `emit_sole_trace` or of the
+/// ring hid a writer from the checks the same way).
+fn renamed_ops(code: &str) -> Vec<String> {
+    const WATCHED: [&str; 8] = [
+        "FS_PROTECT_EVENTS",
+        "emit_sole_trace",
+        "emit_denial",
+        "emit_denial_kind",
+        "emit_attempt",
+        "emit_limited",
+        "emit_task_denial",
+        "emit_held",
+    ];
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("use ") {
+        let line_start = code[..at].rfind('\n').map_or(0, |p| p + 1);
+        let lead = code[line_start..at].trim();
+        if !(lead.is_empty() || lead == "pub" || lead.starts_with("pub(")) {
+            continue;
+        }
+        let end = code[at..].find(';').map_or(code.len(), |p| at + p);
+        let flat = code[at..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (i, _) in flat.match_indices(" as ") {
+            let name = flat[..i]
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("");
+            if name.starts_with("FS_OP_") || WATCHED.contains(&name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The top-level arguments of the call whose `(` is at `open` in `code`.
+fn call_args(code: &str, open: usize) -> Vec<String> {
+    let (mut depth, mut args, mut cur) = (0i32, Vec::new(), String::new());
+    for c in code[open + 1..].chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                args.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        args.push(cur.trim().to_string());
+    }
+    args
+}
+
+/// The parameter names of `fn name` in `code`, if it defines one.
+fn params(code: &str, name: &str) -> Option<Vec<String>> {
+    let at = code.find(&format!("fn {name}("))?;
+    let open = at + 3 + name.len();
+    Some(
+        call_args(code, open)
+            .iter()
+            .map(|p| p.split(':').next().unwrap_or("").trim().to_string())
+            .collect(),
+    )
+}
+
+/// Each call of `callee` in `code` (not its definition, not a method of
+/// another type): the function it is in and its arguments.
+fn calls(code: &str, callee: &str) -> Vec<(String, Vec<String>)> {
+    let needle = format!("{callee}(");
+    code.match_indices(&needle)
+        .filter(|(at, _)| {
+            let before = &code[..*at];
+            !before.ends_with("fn ")
+                && !before.ends_with('.')
+                && !before.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .map(|(at, _)| {
+            let start = code[..at].rfind("fn ").unwrap_or(0);
+            let name_end = code[start..]
+                .find(['(', '<'])
+                .map_or(code.len(), |p| start + p);
+            (
+                code[start + 3..name_end].trim().to_string(),
+                call_args(code, at + needle.len() - 1),
+            )
+        })
+        .collect()
+}
+
+/// The review of #565 (F3, its probe): the ratchet above was blind to an
+/// alias — `use northnarrow_common::wire::FS_OP_BPF_HELD_LOAD as HELD_OP;`
+/// then `emit_held(HELD_OP, …)` wrote a held load through the minor budget
+/// again (`without_uses` strips the renaming `use`; a bare `46` passed too).
+/// Now no `use` of the eBPF programs renames an `FS_OP_*` constant, no
+/// constant of theirs is one, and the operation every budgeted writer is
+/// called with is a named `FS_OP_*` that is not a sole trace, a local that
+/// is no literal, or a parameter of the calling function — whose own
+/// callers are then held to the same rule at that parameter (to the
+/// fixpoint).
+#[test]
+fn no_alias_or_literal_carries_a_sole_trace_into_a_budget() {
+    const SOLE: [&str; 7] = [
+        "FS_OP_BPF_HELD_LOAD",
+        "FS_OP_KERNEL_TAINT",
+        "FS_OP_SYSCTL_ROOT_PROG",
+        "FS_OP_BPF_UNSEEN",
+        "FS_OP_BPF_BASELINE",
+        "FS_OP_CPU_CONFINED",
+        "FS_OP_SOLE_TRACE_SUMMARY",
+    ];
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|f| {
+            let rel = f.strip_prefix(&root).unwrap().display().to_string();
+            let c = code(&rel);
+            (rel, c)
+        })
+        .collect();
+    let mut bad = Vec::new();
+    for (rel, c) in &sources {
+        for name in renamed_ops(c) {
+            bad.push(format!("{rel}: `use … {name} as …`"));
+        }
+        // a constant of the eBPF programs that is an operation code
+        for (at, _) in c.match_indices("= FS_OP_") {
+            let line_start = c[..at].rfind('\n').map_or(0, |p| p + 1);
+            let line = c[line_start..at].trim_start();
+            if line.starts_with("const ") || line.starts_with("static ") || line.contains(" const ")
+            {
+                bad.push(format!(
+                    "{rel}: {}",
+                    c[line_start..].lines().next().unwrap_or("")
+                ));
+            }
+        }
+    }
+    // the budgeted writers (the file defining each, its name, the index of
+    // its operation), and every function passing a parameter to one there
+    let ip = "agent-ebpf/src/inode_protect.rs".to_string();
+    let bd = "agent-ebpf/src/bpf_defense.rs".to_string();
+    let mut writers: Vec<(String, String, usize)> = vec![
+        (ip.clone(), "emit_attempt".into(), 0),
+        (ip.clone(), "emit_limited".into(), 0),
+        (ip.clone(), "emit_task_denial".into(), 0),
+        (ip.clone(), "emit_denial".into(), 0),
+        (bd.clone(), "emit_held".into(), 0),
+        (bd.clone(), "emit_denial_kind".into(), 0),
+        (bd.clone(), "emit_denial".into(), 0),
+    ];
+    let mut i = 0;
+    while i < writers.len() {
+        let (def, w, idx) = writers[i].clone();
+        for (rel, c) in &sources {
+            // a file with a function of that name of its own calls its own
+            if *rel != def && params(c, &w).is_some() {
+                continue;
+            }
+            for (caller, args) in calls(c, &w) {
+                let arg = args.get(idx).cloned().unwrap_or_default();
+                let last = arg.rsplit("::").next().unwrap_or("");
+                if last.starts_with("FS_OP_")
+                    && last
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                {
+                    if SOLE.contains(&last) {
+                        bad.push(format!("{rel}: {caller} → {w}({arg}): a sole trace"));
+                    }
+                    continue;
+                }
+                if arg.is_empty() || !arg.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    bad.push(format!(
+                        "{rel}: {caller} → {w}({arg}): not a named operation"
+                    ));
+                    continue;
+                }
+                match params(c, &caller).and_then(|p| p.iter().position(|p| *p == arg)) {
+                    // a parameter passed through: its callers are checked
+                    // (the unbudgeted writer is the test above's)
+                    Some(j) if caller != "emit_sole_trace" => {
+                        let key = (rel.clone(), caller.clone(), j);
+                        if !writers.contains(&key) {
+                            writers.push(key);
+                        }
+                    }
+                    Some(_) => {}
+                    // a local: never a literal
+                    None => {
+                        let body = body(c, &caller);
+                        for bind in [format!("let {arg} = "), format!("let {arg}: u8 = ")] {
+                            if let Some(p) = body.find(&bind) {
+                                let rhs = body[p + bind.len()..].trim_start();
+                                if rhs.starts_with(|c: char| c.is_ascii_digit()) {
+                                    bad.push(format!(
+                                        "{rel}: {caller} → {w}({arg}): a literal operation"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    assert!(
+        writers.len() > 7,
+        "no pass-through writer found: {writers:?}"
+    );
+    // the probe of #565, and a bare number, as text: caught
+    let probe = "use northnarrow_common::wire::FS_OP_BPF_HELD_LOAD as HELD_OP;\nfn f() {}\n";
+    assert_eq!(renamed_ops(probe), ["FS_OP_BPF_HELD_LOAD"]);
+    let probe = "    use northnarrow_common::wire::{\n    FS_OP_A, FS_OP_BPF_UNSEEN\n as U};\n";
+    assert_eq!(renamed_ops(probe), ["FS_OP_BPF_UNSEEN"]);
+    let probe = "use crate::inode_protect::{emit_sole_trace as w, FS_PROTECT_EVENTS as R};\n";
+    assert_eq!(renamed_ops(probe), ["emit_sole_trace", "FS_PROTECT_EVENTS"]);
+    assert!(renamed_ops("use northnarrow_common::fail_open::hook as fail_open_hook;\n").is_empty());
+    let probe = "fn nn_held_use(fd: u64, how: u64) -> u64 {\n    emit_held(HELD_OP, how as u32, verdict, id);\n    emit_held(46, 0, 0, id);\n}\n";
+    let got = calls(probe, "emit_held");
+    assert_eq!(got.len(), 2);
+    assert_eq!(
+        (got[0].0.as_str(), got[0].1[0].as_str()),
+        ("nn_held_use", "HELD_OP")
+    );
+    assert_eq!(got[1].1[0], "46");
+    assert_eq!(
+        params(
+            "unsafe fn refuse(task: *const c_void, op: u8, d: u64) -> bool {}",
+            "refuse"
+        ),
+        Some(vec!["task".to_string(), "op".to_string(), "d".to_string()])
+    );
 }
 
 /// External bug hunt BUG101 (the kernel half; the record's is lot 315's):
@@ -684,5 +1165,53 @@ fn a_memfd_is_sealed_at_the_exec_by_the_kernel_alone() {
                 .any(|u| u.starts_with(user) && u.contains(".has(MEMFD_SEALED)")),
             "{user} no longer asks for the seals at the exec"
         );
+    }
+}
+
+/// The re-check of #565: the review's F4 gave the ring-drop sampler's
+/// budget and refused-load counters their own wording (records HELD BACK,
+/// loads REFUSED), and the five privileged e2e tests that took the
+/// sampler's lines by the loss message ("ring-buffer events DROPPED")
+/// found none of them — red in the guests only. A test takes those lines
+/// by the field the sampler logs on every one (`ring_drop_lines`:
+/// `dropped_since_last_sample=`), never by one of `drop_warning`'s
+/// messages.
+#[test]
+fn the_e2e_tests_take_the_ring_drop_lines_by_their_field() {
+    let rd = code("crates/nn-linux/src/sensors/ring_drops.rs");
+    in_order(
+        body(&rd, "install"),
+        &[
+            "ring = RING_DROP_NAMES[i],",
+            "dropped_since_last_sample = n - p,",
+            "drop_warning(i)",
+        ],
+    )
+    .unwrap();
+    let e2e = code("agent/tests/privileged_e2e.rs");
+    assert!(
+        body(&e2e, "ring_drop_lines").contains(".contains(\"dropped_since_last_sample=\")"),
+        "the helper takes the sampler's field"
+    );
+    assert!(e2e.matches("ring_drop_lines(&text)").count() >= 4);
+    let mut files = Vec::new();
+    for dir in ["agent/tests", "tests"] {
+        support::rs_files(&repo_root().join(dir), &mut files);
+    }
+    assert!(!files.is_empty());
+    for f in files {
+        let src = strip_comments(&fs::read_to_string(&f).unwrap());
+        for message in [
+            "events DROPPED",
+            "HELD BACK before the ring",
+            "loads REFUSED —",
+        ] {
+            assert!(
+                !src.contains(message),
+                "{}: takes the ring-drop lines by a message of drop_warning ({message:?}); \
+                 use their field, as ring_drop_lines does",
+                f.display()
+            );
+        }
     }
 }

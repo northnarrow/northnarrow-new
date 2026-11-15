@@ -41,7 +41,7 @@ colour.
 
 | Command | What it does | Key |
 |---|---|---|
-| `nn-admin status` | the posture, the network isolation, the last admin action, the COMBAT stage; with `--key` also the telemetry (lost events, the response mode: `OBSERVE-ONLY` under the `alpha` profile) | none, or `audit-read` / `telemetry-read` |
+| `nn-admin status` | the posture, the network isolation, the last admin action, the COMBAT stage; with `--key` also the telemetry (lost events, the response mode: `OBSERVE-ONLY` under the `alpha` profile; the review of #565: the kernel-state round's findings past its quota, `kernel-state quota`, JSON `kernel_state_held_back`) | none, or `audit-read` / `telemetry-read` |
 | `nn-admin capabilities` | this boot's signed capability manifest: kernel, BTF, deny hooks and their self-test, each sensor's attach point, the degradations, the trust level | `audit-read` or `telemetry-read` |
 | `nn-admin host-check` | the host's hardening: lockdown, module signing, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, the install's verification level. Reads `/sys` and `/proc` only | none |
 | `nn-admin verify-keys` | parse `admin.pub`, print each key's fingerprint and roles | none |
