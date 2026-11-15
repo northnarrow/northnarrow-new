@@ -1533,7 +1533,10 @@ async fn run_round(
     if let Some(raw) = deny_run.as_ref().and_then(DenyRun::write_fd) {
         hand_over_write_fd(&mut cmd, raw);
     }
-    let mut child = match cmd.spawn() {
+    // Lot 353 (re-check 2 of #563, R2-4): the spawn off the runtime's
+    // worker — its exec resolves the image by path, and a mount over the
+    // image's directory that does not answer held the worker until it did
+    let mut child = match crate::runtime::off_the_runtime(|| cmd.spawn()) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, exe = %exe.display(), "telemetry probe: cannot spawn the probe child — round skipped");
@@ -1541,7 +1544,9 @@ async fn run_round(
             if let Some(d) = deny_run {
                 d.finish().await;
             }
-            let _ = std::fs::remove_file(&file);
+            crate::runtime::off_the_runtime(|| {
+                let _ = std::fs::remove_file(&file);
+            });
             return;
         }
     };

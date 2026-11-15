@@ -934,14 +934,23 @@ pub fn write<P: AsRef<Path>>(path: P, contents: impl AsRef<[u8]>) -> io::Result<
 /// `std::fs::create_dir` of `path` (a cgroup), its parent opened beneath
 /// its view when it is under one (`mkdirat`).
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    create_dir_mode(path, 0o777)
+}
+
+/// Lot 353 (re-check 2 of #563): [`create_dir`] with `mode` (less the
+/// umask) — a private directory made private at once (the CoW journal's).
+pub fn create_dir_mode<P: AsRef<Path>>(path: P, mode: u32) -> io::Result<()> {
     let path = path.as_ref();
     at_parent(path, |dir, name| {
         // SAFETY: the fd is live, `name` NUL-terminated.
-        (unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o777) } == 0)
+        (unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) } == 0)
             .then_some(())
             .ok_or_else(io::Error::last_os_error)
     })
-    .unwrap_or_else(|| std::fs::create_dir(path))
+    .unwrap_or_else(|| {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(mode).create(path)
+    })
 }
 
 /// `std::fs::create_dir_all` of `path` (a cgroup and its parents), each
@@ -975,6 +984,99 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
             .ok_or_else(io::Error::last_os_error)
     })
     .unwrap_or_else(|| std::fs::remove_dir(path))
+}
+
+/// Lot 353 (re-check 2 of #563): `std::fs::remove_file` of `path`, its
+/// parent opened beneath its view (the host's view `/proc/1/root/…`: the
+/// CoW journal's files).
+pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    let path = path.as_ref();
+    at_parent(path, |dir, name| {
+        // SAFETY: the fd is live, `name` NUL-terminated.
+        (unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0)
+            .then_some(())
+            .ok_or_else(io::Error::last_os_error)
+    })
+    .unwrap_or_else(|| std::fs::remove_file(path))
+}
+
+/// Lot 353 (re-check 2 of #563): `std::fs::rename` of `from` to `to`,
+/// each parent opened beneath its view. Both under a view, or both under
+/// none.
+pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    let parted = |p: &Path| -> Option<io::Result<(File, CString)>> {
+        let (parent, name) = (p.parent()?, p.file_name()?);
+        view_of(parent)?;
+        Some(
+            CString::new(name.as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+                .and_then(|n| Ok((open(parent, libc::O_RDONLY | libc::O_DIRECTORY)?, n))),
+        )
+    };
+    match (parted(from), parted(to)) {
+        (Some(a), Some(b)) => {
+            let ((fd, fname), (td, tname)) = (a?, b?);
+            // SAFETY: live fds, NUL-terminated names.
+            let rc = unsafe {
+                libc::renameat(
+                    fd.as_raw_fd(),
+                    fname.as_ptr(),
+                    td.as_raw_fd(),
+                    tname.as_ptr(),
+                )
+            };
+            (rc == 0).then_some(()).ok_or_else(io::Error::last_os_error)
+        }
+        (None, None) => std::fs::rename(from, to),
+        _ => Err(io::Error::from_raw_os_error(libc::EXDEV)),
+    }
+}
+
+/// Lot 353 (re-check 2 of #563): the file at `path` created (`O_CREAT`,
+/// with `flags` and `mode`) in its parent opened beneath its view — as
+/// [`open`], for a file the caller makes.
+pub fn create<P: AsRef<Path>>(path: P, flags: i32, mode: u32) -> io::Result<File> {
+    let path = path.as_ref();
+    let mut made = None;
+    let r = at_parent(path, |dir, name| {
+        // SAFETY: the fd is live, `name` NUL-terminated; the mode is read
+        // with O_CREAT.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                mode as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a new descriptor the kernel gave this call alone.
+        made = Some(unsafe { File::from_raw_fd(fd) });
+        Ok(())
+    });
+    match r {
+        Some(Ok(())) => made.ok_or_else(|| io::Error::from_raw_os_error(libc::EIO)),
+        Some(Err(e)) => Err(e),
+        None => {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut o = std::fs::OpenOptions::new();
+            o.custom_flags(flags | libc::O_NOFOLLOW)
+                .mode(mode)
+                .create(true);
+            match flags & libc::O_ACCMODE {
+                libc::O_WRONLY => o.write(true),
+                libc::O_RDWR => o.read(true).write(true),
+                _ => o.read(true),
+            };
+            if flags & libc::O_APPEND != 0 {
+                o.append(true);
+            }
+            o.open(path)
+        }
+    }
 }
 
 /// `op` on the parent directory of `path` opened beneath its view (no

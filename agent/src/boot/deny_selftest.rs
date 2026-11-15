@@ -233,8 +233,8 @@ fn take_expected_denial(expected: &Mutex<Vec<Expected>>, event: &Event) -> bool 
     true
 }
 
-/// Run the self-test with `exe` (the agent's own binary,
-/// `/proc/self/exe`) as the child. Blocking, at most [`CHILD_TIMEOUT`].
+/// Run the self-test with `exe` (the agent's own binary, the path
+/// `/proc/self/exe` names: `kernel_roots::current_exe`) as the child. Blocking, at most [`CHILD_TIMEOUT`].
 /// The outcome, and the denial it leaves for the event loop to take.
 pub fn run(exe: &Path) -> (SelfTestOutcome, ExpectedDenial) {
     let mut cmd = Command::new(exe);

@@ -62,6 +62,13 @@ impl DecisionHost for LinuxHost {
         crate::response::on_host_path(path, op)
     }
 
+    /// Lot 353 (re-check 2 of #563, R2-3): beneath the anchored `/proc`
+    /// root (the host's view `/proc/1/root/…`).
+    fn host_lstat(path: &Path) -> io::Result<(bool, std::time::SystemTime)> {
+        let m = antitamper_bpf::kernel_roots::symlink_metadata(path)?;
+        Ok((m.is_file(), m.modified()?))
+    }
+
     fn installer_grant(window: &TrustedInstallerOverride) -> Option<WindowGrant> {
         window.current_grant()
     }
@@ -213,7 +220,11 @@ impl ActorFacts for ProcFacts {
         if !crate::posture::lineage::in_system_tree(&path_s) {
             return None;
         }
-        let mut f = std::fs::File::open(&link).ok()?;
+        // Lot 353 (re-check 2 of #563, R2-2): the image opened through the
+        // magic link beneath the `/proc` root the start anchored — by path,
+        // a FUSE over `/proc` held the decision thread on this open (a rule
+        // with an `exe … sha256` exemption)
+        let mut f = antitamper_bpf::kernel_roots::open(&link, libc::O_RDONLY).ok()?;
         let m = f.metadata().ok()?;
         if !m.file_type().is_file() || !root_only(&m) {
             return None;

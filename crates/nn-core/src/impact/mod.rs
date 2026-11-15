@@ -169,6 +169,10 @@ pub struct RansomCounters {
     /// (the replays, the tests, a full slow-work queue).
     pub prepared: AtomicU64,
     pub inline: AtomicU64,
+    /// Lot 353 (re-check 2 of #563, R2-3): assessments made on the
+    /// decision thread without the I/O ([`RansomTracker::prepare_without_io`]):
+    /// the dispatcher of slow work was full or held.
+    pub unprepared: AtomicU64,
 }
 
 /// A snapshot of [`RansomCounters`].
@@ -180,6 +184,7 @@ pub struct RansomCounts {
     pub samplings: u64,
     pub prepared: u64,
     pub inline: u64,
+    pub unprepared: u64,
 }
 
 #[derive(Debug, Default)]
@@ -256,6 +261,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             samplings: self.counters.samplings.load(Ordering::Relaxed),
             prepared: self.counters.prepared.load(Ordering::Relaxed),
             inline: self.counters.inline.load(Ordering::Relaxed),
+            unprepared: self.counters.unprepared.load(Ordering::Relaxed),
         }
     }
 
@@ -306,7 +312,23 @@ impl<H: DecisionHost> RansomTracker<H> {
     pub fn prepare(&self, event: &Event) -> Option<Arc<Assessment>> {
         let (pid, ts, _) = Self::key_of(event)?;
         self.counters.prepared.fetch_add(1, Ordering::Relaxed);
-        Some(Arc::new(self.judge(event, pid, ts)))
+        Some(Arc::new(self.judge(event, pid, ts, true)))
+    }
+
+    /// Lot 353 (re-check 2 of #563, R2-3): the assessment of `event`
+    /// without its I/O — no file of the burst sampled, no package database
+    /// asked (the writer is not trusted by a package), no copy looked for
+    /// beside a deleted original: what the lineage and the actor's window
+    /// alone show. The decision thread's, for a burst the dispatcher of
+    /// slow work could not take or is held on (a FUSE that does not answer
+    /// on the burst's files, or on the package database): it judged those
+    /// with the I/O itself, and a mount that did not answer held the
+    /// decision. Not memoised ([`Self::prime`] does), counted
+    /// (`unprepared`).
+    pub fn prepare_without_io(&self, event: &Event) -> Option<Arc<Assessment>> {
+        let (pid, ts, _) = Self::key_of(event)?;
+        self.counters.unprepared.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(self.judge(event, pid, ts, false)))
     }
 
     /// R12c (lab PR 270): memoise the assessment [`Self::prepare`] made for
@@ -337,7 +359,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             return Some(Arc::clone(a));
         }
         self.counters.inline.fetch_add(1, Ordering::Relaxed);
-        let a = Arc::new(self.judge(event, pid, ts));
+        let a = Arc::new(self.judge(event, pid, ts, true));
         let mut st = self.state.lock();
         if st.memo.len() >= MEMO_CAP {
             st.memo.pop_front();
@@ -408,7 +430,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             .map(|(key, starter, program, _)| (key, starter, program))
     }
 
-    fn judge(&self, event: &Event, pid: u32, ts: u64) -> Assessment {
+    fn judge(&self, event: &Event, pid: u32, ts: u64, io: bool) -> Assessment {
         // R-F: the lineage as of the burst's own time
         let as_of = crate::posture::lineage::AsOf::judged(ts);
         let lineage = self.lineage.lineage_identities(pid, as_of);
@@ -417,7 +439,9 @@ impl<H: DecisionHost> RansomTracker<H> {
             trust::hop_facts(&self.lineage, pid, as_of, hops)
         });
         let package_tx = self.lineage.in_package_transaction(pid, as_of);
-        let owned = |p: &std::path::Path| self.owners.owned(p);
+        // lot 353 (re-check 2 of #563, R2-3): without the I/O no package
+        // is asked — the writer is not trusted by one
+        let owned = |p: &std::path::Path| if io { self.owners.owned(p) } else { None };
         // lot 313 (BUG-49's residue): the writer is an encryption tool asked
         // to encrypt — its outputs are ciphertext, whatever their header
         let encrypts_writer = self.lineage.runs_encryption(pid, as_of);
@@ -435,8 +459,9 @@ impl<H: DecisionHost> RansomTracker<H> {
             why: String::new(),
         };
         // lot 313 (F3): an unlink burst beside an encryption tool's outputs
-        let beside = self
-            .encryptor_beside(event, lineage.as_deref().unwrap_or_default(), ts)
+        let beside = io
+            .then(|| self.encryptor_beside(event, lineage.as_deref().unwrap_or_default(), ts))
+            .flatten()
             .filter(|(key, ..)| *key != pid);
         let hops = lineage.as_deref().unwrap_or_default();
         // the writer's own process (its forked copies: the topmost one), and
@@ -641,7 +666,7 @@ impl<H: DecisionHost> RansomTracker<H> {
         // counted. In a directory shared by everyone (`/tmp`) only the
         // copies of the uid the burst ran as count (lab PR 238).
         let mut copy_checked = false;
-        if let Some((deleted, new, uid)) = &copies_of {
+        if let Some((deleted, new, uid)) = copies_of.as_ref().filter(|_| io) {
             if let Some((copy, suffix)) = copy_beside::<H>(deleted, new) {
                 copy_checked = true;
                 self.counters.samplings.fetch_add(1, Ordering::Relaxed);
@@ -689,7 +714,7 @@ impl<H: DecisionHost> RansomTracker<H> {
             w.sampling_window = ts;
             w.samplings = 0;
         }
-        let may_sample = want_sample && w.samplings < SAMPLES_PER_WINDOW;
+        let may_sample = io && want_sample && w.samplings < SAMPLES_PER_WINDOW;
         if may_sample {
             w.samplings += 1;
         }
@@ -818,11 +843,15 @@ fn copy_beside<H: DecisionHost>(deleted: &str, new: &[String]) -> Option<(String
     let mut exts: Vec<&str> = new.iter().filter_map(|n| extension(n)).collect();
     exts.sort_unstable();
     exts.dedup();
+    // lot 353 (re-check 2 of #563, R2-3): through the host's anchored
+    // reads (`H::host_lstat`, `H::read_dir`), never `std::fs` by path on
+    // the host's view (`/proc/1/root/…`): a FUSE over `/proc` held the
+    // preparation, and with a full queue the decision thread
     let found = exts.into_iter().find(|ext| {
         H::on_host_path(std::path::Path::new(&format!("{dir}/{name}.{ext}")), |p| {
-            std::fs::symlink_metadata(p)
+            H::host_lstat(p)
         })
-        .is_ok_and(|m| m.is_file())
+        .is_ok_and(|(file, _)| file)
     });
     if let Some(ext) = found {
         return Some((format!("{dir}/{name}.{ext}"), ext.to_string()));
@@ -831,18 +860,16 @@ fn copy_beside<H: DecisionHost>(deleted: &str, new: &[String]) -> Option<(String
     let parent = if dir.is_empty() { "/" } else { dir };
     let newest = H::on_host_path(std::path::Path::new(parent), |p| {
         let mut best: Option<(std::time::SystemTime, String)> = None;
-        for e in std::fs::read_dir(p)?.take(entropy::COPY_SCAN_MAX).flatten() {
-            let leaf = e.file_name();
+        for leaf in H::read_dir(p)?.into_iter().take(entropy::COPY_SCAN_MAX) {
             let Some(suffix) = leaf.to_str().and_then(|l| l.strip_prefix(prefix.as_str())) else {
                 continue;
             };
-            if suffix.is_empty() || !e.file_type().is_ok_and(|t| t.is_file()) {
+            if suffix.is_empty() {
                 continue;
             }
-            let at = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
+            let Ok((true, at)) = H::host_lstat(&p.join(&leaf)) else {
+                continue;
+            };
             if best.as_ref().is_none_or(|(t, _)| at > *t) {
                 best = Some((at, suffix.to_string()));
             }

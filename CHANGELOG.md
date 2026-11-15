@@ -1023,6 +1023,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     view path (the re-check's four plants). Named: the watchdog's ping and
     hold by path, `/proc/1/root` by path in the file responses, the probe's
     exec by path, the systemd watch's blocking pool.
+  - Re-check 2 of #563 (§47.1): a census of every `/proc`, `/sys` and own
+    directory path by thread, and every by-path use on a critical thread
+    moved. **The decision thread** opens a rule exemption's
+    `/proc/<pid>/exe` beneath the anchored root and reads the account
+    database there, bounded (200 ms, once a second). **No ransomware burst
+    is judged with its I/O on the decision thread**: the sampler and the
+    copy check read the host's view beneath the anchored root; a full,
+    held (10 s) or stopped dispatcher of slow work leaves the burst judged
+    without its I/O (`unprepared`; degradation `ransomware_slow_work`).
+    **The admin socket's whole check** (look, clear, bind, mode) runs on a
+    helper, never in the serve loop; the start's bind is bounded. **The
+    watchdog's connect and records** run on helpers with deadlines. **No
+    exec walks a view**: workers by `execveat` of the image's descriptor
+    (R004's own launch `/dev/fd/<n>`), the deny self-test by the path
+    `/proc/self/exe` names; the probe's spawn off the runtime. The file
+    responses and the CoW journal through `kernel_roots`; one systemd
+    question in flight. The ratchet follows fields, execs, imported
+    helpers, closures handed a view, callables and transitive returns, and
+    fails on the re-check's plants; a harness test (`agent/tests/fuse_stall.rs`)
+    runs the critical loops under a FUSE that answers one lookup.
 - Lot 354 (pre-alpha Phase 9, part 1): the docs match the code, the
   operator's help, the protocol version.
   - **README figures checked by a test.** `xtask/tests/readme_figures.rs`

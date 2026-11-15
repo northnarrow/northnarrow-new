@@ -113,6 +113,13 @@ pub trait DecisionHost: PostureAgent + ContentHost {
     /// reached at all; when it can, its error is the answer.
     fn on_host_path<T>(path: &Path, op: impl Fn(&Path) -> io::Result<T>) -> io::Result<T>;
 
+    /// Lot 353 (re-check 2 of #563, R2-3): whether `path` (a path of
+    /// [`Self::on_host_path`]'s op) is a regular file, its final link not
+    /// followed, and its modification time — the agent reads it beneath the
+    /// `/proc` root its start anchored (`kernel_roots`), never by a path
+    /// walk of the `/proc` mounted now.
+    fn host_lstat(path: &Path) -> io::Result<(bool, std::time::SystemTime)>;
+
     /// Who opened the trusted-installer window and until when, while it is
     /// open (lab PR 225).
     fn installer_grant(window: &Self::InstallerWindow) -> Option<WindowGrant>;
@@ -229,6 +236,11 @@ mod testing {
 
         fn on_host_path<T>(path: &Path, op: impl Fn(&Path) -> io::Result<T>) -> io::Result<T> {
             op(path)
+        }
+
+        fn host_lstat(path: &Path) -> io::Result<(bool, std::time::SystemTime)> {
+            let m = std::fs::symlink_metadata(path)?;
+            Ok((m.is_file(), m.modified()?))
         }
 
         fn installer_grant(window: &TestWindow) -> Option<WindowGrant> {

@@ -335,7 +335,10 @@ fn decision_loop(
                             rx.decided();
                             continue;
                         }
-                        Err(e) => *e,
+                        // lot 353 (re-check 2 of #563, R2-3): not taken
+                        // (full, held, not running) — judged without its
+                        // I/O, never the sampler's on this thread
+                        Err(e) => p.slow.primed((*e, None)),
                     }
                 } else {
                     e

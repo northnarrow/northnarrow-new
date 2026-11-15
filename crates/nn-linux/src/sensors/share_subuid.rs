@@ -331,7 +331,8 @@ fn table_of(subuid: std::io::Result<String>, passwd: std::io::Result<String>) ->
 fn read(path: &str) -> std::io::Result<String> {
     crate::response::on_host_path(Path::new(path), |p| {
         let mut s = Vec::new();
-        std::fs::File::open(p)?
+        // lot 353 (re-check 2 of #563): beneath the anchored `/proc` root
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_NONBLOCK)?
             .take(READ_MAX + 1)
             .read_to_end(&mut s)?;
         within_read_max(s)

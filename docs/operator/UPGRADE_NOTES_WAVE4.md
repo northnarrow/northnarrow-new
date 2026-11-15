@@ -2961,9 +2961,16 @@ and the signed log showed a clean `agent_stop` `sigint`.
   function that builds and returns a view path, by its module path in the
   other files; a parameter another file's call hands a view literal or
   constant (`module::function(…)`). It fails on the four shapes the re-check
-  planted. It is lexical: a path that reaches a by-path call through a
-  struct field, a `Vec` filled by `push`, a function imported and called
-  bare, or a closure handed to a helper is not followed.
+  planted. Re-check 2 of #563: it also follows a struct field a function
+  sets to a view path (`Self { root: "/proc".into() }`, or a constructor's
+  parameter), an exec of a view path (`Command::new`, `execv*`), a helper
+  imported and called bare, the closure a function calls with a view path
+  (`on_host_path`'s op, and through a trait's impl that hands it on), a
+  callable returning one handed by name (`&host_view`), and a function
+  returning what a view-returning one returns; and it scans the functions
+  whose signature holds an array type (`[u8; 32]`), which it skipped. It is
+  lexical: a path that reaches a by-path call through a `Vec` filled by
+  `push` is not followed.
 
 Measured (the lab, debian13, 6.12, one vCPU: the agent's runtime with one
 worker): round r2b (this round's tree): `nproc` 1; a FUSE over `/proc` that
@@ -2978,11 +2985,7 @@ target's `/proc/<pid>/mem` (the probe's child, by path) failed under the
 FUSE and was signed as a `deny_selftest` degradation, as a step that cannot
 judge is.
 
-Not done here (recorded): a worker is still executed through
-`/proc/self/fd/<image>` (`execve`, on the worker supervisor's own thread —
-never a signed record's, never the runtime's; `execveat` would change the
-file name the exec sensor reports for the agent's own worker launch,
-R004); the flat chains' tail read after a failed write (`heal`) reads the
+Not done here (recorded): the flat chains' tail read after a failed write (`heal`) reads the
 file by its path (a mount over the directory meanwhile makes the next row's
 link a visible break, never a lost row); aya's loader reads the CPU count
 by path for a perf-event array at load (none in our object); a bind of a
@@ -2994,36 +2997,94 @@ stop; a rotation's lift of the state directory's `+i` opens the directory
 by its path (a FUSE over the agent's own directories is the watchdog's to
 abort).
 
-Not done here either (re-check 1 of #563, recorded):
-- **The watchdog reaches the agent and writes its records by path.** It
-  pings the agent (`connect` of `/run/northnarrow/admin.sock`) and appends
-  its hold records (`/run/northnarrow/watchdog.hold`) by path, on its
-  single-threaded runtime. A file system mounted over `/run/northnarrow`
-  that does not answer holds the watchdog itself — its pings, its wait for
-  the agent's death, its records — for as long as it stays: no abort covers
-  the watchdog's own process. One that answers receives the records the
-  watchdog writes there. With a bind over a signed log file as well (each
-  append there fails `EXDEV`), the agent's `signed_log` degradation and its
-  `signed_records_failed` stay in the agent's memory and are signed once a
-  chain takes rows again: a run that ends first (a reboot, which also
-  clears `/run`) loses them, and the `mount_over_protected` of the mount
-  over `/run/northnarrow` is not signed meanwhile. Root only.
-- **The responses that change a file on the host walk `/proc/1/root` by
-  path** (`on_host_path`, `host_path`: the quarantine, a file capability's
-  removal, an account's lock, the share's subuid check, the copy-on-write
-  journal, the entropy sampler). Under a FUSE over `/proc` that does not
-  answer, such a response waits for as long as the mount stays, on its own
-  thread (not the runtime's). The ratchet does not see it: the path is
-  handed to a closure.
-- **The telemetry probe's child and the deny self-test's target are
-  started by path** (`execve` of the agent's own image and of the target):
-  a mount over their directories that does not answer holds that round's
-  task until the exec resolves.
-- **The systemd watch's `spawn_blocking`** (every 2 s, with a deadline)
-  leaves one blocking thread held per tick under a file system over
-  `/run/systemd` that does not answer: the runtime's blocking pool is
-  bounded (512), so after some 17 minutes every `spawn_blocking` caller
-  (the heartbeat, the anchors, the bus loss recorder) waits.
+Re-check 2 of #563 (fix round 3) — what re-check 1 recorded, and what the
+second re-check found, systematically: a census of every `/proc`, `/sys`
+and own-directory path of the agent, the watchdog, nn-linux, nn-core and
+the start, by thread, and every by-path use on a thread whose stall stops
+the detection, the status or the signing moved off it or beneath the
+anchored roots:
+- **The decision thread never opens `/proc/<pid>/exe` by path**: a rule's
+  `exe … sha256` exemption opens the image beneath the anchored `/proc`
+  root (the magic link followed). The account database (`passwd`,
+  `login.defs`, the host's view) is read beneath it too, its stamps looked
+  at once a second on a helper with a 200 ms deadline: unanswered, the
+  table read last answers.
+- **No ransomware burst is judged with its I/O on the decision thread.**
+  The entropy sampler and the copy check read the host's view (`/proc/1/root`)
+  beneath the anchored `/proc` root; a burst the dispatcher of slow work
+  cannot take — its queue full, its thread held on one preparation past
+  10 s, or not running — and the bursts queued behind a held preparation
+  are judged on the decision thread **without** their I/O: no file sampled,
+  no package asked (the writer is not trusted by a package), counted
+  (`unprepared`). Until then, past 256 bursts the decision thread sampled
+  the files itself, and a mount that did not answer held it. While the
+  thread is held, the degradation `ransomware_slow_work` stands (in
+  `nn-admin status`, signed at the next flush), withdrawn when its
+  preparation answers.
+- **The admin socket's whole check runs off the serve loop**: the look at
+  its path and, for a socket taken away, the clear, the parent, the bind and
+  the mode run on a helper thread (one at a time); the serve loop starts a
+  check every 10 s and takes its answer when it comes, serving the listener
+  it has meanwhile. Only the look was bounded: a FUSE over
+  `/run/northnarrow` that answered it ("removed") and held the next lookup
+  of the same name held the serve loop and its worker — on one worker the
+  whole runtime. The start's bind is bounded the same way (5 s; past it the
+  serve loop does not start, an ERROR and a signed record).
+- **The watchdog reaches the agent and writes its records off its loop**:
+  the admin socket's connect on a helper thread within the ping's timeout,
+  its hold and shutdown-marker records on a helper within 2 s, one
+  unanswered step at most per path (the next fails at once, a ping
+  failure): a mount over `/run/northnarrow` that does not answer no longer
+  holds the watchdog, whose stuck recovery then aborts a FUSE covering the
+  agent's directories.
+- **No exec walks a view**: a worker is executed by its image's descriptor
+  (`execveat(fd, "", …, AT_EMPTY_PATH)` in the child, argv and environment
+  made before the fork; the exec sensor names it `/dev/fd/<n>`, which R004
+  knows as the core's own launch); the start's deny self-test and the move
+  guard's test execute the path `/proc/self/exe` names (read beneath the
+  anchored root). The telemetry probe's child is spawned off the runtime's
+  worker (its exec resolves the image by path).
+- **The responses that change a host file reach it beneath the anchored
+  `/proc` root** (the quarantine's opens and checks, a file capability's
+  removal through the opened file, the share's subuid read), and **the
+  copy-on-write journal** (its directories, index, objects and evidence:
+  the guard's fanotify thread, whose stall left the guarded scopes' opens
+  waiting) through `kernel_roots` or its own descriptors.
+- **The systemd watch asks one question at a time**: while one is held
+  (a mount over `/run/systemd` that does not answer the connect), the next
+  is `None` at once and starts no thread — it leaked one blocking thread per
+  question, and a full pool left every `off_the_runtime` waiting.
+- Measured by a test (`fuse_stall_tests`): in a user and mount namespace,
+  a FUSE over `/proc` and one over the admin socket's directory, each
+  answering the first lookup and holding the rest, the runtime on one
+  worker: the serve loop (STATUS through a second name of the socket, past
+  its check), the decision's process facts, the signed appends, the rule
+  refresh and the entropy sampler each keep going for 14 s.
+- Measured (the lab): debian13, 6.12 (our own guest under a lease, clean
+  before, purged and powered off after), a cold boot with ONE vCPU (the
+  agent's runtime on one worker), round r3b: a FUSE over `/proc` laid in PID
+  1's namespace for 180 s that answers the agent's first lookup (`ENOENT`)
+  and holds every later request of the agent (`EIO` to others). The agent
+  sent it no request at all (answered 0, held 0, 0 threads); `nn-admin
+  status` answered at each of 12 samples (15 s to 178 s), no watchdog ping
+  failed, the same pid (695), no restart; decisions flowed during the mount
+  — an encryptor's copy-then-delete of 60 documents (`NN-L-IMP-001`
+  Critical: the entropy sampler read the burst's files beneath the anchored
+  root) and a program dropped in `/dev/shm` and run (`R002` High); the
+  signed chains took rows (audit +14, heartbeat +7), no signing error;
+  `mount_over_protected` (High) signed during the mount and cleared after
+  it. As in r2b, the deny self-test's step that opens a target's
+  `/proc/<pid>/mem` from the probe's child (another process, by path) failed
+  under the FUSE and was signed as a `deny_selftest` degradation.
+
+Not done here (recorded, out of this census's paths: host files, neither a
+view nor the agent's own directories): the decision's `exe … sha256`
+exemption checks the image's path and its parents in the agent's mount
+namespace by path, and the lineage's `ran_host_file` reads a packaged
+program's file at its path (FIM-005/-019 with `logrotate` only): a FUSE over
+a system directory that does not answer holds the decision there. The
+watchdog's respawn reads the dead agent's pidfile by path, after its stuck
+recovery's abort of a covering FUSE.
 
 ## 48. The admin protocol's version, the help, the checksums' signature (lot 354)
 

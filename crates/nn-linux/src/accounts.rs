@@ -35,6 +35,8 @@ struct Table {
     key: Option<(Stamp, Stamp)>,
     uid_min: u32,
     shells: HashMap<u32, String>,
+    /// When the stamps were last looked at.
+    looked: Option<std::time::Instant>,
 }
 
 /// The table, one per process: the host's account database, read again
@@ -52,7 +54,12 @@ pub(crate) fn stamp(path: &str) -> Stamp {
 fn read(path: &str) -> String {
     crate::response::on_host_path(Path::new(path), |p| {
         let mut s = Vec::new();
-        std::fs::File::open(p)?.take(READ_MAX).read_to_end(&mut s)?;
+        // lot 353 (re-check 2 of #563): `/proc/1/root/etc/passwd` beneath
+        // the `/proc` root the start anchored — by path, a FUSE over `/proc`
+        // held the decision thread here (a changed account database)
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_NONBLOCK)?
+            .take(READ_MAX)
+            .read_to_end(&mut s)?;
         Ok(String::from_utf8_lossy(&s).into_owned())
     })
     .unwrap_or_default()
@@ -94,11 +101,40 @@ pub fn kind(uid: u32) -> AccountKind {
     if uid == 0 {
         return AccountKind::Root;
     }
-    let key = (stamp(LOGIN_DEFS), stamp(PASSWD));
-    let mut t = TABLE.get_or_init(Default::default).lock();
-    t.refresh(key, || read(LOGIN_DEFS), || read(PASSWD));
-    t.kind(uid)
+    let table = TABLE.get_or_init(Default::default);
+    let (current, due) = {
+        let t = table.lock();
+        (t.key, t.looked.is_none_or(|at| at.elapsed() >= LOOK_EVERY))
+    };
+    if due {
+        table.lock().looked = Some(std::time::Instant::now());
+        // Lot 353 (re-check 2 of #563): the stamps and the reads on a
+        // helper thread, waited for at most [`LOOK_DEADLINE`] — the decision
+        // thread asks, and the host's account files are reached by path in
+        // its mount namespace (`/proc/1/root/etc/…`): a file system laid
+        // over `/etc` that does not answer held the decision. Unanswered,
+        // the table read last stays (and the next look is at once refused
+        // while that one is held).
+        let looked = READER.run("the account database", move || {
+            let key = (stamp(LOGIN_DEFS), stamp(PASSWD));
+            (current != Some(key)).then(|| (key, read(LOGIN_DEFS), read(PASSWD)))
+        });
+        if let Ok(Some((key, login_defs, passwd))) = looked {
+            table.lock().refresh(key, || login_defs, || passwd);
+        }
+    }
+    table.lock().kind(uid)
 }
+
+/// Lot 353 (re-check 2 of #563): how often the account files' stamps are
+/// looked at (the table read last answers in between), and how long a look
+/// is waited for.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+const LOOK_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The bounded reader of the account files (one look unanswered at most).
+static READER: std::sync::LazyLock<crate::state_read::TimedReader> =
+    std::sync::LazyLock::new(|| crate::state_read::TimedReader::new(LOOK_DEADLINE, 1));
 
 impl Table {
     /// Read the files again when their stamps are not the ones read.

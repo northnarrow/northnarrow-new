@@ -98,11 +98,6 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "the agent's own descriptors listed (`/proc/self/fd`): read, no match",
     ),
     (
-        "agent/src/boot/attach.rs",
-        2,
-        "the agent's own image (`/proc/self/exe`): read, no match",
-    ),
-    (
         "crates/nn-linux/src/boot/checks.rs",
         2,
         "the agent's own image (`/proc/self/exe`): read, no match",

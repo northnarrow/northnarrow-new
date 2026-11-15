@@ -176,7 +176,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "agent/src/pipeline/mod.rs",
-        6,
+        // lot 353 (re-check 2 of #563, R2-5): 6 → 7, no new I/O — the
+        // question split in two (`systemd_state_with(…).await`, one in flight)
+        7,
         "the systemd watch's (a task): its question to systemd off the runtime's worker, awaited \
          with a bound; `pid1_is_systemd_shutdown` reads `/proc/1/comm` at a SIGTERM (the event \
          loop's task) — the decision reads the watch's snapshot",
@@ -216,7 +218,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
         // around the round's existing reads (the probe file's write, the
         // attach view, the deny self-test's plan), so a mount that does not
         // answer holds the round's thread, not a runtime worker
-        36,
+        // re-check 2 of #563 (R2-4): 36 → 38, no new I/O — two
+        // `off_the_runtime(` around the child's spawn and its error path's
+        // removal of the probe file
+        38,
         "the probe's own task (its marker files, sleeps, child processes; R13, lab PR 271: in \
          debug-trigger builds the lab's `debug-probe-blind` file, read once a round; lot 280c: \
          the attach checks' reads, the child's reap off the runtime; lot 302: the deny \
@@ -260,11 +265,16 @@ const KNOWN: &[(&str, usize, &str)] = &[
     // one reader of a `/proc` link, `posture/proc_link.rs`, does: no read)
     (
         "crates/nn-core/src/impact/mod.rs",
-        4,
+        // lot 353 (re-check 2 of #563, R2-3): 4 → 3, the copy check's
+        // `std::fs` reads of the host's view gone (`H::host_lstat`,
+        // `H::read_dir`); and the decision thread judges a burst it cannot
+        // hand over without its I/O (`prepare_without_io`)
+        3,
         "the ransomware tracker's sampler of a burst's files (entropy, copies) — R12c (lab PR \
          270): run by the dispatcher of slow work (`RansomTracker::prepare` on `nn-slow-work`); \
          the decision thread judges a burst once its assessment is prepared and primed, and \
-         judges one itself only when that queue is full (counted: `ransomware_inline`)",
+         judges one itself, without its I/O, only when that queue is full or held (counted: \
+         `unprepared`; lot 353)",
     ),
     (
         "crates/nn-core/src/impact/trust.rs",

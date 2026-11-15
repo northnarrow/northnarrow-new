@@ -424,6 +424,21 @@ const STATICS: &[Kept] = &[
          bounded once for it (STALLED_MAX); the tests make their own TimedReader",
     ),
     kept(
+        "agent/src/pipeline/mod.rs",
+        "IN_FLIGHT",
+        Process,
+        "lot 353 (re-check 2 of #563, R2-5): whether a question to systemd's private socket is \
+         unanswered — one systemd and one blocking pool per agent process; the test hands its \
+         own flag to `systemd_state_with`",
+    ),
+    kept(
+        "crates/nn-linux/src/accounts.rs",
+        "READER",
+        Process,
+        "lot 353 (re-check 2 of #563): the bounded reader of the host's account files (one look \
+         unanswered at a time), beside the process's one account table (`TABLE`)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/open_sensor.rs",
         "BUILD_READER",
         Process,
@@ -830,6 +845,15 @@ const STATICS: &[Kept] = &[
 /// The free functions the start calls that name a static of their module,
 /// and why each may: `module::function`.
 const START_CALLS: &[(&str, &str)] = &[
+    (
+        "degradation::note",
+        "lot 353 (re-check 2 of #563, R2-3): the dispatcher of slow work's hold, a degradation \
+         of this process's status (noted without I/O from the decision thread)",
+    ),
+    (
+        "degradation::withdraw",
+        "lot 353 (re-check 2 of #563, R2-3): that hold withdrawn once its preparation answers",
+    ),
     (
         "loop_progress::start",
         "fixes the event loop's heartbeat origin at the process's start",

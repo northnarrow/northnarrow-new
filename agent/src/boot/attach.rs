@@ -377,8 +377,20 @@ pub(crate) fn self_test(
     // LSMs, Ubuntu) refuse the start unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1;
     // an unmeasured test is signed and lowers the trust level to L1.
     boot.enter(BootPhase::SelfTest)?;
-    let (self_test, expected_denial) =
-        northnarrow_agent::boot::deny_selftest::run(std::path::Path::new("/proc/self/exe"));
+    // Lot 353 (re-check 2 of #563): the child executes the agent's image by
+    // the path `/proc/self/exe` names, read beneath the `/proc` root the
+    // start anchored — an exec of `/proc/self/exe` walked the `/proc`
+    // mounted now, and a FUSE over it held the start's self-test
+    let own_image = antitamper_bpf::kernel_roots::current_exe();
+    let (self_test, expected_denial) = match &own_image {
+        Ok(exe) => northnarrow_agent::boot::deny_selftest::run(exe),
+        Err(e) => (
+            northnarrow_agent::boot::deny_selftest::SelfTestOutcome::Inconclusive(format!(
+                "the agent's image cannot be named: {e}"
+            )),
+            northnarrow_agent::boot::deny_selftest::ExpectedDenial::default(),
+        ),
+    };
     let self_test_detail = northnarrow_agent::boot::deny_selftest::report(&self_test);
     if self_test == northnarrow_agent::boot::deny_selftest::SelfTestOutcome::NotDenied
         && !allow_degraded
@@ -402,17 +414,20 @@ pub(crate) fn self_test(
     // degraded (the guard is one optional deny set: the start goes on).
     if anti_tamper.move_guard_attached {
         let bpffs = std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT);
-        let outcome = match antitamper_bpf::cgroup_guard::cgroup2_root() {
-            Some(root) => {
+        let outcome = match (antitamper_bpf::cgroup_guard::cgroup2_root(), &own_image) {
+            (Some(root), Ok(exe)) => {
                 let (outcome, moved) = northnarrow_agent::boot::deny_selftest::run_move(
-                    std::path::Path::new("/proc/self/exe"),
+                    exe,
                     &root,
                     &northnarrow_agent::boot::deny_selftest::PinnedMoveRoles(bpffs),
                 );
                 expected_denial.also(&moved);
                 outcome
             }
-            None => northnarrow_agent::boot::deny_selftest::SelfTestOutcome::Inconclusive(
+            (_, Err(e)) => northnarrow_agent::boot::deny_selftest::SelfTestOutcome::Inconclusive(
+                format!("the agent's image cannot be named: {e}"),
+            ),
+            (None, Ok(_)) => northnarrow_agent::boot::deny_selftest::SelfTestOutcome::Inconclusive(
                 "no cgroup v2 hierarchy mounted".to_string(),
             ),
         };

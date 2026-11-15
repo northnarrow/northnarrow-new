@@ -1,6 +1,8 @@
 //! Starting a worker (R14a, plan §3.5): the agent's own binary, from the
-//! descriptor the core opened at boot ([`SelfImage`]: `/proc/self/fd/N`,
-//! never a path that could name another file by then), as `northnarrow-agent
+//! descriptor the core opened at boot ([`SelfImage`], executed by its
+//! descriptor — `execveat(fd, "", …, AT_EMPTY_PATH)`, lot 353: never a path
+//! that could name another file by then, nor one walked through the `/proc`
+//! mounted now), as `northnarrow-agent
 //! --worker <kind> --ipc-fd 3`, as the `northnarrow-worker` account.
 //!
 //! Between `fork` and `exec` the child does async-signal-safe system calls
@@ -9,7 +11,7 @@
 //! `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG` (after the uid change, which
 //! clears it) and a check that the core still lives, then every other
 //! descriptor close-on-exec (`close_range(4, ~0, CLOSE_RANGE_CLOEXEC)`: the
-//! image's descriptor is resolved by `execve` before the close happens).
+//! image's descriptor is resolved by `execveat` before the close happens).
 //! The environment is empty, the directory `/`, stdin and stdout
 //! `/dev/null`. Review of #480: stderr is a pipe the supervisor reads
 //! (F4: a worker writes no line of the agent's journal itself); before the
@@ -127,6 +129,61 @@ fn yield_first() -> io::Result<()> {
     Ok(())
 }
 
+/// Lot 353 (re-check 2 of #563): an exec of a descriptor, its argv and
+/// its empty environment made before the fork — the child's `execveat`
+/// allocates nothing.
+struct FdExec {
+    fd: libc::c_int,
+    _args: Vec<std::ffi::CString>,
+    argv: Vec<*const libc::c_char>,
+    envp: [*const libc::c_char; 1],
+}
+
+// SAFETY: the pointers are into `_args`, owned and never changed while the
+// value lives; the child reads them only.
+unsafe impl Send for FdExec {}
+// SAFETY: as above, read only.
+unsafe impl Sync for FdExec {}
+
+impl FdExec {
+    fn new(fd: libc::c_int, args: impl Iterator<Item = String>) -> io::Result<Self> {
+        let args: Vec<std::ffi::CString> = args
+            .map(|a| {
+                std::ffi::CString::new(a).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+            })
+            .collect::<io::Result<_>>()?;
+        let argv = args
+            .iter()
+            .map(|a| a.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Ok(Self {
+            fd,
+            _args: args,
+            argv,
+            envp: [std::ptr::null()],
+        })
+    }
+
+    /// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`: its error, when it
+    /// returns. Async-signal-safe, no allocation.
+    fn run(&self) -> io::Error {
+        // SAFETY: the descriptor is live in the child (close-on-exec only),
+        // the arrays are NUL-terminated and outlive the call.
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                self.fd,
+                c"".as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            );
+        }
+        io::Error::last_os_error()
+    }
+}
+
 /// Start a `kind` worker from `image` as `account`; `extra` arguments
 /// follow (the lab harness's).
 pub fn spawn(
@@ -147,7 +204,20 @@ pub fn spawn(
     let (uid, gid) = (account.uid, account.gid);
     // SAFETY: getpid has no preconditions.
     let core = unsafe { libc::getpid() };
-    let mut cmd = Command::new(image.exec_path());
+    // Lot 353 (re-check 2 of #563): the child executes the image's
+    // descriptor (`execveat(fd, "", …, AT_EMPTY_PATH)`, the last step of its
+    // `pre_exec`): no path is walked — `Command::new("/proc/self/fd/N")`
+    // walked the `/proc` mounted now in the child, and a FUSE over it held
+    // the exec and the supervisor waiting for it. The program named here is
+    // never executed by path; argv and the (empty) environment are made
+    // before the fork.
+    let exec = FdExec::new(
+        image.raw_fd(),
+        std::iter::once("northnarrow-agent".to_string())
+            .chain(worker_args(kind))
+            .chain(extra.iter().cloned()),
+    )?;
+    let mut cmd = Command::new("northnarrow-agent");
     cmd.arg0("northnarrow-agent")
         .args(worker_args(kind))
         .args(extra)
@@ -199,7 +269,8 @@ pub fn spawn(
                 libc::c_uint::MAX,
                 CLOSE_RANGE_CLOEXEC,
             );
-            Ok(())
+            // the image itself, by its descriptor (returns only on failure)
+            Err(exec.run())
         });
     }
     let child = cmd.spawn()?;

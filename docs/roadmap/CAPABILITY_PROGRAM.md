@@ -11338,6 +11338,35 @@ number in parentheses is a lab PR.
     `/proc/<pid>/mem` (the probe's child, by path) failed under the FUSE and
     was signed as a `deny_selftest` degradation, as a step that cannot judge
     is.
+  - Re-check 2 of #563: open — three by-path walks on critical threads
+    (the decision's `trusted_exe` open of `/proc/<pid>/exe`, the admin
+    socket's rebind in the serve loop after its bounded look, the entropy
+    sampler on `/proc/1/root` with an inline fallback onto the decision
+    thread), the probe's spawn on a worker, the systemd watch's leak; the
+    ratchet missed a field and an exec. Done, systematically: a census of
+    every view and own-directory path by thread (373 literal sites; 35
+    by-path uses, 23 on a critical thread, 28 fixed, 7 accepted with a
+    reason), each critical one moved beneath the anchored roots or onto a
+    bounded helper; the ratchet's field, exec, import, handed-closure,
+    callable and transitive-return rules (it lists 24 sites at 65bf765b);
+    the harness test of the critical loops under a FUSE answering one
+    lookup, the runtime on one worker.
+  - Lab of re-check 2: debian13 (6.12; our own guest under a lease, clean
+    before, purged and powered off after), a cold boot with ONE vCPU (the
+    agent's runtime on one worker), round r3b: a FUSE over `/proc` laid in PID
+    1's namespace for 180 s that answers the agent's first lookup (`ENOENT`)
+    and holds every later request of the agent (`EIO` to others). The agent
+    sent it no request at all (answered 0, held 0, 0 threads); `nn-admin
+    status` answered at each of 12 samples (15 s to 178 s), no watchdog ping
+    failed, the same pid (695), no restart; decisions flowed during the mount
+    — an encryptor's copy-then-delete of 60 documents (`NN-L-IMP-001`
+    Critical: the entropy sampler read the burst's files beneath the anchored
+    root) and a program dropped in `/dev/shm` and run (`R002` High); the
+    signed chains took rows (audit +14, heartbeat +7), no signing error;
+    `mount_over_protected` (High) signed during the mount and cleared after
+    it. As in r2b, the deny self-test's step that opens a target's
+    `/proc/<pid>/mem` from the probe's child (another process, by path) failed
+    under the FUSE and was signed as a `deny_selftest` degradation.
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

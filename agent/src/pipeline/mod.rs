@@ -46,12 +46,38 @@ impl HostStopping {
 /// a second). `None` when systemd does not answer within 1 s, or the socket
 /// is not served by PID 1. R12b: the snapshot is the answer kept (the
 /// process-wide cache of the event loop's own question is gone).
+///
+/// Lot 353 (re-check 2 of #563, R2-5): one question in flight at most. The
+/// connect walks `/run/systemd/private` by path: a mount there that does
+/// not answer held each question's blocking thread past its timeout, and a
+/// question every 2 s (and on `wanted`) leaked one thread each, until the
+/// blocking pool was full — then every `off_the_runtime` handed its core to
+/// a thread that never started. While one is held, the next is `None` at
+/// once, without a thread.
 pub(crate) async fn systemd_state() -> Option<String> {
-    let ask = tokio::task::spawn_blocking(|| {
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    systemd_state_with(&IN_FLIGHT, || {
         northnarrow_agent::systemd_state::system_state(
             std::path::Path::new(northnarrow_agent::systemd_state::PRIVATE_SOCKET),
             Duration::from_millis(800),
         )
+    })
+    .await
+}
+
+/// [`systemd_state`]'s question `ask`, one at a time per `in_flight`.
+async fn systemd_state_with(
+    in_flight: &'static std::sync::atomic::AtomicBool,
+    ask: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let ask = tokio::task::spawn_blocking(move || {
+        let answer = ask();
+        in_flight.store(false, Ordering::Release);
+        answer
     });
     match tokio::time::timeout(Duration::from_secs(1), ask).await {
         Ok(Ok(Ok(state))) => Some(state),
@@ -468,5 +494,41 @@ mod tests {
             "asked after the signal, fresh"
         );
         watch.abort();
+    }
+
+    /// Lot 353 (re-check 2 of #563, R2-5): while a question to systemd is
+    /// held (a mount over `/run/systemd` that does not answer the connect),
+    /// the next ones are `None` at once and start no thread — on main each
+    /// left one more blocking thread held, until the pool was full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn one_question_to_systemd_in_flight_at_most() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Arc::new(parking_lot::Mutex::new(gate));
+        for _ in 0..5 {
+            let g = std::sync::Arc::clone(&gate);
+            let got = systemd_state_with(&IN_FLIGHT, move || {
+                ASKED.fetch_add(1, Ordering::SeqCst);
+                let _ = g.lock().recv();
+                Ok("running".to_string())
+            })
+            .await;
+            assert_eq!(got, None, "held: no answer");
+        }
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            1,
+            "one question asked, four not"
+        );
+        release.send(()).unwrap();
+        let started = std::time::Instant::now();
+        while IN_FLIGHT.load(Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let got = systemd_state_with(&IN_FLIGHT, || Ok("degraded".to_string())).await;
+        assert_eq!(got.as_deref(), Some("degraded"), "answered again once free");
     }
 }

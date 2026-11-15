@@ -110,6 +110,27 @@ const PATH_CALLS: &[&str] = &[
     "libc::linkat(",
     "libc::utimensat(",
     "libc::name_to_handle_at(",
+    // lot 353 (re-check 2 of #563, plant M): an exec resolves its program
+    // by path — `Command::new("/proc/self/exe")` (the start's self-test),
+    // `Command::new("/proc/self/fd/N")` (a worker's image) walk the `/proc`
+    // mounted now, in the child, while the spawner waits for the exec
+    "Command::new(",
+    "libc::execv(",
+    "libc::execve(",
+    "libc::execvp(",
+    "libc::execveat(",
+    // and the by-path calls the responses use on the host's view
+    "libc::removexattr(",
+    "libc::lremovexattr(",
+    "libc::setxattr(",
+    "libc::lsetxattr(",
+    "libc::getxattr(",
+    "libc::lgetxattr(",
+    "libc::unlink(",
+    "libc::rmdir(",
+    "libc::mkdir(",
+    "libc::rename(",
+    "libc::truncate(",
 ];
 
 /// The `Path` methods that walk their receiver.
@@ -259,7 +280,14 @@ fn names_view_path(expr: &str, constants: &[String]) -> bool {
     names_a_view(expr)
         || expr.contains("c\"/proc")
         || expr.contains("c\"/sys")
-        || constants.iter().any(|c| has_word(expr, c))
+        || constants.iter().any(|c| {
+            // a method returning a view path (`.exec_path(`): its call
+            if c.starts_with('.') {
+                expr.contains(c.as_str())
+            } else {
+                has_word(expr, c)
+            }
+        })
         || VIEW_NAMES.iter().any(|n| has_word(expr, n))
 }
 
@@ -273,12 +301,30 @@ fn fn_bodies(code: &str) -> Vec<(usize, &str)> {
             continue;
         }
         let rest = &code[at..];
-        let (Some(brace), semi) = (rest.find('{'), rest.find(';')) else {
-            continue;
-        };
-        if semi.is_some_and(|s| s < brace) {
-            continue; // a declaration, a `fn` type
+        // lot 353 (re-check 2 of #563): the body's `{` or the declaration's
+        // `;` outside brackets — a `;` in an array type of the signature
+        // (`-> Option<(String, [u8; 32])>`, `ProcFacts::trusted_exe`) is
+        // neither, and the function was never scanned
+        let mut depth = 0i32;
+        let mut head_end = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' if depth == 0 => {
+                    head_end = Some((i, false));
+                    break;
+                }
+                ';' if depth == 0 => {
+                    head_end = Some((i, true));
+                    break;
+                }
+                _ => {}
+            }
         }
+        let Some((brace, false)) = head_end else {
+            continue; // a declaration, a `fn` type
+        };
         let end = brace + support::matching_brace(&rest[brace..]);
         out.push((at, &rest[..end.min(rest.len())]));
     }
@@ -611,6 +657,12 @@ fn constants_of(f: &str, constants: &[String], returning: &[(String, String)]) -
         if NOT_VIEWS.contains(&name.as_str()) {
             continue;
         }
+        // lot 353 (re-check 2 of #563): a method (`SelfImage::exec_path`)
+        // by its call, in any file
+        if let Some(m) = name.strip_prefix('.') {
+            out.push(format!(".{m}("));
+            continue;
+        }
         out.push(if rf == f {
             name.clone()
         } else {
@@ -670,14 +722,22 @@ fn cross_file_params(
     {
         for text in code.values() {
             let params = view_params(text, constants, &BTreeMap::new());
+            let imported = imports(text);
+            // re-check 2 of #563: a field set to a view path, handed on
+            // (`cgroup_join::started_in_cgroup(&self.root, pid)`)
+            let fields = view_fields(text, constants, &params);
             for (base, body) in fn_bodies(text) {
                 let mut tainted = constants.to_vec();
+                tainted.extend(fields.iter().cloned());
                 tainted.extend(strict(params.get(&base).cloned().unwrap_or_default()));
                 tainted.extend(strict(view_locals(body, &tainted)));
                 let scopes: Vec<_> = scope_taint(body, &tainted)
                     .into_iter()
                     .map(|(span, t)| (span, strict(t)))
                     .collect();
+                // `module::name(`, and (re-check 2 of #563, plant E) a
+                // bare `name(` the file imports (`use crate::m::name;`)
+                let mut calls: Vec<(usize, String, String)> = Vec::new();
                 for (at, _) in body.match_indices("::") {
                     let rest = &body[at + 2..];
                     let name: String = rest
@@ -695,10 +755,25 @@ fn cross_file_params(
                         .into_iter()
                         .rev()
                         .collect();
+                    calls.push((at + 2 + name.len(), module, name));
+                }
+                for (name, module) in &imported {
+                    for (at, _) in body.match_indices(&format!("{name}(")) {
+                        let before = body[..at].chars().next_back();
+                        if before.is_some_and(|c| {
+                            c.is_alphanumeric() || c == '_' || c == ':' || c == '.'
+                        }) || body[..at].ends_with("fn ")
+                        {
+                            continue;
+                        }
+                        calls.push((at + name.len(), module.clone(), name.clone()));
+                    }
+                }
+                for (open, module, name) in calls {
+                    let at = open;
                     let Some(callees) = public.get(&(module, name.clone())) else {
                         continue;
                     };
-                    let open = at + 2 + name.len();
                     let args = call_args(body, open);
                     let inner = args.get(1..args.len().saturating_sub(1)).unwrap_or("");
                     for (i, arg) in top_level_split(inner).into_iter().enumerate() {
@@ -725,6 +800,44 @@ fn cross_file_params(
     out
 }
 
+/// Lot 353 (re-check 2 of #563, plant E): the functions `text` imports by
+/// name (`use crate::host_hardening::stat_it;`, `use super::m::{a, b};`),
+/// each with its module (the path's last segment before it).
+fn imports(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t
+            .strip_prefix("use ")
+            .or_else(|| t.strip_prefix("pub use "))
+        else {
+            continue;
+        };
+        let rest = rest.trim_end().trim_end_matches(';');
+        let (path, names): (&str, Vec<&str>) = match rest.split_once("::{") {
+            Some((p, n)) => (
+                p,
+                n.trim_end_matches('}').split(',').map(str::trim).collect(),
+            ),
+            None => match rest.rsplit_once("::") {
+                Some((p, n)) => (p, vec![n.trim()]),
+                None => continue,
+            },
+        };
+        let module = path.rsplit("::").next().unwrap_or(path).to_string();
+        for n in names {
+            let n = n.split(" as ").next().unwrap_or(n).trim();
+            if !n.is_empty()
+                && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && n.chars().next().is_some_and(|c| c.is_lowercase())
+            {
+                out.push((n.to_string(), module.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Lot 353 (re-check 1 of #563, N3): the functions of `code` that return a
 /// path under a view (`fn host_root() -> PathBuf { … PathBuf::from(
 /// "/proc/1/root") … }`, a literal outside a reader's call): a walk by
@@ -741,7 +854,12 @@ fn view_returning_fns(code: &BTreeMap<String, String>) -> Vec<(String, String)> 
                 continue;
             };
             let ret = body[..brace].split_once("->").map_or("", |(_, r)| r);
-            if !(ret.contains("PathBuf") || ret.contains("&Path") || ret.contains("Path>")) {
+            let string = ret.trim() == "String";
+            if !(ret.contains("PathBuf")
+                || ret.contains("&Path")
+                || ret.contains("Path>")
+                || string)
+            {
                 continue;
             }
             let mut rest = body[brace..].to_string();
@@ -754,22 +872,361 @@ fn view_returning_fns(code: &BTreeMap<String, String>) -> Vec<(String, String)> 
                     rest.replace_range(at..end, "");
                 }
             }
-            let built = ["PathBuf::from(", "Path::new(", "PathBuf::from(format!("]
-                .iter()
-                .any(|c| {
-                    ["\"/proc", "\"/sys"]
-                        .iter()
-                        .any(|v| rest.contains(&format!("{c}{v}")))
-                });
+            // lot 353 (re-check 2 of #563): a `String` path built by
+            // `format!` (`SelfImage::exec_path`: `/proc/self/fd/N`, which a
+            // worker's exec walked)
+            let builders: &[&str] = if string {
+                &["format!("]
+            } else {
+                &["PathBuf::from(", "Path::new(", "PathBuf::from(format!("]
+            };
+            let built = builders.iter().any(|c| {
+                ["\"/proc", "\"/sys"]
+                    .iter()
+                    .any(|v| rest.contains(&format!("{c}{v}")))
+            });
             if built {
-                if let Some((name, _)) = signature(body) {
+                if let Some((name, params)) = signature(body) {
+                    let method = params.first().is_some_and(|p| p == "self");
+                    out.push((f.clone(), if method { format!(".{name}") } else { name }));
+                }
+            }
+        }
+    }
+    // lot 353 (re-check 2 of #563, R2-3): and to a fixpoint, the functions
+    // returning a path that return what one of those returns — the
+    // sampler's `host_view` returns `response::host_path(p)`
+    loop {
+        let before = out.len();
+        for (f, text) in code {
+            if f == KERNEL_ROOTS {
+                continue;
+            }
+            for (_, body) in fn_bodies(text) {
+                let Some(brace) = body.find('{') else {
+                    continue;
+                };
+                let ret = body[..brace].split_once("->").map_or("", |(_, r)| r);
+                if !(ret.contains("PathBuf") || ret.contains("&Path") || ret.contains("Path>")) {
+                    continue;
+                }
+                let Some((name, _)) = signature(body) else {
+                    continue;
+                };
+                if out.iter().any(|(of, n)| of == f && *n == name) {
+                    continue;
+                }
+                let inner = &body[brace..];
+                let calls = out.iter().any(|(rf, rn)| {
+                    let call = if rf == f {
+                        format!("{rn}(")
+                    } else {
+                        format!("{}::{rn}(", module_of(rf))
+                    };
+                    inner.match_indices(&call).any(|(at, _)| {
+                        !inner[..at]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+                });
+                if calls {
                     out.push((f.clone(), name));
+                }
+            }
+        }
+        if out.len() == before {
+            break;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Lot 353 (re-check 2 of #563, plant R): the fields `text`'s functions set
+/// to a path under a view — a struct literal's `root: "/proc".into()`,
+/// `root: proc_root.into()` with `proc_root` a parameter handed one, its
+/// shorthand `Self { proc_root }` — each as `self.<field>`: a walk by path
+/// of the field in any method of the file is a walk of the view (the
+/// decision's `ProcFacts::trusted_exe` opened `self.root`'s
+/// `/proc/<pid>/exe` by path; no name of [`VIEW_NAMES`] told it).
+fn view_fields(
+    text: &str,
+    constants: &[String],
+    params: &BTreeMap<usize, Vec<String>>,
+) -> Vec<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out: Vec<String> = Vec::new();
+    for (base, body) in fn_bodies(text) {
+        let mut tainted = constants.to_vec();
+        tainted.extend(params.get(&base).cloned().unwrap_or_default());
+        tainted.extend(view_locals(body, &tainted));
+        let b = body.as_bytes();
+        for (at, _) in body.match_indices(':') {
+            if b.get(at + 1) == Some(&b':') || (at > 0 && b[at - 1] == b':') {
+                continue;
+            }
+            let head = body[..at].trim_end();
+            let name: String = head
+                .chars()
+                .rev()
+                .take_while(|c| ident(*c))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if name.is_empty() || name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let before = head[..head.len() - name.len()].trim_end();
+            if !(before.ends_with('{') || before.ends_with(',')) {
+                continue;
+            }
+            let rest = &body[at + 1..];
+            let mut depth = 0i32;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    ')' | ']' | '}' => depth -= 1,
+                    ',' | ';' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // what a call of anything but a path's builder makes of a view
+            // path is no path (`open_dir(&host.join("objects"))?`: a
+            // descriptor)
+            let value = path_builders_only(&rest[..end]);
+            if names_view_path(&value, &tainted) {
+                out.push(format!("self.{name}"));
+            }
+        }
+        // the shorthand: `Self { proc_root, … }` — of a local that is a
+        // path (not what a call made of one: a descriptor)
+        let mut paths = constants.to_vec();
+        paths.extend(params.get(&base).cloned().unwrap_or_default());
+        loop {
+            let before = paths.len();
+            for (at, _) in body.match_indices("let ") {
+                let rest = &body[at + 4..];
+                let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+                let name: String = rest.chars().take_while(|c| ident(*c)).collect();
+                let Some(eq) = rest.find('=') else { continue };
+                let expr = &rest[eq + 1..];
+                let expr = &expr[..expr.find(';').unwrap_or(expr.len())];
+                if !name.is_empty()
+                    && !paths.contains(&name)
+                    && names_view_path(&path_builders_only(expr), &paths)
+                {
+                    paths.push(name);
+                }
+            }
+            if paths.len() == before {
+                break;
+            }
+        }
+        // `Self {` and any `Type {` (a struct literal: `CopyScan { host, … }`)
+        let mut literals: Vec<usize> = Vec::new();
+        for (at, _) in body.match_indices('{') {
+            let head = body[..at].trim_end();
+            let ty: String = head
+                .chars()
+                .rev()
+                .take_while(|c| ident(*c))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if ty.chars().next().is_some_and(|c| c.is_uppercase()) {
+                literals.push(at);
+            }
+        }
+        for open in literals {
+            let end = open + support::matching_brace(&body[open..]);
+            let inner = &body[open + 1..end.saturating_sub(1).max(open + 1)];
+            for item in top_level_split(inner) {
+                let item = item.trim();
+                if !item.contains(':') && paths.iter().any(|t| t == item) {
+                    out.push(format!("self.{item}"));
                 }
             }
         }
     }
     out.sort();
     out.dedup();
+    out
+}
+
+/// `expr` with every call removed but those of a path's builders
+/// (`.join`, `.into`, `PathBuf::from`, `format!`…): what is left names a
+/// view only when the expression is one's path.
+fn path_builders_only(expr: &str) -> String {
+    const BUILDERS: &[&str] = &[
+        ".join",
+        ".into",
+        ".to_path_buf",
+        ".to_owned",
+        ".clone",
+        ".as_ref",
+        ".as_path",
+        ".to_string",
+        "PathBuf::from",
+        "PathBuf::new",
+        "Path::new",
+        "String::from",
+        "format!",
+        "host_path",
+        "host_view",
+    ];
+    let mut out = expr.to_string();
+    let mut from = 0;
+    while let Some(open) = out[from..].find('(').map(|i| from + i) {
+        let name = callee(&out, open);
+        let start = open - name.len();
+        if name.is_empty() || BUILDERS.iter().any(|b| name.ends_with(b)) {
+            from = open + 1;
+            continue;
+        }
+        let end = open + call_args(&out, open).len();
+        out.replace_range(start..end, " ");
+        from = start;
+    }
+    out
+}
+
+/// Lot 353 (re-check 2 of #563, R2-3): the functions, by name, that call a
+/// callable parameter of theirs with a path under a view, each with that
+/// parameter's index — `response::on_host_path(path, op)` calls
+/// `op(&host_path(path))` — and to a fixpoint the functions that hand such
+/// a callable on (`DecisionHost::on_host_path(path, op)` in its impl): the
+/// parameters of the closure a caller hands there are paths under a view
+/// (`accounts::read`'s `|p| File::open(p)` opened `/proc/1/root/etc/passwd`
+/// by path on the decision thread).
+fn view_handing_fns(
+    code: &BTreeMap<String, String>,
+    constants: &[String],
+    returning: &[(String, String)],
+) -> BTreeMap<String, Vec<usize>> {
+    let mut out: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    loop {
+        let mut grew = false;
+        for (f, text) in code {
+            let consts = constants_of(f, constants, returning);
+            let params = view_params(text, &consts, &BTreeMap::new());
+            for (base, body) in fn_bodies(text) {
+                let Some((name, ps)) = signature(body) else {
+                    continue;
+                };
+                let Some(brace) = body.find('{') else {
+                    continue;
+                };
+                let inner = &body[brace..];
+                let mut tainted = consts.clone();
+                tainted.extend(params.get(&base).cloned().unwrap_or_default());
+                tainted.extend(view_locals(body, &tainted));
+                let skip = usize::from(ps.first().is_some_and(|p| p == "self"));
+                for (i, p) in ps.iter().enumerate() {
+                    if p == "self" || p.is_empty() {
+                        continue;
+                    }
+                    let index = i - skip;
+                    if out.get(&name).is_some_and(|v| v.contains(&index)) {
+                        continue;
+                    }
+                    let pat = format!("{p}(");
+                    let calls_with_view = inner.match_indices(&pat).any(|(at, _)| {
+                        let before = inner[..at].chars().next_back();
+                        if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                            return false;
+                        }
+                        let open = at + p.len();
+                        names_view_path(call_args(inner, open), &tainted)
+                    });
+                    // handed on, bare, to a function that hands it a view
+                    let hands_on = out.iter().any(|(g, idx)| {
+                        inner.match_indices(&format!("{g}(")).any(|(at, _)| {
+                            let before = inner[..at].chars().next_back();
+                            if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                                return false;
+                            }
+                            let open = at + g.len();
+                            let args = call_args(inner, open);
+                            let a = args.get(1..args.len().saturating_sub(1)).unwrap_or("");
+                            let items = top_level_split(a);
+                            idx.iter()
+                                .any(|j| items.get(*j).is_some_and(|x| x.trim() == p.as_str()))
+                        })
+                    });
+                    if calls_with_view || hands_on {
+                        out.entry(name.clone()).or_default().push(index);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            return out;
+        }
+    }
+}
+
+/// The spans of the closures `body` hands to a function of `handing` at a
+/// handing index, each with its parameters: within it they are paths
+/// under a view.
+fn handed_closures(
+    body: &str,
+    handing: &BTreeMap<String, Vec<usize>>,
+) -> Vec<(std::ops::Range<usize>, Vec<String>)> {
+    let mut out = Vec::new();
+    for (g, idx) in handing {
+        for (at, _) in body.match_indices(&format!("{g}(")) {
+            let before = body[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                || body[..at].ends_with("fn ")
+            {
+                continue;
+            }
+            let open = at + g.len();
+            let args = call_args(body, open);
+            let inner = args.get(1..args.len().saturating_sub(1)).unwrap_or("");
+            let mut from = open + 1;
+            for (j, item) in top_level_split(inner).into_iter().enumerate() {
+                let start = from + (item.len() - item.trim_start().len());
+                from += item.len() + 1;
+                if !idx.contains(&j) {
+                    continue;
+                }
+                let t = item.trim_start();
+                let t = t.strip_prefix("move").map_or(t, str::trim_start);
+                if !t.starts_with('|') {
+                    continue;
+                }
+                let Some(close) = t[1..].find('|') else {
+                    continue;
+                };
+                let params: Vec<String> = top_level_split(&t[1..1 + close])
+                    .into_iter()
+                    .map(|p| {
+                        let p = p.split(':').next().unwrap_or("").trim();
+                        p.trim_start_matches('&').trim().to_string()
+                    })
+                    .filter(|p| !p.is_empty() && p != "_")
+                    .take(1)
+                    .collect();
+                if !params.is_empty() {
+                    out.push((start..start + item.trim_start().len(), params));
+                }
+            }
+        }
+    }
     out
 }
 
@@ -906,6 +1363,19 @@ fn walks_with(
     constants: &[String],
     seed: &BTreeMap<usize, Vec<String>>,
 ) -> Vec<String> {
+    walks_full(text, constants, seed, &BTreeMap::new())
+}
+
+/// [`walks_with`], with the functions that hand their callable parameter a
+/// view path ([`view_handing_fns`]): the closures handed to them are
+/// scanned with their parameter tainted. Lot 353 (re-check 2 of #563): and
+/// the fields the file's functions set to a view path ([`view_fields`]).
+fn walks_full(
+    text: &str,
+    constants: &[String],
+    seed: &BTreeMap<usize, Vec<String>>,
+    handing: &BTreeMap<String, Vec<usize>>,
+) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let line_of = |at: usize| text[..at].matches('\n').count();
     let mut out = std::collections::BTreeSet::new();
@@ -918,10 +1388,21 @@ fn walks_with(
         ));
     };
     let params = view_params(text, constants, seed);
+    let fields = view_fields(text, constants, &params);
     for (base, body) in fn_bodies(text) {
         let mut tainted = constants.to_vec();
+        tainted.extend(fields.iter().cloned());
         tainted.extend(params.get(&base).cloned().unwrap_or_default());
         tainted.extend(view_locals(body, &tainted));
+        // lot 353 (re-check 2 of #563, R2-3): the closures handed to a
+        // function that calls them with a view path
+        for (span, ps) in handed_closures(body, handing) {
+            let mut t = tainted.clone();
+            t.extend(ps);
+            let locals = view_locals(&body[span.clone()], &t);
+            t.extend(locals);
+            path_uses(body, span, &t, &mut |at| flag(base + at));
+        }
         // lot 353 (re-check 1 of #563, N2 B, N3): any call whose directory
         // is `AT_FDCWD` — a closure or a helper around `openat` — opens its
         // path by path
@@ -1079,7 +1560,7 @@ fn test_module(f: &Path) -> bool {
         };
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         lines.windows(2).any(|w| {
-            w[0].starts_with("#[cfg(test)]")
+            (w[0].starts_with("#[cfg(test)]") || w[0].starts_with("#[cfg(any(test"))
                 && (w[1] == decl
                     || w[1] == format!("pub mod {stem};")
                     || w[1] == format!("pub(crate) mod {stem};"))
@@ -1142,9 +1623,19 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/verifier_check.rs",
-        3,
+        // re-check 2 of #563: 3 → 6, no new walk — the field rule sees the
+        // probe instance's reads and removal (`self.instance`, a tracefs path)
+        6,
         "the verifier gate (a lab build's --verifier-check, a process of its own, never the \
-         agent's run): its kprobe instance created in tracefs, its `kprobe_events` appended",
+         agent's run): its kprobe instance created in tracefs, read and removed, its \
+         `kprobe_events` appended",
+    ),
+    (
+        "crates/nn-linux/src/sensor_feasibility.rs",
+        1,
+        "the sensor-feasibility gate (a lab build's --sensor-feasibility, a process of its own, \
+         never the agent's run): its exec of a memfd through `/proc/<pid>/fd/N`, the very \
+         launch it measures the exec sensor on (re-check 2 of #563: the exec rule sees it)",
     ),
 ];
 
@@ -1170,12 +1661,18 @@ fn no_kernel_view_is_walked_by_path() {
         "the scan finds the slices of view paths: {constants:?}"
     );
     let cross = cross_file_params(&code, &constants);
+    let handing = view_handing_fns(&code, &constants, &returning);
+    assert!(
+        handing.get("on_host_path").is_some_and(|i| i.contains(&1)),
+        "the scan finds the functions handing a view path to a callable: {handing:?}"
+    );
     let mut found = Vec::new();
     for (f, text) in code.iter().filter(|(f, _)| f.as_str() != KERNEL_ROOTS) {
-        let w = walks_with(
+        let w = walks_full(
             text,
             &constants_of(f, &constants, &returning),
             &cross.get(f).cloned().unwrap_or_default(),
+            &handing,
         );
         match KNOWN.iter().find(|(k, _, _)| k == f) {
             Some((_, n, _)) if w.len() == *n => {}
@@ -1490,6 +1987,185 @@ fn the_re_check_s_planted_shapes_are_found() {
     assert!(view_returning_fns(&not).is_empty());
 }
 
+/// Lot 353 (re-check 2 of #563): the shapes the second re-check planted
+/// (its probe `rev563-probe-r2-ratchet`) and the three walks it found, each
+/// failing rule 1 — plant R (a field named `root` holding `/proc`, the
+/// decision's `ProcFacts::trusted_exe`), plant M (an exec of
+/// `/proc/self/exe`, the start's self-test; `/proc/self/fd/N`, a worker's
+/// launch), plant E (a helper imported and called bare), the closure a
+/// function calls with the host's view (`on_host_path`'s op: the account
+/// database read on the decision thread), a callable returning the host's
+/// view handed by name (the entropy sampler's `&host_view`), and a
+/// function returning what a view-returning one returns.
+#[test]
+fn the_re_check_2_s_planted_shapes_are_found() {
+    // R: a field not named as a view
+    let r = "pub struct Rev563Facts { root: std::path::PathBuf }\nimpl Rev563Facts {\n    pub fn \
+             new() -> Self { Self { root: \"/proc\".into() } }\n    pub fn exe_open(&self, pid: \
+             u32) -> bool {\n        let link = self.root.join(pid.to_string()).join(\"exe\");\n        \
+             std::fs::File::open(&link).is_ok()\n    }\n}\n";
+    assert!(!walks(r, &[]).is_empty(), "R: {r}");
+    // R through a constructor's parameter (the decision host's own shape)
+    let r2 = "impl ProcFacts {\n    pub fn new(at: impl Into<PathBuf>) -> Self {\n        Self { \
+              root: at.into(), hashes: Mutex::default() }\n    }\n    fn trusted_exe(&self, pid: \
+              u32) {\n        let link = self.root.join(pid.to_string()).join(\"exe\");\n        \
+              let f = std::fs::File::open(&link);\n    }\n}\nimpl Default for ProcFacts {\n    \
+              fn default() -> Self {\n        Self::new(\"/proc\")\n    }\n}\n";
+    assert!(
+        !walks(r2, &[]).is_empty(),
+        "R (a constructor's parameter): {r2}"
+    );
+    // a field set to what a call made of a view path is a descriptor
+    let fd_field = "impl J {\n    fn open(path: &Path) -> Self {\n        let host = \
+                    PathBuf::from(\"/proc/1/root\").join(path);\n        let evidence = \
+                    open_dir(&host.join(\"evidence\")).unwrap();\n        Self { evidence }\n    \
+                    }\n    fn mv(&self) {\n        unsafe { libc::renameat(0, a.as_ptr(), \
+                    self.evidence.as_raw_fd(), b.as_ptr()) };\n    }\n}\n";
+    assert!(walks(fd_field, &[]).is_empty(), "{fd_field}");
+    // M: an exec of a view path, a literal or a local
+    for m in [
+        "fn f() {\n    let ok = std::process::Command::new(\"/proc/self/exe\").arg(\"x\").status();\n}\n",
+        "fn f() {\n    let exe = Path::new(\"/proc/self/exe\");\n    let mut cmd = Command::new(exe);\n}\n",
+        "fn f(fd: i32) {\n    let mut cmd = Command::new(format!(\"/proc/self/fd/{fd}\"));\n}\n",
+        "fn f() {\n    unsafe { libc::execv(c\"/proc/self/fd/3\".as_ptr(), argv.as_ptr()) };\n}\n",
+    ] {
+        assert!(!walks(m, &[]).is_empty(), "M: {m}");
+    }
+    // M through a method returning a view path (`SelfImage::exec_path`)
+    let m_code = BTreeMap::from([
+        (
+            "crates/nn-linux/src/worker/mod.rs".to_string(),
+            "impl SelfImage {\n    pub fn exec_path(&self) -> String {\n        \
+             format!(\"/proc/self/fd/{}\", self.fd.as_raw_fd())\n    }\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/worker/spawn.rs".to_string(),
+            "pub fn spawn(image: &SelfImage) {\n    let mut cmd = \
+             Command::new(image.exec_path());\n}\n"
+                .to_string(),
+        ),
+    ]);
+    let returning = view_returning_fns(&m_code);
+    let sp = "crates/nn-linux/src/worker/spawn.rs";
+    assert!(
+        !walks(&m_code[sp], &constants_of(sp, &[], &returning)).is_empty(),
+        "M (a method): {returning:?}"
+    );
+    // E: a helper imported and called bare, from another file
+    let e_code = BTreeMap::from([
+        (
+            "crates/nn-linux/src/host_hardening.rs".to_string(),
+            "pub fn rev563_stat_it(p: &std::path::Path) -> bool {\n    \
+             std::fs::metadata(p).is_ok()\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/own_dropins.rs".to_string(),
+            "use crate::host_hardening::rev563_stat_it;\npub fn rev563_call_bare() -> bool {\n    \
+             rev563_stat_it(std::path::Path::new(\"/proc/1/status\"))\n}\n"
+                .to_string(),
+        ),
+    ]);
+    let cross = cross_file_params(&e_code, &[]);
+    let hh = "crates/nn-linux/src/host_hardening.rs";
+    assert!(
+        !walks_with(
+            &e_code[hh],
+            &[],
+            &cross.get(hh).cloned().unwrap_or_default()
+        )
+        .is_empty(),
+        "E: {cross:?}"
+    );
+    // the closure a function calls with the host's view, in another file
+    // (the account database, on the decision thread) — and handed on by a
+    // trait's impl (nn-core's `H::on_host_path`)
+    let h_code = BTreeMap::from([
+        (
+            "crates/nn-linux/src/response/mod.rs".to_string(),
+            "pub fn host_path(path: &Path) -> PathBuf {\n    \
+             Path::new(\"/proc/1/root\").join(path)\n}\npub fn on_host_path<T>(path: &Path, op: \
+             impl Fn(&Path) -> io::Result<T>) -> io::Result<T> {\n    op(&host_path(path))\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/decision_host_linux.rs".to_string(),
+            "impl DecisionHost for LinuxHost {\n    fn on_host_path<T>(path: &Path, op: impl \
+             Fn(&Path) -> io::Result<T>) -> io::Result<T> {\n        \
+             crate::response::on_host_path(path, op)\n    }\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/accounts.rs".to_string(),
+            "fn read(path: &str) -> String {\n    crate::response::on_host_path(Path::new(path), \
+             |p| {\n        let mut s = Vec::new();\n        \
+             std::fs::File::open(p)?.read_to_end(&mut s)?;\n        Ok(s)\n    })\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-core/src/impact/mod.rs".to_string(),
+            "fn copy_beside<H: DecisionHost>(d: &str) -> bool {\n    \
+             H::on_host_path(Path::new(d), |p| std::fs::symlink_metadata(p)).is_ok()\n}\n"
+                .to_string(),
+        ),
+    ]);
+    let returning = view_returning_fns(&h_code);
+    let handing = view_handing_fns(&h_code, &[], &returning);
+    assert_eq!(handing.get("on_host_path"), Some(&vec![1]), "{handing:?}");
+    for f in [
+        "crates/nn-linux/src/accounts.rs",
+        "crates/nn-core/src/impact/mod.rs",
+    ] {
+        assert!(
+            !walks_full(
+                &h_code[f],
+                &constants_of(f, &[], &returning),
+                &BTreeMap::new(),
+                &handing
+            )
+            .is_empty(),
+            "the handed closure: {f}"
+        );
+    }
+    // the same closure reading through kernel_roots is clean
+    let clean =
+        "fn read(path: &str) -> String {\n    crate::response::on_host_path(Path::new(path), \
+                 |p| {\n        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY)\n    })\n}\n";
+    assert!(
+        walks_full(clean, &[], &BTreeMap::new(), &handing).is_empty(),
+        "{clean}"
+    );
+    // a callable returning the host's view, handed by name (the sampler),
+    // through a function that returns another one's view path
+    let s_code = BTreeMap::from([
+        (
+            "crates/nn-linux/src/response/mod.rs".to_string(),
+            "pub fn host_path(path: &Path) -> PathBuf {\n    \
+             Path::new(\"/proc/1/root\").join(path)\n}\n"
+                .to_string(),
+        ),
+        (
+            "crates/nn-linux/src/impact/entropy.rs".to_string(),
+            "fn host_view(p: &Path) -> PathBuf {\n    crate::response::host_path(p)\n}\nfn \
+             sample(path: &str) -> u8 {\n    sample_dir(Path::new(path), &host_view)\n}\npub fn \
+             sample_dir(path: &Path, host: &dyn Fn(&Path) -> PathBuf) -> u8 {\n    let entries = \
+             std::fs::read_dir(host(path));\n    0\n}\n"
+                .to_string(),
+        ),
+    ]);
+    let returning = view_returning_fns(&s_code);
+    assert!(
+        returning.iter().any(|(_, n)| n == "host_view"),
+        "transitive: {returning:?}"
+    );
+    let en = "crates/nn-linux/src/impact/entropy.rs";
+    assert!(
+        !walks(&s_code[en], &constants_of(en, &[], &returning)).is_empty(),
+        "the sampler's callable"
+    );
+}
+
 /// The shared readers and the function each one's body must read through.
 const ROUTED: &[(&str, &str, &str)] = &[
     (
@@ -1623,15 +2299,42 @@ const OFF_THE_RUNTIME: &[(&str, &str, &[&str])] = &[
         "nn_linux::runtime::off_the_runtime(&mut tick_once);",
         &["off_the_runtime(&mut tick_once)"],
     ),
+    // lot 353 (re-check 2 of #563, R2-1): the whole check — the look and
+    // the rebind — on its own helper thread; the serve loop starts it and
+    // takes its answer, the start's bind bounded
     (
         "agent/src/admin/socket_watch.rs",
-        "pub fn path_state_within(",
-        &["looks", ".run(\"the admin socket's path\""],
+        "pub fn start_check(&mut self)",
+        &[
+            "std::thread::Builder::new()",
+            "let looked = look_and_rebind(&path, bound);",
+        ],
     ),
     (
         "agent/src/admin/socket_watch.rs",
-        "pub fn check(&mut self",
-        &["path_state_within(&self.looks, &self.path, self.bound)"],
+        "pub fn look_and_rebind(",
+        &["path_state(path, bound)", "bind_std(path)"],
+    ),
+    (
+        "agent/src/admin/socket_watch.rs",
+        "pub async fn bind_within(",
+        &[
+            "std::thread::Builder::new()",
+            "tokio::time::timeout(deadline, rx)",
+        ],
+    ),
+    (
+        "agent/src/admin/transport.rs",
+        "let mut looking: Option<",
+        &[
+            "looking = watch.start_check();",
+            "watch.finish(looked, audit_log.as_ref())",
+        ],
+    ),
+    (
+        "agent/src/admin/transport.rs",
+        "socket_watch::bind_within(",
+        &["socket_watch::BIND_DEADLINE).await?"],
     ),
     (
         "agent/src/boot/mod.rs",

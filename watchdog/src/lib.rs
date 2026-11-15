@@ -2041,12 +2041,110 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Lot 353 (re-check 2 of #563, N4): the paths whose by-path work has a
+/// helper thread that has not answered (one each at most).
+static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// How long the watchdog waits for a by-path step on `/run/northnarrow`
+/// (a record appended, the admin socket's connect).
+pub const BY_PATH_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Lot 353 (re-check 2 of #563, N4): `work` on `path` on a helper thread,
+/// its answer handed to `done` — never on the caller's thread: a file
+/// system laid over `/run/northnarrow` that does not answer (a FUSE) held
+/// the watchdog's loop on the admin socket's connect and on its own hold
+/// record, and no abort covered the watchdog itself. While one is held for
+/// `path`, the next fails at once (`WouldBlock`), so one thread is held at
+/// most per path.
+fn off_thread<T: Send + 'static>(
+    path: &Path,
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    done: impl FnOnce(std::io::Result<T>) + Send + 'static,
+) -> std::io::Result<()> {
+    {
+        let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+        if held.iter().any(|p| p == path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "{}: an earlier step has not answered (a mount over its directory that does \
+                     not answer?)",
+                    path.display()
+                ),
+            ));
+        }
+        held.push(path.to_path_buf());
+    }
+    let key = path.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("nn-wd-bypath".into())
+        .spawn(move || {
+            let out = work();
+            HELD.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|p| *p != key);
+            done(out);
+        });
+    if let Err(e) = spawned {
+        HELD.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|p| p != path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Lot 353 (re-check 2 of #563, N4): the admin socket's connect (a by-path
+/// lookup in `/run/northnarrow`, blocking inside `connect(2)` whatever the
+/// socket's mode) on a helper thread; the caller's timeout bounds the wait.
+async fn connect_bounded(socket_path: &Path) -> std::io::Result<UnixStream> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = socket_path.to_path_buf();
+    off_thread(
+        socket_path,
+        move || std::os::unix::net::UnixStream::connect(&p),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    )?;
+    let std = rx
+        .await
+        .map_err(|_| std::io::Error::other("the connect's helper ended without an answer"))??;
+    std.set_nonblocking(true)?;
+    UnixStream::from_std(std)
+}
+
 /// Append `line` to `path` (created 0600; never through a symlink).
 ///
 /// Lot 319 (the mini-hunt of BUG31's partial): the start of a line a
 /// watchdog that died left is closed first — the new record is never glued
-/// to it.
+/// to it. Lot 353 (re-check 2 of #563, N4): on a helper thread, waited for
+/// at most [`BY_PATH_DEADLINE`] (past it, `TimedOut`: the record is not
+/// written, the caller says so).
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (p, l) = (path.to_path_buf(), line.to_string());
+    off_thread(
+        path,
+        move || append_line_now(&p, &l),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    )?;
+    rx.recv_timeout(BY_PATH_DEADLINE).unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{}: no answer within {} s (a mount over its directory that does not answer?)",
+                path.display(),
+                BY_PATH_DEADLINE.as_secs()
+            ),
+        ))
+    })
+}
+
+/// [`append_line`]'s work, on its helper thread.
+fn append_line_now(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let mut f = std::fs::OpenOptions::new()
@@ -2616,7 +2714,7 @@ pub async fn ping_agent(
     ask_progress: bool,
 ) -> Result<LoopProgress> {
     let fut = async {
-        let mut stream = UnixStream::connect(socket_path)
+        let mut stream = connect_bounded(socket_path)
             .await
             .with_context(|| format!("connect {}", socket_path.display()))?;
         if let Some(agent_pid) = agent_pid {

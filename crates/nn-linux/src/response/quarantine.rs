@@ -293,7 +293,8 @@ impl ExeHandle {
             return None;
         }
         let p = self.shown_path()?;
-        let m = super::on_host_path(&p, |q| fs::symlink_metadata(q)).ok()?;
+        let m =
+            super::on_host_path(&p, |q| antitamper_bpf::kernel_roots::symlink_metadata(q)).ok()?;
         self.is_inode(m.dev(), m.ino()).then_some(p)
     }
 
@@ -646,11 +647,10 @@ fn restore_in_place(
         })
     };
     let (dev, ino, mode) = (want("dev")?, want("ino")?, want("mode")? as u32);
+    // lot 353 (re-check 2 of #563): the host's view beneath the anchored
+    // `/proc` root, never by a path walk of the `/proc` mounted now
     let held = super::on_host_path(path, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_PATH | libc::O_NOFOLLOW)
     })?;
     let m = held.metadata()?;
     let same_birth = match (inode["btime_ns"].as_i64(), btime_of(held.as_raw_fd())) {
@@ -789,10 +789,7 @@ fn write_restored(plaintext: &[u8], out_path: &Path, cfg: &ExecutorConfig) -> st
         return Err(invalid("the destination must name a file"));
     };
     let dir = super::on_host_path(parent, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_DIRECTORY)
     })?;
     if let Ok(real) =
         antitamper_bpf::kernel_roots::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd()))
@@ -1579,10 +1576,7 @@ fn remove_verified(
         return Err(QuarantineError::PathSwapped);
     };
     let dir = super::on_host_path(parent, |p| {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(p)
+        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY | libc::O_DIRECTORY)
     })?;
     let cname =
         std::ffi::CString::new(name.as_bytes()).map_err(|_| QuarantineError::PathSwapped)?;

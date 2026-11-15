@@ -163,7 +163,9 @@ enum RuntimeCopy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnWorkerLaunch {
     pub agent_pid: u32,
-    /// `/proc/self/fd/<n>`.
+    /// The name of the core's exec of its image's descriptor: `/dev/fd/<n>`
+    /// (lot 353, re-check 2 of #563: `execveat(fd, "", …, AT_EMPTY_PATH)`;
+    /// it was `/proc/self/fd/<n>`, an exec by path through `/proc`).
     pub exec_path: String,
     /// `(dev, ino)` of the core's image, as the exec sensor reports an
     /// executed file (lot 310: the device in the kernel's form, `MKDEV` —
