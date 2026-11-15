@@ -205,23 +205,24 @@ mod tests {
                 let id = LinuxHost::file_id(target.join("logrotate"));
                 let root_only = LinuxHost::dir_is_root_only(target);
                 let facts = crate::decision_host_linux::ProcFacts::new(&proc_root);
-                let trusted = facts.trusted_exe(1);
+                let exe_ok = facts.trusted_exe(1).is_some();
                 let first = t.elapsed();
                 let t = std::time::Instant::now();
-                let again = (
-                    LinuxHost::file_id(target.join("logrotate")),
-                    facts.trusted_exe(1),
-                );
-                let _ = tx.send((id, root_only, trusted, first, again, t.elapsed()));
+                let again = LinuxHost::file_id(target.join("logrotate")).is_some()
+                    || facts.trusted_exe(1).is_some();
+                let _ = tx.send((id.is_some(), root_only, exe_ok, first, again, t.elapsed()));
             });
             let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
             drop(fuse);
-            let Ok((id, root_only, trusted, first, again, second)) = answer else {
+            let Ok((id, root_only, exe_ok, first, again, second)) = answer else {
                 eprintln!("a check held for 10 s");
                 return 5;
             };
-            eprintln!("{id:?} {root_only} {trusted:?} in {first:?}; {again:?} in {second:?}");
-            if id.is_some() || root_only || trusted.is_some() || again != (None, None) {
+            // booleans only: no file identity or digest in the test's log
+            eprintln!(
+                "answered {id} {root_only} {exe_ok} in {first:?}; again {again} in {second:?}"
+            );
+            if id || root_only || exe_ok || again {
                 return 2;
             }
             // 200 ms + 200 ms + 500 ms, then the slots held: at once
