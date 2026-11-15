@@ -2748,7 +2748,8 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 ## 47. A FUSE over `/proc`, `/sys` or the cgroup root does not stall the agent's critical loops; stuck restarts are named and a loop is signed (lot 353)
 
 What this lot covers, and what it does not (mounts over the agent's own
-directories: lot 357), is stated exactly at the end of §47.1.
+directories: lot 357, §51, which closes them), is stated exactly at the
+end of §47.1.
 
 The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
 `/sys/fs/cgroup` that never answered the agent's threads. The integrity
@@ -2997,9 +2998,8 @@ the record and the read (pre-existing); `waiting` counts every process's
 requests, not only the agent's; an `nn-kview-open` thread stuck in a FUSE
 `STATFS` at a start under the mount keeps the agent from exiting at a later
 stop; a rotation's lift of the state directory's `+i` opens the directory
-by its path (a FUSE over the agent's own directories: to be closed by the
-mount refusal, lot 357; the watchdog's abort comes only after a failed
-SIGKILL).
+by its path (a FUSE over the agent's own directories: refused since lot
+357, §51; the watchdog's abort comes only after a failed SIGKILL).
 
 Re-check 2 of #563 (fix round 3) — what re-check 1 recorded, and what the
 second re-check found, systematically: a census of every `/proc`, `/sys`
@@ -3099,11 +3099,13 @@ entropy sampler (`agent/tests/fuse_stall.rs`); nor the watchdog's ping and
 its record appends under a FUSE over `/run/northnarrow`
 (`watchdog/tests/by_path_bounds.rs`).
 
-**Not covered** — a mount over the agent's own directories (or, for the
-decision thread, over a system directory) still holds these. Each is **to
-be closed by the mount refusal, lot 357**: a BPF-LSM refusal, in the host's
-mount namespace, of a mount over `/proc`, `/sys`, the cgroup root and the
-agent's own directories.
+**Not covered by this lot — closed by lot 357 (§51).** A mount over the
+agent's own directories (or, for the decision thread, over a system
+directory) held these. Lot 357 refuses the mount itself (the mount guard:
+a BPF-LSM refusal, in the host's mount namespace, of a mount on, over or
+below `/proc`, `/sys`, the cgroup root, the bpffs and the agent's own
+directories, binaries and units), and bounds each site below as defence in
+depth.
 - **The integrity round reads our directories by path before it signs.**
   `/etc/northnarrow` (the overlays, `read_dir`) and
   `/run/northnarrow/watchdog.pid` (the limits) are read by path before the
@@ -3111,8 +3113,11 @@ agent's own directories.
   shutdowns there are taken and removed by path (`rename`, `remove_file`)
   after. A FUSE over either directory (root) holds the round for as long as
   it stays — off the runtime, with no stall watch, silently: nothing is
-  signed meanwhile, that mount's own `mount_over_protected` included. To be
-  closed by the mount refusal, lot 357.
+  signed meanwhile, that mount's own `mount_over_protected` included.
+  Closed by lot 357: the mount is refused, and the round's reads, renames
+  and removals resolve beneath the directories' anchors (`crate::anchored`:
+  `openat2` `RESOLVE_BENEATH | RESOLVE_NO_XDEV`, `renameat2`, `unlinkat`,
+  bounded reads).
 - **The watchdog's stuck marker and the shutdown marker, by path.** After a
   stuck signal the watchdog removes its marker
   (`/run/northnarrow/watchdog.stuck`) by path, unbounded, on its one
@@ -3122,21 +3127,30 @@ agent's own directories.
   respawn, no `sd_notify`. The FUSE abort does not come before these: it
   runs only after a **failed** SIGKILL (`recovery_failed`); an agent the
   stuck recovery's SIGKILL ended is respawned through these reads with no
-  abort before them. To be closed by the mount refusal, lot 357.
+  abort before them. Closed by lot 357: the mount is refused; the stuck
+  marker's removal and write, and the shutdown check (marker, `admin.pub`,
+  `agent_id`, the honoured list), run on a helper thread waited for at most
+  2 s (no answer: a refusal, and a respawn), beneath the run directory
+  opened at the watchdog's start. The respawn's pidfile reads stay by path
+  (the mount guard covers them).
 - **`bpf-foreign` is written by path every round.** The kernel-state round
   writes `/run/northnarrow/bpf-foreign` (`atomic_file::replace`: remove,
   create, rename by path) at the end of every round (5 s), off the runtime:
   a FUSE over `/run/northnarrow` holds the round that signs the taint,
-  livepatch, root-cgroup program and foreign BPF findings. To be closed by
-  the mount refusal, lot 357.
+  livepatch, root-cgroup program and foreign BPF findings. Closed by lot
+  357: the mount is refused, and the file is replaced beneath the run
+  directory's anchor (`anchored::replace_file`).
 - **`trusted_exe` and `ran_host_file`, on the decision thread.** A rule's
   `exe … sha256` exemption checks the image's path and its parents by path
   in the agent's mount namespace; the lineage's `ran_host_file`
   (FIM-005/-019 with `logrotate` only) reads a packaged program's file at
   its path. A FUSE over a system directory (root) holds the decision there.
-  To be closed by the mount refusal, lot 357 — for these two only if its
-  list takes the system directories an exemption or a packaged program
-  names; otherwise on a bounded reader, as the account database's.
+  Closed by lot 357 on a bounded reader, as the account database's (not by
+  the mount refusal: covering `/usr/sbin`, `/usr/lib` and every directory a
+  packaged program lives in would refuse too much): the image's checks and
+  digest wait at most 500 ms (unanswered: not trusted, the exemption does
+  not hold for that event), a host file's identity at most 200 ms
+  (unanswered: not the host's file).
 - **The ratchet's bypasses.** `xtask/tests/kernel_views.rs` is lexical and
   does not see: a helper returning a view path as `&'static str` (or
   `CStr`, `OsStr`); `std::fs` or one of its functions imported under
@@ -3144,9 +3158,9 @@ agent's own directories.
   libc's `*64` calls (`open64`); a `String` built from `"/proc/"` and read
   in another file. `decision_path_io` does not scan nn-linux's decision
   hosts (`decision_host_linux.rs`, `accounts.rs`, `canary_host_linux.rs`). A
-  by-path read of a view written in one of these shapes passes both. To be
-  closed by the mount refusal, lot 357 (no mount over a view left to hold
-  such a read).
+  by-path read of a view written in one of these shapes passes both.
+  Closed by lot 357's mount refusal: no mount over or below a view is left
+  to hold such a read (the ratchet's shapes stay a named residual).
 
 ### 47.2 Fix round 5 of #563: the decision thread's reads, the bpffs's view
 

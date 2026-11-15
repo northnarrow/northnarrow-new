@@ -238,9 +238,9 @@ pub fn library_dirs(maps: &str) -> Vec<String> {
 /// the agent's shared libraries ([`library_dirs`]).
 pub fn points_in_host(pin_root: Option<&Path>) -> Vec<(String, u8)> {
     let mut pts = protected_points(pin_root, &|p: &str| {
-        std::fs::symlink_metadata(in_host(p)).is_ok()
+        antitamper_bpf::kernel_roots::symlink_metadata(in_host(p)).is_ok()
     });
-    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let maps = antitamper_bpf::kernel_roots::read_to_string("/proc/self/maps").unwrap_or_default();
     let mut extra: Vec<String> = Vec::new();
     for d in library_dirs(&maps) {
         let mut cur = Some(Path::new(&d));
@@ -295,12 +295,16 @@ fn in_host(path: &str) -> String {
     format!("/proc/1/root{path}")
 }
 
-/// The file system magic of a path (`statfs(2)`).
+/// The file system magic of a path (`fstatfs(2)` of it opened `O_PATH`,
+/// beneath the `/proc` root the start anchored for a path through
+/// `/proc/1/root`: lot 357's item 5, no view walked by path).
 fn magic_of(path: &str) -> Result<u64> {
-    let c = std::ffi::CString::new(path)?;
+    use std::os::fd::AsRawFd;
+    let f = antitamper_bpf::kernel_roots::open(path, libc::O_PATH | libc::O_CLOEXEC)
+        .with_context(|| format!("opening {path}"))?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: a NUL-terminated path and a zeroed out-buffer of the right type.
-    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    // SAFETY: an open descriptor and a zeroed out-buffer of the right type.
+    let rc = unsafe { libc::fstatfs(f.as_raw_fd(), &mut st) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("statfs {path}"));
     }
@@ -329,7 +333,10 @@ fn resolve_points(points: &[(String, u8)]) -> (Vec<(InodeKey, u8, String)>, Vec<
     let mut degraded = Vec::new();
     for p in VIEW_SB_EXTRA {
         let host = in_host(p);
-        if let (Ok(md), Ok(m)) = (std::fs::metadata(&host), magic_of(&host)) {
+        if let (Ok(md), Ok(m)) = (
+            antitamper_bpf::kernel_roots::metadata(&host),
+            magic_of(&host),
+        ) {
             if common::mount_guard::is_view_magic(m as u32) && m >> 32 == 0 {
                 keys.push((
                     InodeKey {
@@ -344,7 +351,7 @@ fn resolve_points(points: &[(String, u8)]) -> (Vec<(InodeKey, u8, String)>, Vec<
     }
     for (p, flags) in points {
         let host = in_host(p);
-        let Ok(md) = std::fs::symlink_metadata(&host) else {
+        let Ok(md) = antitamper_bpf::kernel_roots::symlink_metadata(&host) else {
             continue;
         };
         if let Some((_, magics)) = VIEWS.iter().find(|(v, _)| v == p) {
@@ -372,7 +379,7 @@ fn resolve_points(points: &[(String, u8)]) -> (Vec<(InodeKey, u8, String)>, Vec<
         // is registered with its directory's device too.
         if !md.is_dir() && magic_of(&host).ok() == Some(OVERLAYFS_SUPER_MAGIC) {
             if let Some(parent) = Path::new(&host).parent() {
-                if let Ok(pmd) = std::fs::metadata(parent) {
+                if let Ok(pmd) = antitamper_bpf::kernel_roots::metadata(parent) {
                     let odev = stat_dev_to_kernel_dev(pmd.dev());
                     if odev != dev {
                         keys.push((
@@ -401,8 +408,10 @@ fn resolve_points(points: &[(String, u8)]) -> (Vec<(InodeKey, u8, String)>, Vec<
 
 /// PID 1's mount and user namespaces (their `ns.inum`).
 fn host_namespaces() -> Result<(u64, u64)> {
-    let mnt = std::fs::metadata("/proc/1/ns/mnt").context("PID 1's mount namespace")?;
-    let user = std::fs::metadata("/proc/1/ns/user").context("PID 1's user namespace")?;
+    let mnt = antitamper_bpf::kernel_roots::metadata("/proc/1/ns/mnt")
+        .context("PID 1's mount namespace")?;
+    let user = antitamper_bpf::kernel_roots::metadata("/proc/1/ns/user")
+        .context("PID 1's user namespace")?;
     Ok((mnt.ino(), user.ino()))
 }
 
@@ -614,14 +623,15 @@ pub(crate) fn held_in(
 /// | O_DIRECTORY`, its device as the hooks read a dentry's (a btrfs
 /// subvolume's own).
 fn dir_key_in(prefix: &str, dir: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::OpenOptionsExt;
     let mut at = std::ffi::OsString::from(prefix);
     at.push(dir.as_os_str());
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(&at)
-        .ok()?;
+    // lot 357's item 5: through `/proc/<pid>/root`, beneath the `/proc` root
+    // the start anchored
+    let file = antitamper_bpf::kernel_roots::open(
+        Path::new(&at),
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )
+    .ok()?;
     let st = file.metadata().ok()?;
     Some((stat_dev_to_kernel_dev(st.dev()), st.ino()))
 }
@@ -949,7 +959,9 @@ fn pin_maps(ebpf: &mut Ebpf, root: &Path) -> Result<()> {
 /// number).
 fn table_of(pid: &str) -> Result<(Vec<MountEntry>, Groups)> {
     let path = format!("/proc/{pid}/mountinfo");
-    let text = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    // lot 357's item 5: beneath the `/proc` root the start anchored, bounded
+    let text = crate::mountinfo::read_bytes(Path::new(&path))
+        .with_context(|| format!("reading {path}"))?;
     Ok((crate::mountinfo::parse(&text).entries, groups_of(&text)))
 }
 
@@ -1096,7 +1108,9 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
 /// The mount namespace of a process (`/proc/<pid>/ns/mnt`'s inode).
 fn mnt_ns_of(pid: &str) -> Result<u64> {
     let p = format!("/proc/{pid}/ns/mnt");
-    Ok(std::fs::metadata(&p).with_context(|| p.clone())?.ino())
+    Ok(antitamper_bpf::kernel_roots::metadata(&p)
+        .with_context(|| p.clone())?
+        .ino())
 }
 
 /// The review of #567 (F2): the agent's own mount namespace — its unit's

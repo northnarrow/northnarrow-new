@@ -448,6 +448,24 @@ const STATICS: &[Kept] = &[
          unanswered at a time), beside the process's one account table (`TABLE`)",
     ),
     kept(
+        "crates/nn-linux/src/decision_host_linux.rs",
+        "EXE_READER",
+        Process,
+        "lot 357 (item 5, on #563's code): the reader of a `trusted_exe` exemption's image \
+         checks and digest, with a deadline (500 ms), off the decision thread: one decision \
+         host per agent process, and a check a FUSE over a system directory leaves blocked is \
+         the process's helper thread, bounded once for it (4)",
+    ),
+    kept(
+        "crates/nn-linux/src/posture_host_linux.rs",
+        "HOST_FILE_READER",
+        Process,
+        "lot 357 (item 5, on #563's code): the reader of a host file's identity for the \
+         lineage's `ran_host_file`, with a deadline (200 ms), off the decision thread: one \
+         host per agent process, a read a FUSE leaves blocked the process's helper thread, \
+         bounded once for it (4)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/open_sensor.rs",
         "BUILD_READER",
         Process,

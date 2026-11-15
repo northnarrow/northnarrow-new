@@ -767,8 +767,15 @@ fn mounts_over_protected_in(
 /// one (its comm, as `prctl` sets it: another process's namespace is not
 /// read for it).
 fn watchdog_of(pidfile: &Path) -> Option<u32> {
-    let pid = read_trim(pidfile)?.parse::<u32>().ok()?;
-    let comm = read_trim(Path::new(&format!("/proc/{pid}/comm")))?;
+    // lot 357's item 5 (R3-1): the pidfile beneath its anchor, its comm
+    // beneath the `/proc` root the start anchored — both bounded
+    let text = |b: Vec<u8>| String::from_utf8(b).ok().map(|s| s.trim().to_string());
+    let pid = text(crate::anchored::read_bounded(pidfile, 64).ok()?)?
+        .parse::<u32>()
+        .ok()?;
+    let comm = text(
+        antitamper_bpf::kernel_roots::read(Path::new(&format!("/proc/{pid}/comm")), 64).ok()?,
+    )?;
     (comm == crate::anti_tamper::WATCHDOG_COMM).then_some(pid)
 }
 
@@ -872,7 +879,7 @@ fn over_kernel_view(m: &Mount, mounts: &[Mount], host: bool) -> Option<Finding> 
             });
     }
     let below = ["/proc/", "/sys/"].iter().find(|v| mp.starts_with(*v))?;
-    if host && canonical_below_view(m, parent) {
+    if host && canonical_below_view(m, parent, mounts) {
         return None;
     }
     let kernel = antitamper_bpf::kernel_roots::KERNEL_MAGICS
@@ -901,9 +908,9 @@ fn refused_views(why: Vec<String>) -> Vec<Finding> {
         .collect()
 }
 
-/// The review of #567: the drift kinds signed High (the rest are the
-/// audit chain's default) — lot 353: a mount over the agent's paths or the
-/// kernel's views it reads (pre-alpha R003, X6) among them.
+/// The review of #567: the mount guard's drift kinds signed High (beside
+/// lot 353's, `Checker::record_detected`; the rest are the audit chain's
+/// default).
 fn high_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -911,12 +918,6 @@ fn high_kind(kind: &str) -> bool {
             | "mount_attrs_changed"
             | "mount_not_canonical"
             | "state_fs_read_only"
-            | "mount_over_protected"
-            | "agent_restart_loop"
-            | "fuse_aborted"
-            | "stuck_recovery_failed"
-            | "signed_records_failed"
-            | "cgroup_root_changed"
     )
 }
 
@@ -932,13 +933,30 @@ fn high_kind(kind: &str) -> bool {
 /// ([`on_wsl`]) — any root could name a directory of its own tmpfs `/wsl/…`
 /// and bind it there, hiding `status` (and swallowing the `-1` that clears
 /// the handlers) on any host.
-fn canonical_below_view(m: &Mount, parent: Option<&Mount>) -> bool {
+///
+/// Lot 357 (the F4 identity of #563, fixed): by type, point, source and the
+/// mount it comes from, in PID 1's table (`host`, the caller's), never by
+/// its path alone — WSL's lock is the file `/wsl/binfmt-status-lock` of the
+/// host's `/run` (the same device and peer group as PID 1's `/run`
+/// tmpfs, source `none`), bound over `status`. A root's own tmpfs, a
+/// directory of it named `/wsl/…`, is another device: a finding on WSL
+/// too. (The kernel's mount guard leaves binfmt_misc's files alone: no
+/// view is below them.)
+fn canonical_below_view(m: &Mount, parent: Option<&Mount>, mounts: &[Mount]) -> bool {
     const BINFMT: &str = "/proc/sys/fs/binfmt_misc";
+    const WSL_LOCK: &str = "/wsl/binfmt-status-lock";
     match (m.fstype.as_str(), m.mount_point.as_str()) {
         ("binfmt_misc", BINFMT) => true,
         ("tmpfs", p) if p == format!("{BINFMT}/status") => {
-            m.root.starts_with("/wsl/")
+            m.root == WSL_LOCK
+                && m.entry.source.as_os_str() == "none"
                 && parent.is_some_and(|p| p.fstype == "binfmt_misc" && p.mount_point == BINFMT)
+                && mounts.iter().any(|r| {
+                    r.mount_point == "/run"
+                        && r.fstype == "tmpfs"
+                        && r.root == "/"
+                        && r.dev == m.dev
+                })
                 && on_wsl()
         }
         _ => false,
@@ -1286,7 +1304,12 @@ fn covers_tracefs(mp: &str, source_root: &str, fstype: &str) -> bool {
 pub fn config_overlays(dir: &Path) -> Vec<Finding> {
     use sha2::{Digest, Sha256};
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // Lot 357 (re-check 3 of #563, R3-1): the names beneath the directory's
+    // anchor (the start's descriptor), never by path — a mount over
+    // `/etc/northnarrow` (now refused, the mount guard) no longer holds or
+    // blinds the round before it signs; each overlay is opened beneath it
+    // too (`LinuxHost::open_read_nofollow`).
+    let Ok(names) = crate::anchored::read_dir_names(dir) else {
         return out;
     };
     // External audit ATP-001 / DEP-003: the COMBAT files too, reported as
@@ -1298,9 +1321,9 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
             .and_then(nn_proto::admin_signed_payload::OverlayKind::from_keyword)
             .filter(|k| crate::config::overlay_auth::shipped_default(*k).is_some())
     };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
+    let mut paths: Vec<PathBuf> = names
+        .into_iter()
+        .map(|n| dir.join(n))
         .filter(|p| {
             p.extension().and_then(|x| x.to_str()) == Some("local") || combat_kind(p).is_some()
         })
@@ -1396,7 +1419,13 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     {
         v.push((LIMIT_CORE.to_string(), x));
     }
-    if let Some(pid) = read_trim(watchdog_pidfile).and_then(|p| p.parse::<u32>().ok()) {
+    // Lot 357 (re-check 3 of #563, R3-1): the agent's own run directory,
+    // beneath its anchor (64 bytes at most), never by path
+    let pid = crate::anchored::read_bounded(watchdog_pidfile, 64)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|p| p.trim().parse::<u32>().ok());
+    if let Some(pid) = pid {
         if let Some(x) = read_trim(&PathBuf::from(format!("/proc/{pid}/oom_score_adj"))) {
             v.push((LIMIT_WATCHDOG_OOM.to_string(), x));
         }
@@ -1426,7 +1455,8 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
 pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
     // lot 311 (F4): read as bytes — one byte that is not UTF-8 hid every
     // line of the file; a line that does not parse costs itself only
-    let Ok(body) = crate::state_read::read_state(path) else {
+    // lot 357 (re-check 3 of #563, R3-1): beneath the run directory's anchor
+    let Ok(body) = crate::anchored::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1461,8 +1491,9 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
 /// after its recovery) and `respawn_argv_degraded` (WDG-008: the exec
 /// backend respawns with a recorded or the minimal argv).
 pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
-    // lot 311 (F4): read as bytes, as `rejected_shutdowns`
-    let Ok(body) = crate::state_read::read_state(path) else {
+    // lot 311 (F4): read as bytes, as `rejected_shutdowns`; lot 357: beneath
+    // the run directory's anchor
+    let Ok(body) = crate::anchored::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1582,16 +1613,20 @@ pub fn take_holds(holds: &Path, sign: impl FnOnce(Vec<Finding>) -> bool) {
     let mut taken = holds.as_os_str().to_os_string();
     taken.push(".taken");
     let taken = PathBuf::from(taken);
-    if !antitamper_bpf::kernel_roots::exists(&taken).unwrap_or(true)
-        && std::fs::rename(holds, &taken).is_err()
-    {
+    // Lot 357 (re-check 3 of #563, R3-1): each step beneath the run
+    // directory's anchor (`*at`), never by path
+    let taken_there = match crate::anchored::symlink_metadata(&taken) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    };
+    if !taken_there && crate::anchored::rename_noreplace(holds, &taken).is_err() {
         return; // no holds (or the rename refused: read again next round)
     }
     // unreadable: kept (never removed unread)
-    let readable = crate::state_read::read_state(&taken).is_ok();
+    let readable = crate::anchored::read_state(&taken).is_ok();
     let found = watchdog_holds(&taken);
     if readable && (found.is_empty() || sign(found)) {
-        let _ = std::fs::remove_file(&taken);
+        let _ = crate::anchored::remove_file(&taken);
     }
 }
 
@@ -2350,7 +2385,18 @@ impl Checker {
         }
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
-        if high_kind(f.kind) {
+        // lot 353: a mount over the agent's paths or the kernel's views it
+        // reads (pre-alpha R003, X6) is High too; lot 357: the mount guard's
+        // kinds ([`high_kind`])
+        if f.kind == "own_dropin_weakening"
+            || f.kind == "mount_over_protected"
+            || f.kind == "agent_restart_loop"
+            || f.kind == "fuse_aborted"
+            || f.kind == "stuck_recovery_failed"
+            || f.kind == "signed_records_failed"
+            || f.kind == "cgroup_root_changed"
+            || high_kind(f.kind)
+        {
             extra["severity"] = "high".into();
         }
         // lot 353: a restart loop is a degradation of the agent's status
@@ -2543,7 +2589,7 @@ impl Checker {
             for f in cap_per_kind(found) {
                 self.report_once(f, at_boot);
             }
-            let _ = std::fs::remove_file(rejected);
+            let _ = crate::anchored::remove_file(rejected);
         }
         // External audit DEP-004: the watchdog's holds (no agent after a
         // respawn, or the restart ceiling) while the agent was down.
@@ -2626,6 +2672,13 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
             }
         }
     }
+    // Lot 357 (re-check 3 of #563, R3-1): the integrity round reads the
+    // agent's configuration and run directories beneath descriptors taken
+    // now (`crate::anchored`): the watchdog's pidfile, holds and refused
+    // markers, the overlays. Already anchored by their logs, a no-op.
+    crate::anchored::anchor(&watchdog_pidfile);
+    crate::anchored::anchor(Path::new(nn_proto::watchdog_hold::HOLD_PATH));
+    crate::anchored::anchor(&Path::new(CONFIG_DIR).join("audit.log"));
     let mut checker = Checker {
         once: HashSet::new(),
         active: ActiveSet::default(),
@@ -2692,6 +2745,63 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 357 (re-check 3 of #563, R3-1 and R3-3): the integrity round's
+    /// reads and writes of the agent's own directories — the overlays, the
+    /// watchdog's pidfile, its holds and refused markers, the cross-view's
+    /// status — resolve beneath the directory the start anchored. The
+    /// directory moved away and another laid at its path is what a mount
+    /// over it is to a by-path read: each step still meets the anchored one.
+    #[test]
+    fn the_integrity_round_reads_its_directories_beneath_their_anchors() {
+        let t = tempfile::TempDir::new().unwrap();
+        let run = t.path().join("run");
+        let away = t.path().join("away");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("watchdog.pid"), "4242\n").unwrap();
+        std::fs::write(run.join("x.local"), "anchored").unwrap();
+        let rejected = nn_proto::shutdown_marker::RejectedRecord {
+            at: 1_800_000_000,
+            agent_pid: 7,
+            reason: "replayed".into(),
+            sha256: "ab".into(),
+        };
+        std::fs::write(
+            run.join("agent.shutdown_rejected"),
+            serde_json::to_string(&rejected).unwrap() + "\n",
+        )
+        .unwrap();
+        std::fs::write(run.join("watchdog.hold"), "not json\n").unwrap();
+        crate::anchored::anchor(&run.join("watchdog.pid"));
+        std::fs::rename(&run, &away).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("watchdog.pid"), "1\n").unwrap();
+        std::fs::write(run.join("y.local"), "laid over").unwrap();
+
+        let overlays = config_overlays(&run);
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert!(overlays[0].detail.contains("x.local"), "{overlays:?}");
+        assert_eq!(
+            crate::anchored::read_bounded(&run.join("watchdog.pid"), 64).unwrap(),
+            b"4242\n"
+        );
+        let found = rejected_shutdowns(&run.join("agent.shutdown_rejected"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].detail.contains("agent pid 7"));
+        let mut signed = 0;
+        take_holds(&run.join("watchdog.hold"), |f| {
+            signed = f.len();
+            true
+        });
+        assert_eq!(signed, 1);
+        assert!(!away.join("watchdog.hold").exists() && !away.join("watchdog.hold.taken").exists());
+        crate::anchored::replace_file(&run.join("bpf-foreign"), b"status", 0o600).unwrap();
+        assert_eq!(std::fs::read(away.join("bpf-foreign")).unwrap(), b"status");
+        assert!(!run.join("bpf-foreign").exists());
+        assert!(!away.join(".bpf-foreign.tmp").exists());
+        // the path laid over is untouched
+        assert_eq!(std::fs::read(run.join("watchdog.pid")).unwrap(), b"1\n");
+    }
 
     #[test]
     fn rejected_shutdown_markers_become_findings() {
@@ -3385,6 +3495,7 @@ mod tests {
 114 85 0:2 /init /init ro - rootfs rootfs rw
 116 85 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
 117 85 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+119 85 0:63 / /run rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
 124 117 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
 125 116 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:23 - cgroup2 cgroup2 rw,nsdelegate
 136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
@@ -3415,6 +3526,31 @@ mod tests {
         ] {
             assert!(
                 !mount_findings(format!("{wsl}{extra}"), &[]).is_empty(),
+                "{why}"
+            );
+        }
+        // Lot 357 (the F4 identity, fixed): on WSL too, the lock only from
+        // the host's /run, its own source — never by its path alone
+        let without = wsl.replace(
+            "136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755\n",
+            "",
+        );
+        for (extra, why) in [
+            (
+                "936 124 0:96 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw shared:506 - tmpfs none rw\n",
+                "a root's own tmpfs with a /wsl/binfmt-status-lock of its own",
+            ),
+            (
+                "937 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw shared:18 - tmpfs tmpfs rw\n",
+                "the right file under another source",
+            ),
+            (
+                "938 124 0:63 /wsl/other /proc/sys/fs/binfmt_misc/status rw shared:18 - tmpfs none rw\n",
+                "another file of /run",
+            ),
+        ] {
+            assert!(
+                !mount_findings(format!("{without}{extra}"), &[]).is_empty(),
                 "{why}"
             );
         }
@@ -3451,10 +3587,26 @@ mod tests {
             "{}",
             f[0].detail
         );
+        // lot 357 (the F4 identity, fixed): on WSL's kernel, WSL's own lock
+        // (the host's /run file, source `none`) is exempt — a root's own
+        // tmpfs named `/wsl/…` is not, there either
+        let wsl_own = "\
+85 77 8:32 / / rw,relatime shared:9 - ext4 /dev/sda1 rw
+116 85 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
+117 85 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+119 85 0:63 / /run rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
+124 117 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
+136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw
+";
         WSL_FOR_TESTS.with(|w| w.set(Some(true)));
-        let f = mount_findings(forged, &[]);
+        let own = mount_findings(wsl_own, &[]);
+        let forged_on_wsl = mount_findings(forged, &[]);
+        WSL_FOR_TESTS.with(|w| w.set(Some(false)));
+        let own_elsewhere = mount_findings(wsl_own, &[]);
         WSL_FOR_TESTS.with(|w| w.set(None));
-        assert!(f.is_empty(), "on WSL's kernel: {f:?}");
+        assert!(own.is_empty(), "on WSL's kernel: {own:?}");
+        assert_eq!(forged_on_wsl.len(), 1, "{forged_on_wsl:?}");
+        assert_eq!(own_elsewhere.len(), 1, "{own_elsewhere:?}");
     }
 
     /// External audit NN-AUD-098: the tracefs a stock host mounts (and the

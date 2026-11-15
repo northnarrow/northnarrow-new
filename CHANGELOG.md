@@ -83,6 +83,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `confext` and composefs overlays merged at boot are the canonical
     layout at the start; the allow list's out-of-line function is checked
     in the object.
+  - **Item 5, on #563's code** (§47.1, what this lot closes): the integrity
+    round's overlays, `watchdog.pid`, holds and rejected shutdowns, and the
+    `bpf-foreign` write, resolve beneath their directories' anchors
+    (`crate::anchored`, bounded); the watchdog's stuck and shutdown markers
+    through `*at()` on its run directory opened at its start, on a helper
+    thread waited for at most 2 s; `trusted_exe`'s image checks and digest
+    (500 ms) and `ran_host_file`'s host file identity (200 ms) on bounded
+    readers off the decision thread; the mount guard's own reads of
+    `/proc/<pid>/…` and `/proc/1/root/…` beneath the anchored `/proc` root;
+    WSL's binfmt `status` lock judged by its identity (source `none`, root
+    `/wsl/binfmt-status-lock`, `/run`'s device).
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

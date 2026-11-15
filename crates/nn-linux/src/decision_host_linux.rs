@@ -115,14 +115,95 @@ impl DecisionHost for LinuxHost {
     }
 }
 
+/// [`ProcFacts::trusted_exe`]'s work, on its helper thread.
+fn trusted_exe_now(root: &Path, hashes: &Mutex<HashCache>, pid: u32) -> Option<(String, [u8; 32])> {
+    use std::os::unix::fs::MetadataExt;
+    let link = root.join(pid.to_string()).join("exe");
+    let path = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
+    let path_s = path.to_str()?.to_string();
+    if !crate::posture::lineage::in_system_tree(&path_s) {
+        return None;
+    }
+    // Lot 353 (re-check 2 of #563, R2-2): the image opened through the
+    // magic link beneath the `/proc` root the start anchored — by path,
+    // a FUSE over `/proc` held the decision thread on this open (a rule
+    // with an `exe … sha256` exemption)
+    let mut f = antitamper_bpf::kernel_roots::open(&link, libc::O_RDONLY).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.file_type().is_file() || !root_only(&m) {
+        return None;
+    }
+    // The opened file is the one at the path it names now.
+    let at_path = antitamper_bpf::kernel_roots::symlink_metadata(&path).ok()?;
+    if at_path.dev() != m.dev() || at_path.ino() != m.ino() {
+        return None;
+    }
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if !root_only(&antitamper_bpf::kernel_roots::symlink_metadata(d).ok()?) {
+            return None;
+        }
+        dir = d.parent();
+    }
+    let key = FileKey {
+        dev: m.dev(),
+        ino: m.ino(),
+        size: m.size(),
+        mtime: (m.mtime(), m.mtime_nsec()),
+        ctime: (m.ctime(), m.ctime_nsec()),
+    };
+    let digest = hash_file(hashes, &mut f, key)?;
+    Some((path_s, digest))
+}
+fn hash_file(hashes: &Mutex<HashCache>, f: &mut std::fs::File, key: FileKey) -> Option<[u8; 32]> {
+    use std::io::Read as _;
+    if let Some(h) = hashes.lock().map.get(&key) {
+        return Some(*h);
+    }
+    if key.size > MAX_HASHED_BYTES {
+        return None;
+    }
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    let digest: [u8; 32] = h.finalize().into();
+    let mut c = hashes.lock();
+    if c.map.insert(key, digest).is_none() {
+        c.order.push_back(key);
+        while c.order.len() > HASH_CACHE_CAP {
+            if let Some(old) = c.order.pop_front() {
+                c.map.remove(&old);
+            }
+        }
+    }
+    Some(digest)
+}
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────
 
 /// [`ActorFacts`] read from a `/proc` (the host's, or an empty one in the
 /// golden replay).
 pub struct ProcFacts {
     root: PathBuf,
-    hashes: Mutex<HashCache>,
+    hashes: Arc<Mutex<HashCache>>,
 }
+
+/// Lot 357 (#563's §47.1, the coordinator's choice of 15/11): how long the
+/// decision thread waits for an image's identity and digest
+/// ([`ProcFacts::trusted_exe`]), and the reader that bounds it (four checks
+/// unanswered at most, then each refused at once). Its path, its parents' modes and its digest are
+/// read on a helper thread: a FUSE over a system directory (root's, not
+/// one the mount guard covers: `/usr/sbin`, `/usr/lib`…) held the decision
+/// on them. Unanswered: not trusted — the exemption does not hold for that
+/// event; the helper's answer still fills the digest cache.
+const EXE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+static EXE_READER: std::sync::LazyLock<crate::state_read::TimedReader> =
+    std::sync::LazyLock::new(|| crate::state_read::TimedReader::new(EXE_DEADLINE, 4));
 
 /// Executables hashed, by identity; at most [`HASH_CACHE_CAP`].
 #[derive(Default)]
@@ -148,38 +229,8 @@ impl ProcFacts {
     pub fn new(proc_root: impl Into<PathBuf>) -> Self {
         Self {
             root: proc_root.into(),
-            hashes: Mutex::new(HashCache::default()),
+            hashes: Arc::new(Mutex::new(HashCache::default())),
         }
-    }
-
-    fn hash_file(&self, f: &mut std::fs::File, key: FileKey) -> Option<[u8; 32]> {
-        use std::io::Read as _;
-        if let Some(h) = self.hashes.lock().map.get(&key) {
-            return Some(*h);
-        }
-        if key.size > MAX_HASHED_BYTES {
-            return None;
-        }
-        let mut h = Sha256::new();
-        let mut buf = vec![0u8; 64 << 10];
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => h.update(&buf[..n]),
-                Err(_) => return None,
-            }
-        }
-        let digest: [u8; 32] = h.finalize().into();
-        let mut c = self.hashes.lock();
-        if c.map.insert(key, digest).is_none() {
-            c.order.push_back(key);
-            while c.order.len() > HASH_CACHE_CAP {
-                if let Some(old) = c.order.pop_front() {
-                    c.map.remove(&old);
-                }
-            }
-        }
-        Some(digest)
     }
 }
 
@@ -213,43 +264,14 @@ impl ActorFacts for ProcFacts {
     }
 
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
-        use std::os::unix::fs::MetadataExt;
-        let link = self.root.join(pid.to_string()).join("exe");
-        let path = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
-        let path_s = path.to_str()?.to_string();
-        if !crate::posture::lineage::in_system_tree(&path_s) {
-            return None;
-        }
-        // Lot 353 (re-check 2 of #563, R2-2): the image opened through the
-        // magic link beneath the `/proc` root the start anchored — by path,
-        // a FUSE over `/proc` held the decision thread on this open (a rule
-        // with an `exe … sha256` exemption)
-        let mut f = antitamper_bpf::kernel_roots::open(&link, libc::O_RDONLY).ok()?;
-        let m = f.metadata().ok()?;
-        if !m.file_type().is_file() || !root_only(&m) {
-            return None;
-        }
-        // The opened file is the one at the path it names now.
-        let at_path = antitamper_bpf::kernel_roots::symlink_metadata(&path).ok()?;
-        if at_path.dev() != m.dev() || at_path.ino() != m.ino() {
-            return None;
-        }
-        let mut dir = path.parent();
-        while let Some(d) = dir {
-            if !root_only(&antitamper_bpf::kernel_roots::symlink_metadata(d).ok()?) {
-                return None;
-            }
-            dir = d.parent();
-        }
-        let key = FileKey {
-            dev: m.dev(),
-            ino: m.ino(),
-            size: m.size(),
-            mtime: (m.mtime(), m.mtime_nsec()),
-            ctime: (m.ctime(), m.ctime_nsec()),
-        };
-        let digest = self.hash_file(&mut f, key)?;
-        Some((path_s, digest))
+        // Lot 357: off the decision thread, bounded ([`EXE_READER`])
+        let (root, hashes) = (self.root.clone(), Arc::clone(&self.hashes));
+        EXE_READER
+            .run(&format!("the image of pid {pid}"), move || {
+                trusted_exe_now(&root, &hashes, pid)
+            })
+            .ok()
+            .flatten()
     }
 
     /// Lot 277: the kernel's marks ([`crate::cgroup_join`]); not known
