@@ -112,8 +112,9 @@ work. Four changes, each a default the signed per-rule policy can undo with
   (`USER_IMAGE`), are no exec from `/tmp` at all: no R001, no staging
   chain, as the same program run from the home
   (`UPGRADE_NOTES_WAVE4.md` §49). An extracted AppImage
-  (`/tmp/appimage_extracted_*`), one run from `/tmp` itself, and a FUSE
-  mount the pump does not tie stay a person's exec as above.
+  (`/tmp/appimage_extracted_*`), one run from `/tmp` itself or made to
+  serve a file staged there (`TARGET_APPIMAGE`), and a FUSE mount the pump
+  does not tie stay a person's exec as above.
 - **R013, a runc.** A `runc` executed from outside the system directories is
   a High record, its kill held (`enforce R013` gives it back): k3s runs its
   own from `/var/lib/rancher/k3s/data/<hash>/bin/runc`, and the corpus saw

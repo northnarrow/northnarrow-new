@@ -160,10 +160,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "common/src/wire/execpol.rs",
-        3,
+        1,
         "the loader variables' staging prefixes the eBPF program compares in the kernel \
          (`/proc/`, `/dev/fd/`: a string prefix of an `LD_PRELOAD` entry, which the `mmap_file` \
-         hook then judges on the file mapped), and their test (gated on `std`)",
+         hook then judges on the file mapped); its test (gated on `std`) is a test item since \
+         the review of #564",
     ),
 ];
 

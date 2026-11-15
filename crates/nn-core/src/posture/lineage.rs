@@ -4197,22 +4197,26 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         Some(exe.to_string_lossy().into_owned())
     }
 
-    /// Lot 355: `pid` ran, as of `as_of`, a file of a user's program image
-    /// (an AppImage's: `exe_flags::USER_IMAGE` on its exec, or its forker's
-    /// for a fork) — the exec the spawn cache holds for that time. `false`
-    /// when not known: a process `/proc` shows, one the cache does not hold
-    /// then. The staging judgements of a flow or an ancestor by its image
-    /// path ([`Self::image_path_as`]) read it beside that path
+    /// Lot 355: `pid` ran, as of `as_of`, the file `path` of a user's
+    /// program image (an AppImage's: `exe_flags::USER_IMAGE` on its exec,
+    /// or its forker's for a fork) — the exec the spawn cache holds for that
+    /// time, when that exec's image is `path` (the review of #564, F7: a
+    /// path read elsewhere — a flow's row — and an exec of another file
+    /// the cache missed are not paired). `false` when not known: a process
+    /// `/proc` shows, one the cache does not hold then. The staging
+    /// judgements of a flow or an ancestor by its image path
+    /// ([`Self::image_path_as`]) read it beside that path
     /// ([`Self::staged_image_as`]).
-    pub fn runs_user_image(&self, pid: u32, as_of: AsOf) -> bool {
+    pub fn runs_user_image(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
         if pid == 0 {
             return false;
         }
+        let of_path = |e: &Entry| e.user_image && e.exe.as_os_str() == path;
         match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => e.user_image,
+            CachedAt::Current(e) | CachedAt::Past(e) => of_path(&e),
             CachedAt::Absent if !self.judged_from_proc(pid, as_of) => self
                 .fork_entry(pid, as_of.time(), 0)
-                .is_some_and(|e| e.user_image),
+                .is_some_and(|e| of_path(&e)),
             CachedAt::Absent | CachedAt::LaterOnly => false,
         }
     }
@@ -4222,7 +4226,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// ([`crate::decision::rules::is_staging_path`]) and not a file of a
     /// user's program image ([`Self::runs_user_image`]).
     pub fn staged_image_as(&self, pid: u32, as_of: AsOf, path: &str) -> bool {
-        crate::decision::rules::is_staging_path(path) && !self.runs_user_image(pid, as_of)
+        crate::decision::rules::is_staging_path(path) && !self.runs_user_image(pid, as_of, path)
     }
 
     /// R-F: whether a pid the spawn cache does not hold may be read from

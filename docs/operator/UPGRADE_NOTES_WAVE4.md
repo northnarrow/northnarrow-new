@@ -2780,7 +2780,11 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
     trees, still that file at its path — by a path the caller named under
     that mount point;
   - with a daemon of that same image file (device and inode) started since
-    the image's exec, holding `/dev/fuse`, neither stopped nor traced.
+    the image's exec, neither stopped nor traced (`TracerPid:`), holding
+    `/dev/fuse` and the image file itself open (device and inode: a
+    runtime's daemon keeps open the file it serves), and no other regular
+    file a staged image could be served from (one under a staging
+    directory, unlinked, on a memory or FUSE filesystem, or a `memfd`).
 
   Later execs of the mount's files (`AppRun`'s program, a zygote's
   `/proc/self/exe`, a helper) are the image's while that mount and its
@@ -2789,7 +2793,9 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   test of the transfer-tool and impair rules judge such a program as the
   image, as from the home (`nn_linux::sensors::app_image`).
 - **What stays judged.** An AppImage itself in `/tmp`, `/var/tmp` or
-  `/dev/shm`; another user's; one extracted (`--appimage-extract-and-run`,
+  `/dev/shm`, or the user's legit AppImage made to serve a file staged
+  there through the runtime's documented `TARGET_APPIMAGE` variable (its
+  daemon holds that file, not its image); another user's; one extracted (`--appimage-extract-and-run`,
   or a host without FUSE: a writable copy in `/tmp`); a writable FUSE
   mount; a squashfs served by another program (`squashfuse` over a
   downloaded file), whatever AppImage runs meanwhile; a mount over another
@@ -2802,12 +2808,18 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 - **Residual.** A malicious AppImage the user runs is a user program,
   judged by its behaviour. `/proc` shows no tie of a FUSE mount to the
   process that serves it, so the pump ties the mount through the exec that
-  entered it and a daemon of the image started for it: a user who stops
-  its own AppImage's runtime after the mount, moves that mount aside (from
-  a mount namespace of its own) and mounts its own read-only filesystem at
-  the path the runtime then executes gets that filesystem's programs judged
-  as the image's — programs it could run from its home, which it can
-  write. A kernel record of the process the connection's `/dev/fuse` file
-  is handed to would close it.
+  entered it and a daemon of the image started since. No mount namespace
+  is needed to swap what is served: a user who stops its own AppImage's
+  runtime after the mount, unmounts it, mounts its own read-only squashfs
+  there and starts the image again with `--appimage-mount` (a daemon of
+  the image, started since), then lets the runtime go on, gets its
+  squashfs's programs judged as the image's. So does a runtime made to
+  serve a file of the user's home (`TARGET_APPIMAGE` there, with the image
+  held as well). Those are programs it could run from its home, which it
+  can write: the impact stays the user's own. Every fact is checked on the
+  uid (the mount's `user_id`, the image's owner, the daemon's real uid, the
+  exec's), no other user inherits the mark, and root's exec from
+  `/tmp/.mount_*` is still R009. A kernel record of the process the
+  connection's `/dev/fuse` file is handed to would close the swap.
 - **Operator action.** None: no setting, no overlay. The records name the
   program's path as before.

@@ -11251,11 +11251,39 @@ number in parentheses is a lab PR.
     guest; their images are no FUSE mounts in a staging directory, and the
     mark is set for nothing else); debian13/ubuntu2604 (no eBPF, deny hook,
     unit, install or self-test change).
-  - Residual (named): a malicious AppImage is a user program, judged by its
-    behaviour; `/proc` ties no FUSE mount to its serving process, so a user
-    who stops its own AppImage's runtime after the mount and puts its own
-    read-only filesystem at the path the runtime then executes gets that
-    filesystem judged as the image (programs it could run from its home).
+  - Review of #564: the type-2 runtime's documented `TARGET_APPIMAGE` made
+    a user's legit image serve a squashfs staged in `/tmp` as its own (the
+    daemon's `exe` was all the tie read); the daemon must now hold the image
+    file itself open (device and inode) and no other regular file under a
+    staging directory, unlinked, on a memory or FUSE filesystem, or a
+    `memfd` (each descriptor's filesystem from its `fdinfo`, never a FUSE
+    `stat`); a traced daemon (`TracerPid:`) ties nothing; the image's path
+    is never read through a FUSE mount; the mount table is read only for an
+    anonymous device's exec that may tie, the record kept by pid in the
+    order noted; the flow and ancestor tests pair the spawn cache's mark
+    with its own image path; the `staged_images.rs` ratchet counts the
+    prefixes' constants, cuts, prefixes without their slash and the door's
+    file outside its items (the ratchets' scan leaves `cfg(all(test, …))`
+    out). Named tests in `sensors::app_image` (fail on 6695f1e5), NET-008,
+    the ratchet. Mutation on the new code: 18 of 19 caught, one argued
+    equivalent (the early exit before the mount table read only saves the
+    read). Lab ubuntu2404 (6.8), alpha profile, round 4 (on dc9643e7; test
+    and doc changes only since): the runtime's daemon holds `/dev/fuse` and
+    its image (one descriptor each, beside `/dev/null` and a pipe, no
+    tracer); the four AppImage shapes NN-L-NET-007 Medium only (the
+    credential read NN-L-FIM-017 High besides), appimagetool none, as the
+    home reference; `TARGET_APPIMAGE=/tmp/…` R001 High ×4 and CHAIN-002
+    Critical, the same with a descriptor of the image inherited R001 High ×4
+    and CHAIN-002 Critical; the round 3 controls unchanged (squashfuse,
+    writable FUSE, the AppImage in `/tmp`: R001 and CHAIN-002).
+  - Residual (named, §49): a malicious AppImage is a user program, judged by
+    its behaviour; `/proc` ties no FUSE mount to its serving process, so a
+    user who stops its own AppImage's runtime after the mount, unmounts it,
+    mounts its own read-only squashfs there and starts the image again with
+    `--appimage-mount` gets that squashfs judged as the image — no mount
+    namespace needed; so does a runtime made to serve a file of the home.
+    Programs it could run from its home: every fact is checked on the uid,
+    and root's exec from `/tmp/.mount_*` stays R009.
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

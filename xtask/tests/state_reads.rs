@@ -711,6 +711,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         PROC,
     ),
     (
+        "crates/nn-linux/src/sensors/app_image.rs",
+        "read_state(dir.join(\"fdinfo\").join(fd))",
+        PROC,
+    ),
+    (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         "read_state(dir.join(\"status\"))",
         PROC,

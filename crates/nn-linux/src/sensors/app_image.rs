@@ -28,13 +28,19 @@
 //!     still at its path (same device and inode): the image file;
 //!   - a daemon of that same image file (by device and inode, through its
 //!     `exe` link) runs as that user in PID 1's mount namespace, started at
-//!     or after that exec, holds `/dev/fuse` open and is neither stopped,
-//!     traced nor exited: the runtime's FUSE daemon.
+//!     or after that exec, is neither stopped, traced (`TracerPid:`) nor
+//!     exited, and holds open `/dev/fuse` and the image file itself (by
+//!     device and inode: the file a runtime's daemon serves stays open in
+//!     it) and no other regular file a staged image could be served from —
+//!     one under a staging directory, unlinked, on a memory or FUSE
+//!     filesystem, of no mount of PID 1's table (a `memfd`): the runtime's
+//!     FUSE daemon serving its own image. The runtime's documented
+//!     `TARGET_APPIMAGE` makes a legit image serve another file: its daemon
+//!     holds that file, not the image (the review of #564, F1).
 //! - **tied** — a later exec of a file on that filesystem (`AppRun`'s exec
 //!   of the program, a zygote's `/proc/self/exe`, a helper) by the same
 //!   user, while the mount (its id and device) is still there and still such
-//!   a mount and its daemon (its start) still serves it, holding
-//!   `/dev/fuse`, running that image.
+//!   a mount and its daemon (its start) still serves it, as above.
 //! - The LSM program's check of an exec (`ExecCheck`, which the posture's
 //!   exec arm judges before the exec is done) is read the same way by the
 //!   exec-check pump: the process's latest exec of an image read, not taken
@@ -45,27 +51,37 @@
 //! one whose daemon is not the image the process executed (`squashfuse` run
 //! by hand over a file, whatever image runs meanwhile), on one mounted
 //! over another FUSE mount; an AppImage itself run from `/tmp`, `/var/tmp`
-//! or `/dev/shm` (its image is staged), one another user owns, one on a
-//! FUSE or memory filesystem; an AppImage extracted (`--appimage-extract-
-//! and-run`, or no FUSE): a writable copy in `/tmp`; tracepoint mode (no
-//! LSM identity). And whatever the program then does — a credential read,
-//! a file staged and executed, persistence, a shell with a socket — is
-//! judged as any user program's: the flag takes only the staging
-//! directory away.
+//! or `/dev/shm` (its image is staged), or a legit one made to serve a
+//! file staged there (`TARGET_APPIMAGE=/tmp/x.AppImage`); one another user
+//! owns, one on a FUSE or memory filesystem; an AppImage extracted
+//! (`--appimage-extract-and-run`, or no FUSE): a writable copy in `/tmp`;
+//! tracepoint mode (no LSM identity). And whatever the program then does —
+//! a credential read, a file staged and executed, persistence, a shell
+//! with a socket — is judged as any user program's: the flag takes only
+//! the staging directory away.
 //!
-//! Residual, said: a malicious AppImage the user runs is a user program,
-//! judged by its behaviour. The kernel ties no FUSE mount to the process
-//! that serves it in a way `/proc` shows (the connection's `/dev/fuse`
-//! file names no device), so the pump ties the mount to its image through
-//! the exec that entered it and a daemon of the image started for it: a
-//! user who stops its own AppImage's runtime after the mount, moves that
-//! mount aside (from a mount namespace of its own) and mounts its own
-//! read-only filesystem at the path the runtime then executes, gets that
-//! filesystem's programs judged as the image's — as programs it could run
-//! from its home, which it can write. A kernel record of the process the
-//! connection's file is handed to (`security_file_receive`) would close it.
+//! Residual, said (the review of #564, F2): a malicious AppImage the user
+//! runs is a user program, judged by its behaviour. The kernel ties no
+//! FUSE mount to the process that serves it in a way `/proc` shows (the
+//! connection's `/dev/fuse` file names no device), so the pump ties the
+//! mount to its image through the exec that entered it and a daemon of the
+//! image started since. No mount namespace is needed to swap what is
+//! served: a user who stops its own AppImage's runtime after the mount,
+//! unmounts it, mounts its own read-only squashfs there (`squashfuse`) and
+//! starts the image again with `--appimage-mount` (a daemon of the image,
+//! started since), then lets the runtime go on, gets its squashfs's
+//! programs judged as the image's. So does a runtime made to serve a file
+//! of the user's home (`TARGET_APPIMAGE` there, the image held as well):
+//! programs it could run from its home, which it can write. The impact
+//! stays the user's own: every fact is checked on the uid (the mount's
+//! `user_id`, the image's owner, the daemon's real uid, the exec's), no
+//! other user inherits the mark, and root's exec from `/tmp/.mount_*` is
+//! still R009. A kernel record of the process the connection's file is
+//! handed to (`security_file_receive`) would close the swap; it would not
+//! have closed `TARGET_APPIMAGE`, whose daemon is the image's own — the
+//! file the daemon holds does.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -88,6 +104,8 @@ const TIED_MAX: usize = 256;
 /// An exec of a possible image file: the process's latest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Ran {
+    /// The process's start (the exec event's `start_ns`).
+    start: u64,
     dev: u64,
     ino: u64,
     path: PathBuf,
@@ -110,7 +128,10 @@ struct Tied {
 /// The pump's record: the execs of possible images, the filesystems tied.
 #[derive(Debug, Default)]
 pub struct AppImages {
-    ran: HashMap<(u32, u64), Ran>,
+    /// By pid: the latest exec of a possible image of the process there.
+    ran: HashMap<u32, Ran>,
+    /// The pids of `ran` in the order noted: the oldest forgotten first.
+    order: BTreeMap<u64, u32>,
     seq: u64,
     tied: HashMap<u64, Tied>,
 }
@@ -173,10 +194,10 @@ impl AppImages {
             _ => return,
         };
         // the process's exec before this one, if it ran a possible image:
-        // an exec replaces it; a check (its exec not done) reads it
+        // an exec replaces it (one at its pid, the same process's or not)
         let before = match start_ns {
-            Some(start) => self.ran.remove(&(pid, start)),
-            None => self.ran_by(proc_root, pid),
+            Some(start) => self.forget(pid).filter(|r| r.start == start),
+            None => None,
         };
         if !exe.has(exe_flags::KNOWN)
             || start_ns == Some(0)
@@ -190,8 +211,9 @@ impl AppImages {
         if !is_staging_path(&exe.path) {
             if let Some(start) = start_ns.filter(|_| !in_system_tree(&exe.path)) {
                 self.remember(
-                    (pid, start),
+                    pid,
                     Ran {
+                        start,
                         dev: exe.dev,
                         ino: exe.ino,
                         path,
@@ -200,6 +222,21 @@ impl AppImages {
                     },
                 );
             }
+            return;
+        }
+        // the review of #564 (F4): no more is read for a file that cannot
+        // be a tied image's — FUSE's device is an anonymous one (major 0),
+        // and a filesystem not yet tied needs the process's exec of an
+        // image (a check reads it, not taken)
+        if exe.dev >> 20 != 0 {
+            return;
+        }
+        let tied = self.tied.contains_key(&exe.dev);
+        let before = match before {
+            None if !tied && start_ns.is_none() => self.ran_by(proc_root, pid),
+            b => b,
+        };
+        if !tied && before.is_none() {
             return;
         }
         let Ok(table) = crate::mountinfo::read(&proc_root.join("1/mountinfo")) else {
@@ -237,27 +274,33 @@ impl AppImages {
     /// The latest exec of a possible image of the process `pid` runs now
     /// (its `/proc` start that exec's process's), for its check.
     fn ran_by(&self, proc_root: &Path, pid: u32) -> Option<Ran> {
-        let (start, ran) = self
-            .ran
-            .iter()
-            .filter(|((p, _), _)| *p == pid)
-            .max_by_key(|(_, r)| r.seq)
-            .map(|((_, s), r)| (*s, r.clone()))?;
+        let ran = self.ran.get(&pid)?;
         let stat =
             crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
         let ticks = crate::response::proc_ref::stat_start_ticks(&stat)?;
-        crate::response::proc_ref::started_at(ticks, start).then_some(ran)
+        crate::response::proc_ref::started_at(ticks, ran.start).then(|| ran.clone())
     }
 
-    fn remember(&mut self, key: (u32, u64), mut ran: Ran) {
-        if !self.ran.contains_key(&key) && self.ran.len() >= RAN_MAX {
-            if let Some(oldest) = self.ran.iter().min_by_key(|(_, r)| r.seq).map(|(k, _)| *k) {
+    /// `ran` noted as `pid`'s latest exec of a possible image; the oldest
+    /// noted is forgotten first when the record is full.
+    fn remember(&mut self, pid: u32, mut ran: Ran) {
+        self.forget(pid);
+        if self.ran.len() >= RAN_MAX {
+            if let Some((_, oldest)) = self.order.pop_first() {
                 self.ran.remove(&oldest);
             }
         }
         self.seq += 1;
         ran.seq = self.seq;
-        self.ran.insert(key, ran);
+        self.order.insert(self.seq, pid);
+        self.ran.insert(pid, ran);
+    }
+
+    /// `pid`'s exec taken from the record.
+    fn forget(&mut self, pid: u32) -> Option<Ran> {
+        let ran = self.ran.remove(&pid)?;
+        self.order.remove(&ran.seq);
+        Some(ran)
     }
 }
 
@@ -321,7 +364,15 @@ fn tie(
         return None;
     }
     // the image file: still that file at its path, the user's, linked, a
-    // regular file on no FUSE filesystem
+    // regular file on no FUSE filesystem — and its path through no FUSE
+    // mount (its daemon answers the lookup, or never: never `stat`ed)
+    if table
+        .entries
+        .iter()
+        .any(|e| is_fuse(&e.fstype) && before.path.starts_with(&e.mount_point))
+    {
+        return None;
+    }
     let at = dir
         .join("root")
         .join(before.path.strip_prefix("/").unwrap_or(&before.path));
@@ -337,7 +388,7 @@ fn tie(
     {
         return None;
     }
-    let (daemon, daemon_ticks) = find_daemon(proc_root, pid, uid, before)?;
+    let (daemon, daemon_ticks) = find_daemon(proc_root, table, pid, uid, before)?;
     Some(Tied {
         mount_id: m.id,
         uid,
@@ -369,31 +420,39 @@ fn still_tied(
         return false;
     }
     let d = proc_root.join(t.daemon.to_string());
-    daemon_facts(proc_root, &d, uid, t.image, &t.image_path)
+    daemon_facts(proc_root, table, &d, uid, t.image, &t.image_path)
         .is_some_and(|ticks| ticks == t.daemon_ticks)
 }
 
 /// A daemon of the image `before` for `pid`'s exec: a process (not `pid`)
 /// that runs that image as `uid`, started at or after its exec, serving
 /// ([`daemon_facts`]). Its pid and `/proc` start.
-fn find_daemon(proc_root: &Path, pid: u32, uid: u32, before: &Ran) -> Option<(u32, u64)> {
+fn find_daemon(
+    proc_root: &Path,
+    table: &MountTable,
+    pid: u32,
+    uid: u32,
+    before: &Ran,
+) -> Option<(u32, u64)> {
     let image = (before.dev, before.ino);
     std::fs::read_dir(proc_root).ok()?.flatten().find_map(|e| {
         let d: u32 = e.file_name().to_str()?.parse().ok()?;
         if d == pid {
             return None;
         }
-        let ticks = daemon_facts(proc_root, &e.path(), uid, image, &before.path)?;
+        let ticks = daemon_facts(proc_root, table, &e.path(), uid, image, &before.path)?;
         crate::response::proc_ref::started_since(ticks, before.exec_ns).then_some((d, ticks))
     })
 }
 
 /// The process `dir` (`/proc/<pid>`) runs the image `image` (its `exe`
 /// link names `image_path`, and leads to that device and inode) as `uid`
-/// (real), in PID 1's mount namespace, is not stopped, traced or exited,
-/// and holds `/dev/fuse` open: its `/proc` start.
+/// (real), in PID 1's mount namespace, is neither stopped, traced
+/// (`TracerPid:`) nor exited, and serves that image ([`serves_the_image`]):
+/// its `/proc` start.
 fn daemon_facts(
     proc_root: &Path,
+    table: &MountTable,
     dir: &Path,
     uid: u32,
     image: (u64, u64),
@@ -409,14 +468,21 @@ fn daemon_facts(
         return None;
     }
     let status = crate::state_read::read_state(dir.join("status")).ok()?;
-    let real_uid: u32 = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    if real_uid != uid || !super::exec_facts::same_mount_namespace(proc_root, dir) {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))?
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    };
+    // the review of #564 (F5): a tracer (`PTRACE_SEIZE` leaves the state as
+    // it was) may run any code in it
+    if field("Uid:")? != uid
+        || field("TracerPid:")? != 0
+        || !super::exec_facts::same_mount_namespace(proc_root, dir)
+    {
         return None;
     }
     let stat = crate::state_read::read_state(dir.join("stat")).ok()?;
@@ -425,10 +491,73 @@ fn daemon_facts(
         return None;
     }
     let ticks = crate::response::proc_ref::stat_start_ticks(&stat)?;
-    let holds_fuse = std::fs::read_dir(dir.join("fd")).ok()?.flatten().any(|fd| {
-        std::fs::read_link(fd.path()).is_ok_and(|t| t.as_os_str() == OsStr::new("/dev/fuse"))
-    });
-    holds_fuse.then_some(ticks)
+    serves_the_image(table, dir, image).then_some(ticks)
+}
+
+/// The review of #564 (F1): the daemon `dir` holds `/dev/fuse` and the
+/// image file `image` (device and inode) open, and no other regular file a
+/// staged image could be served from. The runtime's daemon keeps open the
+/// file it serves — its own image, or the file `TARGET_APPIMAGE` names (the
+/// runtime's documented variable): a user's legit image made to serve a
+/// squashfs staged in `/tmp` holds that file, not its image, or both (a
+/// descriptor of the image inherited). Refused: a regular file under a
+/// staging directory (its link's text), unlinked, on a memory filesystem,
+/// on a FUSE filesystem, or of no mount of PID 1's table (a `memfd`,
+/// another namespace's) — by the descriptor's `fdinfo` mount, so a FUSE
+/// file is never `stat`ed. A pipe, a socket, a device are no image.
+fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
+    let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
+        return false;
+    };
+    let (mut fuse, mut held) = (false, false);
+    for fd in fds.flatten() {
+        // closed since the directory was read: nothing held
+        let Ok(text) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        if text.as_os_str() == OsStr::new("/dev/fuse") {
+            fuse = true;
+            continue;
+        }
+        // `pipe:[…]`, `socket:[…]`, `anon_inode:…`: no file of a path
+        if !text.as_os_str().as_bytes().starts_with(b"/") {
+            continue;
+        }
+        let Some(m) = fd_mount(table, dir, fd.file_name().as_os_str()) else {
+            return false;
+        };
+        if is_fuse(&m.fstype) {
+            return false;
+        }
+        let Ok(meta) = std::fs::metadata(fd.path()) else {
+            return false;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if (kernel_dev(meta.dev()), meta.ino()) == image {
+            held = true;
+        } else if meta.nlink() == 0
+            || matches!(m.fstype.as_bytes(), b"tmpfs" | b"ramfs")
+            || is_staging_path(&text.to_string_lossy())
+        {
+            return false;
+        }
+    }
+    fuse && held
+}
+
+/// The mount of PID 1's table the descriptor `fd` of `dir` is a file of,
+/// by its `fdinfo`'s `mnt_id:`.
+fn fd_mount<'a>(table: &'a MountTable, dir: &Path, fd: &OsStr) -> Option<&'a MountEntry> {
+    let info = crate::state_read::read_state(dir.join("fdinfo").join(fd)).ok()?;
+    let id: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    table.entries.iter().find(|e| e.id == id)
 }
 
 #[cfg(test)]
@@ -476,16 +605,18 @@ mod tests {
     }
 
     /// A daemon running `image` as `uid`, in `state`, started at `ticks`,
-    /// holding `/dev/fuse` when `fuse`.
+    /// holding `/dev/fuse` when `fuse`, and the image file it serves (on the
+    /// table's root filesystem, mount 22).
     fn daemon(root: &Path, pid: u32, image: &Path, uid: u32, state: &str, ticks: u64, fuse: bool) {
         let d = process(root, pid, INIT_NS);
         let _ = std::fs::remove_file(d.join("exe"));
         symlink(image, d.join("exe")).unwrap();
         std::fs::write(
             d.join("status"),
-            format!("Name:\tApp.AppImage\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            format!("Name:\tApp.AppImage\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nTracerPid:\t0\n"),
         )
         .unwrap();
+        hold(root, pid, 4, image, 22);
         let mut fields = vec!["0"; 19];
         fields[0] = state;
         let ticks = ticks.to_string();
@@ -496,7 +627,28 @@ mod tests {
         )
         .unwrap();
         let _ = std::fs::remove_file(d.join("fd/3"));
-        symlink(if fuse { "/dev/fuse" } else { "/dev/null" }, d.join("fd/3")).unwrap();
+        // (`/dev/null` in its place: a device of the root filesystem)
+        hold(
+            root,
+            pid,
+            3,
+            Path::new(if fuse { "/dev/fuse" } else { "/dev/null" }),
+            22,
+        );
+    }
+
+    /// `pid` holds `target` open as its descriptor `fd`, a file of the
+    /// table's mount `mnt_id` (its `fdinfo`).
+    fn hold(root: &Path, pid: u32, fd: u32, target: &Path, mnt_id: u64) {
+        let d = root.join(pid.to_string());
+        std::fs::create_dir_all(d.join("fdinfo")).unwrap();
+        let _ = std::fs::remove_file(d.join("fd").join(fd.to_string()));
+        symlink(target, d.join("fd").join(fd.to_string())).unwrap();
+        std::fs::write(
+            d.join("fdinfo").join(fd.to_string()),
+            format!("pos:\t0\nflags:\t0100000\nmnt_id:\t{mnt_id}\nino:\t1\n"),
+        )
+        .unwrap();
     }
 
     /// The table: `/`, `/tmp`, and the image's FUSE mount with `super_opts`
@@ -905,6 +1057,7 @@ mod tests {
     fn the_record_is_bounded() {
         let mut images = AppImages::default();
         let ran = |n: u64| Ran {
+            start: 1,
             dev: 1,
             ino: n,
             path: PathBuf::from("/home/u/x"),
@@ -912,18 +1065,23 @@ mod tests {
             seq: 0,
         };
         for n in 0..(RAN_MAX as u64 + 10) {
-            images.remember((n as u32, 1), ran(n));
+            images.remember(n as u32, ran(n));
         }
         assert_eq!(images.ran.len(), RAN_MAX);
-        assert!(!images.ran.contains_key(&(0, 1)));
-        assert!(images.ran.contains_key(&(RAN_MAX as u32 + 9, 1)));
+        assert_eq!(images.order.len(), RAN_MAX);
+        assert!(!images.ran.contains_key(&0));
+        assert!(images.ran.contains_key(&(RAN_MAX as u32 + 9)));
         // a process's later exec replaces its earlier one, and is the newest
-        images.remember((5, 1), ran(1));
-        images.remember((5, 1), ran(2));
+        images.remember(5, ran(1));
+        images.remember(5, ran(2));
         assert_eq!(images.ran.len(), RAN_MAX);
-        assert_eq!(images.ran[&(5, 1)].ino, 2);
-        images.remember((u32::MAX, 1), ran(3));
-        assert!(images.ran.contains_key(&(5, 1)), "not the oldest");
+        assert_eq!(images.order.len(), RAN_MAX);
+        assert_eq!(images.ran[&5].ino, 2);
+        images.remember(u32::MAX, ran(3));
+        assert!(images.ran.contains_key(&5), "not the oldest");
+        // taken, it leaves the order too
+        assert!(images.forget(5).is_some());
+        assert_eq!(images.order.len(), images.ran.len());
     }
 
     fn check(pid: u32, path: &str, dev: u64, filename: &str) -> Event {
@@ -1155,8 +1313,9 @@ mod tests {
         let image = image_of(&f);
         let (dev, ino) = id_of(&f.image);
         images.remember(
-            (RUNTIME, 1_000_000_000_000),
+            RUNTIME,
             Ran {
+                start: 1_000_000_000_000,
                 dev,
                 ino,
                 path: f.image.clone(),
@@ -1169,5 +1328,180 @@ mod tests {
         let mut c = check(RUNTIME, &apprun(), FUSE_DEV, &apprun());
         images.note(f.proc.path(), &mut c);
         assert!(user_image(&c));
+        // an exec of another process at that pid (another start) does not
+        // read the earlier process's image
+        let f = fixture();
+        let (dev, ino) = id_of(&f.image);
+        let mut images = AppImages::default();
+        images.remember(
+            RUNTIME,
+            Ran {
+                start: 1_000_000_000_000,
+                dev,
+                ino,
+                path: f.image.clone(),
+                exec_ns: IMAGE_EXEC_NS,
+                seq: 0,
+            },
+        );
+        let mut e = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e));
+        assert!(images.ran.is_empty(), "taken");
+    }
+
+    /// The review of #564 (F1): the type-2 runtime serves the file its
+    /// documented `TARGET_APPIMAGE` names, not its own image. A user's legit
+    /// image run with `TARGET_APPIMAGE=/tmp/x.AppImage`: its daemon (`exe` the
+    /// image, `/dev/fuse`) holds the staged squashfs, not the image — no tie,
+    /// the AppImage in `/tmp` stays judged. Nor with the image held as well (a
+    /// descriptor inherited) and another file a staged image could be served
+    /// from: under a staging directory (the text, whatever the filesystem),
+    /// unlinked, on a memory filesystem, on a FUSE filesystem (never
+    /// `stat`ed), of no mount of PID 1's table (a `memfd`). A log in the home,
+    /// a pipe, a device, held beside the image, are no image: the tie holds.
+    #[test]
+    fn a_daemon_serving_another_file_than_its_image_is_no_tie() {
+        let staged_dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let staged = staged_dir.path().join("x.AppImage");
+        std::fs::write(&staged, b"\x7fELF runtime + squashfs").unwrap();
+        assert!(is_staging_path(staged.to_str().unwrap()));
+        // TARGET_APPIMAGE: the staged file in place of the image (tmpfs /tmp,
+        // and /tmp on the root filesystem)
+        for mnt in [30, 22] {
+            let f = fixture();
+            hold(f.proc.path(), DAEMON, 4, &staged, mnt);
+            assert!(
+                !run(&mut AppImages::default(), &f, me(), &apprun()),
+                "TARGET_APPIMAGE {mnt}"
+            );
+        }
+        // the daemon serves another file of the home, not its image (nor
+        // holds it): no tie either
+        let f = fixture();
+        hold(f.proc.path(), DAEMON, 4, &home_file(&f), 22);
+        assert!(
+            !run(&mut AppImages::default(), &f, me(), &apprun()),
+            "TARGET_APPIMAGE in the home"
+        );
+        // the image held too, and a file a staged image could be served from
+        let unlinked =
+            tempfile::tempfile_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
+        let unlinked_fd = format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&unlinked)
+        );
+        // (the file, `None` for a log in the fixture's home; its mount)
+        for (name, file, mnt) in [
+            ("staged on /", Some(staged.clone()), 22),
+            ("unlinked", Some(PathBuf::from(&unlinked_fd)), 22),
+            ("memory", None, 40),
+            ("fuse", None, 45),
+            ("no mount", None, 999),
+        ] {
+            let f = fixture();
+            table_plus(
+                f.proc.path(),
+                "40 22 0:41 / /run/user/1000 rw,nosuid,nodev - tmpfs tmpfs rw",
+            );
+            let target = file.unwrap_or_else(|| home_file(&f));
+            hold(f.proc.path(), DAEMON, 5, &target, mnt);
+            assert!(
+                !run(&mut AppImages::default(), &f, me(), &apprun()),
+                "{name}"
+            );
+        }
+        // the image, beside a log in the home, a pipe, a device: the tie holds
+        let f = fixture();
+        hold(f.proc.path(), DAEMON, 1, &home_file(&f), 22);
+        // (`/dev` a tmpfs, as in a container)
+        table_plus(f.proc.path(), "41 22 0:5 / /dev rw,nosuid - tmpfs tmpfs rw");
+        hold(f.proc.path(), DAEMON, 2, Path::new("/dev/null"), 41);
+        symlink("pipe:[4242]", f.proc.path().join(format!("{DAEMON}/fd/0"))).unwrap();
+        assert!(run(&mut AppImages::default(), &f, me(), &apprun()));
+        // and the tie ends when the daemon no longer holds its image
+        let mut images = AppImages::default();
+        let f = fixture();
+        assert!(run(&mut images, &f, me(), &apprun()));
+        hold(f.proc.path(), DAEMON, 4, &staged, 30);
+        let mut e = exec(
+            RUNTIME + 1,
+            me(),
+            &apprun(),
+            (FUSE_DEV, 2),
+            "/proc/self/exe",
+            60,
+        );
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e), "still tied");
+    }
+
+    /// A regular file in the fixture's home (beside the image).
+    fn home_file(f: &Fixture) -> PathBuf {
+        let p = f._files.path().join("app.log");
+        std::fs::write(&p, b"log").unwrap();
+        p
+    }
+
+    /// The review of #564 (F5): a daemon a tracer holds (`PTRACE_SEIZE`
+    /// leaves it running, state `S`) is not the runtime's as it was: its
+    /// tracer may run any code in it.
+    #[test]
+    fn a_traced_daemon_is_no_tie() {
+        let f = fixture();
+        let d = f.proc.path().join(DAEMON.to_string());
+        let status = std::fs::read_to_string(d.join("status")).unwrap();
+        std::fs::write(
+            d.join("status"),
+            status.replace("TracerPid:\t0", "TracerPid:\t4242"),
+        )
+        .unwrap();
+        assert!(!run(&mut AppImages::default(), &f, me(), &apprun()));
+        // no `TracerPid:` line at all: not known untraced
+        std::fs::write(d.join("status"), status.replace("TracerPid:\t0\n", "")).unwrap();
+        assert!(!run(&mut AppImages::default(), &f, me(), &apprun()));
+    }
+
+    /// The image's path is never read through a FUSE mount (a mount on one
+    /// of its directories since its exec: its daemon answers the lookup, or
+    /// never) — the file there is no longer the image anyway.
+    #[test]
+    fn the_image_s_path_is_never_read_through_a_fuse_mount() {
+        let f = fixture();
+        let uid = me();
+        table_plus(
+            f.proc.path(),
+            &format!(
+                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={uid},allow_other",
+                f._files.path().display()
+            ),
+        );
+        assert!(!run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
+    /// The review of #564 (F4): an exec of a file on no anonymous device
+    /// (FUSE's device is one: a disk's is not) is never read further — the
+    /// mount table is not read for it, even in the image's shape.
+    #[test]
+    fn only_an_anonymous_device_is_read_as_an_image() {
+        let f = fixture();
+        let uid = me();
+        std::fs::write(
+            f.proc.path().join("1/mountinfo"),
+            format!(
+                "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:30 / /tmp rw - tmpfs tmpfs rw\n\
+                 61 30 8:{FUSE_DEV} / {MOUNT} ro,nosuid - fuse.App.AppImage x ro,user_id={uid}\n"
+            ),
+        )
+        .unwrap();
+        let mut images = AppImages::default();
+        let image = image_of(&f);
+        let mut first = exec(RUNTIME, uid, image, id_of(&f.image), image, IMAGE_EXEC_NS);
+        images.note(f.proc.path(), &mut first);
+        let dev = (8 << 20) | FUSE_DEV;
+        let mut e = exec(RUNTIME, uid, &apprun(), (dev, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e));
+        assert!(images.tied.is_empty());
     }
 }

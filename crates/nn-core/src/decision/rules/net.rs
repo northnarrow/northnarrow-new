@@ -4310,6 +4310,16 @@ mod tests {
             rule.evaluate(&flow_from(None, 4301, 8080)).is_some(),
             "untied"
         );
+        // the review of #564 (F7): a row's path another file than the
+        // image the cache holds for the process (its exec of a file staged
+        // since, the event lost) is judged by that path
+        for pid in [4300, 4302] {
+            assert!(
+                rule.evaluate(&flow_from(Some("/tmp/evil"), pid, 8080))
+                    .is_some(),
+                "{pid}"
+            );
+        }
         // without a lineage, the row's path alone: staged
         let bare = NnLNet008OutboundFromTmpExec::new(None);
         assert!(bare.evaluate(&flow_from(Some(app), 4300, 8080)).is_some());
