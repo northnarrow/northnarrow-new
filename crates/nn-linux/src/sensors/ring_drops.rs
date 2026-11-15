@@ -697,6 +697,14 @@ mod tests {
             assert!(security_losses(&prev, &cur).is_empty(), "{n}");
         }
         assert!(!SECURITY_RINGS.contains(&ring_slot::MINOR_DENIAL_RATE));
+        // lot 356: a window's held load refused for want of room for its
+        // record hid nothing (the program was never handed out); the lost
+        // reservation is the security ring's
+        let mut cur = prev.clone();
+        cur[ring_slot::HELD_LOAD_UNSIGNED as usize] = 5;
+        assert!(security_losses(&prev, &cur).is_empty());
+        assert!(!SECURITY_RINGS.contains(&ring_slot::HELD_LOAD_UNSIGNED));
+        assert!(SECURITY_RINGS.contains(&ring_slot::FS_PROTECT));
         // another security ring keeps its threshold
         let mut cur = prev.clone();
         cur[ring_slot::FS_PROTECT as usize] = TELEMETRY_LOSS_THRESHOLD;

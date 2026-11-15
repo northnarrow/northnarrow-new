@@ -11208,6 +11208,54 @@ number in parentheses is a lab PR.
   - Levels unchanged: C11 keeps its level (the agent on a container host
     without the overlay no longer kills its runtime's start; no new
     container capability).
+- **Lot 356 — a window's held BPF load is always signed, never
+  rate-limited (pre-alpha F3-8; C23; no level change).**
+  - What was open (P2, every kernel): `bpf_held_load`, the record of a
+    program the content judge refuses outside a trusted-installer window,
+    loaded inside one and held (lot 349), was a "minor" record. It spent the
+    per-CPU budget of the non-decisive refusals (50 a second); a flood of
+    refused uses of an earlier held program on that CPU spent it, and the
+    load in the same second was held with only the anonymous
+    `minor_denial_rate` count behind it — no record named the program, no
+    `TelemetryLoss`. The pre-alpha lab lost it 1 time in 3 on 6.8.
+  - Done: a third class of record, the sole traces (`wire::is_sole_trace`:
+    the held load and its outliving, and the kernel-state round's
+    `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`,
+    `cpu_confined`), out of `is_minor_denial`. In the kernel `hold` signs
+    through `emit_sole_trace` (no budget, no dedup) and a ring with no room
+    refuses the load and lets its id go (fail closed, counted in the new
+    `RING_DROPS` slot `held_load_unsigned`); in the agent a sole trace is
+    logged and stored past NN-L-AT-001's per-uid budget, and the bus never
+    coalesces or caps one. The audit of every minor kind is in
+    `UPGRADE_NOTES_WAVE4.md` §50. Ratchets: `xtask/tests/kernel_halves.rs`
+    (the sole traces' operations and that writer kept to `hold`),
+    `xtask/tests/self_defense.rs`; the posture's equivalence test pins the
+    three classes. Mutation: 12 mutants of the new code, 12 caught by a
+    named test.
+  - Lab (as measured, our own guests, the lot's tree, the agent installed
+    as an operator): ubuntu2404 (6.8.0-149), the investigation's X2 then X3
+    on CPU 0, 10 times: **0 of 10 lost** — each X3 load's `bpf_held_load`
+    present naming its program, X2 refused 11,256–17,598 uses a round; the
+    ring's drops only `minor_denial_rate` (144,898), no
+    `held_load_unsigned`, no `fs_protect`. ubuntu2604 (7.0.0-43): the same,
+    3 times, **0 of 3 lost**; verifier headroom OK (highest
+    `fim_rename_observe` 362,329, 36.2%). ubuntu2204 (5.15.0-202): the
+    verifier-check OK, `bpf_prog_guard` 23,628 processed, highest
+    `module_read_file_observe` 551,900 (55.2%) < 900k; there the new
+    privileged e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`)
+    passes on the lot's tree (64 window loads on CPU 0 behind a flood of
+    refused handles, each signed naming its program, none refused) and
+    fails on rc2 with the test alone (the held load of program 136 left no
+    record; the flood's `minor_denial_rate` drops 2,318,301). On a guest
+    with no `/etc/northnarrow` the guard fixture's last run is refused at
+    `agent_mounts` (the first run made the directory after registering the
+    host's): the lab made it first, as `install.sh` does. X2's
+    `dup2` slot race (§43, a named residual, not this lot's) still let a
+    held program into a slot 0–4 times in 20,000 on 6.8, 0 on 7.0.
+  - Not covered in a guest: the ring-full refusal (a ring with no room at
+    the held load) — by the ratchet and the verifier only.
+  - Levels unchanged: C23 keeps its level (a record made reliable; no new
+    defence).
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

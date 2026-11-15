@@ -117,7 +117,14 @@ and from starving the rest:
   and the io_uring pump between their own events — find room at once and
   hold no pump back while a flood fills the rest. A denial holding a flood
   slot waits for the queue's slot within what is left of its 50 ms (third
-  review, C6: the rare events past the reserve).
+  review, C6: the rare events past the reserve);
+- lot 356 (pre-alpha F3-8): a sole trace (`core_bus::sole_trace`,
+  `FsProtectOperation::is_sole_trace`: a window's held BPF load, its
+  outliving, the kernel-state round's findings) is no flood of P0 — no
+  process repeats one at will — but one of the rare tamper events: never
+  capped, never coalesced (each names its program or finding), it takes
+  the reserve and waits for room; the decision records it past its rule's
+  budget for the uid.
 
 `DefenderSignal` shares the file-open sensor's ring and pump with the FIM
 credential reads, mass writes and bursts (review #471 M2): the pump sends
@@ -828,7 +835,7 @@ stage of an event's path (plan §3.4):
 | Stage | Counted by | Since |
 |---|---|---|
 | 1 kernel ring | `RING_DROPS`, a ring or map full | Tappa 10.8 |
-| 2 kernel budget | `RING_DROPS` `dns_rate`, `listen_rate`, `io_uring_rate`, `task_denial_rate`, `denial_rate` (lot 293), `minor_denial_rate` (lot 318) | reviews 78, EBPF-013/017 |
+| 2 kernel budget | `RING_DROPS` `dns_rate`, `listen_rate`, `io_uring_rate`, `task_denial_rate`, `denial_rate` (lot 293), `minor_denial_rate` (lot 318); `held_load_unsigned` (lot 356: a held BPF load refused, no room for its record) | reviews 78, EBPF-013/017 |
 | 3 decode | `RejectThrottle` | SNS-008 |
 | 4 bus queue | the bus, per queue | R12a |
 | 5 decision delay | the decisions over their class's budget, from the record's kernel time | R12b |

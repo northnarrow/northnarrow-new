@@ -542,21 +542,35 @@ pub(crate) fn emit_sysctl_record(
     entry.submit(0);
 }
 
-/// Best-effort audit record. Silently drops if the ringbuffer is
-/// full — the deny verdict still fires.
+/// Lot 356 (pre-alpha F3-8): the record of a sole trace
+/// (`northnarrow_common::wire::is_sole_trace`: a window's held load) —
+/// through no budget and no dedup, whatever was signed before it on this
+/// CPU; `false` when the ring has no room for it (counted, `fs_protect`),
+/// and the caller then refuses what it would have signed (fail closed).
+/// The held load spent the non-decisive refusals' budget: 50 refused uses
+/// of a held program on a CPU held back, that second, the next window
+/// load's record there, the program never named.
+#[inline(always)]
+pub(crate) fn emit_sole_trace(operation: u8, key: InodeKey) -> bool {
+    emit_denial(operation, key)
+}
+
+/// Best-effort audit record. Drops (counted) if the ringbuffer is
+/// full — the deny verdict still fires. `true` when written.
 ///
 /// Lot 318 (external bug hunt BUG37): private to this module — every
 /// other refusal reaches the ring through a budget ([`emit_attempt`],
 /// [`emit_limited`], [`emit_task_denial`]; the BPF guard's through
-/// `emit_attempt`). `xtask/tests/kernel_halves.rs` keeps the ring's writers
-/// to this function and [`emit_sysctl_record`].
+/// `emit_attempt`), a sole trace through [`emit_sole_trace`] (lot 356).
+/// `xtask/tests/kernel_halves.rs` keeps the ring's writers to this function
+/// and [`emit_sysctl_record`].
 #[inline(always)]
-fn emit_denial(operation: u8, key: InodeKey) {
+fn emit_denial(operation: u8, key: InodeKey) -> bool {
     let mut entry = match FS_PROTECT_EVENTS.reserve::<FsProtectDenialRaw>(0) {
         Some(e) => e,
         None => {
             crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FS_PROTECT);
-            return;
+            return false;
         }
     };
 
@@ -583,6 +597,7 @@ fn emit_denial(operation: u8, key: InodeKey) {
     }
 
     entry.submit(0);
+    true
 }
 
 /// Standard "should we deny?" decision used by every hook once it

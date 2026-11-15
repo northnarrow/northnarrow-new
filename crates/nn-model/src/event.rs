@@ -1323,6 +1323,23 @@ impl FsProtectOperation {
             Self::Unknown(_) => "unknown",
         }
     }
+
+    /// Lot 356 (pre-alpha F3-8): `common::wire::is_sole_trace` of this
+    /// operation — the only trace of something the agent let through (a
+    /// window's held load or its outliving, the kernel-state round's
+    /// findings): never held back by a budget, the bus's cap or its
+    /// coalescing, always recorded.
+    pub const fn is_sole_trace(&self) -> bool {
+        matches!(
+            self,
+            Self::BpfHeldLoad
+                | Self::KernelTaint
+                | Self::SysctlRootProg
+                | Self::BpfUnseen
+                | Self::BpfBaseline
+                | Self::CpuConfined
+        )
+    }
 }
 
 impl core::fmt::Display for FsProtectOperation {
@@ -2115,6 +2132,18 @@ mod tests {
             FsProtectOperation::from_wire(crate::wire::FS_OP_LAST + 1),
             FsProtectOperation::Unknown(crate::wire::FS_OP_LAST + 1)
         );
+    }
+
+    /// Lot 356: the model's sole traces are the wire's, byte for byte.
+    #[test]
+    fn the_sole_traces_are_the_wire_s() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                FsProtectOperation::from_wire(byte).is_sole_trace(),
+                crate::wire::is_sole_trace(byte),
+                "{byte}"
+            );
+        }
     }
     use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
 

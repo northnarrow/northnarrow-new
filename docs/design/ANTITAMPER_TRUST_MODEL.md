@@ -2402,7 +2402,10 @@ by the same tgid) every such signal is refused, `-EPERM` from the hook, and
   R2: the kprobes and lockdown switches, the refused renices and sysctl
   writes, `sigio`, the opt-outs' and the exempt-cgroup and code-injection
   records) spend a per-CPU budget of their own (`MINOR_DENIAL_RATE`, 50 a
-  second; `RING_DROPS` `minor_denial_rate`, signed, not a security ring),
+  second; `RING_DROPS` `minor_denial_rate`, signed, not a security ring;
+  lot 356: never a sole trace, `wire::is_sole_trace` — a window's held load
+  and the kernel-state round's findings, the only trace of what was let
+  through, spend no budget at all),
   whether signed at each attempt or rate-limited per caller; the decisive
   ones keep lot 293's attempt budget (`bpf_map`, `bpf_link` and the file
   refusals) and the task denials' (signals, ptraces, kexecs, cgroup moves,
@@ -2730,7 +2733,12 @@ program's tail call. Before 6.9 the window's load was not kept at all.
 Now:
 - on every kernel the window's forbidden load is held (before 6.9 at its
   `bpf_prog` handle, with the calibrated scan; from 6.9 from the load
-  hook's verdict) and signed at once (`bpf_held_load`, High, not refused);
+  hook's verdict) and signed at once (`bpf_held_load`, High, not refused;
+  lot 356, pre-alpha F3-8: a sole trace, `wire::is_sole_trace`, through no
+  budget — it spent the non-decisive refusals' per-CPU one, and a flood of
+  refused uses of an earlier held program held it back, the program never
+  named — and a load whose record the ring has no room for is refused, its
+  id let go, `held_load_unsigned`: no held program goes unnamed);
 - every run or attach of a held id outside a window, by a caller outside
   the family and not a fresh instance, is refused and signed
   (`bpf_held_use`, the use and the id), in every mode: the `bpf` hook

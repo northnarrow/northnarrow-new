@@ -133,7 +133,7 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     // the unbudgeted writer is the module's own: the compiler keeps every
     // other module out of it
     assert!(
-        i.contains("\nfn emit_denial(operation: u8, key: InodeKey) {"),
+        i.contains("\nfn emit_denial(operation: u8, key: InodeKey) -> bool {"),
         "emit_denial is visible outside inode_protect"
     );
     // the BPF guard's refusals: behind the attempt budget
@@ -241,6 +241,126 @@ fn every_write_of_the_denial_ring_is_behind_a_budget() {
     let sec = &r[r.find("pub const SECURITY_RINGS").unwrap()..];
     let sec = &sec[..sec.find("];").unwrap()];
     assert!(!sec.contains("MINOR_DENIAL_RATE"), "{sec}");
+}
+
+/// `code` without its `use` statements (an import names a constant
+/// without using it).
+fn without_uses(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(at) = ["\nuse ", "\npub use ", "\npub(crate) use "]
+        .iter()
+        .filter_map(|u| rest.find(u))
+        .min()
+    {
+        out.push_str(&rest[..at + 1]);
+        rest = &rest[at + 1..];
+        rest = &rest[rest.find(';').map_or(rest.len(), |p| p + 1)..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Lot 356 (pre-alpha F3-8): a trusted-installer window's held load was a
+/// "minor" record: 50 refused uses of a held program on a CPU spent the
+/// budget it shared with them, and the next window load's record there that
+/// second was a count (`minor_denial_rate`) naming no program. The sole
+/// traces (`wire::is_sole_trace`) spend no budget: in the kernel the held
+/// load is written by `hold` alone, through the unbudgeted writer
+/// `emit_sole_trace`, and a load whose record the ring cannot take is
+/// refused (its id let go, counted). No other function of the eBPF programs
+/// names a sole trace's operation, and no other calls that writer.
+#[test]
+fn a_held_load_is_signed_through_no_budget_or_refused() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let (mut named, mut writers) = (Vec::new(), Vec::new());
+    for f in &files {
+        let c = without_uses(&code(&f.strip_prefix(&root).unwrap().display().to_string()));
+        let rel = f.strip_prefix(&root).unwrap().display().to_string();
+        for op in [
+            "FS_OP_BPF_HELD_LOAD",
+            "FS_OP_KERNEL_TAINT",
+            "FS_OP_SYSCTL_ROOT_PROG",
+            "FS_OP_BPF_UNSEEN",
+            "FS_OP_BPF_BASELINE",
+            "FS_OP_CPU_CONFINED",
+        ] {
+            named.extend(
+                callers(&c, op)
+                    .into_iter()
+                    .map(|f| format!("{rel}: {f} {op}")),
+            );
+        }
+        writers.extend(
+            callers(&c, "emit_sole_trace(")
+                .into_iter()
+                .map(|f| format!("{rel}: {f}")),
+        );
+    }
+    named.sort();
+    writers.sort();
+    assert_eq!(
+        named,
+        ["agent-ebpf/src/bpf_defense.rs: fn hold FS_OP_BPF_HELD_LOAD"],
+        "a sole trace's operation named outside `hold`"
+    );
+    assert_eq!(
+        writers,
+        [
+            "agent-ebpf/src/bpf_defense.rs: fn hold",
+            "agent-ebpf/src/inode_protect.rs: fn emit_sole_trace",
+        ],
+        "the unbudgeted writer called outside `hold`"
+    );
+    let b = code("agent-ebpf/src/bpf_defense.rs");
+    in_order(
+        body(&b, "hold"),
+        &[
+            "if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {",
+            "emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_FULL, verdict, id);",
+            "return false;",
+            "let signed = crate::inode_protect::emit_sole_trace(",
+            "FS_OP_BPF_HELD_LOAD,",
+            "dev: bpf_held_dev(0, verdict),",
+            "ino: id as u64,",
+            "if !signed {",
+            "let _ = PROG_CONTENT_HELD.remove(&id);",
+            "crate::drops::bump(northnarrow_common::ring_drops::ring_slot::HELD_LOAD_UNSIGNED);",
+            "return false;",
+            "true",
+        ],
+    )
+    .unwrap();
+    // the refused uses keep the minor budget (a caller repeats them at will)
+    in_order(
+        body(&b, "emit_held"),
+        &["crate::inode_protect::emit_attempt(", "operation,"],
+    )
+    .unwrap();
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    let w = body(&i, "emit_sole_trace");
+    assert!(w.contains("emit_denial(operation, key)"), "{w}");
+    for budget in ["budget", "RATE", "caller_is_self_test", "SEEN"] {
+        assert!(!w.contains(budget), "emit_sole_trace spends {budget}: {w}");
+    }
+    assert!(i.contains("pub(crate) fn emit_sole_trace(operation: u8, key: InodeKey) -> bool {"));
+    // the wire: the sole traces are not minor
+    let wire = code("common/src/wire/mod.rs");
+    let minor = body(&wire, "is_minor_denial");
+    let sole = body(&wire, "is_sole_trace");
+    for op in [
+        "FS_OP_BPF_HELD_LOAD",
+        "FS_OP_KERNEL_TAINT",
+        "FS_OP_SYSCTL_ROOT_PROG",
+        "FS_OP_BPF_UNSEEN",
+        "FS_OP_BPF_BASELINE",
+        "FS_OP_CPU_CONFINED",
+    ] {
+        assert!(!minor.contains(op), "{op} still minor:\n{minor}");
+        assert!(sole.contains(op), "{op} not a sole trace:\n{sole}");
+    }
 }
 
 /// External bug hunt BUG101 (the kernel half; the record's is lot 315's):

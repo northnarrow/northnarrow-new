@@ -946,6 +946,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 356 (pre-alpha F3-8, P2): **a window's held BPF load is always
+  signed, never rate-limited.** `bpf_held_load` (a program the content
+  judge refuses outside a trusted-installer window, loaded inside one and
+  held) was a "minor" record: it spent the per-CPU budget of the
+  non-decisive refusals (50 a second), and a flood of refused uses of an
+  earlier held program on the CPU held it back — the program held, its
+  record only the anonymous `minor_denial_rate` count (the lab: 1 in 3 on
+  6.8; every kernel).
+  - **A third class, the sole traces** (`wire::is_sole_trace`): the held
+    load and the kernel-state round's findings (`kernel_taint`,
+    `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined`) left
+    `is_minor_denial`; the posture's equivalence test pins the three
+    classes (decisive, minor, sole trace).
+  - **Kernel:** `hold` signs through `inode_protect::emit_sole_trace` (no
+    budget, no dedup); a ring with no room refuses the load and lets its id
+    go (fail closed), counted in the new `RING_DROPS` slot
+    `held_load_unsigned` (31). A ratchet (`xtask/tests/kernel_halves.rs`)
+    keeps the sole traces' operations and that writer to `hold`.
+  - **Agent:** a sole trace is logged and stored past NN-L-AT-001's record
+    budget for the uid (`budget_admit_sole_trace`); the bus never coalesces
+    or caps one (`core_bus::sole_trace`: no flood of P0, it takes the
+    reserve and waits for room).
+  - Audit of every "minor" kind in `UPGRADE_NOTES_WAVE4.md` §50; a privileged
+    e2e (`a_flood_of_minor_refusals_never_hides_a_held_load`: a flood of
+    refused handles on one CPU, then 64 window loads there, each signed with
+    its program id).
 - Lot 354 (pre-alpha Phase 9, part 1): the docs match the code, the
   operator's help, the protocol version.
   - **README figures checked by a test.** `xtask/tests/readme_figures.rs`

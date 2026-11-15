@@ -559,9 +559,10 @@ pub extern "C" fn nn_held_slot(map_fd: u64, value: u64) -> u64 {
     }
 }
 
-/// Lot 349 (the review of #558, F1): a held program's record —
-/// [`FS_OP_BPF_HELD_LOAD`] (`how` 0) or [`FS_OP_BPF_HELD_USE`] — with the
-/// use, the judge's verdict (`why << 32 | type`) and the program id.
+/// Lot 349 (the review of #558, F1): a held program's refused use's record
+/// ([`FS_OP_BPF_HELD_USE`], through the non-decisive refusals' budget) —
+/// with the use, the judge's verdict (`why << 32 | type`) and the program
+/// id. Lot 356: never the load's ([`hold`]: a sole trace, no budget).
 #[inline(always)]
 fn emit_held(operation: u8, how: u32, verdict: u64, id: u32) {
     crate::inode_protect::emit_attempt(
@@ -579,13 +580,33 @@ fn emit_held(operation: u8, how: u32, verdict: u64, id: u32) {
 /// the held set is full: the caller refuses the load (fail closed, signed
 /// with [`BPF_HELD_FULL`]) — a load kept nowhere could be run after the
 /// window unrefused.
+///
+/// Lot 356 (pre-alpha F3-8): the load's record is a sole trace
+/// (`northnarrow_common::wire::is_sole_trace`), written through no budget
+/// ([`crate::inode_protect::emit_sole_trace`]): it spent the non-decisive
+/// refusals' one, and a flood of refused uses of an earlier held program on
+/// the CPU held it back that second — the program held, its record a count
+/// naming nothing. The ring with no room for it, the load is refused too
+/// and its id let go (fail closed, counted: `held_load_unsigned`) — a held
+/// program nothing names must not exist.
 #[inline(always)]
 unsafe fn hold(id: u32, verdict: u64) -> bool {
     if PROG_CONTENT_HELD.insert(&id, &verdict, 0).is_err() {
         emit_held(FS_OP_BPF_HELD_USE, BPF_HELD_FULL, verdict, id);
         return false;
     }
-    emit_held(FS_OP_BPF_HELD_LOAD, 0, verdict, id);
+    let signed = crate::inode_protect::emit_sole_trace(
+        FS_OP_BPF_HELD_LOAD,
+        InodeKey {
+            dev: bpf_held_dev(0, verdict),
+            ino: id as u64,
+        },
+    );
+    if !signed {
+        let _ = PROG_CONTENT_HELD.remove(&id);
+        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::HELD_LOAD_UNSIGNED);
+        return false;
+    }
     true
 }
 

@@ -1421,7 +1421,15 @@ pub const FS_OP_LAST: u8 = FS_OP_BPF_HELD_USE;
 /// a flood of these never takes a decisive record's room. Their held-back
 /// count is its own `RING_DROPS` slot (`minor_denial_rate`), not a security
 /// loss. `nn_core`'s posture test pins the equivalence both ways: minor
-/// here exactly when not `AntiTamperDenial` there.
+/// here exactly when not `AntiTamperDenial` there and not a sole trace
+/// ([`is_sole_trace`]).
+///
+/// Lot 356 (pre-alpha F3-8): a window's held load ([`FS_OP_BPF_HELD_LOAD`])
+/// and the kernel-state round's findings left this list — each is the only
+/// trace of something let through (see [`is_sole_trace`]); every kind left
+/// here is refused whatever its record, or is let through by the signed
+/// per-rule policy of the operator, or keeps its defence in the kernel's
+/// mark (a move into an exempt cgroup, code-injection access).
 pub const fn is_minor_denial(operation: u8) -> bool {
     matches!(
         operation,
@@ -1429,9 +1437,8 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_BPF_HANDLE
             | FS_OP_BPF_PROG_TYPE
             | FS_OP_BPF_PROG_OPT_OUT
-            // lot 349: a held program's load (no refusal) and its refused
-            // uses, like a refused program type
-            | FS_OP_BPF_HELD_LOAD
+            // lot 349: a held program's refused uses, like a refused
+            // program type (lot 356: its load is a sole trace)
             | FS_OP_BPF_HELD_USE
             | FS_OP_SYSCTL_ROOT_ATTACH
             // the re-check of #545, R1: refused at the write-open, signed
@@ -1448,8 +1455,39 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_SIGIO
             | FS_OP_CGROUP_JOIN
             | FS_OP_EXEMPT_INJECT
-            // the kernel-state round's findings (no refusal, no budget of
-            // the kernel's: listed for the equivalence)
+    )
+}
+
+/// Lot 356 (pre-alpha F3-8): the records that are the ONLY trace of a
+/// self-protection event the agent let through — nothing was refused, and
+/// nothing else names what now exists:
+///
+/// - [`FS_OP_BPF_HELD_LOAD`]: a program the content judge refuses outside
+///   a window, loaded inside one and held (its runs and attaches outside a
+///   window are refused; one attached inside it keeps running), and the
+///   kernel-state round's [`BPF_HELD_OUTLIVED`] of it;
+/// - the kernel-state round's findings: a taint flag of code entering the
+///   kernel ([`FS_OP_KERNEL_TAINT`]), a foreign program on the root
+///   cgroup's `cgroup/sysctl` slot ([`FS_OP_SYSCTL_ROOT_PROG`]), a program
+///   or link the `bpf` hook never saw ([`FS_OP_BPF_UNSEEN`]) or present at
+///   the start ([`FS_OP_BPF_BASELINE`]), the agent confined to fewer CPUs
+///   ([`FS_OP_CPU_CONFINED`]).
+///
+/// No caller repeats them at will: a held load is one per program kept in
+/// the held set (`PROG_CONTENT_HELD`, 1,024 ids, a window's loads only),
+/// a finding one per change the round sees. So they spend no budget at
+/// all — neither the kernel's per-CPU ones (the held load was minor until
+/// this lot: 50 refused uses of a held program on a CPU held back, that
+/// second, the next window load's record, the program never named) nor
+/// the agent's record budget per rule and uid, nor the bus's cap; the bus
+/// never coalesces them. A held load whose record the ring cannot take is
+/// refused (fail closed, counted: `held_load_unsigned`). Never decisive
+/// (the posture takes none as `AntiTamperDenial`) and never minor
+/// ([`is_minor_denial`]): `nn_core`'s posture test pins the three classes.
+pub const fn is_sole_trace(operation: u8) -> bool {
+    matches!(
+        operation,
+        FS_OP_BPF_HELD_LOAD
             | FS_OP_KERNEL_TAINT
             | FS_OP_SYSCTL_ROOT_PROG
             | FS_OP_BPF_UNSEEN
@@ -2722,6 +2760,40 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    /// Lot 356 (pre-alpha F3-8): a window's held load spent the per-CPU
+    /// budget of the non-decisive refusals, and 50 refused uses of a held
+    /// program on a CPU held back, that second, the next window load's
+    /// record (the program never named). It and the kernel-state round's
+    /// findings — the only trace of something let through — are sole
+    /// traces now, never minor: the two classes are disjoint, and every
+    /// sole trace is one of these six.
+    #[test]
+    fn a_held_load_and_the_round_s_findings_are_sole_traces_never_minor() {
+        for op in [
+            FS_OP_BPF_HELD_LOAD,
+            FS_OP_KERNEL_TAINT,
+            FS_OP_SYSCTL_ROOT_PROG,
+            FS_OP_BPF_UNSEEN,
+            FS_OP_BPF_BASELINE,
+            FS_OP_CPU_CONFINED,
+        ] {
+            assert!(is_sole_trace(op), "{op} is not a sole trace");
+            assert!(!is_minor_denial(op), "{op} still spends the minor budget");
+        }
+        let mut sole = 0;
+        for op in 0..=u8::MAX {
+            assert!(
+                !(is_sole_trace(op) && is_minor_denial(op)),
+                "{op}: both a sole trace and minor"
+            );
+            sole += usize::from(is_sole_trace(op));
+        }
+        assert_eq!(sole, 6);
+        // a held program's refused uses (and the held set full, a slot not
+        // read) are refusals a caller repeats at will: they stay minor
+        assert!(is_minor_denial(FS_OP_BPF_HELD_USE) && !is_sole_trace(FS_OP_BPF_HELD_USE));
     }
 
     // ── Tappa 10 N2 — BPF emission wire types ──────────────────────

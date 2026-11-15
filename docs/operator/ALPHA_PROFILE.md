@@ -166,7 +166,10 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
     - **A program loaded inside a window** (lot 349, and its review's
       fixes): a window lets any load through, but what the judge would
       refuse outside one is held by id and signed at the load
-      (`bpf_held_load`, High). Once the window closes, by any process
+      (`bpf_held_load`, High; lot 356: through no budget — a flood of
+      refusals on the CPU never holds it back — and when the agent's
+      denial ring has no room for that record the load is refused, `EPERM`,
+      counted as `held_load_unsigned`). Once the window closes, by any process
       outside the agent's family and through ANY descriptor — a new handle
       by id or through its pin (a signed `bpf_prog_type` naming the call),
       the loader's own descriptor kept from the window, one passed over a

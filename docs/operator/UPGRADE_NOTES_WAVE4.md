@@ -2763,3 +2763,51 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
   named the DNS decoder for every field that was not btrfs's, a hook's
   argument or the move guard's).
 
+## 50. A window's held BPF load is always signed (lot 356)
+
+- **A held load's record spends no budget.** A program the content judge
+  refuses outside a trusted-installer window (a kprobe calling
+  `bpf_send_signal`, a `syscall` program calling `bpf_send_signal_task`),
+  loaded inside one, is held by id and signed `bpf_held_load` (High, lot
+  349). Its record went through the kernel's per-CPU budget of the
+  non-decisive refusals (`minor_denial_rate`, 50 a second per CPU): a flood
+  of refused uses of an earlier held program, of refused handles on the
+  agent's maps or of refused reads of its key on that CPU spent it, and the
+  load in the same second was held with no record naming it — only the
+  anonymous `minor_denial_rate` count (no `TelemetryLoss`). The lab lost it
+  1 time in 3 on 6.8; it held on every kernel. Now the record is written
+  through no budget, one per held program.
+- **No room for the record, no load.** When the agent's denial ring has no
+  room for a held load's record, the load is refused (`EPERM`) and its id
+  let go, counted in the new ring-drop counter `held_load_unsigned`
+  (signed, not a security ring: the program was never handed out; the lost
+  reservation is counted in `fs_protect`, which is one). A held program
+  that nothing names does not exist any more. An installer that sees a
+  window load refused with `EPERM` and `held_load_unsigned` > 0 in `nn-admin
+  status` met a full ring: retry the load.
+- **A sole trace in the agent too.** The held load, its "still loaded after
+  the window" record and the kernel-state round's findings (`kernel_taint`,
+  `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined`) are the
+  only trace of something the agent let through. They are logged and stored
+  past NN-L-AT-001's record budget for the uid (a root flood of refusals
+  spent it, and the held load's record was a held count naming a process,
+  not the program), never coalesced or capped by the event bus, and they
+  wait for room in its tamper queue instead of being dropped after 50 ms.
+  None changes the posture: they stay non-decisive. A held program's
+  refused uses (`bpf_held_use`) keep the non-decisive budget — a caller
+  repeats them at will, and each is refused whatever its record.
+- **No action on upgrade.** The ring-drop counters gain one slot
+  (`held_load_unsigned`, slot 31) at the end: readers by name are unchanged.
+
+Audit of the records that were "minor" (lot 356). Each kind left in the
+budget is refused whatever its record, or let through by the operator's
+signed per-rule policy, or keeps its defence in the kernel's mark:
+
+| Record | Refused? | Can losing it hide an attack on the agent? | Now |
+|---|---|---|---|
+| `read` (the agent's key), `bpf_handle`, `bpf_prog_type`, `sysctl_root_attach`, `kprobes`, `lockdown`, `sched`, `nice`, `ioprio`, `sysctl`, `sysctl_value`, `sigio` | yes | no: the refusal holds without its record | minor |
+| `bpf_held_use` (incl. the held set full, a prog array's slot not read) | yes | no: refused; repeatable at will | minor |
+| `bpf_prog_opt_out`, `sysctl_opt_out` | no: the signed per-rule policy lets it through | no: the operator's signed choice; the content judge still refuses a signalling or overriding program; recorded once a second per caller | minor |
+| `cgroup_join`, `exempt_injection` | no | no: the kernel's mark already strips the exemption | minor |
+| `bpf_held_load` (and its outliving) | no | **yes**: the only record of a program that can signal the agent | sole trace |
+| `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined` | no (found by the kernel-state round) | **yes**: the only record of foreign kernel code, a program the agent never saw, the agent confined | sole trace |
