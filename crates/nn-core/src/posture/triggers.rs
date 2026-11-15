@@ -2498,6 +2498,7 @@ pub mod testutil {
             dst_addr: a,
             dst_port,
             timestamp_ns: ts,
+            fork: Default::default(),
         }
     }
 
@@ -2532,6 +2533,7 @@ pub mod testutil {
             dst_addr: a,
             dst_port,
             timestamp_ns: ts,
+            fork: Default::default(),
         }
     }
 
@@ -2601,6 +2603,7 @@ pub mod testutil {
             dst_addr: dst,
             dst_port,
             timestamp_ns: ts,
+            fork: Default::default(),
         }
     }
 }

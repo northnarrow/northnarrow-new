@@ -174,6 +174,7 @@ fn fim_event_on(path: &str, pid: u32) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        modifier_start: 0,
     })
 }
 
@@ -639,6 +640,7 @@ fn connect_to(dst: &str, dst_port: u16, pid: u32, ts: u64) -> Event {
         dst_addr,
         dst_port,
         timestamp_ns: ts,
+        fork: Default::default(),
     }
 }
 
@@ -707,6 +709,53 @@ fn a_connect_to_a_network_canary_trips_it() {
         })
     ));
     assert_eq!(access_rows(&dir).len(), 2);
+}
+
+/// The re-check of #561 (lot 352), N1: the trip carries the accessor's
+/// start as its source event says it — an open's reader, an exec's process,
+/// a fork-only connector — and 0 when it does not, for the chains to tag
+/// the trip with.
+#[test]
+fn a_trip_carries_the_accessor_s_start_from_its_source_event() {
+    let start_of = |out: Option<Event>| match out {
+        Some(Event::CanaryTripped {
+            accessor_start_ns, ..
+        }) => accessor_start_ns,
+        other => panic!("expected a canary trip, got {other:?}"),
+    };
+    let dir = TempDir::new().unwrap();
+    let (detector, registry) = build_detector(&dir);
+    deploy_file_canary(&registry, &detector, "/tmp/decoy.txt", "decoy_file");
+    let mut open = fim_event_on("/tmp/decoy.txt", 4242);
+    assert_eq!(start_of(detector.process_event(&open)), 0, "not said");
+    if let Event::Fim(fe) = &mut open {
+        fe.modifier_start = 41_000;
+    }
+    assert_eq!(start_of(detector.process_event(&open)), 41_000);
+
+    deploy_process_canary(&registry, &detector, "/usr/local/bin/helper", "decoy_exec");
+    let mut exec = process_spawn("/usr/local/bin/helper", 9999);
+    if let Event::ProcessSpawn { start_ns, .. } = &mut exec {
+        *start_ns = 42_000;
+    }
+    assert_eq!(start_of(detector.process_event(&exec)), 42_000);
+
+    deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+    let mut connect = connect_to("100.64.0.9", 4444, 7001, 1_000);
+    assert_eq!(
+        start_of(detector.process_event(&connect)),
+        0,
+        "an exec'd connector"
+    );
+    if let Event::TcpConnect { fork, .. } = &mut connect {
+        *fork = nn_model::ForkRecord {
+            start_ns: 43_000,
+            parent: 7000,
+            parent_start_ns: 40_000,
+            anchor: 7000,
+        };
+    }
+    assert_eq!(start_of(detector.process_event(&connect)), 43_000);
 }
 
 /// The verdict: NN-L-CANARY-003 on the trip the connect makes, Critical,
@@ -981,6 +1030,7 @@ fn the_trips_own_connection_draws_no_chain_verdict_in_any_order() {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        modifier_start: 0,
     });
     let late_exec = Event::ProcessSpawn {
         pid: PID,

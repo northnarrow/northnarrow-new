@@ -11249,6 +11249,141 @@ number in parentheses is a lab PR.
     tracked shell script; the README's test floor within 200 of the count.
     Lab: none (the signed path is covered by the install tests with
     throwaway keys; no signed release exists yet).
+- **Lot 352 — the pre-alpha's Phase 4 misses: a link's new path, the whole
+  module tree, chains across fork-only descendants (C05, C06, C07, C14; no
+  level changes).**
+  - What was open (the Phase 4 of the pre-alpha checks on rc2, detection
+    efficacy): NN-L-FIM-002 did not fire for `ln /usr/bin/passwd
+    /var/tmp/x` (the link record named the source, and the drain dropped a
+    link as a no-op touch); NN-L-FIM-008 saw only the direct children of
+    `/lib/modules`, not `/lib/modules/$(uname -r)/x.ko`; NN-L-CHAIN-004/005/006
+    lost the chain through a process that never executed (edges at exec
+    only: a Python `os.fork()` child, a subshell, a daemon's intermediate —
+    CHAIN-006 fired on no kernel, the e2e's recipe in Python included).
+  - Done: the link hook sends the new link's path as the kernel's walk of
+    its dentries (`FimLinkRaw` on the FIM ring; `fim_rename_observe`
+    untouched), the event names it in `dest_path` and a `Linked` is never
+    content-suppressed; the module trees are critical trees of the
+    file-open sensor, a write-open at any depth (a name below the tree cut
+    or unread included) becomes the tree's `Created`/`Modified`, a package
+    transaction's writes are one Low record per process per 15 minutes
+    (`KmodTreeWrites`), the host's depmod's indexes Low; the fork record
+    carries the forker's start and the child's anchor (the nearest process
+    up the forks that had executed) in the exec record and, for a fork-only
+    process, in its connect record, and the chains' tree enters exec under
+    its forker, a fork-only process under its forker and a forker that
+    never executed under its anchor (one feed, ratchet
+    `xtask/tests/chain_ancestry.rs`). Named tests:
+    `fim002_judges_the_new_link_s_path`,
+    `a_link_to_a_watched_binary_reaches_the_rules_with_its_new_path`,
+    `a_write_open_below_a_module_tree_is_its_creation_or_modification`,
+    `a_package_transaction_s_tree_writes_are_coalesced_into_one_record`,
+    `the_host_s_depmod_writing_an_index_is_recorded`,
+    `fim001_leaves_the_module_tree_to_fim008`,
+    `chain004_fires_for_a_fork_only_child_of_the_reader`,
+    `chain005_fires_for_a_fork_only_child_of_a_staged_exec`,
+    `chain005_crosses_a_subshell`,
+    `chain006_fires_for_the_e2e_recipe_with_a_fork_only_intermediate`,
+    `chain006_fires_for_a_daemon_s_fork_only_grandchild`,
+    `a_fork_record_of_a_reused_pid_lends_no_chain`,
+    `a_fork_of_a_process_that_never_executed_inherits_its_anchor`.
+  - Lab (alpha profile, the Phase 4 recipes): Debian 13 (6.12.116, round r1)
+    and Ubuntu 24.04 (6.8.0-149, round r2). On both: FIM-002 Critical for
+    the link into /var/tmp and into /var/tmp/…/a/b, none for a link into
+    /srv; FIM-008 Critical for an empty `.ko` in `/lib/modules/$(uname -r)/`,
+    in its `kernel/`, for a copy of a real module there and for a direct
+    child; CHAIN-004 for the fork+exec and the fork-only child, CHAIN-005 for
+    the fork-only child of a /tmp copy of python and through a subshell,
+    CHAIN-006 for the daemon with an exec, the e2e's recipe (exec'd
+    daemoniser → fork-only intermediate → exec'd grandchild) and the
+    fork-only daemon; a benign fork-only child connecting: NET-007 Medium
+    only. r2 also: FIM-008 Critical for a module of a 50-byte name and for an
+    index written by `tee`; `depmod -a` (it rewrote `modules.dep`) 10 Low
+    records (r1, before the cut-name fix, none: depmod's temporary names are
+    longer than a slot). `verifier-check` on 6.12 and 6.8: every program OK
+    and within the 900,000 budget, `fim_rename_observe` 512/512 bytes of
+    stack as before, `fim_link_observe` 8,559 instructions processed,
+    `fork_parent_record` 400, the TCP connect kprobes 577 and 529; the
+    guests left uninstalled and off. Mutation testing of the new code: 56
+    mutants, every one caught by a named test (four survivors of the first
+    round got tests: a record without a start, a forker hop without a start,
+    an index name below a subdirectory, a link without its walk).
+  - Not done (named): a file moved or hard-linked INTO a module version
+    directory makes no open and is not seen below the top (the rename hook
+    is at the verifier's 512-byte stack); a fork-only hop between a forker
+    and its anchor is not entered (a precursor recorded by such a middle hop
+    is not found); a fork-only process's UDP datagram carries no fork record
+    (only the TCP connect does); a module more than 10 directories below a
+    version directory on merged `/usr` (11 with a separate `/lib`: the walk's
+    16 names) is a critical write-open of the posture, not FIM-008; a symlink
+    created in the tree (no open) is not seen, and an `external`/`search`
+    directive of `/etc/depmod.d` makes depmod index modules outside it; a
+    module installed outside a package transaction (`make modules_install`,
+    the NVIDIA installer, `vboxconfig`) is one Critical per file; a coalesced
+    package transaction keeps at most 8 of its paths (the record budget's
+    samples); NN-L-FIM-002 sees a hard link of sudo, su and passwd only among
+    the setuid-root binaries (the watch list: `pkexec` is not watched).
+  - Review of #561 (fix round): F1, a fork record of a forker that started
+    before the process the tree holds at its pid (the forker exited, the
+    pid reused) lent the reused pid's precursors to a benign daemon's worker
+    (CHAIN-005, a kill of its tree): such a record is stale and not
+    followed, and the store never enters a start older than the one it
+    holds for a pid (`a_stale_fork_record_gives_a_daemon_s_worker_no_chain`,
+    `a_stale_fork_record_moves_nothing_onto_the_exited_forker`); F2, a
+    second exec (`sh -c '…; exec python3'`) put an orphan back under its
+    reaper: a later exec of the same process keeps the edge the tree holds
+    for it (`a_second_exec_keeps_an_orphan_under_its_forker`); F4, the
+    ratchet names `observe_spawn` as an identifier (a function path too) and
+    allows only the fork-record entries inside the store, `observe_spawn` is
+    `pub(crate)` (`the_ratchet_sees_a_call_a_path_and_a_store_wrapper`); F5,
+    the residuals above corrected. F3 (Electron AppImages), measured on
+    Ubuntu 24.04 (6.8, alpha profile, the lab's own account): an
+    AppImage-style image on `squashfuse` under `/tmp/.mount_*` gives R001
+    High plus NN-L-CHAIN-005 Critical when its zygote forks (no exec) the
+    process that connects, NN-L-CHAIN-002 Critical when that process is
+    started by fork+exec or the main process connects itself; Chrome for
+    Testing's `chrome-headless-shell` mounted the same way gives the same
+    (R001 High, CHAIN-002 Critical, sandboxed and `--no-sandbox`); the image
+    and the headless shell run from `$HOME` give NN-L-NET-007 Medium only.
+    The responses were would-have tree kills (the alpha profile kills
+    nothing). This false-positive class exists on rc2 with CHAIN-002
+    (pre-existing, not introduced here); lot 352 extends it to CHAIN-005
+    for fork-only children. It is handled by a separate lot (355): an
+    AppImage is judged by its image file, not by its `/tmp` mount point.
+  - Re-check 1 of #561 (second fix round). F1 was closed for an exec'd
+    reuser only. N1 (P2): a FORK-ONLY process that takes an exited
+    intermediate's pid and reads a credential store or trips a canary still
+    lent its read to the intermediate's descendants — recorded under the
+    tree's key for the pid (the intermediate's, entered by a hop), or handed
+    to it by a stale hop when the tree had not seen the pid — a false
+    CHAIN-004/006 Critical on a double-forked daemon's worker (and on rc2
+    with an exec'd intermediate). A precursor now keeps the start of the
+    process that made it (the kernel's open record carries the reader's
+    start: `FimDriftRaw::modifier_start`, else a fork-only process's fork
+    record; the trip's `accessor_start_ns`), and an ancestor walk counts it
+    only for that incarnation; the same pid's own queries and the
+    reader's own hand-over are unchanged
+    (`a_fork_only_reuser_s_read_is_not_lent_through_a_stale_hop`,
+    `a_stale_hop_takes_over_a_fork_only_reuser_s_read_without_its_chain`,
+    `a_fork_only_reuser_of_an_exec_d_intermediate_lends_its_read_to_no_one`,
+    `a_fork_only_reuser_s_canary_trip_is_not_lent_through_a_stale_hop`,
+    `an_ancestor_walk_counts_a_precursor_for_its_own_incarnation_only`,
+    `a_late_exec_s_sequence_takes_its_own_process_s_read_only`; the
+    legitimate reader keeps both chains:
+    `a_fork_only_reader_keeps_its_chains_past_a_stale_record_of_its_pid`).
+    N2: the ratchet refuses a store wrapper over the forker's hop and
+    `observe_exec`/`observe_fork` named outside `observe_lineage`
+    (`the_ratchet_sees_a_hop_wrapper_and_an_entry_outside_observe_lineage`).
+    No lab round (one eBPF line, the open record's start: the PR's lab VM
+    gate loads it on 5.15 and 6.8). Residuals: an event that does not say
+    its process's start (an exec'd process's open-sensor record or connect,
+    a write by an exec'd process not seen at close, a record whose fork
+    record was evicted) counts under the tree's incarnation of the pid, as
+    before — an exec'd process is in the tree by its exec record; N3 (P3,
+    evasion, not a regression from rc2): a stale record is dropped whole, so
+    a dropper whose fork-only intermediate exits and has its pid reused by
+    an exec before the child's connect loses its chain (a full pid rotation
+    within the window).
   - Levels unchanged.
 - **Lot 351 — the review of #559: a log shrunk back to its baseline, sudo's
   askpass helper, the uninstall's leftovers (C06, C11; no level changes).**

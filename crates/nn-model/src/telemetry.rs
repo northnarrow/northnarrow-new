@@ -165,6 +165,21 @@ pub struct FimEvent {
     /// rsyslog daemon as the writer.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub unchanged_since_read: bool,
+    /// Lot 352 (the re-check of #561, N1): the start of the process
+    /// `modifier_pid` named (its thread group leader's `task->start_time`,
+    /// `CLOCK_MONOTONIC` ns) when the kernel's record says it — an open's
+    /// reader and a write seen at close (`FimDriftRaw::modifier_start`), a
+    /// writer that executed nothing since its fork (its fork record's
+    /// `fork_start`) — else 0. The chains tag a credential read with it: the
+    /// process the ancestry tree last knew at that pid may be an earlier one,
+    /// exited (a daemon's intermediate), whose descendants the read is not
+    /// theirs to inherit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub modifier_start: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Wave 2 (TST-004): a watched file's permission bits and ownership, as
@@ -774,6 +789,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -881,6 +897,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            modifier_start: 0,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

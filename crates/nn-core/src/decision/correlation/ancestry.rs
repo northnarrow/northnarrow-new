@@ -20,6 +20,16 @@
 //! its child: such a hop is a later process holding a reused PID (the
 //! POS-003 rule of `lineage_match`).
 //!
+//! Lot 352 (pre-alpha Phase 4): edges entered only at exec lost every
+//! process that never executed — a Python `os.fork()` child, a shell's
+//! subshell, a daemon's intermediate. The kernel's fork record now names
+//! them ([`super::CorrelationStore::observe_exec`],
+//! [`super::CorrelationStore::observe_fork`]): an exec is entered under the
+//! process that forked it, a fork-only process (named by its connect) under
+//! its forker, and a forker that never executed under its anchor — the
+//! nearest process up the forks that had executed when it was forked. Fork-
+//! only hops between that forker and its anchor are not entered.
+//!
 //! External audit NETR-010: bounded at [`MAX_TRACKED_EDGES`] edges with
 //! second-chance eviction. When the tree is full, up to
 //! [`SECOND_CHANCE_SCAN`] edges are taken from the front of the recency

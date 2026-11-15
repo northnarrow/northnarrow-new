@@ -1953,6 +1953,7 @@ fn fim(op: nn_model::telemetry::FimOp, path: &str, pid: u32) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        modifier_start: 0,
     })
 }
 
