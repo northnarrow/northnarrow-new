@@ -1,7 +1,8 @@
 //! Every socket verb against the mock agent: each success reply the verb
 //! renders differently, the ten refusals (every `AdminResult` but
 //! `Success`), the transport faults (seven for a signed verb, five for an
-//! unsigned one), no socket, and a socket nobody listens on.
+//! unsigned one), no socket, a socket nobody listens on, and (lot 365) a
+//! running agent's socket this user may not open.
 
 use nn_model::posture_types::PostureKind;
 use nn_proto::admin_protocol::{AdminMessage, AdminResult, StatusResponse};
@@ -1182,6 +1183,7 @@ pub fn cases() -> Vec<Case> {
         }
         out.push(base(format!("sock.{}.no-socket", verb.name)));
         out.push(base(format!("sock.{}.refused-connection", verb.name)).mock(Script::Refused));
+        out.push(base(format!("sock.{}.permission-denied", verb.name)).mock(Script::Denied));
     }
     for (id, args, reply, put) in variants() {
         out.push(

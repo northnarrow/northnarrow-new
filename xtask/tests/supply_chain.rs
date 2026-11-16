@@ -3,7 +3,7 @@
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
 //! SUP-005, SUP-006, SUP-007 to SUP-018, SUP-021 to SUP-024, DEP-008 and
 //! PROC-015; and the CodeQL code scanning (lot codeql). The tests read
-//! committed files; seven run a local tool and none touches the network:
+//! committed files; eight run a local tool and none touches the network:
 //! `codeql_scans_every_language_of_the_tree` lists the tracked files
 //! (`git ls-files`) and the members (`cargo metadata --offline`),
 //! `prune_script_fails_closed` runs the CI prune
@@ -14,9 +14,11 @@
 //! `btf_matrix_script_passes_its_offline_tests` runs
 //! `deploy/btf-matrix/run-test.sh` (bash, tar, xz, sha256sum; stub curl, gh
 //! and agent), `release_tag_check_accepts_only_listed_signers` runs the
-//! tag check's selftest (git and ssh-keygen, throwaway keys) and
+//! tag check's selftest (git and ssh-keygen, throwaway keys),
 //! `the_release_scripts_refuse_a_lab_build` runs the tarball's and the
-//! packages' scripts under bash with stub binaries.
+//! packages' scripts under bash with stub binaries, and
+//! `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34` runs the glibc
+//! check's selftest (cc and the toolchain's rust-lld).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3522,4 +3524,184 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
         info.contains(".chain(DEPENDENCY_TEST_FEATURES)"),
         "build_features() names the dependencies' test features"
     );
+}
+
+/// The glibc of each GitHub-hosted image the release may be built on.
+const RUNNER_GLIBC: [(&str, &str); 3] = [
+    ("ubuntu-22.04", "2.35"),
+    ("ubuntu-24.04", "2.39"),
+    ("ubuntu-26.04", "2.43"),
+];
+
+/// `GLIBC_BASELINE=` of deploy/release/glibc-baseline.sh.
+fn glibc_baseline() -> String {
+    let script = read(&repo_root().join("deploy/release/glibc-baseline.sh"));
+    script
+        .lines()
+        .find_map(|l| l.strip_prefix("GLIBC_BASELINE="))
+        .map(|v| v.trim().to_string())
+        .expect("deploy/release/glibc-baseline.sh sets GLIBC_BASELINE=")
+}
+
+fn version_key(s: &str) -> Vec<u64> {
+    s.split('.').map(|p| p.parse().unwrap()).collect()
+}
+
+fn version_le(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap()).collect() };
+    parse(a) <= parse(b)
+}
+
+/// Lot 365 (an external tester's run on Debian 12): the release was linked
+/// on Ubuntu 24.04 (glibc 2.39), so every `nn-admin` on Debian 12 and Ubuntu
+/// 22.04 printed `weak version 'GLIBC_2.39' not found`, and an image with a
+/// newer glibc could have shipped binaries that do not start there. The
+/// package job builds on the image of the oldest supported glibc, and a
+/// step checks every shipped ELF file — the tarball's, the .deb's and the
+/// .rpm's — against that baseline after a selftest that proves the check
+/// refuses a weak need. The packages never ask for a glibc newer than the
+/// baseline.
+#[test]
+fn the_release_is_built_and_checked_on_the_glibc_baseline() {
+    let root = repo_root();
+    let baseline = glibc_baseline();
+    assert_eq!(
+        baseline, "2.34",
+        "the oldest supported glibc is AlmaLinux/RHEL 9's (2.34), the packages' floor"
+    );
+    let wf = workflow_yaml(&root.join(".github/workflows/release.yml"));
+    let package = jobs(&wf)
+        .into_iter()
+        .find(|(n, _)| n == "package")
+        .map(|(_, j)| j)
+        .expect("release.yml has a package job");
+    let image = str_of(&package, "runs-on").expect("package: runs-on");
+    let glibc = RUNNER_GLIBC
+        .iter()
+        .find(|(i, _)| *i == image)
+        .map(|(_, g)| *g)
+        .unwrap_or_else(|| {
+            panic!(
+                "package runs on `{image}`, not a pinned image of known glibc ({RUNNER_GLIBC:?})"
+            )
+        });
+    // The build image is the OLDEST of the images the release could use
+    // (never ubuntu-latest): no image of a lower glibc exists on GitHub, and
+    // the check, not the image, holds the needs at the baseline.
+    let oldest = RUNNER_GLIBC
+        .iter()
+        .min_by_key(|(_, g)| version_key(g))
+        .map(|(i, _)| *i)
+        .unwrap();
+    assert_eq!(
+        image, oldest,
+        "package runs on {image} (glibc {glibc}): the release is built on the oldest image ({oldest})"
+    );
+    assert!(
+        version_le(&baseline, glibc),
+        "the baseline {baseline} is above the image's glibc {glibc}: nothing could link"
+    );
+    let runs: Vec<String> = steps(&package)
+        .iter()
+        .map(|s| str_of(s, "run").unwrap_or("").to_string())
+        .collect();
+    let at = |needle: &str| {
+        runs.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no package step runs `{needle}`"))
+    };
+    let check = at("deploy/release/glibc-baseline.sh check \"$tmp/tgz\" \"$tmp/deb\" \"$tmp/rpm\"");
+    assert_eq!(
+        at("deploy/release/glibc-baseline.sh selftest"),
+        check,
+        "the selftest runs in the check's step, before it"
+    );
+    // The glibc step is unconditional: no `if:`, no `continue-on-error`
+    // (`if: false` or a swallowed failure would let a release pass without
+    // the check; sign requires package's success, publish requires sign).
+    let check_step = &steps(&package)[check];
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            check_step.get(key).is_none(),
+            "the glibc step must not carry `{key}:` (it runs on every release and its failure fails the job)"
+        );
+    }
+    assert!(
+        package.get("continue-on-error").is_none(),
+        "the package job must not carry `continue-on-error:`"
+    );
+    let step = &runs[check];
+    assert!(
+        step.find("selftest").unwrap() < step.find(" check ").unwrap(),
+        "the selftest runs before the check"
+    );
+    for needle in ["tar -C \"$tmp/tgz\" -xzf", "dpkg-deb -x", "rpm2cpio"] {
+        assert!(
+            step.contains(needle),
+            "the check's step extracts with `{needle}`"
+        );
+    }
+    assert!(
+        check > at("deploy/release/mk-packages.sh dist"),
+        "the check reads the packages, so it runs after they are built"
+    );
+    let upload = steps(&package)
+        .iter()
+        .position(|s| str_of(s, "uses").is_some_and(|u| u.starts_with("actions/upload-artifact@")))
+        .expect("package uploads its artefacts");
+    assert!(
+        check < upload,
+        "the check runs before the artefacts are uploaded"
+    );
+    // The packages' floors never exceed what the build guarantees.
+    let pkgs = read(&root.join("deploy/release/mk-packages.sh"));
+    for (marker, what) in [
+        ("libc6 (>= ", ".deb Depends"),
+        ("glibc >= ", ".rpm Requires"),
+    ] {
+        let floor: String = pkgs
+            .split(marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("mk-packages.sh: no `{marker}` ({what})"))
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        assert_eq!(
+            floor, baseline,
+            "the {what} floor {floor} must equal the check's baseline {baseline}: one ceiling"
+        );
+    }
+}
+
+/// Lot 365: the check itself, against binaries built on purpose — a strong
+/// and a weak (`Flags: WEAK`, as the release's linker marks Rust's probes)
+/// need of GLIBC_2.35 (one above the baseline) and of GLIBC_2.39 refused,
+/// GLIBC_2.34 (the baseline) accepted, an undeclared library refused. Runs cc and the toolchain's rust-lld; no network.
+#[test]
+fn glibc_baseline_check_refuses_a_binary_that_needs_above_2_34() {
+    let out = std::process::Command::new("bash")
+        .arg(repo_root().join("deploy/release/glibc-baseline.sh"))
+        .arg("selftest")
+        .output()
+        .expect("bash runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "glibc-baseline.sh selftest failed:\n{text}"
+    );
+    for line in [
+        "selftest ok    a strong need of GLIBC_2.39 is refused (exit 1)",
+        "selftest ok    a weak need of GLIBC_2.39 is refused (exit 1)",
+        "selftest ok    a strong need of GLIBC_2.35 is refused (exit 1)",
+        "selftest ok    a weak need of GLIBC_2.35 is refused (exit 1)",
+        "selftest ok    a need of GLIBC_2.34 is accepted (exit 0)",
+        "selftest ok    an undeclared shared library is refused (exit 1)",
+        "glibc-baseline: selftest passed",
+    ] {
+        assert!(text.contains(line), "missing `{line}`:\n{text}");
+    }
 }
