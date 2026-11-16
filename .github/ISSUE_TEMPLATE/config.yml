@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/northnarrow/northnarrow-new/security/advisories/new
+    about: A way to stop, blind or get around the agent's self-protection, to make it sign something false, or a crash caused by an unprivileged user. Report it privately, never in a public issue.
+  - name: Alpha tester guide
+    url: https://github.com/northnarrow/northnarrow-new/blob/main/docs/operator/ALPHA_TESTER_GUIDE.md
+    about: How to install, test, collect diagnostics without personal data, and uninstall.

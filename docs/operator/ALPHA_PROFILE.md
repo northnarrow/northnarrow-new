@@ -188,10 +188,10 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       running (a link, pinned or not, a perf event, a prog array filled
       then, an iterator link read later), a netlink attach (an XDP or tc
       program through `ip link` / `tc`, no `bpf(2)` command), and a race
-      (another thread's `dup2` of the descriptor between the agent's check
-      and the kernel's: a lost attempt is refused and signed, but a
-      stall on the copy can make the race deterministic, and the winning
-      use leaves no record of its own) — each
+      (another thread's change of the descriptor between the agent's
+      check and the kernel's: an attempt that loses it is refused, signed
+      once per program and caller with its repeats coalesced; one that
+      wins it leaves no record of its own) — each
       such program's load is the signed High record above, and once the
       window has closed the agent signs each one still loaded (High,
       `bpf_held_load` "still loaded after the window", with where it is
