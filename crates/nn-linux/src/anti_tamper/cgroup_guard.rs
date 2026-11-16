@@ -631,7 +631,10 @@ pub(crate) fn offsets_degraded<'a>(absent: impl IntoIterator<Item = &'a str>) ->
     if !proc.is_empty() {
         out.push(format!(
             "anti-tamper: a write of a protected process's oom_score_adj is not refused (the \
-             kernel's BTF has no {}): root can make the agent the OOM killer's first victim",
+             kernel's BTF has no {}): root can make the agent the OOM killer's first victim; \
+             nor is the open of its memory views (/proc/<pid>/environ, auxv, maps, smaps, \
+             smaps_rollup, numa_maps, pagemap), which on a kernel from 6.16 a process with \
+             CAP_PERFMON or CAP_SYS_ADMIN then reads past the ptrace hook's refusal",
             proc.join(", ")
         ));
     }
@@ -753,6 +756,11 @@ mod tests {
         assert_eq!(d.len(), 2, "{d:?}");
         assert!(
             d[0].contains("oom_score_adj") && d[0].contains("PID_TASKS_OFFSET"),
+            "{d:?}"
+        );
+        // lot 367 (F3b-1): the memory views' open deny needs them too
+        assert!(
+            d[0].contains("memory views") && d[0].contains("CAP_PERFMON"),
             "{d:?}"
         );
         assert!(

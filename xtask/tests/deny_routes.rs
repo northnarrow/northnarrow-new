@@ -81,6 +81,7 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ("cgroup_files.rs", "refuse_v1", 1, Enforced("a cgroup v1 write (cgroup.procs, tasks, freezer.state under a controller): a v1 freezer moves and freezes the agent past the v2 move guard (lot 273b)")),
     ("cgroup_files.rs", "refuse_sysctl", 1, Enforced("a guarded sysctl's file: kernel.ftrace_enabled=0 silences the BPF trampolines, the deny hooks' among them; the others abort or starve the agent")),
     ("cgroup_files.rs", "refuse_oom_adj", 1, Enforced("the oom_score_adj of the agent, its watchdog or a worker")),
+    ("cgroup_files.rs", "refuse_memory_view", 1, Enforced("the open of a memory view of the agent, its watchdog or a worker (/proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, numa_maps, pagemap): from 6.16 the kernel lets a caller with CAP_PERFMON through the ptrace hook's read-mode refusal (lot 367)")),
     ("cgroup_guard.rs", "try_cgroup_move_deny", 1, Enforced("a move of the agent's processes out of its cgroup")),
     ("epg.rs", "respond", 1, Gated("the exploit guard's SIGKILL: detect mode under the gate (effective_response)")),
     ("epg_lite.rs", "use_point_found", 3, Gated("the exploit guard's response (EPERM, SIGKILL): detect mode under the gate (effective_response)")),
@@ -99,6 +100,7 @@ const SITES: &[(&str, &str, usize, Route)] = &[
     ("inode_protect.rs", "try_file_ioctl", 1, Enforced("a perf event's PERF_EVENT_IOC_SET_BPF, outside a window, of a program held at a window's load: a kprobe calling bpf_send_signal attached with no bpf(2) command (the review of #558, F1)")),
     ("inode_protect.rs", "try_protected_open_deny", 2, Enforced("a read-open of the agent's key, a write-open of its protected files")),
     ("inode_protect.rs", "try_protected_open_deny", 1, Delegated("refuse_write(")),
+    ("inode_protect.rs", "try_protected_open_deny", 1, Delegated("refuse_memory_view(")),
     ("inode_protect.rs", "try_protected_write_deny", 1, Enforced("a write through a descriptor of the agent's protected files")),
     ("inode_protect.rs", "try_protected_write_deny", 1, Delegated("refuse_write(")),
     ("inode_protect.rs", "deny_new_entry", 1, Enforced(OWN_FILES)),
@@ -213,7 +215,10 @@ fn deny_sites(file: &str, text: &str, name: &str, body: &str) -> usize {
         n += body.matches("SysctlVerdict::Refuse =>").count();
     }
     if file == "cgroup_files.rs" && name.starts_with("refuse_") && name != "refuse_write" {
-        n += body.matches("sign(phase,").count() + body.matches("emit_task_denial(").count();
+        n += body.matches("sign(phase,").count()
+            + body.matches("emit_task_denial(").count()
+            // lot 367: the memory views' open, signed as a read-mode refusal
+            + body.matches("emit_task_read_denial(").count();
     }
     n
 }

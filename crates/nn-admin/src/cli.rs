@@ -1724,7 +1724,26 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 }
                 ExitCode::SUCCESS
             }
-            Err(code) => code,
+            Err(code) => {
+                // lot 367 (pre-alpha Phase 3-bis, F3b-7): the agent not
+                // reached — the cause of its last refused start, signed in
+                // its audit log, not only in the journal
+                if code == ExitCode::from(5) {
+                    let key = load_audit_pubkey(
+                        host,
+                        None,
+                        std::path::Path::new(DEFAULT_SIGNING_KEY_PATH),
+                    )
+                    .ok();
+                    if let Some(line) = crate::admin_cli::last_refused_start(
+                        std::path::Path::new(DEFAULT_AUDIT_LOG_PATH),
+                        key.as_ref(),
+                    ) {
+                        eprintln!("status: {line}");
+                    }
+                }
+                code
+            }
         },
         Cmd::Capabilities {
             key,

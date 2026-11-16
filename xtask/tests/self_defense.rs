@@ -486,7 +486,7 @@ fn a_read_mode_refusal_is_recorded_by_image_and_never_unrefused() {
         body(&p, "try_ptrace_access_check"),
         &[
             "if mode & PTRACE_MODE_NOAUDIT == 0 {",
-            "crate::inode_protect::emit_task_read_denial(mode, target_tgid);",
+            "crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);",
             "-EPERM",
         ],
     )
@@ -532,6 +532,61 @@ fn every_watchdog_pin_handle_failure_is_signed() {
             "self_integrity::PIN_HANDLE_FAILED,",
             "anti_tamper::claim_watchdog_role(bpffs_root, p)",
             "self_integrity::PIN_HANDLE_FAILED,",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): on 7.0 root read the agent's
+/// `environ`, `maps`, `smaps`, `pagemap` and `auxv` while the ptrace hook
+/// refused them (from 6.16 `mm_access()` lets `CAP_PERFMON` through a
+/// read-mode refusal), and the signed record said "denied in kernel".
+/// - the open of those views is refused by the read branch of the
+///   `file_open` deny, through `refuse_memory_view`, which takes the hook's
+///   own two decisions (never a copy of them) and lets a process's access
+///   to itself through, as the kernel does;
+/// - its record carries `VIEW_OPEN`; the hook's read-mode record does not;
+/// - the record's response is the shared module's, which says "denied"
+///   only for the open (`common::ptrace_read::response`, host-tested).
+#[test]
+fn the_memory_views_are_refused_at_their_open_with_the_hooks_decisions() {
+    let i = code("agent-ebpf/src/inode_protect.rs");
+    let open = body(&i, "try_protected_open_deny");
+    let read_branch = &open[open.find("if f_mode & FMODE_WRITE == 0 {").unwrap()..];
+    let read_branch = &read_branch[..read_branch.find("return 0;\n    }").unwrap()];
+    assert!(read_branch.contains(
+        "if crate::cgroup_files::refuse_memory_view(file, inode) {\n            return -EPERM;\n        }"
+    ));
+    let c = code("agent-ebpf/src/cgroup_files.rs");
+    in_order(
+        body(&c, "refuse_memory_view"),
+        &[
+            "if !matches!(special_fs(magic), Some(SpecialFs::Proc)) {\n        return false;\n    }",
+            "if !northnarrow_common::ptrace_read::is_memory_view(len, words) {\n        return false;\n    }",
+            "proc_file_task(inode)",
+            "if caller == tgid {\n        return false;\n    }",
+            "if !crate::ptrace_check::target_is_protected(tgid, task) {",
+            "if crate::ptrace_check::caller_may_access(caller, false) {",
+            "northnarrow_common::ptrace_read::VIEW_OPEN | MODE_READ_FSCREDS",
+            "true",
+        ],
+    )
+    .unwrap();
+    // the decisions are the hook's: no role asked here directly
+    let view = body(&c, "refuse_memory_view");
+    assert!(!view.contains("is_protected_pid(") && !view.contains("is_exempt_pid("));
+    assert!(!view.contains("PROTECTED_OBSERVERS") && !view.contains("PTRACE_OVERRIDE"));
+    let p = code("agent-ebpf/src/ptrace_check.rs");
+    let hook = body(&p, "try_ptrace_access_check");
+    assert!(!hook.contains("VIEW_OPEN"));
+    assert!(hook.contains("crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);"));
+    // the record's words: the shared module's, for every read-mode record
+    let e = code("agent/src/pipeline/process_event.rs");
+    in_order(
+        &e,
+        &[
+            "*operation == nn_model::FsProtectOperation::PtraceRead {",
+            "common::ptrace_read::response(*target_dev).to_string()",
         ],
     )
     .unwrap();

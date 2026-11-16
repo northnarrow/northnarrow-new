@@ -622,7 +622,7 @@ missing and how to fix it:
 | Check | Expected | Why |
 |---|---|---|
 | BPF LSM in the LSM list | `bpf` present | otherwise the deny hooks attach and never run: the agent refuses to start (exit 78) unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, which starts it at trust level L0 (lab PR 218, `BOOT_INTEGRITY.md`) |
-| Kernel lockdown | `[integrity]` or stronger | blocks unsigned modules, kexec of unsigned kernels, `/dev/mem` |
+| Kernel lockdown | `[integrity]` or stronger | blocks unsigned modules, kexec of unsigned kernels, `/dev/mem`; only `[confidentiality]` also closes root's reads of kernel and physical memory (`/proc/kcore`): under `[integrity]` or none, root can read the agent's signing key in memory ([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), lot 367) |
 | Unprivileged BPF | `kernel.unprivileged_bpf_disabled` = 1 or 2 | only privileged processes load BPF |
 | Module signature | `module.sig_enforce` = Y, or lockdown `[integrity]`/`[confidentiality]` (refuses unsigned modules whatever the parameter says) | an unsigned module is the classic way to blind a kernel sensor |
 | UEFI Secure Boot | enabled | anchors the boot chain; turns on lockdown and module signing on most distros |

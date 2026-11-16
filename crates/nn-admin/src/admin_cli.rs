@@ -1356,6 +1356,72 @@ pub fn load_audit_pubkey<H: AdminHost>(
     Ok(key)
 }
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-7): how much of the audit log's end
+/// `nn-admin status` reads for the agent's last start, when the agent
+/// cannot be reached.
+pub const LAST_START_TAIL: u64 = 256 * 1024;
+
+/// Lot 367 (F3b-7): the agent cannot be reached — the cause of its last
+/// start, when the last `agent_boot` row in the end of the audit log `log`
+/// ([`LAST_START_TAIL`] bytes) is a refusal: the gate (`refused_by`), what
+/// it found, the row's time, and whether its signature verifies with
+/// `pubkey` (the agent's `agent.sig.pub`). A refused start signs its cause
+/// there (`docs/operator/BOOT_INTEGRITY.md`), the journal aside. `None`
+/// when the last start was not refused, no `agent_boot` row is in the end,
+/// or the log cannot be read.
+pub fn last_refused_start(log: &Path, pubkey: Option<&VerifyingKey>) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    // one byte before the tail too: the piece up to its first newline is a
+    // row cut by the tail (or only that newline), never read as a row
+    let from = len.saturating_sub(LAST_START_TAIL + 1);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    f.take(LAST_START_TAIL + 1).read_to_end(&mut tail).ok()?;
+    let mut lines: Vec<&[u8]> = tail.split(|b| *b == b'\n').collect();
+    if from > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    for line in lines.iter().rev() {
+        let Ok(row) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("op").and_then(|v| v.as_str()) != Some("agent_boot") {
+            continue;
+        }
+        if row.get("result").and_then(|v| v.as_str()) != Some("refused") {
+            return None;
+        }
+        let text = |v: Option<&serde_json::Value>| {
+            v.and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(400)
+                .collect::<String>()
+        };
+        let extra = row.get("extra");
+        let gate = text(extra.and_then(|e| e.get("refused_by")));
+        let detail = text(extra.and_then(|e| e.get("detail")));
+        let ts = text(row.get("ts"));
+        let signed = match pubkey {
+            Some(k) if nn_evidence::audit::row_is_genuine(line, k) => {
+                "its signature verifies with the agent's key"
+            }
+            Some(_) => {
+                "its signature does NOT verify with the agent's key: run `nn-admin audit verify`"
+            }
+            None => "the agent's public key not read: its signature not checked",
+        };
+        return Some(format!(
+            "the agent's last start was refused (refused_by: {gate}): {detail} — the audit log's \
+             agent_boot row of {ts}, {signed}"
+        ));
+    }
+    None
+}
+
 // ── Tappa 9 C6 — nn-admin fim baseline / report ────────────────────
 
 /// Outcome of `nn-admin fim baseline`. Mirrors
@@ -4508,5 +4574,170 @@ mod tests {
             map_response_to_set_status(persist),
             DetectionSetStatusOutcome::PersistFailed { id: 7 }
         ));
+    }
+
+    /// A base64 (`STANDARD`) of `b`, as the audit rows carry signatures.
+    fn b64(b: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in b.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// An audit row signed by `k`, as the agent writes it.
+    fn signed_row(k: &SigningKey, op: &str, result: &str, extra: serde_json::Value) -> String {
+        let mut e = nn_evidence::audit::AuditEntry {
+            ts: "2026-11-16T12:00:00.000000Z".into(),
+            agent_id: "00".repeat(16),
+            op: op.into(),
+            extra,
+            key_fp: "agent-self".into(),
+            cosigner_fps: Vec::new(),
+            result: result.into(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".into(),
+            client_exe: None,
+            seq: None,
+            prev_hash: "0".repeat(64),
+            entry_hash: String::new(),
+            agent_sig: String::new(),
+        };
+        let h = nn_evidence::audit::compute_entry_hash(&e).unwrap();
+        e.entry_hash = hex::encode(h);
+        e.agent_sig = b64(&k.sign(&h).to_bytes());
+        serde_json::to_string(&e).unwrap()
+    }
+
+    /// Lot 367 (F3b-7): `status` reads the last refused start only when the
+    /// agent could not be reached (exit 5), from the default audit log, with
+    /// the agent's public key.
+    #[test]
+    fn status_reads_the_last_start_only_when_the_agent_is_not_reached() {
+        let cli = include_str!("cli.rs");
+        let arm = &cli[cli.find("        Cmd::Status {").unwrap()..];
+        let arm = &arm[..arm.find("        Cmd::Capabilities {").unwrap()];
+        let err = &arm[arm.find("Err(code) => {").unwrap()..];
+        let five = err.find("if code == ExitCode::from(5) {").unwrap();
+        let read = err.find("crate::admin_cli::last_refused_start(").unwrap();
+        assert!(five < read);
+        assert!(err.contains("std::path::Path::new(DEFAULT_AUDIT_LOG_PATH)"));
+        assert!(err.contains("std::path::Path::new(DEFAULT_SIGNING_KEY_PATH)"));
+        assert!(err[read..].contains("eprintln!(\"status: {line}\");"));
+    }
+
+    /// Named test (lot 367, pre-alpha Phase 3-bis F3b-7): with the agent
+    /// down, `status` names the cause of its last start when that start was
+    /// refused — `--watchdog-exe` the agent's own executable — from the
+    /// signed audit log, and says whether the row's signature verifies; a
+    /// last start that was not refused, a log without one, say nothing.
+    #[test]
+    fn status_names_the_cause_of_a_refused_last_start() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        let boot =
+            |result: &str, extra: serde_json::Value| signed_row(&k, "agent_boot", result, extra);
+        let refused = boot(
+            "refused",
+            serde_json::json!({
+                "refused_by": "watchdog_exe",
+                "detail": "--watchdog-exe /usr/local/bin/northnarrow-agent is the agent's own executable",
+            }),
+        );
+        let stop = signed_row(&k, "agent_stop", "success", serde_json::json!({}));
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{stop}\n{refused}\n",
+                boot("success", serde_json::json!({}))
+            ),
+        )
+        .unwrap();
+        let line = last_refused_start(&log, Some(&k.verifying_key())).unwrap();
+        for w in [
+            "refused_by: watchdog_exe",
+            "is the agent's own executable",
+            "2026-11-16T12:00:00",
+            "verifies",
+        ] {
+            assert!(line.contains(w), "{w}: {line}");
+        }
+        assert!(!line.contains("NOT"), "{line}");
+        // another key: said so
+        let other = SigningKey::from_bytes(&[6; 32]).verifying_key();
+        assert!(last_refused_start(&log, Some(&other))
+            .unwrap()
+            .contains("does NOT verify"));
+        assert!(last_refused_start(&log, None)
+            .unwrap()
+            .contains("not checked"));
+        // a later row that is no start does not hide it
+        std::fs::write(
+            &log,
+            format!(
+                "{refused}\n{}\n",
+                signed_row(&k, "integrity_drift", "detected", serde_json::json!({}))
+            ),
+        )
+        .unwrap();
+        assert!(last_refused_start(&log, Some(&k.verifying_key())).is_some());
+        // the last start was not refused
+        std::fs::write(
+            &log,
+            format!("{refused}\n{}\n", boot("success", serde_json::json!({}))),
+        )
+        .unwrap();
+        assert_eq!(last_refused_start(&log, Some(&k.verifying_key())), None);
+        // no start in the log, no log
+        std::fs::write(&log, format!("{stop}\n")).unwrap();
+        assert_eq!(last_refused_start(&log, None), None);
+        assert_eq!(last_refused_start(&dir.path().join("none"), None), None);
+        // a refusal past a long tail: the first, cut line is skipped
+        let filler = signed_row(
+            &k,
+            "integrity_drift",
+            "detected",
+            serde_json::json!({"pad": "x".repeat(1000)}),
+        );
+        let mut big = format!("{refused}\n");
+        while (big.len() as u64) < LAST_START_TAIL + 4096 {
+            big.push_str(&filler);
+            big.push('\n');
+        }
+        big.push_str(&refused);
+        big.push('\n');
+        std::fs::write(&log, big).unwrap();
+        assert!(last_refused_start(&log, Some(&k.verifying_key()))
+            .unwrap()
+            .contains("verifies"));
+        // a row that starts exactly where the tail does is read whole (the
+        // blank lines after it are no rows)
+        let row = format!("{refused}\n");
+        let file = format!(
+            "{}\n{row}{}",
+            "x".repeat(10),
+            "\n".repeat(LAST_START_TAIL as usize - row.len())
+        );
+        assert_eq!(
+            file.len() - file.find(&row).unwrap(),
+            LAST_START_TAIL as usize
+        );
+        std::fs::write(&log, &file).unwrap();
+        assert!(
+            last_refused_start(&log, None).is_some(),
+            "the row at the tail's first byte"
+        );
     }
 }

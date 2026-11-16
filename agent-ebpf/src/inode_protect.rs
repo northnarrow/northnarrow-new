@@ -443,7 +443,11 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// The re-check of #567 (b): a refused read-mode ptrace access to one of
 /// the agent's processes (`FS_OP_PTRACE_READ`: its `/proc/<pid>/ns/*` for
 /// `nsenter` or `systemctl bind`, `exe`, `fd/` …), `target_ino` = target
-/// tgid, `target_dev` = the ptrace mode. The re-check 2 of #567 (point 2,
+/// tgid, `target_dev` = the ptrace mode — lot 367: with
+/// `northnarrow_common::ptrace_read::VIEW_OPEN` when it is the open of a
+/// memory view that was refused (`cgroup_files::refuse_memory_view`), a
+/// real denial; without, the hook's verdict, whose outcome the kernel
+/// decides. The re-check 2 of #567 (point 2,
 /// `northnarrow_common::ptrace_read`): not recorded for the packaged
 /// journald in its unit's cgroup ([`PTRACE_READ_QUIET`]; journald reads the
 /// agent's `/proc/<pid>/exe` for every line it takes, all day), recorded
@@ -452,9 +456,9 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// non-decisive records' budget ([`limited_budget`]). The refusal never
 /// depends on the record.
 #[inline(always)]
-pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
+pub fn emit_task_read_denial(detail: u64, target_tgid: u32) {
     let key = InodeKey {
-        dev: mode as u64,
+        dev: detail,
         ino: target_tgid as u64,
     };
     if caller_is_self_test() {
@@ -1029,6 +1033,12 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
     };
     if f_mode & FMODE_WRITE == 0 {
         if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode, hook::FILE_OPEN) {
+            return -EPERM;
+        }
+        // Lot 367 (F3b-1): a protected process's memory views, refused at
+        // their open — the ptrace hook's read-mode refusal is let through
+        // by the kernel from 6.16 for a caller with CAP_PERFMON
+        if crate::cgroup_files::refuse_memory_view(file, inode) {
             return -EPERM;
         }
         return 0;

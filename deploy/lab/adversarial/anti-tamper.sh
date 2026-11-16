@@ -170,7 +170,7 @@ def cmd_signal(pid, comm, start, sig):
         os.close(fd)
 
 def cmd_procopen(pid, comm, start, name, offset):
-    if name not in ("mem", "environ"):
+    if name not in ("mem", "environ", "maps", "pagemap"):
         print("setup: unknown /proc file %r" % name)
         return 2
     cur, why = resolve(pid, comm, start)
@@ -1767,7 +1767,14 @@ agent_signal_case C01 "kill -9 the agent from a root shell" KILL
 watchdog_signal_case C02 "kill -9 the watchdog from a root shell" KILL
 agent_mem_case C03 "ptrace attach: read /proc/<agent>/mem"
 PID=$(agent_pid); START=$(proc_start "$PID")
-run_case C04b "ptrace read-mode: /proc/<agent>/environ (silent by design)" denied "" 0 -- nnpy procopen "$PID" northnarrow-age "${START:-0}" environ 0
+# Lot 367 (pre-alpha Phase 3-bis, F3b-1): the agent's memory views are
+# refused at their open (from 6.16 the kernel let root read them past the
+# ptrace hook's read-mode refusal); each refusal is a signed Low ptrace_read,
+# once an hour per caller program and target (so no evidence is required
+# here: an earlier case may have taken the hour's record)
+run_case C04b "ptrace read-mode: /proc/<agent>/environ (refused at its open)" denied "" 0 -- nnpy procopen "$PID" northnarrow-age "${START:-0}" environ 0
+run_case C04c "ptrace read-mode: /proc/<agent>/maps (refused at its open)" denied "" 0 -- nnpy procopen "$PID" northnarrow-age "${START:-0}" maps 0
+run_case C04d "ptrace read-mode: /proc/<agent>/pagemap (refused at its open)" denied "" 0 -- nnpy procopen "$PID" northnarrow-age "${START:-0}" pagemap 0
 # ── protected files and pins ──────────────────────────────────────────────
 POST=$(post post_same "$ETC/admin.pub" hash "$(nnpy fileid "$ETC/admin.pub" hash)") \
 run_case C04 "append to /etc/northnarrow/admin.pub" denied "deny=write" 0 -- bash -c "echo x >> $ETC/admin.pub"
@@ -1875,10 +1882,13 @@ if selected C13; then
 fi
 # mounted, held for one check, unmounted BEFORE the evidence is read: while
 # it is mounted the host's /etc/northnarrow/audit.log is the fake one
+# Lot 367 (pre-alpha Phase 3-bis, F3b-3): since the mount guard (#563,
+# #567) both are refused at the mount and signed (`deny=mount`); mount(8)
+# says "permission denied" in lower case, read here as the refusal it is.
 if selected C14; then
     mkdir -p "$TMPD/fake-etc"
     MOUNTS+=("$ETC")
-    run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind $TMPD/fake-etc $ETC && sleep 40; umount $ETC"
+    run_case C14 "bind mount over /etc/northnarrow (the mount guard)" denied "deny=mount" 0 -- bash -c "out=\$(LC_ALL=C mount --bind $TMPD/fake-etc $ETC 2>&1) || { case \$out in *'ermission denied'*|*'not permitted'*) echo \"mount: errno=EPERM\";; *) echo \"\$out\";; esac; exit 1; }; sleep 40; umount $ETC"
     mount_gone C14 "$ETC" || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: $ETC still mounted)"; exit 1; }
 fi
 # Review 53: hiding the kernel BTF keeps every LSM hook from attaching at
@@ -1886,7 +1896,7 @@ fi
 # reported while the agent runs.
 if selected C26; then
     MOUNTS+=(/sys/kernel/btf)
-    run_case C26 "tmpfs over /sys/kernel/btf for 40 s" allowed "integrity_drift" 0 -- bash -c "mount -t tmpfs tmpfs /sys/kernel/btf && sleep 40; umount /sys/kernel/btf"
+    run_case C26 "tmpfs over /sys/kernel/btf (the mount guard)" denied "deny=mount" 0 -- bash -c "out=\$(LC_ALL=C mount -t tmpfs tmpfs /sys/kernel/btf 2>&1) || { case \$out in *'ermission denied'*|*'not permitted'*) echo \"mount: errno=EPERM\";; *) echo \"\$out\";; esac; exit 1; }; sleep 40; umount /sys/kernel/btf"
     mount_gone C26 /sys/kernel/btf || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: /sys/kernel/btf still mounted)"; exit 1; }
 fi
 # ── cgroup freezer ────────────────────────────────────────────────────────

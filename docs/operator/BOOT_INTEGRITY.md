@@ -107,6 +107,7 @@ and BTF (until review #466 F6).
 | the kernel's BTF (`/sys/kernel/btf/vmlinux`), which every deny hook resolves against (review 53: none attaches without it), unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` | yes (likewise; a BTF that does not parse is the BTF offsets' refusal) | `deny_hooks` |
 | the load itself and each mandatory sensor's attach | is L | `sensors` |
 | the deny hooks' attach and pins | after L (it is the attach) | `deny_hooks` |
+| `--watchdog-exe` not the agent's own executable (lot 348; signed since lot 367) | after L, before the deny hooks attach | `watchdog_exe` |
 | the deny self-test | after the attach (it exercises an attached hook) | `deny_self_test` |
 | the boot's own `agent_boot` row (a full disk is found by the write) | after the attach | `audit_log` |
 

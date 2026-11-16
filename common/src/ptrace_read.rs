@@ -98,6 +98,76 @@ pub fn admit(last: Option<u64>, now: u64, budget: impl FnOnce() -> bool) -> bool
     due(last, now) && budget()
 }
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): the bit of a `FS_OP_PTRACE_READ`
+/// record's detail (`target_dev`, the ptrace mode below it) that says where
+/// the refusal was made. Set: at the OPEN of one of the agent's memory views
+/// ([`is_memory_view`]) — the open failed, the read did not happen. Clear:
+/// by the `ptrace_access_check` hook — the hook refused, and the agent does
+/// not see what the kernel did with that verdict: from 6.16 the kernel's
+/// `mm_access()` lets a caller with `CAP_PERFMON` or `CAP_SYS_ADMIN` through
+/// a read-mode check the hook refused.
+pub const VIEW_OPEN: u64 = 1 << 32;
+
+/// The per-process `/proc` files whose open takes the process's memory
+/// (`proc_mem_open`, `mm_access()` in read mode) and so pass, from 6.16, a
+/// caller with `CAP_PERFMON` or `CAP_SYS_ADMIN` through a read-mode
+/// refusal of the ptrace hook: the agent refuses their open itself.
+/// `mem` is not one: it is opened in attach mode, which the kernel never
+/// lets through past the hook.
+pub const MEMORY_VIEWS: [&[u8]; 7] = [
+    b"environ",
+    b"auxv",
+    b"maps",
+    b"smaps",
+    b"smaps_rollup",
+    b"numa_maps",
+    b"pagemap",
+];
+
+/// [`MEMORY_VIEWS`] packed as the eBPF programs pack a dentry's name
+/// (`cgroup_limits::name_words`), at compile time.
+const MEMORY_VIEW_WORDS: [(usize, [u64; 3]); 7] = {
+    let mut out = [(0usize, [0u64; 3]); 7];
+    let mut i = 0;
+    while i < MEMORY_VIEWS.len() {
+        out[i] = (
+            MEMORY_VIEWS[i].len(),
+            crate::cgroup_limits::name_words(MEMORY_VIEWS[i]),
+        );
+        i += 1;
+    }
+    out
+};
+
+/// `(len, words)` — a dentry's name as the eBPF programs pack it
+/// (`cgroup_limits::name_words`, the bytes past `len` cleared) — is one of
+/// [`MEMORY_VIEWS`].
+#[inline(always)]
+pub fn is_memory_view(len: usize, words: [u64; 3]) -> bool {
+    let mut i = 0;
+    while i < MEMORY_VIEW_WORDS.len() {
+        let (l, w) = MEMORY_VIEW_WORDS[i];
+        if l == len && w[0] == words[0] && w[1] == words[1] && w[2] == words[2] {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A `FS_OP_PTRACE_READ` record's `response`: what the kernel did, as far
+/// as the agent knows it (lot 367, F3b-1: on 7.0 the record said "denied"
+/// of a read the kernel let through).
+pub const fn response(detail: u64) -> &'static str {
+    if detail & VIEW_OPEN != 0 {
+        "denied in kernel (the open of a memory view of the agent's process refused: \
+         /proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, numa_maps or pagemap)"
+    } else {
+        "the hook refused; the kernel's outcome not observed (a read-mode access check, \
+         which the kernel may let through past the hook)"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +231,75 @@ mod tests {
         fn count(&self, exe: (u64, u64)) -> usize {
             self.records.iter().filter(|e| **e == exe).count()
         }
+    }
+
+    /// Lot 367 (F3b-1): the memory views by name, as the eBPF program packs
+    /// a dentry's — and no other `/proc/<pid>` file (`mem` is attach mode,
+    /// `exe` and `io` are refused by the hook on every kernel).
+    #[test]
+    fn the_memory_views_are_named_exactly() {
+        use crate::cgroup_limits::name_words;
+        let packed = |n: &[u8]| (n.len(), name_words(n));
+        // the views whose open takes the process's memory in read mode
+        // (`proc_mem_open`) on 7.0, by name
+        assert_eq!(
+            MEMORY_VIEWS,
+            [
+                &b"environ"[..],
+                b"auxv",
+                b"maps",
+                b"smaps",
+                b"smaps_rollup",
+                b"numa_maps",
+                b"pagemap"
+            ]
+        );
+        for v in MEMORY_VIEWS {
+            let (len, words) = packed(v);
+            assert!(is_memory_view(len, words), "{}", String::from_utf8_lossy(v));
+        }
+        for other in [
+            &b"mem"[..],
+            b"exe",
+            b"io",
+            b"status",
+            b"cmdline",
+            b"map_files",
+            b"smaps_rollu",
+            b"smaps_rollupX",
+            b"environ2",
+            b"maps ",
+            b"oom_score_adj",
+        ] {
+            let (len, words) = packed(other);
+            assert!(
+                !is_memory_view(len, words),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+        // the same bytes with another length: a prefix is no view
+        let (_, words) = packed(b"maps");
+        assert!(!is_memory_view(3, words));
+    }
+
+    /// Lot 367 (F3b-1): the record says "denied" only when the open was
+    /// refused; the hook's own refusal says the outcome was not observed.
+    #[test]
+    fn a_hook_refusal_never_claims_the_kernel_denied() {
+        let hook = response(0x09);
+        assert!(!hook.contains("denied"), "{hook}");
+        assert!(hook.contains("the hook refused"), "{hook}");
+        assert!(hook.contains("not observed"), "{hook}");
+        let open = response(VIEW_OPEN | 0x09);
+        assert!(open.starts_with("denied in kernel"), "{open}");
+        assert!(
+            open.contains("environ") && open.contains("pagemap"),
+            "{open}"
+        );
+        // the mode bits never read as the open's bit
+        assert_eq!(response(0xff), hook);
+        assert_ne!(response(VIEW_OPEN), hook);
     }
 
     const S: u64 = 1_000_000_000;
