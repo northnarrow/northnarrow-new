@@ -1364,11 +1364,16 @@ pub const LAST_START_TAIL: u64 = 256 * 1024;
 /// Lot 367 (F3b-7): the agent cannot be reached — the cause of its last
 /// start, when the last `agent_boot` row in the end of the audit log `log`
 /// ([`LAST_START_TAIL`] bytes) is a refusal: the gate (`refused_by`), what
-/// it found, the row's time, and whether its signature verifies with
-/// `pubkey` (the agent's `agent.sig.pub`). A refused start signs its cause
-/// there (`docs/operator/BOOT_INTEGRITY.md`), the journal aside. `None`
-/// when the last start was not refused, no `agent_boot` row is in the end,
-/// or the log cannot be read.
+/// it found, the row's time, whether its signature verifies with `pubkey`
+/// (the agent's `agent.sig.pub`) and (the review of #574, F5) whether it is
+/// in the chain there ([`tail_linked`]: an older row written again at the
+/// end is not). A refused start signs its cause there
+/// (`docs/operator/BOOT_INTEGRITY.md`), the journal aside. A last start
+/// that was not refused says nothing — unless its row is not in the chain
+/// there (an older good start written again over a refusal): then that is
+/// said. `None` when the last start was not refused and its row is in the
+/// chain, no `agent_boot` row is in the end, or the log cannot be read.
+/// The whole chain and its anchor are `nn-admin audit verify`'s.
 pub fn last_refused_start(log: &Path, pubkey: Option<&VerifyingKey>) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(log).ok()?;
@@ -1383,15 +1388,14 @@ pub fn last_refused_start(log: &Path, pubkey: Option<&VerifyingKey>) -> Option<S
     if from > 0 && !lines.is_empty() {
         lines.remove(0);
     }
-    for line in lines.iter().rev() {
+    // the rows of the end, blank lines out (the file ends with a newline)
+    let rows: Vec<&[u8]> = lines.into_iter().filter(|l| !l.is_empty()).collect();
+    for (at, line) in rows.iter().enumerate().rev() {
         let Ok(row) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
         if row.get("op").and_then(|v| v.as_str()) != Some("agent_boot") {
             continue;
-        }
-        if row.get("result").and_then(|v| v.as_str()) != Some("refused") {
-            return None;
         }
         let text = |v: Option<&serde_json::Value>| {
             v.and_then(|v| v.as_str())
@@ -1401,10 +1405,27 @@ pub fn last_refused_start(log: &Path, pubkey: Option<&VerifyingKey>) -> Option<S
                 .take(400)
                 .collect::<String>()
         };
+        let ts = text(row.get("ts"));
+        let linked = tail_linked(&rows, at, pubkey);
+        if row.get("result").and_then(|v| v.as_str()) != Some("refused") {
+            return (!linked).then(|| {
+                format!(
+                    "the audit log's last agent_boot row (of {ts}) is NOT linked in the chain to \
+                     the rows around it: the outcome of the agent's last start is not known from \
+                     the log's end — run `nn-admin audit verify`"
+                )
+            });
+        }
         let extra = row.get("extra");
         let gate = text(extra.and_then(|e| e.get("refused_by")));
         let detail = text(extra.and_then(|e| e.get("detail")));
-        let ts = text(row.get("ts"));
+        let chain = if linked {
+            "it is linked in the chain to the rows around it up to the log's end (the whole \
+             chain and its anchor: `nn-admin audit verify`)"
+        } else {
+            "it is NOT linked in the chain to the rows around it (an older row written again?): \
+             run `nn-admin audit verify`"
+        };
         let signed = match pubkey {
             Some(k) if nn_evidence::audit::row_is_genuine(line, k) => {
                 "its signature verifies with the agent's key"
@@ -1416,10 +1437,42 @@ pub fn last_refused_start(log: &Path, pubkey: Option<&VerifyingKey>) -> Option<S
         };
         return Some(format!(
             "the agent's last start was refused (refused_by: {gate}): {detail} — the audit log's \
-             agent_boot row of {ts}, {signed}"
+             agent_boot row of {ts}, {signed}; {chain}"
         ));
     }
     None
+}
+
+/// The review of #574 (F5): the row at `at` of `rows` (the end of the audit
+/// log, whole rows only) is in the chain there — its `prev_hash` is the
+/// `entry_hash` of the row before it when the end holds one, every row after
+/// it to the end follows from the one before, and (with `pubkey`) each of
+/// them, from `at`, is genuine (its hash recomputes, its signature
+/// verifies). A row the agent wrote earlier, written again at the end, is
+/// not linked to the row before it; a row forged after it does not verify.
+/// What precedes the end, and a cut end, are `nn-admin audit verify`'s.
+pub fn tail_linked(rows: &[&[u8]], at: usize, pubkey: Option<&VerifyingKey>) -> bool {
+    if at >= rows.len() {
+        return false;
+    }
+    let link = |line: &[u8]| -> Option<(String, String)> {
+        let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let hash = |k: &str| v.get(k).and_then(|h| h.as_str()).map(str::to_string);
+        Some((hash("prev_hash")?, hash("entry_hash")?))
+    };
+    let Some(links) = rows[at.saturating_sub(1)..]
+        .iter()
+        .map(|l| link(l))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    links.windows(2).all(|w| w[1].0 == w[0].1)
+        && pubkey.is_none_or(|k| {
+            rows[at..]
+                .iter()
+                .all(|l| nn_evidence::audit::row_is_genuine(l, k))
+        })
 }
 
 // ── Tappa 9 C6 — nn-admin fim baseline / report ────────────────────
@@ -4597,6 +4650,38 @@ mod tests {
 
     /// An audit row signed by `k`, as the agent writes it.
     fn signed_row(k: &SigningKey, op: &str, result: &str, extra: serde_json::Value) -> String {
+        signed_row_after(k, op, result, extra, &"0".repeat(64))
+    }
+
+    /// The `entry_hash` of the row `line`.
+    fn entry_hash_of(line: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["entry_hash"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `rows` signed by `k` and linked as the agent writes them: each one's
+    /// `prev_hash` the `entry_hash` of the one before.
+    fn chained(k: &SigningKey, rows: &[(&str, &str, serde_json::Value)]) -> Vec<String> {
+        let mut prev = "0".repeat(64);
+        rows.iter()
+            .map(|(op, result, extra)| {
+                let line = signed_row_after(k, op, result, extra.clone(), &prev);
+                prev = entry_hash_of(&line);
+                line
+            })
+            .collect()
+    }
+
+    /// [`signed_row`] after the row whose `entry_hash` is `prev`.
+    fn signed_row_after(
+        k: &SigningKey,
+        op: &str,
+        result: &str,
+        extra: serde_json::Value,
+        prev: &str,
+    ) -> String {
         let mut e = nn_evidence::audit::AuditEntry {
             ts: "2026-11-16T12:00:00.000000Z".into(),
             agent_id: "00".repeat(16),
@@ -4610,7 +4695,7 @@ mod tests {
             client_comm: "northnarrow-agent".into(),
             client_exe: None,
             seq: None,
-            prev_hash: "0".repeat(64),
+            prev_hash: prev.to_string(),
             entry_hash: String::new(),
             agent_sig: String::new(),
         };
@@ -4649,20 +4734,23 @@ mod tests {
         let log = dir.path().join("audit.log");
         let boot =
             |result: &str, extra: serde_json::Value| signed_row(&k, "agent_boot", result, extra);
-        let refused = boot(
-            "refused",
-            serde_json::json!({
-                "refused_by": "watchdog_exe",
-                "detail": "--watchdog-exe /usr/local/bin/northnarrow-agent is the agent's own executable",
-            }),
-        );
+        let refused_extra = serde_json::json!({
+            "refused_by": "watchdog_exe",
+            "detail": "--watchdog-exe /usr/local/bin/northnarrow-agent is the agent's own executable",
+        });
+        let refused = boot("refused", refused_extra.clone());
         let stop = signed_row(&k, "agent_stop", "success", serde_json::json!({}));
+        // the review of #574 (F5): the rows linked, as the agent writes them
+        let rows =
+            |r: &[(&str, &str, serde_json::Value)]| format!("{}\n", chained(&k, r).join("\n"));
+        let none = || serde_json::json!({});
         std::fs::write(
             &log,
-            format!(
-                "{}\n{stop}\n{refused}\n",
-                boot("success", serde_json::json!({}))
-            ),
+            rows(&[
+                ("agent_boot", "success", none()),
+                ("agent_stop", "success", none()),
+                ("agent_boot", "refused", refused_extra.clone()),
+            ]),
         )
         .unwrap();
         let line = last_refused_start(&log, Some(&k.verifying_key())).unwrap();
@@ -4686,17 +4774,20 @@ mod tests {
         // a later row that is no start does not hide it
         std::fs::write(
             &log,
-            format!(
-                "{refused}\n{}\n",
-                signed_row(&k, "integrity_drift", "detected", serde_json::json!({}))
-            ),
+            rows(&[
+                ("agent_boot", "refused", refused_extra.clone()),
+                ("integrity_drift", "detected", none()),
+            ]),
         )
         .unwrap();
         assert!(last_refused_start(&log, Some(&k.verifying_key())).is_some());
         // the last start was not refused
         std::fs::write(
             &log,
-            format!("{refused}\n{}\n", boot("success", serde_json::json!({}))),
+            rows(&[
+                ("agent_boot", "refused", refused_extra.clone()),
+                ("agent_boot", "success", none()),
+            ]),
         )
         .unwrap();
         assert_eq!(last_refused_start(&log, Some(&k.verifying_key())), None);
@@ -4711,17 +4802,20 @@ mod tests {
             "detected",
             serde_json::json!({"pad": "x".repeat(1000)}),
         );
-        let mut big = format!("{refused}\n");
-        while (big.len() as u64) < LAST_START_TAIL + 4096 {
-            big.push_str(&filler);
-            big.push('\n');
+        let mut list = vec![("agent_boot", "refused", refused_extra.clone())];
+        for _ in 0..(LAST_START_TAIL as usize + 4096) / filler.len() + 1 {
+            list.push((
+                "integrity_drift",
+                "detected",
+                serde_json::json!({"pad": "x".repeat(1000)}),
+            ));
         }
-        big.push_str(&refused);
-        big.push('\n');
+        list.push(("agent_boot", "refused", refused_extra.clone()));
+        let big = rows(&list);
+        assert!(big.len() as u64 > LAST_START_TAIL + 4096);
         std::fs::write(&log, big).unwrap();
-        assert!(last_refused_start(&log, Some(&k.verifying_key()))
-            .unwrap()
-            .contains("verifies"));
+        let line = last_refused_start(&log, Some(&k.verifying_key())).unwrap();
+        assert!(line.contains("verifies") && !line.contains("NOT"), "{line}");
         // a row that starts exactly where the tail does is read whole (the
         // blank lines after it are no rows)
         let row = format!("{refused}\n");
@@ -4739,5 +4833,80 @@ mod tests {
             last_refused_start(&log, None).is_some(),
             "the row at the tail's first byte"
         );
+    }
+
+    /// Named test (the review of #574, F5): the refused start's line says
+    /// whether its row is in the chain at the log's end, not only whether
+    /// the row's own signature verifies — an older refusal written again at
+    /// the end (its signature verifies), a row forged after a genuine
+    /// refusal, an older good start written again over a refusal (said, not
+    /// silent); the genuine chain is linked.
+    #[test]
+    fn status_says_whether_the_refused_start_row_is_in_the_chain() {
+        let k = SigningKey::from_bytes(&[5; 32]);
+        let pk = k.verifying_key();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        let refused = serde_json::json!({
+            "refused_by": "watchdog_exe",
+            "detail": "--watchdog-exe /usr/local/bin/northnarrow-agent is the agent's own executable",
+        });
+        let none = || serde_json::json!({});
+        let old = chained(
+            &k,
+            &[
+                ("agent_boot", "refused", refused.clone()),
+                ("agent_boot", "success", none()),
+                ("integrity_drift", "detected", none()),
+            ],
+        );
+        std::fs::write(&log, format!("{}\n{}\n", old.join("\n"), old[0])).unwrap();
+        let line = last_refused_start(&log, Some(&pk)).unwrap();
+        assert!(
+            line.contains("its signature verifies") && line.contains("NOT linked"),
+            "{line}"
+        );
+        assert!(last_refused_start(&log, None)
+            .unwrap()
+            .contains("NOT linked"));
+        let c = chained(
+            &k,
+            &[
+                ("agent_boot", "success", none()),
+                ("agent_stop", "success", none()),
+                ("agent_boot", "refused", refused),
+            ],
+        );
+        // an older good start written again over the refusal
+        std::fs::write(&log, format!("{}\n{}\n", c.join("\n"), c[0])).unwrap();
+        let line = last_refused_start(&log, Some(&pk)).unwrap();
+        assert!(
+            line.contains("NOT linked") && line.contains("not known"),
+            "{line}"
+        );
+        // a row after the refusal, linked by its prev_hash, not the agent's
+        let forged = signed_row_after(
+            &SigningKey::from_bytes(&[6; 32]),
+            "integrity_drift",
+            "detected",
+            none(),
+            &entry_hash_of(&c[2]),
+        );
+        std::fs::write(&log, format!("{}\n{forged}\n", c.join("\n"))).unwrap();
+        let line = last_refused_start(&log, Some(&pk)).unwrap();
+        assert!(
+            line.contains("its signature verifies") && line.contains("NOT linked"),
+            "{line}"
+        );
+        // the genuine chain
+        std::fs::write(&log, format!("{}\n", c.join("\n"))).unwrap();
+        let line = last_refused_start(&log, Some(&pk)).unwrap();
+        assert!(
+            line.contains("it is linked") && !line.contains("NOT"),
+            "{line}"
+        );
+        let rows: Vec<&[u8]> = c.iter().map(|l| l.as_bytes()).collect();
+        assert!(tail_linked(&rows, 2, Some(&pk)) && tail_linked(&rows, 0, None));
+        assert!(!tail_linked(&rows, 3, None), "no row there");
     }
 }

@@ -301,7 +301,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        27,
+        28,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses' — lot 360, the review of #568 \
          (F1): at `AsOf::Live` only, the `exe` link of a fork the kernel's fork record names, \
@@ -324,7 +324,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
          lot 340: `ran_host_file`, the device and inode of a packaged program's file at its \
          path (one `fstat`, the host's root), compared with the image the exec recorded — \
          read only when a FIM-005/-019 verdict's writer already runs `logrotate`, never a \
-         process's `/proc` image",
+         process's `/proc` image; lot 367 (the review of #574, F2): `is_snapd_write`, the \
+         device and inode of the snapd package's binary at its path (one `fstat`, the host's \
+         root: the package is on the host) — read only when a destructive FIM-009 verdict's \
+         file is one of snapd's own units and its writer's nearest snapd, executed by root as \
+         PID 1's child, is the host's file at its path",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

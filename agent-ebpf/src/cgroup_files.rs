@@ -125,8 +125,8 @@ pub(crate) unsafe fn refuse_write(
 }
 
 /// The `s_magic` of `inode`'s file system; `None` (a fail-open of `hook`,
-/// counted) when it cannot be read — [`refuse_write`]'s reads, for the
-/// read-open's [`refuse_memory_view`].
+/// counted) when it cannot be read — [`refuse_write`]'s reads, for
+/// [`refuse_memory_view`] at every open.
 #[inline(always)]
 unsafe fn sb_magic(inode: *const c_void, hook: u32) -> Option<u64> {
     let sb = match bpf_probe_read_kernel::<*const c_void>(
@@ -147,11 +147,13 @@ unsafe fn sb_magic(inode: *const c_void, hook: u32) -> Option<u64> {
     }
 }
 
-/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): the read-open of one of a
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): the open of one of a
 /// protected process's memory views (`/proc/<pid>/environ`, `auxv`, `maps`,
 /// `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`, and the same under
 /// `task/<tid>/`: `northnarrow_common::ptrace_read::MEMORY_VIEWS`) is
-/// refused here, to the callers the `ptrace_access_check` hook refuses
+/// refused here, whatever its access mode (the review of #574, F1: a
+/// read-write, write-only or no-access open takes the process's memory as
+/// a read-only one does, and reads it or answers the layout queries), to the callers the `ptrace_access_check` hook refuses
 /// (its own two decisions, `ptrace_check::target_is_protected` and
 /// `ptrace_check::caller_may_access`). The hook alone no longer holds for
 /// them: from 6.16 the kernel's `mm_access()` lets a caller with

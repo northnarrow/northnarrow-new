@@ -511,14 +511,15 @@ impl Rule for NnLAt001AntiTamperDenial {
                 let reasoning = format!(
                     "`{comm}` (pid {pid}) was refused a read-mode access (ptrace mode \
                      {target_dev:#x}) to the agent's process {target_ino} by the anti-tamper \
-                     hook: one of its /proc/<pid>/ links — ns/* (nsenter, `systemctl bind` or \
-                     `mount-image` entering its namespace), exe, root, cwd, fd/ or io. The \
-                     kernel's outcome is not observed: from 6.16 it lets a caller with \
-                     CAP_PERFMON or CAP_SYS_ADMIN through some read-mode checks the hook \
-                     refused (the memory views are refused at their open instead). Recorded \
-                     once an hour per caller program and process; lsof, htop and a monitoring \
-                     agent's process collector are refused the same way, and journald (its \
-                     reads of the agent's executable for its log lines) unrecorded."
+                     hook: for example one of its /proc/<pid>/ entries — ns/* (nsenter, \
+                     `systemctl bind` or `mount-image` entering its namespace), exe, root, cwd, \
+                     fd/, io. The kernel's outcome is not observed: from 6.16 it lets a caller \
+                     with CAP_PERFMON or CAP_SYS_ADMIN through some read-mode checks the hook \
+                     refused (the memory views are refused at their open instead, whatever its \
+                     access mode). Recorded once an hour per caller program and process; lsof, \
+                     htop and a monitoring agent's process collector are refused the same way, \
+                     and journald (its reads of the agent's executable for its log lines) \
+                     unrecorded."
                 );
                 return Some(build_verdict(
                     self,

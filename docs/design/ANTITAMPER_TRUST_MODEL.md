@@ -20,8 +20,8 @@ pre-alpha F3b-1: from kernel 6.16 `mm_access()` lets a caller with
 `CAP_PERFMON` or `CAP_SYS_ADMIN` through a read-mode check the ptrace hook
 refused, so the memory views — `environ`, `auxv`, `maps`, `smaps`,
 `smaps_rollup`, `numa_maps`, `pagemap` — are refused at their open by the
-`file_open` deny, to the callers the hook refuses, through the hook's own
-two decisions; a read-mode record of the hook says the kernel's outcome was
+`file_open` deny, whatever the open's access mode, to the callers the hook
+refuses, through the hook's own two decisions; a read-mode record of the hook says the kernel's outcome was
 not observed.) That is correct against the V1 adversary
 ("post-compromise root tries to silence the defender"), but it locks out
 three legitimate principals:

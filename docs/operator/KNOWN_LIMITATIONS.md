@@ -392,12 +392,15 @@ not cause as an incident.
   read-mode memory access check even when the agent's ptrace hook refuses
   it. The agent refuses the open of its memory views itself
   (`/proc/<pid>/environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`,
-  `numa_maps`, `pagemap`, its own or a thread's), recorded Low as
+  `numa_maps`, `pagemap`, its own or a thread's), whatever the open's
+  access mode, recorded Low as
   `ptrace_read`, "denied in kernel (the open …)". The hook's other
   read-mode refusals (`exe`, `ns/*`, `fd/`) are recorded "the hook
   refused; the kernel's outcome not observed". Not refused there:
   `process_madvise(2)` hints on the agent's memory (cold, pageout,
-  willneed, collapse: no read). Without the kernel's proc offsets in its
+  willneed, collapse): they read none of its content, but their answer
+  can reveal the layout of the agent's memory (which address ranges are
+  mapped). Without the kernel's proc offsets in its
   BTF the open refusal is not armed, a signed degradation. *Evidence:*
   `the_memory_views_are_refused_at_their_open_with_the_hooks_decisions`;
   lot 367; internal check Phase 3b (F3b-1).
@@ -530,8 +533,10 @@ lists the known false positives of each rule.
   `/tmp` that connects out (`NN-L-NET-008_OutboundFromTmpExec`): recorded
   High. *Evidence:* internal check Phase 0, residuals R054. A snap
   install's own units (the snap's mount and service units, written by the
-  host's snapd) are recorded Low. *Evidence:*
-  `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`; lot
+  host's snapd, the process its systemd unit runs, in the unit's cgroup) are
+  recorded Low. *Evidence:*
+  `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`,
+  `snapds_identity_is_snapd_services_process_with_clean_marks`; lot
   367.
 - **DNS resolvers outside the system trees**, or run in a unit with a name
   the agent does not know: judged as any process, so their DNS traffic can

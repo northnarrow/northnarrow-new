@@ -11789,15 +11789,59 @@ number in parentheses is a lab PR.
     the three records (`python3`, `head`, `readlink`'s "not observed"), the
     snap install 2 Low and 0 High, the lock's line 16 s after and gone 55 s
     after the unmask, the refused start named with its signature verified.
-    Verifier check of the object (every program within
-    900,000 instructions): 5.15 highest `mount_guard_sb_mount` 830,908
-    (83.1%), `protected_open_deny` 27,991, `ptrace_access_check` 3,375;
-    6.1 (debian12) highest `mount_guard_move_mount` 82.1%,
-    `protected_open_deny` 26,077; 6.8 28.5%, `protected_open_deny` 18,380;
-    6.12 (debian13) 37.7%,
-    `protected_open_deny` 17,958; 7.0 60.3%, `protected_open_deny` 26,016,
-    `ptrace_access_check` 2,484. Uninstalled (`--purge`), no `.local`, no
-    pins, no mask or drop-in left, guests powered off.
+    Verifier check of the object (every program within the 900,000
+    instructions' gate; the shares below are of that gate): 5.15 highest
+    `mount_guard_sb_mount` 830,908 (92.3%), `protected_open_deny` 27,991,
+    `ptrace_access_check` 3,375; 6.1 (debian12) highest
+    `mount_guard_move_mount` 91.2%, `protected_open_deny` 26,077; 6.8
+    31.7%, `protected_open_deny` 18,380; 6.12 (debian13) 41.9%,
+    `protected_open_deny` 17,958; 7.0 67.0% (602,885),
+    `protected_open_deny` 26,016, `ptrace_access_check` 2,484. Uninstalled
+    (`--purge`), no `.local`, no pins, no mask or drop-in left, guests
+    powered off.
+  - Fix round 1 (the review of #574): the view deny looked at read-only
+    opens only — a read-write or write-only open of a view read the memory,
+    or answered the maps layout query, on 7.0 (F1); snapd's identity was a
+    file root can put at a snap's revision path (F2); the read-mode
+    record's hourly dedup let one kind of refusal hide the other (F3); the
+    `process_madvise` limit under-stated the layout it can reveal (F4); the
+    refused-start line checked the row's signature only (F5). Done:
+    `refuse_memory_view` called once at every open, before the access mode
+    is read (ratchet
+    `the_memory_views_are_refused_whatever_the_opens_access_mode`);
+    `is_snapd_write` takes the process systemd's `snapd.service` started —
+    its main process, the package's binary on the host — with it and every
+    process from the writer up to it in the unit's cgroup, started there,
+    nothing injected (the lot 277/281 marks through the per-rule policy's
+    facts) (`a_root_made_snapd_revision_path_keeps_high`,
+    `snapds_identity_is_snapd_services_process_with_clean_marks`); the
+    dedup key's kind bit `ptrace_read::SEEN_VIEW_OPEN`
+    (`the_hourly_dedup_keeps_the_two_refusal_kinds_apart`);
+    `admin_cli::tail_linked` (`status_says_whether_the_refused_start_row_is_in_the_chain`).
+    Mutation: 21 mutants on the new code, 21 caught by a named test (two
+    only after two cases were added: marks partly not known, a daemon seen
+    only as the snap's image on a host without the package). Lab (as
+    measured): ubuntu2604 (7.0.0-43): root's opens of the agent's
+    `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `numa_maps`,
+    `pagemap`, and of a thread's, each read-only, read-write, write-only and
+    with no access mode, refused (EPERM: 56 of 56), and an `O_PATH`
+    descriptor of `environ` and `maps` reopened read-only and read-write
+    through `/proc/self/fd` refused; a process's own `maps` opened
+    read-write read; one record "denied in kernel (the open …)" for
+    `python3`; `snap install hello-world` and `snap remove --purge`: 3 Low
+    `NN-L-FIM-009` by snapd (its main process re-executed from the snapd
+    snap, in `snapd.service`'s cgroup), 0 High; the review's probe (a shell
+    copied by root to `/snap/snapd/99999/usr/lib/snapd/snapd`, writing
+    `snap.k367fr1.b.service` and its `.wants` link): High `NN-L-FIM-009`,
+    removed after; verifier highest `mount_guard_move_mount` 602,885
+    (67.0%), `protected_open_deny` 26,034.
+    ubuntu2204 (5.15.0-203): the same 56 opens and the two reopens refused
+    (EPERM), the own `maps` read, one "denied in kernel (the open …)"
+    record; the snap install 4 Low and 0 High; the review's probe High;
+    verifier `mount_guard_sb_mount` 830,908 (92.3%, unchanged: the mount
+    guard untouched), `protected_open_deny` 27,742, `ptrace_access_check`
+    3,375. Both guests uninstalled (`--purge`), the probe's files removed,
+    powered off.
 - **Lot 360 — the pre-alpha's Phase 4b, F4b-1 (P2): an AppImage's fork-only
   child is judged like its AppImage (C14; no level changes).**
   - What was open (rc3, Phase 4b, five kernels, alpha profile): a type-2
