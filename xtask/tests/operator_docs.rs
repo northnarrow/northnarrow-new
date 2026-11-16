@@ -589,3 +589,25 @@ fn the_checker_refuses_unshipped_documents_and_dead_links() {
         "enabling-the-bpf-lsm-kernel-command-line"
     );
 }
+
+/// Lot 365: every exit code nn-admin's command line names as a constant is a
+/// row of NN_ADMIN.md's table — 17, a permission the host refused (the
+/// agent's socket, a key or the agent id), told from 5 (the agent not
+/// reached).
+#[test]
+fn nn_admin_s_permission_exit_is_in_the_operator_table() {
+    let cli = read("crates/nn-admin/src/cli.rs");
+    assert!(
+        cli.contains("const EXIT_PERMISSION_DENIED: u8 = 17;"),
+        "nn-admin's permission exit is 17"
+    );
+    let table = read("docs/operator/NN_ADMIN.md");
+    assert!(
+        table.contains("| 17 | the host refused this user the agent's admin socket"),
+        "NN_ADMIN.md §4 names exit 17"
+    );
+    assert!(
+        table.contains("no socket or nobody listening on it (the agent is not running)"),
+        "NN_ADMIN.md §4 says what exit 5 still means"
+    );
+}

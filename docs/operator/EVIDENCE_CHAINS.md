@@ -142,11 +142,11 @@ by `nn-admin heartbeat watch` — `HEARTBEAT.md`.
 Stable (scripts may rely on them; external audit MAIN-014, EVD-017, lab
 PR 190):
 
-| Command | 0 | 1 | 8 |
-|---|---|---|---|
-| `nn-admin chain verify` | every chain verifies (and the anchor, when there is one) | the agent public key could not be loaded | at least one `BROKEN` line; every chain is still reported, one damaged chain does not hide the others |
-| `nn-admin audit verify --from F` | the chain is intact (a missing or empty file is 0 rows) | `F` or the key cannot be read (I/O, permissions) | the first row that does not verify, or the first line that is not a row, with its line number and the rows verified before it; or `--expect-head`/`--min-seq` not reached |
-| `nn-admin audit read` | every line was a row | the log cannot be read, or stdout was closed | some lines are not audit rows: each is named on stderr (`audit: line N of F skipped: …`, the first 100, then the count), and every row before and after them was printed |
+| Command | 0 | 1 | 8 | 17 |
+|---|---|---|---|---|
+| `nn-admin chain verify` | every chain verifies (and the anchor, when there is one) | the agent public key could not be loaded | at least one `BROKEN` line; every chain is still reported, one damaged chain does not hide the others | without root: a chain's file or directory is not readable (permission, not damage); nothing is verified: run it with `sudo` |
+| `nn-admin audit verify --from F` | the chain is intact (a missing or empty file is 0 rows) | `F` or the key cannot be read (I/O, permissions) | the first row that does not verify, or the first line that is not a row, with its line number and the rows verified before it; or `--expect-head`/`--min-seq` not reached | (not used) |
+| `nn-admin audit read` | every line was a row | the log cannot be read, or stdout was closed | some lines are not audit rows: each is named on stderr (`audit: line N of F skipped: …`, the first 100, then the count), and every row before and after them was printed | (not used) |
 
 What the verifiers report instead of stopping (before lab PR 190 they
 aborted or stopped at the first bad line):

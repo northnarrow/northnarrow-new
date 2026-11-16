@@ -392,11 +392,12 @@ tarball and `SHA256SUMS` to the guest, stops the lab's source install and
 then checks, in order: the tarball against its own line in `SHA256SUMS`
 (exactly one; external audit LAB-010: nothing is extracted otherwise, and
 the archive's owners and modes are not kept); that the release
-binaries run on the guest's glibc (CI builds on Ubuntu 24.04; the only
-newer glibc symbols are weak); that `install.sh --tarball --sums` verifies
+binaries run on the guest's glibc, none of the four printing a word on
+stderr (CI builds on Ubuntu 22.04 and the release check holds every need at
+or below glibc 2.34); that `install.sh --tarball --sums` verifies
 the tree and records `"provenance": "checksums"`; that the agent boots,
 verifies its binaries against that manifest, attaches every deny hook and
-arms the telemetry probe; and that an exec from `/tmp` fires R001. The
+passes the sensors' self-test (`sensor self-test armed`); and that an exec from `/tmp` fires R001. The
 lab's source install is put back at the end. The attestation itself is
 checked off the guest (gh ≥ 2.49 or cosign) with the tag-bound command of
 `docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §5: an artefact of a dispatch

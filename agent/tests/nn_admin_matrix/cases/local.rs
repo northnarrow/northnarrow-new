@@ -722,6 +722,31 @@ pub fn chain() -> Vec<Case> {
     }));
     // A key nn-admin cannot read: the chain is not verified.
     out.push(Case::args_owned("chain", "chain.no-key", base_args(&by_key)).with([audit(&pin)]));
+    // Lot 365's mini-hunt: a chain this user may not read is a permission
+    // (exit 17, "run it with sudo"), not a BROKEN chain (exit 8); not run as
+    // root, which reads it.
+    out.push(
+        Case::args_owned(
+            "chain",
+            "chain.a-chain-this-user-may-not-read",
+            base_args(&by_key),
+        )
+        .with(fixtures::agent_keys())
+        .with([audit(&pin), Put::file("netflow.jsonl", "", 0o000)])
+        .without_root(),
+    );
+    // ... and one not asked for (`--log audit`) is not read: the audit
+    // chain is verified
+    out.push(
+        Case::args_owned(
+            "chain",
+            "chain.a-chain-this-user-may-not-read-not-asked",
+            base_args(&[by_key[0], by_key[1], "--log", "audit"]),
+        )
+        .with(fixtures::agent_keys())
+        .with([audit(&pin), Put::file("netflow.jsonl", "", 0o000)])
+        .without_root(),
+    );
     out.push(
         Case::args_owned("chain", "chain.published-key-not-hex", base_args(&by_key))
             .with([audit(&pin), Put::file("agent.sig.pub", "not hex\n", 0o444)]),

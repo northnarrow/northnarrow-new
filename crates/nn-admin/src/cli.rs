@@ -32,6 +32,9 @@
 //!   unlock, force-posture out of COMBAT: the agent verified the request
 //!   and could not release the isolation — the tables read back still hold
 //!   the COMBAT chain, the posture stays COMBAT (lab PR 217; reason printed)
+//! - 17 the host refused this user the agent's admin socket, a key or the
+//!   agent id (`EACCES`/`EPERM`): run it with sudo — never "the agent is
+//!   not running", which is 5 (lot 365, `exit_from_request_error`)
 //! - 141 stdout (or stderr) closed before everything was written —
 //!   `nn-admin status | head -1` (128 + SIGPIPE, lab PR 188)
 //!
@@ -220,7 +223,9 @@ enum Cmd {
     /// agent answers the posture, the isolation, the last admin action and
     /// the COMBAT stage and lock; --key signs the
     /// request and adds the telemetry: ring drops and rejected records, the
-    /// response mode (detect-only), the COMBAT evidence gaps.
+    /// response mode (detect-only), the COMBAT evidence gaps. Run it as root
+    /// (sudo): exit 17 when this user may not open the admin socket, exit 5
+    /// when the agent cannot be reached (not running).
     Status {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
@@ -1634,10 +1639,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             socket,
         } => match run_unlock(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_unlock(outcome),
-            Err(e) => {
-                eprintln!("unlock: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("unlock", &e),
         },
         Cmd::Detections {
             key,
@@ -1663,10 +1665,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             path,
         ) {
             Ok(outcome) => exit_from_detections(outcome),
-            Err(e) => {
-                eprintln!("detections: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("detections", &e),
         },
         Cmd::DetectionSetStatus {
             key,
@@ -1684,10 +1683,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             note,
         ) {
             Ok(outcome) => exit_from_detection_set_status(outcome),
-            Err(e) => {
-                eprintln!("detection-set-status: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("detection-set-status", &e),
         },
         Cmd::HostCheck { json } => {
             let checks = host.host_checks();
@@ -1763,8 +1759,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 // generic startup failure and we want shutdown
                 // failures to be distinguishable from "couldn't
                 // even launch nn-admin."
-                eprintln!("shutdown: {e:#}");
-                ExitCode::from(5)
+                exit_from_request_error("shutdown", &e)
             }
         },
         Cmd::ForcePosture {
@@ -1781,8 +1776,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     // class errors are operator-investigation,
                     // distinguishable from exit 1 (clap parse
                     // failure / didn't even launch).
-                    eprintln!("force-posture: {e:#}");
-                    ExitCode::from(5)
+                    exit_from_request_error("force-posture", &e)
                 }
             }
         }
@@ -1813,10 +1807,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 &roles,
             ) {
                 Ok(out) => exit_from_rotate_keys(out, "rotate-keys add"),
-                Err(e) => {
-                    eprintln!("rotate-keys add: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("rotate-keys add", &e),
             }
         }
         Cmd::RotateKeys {
@@ -1831,10 +1822,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
         } => match run_rotate_keys_revoke(&socket, &key, &cosign_key, &agent_id_file, &fingerprint)
         {
             Ok(out) => exit_from_rotate_keys(out, "rotate-keys revoke"),
-            Err(e) => {
-                eprintln!("rotate-keys revoke: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("rotate-keys revoke", &e),
         },
         Cmd::Audit {
             sub: AuditCmd::Read { path, since, json },
@@ -1943,6 +1931,9 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                         .join(nn_evidence::chain_anchor::HEADS_FILE_NAME)
                 });
                 let paths = host.chains(audit_log, &state_dir);
+                if let Some(e) = refused_without_root(&paths, &only) {
+                    return exit_from_request_error("chain verify", &e);
+                }
                 let lines = run_chain_verify(&paths, &heads, &only, &pubkey);
                 let mut broken = 0;
                 for l in &lines {
@@ -2032,10 +2023,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_fim_baseline(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_fim_baseline(outcome),
-            Err(e) => {
-                eprintln!("fim baseline: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("fim baseline", &e),
         },
         Cmd::Fim {
             sub:
@@ -2047,10 +2035,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_fim_report(&socket, &key, &agent_id_file, since) {
             Ok(outcome) => exit_from_fim_report(outcome),
-            Err(e) => {
-                eprintln!("fim report: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("fim report", &e),
         },
         Cmd::Fim {
             sub:
@@ -2061,10 +2046,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_fim_status(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_fim_status(outcome),
-            Err(e) => {
-                eprintln!("fim status: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("fim status", &e),
         },
         Cmd::Canary {
             sub:
@@ -2079,10 +2061,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             let spec: CanaryDeploySpec = kind.into();
             match run_canary_deploy(&socket, &key, &agent_id_file, name, spec) {
                 Ok(outcome) => exit_from_canary_deploy(outcome),
-                Err(e) => {
-                    eprintln!("canary deploy: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("canary deploy", &e),
             }
         }
         Cmd::Canary {
@@ -2094,10 +2073,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_canary_list(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_canary_list(outcome),
-            Err(e) => {
-                eprintln!("canary list: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("canary list", &e),
         },
         Cmd::Canary {
             sub:
@@ -2109,10 +2085,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_canary_burn(&socket, &key, &agent_id_file, canary_id) {
             Ok(outcome) => exit_from_canary_burn(outcome),
-            Err(e) => {
-                eprintln!("canary burn: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("canary burn", &e),
         },
         Cmd::Canary {
             sub:
@@ -2124,10 +2097,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match run_canary_refresh(&socket, &key, &agent_id_file, canary_id) {
             Ok(outcome) => exit_from_canary_refresh(outcome),
-            Err(e) => {
-                eprintln!("canary refresh: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("canary refresh", &e),
         },
 
         // ── Lot 276 — the export ───────────────────────────────────
@@ -2227,10 +2197,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match crate::admin_cli::run_net_flows(&socket, &key, &agent_id_file, since_unix) {
             Ok(outcome) => exit_from_net_jsonl(outcome, "net flows"),
-            Err(e) => {
-                eprintln!("net flows: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("net flows", &e),
         },
         Cmd::Net {
             sub:
@@ -2241,10 +2208,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match crate::admin_cli::run_net_listeners(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_net_jsonl(outcome, "net listeners"),
-            Err(e) => {
-                eprintln!("net listeners: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("net listeners", &e),
         },
         Cmd::Net {
             sub:
@@ -2256,10 +2220,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match crate::admin_cli::run_net_resolve(&socket, &key, &agent_id_file, ip) {
             Ok(outcome) => exit_from_net_resolve(outcome),
-            Err(e) => {
-                eprintln!("net resolve: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("net resolve", &e),
         },
         Cmd::Net {
             sub:
@@ -2271,10 +2232,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 },
         } => match crate::admin_cli::run_net_fingerprint(&socket, &key, &agent_id_file, flow_id) {
             Ok(outcome) => exit_from_net_jsonl(outcome, "net fingerprint"),
-            Err(e) => {
-                eprintln!("net fingerprint: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("net fingerprint", &e),
         },
 
         Cmd::Response { sub } => run_response_cmd(sub),
@@ -2315,10 +2273,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     }
                     code
                 }
-                Err(e) => {
-                    eprintln!("trusted-installer-grant: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("trusted-installer-grant", &e),
             }
         }
 
@@ -2330,10 +2285,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                 println!("debug: posture forced.");
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("debug: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("debug", &e),
         },
     }
 }
@@ -2787,10 +2739,7 @@ fn read_status(
 ) -> Result<StatusOutcome, ExitCode> {
     use nn_proto::admin_protocol::AdminResult;
     let Some(key) = key else {
-        return run_status(socket).map_err(|e| {
-            eprintln!("{op}: {e:#}");
-            ExitCode::from(5)
-        });
+        return run_status(socket).map_err(|e| exit_from_request_error(op, &e));
     };
     match crate::admin_cli::run_telemetry_status(socket, key, agent_id_file) {
         Ok(Ok(out)) => Ok(out),
@@ -2801,10 +2750,7 @@ fn read_status(
             Err(ExitCode::from(7))
         }
         Ok(Err(refused)) => Err(exit_from_admin_result(op, refused)),
-        Err(e) => {
-            eprintln!("{op}: {e:#}");
-            Err(ExitCode::from(5))
-        }
+        Err(e) => Err(exit_from_request_error(op, &e)),
     }
 }
 
@@ -4674,6 +4620,80 @@ fn overlay_kind_arg(kind: &str) -> Option<nn_proto::admin_signed_payload::Overla
     k
 }
 
+/// Lot 365: the exit status of a command this user may not run here: the
+/// host refused it the agent's admin socket, its key or the agent id file
+/// (`EACCES`, `EPERM`). Under exit 5 ("the agent could not be reached") a
+/// user without root, with the agent running, read that the agent was
+/// down. 17 is free in every table of nn-admin (11 to 16 are `heartbeat
+/// watch`'s and `export verify`'s alerts).
+const EXIT_PERMISSION_DENIED: u8 = 17;
+
+/// An `EACCES` or `EPERM` anywhere in `e`'s chain — the host refused this
+/// process a file or the socket, whatever wrapped it on the way up — said
+/// as the step that met it (`connecting to /run/northnarrow/admin.sock:
+/// Permission denied`), without the wrappers' guesses about why the request
+/// failed (unlock's "got no reply").
+fn permission_denied(e: &anyhow::Error) -> Option<String> {
+    let chain: Vec<&(dyn std::error::Error + 'static)> = e.chain().collect();
+    let at = chain.iter().position(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })?;
+    Some(match at.checked_sub(1).map(|i| chain[i]) {
+        Some(step) => format!("{step}: {}", chain[at]),
+        None => chain[at].to_string(),
+    })
+}
+
+/// Lot 365's mini-hunt: without root, `chain verify` reported each chain it
+/// may not read (the state directory is root's) as `BROKEN`, exit 8 —
+/// "evidence missing or altered", a false alarm. Without root, a chain this
+/// user may not open is a permission ([`EXIT_PERMISSION_DENIED`]). As root a
+/// refused read stays `BROKEN`: no mode refuses root, so it is evidence.
+fn refused_without_root<C: crate::host::Chains>(
+    paths: &C,
+    only: &[String],
+) -> Option<anyhow::Error> {
+    if rustix::process::geteuid().is_root() {
+        return None;
+    }
+    paths
+        .targets()
+        .into_iter()
+        .filter(|t| only.is_empty() || only.iter().any(|o| o == t.chain))
+        .find_map(|t| match std::fs::File::open(&t.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Some(anyhow::Error::new(e).context(format!("reading {}", t.path.display())))
+            }
+            _ => None,
+        })
+}
+
+/// Lot 365: how a command that talks to the agent ends when it failed
+/// before or around its request — the one place that tells "you may not"
+/// (exit [`EXIT_PERMISSION_DENIED`], and what to do, in plain words) from
+/// "the agent could not be reached or answered something else" (exit 5).
+fn exit_from_request_error(op: &str, e: &anyhow::Error) -> ExitCode {
+    let Some(denied) = permission_denied(e) else {
+        eprintln!("{op}: {e:#}");
+        return ExitCode::from(5);
+    };
+    eprintln!("{op}: {denied}");
+    if rustix::process::geteuid().is_root() {
+        eprintln!(
+            "{op}: permission denied even as root: a security module (SELinux, AppArmor) or the \
+             agent's own protection refused it. This does not mean the agent is stopped: check \
+             `systemctl status northnarrow-agent`"
+        );
+    } else {
+        eprintln!(
+            "{op}: permission denied: only root may use the agent's admin socket, keys and files. \
+             Run it with sudo: `sudo nn-admin {op} …`. This does not mean the agent is stopped"
+        );
+    }
+    ExitCode::from(EXIT_PERMISSION_DENIED)
+}
+
 /// Exit code of a signed verb that the agent refused before doing
 /// anything (authentication, role, version).
 fn exit_from_admin_result(op: &str, r: nn_proto::admin_protocol::AdminResult) -> ExitCode {
@@ -4722,10 +4742,7 @@ fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
             ExitCode::from(9)
         }
         Ok(o) => exit_from_admin_result(op, o.result),
-        Err(e) => {
-            eprintln!("{op}: {e:#}");
-            ExitCode::from(5)
-        }
+        Err(e) => exit_from_request_error(op, &e),
     };
     match sub {
         ResponseCmd::Status {
@@ -4779,10 +4796,7 @@ fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(r) => exit_from_admin_result("response status", r.result),
-            Err(e) => {
-                eprintln!("response status: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(e) => exit_from_request_error("response status", &e),
         },
         ResponseCmd::Release {
             pid,
@@ -4869,10 +4883,7 @@ fn run_remediate_cmd(sub: RemediateCmd) -> ExitCode {
                     }
                 }
                 Ok(r) => exit_from_admin_result("remediate ransomware", r.result),
-                Err(e) => {
-                    eprintln!("remediate ransomware: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("remediate ransomware", &e),
             }
         }
     }
@@ -4918,10 +4929,7 @@ fn run_overlay_cmd<H: AdminHost>(host: &H, sub: OverlayCmd) -> ExitCode {
                         _ => 5,
                     })
                 }
-                Err(e) => {
-                    eprintln!("config overlay set: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("config overlay set", &e),
             }
         }
         OverlayCmd::Sign {
@@ -4951,10 +4959,7 @@ fn run_overlay_cmd<H: AdminHost>(host: &H, sub: OverlayCmd) -> ExitCode {
                     );
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("config overlay sign: {e:#}");
-                    ExitCode::from(5)
-                }
+                Err(e) => exit_from_request_error("config overlay sign", &e),
             }
         }
         OverlayCmd::Status {
@@ -4966,10 +4971,7 @@ fn run_overlay_cmd<H: AdminHost>(host: &H, sub: OverlayCmd) -> ExitCode {
         } => {
             let agent_id = match crate::agent_id::load_existing(&agent_id_file) {
                 Ok(a) => a,
-                Err(e) => {
-                    eprintln!("config overlay status: {e:#}");
-                    return ExitCode::from(5);
-                }
+                Err(e) => return exit_from_request_error("config overlay status", &e),
             };
             // External audit LLMR-014: the floor the verified chain proves.
             let floor = host.rollback_floor(&audit_log, &agent_sig_key);
@@ -5046,10 +5048,7 @@ fn run_policy_cmd<H: AdminHost>(host: &H, sub: PolicyCmd) -> ExitCode {
         } => {
             let agent_id = match crate::agent_id::load_existing(&agent_id_file) {
                 Ok(a) => a,
-                Err(e) => {
-                    eprintln!("policy show: {e:#}");
-                    return ExitCode::from(5);
-                }
+                Err(e) => return exit_from_request_error("policy show", &e),
             };
             let floor = host.rollback_floor(&audit_log, &agent_sig_key);
             let gate = host.overlay_gate(&admin_pub, agent_id, floor);
@@ -7067,5 +7066,72 @@ mod help_text_tests {
                 }
             }
         }
+    }
+}
+
+/// Lot 365: a permission the host refused is told from an agent that cannot
+/// be reached, wherever in the chain the refusal sits.
+#[cfg(test)]
+mod permission_tests {
+    use super::{exit_from_request_error, permission_denied, EXIT_PERMISSION_DENIED};
+    use anyhow::Context as _;
+    use std::process::ExitCode;
+
+    fn io(errno: i32, context: &str) -> anyhow::Error {
+        Err::<(), _>(std::io::Error::from_raw_os_error(errno))
+            .context(context.to_string())
+            .unwrap_err()
+    }
+
+    #[test]
+    fn a_refused_socket_key_or_agent_id_is_a_permission_error() {
+        for (errno, what) in [
+            (libc::EACCES, "connecting to /run/northnarrow/admin.sock"),
+            (libc::EPERM, "connecting to /run/northnarrow/admin.sock"),
+            (
+                libc::EACCES,
+                "reading private key /root/northnarrow-admin.key",
+            ),
+            (libc::EACCES, "reading /etc/northnarrow/agent_id"),
+        ] {
+            let e = io(errno, what);
+            let said = permission_denied(&e).expect("a permission error");
+            assert!(said.starts_with(&format!("{what}: ")), "{said}");
+            // wrapped again on the way up (unlock's context): said as the
+            // step that met it, without the wrapper's guess
+            let e = e.context("the signed unlock got no reply");
+            assert_eq!(permission_denied(&e).as_deref(), Some(said.as_str()));
+            assert_eq!(
+                exit_from_request_error("status", &e),
+                ExitCode::from(EXIT_PERMISSION_DENIED)
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_that_cannot_be_reached_stays_exit_5() {
+        for errno in [
+            libc::ENOENT,
+            libc::ECONNREFUSED,
+            libc::ETIMEDOUT,
+            libc::EPIPE,
+        ] {
+            let e = io(errno, "connecting to /run/northnarrow/admin.sock");
+            assert!(permission_denied(&e).is_none(), "{e:#}");
+            assert_eq!(exit_from_request_error("status", &e), ExitCode::from(5));
+        }
+        let e = anyhow::anyhow!("decode_frame: truncated");
+        assert_eq!(exit_from_request_error("status", &e), ExitCode::from(5));
+    }
+
+    /// 17 means one thing in every table: neither a general code (0 to 10,
+    /// 141) nor an alert of `heartbeat watch` (10 to 16) or `export verify`
+    /// (xtask/tests/operator_docs.rs holds NN_ADMIN.md's table to it).
+    #[test]
+    fn exit_17_is_free_in_every_table() {
+        assert_eq!(EXIT_PERMISSION_DENIED, 17);
+        // the alerts end at 16 (`heartbeat watch`'s help; `export verify`
+        // uses 2, 11 and 13)
+        assert!(include_str!("cli.rs").contains("15 stopped, 16 degraded)"));
     }
 }

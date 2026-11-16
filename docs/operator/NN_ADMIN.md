@@ -1,7 +1,8 @@
 # `nn-admin`: the commands, the keys they need, the exit codes
 
 `nn-admin` is the operator's client of the agent. It runs on the agent's
-host (as root: the admin socket and the agent's files are root's), except
+host (as root: the admin socket and the agent's files are root's; without
+root a command that needs them exits 17 and says to use `sudo`), except
 `heartbeat watch` and `export verify`, which run on another host. Every
 command has its own help: `nn-admin <command> --help`. This page lists them
 all, the options they share and every exit code an operator or a script
@@ -43,7 +44,7 @@ colour.
 |---|---|---|
 | `nn-admin status` | the posture, the network isolation, the last admin action, the COMBAT stage; with `--key` also the telemetry (lost events, the response mode: `OBSERVE-ONLY` under the `alpha` profile; the review of #565: the kernel-state round's findings past its quota, `kernel-state quota`, JSON `kernel_state_held_back`) | none, or `audit-read` / `telemetry-read` |
 | `nn-admin capabilities` | this boot's signed capability manifest: kernel, BTF, deny hooks and their self-test, each sensor's attach point, the degradations, the trust level | `audit-read` or `telemetry-read` |
-| `nn-admin host-check` | the host's hardening: lockdown, module signing, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, the install's verification level. Reads `/sys` and `/proc` only | none |
+| `nn-admin host-check` | the host's hardening: lockdown, module signing, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, a single bpffs (the agent's own pin lock, recognised as such, is not counted), the install's verification level. Reads `/sys` and `/proc` only | none |
 | `nn-admin verify-keys` | parse `admin.pub`, print each key's fingerprint and roles | none |
 
 ### Detections
@@ -131,12 +132,13 @@ which of them it uses.
 | 2 | a usage error (an unknown option, a missing value: the help is printed); `unlock` / `shutdown`: the agent rejected the signature; `host-check`: warnings found |
 | 3 | `unlock` / `shutdown`: the agent has no pending challenge for this request (retry) |
 | 4 | rate-limited by the agent (the wait is printed; retry after it) |
-| 5 | the agent could not be reached or answered something else: socket, protocol, a skewed clock, another install's agent id, an operation this agent does not know (an `nn-admin` of another release) |
+| 5 | the agent could not be reached or answered something else: no socket or nobody listening on it (the agent is not running), protocol, a skewed clock, another install's agent id, an operation this agent does not know (an `nn-admin` of another release) |
 | 6 | `shutdown`, `rotate-keys`: the quorum was not met (two distinct valid keys are needed) |
 | 7 | the key is valid but lacks the role the command needs |
 | 8 | evidence missing or altered: `audit verify`, `chain verify` (a `BROKEN` chain), `audit read` (lines that are not rows were skipped) — [`EVIDENCE_CHAINS.md`](EVIDENCE_CHAINS.md#exit-codes-of-the-verifiers) |
 | 9 | the agent verified the request and did nothing: no such canary (`canary burn` / `refresh`), nothing to release or restore (`response`), the isolation could not be released (`unlock`, `force-posture` out of COMBAT: the posture stays COMBAT) — the reason is printed |
 | 10 | `detection-set-status`: the change was not recorded (the agent could not append its chain: disk full?) |
+| 17 | the host refused this user the agent's admin socket, a key, the agent id or (`chain verify`) a chain (permission denied): run it with `sudo`. It says nothing about whether the agent runs, nor about the chains. 11 to 16 are left to the alerts of `heartbeat watch` and `export verify` |
 | 141 | the output was closed before everything was written (`nn-admin status \| head -1`) |
 
 `heartbeat watch` and `export verify` have their own codes, one per alert:

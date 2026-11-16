@@ -357,7 +357,8 @@ Further down, among other lines:
 
 If the agent does not run, `nn-admin status` exits 5 with
 `status: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)`.
-Then look at `systemctl status northnarrow-agent northnarrow-watchdog`
+Without sudo the same command exits 17 (`Permission denied`: run it with
+`sudo`; the agent may be running). If it was run with sudo, look at `systemctl status northnarrow-agent northnarrow-watchdog`
 and the agent's journal (below). The commands and their exit codes are in
 [NN_ADMIN.md](NN_ADMIN.md).
 

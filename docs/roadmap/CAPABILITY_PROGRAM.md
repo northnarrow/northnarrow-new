@@ -11826,6 +11826,58 @@ number in parentheses is a lab PR.
     among its matches; the home reference NET-007 only. Guests left clean
     (agent uninstalled, no `.local`, packages purged, no mounts), powered
     off.
+- **Lot 365 — the pre-alpha's external tester run (Debian 12, the guide of
+  #571): release binaries for glibc 2.34, a clear `nn-admin` permission
+  error, `host-check`'s pin lock (no level changes).**
+  - What was open: on Debian 12 every start of the CI release's binaries
+    printed `weak version 'GLIBC_2.39' not found` (linked on Ubuntu 24.04:
+    Rust's standard library refers weakly to `pidfd_spawnp` and
+    `pidfd_getpid`); `nn-admin status` without sudo exited 5, "the agent is
+    not running" to the guide, for a refused socket; `host-check` warned
+    "bpffs mounted 2×" on every host since lot 359 (the pin lock). The
+    diagnostics masking the tester found is the guide's own snippet (#571's
+    fix round): no product code builds that bundle.
+  - Done: the release's `package` job on `ubuntu-22.04`, and a step that
+    checks every ELF file of the tarball, the `.deb` and the `.rpm`
+    (`deploy/release/glibc-baseline.sh`: no `GLIBC_` need above 2.34, weak
+    included, no library but glibc's and `libgcc_s`; its selftest refuses a
+    strong and a weak need of 2.35 and of 2.39, accepts 2.34, built on purpose with the release's
+    linker). Ratchets `the_release_is_built_and_checked_on_the_glibc_baseline`
+    and `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34`. One helper
+    for every command that talks to the agent (`exit_from_request_error`):
+    `EACCES`/`EPERM` → exit 17 with the sudo advice; 5 unchanged otherwise.
+    The mini-hunt's variants: a root-only key (17), `chain verify` without
+    root (each unreadable chain was `BROKEN`, exit 8 — now 17; as root
+    unchanged), unlock's wrapper (the step named, not its guess).
+    `host-check` takes out of its bpffs count the lock `pin_lock::state_in`
+    finds in place (self-bind of the pin dir, child of the whole bpffs,
+    private and unbindable) and locks stacked on it with that propagation.
+    Named tests: `status_without_root_on_a_running_agent_says_sudo_not_stopped`,
+    `status_with_no_agent_is_still_exit_5`,
+    `a_key_this_user_may_not_read_is_exit_17_not_5`, `cli::permission_tests`,
+    `the_agent_s_pin_lock_is_not_a_second_bpffs`; matrix
+    `sock.<verb>.permission-denied` ×41 and two `chain` cases.
+    Mutation on the new code: 21 mutants (the permission helper 6, the
+    glibc check 6, chain verify 3, the lock's recognition 6), 21 caught by a
+    named test or the selftest.
+  - Lab (as measured, our own guests): the tree built in the ubuntu2204 guest (Ubuntu 22.04,
+    glibc 2.35-0ubuntu3.18: the release job's image) the release's way
+    (`cargo build --release --locked`, x86-64-v2, then `mk-tarball.sh`; LTO
+    thin for the guest's memory) — the glibc check passes, highest need
+    `GLIBC_2.34` in all four binaries (the 24.04 artefact: `GLIBC_2.39`
+    `WEAK`), installed on ubuntu2204 (5.15.0-203) and debian12
+    (6.1.0-55): `release-check` PASS on both (with its new check: every
+    binary's `--version` with nothing on stderr), `ldd -v` nothing above
+    2.34, no `weak version` line in the agent's or the watchdog's journal;
+    `nn-admin status` with sudo 0, without sudo 17 (the socket), with the
+    root-only key 17, no agent at the socket 5; `chain verify` and
+    `capabilities --key` without sudo 17; `host-check` with the lock in
+    place: bpffs OK, the lock named and not counted (`status`: 13 checks, 6
+    warnings — 7 in the tester's run), a second bpffs mounted at
+    `/tmp/k365-bpf2` WARN "mounted 2×", OK again once it was unmounted.
+    Uninstalled (`--purge`, rc 0), no `.local`, no pins, guests powered
+    off. Found in the lab, fixed: `release-check`'s "telemetry probe
+    armed" (the line lot 280c renamed "sensor self-test armed").
 - **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
   and the re-check 3's P3s (pre-alpha; C23; no level change).**
   - What was open: the unmount hook runs before the kernel's namespace

@@ -583,6 +583,7 @@ pub fn check_socket_coverage(cases: &[Case]) {
         }
         want.push("no-socket".to_string());
         want.push("refused-connection".to_string());
+        want.push("permission-denied".to_string());
         want.extend(verb.success.iter().map(|(n, _)| n.clone()));
         for w in want {
             let id = format!("sock.{}.{w}", verb.name);
