@@ -7903,9 +7903,10 @@ number in parentheses is a lab PR.
     survivors named and caught (BUG46's helpers), 1 argued equivalent
     (BUG70: the window expired against its newest sample or against an
     out-of-order one expires the same).
-  - Open: a tunnel whose first label is short or of low entropy is not
-    scored at all, and one rotating over 8 or more registrable domains
-    stays under each one's count (both before this lot); a suffix the list
+  - Open: the tunnel score reads the first label and counts per
+    registrable domain, so a tunnel that does not look like one in its
+    first label, or spreads over many domains, is not scored as one (both
+    before this lot); a suffix the list
     lacks keys its sites one level coarser (more names add up); CoreDNS is
     not among the forwarders NN-L-NET-004/014 spare (noticed, not this
     lot's).
@@ -9403,8 +9404,9 @@ number in parentheses is a lab PR.
     the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
     r4: one inline and one interactive session — the files encrypted and
     deleted, no NN-L-IMP-001); not claimed closed.
-    Residuals stated: one appended byte or a patched sample defeats the
-    copy check; a container's own shells (and overlayfs' identities) are not
+    Residuals stated: the copy check compares a file's identity with the
+    installed shells, so a copy that differs from them is not recognised as
+    one; a container's own shells (and overlayfs' identities) are not
     compared — lot 329's behaviour-based check is the answer to both.
   - The lab, as measured (our own guests under lease k313; the agent
     uninstalled, the guests clean and off at the end):
@@ -11620,8 +11622,8 @@ number in parentheses is a lab PR.
     user namespace on 6.18). Now one shared walk
     (`common::mount_guard::spread`/`target_reach`, the hooks' `Mounts`
     over `struct mount`, the tests' over a graph): a group the map does not
-    hold is read in the hook, its peers and each one's slaves up to 16
-    mounts, undecided counting as reaching (refused only on a protected
+    hold is read in the hook, its peers and each one's slaves,
+    undecided counting as reaching (refused only on a protected
     point); an unmount walks the parent's propagation for the mount a held
     one sits under at that place (`HELD_UNDER`, by the parent's id), an
     undecided walk refused only under a copy of a held mount — two first
@@ -11667,16 +11669,13 @@ number in parentheses is a lab PR.
     root; §47.1): ubuntu2204 again on that tree, the same verifier figures
     and verdicts, a clean cold boot; `agent/tests/fuse_stall.rs` under
     `CI=true` passed (14.3 s).
-  - Fix round 3 (re-check 2 of #567): N3 (P1) — `mount --rbind /sys
-    /mnt/s; umount -l /mnt/s` was judged by its top only (a copy at a place
-    nothing is held at) while `umount_tree()` took the host's childless
+  - Fix round 3 (re-check 2 of #567): N3 (P1) — a lazy unmount of an rbind copy of `/sys` was judged by its top only while `umount_tree()` took the host's childless
     `/sys/fs/bpf` and `/sys/fs/cgroup` through the copies below it, and
     their copies in every slave namespace, the agent's own included (the
     reviewer's probes, a user namespace on 6.18); a raw namespace's
     `umount -l /` the same. Now `sb_umount` reads the subtree in the
-    kernel's order (`common::mount_guard::umount_below`, 32 mounts, a
-    climb of at most 8 levels a step; offsets `mount.mnt_mounts`,
-    `.mnt_child`), each mount below judged as the top (a held mount at its
+    kernel's order (`common::mount_guard::umount_below`, a bounded walk;
+    offsets `mount.mnt_mounts`, `.mnt_child`), each mount below judged as the top (a held mount at its
     place under its parent's group; its root a held mount's, then by id in
     a guarded namespace or under a group not followed and a copy of a held
     parent); a subtree wider than the walk is refused in a guarded
@@ -11690,10 +11689,10 @@ number in parentheses is a lab PR.
     `systemd-journald@northnarrow.service`, which the agent's units log
     to) and is once an hour per caller image and target otherwise
     (`common::ptrace_read`, `PTRACE_READ_QUIET`, `PTRACE_READ_SEEN`); the
-    refusal unchanged. P3: KNOWN_LIMITATIONS names the two unmounts the
-    walk does not refuse (a copy behind 32 private mounts, or a chain of
-    9, of a namespace not guarded; the regroup window, one shared slave
-    enough; a lazy unmount racing the walk, N4 of the re-check 3) and what the
+    refusal unchanged. P3: KNOWN_LIMITATIONS names, as behaviour, the
+    unmounts the guard does not always refuse (a large subtree in a
+    namespace not guarded; through a parent regrouped before the refresh;
+    a tree rebuilt concurrently, N4 of the re-check 3) and what the
     bpffs losing its last mount does; `ProcFacts`'s `/proc` root is
     `proc_root` (a planted `std::fs::read_link` in `trusted_exe_now` is
     caught by the kernel-views ratchet now). The coordinator's decision
@@ -11707,8 +11706,8 @@ number in parentheses is a lab PR.
     Mutation on the final tree: 54 mutants (the walk 24, `ptrace_read` 8,
     journald's identity and its order 5, `held` 12, the round's held pins 4,
     the purge's release 1), 54 caught by a named test — two after
-    `the_walk_reads_exactly_its_bound_and_every_group_read` (a 33rd mount
-    read; only the last group kept).
+    `the_walk_reads_exactly_its_bound_and_every_group_read` (one mount read
+    past the bound; only the last group kept).
     Lab (as measured, our own guests): ubuntu2204 (5.15.0-203) at a091aa8c
     and 59989001 — the 900k verifier gate 123 programs, 0 failing, highest
     `mount_guard_sb_umount` 675,751 (67.6 %), N3a refused (one High) with
@@ -11880,10 +11879,8 @@ number in parentheses is a lab PR.
     armed" (the line lot 280c renamed "sensor self-test armed").
 - **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
   and the re-check 3's P3s (pre-alpha; C23; no level change).**
-  - What was open: the unmount hook runs before the kernel's namespace
-    lock, so a copy grafted by a racing rbind, or a subtree wider or deeper
-    than the walk (32 mounts, a chain of 9), let a lazy unmount take the
-    host's bpffs and the pins, in any namespace (N4; N3's named residual).
+  - What was open: a lazy unmount that the guard did not judge
+    completely could take the host's bpffs and the pins, in any namespace (N4; N3's named residual).
   - Done: the pin directory bound onto itself, private and unbindable, as
     the host's bpffs's child (`nn_linux::anti_tamper::pin_lock`, the unit's
     `ExecStartPre=-+ … --pin-lock` in PID 1's namespace before any pin;
@@ -11954,7 +11951,7 @@ number in parentheses is a lab PR.
     (rev567-lock-probe.sh in a user namespace) as the review found it; N4's
     race won (the unmount entered before the graft, returned after it) in
     a raw namespace on all three and in the host's on 6.8 and 7.0 (on 5.15
-    the graft came first and the walk refused it), N3's chain of 9 — the
+    the graft came first and the walk refused it), N3's deep chain — the
     host's bpffs and the pins kept every time (round 1 on 6.8, the lock
     not made: both gone); a freshly started agent's namespace has no copy
     of the lock, and the race took its view of the bpffs (signed
@@ -12005,8 +12002,7 @@ number in parentheses is a lab PR.
     change of the lock), 8/8 let through without a record (the plain
     shared change of the bpffs, a private namespace's recursive private
     change, the runtimes); the lock still unbindable after them, never in
-    an rbind copy; the bpffs and the pins kept through the race and the
-    chain of 9; a remake whose attempts all failed signed with the next
+    an rbind copy; the bpffs and the pins kept through the rbind variants; a remake whose attempts all failed signed with the next
     attempt's round, then made again after the back-off; cold boot and
     uninstall clean. On 5.15 and 7.0 the record of that last remake was
     held back by the drift back-off (its text the same as the remake's
@@ -12046,6 +12042,61 @@ number in parentheses is a lab PR.
     (83.1 %, 69,092 under the 900k gate; its stack chain 480 of 512),
     `move_mount` 830,510 (69,490 under); 6.8 `sb_mount` 235,430,
     `move_mount` 269,733.
+- **Lot 364 — pre-alpha Phase 9, part 2: documentation truth and the
+  tester kit (docs, two tests and a lab phase; no level changes).**
+  - What was open: the plan's Phase 9 exit, "no public claim without a
+    linked proof", and a tester guide an outside reader can follow alone;
+    Phase 4's export check (attribute 13); the backlog's 16/11 decisions
+    to write the pin lock's residuals, F8b-1 and #568's P3s as behaviour.
+  - Done: `KNOWN_LIMITATIONS.md` rebuilt (every item with its evidence;
+    ratchet `xtask/tests/known_limitations.rs`); `ALPHA_TESTER_GUIDE.md`
+    (renamed from `TESTING_THE_ALPHA.md`) and three issue forms; the
+    forward-secrecy limit proved by
+    `a_history_rewritten_with_the_agent_key_verifies_only_a_kept_head_tells`;
+    `readme_figures.rs` extended (sources, kernel table, capability levels,
+    measured figures' sources), which found two stale README statements
+    (the self-test's "3 of the 16 sources", C21 at level 0); the design
+    docs' residuals rewritten as behaviour (posture §10.5, ransomware
+    residuals, trust model, upgrade notes §42/§43/§49/§51, this file's
+    notes on the DNS tunnel score, the shell copy check and lots 355,
+    357 and 359).
+  - Lab, as measured (our own guest, ubuntu2404, kernel 6.8.0-149; the
+    agent installed and purged at the end, the guest off):
+    - round 1 (the lab's enforcing install), `export-guest.sh setup
+      arrive interop off`: 28 checks, 28 passed; 118 chain rows in the
+      capture and the JSONL files, none missing, none other, no duplicate;
+      rsyslog 8.2312 present without a TLS driver, so the foreign receiver
+      was OpenSSL 3.0.13's `s_server` (TLS 1.3, X25519): 85 rows written
+      while it listened, 0 missing, 87 records, whole RFC 5425 frames, all
+      verified; on the host, 340 received records (classes 0, 1001, 1007,
+      2004, 4001) passed the pinned OCSF 1.9.0 schema, 0 problems;
+    - round 2 (the operator's `alpha` install), the guide's section 6 and
+      section 8 extracted from the synced guide and run as written by the
+      lab user: 8 of 8 scenarios drew the expected record (R001/R003 High,
+      R008 Medium, R007 Critical "would have: KillProcessTree", R005 High,
+      NET-001 Critical, FIM-009 High, IMP-002 High, AT-001 High "denied in
+      kernel"); the posture rose to COMBAT, observe-only; the diagnostics
+      left 0 files with the host name, 0 with the user name, no
+      non-loopback IPv4; `uninstall.sh --purge` left no unit, no pin, no
+      `/etc/northnarrow`.
+  - Fix round 1 (the review of #571, and an outside tester's run of the
+    guide alone on Debian 12 with a CI build): the FUSE item rewritten as
+    behaviour (a file system that does not answer can delay exec records,
+    signed by the sensor self-test) and moved out of "against root"; the
+    unmount walk's bounds and the pin lock's residuals as behaviour (fix rounds 2 and 3: also in the trust model, the upgrade notes, the changelog and these notes, as behaviour); the guide's "Before the release exists"
+    (what a tester can and cannot verify, the flags that record it),
+    what `install.sh` needs, the `.deb`'s check, `sudo`, `decision
+    delay`, the `host-check` warnings, netcat on Debian, `grep` for the
+    diagnostics, what the uninstall removes; the diagnostics also mask
+    the domain, the machine id and the boot id, and the user name only as
+    a word; the forms' labels created; the ratchet checks every
+    backticked word of the evidence (three dead citations planted beside
+    live ones: the test failed on each; removed); six items cite now the
+    evidence that proves them; #568's suspend residual and the agent run
+    by hand added.
+  - Not done: rsyslog as the receiver (no TLS driver in the guest); the
+    `.rpm`.
+  - Levels unchanged.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
@@ -12094,9 +12145,12 @@ number in parentheses is a lab PR.
     daemon's `exe` was all the tie read); the daemon must now hold the image
     file itself open (device and inode) and no other regular file under a
     staging directory, unlinked, on a memory or FUSE filesystem, or a
-    `memfd` (each descriptor's filesystem from its `fdinfo`, never a FUSE
-    `stat`); a traced daemon (`TracerPid:`) ties nothing; the image's path
-    is never read through a FUSE mount; the mount table is read only for an
+    `memfd` (each descriptor's filesystem from its `fdinfo`, so no `stat`
+    of a FUSE file there); a traced daemon (`TracerPid:`) ties nothing
+    (lot 364 withdraws this note's "the image's path is never read through
+    a FUSE mount": a file system that does not answer can still delay the
+    exec reading, signed by the sensor self-test;
+    `UPGRADE_NOTES_WAVE4.md` §49); the mount table is read only for an
     anonymous device's exec that may tie, the record kept by pid in the
     order noted; the flow and ancestor tests pair the spawn cache's mark
     with its own image path; the `staged_images.rs` ratchet counts the
@@ -12116,12 +12170,10 @@ number in parentheses is a lab PR.
     writable FUSE, the AppImage in `/tmp`: R001 and CHAIN-002).
   - Residual (named, §49): a malicious AppImage is a user program, judged by
     its behaviour; `/proc` ties no FUSE mount to its serving process, so a
-    user who stops its own AppImage's runtime after the mount, unmounts it,
-    mounts its own read-only squashfs there and starts the image again with
-    `--appimage-mount` gets that squashfs judged as the image — no mount
-    namespace needed; so does a runtime made to serve a file of the home.
-    Programs it could run from its home: every fact is checked on the uid,
-    and root's exec from `/tmp/.mount_*` stays R009.
+    user who controls their own image's runtime can have files of their own
+    judged as the image's (no mount namespace needed). Programs they could
+    run from their home: every fact is checked on the uid, and root's exec
+    from `/tmp/.mount_*` stays R009.
 - **Lot 354 — pre-alpha Phase 9, part 1: the docs match the code, the
   operator's help, the protocol version (docs and UX; no level changes).**
   - What was open (the pre-alpha checks' Phases 0, 1, 2b, 3, 4 and 8, and

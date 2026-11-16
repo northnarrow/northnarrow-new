@@ -233,7 +233,7 @@ Thirty capabilities, each with a level that changes only together with its evide
 supported kernel. The table in
 [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md) was re-assessed on 2026-11-03
 against `main`, separately from the lab PRs. It is a self-assessment, not a third party's.
-**No capability is at level 3.** Eleven are at 2, nine at 1 and ten at 0.
+**No capability is at level 3.** Eleven are at 2, ten at 1 and nine at 0.
 
 <details>
 <summary><b>All thirty levels</b></summary>
@@ -241,8 +241,8 @@ against `main`, separately from the lab PRs. It is a self-assessment, not a thir
 | Level | Capabilities |
 |---|---|
 | **2** | C01 Linux sensor · C06 file telemetry and FIM · C07 endpoint network telemetry · C12 synchronous inline blocking (experimental, off by default) · C14 behavioural detection and correlation · C16 structured ATT&CK mapping · C17 response on processes and files · C23 anti-tamper and self-defence (*provisional*) · C24 offline and air-gapped operation · C25 data sovereignty · C26 open code and inspectability |
-| **1** | C05 process telemetry (exec only) · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C27 product supply chain · C28 safe content release |
-| **0** | C02 Windows · C03 macOS · C04 ARM64 · C08 identity / ITDR · C09 cloud · C10 NDR · C21 SIEM export · C22 backend · C29 independent public validation · C30 generative AI on the host (absent by design) |
+| **1** | C05 process telemetry (exec only) · C11 containers · C13 malware prevention · C15 custom rules · C18 host network isolation · C19 rollback · C20 automation · C21 SIEM export (signed OCSF records to files and syslog over TLS) · C27 product supply chain · C28 safe content release |
+| **0** | C02 Windows · C03 macOS · C04 ARM64 · C08 identity / ITDR · C09 cloud · C10 NDR · C22 backend · C29 independent public validation · C30 generative AI on the host (absent by design) |
 
 </details>
 
@@ -291,8 +291,10 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   well as new rows; only what already left the host (the beats an off-host verifier fetched, an
   export) is beyond its reach. Hardware attestation (a TPM quote of the measured boot) is future work
   ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md#what-it-does-not-prove)).
-- **The capability manifest is the agent's own word.** The telemetry probe exercises 3 of the
-  16 sources, and the boot's deny self-test exercises `task_kill` and the move guard.
+- **The capability manifest is the agent's own word.** Every round, the sensor self-test sees
+  a harmless live event of 13 of the 16 sources and checks that the other 3 are still attached
+  (no harmless operation makes them report); the boot's deny self-test exercises `task_kill` and
+  the move guard ([`SENSOR_CONTRACT.md`](docs/operator/SENSOR_CONTRACT.md) §5a).
 
 **Not verified yet.**
 

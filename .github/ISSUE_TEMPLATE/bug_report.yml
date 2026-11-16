@@ -1,0 +1,54 @@
+name: Bug report
+description: An install, upgrade or uninstall that failed, a crash, a command that misbehaves, a confusing message, or a degradation or lost event you cannot explain.
+title: "[bug] "
+labels: ["bug", "alpha"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing. Before you post, check `docs/operator/KNOWN_LIMITATIONS.md`, and remove what you do not want public: the alpha tester guide, section 8, collects diagnostics and replaces host names, user names and addresses. Never attach the admin key, a file from `/etc/northnarrow` or a real credential.
+        **A security vulnerability goes through private reporting, not here.**
+  - type: input
+    id: release
+    attributes:
+      label: Release
+      description: The output of `nn-admin --version`, and how you installed (tarball or `.deb`).
+      placeholder: "nn-admin 0.1.0-alpha (tarball)"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and kernel
+      description: "`PRETTY_NAME` from `/etc/os-release` and `uname -r`."
+      placeholder: "Ubuntu 24.04.3 LTS, 6.8.0-90-generic"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What you did, what you expected, what happened
+      description: The exact commands, in order. A minimal reproduction helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: "`nn-admin status --key <key>`"
+      description: The output, redacted (`status.txt` from the guide's diagnostics).
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Messages and journal lines
+      description: The error message, and the agent's journal lines around it (`agent-journal.txt`, `units-journal.txt`), redacted.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I read KNOWN_LIMITATIONS.md and this is not listed there.
+          required: true
+        - label: I removed personal data, keys and credentials from what I attached.
+          required: true

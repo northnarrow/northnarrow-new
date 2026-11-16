@@ -275,3 +275,99 @@ pub fn check_record(rec: &Value) -> Vec<String> {
     }
     errs
 }
+
+/// Lot 364 (pre-alpha, the export to a real receiver): the records a
+/// receiver wrote — the lab's rsyslog or OpenSSL listener, one message a
+/// line after its syslog header, or the JSONL sink's files — checked
+/// against the pinned schema, as the mapping's own records are above.
+#[cfg(test)]
+mod received {
+    use super::*;
+
+    /// The OCSF record of one received line: the JSON object after the
+    /// syslog header (a JSONL line is the object itself); `None` for an
+    /// empty line, which the file sink writes at a start (EXPORT.md §8).
+    pub(super) fn record_of(line: &str) -> Option<Result<Value, String>> {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let Some(i) = line.find('{') else {
+            return Some(Err("no JSON object on the line".into()));
+        };
+        Some(serde_json::from_str(&line[i..]).map_err(|e| format!("not one JSON object ({e})")))
+    }
+
+    /// The problems of one received record (a record with no class is one).
+    pub(super) fn problems_of(rec: &Value) -> Vec<String> {
+        if rec["class_uid"].as_u64().is_none() {
+            return vec!["no class_uid".into()];
+        }
+        check_record(rec)
+    }
+
+    #[test]
+    fn a_received_line_gives_its_record() {
+        let rec = r#"{"class_uid":2004,"activity_id":1}"#;
+        let syslog =
+            format!("<107>1 2026-11-16T10:00:00.000Z host northnarrow - DETECTION - {rec}");
+        for line in [rec.to_string(), syslog, format!("  {rec}\n")] {
+            let v = record_of(&line).expect("a record").expect("JSON");
+            assert_eq!(v["class_uid"], 2004);
+        }
+        assert!(record_of("").is_none());
+        assert!(record_of("   \n").is_none());
+        assert!(record_of("<107>1 cut before the record").unwrap().is_err());
+        assert!(record_of("<107>1 - - - {\"class_uid\":20")
+            .unwrap()
+            .is_err());
+        assert_eq!(problems_of(&serde_json::json!({})), ["no class_uid"]);
+        assert!(problems_of(&serde_json::json!({"class_uid": 1}))
+            .iter()
+            .any(|p| p.contains("not one the schema pins")));
+    }
+
+    /// `NN_OCSF_RECEIVED=<file>[:<file>…]`: every record of each file
+    /// passes the pinned schema and its rules; a no-op without it.
+    #[test]
+    #[ignore = "lab: NN_OCSF_RECEIVED names the files a receiver wrote"]
+    fn received_records_match_the_pinned_schema() {
+        let Ok(files) = std::env::var("NN_OCSF_RECEIVED") else {
+            return;
+        };
+        let mut problems = Vec::new();
+        for f in files.split(':').filter(|f| !f.is_empty()) {
+            let text = std::fs::read_to_string(f).expect("a received file");
+            let mut by_class = std::collections::BTreeMap::<u64, usize>::new();
+            let mut records = 0;
+            for (n, line) in text.lines().enumerate() {
+                let Some(rec) = record_of(line) else { continue };
+                records += 1;
+                match rec {
+                    Ok(v) => {
+                        *by_class
+                            .entry(v["class_uid"].as_u64().unwrap_or(0))
+                            .or_default() += 1;
+                        for p in problems_of(&v) {
+                            problems.push(format!("{f}:{}: {p}", n + 1));
+                        }
+                    }
+                    Err(e) => problems.push(format!("{f}:{}: {e}", n + 1)),
+                }
+            }
+            println!("{f}: {records} records, by class {by_class:?}");
+            assert!(records > 0, "{f}: no record");
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems, the first:\n  {}",
+            problems.len(),
+            problems
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+}

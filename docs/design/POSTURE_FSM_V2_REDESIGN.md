@@ -910,60 +910,53 @@ design):
 
 Residual: kube-proxy, Calico and Cilium run in containers on most clusters;
 their executables are no package of the host, so their flushes stay records.
-A root process can make a packaged runtime its parent (`LD_PRELOAD` into
-dockerd or podman, a ptrace) and flush a runtime's chain without a record:
-an accepted residual of a heuristic, the filter chains excluded.
+A flush done from inside a packaged runtime's process carries that
+runtime's trust, whatever code made it: an accepted residual of a
+heuristic, the filter chains excluded.
 
 ### 10.5 What stays as it was, said explicitly
 
+This section states limits as behaviour: what each signal judges, and
+where its bounds leave the judgement to another signal or to none. It
+does not list ways to stay under a bound (lot 364, the pre-alpha's
+design-doc hygiene).
+
 - **Copy then delete from a login session.** The replacement shape (§10.1,
   rule 2) counts outside an authenticated session only, as new files never
-  counted inside one (POS-002). Ransomware run from an SSH shell that writes
-  encrypted copies and deletes the originals does not pass through the
-  mass-write arm: the ransomware tracker (lot 225, NN-L-IMP-001 and the
-  posture's `RansomwareEncryption`) judges it, by the copies' content and
-  names — copies written new, or (the re-check of #500) copies sized to
-  one byte before they are written. Encryption in place from a session
-  still raises the arm (rule 1), for files of 4 KiB or more: small
-  documents encrypted in place from a session do not (as on `main`; the
-  tracker sees them by their renames; a session threshold of its own for
-  small rewrites is to be measured on a development corpus first: lot
-  283).
+  counted inside one (POS-002). Ransomware run from a login session that
+  writes encrypted copies and deletes the originals is judged by the
+  ransomware tracker (lot 225, NN-L-IMP-001 and the posture's
+  `RansomwareEncryption`) by the copies' content and names, not by the
+  mass-write arm. Encryption in place from a session still raises the arm
+  for files above the arm's size floor; smaller documents encrypted in
+  place from a session are the tracker's, by their renames (a session
+  threshold of its own for small rewrites is to be measured on a
+  development corpus first: lot 283).
 - **What the arm does not see (the review of #500, C1), and who does.**
-  - Originals deleted more than 60 s after the copies were written (the
-    halves pair within one window, either order). NN-L-IMP-001 pairs its
-    shapes within 120 s; past that, nothing.
-  - An encryptor and a deleter in different cgroups (the deletion handed to
-    another unit, a cron job, a `systemd-run`), or a deleter forked once per
-    file (each process under 20 originals): the copies' crossing alone is no
-    shape. `main` raised the arm on the encryptor's 20 write-opens; the
-    tracker's (d) needs the deleter to descend from the encryptor.
-  - Writers forked once per file (each under 20 files written new or
-    rewritten) and a slow encryptor (under 20 files a minute): as on `main`,
-    the counters are per process (the cgroup window adds rewrites of 4 KiB
-    or more only).
-  - A truncated original whose `OPEN_HAD_DATA` entry was evicted (more than
-    4,096 files truncated in the window — since the re-check of #500 a
-    chmod, a chown or a `touch` no longer marks a file): its unlink counts
-    nothing, as it did.
-  - Tracepoint mode: the arm counts files written, no replacement shape, and
-    the tracker is blind (no `MassWrite`, no `FileBurst`).
-  - NN-L-IMP-001 itself: (a) counts rewrites of files of 4 KiB or more only;
-    (b) measures entropy over the bytes it reads, and a file of a few
-    hundred bytes of random data measures under 7.5 bits per byte (the
-    signal needs about 1 KiB of ciphertext); (d) needs the deleter to be the
-    writer's actor (the nearest foreign program of its lineage). Small
-    documents encrypted in place are the tracker's by (c), their renames to
-    a new extension, with (b) where they hold a kilobyte or more.
+  The arm pairs a replacement's halves (the copies written, the originals
+  deleted) within a bounded window, and counts per process, with a
+  per-cgroup window for rewrites. Work spread beyond those bounds — over
+  more time than the window, over processes or units that do not share an
+  actor, below the per-process counts — is no shape for the arm; the
+  ransomware tracker judges part of it (its own, longer pairing, its
+  entropy and rename signals, a deleter that descends from the writer),
+  and what neither judges is a stated limit, as on `main`. A truncated
+  original the kernel's bounded map has forgotten counts nothing at its
+  unlink, as before. In tracepoint mode the arm counts files written and
+  no replacement shape, and the tracker is blind (no `MassWrite`, no
+  `FileBurst`). NN-L-IMP-001's own signals have floors of their own (a
+  minimum size for rewrites, enough ciphertext for its entropy measure,
+  the deleter being the writer's actor); small documents encrypted in
+  place are the tracker's by their renames to a new extension.
 - **The kernel windows evict.** The per-process windows (`OPEN_WRITES`,
-  `OPEN_UNLINKS`: 4,096 processes, LRU, as before the lot) restart a
-  process's counts when another 4,096 processes write or delete within its
-  window: fewer, not more. The lot's maps evict the other way — a file or a
-  name seen again counts again (`OPEN_OVERWRITE_SEEN`, `OPEN_DESTROY_SEEN`),
-  a process's own temporary file forgotten counts as an original
-  (`OPEN_CREATED`) — save `OPEN_HAD_DATA`, above. Documented, not changed:
-  4,096 writers in a minute is a host under a fork storm, which other
-  signals see.
+  `OPEN_UNLINKS`, bounded LRU maps, as before the lot) restart a process's
+  counts when many other processes write or delete within its window:
+  fewer counts, not more. The lot's maps evict the other way — a file or a
+  name seen again counts again (`OPEN_OVERWRITE_SEEN`,
+  `OPEN_DESTROY_SEEN`), a process's own temporary file forgotten counts as
+  an original (`OPEN_CREATED`) — save `OPEN_HAD_DATA`, above. Documented,
+  not changed: that many writers in a minute is a host under a fork storm,
+  which other signals see.
 - **Corroboration is per actor scope, not per process tree** (future work).
   A signal of one process of a login session or a workload vouches for
   another process of the same scope, as the lab's `iptables` (podman's CNI
@@ -971,30 +964,26 @@ an accepted residual of a heuristic, the filter chains excluded.
   NEUTRALIZE hold of §10.3 judges the cause's evidence classes, not which
   process raised them.
 - **A writer's own data (lot 283c, §10.7).** The arm leaves out a crossing
-  whose window held only the writer's own data; what that lets through is
-  said here, and every such crossing still reaches the ransomware tracker:
-  - *A compromised service account encrypting its own data directory only
-    reaches NN-L-IMP-001* (entropy, renames to a new extension, copies and
-    deletions; its kill held by the per-rule policy, off by default) — the
-    mass-write arm does not see it. A payload the account runs in a
-    session, or anything it writes outside its own files (a person's, root's,
-    a file with another link), still raises the arm.
-  - *A root daemon named like a listed unit gets that unit's directory
-    exempt, and nothing else*: any root process that installs and starts a
-    unit of that name (`containerd.service`), or runs in its cgroup, writes
-    that unit's listed directories unseen by the arm; its writes anywhere
-    else count, and so does the same directory written from any other
-    cgroup.
-  - *A file moved into an own-data directory before it is rewritten* is
-    judged there (the kernel classifies the directory the file is in when
-    it is opened): a person's process that moves documents into its
-    `~/.cache` — or a listed daemon that moves files into its directory —
-    and encrypts them there, then moves them back, only reaches
-    NN-L-IMP-001 for those rewrites. A hard link is no way in (a file with
-    another link is no one's own data), nor is a bind mount (the
-    classification follows the dentries, not the mount).
-  - *Tracepoint mode* knows no own data (no kernel summary): every crossing
-    counts there, as before.
+  whose window held only the writer's own data; every such crossing still
+  reaches the ransomware tracker:
+  - *a compromised service account that encrypts its own data directory
+    only reaches NN-L-IMP-001* (entropy, renames to a new extension,
+    copies and deletions; its kill held by the per-rule policy, off by
+    default); what the account writes outside its own files (a person's,
+    root's, a file with another link), or runs in a session, still raises
+    the arm;
+  - *a root daemon running as a listed unit gets that unit's listed
+    directories exempt, and nothing else*: the unit is recognised by its
+    name, which any root process can take by installing and starting a
+    unit of that name; whatever runs as or in that unit writes those
+    directories unseen by the arm; its writes anywhere else count, and so
+    do the same directories written from any other cgroup;
+  - *own data is classified by the directory a file is in when it is
+    opened* (the dentries, not the mount): a rewrite made there is judged
+    as own data, whatever directory the file came from, and reaches
+    NN-L-IMP-001 only. A file with another link is no one's own data;
+  - *tracepoint mode* knows no own data (no kernel summary): every
+    crossing counts there, as before.
 
 ### 10.6 The review of #500: the kernel's cost, and the variants measured
 

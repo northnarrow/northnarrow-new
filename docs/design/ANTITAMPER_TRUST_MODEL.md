@@ -2825,13 +2825,13 @@ Now:
   hook with the descriptor; 6.13+, where such a type can call
   `bpf_send_signal_task`), and the other maps whose values hold program
   descriptors (a devmap's or cpumap's XDP program, a `struct_ops` map);
-- a race: another thread's `dup2` between the hook's read of the
-  descriptor and the kernel's, or a rewrite of a prog array's value in
-  that gap (the kernel copies it after the hook) — a lost attempt is
-  refused and signed, but a stall (userfaultfd or FUSE on the copied key,
-  or perf's context lock for `SET_BPF`) makes the race deterministic and
-  the winning use leaves no record of its own; the load, and the program
-  still loaded after the window, are signed High (re-check 2 of #558, N4);
+- a race: another thread's change of the descriptor between the hook's
+  read and the kernel's, or of a prog array's value in that gap (the
+  kernel copies it after the hook) — an attempt that loses it is refused,
+  signed once per program and caller (repeats coalesced); a root user can
+  win it, and the winning use leaves no record of its own; the load, and
+  the program still loaded after the window, are signed High (re-check 2
+  of #558, N4; the pre-alpha Phase 3 measured the race);
 - a program loaded before the agent started: signed High at the start
   (its baseline) but neither its handles (from 6.9) nor its loader's
   descriptor are judged. Its verified instructions carry the helpers'
@@ -3026,8 +3026,8 @@ where it starts.
   for each mount in it, the mount at the same place under every peer and
   slave of its parent — no other LSM call. The hook now walks that
   subtree in `next_mnt()`'s order (`mount.mnt_mounts`, `mnt_child`,
-  `mnt_parent`; 32 mounts, a climb back up of at most 8 levels a step,
-  `common::mount_guard::umount_below`), each mount
+  `mnt_parent`; a bounded walk, `common::mount_guard::umount_below`),
+  each mount
   judged as the top is (`below_of`: its root a held mount's, then by its
   id in a guarded namespace, then its place under its parent's group, a
   group not followed failing closed under a copy of a held mount). A walk
@@ -3076,18 +3076,16 @@ where it starts.
 
 ### The pin directory's lock (lot 359, the re-check 3 of #567)
 
-- **What it defends.** The unmount hook runs before the kernel's
-  namespace lock, and the walk reads a bounded subtree: a racing graft, or
-  a subtree wider or deeper than the walk, can still be taken by a lazy
-  unmount, its propagation taking a childless mount it does not name. The
+- **What it defends.** A lazy unmount's propagation can take a
+  childless mount the hook does not name, and the guard does not read every
+  subtree to the end. The
   kernel's own rule is the defence: `propagate_umount()` never takes a
   mount that keeps a child that is not itself unmounted. The pin directory
   is bound onto itself, then made unbindable (which makes it private too),
   as the child of the host's bpffs in PID 1's namespace (an rbind never
   copies an unbindable mount, so no rbind copy of it can be among what an
   unmount takes): the host's bpffs keeps that child, and the pins stay,
-  against the rbind variants — a racing rbind graft, an rbind copy behind
-  the walk's bound. It holds only while the lock stays unbindable and no
+  against the unmounts of rbind copies. It holds only while the lock stays unbindable and no
   other copy of it is among what an unmount takes ("Behind it still").
 - **Its maker.** The agent's process has no `CAP_SYS_ADMIN` and no
   `mount(2)` (by design), and its namespace is its unit's: the lock is a
@@ -3130,16 +3128,15 @@ where it starts.
   and documented; the first lot after it refuses the move of a copy that
   is a peer of a held mount, and signals `mount_setattr(2)` at once). Each
   is signed at the next integrity round (about 30 s):
-  - `mount_setattr(2)` has no LSM hook: root can clear the lock's flags
-    through it, and until the round makes the lock again, a racing
-    unmount, or one beyond the walk's bound, can take the host's bpffs and
-    the pins (`pin_lock_changed`);
+  - `mount_setattr(2)` has no LSM hook: a root user who deliberately
+    changes the lock's flags can remove the pins' protection until the
+    round makes the lock again; the agent signs it (`pin_lock_changed`) and
+    keeps its programs;
   - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
-    copies unbindable mounts): its own recursive change of propagation
-    above it (shared or private) is not judged, and a move of its copy of
-    `/sys` is judged by its target only: that copy is then defended by the
-    walk alone, and an unmount of it racing the walk, or beyond its bound,
-    propagates to the host's lock and bpffs (`protected_mount_gone`,
+    copies unbindable mounts): a root user who deliberately
+    changes propagation above it, or moves its copy, in a namespace of
+    their own can leave the host's bpffs and pins with the guard's
+    protection alone; the agent signs it (`protected_mount_gone`,
     `pin_lock_missing`);
   - the units' namespaces (the agent's, the watchdog's) never have the
     lock, for the unit's whole run (systemd builds their view with a
@@ -3152,29 +3149,28 @@ where it starts.
 
 ### Residual
 
-- An unmount whose subtree is wider than the walk, in a namespace not
-  guarded, with only private mounts read: let through (a container
-  runtime's old root has that shape; so has a copy hidden behind 32
-  private mounts, or a chain of 9 levels). What it can take is the host's
-  childless `/sys/fs/cgroup`; the bpffs, whose lock keeps it against an
-  rbind copy (lot 359), only through what is still behind the lock
-  ("The pin directory's lock": a raw namespace's moved copy of `/sys`, a
-  lock made bindable by `mount_setattr(2)`, or none).
-- An unmount that races the walk: the unmount hook runs before the
-  kernel's namespace lock, so a copy grafted by a concurrent rbind after
-  the walk is taken by a lazy unmount, in a guarded namespace too (N4 of
-  the re-check 3 of #567). For the pins lot 359 closes the rbind variants
+- An unmount of a large subtree in a namespace that is not guarded can
+  be let through when the walk cannot show that it reaches a held mount
+  (a container runtime's old root has that shape). What it can take is
+  the host's `/sys/fs/cgroup`, and the bpffs only through what remains
+  outside the lock's reach ("The pin directory's lock"). Either loss is
+  signed at the next integrity round, and the agent keeps its programs.
+- An unmount made while the mount tree is being rebuilt concurrently is
+  not always judged completely, in a guarded namespace too (N4 of the
+  re-check 3 of #567). For the pins lot 359 closes the rbind variants
   ("The pin directory's lock", with what stays behind it);
-  `/sys/fs/cgroup` stays behind the walk: its childless mount can be taken
-  that way, signed (`protected_mount_gone`). An unmount through a
-  regrouped parent before the refresh: one shared slave of it ends the
-  walk (§51.2's window) — the bpffs keeps its lock's child there too.
+  `/sys/fs/cgroup` stays behind the guard: a root user who deliberately
+  arranges it can lose that mount, signed (`protected_mount_gone`). An
+  unmount through a parent regrouped since the guard's last refresh is
+  judged less completely until the refresh (§51.2) — the bpffs keeps its
+  lock's child there too.
 - A change reaches a guarded namespace through one group (the target's
   is a guarded mount's own or master group); two masters deep is not
   followed. An unmount's propagation is judged the same way (the parent's
   group against the held mounts' places).
 - `mount_setattr(2)` is observed (≤ one integrity round), not refused —
-  of the pin directory's lock too (the race for the pins open meanwhile).
+  of the pin directory's lock too (the pins are less protected until the
+  round).
 - A held file system's writable reconfigure passes (its options are the
   operator's: `size=` of `/run`, finalrd's `exec`); only read-only is
   refused there.

@@ -2347,8 +2347,11 @@ detail.
 - **Residuals named by the review of #557.**
   - With `+cpuset` now enabled at the root on 5.15 (and, as before, on 6.8
     and later), root can confine the agent to one CPU through a sibling
-    cgroup in `cpuset.cpus.partition=root`: no hook sees it and no record
-    is written. The agent does not yet watch its own effective CPUs.
+    cgroup in `cpuset.cpus.partition=root`: no hook sees it, and at this
+    lot no record was written. Superseded by lot 349 (§43): the
+    confinement is still not refused, but it is detected and signed
+    (`cpu_confined`, High) and shown in `nn-admin status`; a confinement
+    made before the agent's first round is not proven.
   - The write's mark lives up to 5 s if the clean-up fexit is skipped
     (full preemption), and stale entries are not reclaimed. A user with a
     delegated cgroup can fill the 64 entries, and root's containers then
@@ -2494,14 +2497,13 @@ detail.
     then; an iterator link read later with `cat`), and an XDP or tc program
     attached over netlink (`ip link`, `tc`: no `bpf(2)` command; 6.13+
     only, where such a program can call `bpf_send_signal_task`). A
-    descriptor swapped by another thread (`dup2`) between the hook's read
-    and the kernel's, or a prog array's value rewritten in that gap, can
-    win a race. Each attempt that loses the race is refused and signed,
-    but a stall (userfaultfd or FUSE on the prog array's key copy, or on
-    perf's context lock for `SET_BPF`) can make the race deterministic,
-    and the winning attempt leaves no record at its use (re-check 2 of
-    #558, N4): the load's High and the "still loaded after the window"
-    High are then the only records. Check
+    descriptor changed by another thread between the hook's read and the
+    kernel's, or a prog array's value changed in that gap, can win a race.
+    Each attempt that loses it is refused, signed once per program and
+    caller (repeats coalesced); a root user can win it, and the winning
+    attempt leaves no record at its use (re-check 2 of #558, N4): the
+    load's High and the "still loaded after the window" High are then the
+    only records. Check
     `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
   - **Held across an agent restart, emptied as programs go.** The held set
     (`PROG_CONTENT_HELD`, 1024 ids) is pinned now: a restart keeps it. Each
@@ -2553,15 +2555,14 @@ detail.
     window to the requester's tree is one fix for all of them; until then
     open a window only on a host you trust for its length, and keep it
     short (`--window-secs`).
-  - **P2: the `dup2` race.** Another thread's `dup2` of a descriptor
-    between the agent's check and the kernel's own read (a few
-    microseconds), or a prog array's value rewritten in that gap, can
-    win. A lost attempt is refused and signed (`bpf_held_use`); but a
-    stall on the copy (userfaultfd or FUSE on the prog array's key, or
-    on perf's context lock for `SET_BPF`) makes the race deterministic,
-    and the winning use then leaves no record of its own (N4). The load
-    and the "still loaded after the window" record are signed High. No
-    hook exists that sees the resolved program for every run and attach.
+  - **P2: the descriptor race.** Another thread's change of a
+    descriptor between the agent's check and the kernel's own read, or of
+    a prog array's value in that gap, can win. An attempt that loses it
+    is refused, signed once per program and caller with its repeats
+    coalesced (`bpf_held_use`); a root user can win it, and the winning
+    use then leaves no record of its own (N4). The load and the "still
+    loaded after the window" record are signed High. No hook exists that
+    sees the resolved program for every run and attach.
   - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
     attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
     carry a map's descriptor where the agent reads a program's: on 6.8 a
@@ -3346,19 +3347,20 @@ depth.
 - **Residual.** A malicious AppImage the user runs is a user program,
   judged by its behaviour. `/proc` shows no tie of a FUSE mount to the
   process that serves it, so the pump ties the mount through the exec that
-  entered it and a daemon of the image started since. No mount namespace
-  is needed to swap what is served: a user who stops its own AppImage's
-  runtime after the mount, unmounts it, mounts its own read-only squashfs
-  there and starts the image again with `--appimage-mount` (a daemon of
-  the image, started since), then lets the runtime go on, gets its
-  squashfs's programs judged as the image's. So does a runtime made to
-  serve a file of the user's home (`TARGET_APPIMAGE` there, with the image
-  held as well). Those are programs it could run from its home, which it
-  can write: the impact stays the user's own. Every fact is checked on the
-  uid (the mount's `user_id`, the image's owner, the daemon's real uid, the
+  entered it and a daemon of the image started since. A user who controls
+  their own image's runtime can therefore have files of their own choosing
+  judged as the image's programs (no mount namespace needed). Those are
+  programs they could run from their home, which they can write: the
+  impact stays the user's own. Every fact is checked on the uid (the
+  mount's `user_id`, the image's owner, the daemon's real uid, the
   exec's), no other user inherits the mark, and root's exec from
   `/tmp/.mount_*` is still R009. A kernel record of the process the
-  connection's `/dev/fuse` file is handed to would close the swap.
+  connection's `/dev/fuse` file is handed to would close it.
+- **Limit (lot 364, the re-check of #564).** "Never read through a FUSE
+  mount" is withdrawn. A file system the agent does not trust to answer
+  (FUSE, a network file system) can delay the exec reading; the sensor
+  self-test signs it (`subsystem_degraded`, source `sensor_selftest`). A
+  hardening lot follows (`KNOWN_LIMITATIONS.md`, "Detection coverage").
 - **Operator action.** None: no setting, no overlay. The records name the
   program's path as before.
 
@@ -3626,7 +3628,7 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   master's group of a mount there that holds a protected point or is a
   view (`MOUNT_GROUPS`, one look-up), or — a group the map does not hold
   yet (§51.2: a guarded mount regrouped since the last refresh) — its
-  peers and each one's slaves, read in the hook up to 16 mounts, include a
+  peers and each one's slaves, read in the hook, include a
   mount of a guarded namespace, or cannot be read whole (more mounts, a
   slave that is itself shared or a master: counted as reaching, and then
   refused only on, over or below a protected point, so a host with many
@@ -3741,7 +3743,7 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   `/etc/northnarrow` that the kernel propagated into PID 1's namespace with
   no refusal (recorded only at the next round). Now:
   - a group the map does not hold is walked in the hook — the target
-    mount's peers and each one's slaves, up to 16 mounts: a mount of a
+    mount's peers and each one's slaves: a mount of a
     guarded namespace among them, or a walk that cannot be finished (more
     mounts, a slave that is itself shared or a master, a peer ring
     unreadable), counts as reaching, and the mount is refused there on,
@@ -3763,20 +3765,19 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     (`MOVE_MOUNT_SET_GROUP` among them), are counted by the hooks (they
     run before the change: the new group has no number yet); the agent
     reads the count each second and reads the guarded namespaces' groups
-    again when it moved. `mount_setattr(2)` has no hook: until the 30 s
+    again when it moved. `mount_setattr(2)` has no hook: until the next
     refresh, the walk;
   - a propagation chain two masters deep is no longer a residual: the
     slave that carries the change on makes the walk undecided, so it
     counts as reaching.
   Named: a peer of a regrouped held parent made at another place (a
-  bind of `/sys` elsewhere, in a group the map does not hold yet), behind
-  more than 16 mounts of propagation, can unmount a childless held mount
-  (`/sys/fs/bpf`) through it within the window before the refresh (a
-  second after `mount(2)`, up to 30 s after `mount_setattr(2)`): signed by
-  the integrity round, not refused.
+  bind of `/sys` elsewhere, in a group the map does not hold yet), can,
+  until the agent's next refresh of the peer groups, unmount a childless
+  held mount (`/sys/fs/bpf`) through it: signed by the integrity round, not
+  refused.
   The false-positive side: a mount in a group the map does not hold and
-  the walk cannot finish (a container running systemd, whose mounts have
-  more than 16 peers and slaves) is judged as reaching — refused only on a
+  the walk cannot finish (for example a container running systemd, whose
+  mounts have many peers and slaves) is judged as reaching — refused only on a
   protected point, which a container's own file systems never are, or on
   the host's own view super block (`systemd-nspawn` sharing the host's
   network namespace, a mount below its `/sys` that is not the kernel's
@@ -3822,14 +3823,14 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   (`MNT_DETACH`) calls the kernel's hook once, for the mount it names; the
   kernel then takes that mount's whole subtree and propagates the unmount
   of each mount in it to the peers and slaves of that mount's parent, with
-  no other check. `mount --rbind /sys /mnt/s; umount -l /mnt/s` — the copy
-  at a place nothing is held at — took the host's childless `/sys/fs/bpf`
+  no other check. An rbind copy of `/sys`, unmounted lazily at a place
+  nothing is held at, took the host's childless `/sys/fs/bpf`
   and `/sys/fs/cgroup` through the copies below it, and the copies in every
   slave namespace (the agent's own included): the bpffs lost its last
   mount, with no refusal. The same held for a raw namespace's `umount -l
-  /`. Now the guard reads the subtree in the kernel's order (32 mounts: a
-  child, else the next sibling of the mount or of one of its parents up to
-  8 levels), and refuses
+  /`. Now the guard reads the subtree in the kernel's order (a bounded
+  walk: a child, else the next sibling of the mount or of one of its
+  parents), and refuses
   the unmount when a mount in it is held (by its id in a guarded
   namespace), or its unmount propagates onto a held mount (its place under
   its parent's peer group; a group not followed yet, regrouped since:
@@ -3916,19 +3917,14 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   `link_ptrace_access_check`), then outside it SIGKILL, the `environ` read
   and the create still refused; three Highs, the three pins back, three
   clears a round later.
-- **Named, not changed:** a lazy unmount in a namespace that is not PID
-  1's, the agent's or the watchdog's, of a subtree whose first 32 mounts
-  (or a chain of 9 levels) are all private, behind which lies a copy in one of the host's
-  peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
-  namespace) is not refused: the walk is bounded. A lazy unmount that races the
-  walk (a copy grafted by a concurrent rbind after the guard read the
-  subtree, in any namespace) is not refused either: the hook runs before
-  the kernel's mount lock (re-check 3 of #567, N4); the deny links stay,
-  the loss is signed, the pins do not. To close it: the pin directory as
-  its own private, unbindable mount. And the regroup window
-  of §51.2 (a peer of a regrouped held parent unmounting through it before
-  the refresh) needs only one shared slave of that parent, not 16 mounts —
-  every sandboxed unit's namespace is one — hiding the host's bpffs mount
+- **Named, not changed:** a lazy unmount of a large subtree in a
+  namespace that is not PID 1's, the agent's or the watchdog's is not
+  always refused when the walk cannot show what it reaches. A lazy unmount made
+  while the mount tree is rebuilt concurrently is not always judged
+  completely either (re-check 3 of #567, N4): the deny links stay, the loss
+  is signed, the pins do not (§52 closes that for the pins). The regrouped
+  parent of §51.2 is judged less completely until the next refresh, for
+  any sandboxed unit's namespace, hiding the host's bpffs mount
   (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
   the pins can still be lost or hidden, the hooks no longer detach while
   the agent runs.
@@ -3936,10 +3932,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 ## 52. The pin directory is locked; three record fixes (lot 359)
 
 The re-check 3 of #567 named an unmount the guard could not stop: the
-kernel calls the unmount hook before it takes its namespace lock, so the
-subtree the guard reads can still grow (a copy grafted by a concurrent
-rbind), and the walk reads a bounded subtree only. A lazy unmount could then
-take the host's bpffs, and the pins with it, in any namespace (N4, and the
+guard does not judge every lazy unmount completely: the subtree it reads
+can change while it is read, and it is not read to the end of a large one.
+A lazy unmount could then take the host's bpffs, and the pins with it, in any namespace (N4, and the
 residual of §51.3). This lot closes the rbind variants of both for the
 pins; what stays open for the alpha, each signed at the next integrity
 round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
@@ -3951,12 +3946,11 @@ round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
   the child of the host's bpffs in PID 1's mount namespace. The kernel
   never takes, in an unmount's propagation, a mount that keeps a child
   that is not itself unmounted, and an rbind never copies an unbindable
-  mount: whatever an rbind copy's unmount takes (a racing graft, a copy
-  beyond the walk's bound), the host's bpffs keeps its child, and the pins
-  stay. A unit's own namespace (the agent's and the watchdog's among them)
+  mount: whatever an rbind copy's unmount takes, the host's bpffs keeps
+  its child, and the pins stay. A unit's own namespace (the agent's and the watchdog's among them)
   is not covered, for the unit's whole run: systemd builds its view with a
   recursive bind, which skips an unbindable mount (the lab: no copy of the
-  lock there), so a racing unmount can still take that namespace's view
+  lock there), so an unmount can still take that namespace's view
   of the bpffs — not the pins, which the host's bpffs keeps; the agent and
   the watchdog keep their anchors, and a restart builds the view again.
 - **Who makes it, and when.** A new step of the agent's unit, before the
@@ -4013,19 +4007,19 @@ round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
   the alpha as signed and documented limits, and the first lot after it
   refuses the move of a copy that is a peer of a held mount and signals a
   `mount_setattr(2)` at once (KNOWN_LIMITATIONS.md):
-  - `mount_setattr(2)` has no LSM hook: root can clear the lock's flags
-    through it; until the round makes the lock again (`pin_lock_changed`,
-    High), a racing unmount can take the host's bpffs and the pins;
-  - a raw mount namespace holds its own copy of the lock: its own
-    recursive change of propagation above it is not judged (52.4), and a
-    move of its copy of `/sys` is judged by its target only: that copy is then
-    defended by the walk alone, and its unmount can still race the walk,
-    or lie beyond its bound, and take the host's bpffs and the pins
+  - `mount_setattr(2)` has no LSM hook: a root user who deliberately
+    changes the lock's flags can remove the pins' protection until the
+    round makes the lock again; the agent signs it (`pin_lock_changed`,
+    High) and keeps its programs;
+  - a raw mount namespace holds its own copy of the lock: a root
+    user who deliberately changes propagation above it (52.4) or moves its
+    copy in a namespace of their own can leave the host's bpffs and pins
+    with the guard's protection alone; the agent signs it
     (`protected_mount_gone`, `pin_lock_missing`, High);
   - the units' own views of the bpffs never have the lock (above;
     `protected_mount_gone`, High);
-  - `/sys/fs/cgroup` has no such child: its unmount by a racing or
-    out-of-bound lazy unmount stays behind the walk.
+  - `/sys/fs/cgroup` has no such child: a lazy unmount that the guard does
+    not judge completely can still take it; signed.
 - **For you.** `mount --make-rshared /` (or of `/sys`, `/sys/fs/bpf`) in
   the host's namespace is refused: it would make the lock shared. 52.3:
   `mount --make-rprivate` of the same there is refused too. 52.4: in
@@ -4080,7 +4074,7 @@ round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
 ### 52.3 The review of #569: the lock kept unbindable, retried, its limits
 
 The review of #569 found the lock's `MNT_UNBINDABLE` could be cleared
-without a refusal, which reopens the race for the pins (an rbind copies a
+without a refusal, which reopens the pins to the unmounts of rbind copies (an rbind copies a
 bindable lock); and the lock missing at a start was never made again.
 
 - **A recursive `MS_PRIVATE` above the lock, in the host's namespace,
@@ -4119,13 +4113,11 @@ bindable lock); and the lock missing at a start was never made again.
   keeps it. An agent run by hand (no `--pin-lock` step ran) is left as its
   start signed it.
 - **What the lock closes, and what it does not.** It closes the rbind
-  variants for the pins: a racing rbind graft, an rbind copy beyond the
-  walk's bound. It does not close, each signed at the next integrity round
+  variants for the pins. It does not close, each signed at the next integrity round
   (about 30 s) — 52.1, "What it does not cover": a change of the lock's
   flags through `mount_setattr(2)`, which has no LSM hook; a raw
-  namespace's own copy of the lock, whose move is judged by its target
-  only and is then defended by the walk alone (52.4: its own recursive
-  change of propagation is not judged either); the units' namespaces,
+  namespace's own copy of the lock, defended by the guard's walk alone
+  (52.4: its own recursive change of propagation is not judged either); the units' namespaces,
   which never have the lock. The first lot after the alpha refuses the move of peer copies
   and signals `mount_setattr(2)` at once.
 - **Found by the lab (5.15).** With these changes the BPF back end loaded
