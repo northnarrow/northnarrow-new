@@ -2853,21 +2853,32 @@ mod bug90 {
     }
 
     /// `of_pid` (Executor's Quarantine, the ladder's `binary_of`): a real
-    /// process running a copy of `sleep` named `evil (deleted)`.
+    /// process running a copy of the shell named `evil (deleted)`.
+    ///
+    /// Lot 362: the copy is of `sh`, not of `sleep`. Ubuntu 26.04 (the hosted
+    /// runners' `ubuntu-latest`) ships uutils' multicall coreutils as
+    /// `/usr/bin/sleep`: it picks the utility from the name of its own
+    /// executable (`argv[0]` does not change that), so a copy named
+    /// `evil (deleted)` printed "unknown program" and exited at once.
     #[test]
     fn bug90_of_pid_of_a_running_binary_named_deleted() {
         let tmp = TempDir::new().unwrap();
         let f = tmp.path().join("evil (deleted)");
-        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        let sh = ["/bin/sh", "/usr/bin/sh"]
             .into_iter()
             .find(|p| Path::new(p).exists())
-            .expect("a sleep binary");
-        fs::copy(sleep, &f).unwrap();
+            .expect("a shell binary");
+        fs::copy(sh, &f).unwrap();
         fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
         // ETXTBSY: another test thread's fork may hold the copy's write fd
         let mut child = None;
         for _ in 0..50 {
-            match std::process::Command::new(&f).arg("30").spawn() {
+            // `read` blocks on the pipe we keep open: it lives until killed
+            match std::process::Command::new(&f)
+                .args(["-c", "read x"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
                 Ok(c) => {
                     child = Some(c);
                     break;
