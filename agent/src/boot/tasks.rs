@@ -477,11 +477,22 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     northnarrow_agent::anti_tamper::register_protected_pid(bpffs_root, p)
                 {
                     warn!(watchdog_pid = p, error = %e, "PROTECTED_PIDS register of the verified watchdog failed");
+                    // lot 359 (the re-check 3 of #567, P3 e, its mini-hunt):
+                    // the agent's own handle on the pinned map for the
+                    // watchdog, a degradation as the watchdog's own
+                    northnarrow_agent::boot::degradation::report(
+                        northnarrow_agent::self_integrity::PIN_HANDLE_FAILED,
+                        &format!("the agent's register of the verified watchdog {p} in PROTECTED_PIDS: {e:#}"),
+                    );
                 }
                 // External audit EBPF-002: the verified watchdog is the
                 // live one — no second watchdog binary may load beside it.
                 if let Err(e) = northnarrow_agent::anti_tamper::claim_watchdog_role(bpffs_root, p) {
                     debug!(watchdog_pid = p, error = %e, "watchdog role not recorded");
+                    northnarrow_agent::boot::degradation::report(
+                        northnarrow_agent::self_integrity::PIN_HANDLE_FAILED,
+                        &format!("the agent's record of the verified watchdog {p}'s role: {e:#}"),
+                    );
                 }
                 // Lot 273: and its unit cgroup protected — the watchdog
                 // registers it at its start; this covers one that could

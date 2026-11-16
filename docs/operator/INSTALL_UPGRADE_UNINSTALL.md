@@ -211,7 +211,11 @@ start — left the host without a working agent. What it does now, in order:
 4. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
    restarts only through their pinned links, so dropping the pin root
    detaches them; the pin root is in the protected-inode set, so this
-   needs the window of step 3 (or a reboot); waits until the agent's own
+   needs the window of step 3 (or a reboot). Lot 359: the pin root is a
+   mount point — its lock, bound onto itself, private and unbindable — so
+   the lock is unmounted first, inside the same window (`rm_pin_root`;
+   the mount guard refuses it outside one), and no lock is left behind;
+   waits until the agent's own
    BPF programs are unloaded (30 s budget, `LSM_DRAIN_TIMEOUT`; fails
    loudly, naming the ids, otherwise). The agent lists their ids in
    `/run/northnarrow/bpf-own-ids` at every boot and the script reads the

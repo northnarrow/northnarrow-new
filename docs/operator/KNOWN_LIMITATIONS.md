@@ -183,12 +183,58 @@ analysis is in the
 - **An unmount that races the guard's read.** The kernel calls the
   unmount hook before it takes its mount lock. A copy grafted by a slow,
   concurrent rbind after the guard has read the subtree is taken by a lazy
-  unmount, in any namespace, the guarded ones included: `/sys/fs/bpf` can
-  lose its last mount. The deny hooks stay attached (the agent holds their
-  descriptors) and the loss is signed High, but the pins are gone: a later
-  start must load again, and the watchdog's handles on pinned maps fail.
-  Planned: the pin directory made its own private, unbindable mount, which
-  no propagation or copy can reach (re-check 3 of #567, N4).
+  unmount, in any namespace, the guarded ones included. Since lot 359 the
+  pin directory is locked — bound onto itself, private and unbindable, as
+  the child of the host's bpffs (the agent unit's `--pin-lock` step) — and
+  the kernel never takes, in an unmount's propagation, a mount that keeps
+  a child that is not itself unmounted, while an rbind never copies an
+  unbindable mount. What the lock closes for the pins: the rbind variants
+  — a racing rbind graft, and an rbind copy hidden behind the walk's bound
+  (below) — leave the host's bpffs and the pins in place. In PID 1's
+  namespace, every change of propagation that would make the lock bindable
+  through `mount(2)` is refused and signed High: any change of the lock
+  itself (its maker's own `MS_UNBINDABLE` aside), and a recursive shared or
+  private change of `/`, `/sys` or `/sys/fs/bpf` (the review of #569). What
+  remains open for the pins until the first lot after the alpha, each
+  signed at the next integrity round (about 30 s):
+  - `mount_setattr(2)` has no LSM hook, so a root user can clear the
+    lock's flags through it, and the next racing unmount takes the bpffs
+    and the pins; the round signs `pin_lock_changed` (High) and makes the
+    lock again;
+  - a raw mount namespace (`unshare(CLONE_NEWNS)` keeping the host's peer
+    groups) holds its own copy of the lock: its own recursive change of
+    propagation above that copy (shared or private) changes its own copies
+    only and is not judged, and a move of its copy of `/sys` is judged by
+    its target only: that copy is then defended by the walk alone, so its
+    unmount can still race the walk, or lie beyond its bound, and take the
+    host's bpffs and the pins; the round signs `protected_mount_gone` and
+    `pin_lock_missing` (High);
+  - the units' own namespaces — the agent's and the watchdog's among them —
+    never have the lock, for the unit's whole run: systemd builds their
+    view with a recursive bind, which skips an unbindable mount, so such an
+    unmount can take that namespace's view of the bpffs (not the host's,
+    nor the pins: the agent and the watchdog keep their anchors, and what
+    reads the pins by path there fails until a restart builds the view
+    again); the round signs `protected_mount_gone` (High).
+  The first lot after the alpha refuses the move of a copy that is a peer
+  of a held mount, and signals a `mount_setattr(2)` at once. A start that
+  finds no lock (a kernel without `open_tree(2)`, an error) signs a
+  degradation; in the agent's unit the integrity round then makes it (a few
+  attempts each round, then a back-off). `/sys/fs/cgroup` has no such
+  child: a racing lazy unmount can take the host's childless cgroup mount
+  (the integrity round signs `protected_mount_gone`, High). *For you:*
+  container runtimes and Kubernetes' `mountPropagation: Bidirectional`
+  mounts work: containerd and CRI-O make the container's `/` recursively
+  shared for them (`rootfsPropagation: rshared`), in the container's own
+  mount namespace, and a recursive shared or private change made outside
+  PID 1's namespace is not judged (the re-check of #569) — Cilium's bpffs
+  mount, the CSI node plugins, `docker run -v …:rshared` and `unshare -m
+  --propagation shared` among them. In the host's namespace itself `mount
+  --make-rprivate` (or `--make-rshared`) of `/`, `/sys` or `/sys/fs/bpf`
+  is refused and signed — `systemd-shutdown`'s own switch to its shutdown
+  image excepted — also on a bind of `/` or `/sys` made there, which the
+  guard cannot tell from the host's tree; a recursive `MS_SLAVE` of such
+  a bind (`--make-rslave`) is not judged.
 - **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
   takes the whole subtree of the mount it names, and the kernel carries
   the unmount of each mount in it onto the peers and slaves of its parent:
@@ -199,11 +245,14 @@ analysis is in the
     chain of 9 levels (about 10 mounts), are all private, behind which
     lies a copy (an rbind of `/sys`) in one of
     the host's peer groups: the kernel takes the host's childless
-    `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
-    the watchdog's and the units' namespaces (slaves of the host's). The
-    bpffs then loses its last mount: no path reaches its pins any more
-    (the watchdog's handles on the pinned maps fail; a later start finds
-    none), while its super block, the pins in it, lives on as long as the
+    `/sys/fs/cgroup` and its copies in the agent's, the watchdog's and the
+    units' namespaces (slaves of the host's). Since lot 359 the host's
+    bpffs is not childless — its lock keeps it, and the pins — against an
+    rbind copy; it does not against a copy of `/sys` that a raw namespace
+    moved (its own copy of the lock, above), nor when the lock is missing
+    or made bindable. Then the bpffs loses its last mount: no path
+    reaches its pins any more (the watchdog's handles on the pinned maps
+    fail; a later start finds none), while its super block, the pins in it, lives on as long as the
     agent holds a descriptor in it (its anchor of `/sys/fs/bpf`, lot 353).
     The deny hooks no longer detach: the agent holds a descriptor of every
     link and program it pins (fix round 3 of #567, `antitamper_bpf::held`),

@@ -52,6 +52,8 @@ pub mod fail_open;
 pub mod filesystem;
 pub mod mount_guard;
 pub mod network_isolate;
+/// Lot 359 (the re-check 3 of #567, N4): the lock of the pin directory.
+pub mod pin_lock;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
 /// stub the recon flagged).
@@ -586,6 +588,33 @@ fn attach_reporting(
     report
         .degraded
         .extend(mount_guard::attach(ebpf, &btf, pin_root).degraded);
+    // Lot 359 (the re-check 3 of #567, N4): the pin directory's lock, made
+    // by the unit's `ExecStartPre=-+ … --pin-lock` step before this process
+    // — in place in PID 1's table, or a signed degradation (#567's walk
+    // remains); the integrity round keeps one found in place, and makes
+    // one the unit's start did not (the review of #569, F3)
+    if let Some(root) = pin_root {
+        match crate::mountinfo::read_bytes(Path::new("/proc/1/mountinfo")) {
+            Ok(text) => match pin_lock::at_start(&text, root) {
+                None => info!(
+                    pin_root = %root.display(),
+                    "anti-tamper: the pin directory is locked (private, unbindable, the host's \
+                     bpffs's child)"
+                ),
+                Some(why) => {
+                    warn!(reason = %why, "anti-tamper: the pin directory is NOT locked");
+                    report.degraded.push(why);
+                }
+            },
+            Err(e) => {
+                pin_lock::at_start_unread();
+                report.degraded.push(format!(
+                    "pin lock: PID 1's mount table is not read ({e}) ({})",
+                    pin_lock::ABSENT_EFFECT
+                ))
+            }
+        }
+    }
 
     // Lot 277: the start-in-cgroup tracker (the per-rule policy's
     // exemptions by cgroup or unit hold for processes started in their

@@ -227,11 +227,12 @@ pub fn bpffs_findings(table: &MountTable, pin_root: &Path) -> Vec<String> {
             ));
         }
     }
-    for m in table
-        .entries
-        .iter()
-        .filter(|m| m.mount_point.starts_with(pin_root))
-    {
+    // lot 359 (the re-check 3 of #567, N4): the pin directory's lock — its
+    // own self-bind on the bpffs at /sys/fs/bpf — shows the same pins
+    for m in table.entries.iter().filter(|m| {
+        m.mount_point.starts_with(pin_root)
+            && !crate::anti_tamper::pin_lock::is_lock(&table.entries, m, pin_root)
+    }) {
         out.push(format!(
             "{} ({} {}): a mount over the pin root {}",
             m.mount_point.display(),
@@ -780,6 +781,54 @@ mod tests {
         );
         assert_eq!(t.malformed.len(), 1);
         assert!(mounts_over(&t, &dirs()).is_empty());
+    }
+
+    /// Named test (lot 359): the pin directory's lock — its self-bind on the
+    /// bpffs at `/sys/fs/bpf`, in PID 1's table or the agent's namespace's —
+    /// is no mount over the pin root; a bpffs root, another directory, a
+    /// tmpfs, or a mount laid over the lock still are.
+    #[test]
+    fn the_pin_directorys_lock_is_no_mount_over_the_pin_root() {
+        let root = Path::new("/sys/fs/bpf/northnarrow");
+        let base = "29 1 252:1 / / rw - ext4 /dev/vda1 rw\n\
+                    554 29 0:30 / /sys/fs/bpf rw - bpf bpf rw,mode=700\n";
+        let lock = format!(
+            "{base}556 554 0:30 /northnarrow /sys/fs/bpf/northnarrow rw unbindable - bpf bpf rw\n"
+        );
+        assert!(bpffs_findings(&parse_mountinfo(&lock), root).is_empty());
+        for (what, line) in [
+            (
+                "a bpffs root",
+                "557 554 0:30 / /sys/fs/bpf/northnarrow rw - bpf bpf rw\n",
+            ),
+            (
+                "another directory",
+                "557 554 0:30 /other /sys/fs/bpf/northnarrow rw - bpf bpf rw\n",
+            ),
+            (
+                "another bpffs",
+                "557 554 0:93 / /sys/fs/bpf/northnarrow rw - bpf bpf rw\n",
+            ),
+            (
+                "a tmpfs",
+                "557 554 0:94 / /sys/fs/bpf/northnarrow rw - tmpfs tmpfs rw\n",
+            ),
+        ] {
+            let f = bpffs_findings(&parse_mountinfo(&format!("{base}{line}")), root);
+            assert_eq!(f.len(), 1, "{what}: {f:?}");
+        }
+        let over = format!("{lock}557 556 0:94 / /sys/fs/bpf/northnarrow rw - tmpfs tmpfs rw\n");
+        assert_eq!(
+            bpffs_findings(&parse_mountinfo(&over), root).len(),
+            1,
+            "over the lock"
+        );
+        let below = format!("{lock}557 556 0:94 / /sys/fs/bpf/northnarrow/x rw - tmpfs tmpfs rw\n");
+        assert_eq!(
+            bpffs_findings(&parse_mountinfo(&below), root).len(),
+            1,
+            "below the lock"
+        );
     }
 
     /// `mountinfo` escapes the blanks of a path; the mount point is

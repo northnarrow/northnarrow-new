@@ -192,7 +192,11 @@ of the filesystem can change (the independent review of the PR, #468, R2).
     the mounts (the re-review of #468, S3): a bind of the same bpffs (its
     `major:minor`, its root `/`) onto itself, as a node or CNI script may
     lay, shows the same pins and is accepted; another bpffs, a tmpfs or a
-    directory of the bpffs bound there refuses.
+    directory of the bpffs bound there refuses. Lot 359: the pin root's
+    own lock — the directory bound onto itself on that bpffs, private and
+    unbindable, made by the unit's `--pin-lock` step (`UPGRADE_NOTES_WAVE4.md`
+    §52) — is the pin root itself, not a mount over it; anything laid over
+    the lock, or below it, still refuses.
   - With the previous agent's pins there (they survive a `cgroup.kill` and
     a crash, not a reboot): `/etc/northnarrow` and `/var/lib/northnarrow`
     as this start sees them must be the inodes that agent protected (its

@@ -281,9 +281,11 @@ static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(102
 /// last record by caller IMAGE and target
 /// (`northnarrow_common::ptrace_read::seen_key`) → monotonic ns, one an
 /// hour ([`emit_task_read_denial`]). By image, not by process: a
-/// short-lived tool (`pidof`, `lsof`) is a new process at each run.
+/// short-lived tool (`pidof`, `lsof`) is a new process at each run. Lot
+/// 359 (P3 b): and by the caller's cgroup — an interpreter is one image for
+/// every program it runs.
 #[map]
-static PTRACE_READ_SEEN: LruHashMap<[u64; 2], u64> = LruHashMap::with_max_entries(1024, 0);
+static PTRACE_READ_SEEN: LruHashMap<[u64; 3], u64> = LruHashMap::with_max_entries(1024, 0);
 
 /// The re-check 2 of #567 (point 2): the packaged `systemd-journald`'s
 /// identities — its images (the kernel's `(dev, ino)`, as `mm->exe_file`
@@ -464,27 +466,30 @@ pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
         None => InodeKey { dev: 0, ino: 0 },
     };
     let cgroup = unsafe { aya_ebpf::helpers::generated::bpf_get_current_cgroup_id() };
-    if ptrace_read::quiet(exe.dev, exe.ino, cgroup, |k| unsafe {
-        PTRACE_READ_QUIET.get(k).is_some()
-    }) {
+    // lot 359 (the re-check 3 of #567, P3 a): and journald's lot 277/281
+    // marks clean — not moved into its cgroup, no injection access given
+    if ptrace_read::quiet(
+        exe.dev,
+        exe.ino,
+        cgroup,
+        |k| unsafe { PTRACE_READ_QUIET.get(k).is_some() },
+        crate::cgroup_join::caller_marks_clean,
+    ) {
         return;
     }
     let now = unsafe { bpf_ktime_get_ns() };
-    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid);
-    match PTRACE_READ_SEEN.get_ptr_mut(&seen) {
-        Some(last) => unsafe {
-            if !ptrace_read::due(Some(*last), now) {
-                return;
-            }
-            *last = now;
-        },
-        None => {
-            let _ = PTRACE_READ_SEEN.insert(&seen, &now, 0);
-        }
-    }
-    if !limited_budget(FS_OP_PTRACE_READ, now) {
+    // lot 359 (P3 b): the caller's cgroup in the key — one collector's
+    // record does not silence another program's probe of the same image
+    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid, cgroup);
+    // SAFETY: a lookup of this program's map, the value copied out at once.
+    let last = unsafe { PTRACE_READ_SEEN.get(&seen) }.copied();
+    // lot 359 (P3 c): due, then the budget — and seen only once the budget
+    // let the record through: a flood that took the budget no longer drops
+    // the first record and silences that image and target for an hour
+    if !ptrace_read::admit(last, now, || limited_budget(FS_OP_PTRACE_READ, now)) {
         return;
     }
+    let _ = PTRACE_READ_SEEN.insert(&seen, &now, 0);
     emit_denial(FS_OP_PTRACE_READ, key);
 }
 

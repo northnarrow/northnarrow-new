@@ -261,6 +261,23 @@ fn is_lost(tgid: u32) -> bool {
     lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)
 }
 
+/// Lot 359 (the re-check 3 of #567, P3 a): thread group `tgid`'s marks
+/// are clean (`common::cgroup_join::clean`): no placement, no taint, not
+/// lost. Any mark of the tgid counts (one a dead group left is cleared at
+/// the next birth): a stale one fails closed.
+#[inline(always)]
+pub(crate) fn marks_clean(tgid: u32) -> bool {
+    // SAFETY: a lookup of the marks' map, the value copied out at once.
+    let how = unsafe { CGROUP_JOINED.get(&tgid) }.map(|rec| unpack(rec[1]).0);
+    northnarrow_common::cgroup_join::clean(how, is_lost(tgid))
+}
+
+/// [`marks_clean`] of the calling thread group.
+#[inline(always)]
+pub(crate) fn caller_marks_clean() -> bool {
+    marks_clean((bpf_get_current_pid_tgid() >> 32) as u32)
+}
+
 /// The group's byte cleared: its tgid is a new thread group's
 /// (`cgroup_join_born`), before the group runs and before any move can
 /// reach it; the only clear.

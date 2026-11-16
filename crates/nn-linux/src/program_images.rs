@@ -1263,7 +1263,14 @@ mod tests {
         use nn_core::decision::rules::program_identity::runtime_clone_of;
         let t = tempfile::tempdir().unwrap();
         let (root, proc) = (t.path().join("root"), t.path().join("proc"));
-        let image: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 241) as u8).collect();
+        // a length no other test's runtime has: the installed runtimes are
+        // one registry for the test binary (`runtimes_of_len`), and
+        // `a_memfd_sealed_only_after_its_exec_is_no_runtime_clone`'s runc of
+        // 1 MiB, recorded in parallel, was this one's first candidate (a
+        // flake the gates met)
+        let image: Vec<u8> = (0..((1u32 << 20) + 4093))
+            .map(|i| (i % 241) as u8)
+            .collect();
         let runc = put(&root, "/usr/sbin/runc", &image);
         let checks = RuntimeChecks::new(
             RUNTIME_BUDGET_PER_UID,

@@ -212,6 +212,14 @@ fn sites(text: &str) -> Vec<String> {
 /// option read.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-linux/src/anti_tamper/pin_lock.rs",
+        5,
+        "lot 359: the options the agent passes (never reads): `systemd-run`'s own (`--wait`, \
+         `--collect`, `--quiet`, `--pipe`) for the transient unit that makes the pin \
+         directory's lock again, and its own binary's step argument (`--pin-lock`) — no \
+         interpreter's command line read",
+    ),
+    (
         "crates/nn-core/src/impair/mod.rs",
         4,
         "lot 316: the system tools' options are read by their tables (`tool_options`; it held \

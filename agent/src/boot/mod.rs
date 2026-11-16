@@ -110,6 +110,16 @@ pub fn main() -> Result<()> {
             northnarrow_agent::export::worker::main,
         ));
     }
+    // Lot 359 (the re-check 3 of #567, N4): the unit's `ExecStartPre=-+`
+    // step (and the integrity round's transient unit) — the pin directory's
+    // lock, in PID 1's mount namespace, before the agent's process exists;
+    // nothing of the agent's runs
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == nn_linux::anti_tamper::pin_lock::STEP_ARG)
+    {
+        std::process::exit(nn_linux::anti_tamper::pin_lock::step_main());
+    }
     let cli = Cli::parse();
     if cli.build_features {
         let features = northnarrow_agent::build_info::build_features();

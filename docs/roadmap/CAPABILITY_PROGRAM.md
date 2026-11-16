@@ -11826,6 +11826,174 @@ number in parentheses is a lab PR.
     among its matches; the home reference NET-007 only. Guests left clean
     (agent uninstalled, no `.local`, packages purged, no mounts), powered
     off.
+- **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
+  and the re-check 3's P3s (pre-alpha; C23; no level change).**
+  - What was open: the unmount hook runs before the kernel's namespace
+    lock, so a copy grafted by a racing rbind, or a subtree wider or deeper
+    than the walk (32 mounts, a chain of 9), let a lazy unmount take the
+    host's bpffs and the pins, in any namespace (N4; N3's named residual).
+  - Done: the pin directory bound onto itself, private and unbindable, as
+    the host's bpffs's child (`nn_linux::anti_tamper::pin_lock`, the unit's
+    `ExecStartPre=-+ … --pin-lock` in PID 1's namespace before any pin;
+    the agent itself keeps no `CAP_SYS_ADMIN` and no `mount(2)`); the guard
+    lets through only its maker's two steps in PID 1's namespace
+    (`common::mount_guard::lock_maker`, `lock_bind`, `lock_step_at`;
+    `MG_LOCK`, `MG_LOCK_ABOVE`, `MG_OP_PROPAGATE`, `MG_WHY_LOCK`), every
+    other mount, unmount, move or change of propagation of it (or of a copy
+    that reaches the host), a recursive `MS_SHARED` above it, and a
+    recursive `MS_PRIVATE` above it in PID 1's namespace refused; a start
+    without it a signed degradation, each integrity round
+    `pin_lock_missing` / `pin_lock_changed` (High) and a transient unit
+    making it again (`pin_lock::Keeper`: three attempts, a back-off); the
+    start's bpffs check, the integrity round's mount watch and the views
+    (`kernel_roots`: the locked pin directory a view of its own) take it
+    for the agent's own; `rm_pin_root` in `install.sh` and `uninstall.sh`.
+    P3s: journald's quiet reads need clean marks (`cgroup_join::clean`), the
+    read dedup's key carries the cgroup, a record the budget drops is not
+    seen (`ptrace_read::admit`), `EXECUTOR_IDS` before the fork record's
+    attach, the watchdog's failed pin handles signed
+    (`watchdog_pin_handle_failed`). `/sys/fs/cgroup` stays behind the walk.
+  - Tests: `the_agents_own_self_bind_of_its_pin_directory_passes_and_nothing_else_does`,
+    `the_lock_bind_needs_every_part_of_its_shape`,
+    `the_locks_maker_needs_each_part_of_its_identity`,
+    `a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above`,
+    `a_change_of_propagation_of_the_lock_is_refused_but_its_makers_steps`,
+    `the_lock_is_never_unmounted_or_moved_outside_a_window_by_its_maker_either`,
+    `the_lock_is_in_place_only_private_unbindable_and_the_bpffs_child`,
+    `only_the_self_bind_of_the_pin_directory_is_the_lock`,
+    `a_lost_or_changed_lock_is_a_finding_and_made_again`,
+    `a_start_without_the_lock_is_a_degradation`,
+    `the_pin_directorys_lock_is_no_mount_over_the_pin_root`,
+    `the_pin_directory_is_its_own_view_only_under_its_lock`,
+    `the_pin_directory_is_the_locks_point_and_its_ancestors_above_it`,
+    `both_scripts_unmount_the_pin_roots_lock_before_removing_it`,
+    `journald_with_marks_that_are_not_clean_is_recorded`,
+    `a_collectors_record_does_not_silence_another_programs_probe_of_the_same_image`,
+    `a_record_the_budget_drops_is_not_marked_seen`,
+    `the_executors_identities_are_in_the_kernel_before_the_fork_record_attaches`,
+    `a_failed_pin_handle_is_recorded_once_per_handle`,
+    `a_watchdog_pin_handle_failure_is_a_signed_degradation`,
+    `a_clean_mark_has_neither_placement_nor_taint_and_is_not_lost`,
+    `the_pin_directorys_lock_is_no_mount_over_protected`,
+    `the_remake_is_waited_for_within_a_deadline`,
+    `the_lock_judge_is_out_of_line_and_signs_nothing`,
+    `the_root_through_proc_pid_root_is_the_namespace_root` (the lab's find:
+    `/` was registered by its `/proc/1/root` link's key),
+    `every_watchdog_pin_handle_failure_is_signed`.
+  - Mutation: 52 mutants of the guard rule, the lock's watch, the views,
+    the scripts' order and the P3s; all caught by a named test (four after
+    new cases: `is_lock`'s and `pin_locked`'s bpffs root, a slave allowed,
+    any type at the pin root). The eBPF hooks' wiring has no host harness:
+    the lab's.
+  - Lab (as measured, our own guests; 5b8e62c6, ubuntu2204 at 859d3a50,
+    the same code): ubuntu2204 (5.15.0-203), ubuntu2404 (6.8.0-149),
+    ubuntu2604 (7.0.0-43) — the step made the lock at the install and at a
+    cold boot (`pin lock: made`), reused it at a restart; 17 refusals each
+    one High with the lock unchanged (its unmount, lazy or not, a move by
+    either API, a mount over it, root's self-bind over it, every change of
+    its propagation by root, `--make-rshared` of `/`, `/sys`,
+    `/sys/fs/bpf`, a raw namespace's change of its copy or of its `/`,
+    `unshare --propagation shared`); 7 cases let through with no record
+    (`unshare -m`, a private namespace's `rshared`, a unit sandbox,
+    `systemd-nspawn`, podman with and without `--privileged`, a tmpfs's
+    propagation); `mount_setattr` shared → `pin_lock_changed` and repaired
+    by the transient unit; lost in a window → `pin_lock_missing`, made
+    again outside it, its unmount refused again; the kernel's rule
+    (rev567-lock-probe.sh in a user namespace) as the review found it; N4's
+    race won (the unmount entered before the graft, returned after it) in
+    a raw namespace on all three and in the host's on 6.8 and 7.0 (on 5.15
+    the graft came first and the walk refused it), N3's chain of 9 — the
+    host's bpffs and the pins kept every time (round 1 on 6.8, the lock
+    not made: both gone); a freshly started agent's namespace has no copy
+    of the lock, and the race took its view of the bpffs (signed
+    `protected_mount_gone`), the agent active; the uninstall left no lock.
+    Verifier: 0 failing on all five guests, the 900k gate held — 5.15
+    `sb_mount` 863,550 (86.4 %), `move_mount` 833,357, `sb_umount` 692,576;
+    debian12 (6.1) `move_mount` 819,161 (81.9 %); 7.0 `move_mount` 600,842;
+    debian13 (6.12) 374,930; 6.8 the highest 273,029 (above 80 % on 5.15
+    and 6.1: a later lot adding to these hooks moves the lock's checks
+    further out of line). Two fixes found by
+    the lab: `sb_mount`'s chain past 512 bytes of stack (576, round 1), and
+    `/` registered by its `/proc/1/root` link's key.
+  - Fix round 1 (the review of #569): the lock's `MNT_UNBINDABLE` could be
+    cleared without a refusal — a recursive `MS_PRIVATE` above it in PID
+    1's namespace (F1a), the maker's own `MS_PRIVATE` step, at any time and
+    in any namespace (F1c) — which reopened N4 for the pins. Now refused
+    (`lock_touched` reads the target's namespace; `lock_step` is exactly
+    `MS_UNBINDABLE`, `lock_step_at` on the host's lock only;
+    `lock_shutdown_step` for `systemd-shutdown`'s `switch_root()`); the
+    step makes the lock with `MS_UNBINDABLE` alone (`pin_lock::LOCK_FLAGS`).
+    The round's remake is retried within the round and backs off over the
+    rounds; a start of the unit without the lock has the round make it (F3,
+    F5). The docs state the real coverage: the rbind variants closed;
+    `mount_setattr(2)`, a raw namespace's own copy of the lock and the
+    units' namespaces open, signed at the next round (the coordinator's
+    decision for the alpha; the first lot after it). Tests:
+    `a_recursive_private_change_above_the_lock_in_pid_1s_namespace_is_refused`,
+    `a_plain_shared_change_of_the_lock_is_refused`,
+    `the_makers_step_is_unbindable_on_the_hosts_lock_only`,
+    `the_step_makes_the_lock_unbindable_alone_never_private`,
+    `one_failed_remake_is_retried_within_the_round`,
+    `a_round_whose_attempts_all_fail_signs_it_and_backs_off`,
+    `a_start_without_the_lock_has_it_made_by_the_round_in_its_unit`,
+    `the_remakes_of_a_round_share_one_deadline`,
+    `the_round_keeps_the_pin_lock_through_its_keeper`,
+    `the_lock_judge_reads_the_namespace_before_a_private_change_and_the_makers_step`,
+    `the_mount_walks_carry_no_option_across_a_loop` (found by the lab:
+    5.15's verifier refused `sb_mount` — `spread` carried an `Option`
+    whose never-written `None` payload the BPF back end loaded before the
+    tag; a value and a flag now). Mutation: 39 mutants of the new code (7
+    of them lot 359's first behaviour put back), all caught by a named
+    test (one after a new test: the remakes' shared deadline).
+    Lab (fix round 1, as measured, our own guests; the same eBPF object on
+    all five): ubuntu2204 (5.15.0-203, run again after the walk's fix),
+    ubuntu2404 (6.8.0-149), ubuntu2604 (7.0.0-43) — 21/21 refused, one
+    signed High each and the lock unchanged (among them the recursive
+    private change of `/sys/fs/bpf`, `/sys` and `/`, and a plain shared
+    change of the lock), 8/8 let through without a record (the plain
+    shared change of the bpffs, a private namespace's recursive private
+    change, the runtimes); the lock still unbindable after them, never in
+    an rbind copy; the bpffs and the pins kept through the race and the
+    chain of 9; a remake whose attempts all failed signed with the next
+    attempt's round, then made again after the back-off; cold boot and
+    uninstall clean. On 5.15 and 7.0 the record of that last remake was
+    held back by the drift back-off (its text the same as the remake's
+    signed minutes before, the same mount id): the loss and its clearing
+    signed at once. Verifier: 0 failing on all five, within the 900k gate
+    — 5.15 `sb_mount` 868,535 (86.9 %), `move_mount` 830,510, `sb_umount`
+    584,166; debian12 (6.1) `move_mount` 821,218; 7.0 602,885; debian13
+    (6.12) 376,974; 6.8 the highest 285,254.
+  - Fix round 2 (the re-check of #569, N1): a recursive `MS_SHARED` above
+    the lock was refused in any namespace that reaches the host's, so
+    runc's `rootfsPropagation: rshared` (containerd's and CRI-O's for any
+    Kubernetes `Bidirectional` mount: Cilium's bpffs, the CSI node
+    plugins) and `unshare -m --propagation shared` failed in a fresh
+    namespace whose `/` is still a peer of PID 1's. `lock_touched` judges a
+    recursive `MS_SHARED` or `MS_PRIVATE` above the lock in PID 1's
+    namespace only; a raw namespace's own recursive change joins its
+    accepted residual (its copy of the lock behind the walk, signed at the
+    round). Test: `a_recursive_shared_change_above_the_lock_is_judged_in_pid_1s_namespace_only`
+    (fails before the fix; `a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above`'s
+    shared input now PID 1's namespace, the others asserted not judged).
+    Mutation: 4 mutants of the rule (the host condition dropped, the old
+    rule put back, the shared flag dropped, `guard != 0` for the host),
+    all caught by both named tests.
+    Lab (fix round 2, as measured, our own guests): ubuntu2204
+    (5.15.0-203), ubuntu2404 (6.8.0-149) — 19/19 refused, one signed High
+    each and the lock unchanged (among them `--make-rshared` and
+    `--make-rprivate` of `/`, `/sys`, `/sys/fs/bpf` in the host's
+    namespace); a raw namespace's `--make-rshared /` and `unshare -m
+    --propagation shared`, refused in fix round 1, let through without a
+    record; 13/13 let through without a record — fix round 1's 8, docker,
+    `docker run -v /sys/fs/bpf:/sys/fs/bpf:rshared` (the bind `shared:11`,
+    the host's group, inside the container) and a runc bundle with
+    `rootfsPropagation: rshared` and an `rbind,rshared` bind of
+    `/sys/fs/bpf`; the lock unbindable after them, never in an rbind
+    copy; the bpffs and the pins kept through the race and the chain of
+    9; cold boot and uninstall clean. Verifier: 5.15 `sb_mount` 830,908
+    (83.1 %, 69,092 under the 900k gate; its stack chain 480 of 512),
+    `move_mount` 830,510 (69,490 under); 6.8 `sb_mount` 235,430,
+    `move_mount` 269,733.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
