@@ -900,7 +900,7 @@ unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
 
 /// Role of the calling task's executable (0: not one of ours).
 #[inline(always)]
-fn caller_role() -> u8 {
+pub(crate) fn caller_role() -> u8 {
     match unsafe { caller_exe_key() } {
         Some(k) => unsafe { OWN_EXE_INODES.get(&k).copied().unwrap_or(0) },
         None => 0,

@@ -214,6 +214,94 @@ fn both_scripts_share_the_stale_pin_root_block() {
     }
 }
 
+/// Named test (lot 359, the re-check 3 of #567, N4): both scripts remove
+/// the pin root the same way — its lock (the directory bound onto itself)
+/// unmounted first, a few stacked at most, then the directory; a pin root
+/// that is no mount point is removed as before; one whose lock is refused
+/// (no window) stays.
+#[test]
+fn both_scripts_unmount_the_pin_roots_lock_before_removing_it() {
+    let a = block("deploy/install.sh", "rm_pin_root");
+    assert_eq!(a, block("deploy/uninstall.sh", "rm_pin_root"));
+    for rel in ["deploy/install.sh", "deploy/uninstall.sh"] {
+        let text = read(rel);
+        let after = &text[text.find("# <<< rm_pin_root").unwrap()..];
+        assert!(
+            !after.contains("rm -rf \"$BPFFS_ROOT\""),
+            "{rel}: the pin root removed without its lock unmounted"
+        );
+        assert!(after.contains("rm_pin_root"), "{rel}");
+    }
+    for (case, mounted, umount_ok, removed) in [
+        ("lock-none", 0, true, true),
+        ("lock-one", 1, true, true),
+        ("lock-two", 2, true, true),
+        ("lock-refused", 1, false, false),
+    ] {
+        let dir = case_dir(&format!("rm-pin-root-{case}"));
+        let stub = dir.join("stub");
+        fs::create_dir_all(&stub).unwrap();
+        let root = dir.join("pins");
+        fs::create_dir_all(root.join("x")).unwrap();
+        let calls = dir.join("calls");
+        let count = dir.join("mounted");
+        fs::write(&count, format!("{mounted}")).unwrap();
+        // `mountpoint -q` answers from the count; `umount` lowers it (or is
+        // refused); `rm` removes only what is no mount point any more
+        write_exec(
+            &stub.join("mountpoint"),
+            &format!(
+                "echo mountpoint >> {c}; n=$(cat {n}); [ \"$n\" -gt 0 ]",
+                c = calls.display(),
+                n = count.display()
+            ),
+        );
+        write_exec(
+            &stub.join("umount"),
+            &format!(
+                "echo \"umount $1\" >> {c}; {ok}",
+                c = calls.display(),
+                ok = if umount_ok {
+                    format!("n=$(cat {n}); echo $((n-1)) > {n}", n = count.display())
+                } else {
+                    "exit 1".to_string()
+                }
+            ),
+        );
+        write_exec(
+            &stub.join("rm"),
+            &format!(
+                "echo rm >> {c}; n=$(cat {n}); [ \"$n\" -gt 0 ] && exit 1; /bin/rm \"$@\"",
+                c = calls.display(),
+                n = count.display()
+            ),
+        );
+        let script = format!(
+            "BPFFS_ROOT={root}\n{a}\nrm_pin_root\n",
+            root = root.display()
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{case}: {out:?}");
+        let seen = fs::read_to_string(&calls).unwrap_or_default();
+        let umounts = seen.lines().filter(|l| l.starts_with("umount")).count();
+        let first_rm = seen.lines().position(|l| l == "rm");
+        let lines: Vec<&str> = seen.lines().collect();
+        let last_umount = lines.iter().rposition(|l| l.starts_with("umount"));
+        assert_eq!(root.exists(), !removed, "{case}: {seen}");
+        if umount_ok {
+            assert_eq!(umounts, mounted, "{case}: {seen}");
+        }
+        if let (Some(r), Some(u)) = (first_rm, last_umount) {
+            assert!(u < r, "{case}: the lock unmounted after the rm: {seen}");
+        }
+    }
+}
+
 /// The host a stop section runs against: unit states, the pin root, the
 /// key, and what the stubs saw.
 /// The fake admin socket of a test host: a unix socket path must stay
@@ -4207,9 +4295,15 @@ fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
         fs::write(dir.join(d).join("link_x"), "").unwrap();
     }
     fs::create_dir_all(dir.join("pins-other")).unwrap();
-    let fns = ["tracker_pin_dirs", "pins_present", "remove_pins"]
-        .map(|f| shell_fn("deploy/uninstall.sh", f))
-        .join("\n");
+    // lot 359: remove_pins unmounts the pin root's lock first (rm_pin_root)
+    let fns = [
+        "tracker_pin_dirs",
+        "pins_present",
+        "rm_pin_root",
+        "remove_pins",
+    ]
+    .map(|f| shell_fn("deploy/uninstall.sh", f))
+    .join("\n");
     let listed = run("uninstall.sh", &format!("{fns}\ntracker_pin_dirs"));
     assert_eq!(
         listed.lines().collect::<Vec<_>>(),
@@ -4250,7 +4344,10 @@ fn an_upgrade_keeps_the_tracker_and_an_uninstall_removes_it() {
     // install.sh's purge of the root leaves the tracker's directory
     fs::create_dir_all(dir.join("pins/x")).unwrap();
     fs::create_dir_all(dir.join("pins-cgroup-join-v1-64")).unwrap();
-    let purge = shell_fn("deploy/install.sh", "purge_pin_root");
+    // lot 359: the purge unmounts the pin root's lock first (rm_pin_root)
+    let purge = ["rm_pin_root", "purge_pin_root"]
+        .map(|f| shell_fn("deploy/install.sh", f))
+        .join("\n");
     run("install.sh", &format!("{purge}\npurge_pin_root"));
     assert!(!dir.join("pins").exists());
     assert!(

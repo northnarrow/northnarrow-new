@@ -16,7 +16,8 @@
 //! ([`REASON_ADMIN_SOCKET_VANISHED`], [`REASON_RESPAWN_ARGV_DEGRADED`],
 //! and since lab PR 216 [`REASON_WATCHDOG_EXIT`], [`REASON_WATCHDOG_FAILED`],
 //! [`REASON_STUCK_RECOVERY_FAILED`], [`REASON_EVENT_LOOP_STALLED`],
-//! [`REASON_HOLD_RETRY`], [`REASON_HOLD_ENDED`]); the agent signs them under
+//! [`REASON_HOLD_RETRY`], [`REASON_HOLD_ENDED`]; lot 359:
+//! [`REASON_PIN_HANDLE_FAILED`]); the agent signs them under
 //! their own kind.
 
 use alloc::string::String;
@@ -114,6 +115,16 @@ pub const REASON_FUSE_ABORTED: &str = "fuse_aborted";
 /// over a path it writes, a full disk) — the watchdog's record, signed by
 /// the next agent that can sign, High.
 pub const REASON_SIGNED_RECORDS_FAILED: &str = "signed_records_failed";
+/// Lot 359 (the re-check 3 of #567, P3 e): a handle of the watchdog's on a
+/// pinned map of the agent's failed — its registration in
+/// `PROTECTED_PIDS` (`register_self_pid`) or of its role (`claim_role`),
+/// the respawned agent's re-insert (`reinsert_new_agent_pid`), a dead
+/// agent's eviction (`evict_dead_agent`). They fail when the pins cannot
+/// be reached (the bpffs lost its last mount): a watchdog restarted then
+/// stays outside `PROTECTED_PIDS` until a reboot. The detail names the
+/// handle and the error; the agent signs it as a degradation
+/// (`watchdog_pin_handle_failed`), once per handle and watchdog.
+pub const REASON_PIN_HANDLE_FAILED: &str = "pin_handle_failed";
 /// Lot 353: how many stuck recoveries make a restart loop…
 pub const RESTART_LOOP_RECOVERIES: usize = 3;
 /// …within this many seconds.

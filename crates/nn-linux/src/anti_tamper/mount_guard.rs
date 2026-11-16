@@ -43,8 +43,9 @@ use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
     held_by_id, held_by_place, held_under, NameKey, BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT,
-    GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_NOTE, MG_ON, MG_OWN, MG_SB,
-    MG_VIEW, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC, TMPFS_MAGIC,
+    GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE,
+    MG_NOTE, MG_ON, MG_OWN, MG_SB, MG_VIEW, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC,
+    TMPFS_MAGIC,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -204,6 +205,17 @@ pub fn protected_points(
             cur = a.parent();
         }
     }
+    // Lot 359 (the re-check 3 of #567, N4): the pin directory is its lock's
+    // root and place (`MG_LOCK`), the directories above it are where a
+    // recursive `MS_SHARED` would reach the lock (`MG_LOCK_ABOVE`)
+    if let Some(p) = pin_root {
+        add(&p.display().to_string(), MG_LOCK, &mut out);
+        let mut cur = p.parent();
+        while let Some(a) = cur {
+            add(&a.display().to_string(), MG_LOCK_ABOVE, &mut out);
+            cur = a.parent();
+        }
+    }
     out
 }
 
@@ -298,6 +310,28 @@ fn in_host(path: &str) -> String {
     format!("/proc/1/root{path}")
 }
 
+/// Lot 359 (its mini-hunt): `dir` under the namespace root `prefix`
+/// (`/proc/<pid>/root`) is that root itself — whose last component is the
+/// magic link `root`, to be followed (a path's trailing `/` is no
+/// component: `/proc/1/root/` read without following is the link, not
+/// PID 1's `/`).
+fn follows_root(prefix: &str, dir: &Path) -> bool {
+    !prefix.is_empty() && dir == Path::new("/")
+}
+
+/// The metadata of the protected point `p` as the namespace root `prefix`
+/// shows it: the point itself, never a link it is followed through (a
+/// binary that is a symbolic link is the link) — but the root, whose link
+/// is followed ([`follows_root`]).
+fn point_metadata(prefix: &str, p: &str) -> std::io::Result<std::fs::Metadata> {
+    let at = format!("{prefix}{p}");
+    if follows_root(prefix, Path::new(p)) {
+        antitamper_bpf::kernel_roots::metadata(&at)
+    } else {
+        antitamper_bpf::kernel_roots::symlink_metadata(&at)
+    }
+}
+
 /// The file system magic of a path (`fstatfs(2)` of it opened `O_PATH`,
 /// beneath the `/proc` root the start anchored for a path through
 /// `/proc/1/root`: lot 357's item 5, no view walked by path).
@@ -354,7 +388,9 @@ fn resolve_points(points: &[(String, u8)]) -> (Vec<(InodeKey, u8, String)>, Vec<
     }
     for (p, flags) in points {
         let host = in_host(p);
-        let Ok(md) = antitamper_bpf::kernel_roots::symlink_metadata(&host) else {
+        // lot 359: `/` by the root PID 1's link names (MG_LOCK_ABOVE among
+        // its kinds: `mount --make-rshared /` reaches the lock)
+        let Ok(md) = point_metadata("/proc/1/root", p) else {
             continue;
         };
         if let Some((_, magics)) = VIEWS.iter().find(|(v, _)| v == p) {
@@ -628,11 +664,20 @@ pub(crate) fn held_in(
 fn dir_key_in(prefix: &str, dir: &Path) -> Option<(u64, u64)> {
     let mut at = std::ffi::OsString::from(prefix);
     at.push(dir.as_os_str());
+    // lot 359 (its mini-hunt): the root of a `/proc/<pid>/root` prefix is the
+    // magic link itself — followed, or `O_NOFOLLOW` opened the link (no
+    // directory) and every place under `/` (`/sys`, `/proc`, `/run`…) of
+    // PID 1's and the watchdog's namespaces went unregistered
+    let nofollow = if follows_root(prefix, dir) {
+        0
+    } else {
+        libc::O_NOFOLLOW
+    };
     // lot 357's item 5: through `/proc/<pid>/root`, beneath the `/proc` root
     // the start anchored
     let file = antitamper_bpf::kernel_roots::open(
         Path::new(&at),
-        libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        libc::O_PATH | nofollow | libc::O_DIRECTORY | libc::O_CLOEXEC,
     )
     .ok()?;
     let st = file.metadata().ok()?;
@@ -1240,6 +1285,22 @@ impl RegroupWatch {
     }
 }
 
+/// Lot 359 (the re-check 3 of #567, N4): the regroup watch woken — the
+/// count it follows (`MOUNT_GUARD_CONF`'s [`CONF_REGROUP`]) moved by one, by
+/// the map's pin — so that every guarded namespace's held mounts are read
+/// again within a second ([`refresh_now`], under the watch's one refresh
+/// handle): the pin directory's lock, made again by the integrity round, is
+/// held by its new id.
+pub fn wake_refresh(bpffs_root: &Path) -> Result<()> {
+    use aya::maps::Map;
+    let path = bpffs_root.join(CONF_MAP);
+    let data = MapData::from_pin(&path).with_context(|| format!("opening pinned {CONF_MAP}"))?;
+    let mut conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(data))?;
+    let n = conf.get(&CONF_REGROUP, 0)?;
+    conf.set(CONF_REGROUP, n.wrapping_add(1), 0)?;
+    Ok(())
+}
+
 /// The re-check of #567 (N1): every guarded namespace's held mounts and
 /// peer groups read again now — PID 1's and the agent's ([`refresh`]), and
 /// the watchdog's, the holder of its role ([`guard_watchdog`]; its errors
@@ -1403,6 +1464,72 @@ mod tests {
         // no point twice
         let mut seen = HashSet::new();
         assert!(pts.iter().all(|(p, _)| seen.insert(p.clone())));
+    }
+
+    /// Named test (lot 359, its mini-hunt): the root of a namespace, read
+    /// through `/proc/<pid>/root`, is the directory the link names — read
+    /// without following (`/proc/1/root/`: the trailing `/` is no
+    /// component), it was the link itself, and `/` was never a point (its
+    /// `MG_LOCK_ABOVE`: `mount --make-rshared /` let through in the lab),
+    /// nor any place under it held.
+    #[test]
+    fn the_root_through_proc_pid_root_is_the_namespace_root() {
+        let me = "/proc/self/root";
+        let root = std::fs::metadata("/").unwrap();
+        let md = point_metadata(me, "/").unwrap();
+        assert!(md.is_dir());
+        assert_eq!((md.dev(), md.ino()), (root.dev(), root.ino()));
+        // what was read before: the link
+        let link = antitamper_bpf::kernel_roots::symlink_metadata(format!("{me}/")).unwrap();
+        assert!(
+            link.file_type().is_symlink(),
+            "the trailing / is no component"
+        );
+        // another point keeps its own kind (a link stays a link)
+        let etc = std::fs::symlink_metadata("/etc").unwrap();
+        let p = point_metadata(me, "/etc").unwrap();
+        assert_eq!((p.dev(), p.ino()), (etc.dev(), etc.ino()));
+        // a place under `/`: its directory's key is the root's
+        assert_eq!(
+            dir_key_in(me, Path::new("/")),
+            Some((stat_dev_to_kernel_dev(root.dev()), root.ino()))
+        );
+        assert_eq!(
+            dir_key_in("", Path::new("/")),
+            Some((stat_dev_to_kernel_dev(root.dev()), root.ino()))
+        );
+        assert!(!follows_root("", Path::new("/")));
+        assert!(!follows_root(me, Path::new("/etc")));
+    }
+
+    /// Named test (lot 359): the pin directory is its lock's root and place
+    /// (`MG_LOCK`), every directory above it is where a recursive shared
+    /// change reaches the lock (`MG_LOCK_ABOVE`) — and nothing else is
+    /// either; without a pin root, no point is.
+    #[test]
+    fn the_pin_directory_is_the_locks_point_and_its_ancestors_above_it() {
+        let pts = protected_points(Some(Path::new("/sys/fs/bpf/northnarrow")), &|_| true);
+        assert_ne!(flags(&pts, "/sys/fs/bpf/northnarrow") & MG_LOCK, 0);
+        assert_eq!(flags(&pts, "/sys/fs/bpf/northnarrow") & MG_LOCK_ABOVE, 0);
+        for a in ["/", "/sys", "/sys/fs", "/sys/fs/bpf"] {
+            assert_ne!(flags(&pts, a) & MG_LOCK_ABOVE, 0, "{a}");
+            assert_eq!(flags(&pts, a) & MG_LOCK, 0, "{a}");
+        }
+        for (p, f) in &pts {
+            if ![
+                "/",
+                "/sys",
+                "/sys/fs",
+                "/sys/fs/bpf",
+                "/sys/fs/bpf/northnarrow",
+            ]
+            .contains(&p.as_str())
+            {
+                assert_eq!(f & (MG_LOCK | MG_LOCK_ABOVE), 0, "{p}");
+            }
+        }
+        let none = protected_points(None, &|_| true);
+        assert!(none.iter().all(|(_, f)| f & (MG_LOCK | MG_LOCK_ABOVE) == 0));
     }
 
     #[test]

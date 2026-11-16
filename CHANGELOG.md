@@ -6,6 +6,65 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 359 (pre-alpha, the re-check 3 of #567): the **pin directory's
+  lock** (`UPGRADE_NOTES_WAVE4.md` §52). The unmount hook runs before the
+  kernel's namespace lock, so a racing rbind, or a subtree wider or deeper
+  than the guard's walk, could still let a lazy unmount take the host's
+  bpffs and the pins (N4). `/sys/fs/bpf/northnarrow` is now bound onto
+  itself, private and unbindable, as the child of the host's bpffs, by a
+  new step of the agent's unit (`ExecStartPre=-+… --pin-lock`, which
+  enters PID 1's mount namespace, before any pin): the kernel never takes, in an unmount's
+  propagation, a mount that keeps a child not itself unmounted, and an
+  rbind never copies an unbindable mount. Reused at a restart, made again
+  at a cold boot.
+  - **Guard:** only its maker's two steps pass, in PID 1's namespace (the
+    agent's binary as a unit's process; the self-bind judged by the
+    kernel's objects, then `MS_UNBINDABLE` on the host's lock); any other
+    unmount, move, mount or change of propagation of it, a copy of it that
+    reaches the host, or a recursive `MS_SHARED` or `MS_PRIVATE` above it
+    in PID 1's namespace (`systemd-shutdown`'s `switch_root()` excepted) is
+    refused, signed High (`MG_WHY_LOCK`, operation `MG_OP_PROPAGATE`). The
+    review of #569 (F1): the maker's `MS_PRIVATE` step, and a recursive
+    `MS_PRIVATE` above the lock, left it bindable without a refusal — the
+    step is gone, the change refused. Its re-check (N1): a recursive
+    `MS_SHARED` above the lock was refused in any namespace that reaches
+    the host's, so a container whose runtime makes its fresh namespace's
+    `/` recursively shared (containerd's and CRI-O's `rootfsPropagation:
+    rshared` for any Kubernetes `Bidirectional` mount: Cilium, the CSI node
+    plugins) failed to start, and so did `unshare -m --propagation shared`;
+    judged in PID 1's namespace only now — container runtimes and
+    `Bidirectional` mounts work.
+  - **Watch:** a start without it signs a degradation (the walk remains;
+    in the agent's unit the round then makes it); each integrity round
+    signs `pin_lock_missing` / `pin_lock_changed` (High) and makes it again
+    (a transient unit, up to three attempts within 30 s, then a back-off
+    over the rounds), its result in the record.
+  - **Closes** the rbind variants for the pins (a racing rbind graft, an
+    rbind copy beyond the walk's bound). **Does not close**, each signed at
+    the next integrity round: the lock's flags cleared through
+    `mount_setattr(2)` (no LSM hook); a raw namespace's own copy of the
+    lock, its move judged by its target only and its own recursive change
+    of propagation not judged; the units' namespaces, which
+    never have the lock (KNOWN_LIMITATIONS.md). Scheduled first after the
+    alpha.
+  - **Fixed on the way (the fix round's lab, 5.15):** the peer-group walk
+    (`common::mount_guard::spread`) carried an `Option` across its loop;
+    the BPF back end loaded its never-written `None` payload before the
+    tag, and 5.15's verifier refused `sb_mount`. A value and a flag now
+    (ratchet `the_mount_walks_carry_no_option_across_a_loop`).
+  - **Scripts:** `install.sh` and `uninstall.sh` unmount it before they
+    remove the pin root (`rm_pin_root`, inside the window).
+  - `/sys/fs/cgroup` stays behind the walk (KNOWN_LIMITATIONS.md).
+  - **Fixed on the way (the lab):** the host's `/` was registered by the
+    key of its `/proc/1/root` link, not of PID 1's root (`/proc/1/root/`
+    read without following): `/` was no point of the mount guard and no
+    place under it was held; both are read through the link now.
+- Lot 359: the re-check 3's P3s — journald's quiet reads need its lot
+  277/281 marks clean; the refused-read dedup carries the caller's cgroup;
+  a record the budget drops is not marked seen; the executor's identities
+  are written before the fork record attaches; the watchdog's failed
+  handles on the pinned maps are a signed degradation
+  (`watchdog_pin_handle_failed`).
 - Lot 357 (pre-alpha): the **mount guard** — a mount on, over or below the
   paths the agent depends on is refused in PID 1's mount namespace
   (`agent-ebpf/src/mount_guard.rs`, the decision in

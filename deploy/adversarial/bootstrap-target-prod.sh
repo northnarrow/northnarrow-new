@@ -214,6 +214,8 @@ if [ "$units_present" = 1 ] || [ -d /sys/fs/bpf/northnarrow ]; then
         ! unit_has_procs "$u" || die "$u still runs after SIGTERM and SIGKILL — is the window open?"
         systemctl reset-failed "$u" 2>/dev/null || true
     done
+    # lot 359: the pin root's lock unmounted first (a mount point is never removed)
+    umount /sys/fs/bpf/northnarrow 2>/dev/null || umount -l /sys/fs/bpf/northnarrow 2>/dev/null || true
     rm -rf /sys/fs/bpf/northnarrow 2>/dev/null || true
     [ ! -d /sys/fs/bpf/northnarrow ] \
         || die "/sys/fs/bpf/northnarrow is still protected (no window: the agent was not running) — reboot the target (bpffs does not survive it) and re-run"

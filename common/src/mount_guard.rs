@@ -78,6 +78,16 @@ pub const MS_MOVE: u64 = 8192;
 /// `MS_UNBINDABLE`, `MS_PRIVATE`, `MS_SLAVE`, `MS_SHARED`: a change of
 /// propagation.
 pub const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+/// `MS_REC`: the change made to the whole subtree of the mount.
+pub const MS_REC: u64 = 1 << 14;
+/// `MS_UNBINDABLE`.
+pub const MS_UNBINDABLE: u64 = 1 << 17;
+/// `MS_PRIVATE`.
+pub const MS_PRIVATE: u64 = 1 << 18;
+/// `MS_SLAVE`.
+pub const MS_SLAVE: u64 = 1 << 19;
+/// `MS_SHARED`.
+pub const MS_SHARED: u64 = 1 << 20;
 
 /// Superblock magics (`include/uapi/linux/magic.h`).
 pub const PROC_SUPER_MAGIC: u32 = 0x9fa0;
@@ -114,6 +124,16 @@ pub const MG_HOLD: u8 = 8;
 /// The device is the super block's own (`super_block.s_dev`, field 3 of
 /// `mountinfo`), never a btrfs subvolume's.
 pub const MG_SB: u8 = 16;
+/// Lot 359 (the re-check 3 of #567, N4): the agent's pin directory — the
+/// root and the place of its lock ([`lock_bind`]): a self-bind of the
+/// directory, private and unbindable, as the bpffs's child in PID 1's
+/// namespace.
+pub const MG_LOCK: u8 = 32;
+/// Lot 359: a directory above the pin directory (`/`, `/sys`, `/sys/fs`,
+/// `/sys/fs/bpf`): a recursive `MS_SHARED` made on a mount rooted there,
+/// or a recursive `MS_PRIVATE` in PID 1's namespace (the review of #569),
+/// reaches the lock ([`lock_touched`]).
+pub const MG_LOCK_ABOVE: u8 = 64;
 
 // ── The mounts held, by their id (the `MOUNT_HELD` map, F1) ──────────────
 
@@ -234,28 +254,39 @@ pub trait Mounts {
 #[inline(always)]
 pub fn spread<G: Mounts>(g: &G, m: G::M) -> Spread {
     let mut peer = m;
-    let mut slave: Option<G::M> = None;
+    // the slave walked, valid while `in_slaves` — never an `Option` carried
+    // across the loop: its `None` leaves the payload unwritten, and the BPF
+    // back end may load it before it tests the tag (the review of #569's
+    // fix round: 5.15's verifier refused `sb_mount`, "invalid read from
+    // stack", the uninitialized payload of `None`)
+    let mut slave = m;
+    let mut in_slaves = false;
     let mut i = 0;
     while i < SPREAD_MAX {
-        let at = match slave {
-            Some(s) => s,
-            None => peer,
-        };
+        let at = if in_slaves { slave } else { peer };
         if g.guard(at) != 0 {
             return Spread::Guarded;
         }
-        if slave.is_some() && (g.group(at) != 0 || g.first_slave(at).is_some()) {
+        if in_slaves && (g.group(at) != 0 || g.first_slave(at).is_some()) {
             return Spread::Unread;
         }
-        slave = match slave {
-            None => g.first_slave(peer),
-            Some(s) => g.next_slave(peer, s),
+        let next = if in_slaves {
+            g.next_slave(peer, slave)
+        } else {
+            g.first_slave(peer)
         };
-        if slave.is_none() {
-            match g.next_peer(peer) {
-                None => return Spread::Unread,
-                Some(n) if n == m => return Spread::Nowhere,
-                Some(n) => peer = n,
+        match next {
+            Some(s) => {
+                slave = s;
+                in_slaves = true;
+            }
+            None => {
+                in_slaves = false;
+                match g.next_peer(peer) {
+                    None => return Spread::Unread,
+                    Some(n) if n == m => return Spread::Nowhere,
+                    Some(n) => peer = n,
+                }
             }
         }
         i += 1;
@@ -558,6 +589,10 @@ pub const MG_OP_PIVOT: u8 = 6;
 pub const MG_OP_REMOUNT: u8 = 7;
 /// `mount(2)` with `MS_REMOUNT | MS_BIND`: one mount's flags changed.
 pub const MG_OP_REMOUNT_BIND: u8 = 8;
+/// Lot 359: a change of propagation that reaches the pin directory's lock
+/// ([`lock_touched`]) — every other change of propagation is
+/// [`MG_OP_PASS`].
+pub const MG_OP_PROPAGATE: u8 = 9;
 
 /// `MS_RDONLY`, `MS_NOEXEC`: the flags of a bind remount that make a held
 /// mount refuse the agent's writes, or its binaries' exec at a restart.
@@ -639,6 +674,9 @@ pub const MG_WHY_REMOUNT_RESTRICT: u8 = 9;
 /// An unmount of the tracefs, debugfs or securityfs the agent reads (let
 /// through, recorded).
 pub const MG_WHY_UMOUNT_NOTED: u8 = 10;
+/// Lot 359: the pin directory's lock changed — its propagation, or a mount
+/// of it that is not its maker's own step.
+pub const MG_WHY_LOCK: u8 = 11;
 
 /// A dentry name or a file-system type as the hook compares it: its length
 /// and a 64-bit FNV-1a hash of its first 15 bytes, zero-padded to 16 (the
@@ -992,6 +1030,172 @@ pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool, src_root: bool
     None
 }
 
+// ── The pin directory's lock (lot 359, the re-check 3 of #567, N4) ──────
+
+/// The re-check 3 of #567 (N4): `sb_umount` runs before the kernel takes
+/// the namespace lock, so the subtree [`umount_below`] reads can grow
+/// before `umount_tree()` collects it (an rbind grafted meanwhile) — and
+/// [`umount_below`] reads only its bound. The kernel's own rule closes the
+/// rbind variants of both for the pins: `propagate_umount()` never takes a
+/// mount that keeps a child that is not itself unmounted. The agent's pin
+/// directory is bound onto itself, private and unbindable, as the child of
+/// the host's bpffs (an rbind never copies an unbindable mount): the
+/// host's bpffs keeps that child, whatever an rbind copy's unmount takes.
+/// Not closed (the review of #569, signed at the next integrity round):
+/// its flags cleared by `mount_setattr(2)` (no LSM hook), a raw
+/// namespace's own copy of it moved (judged by its target only), the
+/// units' namespaces (never a copy of it).
+///
+/// The lock passes the guard only as its maker's own two steps
+/// ([`lock_maker`]: the agent's binary as a unit's process), both in PID
+/// 1's namespace: the self-bind ([`lock_bind`], `open_tree(OPEN_TREE_CLONE)`
+/// then `move_mount(2)`, the kernel's objects compared, never a path), then
+/// `MS_UNBINDABLE` on it ([`lock_step_at`]), which alone makes the fresh,
+/// shared self-bind private and unbindable. Whatever else is done to it — an
+/// unmount or a move (it is a held mount), a mount on or below it (the pin
+/// directory is the agent's own), any other change of its propagation, or a
+/// recursive change above it that would make it bindable — is refused
+/// ([`MG_WHY_LOCK`]). A caller who forged the identity gains nothing: each
+/// of the two steps only makes the lock (the review of #569, F1c: a third,
+/// `MS_PRIVATE`, made a lock in place bindable again, and a raw namespace's
+/// copy of it too — gone).
+///
+/// A change of propagation touches the lock: one made on the lock itself,
+/// or on a copy of it in another namespace (`on_lock`: a mount whose root
+/// and mount point are both the pin directory — any change, `MS_SLAVE` and
+/// `MS_UNBINDABLE` included, is judged), or a recursive one on a mount
+/// rooted above it (`above_lock`, [`MG_LOCK_ABOVE`]) that clears its
+/// `MNT_UNBINDABLE` (the kernel's `change_mnt_propagation()`), made in PID
+/// 1's namespace (`guard`, [`GUARD_HOST`]): a recursive `MS_SHARED` (it
+/// would make the lock shared, and an rbind copies a shared mount) or a
+/// recursive `MS_PRIVATE` (the review of #569, F1a — private but bindable,
+/// the host's lock is copied by the next rbind). In another namespace
+/// either changes that namespace's own copies only (the re-check of #569,
+/// N1: runc's `rootfsPropagation: rshared`, which containerd and CRI-O set
+/// for any Kubernetes `Bidirectional` mount, and `unshare -m
+/// --propagation shared` make `/` recursively shared in a fresh namespace
+/// whose `/` is still a peer of PID 1's; container runtimes, `unshare -m`
+/// and systemd's unit namespaces make it recursively private): its copy of
+/// the lock is the raw namespace's residual, behind the walk and signed at
+/// the integrity round. A recursive `MS_SLAVE` or `MS_UNBINDABLE` keeps the
+/// flag; a change that is not recursive leaves the lock as it is: not
+/// judged.
+pub const fn lock_touched(flags: u64, on_lock: bool, above_lock: bool, guard: u8) -> bool {
+    (on_lock && flags & MS_PROPAGATION != 0)
+        || (above_lock
+            && flags & MS_REC != 0
+            && guard == GUARD_HOST
+            && flags & (MS_SHARED | MS_PRIVATE) != 0)
+}
+
+/// The lock's own change of propagation: exactly `MS_UNBINDABLE` — no
+/// `MS_REC`, no other flag. `MS_PRIVATE` is not one (the review of #569,
+/// F1c: it clears `MNT_UNBINDABLE`).
+pub const fn lock_step(flags: u64) -> bool {
+    flags == MS_UNBINDABLE
+}
+
+/// The maker's step as the hook reads it: [`lock_step`] on the lock itself
+/// in PID 1's namespace (`guard` of the lock's parent: [`GUARD_HOST`]) —
+/// never on a raw namespace's copy of it (the review of #569, F1c). Asked
+/// of [`lock_maker`] only then.
+pub const fn lock_step_at(flags: u64, on_lock: bool, guard: u8) -> bool {
+    on_lock && guard == GUARD_HOST && lock_step(flags)
+}
+
+/// `systemd-shutdown`'s switch to `/run/initramfs` (dracut's shutdown
+/// image): `switch_root()` makes `/` recursively private before its move —
+/// the one recursive `MS_PRIVATE` above the lock let through in PID 1's
+/// namespace, asked of the shutdown's identity only then (the same
+/// exemption as its pivot and move, the review of #567, F4).
+pub const fn lock_shutdown_step(flags: u64, on_lock: bool) -> bool {
+    !on_lock && flags & MS_REC != 0 && flags & MS_PRIVATE != 0 && flags & MS_SHARED == 0
+}
+
+/// How long after its start a process may still be the lock's maker: the
+/// step runs in well under a second.
+pub const LOCK_MAKER_NS: u64 = 10_000_000_000;
+
+/// The lock's maker: the agent's binary (`OWN_EXE_INODES`' agent role, by
+/// the kernel's `mm->exe_file`) run as a unit's process — the main thread,
+/// a child of PID 1, in its first seconds ([`LOCK_MAKER_NS`]: `age_ns`
+/// since its start) — whose lot 277/281 marks are clean (not moved into
+/// its cgroup, no code-injection access given to another:
+/// [`crate::cgroup_join::clean`]). The agent's unit makes it from an
+/// `ExecStartPre=+` step; its integrity round, through a transient unit.
+pub const fn lock_maker(
+    main_thread: bool,
+    parent_tgid: u32,
+    agent_image: bool,
+    age_ns: u64,
+    marks_clean: bool,
+) -> bool {
+    main_thread && parent_tgid == 1 && agent_image && age_ns < LOCK_MAKER_NS && marks_clean
+}
+
+/// The verdict of a change of propagation that reaches the lock
+/// ([`MG_OP_PROPAGATE`], [`lock_touched`]): let through for an
+/// unprivileged caller (the kernel's own `EPERM`), in a namespace that
+/// reaches no guarded one, and for an exempt step (`exempt`: its maker's
+/// own step on it, [`lock_maker`] and [`lock_step_at`]; or
+/// `systemd-shutdown`'s, [`lock_shutdown_step`]); else refused
+/// ([`MG_WHY_LOCK`]), or let through and recorded inside the window. One
+/// small function the hook calls without a [`Query`] (5.15's 512 bytes of
+/// a call chain), and [`decide`]'s own.
+pub const fn lock_verdict(
+    privileged: bool,
+    host: bool,
+    reaches: bool,
+    exempt: bool,
+    window: bool,
+) -> Verdict {
+    if !privileged || !(host || reaches) || exempt {
+        Verdict::Allow
+    } else if window {
+        Verdict::Window(MG_WHY_LOCK)
+    } else {
+        Verdict::Refuse(MG_WHY_LOCK)
+    }
+}
+
+/// What the hook reads of a `move_mount(2)` that may be the lock's
+/// self-bind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BindShape {
+    /// The source is a detached mount: the root of its own anonymous
+    /// namespace (`open_tree(OPEN_TREE_CLONE)`), its parent itself.
+    pub detached: bool,
+    /// The source path is its mount's root.
+    pub at_root: bool,
+    /// The source's root is the target's dentry (one dentry, one super
+    /// block: the pin directory bound onto itself).
+    pub onto_itself: bool,
+    /// The source has no mount below it (no `AT_RECURSIVE`).
+    pub childless: bool,
+    /// The target is the pin directory ([`MG_LOCK`]).
+    pub target_lock: bool,
+    /// Mounts covered at the target ([`Point::stack`]): 0 — the lock is
+    /// made once, never stacked.
+    pub stack: u8,
+    /// The target's file system ([`Point::magic`]): the bpffs.
+    pub magic: u32,
+    /// The target's guarded namespace: PID 1's.
+    pub guard: u8,
+}
+
+/// The lock's self-bind: the pin directory, detached and childless, bound
+/// onto itself on the bpffs in PID 1's namespace, nothing below.
+pub const fn lock_bind(s: &BindShape) -> bool {
+    s.detached
+        && s.at_root
+        && s.onto_itself
+        && s.childless
+        && s.target_lock
+        && s.stack == 0
+        && s.magic == BPF_FS_MAGIC
+        && s.guard == GUARD_HOST
+}
+
 /// Everything [`decide`] weighs, read by the hook.
 #[derive(Clone, Copy, Debug)]
 pub struct Query {
@@ -1046,6 +1250,13 @@ pub struct Query {
     /// A bind remount asks for read-only or `noexec`; a super block's
     /// reconfigure makes it read-only, or its new flags could not be read.
     pub restrict: bool,
+    /// Lot 359: the caller is the pin directory's lock's maker
+    /// ([`lock_maker`]).
+    pub lock_maker: bool,
+    /// Lot 359: the operation is one of the lock's own steps — a
+    /// `move_mount(2)` of its self-bind ([`lock_bind`]), or, on the lock in
+    /// PID 1's namespace, a change of propagation [`lock_step_at`] names.
+    pub lock_step: bool,
 }
 
 /// What the hook does.
@@ -1074,6 +1285,16 @@ pub enum Verdict {
 /// by where it lands. A super block's reconfigure is judged in every
 /// namespace: the super block is the same one.
 pub fn decide(q: &Query) -> Verdict {
+    // lot 359: a change of propagation that reaches the lock
+    if q.op == MG_OP_PROPAGATE {
+        return lock_verdict(
+            q.privileged,
+            q.host,
+            q.reaches,
+            q.lock_maker && q.lock_step,
+            q.window,
+        );
+    }
     if !q.privileged {
         return Verdict::Allow;
     }
@@ -1115,6 +1336,9 @@ pub fn decide(q: &Query) -> Verdict {
                     Some(MG_WHY_MOVE_AWAY)
                 }
             }
+            // lot 359: the lock's self-bind, by its maker, in PID 1's
+            // namespace (a mount on the pin directory otherwise)
+            MG_OP_MOVE_MOUNT if q.host && q.lock_maker && q.lock_step => None,
             MG_OP_MOVE_MOUNT | MG_OP_MOUNT => {
                 point_refusal(&q.point, &q.fstype, q.host, q.src_root)
             }
@@ -1223,6 +1447,7 @@ pub const fn op_name(op: u8) -> &'static str {
         MG_OP_PIVOT => "pivot_root(2)",
         MG_OP_REMOUNT => "remount of a super block (mount(2) MS_REMOUNT, or fsconfig(2) FSCONFIG_CMD_RECONFIGURE)",
         MG_OP_REMOUNT_BIND => "mount(2) -o remount,bind",
+        MG_OP_PROPAGATE => "a change of propagation (mount(2) MS_SHARED, MS_PRIVATE, MS_SLAVE or MS_UNBINDABLE)",
         _ => "mount operation",
     }
 }
@@ -1240,6 +1465,7 @@ pub const fn why_name(why: u8) -> &'static str {
         MG_WHY_REMOUNT_SB => "the super block of a kernel view or of a file system the agent's paths are on, reconfigured (proc's subset=pid or hidepid hide what the agent reads; a read-only state file system refuses its writes)",
         MG_WHY_REMOUNT_RESTRICT => "a mount that holds the agent's paths made read-only or noexec",
         MG_WHY_UMOUNT_NOTED => "an unmount of a kernel file system the agent reads (the tracefs, debugfs or securityfs), let through and recorded",
+        MG_WHY_LOCK => "the lock of the agent's pin directory (its self-bind, private and unbindable, under the host's bpffs) changed: only its maker's own steps pass",
         _ => "a mount refused",
     }
 }
@@ -1282,6 +1508,8 @@ mod tests {
             kernel: false,
             src_root: true,
             restrict: false,
+            lock_maker: false,
+            lock_step: false,
         }
     }
 
@@ -2923,5 +3151,468 @@ mod tests {
         let blind = inode_key(s_dev, BTRFS_SUPER_MAGIC, 256, 0);
         assert_eq!(blind, (s_dev as u64, 256));
         assert!(!points.contains(&blind));
+    }
+
+    // ── Lot 359: the pin directory's lock (the re-check 3 of #567, N4) ──
+
+    /// The pin directory as the hook reads it as a `move_mount(2)` target:
+    /// the agent's own directory, held, the lock's place, on the bpffs.
+    fn pin_dir() -> Point {
+        Point {
+            flags: MG_OWN | MG_HOLD | MG_LOCK,
+            magic: BPF_FS_MAGIC,
+            depth: 1,
+            ..Point::EMPTY
+        }
+    }
+
+    fn the_bind() -> BindShape {
+        BindShape {
+            detached: true,
+            at_root: true,
+            onto_itself: true,
+            childless: true,
+            target_lock: true,
+            stack: 0,
+            magic: BPF_FS_MAGIC,
+            guard: GUARD_HOST,
+        }
+    }
+
+    /// Named test (lot 359): the agent's own self-bind of its pin directory
+    /// passes the guard — by its maker, as its own step, in PID 1's
+    /// namespace — and the same bind by anyone else, or of another shape,
+    /// is the mount on the pin directory it always was (refused).
+    #[test]
+    fn the_agents_own_self_bind_of_its_pin_directory_passes_and_nothing_else_does() {
+        let bind = Query {
+            lock_maker: true,
+            lock_step: lock_bind(&the_bind()),
+            ..host(MG_OP_MOVE_MOUNT, pin_dir(), "bpf")
+        };
+        assert!(bind.lock_step);
+        assert_eq!(decide(&bind), Verdict::Allow);
+        // not its maker (a root shell's open_tree + move_mount)
+        let other = Query {
+            lock_maker: false,
+            ..bind
+        };
+        assert_eq!(decide(&other), Verdict::Refuse(MG_WHY_ON));
+        // its maker, but not the lock's shape
+        let shape = Query {
+            lock_step: false,
+            ..bind
+        };
+        assert_eq!(decide(&shape), Verdict::Refuse(MG_WHY_ON));
+        // made in another namespace that reaches PID 1's: refused
+        let elsewhere = Query {
+            host: false,
+            reaches: true,
+            ..bind
+        };
+        assert_eq!(decide(&elsewhere), Verdict::Refuse(MG_WHY_ON));
+        // a new mount (fsmount) or an old-API bind there by its maker: refused
+        for op in [MG_OP_MOUNT, MG_OP_BIND] {
+            let q = Query { op, ..bind };
+            assert_eq!(decide(&q), Verdict::Refuse(MG_WHY_ON), "op {op}");
+        }
+        // inside a window, the bind of another: let through, recorded
+        let window = Query {
+            window: true,
+            ..other
+        };
+        assert_eq!(decide(&window), Verdict::Window(MG_WHY_ON));
+    }
+
+    /// Named test (lot 359): the self-bind's shape, each part needed — a
+    /// clone of something else, a recursive clone, a bind stacked over the
+    /// lock, a target that is not the pin directory, another file system,
+    /// another namespace than PID 1's.
+    #[test]
+    fn the_lock_bind_needs_every_part_of_its_shape() {
+        assert!(lock_bind(&the_bind()));
+        let off = [
+            BindShape {
+                detached: false,
+                ..the_bind()
+            },
+            BindShape {
+                at_root: false,
+                ..the_bind()
+            },
+            BindShape {
+                onto_itself: false,
+                ..the_bind()
+            },
+            BindShape {
+                childless: false,
+                ..the_bind()
+            },
+            BindShape {
+                target_lock: false,
+                ..the_bind()
+            },
+            BindShape {
+                stack: 1,
+                ..the_bind()
+            },
+            BindShape {
+                magic: TMPFS_MAGIC,
+                ..the_bind()
+            },
+            BindShape {
+                guard: GUARD_AGENT,
+                ..the_bind()
+            },
+            BindShape {
+                guard: 0,
+                ..the_bind()
+            },
+        ];
+        for (i, s) in off.iter().enumerate() {
+            assert!(!lock_bind(s), "part {i}: {s:?}");
+        }
+    }
+
+    /// Named test (lot 359): the lock's maker is the agent's binary as a
+    /// unit's fresh main process with clean marks — each part needed.
+    #[test]
+    fn the_locks_maker_needs_each_part_of_its_identity() {
+        assert!(lock_maker(true, 1, true, 0, true));
+        assert!(lock_maker(true, 1, true, LOCK_MAKER_NS - 1, true));
+        assert!(!lock_maker(false, 1, true, 0, true), "a thread");
+        assert!(
+            !lock_maker(true, 812, true, 0, true),
+            "a root shell's child"
+        );
+        assert!(!lock_maker(true, 0, true, 0, true), "no parent read");
+        assert!(!lock_maker(true, 1, false, 0, true), "another binary");
+        assert!(!lock_maker(true, 1, true, LOCK_MAKER_NS, true), "not fresh");
+        assert!(!lock_maker(true, 1, true, 0, false), "moved or injected");
+    }
+
+    /// Named test (lot 359): which changes of propagation reach the lock —
+    /// any on it (or on a copy of it), a recursive shared one above it in
+    /// PID 1's namespace; a recursive shared, private or slave one above it
+    /// in another namespace (a container's, `unshare -m`'s, a unit's) is
+    /// not judged (the re-check of #569, N1: the input of this loop's
+    /// shared case is now PID 1's namespace, the other namespaces below).
+    #[test]
+    fn a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above() {
+        for guard in [GUARD_HOST, GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            for f in [
+                MS_SHARED,
+                MS_PRIVATE,
+                MS_SLAVE,
+                MS_UNBINDABLE,
+                MS_PRIVATE | MS_REC,
+                MS_SHARED | MS_REC,
+            ] {
+                assert!(lock_touched(f, true, false, guard), "on the lock: {f:#x}");
+            }
+            assert!(!lock_touched(MS_SHARED | MS_REC, false, false, guard));
+            assert!(!lock_touched(0, true, true, guard), "no propagation flag");
+        }
+        assert!(lock_touched(MS_SHARED | MS_REC, false, true, GUARD_HOST));
+        for guard in [GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            for f in [
+                MS_SHARED,
+                MS_SHARED | MS_REC,
+                MS_PRIVATE | MS_REC,
+                MS_SLAVE | MS_REC,
+                MS_UNBINDABLE | MS_REC,
+                MS_PRIVATE,
+            ] {
+                assert!(!lock_touched(f, false, true, guard), "above: {f:#x}");
+            }
+        }
+        // the lock's own step: exactly MS_UNBINDABLE (the review of #569, F1c)
+        assert!(lock_step(MS_UNBINDABLE));
+        for f in [
+            MS_SHARED,
+            MS_SLAVE,
+            MS_PRIVATE,
+            MS_PRIVATE | MS_REC,
+            MS_UNBINDABLE | MS_REC,
+            MS_PRIVATE | MS_UNBINDABLE,
+            0,
+        ] {
+            assert!(!lock_step(f), "{f:#x}");
+        }
+    }
+
+    /// Named test (the review of #569, F1a): in PID 1's namespace a
+    /// recursive `MS_PRIVATE` above the lock (`mount --make-rprivate` of
+    /// `/sys/fs/bpf`, `/sys` or `/`) reaches it — it clears the lock's
+    /// `MNT_UNBINDABLE`, and the next rbind copies it — and is refused and
+    /// signed; a recursive `MS_SLAVE` or `MS_UNBINDABLE` there keeps the
+    /// flag, and a change that is not recursive leaves the lock as it is.
+    #[test]
+    fn a_recursive_private_change_above_the_lock_in_pid_1s_namespace_is_refused() {
+        // `MS_SILENT` (`include/uapi/linux/mount.h`): `mount(8)`'s own
+        const MS_SILENT: u64 = 1 << 15;
+        assert!(lock_touched(MS_PRIVATE | MS_REC, false, true, GUARD_HOST));
+        assert!(lock_touched(
+            MS_PRIVATE | MS_REC | MS_SILENT,
+            false,
+            true,
+            GUARD_HOST
+        ));
+        for f in [
+            MS_SLAVE | MS_REC,
+            MS_UNBINDABLE | MS_REC,
+            MS_PRIVATE,
+            MS_SHARED,
+            MS_SLAVE,
+            0,
+        ] {
+            assert!(!lock_touched(f, false, true, GUARD_HOST), "above: {f:#x}");
+        }
+        // not above it (another mount's root): never
+        assert!(!lock_touched(MS_PRIVATE | MS_REC, false, false, GUARD_HOST));
+        // judged as any change that reaches the lock: refused, signed
+        let rprivate = Query {
+            lock_maker: false,
+            lock_step: false,
+            ..host(MG_OP_PROPAGATE, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&rprivate), Verdict::Refuse(MG_WHY_LOCK));
+        // the maker's identity is no exemption above it: its step is on the
+        // lock only
+        assert!(!lock_step_at(MS_PRIVATE | MS_REC, false, GUARD_HOST));
+        assert!(!lock_step_at(MS_UNBINDABLE, false, GUARD_HOST));
+        // systemd-shutdown's switch_root (`MS_REC | MS_PRIVATE` on `/`): the
+        // one exempt shape, asked of the shutdown's identity
+        assert!(lock_shutdown_step(MS_PRIVATE | MS_REC, false));
+        for (f, on) in [
+            (MS_PRIVATE | MS_REC, true),
+            (MS_SHARED | MS_REC, false),
+            (MS_PRIVATE | MS_SHARED | MS_REC, false),
+            (MS_PRIVATE, false),
+            (MS_UNBINDABLE | MS_REC, false),
+        ] {
+            assert!(!lock_shutdown_step(f, on), "{f:#x} on the lock {on}");
+        }
+        assert_eq!(
+            lock_verdict(
+                true,
+                true,
+                false,
+                lock_shutdown_step(MS_PRIVATE | MS_REC, false),
+                false
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            lock_verdict(true, true, false, false, false),
+            Verdict::Refuse(MG_WHY_LOCK)
+        );
+    }
+
+    /// Named test (the re-check of #569, N1): runc's `prepareRoot()` with
+    /// `rootfsPropagation: rshared` — what containerd and CRI-O set for any
+    /// Kubernetes `mountPropagation: Bidirectional` mount (Cilium's bpffs,
+    /// the CSI node plugins), and `unshare -m --propagation shared` —
+    /// makes `/` recursively shared in the container's fresh namespace,
+    /// whose `/` is still a peer of PID 1's: it changes that namespace's
+    /// own copies (its copy of the lock among them, a residual behind the
+    /// walk, signed at the round) and is let through; the same change
+    /// made where the mount is PID 1's own stays refused and signed.
+    #[test]
+    fn a_recursive_shared_change_above_the_lock_is_judged_in_pid_1s_namespace_only() {
+        let flags = MS_SHARED | MS_REC;
+        // 0: PID 1's `/` (guarded), 1: the container's copy, a peer of it
+        for known in [false, true] {
+            let mut g = Graph::new(2).guard(0, GUARD_HOST).peers(1, &[0, 1]);
+            if known {
+                g = g.following(&[1]);
+            }
+            let (guard, reach) = target_reach(&g, 1).expect("reaches PID 1's");
+            assert_eq!((guard, reach), (0, REACH_OTHER_NS));
+            // the hook's widest rule first (`/` is keyed MG_LOCK_ABOVE),
+            // then the rule by the target's namespace: not judged there
+            assert!(lock_touched(flags, false, true, GUARD_HOST));
+            assert!(!lock_touched(flags, false, true, guard), "known {known}");
+        }
+        for guard in [GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            assert!(!lock_touched(flags, false, true, guard), "guard {guard}");
+            assert!(
+                !lock_touched(flags | MS_PRIVATE, false, true, guard),
+                "guard {guard}"
+            );
+        }
+        // in PID 1's namespace: still judged, refused and signed
+        assert!(lock_touched(flags, false, true, GUARD_HOST));
+        let rshared = Query {
+            lock_maker: false,
+            lock_step: false,
+            ..host(MG_OP_PROPAGATE, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&rshared), Verdict::Refuse(MG_WHY_LOCK));
+        assert!(
+            !lock_shutdown_step(flags, false),
+            "not the shutdown's shape"
+        );
+        // on the lock itself, or a raw namespace's copy of it that reaches
+        // the host's: judged in every namespace, as before
+        for guard in [GUARD_HOST, GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            assert!(lock_touched(MS_SHARED, true, false, guard), "guard {guard}");
+            assert!(lock_touched(flags, true, false, guard), "guard {guard}");
+        }
+        let copy = Query {
+            host: false,
+            reaches: true,
+            lock_maker: false,
+            lock_step: lock_step_at(MS_SHARED, true, 0),
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&copy), Verdict::Refuse(MG_WHY_LOCK));
+    }
+
+    /// Named test (the review of #569, F1a): a plain `MS_SHARED` of the
+    /// lock itself — what would follow a recursive `MS_PRIVATE` above it to
+    /// make it reachable again — is refused in PID 1's namespace, its
+    /// maker's included.
+    #[test]
+    fn a_plain_shared_change_of_the_lock_is_refused() {
+        assert!(lock_touched(MS_SHARED, true, false, GUARD_HOST));
+        assert!(!lock_step_at(MS_SHARED, true, GUARD_HOST));
+        for maker in [false, true] {
+            let q = Query {
+                lock_maker: maker,
+                lock_step: lock_step_at(MS_SHARED, true, GUARD_HOST),
+                ..host(MG_OP_PROPAGATE, pin_dir(), "")
+            };
+            assert_eq!(decide(&q), Verdict::Refuse(MG_WHY_LOCK), "maker {maker}");
+        }
+    }
+
+    /// Named test (the review of #569, F1c): the maker's step is
+    /// `MS_UNBINDABLE` on the lock in PID 1's namespace only — not
+    /// `MS_PRIVATE` (it clears `MNT_UNBINDABLE` of a lock in place), and
+    /// not on a raw namespace's copy of the lock (its parent's guard is
+    /// not PID 1's), nor in the agent's or the watchdog's.
+    #[test]
+    fn the_makers_step_is_unbindable_on_the_hosts_lock_only() {
+        assert!(lock_step_at(MS_UNBINDABLE, true, GUARD_HOST));
+        assert!(!lock_step_at(MS_PRIVATE, true, GUARD_HOST), "MS_PRIVATE");
+        for guard in [GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            assert!(!lock_step_at(MS_UNBINDABLE, true, guard), "guard {guard}");
+        }
+        assert!(!lock_step_at(MS_UNBINDABLE, false, GUARD_HOST), "not on it");
+        // the maker's MS_PRIVATE on the host's lock: refused, signed
+        let private = Query {
+            lock_maker: true,
+            lock_step: lock_step_at(MS_PRIVATE, true, GUARD_HOST),
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&private), Verdict::Refuse(MG_WHY_LOCK));
+        // the maker's MS_UNBINDABLE on a raw namespace's copy that reaches
+        // the host's: refused, signed
+        let copy = Query {
+            host: false,
+            reaches: true,
+            lock_maker: true,
+            lock_step: lock_step_at(MS_UNBINDABLE, true, 0),
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&copy), Verdict::Refuse(MG_WHY_LOCK));
+        // its own step on the host's lock: let through
+        let own = Query {
+            lock_maker: true,
+            lock_step: lock_step_at(MS_UNBINDABLE, true, GUARD_HOST),
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&own), Verdict::Allow);
+    }
+
+    /// Named test (lot 359): a change of propagation that reaches the lock
+    /// is refused and signed (`MG_WHY_LOCK`) — but its maker's own step on
+    /// it; let through and recorded inside the window; another
+    /// namespace that reaches no guarded one is untouched.
+    #[test]
+    fn a_change_of_propagation_of_the_lock_is_refused_but_its_makers_steps() {
+        let step = Query {
+            lock_maker: true,
+            lock_step: true,
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&step), Verdict::Allow);
+        for q in [
+            Query {
+                lock_maker: false,
+                ..step
+            },
+            Query {
+                lock_step: false,
+                ..step
+            },
+            Query {
+                lock_maker: false,
+                lock_step: false,
+                ..step
+            },
+            // a raw namespace's copy, whose parent's group reaches PID 1's
+            Query {
+                host: false,
+                reaches: true,
+                lock_maker: false,
+                ..step
+            },
+        ] {
+            assert_eq!(decide(&q), Verdict::Refuse(MG_WHY_LOCK), "{q:?}");
+        }
+        let window = Query {
+            lock_maker: false,
+            window: true,
+            ..step
+        };
+        assert_eq!(decide(&window), Verdict::Window(MG_WHY_LOCK));
+        let away = Query {
+            host: false,
+            reaches: false,
+            lock_maker: false,
+            ..step
+        };
+        assert_eq!(
+            decide(&away),
+            Verdict::Allow,
+            "a namespace that reaches none"
+        );
+        let unprivileged = Query {
+            privileged: false,
+            lock_maker: false,
+            ..step
+        };
+        assert_eq!(decide(&unprivileged), Verdict::Allow, "the kernel's EPERM");
+    }
+
+    /// Named test (lot 359): the lock is a held mount — its maker can
+    /// neither unmount nor move it (the uninstaller and the window can).
+    #[test]
+    fn the_lock_is_never_unmounted_or_moved_outside_a_window_by_its_maker_either() {
+        for (op, why) in [
+            (MG_OP_UMOUNT, MG_WHY_UMOUNT),
+            (MG_OP_MOVE_MOUNT, MG_WHY_MOVE_AWAY),
+        ] {
+            let q = Query {
+                held: true,
+                lock_maker: true,
+                lock_step: true,
+                ..host(op, pin_dir(), "")
+            };
+            assert_eq!(decide(&q), Verdict::Refuse(why), "op {op}");
+            let w = Query { window: true, ..q };
+            assert_eq!(decide(&w), Verdict::Window(why), "op {op}");
+        }
+        // and a record names what it was
+        assert!(why_name(MG_WHY_LOCK).contains("lock"));
+        assert!(op_name(MG_OP_PROPAGATE).contains("propagation"));
+        // its flags are new bits of the protected points'
+        const {
+            assert!(MG_LOCK & (MG_ON | MG_OWN | MG_VIEW | MG_HOLD | MG_SB) == 0);
+            assert!(MG_LOCK_ABOVE & (MG_ON | MG_OWN | MG_VIEW | MG_HOLD | MG_SB | MG_LOCK) == 0);
+            assert!(MS_PROPAGATION == MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
+        }
     }
 }

@@ -521,7 +521,8 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
     in_order(
         &w,
         &[
-            "register_self_pid(&cli.bpffs_root, own_pid)",
+            // lot 359: its role's failure handed back (a signed degradation)
+            "register_self_pid(&cli.bpffs_root, own_pid, |e| {",
             "register_own_cgroup(\n            &cli.bpffs_root,\n            own_pid,",
         ],
     )

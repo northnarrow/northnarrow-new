@@ -165,6 +165,9 @@ pub struct Views {
     cgroup: Option<View>,
     /// `None` on a host with no bpffs at [`BPF_ROOT`] ([`bpf_view`]).
     bpf: Option<View>,
+    /// Lot 359: the agent's pin directory when its lock is mounted there
+    /// ([`pin_view`]); `None` otherwise (its paths are the bpffs view's).
+    pin: Option<View>,
 }
 
 static VIEWS: OnceLock<Views> = OnceLock::new();
@@ -270,6 +273,7 @@ pub fn unanchored() -> Vec<String> {
         Some(&v.sys),
         v.cgroup.as_ref(),
         v.bpf.as_ref(),
+        v.pin.as_ref(),
     ]
     .into_iter()
     .flatten()
@@ -325,18 +329,20 @@ impl Views {
         let unified_only = proc.root.as_ref().ok().is_some_and(cgroup2_alone);
         let cgroup = cgroup_view(table.as_deref(), unified_only);
         let bpf = bpf_view();
+        let pin = bpf.as_ref().and_then(|_| pin_view(table.as_deref()));
         Views {
             proc,
             sys,
             cgroup,
             bpf,
+            pin,
         }
     }
 
     /// The view `path` is under (the cgroup2 one and the bpffs before
-    /// `/sys`).
+    /// `/sys`; lot 359: the locked pin directory before the bpffs).
     pub fn view_of(&self, path: &Path) -> Option<&View> {
-        for v in [&self.cgroup, &self.bpf].into_iter().flatten() {
+        for v in [&self.cgroup, &self.pin, &self.bpf].into_iter().flatten() {
             if path.starts_with(&v.at) {
                 return Some(v);
             }
@@ -516,6 +522,56 @@ fn bpf_view() -> Option<View> {
         Err(why) if why.contains("No such file") => None,
         Err(why) => view(Err(why)),
     }
+}
+
+/// Lot 359 (the re-check 3 of #567, N4): the agent's pin directory, when
+/// its lock — the directory bound onto itself, private and unbindable — is
+/// mounted there ([`pin_locked`] in this process's table): a view of its
+/// own, anchored at the start (a path beneath the bpffs root would cross
+/// the lock's mount: `EXDEV`, then a walk on a helper thread for each pin).
+/// `None` without the lock (the bpffs view's, as before).
+fn pin_view(table: Option<&str>) -> Option<View> {
+    let at = Path::new(crate::DEFAULT_BPFFS_ROOT);
+    if !table.is_some_and(|t| pin_locked(t, crate::DEFAULT_BPFFS_ROOT)) {
+        return None;
+    }
+    Some(View {
+        kind: Kind::Bpf,
+        at: at.to_path_buf(),
+        root: anchor(at, &[BPF_FS_MAGIC]).map(|(f, _)| f),
+    })
+}
+
+/// Lot 359: the mount on top at `pin_root` in the mount table `table` is
+/// the pin directory's lock: a bpffs whose root is that directory, on a
+/// mount of the same bpffs at [`BPF_ROOT`] (or on another lock, stacked).
+pub fn pin_locked(table: &str, pin_root: &str) -> bool {
+    let lines: Vec<_> = table.lines().filter_map(mount_line).collect();
+    let Some(name) = Path::new(pin_root).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let want_root = format!("/{name}");
+    let Some(top) = lines.iter().rev().find(|m| m.4 == pin_root) else {
+        return false;
+    };
+    let mut cur = *top;
+    for _ in 0..lines.len() {
+        let (_, parent, dev, root, point, fstype) = cur;
+        if fstype != "bpf" || root != want_root || point != pin_root {
+            return false;
+        }
+        let Some(below) = lines.iter().rev().find(|m| m.0 == parent) else {
+            return false;
+        };
+        if below.2 != dev || below.5 != "bpf" {
+            return false;
+        }
+        if below.4 == BPF_ROOT {
+            return below.3 == "/";
+        }
+        cur = *below;
+    }
+    false
 }
 
 /// `path` opened `O_PATH | O_DIRECTORY` and its file system's type, which
@@ -2422,6 +2478,60 @@ mod tests {
     /// their parent (a planted one was left, the debug build's plant never
     /// made). Where no bpffs is mounted at `/sys/fs/bpf` (WSL2's kernel), it
     /// is no view.
+    /// Named test (lot 359): the pin directory is a view of its own only
+    /// when its lock is mounted there — a self-bind of the bpffs at
+    /// `/sys/fs/bpf` (one stacked on another too); a tmpfs, another bpffs, a
+    /// bind of another directory, a lock under a bpffs elsewhere are not.
+    #[test]
+    fn the_pin_directory_is_its_own_view_only_under_its_lock() {
+        const ROOT: &str = "/sys/fs/bpf/northnarrow";
+        let base = "1 0 252:1 / / rw - ext4 /dev/vda1 rw\n\
+                    20 1 0:20 / /sys rw shared:7 - sysfs sysfs rw\n\
+                    30 20 0:30 / /sys/fs/bpf rw shared:9 - bpf bpf rw,mode=700\n";
+        assert!(!pin_locked(base, ROOT), "no lock");
+        let lock = format!("{base}90 30 0:30 /northnarrow {ROOT} rw unbindable - bpf bpf rw\n");
+        assert!(pin_locked(&lock, ROOT));
+        let twice = format!("{lock}91 90 0:30 /northnarrow {ROOT} rw unbindable - bpf bpf rw\n");
+        assert!(pin_locked(&twice, ROOT), "a lock stacked on the lock");
+        for (what, line) in [
+            (
+                "a tmpfs over it",
+                format!("90 30 0:91 / {ROOT} rw - tmpfs tmpfs rw\n"),
+            ),
+            (
+                "another bpffs",
+                format!("90 30 0:92 / {ROOT} rw - bpf bpf rw\n"),
+            ),
+            (
+                "another directory of the bpffs",
+                format!("90 30 0:30 /other {ROOT} rw - bpf bpf rw\n"),
+            ),
+            (
+                "a bpffs root over it",
+                format!("90 30 0:30 / {ROOT} rw - bpf bpf rw\n"),
+            ),
+        ] {
+            assert!(!pin_locked(&format!("{base}{line}"), ROOT), "{what}");
+        }
+        let over = format!("{lock}91 90 0:93 / {ROOT} rw - tmpfs tmpfs rw\n");
+        assert!(!pin_locked(&over, ROOT), "a tmpfs over the lock");
+        // a line of another type naming the lock's root, on the bpffs's device
+        let typed = format!("{base}90 30 0:30 /northnarrow {ROOT} rw - tmpfs tmpfs rw\n");
+        assert!(!pin_locked(&typed, ROOT), "not a bpffs");
+        // the "lock" on a bind of a directory of the bpffs at /sys/fs/bpf
+        let sub = "1 0 252:1 / / rw - ext4 /dev/vda1 rw\n\
+                   30 1 0:30 /sub /sys/fs/bpf rw - bpf bpf rw\n\
+                   90 30 0:30 /northnarrow /sys/fs/bpf/northnarrow rw - bpf bpf rw\n";
+        assert!(!pin_locked(sub, ROOT), "on a part of the bpffs");
+        let elsewhere = "1 0 252:1 / / rw - ext4 /dev/vda1 rw\n\
+                         30 1 0:30 / /mnt/b rw - bpf bpf rw\n\
+                         90 30 0:30 /northnarrow /sys/fs/bpf/northnarrow rw - bpf bpf rw\n";
+        assert!(
+            !pin_locked(elsewhere, ROOT),
+            "under a bpffs that is not at /sys/fs/bpf"
+        );
+    }
+
     #[test]
     fn a_pin_directory_s_parent_is_beneath_the_bpffs_root() {
         let c = CString::new(BPF_ROOT).unwrap();

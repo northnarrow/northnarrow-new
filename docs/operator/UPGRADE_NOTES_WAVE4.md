@@ -3929,6 +3929,251 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   the pins can still be lost or hidden, the hooks no longer detach while
   the agent runs.
 
+## 52. The pin directory is locked; three record fixes (lot 359)
+
+The re-check 3 of #567 named an unmount the guard could not stop: the
+kernel calls the unmount hook before it takes its namespace lock, so the
+subtree the guard reads can still grow (a copy grafted by a concurrent
+rbind), and the walk reads a bounded subtree only. A lazy unmount could then
+take the host's bpffs, and the pins with it, in any namespace (N4, and the
+residual of §51.3). This lot closes the rbind variants of both for the
+pins; what stays open for the alpha, each signed at the next integrity
+round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
+
+### 52.1 The lock
+
+- **What it is.** The agent's pin directory, `/sys/fs/bpf/northnarrow`, is
+  bound onto itself, then made unbindable (which makes it private too), as
+  the child of the host's bpffs in PID 1's mount namespace. The kernel
+  never takes, in an unmount's propagation, a mount that keeps a child
+  that is not itself unmounted, and an rbind never copies an unbindable
+  mount: whatever an rbind copy's unmount takes (a racing graft, a copy
+  beyond the walk's bound), the host's bpffs keeps its child, and the pins
+  stay. A unit's own namespace (the agent's and the watchdog's among them)
+  is not covered, for the unit's whole run: systemd builds its view with a
+  recursive bind, which skips an unbindable mount (the lab: no copy of the
+  lock there), so a racing unmount can still take that namespace's view
+  of the bpffs — not the pins, which the host's bpffs keeps; the agent and
+  the watchdog keep their anchors, and a restart builds the view again.
+- **Who makes it, and when.** A new step of the agent's unit, before the
+  agent's process exists and before any pin is written:
+  `ExecStartPre=-+/usr/local/bin/northnarrow-agent --pin-lock` (install.sh
+  rewrites the path with `BIN_DIR`). `+` runs it with full privileges,
+  outside the unit's sandbox — the agent itself has no `CAP_SYS_ADMIN` and
+  no `mount(2)` (its system call filter), on purpose, for its whole life,
+  so it could not make a mount in the host's namespace, nor `setns(2)` into
+  it. The unit's `LogNamespace=` still gives the step the unit's own mount
+  namespace, so the step enters PID 1's itself (`setns(2)`), then checks it
+  is there. `-`: a lock that cannot be made does not fail the start. The
+  step uses the new mount API (`open_tree(OPEN_TREE_CLONE)`, then
+  `move_mount(2)`), then `MS_UNBINDABLE` (52.3: no `MS_PRIVATE` step), and
+  reads PID 1's table again; one line in the unit's journal:
+  `pin lock: made`, `reused`, `repaired`, or `NOT made: <why>`.
+- **Kept across restarts.** A lock already in place, private and
+  unbindable, is reused; a reboot's new bpffs has none, and the next start
+  makes it. A lock whose propagation changed is made unbindable (and so
+  private) again.
+- **The guard.** The lock passes the mount guard only as its maker's own
+  two steps, in PID 1's namespace: the agent's binary run as a unit's
+  process (PID 1's child, the main thread, in its first seconds, its
+  start-in-cgroup and injection marks clean), and exactly the self-bind of
+  the pin directory onto itself (judged by the kernel's objects: a
+  detached, childless clone whose root is the target's own dentry, on the
+  bpffs, not stacked), then `MS_UNBINDABLE` on the host's lock itself.
+  Anything else is refused and signed High (`NN-L-AT-001`, operation
+  `mount`): an unmount or a move of it (a held mount), a mount on or below
+  it, any other change of its propagation — on the lock, or on a copy of it
+  in a namespace whose changes reach the host's — and, in the host's
+  namespace, a recursive `MS_SHARED` on `/`, `/sys` or `/sys/fs/bpf` that
+  would make it shared and (52.3) a recursive `MS_PRIVATE` there (52.4:
+  in another namespace neither is judged). A caller who
+  forged the maker's identity gains nothing: each of the two steps only
+  makes the lock (52.3: lot 359's third step, `MS_PRIVATE`, did not).
+- **The integrity round.** The start reads the lock in PID 1's table: in
+  place, or a signed degradation (the walk of §51.3 then remains the
+  defence). Each round after a start that found it in place checks it is
+  still there, private, unbindable and the child of the host's bpffs:
+  missing (`pin_lock_missing`) or changed (`pin_lock_changed`), a signed
+  High, and the lock made again by the same step, run in a transient unit
+  (`systemd-run`, at most 20 s, all attempts waited for at most 30 s), its
+  result in the record; the guard's held mounts are read again for its new
+  id within a second. 52.3: the attempts, the back-off, and a start that
+  found none.
+- **Uninstall, upgrade, the window.** A mount point cannot be removed:
+  `uninstall.sh` and `install.sh` unmount the lock before they remove the
+  pin root (`rm_pin_root`), which the guard lets through only inside the
+  signed trusted-installer window (recorded, `FS_OP_MOUNT_WINDOW`). No lock
+  is left behind.
+- **What it does not cover.** Each of these is signed at the next
+  integrity round (about 30 s), not refused; the coordinator kept them for
+  the alpha as signed and documented limits, and the first lot after it
+  refuses the move of a copy that is a peer of a held mount and signals a
+  `mount_setattr(2)` at once (KNOWN_LIMITATIONS.md):
+  - `mount_setattr(2)` has no LSM hook: root can clear the lock's flags
+    through it; until the round makes the lock again (`pin_lock_changed`,
+    High), a racing unmount can take the host's bpffs and the pins;
+  - a raw mount namespace holds its own copy of the lock: its own
+    recursive change of propagation above it is not judged (52.4), and a
+    move of its copy of `/sys` is judged by its target only: that copy is then
+    defended by the walk alone, and its unmount can still race the walk,
+    or lie beyond its bound, and take the host's bpffs and the pins
+    (`protected_mount_gone`, `pin_lock_missing`, High);
+  - the units' own views of the bpffs never have the lock (above;
+    `protected_mount_gone`, High);
+  - `/sys/fs/cgroup` has no such child: its unmount by a racing or
+    out-of-bound lazy unmount stays behind the walk.
+- **For you.** `mount --make-rshared /` (or of `/sys`, `/sys/fs/bpf`) in
+  the host's namespace is refused: it would make the lock shared. 52.3:
+  `mount --make-rprivate` of the same there is refused too. 52.4: in
+  another namespace a recursive change of propagation — shared, private or
+  slave — is not judged: container runtimes (Kubernetes' `Bidirectional`
+  mounts included), `unshare -m` (with `--propagation shared` too),
+  `systemd-nspawn` and systemd's own unit namespaces work. A tool
+  that removes `/sys/fs/bpf/northnarrow` by hand must unmount it first, in
+  a window. `findmnt /sys/fs/bpf/northnarrow` shows the lock
+  (`unbindable`).
+
+- **The root's own point (a fix found by the lab).** The host's `/` was
+  read through `/proc/1/root/` without following its link (a path's
+  trailing `/` is no component): the key registered was the link's, so
+  `/` was no point of the guard (`mount --make-rshared /` was let through
+  in the lab, and the lock repaired a round later), and no mount's place
+  directly under `/` (`/sys`, `/proc`, `/run`, `/etc`…) was held in PID 1's
+  or the watchdog's namespace. Both are read through the link now: a mount
+  on `/`, a read-only bind remount of `/`, an unmount propagating onto a
+  root-level held mount from a namespace that reaches the host's are
+  judged as the other points always were.
+
+### 52.2 The re-check 3's records (P3)
+
+- **journald's quiet reads.** The packaged journald's refused reads of the
+  agent's processes are left unrecorded only while its start-in-cgroup and
+  injection marks are clean: a process written into journald's cgroup, or
+  journald with code-injection access given to another, is recorded as any
+  caller.
+- **The dedup of a refused read carries the caller's cgroup.** An
+  interpreter is one image for every program it runs: a collector's record
+  no longer silences another program's probe of the same target, by the
+  same interpreter, for the hour.
+- **A record the budget drops is not "seen".** The once-an-hour key was
+  written before the records' budget was asked: a flood of minor refusals
+  on one CPU dropped the first record and still silenced that program and
+  target for an hour. It is written once the record is let through.
+- **The executor's identities before the fork record attaches.** A unit
+  started in the window between the fork record's attach and the identities'
+  write (at each start of the agent) carried `fork_ppid` 0 ("not known").
+  The identities are written first.
+- **The watchdog's handles on the pinned maps.** A failure of
+  `register_self_pid`, `claim_role`, `reinsert_new_agent_pid` or
+  `evict_dead_agent` (the pins out of reach) is a record the agent signs, a
+  degradation of its status (`watchdog_pin_handle_failed`), once per handle
+  and watchdog — no longer only a log line.
+- **eBPF.** The ptrace guard's record (`emit_task_read_denial`: its quiet
+  check, its dedup key, its order) and the mount guard (`sb_mount`'s change
+  of propagation, `move_mount`'s self-bind) changed; the fork record's
+  program did not.
+
+### 52.3 The review of #569: the lock kept unbindable, retried, its limits
+
+The review of #569 found the lock's `MNT_UNBINDABLE` could be cleared
+without a refusal, which reopens the race for the pins (an rbind copies a
+bindable lock); and the lock missing at a start was never made again.
+
+- **A recursive `MS_PRIVATE` above the lock, in the host's namespace,
+  is refused.** The kernel clears `MNT_UNBINDABLE` at any `MS_PRIVATE`, the
+  recursive one included: `mount --make-rprivate` of `/sys/fs/bpf`,
+  `/sys` or `/` left the lock private but bindable, and a later plain
+  `--make-shared` restored the propagation. It is now refused and signed
+  High (`NN-L-AT-001`, operation `mount`, the lock's reason), in PID 1's
+  namespace only (in another namespace it changes that namespace's own
+  copies: `unshare -m`, container runtimes and systemd's unit namespaces
+  still make it there). `systemd-shutdown`'s switch to its shutdown image
+  (`switch_root()`, at the very end of a shutdown, by its identity) is let
+  through, as its pivot was. A plain `--make-shared` of the lock itself
+  stays refused, its maker's included; a recursive `MS_SLAVE` or
+  `MS_UNBINDABLE` above it keeps the flag and is not judged.
+- **The maker's steps: the self-bind, then `MS_UNBINDABLE`, in the host's
+  namespace only.** Lot 359 let its maker's `MS_PRIVATE` through at any
+  time and in any namespace: on a lock in place it cleared the flag, and a
+  raw namespace's copy of the lock could be made bindable the same way.
+  `MS_UNBINDABLE` alone makes the fresh self-bind private and unbindable
+  (the kernel leaves its peer group), so the step no longer asks for
+  `MS_PRIVATE` — the step's journal line and its result are unchanged —
+  and the guard refuses it. The maker's exemption holds only on the
+  host's lock, in PID 1's namespace.
+- **A lock that could not be made is asked for again.** Each integrity
+  round that finds it missing or changed asks for it up to three times
+  (a pause of 1 s, then 2 s), all within 30 s, so one failure (the
+  transient unit's name taken, a slow manager) no longer leaves it missing
+  until the next round; the record says at which attempt it was made, or
+  that every attempt failed and when the next one is due. A round whose
+  attempts all failed leaves the next rounds out — 1, 3, then 7 rounds
+  (an attempt about every four minutes) — and the same High stays signed
+  meanwhile (it is not "cleared" while the lock is not in place). A start
+  of the agent's unit that found no lock (signed as a degradation) no
+  longer leaves it unwatched for the whole run: the round makes it, then
+  keeps it. An agent run by hand (no `--pin-lock` step ran) is left as its
+  start signed it.
+- **What the lock closes, and what it does not.** It closes the rbind
+  variants for the pins: a racing rbind graft, an rbind copy beyond the
+  walk's bound. It does not close, each signed at the next integrity round
+  (about 30 s) — 52.1, "What it does not cover": a change of the lock's
+  flags through `mount_setattr(2)`, which has no LSM hook; a raw
+  namespace's own copy of the lock, whose move is judged by its target
+  only and is then defended by the walk alone (52.4: its own recursive
+  change of propagation is not judged either); the units' namespaces,
+  which never have the lock. The first lot after the alpha refuses the move of peer copies
+  and signals `mount_setattr(2)` at once.
+- **Found by the lab (5.15).** With these changes the BPF back end loaded
+  the payload of an `Option` that the peer-group walk (`spread`) carried
+  across its loop before it tested the tag; the payload of its first
+  `None` was never written, and 5.15's verifier refused `sb_mount`
+  ("invalid read from stack" — 6.5 and later allow that read to a
+  privileged loader). The walk carries a value always written and a flag
+  now, the same walk, and a test forbids a mutable `Option` in the walks
+  the eBPF inlines.
+- **eBPF.** `sb_mount`'s judge of a change of propagation that reaches the
+  lock changed (a recursive `MS_PRIVATE` above it judged by the target's
+  namespace, the maker's step on the host's lock only,
+  `systemd-shutdown`'s exemption); the peer-group walk's code changed in
+  `sb_mount`, `move_mount`, `sb_umount` and the lock's judge (the same
+  walk).
+
+### 52.4 The re-check of #569: container runtimes and Kubernetes' `Bidirectional` mounts
+
+52.1 refused a recursive `MS_SHARED` above the lock in any namespace whose
+changes reach the host's. A container's fresh mount namespace is one: its
+`/` is still a peer of the host's `/` when the runtime makes its first
+change. So every container whose runtime makes `/` recursively shared was
+refused at its start — containerd and CRI-O do it (`rootfsPropagation:
+rshared`) for any Kubernetes `mountPropagation: Bidirectional` mount:
+Cilium's bpffs mount (its chart's default), the CSI node plugins
+(Longhorn, Rook-Ceph and others), so a node had no CNI and its pods stayed
+in `Init`; `unshare -m --propagation shared` the same.
+
+- **A recursive `MS_SHARED` above the lock is judged in the host's
+  namespace only**, as the recursive `MS_PRIVATE` of 52.3 already was. In
+  another namespace either changes that namespace's own copies only: let
+  through, without a record. Container runtimes and Kubernetes'
+  `Bidirectional` mounts work: the container's `rootfsPropagation:
+  rshared`, a bind of `/sys/fs/bpf` with `rbind,rshared`, `docker run -v
+  /sys/fs/bpf:/sys/fs/bpf:rshared`, `unshare -m --propagation shared`.
+- **Unchanged in the host's namespace.** `mount --make-rshared` and
+  `--make-rprivate` of `/`, `/sys` or `/sys/fs/bpf` stay refused and
+  signed High (`NN-L-AT-001`, operation `mount`). Every change of
+  propagation of the lock itself, or of a raw namespace's copy of it whose
+  changes reach the host's, stays refused in every namespace.
+- **What it costs.** It is inside the raw-namespace residual of 52.1: a
+  raw namespace may now also make its own copy of the lock shared through
+  a recursive change above it. That copy, like its move, is defended by
+  the walk alone, and a loss is signed at the next integrity round
+  (`protected_mount_gone`, `pin_lock_missing`, High). The units' views
+  never have the lock, so nothing is lost in the agent's or the
+  watchdog's namespace.
+- **eBPF.** `sb_mount`'s judge of a change of propagation that reaches the
+  lock changed: a recursive `MS_SHARED` above it is judged by the target's
+  namespace, as a recursive `MS_PRIVATE` was.
+
 ## 53. An AppImage's fork-only child is judged like its AppImage (lot 360)
 
 - **What changes.** §49 made an AppImage's programs its image's. Its

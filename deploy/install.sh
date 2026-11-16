@@ -1279,7 +1279,7 @@ txn_take_down_new() {
     if systemctl is-active --quiet northnarrow-agent.service; then
         open_trusted_installer_window "$GRANT_KEY" || return 1
     elif [[ -d "$BPFFS_ROOT" ]]; then
-        rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+        rm_pin_root
         if [[ -d "$BPFFS_ROOT" ]]; then
             # its pins outlive it (DEP-020): the installed (new) agent once more, for its window
             if ! { start_agent_for_window && open_trusted_installer_window "$GRANT_KEY"; }; then
@@ -2243,10 +2243,27 @@ open_trusted_installer_window() {
         return 1
     fi
 }
+# >>> rm_pin_root (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# Lot 359 (the re-check 3 of #567, N4): the pin root is locked — bound onto
+# itself, private and unbindable, as the child of the host's bpffs (the agent
+# unit's `--pin-lock` step) — and a mount point is never removed (EBUSY). Its
+# lock is unmounted first (a few, one stacked on another), which the mount
+# guard lets through only inside the trusted-installer window; then the pins
+# go with the directory. Outside a window both are refused: the pin root
+# stays, as before.
+rm_pin_root() {
+    local i
+    for ((i = 0; i < 4; i++)); do
+        mountpoint -q -- "$BPFFS_ROOT" 2>/dev/null || break
+        umount -- "$BPFFS_ROOT" 2>/dev/null || umount -l -- "$BPFFS_ROOT" 2>/dev/null || break
+    done
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+}
+# <<< rm_pin_root
 purge_pin_root() {
     [[ -d "$BPFFS_ROOT" ]] || return 0
     echo "install.sh: dropping $BPFFS_ROOT so the LSM programs detach (the new agent re-pins fresh)"
-    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    rm_pin_root
     if [[ -d "$BPFFS_ROOT" ]]; then
         echo "install.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window" >&2
         echo "install.sh: is open (review entry 39). Re-run with --grant-key <admin.key carrying the trusted-installer" >&2
@@ -2328,7 +2345,7 @@ fi
 STARTED_FOR_WINDOW=0
 if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d "$BPFFS_ROOT" ]]; then
     echo "install.sh: units inactive but $BPFFS_ROOT exists — purging the stale pins first"
-    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    rm_pin_root
     if [[ -d "$BPFFS_ROOT" ]]; then
         if [[ -z "$GRANT_KEY" ]]; then
             stale_pin_root_help >&2

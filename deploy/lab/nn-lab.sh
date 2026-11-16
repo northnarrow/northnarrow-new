@@ -989,6 +989,12 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-
     # the agent's workers run its binary too (as `northnarrow-agent --worker
     # parse`), and a fixture agent's workers go with it here.
     sudo bash -c 'for d in /proc/[0-9]*; do e=$(readlink "$d/exe" 2>/dev/null) || continue; case "$e" in */northnarrow-agent-e2etest-*|*/northnarrow-watchdog-e2etest-*) kill -9 "${d#/proc/}" 2>/dev/null ;; esac; done'
+    # Lot 359: the pin root's lock (its self-bind) unmounted first, as
+    # install.sh's rm_pin_root does — a mount point is never removed
+    for i in 1 2 3 4; do
+        sudo mountpoint -q /sys/fs/bpf/northnarrow 2>/dev/null || break
+        sudo umount /sys/fs/bpf/northnarrow 2>/dev/null || sudo umount -l /sys/fs/bpf/northnarrow 2>/dev/null || break
+    done
     sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
     sudo test -d /sys/fs/bpf/northnarrow && echo PINS_PROTECTED
     # Lot 277 (the re-review of #494, R2): the tracker's pins, beside the root;

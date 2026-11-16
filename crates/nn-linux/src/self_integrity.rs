@@ -59,6 +59,12 @@ pub const AUDIT_OP: &str = crate::audit::INTEGRITY_DRIFT_OP;
 /// loop of stuck recoveries (`agent_restart_loop`).
 pub const RESTART_LOOP_DEGRADATION: &str = "agent_restart_loop";
 
+/// Lot 359 (the re-check 3 of #567, P3 e): the watchdog's record of a
+/// failed handle on the agent's pinned maps — signed, and a degradation of
+/// the agent's status for the rest of its run (a watchdog restarted after
+/// the pins were lost stays outside `PROTECTED_PIDS` until a reboot).
+pub const PIN_HANDLE_FAILED: &str = "watchdog_pin_handle_failed";
+
 /// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
 /// watchdog's `OnFailure=` handler too — masked or overridden, systemd's
 /// giving up on the watchdog would leave no record.
@@ -742,6 +748,12 @@ fn mounts_over_protected_in(
             if !sandbox.is_empty() && is_unit_sandbox(m, mounts, sandbox) {
                 continue;
             }
+            // lot 359 (the re-check 3 of #567, N4): the pin directory's lock
+            // (its own self-bind on the bpffs) — its loss or change is the
+            // lock's own finding (`pin_lock_missing`, `pin_lock_changed`)
+            if is_pin_lock(m, mounts) {
+                continue;
+            }
             out.push(Finding {
                 kind: "mount_over_protected",
                 detail: format!("{mp} ({fstype}, source root {root})"),
@@ -761,6 +773,18 @@ fn mounts_over_protected_in(
         }
     }
     out
+}
+
+/// Lot 359: `m` is the pin directory's lock in the table `mounts`
+/// (`anti_tamper::pin_lock::is_lock`).
+fn is_pin_lock(m: &Mount, mounts: &[Mount]) -> bool {
+    let root = crate::anti_tamper::pin_lock::pin_root();
+    if m.entry.mount_point != root {
+        return false;
+    }
+    let entries: Vec<crate::mountinfo::MountEntry> =
+        mounts.iter().map(|x| x.entry.clone()).collect();
+    crate::anti_tamper::pin_lock::is_lock(&entries, &m.entry, &root)
 }
 
 /// The review of #567 (F2): the watchdog the pidfile names, while it is
@@ -919,6 +943,9 @@ fn high_kind(kind: &str) -> bool {
             | "mount_not_canonical"
             | "state_fs_read_only"
             | PIN_VANISHED
+            // lot 359 (the re-check 3 of #567, N4)
+            | crate::anti_tamper::pin_lock::MISSING
+            | crate::anti_tamper::pin_lock::CHANGED
     )
 }
 
@@ -1614,6 +1641,13 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "signed_records_failed",
                             "the watchdog found the agent's signed records failing",
                         ),
+                        // Lot 359 (the re-check 3 of #567, P3 e): a
+                        // watchdog handle on the pinned maps failed — a
+                        // degradation, signed
+                        wh::REASON_PIN_HANDLE_FAILED => (
+                            PIN_HANDLE_FAILED,
+                            "the watchdog's handle on the agent's pinned maps failed",
+                        ),
                         wh::REASON_HOLD_RETRY => (
                             "watchdog_hold",
                             "the holding watchdog tried to start the agent again",
@@ -2229,6 +2263,9 @@ struct Checker {
     /// watchdog's (with the pid it was read for).
     own_mounts: MountWatch,
     watchdog_mounts: (Option<u32>, MountWatch),
+    /// Lot 359: the pin directory's lock, kept (the review of #569: its
+    /// attempts and back-off).
+    pin_lock: crate::anti_tamper::pin_lock::Keeper,
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
@@ -2395,6 +2432,38 @@ impl Checker {
                 None => self.watchdog_mounts.0 = None,
             }
         }
+        // Lot 359 (the re-check 3 of #567, N4): the pin directory's lock the
+        // start found in place, kept so — lost or changed, a High of its own
+        // and made again (a transient unit running the unit's step), the
+        // guard's held mounts then read again for its new id. The review of
+        // #569: asked for again within the round, bounded (F5), and made
+        // when the agent's unit started without it (F3)
+        if let Some(host) = &host_copy {
+            let in_unit = own_cgroup().as_deref() == Some(AGENT_UNIT_CGROUP);
+            if self.pin_lock.watches(in_unit) {
+                let root = crate::anti_tamper::pin_lock::pin_root();
+                let until =
+                    std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE;
+                if let Some((kind, detail)) = self.pin_lock.round(
+                    host,
+                    &root,
+                    || {
+                        let out = crate::anti_tamper::pin_lock::remake(&root, until);
+                        if out.in_place() {
+                            if let Err(e) = crate::anti_tamper::mount_guard::wake_refresh(
+                                Path::new(antitamper_bpf::DEFAULT_BPFFS_ROOT),
+                            ) {
+                                warn!(error = %format!("{e:#}"), "integrity: the mount guard's refresh not woken after the pin lock was made again");
+                            }
+                        }
+                        out
+                    },
+                    std::thread::sleep,
+                ) {
+                    out.push(Finding { kind, detail });
+                }
+            }
+        }
         out.extend(read_only_state());
         out.extend(refused_views(antitamper_bpf::kernel_roots::unanchored()));
         out
@@ -2465,6 +2534,10 @@ impl Checker {
         // (`nn-admin status`) for the rest of this run
         if f.kind == "agent_restart_loop" {
             crate::boot::degradation::report(RESTART_LOOP_DEGRADATION, &f.detail);
+        }
+        // lot 359 (P3 e): the watchdog's failed pin handle, the same way
+        if f.kind == PIN_HANDLE_FAILED {
+            crate::boot::degradation::report(PIN_HANDLE_FAILED, &f.detail);
         }
         if reappeared > 0 {
             extra["reappeared"] = reappeared.into();
@@ -2762,6 +2835,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
         own_mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
         watchdog_mounts: (None, MountWatch::default()),
+        pin_lock: Default::default(),
         watchdog_pidfile,
         own_files,
         audit_log,
@@ -3008,6 +3082,42 @@ mod tests {
         );
     }
 
+    /// Named test (lot 359, the re-check 3 of #567, P3 e): the watchdog's
+    /// record of a failed handle on the pinned maps is signed and a
+    /// degradation of the agent's status — not only the watchdog's log line.
+    #[test]
+    fn a_watchdog_pin_handle_failure_is_a_signed_degradation() {
+        use nn_proto::watchdog_hold as wh;
+        let dir = tempfile::tempdir().unwrap();
+        let holds = dir.path().join("holds");
+        let rec = wh::HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 812,
+            reason: wh::REASON_PIN_HANDLE_FAILED.to_string(),
+            detail: "reinsert_new_agent_pid: opening pinned PROTECTED_PIDS: No such file".into(),
+            unit_state: None,
+        };
+        std::fs::write(&holds, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        let f = watchdog_holds(&holds);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, PIN_HANDLE_FAILED);
+        assert!(
+            f[0].detail.contains("reinsert_new_agent_pid"),
+            "{}",
+            f[0].detail
+        );
+        let (c, path) = checker_with_log(dir.path());
+        assert!(c.record_detected(&f[0], false, 0));
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains(PIN_HANDLE_FAILED), "{log}");
+        let now = crate::boot::degradation::snapshot();
+        assert!(
+            now.iter()
+                .any(|d| d.starts_with(PIN_HANDLE_FAILED) && d.contains("reinsert_new_agent_pid")),
+            "{now:?}"
+        );
+    }
+
     /// Lot 353 (named): the stuck marker names the SIGINT of the agent it
     /// names, fresh — read once (removed); another agent's, or a stale one,
     /// names nothing.
@@ -3165,6 +3275,8 @@ mod tests {
             (wh::REASON_COPY_BEFORE_RESPAWN, "systemd_copy_below_floor"),
             // lot 353 (the review of #563, F1)
             (wh::REASON_SIGNED_RECORDS_FAILED, "signed_records_failed"),
+            // lot 359 (the re-check 3 of #567, P3 e)
+            (wh::REASON_PIN_HANDLE_FAILED, PIN_HANDLE_FAILED),
         ];
         let body = reasons
             .iter()
@@ -3388,6 +3500,44 @@ mod tests {
     /// `mount_over_protected` naming the mount, its file system and its
     /// source; so is one over `/proc` or `/sys`, and a file system not the
     /// kernel's below them.
+    /// Named test (lot 359, the re-check 3 of #567, N4): the pin
+    /// directory's lock — its self-bind on the bpffs at `/sys/fs/bpf` — is
+    /// no mount over a protected path (its loss or change is its own High:
+    /// `pin_lock_missing`, `pin_lock_changed`); a tmpfs, a bpffs root or
+    /// another directory there, or a mount over the lock, still is.
+    #[test]
+    fn the_pin_directorys_lock_is_no_mount_over_protected() {
+        let host = "\
+24 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+25 24 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+30 25 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:9 - bpf bpf rw,mode=700
+";
+        let lock = format!(
+            "{host}90 30 0:30 /northnarrow /sys/fs/bpf/northnarrow rw,relatime unbindable - bpf bpf rw,mode=700\n"
+        );
+        assert!(
+            mount_findings(&lock, &[]).is_empty(),
+            "{:?}",
+            mount_findings(&lock, &[])
+        );
+        for line in [
+            "90 30 0:91 / /sys/fs/bpf/northnarrow rw - tmpfs tmpfs rw",
+            "90 30 0:30 / /sys/fs/bpf/northnarrow rw - bpf bpf rw",
+            "90 30 0:30 /other /sys/fs/bpf/northnarrow rw - bpf bpf rw",
+        ] {
+            let f = mount_findings(format!("{host}{line}\n"), &[]);
+            assert_eq!(f.len(), 1, "{line}: {f:?}");
+            assert_eq!(f[0].kind, "mount_over_protected", "{line}");
+        }
+        let over = format!("{lock}91 90 0:93 / /sys/fs/bpf/northnarrow rw - tmpfs tmpfs rw\n");
+        let f = mount_findings(&over, &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].detail.contains("tmpfs"), "{}", f[0].detail);
+        // the lock's own findings are High
+        assert!(high_kind(crate::anti_tamper::pin_lock::MISSING));
+        assert!(high_kind(crate::anti_tamper::pin_lock::CHANGED));
+    }
+
     #[test]
     fn a_mount_over_the_kernel_s_views_is_a_mount_over_protected() {
         let host = "\
@@ -3552,6 +3702,28 @@ mod tests {
         );
         let high = &code[code.find("fn record_detected(").unwrap()..];
         assert!(high[..2000].contains("f.kind == \"mount_over_protected\""));
+    }
+
+    /// Named test (the review of #569, F3 and F5): the round keeps the pin
+    /// directory's lock through its keeper — watched as the keeper says for
+    /// this agent's own unit (its cgroup), every attempt within one
+    /// deadline (`REMAKE_DEADLINE`), a pause between two.
+    #[test]
+    fn the_round_keeps_the_pin_lock_through_its_keeper() {
+        let src = include_str!("self_integrity.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let read = &code[code.find("fn read_mounts(").unwrap()..];
+        let read = &read[..read.find("\n    }\n").unwrap()];
+        assert!(read.contains("let in_unit = own_cgroup().as_deref() == Some(AGENT_UNIT_CGROUP);"));
+        assert!(read.contains("if self.pin_lock.watches(in_unit) {"));
+        assert!(read
+            .contains("std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE"));
+        assert!(read.contains("crate::anti_tamper::pin_lock::remake(&root, until)"));
+        assert!(read.contains("std::thread::sleep,"));
+        assert!(
+            !read.contains("pin_lock::established()"),
+            "the start's lock alone"
+        );
     }
 
     /// Lot 353 (the review of #563, F4, verified false positive): WSL2's
@@ -4418,6 +4590,7 @@ mod tests {
             mounts: MountWatch::default(),
             own_mounts: MountWatch::default(),
             watchdog_mounts: (None, MountWatch::default()),
+            pin_lock: Default::default(),
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),

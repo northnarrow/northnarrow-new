@@ -81,6 +81,13 @@ fn count(text: &str) -> usize {
 /// caller wrote.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-linux/src/anti_tamper/pin_lock.rs",
+        1,
+        "lot 359: the agent's own `/proc/self/exe`, read beneath the `/proc` root, to run its own \
+         binary in the transient unit that makes the pin directory's lock again — the kernel's \
+         answer about this process, matched against nothing a caller wrote",
+    ),
+    (
         "crates/nn-linux/src/response/quarantine.rs",
         2,
         "the restore's destination as the kernel resolved it: the agent's own descriptor of the \
@@ -94,10 +101,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/anti_tamper/mount_guard.rs",
-        4,
+        5,
         "the review of #567 (F1, F2): a guarded namespace's own mount table, its namespace link \
          and its root (`/proc/<pid>/mountinfo`, `/proc/<pid>/ns/mnt`, `/proc/<pid>/root`) read for \
-         the mount guard's registration: read, no match",
+         the mount guard's registration: read, no match; lot 359: PID 1's root the points are \
+         read beneath (`point_metadata`, the root's link followed)",
     ),
     (
         "crates/nn-linux/src/posture_host_linux.rs",

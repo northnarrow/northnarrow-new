@@ -3074,24 +3074,107 @@ where it starts.
   unlinks, so the agent's own retirements still detach; the ratchet
   `held_pins` refuses a link or program pinned any other way.
 
+### The pin directory's lock (lot 359, the re-check 3 of #567)
+
+- **What it defends.** The unmount hook runs before the kernel's
+  namespace lock, and the walk reads a bounded subtree: a racing graft, or
+  a subtree wider or deeper than the walk, can still be taken by a lazy
+  unmount, its propagation taking a childless mount it does not name. The
+  kernel's own rule is the defence: `propagate_umount()` never takes a
+  mount that keeps a child that is not itself unmounted. The pin directory
+  is bound onto itself, then made unbindable (which makes it private too),
+  as the child of the host's bpffs in PID 1's namespace (an rbind never
+  copies an unbindable mount, so no rbind copy of it can be among what an
+  unmount takes): the host's bpffs keeps that child, and the pins stay,
+  against the rbind variants — a racing rbind graft, an rbind copy behind
+  the walk's bound. It holds only while the lock stays unbindable and no
+  other copy of it is among what an unmount takes ("Behind it still").
+- **Its maker.** The agent's process has no `CAP_SYS_ADMIN` and no
+  `mount(2)` (by design), and its namespace is its unit's: the lock is a
+  step of the unit's start (`ExecStartPre=-+ … --pin-lock`, privileged,
+  entering PID 1's namespace itself, before the agent's process and its
+  pins), reused at a restart, made again by a transient unit running the
+  same step when the integrity round finds it lost or changed. The mount
+  guard lets through only that maker's two steps, in PID 1's namespace
+  only — its identity (the agent's binary, PID 1's child, the main thread,
+  in its first seconds, its lot 277/281 marks clean) and the exact
+  operations (the self-bind compared by the kernel's objects, never a
+  path; then `MS_UNBINDABLE` on the host's lock itself). Root can forge
+  that identity (the binary run under a preload by `systemd-run`); since
+  the review of #569 (F1c) it gains nothing by it: each of the two steps
+  only makes the lock. (Lot 359 let a third step through, `MS_PRIVATE`,
+  and in any namespace: it made a lock in place, or a raw namespace's
+  copy of it, bindable again — removed.) Every other unmount, move, mount
+  over or below, or change of propagation of the lock (or of a copy of it
+  where a change reaches the host), and a recursive `MS_SHARED` or
+  `MS_PRIVATE` above it in PID 1's namespace (the review of #569, F1a: the
+  private one clears the lock's `MNT_UNBINDABLE`; `systemd-shutdown`'s
+  `switch_root()` excepted, by its identity) is refused and signed High
+  (the re-check of #569, N1: in another namespace a recursive change above
+  the lock changes that namespace's own copies, and is not judged — a
+  container's `rootfsPropagation: rshared`, which containerd and CRI-O set
+  for any Kubernetes `Bidirectional` mount, runs in a fresh namespace
+  whose `/` is still a peer of PID 1's); inside the signed
+  trusted-installer window it is let through and recorded (the
+  uninstaller and an upgrade unmount it before they remove the
+  directory).
+- **Its watch.** The start reads it in PID 1's table (absent: a signed
+  degradation, the walk alone remains); each integrity round checks it is
+  in place, private, unbindable, the bpffs's child (`pin_lock_missing`,
+  `pin_lock_changed`: High, the lock made again, the result in the
+  record). The review of #569: a round asks for it up to three times
+  within its 30 s, then backs off over the rounds while it cannot be made
+  (the same finding signed meanwhile); a start in the agent's unit that
+  found none has the round make it, then watch it.
+- **Behind it still** (the coordinator's decision for the alpha: signed
+  and documented; the first lot after it refuses the move of a copy that
+  is a peer of a held mount, and signals `mount_setattr(2)` at once). Each
+  is signed at the next integrity round (about 30 s):
+  - `mount_setattr(2)` has no LSM hook: root can clear the lock's flags
+    through it, and until the round makes the lock again, a racing
+    unmount, or one beyond the walk's bound, can take the host's bpffs and
+    the pins (`pin_lock_changed`);
+  - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
+    copies unbindable mounts): its own recursive change of propagation
+    above it (shared or private) is not judged, and a move of its copy of
+    `/sys` is judged by its target only: that copy is then defended by the
+    walk alone, and an unmount of it racing the walk, or beyond its bound,
+    propagates to the host's lock and bpffs (`protected_mount_gone`,
+    `pin_lock_missing`);
+  - the units' namespaces (the agent's, the watchdog's) never have the
+    lock, for the unit's whole run (systemd builds their view with a
+    recursive bind, which skips an unbindable mount): their view of the
+    bpffs stays behind the walk, and its loss costs what reads the pins by
+    path there until a restart (the watchdog's handles, signed
+    `watchdog_pin_handle_failed`), not the anchors nor the pins
+    (`protected_mount_gone`);
+  - `/sys/fs/cgroup`, which has no such child.
+
 ### Residual
 
 - An unmount whose subtree is wider than the walk, in a namespace not
   guarded, with only private mounts read: let through (a container
   runtime's old root has that shape; so has a copy hidden behind 32
-  private mounts, or a chain of 9 levels).
+  private mounts, or a chain of 9 levels). What it can take is the host's
+  childless `/sys/fs/cgroup`; the bpffs, whose lock keeps it against an
+  rbind copy (lot 359), only through what is still behind the lock
+  ("The pin directory's lock": a raw namespace's moved copy of `/sys`, a
+  lock made bindable by `mount_setattr(2)`, or none).
 - An unmount that races the walk: the unmount hook runs before the
   kernel's namespace lock, so a copy grafted by a concurrent rbind after
   the walk is taken by a lazy unmount, in a guarded namespace too (N4 of
-  the re-check 3 of #567). The deny links stay (held descriptors) and
-  the loss is signed; the pins do not. The closure planned: a private,
-  unbindable mount of the pin directory. An unmount through a regrouped parent before the
-  refresh: one shared slave of it ends the walk (§51.2's window).
+  the re-check 3 of #567). For the pins lot 359 closes the rbind variants
+  ("The pin directory's lock", with what stays behind it);
+  `/sys/fs/cgroup` stays behind the walk: its childless mount can be taken
+  that way, signed (`protected_mount_gone`). An unmount through a
+  regrouped parent before the refresh: one shared slave of it ends the
+  walk (§51.2's window) — the bpffs keeps its lock's child there too.
 - A change reaches a guarded namespace through one group (the target's
   is a guarded mount's own or master group); two masters deep is not
   followed. An unmount's propagation is judged the same way (the parent's
   group against the held mounts' places).
-- `mount_setattr(2)` is observed (≤ one integrity round), not refused.
+- `mount_setattr(2)` is observed (≤ one integrity round), not refused —
+  of the pin directory's lock too (the race for the pins open meanwhile).
 - A held file system's writable reconfigure passes (its options are the
   operator's: `size=` of `/run`, finalrd's `exec`); only read-only is
   refused there.
