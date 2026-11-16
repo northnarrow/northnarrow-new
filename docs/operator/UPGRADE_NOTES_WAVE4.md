@@ -3928,3 +3928,50 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
   the pins can still be lost or hidden, the hooks no longer detach while
   the agent runs.
+
+## 53. An AppImage's fork-only child is judged like its AppImage (lot 360)
+
+- **What changes.** §49 made an AppImage's programs its image's. Its
+  zygote's child — forked without an exec, as Chromium's and Electron's
+  zygotes do — was the image's only while `/proc` still showed it: it has
+  no exec record, so the connect pump named it from `/proc/<pid>/exe` and
+  the judgement found its image's mark through `/proc` again. A child that
+  closes its connection and exits at once was gone by then, its mark "not
+  known", and its flow was judged as a staged image's: NN-L-NET-008 High,
+  "would have: KillProcess" (the pre-alpha's rc3 round, five kernels).
+  The connect already carried the kernel's fork record of such a process
+  (lot 352: its forker and its start, read by the eBPF connect program); the
+  connect pump now teaches it to the lineage before it names the flow's
+  image, as the open sensor does for a write (lot 340). A process that
+  executed nothing since its fork is its forker's exec at that fork — its
+  image and its mark — whether it still runs or not; a connect made before
+  a later exec of it stays its forker's. No eBPF program changed.
+- **An image nothing names.** NN-L-NET-008 judges a flow by its process's
+  image path. A flow whose image is empty or unreadable, and that the
+  lineage cannot name (no exec, no fork record, no `/proc` link at the
+  connect), is not judged by a path: it is counted and said in the agent's
+  journal at debug level. A process the lineage names by its `/proc` link
+  alone (no exec or fork record: the record lost, a process older than the
+  agent) is judged by that path, as before: the user image's exemption
+  needs the mark.
+- **What stays judged, and is now judged more.** A binary staged in `/tmp`,
+  `/var/tmp` or `/dev/shm`, its fork+exec child and its fork-only children
+  keep NN-L-NET-008's kill (and R001, CHAIN-002/005 as before). A fork-only
+  child of a staged binary that exited before the pump read it was not
+  named, and drew nothing: it is now its forker's image, judged. The
+  programs of a FUSE mount the exec pump does not tie (§49: `squashfuse`,
+  a writable mount, a daemon that does not hold its image) and their forks
+  stay judged.
+- **Residual.** A fork of a fork-only process (a sandboxed zygote's
+  renderer) is named through its forker, read as before (by `/proc` while
+  it runs); when that forker has exited without a record of its own, the
+  child named by its `/proc` link is judged by its path. Its anchor (the
+  nearest process that executed) is not used: it may have executed since
+  that fork. A UDP datagram carries no fork record: a fork-only sender is
+  named as before.
+- **Seen in this lot's lab, not changed here.** §49's tie needs the image
+  file's path whole: the LSM exe walk keeps 31 bytes of a name, so an image
+  whose file name is 31 bytes or more (`Some-App-1.2.34-x86_64.AppImage` and
+  longer) is not tied, and its programs are judged as staged (R001,
+  CHAIN-002/005), as before §49.
+- **Operator action.** None.

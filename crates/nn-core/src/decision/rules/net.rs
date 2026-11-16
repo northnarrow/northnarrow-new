@@ -1673,6 +1673,9 @@ impl<H: PostureHost> Rule for NnLNet007Rfc1918FromUnusualProc<H> {
 pub struct NnLNet008OutboundFromTmpExec<H: PostureHost> {
     lineage: Option<crate::posture::lineage::AuthSessionTracker<H>>,
     resolvers: Arc<crate::net::resolvers::HostResolvers>,
+    /// Lot 360 (F4b-1): the flows left unjudged because their process's
+    /// image was not known ([`Self::image_not_known`]).
+    not_known: AtomicU64,
 }
 
 impl<H: PostureHost> NnLNet008OutboundFromTmpExec<H> {
@@ -1681,7 +1684,32 @@ impl<H: PostureHost> NnLNet008OutboundFromTmpExec<H> {
         Self {
             lineage,
             resolvers: crate::net::resolvers::HostResolvers::none(),
+            not_known: AtomicU64::new(0),
         }
+    }
+
+    /// Lot 360: the flows this rule left unjudged because their process's
+    /// image was not known ([`Self::image_not_known`]).
+    pub fn images_not_known(&self) -> u64 {
+        self.not_known.load(Ordering::Relaxed)
+    }
+
+    /// Lot 360 (F4b-1): a flow whose process's image is not known — the
+    /// row names none (or an empty one), and the lineage knows no exec of
+    /// it, no kernel fork record and, outside a judgement, no `/proc` link —
+    /// is recorded as such: counted and said in the journal, never judged
+    /// on a path it does not have. A process the lineage names by its path
+    /// alone (`/proc` at the connect: no exec or fork record) is still
+    /// judged by that path; the user image's exemption needs its mark.
+    fn image_not_known(&self, nf: &nn_model::telemetry::NetFlowEvent) {
+        self.not_known.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            rule = "NN-L-NET-008_OutboundFromTmpExec",
+            pid = nf.pid,
+            comm = %nn_model::log_escape::Escaped(&nf.comm),
+            "the connecting process's image is not known (no exec or fork record, \
+             not named at the connect): not judged by a staging path"
+        );
     }
 
     /// Lab PR 224: the resolvers whose DNS port a staged image may reach.
@@ -1717,16 +1745,29 @@ impl<H: PostureHost> Rule for NnLNet008OutboundFromTmpExec<H> {
         if crate::net::resolvers::is_resolver_flow(nf, &self.resolvers) {
             return None;
         }
+        // Lot 360 (F4b-1): an image not named — none in the row, an empty
+        // one (no path), none in the lineage — is not known: never judged by
+        // a staging path it does not have; counted, and said in the journal
         let looked_up;
-        let exe = match nf.exe.as_deref() {
+        let exe = match nf.exe.as_deref().filter(|e| !e.is_empty()) {
             Some(exe) => exe,
             None => {
-                // R-F: as of the flow (its connect), the cache only
+                // R-F: as of the flow (its connect), the cache only (and,
+                // lot 360, the kernel's fork record of a fork-only process)
                 looked_up = self
                     .lineage
-                    .as_ref()?
-                    .image_path_as(nf.pid, crate::posture::lineage::AsOf::of_event(event))?;
-                looked_up.as_str()
+                    .as_ref()
+                    .and_then(|l| {
+                        l.image_path_as(nf.pid, crate::posture::lineage::AsOf::of_event(event))
+                    })
+                    .filter(|e| !e.is_empty());
+                match looked_up.as_deref() {
+                    Some(exe) => exe,
+                    None => {
+                        self.image_not_known(nf);
+                        return None;
+                    }
+                }
             }
         };
         // lot 355: a program of a user's image (an AppImage's, served at its

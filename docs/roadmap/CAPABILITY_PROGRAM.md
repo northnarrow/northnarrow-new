@@ -11727,6 +11727,57 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 360 — the pre-alpha's Phase 4b, F4b-1 (P2): an AppImage's fork-only
+  child is judged like its AppImage (C14; no level changes).**
+  - What was open (rc3, Phase 4b, five kernels, alpha profile): a type-2
+    AppImage's zygote child (fork, no exec) connecting drew NN-L-NET-008 High
+    ("would have: KillProcess"), where lot 355's lab had NN-L-NET-007 only.
+    The connect's kernel fork record (lot 352) fed the chains' ancestry, not
+    the lineage: the child was named from `/proc` at the connect and known in
+    the judgement only while `/proc` still showed it; it exits at once. Lot
+    355's round saw the same race in its `squashfuse` control. The runtime is
+    not the cause: Phase 4b's `continuous` runtime is lot 355's file (the
+    same SHA-256).
+  - Done: the connect pump teaches the connect's fork record to the lineage
+    (`teach_connect_fork`) before it names the flow's image; the lineage
+    names a process that executed nothing since its fork by that record (its
+    forker's exec at the fork, and its mark) before any `/proc` read, gone or
+    not, and before a later exec (`forked_image_as`). NN-L-NET-008 treats an
+    empty or unreadable image as no path, counts a flow it cannot name;
+    a process named by `/proc` alone is still judged (fail-closed). Ratchet
+    `xtask/tests/fork_records.rs` (every wire record with a fork record is
+    taught by its pump). Named tests:
+    `sensors::multiplexer::tests::fork_only_connects::*` (each form, from
+    the pump to NN-L-NET-008; 6 of 10 fail on main: the fork-only child
+    exiting at once, the empty image, the staged binary's and the untied
+    mount's fork gone before the pump — not named, no verdict —, a fork
+    executing after its connect, the record's uid), the lineage's
+    `a_recorded_fork_is_its_forker_s_image_before_proc_and_after_its_exit`.
+    Mutation on the new code: 19 mutants, 18 caught by a named test, one
+    argued equivalent (an empty image the lineage names: no verdict either
+    way, only the count differs).
+  - Lab (alpha profile, the Phase 4b app — a `python3` copy with the F3
+    shapes — as a type-2 AppImage in `~/Applications`, a listener of our own
+    on the guest; the AppImage project's `continuous` runtime and its tagged
+    release 20251108, each image file named in 22 bytes): ubuntu2204 (5.15)
+    and ubuntu2604 (7.0). Both runtimes: the main process connecting, the
+    zygote's fork+exec child, its fork-only child exiting at once (three runs
+    each) and its fork-only child alive 3 s after its connect, NN-L-NET-007
+    Medium only, every run (on 7.0 one main-process run of the 20251108
+    image drew no record at all). Controls, still judged: the AppImage
+    copied to `/tmp` R001 High and NN-L-CHAIN-002 or -005 Critical (would
+    have: KillProcessTree); a `python3` copy staged in `/tmp` and its
+    fork-only child (exiting at once, alive 3 s) NN-L-CHAIN-005 Critical
+    with NN-L-NET-008 among its matches; `squashfuse` over the same squashfs
+    R001 and CHAIN-005; the home reference NET-007 only. Guests left
+    clean (agent uninstalled, no `.local`, no pins, packages purged, no
+    mounts), powered off.
+  - Found in the lab, not this lot's fix: an image file whose name is 31
+    bytes or more (`K360-continuous-x86_64.AppImage`) is never tied (the
+    LSM exe walk keeps 31 bytes of a name and marks it cut, so the image's
+    path names no file): every shape R001 High and CHAIN-002/005 Critical
+    on 5.15, the fork-only shape the same on 7.0. Common release names are
+    that long.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

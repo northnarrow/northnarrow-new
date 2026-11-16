@@ -1058,6 +1058,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 360 (pre-alpha Phase 4b, F4b-1, P2): **an AppImage's fork-only child
+  is judged like its AppImage** (`UPGRADE_NOTES_WAVE4.md` §53). A type-2
+  AppImage's zygote child (fork, no exec, as Chromium's and Electron's)
+  that connected drew NN-L-NET-008 High ("would have: KillProcess") on the
+  five kernels of the rc3 round, where lot 355 promised NN-L-NET-007 only.
+  The connect's kernel fork record (lot 352) reached the chains' ancestry
+  but never the lineage: the child was named from `/proc` at the connect
+  and, in the judgement, known only while `/proc` still showed it; it
+  closes its connection and exits at once, so its image's mark was "not
+  known" and its flow was judged as a staged image's. The runtime is not the
+  cause: the AppImage project's `continuous` runtime of Phase 4b is the
+  file lot 355 used (the same SHA-256).
+  - The connect pump teaches the connect's fork record to the lineage
+    (`teach_connect_fork`, as the open sensor's `teach_fork` for a write)
+    before it names the flow's image; the lineage names a process that
+    executed nothing since its fork by that record — its forker's exec at
+    the fork and its mark — before any `/proc` read, gone or not, and before
+    a later exec of it (`AuthSessionTracker::forked_image_as`, read by
+    `image_path_as` and `runs_user_image`). Ratchet
+    `xtask/tests/fork_records.rs`: every wire record with a fork record is
+    taught by its pump.
+  - NN-L-NET-008: an empty or unreadable image is no path; a flow whose
+    image nothing names is not judged by a path, counted
+    by the rule (`images_not_known`) and said in the journal (debug). A
+    process named by its `/proc` link alone (no exec or fork record) is
+    still judged by that path: the exemption needs the image's mark.
+  - Not weakened, stricter: a binary staged in `/tmp`, its fork+exec child
+    and its fork-only children keep NN-L-NET-008's kill; the fork-only child
+    that exited before the pump read it, which drew nothing, is now judged
+    too. An untied FUSE mount's program (`squashfuse`, a mount whose image
+    its daemon does not hold) and its forks stay judged, as in lot 355.
+  - Named tests: `sensors::multiplexer::tests::fork_only_connects::*` (the
+    main process, fork+exec, fork-only alive past 2 s and exiting at once,
+    an empty image, the staged binary and the untied mount's forks, a
+    fork of a fork-only forker, a fork executing after its connect, the
+    uid kept), `posture::lineage::tests::a_recorded_fork_is_its_forker_s_image_before_proc_and_after_its_exit`.
 - Lot 353 (pre-alpha Phase 3, case X6, P1): **a FUSE over `/proc`, `/sys`
   or the cgroup root does not stall the agent's critical loops; stuck
   restarts are named and a loop is signed** (mounts over the agent's own
