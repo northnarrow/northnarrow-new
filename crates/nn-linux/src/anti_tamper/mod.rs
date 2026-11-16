@@ -591,7 +591,8 @@ fn attach_reporting(
     // Lot 359 (the re-check 3 of #567, N4): the pin directory's lock, made
     // by the unit's `ExecStartPre=-+ … --pin-lock` step before this process
     // — in place in PID 1's table, or a signed degradation (#567's walk
-    // remains); the integrity round keeps one found in place
+    // remains); the integrity round keeps one found in place, and makes
+    // one the unit's start did not (the review of #569, F3)
     if let Some(root) = pin_root {
         match crate::mountinfo::read_bytes(Path::new("/proc/1/mountinfo")) {
             Ok(text) => match pin_lock::at_start(&text, root) {
@@ -605,10 +606,13 @@ fn attach_reporting(
                     report.degraded.push(why);
                 }
             },
-            Err(e) => report.degraded.push(format!(
-                "pin lock: PID 1's mount table is not read ({e}) ({})",
-                pin_lock::ABSENT_EFFECT
-            )),
+            Err(e) => {
+                pin_lock::at_start_unread();
+                report.degraded.push(format!(
+                    "pin lock: PID 1's mount table is not read ({e}) ({})",
+                    pin_lock::ABSENT_EFFECT
+                ))
+            }
         }
     }
 

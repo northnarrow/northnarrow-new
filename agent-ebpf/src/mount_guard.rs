@@ -47,8 +47,8 @@ use northnarrow_common::mount_guard::{
     MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
     umount_spread, umount_takes_held, Spread, HELD_UNDER, PLACE_ANY_GROUP, REACH_OTHER_NS,
     below_of, below_takes_held, umount_below, Tree,
-    lock_bind, lock_maker, lock_step, lock_touched, lock_verdict, BindShape, MG_LOCK,
-    MG_LOCK_ABOVE, MG_OP_PROPAGATE,
+    lock_bind, lock_maker, lock_shutdown_step, lock_step_at, lock_touched, lock_verdict,
+    BindShape, MG_LOCK, MG_LOCK_ABOVE, MG_OP_PROPAGATE,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
@@ -1080,8 +1080,10 @@ unsafe fn note_propagation_change(ctx: &LsmContext) {
 /// the pin directory's one dentry, [`MG_LOCK`]), judged where its parent's
 /// group lands (the place an unmount propagates through); or a recursive
 /// `MS_SHARED` on a mount rooted above it ([`MG_LOCK_ABOVE`]), judged where
-/// that mount lands. Refused but the maker's own two steps on the lock
-/// (`MS_PRIVATE`, then `MS_UNBINDABLE`). A target that is not a mount's
+/// that mount lands, and a recursive `MS_PRIVATE` there in PID 1's
+/// namespace (the review of #569, F1a). Refused but the maker's own step on
+/// the host's lock (`MS_UNBINDABLE`, `lock_step_at`) and `systemd-shutdown`'s
+/// `switch_root()` (`lock_shutdown_step`). A target that is not a mount's
 /// root is the kernel's `EINVAL`: let through. Out of line, a BPF-to-BPF
 /// call: its walk's states end with its frame.
 #[inline(never)]
@@ -1119,7 +1121,9 @@ unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
     let key = key_of(o, root);
     let rflags = flags_at(&key);
     let on_lock = rflags & MG_LOCK != 0 && peek_ptr(real.add(o.mnt_mountpoint as usize)) == root;
-    if !lock_touched(flags, on_lock, rflags & MG_LOCK_ABOVE != 0) {
+    let above = rflags & MG_LOCK_ABOVE != 0;
+    // the widest first (as in PID 1's namespace), the namespace read after
+    if !lock_touched(flags, on_lock, above, GUARD_HOST) {
         return 0;
     }
     let at = if on_lock {
@@ -1134,16 +1138,22 @@ unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
     let Some((guard, reach)) = target_of(o, at) else {
         return 0;
     };
-    // the maker's own step on the lock itself; the verdict without a
-    // `Query` or `decide` (whose allow-list call put this chain past 5.15's
-    // and 6.8's 512 bytes of stack: the lab's first verifier check of this
-    // lot, 576)
-    let maker_step = on_lock && lock_step(flags) && lock_maker_now();
+    // the review of #569 (F1a): a recursive MS_PRIVATE above it, in PID 1's
+    // namespace only
+    if !lock_touched(flags, on_lock, above, guard) {
+        return 0;
+    }
+    // the maker's own step on the host's lock (F1c), or systemd-shutdown's
+    // switch_root(); the verdict without a `Query` or `decide` (whose
+    // allow-list call put this chain past 5.15's and 6.8's 512 bytes of
+    // stack: the lab's first verifier check of this lot, 576)
+    let exempt = (lock_step_at(flags, on_lock, guard) && lock_maker_now())
+        || (lock_shutdown_step(flags, on_lock) && shutdown_stage());
     let kind = match lock_verdict(
         c.privileged,
         guard != 0,
         guard == 0,
-        maker_step,
+        exempt,
         crate::inode_protect::override_active(),
     ) {
         Verdict::Refuse(_) => LOCK_REFUSE,

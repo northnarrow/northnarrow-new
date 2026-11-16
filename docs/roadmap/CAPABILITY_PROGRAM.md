@@ -11737,13 +11737,15 @@ number in parentheses is a lab PR.
     the host's bpffs's child (`nn_linux::anti_tamper::pin_lock`, the unit's
     `ExecStartPre=-+ … --pin-lock` in PID 1's namespace before any pin;
     the agent itself keeps no `CAP_SYS_ADMIN` and no `mount(2)`); the guard
-    lets through only its maker's three steps (`common::mount_guard::
-    lock_maker`, `lock_bind`, `lock_step`; `MG_LOCK`, `MG_LOCK_ABOVE`,
-    `MG_OP_PROPAGATE`, `MG_WHY_LOCK`), every other mount, unmount, move or
-    change of propagation of it (or of a copy that reaches the host), and a
-    recursive `MS_SHARED` above it refused; a start without it a signed
-    degradation, each integrity round `pin_lock_missing` /
-    `pin_lock_changed` (High) and a transient unit making it again; the
+    lets through only its maker's two steps in PID 1's namespace
+    (`common::mount_guard::lock_maker`, `lock_bind`, `lock_step_at`;
+    `MG_LOCK`, `MG_LOCK_ABOVE`, `MG_OP_PROPAGATE`, `MG_WHY_LOCK`), every
+    other mount, unmount, move or change of propagation of it (or of a copy
+    that reaches the host), a recursive `MS_SHARED` above it, and a
+    recursive `MS_PRIVATE` above it in PID 1's namespace refused; a start
+    without it a signed degradation, each integrity round
+    `pin_lock_missing` / `pin_lock_changed` (High) and a transient unit
+    making it again (`pin_lock::Keeper`: three attempts, a back-off); the
     start's bpffs check, the integrity round's mount watch and the views
     (`kernel_roots`: the locked pin directory a view of its own) take it
     for the agent's own; `rm_pin_root` in `install.sh` and `uninstall.sh`.
@@ -11814,6 +11816,54 @@ number in parentheses is a lab PR.
     further out of line). Two fixes found by
     the lab: `sb_mount`'s chain past 512 bytes of stack (576, round 1), and
     `/` registered by its `/proc/1/root` link's key.
+  - Fix round 1 (the review of #569): the lock's `MNT_UNBINDABLE` could be
+    cleared without a refusal — a recursive `MS_PRIVATE` above it in PID
+    1's namespace (F1a), the maker's own `MS_PRIVATE` step, at any time and
+    in any namespace (F1c) — which reopened N4 for the pins. Now refused
+    (`lock_touched` reads the target's namespace; `lock_step` is exactly
+    `MS_UNBINDABLE`, `lock_step_at` on the host's lock only;
+    `lock_shutdown_step` for `systemd-shutdown`'s `switch_root()`); the
+    step makes the lock with `MS_UNBINDABLE` alone (`pin_lock::LOCK_FLAGS`).
+    The round's remake is retried within the round and backs off over the
+    rounds; a start of the unit without the lock has the round make it (F3,
+    F5). The docs state the real coverage: the rbind variants closed;
+    `mount_setattr(2)`, a raw namespace's own copy of the lock and the
+    units' namespaces open, signed at the next round (the coordinator's
+    decision for the alpha; the first lot after it). Tests:
+    `a_recursive_private_change_above_the_lock_in_pid_1s_namespace_is_refused`,
+    `a_plain_shared_change_of_the_lock_is_refused`,
+    `the_makers_step_is_unbindable_on_the_hosts_lock_only`,
+    `the_step_makes_the_lock_unbindable_alone_never_private`,
+    `one_failed_remake_is_retried_within_the_round`,
+    `a_round_whose_attempts_all_fail_signs_it_and_backs_off`,
+    `a_start_without_the_lock_has_it_made_by_the_round_in_its_unit`,
+    `the_remakes_of_a_round_share_one_deadline`,
+    `the_round_keeps_the_pin_lock_through_its_keeper`,
+    `the_lock_judge_reads_the_namespace_before_a_private_change_and_the_makers_step`,
+    `the_mount_walks_carry_no_option_across_a_loop` (found by the lab:
+    5.15's verifier refused `sb_mount` — `spread` carried an `Option`
+    whose never-written `None` payload the BPF back end loaded before the
+    tag; a value and a flag now). Mutation: 39 mutants of the new code (7
+    of them lot 359's first behaviour put back), all caught by a named
+    test (one after a new test: the remakes' shared deadline).
+    Lab (fix round 1, as measured, our own guests; the same eBPF object on
+    all five): ubuntu2204 (5.15.0-203, run again after the walk's fix),
+    ubuntu2404 (6.8.0-149), ubuntu2604 (7.0.0-43) — 21/21 refused, one
+    signed High each and the lock unchanged (among them the recursive
+    private change of `/sys/fs/bpf`, `/sys` and `/`, and a plain shared
+    change of the lock), 8/8 let through without a record (the plain
+    shared change of the bpffs, a private namespace's recursive private
+    change, the runtimes); the lock still unbindable after them, never in
+    an rbind copy; the bpffs and the pins kept through the race and the
+    chain of 9; a remake whose attempts all failed signed with the next
+    attempt's round, then made again after the back-off; cold boot and
+    uninstall clean. On 5.15 and 7.0 the record of that last remake was
+    held back by the drift back-off (its text the same as the remake's
+    signed minutes before, the same mount id): the loss and its clearing
+    signed at once. Verifier: 0 failing on all five, within the 900k gate
+    — 5.15 `sb_mount` 868,535 (86.9 %), `move_mount` 830,510, `sb_umount`
+    584,166; debian12 (6.1) `move_mount` 821,218; 7.0 602,885; debian13
+    (6.12) 376,974; 6.8 the highest 285,254.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

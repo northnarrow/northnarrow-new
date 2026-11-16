@@ -120,3 +120,63 @@ fn the_lock_judge_is_out_of_line_and_signs_nothing() {
     assert!(hook.contains("let r = lock_propagation(path, flags);"));
     assert!(hook.contains("return lock_answer(path, r);"));
 }
+
+/// The review of #569 (F1a, F1c): the lock's judge in `sb_mount` reads the
+/// namespace before the rule — a recursive `MS_PRIVATE` above the lock is
+/// judged only where the mount changed is PID 1's (`lock_touched` with the
+/// target's guard, after `target_of`), the maker's identity is asked only
+/// of its own step on the host's lock (`lock_step_at`, never `lock_step`
+/// alone), and `systemd-shutdown`'s identity only of its `switch_root()`
+/// shape (`lock_shutdown_step`).
+#[test]
+fn the_lock_judge_reads_the_namespace_before_a_private_change_and_the_makers_step() {
+    let e = source("agent-ebpf/src/mount_guard.rs");
+    let t = e
+        .find("unsafe fn try_lock_propagation(")
+        .expect("try_lock_propagation is gone");
+    let body = &e[t..];
+    let body = &body[..body.find("\n}\n").expect("its end")];
+    let widest = body
+        .find("lock_touched(flags, on_lock, above, GUARD_HOST)")
+        .expect("the widest rule first");
+    let target = body.find("target_of(o, at)").expect("the target's guard");
+    let by_ns = body
+        .find("lock_touched(flags, on_lock, above, guard)")
+        .expect("the rule by the target's namespace");
+    assert!(widest < target && target < by_ns, "the order of the rule");
+    assert!(body.contains("lock_step_at(flags, on_lock, guard) && lock_maker_now()"));
+    assert!(body.contains("lock_shutdown_step(flags, on_lock) && shutdown_stage()"));
+    assert!(
+        !body.contains("lock_step(flags)"),
+        "the maker's step anywhere"
+    );
+}
+
+/// The review of #569's fix round (lab, 5.15): `spread`'s slave carried
+/// across its loop as an `Option<G::M>` started as `None`, whose payload is
+/// never written — the BPF back end loaded it before it tested the tag
+/// (a select), and 5.15's verifier refused `sb_mount` ("invalid read from
+/// stack"; 6.5 and later allow the read for a privileged loader, so 6.8
+/// and 7.0 loaded it). The walks the eBPF inlines carry no `Option` in a
+/// mutable binding: a value always written, and a flag.
+#[test]
+fn the_mount_walks_carry_no_option_across_a_loop() {
+    let s = source("common/src/mount_guard.rs");
+    let code = &s[..s.find("#[cfg(test)]").expect("its tests")];
+    for (n, line) in code.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("//") {
+            continue;
+        }
+        assert!(
+            !(t.starts_with("let mut ") && t.contains(": Option<")),
+            "common/src/mount_guard.rs:{}: a mutable Option ({t})",
+            n + 1
+        );
+        assert!(
+            !(t.starts_with("let mut ") && t.ends_with("= None;")),
+            "common/src/mount_guard.rs:{}: a mutable Option ({t})",
+            n + 1
+        );
+    }
+}

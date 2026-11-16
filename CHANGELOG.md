@@ -17,15 +17,33 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   propagation, a mount that keeps a child not itself unmounted, and an
   rbind never copies an unbindable mount. Reused at a restart, made again
   at a cold boot.
-  - **Guard:** only its maker's three steps pass (the agent's binary as a
-    unit's process; the self-bind judged by the kernel's objects,
-    `MS_PRIVATE`, `MS_UNBINDABLE`); any other unmount, move, mount or
-    change of propagation of it, a copy of it that reaches the host, or a
-    recursive `MS_SHARED` above it is refused, signed High
-    (`MG_WHY_LOCK`, operation `MG_OP_PROPAGATE`).
-  - **Watch:** a start without it signs a degradation (the walk remains);
-    each integrity round signs `pin_lock_missing` / `pin_lock_changed`
-    (High) and makes it again (a transient unit), its result in the record.
+  - **Guard:** only its maker's two steps pass, in PID 1's namespace (the
+    agent's binary as a unit's process; the self-bind judged by the
+    kernel's objects, then `MS_UNBINDABLE` on the host's lock); any other
+    unmount, move, mount or change of propagation of it, a copy of it that
+    reaches the host, a recursive `MS_SHARED` above it, or a recursive
+    `MS_PRIVATE` above it in PID 1's namespace (`systemd-shutdown`'s
+    `switch_root()` excepted) is refused, signed High (`MG_WHY_LOCK`,
+    operation `MG_OP_PROPAGATE`). The review of #569 (F1): the maker's
+    `MS_PRIVATE` step, and a recursive `MS_PRIVATE` above the lock, left it
+    bindable without a refusal — the step is gone, the change refused.
+  - **Watch:** a start without it signs a degradation (the walk remains;
+    in the agent's unit the round then makes it); each integrity round
+    signs `pin_lock_missing` / `pin_lock_changed` (High) and makes it again
+    (a transient unit, up to three attempts within 30 s, then a back-off
+    over the rounds), its result in the record.
+  - **Closes** the rbind variants for the pins (a racing rbind graft, an
+    rbind copy beyond the walk's bound). **Does not close**, each signed at
+    the next integrity round: the lock's flags cleared through
+    `mount_setattr(2)` (no LSM hook); a raw namespace's own copy of the
+    lock, its move judged by its target only; the units' namespaces, which
+    never have the lock (KNOWN_LIMITATIONS.md). Scheduled first after the
+    alpha.
+  - **Fixed on the way (the fix round's lab, 5.15):** the peer-group walk
+    (`common::mount_guard::spread`) carried an `Option` across its loop;
+    the BPF back end loaded its never-written `None` payload before the
+    tag, and 5.15's verifier refused `sb_mount`. A value and a flag now
+    (ratchet `the_mount_walks_carry_no_option_across_a_loop`).
   - **Scripts:** `install.sh` and `uninstall.sh` unmount it before they
     remove the pin root (`rm_pin_root`, inside the window).
   - `/sys/fs/cgroup` stays behind the walk (KNOWN_LIMITATIONS.md).

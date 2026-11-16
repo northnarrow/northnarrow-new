@@ -6,13 +6,14 @@
 //! takes the namespace lock, so that subtree can grow before the kernel
 //! collects it (an rbind grafted meanwhile), and the walk reads only its
 //! bound: a lazy unmount could still take the host's bpffs, and the pins
-//! with it, in any namespace. The kernel's own rule closes both for the
-//! pins: `propagate_umount()` never takes a mount that keeps a child that is
-//! not itself unmounted. So the pin directory is bound onto itself, made
-//! private, then unbindable — the lock — as the child of the host's bpffs
-//! in PID 1's mount namespace: an rbind never copies an unbindable mount,
-//! and the host's bpffs keeps that child whatever an unmount elsewhere
-//! takes. `/sys/fs/cgroup` has no such child: it stays behind the walk.
+//! with it, in any namespace. The kernel's own rule closes the rbind
+//! variants of both for the pins: `propagate_umount()` never takes a mount
+//! that keeps a child that is not itself unmounted. So the pin directory
+//! is bound onto itself, then made unbindable (which makes it private
+//! too) — the lock — as the child of the host's bpffs in PID 1's mount
+//! namespace: an rbind never copies an unbindable mount, and the host's
+//! bpffs keeps that child whatever an rbind copy's unmount takes.
+//! `/sys/fs/cgroup` has no such child: it stays behind the walk.
 //!
 //! Who makes it, and why there: the lock must be the host's bpffs's own
 //! child (that is the mount the propagation would take), and the agent's
@@ -28,13 +29,25 @@
 //! kept across restarts (one already in place, with the right flags, is
 //! reused), gone at a reboot (the bpffs is new) and made again by the next
 //! start. The integrity round makes it again when it is lost or changed,
-//! through a transient unit running the same step ([`remake`]).
+//! through a transient unit running the same step ([`remake`]), a few
+//! times within its deadline, then with a back-off over the rounds
+//! ([`Keeper`]); and makes it when the start found none (the review of
+//! #569, F3).
 //!
-//! It passes the mount guard only as its maker's own three steps
-//! (`common::mount_guard::lock_maker`, `lock_bind`, `lock_step`); every
-//! other mount, unmount, move or change of propagation of it is refused and
-//! signed High. The uninstaller and the signed trusted-installer window
-//! unmount it before they remove the directory.
+//! It passes the mount guard only as its maker's own two steps in PID 1's
+//! namespace (`common::mount_guard::lock_maker`, `lock_bind`,
+//! `lock_step_at`: the self-bind, then `MS_UNBINDABLE` — never
+//! `MS_PRIVATE`, which makes a lock in place bindable again); every other
+//! mount, unmount, move or change of propagation of it, and a recursive
+//! change above it in PID 1's namespace that would make it bindable, is
+//! refused and signed High. The uninstaller and the signed
+//! trusted-installer window unmount it before they remove the directory.
+//!
+//! What it does not cover, each signed at the next integrity round
+//! (about 30 s), where it can be seen: `mount_setattr(2)` has no LSM hook,
+//! so root can clear the lock's flags through it; a raw mount namespace
+//! holds its own copy of the lock, and a move of its copy of `/sys` is
+//! judged by its target only; the units' namespaces never have the lock.
 //!
 //! Fail-safe: a lock that cannot be made (a kernel without `open_tree(2)`,
 //! an error) is a signed degradation of the start ([`at_start`]), and
@@ -326,8 +339,8 @@ fn host_table() -> io::Result<Vec<u8>> {
 /// The lock made, reused or repaired at `pin_root` — in PID 1's mount
 /// namespace only, by a privileged process (the unit's `ExecStartPre=+`
 /// step): the directory made if it is not there (mode 0700, never through
-/// a symbolic link), then the self-bind, `MS_PRIVATE`, `MS_UNBINDABLE`, and
-/// the table read again.
+/// a symbolic link), then the self-bind, `MS_UNBINDABLE`, and the table
+/// read again.
 pub fn step(pin_root: &Path) -> Outcome {
     let (Ok(me), Ok(host)) = (mnt_ns("self"), mnt_ns("1")) else {
         return Outcome::Failed("the mount namespaces cannot be read".into());
@@ -393,14 +406,19 @@ pub fn step(pin_root: &Path) -> Outcome {
     }
 }
 
-/// The lock's two changes of propagation, in its order.
+/// The lock's change of propagation: [`LOCK_FLAGS`] alone.
 fn lock_flags(pin_root: &Path) -> Result<(), String> {
-    use common::mount_guard::{MS_PRIVATE, MS_UNBINDABLE};
-    propagation(pin_root, MS_PRIVATE)
-        .map_err(|e| format!("MS_PRIVATE on {}: {e}", pin_root.display()))?;
-    propagation(pin_root, MS_UNBINDABLE)
+    propagation(pin_root, LOCK_FLAGS)
         .map_err(|e| format!("MS_UNBINDABLE on {}: {e}", pin_root.display()))
 }
+
+/// The one change of propagation the step makes: `MS_UNBINDABLE`, which
+/// makes the mount private too (the kernel's `change_mnt_propagation()`
+/// leaves its peer group and its master) — the review of #569 (F1c): no
+/// `MS_PRIVATE` step, which clears `MNT_UNBINDABLE` of a lock in place. The
+/// mount guard lets this one through for the maker only
+/// (`common::mount_guard::lock_step`).
+pub const LOCK_FLAGS: u64 = common::mount_guard::MS_UNBINDABLE;
 
 /// The pin directory there to bind: made (0700) when absent, refused when
 /// it is a symbolic link or not a directory, on a bpffs at [`BPF_ROOT`].
@@ -445,7 +463,7 @@ pub fn step_main() -> i32 {
 
 /// The lock as this start found it in PID 1's table (the step ran just
 /// before the agent's process), for the integrity round: `Some(true)` it
-/// was in place.
+/// was in place, `Some(false)` it was not (or the table was not read).
 static AT_START: OnceLock<bool> = OnceLock::new();
 
 /// The start's check of the lock: `None` when it is in place (recorded for
@@ -457,45 +475,144 @@ pub fn at_start(host_table: &[u8], pin_root: &Path) -> Option<String> {
     (!in_place).then(|| format!("pin lock: {} at the start ({ABSENT_EFFECT})", s.describe()))
 }
 
-/// The start found the lock in place: the integrity round keeps it so.
-pub fn established() -> bool {
-    AT_START.get().copied().unwrap_or(false)
+/// The start could not read PID 1's table (a signed degradation): the
+/// lock is not known to be in place.
+pub fn at_start_unread() {
+    let _ = AT_START.set(false);
 }
 
 /// The integrity round's finding kinds (High).
 pub const MISSING: &str = "pin_lock_missing";
 pub const CHANGED: &str = "pin_lock_changed";
 
-/// The integrity round's check of a lock the start found in place: `None`
-/// when it is in place still; else the finding's kind and detail, after
-/// `remake` was asked to make it again — its result in the detail.
-pub fn round(
-    host_table: &[u8],
-    pin_root: &Path,
-    remake: impl FnOnce() -> Outcome,
-) -> Option<(&'static str, String)> {
-    let s = state_in(host_table, pin_root);
-    let kind = match &s {
-        State::InPlace(_) => return None,
-        State::Missing(_) => MISSING,
-        State::Propagation(..) | State::Changed(_) => CHANGED,
-    };
-    let out = remake();
-    Some((
-        kind,
-        format!(
-            "the lock of {} {} since the start — an unmount racing the mount guard's walk could \
-             take the host's bpffs and the pins; made again: {}",
-            pin_root.display(),
-            s.describe(),
-            out.line()
-        ),
-    ))
+/// How many times one integrity round asks for the lock again, all within
+/// [`REMAKE_DEADLINE`] (the review of #569: one failure no longer leaves it
+/// missing until the next round).
+pub const REMAKE_TRIES: u32 = 3;
+
+/// The pause after a failed attempt, times its number (1 s, then 2 s).
+pub const REMAKE_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// After rounds whose attempts all failed, the rounds left out before the
+/// next attempt: 1, 3, then [`MAX_SKIP`] (an attempt about every 4 minutes)
+/// — a persistent failure never holds every round.
+pub const MAX_SKIP: u32 = 7;
+
+/// The integrity round's keeper of the lock (lot 359; the review of #569,
+/// F3 and F5): it watches the lock the start found in place, or the one it
+/// made itself — and, in the agent's unit, one the start did not find (the
+/// unit's step should have made it: a transient failure, a refusal). A lock
+/// missing or changed is a finding (High) and asked for again
+/// [`REMAKE_TRIES`] times within the round; every attempt's outcome is in
+/// the signed finding. After a round whose attempts all failed, the next
+/// rounds sign the same finding (it is not "cleared" while the lock is
+/// still not in place) and the next attempt waits ([`MAX_SKIP`]).
+#[derive(Debug, Default)]
+pub struct Keeper {
+    /// The lock was in place in a round since the start.
+    seen: bool,
+    /// Rounds in a row whose attempts all failed.
+    failed: u32,
+    /// Rounds still to leave out before the next attempt.
+    skip: u32,
+    /// The last failed round's finding, signed again while waiting.
+    last: Option<(&'static str, String)>,
 }
 
-/// How long the integrity round waits for the transient unit (its own
-/// `RuntimeMaxSec=` is 20 s): a manager that does not answer never holds
-/// the round.
+impl Keeper {
+    /// Whether the round watches the lock: the start found it in place, or
+    /// a round saw it since; or the start did not find it and the agent
+    /// runs as its unit (`in_unit`), whose step makes it — never for an
+    /// agent run by hand, where no step ran.
+    pub fn watches(&self, in_unit: bool) -> bool {
+        self.watches_after(AT_START.get().copied(), in_unit)
+    }
+
+    /// [`Keeper::watches`] after the start's check `at_start`.
+    fn watches_after(&self, at_start: Option<bool>, in_unit: bool) -> bool {
+        self.seen
+            || match at_start {
+                Some(true) => true,
+                Some(false) => in_unit,
+                None => false,
+            }
+    }
+
+    /// One round: `None` while the lock is in place; else the finding's
+    /// kind and detail, after `remake` was asked up to [`REMAKE_TRIES`]
+    /// times (`pause` between two) — or, while waiting after failed
+    /// rounds, the last finding again.
+    pub fn round(
+        &mut self,
+        host_table: &[u8],
+        pin_root: &Path,
+        mut remake: impl FnMut() -> Outcome,
+        mut pause: impl FnMut(std::time::Duration),
+    ) -> Option<(&'static str, String)> {
+        let s = state_in(host_table, pin_root);
+        let kind = match &s {
+            State::InPlace(_) => {
+                *self = Keeper {
+                    seen: true,
+                    ..Keeper::default()
+                };
+                return None;
+            }
+            State::Missing(_) => MISSING,
+            State::Propagation(..) | State::Changed(_) => CHANGED,
+        };
+        if self.skip > 0 {
+            if let Some(last) = &self.last {
+                self.skip -= 1;
+                return Some(last.clone());
+            }
+        }
+        let mut tries = 0;
+        let out = loop {
+            tries += 1;
+            let out = remake();
+            if out.in_place() || tries >= REMAKE_TRIES {
+                break out;
+            }
+            pause(REMAKE_PAUSE * tries);
+        };
+        let outcome = if out.in_place() {
+            *self = Keeper {
+                seen: true,
+                ..Keeper::default()
+            };
+            format!(
+                "made again: {} (attempt {tries} of {REMAKE_TRIES})",
+                out.line()
+            )
+        } else {
+            self.failed = self.failed.saturating_add(1);
+            self.skip = ((1u32 << self.failed.min(3)) - 1).min(MAX_SKIP);
+            format!(
+                "NOT made again after {tries} attempts: {}; the next attempt in {} rounds",
+                out.line(),
+                self.skip + 1
+            )
+        };
+        let f = (
+            kind,
+            format!(
+                "the lock of {} {} — an unmount racing the mount guard's walk could take the \
+                 host's bpffs and the pins; {outcome}",
+                pin_root.display(),
+                s.describe(),
+            ),
+        );
+        if !out.in_place() {
+            self.last = Some(f.clone());
+        }
+        Some(f)
+    }
+}
+
+/// How long the integrity round waits for the transient unit, all its
+/// attempts together (each unit's own `RuntimeMaxSec=` is 20 s): a manager
+/// that does not answer never holds the round.
 pub const REMAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `cmd` run, its standard output read once it exited, within `deadline`
@@ -529,9 +646,16 @@ fn run_bounded(
 
 /// The step run again from the agent (the integrity round): the agent's
 /// own binary as a transient unit's process (`systemd-run --wait`, PID 1's
-/// child in PID 1's namespace, outside the agent's sandbox), then PID 1's
-/// table read again.
-pub fn remake(pin_root: &Path) -> Outcome {
+/// child in PID 1's namespace, outside the agent's sandbox), waited for
+/// until `until` at most, then PID 1's table read again.
+pub fn remake(pin_root: &Path, until: std::time::Instant) -> Outcome {
+    let left = until.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Outcome::Failed(format!(
+            "no time left within the round's {} s",
+            REMAKE_DEADLINE.as_secs()
+        ));
+    }
     let exe = match antitamper_bpf::kernel_roots::read_link("/proc/self/exe") {
         Ok(p) => p,
         Err(e) => return Outcome::Failed(format!("/proc/self/exe: {e}")),
@@ -562,7 +686,7 @@ pub fn remake(pin_root: &Path) -> Outcome {
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
-    let said = match run_bounded(cmd, REMAKE_DEADLINE) {
+    let said = match run_bounded(cmd, left) {
         Ok(out) => out.trim().chars().take(300).collect::<String>(),
         Err(e) => return Outcome::Failed(format!("systemd-run: {e}")),
     };
@@ -711,29 +835,210 @@ mod tests {
     fn a_lost_or_changed_lock_is_a_finding_and_made_again() {
         let root = Path::new(ROOT);
         let mut asked = 0;
-        assert!(round(&with(&lock_line("unbindable")), root, || {
-            asked += 1;
-            Outcome::Made(1)
-        })
-        .is_none());
+        assert!(Keeper::default()
+            .round(
+                &with(&lock_line("unbindable")),
+                root,
+                || {
+                    asked += 1;
+                    Outcome::Made(1)
+                },
+                |_| {}
+            )
+            .is_none());
         assert_eq!(asked, 0);
-        let (kind, detail) = round(BASE.as_bytes(), root, || Outcome::Made(95)).unwrap();
+        let (kind, detail) = Keeper::default()
+            .round(BASE.as_bytes(), root, || Outcome::Made(95), |_| {})
+            .unwrap();
         assert_eq!(kind, MISSING);
         assert!(detail.contains("pin lock: made (mount 95)"), "{detail}");
-        let (kind, detail) = round(&with(&lock_line("shared:120")), root, || {
-            Outcome::Repaired(90)
-        })
-        .unwrap();
+        let (kind, detail) = Keeper::default()
+            .round(
+                &with(&lock_line("shared:120")),
+                root,
+                || Outcome::Repaired(90),
+                |_| {},
+            )
+            .unwrap();
         assert_eq!(kind, CHANGED);
         assert!(
             detail.contains("propagation changed") && detail.contains("repaired"),
             "{detail}"
         );
-        let (_, detail) = round(BASE.as_bytes(), root, || {
-            Outcome::Failed("systemd-run: no".into())
-        })
-        .unwrap();
+        let (_, detail) = Keeper::default()
+            .round(
+                BASE.as_bytes(),
+                root,
+                || Outcome::Failed("systemd-run: no".into()),
+                |_| {},
+            )
+            .unwrap();
         assert!(detail.contains("NOT made: systemd-run: no"), "{detail}");
+    }
+
+    /// Named test (the review of #569, F5 and the coordinator's fix 3): one
+    /// failed attempt no longer leaves the lock missing until the next
+    /// round — it is asked for again within the round, after a pause, and
+    /// the signed finding says at which attempt it was made.
+    #[test]
+    fn one_failed_remake_is_retried_within_the_round() {
+        let root = Path::new(ROOT);
+        let mut asked = 0;
+        let mut paused = Vec::new();
+        let mut k = Keeper::default();
+        let (kind, detail) = k
+            .round(
+                BASE.as_bytes(),
+                root,
+                || {
+                    asked += 1;
+                    if asked == 1 {
+                        Outcome::Failed("Unit northnarrow-pin-lock.service already exists".into())
+                    } else {
+                        Outcome::Made(96)
+                    }
+                },
+                |d| paused.push(d),
+            )
+            .unwrap();
+        assert_eq!(kind, MISSING);
+        assert_eq!(asked, 2);
+        assert_eq!(paused, vec![REMAKE_PAUSE]);
+        assert!(
+            detail.contains("made again: pin lock: made (mount 96) (attempt 2 of 3)"),
+            "{detail}"
+        );
+        // in place at the next round: nothing, and nothing asked
+        assert!(k
+            .round(
+                &with(&lock_line("unbindable")),
+                root,
+                || unreachable!(),
+                |_| {}
+            )
+            .is_none());
+    }
+
+    /// Named test (the review of #569, F5): a round whose attempts all fail
+    /// signs it, with each attempt counted — bounded ([`REMAKE_TRIES`]) —
+    /// and the next rounds sign the same finding (it is not "cleared" while
+    /// the lock is not in place) and ask again only after a back-off
+    /// (1, 3, then [`MAX_SKIP`] rounds left out); once it is made, the
+    /// back-off is gone.
+    #[test]
+    fn a_round_whose_attempts_all_fail_signs_it_and_backs_off() {
+        let root = Path::new(ROOT);
+        let asked = std::cell::Cell::new(0);
+        let fail = || {
+            asked.set(asked.get() + 1);
+            Outcome::Failed("systemd-run: no".into())
+        };
+        let mut k = Keeper::default();
+        let mut paused = Vec::new();
+        let first = k
+            .round(BASE.as_bytes(), root, fail, |d| paused.push(d))
+            .unwrap();
+        assert_eq!(asked.get(), REMAKE_TRIES);
+        assert_eq!(paused, vec![REMAKE_PAUSE, REMAKE_PAUSE * 2]);
+        assert!(
+            first.1.contains("NOT made again after 3 attempts")
+                && first.1.contains("the next attempt in 2 rounds"),
+            "{}",
+            first.1
+        );
+        // left out: the same finding, nothing asked
+        assert_eq!(k.round(BASE.as_bytes(), root, fail, |_| {}), Some(first));
+        assert_eq!(asked.get(), REMAKE_TRIES);
+        // asked again: fails again, a longer wait
+        let second = k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert_eq!(asked.get(), 2 * REMAKE_TRIES);
+        assert!(second.1.contains("in 4 rounds"), "{}", second.1);
+        for _ in 0..3 {
+            assert_eq!(
+                k.round(BASE.as_bytes(), root, fail, |_| {}),
+                Some(second.clone())
+            );
+        }
+        assert_eq!(asked.get(), 2 * REMAKE_TRIES);
+        let third = k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert!(third.1.contains("in 8 rounds"), "{}", third.1);
+        for _ in 0..MAX_SKIP {
+            k.round(BASE.as_bytes(), root, fail, |_| {});
+        }
+        let fourth = k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert_eq!(asked.get(), 4 * REMAKE_TRIES);
+        assert!(fourth.1.contains("in 8 rounds"), "capped: {}", fourth.1);
+        // made: the back-off is gone
+        for _ in 0..MAX_SKIP {
+            k.round(BASE.as_bytes(), root, fail, |_| {});
+        }
+        let made = k
+            .round(BASE.as_bytes(), root, || Outcome::Made(97), |_| {})
+            .unwrap();
+        assert!(made.1.contains("made again"), "{}", made.1);
+        let again = k
+            .round(BASE.as_bytes(), root, || Outcome::Made(98), |_| {})
+            .unwrap();
+        assert!(again.1.contains("mount 98"), "asked at once: {}", again.1);
+        // found in place after failed rounds: the back-off is gone too
+        let mut k = Keeper::default();
+        k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert!(k
+            .round(&with(&lock_line("unbindable")), root, fail, |_| {})
+            .is_none());
+        let after = k
+            .round(BASE.as_bytes(), root, || Outcome::Made(99), |_| {})
+            .unwrap();
+        assert!(after.1.contains("mount 99"), "asked at once: {}", after.1);
+    }
+
+    /// Named test (the review of #569, F3): a start that did not find the
+    /// lock no longer leaves it unwatched for the whole run — in the
+    /// agent's unit the round makes it (and watches it from then on); an
+    /// agent run by hand (no step ran) is left as its start signed it.
+    #[test]
+    fn a_start_without_the_lock_has_it_made_by_the_round_in_its_unit() {
+        let k = Keeper::default();
+        assert!(k.watches_after(Some(true), false));
+        assert!(k.watches_after(Some(true), true));
+        assert!(k.watches_after(Some(false), true));
+        assert!(!k.watches_after(Some(false), false), "run by hand");
+        assert!(!k.watches_after(None, true), "no pin root: no lock");
+        let mut k = Keeper::default();
+        let (kind, detail) = k
+            .round(
+                BASE.as_bytes(),
+                Path::new(ROOT),
+                || Outcome::Made(99),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(kind, MISSING);
+        assert!(detail.contains("made again"), "{detail}");
+        assert!(k.watches_after(Some(false), false), "watched once made");
+    }
+
+    /// Named test (the review of #569, F1c): the step's one change of
+    /// propagation is `MS_UNBINDABLE` — the maker's step the guard lets
+    /// through — and the step never asks for `MS_PRIVATE`, which made a
+    /// lock in place bindable again (a repair included).
+    #[test]
+    fn the_step_makes_the_lock_unbindable_alone_never_private() {
+        use common::mount_guard::{lock_step, MS_PRIVATE, MS_UNBINDABLE};
+        assert_eq!(LOCK_FLAGS, MS_UNBINDABLE);
+        assert!(lock_step(LOCK_FLAGS));
+        let src = include_str!("pin_lock.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(!code.contains("MS_PRIVATE)"), "a step asks for MS_PRIVATE");
+        assert!(!lock_step(MS_PRIVATE));
+        let calls: Vec<&str> = code
+            .match_indices("propagation(pin_root, ")
+            .map(|(i, _)| &code[i..i + 40])
+            .collect();
+        assert!(!calls.is_empty());
+        for c in calls {
+            assert!(c.starts_with("propagation(pin_root, LOCK_FLAGS)"), "{c}");
+        }
     }
 
     /// Named test (lot 359): the start that finds no lock signs a
@@ -745,6 +1050,28 @@ mod tests {
             why.contains("missing") && why.contains("the walk (#567) remains"),
             "{why}"
         );
+    }
+
+    /// Named test (the review of #569, F5): a round's attempts share one
+    /// deadline — each transient unit is waited for only for the time left
+    /// until the round's `until`, and none is started once it has passed.
+    #[test]
+    fn the_remakes_of_a_round_share_one_deadline() {
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        match remake(Path::new(ROOT), past) {
+            Outcome::Failed(why) => assert!(why.contains("no time left"), "{why}"),
+            o => panic!("{o:?}"),
+        }
+        let src = include_str!("pin_lock.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = &code[code.find("pub fn remake(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("until.saturating_duration_since(std::time::Instant::now())"));
+        assert!(
+            body.contains("run_bounded(cmd, left)"),
+            "the time left only"
+        );
+        assert!(!body.contains("REMAKE_DEADLINE)"), "a deadline of its own");
     }
 
     /// Named test (lot 359): the transient unit is waited for within a

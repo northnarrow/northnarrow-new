@@ -84,7 +84,8 @@ ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
 # bpffs, before the agent writes a pin. The kernel never takes, in an
 # unmount's propagation, a mount that keeps a child that is not itself
 # unmounted, and an rbind never copies an unbindable mount: the host's
-# bpffs and the pins stay, whatever an unmount elsewhere takes. `+`: with
+# bpffs and the pins stay, whatever an rbind copy's unmount takes
+# (UPGRADE_NOTES_WAVE4.md §52 lists what it does not cover). `+`: with
 # full privileges, outside this unit's sandbox (the agent itself has no
 # CAP_SYS_ADMIN and no mount(2), on purpose); LogNamespace= still gives the
 # step this unit's mount namespace, so the step enters PID 1's itself

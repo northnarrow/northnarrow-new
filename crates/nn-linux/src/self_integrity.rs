@@ -2263,6 +2263,9 @@ struct Checker {
     /// watchdog's (with the pid it was read for).
     own_mounts: MountWatch,
     watchdog_mounts: (Option<u32>, MountWatch),
+    /// Lot 359: the pin directory's lock, kept (the review of #569: its
+    /// attempts and back-off).
+    pin_lock: crate::anti_tamper::pin_lock::Keeper,
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
@@ -2432,15 +2435,20 @@ impl Checker {
         // Lot 359 (the re-check 3 of #567, N4): the pin directory's lock the
         // start found in place, kept so — lost or changed, a High of its own
         // and made again (a transient unit running the unit's step), the
-        // guard's held mounts then read again for its new id
+        // guard's held mounts then read again for its new id. The review of
+        // #569: asked for again within the round, bounded (F5), and made
+        // when the agent's unit started without it (F3)
         if let Some(host) = &host_copy {
-            if crate::anti_tamper::pin_lock::established() {
+            let in_unit = own_cgroup().as_deref() == Some(AGENT_UNIT_CGROUP);
+            if self.pin_lock.watches(in_unit) {
                 let root = crate::anti_tamper::pin_lock::pin_root();
-                if let Some((kind, detail)) = crate::anti_tamper::pin_lock::round(
+                let until =
+                    std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE;
+                if let Some((kind, detail)) = self.pin_lock.round(
                     host,
                     &root,
                     || {
-                        let out = crate::anti_tamper::pin_lock::remake(&root);
+                        let out = crate::anti_tamper::pin_lock::remake(&root, until);
                         if out.in_place() {
                             if let Err(e) = crate::anti_tamper::mount_guard::wake_refresh(
                                 Path::new(antitamper_bpf::DEFAULT_BPFFS_ROOT),
@@ -2450,6 +2458,7 @@ impl Checker {
                         }
                         out
                     },
+                    std::thread::sleep,
                 ) {
                     out.push(Finding { kind, detail });
                 }
@@ -2826,6 +2835,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
         own_mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
         watchdog_mounts: (None, MountWatch::default()),
+        pin_lock: Default::default(),
         watchdog_pidfile,
         own_files,
         audit_log,
@@ -3694,6 +3704,28 @@ mod tests {
         assert!(high[..2000].contains("f.kind == \"mount_over_protected\""));
     }
 
+    /// Named test (the review of #569, F3 and F5): the round keeps the pin
+    /// directory's lock through its keeper — watched as the keeper says for
+    /// this agent's own unit (its cgroup), every attempt within one
+    /// deadline (`REMAKE_DEADLINE`), a pause between two.
+    #[test]
+    fn the_round_keeps_the_pin_lock_through_its_keeper() {
+        let src = include_str!("self_integrity.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let read = &code[code.find("fn read_mounts(").unwrap()..];
+        let read = &read[..read.find("\n    }\n").unwrap()];
+        assert!(read.contains("let in_unit = own_cgroup().as_deref() == Some(AGENT_UNIT_CGROUP);"));
+        assert!(read.contains("if self.pin_lock.watches(in_unit) {"));
+        assert!(read
+            .contains("std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE"));
+        assert!(read.contains("crate::anti_tamper::pin_lock::remake(&root, until)"));
+        assert!(read.contains("std::thread::sleep,"));
+        assert!(
+            !read.contains("pin_lock::established()"),
+            "the start's lock alone"
+        );
+    }
+
     /// Lot 353 (the review of #563, F4, verified false positive): WSL2's
     /// init lays a tmpfs over `binfmt_misc`'s `status` (source root
     /// `/wsl/binfmt-status-lock`) at every boot of a supported platform —
@@ -4558,6 +4590,7 @@ mod tests {
             mounts: MountWatch::default(),
             own_mounts: MountWatch::default(),
             watchdog_mounts: (None, MountWatch::default()),
+            pin_lock: Default::default(),
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
