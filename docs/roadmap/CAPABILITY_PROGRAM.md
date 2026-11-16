@@ -11706,8 +11706,8 @@ number in parentheses is a lab PR.
     Mutation on the final tree: 54 mutants (the walk 24, `ptrace_read` 8,
     journald's identity and its order 5, `held` 12, the round's held pins 4,
     the purge's release 1), 54 caught by a named test — two after
-    `the_walk_reads_exactly_its_bound_and_every_group_read` (a 33rd mount
-    read; only the last group kept).
+    `the_walk_reads_exactly_its_bound_and_every_group_read` (one mount read
+    past the bound; only the last group kept).
     Lab (as measured, our own guests): ubuntu2204 (5.15.0-203) at a091aa8c
     and 59989001 — the 900k verifier gate 123 programs, 0 failing, highest
     `mount_guard_sb_umount` 675,751 (67.6 %), N3a refused (one High) with
@@ -12031,7 +12031,7 @@ number in parentheses is a lab PR.
     guide alone on Debian 12 with a CI build): the FUSE item rewritten as
     behaviour (a file system that does not answer can delay exec records,
     signed by the sensor self-test) and moved out of "against root"; the
-    unmount walk's bounds and the pin lock's residuals as behaviour (fix round 2: also in the trust model, the upgrade notes, the changelog and these notes, without numbers, sequences or windows); the guide's "Before the release exists"
+    unmount walk's bounds and the pin lock's residuals as behaviour (fix rounds 2 and 3: also in the trust model, the upgrade notes, the changelog and these notes, as behaviour); the guide's "Before the release exists"
     (what a tester can and cannot verify, the flags that record it),
     what `install.sh` needs, the `.deb`'s check, `sudo`, `decision
     delay`, the `host-check` warnings, netcat on Debian, `grep` for the

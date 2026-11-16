@@ -3149,14 +3149,12 @@ where it starts.
 
 ### Residual
 
-- An unmount of a large subtree in a namespace not guarded, with only
-  private mounts read: let through (a
-  container runtime's old root has that shape; root can build one on
-  purpose). What it can take is the host's
-  childless `/sys/fs/cgroup`; the bpffs, whose lock keeps it against an
-  rbind copy (lot 359), only through what is still behind the lock
-  ("The pin directory's lock": a raw namespace's moved copy of `/sys`, a
-  lock made bindable by `mount_setattr(2)`, or none).
+- An unmount of a large subtree in a namespace that is not guarded can
+  be let through when the walk cannot show that it reaches a held mount
+  (a container runtime's old root has that shape). What it can take is
+  the host's `/sys/fs/cgroup`, and the bpffs only through what remains
+  outside the lock's reach ("The pin directory's lock"). Either loss is
+  signed at the next integrity round, and the agent keeps its programs.
 - An unmount made while the mount tree is being rebuilt concurrently is
   not always judged completely, in a guarded namespace too (N4 of the
   re-check 3 of #567). For the pins lot 359 closes the rbind variants

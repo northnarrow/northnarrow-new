@@ -24,7 +24,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     self-test; a long suspend can make a record name an earlier program;
     run the agent only through its units; `nn-admin chain verify` saying
     OK with no chains; the release's provenance only from the first tag.
-    A search of the docs, this page and the README finds no numeric bound of the unmount walk, no lock sequence and no timing window any more (fix round 2). Ratchet
+    Fix rounds 2 and 3 rewrote the remaining walk bounds and lock residuals in the upgrade notes, the trust model, these notes and the capability program as behaviour. Ratchet
     `xtask/tests/known_limitations.rs`: every item names evidence, and
     every backticked word of the evidence is a test (by name or by path),
     a file or a golden case that exists, every lot (any case) is in the

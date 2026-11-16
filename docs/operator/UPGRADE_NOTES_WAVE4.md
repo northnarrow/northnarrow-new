@@ -3772,8 +3772,8 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   held mount (`/sys/fs/bpf`) through it: signed by the integrity round, not
   refused.
   The false-positive side: a mount in a group the map does not hold and
-  the walk cannot finish (a container running systemd, whose mounts have
-  more than 16 peers and slaves) is judged as reaching — refused only on a
+  the walk cannot finish (for example a container running systemd, whose
+  mounts have many peers and slaves) is judged as reaching — refused only on a
   protected point, which a container's own file systems never are, or on
   the host's own view super block (`systemd-nspawn` sharing the host's
   network namespace, a mount below its `/sys` that is not the kernel's
@@ -3913,10 +3913,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   `link_ptrace_access_check`), then outside it SIGKILL, the `environ` read
   and the create still refused; three Highs, the three pins back, three
   clears a round later.
-- **Named, not changed:** a lazy unmount in a namespace that is not PID
-  1's, the agent's or the watchdog's, of a large subtree, behind which
-  lies a copy in one of the host's peer groups (root building it on
-  purpose in a raw namespace), is not always refused. A lazy unmount made
+- **Named, not changed:** a lazy unmount of a large subtree in a
+  namespace that is not PID 1's, the agent's or the watchdog's is not
+  always refused when the walk cannot show what it reaches. A lazy unmount made
   while the mount tree is rebuilt concurrently is not always judged
   completely either (re-check 3 of #567, N4): the deny links stay, the loss
   is signed, the pins do not (§52 closes that for the pins). The regrouped
