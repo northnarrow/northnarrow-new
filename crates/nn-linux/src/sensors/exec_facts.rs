@@ -93,15 +93,9 @@ const INTERACTIVE_VARS: &[&str] = &["PYTHONSTARTUP", "ENV", "NODE_REPL_EXTERNAL_
 /// first MiB loaded its `sitecustomize` unseen).
 const MAX_ENVIRON: u64 = 1 << 20;
 
-/// The exec pump's step: `event`'s process read under `/proc`. Lot 355:
-/// then an exec of an AppImage's program marked as its image's
-/// ([`super::app_image`]).
-pub fn read(event: &mut Event) {
-    read_under(Path::new("/proc"), event);
-    super::app_image::read(event);
-}
-
-/// [`read`] with the processes under `proc_root` (a fixture tree in tests).
+/// The exec pump's step: `event`'s process read under `proc_root`
+/// (`/proc`; a fixture tree in tests) — on the exec pumps' reader
+/// ([`super::pump_reads::bounded`]).
 pub fn read_under(proc_root: &Path, event: &mut Event) {
     read_judged(proc_root, event, &super::pump_reads::Judge::host());
 }
@@ -110,9 +104,7 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
 /// judged by `judge` ([`super::pump_reads`]): the image's identity from the
 /// kernel's cache, its directory walked from the process's root one name
 /// at a time, no symbolic link followed, nothing asked of a file system
-/// `judge` refuses — a user's FUSE file system whose daemon never answers
-/// held the exec pump on the `metadata` of the image and the walk of its
-/// directory. What is not read is not trusted: no `ROOT_DIR`.
+/// `judge` refuses. What is not read is not trusted: no `ROOT_DIR`.
 pub fn read_judged(proc_root: &Path, event: &mut Event, judge: &super::pump_reads::Judge) {
     let Event::ProcessSpawn {
         pid,

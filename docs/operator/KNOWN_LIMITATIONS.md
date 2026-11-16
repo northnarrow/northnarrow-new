@@ -436,17 +436,18 @@ not cause as an incident.
   programs they could run from their home anyway. What the program then
   does is judged as for any user program. *Evidence:*
   `an_appimage_program_is_its_image_s`; lot 355.
-- **A file system that does not answer can delay exec records.** To
-  judge a program it runs, the agent reads facts about the program's file.
-  A program on a file system the agent does not trust to answer (FUSE, a
-  network file system) can delay that reading, and the exec records
-  behind it. The sensor self-test then finds its own
-  exec missing and signs a degradation (`subsystem_degraded`, source
-  `sensor_selftest`). *For you:* such a degradation in `nn-admin status`
-  is worth a report, with the file systems mounted at the time
-  (`findmnt -t fuse,fuseblk`). *Evidence:*
-  `a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert`;
-  lot 355.
+- **A file system that does not answer leaves exec facts not verified.**
+  To judge a program it runs, the agent reads facts about the program's
+  files, with a short deadline and fairly between users, never on the
+  exec pumps themselves; a FUSE file system is never read. A fact not read
+  in time is judged not verified, never trusted, and the exec sensor is
+  signed degraded (`exec_reads_unanswered`; `exec_readers_held` while a
+  share of the reader is held; `exec_reads_slow`, naming the uid, when
+  slow reads slowed the exec pump). *For you:* such a degradation in
+  `nn-admin status` is worth a report, with the file systems mounted at
+  the time (`findmnt -t fuse,fuseblk,nfs,nfs4,cifs`). *Evidence:*
+  `one_uid_cannot_starve_root_s_reads`;
+  `an_exec_step_that_never_answers_is_not_waited_for`; lot 366.
 - **After a long suspend, a record can name an earlier program.** A
   process id reused after the host spent a long time suspended can be
   taken for a process that held it before the agent started (a laptop

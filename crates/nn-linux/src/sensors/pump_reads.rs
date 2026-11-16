@@ -1,249 +1,427 @@
-//! Lot 366: what the exec pumps may read of a process's files, and how
-//! long they wait for it.
+//! Lot 366: what the exec pumps may read of a process's files, how long
+//! they wait for it, and how the reads of one user are kept from holding
+//! another's.
 //!
 //! The exec pump and the exec-check pump read, for each exec, the file the
 //! process runs (`/proc/<pid>/exe`), its root, the directory it was run
 //! from, an AppImage's image and daemon, a module tool's script and
-//! library path. A file of a FUSE file system answers through its daemon;
-//! a user who may mount one with `allow_other` (`user_allow_other` in
-//! `/etc/fuse.conf`) runs a program from it, and a daemon that stops
-//! answering the agent held the pump — and every exec behind it — for as
-//! long as it liked. So:
+//! library path. Any such read may wait on something the process's user
+//! controls: a file system served from user space, or a lookup in a
+//! directory. So:
 //!
+//! - **Never inline.** Every read the pumps need runs on the exec pumps'
+//!   reader ([`bounded`], [`ExecReader`]) and is waited for at most a
+//!   deadline; past it the pump goes on, the facts it did not get are
+//!   judged as not verified — the flags that take trust away set, the ones
+//!   that give it left out — and the condition is signed
+//!   ([`UNANSWERED`], a degradation of the exec sensor while it lasts). No
+//!   lock a pump takes is held while a read runs.
+//! - **Fair between users.** A read is for the uid of the exec's process.
+//!   One uid's reads that did not answer hold at most one of the reader's
+//!   helpers — a second read for that uid waits for the first (within its
+//!   own deadline), or is refused at once while the first is held; the
+//!   users together, the system's accounts together and root each have a
+//!   share of their own, so no user can make root's facts unverifiable.
+//!   A share used up is signed once while it lasts ([`HELD`]). The pump's
+//!   waits on reads that answered slowly add up per uid: past a budget, a
+//!   signed record names the uid and that the pump was slowed ([`SLOW`]).
 //! - **The kernel's identity, never the path's text.** Which file system a
-//!   file is on is told by the device the kernel reports for it (`statx`,
-//!   from the kernel's cache: [`antitamper_bpf::kernel_roots::cached`])
-//!   against PID 1's mount table ([`Judge`]): a FUSE (`fuse`, `fuse.*`,
-//!   `fuseblk`, `virtiofs`) or a network file system ([`FOREIGN_TYPES`]) is
-//!   not asked; one the table does not show mounted is not either.
-//! - **Nothing asked of such a file system.** A process's link (`exe`,
-//!   `root`, `fd/<n>`) is followed alone and its target's identity read from
-//!   the cache ([`kernel_roots::link_target`]); a path is walked one name at
-//!   a time, each directory judged before a name is looked up in it, no
-//!   symbolic link followed unless the caller needs the target
-//!   ([`kernel_roots::walk_judged`]); a file is opened for reading only
-//!   once judged ([`open_exe`]).
-//! - **A deadline.** The pumps' reads run on #563's bounded reader
-//!   ([`bounded`], [`EXEC_READER`]), waited for at most [`READ_DEADLINE`];
-//!   past it the pump goes on, the facts it did not get are judged as not verified — the
-//!   flags that take trust away set, the ones that give it left out — and
-//!   the condition is signed (`exec_reads_unanswered`, a degradation of
-//!   the exec sensor while it lasts). At most [`READERS_MAX`] reads may be
-//!   unanswered at once: past it a read is refused at once, no thread made.
-//!
-//! A FUSE file system mounted without `allow_other` refuses root at once
-//! (`EACCES`, nothing asked of its daemon); the kernel reads a process's
-//! `environ` and `cmdline` from its anonymous memory only (a file mapped
-//! over them is `EFAULT`, since Linux 4.18).
+//!   file is on is told by the mount the kernel reached it through (its
+//!   mount id, from the kernel's cache: [`antitamper_bpf::kernel_roots::cached`])
+//!   against the mount tables ([`Judge`]): a FUSE file system (`fuse`,
+//!   `fuse.*`, `fuseblk`) is never asked; any other file system a table
+//!   shows — local, or a network one root mounted — is read, on the reader.
+//!   A mount no table shows is not read.
+//! - **Nothing asked of a file system before it is judged.** A process's
+//!   link (`exe`, `root`, `fd/<n>`) is followed alone and its target's
+//!   identity read from the cache ([`kernel_roots::link_target`]); a path is
+//!   walked one name at a time, each directory judged before a name is
+//!   looked up in it ([`kernel_roots::walk_judged`]); a file is opened for
+//!   reading only once judged ([`open_exe`]).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use antitamper_bpf::kernel_roots::{self, Cached};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
-use crate::mountinfo::{MountEntry, MountTable};
-use crate::state_read::TimedReader;
+use crate::mountinfo::MountTable;
+use crate::state_read::{Condition, TimedReader};
 
-/// The file systems whose files the pumps do not ask about: served by a
-/// user-space daemon (FUSE, its block and virtio forms) or over the
-/// network — their server, not the kernel, answers, and may never.
-pub const FOREIGN_TYPES: &[&str] = &[
-    "fuse",
-    "fuseblk",
-    "virtiofs",
-    "9p",
-    "nfs",
-    "nfs4",
-    "cifs",
-    "smb3",
-    "smbfs",
-    "ceph",
-    "afs",
-    "coda",
-    "orangefs",
-    "lustre",
-    "vboxsf",
-    "ncpfs",
-    "glusterfs",
-];
-
-/// A file system type of [`FOREIGN_TYPES`] (or `fuse.<subtype>`).
-pub fn foreign_type(fstype: &OsStr) -> bool {
-    let t = fstype.as_bytes();
-    t.starts_with(b"fuse.")
-        || t.starts_with(b"fuseblk.")
-        || FOREIGN_TYPES.iter().any(|f| t == f.as_bytes())
+/// The file systems the pumps never ask about a file: served by a daemon
+/// in user space (FUSE, and its block form) — the daemon, not the kernel,
+/// answers, when it cares to.
+pub fn never_asked(fstype: &OsStr) -> bool {
+    crate::mountinfo::is_fuse(fstype)
 }
 
-/// Whether the pumps may ask the file system of `c`, by `table`: its
-/// device is a mounted file system's, of no [`foreign_type`] — every mount
-/// of one file system has its type; a namespace's own copy of a mount (the
-/// agent's, under `ProtectSystem=`; a container's) has another id, the same
-/// device.
+/// A mount of a table, by its id: its file system's device, and whether it
+/// is [`never_asked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    dev: u64,
+    never: bool,
+}
+
+/// A mount table as the judge reads it: by mount id, and the file systems
+/// it shows by device (whether one of their mounts is never asked).
+#[derive(Debug, Default)]
+struct Mounted {
+    by_id: HashMap<u64, Entry>,
+    by_dev: HashMap<u64, bool>,
+}
+
+fn mounted(table: &MountTable) -> Arc<Mounted> {
+    let mut m = Mounted::default();
+    for e in &table.entries {
+        let never = never_asked(&e.fstype);
+        // a mount id twice (no kernel's table): never asked if either is
+        m.by_id
+            .entry(e.id)
+            .and_modify(|x| x.never |= never)
+            .or_insert(Entry {
+                dev: e.kernel_dev(),
+                never,
+            });
+        *m.by_dev.entry(e.kernel_dev()).or_default() |= never;
+    }
+    Arc::new(m)
+}
+
+/// Whether the pumps may ask the file system of `c`, by `table` (a table
+/// read just before: the AppImage tie's, PID 1's): [`Judge::of`].
 pub fn trusted_in(table: &MountTable, c: &Cached) -> bool {
-    let mut mounts = table
-        .entries
-        .iter()
-        .filter(|m| m.kernel_dev() == c.dev)
-        .peekable();
-    mounts.peek().is_some() && mounts.all(|m: &MountEntry| !foreign_type(&m.fstype))
+    Judge::of(table).trusts(c)
 }
 
-/// How often PID 1's table is read again after a change of the mounts.
+/// How often a mount table is read again after a change of the mounts.
 const REFRESH_MIN: Duration = Duration::from_millis(250);
 
-/// The mounted file systems by device: whether one of its mounts is of a
-/// foreign type.
-type ById = std::sync::Arc<std::collections::HashMap<u64, bool>>;
-
-fn by_id(table: &MountTable) -> ById {
-    let mut by: std::collections::HashMap<u64, bool> = std::collections::HashMap::new();
-    for m in &table.entries {
-        *by.entry(m.kernel_dev()).or_default() |= foreign_type(&m.fstype);
-    }
-    std::sync::Arc::new(by)
-}
-
-/// PID 1's mount table, kept by device — read again after the kernel
-/// flags a change (`POLLPRI` on the open table: the poll clears the flag,
-/// so a change seen and not yet read stays `pending`), at most every
-/// [`REFRESH_MIN`].
+/// A mount table kept for the judge — read again after the kernel flags a
+/// change (`POLLPRI` on the open table: the poll clears the flag, so a
+/// change seen and not yet read stays `pending`), at most every
+/// [`REFRESH_MIN`]. The review of #573 (F1): its lock is taken only to
+/// look and to publish — never while the table is read.
 #[derive(Debug)]
 struct Mounts {
-    by_id: ById,
+    mounted: Arc<Mounted>,
     loaded: Option<Instant>,
     pending: bool,
-    watch: Option<File>,
+    /// A read of the table is under way (by another reader).
+    reading: bool,
+    watch: Option<Arc<File>>,
     source: PathBuf,
-    /// A table that cannot be read leaves the last one read in force,
-    /// signed.
-    read: crate::state_read::LastGood,
 }
 
 impl Mounts {
-    fn changed(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        let Some(w) = &self.watch else {
-            return true;
-        };
-        let mut p = libc::pollfd {
-            fd: w.as_raw_fd(),
-            events: libc::POLLPRI,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd for a descriptor `self` keeps open; a
-        // zero timeout never blocks.
-        let n = unsafe { libc::poll(&mut p, 1, 0) };
-        n > 0 && p.revents & (libc::POLLPRI | libc::POLLERR) != 0
-    }
-
-    fn refresh(&mut self) {
-        if self.watch.is_none() {
-            self.watch = kernel_roots::open(&self.source, libc::O_RDONLY).ok();
-        }
-        // a change after the poll below is flagged at the next one
-        let _ = self.changed();
-        self.loaded = Some(Instant::now());
-        match crate::mountinfo::read(&self.source) {
-            Ok(t) => {
-                self.read.ok();
-                self.by_id = by_id(&t);
-                self.pending = false;
-            }
-            // the last table read kept, signed — and a change not read:
-            // an anonymous device is judged on none
-            Err(e) => {
-                self.read.failed(&e);
-                self.pending = true;
-            }
-        }
-    }
-
-    /// A judge of one walk: the table read again first when the mounts
-    /// changed since (at most every [`REFRESH_MIN`]); a change it could not
-    /// read yet leaves an anonymous device (FUSE's, a network file
-    /// system's) unjudged.
-    fn judge(&mut self) -> Judge {
-        if self.changed() {
-            self.pending = true;
-        }
-        let due = self.loaded.is_none_or(|at| at.elapsed() >= REFRESH_MIN);
-        if (self.loaded.is_none() || self.pending) && due {
-            self.refresh();
-        }
-        Judge {
-            by_id: self.by_id.clone(),
-            fresh: !self.pending,
+    fn new(source: &str) -> Self {
+        Mounts {
+            mounted: Arc::default(),
+            loaded: None,
+            pending: false,
+            reading: false,
+            watch: None,
+            source: PathBuf::from(source),
         }
     }
 }
 
-/// PID 1's mounts, for the pumps' walks.
-static MOUNTS: LazyLock<Mutex<Mounts>> = LazyLock::new(|| {
-    Mutex::new(Mounts {
-        by_id: ById::default(),
-        loaded: None,
-        pending: false,
-        watch: None,
-        source: PathBuf::from("/proc/1/mountinfo"),
-        read: crate::state_read::LastGood::new("exec_pump_mounts", "PID 1's mount table"),
+/// Whether the kernel flagged a change of the mounts `watch` shows.
+fn changed(watch: Option<&File>) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(w) = watch else {
+        return true;
+    };
+    let mut p = libc::pollfd {
+        fd: w.as_raw_fd(),
+        events: libc::POLLPRI,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for a descriptor the caller keeps open; a
+    // zero timeout never blocks.
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    n > 0 && p.revents & (libc::POLLPRI | libc::POLLERR) != 0
+}
+
+/// A read of a table due: its source, and the watch already open.
+struct Due {
+    source: PathBuf,
+    watch: Option<Arc<File>>,
+}
+
+/// Under `m`'s lock, memory only: whether the table is to be read now (it
+/// changed, or was never read, and was not read within [`REFRESH_MIN`]);
+/// the read is then this caller's.
+fn mounts_due(m: &Mutex<Mounts>) -> Option<Due> {
+    let mut g = m.lock();
+    if changed(g.watch.as_deref()) {
+        g.pending = true;
+    }
+    let due = g.loaded.is_none_or(|at| at.elapsed() >= REFRESH_MIN);
+    if !(g.loaded.is_none() || g.pending) || !due || g.reading {
+        return None;
+    }
+    g.reading = true;
+    Some(Due {
+        source: g.source.clone(),
+        watch: g.watch.clone(),
     })
+}
+
+/// The table read — no lock held: its watch opened first when it is not
+/// (a change after the poll below is flagged at the next one).
+fn mounts_read(due: Due) -> (Option<Arc<File>>, io::Result<MountTable>) {
+    let watch = due.watch.or_else(|| {
+        kernel_roots::open(&due.source, libc::O_RDONLY)
+            .ok()
+            .map(Arc::new)
+    });
+    let _ = changed(watch.as_deref());
+    (watch, crate::mountinfo::read(&due.source))
+}
+
+/// Under `m`'s lock, memory only: a read's table published — or, failed,
+/// the last one read kept and the change not read (an anonymous device is
+/// judged on none). Whether the read failed.
+fn mounts_publish(
+    m: &Mutex<Mounts>,
+    watch: Option<Arc<File>>,
+    read: Result<Arc<Mounted>, ()>,
+) -> bool {
+    let mut g = m.lock();
+    g.reading = false;
+    g.watch = watch;
+    g.loaded = Some(Instant::now());
+    match read {
+        Ok(t) => {
+            g.mounted = t;
+            g.pending = false;
+            false
+        }
+        Err(()) => {
+            g.pending = true;
+            true
+        }
+    }
+}
+
+/// Under `m`'s lock, memory only: the table now, and whether no change is
+/// pending.
+fn mounts_now(m: &Mutex<Mounts>) -> (Arc<Mounted>, bool) {
+    let g = m.lock();
+    (g.mounted.clone(), !g.pending)
+}
+
+/// `m`'s table for a judge: read again first when due ([`mounts_due`]) —
+/// on the caller's thread, the exec pumps' reader, no lock held — then
+/// taken; a table that cannot be read is signed by `read`
+/// ([`crate::state_read::LastGood`]).
+fn table_of(m: &Mutex<Mounts>, read: &Mutex<crate::state_read::LastGood>) -> (Arc<Mounted>, bool) {
+    if let Some(due) = mounts_due(m) {
+        let (watch, table) = mounts_read(due);
+        let failed = match table {
+            Ok(t) => {
+                mounts_publish(m, watch, Ok(mounted(&t)));
+                None
+            }
+            Err(e) => {
+                mounts_publish(m, watch, Err(()));
+                Some(e)
+            }
+        };
+        last_good(read, failed.as_ref());
+    }
+    mounts_now(m)
+}
+
+/// A table's read signed (failed) or its condition ended.
+fn last_good(read: &Mutex<crate::state_read::LastGood>, failed: Option<&io::Error>) {
+    let mut g = read.lock();
+    match failed {
+        Some(e) => g.failed(e),
+        None => g.ok(),
+    }
+}
+
+/// PID 1's mounts.
+static PID1: LazyLock<Mutex<Mounts>> =
+    LazyLock::new(|| Mutex::new(Mounts::new("/proc/1/mountinfo")));
+/// The agent's own mounts (its unit's namespace: a walk from its own `/`).
+static OWN: LazyLock<Mutex<Mounts>> =
+    LazyLock::new(|| Mutex::new(Mounts::new("/proc/self/mountinfo")));
+/// PID 1's table read, or not (signed).
+static PID1_READ: LazyLock<Mutex<crate::state_read::LastGood>> = LazyLock::new(|| {
+    Mutex::new(crate::state_read::LastGood::new(
+        "exec_pump_mounts",
+        "PID 1's mount table",
+    ))
+});
+/// The agent's own table read, or not (signed).
+static OWN_READ: LazyLock<Mutex<crate::state_read::LastGood>> = LazyLock::new(|| {
+    Mutex::new(crate::state_read::LastGood::new(
+        "exec_pump_own_mounts",
+        "the agent's own mount table",
+    ))
 });
 
-/// Lot 366: whether the pumps may ask a file system about a file, by the
-/// file's cached identity: its device a file system PID 1's table shows
-/// mounted, of a type not foreign ([`trusted_in`]).
+/// The source while a file is left not verified because the mounts changed
+/// and the tables were not read again yet.
+pub const CHANGING: &str = "exec_pump_mounts_changing";
+
+/// Signed while files are judged not verified for a change of the mounts
+/// not read yet (one record per hold, however often the mounts change).
+static STALE: LazyLock<Mutex<Condition>> =
+    LazyLock::new(|| Mutex::new(Condition::deferred(CHANGING, Duration::from_secs(60))));
+
+/// Files judged not verified for a change of the mounts not read yet.
+static JUDGED_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lot 366, the review of #573 (F2): whether the pumps may ask a file
+/// system about a file, by the mount the kernel reached the file through
+/// (`statx`'s mount id, from the kernel's cache) — never by its device: a
+/// btrfs subvolume's files show a device of their own, which no table
+/// shows.
+///
+/// - The mount is looked up by its id in PID 1's table, then in the
+///   agent's own (its unit's namespace), then — for a walk through a
+///   process's `/proc` entry ([`Judge::of_process`]) — in that process's
+///   own table, read then.
+/// - A mount of a [`never_asked`] type is not asked, whichever table shows
+///   it.
+/// - A mount only the process's own table shows (another mount namespace:
+///   a container's) is asked only when its file system is one PID 1's or
+///   the agent's table shows (a copy of a host's mount); one made in that
+///   namespace (a user's own `tmpfs` or `overlay`) is not.
+/// - A table with a change of the mounts not read yet (within
+///   [`REFRESH_MIN`] of its last read) vouches only for a block device's
+///   file system, the file's own device its mount's — a mount id or an
+///   anonymous device is handed out again; such a file is judged not
+///   verified, signed ([`CHANGING`]).
 #[derive(Debug, Clone)]
 pub struct Judge {
-    by_id: ById,
-    fresh: bool,
+    tables: Vec<(Arc<Mounted>, bool)>,
+    process: Option<PathBuf>,
+    own: Arc<OnceLock<Option<Arc<Mounted>>>>,
 }
 
 impl Judge {
-    /// The judge of the host's mounts now ([`MOUNTS`]).
+    /// The judge of the host's mounts now: PID 1's table and the agent's
+    /// own, read again when they changed. Run on the exec pumps' reader.
     pub fn host() -> Judge {
-        MOUNTS.lock().judge()
+        let tables = vec![table_of(&PID1, &PID1_READ), table_of(&OWN, &OWN_READ)];
+        if tables.iter().all(|(_, fresh)| *fresh) {
+            stale_ended();
+        }
+        Judge {
+            tables,
+            process: None,
+            own: Arc::default(),
+        }
     }
 
-    /// A judge of `table` (read just before: an AppImage's tie, tests).
+    /// A judge of `table` alone (read just before: an AppImage's tie, tests).
     pub fn of(table: &MountTable) -> Judge {
         Judge {
-            by_id: by_id(table),
-            fresh: true,
+            tables: vec![(mounted(table), true)],
+            process: None,
+            own: Arc::default(),
         }
+    }
+
+    /// This judge for a walk through the process `proc_dir` (`/proc/<pid>`):
+    /// a mount none of its tables shows is looked up in that process's own
+    /// table (`proc_dir/mountinfo`), read once, on a first such mount.
+    pub fn of_process(&self, proc_dir: &Path) -> Judge {
+        Judge {
+            tables: self.tables.clone(),
+            process: Some(proc_dir.to_path_buf()),
+            own: Arc::default(),
+        }
+    }
+
+    /// The process's own table, read on the first call.
+    fn process_table(&self) -> Option<&Mounted> {
+        let dir = self.process.as_ref()?;
+        self.own
+            .get_or_init(|| {
+                crate::mountinfo::read(&dir.join("mountinfo"))
+                    .ok()
+                    .map(|t| mounted(&t))
+            })
+            .as_deref()
     }
 
     /// The file system of `c` may be asked.
     pub fn trusts(&self, c: &Cached) -> bool {
-        // a block device's file system is no user's FUSE (`fuseblk` is
-        // mounted by root); an anonymous one is judged only on a table read
-        // since the last change
-        if c.dev >> 20 == 0 && !self.fresh {
-            JUDGED_STALE.fetch_add(1, Ordering::Relaxed);
-            return false;
+        for (t, fresh) in &self.tables {
+            if let Some(e) = t.by_id.get(&c.mnt_id) {
+                return !e.never && (*fresh || stale_vouches(e, c));
+            }
         }
-        self.by_id.get(&c.dev) == Some(&false)
+        let stale = self.tables.iter().any(|(_, fresh)| !fresh);
+        let Some(e) = self.process_table().and_then(|t| t.by_id.get(&c.mnt_id)) else {
+            // a mount made since a table with a change not read yet
+            if stale {
+                stale_refused();
+            }
+            return false;
+        };
+        // another namespace's mount: of a file system the host's tables show
+        // (a copy of a host's mount), never one made in that namespace
+        let shown = |want_fresh: bool| {
+            self.tables
+                .iter()
+                .any(|(t, fresh)| *fresh == want_fresh && t.by_dev.get(&e.dev) == Some(&false))
+        };
+        !e.never
+            && (shown(true) || (shown(false) && stale_vouches(e, &Cached { dev: e.dev, ..*c })))
     }
 }
 
-/// Anonymous devices left unjudged because the table had changed.
-static JUDGED_STALE: AtomicU64 = AtomicU64::new(0);
+/// A table with a change not read yet vouches for `e`, the mount of `c`:
+/// a block device's file system, `c` on that very device — else `c` is
+/// judged not verified, signed.
+fn stale_vouches(e: &Entry, c: &Cached) -> bool {
+    if e.dev == c.dev && c.dev >> 20 != 0 {
+        return true;
+    }
+    stale_refused();
+    false
+}
+
+/// The tables read since the mounts changed: the condition ended (after
+/// its hold).
+fn stale_ended() {
+    STALE.lock().ended();
+}
+
+/// A file judged not verified for a change of the mounts not read yet:
+/// counted and signed.
+fn stale_refused() {
+    JUDGED_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STALE.lock().holds(
+        "the mounts changed and their tables were not read again yet: files on file systems \
+         with an anonymous device (FUSE's kind; tmpfs, overlay, btrfs) are judged not verified \
+         until they are"
+            .to_string(),
+    );
+}
 
 /// Lot 366: `rel` walked from the process's root (`proc_dir/root`: the
 /// directory its `root` link names), every file system on the way judged
-/// by `judge` ([`kernel_roots::walk_judged`]; no symbolic link followed).
+/// by `judge` for that process ([`Judge::of_process`],
+/// [`kernel_roots::walk_judged`]; no symbolic link followed).
 pub fn walk_in_root(
     proc_dir: &Path,
     rel: &Path,
     judge: &Judge,
 ) -> io::Result<kernel_roots::Walked> {
+    let judge = judge.of_process(proc_dir);
     let (root, c) = kernel_roots::link_target(&proc_dir.join("root"))?;
     if !c.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -265,11 +443,16 @@ pub fn walk_host(
 
 /// Lot 366: the file a process's link names (`/proc/<pid>/exe`, `fd/<n>`)
 /// opened with `flags` — its identity read from the kernel's cache first
-/// and its file system judged (`PermissionDenied` when `judge` refuses it:
-/// not verified), then the same file opened again through this thread's own
-/// descriptor ([`kernel_roots::reopen_fd`]: compared, same mount and inode).
+/// and its file system judged for that process (`PermissionDenied` when
+/// `judge` refuses it: not verified), then the same file opened again
+/// through this thread's own descriptor ([`kernel_roots::reopen_fd`]:
+/// compared, same mount and inode).
 pub fn open_exe(link: &Path, flags: i32, judge: &Judge) -> io::Result<(File, Cached)> {
     let (f, c) = kernel_roots::link_target(link)?;
+    let judge = match link.parent() {
+        Some(dir) => judge.of_process(dir),
+        None => judge.clone(),
+    };
     if !judge.trusts(&c) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -284,100 +467,581 @@ pub fn open_exe(link: &Path, flags: i32, judge: &Judge) -> io::Result<(File, Cac
 
 /// How long a pump waits for one exec's reads.
 pub const READ_DEADLINE: Duration = Duration::from_millis(500);
-/// How many reads may be unanswered at once — past it, one is refused at
-/// once.
-pub const READERS_MAX: usize = 4;
-/// The degradation's source while reads are unanswered.
+/// The degradation's source while reads are not waited for.
 pub const UNANSWERED: &str = "exec_reads_unanswered";
+/// The degradation's source while a share of the reader is held.
+pub const HELD: &str = "exec_readers_held";
+/// The degradation's source of a uid whose slow reads slowed the pump.
+pub const SLOW: &str = "exec_reads_slow";
 
-/// The exec pumps' reader: #563's bounded reader
-/// ([`crate::state_read::TimedReader`]: its helpers reused, at most
-/// [`READERS_MAX`] reads unanswered, each waited for [`READ_DEADLINE`]).
-pub static EXEC_READER: LazyLock<TimedReader> =
-    LazyLock::new(|| TimedReader::new(READ_DEADLINE, READERS_MAX));
-
-/// The signed condition while an exec's reads are not waited for.
-static NOT_WAITED: LazyLock<Mutex<crate::state_read::Condition>> = LazyLock::new(|| {
-    Mutex::new(crate::state_read::Condition::with_hold(
-        UNANSWERED,
-        Duration::from_secs(60),
-    ))
-});
-
-/// Reads not waited for since the start.
-static NOT_WAITED_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Lot 366: `f` (an exec's reads) run on the exec pumps' reader
-/// ([`EXEC_READER`]) and waited for at most its deadline. `Err(why)` when it
-/// did not answer in time — the pump goes on, the helper stays with the
-/// read until it answers — or when [`READERS_MAX`] reads are already
-/// unanswered. Either is signed ([`UNANSWERED`]) until no read is.
-pub fn bounded<T: Send + 'static>(
-    what: &str,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, String> {
-    bounded_in(&EXEC_READER, what, f)
+/// Who a read is for: root, the system's accounts, or a user — each with a
+/// share of the reader's helpers of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    Root,
+    System,
+    Users,
 }
 
-/// [`bounded`] on the reader `reader`.
-pub fn bounded_in<T: Send + 'static>(
-    reader: &TimedReader,
-    what: &str,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, String> {
-    match reader.run(what, f) {
-        Ok(v) => {
-            if reader.unanswered() == 0 {
-                NOT_WAITED.lock().ended();
-            }
-            Ok(v)
+/// The uids below it are the system's accounts (the distributions' first
+/// user's, `login.defs`' `UID_MIN`).
+pub const FIRST_USER_UID: u32 = 1000;
+
+impl Pool {
+    fn of(uid: u32) -> Pool {
+        match uid {
+            0 => Pool::Root,
+            u if u < FIRST_USER_UID => Pool::System,
+            _ => Pool::Users,
         }
-        Err(why) => {
-            NOT_WAITED_COUNT.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(read = what, why = %why, "exec pump: a read of a process's files was not waited for");
-            NOT_WAITED.lock().holds(format!(
-                "the exec pumps' reads of a process's files did not answer within {} ms (a file \
-                 system whose server does not answer?): the facts they did not get are judged \
-                 as not verified",
-                READ_DEADLINE.as_millis()
-            ));
-            Err(why)
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The reads of the pool that may be held (unanswered past their
+    /// deadline) at once.
+    fn held_max(self) -> usize {
+        match self {
+            Pool::Root => 2,
+            Pool::System | Pool::Users => 2,
+        }
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            Pool::Root => "root's",
+            Pool::System => "the system accounts'",
+            Pool::Users => "the users'",
         }
     }
 }
 
-/// Lot 366: whether the condition "an exec's reads not waited for" stands
-/// (signed, [`UNANSWERED`]).
-pub fn not_waited() -> bool {
-    NOT_WAITED.lock().holding()
+/// How many reads may run on the reader at once: every share held, and
+/// the pumps' own waits.
+const READS_MAX: usize = 2 + 2 + 2 + 4;
+
+/// The reads under way: per uid other than root, its one read (held or
+/// not); per pool, how many are held.
+#[derive(Debug, Default)]
+struct Pools {
+    busy: HashMap<u32, bool>,
+    held: [usize; 3],
 }
 
-/// Reads not waited for since the start, and anonymous devices left
-/// unjudged after a change of the mounts.
+/// Why a read was not started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// The uid's earlier read is held (did not answer by its deadline).
+    UidHeld,
+    /// The uid's earlier read was still being read at this one's deadline.
+    UidBusy,
+    /// The pool's share is held.
+    Share(Pool),
+}
+
+/// A read's place in its pool: waited for, held past its deadline, or done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flight {
+    Waited,
+    Held,
+    Done,
+}
+
+/// A read admitted: its pool's account, settled once it is done.
+#[derive(Debug)]
+struct Ticket {
+    uid: u32,
+    pool: Pool,
+    flight: Mutex<Flight>,
+    pools: Arc<Mutex<Pools>>,
+    freed: Arc<Condvar>,
+}
+
+impl Ticket {
+    /// The read answered, or never ran: its place given back.
+    fn done(&self) {
+        let mut f = self.flight.lock();
+        let was = std::mem::replace(&mut *f, Flight::Done);
+        if was == Flight::Done {
+            return;
+        }
+        let mut p = self.pools.lock();
+        if was == Flight::Held {
+            p.held[self.pool.index()] -= 1;
+        }
+        if self.pool != Pool::Root {
+            p.busy.remove(&self.uid);
+        }
+        drop(p);
+        drop(f);
+        self.freed.notify_all();
+    }
+
+    /// Its deadline passed, the read still running: held. Whether it is.
+    fn passed(&self) -> bool {
+        let mut f = self.flight.lock();
+        if *f != Flight::Waited {
+            return false;
+        }
+        *f = Flight::Held;
+        let mut p = self.pools.lock();
+        p.held[self.pool.index()] += 1;
+        if self.pool != Pool::Root {
+            p.busy.insert(self.uid, true);
+        }
+        true
+    }
+}
+
+/// Settles its ticket when dropped: after the read, or with a read that
+/// never ran.
+struct Settle(Arc<Ticket>);
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        self.0.done();
+    }
+}
+
+/// A read that answered in this long or less did not slow the pump.
+const SLOW_FLOOR: Duration = Duration::from_millis(25);
+/// The window the slow reads add up in.
+const SLOW_WINDOW: Duration = Duration::from_secs(60);
+/// One uid's slow reads past it within the window are signed.
+const SLOW_BUDGET: Duration = Duration::from_secs(1);
+/// Every uid's slow reads together past it within the window are signed.
+const SLOW_BUDGET_ALL: Duration = Duration::from_secs(5);
+/// The uids accounted at once: past it, the least slow is forgotten.
+const ACCOUNTS_MAX: usize = 512;
+
+/// One uid's (or every uid's) slow reads in the current window.
+#[derive(Debug, Clone)]
+struct Account {
+    since: Instant,
+    waited: Duration,
+    /// The record signed in this window.
+    signed: Option<String>,
+}
+
+impl Account {
+    fn new(now: Instant) -> Self {
+        Account {
+            since: now,
+            waited: Duration::ZERO,
+            signed: None,
+        }
+    }
+}
+
+/// The slow reads' accounts.
+#[derive(Debug)]
+struct Slow {
+    by_uid: HashMap<u32, Account>,
+    all: Account,
+}
+
+/// Lot 366, the review of #573 (F4): the exec pumps' reader — #563's
+/// bounded reader ([`TimedReader`]: its helpers reused, each read waited
+/// for at most its deadline) with each read's uid's share: see the
+/// module's "Fair between users".
+#[derive(Debug)]
+pub struct ExecReader {
+    reader: TimedReader,
+    deadline: Duration,
+    pools: Arc<Mutex<Pools>>,
+    freed: Arc<Condvar>,
+    slow: Mutex<Slow>,
+    unanswered: Mutex<Condition>,
+    held: [Mutex<Condition>; 3],
+}
+
+impl ExecReader {
+    /// A reader whose reads are waited for at most `deadline`.
+    pub fn new(deadline: Duration) -> Self {
+        let held = || Mutex::new(Condition::deferred(HELD, Duration::from_secs(60)));
+        ExecReader {
+            reader: TimedReader::new(deadline, READS_MAX),
+            deadline,
+            pools: Arc::default(),
+            freed: Arc::default(),
+            slow: Mutex::new(Slow {
+                by_uid: HashMap::new(),
+                all: Account::new(Instant::now()),
+            }),
+            unanswered: Mutex::new(Condition::deferred(UNANSWERED, Duration::from_secs(60))),
+            held: [held(), held(), held()],
+        }
+    }
+
+    /// `f` (reads of the files of a process of `uid`, `what` in words) run
+    /// on a helper and waited for at most the deadline. `Err(why)` when it
+    /// did not answer in time — the helper stays with it until it answers
+    /// — or was refused at once (its uid's earlier read held, its pool's
+    /// share held). Either is signed until reads answer again.
+    pub fn run<T: Send + 'static>(
+        &self,
+        uid: u32,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let t0 = Instant::now();
+        let until = t0 + self.deadline;
+        let out = match self.admit(uid, until) {
+            Ok(ticket) => self.read(ticket, what, until, f),
+            Err(r) => Err(self.refused(uid, what, r)),
+        };
+        self.waited(uid, t0.elapsed(), Instant::now());
+        match &out {
+            Ok(_) => self.answered(),
+            Err(why) => self.not_waited(what, why),
+        }
+        out
+    }
+
+    /// `f` on a helper as `ticket` admitted it, waited for until `until`.
+    fn read<T: Send + 'static>(
+        &self,
+        ticket: Arc<Ticket>,
+        what: &str,
+        until: Instant,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let settle = Settle(Arc::clone(&ticket));
+        let wait = until.saturating_duration_since(Instant::now());
+        let got = self.reader.run_within(what, wait, move || {
+            let v = f();
+            drop(settle);
+            v
+        });
+        if got.is_err() && ticket.passed() {
+            self.held_now(ticket.pool);
+        }
+        got
+    }
+
+    /// Under the pools' lock (and waiting on it, at most until `until`, for
+    /// the uid's earlier read): the read admitted, or why not.
+    fn admit(&self, uid: u32, until: Instant) -> Result<Arc<Ticket>, Refused> {
+        let pool = Pool::of(uid);
+        let mut p = self.pools.lock();
+        loop {
+            if p.held[pool.index()] >= pool.held_max() {
+                return Err(Refused::Share(pool));
+            }
+            if pool == Pool::Root {
+                break;
+            }
+            match p.busy.get(&uid) {
+                None => break,
+                Some(true) => return Err(Refused::UidHeld),
+                Some(false) => {
+                    if self.freed.wait_until(&mut p, until).timed_out() {
+                        return Err(Refused::UidBusy);
+                    }
+                }
+            }
+        }
+        if pool != Pool::Root {
+            p.busy.insert(uid, false);
+        }
+        Ok(Arc::new(Ticket {
+            uid,
+            pool,
+            flight: Mutex::new(Flight::Waited),
+            pools: Arc::clone(&self.pools),
+            freed: Arc::clone(&self.freed),
+        }))
+    }
+
+    /// A refusal in words; a share held signed once while it lasts.
+    fn refused(&self, uid: u32, what: &str, r: Refused) -> String {
+        match r {
+            Refused::UidHeld => format!(
+                "{what}: not read — an earlier read of the files of uid {uid}'s processes has \
+                 not answered"
+            ),
+            Refused::UidBusy => format!(
+                "{what}: not read — an earlier read of the files of uid {uid}'s processes was \
+                 still running at the deadline"
+            ),
+            Refused::Share(pool) => {
+                self.held_now(pool);
+                format!(
+                    "{what}: not read — {} share of the exec pumps' reader is held by reads \
+                     that have not answered",
+                    pool.words()
+                )
+            }
+        }
+    }
+
+    /// `pool`'s share used up: signed once while it lasts.
+    fn held_now(&self, pool: Pool) {
+        let full = self.pools.lock().held[pool.index()] >= pool.held_max();
+        if !full {
+            return;
+        }
+        let mut c = self.held[pool.index()].lock();
+        if !c.holding() {
+            c.holds(format!(
+                "{} share of the exec pumps' reader is held by reads of processes' files that \
+                 have not answered: further reads of those processes are refused at once, their \
+                 facts judged not verified",
+                pool.words()
+            ));
+        }
+    }
+
+    /// A read answered: the conditions of the shares with room again, and
+    /// of reads not waited for once none is held, ended (after their hold).
+    fn answered(&self) {
+        let held = self.pools.lock().held;
+        for pool in [Pool::Root, Pool::System, Pool::Users] {
+            if held[pool.index()] < pool.held_max() {
+                self.held[pool.index()].lock().ended();
+            }
+        }
+        if held.iter().all(|n| *n == 0) {
+            self.unanswered.lock().ended();
+        }
+    }
+
+    /// A read not waited for: signed.
+    fn not_waited(&self, what: &str, why: &str) {
+        NOT_WAITED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(read = what, why = %why, "exec pump: a read of a process's files was not waited for");
+        self.unanswered.lock().holds(format!(
+            "the exec pumps' reads of a process's files did not answer within {} ms, or were \
+             refused while earlier ones had not: the facts they did not get are judged as not \
+             verified",
+            self.deadline.as_millis()
+        ));
+    }
+
+    /// The pump waited `took` on a read of `uid`'s: a slow one added to the
+    /// uid's account, and to every uid's — past a budget within the window,
+    /// a signed record names the uid and that the pump was slowed.
+    fn waited(&self, uid: u32, took: Duration, now: Instant) {
+        if took <= SLOW_FLOOR {
+            return;
+        }
+        let records = {
+            let mut s = self.slow.lock();
+            slow_add(&mut s, uid, took, now)
+        };
+        for r in records {
+            match r {
+                SlowRecord::Sign(detail) => {
+                    tracing::warn!(uid, detail = %detail, "exec pump slowed by slow reads");
+                    crate::boot::degradation::note(SLOW, &detail);
+                }
+                SlowRecord::Retire(detail) => {
+                    crate::boot::degradation::retire_where(SLOW, |d| d == detail);
+                }
+            }
+        }
+    }
+
+    /// The reads unanswered now.
+    pub fn unanswered(&self) -> usize {
+        self.reader.unanswered()
+    }
+
+    /// The helpers free now.
+    pub fn free_helpers(&self) -> usize {
+        self.reader.free_helpers()
+    }
+
+    /// Whether reads not waited for are signed now ([`UNANSWERED`]).
+    pub fn not_waited_now(&self) -> bool {
+        self.unanswered.lock().holding()
+    }
+
+    /// Whether `uid`'s pool's share is signed held now ([`HELD`]).
+    #[cfg(test)]
+    fn held_signed(&self, uid: u32) -> bool {
+        self.held[Pool::of(uid).index()].lock().holding()
+    }
+
+    /// The record signed for `uid`'s slow reads in this window, if any.
+    #[cfg(test)]
+    fn slow_signed(&self, uid: u32) -> Option<String> {
+        self.slow.lock().by_uid.get(&uid)?.signed.clone()
+    }
+}
+
+/// A record of the slow reads: to sign, or whose window ended, to retire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlowRecord {
+    Sign(String),
+    Retire(String),
+}
+
+/// `a`'s window ended at `now`: begun again, its record retired.
+fn roll(a: &mut Account, now: Instant, out: &mut Vec<SlowRecord>) {
+    if now.saturating_duration_since(a.since) >= SLOW_WINDOW {
+        if let Some(d) = a.signed.take() {
+            out.push(SlowRecord::Retire(d));
+        }
+        *a = Account::new(now);
+    }
+}
+
+/// Room for one more uid's account: the ones whose window ended dropped,
+/// then the least slow not signed.
+fn make_room(s: &mut Slow, now: Instant, out: &mut Vec<SlowRecord>) {
+    if s.by_uid.len() < ACCOUNTS_MAX {
+        return;
+    }
+    s.by_uid.retain(|_, a| {
+        let ended = now.saturating_duration_since(a.since) >= SLOW_WINDOW;
+        if ended {
+            if let Some(d) = a.signed.take() {
+                out.push(SlowRecord::Retire(d));
+            }
+        }
+        !ended
+    });
+    if s.by_uid.len() >= ACCOUNTS_MAX {
+        if let Some(least) = s
+            .by_uid
+            .iter()
+            .filter(|(_, a)| a.signed.is_none())
+            .min_by_key(|(_, a)| a.waited)
+            .map(|(u, _)| *u)
+        {
+            s.by_uid.remove(&least);
+        }
+    }
+}
+
+/// `took` added to `uid`'s account and to every uid's, in `s` (memory
+/// only): the records to sign, and the ones whose window ended.
+fn slow_add(s: &mut Slow, uid: u32, took: Duration, now: Instant) -> Vec<SlowRecord> {
+    let mut out = Vec::new();
+    if !s.by_uid.contains_key(&uid) {
+        make_room(s, now, &mut out);
+    }
+    let a = s.by_uid.entry(uid).or_insert_with(|| Account::new(now));
+    roll(a, now, &mut out);
+    a.waited += took;
+    if a.waited > SLOW_BUDGET && a.signed.is_none() {
+        let d = format!(
+            "uid {uid}: the exec pumps waited {} ms within {} s on reads of the files of that \
+             uid's processes that answered slowly — the exec pump was slowed (the events behind \
+             it waited)",
+            a.waited.as_millis(),
+            SLOW_WINDOW.as_secs()
+        );
+        a.signed = Some(d.clone());
+        out.push(SlowRecord::Sign(d));
+    }
+    roll(&mut s.all, now, &mut out);
+    s.all.waited += took;
+    if s.all.waited > SLOW_BUDGET_ALL && s.all.signed.is_none() {
+        let most = s
+            .by_uid
+            .iter()
+            .max_by_key(|(_, a)| a.waited)
+            .map_or(uid, |(u, _)| *u);
+        let d = format!(
+            "every uid: the exec pumps waited {} ms within {} s on reads of processes' files \
+             that answered slowly, the most for uid {most} — the exec pump was slowed (the \
+             events behind it waited)",
+            s.all.waited.as_millis(),
+            SLOW_WINDOW.as_secs()
+        );
+        s.all.signed = Some(d.clone());
+        out.push(SlowRecord::Sign(d));
+    }
+    out
+}
+
+/// The exec pumps' reader ([`ExecReader`], [`READ_DEADLINE`]).
+pub static EXEC_READER: LazyLock<ExecReader> = LazyLock::new(|| ExecReader::new(READ_DEADLINE));
+
+/// Reads not waited for since the start.
+static NOT_WAITED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lot 366: `f` (an exec's reads, for a process of `uid`) run on the exec
+/// pumps' reader ([`EXEC_READER`]) and waited for at most its deadline:
+/// [`ExecReader::run`].
+pub fn bounded<T: Send + 'static>(
+    uid: u32,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    EXEC_READER.run(uid, what, f)
+}
+
+/// Lot 366: whether the condition "an exec's reads not waited for" stands
+/// on the exec pumps' reader (signed, [`UNANSWERED`]).
+pub fn not_waited() -> bool {
+    EXEC_READER.not_waited_now()
+}
+
+/// Reads not waited for since the start, and files judged not verified
+/// for a change of the mounts not read yet (both signed as they happen:
+/// [`UNANSWERED`], [`CHANGING`]).
 pub fn counts() -> (u64, u64) {
     (
-        NOT_WAITED_COUNT.load(Ordering::Relaxed),
-        JUDGED_STALE.load(Ordering::Relaxed),
+        NOT_WAITED_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        JUDGED_STALE.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
 
-    /// Lot 366: a read that never answers (a user's FUSE daemon that stops
-    /// answering the agent) holds a helper, never the caller: given up at
-    /// the deadline and signed (`exec_reads_unanswered`, a degradation);
-    /// another read meanwhile is answered by another helper, and the first
-    /// serves again once its read answers — no helper made for it.
+    /// A judge of the watched table `m` alone (tests).
+    fn judge_of(m: &Mutex<Mounts>) -> Judge {
+        let read = Mutex::new(crate::state_read::LastGood::new(
+            "exec_pump_mounts_test",
+            "a test's table",
+        ));
+        Judge {
+            tables: vec![table_of(m, &read)],
+            process: None,
+            own: Arc::default(),
+        }
+    }
+
+    /// A mount table's line: mount `id`, device `dev`, of `fstype`.
+    fn line(id: u64, dev: u64, fstype: &str) -> String {
+        format!(
+            "{id} 1 {}:{} / /x{id} rw - {fstype} src rw\n",
+            dev >> 20,
+            dev & 0xfffff
+        )
+    }
+
+    fn judge(text: &str) -> Judge {
+        Judge::of(&crate::mountinfo::parse(text.as_bytes()))
+    }
+
+    fn here() -> Cached {
+        let t = std::env::temp_dir();
+        kernel_roots::cached(&File::open(t).unwrap()).unwrap()
+    }
+
+    /// Lot 366, the review of #573 (F3): a read that never answers holds a
+    /// helper, never the caller: given up at the deadline and signed
+    /// (`exec_reads_unanswered`, a degradation); another read meanwhile is
+    /// answered by another helper, and the first serves again once its read
+    /// answers — no helper made for it. Deterministic: a helper is free
+    /// again before its answer is handed over.
     #[test]
     fn a_read_that_never_answers_holds_a_helper_not_the_pump() {
-        let r = TimedReader::new(Duration::from_millis(200), 2);
+        let r = ExecReader::new(Duration::from_millis(200));
         let (release, wait) = channel::<()>();
         let before = counts().0;
         let t0 = Instant::now();
-        let got = bounded_in(&r, "test", move || {
+        let got = r.run(1000, "test", move || {
             let _ = wait.recv();
             1
         });
@@ -387,9 +1051,9 @@ mod tests {
             took >= Duration::from_millis(200) && took < Duration::from_secs(5),
             "{took:?}"
         );
-        assert!(counts().0 > before && not_waited(), "signed");
+        assert!(counts().0 > before && r.not_waited_now(), "signed");
         assert_eq!(r.unanswered(), 1);
-        assert_eq!(bounded_in(&r, "test", || 2), Ok(2));
+        assert_eq!(r.run(1001, "test", || 2), Ok(2));
         release.send(()).unwrap();
         let t = Instant::now();
         while r.unanswered() != 0 && t.elapsed() < Duration::from_secs(5) {
@@ -399,56 +1063,225 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(r.free_helpers(), 2, "both helpers free again");
-        assert_eq!(bounded_in(&r, "test", || 3), Ok(3));
-        assert_eq!(r.free_helpers(), 2, "a free helper reused, none made");
+        for n in 3..50 {
+            assert_eq!(r.run(1000, "test", move || n), Ok(n));
+            assert_eq!(r.free_helpers(), 2, "a free helper reused, none made");
+            assert_eq!(r.unanswered(), 0, "none counted unanswered");
+        }
     }
 
-    /// Lot 366: every helper held by a read that does not answer: the next
-    /// read is refused at once — no wait, no thread made — and signed.
+    /// Lot 366, the review of #573 (F4): the users' share of the reader
+    /// held by reads that do not answer: the next user's read is refused at
+    /// once — no wait, no thread made — and the share signed held once.
     #[test]
-    fn helpers_held_past_the_bound_refuse_at_once() {
-        let r = TimedReader::new(Duration::from_millis(50), 2);
+    fn a_share_held_refuses_at_once_and_is_signed_once() {
+        let r = ExecReader::new(Duration::from_millis(50));
         let mut releases = Vec::new();
         let before = counts().0;
-        for _ in 0..2 {
+        for uid in [1000, 1001] {
             let (tx, rx) = channel::<()>();
             releases.push(tx);
-            let got = bounded_in(&r, "test", move || {
+            assert!(r
+                .run(uid, "test", move || {
+                    let _ = rx.recv();
+                })
+                .is_err());
+        }
+        assert!(r.held_signed(1002), "the users' share signed held");
+        let t0 = Instant::now();
+        assert!(r.run(1002, "test", || ()).is_err());
+        assert!(r.run(1003, "test", || ()).is_err());
+        assert!(t0.elapsed() < Duration::from_millis(50), "refused at once");
+        assert_eq!(r.unanswered(), 2, "no read started for them");
+        assert!(
+            counts().0 >= before + 4 && r.not_waited_now(),
+            "each signed"
+        );
+        assert_eq!(
+            r.held[Pool::Users.index()].lock().reports(),
+            1,
+            "once per episode"
+        );
+        drop(releases);
+    }
+
+    /// Lot 366, the review of #573 (F4, the R011 case): one uid's reads
+    /// that do not answer hold one helper — its next read refused at once —
+    /// and the users together hold their share only: root's reads and a
+    /// system account's are read as ever, however many users' reads are
+    /// held. Fails where every read shares one bound (bad1b957: four held,
+    /// root's module tool's facts refused).
+    #[test]
+    fn one_uid_cannot_starve_root_s_reads() {
+        let r = ExecReader::new(Duration::from_millis(50));
+        let mut releases = Vec::new();
+        let (tx, rx) = channel::<()>();
+        releases.push(tx);
+        assert!(r
+            .run(1000, "test", move || {
+                let _ = rx.recv();
+            })
+            .is_err());
+        let t0 = Instant::now();
+        let (tx, rx) = channel::<()>();
+        releases.push(tx);
+        assert!(
+            r.run(1000, "test", move || {
+                let _ = rx.recv();
+            })
+            .is_err(),
+            "the uid's second read"
+        );
+        assert!(t0.elapsed() < Duration::from_millis(50), "refused at once");
+        assert_eq!(r.unanswered(), 1, "one helper held by the uid");
+        // more uids of users (a user's subordinate ids) fill the users' share
+        for uid in 100_000..100_010 {
+            let (tx, rx) = channel::<()>();
+            releases.push(tx);
+            let _ = r.run(uid, "test", move || {
                 let _ = rx.recv();
             });
-            assert!(got.is_err());
         }
-        let t0 = Instant::now();
-        assert!(bounded_in(&r, "test", || ()).is_err());
-        assert!(t0.elapsed() < Duration::from_millis(50), "refused at once");
-        assert_eq!(r.unanswered(), 2);
-        assert!(counts().0 >= before + 3 && not_waited(), "each signed");
+        assert_eq!(r.unanswered(), 2, "the users' share, no more");
+        for _ in 0..20 {
+            assert_eq!(r.run(0, "root", || 7), Ok(7), "root's read answered");
+            assert_eq!(r.run(104, "system", || 8), Ok(8), "a system account's");
+        }
         drop(releases);
+    }
+
+    /// Lot 366, the review of #573 (F4): a uid's second read while its
+    /// first is still being read waits for it (within its own deadline) —
+    /// the two pumps' reads of one user's files never run at once, so one
+    /// uid's reads hold at most one helper — and is answered once the first
+    /// is; root's run beside.
+    #[test]
+    fn a_uid_s_second_read_waits_for_its_first() {
+        let r = Arc::new(ExecReader::new(Duration::from_millis(400)));
+        let at_once = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let read = |at_once: Arc<AtomicUsize>, most: Arc<AtomicUsize>| {
+            move || {
+                let n = at_once.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                at_once.fetch_sub(1, Ordering::SeqCst);
+                n
+            }
+        };
+        let other = {
+            let (r, f) = (
+                Arc::clone(&r),
+                read(Arc::clone(&at_once), Arc::clone(&most)),
+            );
+            std::thread::spawn(move || r.run(1000, "test", f))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let mine = r.run(1000, "test", read(Arc::clone(&at_once), Arc::clone(&most)));
+        assert!(
+            mine.is_ok() && other.join().unwrap().is_ok(),
+            "both answered"
+        );
+        assert_eq!(most.load(Ordering::SeqCst), 1, "never at once");
+        // root's reads are not one user's: beside each other
+        let (r2, f) = (
+            Arc::clone(&r),
+            read(Arc::clone(&at_once), Arc::clone(&most)),
+        );
+        let other = std::thread::spawn(move || r2.run(0, "test", f));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(r
+            .run(0, "test", read(Arc::clone(&at_once), Arc::clone(&most)))
+            .is_ok());
+        assert!(other.join().unwrap().is_ok());
+        assert_eq!(most.load(Ordering::SeqCst), 2, "root's beside each other");
+    }
+
+    /// Lot 366, the review of #573 (F4): the pump's waits on reads that
+    /// answered slowly add up per uid: past the budget within the window a
+    /// record names the uid and that the pump was slowed — once in the
+    /// window, retired with it; fast reads add nothing; every uid's
+    /// together past theirs is signed too, naming the slowest.
+    #[test]
+    fn the_slow_read_budget_is_signed_naming_the_uid() {
+        let t0 = Instant::now();
+        let mut s = Slow {
+            by_uid: HashMap::new(),
+            all: Account::new(t0),
+        };
+        let slow = Duration::from_millis(400);
+        assert!(slow_add(&mut s, 1234, slow, t0).is_empty());
+        assert!(slow_add(&mut s, 1234, slow, t0).is_empty());
+        let out = slow_add(&mut s, 1234, slow, t0);
+        let [SlowRecord::Sign(d)] = out.as_slice() else {
+            panic!("one record past the budget: {out:?}");
+        };
+        assert!(d.starts_with("uid 1234:") && d.contains("slowed"), "{d}");
+        assert!(
+            slow_add(&mut s, 1234, slow, t0).is_empty(),
+            "once per window"
+        );
+        let later = t0 + SLOW_WINDOW;
+        let out = slow_add(&mut s, 1234, slow, later);
+        assert_eq!(
+            out,
+            vec![SlowRecord::Retire(d.clone())],
+            "retired with its window"
+        );
+        // every uid's together
+        let mut s = Slow {
+            by_uid: HashMap::new(),
+            all: Account::new(t0),
+        };
+        let mut all = None;
+        for uid in 2000..2020 {
+            for r in slow_add(&mut s, uid, slow, t0) {
+                if let SlowRecord::Sign(d) = r {
+                    all = Some(d);
+                }
+            }
+        }
+        let all = all.expect("every uid's past theirs");
+        assert!(
+            all.starts_with("every uid:") && all.contains("slowed"),
+            "{all}"
+        );
+        // through the reader: the waits it measured
+        let r = ExecReader::new(Duration::from_secs(2));
+        for _ in 0..3 {
+            assert_eq!(
+                r.run(4321, "test", || std::thread::sleep(Duration::from_millis(
+                    400
+                ))),
+                Ok(())
+            );
+            assert_eq!(r.run(4322, "test", || ()), Ok(()));
+        }
+        assert!(r
+            .slow_signed(4321)
+            .is_some_and(|d| d.starts_with("uid 4321:")));
+        assert!(r.slow_signed(4322).is_none(), "fast reads add nothing");
     }
 
     /// Lot 366: a mount made since the table was read: within
     /// [`REFRESH_MIN`] of the last read the table is not read again, and its
-    /// anonymous device (a FUSE's kind) is not trusted; past it the table is
-    /// read again and the new mount judged by its type; a FUSE mounted at
-    /// once in its place that got its device back is not vouched for by
-    /// the table read before. In a user and mount namespace of the test's
-    /// own.
+    /// mount is not trusted (signed); past it the table is read again and
+    /// the new mount judged by its type; a FUSE mounted at once in its place
+    /// — given its mount id, or its device, back — is not vouched for by the
+    /// table read before. In a user and mount namespace of the test's own.
     #[test]
     fn a_mount_made_since_the_table_is_judged_only_once_read() {
+        // the statics the child reads and signs through, made before the
+        // fork (one being made at the fork would never be in the child)
+        let _ = STALE.lock().holding();
+        let _ = kernel_roots::views();
         let rc = crate::fuse_testing::in_userns(|| {
             let dir = std::env::temp_dir().join(format!("nn-k366-mounts-{}", std::process::id()));
             if std::fs::create_dir(&dir).is_err() {
                 return 99;
             }
-            let mut m = Mounts {
-                by_id: ById::default(),
-                loaded: None,
-                pending: false,
-                watch: None,
-                source: PathBuf::from("/proc/self/mountinfo"),
-                read: crate::state_read::LastGood::new("exec_pump_mounts_test", "a test's table"),
-            };
-            let before = m.judge();
+            let m = Mutex::new(Mounts::new("/proc/self/mountinfo"));
+            let before = judge_of(&m);
             let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
             // SAFETY: NUL-terminated strings; a tmpfs of the test's own
             // namespace.
@@ -465,13 +1298,14 @@ mod tests {
                 return 99;
             }
             let id = kernel_roots::cached(&File::open(&dir).unwrap()).unwrap();
+            let stale = counts().1;
             let rc = if before.trusts(&id) {
                 1
-            } else if m.judge().trusts(&id) {
+            } else if judge_of(&m).trusts(&id) || counts().1 == stale {
                 2
             } else {
                 std::thread::sleep(REFRESH_MIN + Duration::from_millis(100));
-                if m.judge().trusts(&id) {
+                if judge_of(&m).trusts(&id) {
                     0
                 } else {
                     3
@@ -483,10 +1317,6 @@ mod tests {
                 let _ = std::fs::remove_dir(&dir);
                 return rc;
             }
-            // the tmpfs gone and a FUSE mounted there at once: when it got
-            // the tmpfs's device back (the kernel hands out the lowest one
-            // free), the table read before it — the tmpfs's — does not
-            // vouch for it until read again
             let rc = match crate::fuse_testing::smart_fuse_over(&dir, 0) {
                 Some(fuse) => {
                     let root = std::os::unix::fs::OpenOptionsExt::custom_flags(
@@ -496,12 +1326,12 @@ mod tests {
                     .open(&dir)
                     .unwrap();
                     let now = kernel_roots::cached(&root).unwrap();
-                    let trusted = m.judge().trusts(&now);
+                    let trusted = judge_of(&m).trusts(&now);
                     drop(root);
                     drop(fuse);
                     // SAFETY: as above.
                     unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
-                    if now.dev == id.dev && trusted {
+                    if trusted {
                         4
                     } else {
                         0
@@ -515,84 +1345,144 @@ mod tests {
         if let Some(rc) = crate::fuse_testing::ran(rc) {
             assert_eq!(
                 rc, 0,
-                "1: trusted before its read, 2: stale, 3: never read again, 4: a device reused"
+                "1: trusted before its read, 2: stale (or not signed), 3: never read again, \
+                 4: a FUSE vouched for"
             );
         }
     }
 
-    /// Lot 366: the judge asks a file system PID 1's table shows mounted,
-    /// of a local type, by its device (a namespace's copy of the mount too);
-    /// not a FUSE or network one, not one the table does not show, and not
-    /// an anonymous device (FUSE's kind) while a change of the mounts is not
-    /// read yet.
+    /// Lot 366, the review of #573 (F2): the judge asks a file system by
+    /// the mount the kernel reached the file through (its id), never by the
+    /// file's device — not a FUSE one, not one no table shows.
     #[test]
-    fn only_a_local_mount_the_table_shows_is_asked() {
-        let t = tempfile::tempdir().unwrap();
-        let c = kernel_roots::cached(&File::open(t.path()).unwrap()).unwrap();
-        let line = |fstype: &str, dev: u64| {
-            format!(
-                "{} 1 {}:{} / /x rw - {fstype} src rw\n",
-                c.mnt_id,
-                dev >> 20,
-                dev & 0xfffff
-            )
-        };
-        let judge = |text: String| Judge::of(&crate::mountinfo::parse(text.as_bytes()));
-        assert!(judge(line("ext4", c.dev)).trusts(&c));
-        for fstype in [
-            "fuse",
-            "fuse.sshfs",
-            "fuseblk",
-            "virtiofs",
-            "nfs4",
-            "cifs",
-            "9p",
-            "ceph",
-        ] {
-            assert!(!judge(line(fstype, c.dev)).trusts(&c), "{fstype}");
+    fn only_a_mount_the_table_shows_and_not_fuse_is_asked() {
+        let c = here();
+        assert!(judge(&line(c.mnt_id, c.dev, "ext4")).trusts(&c));
+        for fstype in ["fuse", "fuse.sshfs", "fuseblk", "fuse.App.AppImage"] {
+            assert!(
+                !judge(&line(c.mnt_id, c.dev, fstype)).trusts(&c),
+                "{fstype}"
+            );
         }
-        assert!(!judge(String::new()).trusts(&c), "no such mount");
-        assert!(!judge(line("ext4", c.dev + 1)).trusts(&c), "another device");
-        // a namespace's own copy of the mount: another id, the same device
-        let copy = Cached {
-            mnt_id: c.mnt_id + 1000,
-            ..c
-        };
-        assert!(judge(line("ext4", c.dev)).trusts(&copy));
-        let table = crate::mountinfo::parse(
-            format!("{}{}", line("ext4", c.dev), line("fuse.x", c.dev)).as_bytes(),
-        );
+        assert!(!judge("").trusts(&c), "no such mount");
         assert!(
-            !Judge::of(&table).trusts(&c) && !trusted_in(&table, &c),
-            "one of its mounts foreign"
+            !judge(&line(c.mnt_id + 1, c.dev, "ext4")).trusts(&c),
+            "another mount of the same device"
         );
+        let two = format!(
+            "{}{}",
+            line(c.mnt_id + 1, c.dev, "fuse.x"),
+            line(c.mnt_id, c.dev, "ext4")
+        );
+        assert!(judge(&two).trusts(&c), "its own mount decides");
         assert!(trusted_in(
-            &crate::mountinfo::parse(line("ext4", c.dev).as_bytes()),
+            &crate::mountinfo::parse(line(c.mnt_id, c.dev, "ext4").as_bytes()),
             &c
         ));
-        let anon = Cached {
-            dev: c.dev & 0xfffff,
-            ..c
+        assert!(never_asked(OsStr::new("fuse.App.AppImage")));
+        assert!(!never_asked(OsStr::new("ext4")) && !never_asked(OsStr::new("nfs4")));
+    }
+
+    /// Lot 366, the review of #573 (F2): a btrfs subvolume's file shows a
+    /// device of its own (`statx`'s), which no table shows: judged by its
+    /// mount (id), it is asked. Fails where the judge went by the device
+    /// (bad1b957: every file of a btrfs root or home refused, every
+    /// AppImage killed).
+    #[test]
+    fn a_btrfs_subvolume_s_file_is_judged_by_its_mount() {
+        let c = here();
+        let sb = 31;
+        assert_ne!(c.dev, sb);
+        assert!(judge(&line(c.mnt_id, sb, "btrfs")).trusts(&c));
+        // a walk through a process of another namespace: its own table
+        // shows the mount, PID 1's the file system
+        let proc = tempfile::tempdir().unwrap();
+        let other = c.mnt_id + 7000;
+        std::fs::write(proc.path().join("mountinfo"), line(other, sb, "btrfs")).unwrap();
+        let copy = Cached { mnt_id: other, ..c };
+        let host = judge(&line(c.mnt_id, sb, "btrfs"));
+        assert!(!host.trusts(&copy), "not the host's mount");
+        assert!(host.of_process(proc.path()).trusts(&copy), "the process's");
+        // a file system made in that namespace (no host table shows it)
+        std::fs::write(proc.path().join("mountinfo"), line(other, 99, "tmpfs")).unwrap();
+        assert!(!host.of_process(proc.path()).trusts(&copy), "made there");
+    }
+
+    /// Lot 366, the review of #573 (F2): a walk through a process's `/proc`
+    /// entry (its root, its `exe`) is judged by that process's own table
+    /// when no host table shows the mount (another mount namespace's: a
+    /// container's) — asked when the host's tables show its file system,
+    /// not when none is read.
+    #[test]
+    fn a_walk_through_a_process_judges_by_its_own_table() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir(t.path().join("d")).unwrap();
+        std::fs::write(t.path().join("d/f"), b"x").unwrap();
+        let c = kernel_roots::cached(&File::open(t.path()).unwrap()).unwrap();
+        let proc = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(t.path(), proc.path().join("root")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("d/f"), proc.path().join("exe")).unwrap();
+        // the host's tables: the file system, by another mount
+        let host = judge(&line(c.mnt_id + 9000, c.dev, "ext4"));
+        let exe = proc.path().join("exe");
+        assert!(walk_in_root(proc.path(), Path::new("d/f"), &host).is_err());
+        assert!(open_exe(&exe, libc::O_RDONLY, &host).is_err());
+        std::fs::write(proc.path().join("mountinfo"), line(c.mnt_id, c.dev, "ext4")).unwrap();
+        assert!(walk_in_root(proc.path(), Path::new("d/f"), &host).is_ok());
+        assert!(open_exe(&exe, libc::O_RDONLY, &host).is_ok());
+    }
+
+    /// Lot 366, the review of #573 (F2): a network file system root mounted
+    /// (NFS, CIFS) is read — on the exec pumps' reader, with its deadline:
+    /// a home there keeps its AppImage's tie, and a server that does not
+    /// answer holds a helper, never the pump.
+    #[test]
+    fn nfs_and_cifs_are_read_on_the_reader_with_its_deadline() {
+        let c = here();
+        for fstype in ["nfs", "nfs4", "cifs", "smb3"] {
+            assert!(judge(&line(c.mnt_id, 50, fstype)).trusts(&c), "{fstype}");
+        }
+        let r = ExecReader::new(Duration::from_millis(100));
+        let (tx, rx) = channel::<()>();
+        let t0 = Instant::now();
+        assert!(r
+            .run(1000, "nfs", move || {
+                let _ = rx.recv();
+            })
+            .is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2), "the deadline");
+        assert!(r.not_waited_now(), "signed");
+        drop(tx);
+    }
+
+    /// Lot 366: a table with a change of the mounts not read yet vouches
+    /// only for a block device's file system, the file on that very device;
+    /// any other file is judged not verified, counted and signed.
+    #[test]
+    fn a_stale_table_vouches_only_for_a_block_device() {
+        let c = here();
+        let stale = |text: &str| Judge {
+            tables: vec![(mounted(&crate::mountinfo::parse(text.as_bytes())), false)],
+            process: None,
+            own: Arc::default(),
         };
-        assert!(judge(line("tmpfs", anon.dev)).trusts(&anon));
-        let stale = Judge {
-            fresh: false,
-            ..judge(line("tmpfs", anon.dev))
-        };
-        assert!(!stale.trusts(&anon), "an anonymous device, the table stale");
         let block = Cached {
             dev: (8 << 20) | 1,
             ..c
         };
-        let stale = Judge {
-            fresh: false,
-            ..judge(line("ext4", block.dev))
-        };
+        assert!(stale(&line(c.mnt_id, block.dev, "ext4")).trusts(&block));
+        let anon = Cached { dev: 40, ..c };
+        let before = counts().1;
         assert!(
-            stale.trusts(&block),
-            "a block device's mount, the table stale"
+            !stale(&line(c.mnt_id, 40, "tmpfs")).trusts(&anon),
+            "anonymous"
         );
-        assert!(foreign_type(OsStr::new("fuse.App.AppImage")));
-        assert!(!foreign_type(OsStr::new("ext4")) && !foreign_type(OsStr::new("tmpfs")));
+        assert!(
+            !stale(&line(c.mnt_id, 31, "btrfs")).trusts(&anon),
+            "another device"
+        );
+        assert!(!stale("").trusts(&anon), "a mount made since");
+        assert!(counts().1 >= before + 3, "counted");
+        assert!(STALE.lock().holding(), "signed");
     }
 }

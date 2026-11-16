@@ -25,6 +25,10 @@ pub fn in_userns(body: impl FnOnce() -> i32) -> Option<i32> {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
+        // a child held (a lock another test's thread held at the fork) ends,
+        // failing its test, never holding the run
+        // SAFETY: alarm has no preconditions.
+        unsafe { libc::alarm(60) };
         // SAFETY: the child's own namespaces; no data.
         let refused = unsafe {
             libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
@@ -217,6 +221,12 @@ fn serve(mut dev: File, answered: usize, stop: &AtomicBool) {
 pub fn answers_beside_a_held_fuse(
     check: impl FnOnce(&Path) -> bool + Send + 'static,
 ) -> Option<i32> {
+    // the views the checks read through made before the fork: views
+    // another test's thread is making at the fork would never be made in
+    // the child (their maker is not there), and the child would wait on
+    // them for ever (a test that anchors its own in the child calls
+    // `in_userns` itself)
+    let _ = antitamper_bpf::kernel_roots::views();
     ran(in_userns(move || {
         // SAFETY: alarm has no preconditions; a held check ends the child.
         unsafe { libc::alarm(30) };

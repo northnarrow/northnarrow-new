@@ -1,31 +1,40 @@
 //! Lot 366: the exec pumps read a process's files only through the doors
 //! of `nn_linux::sensors::pump_reads` and `antitamper_bpf::kernel_roots`
-//! (`link_target`, `walk_judged`, `cached`), and this ratchet keeps it so.
+//! (`link_target`, `walk_judged`, `cached`), on the exec pumps' reader, and
+//! hold no lock while a file is read — and this ratchet keeps it so.
 //!
 //! The exec pump and the exec-check pump read, for each exec, the file the
 //! process runs, its root, the directory it was run from, an AppImage's
-//! image and daemon, a module tool's script and library path. A `metadata`
-//! of `/proc/<pid>/exe`, or of a path under `/proc/<pid>/root`, asked a
-//! user's FUSE file system (`allow_other`) for an answer its daemon never
-//! gave, and the pump waited with every exec behind it. The doors read the
+//! image and daemon, a module tool's script and library path. A read of a
+//! path may wait on what the process's user controls; the doors read the
 //! kernel's cached identity of a process's link, walk a path one name at a
-//! time with every file system judged by its device before a name is
-//! looked up in it, and open a file only once it is judged.
+//! time with every file system judged before a name is looked up in it,
+//! and open a file only once it is judged.
 //!
-//! A new site in the pumps' modules that reads a path by itself —
-//! [`MARKERS`]: a `metadata`, an open, a listing, a `canonicalize`, by
-//! `std::fs` or by `kernel_roots`' path readers — fails here until it goes
-//! through a door, or its file is listed in [`KNOWN`] with its count and
-//! why its paths are the kernel's (`/proc`'s own files) or root's (the
-//! system's module tool, the installed programs' list). The scan is
-//! lexical over the production code (comments blanked, test items left
-//! out); the rule is shown failing on planted sites, one per spelling.
+//! - **Reads.** A new site in the pumps' modules (and the multiplexer's
+//!   pump steps) that reads a path by itself — [`MARKERS`]: a `metadata`,
+//!   an open, a listing, a `canonicalize`, a link's text, a state file, an
+//!   existence or kind check of a path, by `std::fs` (any spelling: `fs::`,
+//!   an import, a `Path` method) or by `kernel_roots`' path readers — fails
+//!   here until it goes through a door, or its file's pin in [`KNOWN`] is
+//!   raised with why its paths are the kernel's (`/proc`'s own files) or
+//!   root's (the system's module tool, the installed programs' list), or
+//!   the call is a cached identity's (`Cached::is_dir`: memory).
+//! - **Locks** (the review of #573, F1). In those modules, a function that
+//!   takes a lock (`.lock()`) reads nothing — no marker, no door, no wait
+//!   on the reader — directly or through a function of its module it calls:
+//!   a read under a lock the pumps share held both pumps when the read did
+//!   not answer.
+//!
+//! The scan is lexical over the production code (comments blanked, test
+//! items left out); each rule is shown failing on planted sites, one per
+//! spelling.
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use support::{product_code, repo_root};
+use support::{matching_brace, product_code, repo_root};
 
 /// The pumps' modules: what the exec pump and the exec-check pump run for
 /// each exec.
@@ -35,65 +44,114 @@ const PUMP_FILES: &[&str] = &[
     "crates/nn-linux/src/sensors/kmod_exec.rs",
     "crates/nn-linux/src/sensors/exe_identity.rs",
     "crates/nn-linux/src/program_images.rs",
+    "crates/nn-linux/src/sensors/multiplexer.rs",
+];
+
+/// The doors' module: its locks are held across no read either.
+const DOORS: &str = "crates/nn-linux/src/sensors/pump_reads.rs";
+
+/// The multiplexer's pump steps (the rest of that file is the sensors'
+/// setup, before any pump runs): the lock rule reads these.
+const STEPS: &[&str] = &[
+    "resolved",
+    "check_resolved",
+    "reader_uid",
+    "bounded_step",
+    "bounded_step_in",
+    "kmod_read_then_resolved",
 ];
 
 /// A path read by itself: the kernel walks it, follows its links, crosses
-/// its mounts and asks each file system on the way.
+/// its mounts and asks each file system on the way. Each spelling counted
+/// once (none is a part of another).
 const MARKERS: &[&str] = &[
-    "kernel_roots::metadata(",
-    "kernel_roots::symlink_metadata(",
-    "kernel_roots::exists(",
-    "kernel_roots::is_dir(",
-    "kernel_roots::open(",
-    "kernel_roots::open_crossing(",
+    "metadata(",
+    "exists(",
+    "is_dir(",
+    "is_file(",
+    "is_symlink(",
+    "canonicalize(",
+    "read_dir(",
+    "read_dir_max(",
+    "read_link(",
+    "read_state(",
+    "read_to_string(",
+    "fs::read(",
     "kernel_roots::read(",
     "kernel_roots::read_all(",
     "kernel_roots::read_text(",
-    "kernel_roots::read_to_string(",
-    "kernel_roots::read_dir(",
-    "std::fs::metadata(",
-    "std::fs::symlink_metadata(",
-    "std::fs::canonicalize(",
-    "std::fs::read_dir(",
-    "std::fs::read(",
-    "std::fs::read_to_string(",
+    "kernel_roots::open(",
+    "kernel_roots::open_crossing(",
     "File::open(",
     "OpenOptions",
+    "use std::fs::{",
 ];
 
+/// An import of one of `std::fs`' functions by its own name (`use
+/// std::fs::metadata;`): its calls are then bare.
+fn fs_function_imports(text: &str) -> usize {
+    text.match_indices("use std::fs::")
+        .filter(|(at, _)| {
+            let rest = &text[at + "use std::fs::".len()..];
+            rest.starts_with(|c: char| c.is_ascii_lowercase())
+        })
+        .count()
+}
+
 fn count(text: &str) -> usize {
-    MARKERS.iter().map(|m| text.matches(m).count()).sum()
+    MARKERS
+        .iter()
+        .map(|m| text.matches(m).count())
+        .sum::<usize>()
+        + fs_function_imports(text)
 }
 
 /// The files with sites: how many, and why their paths ask no file system
-/// a user mounts.
+/// a user controls, or are no path at all.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-linux/src/sensors/exec_facts.rs",
-        2,
-        "`/proc/<pid>/environ`, opened beneath the `/proc` root the start anchored: procfs's \
-         own file (the kernel reads it from the process's anonymous memory only)",
+        7,
+        "`/proc/<pid>`'s own links' text (`exe`, `ns/mnt`, `fd/0`), its `environ` and `stat` \
+         — procfs's own, opened beneath the `/proc` root the start anchored (the kernel \
+         answers from the process's state); `Cached::is_dir` (the kernel's cached identity: \
+         memory)",
     ),
     (
         "crates/nn-linux/src/sensors/app_image.rs",
-        2,
-        "the `/proc` root and `/proc/<pid>/fd`, listed beneath the anchored `/proc` root: \
-         procfs's own directories",
+        10,
+        "the `/proc` root and `/proc/<pid>/fd` listed, `stat`, `status`, `fdinfo/<n>` read, \
+         the `exe` and `fd/<n>` links' text — procfs's own, beneath the anchored `/proc` root, \
+         on the reader; `Cached::is_file` (memory)",
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
-        4,
-        "`/proc/<pid>/environ` and `/proc/<pid>/task` (procfs's own, beneath the anchored \
-         root); the system's module tool and the initramfs builders at their fixed, root-owned \
-         paths (`/usr/bin/kmod`, `/bin/kmod`, `/usr/sbin/update-initramfs`, …)",
+        15,
+        "`/proc/<pid>/environ`, `stat`, `status`, `exe`, `task` (procfs's own, beneath the \
+         anchored root); the system's module tool and the initramfs builders at their fixed, \
+         root-owned paths (`/usr/bin/kmod`, `/usr/sbin/update-initramfs`, …), on the reader; \
+         `Cached::is_dir`/`is_file` (memory)",
+    ),
+    (
+        "crates/nn-linux/src/sensors/exe_identity.rs",
+        1,
+        "`/proc/<pid>/exe`'s text (procfs's own link: the kernel's `d_path`, nothing looked \
+         up on the file's file system)",
     ),
     (
         "crates/nn-linux/src/program_images.rs",
-        10,
+        18,
         "the installed programs' list (`/etc/shells`, the system's binary directories and \
          the runtimes' fixed paths, resolved and checked root-only at a refresh); the \
          installed program a running image is compared with, and a runtime at its recorded \
-         path (root's)",
+         path (root's); procfs's own `stat`/`status`; `Cached::is_dir`, `Metadata::is_file` \
+         (memory)",
+    ),
+    (
+        "crates/nn-linux/src/sensors/multiplexer.rs",
+        2,
+        "the sensors' setup before any pump runs: `/sys/kernel/btf/vmlinux` (sysfs), \
+         `/proc/sys/kernel/perf_event_paranoid` (procfs) — no pump step reads by hand",
     ),
 ];
 
@@ -125,10 +183,134 @@ fn violations(code: &BTreeMap<String, String>) -> Vec<String> {
             out.push(format!("{file}: listed in KNOWN, not a pump's module"));
         }
     }
+    out.extend(lock_violations(code));
     out
 }
 
-/// No exec pump reads a path by itself outside the doors.
+/// What a function that holds a lock must not do: read a path ([`MARKERS`]),
+/// go through a door, or wait on the exec pumps' reader.
+const READS: &[&str] = &[
+    "link_target(",
+    "walk_judged(",
+    "walk_in_root(",
+    "walk_host(",
+    "open_exe(",
+    "reopen_fd(",
+    "kernel_roots::cached(",
+    "mountinfo::read(",
+    "MountTable::load",
+    "read_to_end(",
+    "dir_names_max(",
+    "run_within(",
+    "bounded(",
+    ".run(",
+];
+
+/// The functions of `text` (production code): name and body, lexically —
+/// `fn name` to the brace that closes its body.
+fn functions(text: &str) -> Vec<(String, String)> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices("fn ") {
+        if at > 0 && text[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let rest = &text[at + 3..];
+        let name: String = rest.chars().take_while(|c| ident(*c)).collect();
+        if name.is_empty() {
+            continue;
+        }
+        // the body: the first `{` after the signature, outside its
+        // parentheses and brackets (`-> [T; 2]`); a `;` first: none
+        let mut depth = 0i32;
+        let mut open = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                ';' if depth == 0 => break,
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let len = matching_brace(&rest[open..]);
+        out.push((name, rest[open..open + len].to_string()));
+    }
+    out
+}
+
+/// Whether `body` calls the function `name` (`name(`, after no identifier
+/// character: `f(`, `.f(`, `::f(`).
+fn calls(body: &str, name: &str) -> bool {
+    let pat = format!("{name}(");
+    body.match_indices(&pat).any(|(at, _)| {
+        at == 0
+            || !body[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The review of #573 (F1): in each pump module and the doors' module, a
+/// function that takes a lock reads nothing, directly or through the
+/// module's functions it calls (transitively).
+fn lock_violations(code: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for file in PUMP_FILES.iter().chain([&DOORS]) {
+        let Some(text) = code.get(*file) else {
+            continue;
+        };
+        let mut fns = functions(text);
+        if file.ends_with("multiplexer.rs") {
+            fns.retain(|(n, _)| STEPS.contains(&n.as_str()));
+            for step in STEPS {
+                if !fns.iter().any(|(n, _)| n == step) {
+                    out.push(format!(
+                        "{file}: the pump step `{step}` is gone: list the steps"
+                    ));
+                }
+            }
+        }
+        let direct = |b: &str| {
+            MARKERS.iter().chain(READS).any(|m| b.contains(m)) || fs_function_imports(b) > 0
+        };
+        let mut reading: BTreeSet<String> = fns
+            .iter()
+            .filter(|(_, b)| direct(b))
+            .map(|(n, _)| n.clone())
+            .collect();
+        loop {
+            let more: Vec<String> = fns
+                .iter()
+                .filter(|(n, b)| !reading.contains(n) && reading.iter().any(|r| calls(b, r)))
+                .map(|(n, _)| n.clone())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            reading.extend(more);
+        }
+        for (name, body) in &fns {
+            if body.contains(".lock()") && reading.contains(name) {
+                out.push(format!(
+                    "{file}: `{name}` takes a lock and reads (or waits on the reader), directly \
+                     or through what it calls — take the lock only to look and to publish, read \
+                     with none held"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// No exec pump reads a path by itself outside the doors, nor under a lock.
 #[test]
 fn the_exec_pumps_read_a_process_s_files_through_the_doors() {
     let code = product_code(&repo_root());
@@ -137,12 +319,13 @@ fn the_exec_pumps_read_a_process_s_files_through_the_doors() {
     for (file, _, why) in KNOWN {
         assert!(why.len() > 20, "{file}: say why");
     }
-    let doors = &code["crates/nn-linux/src/sensors/pump_reads.rs"];
+    let doors = &code[DOORS];
     for door in [
         "pub fn walk_in_root",
         "pub fn walk_host",
         "pub fn open_exe",
         "pub fn bounded",
+        "c.mnt_id",
     ] {
         assert!(doors.contains(door), "{door}");
     }
@@ -151,19 +334,42 @@ fn the_exec_pumps_read_a_process_s_files_through_the_doors() {
         "pub fn link_target",
         "pub fn walk_judged",
         "AT_STATX_DONT_SYNC",
+        "STATX_MNT_ID",
     ] {
         assert!(roots.contains(door), "{door}");
     }
 }
 
-/// Each spelling of a path read by hand, planted in a pump's module,
-/// fails; so does one more in a listed file.
+/// Each spelling of a path read by hand, planted in a pump's module (the
+/// review of #573's five ordinary spellings among them), fails; so does
+/// one more in a listed file, and one in a pump step.
 #[test]
 fn every_spelling_of_a_path_read_by_hand_fails_the_ratchet() {
     let base = product_code(&repo_root());
+    assert!(violations(&base).is_empty());
     let facts = "crates/nn-linux/src/sensors/exec_facts.rs";
     let image = "crates/nn-linux/src/sensors/exe_identity.rs";
+    let steps = "crates/nn-linux/src/sensors/multiplexer.rs";
     for plant in [
+        // the review of #573 (F6): its five
+        "use std::fs; fs::metadata(p)",
+        "p.is_dir()",
+        "p.canonicalize()",
+        "crate::state_read::read_state(p)",
+        "antitamper_bpf::kernel_roots::read_link(dir.join(\"root\").join(rel))",
+        // and their kin
+        "use std::fs::metadata; metadata(p)",
+        "use std::fs::{self}; fs::read(p)",
+        "p.metadata()",
+        "p.symlink_metadata()",
+        "p.exists()",
+        "p.try_exists()",
+        "p.is_file()",
+        "p.is_symlink()",
+        "p.read_dir()",
+        "p.read_link()",
+        "fs::read_to_string(p)",
+        "fs::read_link(p)",
         "antitamper_bpf::kernel_roots::metadata(dir.join(\"exe\"))",
         "antitamper_bpf::kernel_roots::symlink_metadata(p)",
         "antitamper_bpf::kernel_roots::exists(p)",
@@ -175,6 +381,7 @@ fn every_spelling_of_a_path_read_by_hand_fails_the_ratchet() {
         "antitamper_bpf::kernel_roots::read_text(p)",
         "antitamper_bpf::kernel_roots::read_to_string(p)",
         "antitamper_bpf::kernel_roots::read_dir(p)",
+        "antitamper_bpf::kernel_roots::read_dir_max(p, 9)",
         "std::fs::metadata(p)",
         "std::fs::symlink_metadata(p)",
         "std::fs::canonicalize(p)",
@@ -183,11 +390,24 @@ fn every_spelling_of_a_path_read_by_hand_fails_the_ratchet() {
         "std::fs::read_to_string(p)",
         "std::fs::File::open(p)",
         "std::fs::OpenOptions::new().read(true).open(p)",
+        "reader.read_state(p)",
     ] {
-        for file in [facts, image] {
+        for file in [facts, image, steps] {
             let mut code = base.clone();
-            let more = format!("{}\nfn planted() {{ {plant}; }}", code[file]);
-            code.insert(file.to_string(), more);
+            let body = if file == steps {
+                // inside a pump step
+                code[file].replacen(
+                    "fn check_resolved(raw: &ExecCheckRaw, e: Event) -> (Event, [Option<Event>; 2]) {",
+                    &format!(
+                        "fn check_resolved(raw: &ExecCheckRaw, e: Event) -> (Event, [Option<Event>; 2]) {{ {plant};"
+                    ),
+                    1,
+                )
+            } else {
+                format!("{}\nfn planted() {{ {plant}; }}", code[file])
+            };
+            assert_ne!(body, code[file], "{plant} planted in {file}");
+            code.insert(file.to_string(), body);
             let v = violations(&code);
             assert!(
                 v.iter().any(|m| m.starts_with(file)),
@@ -195,5 +415,52 @@ fn every_spelling_of_a_path_read_by_hand_fails_the_ratchet() {
             );
         }
     }
-    assert!(violations(&base).is_empty());
+}
+
+/// The review of #573 (F1): a lock held while a file is read — directly,
+/// through a door, through a function of the module that reads, or while
+/// waiting on the reader — fails, in a pump's module and in the doors'.
+#[test]
+fn a_lock_held_across_a_read_fails_the_ratchet() {
+    let base = product_code(&repo_root());
+    assert!(
+        lock_violations(&base).is_empty(),
+        "{:#?}",
+        lock_violations(&base)
+    );
+    for (file, plant) in [
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(p: &Path, r: &TieRead) -> bool { let mut g = PUMP.lock(); let f = read_step(p, r); g.publish(r, &f) }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(p: &Path) { let _g = PUMP.lock(); let _ = crate::mountinfo::read(p); }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/kmod_exec.rs",
+            "fn planted(e: &Event) { BUILDERS.lock().record(e, builder_exec(Path::new(\"/\"), e)); }",
+        ),
+        (
+            "crates/nn-linux/src/program_images.rs",
+            "fn planted(p: &Path) { let _g = RUNTIMES.refreshed.lock(); let _ = installed_runtimes_under(p); }",
+        ),
+        (
+            DOORS,
+            "fn planted(m: &Mutex<Mounts>) { let g = m.lock(); let _ = crate::mountinfo::read(&g.source); }",
+        ),
+        (
+            DOORS,
+            "fn planted() { let _g = STALE.lock(); let _ = bounded(0, \"x\", || ()); }",
+        ),
+    ] {
+        let mut code = base.clone();
+        let more = format!("{}\n{plant}", code[file]);
+        code.insert(file.to_string(), more);
+        let v = lock_violations(&code);
+        assert!(
+            v.iter().any(|m| m.starts_with(file) && m.contains("`planted`")),
+            "{plant} in {file}: {v:#?}"
+        );
+    }
 }

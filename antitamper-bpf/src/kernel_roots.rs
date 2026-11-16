@@ -1963,10 +1963,9 @@ pub fn cached(f: &File) -> io::Result<Cached> {
 /// its identity from the kernel's cache ([`cached`]). The link's directory
 /// is opened beneath its view (crossing nothing, [`open`]); the link alone
 /// is followed from there: nothing is looked up on the file system the
-/// file is on, nothing opened, nothing asked of a FUSE daemon. A `metadata`
-/// of the link asked the daemon of a user's FUSE file system (`allow_other`)
-/// for its attributes, and the exec pump waited for an answer that never
-/// came.
+/// file is on, nothing opened, nothing asked of a FUSE daemon (a
+/// `metadata` of the link asked the file's file system, and its caller
+/// waited for the answer).
 pub fn link_target(path: &Path) -> io::Result<(File, Cached)> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));

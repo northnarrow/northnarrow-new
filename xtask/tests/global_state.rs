@@ -764,30 +764,52 @@ const STATICS: &[Kept] = &[
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,
-        "the host's mount table, read again when it changes",
+        "the host's mount table, read again when it changes — lot 366 (the review of #573, \
+         F1): each pump thread's own (thread-local), no lock the pumps share",
     ),
     kept(
         "crates/nn-linux/src/sensors/pump_reads.rs",
-        "MOUNTS",
+        "PID1",
         HostFact,
-        "lot 366: PID 1's mount table by device (whether a file system is a FUSE or network \
-         one), read again when the kernel flags a change, which the exec pumps judge a \
+        "lot 366 (the review of #573, F2): PID 1's mount table by mount id, read again when the \
+         kernel flags a change (no lock held while it is read), which the exec pumps judge a \
          process's files against before they ask a file system anything",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "OWN",
+        HostFact,
+        "lot 366 (the review of #573, F2): the agent's own mount table (its unit's namespace: \
+         a walk from its own root) by mount id, read again when it changes",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "PID1_READ",
+        Process,
+        "lot 366: the signed condition while PID 1's mount table cannot be read (the last one \
+         read stays in force)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "OWN_READ",
+        Process,
+        "lot 366: the signed condition while the agent's own mount table cannot be read",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "STALE",
+        Process,
+        "lot 366 (the review of #573, F7): the signed condition while files are judged not \
+         verified because the mounts changed and their tables were not read again yet",
     ),
     kept(
         "crates/nn-linux/src/sensors/pump_reads.rs",
         "EXEC_READER",
         Process,
-        "lot 366: the exec pumps' bounded reader (#563's, its helpers reused, at most four \
-         reads unanswered), which runs an exec's reads under a deadline so that a file system \
-         whose server does not answer holds a helper, never a pump",
-    ),
-    kept(
-        "crates/nn-linux/src/sensors/pump_reads.rs",
-        "NOT_WAITED",
-        Process,
-        "lot 366: the signed condition (a degradation of the exec pumps) while an exec's reads \
-         are not waited for",
+        "lot 366: the exec pumps' bounded reader (#563's, its helpers reused; the review of #573, \
+         F4: a share per pool — root, the system's accounts, the users — one read per uid at \
+         once, the slow reads' budget), which runs an exec's reads under a deadline so that a \
+         read that does not answer holds a helper, never a pump",
     ),
     kept(
         "crates/nn-linux/src/sensors/pump_reads.rs",
@@ -799,8 +821,8 @@ const STATICS: &[Kept] = &[
         "crates/nn-linux/src/sensors/pump_reads.rs",
         "JUDGED_STALE",
         Telemetry,
-        "lot 366: the anonymous devices the exec pumps left unjudged because the mount table \
-         had changed and was not read again yet (a process total)",
+        "lot 366: the files the exec pumps judged not verified because the mounts had changed \
+         and their tables were not read again yet (a process total)",
     ),
     kept(
         "crates/nn-linux/src/sensors/flow_sock.rs",

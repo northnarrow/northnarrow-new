@@ -4351,30 +4351,44 @@ product code builds that bundle), with a false `host-check` warning.
   every protection. The release's contents are the same programs, linked
   on another image.
 
-## 55. A user's FUSE file system cannot hold the exec pumps (lot 366)
+## 55. The exec pumps never wait on a process's files (lot 366)
 
 - **What changed.** For each exec, the exec pump and the exec-check pump
   read the file the process runs and a few facts about it: the directory
   it was run from, an AppImage's image and daemon, a module tool's script
-  and library path, the image of a program whose stdio is a socket. These
-  reads no longer ask a FUSE or network file system anything:
-  - a process's file, root and descriptors are identified by the kernel's
-    cached identity of the file;
-  - a path is walked one name at a time. Before any name is looked up in a
-    directory, its file system is judged by the device the kernel reports,
-    against PID 1's mount table. FUSE (`fuse`, `fuse.*`, `fuseblk`,
-    `virtiofs`), network file systems (NFS, CIFS/SMB, 9p, Ceph, AFS, …) and
-    a file system the table does not show are not walked;
-  - where the fact is about a path (the directory an image was run from,
-    an AppImage's image, a module tool's script), no symbolic link on the
-    way is followed;
-  - a file is opened for reading only once its file system is judged.
-- **A deadline.** An exec's reads run on the agent's bounded reader:
-  500 ms at most, and at most four unanswered at once (past that, a read
-  is refused at once). The pump goes on either way. An exec the pumps read
-  nothing of (no module tool, no socket program, no AppImage tie to check)
-  is not handed over.
-- **What is judged when a fact is not read.** Not verified, never trusted:
+  and library path, the image of a program whose stdio is a socket.
+  - **With a deadline, never on the pump.** Every exec's reads run on the
+    agent's bounded reader (one hand-over per exec); the pump waits for
+    them only up to a short deadline, then goes on. No lock the pumps share
+    is held while a file is read.
+  - **Fair between users.** Each read is for the real uid of the exec's
+    process. Reads of one uid that do not answer hold at most one of the
+    reader's helpers: that uid's next read waits for its first, within its
+    own deadline, or is refused at once while the first is held. Users,
+    the system's accounts and root each keep a share of their own, so no
+    user can make root's facts unverifiable.
+  - **Which file systems are read.** A file's file system is told by the
+    mount the kernel reached the file through, against PID 1's mount table
+    (and the agent's own; for a process in another mount namespace, a
+    container's, that process's own table, for a file system the host's
+    tables show):
+    - FUSE (`fuse`, `fuse.*`, `fuseblk`) is never read: a fact that needs
+      it is not verified;
+    - network file systems mounted by root (NFS, CIFS/SMB and the other
+      kernel clients) are read, on the bounded reader with its deadline: a
+      home on NFS or CIFS keeps its AppImage tie;
+    - btrfs is read as any local file system (a subvolume's files show a
+      device of their own; the mount decides, not the device);
+    - a file system no table shows (mounted in a user's own namespace, or
+      since the tables were read) is not read.
+  - A process's file, root and descriptors are identified by the kernel's
+    cached identity of the file; a path is walked one name at a time, each
+    directory's file system judged before a name is looked up in it; where
+    the fact is about a path (the directory an image was run from, an
+    AppImage's image, a module tool's script), no symbolic link on the way
+    is followed; a file is opened for reading only once judged.
+- **What is judged when a fact is not read in time.** Not verified, never
+  trusted:
   - no `ROOT_DIR` and no AppImage tie (`USER_IMAGE`);
   - an interpreter naming a system script or nothing is taken to load the
     caller's code, as for an environment larger than the pump reads;
@@ -4383,23 +4397,33 @@ product code builds that bundle), with a false `host-check` warning.
   - the image of a program whose stdio is a socket is unverified:
     R020 records it.
 - **Signed.**
-  - `exec_reads_unanswered`: a degradation of the exec pumps while an
-    exec's reads do not answer within the deadline (it stands at least
-    60 s once reported).
-  - `exec_pump_mounts`: PID 1's mount table could not be read. The table
-    last read stays in force; a file system mounted since is not trusted.
-- **Before this change.** On a host whose `/etc/fuse.conf` sets
-  `user_allow_other`, a program a user ran from their own FUSE mount
-  (mounted with `allow_other`) whose daemon then stopped answering held the
-  exec pump until the daemon answered; the sensor self-test signed the
-  exec source degraded. Without `user_allow_other` (the default on Debian
-  and Ubuntu) the kernel refuses root's access to a user's FUSE mount at
-  once, and nothing was held.
+  - `exec_reads_unanswered`: reads not answered in time, or refused while
+    earlier ones had not answered — a degradation of the exec pumps while
+    it lasts.
+  - `exec_readers_held`: a share of the reader (users', system accounts',
+    root's) used up by reads that do not answer — once while it lasts.
+  - `exec_reads_slow`: reads that answered slowly added up, for one uid
+    (the record names it) or for every uid together, past a budget — the
+    exec pump was slowed.
+  - `exec_pump_mounts_changing`: files judged not verified because the
+    mounts changed and their tables were not read again yet.
+  - `exec_pump_mounts`, `exec_pump_own_mounts`: PID 1's (or the agent's
+    own) mount table could not be read; the table last read stays in
+    force.
+- **Before this change.** A read of a process's files could hold the exec
+  pumps with no deadline; and in lot 366's first form, the AppImage
+  record's lock was held while the tie read, a btrfs root or home had
+  every file refused (every AppImage's program judged from `/tmp`), NFS
+  and CIFS homes lost their AppImage tie, and the reads of all users
+  shared one bound.
 - **Residuals, accepted.**
-  - A file system the administrator mounted, served from outside the
-    kernel, of a type outside the list above, is walked as a local one.
-    If its server stops answering, it holds one of the four readers; the
-    pump goes on after 500 ms.
-  - On a slow local disk, an exec whose reads take longer than 500 ms is
-    judged as not verified (signed).
+  - A read that does not answer holds one of the reader's helpers until it
+    answers. A user can make the facts of their own processes not
+    verified: they are judged as such, and signed.
+  - On a slow disk or network file system, an exec whose reads miss the
+    deadline is judged as not verified (signed); slow reads that still
+    answer slow the pump, and are signed past a budget.
+  - Right after a change of the mounts, before the tables are read again,
+    files on a file system with an anonymous device (tmpfs, overlay,
+    btrfs) are judged not verified (signed).
 - **Operator action.** None.

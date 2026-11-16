@@ -92,8 +92,12 @@ pub struct TimedReader {
     stall: parking_lot::Mutex<Option<String>>,
 }
 
-/// A read handed to a helper.
-type Job = Box<dyn FnOnce() + Send>;
+/// A read handed to a helper: it reads, and gives back how to hand its
+/// answer over.
+type Job = Box<dyn FnOnce() -> Answer + Send>;
+
+/// A read's answer, handed over once its helper is free again.
+type Answer = Box<dyn FnOnce() + Send>;
 
 /// Lot 366: a helper thread's channel. It hands a read over with the
 /// helper's own channel, which the helper puts back among the free ones
@@ -102,18 +106,23 @@ type Job = Box<dyn FnOnce() + Send>;
 #[derive(Debug, Clone)]
 struct Helper(std::sync::mpsc::SyncSender<(Job, Helper)>);
 
-/// A helper's loop: each read it is handed, then itself free again — or,
-/// its reader gone, its end.
+/// A helper's loop: each read it is handed, then itself free again, then
+/// the answer handed over — or, its reader gone, its end. The review of
+/// #573 (F3): free before the answer, so a caller that has its answer finds
+/// the helper free (none made for its next read, none counted unanswered).
 fn helper(
     rx: std::sync::mpsc::Receiver<(Job, Helper)>,
     idle: std::sync::Weak<parking_lot::Mutex<Vec<Helper>>>,
 ) {
     while let Ok((job, me)) = rx.recv() {
-        job();
-        match idle.upgrade() {
-            Some(free) => free.lock().push(me),
-            None => return,
-        }
+        let answer = job();
+        let Some(free) = idle.upgrade() else {
+            answer();
+            return;
+        };
+        free.lock().push(me);
+        drop(free);
+        answer();
     }
 }
 
@@ -143,6 +152,17 @@ impl TimedReader {
         what: &str,
         read: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, String> {
+        self.run_within(what, self.deadline, read)
+    }
+
+    /// The review of #573 (F4): [`Self::run`], its answer waited for at most
+    /// `wait` (what is left of a caller's deadline).
+    pub fn run_within<T: Send + 'static>(
+        &self,
+        what: &str,
+        wait: std::time::Duration,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
         use std::sync::atomic::Ordering;
         let busy = self.in_flight.load(Ordering::SeqCst);
         if busy >= self.max {
@@ -157,7 +177,9 @@ impl TimedReader {
         let mut job: Option<Job> = Some(Box::new(move || {
             let out = read();
             in_flight.fetch_sub(1, Ordering::SeqCst);
-            let _ = tx.send(out);
+            Box::new(move || {
+                let _ = tx.send(out);
+            }) as Answer
         }));
         // a free helper first; one gone since is passed over
         while let Some(j) = job.take() {
@@ -183,10 +205,10 @@ impl TimedReader {
                 return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
             }
         }
-        rx.recv_timeout(self.deadline).map_err(|_| {
+        rx.recv_timeout(wait).map_err(|_| {
             self.stalled(format!(
                 "{what} did not answer within {} ms (a FUSE file bound over it?): not read",
-                self.deadline.as_millis()
+                wait.as_millis()
             ))
         })
     }
@@ -253,6 +275,7 @@ pub struct Condition {
     hold: std::time::Duration,
     since: Option<std::time::Instant>,
     reports: u32,
+    deferred: bool,
 }
 
 impl Condition {
@@ -268,6 +291,34 @@ impl Condition {
             hold,
             since: None,
             reports: 0,
+            deferred: false,
+        }
+    }
+
+    /// The review of #573 (F1): [`Self::with_hold`] for a thread that may
+    /// never wait on I/O (an exec pump): its records are kept and signed by
+    /// the next flush ([`crate::boot::degradation::note`],
+    /// [`crate::boot::degradation::retire_where`]) — never written to the
+    /// audit log on that thread.
+    pub const fn deferred(source: &'static str, hold: std::time::Duration) -> Self {
+        let mut c = Self::with_hold(source, hold);
+        c.deferred = true;
+        c
+    }
+
+    fn report(&self, detail: &str) {
+        if self.deferred {
+            crate::boot::degradation::note(self.source, detail);
+        } else {
+            crate::boot::degradation::report(self.source, detail);
+        }
+    }
+
+    fn withdraw(&self) {
+        if self.deferred {
+            crate::boot::degradation::retire_where(self.source, |_| true);
+        } else {
+            crate::boot::degradation::withdraw(self.source, &[]);
         }
     }
 
@@ -282,10 +333,10 @@ impl Condition {
             return;
         }
         if self.holding.is_some() {
-            crate::boot::degradation::withdraw(self.source, &[]);
+            self.withdraw();
         }
         tracing::warn!(source = self.source, detail = %detail, "degraded");
-        crate::boot::degradation::report(self.source, &detail);
+        self.report(&detail);
         self.holding = Some(detail);
         self.since = Some(now);
         self.reports = self.reports.saturating_add(1);
@@ -307,7 +358,7 @@ impl Condition {
         }
         self.holding = None;
         tracing::info!(source = self.source, "no longer degraded");
-        crate::boot::degradation::withdraw(self.source, &[]);
+        self.withdraw();
     }
 
     /// It holds now.
@@ -641,6 +692,41 @@ mod tests {
     /// deadline, keeps the stall for the round, and past `max` unanswered
     /// reads fails at once without a thread; once the stalled read
     /// answers, reads go through again.
+    /// Lot 366, the review of #573 (F3): a helper is free again — back
+    /// among the free ones, its read counted down — before its answer is
+    /// handed over: with the free helpers' list held while the read answers,
+    /// the answer waits for it. Deterministic, where the racing test was not.
+    #[test]
+    fn a_helper_is_free_again_before_its_answer_is_handed_over() {
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let r = std::sync::Arc::new(TimedReader::new(Duration::from_secs(5), 4));
+        assert_eq!(r.run("warm", || 0), Ok(0));
+        assert_eq!(r.free_helpers(), 1);
+        let (started_tx, started_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let r2 = std::sync::Arc::clone(&r);
+        let caller = std::thread::spawn(move || {
+            let v = r2.run("test", move || {
+                started_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                7
+            });
+            (v, Instant::now())
+        });
+        started_rx.recv().unwrap();
+        let held = r.idle.lock();
+        go_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(r.unanswered(), 0, "counted down as it answered");
+        let released = Instant::now();
+        drop(held);
+        let (v, answered) = caller.join().unwrap();
+        assert_eq!(v, Ok(7));
+        assert!(answered >= released, "answered before its helper was free");
+        assert_eq!(r.free_helpers(), 1, "the one helper, free again");
+    }
+
     #[test]
     fn a_read_that_never_answers_is_bounded_in_time() {
         let d = tempfile::tempdir().unwrap();

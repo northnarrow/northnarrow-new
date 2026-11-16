@@ -136,7 +136,7 @@ pub fn not_read(event: &mut Event) {
 /// `comm` is a module tool's; `root`: the host's root (`/`; a fixture tree
 /// in tests) the tools' paths are under.
 pub fn facts(root: &Path, event: &Event) -> Option<ExecFacts> {
-    let builders = BUILDERS.lock().running();
+    let builders = running_builders();
     let facts = facts_in(root, Path::new("/proc"), &builders, event)?;
     // lot 348: a runtime or manager installed since the last minute's
     // refresh is known to R011's runtime exemption (its parent's identity)
@@ -219,14 +219,22 @@ const KEPT_BUILDERS: usize = 64;
 
 static BUILDERS: std::sync::LazyLock<Mutex<Builders>> = std::sync::LazyLock::new(Default::default);
 
+/// The builders kept now (memory only: the lock is never held while a
+/// file is read — the review of #573, F1).
+fn running_builders() -> Vec<(u32, Builder)> {
+    BUILDERS.lock().running()
+}
+
 impl Builders {
-    /// `event` (an exec) noted: a builder's kept, by its pid and start;
-    /// any other exec of a pid kept forgets it (its image is another now).
-    fn note(&mut self, root: &Path, event: &Event) {
+    /// `event` (an exec) noted, `found` the builder it executes if it is
+    /// one ([`builder_exec`], read before): a builder's kept, by its pid and
+    /// start; any other exec of a pid kept forgets it (its image is another
+    /// now). Memory only.
+    fn record(&mut self, event: &Event, found: Option<Builder>) {
         let Event::ProcessSpawn { pid, .. } = event else {
             return;
         };
-        match builder_exec(root, event) {
+        match found {
             Some(b) => {
                 if self.by_pid.insert(*pid, b).is_none() {
                     self.order.push_back(*pid);
@@ -254,7 +262,14 @@ impl Builders {
 /// Lot 287: the exec pump's step after each exec (its path resolved): an
 /// exec of an initramfs builder remembered, any other forgets its pid.
 pub fn note_exec(event: &Event) {
-    BUILDERS.lock().note(Path::new("/"), event);
+    // the builder's file read first, no lock held (the review of #573, F1)
+    let found = builder_exec(Path::new("/"), event);
+    record_exec(event, found);
+}
+
+/// [`note_exec`]'s finding kept (memory only).
+fn record_exec(event: &Event, found: Option<Builder>) {
+    BUILDERS.lock().record(event, found);
 }
 
 /// Lot 287: the builder `event` executes, if it is one — run as root
@@ -1409,6 +1424,15 @@ mod tests {
 
     use super::*;
     use std::process::{Child, Command, Stdio};
+
+    impl Builders {
+        /// `event` noted with its builder read under `root` at once (the
+        /// fixtures' record: no pump shares it).
+        fn note(&mut self, root: &Path, event: &Event) {
+            let found = builder_exec(root, event);
+            self.record(event, found);
+        }
+    }
 
     use crate::response::proc_ref::proc_start_ns;
 

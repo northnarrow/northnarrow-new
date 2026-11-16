@@ -361,20 +361,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
-- Lot 366 (pre-alpha): **a user's FUSE file system cannot hold the exec
-  pumps** (`UPGRADE_NOTES_WAVE4.md` §55). The exec and exec-check pumps
-  read each exec's file and facts without asking a FUSE or network file
-  system anything: a process's file, root and descriptors by the kernel's
-  cached identity; a path walked one name at a time, each file system
-  judged by its device against PID 1's mount table before a name is looked
-  up in it, no symbolic link followed where the fact is about a path; a
-  file opened only once judged. An exec's reads run on the bounded reader
-  (500 ms, at most four unanswered); a fact not read is judged as not
-  verified, never trusted, and signed (`exec_reads_unanswered`). Before, on
-  a host with `user_allow_other` in `/etc/fuse.conf`, a program run from a
-  user's FUSE mount whose daemon stopped answering held the exec pump.
-  The bounded reader (`state_read::TimedReader`) now reuses its free helper
-  threads.
+- Lot 366 (pre-alpha): **the exec pumps never wait on a process's files**
+  (`UPGRADE_NOTES_WAVE4.md` §55). Every exec's reads (its file, its
+  directory, an AppImage's image and daemon, a module tool's script and
+  library path, a socket program's image) run on the bounded reader with a
+  deadline, never on the pump, and no lock the pumps share is held while a
+  file is read; reads are fair between users (one uid's unanswered reads
+  hold at most one helper; users, system accounts and root keep shares of
+  their own); a fact not read in time is judged not verified and signed
+  (`exec_reads_unanswered`, `exec_readers_held`; slow reads past a budget,
+  `exec_reads_slow`, naming the uid). A file's file system is told by the
+  mount the kernel reached it through, against the mount tables: FUSE is
+  never read; network file systems mounted by root are read, with the
+  deadline; btrfs subvolumes are read as local. The bounded reader
+  (`state_read::TimedReader`) reuses its free helper threads, each free
+  again before its answer is handed over.
 - Lot 349 (pre-alpha self-protection blockers R001–R003, R090; rc2).
   - **The agent watches its own CPUs (R001).** Root could confine the agent
     to one CPU without touching it: a sibling cgroup put in

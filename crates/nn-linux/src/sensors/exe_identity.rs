@@ -14,7 +14,6 @@ use aya::programs::Lsm;
 use aya::Ebpf;
 use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
 use nn_model::Event;
-use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::boot::manifest::{AttachPoints, Took};
@@ -161,7 +160,13 @@ pub fn verifier_tail(e: &anyhow::Error) -> String {
     )
 }
 
-static MOUNTS: Mutex<Option<MountTable>> = Mutex::new(None);
+std::thread_local! {
+    /// The review of #573 (F1): each pump thread's own table — no lock the
+    /// exec pump and the exec-check pump share. It reads only the kernel's
+    /// own state (`/proc/self/mountinfo`; the mount points, pinned in the
+    /// kernel's cache while mounted).
+    static MOUNTS: std::cell::RefCell<Option<MountTable>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Make an exec event's path absolute: the root of the file's filesystem
 /// mapped to its mount point. A root the table does not know (a mount of
@@ -182,9 +187,11 @@ pub fn resolve(event: &mut Event) {
         _ => return,
     };
     if exe.root != (0, 0) {
-        let mut guard = MOUNTS.lock();
-        let table = guard.get_or_insert_with(MountTable::load);
-        match table.absolute(exe.root, &exe.path) {
+        let abs = MOUNTS.with_borrow_mut(|m| {
+            m.get_or_insert_with(MountTable::load)
+                .absolute(exe.root, &exe.path)
+        });
+        match abs {
             Some(abs) => exe.path = abs,
             None => exe.path.clear(),
         }

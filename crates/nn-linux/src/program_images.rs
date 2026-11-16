@@ -562,6 +562,8 @@ fn open_operand(dir: &Path, program: &str, judge: &Judge) -> std::io::Result<std
     if !c.is_dir() {
         return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
     }
+    // the process's own mounts (a container's) judged by its own table
+    let judge = judge.of_process(dir);
     let w = kernel_roots::walk_judged(&from, Path::new("/"), Path::new(rel), true, &mut |c| {
         judge.trusts(c)
     })?;
@@ -699,16 +701,23 @@ impl RuntimeChecks {
     /// The runtimes under `root` recorded, unless done in the last
     /// [`RUNTIME_REFRESH_EVERY`].
     fn refresh(&self, root: &Path, now: Instant) {
-        {
-            let mut at = self.refreshed.lock();
-            if at.is_some_and(|t| now.duration_since(t) < RUNTIME_REFRESH_EVERY) {
-                return;
-            }
-            *at = Some(now);
+        if !self.due(now) {
+            return;
         }
         for image in installed_runtimes_under(root) {
             program_identity::record_installed(image);
         }
+    }
+
+    /// Whether a refresh is due at `now` (then it is this caller's) —
+    /// memory only: the lock is never held while the runtimes are read.
+    fn due(&self, now: Instant) -> bool {
+        let mut at = self.refreshed.lock();
+        if at.is_some_and(|t| now.duration_since(t) < RUNTIME_REFRESH_EVERY) {
+            return false;
+        }
+        *at = Some(now);
+        true
     }
 }
 
@@ -928,6 +937,40 @@ fn parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 366, the review of #573 (F2): a loader's operand is walked from
+    /// its process's root or working directory, each mount judged by that
+    /// process's own table when no host table shows it (a container's
+    /// mounts) — opened when the host's tables show its file system.
+    #[test]
+    fn a_loader_s_operand_is_judged_by_its_process_s_own_mounts() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("prog"), b"x").unwrap();
+        let c =
+            antitamper_bpf::kernel_roots::cached(&std::fs::File::open(t.path()).unwrap()).unwrap();
+        let proc = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(t.path(), proc.path().join("root")).unwrap();
+        std::os::unix::fs::symlink(t.path(), proc.path().join("cwd")).unwrap();
+        let line = |id: u64| {
+            format!(
+                "{id} 1 {}:{} / /x rw - ext4 src rw\n",
+                c.dev >> 20,
+                c.dev & 0xfffff
+            )
+        };
+        let host = Judge::of(&crate::mountinfo::parse(line(c.mnt_id + 9000).as_bytes()));
+        assert!(open_operand(proc.path(), "prog", &host).is_err());
+        std::fs::write(proc.path().join("mountinfo"), line(c.mnt_id)).unwrap();
+        assert!(
+            open_operand(proc.path(), "prog", &host).is_ok(),
+            "by its cwd"
+        );
+        assert!(
+            open_operand(proc.path(), "/prog", &host).is_ok(),
+            "by its root"
+        );
+    }
+
     use nn_model::{StdioSocket, StdioSockets};
     use std::os::unix::fs::symlink;
 
