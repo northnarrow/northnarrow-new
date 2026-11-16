@@ -2207,6 +2207,22 @@ fn read_priv_key(path: &Path) -> Result<SigningKey> {
         // no preconditions and cannot fail (nn-admin forbids unsafe code).
         let euid = rustix::process::geteuid().as_raw();
         if meta.uid() != euid {
+            // Lot 365 (review F3): without root, another user's key (root's,
+            // moved to a medium this user can traverse) is a permission the
+            // host refuses this user, told as one (exit 17, "run it with
+            // sudo"), not an anyhow message that looks like "agent not
+            // reachable" (exit 5). As root the OpenSSH rule stays a plain
+            // refusal.
+            if euid != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "belongs to uid {}, not to this user (uid {euid})",
+                        meta.uid()
+                    ),
+                ))
+                .with_context(|| format!("reading private key {}", path.display()));
+            }
             bail!(
                 "private key {} belongs to uid {}, not to this user (uid {euid})",
                 path.display(),

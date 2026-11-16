@@ -768,14 +768,66 @@ fn kexec_load_disabled(root: &Path) -> Check {
     }
 }
 
+/// Lot 365: the mount ids of the agent's pin lock in the mount table `text`
+/// — the lock `pin_lock::state_in` finds in place (the self-bind of
+/// `pin_root`, private and unbindable, the child of the whole bpffs at
+/// /sys/fs/bpf) and each lock stacked on it that is private and
+/// unbindable too. None when the lock is not in place.
+fn own_pin_lock(text: &[u8], pin_root: &Path) -> Vec<u64> {
+    use crate::anti_tamper::pin_lock::{is_lock, propagation_is_locked, state_in, State};
+    let State::InPlace(first) = state_in(text, pin_root) else {
+        return Vec::new();
+    };
+    let t = crate::mountinfo::parse(text).entries;
+    let attrs = crate::mount_attrs::attrs_of(text);
+    let mut ids = vec![first];
+    while let Some(over) = t.iter().find(|m| {
+        m.parent == ids[ids.len() - 1] && m.mount_point == pin_root && !ids.contains(&m.id)
+    }) {
+        let locked = attrs
+            .get(&over.id)
+            .is_some_and(|(_, a)| propagation_is_locked(&a.propagation));
+        if !(is_lock(&t, over, pin_root) && locked) {
+            break;
+        }
+        ids.push(over.id);
+    }
+    ids
+}
+
 fn bpffs_mounts(root: &Path) -> Check {
     // lot 311 (bug hunt 1.4, F4): the table read as bytes — a user's FUSE
     // mount named with bytes that are not UTF-8 made it unreadable, and the
     // check said "not mounted"; a table that cannot be read is said so
-    let table = crate::mountinfo::read(&root.join("proc/self/mountinfo"));
-    let bpf: Vec<&crate::mountinfo::MountEntry> = match &table {
-        Ok(t) => t.entries.iter().filter(|m| m.fstype == "bpf").collect(),
+    let bytes = crate::mountinfo::read_bytes(&root.join("proc/self/mountinfo"));
+    let table = bytes.as_ref().map(|b| crate::mountinfo::parse(b));
+    // Lot 365: the pin directory's lock (lot 359), recognised by what it is,
+    // never by its path: the self-bind of the pin directory, private and
+    // unbindable, the child of the whole bpffs at /sys/fs/bpf
+    // (`pin_lock::state_in`, the agent's own test of it). It is no second
+    // bpffs — it hides nothing, it holds the pins in place — and every
+    // host with the agent showed "mounted 2×". Anything else at that path
+    // (not a self-bind, shared, bindable, laid over the lock) still counts.
+    let pin_root = crate::anti_tamper::pin_lock::pin_root();
+    let lock = match &bytes {
+        Ok(b) => own_pin_lock(b, &pin_root),
         Err(_) => Vec::new(),
+    };
+    let bpf: Vec<&crate::mountinfo::MountEntry> = match &table {
+        Ok(t) => t
+            .entries
+            .iter()
+            .filter(|m| m.fstype == "bpf" && !lock.contains(&m.id))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let lock_said = if !lock.is_empty() {
+        format!(
+            " (and the agent's pin lock at {}, not counted)",
+            pin_root.display()
+        )
+    } else {
+        String::new()
     };
     let at_std = bpf
         .iter()
@@ -786,11 +838,17 @@ fn bpffs_mounts(root: &Path) -> Check {
             format!("the mount table could not be read: {e}"),
         ),
         (_, 0) => (Status::Warn, "not mounted".to_string()),
-        (_, 1) if at_std => (Status::Ok, "mounted once at /sys/fs/bpf".to_string()),
+        (_, 1) if at_std => (
+            Status::Ok,
+            format!("mounted once at /sys/fs/bpf{lock_said}"),
+        ),
         (_, 1) => (Status::Warn, "mounted once, not at /sys/fs/bpf".to_string()),
         (_, n) => (
             Status::Warn,
-            format!("mounted {n}× — a second bpffs can hide pinned objects from the inventory"),
+            format!(
+                "mounted {n}×{lock_said} — a second bpffs can hide pinned objects from the \
+                 inventory"
+            ),
         ),
     };
     // lot 311 (the review of #538, F2): lines not in the kernel's shape are
@@ -1458,6 +1516,100 @@ mod tests {
         let c = bpffs_mounts(r);
         assert_eq!(c.status, Status::Warn);
         assert!(c.value.contains("not in the kernel's shape"), "{}", c.value);
+    }
+
+    /// Lot 365: since lot 359 every host with the agent showed "bpffs
+    /// mounted 2×": the pin directory's lock is a second bpffs mount. It is
+    /// recognised by what it is (the self-bind of the pin directory, private
+    /// and unbindable, the child of the whole bpffs at /sys/fs/bpf, or a lock
+    /// stacked on it) — never by its path: a bpffs at that path that is not
+    /// the lock, the lock shared or bindable, a mount over it, and any other
+    /// bpffs still warn.
+    #[test]
+    fn the_agent_s_pin_lock_is_not_a_second_bpffs() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let base = "1 0 252:1 / / rw shared:1 - ext4 /dev/vda1 rw\n\
+                    20 1 0:20 / /sys rw shared:7 - sysfs sysfs rw\n\
+                    30 20 0:30 / /sys/fs/bpf rw shared:9 - bpf bpf rw,mode=700\n";
+        let lock = |prop: &str| {
+            let prop = if prop.is_empty() {
+                String::new()
+            } else {
+                format!(" {prop}")
+            };
+            format!(
+                "90 30 0:30 /northnarrow /sys/fs/bpf/northnarrow rw,relatime{prop} - bpf bpf \
+                 rw,mode=700\n"
+            )
+        };
+        let check = |lines: &str| {
+            w(
+                r,
+                "proc/self/mountinfo",
+                format!("{base}{lines}").as_bytes(),
+            );
+            bpffs_mounts(r)
+        };
+        let c = check(&lock("unbindable"));
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        assert!(c.value.contains("the agent's pin lock"), "{}", c.value);
+        // a lock stacked on the lock is the lock
+        let c = check(&format!(
+            "{}91 90 0:30 /northnarrow /sys/fs/bpf/northnarrow rw unbindable - bpf bpf rw\n",
+            lock("unbindable")
+        ));
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        for (what, n, lines) in [
+            ("the lock shared", 2, lock("shared:120 unbindable")),
+            (
+                "a lock stacked on the lock, shared",
+                2,
+                format!(
+                    "{}91 90 0:30 /northnarrow /sys/fs/bpf/northnarrow rw shared:121 unbindable - \
+                     bpf bpf rw\n",
+                    lock("unbindable")
+                ),
+            ),
+            ("the lock bindable", 2, lock("")),
+            (
+                "another bpffs at the pin path",
+                2,
+                "90 30 0:92 / /sys/fs/bpf/northnarrow rw unbindable - bpf bpf rw\n".to_string(),
+            ),
+            (
+                "another directory of the bpffs at the pin path",
+                2,
+                "90 30 0:30 /other /sys/fs/bpf/northnarrow rw unbindable - bpf bpf rw\n"
+                    .to_string(),
+            ),
+            (
+                "the lock and a bpffs elsewhere",
+                2,
+                format!(
+                    "{}95 1 0:96 / /mnt/bpf2 rw - bpf bpf rw\n",
+                    lock("unbindable")
+                ),
+            ),
+            (
+                "a bpffs over the lock (the lock no longer in place)",
+                3,
+                format!(
+                    "{}91 90 0:97 / /sys/fs/bpf/northnarrow rw unbindable - bpf bpf rw\n",
+                    lock("unbindable")
+                ),
+            ),
+        ] {
+            let c = check(&lines);
+            assert_eq!(c.status, Status::Warn, "{what}: {}", c.value);
+            assert!(
+                c.value.contains(&format!("mounted {n}×")),
+                "{what}: {}",
+                c.value
+            );
+        }
+        // without the lock, once is once
+        assert_eq!(check("").status, Status::Ok);
     }
 
     #[test]

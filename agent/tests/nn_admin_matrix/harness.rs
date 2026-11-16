@@ -67,9 +67,24 @@ pub struct Case {
     /// `/run/northnarrow`, `/var/lib/northnarrow`): run only where none of
     /// them exists (`host_defaults_absent`).
     pub host_defaults: bool,
+    /// Lot 365: the case needs a user without root (a file of mode 0 that
+    /// root would read): not run as root.
+    pub no_root: bool,
 }
 
 impl Case {
+    /// Lot 365: the case needs a user without root (root opens a socket of
+    /// mode 0): not run as root.
+    pub fn needs_no_root(&self) -> bool {
+        self.no_root || matches!(self.mock, Some(mock::Script::Denied))
+    }
+
+    /// Run only without root ([`Case::no_root`]).
+    pub fn without_root(mut self) -> Self {
+        self.no_root = true;
+        self
+    }
+
     pub fn new(area: &'static str, id: impl Into<String>, args: &[&str]) -> Self {
         Case {
             area,
@@ -82,6 +97,7 @@ impl Case {
             stderr: Sink::Piped,
             special: Special::None,
             host_defaults: false,
+            no_root: false,
         }
     }
 

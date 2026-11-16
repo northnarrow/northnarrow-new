@@ -6,6 +6,50 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 365 (an external tester's run of the alpha on Debian 12): two of
+  the findings, and a false host-check warning (`UPGRADE_NOTES_WAVE4.md`
+  §54).
+  - **Release binaries for glibc 2.34.** The release's `package` job runs
+    on `ubuntu-22.04`, the oldest image GitHub offers (was `ubuntu-24.04`, glibc 2.39): linked there, the
+    agent, the watchdog and `nn-admin` recorded a weak need of
+    `GLIBC_2.39` (Rust's standard library probes `pidfd_spawnp` and
+    `pidfd_getpid`), and every start on Ubuntu 22.04 and Debian 12 printed
+    `weak version 'GLIBC_2.39' not found`. A new step checks every ELF
+    file of the tarball, the `.deb` and the `.rpm`
+    (`deploy/release/glibc-baseline.sh check`): no glibc symbol version
+    above 2.34 (AlmaLinux/RHEL 9, the packages' floor), weak needs included, and no shared library but glibc's and
+    `libgcc_s`; its selftest first builds a strong and a weak need of
+    `GLIBC_2.39` and proves both refused. The tester's CI artefact fails
+    it. Still a GitHub-hosted image: the provenance attestation and its
+    `--deny-self-hosted-runners` check are unchanged. Ratchets
+    `the_release_is_built_and_checked_on_the_glibc_baseline` and
+    `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34`.
+  - **`nn-admin` exit 17: permission denied.** A command that talks to the
+    agent and is refused (`EACCES`, `EPERM`) its socket, key or agent id
+    file exits 17 with the step that met it and "run it with sudo … this
+    does not mean the agent is stopped" (was exit 5, the code of an agent
+    that is not running). One helper for every command
+    (`exit_from_request_error`); the output matrix has a
+    `sock.<verb>.permission-denied` case for each of its socket verbs (not
+    run as root). Named tests:
+    `status_without_root_on_a_running_agent_says_sudo_not_stopped`,
+    `status_with_no_agent_is_still_exit_5`,
+    `a_key_this_user_may_not_read_is_exit_17_not_5`, and the helper's
+    `permission_tests`.
+  - **`nn-admin chain verify` without root** (the mini-hunt's variant): a
+    chain this user may not open (the state directory is root's) was
+    `BROKEN`, exit 8, "evidence missing or altered" — a false alarm; now
+    exit 17 with the sudo advice. As root a refused read stays `BROKEN`.
+    Matrix case `chain.a-chain-this-user-may-not-read`.
+  - **`nn-admin host-check`: the agent's pin lock is no second bpffs.**
+    Since lot 359 every host with the agent warned "bpffs mounted 2×": the
+    pin directory's lock is a bpffs mount. It is recognised by what it is,
+    never by its path — the self-bind of `/sys/fs/bpf/northnarrow`,
+    private and unbindable, the child of the whole bpffs at `/sys/fs/bpf`
+    (`pin_lock::state_in`), or a lock stacked on it — and named in the
+    check's line, not counted. A bpffs at that path that is not the lock,
+    the lock shared or bindable, a mount over it, and any other bpffs
+    still warn. Named test `the_agent_s_pin_lock_is_not_a_second_bpffs`.
 - Lot 364 (pre-alpha Phase 9, part 2): **documentation truth and the
   tester kit**. No code of the agent changes.
   - **`KNOWN_LIMITATIONS.md`, final for the alpha**: built from the

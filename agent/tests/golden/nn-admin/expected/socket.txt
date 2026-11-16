@@ -303,6 +303,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.unlock.permission-denied
+$ nn-admin unlock --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| unlock: connecting to admin.sock: Permission denied (os error 13)
+| unlock: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin unlock …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.status.observing
 $ nn-admin status --socket admin.sock
 exit: 0
@@ -492,6 +503,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.status.permission-denied
+$ nn-admin status --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| status: connecting to admin.sock: Permission denied (os error 13)
+| status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.status-json.observing
 $ nn-admin status --json --socket admin.sock
 exit: 0
@@ -610,6 +632,17 @@ exit: 5
 | status: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.status-json.permission-denied
+$ nn-admin status --json --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| status: connecting to admin.sock: Permission denied (os error 13)
+| status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.net-status.observing
 $ nn-admin net status --socket admin.sock
@@ -740,6 +773,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.net-status.permission-denied
+$ nn-admin net status --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to admin.sock: Permission denied (os error 13)
+| net status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.net-status-json.observing
 $ nn-admin net status --json --socket admin.sock
 exit: 0
@@ -858,6 +902,17 @@ exit: 5
 | net status: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.net-status-json.permission-denied
+$ nn-admin net status --json --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to admin.sock: Permission denied (os error 13)
+| net status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.export-status.observing
 $ nn-admin export status --socket admin.sock
@@ -988,6 +1043,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.export-status.permission-denied
+$ nn-admin export status --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to admin.sock: Permission denied (os error 13)
+| export status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin export status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.export-status-json.observing
 $ nn-admin export status --json --socket admin.sock
 exit: 0
@@ -1106,6 +1172,17 @@ exit: 5
 | export status: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.export-status-json.permission-denied
+$ nn-admin export status --json --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to admin.sock: Permission denied (os error 13)
+| export status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin export status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.status-key.full
 $ nn-admin status --key key-a --agent-id-file agent_id --socket admin.sock
@@ -1566,6 +1643,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.status-key.permission-denied
+$ nn-admin status --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| status: connecting to admin.sock: Permission denied (os error 13)
+| status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.status-key-json.full
 $ nn-admin status --json --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -1891,6 +1979,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.status-key-json.permission-denied
+$ nn-admin status --json --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| status: connecting to admin.sock: Permission denied (os error 13)
+| status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.net-status-key.full
 $ nn-admin net status --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -2211,6 +2310,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.net-status-key.permission-denied
+$ nn-admin net status --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to admin.sock: Permission denied (os error 13)
+| net status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.net-status-key-json.full
 $ nn-admin net status --json --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -2520,6 +2630,17 @@ exit: 5
 | net status: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.net-status-key-json.permission-denied
+$ nn-admin net status --json --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net status: connecting to admin.sock: Permission denied (os error 13)
+| net status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.export-status-key.full
 $ nn-admin export status --key key-a --agent-id-file agent_id --socket admin.sock
@@ -2846,6 +2967,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.export-status-key.permission-denied
+$ nn-admin export status --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to admin.sock: Permission denied (os error 13)
+| export status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin export status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.export-status-key-json.full
 $ nn-admin export status --json --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -3170,6 +3302,17 @@ exit: 5
 | export status: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.export-status-key-json.permission-denied
+$ nn-admin export status --json --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| export status: connecting to admin.sock: Permission denied (os error 13)
+| export status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin export status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.capabilities.full
 $ nn-admin capabilities --key key-a --agent-id-file agent_id --socket admin.sock
@@ -3553,6 +3696,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.capabilities.permission-denied
+$ nn-admin capabilities --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| capabilities: connecting to admin.sock: Permission denied (os error 13)
+| capabilities: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin capabilities …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.capabilities-json.full
 $ nn-admin capabilities --json --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -3893,6 +4047,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.capabilities-json.permission-denied
+$ nn-admin capabilities --json --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| capabilities: connecting to admin.sock: Permission denied (os error 13)
+| capabilities: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin capabilities …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.detections.two-rows
 $ nn-admin detections --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -4205,6 +4370,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.detections.permission-denied
+$ nn-admin detections --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| detections: connecting to admin.sock: Permission denied (os error 13)
+| detections: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin detections …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.detections-filtered.two-rows
 $ nn-admin detections --limit 5 --since 1750000000 --until 1750003600 --min-severity high --status open --sensor exec --path /usr/bin/curl --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -4485,6 +4661,17 @@ exit: 5
 | detections: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.detections-filtered.permission-denied
+$ nn-admin detections --limit 5 --since 1750000000 --until 1750003600 --min-severity high --status open --sensor exec --path /usr/bin/curl --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| detections: connecting to admin.sock: Permission denied (os error 13)
+| detections: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin detections …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.detection-set-status.set
 $ nn-admin detection-set-status --id 42 --status resolved --note checked --key key-a --agent-id-file agent_id --socket admin.sock
@@ -4781,6 +4968,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.detection-set-status.permission-denied
+$ nn-admin detection-set-status --id 42 --status resolved --note checked --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| detection-set-status: connecting to admin.sock: Permission denied (os error 13)
+| detection-set-status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin detection-set-status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.shutdown.acknowledged
 $ nn-admin shutdown --cosign-key key-b --grace-secs 45 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -5062,6 +5260,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.shutdown.permission-denied
+$ nn-admin shutdown --cosign-key key-b --grace-secs 45 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| shutdown: connecting to admin.sock: Permission denied (os error 13)
+| shutdown: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin shutdown …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.force-posture.forced
 $ nn-admin force-posture engaged --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -5341,6 +5550,17 @@ exit: 5
 | force-posture: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.force-posture.permission-denied
+$ nn-admin force-posture engaged --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| force-posture: connecting to admin.sock: Permission denied (os error 13)
+| force-posture: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin force-posture …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.rotate-keys-add.added
 $ nn-admin rotate-keys add --new-pubkey d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf --new-roles fim-read,net-read --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
@@ -5622,6 +5842,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.rotate-keys-add.permission-denied
+$ nn-admin rotate-keys add --new-pubkey d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf --new-roles fim-read,net-read --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| rotate-keys add: connecting to admin.sock: Permission denied (os error 13)
+| rotate-keys add: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin rotate-keys add …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.rotate-keys-revoke.revoked
 $ nn-admin rotate-keys revoke --fingerprint b28baab3 --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -5902,6 +6133,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.rotate-keys-revoke.permission-denied
+$ nn-admin rotate-keys revoke --fingerprint b28baab3 --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| rotate-keys revoke: connecting to admin.sock: Permission denied (os error 13)
+| rotate-keys revoke: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin rotate-keys revoke …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.fim-baseline.queued
 $ nn-admin fim baseline --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -6181,6 +6423,17 @@ exit: 5
 | fim baseline: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.fim-baseline.permission-denied
+$ nn-admin fim baseline --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| fim baseline: connecting to admin.sock: Permission denied (os error 13)
+| fim baseline: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin fim baseline …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.fim-report.two-rows
 $ nn-admin fim report --since 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
@@ -6494,6 +6747,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.fim-report.permission-denied
+$ nn-admin fim report --since 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| fim report: connecting to admin.sock: Permission denied (os error 13)
+| fim report: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin fim report …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.fim-status.snapshot
 $ nn-admin fim status --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -6778,6 +7042,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.fim-status.permission-denied
+$ nn-admin fim status --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| fim status: connecting to admin.sock: Permission denied (os error 13)
+| fim status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin fim status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.canary-deploy-file.deployed
 $ nn-admin canary deploy --name honeypot-file --key key-a --agent-id-file agent_id --socket admin.sock file --path /srv/matrix/canary.txt
 exit: 0
@@ -7057,6 +7332,17 @@ exit: 5
 | canary deploy: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.canary-deploy-file.permission-denied
+$ nn-admin canary deploy --name honeypot-file --key key-a --agent-id-file agent_id --socket admin.sock file --path /srv/matrix/canary.txt
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| canary deploy: connecting to admin.sock: Permission denied (os error 13)
+| canary deploy: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin canary deploy …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.canary-list.two-rows
 $ nn-admin canary list --key key-a --agent-id-file agent_id --socket admin.sock
@@ -7370,6 +7656,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.canary-list.permission-denied
+$ nn-admin canary list --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| canary list: connecting to admin.sock: Permission denied (os error 13)
+| canary list: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin canary list …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.canary-burn.burned
 $ nn-admin canary burn --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -7650,6 +7947,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.canary-burn.permission-denied
+$ nn-admin canary burn --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| canary burn: connecting to admin.sock: Permission denied (os error 13)
+| canary burn: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin canary burn …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.canary-refresh.refreshed
 $ nn-admin canary refresh --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -7929,6 +8237,17 @@ exit: 5
 | canary refresh: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.canary-refresh.permission-denied
+$ nn-admin canary refresh --canary-id c0ffee0123456789 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| canary refresh: connecting to admin.sock: Permission denied (os error 13)
+| canary refresh: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin canary refresh …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.net-flows.two-rows
 $ nn-admin net flows --since-unix 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
@@ -8242,6 +8561,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.net-flows.permission-denied
+$ nn-admin net flows --since-unix 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net flows: connecting to admin.sock: Permission denied (os error 13)
+| net flows: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net flows …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.net-listeners.two-rows
 $ nn-admin net listeners --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -8554,6 +8884,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.net-listeners.permission-denied
+$ nn-admin net listeners --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net listeners: connecting to admin.sock: Permission denied (os error 13)
+| net listeners: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net listeners …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.net-resolve.named
 $ nn-admin net resolve --ip 203.0.113.7 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -8863,6 +9204,17 @@ exit: 5
 | net resolve: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.net-resolve.permission-denied
+$ nn-admin net resolve --ip 203.0.113.7 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net resolve: connecting to admin.sock: Permission denied (os error 13)
+| net resolve: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net resolve …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.net-fingerprint.two-rows
 $ nn-admin net fingerprint --flow-id 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --key key-a --agent-id-file agent_id --socket admin.sock
@@ -9176,6 +9528,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.net-fingerprint.permission-denied
+$ nn-admin net fingerprint --flow-id 0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| net fingerprint: connecting to admin.sock: Permission denied (os error 13)
+| net fingerprint: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin net fingerprint …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.trusted-installer-grant.granted
 $ nn-admin trusted-installer-grant --window-secs 300 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -9458,6 +9821,17 @@ exit: 5
 | trusted-installer-grant: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.trusted-installer-grant.permission-denied
+$ nn-admin trusted-installer-grant --window-secs 300 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| trusted-installer-grant: connecting to admin.sock: Permission denied (os error 13)
+| trusted-installer-grant: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin trusted-installer-grant …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.response-status.populated
 $ nn-admin response status --key key-a --agent-id-file agent_id --socket admin.sock
@@ -9763,6 +10137,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.response-status.permission-denied
+$ nn-admin response status --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| response status: connecting to admin.sock: Permission denied (os error 13)
+| response status: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin response status …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.response-release.released
 $ nn-admin response release --pid 4242 --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -10058,6 +10443,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.response-release.permission-denied
+$ nn-admin response release --pid 4242 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| response release: connecting to admin.sock: Permission denied (os error 13)
+| response release: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin response release …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.response-restore.restored
 $ nn-admin response restore --vault-id 1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b --to /srv/matrix/restored --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -10352,6 +10748,17 @@ exit: 5
 | response restore: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.response-restore.permission-denied
+$ nn-admin response restore --vault-id 1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b --to /srv/matrix/restored --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| response restore: connecting to admin.sock: Permission denied (os error 13)
+| response restore: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin response restore …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.remediate-ransomware.restored
 $ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a --agent-id-file agent_id --socket admin.sock
@@ -10671,6 +11078,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.remediate-ransomware.permission-denied
+$ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: connecting to admin.sock: Permission denied (os error 13)
+| remediate ransomware: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin remediate ransomware …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.remediate-ransomware-json.restored
 $ nn-admin remediate ransomware --since 1750000000 --dry-run --json --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -10950,6 +11368,17 @@ exit: 5
 | remediate ransomware: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.remediate-ransomware-json.permission-denied
+$ nn-admin remediate ransomware --since 1750000000 --dry-run --json --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| remediate ransomware: connecting to admin.sock: Permission denied (os error 13)
+| remediate ransomware: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin remediate ransomware …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.config-overlay-set.stored
 $ nn-admin config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
@@ -11246,6 +11675,17 @@ exit: 5
 --- agent
 (a socket file nobody listens on)
 
+### sock.config-overlay-set.permission-denied
+$ nn-admin config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| config overlay set: connecting to admin.sock: Permission denied (os error 13)
+| config overlay set: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin config overlay set …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
+
 ### sock.policy-set.stored
 $ nn-admin policy set --file policy.local --key key-a --agent-id-file agent_id --socket admin.sock
 exit: 0
@@ -11541,6 +11981,17 @@ exit: 5
 | config overlay set: connecting to admin.sock: Connection refused (os error 111)
 --- agent
 (a socket file nobody listens on)
+
+### sock.policy-set.permission-denied
+$ nn-admin policy set --file policy.local --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 17
+--- stdout
+| policy set: 1 enforce, 0 alert, 0 audit, 0 off, 0 exemptions on 0 rules, ransomware COMBAT without corroboration off
+--- stderr
+| config overlay set: connecting to admin.sock: Permission denied (os error 13)
+| config overlay set: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin config overlay set …`. This does not mean the agent is stopped
+--- agent
+(a running agent's socket of mode 0: this user may not open it)
 
 ### sock.force-posture.observing
 $ nn-admin force-posture observing --key key-a --agent-id-file agent_id --socket admin.sock

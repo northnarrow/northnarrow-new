@@ -16,7 +16,8 @@
 //! `verify-keys`, `host-check`, `audit read|verify`, `chain verify`,
 //! `config overlay status|sign`, `policy show|test`, every socket verb
 //! against the mock agent (its replies, the ten refusals, seven transport
-//! faults, no socket and a socket nobody listens on), the key and identity
+//! faults, no socket, a socket nobody listens on and, lot 365, a running
+//! agent's socket this user may not open: not run as root), the key and identity
 //! errors through every signed verb, closed pipes and the default paths.
 //!
 //! No root, no agent, no network: the mock agent is a thread of this test
@@ -82,6 +83,8 @@ fn run_all(cases: &[harness::Case]) -> Vec<String> {
         .or_else(|_| tempfile::tempdir())
         .unwrap();
     let defaults = harness::host_defaults_absent();
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    let as_root = unsafe { libc::geteuid() } == 0;
     let out: Vec<Mutex<Option<String>>> = cases.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism()
@@ -95,7 +98,8 @@ fn run_all(cases: &[harness::Case]) -> Vec<String> {
                 let Some(case) = cases.get(i) else {
                     break;
                 };
-                let text = if case.host_defaults && !defaults {
+                let text = if (case.host_defaults && !defaults) || (case.needs_no_root() && as_root)
+                {
                     None
                 } else {
                     Some(harness::run(case, root.path()).text)
@@ -104,6 +108,9 @@ fn run_all(cases: &[harness::Case]) -> Vec<String> {
             });
         }
     });
+    if as_root {
+        eprintln!("nn-admin matrix: run as root: the cases of a socket this user may not open were not run");
+    }
     if !defaults {
         eprintln!(
             "nn-admin matrix: {} of nn-admin's default directories exist on this host \
@@ -228,8 +235,8 @@ fn nn_admin_output_matrix_matches_the_committed_files() {
     if updating() {
         assert!(
             skipped.is_empty(),
-            "{UPDATE_ENV}=1 where nn-admin's default directories exist: {} case(s) not run; \
-             update on a host without an installed agent",
+            "{UPDATE_ENV}=1 where nn-admin's default directories exist, or as root: {} case(s) \
+             not run; update on a host without an installed agent, without root",
             skipped.len()
         );
         std::fs::create_dir_all(&dir).unwrap();

@@ -91,6 +91,10 @@ has the details of each change below.
    which refuses until they are gone or you accept their move
    (`--accept-dropin-quarantine`); the ones kept are write-protected
    outside a window from then on.
+14. **`nn-admin` without root** (lot 365, §54): a command that talks to
+   the agent and is refused its socket, key or agent id exits 17 (was 5,
+   which also means "the agent is not running") and says to use `sudo`.
+   A script that ran it without root and read 5 as "agent down" gets 17.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -4256,3 +4260,93 @@ in `Init`; `unshare -m --propagation shared` the same.
     an NN-L-NET-008 on that rare shape). The nearest process that executed
     (its anchor) is not used: it may have executed since that fork.
 - **Operator action.** None.
+
+## 54. Release binaries for glibc 2.34, a clear permission error, no false bpffs warning (lot 365)
+
+An external tester followed the alpha tester's guide on Debian 12 with a
+release built by CI; two of the findings are fixed here (the third, the
+masking of the diagnostics the guide collects, is the guide's own: no
+product code builds that bundle), with a false `host-check` warning.
+
+- **The release is built on Ubuntu 22.04 and holds glibc 2.34.** The release
+  workflow's `package` job ran on Ubuntu 24.04 (glibc 2.39). Rust's
+  standard library refers weakly to two glibc 2.39 functions
+  (`pidfd_spawnp`, `pidfd_getpid`), so the agent, the watchdog and
+  `nn-admin` recorded a weak need of `GLIBC_2.39`, and on Ubuntu 22.04
+  (2.35) and Debian 12 (2.36) every start printed
+  `weak version 'GLIBC_2.39' not found (required by nn-admin)` — in every
+  command's output and in the agent's journal. Harmless then; but a build
+  on a newer image (GitHub's `ubuntu-latest` is moving to 26.04) could
+  need a newer symbol strongly, and then the binaries would not start
+  there at all. The job now runs on `ubuntu-22.04`, the oldest image
+  GitHub offers (glibc 2.35), and the check below holds every need at or
+  below 2.34: AlmaLinux/RHEL 9, the oldest supported distribution, whose
+  glibc is the floor the `.deb` and the `.rpm` declare (a 22.04 build
+  tops out at `GLIBC_2.34` today). It stays a GitHub-hosted image, so the
+  build provenance is unchanged: the `sign` job (which builds nothing)
+  attests the same artefacts, and `gh attestation verify
+  --deny-self-hosted-runners` with the tag-bound identity still applies.
+- **The baseline is checked on what is shipped.** A new step of the
+  `package` job, `deploy/release/glibc-baseline.sh check`, reads every ELF
+  file of the tarball's tree, of the `.deb` and of the `.rpm` (the four
+  binaries, the eBPF object; any shared library a later release ships)
+  and fails when one needs a glibc symbol version above 2.34 — weak needs
+  included (`readelf -V`, the `.gnu.version_r` section) — or a shared
+  library other than glibc's own and `libgcc_s` (a dependency the packages
+  would not declare). Its `selftest` runs first, in the same step: it
+  builds, with the release's linker, binaries with a strong and a weak need
+  of `GLIBC_2.35` (one above the baseline) and of `GLIBC_2.39`, and one of
+  `GLIBC_2.34`, and proves the check refuses the first four and accepts the
+  last. The CI
+  artefact the tester installed fails this check (the agent, the watchdog
+  and `nn-admin`: `GLIBC_2.39`, flags `WEAK`). Ratchets in
+  `xtask/tests/supply_chain.rs`
+  (`the_release_is_built_and_checked_on_the_glibc_baseline`: the job runs on
+  the oldest image, the glibc step carries no `if` nor `continue-on-error`,
+  and the `.deb`'s and `.rpm`'s glibc floors equal the baseline) and the
+  selftest passes (`glibc_baseline_check_refuses_a_binary_that_needs_above_2_34`).
+  An operator of an earlier release: nothing to do; the warning goes away
+  with the next upgrade.
+- **`nn-admin` exits 17 when this user may not reach the agent.** Without
+  root, `nn-admin status` (any command that talks to the agent) failed to
+  open `/run/northnarrow/admin.sock` (root's) and exited 5 with
+  `connecting to /run/northnarrow/admin.sock: Permission denied` — the
+  code and the words of an agent that is not running. A permission the
+  host refused (`EACCES`, `EPERM`) on the admin socket, on the key or on
+  the agent id file now exits **17**, with the step that met it and, in
+  plain words, what to do: run it with `sudo`; and that this does not
+  mean the agent is stopped. As root (a security module refused it) the
+  message says so instead. Exit 5 keeps its meaning: no socket, nobody
+  listening on it, or a protocol failure. One helper decides it for every
+  command (`exit_from_request_error`); nn-admin's output matrix covers
+  each of its 41 socket cases with a socket this user may not open
+  (`sock.<verb>.permission-denied`, run only without root). A script that
+  runs `nn-admin` without root and read 5 as "the agent is down" now gets
+  17. NN_ADMIN.md §4 lists it; 11 to 16 stay the alerts of `heartbeat
+  watch` and `export verify`.
+- **`nn-admin chain verify` without root.** Its readers met the state
+  directory (root's, mode 0700) and printed each chain they could not open
+  as `BROKEN`, exit 8 — "evidence missing or altered", a false alarm.
+  Without root, a chain this user may not open is now exit 17 with the
+  same advice; as root a refused read stays `BROKEN` (no mode refuses
+  root, so it is evidence). `audit read` and `audit verify` keep exit 1, "a
+  file that cannot be read".
+- **`nn-admin host-check` no longer counts the agent's pin lock as a
+  second bpffs.** Lot 359 (§52) binds `/sys/fs/bpf/northnarrow` onto
+  itself, private and unbindable, to lock the pins; the check counted
+  every bpffs mount and warned "mounted 2× — a second bpffs can hide
+  pinned objects" on every host with the agent. The lock is recognised by
+  what it is, never by its path: the mount lot 359's start and integrity
+  round take for it (`pin_lock::state_in`: the self-bind of the pin
+  directory, the child of the whole bpffs at `/sys/fs/bpf`) with private
+  and unbindable propagation, and a lock stacked on it with the same
+  propagation. The check's line names it ("and the agent's pin lock at
+  /sys/fs/bpf/northnarrow, not counted"). A bpffs at that path that is not
+  the lock (another bpffs, another directory of the host's), the lock made
+  shared or bindable, a mount laid over it, and any other bpffs anywhere
+  still warn. Named test `the_agent_s_pin_lock_is_not_a_second_bpffs`
+  (`host_hardening`). `nn-admin status`'s "host hardening" line counts one
+  warning less.
+- **Not changed:** the agent's eBPF programs, its units, `install.sh`,
+  every protection. The release's contents are the same programs, linked
+  on another image.
