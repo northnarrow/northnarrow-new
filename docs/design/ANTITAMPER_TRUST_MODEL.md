@@ -15,7 +15,14 @@ policed only SIGKILL and SIGTERM, so `kill -INT`/`-HUP`/`-QUIT`/`-STOP` from a
 root shell stopped or froze the agent — `task-kill-signals-1`. The hook is now
 deny-by-default: every userspace signal towards a protected PID is refused
 unless it is signal 0, a self-signal, a signal from another protected PID
-(watchdog ↔ agent), or PID 1 under the grant described below.) That is correct against the V1 adversary
+(watchdog ↔ agent), or PID 1 under the grant described below. Lot 367,
+pre-alpha F3b-1: from kernel 6.16 `mm_access()` lets a caller with
+`CAP_PERFMON` or `CAP_SYS_ADMIN` through a read-mode check the ptrace hook
+refused, so the memory views — `environ`, `auxv`, `maps`, `smaps`,
+`smaps_rollup`, `numa_maps`, `pagemap` — are refused at their open by the
+`file_open` deny, whatever the open's access mode, to the callers the hook
+refuses, through the hook's own two decisions; a read-mode record of the hook says the kernel's outcome was
+not observed.) That is correct against the V1 adversary
 ("post-compromise root tries to silence the defender"), but it locks out
 three legitimate principals:
 
@@ -368,6 +375,9 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   #554): an agent whose `--watchdog-exe` is its own executable (the same
   device and inode, through any link) refuses to start — one binary in both
   roles would make any process running the agent's binary the watchdog.
+  Lot 367 (pre-alpha F3b-7): through the boot refusal, signed
+  (`refused_by: watchdog_exe` in the audit log), and named by `nn-admin
+  status` while the agent is down; it was a journal line only.
 - **Mechanism:** the role is vacant. `ROLE_TGIDS` (pinned, two slots) holds
   the tgid of the live watchdog and agent; each records itself once it is a
   protected pid (the agent also records the watchdog it verifies), and

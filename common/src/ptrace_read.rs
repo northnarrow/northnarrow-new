@@ -47,16 +47,35 @@ pub const DEDUP_NS: u64 = 3_600_000_000_000;
 
 /// The dedup's key: the caller's image (the device in the kernel's form
 /// and the inode of `mm->exe_file`, `(0, 0)` for a task without one), the
-/// target's tgid and (lot 359, P3 b) the caller's cgroup id —
-/// `[ino, dev << 32 | tgid, cgroup]` (a kernel device is 32 bits, a tgid
-/// below 2^22): exact, no hash.
-pub const fn seen_key(exe_dev: u64, exe_ino: u64, target_tgid: u32, cgroup: u64) -> [u64; 3] {
+/// target's tgid, (the review of #574, F3) where the refusal was made —
+/// [`VIEW_OPEN`] in the record's `detail`: a memory view's refused open, or
+/// the hook's verdict — and (lot 359, P3 b) the caller's cgroup id —
+/// `[ino, dev << 32 | kind | tgid, cgroup]` (a kernel device is 32 bits, a
+/// tgid below 2^22, the kind [`SEEN_VIEW_OPEN`] above it): exact, no hash.
+/// One kind's record never hides the other's for the hour.
+pub const fn seen_key(
+    exe_dev: u64,
+    exe_ino: u64,
+    target_tgid: u32,
+    detail: u64,
+    cgroup: u64,
+) -> [u64; 3] {
+    let kind = if detail & VIEW_OPEN != 0 {
+        SEEN_VIEW_OPEN
+    } else {
+        0
+    };
     [
         exe_ino,
-        (exe_dev & 0xffff_ffff) << 32 | target_tgid as u64,
+        (exe_dev & 0xffff_ffff) << 32 | kind | target_tgid as u64,
         cgroup,
     ]
 }
+
+/// The review of #574 (F3): the bit of [`seen_key`]'s second word that says
+/// the refusal was a memory view's open ([`VIEW_OPEN`]) — above every tgid
+/// (`PID_MAX_LIMIT` is 2^22), below the device.
+pub const SEEN_VIEW_OPEN: u64 = 1 << 31;
 
 /// The key of the kernel's journald identities (`PTRACE_READ_QUIET`): an
 /// image (the device in the kernel's form, the inode) in a cgroup (its id).
@@ -98,6 +117,76 @@ pub fn admit(last: Option<u64>, now: u64, budget: impl FnOnce() -> bool) -> bool
     due(last, now) && budget()
 }
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): the bit of a `FS_OP_PTRACE_READ`
+/// record's detail (`target_dev`, the ptrace mode below it) that says where
+/// the refusal was made. Set: at the OPEN of one of the agent's memory views
+/// ([`is_memory_view`]) — the open failed, the read did not happen. Clear:
+/// by the `ptrace_access_check` hook — the hook refused, and the agent does
+/// not see what the kernel did with that verdict: from 6.16 the kernel's
+/// `mm_access()` lets a caller with `CAP_PERFMON` or `CAP_SYS_ADMIN` through
+/// a read-mode check the hook refused.
+pub const VIEW_OPEN: u64 = 1 << 32;
+
+/// The per-process `/proc` files whose open takes the process's memory
+/// (`proc_mem_open`, `mm_access()` in read mode) and so pass, from 6.16, a
+/// caller with `CAP_PERFMON` or `CAP_SYS_ADMIN` through a read-mode
+/// refusal of the ptrace hook: the agent refuses their open itself.
+/// `mem` is not one: it is opened in attach mode, which the kernel never
+/// lets through past the hook.
+pub const MEMORY_VIEWS: [&[u8]; 7] = [
+    b"environ",
+    b"auxv",
+    b"maps",
+    b"smaps",
+    b"smaps_rollup",
+    b"numa_maps",
+    b"pagemap",
+];
+
+/// [`MEMORY_VIEWS`] packed as the eBPF programs pack a dentry's name
+/// (`cgroup_limits::name_words`), at compile time.
+const MEMORY_VIEW_WORDS: [(usize, [u64; 3]); 7] = {
+    let mut out = [(0usize, [0u64; 3]); 7];
+    let mut i = 0;
+    while i < MEMORY_VIEWS.len() {
+        out[i] = (
+            MEMORY_VIEWS[i].len(),
+            crate::cgroup_limits::name_words(MEMORY_VIEWS[i]),
+        );
+        i += 1;
+    }
+    out
+};
+
+/// `(len, words)` — a dentry's name as the eBPF programs pack it
+/// (`cgroup_limits::name_words`, the bytes past `len` cleared) — is one of
+/// [`MEMORY_VIEWS`].
+#[inline(always)]
+pub fn is_memory_view(len: usize, words: [u64; 3]) -> bool {
+    let mut i = 0;
+    while i < MEMORY_VIEW_WORDS.len() {
+        let (l, w) = MEMORY_VIEW_WORDS[i];
+        if l == len && w[0] == words[0] && w[1] == words[1] && w[2] == words[2] {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A `FS_OP_PTRACE_READ` record's `response`: what the kernel did, as far
+/// as the agent knows it (lot 367, F3b-1: on 7.0 the record said "denied"
+/// of a read the kernel let through).
+pub const fn response(detail: u64) -> &'static str {
+    if detail & VIEW_OPEN != 0 {
+        "denied in kernel (the open of a memory view of the agent's process refused: \
+         /proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, numa_maps or pagemap)"
+    } else {
+        "the hook refused; the kernel's outcome not observed (a read-mode access check, \
+         which the kernel may let through past the hook)"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,8 +219,13 @@ mod tests {
             }
         }
         /// A refused read of `target` by a process running `exe` in
-        /// `cgroup` at `now`, in the eBPF record's order.
+        /// `cgroup` at `now`, in the eBPF record's order: the hook's.
         fn read(&mut self, exe: (u64, u64), cgroup: u64, target: u32, now: u64) {
+            self.read_as(exe, cgroup, target, 0x01, now);
+        }
+        /// [`Self::read`], the record's `detail` given (the review of
+        /// #574, F3: [`VIEW_OPEN`] for a memory view's refused open).
+        fn read_as(&mut self, exe: (u64, u64), cgroup: u64, target: u32, detail: u64, now: u64) {
             let marked = self.marked.contains(&cgroup);
             if quiet(
                 exe.0,
@@ -142,7 +236,7 @@ mod tests {
             ) {
                 return;
             }
-            let k = seen_key(exe.0, exe.1, target, cgroup);
+            let k = seen_key(exe.0, exe.1, target, detail, cgroup);
             let budget = &mut self.budget;
             let room = || match budget {
                 None => true,
@@ -161,6 +255,75 @@ mod tests {
         fn count(&self, exe: (u64, u64)) -> usize {
             self.records.iter().filter(|e| **e == exe).count()
         }
+    }
+
+    /// Lot 367 (F3b-1): the memory views by name, as the eBPF program packs
+    /// a dentry's — and no other `/proc/<pid>` file (`mem` is attach mode,
+    /// `exe` and `io` are refused by the hook on every kernel).
+    #[test]
+    fn the_memory_views_are_named_exactly() {
+        use crate::cgroup_limits::name_words;
+        let packed = |n: &[u8]| (n.len(), name_words(n));
+        // the views whose open takes the process's memory in read mode
+        // (`proc_mem_open`) on 7.0, by name
+        assert_eq!(
+            MEMORY_VIEWS,
+            [
+                &b"environ"[..],
+                b"auxv",
+                b"maps",
+                b"smaps",
+                b"smaps_rollup",
+                b"numa_maps",
+                b"pagemap"
+            ]
+        );
+        for v in MEMORY_VIEWS {
+            let (len, words) = packed(v);
+            assert!(is_memory_view(len, words), "{}", String::from_utf8_lossy(v));
+        }
+        for other in [
+            &b"mem"[..],
+            b"exe",
+            b"io",
+            b"status",
+            b"cmdline",
+            b"map_files",
+            b"smaps_rollu",
+            b"smaps_rollupX",
+            b"environ2",
+            b"maps ",
+            b"oom_score_adj",
+        ] {
+            let (len, words) = packed(other);
+            assert!(
+                !is_memory_view(len, words),
+                "{}",
+                String::from_utf8_lossy(other)
+            );
+        }
+        // the same bytes with another length: a prefix is no view
+        let (_, words) = packed(b"maps");
+        assert!(!is_memory_view(3, words));
+    }
+
+    /// Lot 367 (F3b-1): the record says "denied" only when the open was
+    /// refused; the hook's own refusal says the outcome was not observed.
+    #[test]
+    fn a_hook_refusal_never_claims_the_kernel_denied() {
+        let hook = response(0x09);
+        assert!(!hook.contains("denied"), "{hook}");
+        assert!(hook.contains("the hook refused"), "{hook}");
+        assert!(hook.contains("not observed"), "{hook}");
+        let open = response(VIEW_OPEN | 0x09);
+        assert!(open.starts_with("denied in kernel"), "{open}");
+        assert!(
+            open.contains("environ") && open.contains("pagemap"),
+            "{open}"
+        );
+        // the mode bits never read as the open's bit
+        assert_eq!(response(0xff), hook);
+        assert_ne!(response(VIEW_OPEN), hook);
     }
 
     const S: u64 = 1_000_000_000;
@@ -241,20 +404,57 @@ mod tests {
     /// (lot 359) the cgroup, no two of them alike.
     #[test]
     fn the_dedup_key_tells_images_and_targets_apart() {
-        let k = seen_key(0x0080_0001, 4242, AGENT, 900);
-        assert_ne!(k, seen_key(0x0080_0002, 4242, AGENT, 900));
-        assert_ne!(k, seen_key(0x0080_0001, 4243, AGENT, 900));
-        assert_ne!(k, seen_key(0x0080_0001, 4242, WATCHDOG, 900));
-        assert_ne!(k, seen_key(0x0080_0001, 4242, AGENT, 901));
-        assert_ne!(seen_key(0, 0, 1, 0), seen_key(0, 1, 0, 0));
+        let k = seen_key(0x0080_0001, 4242, AGENT, 0x01, 900);
+        assert_ne!(k, seen_key(0x0080_0002, 4242, AGENT, 0x01, 900));
+        assert_ne!(k, seen_key(0x0080_0001, 4243, AGENT, 0x01, 900));
+        assert_ne!(k, seen_key(0x0080_0001, 4242, WATCHDOG, 0x01, 900));
+        assert_ne!(k, seen_key(0x0080_0001, 4242, AGENT, 0x01, 901));
+        assert_ne!(seen_key(0, 0, 1, 0, 0), seen_key(0, 1, 0, 0, 0));
         assert_eq!(
-            seen_key(u64::MAX, 1, (1 << 22) - 1, 0)[1] & 0xffff_ffff,
+            seen_key(u64::MAX, 1, (1 << 22) - 1, 0, 0)[1] & 0xffff_ffff,
             (1 << 22) - 1
         );
         assert!(due(None, 0));
         assert!(!due(Some(10), 10 + DEDUP_NS - 1));
         assert!(due(Some(10), 10 + DEDUP_NS));
         assert_eq!(DEDUP_NS, 3600 * 1_000_000_000);
+    }
+
+    /// Named test (the review of #574, F3): the hour's dedup keeps the two
+    /// kinds of refusal apart — a hook's refused read-mode access (`readlink
+    /// exe`) and a memory view's refused open by the same image of the same
+    /// target are two records, in either order; a second of either kind in
+    /// the hour is none. The key's kind bit is the open's alone (the ptrace
+    /// mode below it does not split the key) and never a tgid's.
+    #[test]
+    fn the_hourly_dedup_keeps_the_two_refusal_kinds_apart() {
+        let open = VIEW_OPEN | 0x09;
+        for first in [0x01, open] {
+            let second = if first == open { 0x01 } else { open };
+            let mut k = Kernel::new();
+            k.read_as(HTOP, 77, AGENT, first, S);
+            k.read_as(HTOP, 77, AGENT, second, 2 * S);
+            assert_eq!(k.count(HTOP), 2, "first {first:#x}, then {second:#x}");
+            k.read_as(HTOP, 77, AGENT, first, 3 * S);
+            k.read_as(HTOP, 77, AGENT, second, 4 * S);
+            assert_eq!(k.count(HTOP), 2, "the hour's second of each kind");
+        }
+        let hook = seen_key(0x0080_0001, 4242, AGENT, 0x01, 900);
+        assert_ne!(hook, seen_key(0x0080_0001, 4242, AGENT, open, 900));
+        assert_eq!(hook, seen_key(0x0080_0001, 4242, AGENT, 0x09, 900));
+        assert_eq!(
+            seen_key(0, 0, AGENT, open, 0)[1],
+            SEEN_VIEW_OPEN | AGENT as u64
+        );
+        // above every tgid (the highest has every bit below 2^22 set) …
+        let max = (1u32 << 22) - 1;
+        assert_ne!(
+            seen_key(0, 0, max, open, 0),
+            seen_key(0, 0, max, 0x01, 0),
+            "the kind bit above every tgid"
+        );
+        // … and below the device
+        assert_eq!(seen_key(7, 0, max, open, 0)[1] >> 32, 7, "below the device");
     }
 
     /// Named test (lot 359, the re-check 3 of #567, P3 a): journald's image

@@ -1202,12 +1202,16 @@ mod tests {
         let deferred = at("unchecked.refuse(None,r)");
         assert!(deferred > at("identity::resolve("));
         assert!(deferred < at("checks::capabilities("));
-        for gate in ["sensors", "deny_hooks"] {
+        for gate in ["sensors", "deny_hooks", "watchdog_exe"] {
             let last = main
                 .rfind(&format!("Refusal::new(\"{gate}\""))
                 .unwrap_or_else(|| panic!("no {gate} refusal"));
             assert!(last > load, "{gate}");
         }
+        // lot 367 (F3b-7): one binary in both roles refuses through the
+        // signed refusal, before the deny hooks attach — no `?` left
+        assert!(at("Refusal::new(\"watchdog_exe\",why)") < at(".attach_anti_tamper("));
+        assert!(!main.contains("refuse_one_binary_in_both_roles(&own)?"));
         // review #466 F6: the deny hooks' pin root and BTF, before the load
         assert!(at("Refusal::new(\"deny_hooks\",why)") < load);
         assert!(at("Refusal::new(\"deny_self_test\"") > at("boot::deny_selftest::run("));

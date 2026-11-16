@@ -51,6 +51,7 @@ use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{is_own_unit_dropin, OWN_SYSTEMD_UNITS};
 use crate::decision::attack::{AttackRef, Tactic};
+use crate::decision::host::DecisionHost;
 use crate::decision::response_policy::{PolicySwitch, FIM_007_KILL, FIM_009_KILL};
 use crate::decision::Rule;
 use crate::posture::host::PostureHost;
@@ -2713,6 +2714,133 @@ impl<H: PostureHost> Rule for PackageManaged<H> {
     }
 }
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-5): `path` is one of snapd's own
+/// unit files — the mount unit of a snap's revision (`snap-<name>-<rev>.mount`,
+/// `var-lib-snapd-snap-….mount` where snaps live under `/var/lib/snapd/snap`)
+/// or the unit of a snap's service, socket or timer (`snap.<snap>.<app>.…`),
+/// written in `/etc/systemd/system/` or one of its `.wants/` or `.requires/`
+/// directories, or the temporary file snapd writes it through
+/// (`<name>.<random>~`, renamed onto the name). By name only: the writer is
+/// judged apart ([`AuthSessionTracker::is_snapd_write`]).
+pub fn is_snapd_unit_file(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/etc/systemd/system/") else {
+        return false;
+    };
+    let name = match rest.split_once('/') {
+        None => rest,
+        Some((dir, name)) => {
+            let wants = dir.len() > ".wants".len() && dir.ends_with(".wants");
+            let requires = dir.len() > ".requires".len() && dir.ends_with(".requires");
+            if !(wants || requires) || name.contains('/') {
+                return false;
+            }
+            name
+        }
+    };
+    // snapd's atomic write: `<name>.<random>~`
+    let name = match name.strip_suffix('~').and_then(|n| n.rsplit_once('.')) {
+        Some((base, random))
+            if !random.is_empty()
+                && random.len() <= 24
+                && random.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            base
+        }
+        Some(_) => return false,
+        None => name,
+    };
+    let middle = |prefix: &str, suffix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|n| n.strip_suffix(suffix))
+            .is_some_and(|m| !m.is_empty())
+    };
+    middle("snap-", ".mount")
+        || middle("var-lib-snapd-snap-", ".mount")
+        || [".service", ".socket", ".timer"]
+            .iter()
+            .any(|suffix| middle("snap.", suffix))
+}
+
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-5): snapd's own unit files written
+/// by the host's snapd are recorded Low, not High. A `snap install` writes
+/// the mount unit of each snap it installs (and of the base it pulls in),
+/// each through a temporary file: the lab saw 4 to 8 High NN-L-FIM-009
+/// records per install on Ubuntu, where the daemon runs re-executed from the
+/// snapd snap, which the package carve-out ([`PackageManaged`]) does not
+/// know. A destructive verdict of `inner` becomes `Log` + `Low` when the
+/// file is one of snapd's own ([`is_snapd_unit_file`]) AND the writer is
+/// the host's snapd in its run ([`AuthSessionTracker::is_snapd_write`]:
+/// the review of #574 (F2), the process systemd's `snapd.service` started,
+/// in its cgroup with clean lot 277/281 marks, read through `facts`):
+/// neither the name alone (another process writing `snap-x.mount` keeps the
+/// rule's verdict) nor the writer alone (snapd writing another unit keeps
+/// it too), nor a file at snapd's path run outside its unit. Rule id and
+/// reasoning kept: the write stays in the signed chain.
+pub struct SnapdOwnUnits<H: PostureHost> {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker<H>,
+    facts: Arc<dyn crate::decision::rule_policy::ActorFacts>,
+}
+
+impl<H: PostureHost> SnapdOwnUnits<H> {
+    pub fn new(
+        inner: Box<dyn Rule>,
+        lineage: AuthSessionTracker<H>,
+        facts: Arc<dyn crate::decision::rule_policy::ActorFacts>,
+    ) -> Self {
+        Self {
+            inner,
+            lineage,
+            facts,
+        }
+    }
+}
+
+impl<H: PostureHost> Rule for SnapdOwnUnits<H> {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        if verdict.action == ResponseAction::Log {
+            return Some(verdict);
+        }
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        if !is_snapd_unit_file(&fe.path) {
+            return Some(verdict);
+        }
+        let at = crate::posture::lineage::AsOf::judged(fe.timestamp_ns);
+        if !self
+            .lineage
+            .is_snapd_write(fe.modifier_pid, at, self.facts.as_ref())
+        {
+            return Some(verdict);
+        }
+        Some(Verdict {
+            action: ResponseAction::Log,
+            severity: Severity::Low,
+            reasoning: format!(
+                "{} [one of snapd's own unit files (a snap's mount or service unit), written \
+                 by the host's snapd in its run (snapd.service's process, in its cgroup): \
+                 recorded, not killed]",
+                verdict.reasoning
+            ),
+            ..verdict
+        })
+    }
+}
+
 /// Lot 352: how long the records of one package-manager process's writes
 /// in the kernel's module trees are coalesced into its first.
 const KMOD_TRANSACTION_COALESCE_NS: u64 = 15 * 60 * 1_000_000_000;
@@ -3351,7 +3479,7 @@ pub(crate) fn log_rules<H: PostureHost>(
 /// package-manager carve-out ([`PackageManaged`]). Production threads the
 /// agent's shared tracker through [`fim_rules_with_lineage`] instead, so
 /// spawn events feed the cache the carve-out reads.
-pub fn fim_rules<H: PostureAgent>(
+pub fn fim_rules<H: DecisionHost>(
     installer_override: Arc<H::InstallerWindow>,
 ) -> Vec<Box<dyn Rule>> {
     fim_rules_with_lineage::<H>(installer_override, AuthSessionTracker::with_proc())
@@ -3365,10 +3493,13 @@ pub fn fim_rules<H: PostureAgent>(
 /// are wrapped in [`OwnClient`], and the account-file rules (NN-L-FIM-003,
 /// -018) in [`AccountTool`]; lot 340: the log rules NN-L-FIM-005 and -019
 /// in [`LogRotation`]. Order and ids are unchanged.
-pub fn fim_rules_with_lineage<H: PostureAgent>(
+pub fn fim_rules_with_lineage<H: DecisionHost>(
     installer_override: Arc<H::InstallerWindow>,
     lineage: AuthSessionTracker<H>,
 ) -> Vec<Box<dyn Rule>> {
+    // the review of #574 (F2): snapd's identity reads its process's cgroup
+    // and the kernel's marks, as the per-rule policy's exemptions do
+    let facts = H::actor_facts(Path::new(H::PROC_ROOT));
     let pkg = |rule: Box<dyn Rule>| -> Box<dyn Rule> {
         Box::new(PackageManaged::new(rule, lineage.clone()))
     };
@@ -3413,10 +3544,15 @@ pub fn fim_rules_with_lineage<H: PostureAgent>(
             admin(Box::new(NnLFim007CronDropInCreated::with_fresh_window())),
             FIM_007_KILL,
         )),
+        // Lot 367 (F3b-5): snapd's own units by the host's snapd, Low.
         Box::new(SwitchHeld::new(
-            admin(Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
-                &installer_override,
-            )))),
+            admin(Box::new(SnapdOwnUnits::new(
+                Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
+                    &installer_override,
+                ))),
+                lineage.clone(),
+                facts,
+            ))),
             FIM_009_KILL,
         )),
         // C5.3 — cloud credential read family. Same High
@@ -7641,6 +7777,559 @@ mod tests {
     }
 
     // ── lot 352 — the whole module tree ───────────────────────────────
+
+    /// Lot 367 (pre-alpha Phase 3-bis, F3b-5): snapd's own unit files.
+    mod snapd_units {
+        use super::*;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+
+        type Tracker = crate::posture::lineage::AuthSessionTracker<IdTestHost>;
+        const S: u64 = 1_000_000_000;
+        /// The snapd snap's squashfs (a loop device).
+        const STAT_DEV: u64 = 1793;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        const SNAPD: (u64, u64) = (KDEV, 4_242);
+        const DEB_SNAPD: (u64, u64) = (KDEV + 1, 77);
+        const REEXEC: &str = "/snap/snapd/28332/usr/lib/snapd/snapd";
+
+        fn exec(pid: u32, ppid: u32, exe: &str, id: (u64, u64), uid: u32, start: u64) -> Event {
+            Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid,
+                gid: 0,
+                comm: "snapd".into(),
+                filename: exe.into(),
+                timestamp_ns: start + S / 10,
+                argv: vec![exe.to_string()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: id.0,
+                    ino: id.1,
+                    flags: KNOWN | ROOT_DIR,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        }
+
+        fn write_at(op: FimOp, path: &str, pid: u32, ts: u64) -> Event {
+            let mut e = written_by(op, path, pid, "snapd");
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = ts;
+            }
+            e
+        }
+
+        /// snapd.service's cgroup, as `/proc/<pid>/cgroup` shows it.
+        const SVC: &str = "/system.slice/snapd.service";
+        /// A root shell's session.
+        const SESSION: &str = "/user.slice/user-0.slice/session-1.scope";
+
+        /// The review of #574 (F2): what the agent reads of a process for
+        /// snapd's identity — its cgroup, and the kernel's lot 277/281
+        /// marks (started where it runs; injected) — by pid; not known for
+        /// a pid not given.
+        #[derive(Default)]
+        struct Facts(
+            std::collections::HashMap<
+                u32,
+                (
+                    &'static str,
+                    Option<bool>,
+                    Option<crate::decision::rule_policy::Injected>,
+                ),
+            >,
+        );
+
+        impl Facts {
+            /// `pids` in `cgroup`, started there, nothing injected.
+            fn clean(mut self, cgroup: &'static str, pids: &[u32]) -> Self {
+                for p in pids {
+                    self.0.insert(
+                        *p,
+                        (
+                            cgroup,
+                            Some(true),
+                            Some(crate::decision::rule_policy::Injected::No),
+                        ),
+                    );
+                }
+                self
+            }
+            fn with(
+                mut self,
+                pid: u32,
+                cgroup: &'static str,
+                started: Option<bool>,
+                injected: Option<crate::decision::rule_policy::Injected>,
+            ) -> Self {
+                self.0.insert(pid, (cgroup, started, injected));
+                self
+            }
+        }
+
+        impl crate::decision::rule_policy::ActorFacts for Facts {
+            fn uid(&self, _pid: u32) -> Option<u32> {
+                Some(0)
+            }
+            fn cgroup(&self, pid: u32) -> Option<String> {
+                self.0.get(&pid).map(|f| f.0.to_string())
+            }
+            fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
+                None
+            }
+            fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
+                self.0.get(&pid).and_then(|f| f.1)
+            }
+            fn injected(&self, pid: u32) -> Option<crate::decision::rule_policy::Injected> {
+                self.0.get(&pid).and_then(|f| f.2)
+            }
+            fn unread(
+                &self,
+                _pid: u32,
+                _fact: crate::decision::rule_policy::ExemptionFact,
+            ) -> Option<String> {
+                None
+            }
+        }
+
+        fn rule(t: Tracker, facts: Facts) -> SnapdOwnUnits<IdTestHost> {
+            SnapdOwnUnits::new(
+                Box::new(NnLFim009SystemdUnitDropped::new(H::inert_installer_window())),
+                t,
+                Arc::new(facts),
+            )
+        }
+
+        /// The verdict on `path` created by `pid` 3 s in.
+        fn verdict(
+            r: &SnapdOwnUnits<IdTestHost>,
+            path: &str,
+            pid: u32,
+        ) -> (ResponseAction, Severity) {
+            let v = r
+                .evaluate(&write_at(FimOp::Created, path, pid, 3 * S))
+                .unwrap();
+            (v.action, v.severity)
+        }
+
+        /// The units the lab saw a `snap install` write, and their
+        /// neighbours that are not snapd's.
+        #[test]
+        fn snapds_own_unit_files_by_name() {
+            for p in [
+                "/etc/systemd/system/snap-core-17292.mount",
+                "/etc/systemd/system/snap-core-17292.mount.1898898394~",
+                "/etc/systemd/system/snap-hello\\x2dworld-29.mount.1522458270~",
+                "/etc/systemd/system/snap-hello\\x2dworld-29.mount",
+                "/etc/systemd/system/snap.lxd.daemon.service",
+                "/etc/systemd/system/snap.lxd.daemon.unix.socket",
+                "/etc/systemd/system/snap.certbot.renew.timer",
+                "/etc/systemd/system/multi-user.target.wants/snap-core-17292.mount",
+                "/etc/systemd/system/snapd.mounts.target.wants/snap-snapd-28332.mount",
+                "/etc/systemd/system/var-lib-snapd-snap-core-17292.mount",
+            ] {
+                assert!(is_snapd_unit_file(p), "{p}");
+            }
+            for p in [
+                "/etc/systemd/system/evil.service",
+                "/etc/systemd/system/snap-.mount",
+                "/etc/systemd/system/snap..service",
+                "/etc/systemd/system/snap-x.service",
+                "/etc/systemd/system/snap.x.service.d/override.conf",
+                "/etc/systemd/system/snap-x.mount.d/override.conf",
+                "/etc/systemd/system/snapd.service",
+                "/etc/systemd/system/snap.x.path",
+                "/etc/systemd/system/snap-x.mount~",
+                "/etc/systemd/system/snap-x.mount.ab/c~",
+                "/etc/systemd/system/a/b/snap-x.mount",
+                "/etc/systemd/system/foo.d/snap-x.mount",
+                "/etc/systemd/system/x.wants/snap-x.service.d",
+                "/etc/systemd/system/.wants/snap-x.mount",
+                "/usr/lib/systemd/system/snap-x.mount",
+                "/lib/systemd/system/snap.x.y.service",
+                "/run/systemd/system/snap-x.mount",
+            ] {
+                assert!(!is_snapd_unit_file(p), "{p}");
+            }
+        }
+
+        /// The daemon's images by path: the package's, and the snapd or
+        /// core snap's it re-executes into; not a side-loaded revision, not
+        /// another snap's copy, not a copy elsewhere.
+        #[test]
+        fn snapds_images_by_path() {
+            use crate::posture::lineage::is_snapd_image_path as is;
+            use std::path::Path;
+            for p in [
+                "/usr/lib/snapd/snapd",
+                REEXEC,
+                "/snap/snapd/current/usr/lib/snapd/snapd",
+                "/snap/core/17292/usr/lib/snapd/snapd",
+                "/var/lib/snapd/snap/snapd/28332/usr/lib/snapd/snapd",
+            ] {
+                assert!(is(Path::new(p)), "{p}");
+            }
+            for p in [
+                "/tmp/snapd",
+                "/usr/local/lib/snapd/snapd",
+                "/snap/snapd/x1/usr/lib/snapd/snapd",
+                "/snap/evil/1/usr/lib/snapd/snapd",
+                "/snap/snapd//usr/lib/snapd/snapd",
+                "/snap/snapd/1/2/usr/lib/snapd/snapd",
+                "/snap/snapd/28332/usr/lib/snapd/snap",
+                "/home/u/snap/snapd/1/usr/lib/snapd/snapd",
+            ] {
+                assert!(!is(Path::new(p)), "{p}");
+            }
+        }
+
+        /// The lab's case (F3b-5): snapd re-executed from the snapd snap
+        /// (PID 1 → the package's snapd → its re-exec) writes the mount
+        /// unit of the snap it installs through a temporary file — Low,
+        /// recorded, not High. The same names written by another root
+        /// process, another unit written by snapd, a copy of snapd's image,
+        /// a snapd run by a user or no longer running: the rule's verdict.
+        #[test]
+        fn the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            IdTestHost::set_file_id(REEXEC, Some((STAT_DEV, SNAPD.1)));
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", Some((STAT_DEV + 1, DEB_SNAPD.1)));
+            // the package's snapd, re-executing into the snap's
+            assert!(t.ingest_spawn_event(&exec(971, 1, "/usr/lib/snapd/snapd", DEB_SNAPD, 0, S)));
+            assert!(t.ingest_spawn_event(&exec(971, 1, REEXEC, SNAPD, 0, S)));
+            // its child systemctl (the wants symlinks)
+            assert!(t.ingest_spawn_event(&exec(
+                975,
+                971,
+                "/usr/bin/systemctl",
+                (KDEV, 9),
+                0,
+                2 * S
+            )));
+            // a root shell writing the same names
+            assert!(t.ingest_spawn_event(&exec(980, 1, "/usr/bin/bash", (KDEV, 10), 0, S)));
+            // a copy of the snap's snapd elsewhere, and a container's file
+            // at the snap's path (another inode)
+            assert!(t.ingest_spawn_event(&exec(981, 1, "/tmp/snapd", SNAPD, 0, S)));
+            assert!(t.ingest_spawn_event(&exec(982, 1, REEXEC, (KDEV, 5_555), 0, S)));
+            // the snap's snapd run by a user
+            assert!(t.ingest_spawn_event(&exec(983, 1, REEXEC, SNAPD, 1000, S)));
+            for pid in [971, 975, 980, 981, 982, 983] {
+                running_proc(tmp.path(), pid, 1);
+            }
+            // the review of #574 (F2): every one in snapd.service's cgroup
+            // with clean marks — each verdict below is its own check's
+            let r = rule(
+                t.clone(),
+                Facts::default().clean(SVC, &[971, 975, 980, 981, 982, 983]),
+            );
+            let own = "/etc/systemd/system/snap-core-17292.mount.1898898394~";
+            for (path, pid) in [
+                (own, 971),
+                ("/etc/systemd/system/snap-core-17292.mount", 971),
+                (
+                    "/etc/systemd/system/multi-user.target.wants/snap-core-17292.mount",
+                    975,
+                ),
+            ] {
+                let v = r
+                    .evaluate(&write_at(FimOp::Created, path, pid, 3 * S))
+                    .unwrap();
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::Log, Severity::Low),
+                    "{path} by {pid}"
+                );
+                assert!(v.reasoning.contains("snapd's own unit"), "{}", v.reasoning);
+                assert!(
+                    v.reasoning.contains("Systemd unit file"),
+                    "the rule's reasoning kept"
+                );
+            }
+            for (path, pid) in [
+                (own, 980),
+                ("/etc/systemd/system/evil.service", 971),
+                ("/etc/systemd/system/snapd.service", 971),
+                (own, 981),
+                (own, 982),
+                (own, 983),
+            ] {
+                let v = r
+                    .evaluate(&write_at(FimOp::Created, path, pid, 3 * S))
+                    .unwrap();
+                assert_eq!(
+                    (v.action, v.severity),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{path} by {pid}"
+                );
+            }
+            // snapd gone: its run no longer covers a write an hour after it
+            // was last seen running
+            std::fs::remove_dir_all(tmp.path().join("971")).unwrap();
+            let later =
+                <IdTestHost as crate::posture::host::PostureHost>::monotonic_ns() + 3_600 * S;
+            let v = r
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    "/etc/systemd/system/snap-x-1.mount",
+                    971,
+                    later,
+                ))
+                .unwrap();
+            assert_eq!(
+                v.action,
+                ResponseAction::KillProcess,
+                "a snapd no longer running"
+            );
+            IdTestHost::set_file_id(REEXEC, None);
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", None);
+        }
+
+        /// The carve-out changes only a destructive verdict: a `Log` of the
+        /// inner rule (a held kill's High record) passes unchanged, even for
+        /// snapd's own unit written by the host's snapd.
+        #[test]
+        fn a_log_verdict_passes_the_snapd_carve_out_unchanged() {
+            struct LogHigh;
+            impl Rule for LogHigh {
+                fn id(&self) -> &'static str {
+                    "NN-L-FIM-009_SystemdUnitDropped"
+                }
+                fn name(&self) -> &'static str {
+                    "held"
+                }
+                fn category(&self) -> &'static str {
+                    "fim_persistence"
+                }
+                fn attack(&self) -> &'static [AttackRef] {
+                    &[]
+                }
+                fn evaluate(&self, event: &Event) -> Option<Verdict> {
+                    let fe = as_fim(event)?;
+                    Some(fim_verdict(
+                        self,
+                        fe,
+                        ResponseAction::Log,
+                        Severity::High,
+                        "held",
+                    ))
+                }
+            }
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            IdTestHost::set_file_id(REEXEC, Some((STAT_DEV, SNAPD.1)));
+            assert!(t.ingest_spawn_event(&exec(971, 1, REEXEC, SNAPD, 0, S)));
+            running_proc(tmp.path(), 971, 1);
+            let r = SnapdOwnUnits::new(
+                Box::new(LogHigh),
+                t,
+                Arc::new(Facts::default().clean(SVC, &[971])),
+            );
+            let v = r
+                .evaluate(&write_at(
+                    FimOp::Created,
+                    "/etc/systemd/system/snap-core-17292.mount",
+                    971,
+                    3 * S,
+                ))
+                .unwrap();
+            assert_eq!(
+                (v.action, v.severity),
+                (ResponseAction::Log, Severity::High)
+            );
+            assert_eq!(v.reasoning, "held");
+            IdTestHost::set_file_id(REEXEC, None);
+        }
+
+        /// Named test (the review of #574, F2 — its probe): root makes a
+        /// "revision" directory of its own under /snap/snapd and puts any
+        /// binary at usr/lib/snapd/snapd there — the host's file at a snapd
+        /// image path, run by root from its shell, running, on a host with
+        /// the snapd package — and writes a snap's service unit and its
+        /// `.wants` link: High, the rule's verdict, not snapd's Low.
+        #[test]
+        fn a_root_made_snapd_revision_path_keeps_high() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            const FAKE: &str = "/snap/snapd/99999/usr/lib/snapd/snapd";
+            const ROOTFS: u64 = 2049; // the root file system, not a squashfs
+            let id = (common::wire::exe::kernel_dev(ROOTFS), 31_337);
+            IdTestHost::set_file_id(FAKE, Some((ROOTFS, 31_337)));
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", Some((STAT_DEV + 1, DEB_SNAPD.1)));
+            assert!(t.ingest_spawn_event(&exec(980, 1, "/usr/bin/bash", (KDEV, 10), 0, S)));
+            assert!(t.ingest_spawn_event(&exec(990, 980, FAKE, id, 0, S)));
+            running_proc(tmp.path(), 980, 1);
+            running_proc(tmp.path(), 990, 980);
+            let r = rule(t.clone(), Facts::default().clean(SESSION, &[980, 990]));
+            for path in [
+                "/etc/systemd/system/snap.a.b.service",
+                "/etc/systemd/system/multi-user.target.wants/snap.a.b.service",
+            ] {
+                assert_eq!(
+                    verdict(&r, path, 990),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{path}"
+                );
+            }
+            IdTestHost::set_file_id(FAKE, None);
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", None);
+        }
+
+        /// Named test (the review of #574, F2): snapd is the process
+        /// systemd's snapd.service started — its main process, in its
+        /// cgroup, started there, nothing injected, every process from the
+        /// writer up to it the same, the package's binary on the host. The
+        /// real daemon and its systemctl: Low. Each of these keeps High:
+        /// - a file at a snap's revision path run as a daemon of root's
+        ///   (PID 1's child) from a session, or a bind of root's file over
+        ///   the real path run from a session (the host's file at the path);
+        /// - one moved into snapd.service's cgroup (not started there);
+        /// - the real daemon with code injected, or its marks not known;
+        /// - its systemctl child with code injected;
+        /// - a snapd image run by a process of the unit (not its main one);
+        /// - a cgroup that only ends with snapd.service (a user's manager);
+        /// - the unit's daemon on a host without the snapd package (a
+        ///   transient unit under snapd's name).
+        #[test]
+        fn snapds_identity_is_snapd_services_process_with_clean_marks() {
+            use crate::decision::rule_policy::Injected;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let t = Tracker::new(tmp.path());
+            IdTestHost::set_file_id(REEXEC, Some((STAT_DEV, SNAPD.1)));
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", Some((STAT_DEV + 1, DEB_SNAPD.1)));
+            const FAKE: &str = "/snap/snapd/99999/usr/lib/snapd/snapd";
+            const ROOTFS: u64 = 2049;
+            let fake = (common::wire::exe::kernel_dev(ROOTFS), 31_337);
+            IdTestHost::set_file_id(FAKE, Some((ROOTFS, fake.1)));
+            // the real daemon (re-executed) and its systemctl
+            assert!(t.ingest_spawn_event(&exec(971, 1, "/usr/lib/snapd/snapd", DEB_SNAPD, 0, S)));
+            assert!(t.ingest_spawn_event(&exec(971, 1, REEXEC, SNAPD, 0, S)));
+            assert!(t.ingest_spawn_event(&exec(
+                975,
+                971,
+                "/usr/bin/systemctl",
+                (KDEV, 9),
+                0,
+                2 * S
+            )));
+            // a daemon seen only as the snap's image (its re-execution
+            // only: the agent started after it)
+            assert!(t.ingest_spawn_event(&exec(974, 1, REEXEC, SNAPD, 0, S)));
+            // the second daemon: injected into, or its marks not known
+            // (both, its start only, its injection only)
+            for pid in [972, 973, 978, 979] {
+                assert!(t.ingest_spawn_event(&exec(pid, 1, REEXEC, SNAPD, 0, S)));
+            }
+            // a systemctl of the real daemon, injected into
+            assert!(t.ingest_spawn_event(&exec(
+                976,
+                971,
+                "/usr/bin/systemctl",
+                (KDEV, 9),
+                0,
+                2 * S
+            )));
+            // a process of the unit (forked by the daemon) running a snapd image
+            assert!(t.ingest_spawn_event(&exec(977, 971, REEXEC, SNAPD, 0, 2 * S)));
+            // root's file at a revision path, daemonized (PID 1's child)
+            assert!(t.ingest_spawn_event(&exec(990, 1, FAKE, fake, 0, S)));
+            // the same, moved into snapd.service's cgroup
+            assert!(t.ingest_spawn_event(&exec(991, 1, FAKE, fake, 0, S)));
+            // a bind of root's file over the real path, run from a session
+            assert!(t.ingest_spawn_event(&exec(992, 1, REEXEC, SNAPD, 0, S)));
+            // a namesake cgroup under a user's manager
+            assert!(t.ingest_spawn_event(&exec(993, 1, REEXEC, SNAPD, 0, S)));
+            for pid in [
+                971, 972, 973, 974, 975, 976, 977, 978, 979, 990, 991, 992, 993,
+            ] {
+                running_proc(tmp.path(), pid, 1);
+            }
+            let facts = Facts::default()
+                .clean(SVC, &[971, 974, 975, 977])
+                .with(
+                    972,
+                    SVC,
+                    Some(true),
+                    Some(Injected::Yes {
+                        by: 4000,
+                        inherited: false,
+                    }),
+                )
+                .with(973, SVC, None, None)
+                .with(978, SVC, None, Some(Injected::No))
+                .with(979, SVC, Some(true), None)
+                .with(
+                    976,
+                    SVC,
+                    Some(true),
+                    Some(Injected::Yes {
+                        by: 4000,
+                        inherited: false,
+                    }),
+                )
+                .clean(SESSION, &[990, 992])
+                .with(991, SVC, Some(false), Some(Injected::No))
+                .clean(
+                    "/user.slice/user-0.slice/user@0.service/system.slice/snapd.service",
+                    &[993],
+                );
+            let r = rule(t.clone(), facts);
+            let own = "/etc/systemd/system/snap-core-17292.mount";
+            for pid in [971, 974, 975] {
+                assert_eq!(
+                    verdict(&r, own, pid),
+                    (ResponseAction::Log, Severity::Low),
+                    "the real daemon's {pid}"
+                );
+            }
+            for pid in [972, 973, 976, 977, 978, 979, 990, 991, 992, 993] {
+                assert_eq!(
+                    verdict(&r, own, pid),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "{pid}"
+                );
+            }
+            // no snapd package on the host: the unit's daemon is not snapd's
+            IdTestHost::set_file_id("/usr/lib/snapd/snapd", None);
+            for pid in [971, 974] {
+                assert_eq!(
+                    verdict(&r, own, pid),
+                    (ResponseAction::KillProcess, Severity::High),
+                    "no package: {pid}"
+                );
+            }
+            IdTestHost::set_file_id(REEXEC, None);
+            IdTestHost::set_file_id(FAKE, None);
+        }
+
+        /// The rule set wraps NN-L-FIM-009 in the carve-out, inside the
+        /// administrator's and the switch's wrappers (a held kill stays the
+        /// switch's).
+        #[test]
+        fn fim_009_is_wrapped_in_the_snapd_carve_out() {
+            let src = include_str!("rules.rs");
+            let set = &src[src.find("pub fn fim_rules_with_lineage").unwrap()..];
+            let at = set.find("NnLFim009SystemdUnitDropped::<H>::new(").unwrap();
+            let before = &set[..at];
+            let wrap = before.rfind("SnapdOwnUnits::new(").unwrap();
+            assert!(
+                before[..wrap].trim_end().ends_with("admin(Box::new("),
+                "{}",
+                &before[wrap - 40..]
+            );
+            assert!(before[..wrap].contains("Box::new(SwitchHeld::new("));
+        }
+    }
 
     mod kmod_tree {
         use super::*;

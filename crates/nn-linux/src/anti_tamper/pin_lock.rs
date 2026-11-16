@@ -485,6 +485,29 @@ pub fn at_start_unread() {
 pub const MISSING: &str = "pin_lock_missing";
 pub const CHANGED: &str = "pin_lock_changed";
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-6): the degradation source of a lock
+/// the integrity round found lost or changed and could not make again — in
+/// `nn-admin status` while it is not in place, withdrawn once a round finds
+/// it in place (its signed findings stay in the chain).
+pub const DEGRADATION_SOURCE: &str = "pin_lock";
+
+/// The start's degradations of the lock (source `anti_tamper`) begin so:
+/// withdrawn too once a round finds the lock in place.
+pub const START_DEGRADATION_PREFIX: &str = "pin lock:";
+
+/// What the status says of the lock after a round: `Some(line)` while the
+/// round knows it is not in place (a degradation), `None` once a round found
+/// it in place or made it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusLine {
+    /// The lock is not in place: the degradation's one stable line.
+    NotInPlace(String),
+    /// The lock is in place: the degradations of it withdrawn.
+    InPlace,
+    /// The round did not look (it does not watch the lock).
+    Unwatched,
+}
+
 /// How many times one integrity round asks for the lock again, all within
 /// [`REMAKE_DEADLINE`] (the review of #569: one failure no longer leaves it
 /// missing until the next round).
@@ -536,6 +559,25 @@ impl Keeper {
                 Some(false) => in_unit,
                 None => false,
             }
+    }
+
+    /// Lot 367 (F3b-6): the status after the round just run — the lock not
+    /// in place since a round whose attempts all failed (the same line each
+    /// round, so the status keeps one), or in place. A lock lost and made
+    /// again within one round is in place: its finding is signed, the
+    /// status has nothing to keep.
+    pub fn status_line(&self) -> StatusLine {
+        match &self.last {
+            Some((kind, _)) => {
+                StatusLine::NotInPlace(format!(
+                "the lock of the pin directory {}: the integrity round could not make it again \
+                 ({ABSENT_EFFECT}); signed as {kind}, asked for again at the next attempts",
+                if *kind == MISSING { "is missing" } else { "changed" },
+            ))
+            }
+            None if self.seen => StatusLine::InPlace,
+            None => StatusLine::Unwatched,
+        }
     }
 
     /// One round: `None` while the lock is in place; else the finding's
@@ -990,6 +1032,74 @@ mod tests {
             .round(BASE.as_bytes(), root, || Outcome::Made(99), |_| {})
             .unwrap();
         assert!(after.1.contains("mount 99"), "asked at once: {}", after.1);
+    }
+
+    /// Named test (lot 367, pre-alpha Phase 3-bis F3b-6): while the round
+    /// cannot make the lock again, the status has one degradation line for
+    /// it, the same each round; once a round finds it in place (or makes it
+    /// again) the line is gone. A lock lost and made again in the same
+    /// round leaves no line (its finding is signed).
+    #[test]
+    fn the_status_shows_the_lock_not_in_place_until_a_round_finds_it() {
+        let root = Path::new(ROOT);
+        let fail = || Outcome::Failed("systemd-run: no".into());
+        let mut k = Keeper::default();
+        assert_eq!(k.status_line(), StatusLine::Unwatched);
+        k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        let StatusLine::NotInPlace(line) = k.status_line() else {
+            panic!("{:?}", k.status_line())
+        };
+        assert!(
+            line.contains("is missing") && line.contains(MISSING),
+            "{line}"
+        );
+        // waiting, then asked again and failing: the same line
+        k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert_eq!(k.status_line(), StatusLine::NotInPlace(line.clone()));
+        k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert_eq!(k.status_line(), StatusLine::NotInPlace(line.clone()));
+        // the rounds left out keep the line; the next attempt makes it:
+        // in place, the line gone
+        let mut made = false;
+        for _ in 0..=MAX_SKIP {
+            let f = k
+                .round(BASE.as_bytes(), root, || Outcome::Made(97), |_| {})
+                .unwrap();
+            if f.1.contains("made again:") {
+                made = true;
+                break;
+            }
+            assert_eq!(k.status_line(), StatusLine::NotInPlace(line.clone()));
+        }
+        assert!(made);
+        assert_eq!(k.status_line(), StatusLine::InPlace);
+        // found in place by a round
+        let mut k = Keeper::default();
+        k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
+        assert!(matches!(k.status_line(), StatusLine::NotInPlace(_)));
+        assert!(k
+            .round(&with(&lock_line("unbindable")), root, fail, |_| {})
+            .is_none());
+        assert_eq!(k.status_line(), StatusLine::InPlace);
+        // lost and made again in one round: a finding, no line
+        let mut k = Keeper::default();
+        let f = k
+            .round(BASE.as_bytes(), root, || Outcome::Made(5), |_| {})
+            .unwrap();
+        assert_eq!(f.0, MISSING);
+        assert_eq!(k.status_line(), StatusLine::InPlace);
+        // the mini-hunt: a lock whose propagation changed (shared), not made
+        // again — its own line, "changed", not "missing"
+        let mut k = Keeper::default();
+        let f = k
+            .round(&with(&lock_line("shared:120")), root, fail, |_| {})
+            .unwrap();
+        assert_eq!(f.0, CHANGED);
+        let StatusLine::NotInPlace(line) = k.status_line() else {
+            panic!("{:?}", k.status_line())
+        };
+        assert!(line.contains("changed") && line.contains(CHANGED), "{line}");
+        assert!(!line.contains("is missing"), "{line}");
     }
 
     /// Named test (the review of #569, F3): a start that did not find the

@@ -4350,3 +4350,103 @@ product code builds that bundle), with a false `host-check` warning.
 - **Not changed:** the agent's eBPF programs, its units, `install.sh`,
   every protection. The release's contents are the same programs, linked
   on another image.
+
+## 56. The agent's memory views on 7.0, snapd's own units, lock and watchdog causes in status (lot 367)
+
+Four behaviours from the pre-alpha self-protection round on five kernels
+(5.15, 6.1, 6.8, 6.12, 7.0), and the texts that went with them.
+
+- **The agent's memory views are refused at their open.** From kernel 6.16
+  the kernel's read-mode memory access check (`mm_access()`) lets a process
+  with `CAP_PERFMON` or `CAP_SYS_ADMIN` through even when a security module
+  refused it, so on 7.0 root read the agent's `/proc/<pid>/environ`,
+  `maps`, `smaps`, `pagemap` and `auxv` while the agent's ptrace hook said
+  no (`readlink /proc/<pid>/exe`, `mem` and `process_vm_readv` stayed
+  refused). The `file_open` deny now refuses the open of those views —
+  `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `numa_maps`,
+  `pagemap`, the process's own or a thread's under `task/<tid>/` — of the
+  agent, its watchdog and its workers, whatever the open's access mode
+  (read-only, read-write or write-only: each one reads the process's
+  memory or its layout), to every caller the ptrace hook
+  refuses (the same two decisions, shared: the agent's family and the
+  verified watchdog pass, a process reading its own views passes, as the
+  kernel lets it). On every kernel, not only 7.0: the same refusal,
+  earlier. No program was added; two programs changed (`file_open`'s
+  `protected_open_deny`, and `ptrace_access_check`, whose decisions moved
+  into the shared helpers). Without the proc offsets in the kernel's BTF
+  the open refusal is not armed, and the degradation the agent already
+  signs for them now says so.
+- **A read-mode record says what the agent knows.** The signed
+  `NN-L-AT-001` `ptrace_read` record (Low) read "denied in kernel
+  (anti-tamper LSM hook)" even when the kernel let the read through. Now:
+  `denied in kernel (the open of a memory view of the agent's process
+  refused: …)` when the open was refused, a real denial; `the hook refused;
+  the kernel's outcome not observed (…)` for the hook's own read-mode
+  verdict (`exe`, `ns/*`, `fd/`, `io`), whose outcome the kernel decides.
+  Records already written keep their text. The hour's dedup of these
+  records keeps the two kinds apart: a refused open of a memory view and
+  the hook's verdict, by the same program on the same process, are a
+  record each.
+- **snapd's own units are Low.** A `snap install` writes the mount unit of
+  each snap it installs (and of the base it pulls in), each through a
+  temporary file, in `/etc/systemd/system/`: 4 to 8 `NN-L-FIM-009` High
+  records per install on Ubuntu, because the daemon runs re-executed from
+  the snapd snap (`/snap/snapd/<revision>/usr/lib/snapd/snapd`), which the
+  package-manager carve-out (`/usr/lib/snapd/snapd` only) does not know.
+  Now such a write is `Log` + `Low` when the file is one of snapd's own
+  (`snap-<name>-<rev>.mount`, `var-lib-snapd-snap-….mount`,
+  `snap.<snap>.<app>.service|socket|timer`, in the unit directory or one of
+  its `.wants/`/`.requires/` directories, or the temporary file snapd
+  writes it through) AND the writer is the host's snapd in its run: the
+  nearest snapd in its lineage, by what the kernel executed (the package's
+  binary, or `usr/lib/snapd/snapd` in the `snapd` or `core` snap at a
+  revision directory or `current`), that file being the host's (a copy, a
+  container's file at that path, a side-loaded revision are not), executed
+  by root, still running or recently; and that snapd is the process
+  systemd's `snapd.service` started — its main process, which the
+  package's binary re-executes into the snap's, on a host with the snapd
+  package — with it and every process from the writer up to it in
+  `snapd.service`'s cgroup, started there and with no code-injection
+  access given to another (the same marks as the per-rule policy's
+  exemptions by cgroup or unit; not known is no). A file at a snapd path
+  run outside the unit, one moved into the unit's cgroup, a snapd with
+  code injected keep the rule's verdict, as do another process writing
+  those names and snapd writing any other unit. After the agent's marks
+  are reset (a signed degradation), snapd's writes are judged High until
+  `snapd.service` restarts, as for every exemption by cgroup or unit.
+- **A lost pin lock is in `nn-admin status`.** While the integrity round
+  cannot make the pin directory's lock again, `nn-admin status` lists the
+  degradation `pin_lock: the lock of the pin directory is missing …` (or
+  `changed`); it leaves the status once a round finds the lock in place,
+  with the start's own line of a lock it did not find. The signed High
+  findings (`pin_lock_missing`, `pin_lock_changed`) and the degradation's
+  own signed record stay in the chain. A lock lost and made again within
+  one round leaves no status line (its High finding is signed).
+- **A refused `--watchdog-exe` is signed, and named by `nn-admin
+  status`.** An agent whose `--watchdog-exe` names its own executable
+  refused to start with the cause in the journal only. It now refuses
+  through the boot refusal (exit 78): the audit log's `agent_boot` row with
+  `result: refused`, `refused_by: watchdog_exe` and the cause. And
+  `nn-admin status`, when the agent cannot be reached (exit 5), reads the
+  end of the audit log and names the cause of the last start when it was
+  refused, saying whether that row's signature verifies with the agent's
+  public key and whether it is linked in the chain to the rows around it
+  up to the log's end (a row written again there is not; the whole chain
+  and its anchor are `nn-admin audit verify`'s) — for every boot gate, not
+  only this one. A last good start whose row is not linked there is said
+  too: the outcome of the last start is then not known from the log's
+  end.
+- **Texts.** The anti-tamper suite expects the mount guard's refusal of
+  C14 (a bind over `/etc/northnarrow`) and C26 (a tmpfs over
+  `/sys/kernel/btf`) — refused and signed `deny=mount` on every kernel
+  since lots 357 and 359, where it expected them let through with an
+  `integrity_drift` — and reads `mount(8)`'s lower-case "permission
+  denied" as a refusal; C04b is no longer "silent by design", and C04c
+  and C04d open the agent's `maps` and `pagemap`. `KNOWN_LIMITATIONS.md`
+  and `INSTALL_UPGRADE_UNINSTALL.md` §3.1 say that root reads physical
+  memory (`/proc/kcore`) on a host without lockdown `confidentiality`,
+  which the recommended `integrity` does not close, so in-memory secrets,
+  the agent's signing key among them, are not protected from root there;
+  `nn-admin host-check` warns about lockdown.
+- **Not changed:** the units, `install.sh`, the mount guard's programs, the
+  ptrace hook's refusals (each one stands), every other protection.

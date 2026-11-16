@@ -377,6 +377,33 @@ not cause as an incident.
   `nn-admin host-check` reports each one
   ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §3.1).
   *Evidence:* internal check Phase 3 §7.1.
+- **Root can read physical memory without lockdown `confidentiality`.** The
+  agent keeps its signing key in a locked page that is never swapped or
+  dumped, and refuses root's ptrace, `/proc/<pid>/mem`,
+  `process_vm_readv` and core dumps of its processes. It cannot refuse a
+  read of physical memory: root reads it through `/proc/kcore` unless
+  kernel lockdown is `confidentiality`, and `integrity`, the level
+  recommended, does not close it. On such a host the signing key and the
+  agent's other in-memory secrets are not protected from root.
+  `nn-admin host-check` warns when lockdown is off. *Evidence:* lot 367;
+  internal check Phase 3b (F3b-4).
+- **Reading the agent's memory on kernels from 6.16.** From 6.16 the
+  kernel lets a process with `CAP_PERFMON` or `CAP_SYS_ADMIN` through its
+  read-mode memory access check even when the agent's ptrace hook refuses
+  it. The agent refuses the open of its memory views itself
+  (`/proc/<pid>/environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`,
+  `numa_maps`, `pagemap`, its own or a thread's), whatever the open's
+  access mode, recorded Low as
+  `ptrace_read`, "denied in kernel (the open …)". The hook's other
+  read-mode refusals (`exe`, `ns/*`, `fd/`) are recorded "the hook
+  refused; the kernel's outcome not observed". Not refused there:
+  `process_madvise(2)` hints on the agent's memory (cold, pageout,
+  willneed, collapse): they read none of its content, but their answer
+  can reveal the layout of the agent's memory (which address ranges are
+  mapped). Without the kernel's proc offsets in its
+  BTF the open refusal is not armed, a signed degradation. *Evidence:*
+  `the_memory_views_are_refused_at_their_open_with_the_hooks_decisions`;
+  lot 367; internal check Phase 3b (F3b-1).
 
 ## Detection coverage
 
@@ -504,7 +531,17 @@ lists the known false positives of each rule.
   (`NN-L-FIM-004_AuthorizedKeysModified`), a systemd timer installed outside
   a package (`NN-L-FIM-009_SystemdUnitDropped`), an installer run from
   `/tmp` that connects out (`NN-L-NET-008_OutboundFromTmpExec`): recorded
-  High. *Evidence:* internal check Phase 0, residuals R054.
+  High. *Evidence:* internal check Phase 0, residuals R054. A snap
+  install's own units (the snap's mount and service units, written by the
+  host's snapd, the process its systemd unit runs, in the unit's cgroup) are
+  recorded Low. The agent takes whatever program the snapd service runs
+  for snapd: a root user who makes that service run a program of their own
+  gets the same Low for unit files, as installing a package of their own
+  already does (the package-manager boundary above); root changing what a
+  system service runs is itself the act to watch for. *Evidence:*
+  `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`,
+  `snapds_identity_is_snapd_services_process_with_clean_marks`; lot
+  367.
 - **DNS resolvers outside the system trees**, or run in a unit with a name
   the agent does not know: judged as any process, so their DNS traffic can
   draw DNS records ([UPGRADE_NOTES_WAVE4.md](UPGRADE_NOTES_WAVE4.md) §34).

@@ -6,6 +6,52 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 367 (the pre-alpha self-protection round on five kernels, Phase
+  3-bis): four behaviours and their texts (`UPGRADE_NOTES_WAVE4.md` §56).
+  - **The agent's memory views refused at their open.** From kernel 6.16
+    `mm_access()` lets `CAP_PERFMON` through a read-mode refusal of the
+    ptrace hook: on 7.0 root read the agent's `environ`, `maps`, `smaps`,
+    `pagemap`, `auxv`. The `file_open` deny refuses their open (and
+    `smaps_rollup`, `numa_maps`, a thread's) to the callers the hook
+    refuses, through the hook's own two decisions (shared helpers),
+    whatever the open's access mode (read-write and write-only included).
+    The `ptrace_read` record says "denied in kernel" only for that refused
+    open; the hook's own read-mode verdict reads "the hook refused; the
+    kernel's outcome not observed"; the hour's dedup keeps the two kinds
+    apart. Tests
+    `the_memory_views_are_refused_at_their_open_with_the_hooks_decisions`,
+    `the_memory_views_are_refused_whatever_the_opens_access_mode`,
+    `the_hourly_dedup_keeps_the_two_refusal_kinds_apart`,
+    `the_memory_views_are_named_exactly`,
+    `a_hook_refusal_never_claims_the_kernel_denied`,
+    `a_memory_view_refused_at_its_open_is_told_apart_from_the_hooks_verdict`.
+  - **snapd's own units Low.** A snap install's mount units (written by
+    snapd re-executed from the snapd snap) were 4–8 `NN-L-FIM-009` High
+    records; written by the host's snapd (the package's binary or the
+    snapd/core snap's, the host's file, root, in its run, the process
+    `snapd.service` started, in its cgroup with clean lot 277/281 marks)
+    they are Low. Another writer of those names, a file at a snapd path run
+    outside the unit, or snapd writing another unit, keep the rule's
+    verdict. Tests
+    `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`,
+    `a_root_made_snapd_revision_path_keeps_high`,
+    `snapds_identity_is_snapd_services_process_with_clean_marks`,
+    `snapds_own_unit_files_by_name`, `snapds_images_by_path`.
+  - **A lost pin lock in `nn-admin status`.** A degradation while the
+    integrity round cannot make the lock again, withdrawn once it is in
+    place. Tests
+    `the_status_shows_the_lock_not_in_place_until_a_round_finds_it`,
+    `a_pin_lock_not_in_place_is_in_the_status_until_it_is_in_place`.
+  - **A refused `--watchdog-exe` signed.** The start refused through the
+    boot refusal (`refused_by: watchdog_exe`), and `nn-admin status` names
+    the cause of a refused last start when the agent cannot be reached,
+    with its row's signature and its link in the chain at the log's end.
+    Tests `every_refusal_is_signed_and_the_pre_load_ones_refuse_before_it`,
+    `status_names_the_cause_of_a_refused_last_start`,
+    `status_says_whether_the_refused_start_row_is_in_the_chain`.
+  - **Texts:** the anti-tamper suite's C14/C26 (refused by the mount
+    guard), C04b–d; the physical-memory limit on a host without lockdown
+    `confidentiality` (`KNOWN_LIMITATIONS.md`, §3.1 of the install guide).
 - Lot 365 (an external tester's run of the alpha on Debian 12): two of
   the findings, and a false host-check warning (`UPGRADE_NOTES_WAVE4.md`
   §54).

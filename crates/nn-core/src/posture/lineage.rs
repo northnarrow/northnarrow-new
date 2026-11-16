@@ -2425,6 +2425,83 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         self.in_package_transaction(pid, as_of)
     }
 
+    /// Lot 367 (pre-alpha Phase 3-bis, F3b-5): a write `pid` made at
+    /// `as_of` is the host's snapd's — its own work (the FIM rule then
+    /// judges whether the file is one of snapd's own units):
+    /// - the nearest snapd in its lineage, by what the kernel executed
+    ///   ([`is_snapd_image_path`]: the snapd package's
+    ///   `/usr/lib/snapd/snapd`, or the `usr/lib/snapd/snapd` of the
+    ///   `snapd` or `core` snap the daemon re-executes into, at a revision
+    ///   directory (digits) or `current`), whose executed file is the
+    ///   host's file at that path ([`Self::is_host_file`]: a copy, a
+    ///   container's file at that path, a file replaced since, are not);
+    /// - executed by root;
+    /// - the review of #574 (F2): the process systemd's `snapd.service`
+    ///   started — its main process (PID 1's child; a re-execution keeps
+    ///   its pid), and it and every process from the writer up to it run in
+    ///   `snapd.service`'s cgroup ([`SNAPD_SERVICE_CGROUP`]), started there
+    ///   with no code-injection access given (`facts`: the kernel's lot
+    ///   277/281 marks, as journald's identity — not known is not one); and
+    ///   the package's binary is on the host (what re-executes into the
+    ///   snap's). A file root puts at a snap's revision path, or binds over
+    ///   it, and runs outside the unit is not snapd;
+    /// - its run covers the write ([`Self::transaction_covers`], as a
+    ///   package manager's).
+    ///
+    /// The package carve-out ([`Self::is_package_transaction_write`])
+    /// already covers `/usr/lib/snapd/snapd`, for every file; on Ubuntu the
+    /// daemon runs re-executed from the snapd snap, which it does not
+    /// cover — this covers it, for snapd's own units only.
+    pub fn is_snapd_write(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+        facts: &dyn crate::decision::rule_policy::ActorFacts,
+    ) -> bool {
+        // the processes from the writer up to snapd, snapd's included
+        let chain = std::cell::RefCell::new(Vec::new());
+        let Some(WalkEnd::Found(hop)) = self.lineage_walk_to(
+            pid,
+            as_of,
+            |hop| {
+                chain.borrow_mut().push(hop.pid);
+                is_snapd_image_path(&hop.exe)
+            },
+            LINEAGE_DEPTH_CAP,
+        ) else {
+            return false;
+        };
+        if hop.uid != Some(0) || hop.ppid != 1 {
+            return false;
+        }
+        let Some(path) = hop.exe.to_str() else {
+            return false;
+        };
+        let host = self
+            .exec_file(hop.pid, as_of)
+            .is_some_and(|image| self.is_host_file(path, image));
+        if !host {
+            return false;
+        }
+        let package = H::file_id(
+            self.inner
+                .host_root
+                .join(SNAPD_PACKAGE_EXE.trim_start_matches('/')),
+        );
+        if package.is_none() {
+            return false;
+        }
+        if !chain
+            .into_inner()
+            .into_iter()
+            .all(|p| in_snapd_service(facts, p))
+        {
+            return false;
+        }
+        let event_ns = as_of.time().unwrap_or_else(H::monotonic_ns);
+        self.transaction_covers(&hop, event_ns)
+    }
+
     /// Lab PR 175: what `pid` did at `event_ns` (CLOCK_MONOTONIC: a write,
     /// a connect, an exec) belongs to a package transaction — the check of
     /// [`Self::is_package_transaction_write`], for every event:
@@ -4597,6 +4674,63 @@ fn is_auth_binary(exe: &Path) -> bool {
 fn is_system_daemon_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     SYSTEM_DAEMON_EXES.iter().any(|p| s == *p)
+}
+
+/// Lot 367 (F3b-5): the snapd daemon's images by path — the snapd
+/// package's `/usr/lib/snapd/snapd`, and `usr/lib/snapd/snapd` inside the
+/// `snapd` or `core` snap at a revision directory (digits) or `current`,
+/// under `/snap` or `/var/lib/snapd/snap` (Fedora, Arch): where the
+/// package's snapd re-executes itself when a snap carries a newer one. A
+/// side-loaded revision (`x1`) is not one. The path only — root can make
+/// such a directory and put any file there: the caller checks the executed
+/// file is the host's at that path, and (the review of #574, F2) that the
+/// process is the one systemd's `snapd.service` started
+/// ([`AuthSessionTracker::is_snapd_write`]).
+pub fn is_snapd_image_path(exe: &Path) -> bool {
+    let Some(s) = exe.to_str() else {
+        return false;
+    };
+    if s == SNAPD_PACKAGE_EXE {
+        return true;
+    }
+    let Some(rest) = s
+        .strip_prefix("/snap/")
+        .or_else(|| s.strip_prefix("/var/lib/snapd/snap/"))
+    else {
+        return false;
+    };
+    let Some(rest) = rest
+        .strip_prefix("snapd/")
+        .or_else(|| rest.strip_prefix("core/"))
+    else {
+        return false;
+    };
+    let Some(rev) = rest.strip_suffix("/usr/lib/snapd/snapd") else {
+        return false;
+    };
+    rev == "current" || (!rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The snapd package's daemon: what systemd's `snapd.service` executes,
+/// and what re-executes into the snapd snap's.
+pub const SNAPD_PACKAGE_EXE: &str = "/usr/lib/snapd/snapd";
+
+/// The review of #574 (F2): `snapd.service`'s cgroup, from the root of the
+/// unified hierarchy (`/proc/<pid>/cgroup`'s `0::` path).
+pub const SNAPD_SERVICE_CGROUP: &str = "/system.slice/snapd.service";
+
+/// The review of #574 (F2): process `pid` runs in `snapd.service`'s cgroup
+/// itself ([`SNAPD_SERVICE_CGROUP`], by its components), started there —
+/// spawned into it by systemd or forked from a process that was, never
+/// moved into it — with no code-injection access to it given to another
+/// (the kernel's lot 277/281 marks, `facts`). Not known (no cgroup v2, no
+/// tracker, a mark not read, the process gone): no.
+fn in_snapd_service(facts: &dyn crate::decision::rule_policy::ActorFacts, pid: u32) -> bool {
+    facts
+        .cgroup(pid)
+        .is_some_and(|cg| crate::response::cgroup::cgroup_at(&cg, SNAPD_SERVICE_CGROUP))
+        && facts.started_in_cgroup(pid) == Some(true)
+        && facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
 }
 
 fn is_package_manager_binary(exe: &Path) -> bool {

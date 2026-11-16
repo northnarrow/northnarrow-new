@@ -596,14 +596,29 @@ fn the_task_settings_denies_refuse_another_processs_change() {
     }
     // PID 1, attach mode only, outside a window
     let p = code("agent-ebpf/src/ptrace_check.rs");
+    // lot 367: the target's and the caller's decisions are two helpers the
+    // memory views' open deny shares (`ptrace_check::target_is_protected`,
+    // `caller_may_access`) — the same lines, in them
     in_order(
         body(&p, "try_ptrace_access_check"),
         &[
             "let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;",
-            "if !init_attach\n        && !crate::task_kill::is_protected_pid(target_tgid)",
-            "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return 0;\n    }",
-            "if init_attach && crate::inode_protect::override_active() {\n        return 0;\n    }",
+            "if !init_attach && !target_is_protected(target_tgid, target as *const u8) {\n        return 0;\n    }",
+            "if caller_may_access(caller_tgid, init_attach) {\n        return 0;\n    }",
             "-EPERM",
+        ],
+    )
+    .unwrap();
+    assert!(
+        body(&p, "target_is_protected").contains(
+            "crate::task_kill::is_protected_pid(target_tgid) || crate::bpf_defense::task_runs_own_binary(target)"
+        )
+    );
+    in_order(
+        body(&p, "caller_may_access"),
+        &[
+            "if crate::task_kill::is_exempt_pid(caller_tgid) {\n        return true;\n    }",
+            "if init_attach && crate::inode_protect::override_active() {\n        return true;\n    }",
         ],
     )
     .unwrap();

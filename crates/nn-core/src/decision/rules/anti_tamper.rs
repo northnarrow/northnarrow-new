@@ -487,15 +487,39 @@ impl Rule for NnLAt001AntiTamperDenial {
             // — Low; the re-check 2 (point 2): once an hour per caller image
             // and target, never for the packaged journald in its units'
             // cgroups (its metadata reads of the agent's log lines, all day).
+            // Lot 367 (F3b-1): the open of a memory view, refused at the
+            // open (a real denial), apart from the hook's own verdict.
+            FsProtectOperation::PtraceRead
+                if *target_dev & common::ptrace_read::VIEW_OPEN != 0 =>
+            {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) was refused the open of a memory view of the agent's \
+                     process {target_ino} (/proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, \
+                     numa_maps or pagemap, its own or a thread's): the open failed, nothing was \
+                     read. Recorded once an hour per caller program and process; a monitoring \
+                     agent's process collector is refused the same way."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             FsProtectOperation::PtraceRead => {
                 let reasoning = format!(
                     "`{comm}` (pid {pid}) was refused a read-mode access (ptrace mode \
-                     {target_dev:#x}) to the agent's process {target_ino}: one of its \
-                     /proc/<pid>/ links — ns/* (nsenter, `systemctl bind` or `mount-image` \
-                     entering its namespace), exe, root, cwd, fd/, environ, maps or io. Recorded \
-                     once an hour per caller program and process; lsof, htop and a monitoring \
-                     agent's process collector are refused the same way, and journald (its \
-                     reads of the agent's executable for its log lines) unrecorded."
+                     {target_dev:#x}) to the agent's process {target_ino} by the anti-tamper \
+                     hook: for example one of its /proc/<pid>/ entries — ns/* (nsenter, \
+                     `systemctl bind` or `mount-image` entering its namespace), exe, root, cwd, \
+                     fd/, io. The kernel's outcome is not observed: from 6.16 it lets a caller \
+                     with CAP_PERFMON or CAP_SYS_ADMIN through some read-mode checks the hook \
+                     refused (the memory views are refused at their open instead, whatever its \
+                     access mode). Recorded once an hour per caller program and process; lsof, \
+                     htop and a monitoring agent's process collector are refused the same way, \
+                     and journald (its reads of the agent's executable for its log lines) \
+                     unrecorded."
                 );
                 return Some(build_verdict(
                     self,
@@ -1233,6 +1257,39 @@ mod tests {
             .evaluate(&denial(FsProtectOperation::Ptrace))
             .expect("verdict");
         assert_eq!(v.severity, Severity::High);
+    }
+
+    /// Lot 367 (F3b-1): a memory view refused at its open says so, and
+    /// says nothing was read; the hook's own read-mode refusal says the
+    /// kernel's outcome was not observed — never that the kernel denied.
+    #[test]
+    fn a_memory_view_refused_at_its_open_is_told_apart_from_the_hooks_verdict() {
+        let mut e = denial(FsProtectOperation::PtraceRead);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = common::ptrace_read::VIEW_OPEN | 0x09;
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert_eq!(v.action, ResponseAction::Log);
+        for words in [
+            "open of a memory view",
+            "environ",
+            "pagemap",
+            "nothing was read",
+        ] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        let mut e = denial(FsProtectOperation::PtraceRead);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = 0x09;
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert!(
+            v.reasoning.contains("outcome is not observed"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!v.reasoning.contains("nothing was read"), "{}", v.reasoning);
     }
 
     /// Review 82: the kexec wire byte decodes to `Kexec`, and an unknown

@@ -124,6 +124,93 @@ pub(crate) unsafe fn refuse_write(
     }
 }
 
+/// The `s_magic` of `inode`'s file system; `None` (a fail-open of `hook`,
+/// counted) when it cannot be read — [`refuse_write`]'s reads, for
+/// [`refuse_memory_view`] at every open.
+#[inline(always)]
+unsafe fn sb_magic(inode: *const c_void, hook: u32) -> Option<u64> {
+    let sb = match bpf_probe_read_kernel::<*const c_void>(
+        (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void,
+    ) {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            crate::fail_open::bump(hook);
+            return None;
+        }
+    };
+    match bpf_probe_read_kernel::<u64>((sb as *const u8).add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64) {
+        Ok(m) => Some(m),
+        Err(_) => {
+            crate::fail_open::bump(hook);
+            None
+        }
+    }
+}
+
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-1): the open of one of a
+/// protected process's memory views (`/proc/<pid>/environ`, `auxv`, `maps`,
+/// `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`, and the same under
+/// `task/<tid>/`: `northnarrow_common::ptrace_read::MEMORY_VIEWS`) is
+/// refused here, whatever its access mode (the review of #574, F1: a
+/// read-write, write-only or no-access open takes the process's memory as
+/// a read-only one does, and reads it or answers the layout queries), to the callers the `ptrace_access_check` hook refuses
+/// (its own two decisions, `ptrace_check::target_is_protected` and
+/// `ptrace_check::caller_may_access`). The hook alone no longer holds for
+/// them: from 6.16 the kernel's `mm_access()` lets a caller with
+/// `CAP_PERFMON` or `CAP_SYS_ADMIN` through a read-mode check the hook
+/// refused — root read the agent's `environ`, `maps` and `pagemap` on 7.0.
+/// A process opening its own views (glibc reads `/proc/self/maps`) is let
+/// through, as the kernel lets it through before any security module.
+/// Signed as the hook's read-mode refusal, with
+/// `northnarrow_common::ptrace_read::VIEW_OPEN` in its detail: this one is
+/// a real denial. Not armed without the proc offsets (the agent signs that
+/// degradation).
+#[inline(always)]
+pub(crate) unsafe fn refuse_memory_view(file: *const c_void, inode: *const c_void) -> bool {
+    if inode.is_null() {
+        return false;
+    }
+    let Some(magic) = sb_magic(inode, northnarrow_common::fail_open::hook::FILE_OPEN) else {
+        return false;
+    };
+    if !matches!(special_fs(magic), Some(SpecialFs::Proc)) {
+        return false;
+    }
+    let Some(dentry) = file_dentry(file) else {
+        return false;
+    };
+    let Some((len, words)) = dentry_name_words(dentry) else {
+        return false;
+    };
+    if !northnarrow_common::ptrace_read::is_memory_view(len, words) {
+        return false;
+    }
+    let Some((task, tgid)) = proc_file_task(inode) else {
+        return false;
+    };
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // the kernel's own rule (`__ptrace_may_access`): a thread group's
+    // access to itself is never refused by a security module
+    if caller == tgid {
+        return false;
+    }
+    if !crate::ptrace_check::target_is_protected(tgid, task) {
+        return false;
+    }
+    if crate::ptrace_check::caller_may_access(caller, false) {
+        return false;
+    }
+    crate::inode_protect::emit_task_read_denial(
+        northnarrow_common::ptrace_read::VIEW_OPEN | MODE_READ_FSCREDS,
+        tgid,
+    );
+    true
+}
+
+/// `PTRACE_MODE_READ_FSCREDS` (`include/linux/ptrace.h`): the mode the
+/// memory views' open asks for, in their record.
+const MODE_READ_FSCREDS: u64 = 0x01 | 0x08;
+
 /// Lot 280b: a write of `kprobes/enabled` on debugfs or of `lockdown` on
 /// securityfs (`northnarrow_common::cgroup_limits::switch_file_op`, by the
 /// file's name and its directory's), refused outside the agent's family
@@ -622,6 +709,12 @@ unsafe fn refuse_oom_adj(file: *const c_void, inode: *const c_void, phase: Phase
 /// file belongs to: `proc_inode->pid`'s task, and that task's tgid.
 #[inline(always)]
 unsafe fn proc_file_tgid(inode: *const c_void) -> Option<u32> {
+    proc_file_task(inode).map(|(_, tgid)| tgid)
+}
+
+/// [`proc_file_tgid`], with the task (`proc_inode->pid`'s) it read it from.
+#[inline(always)]
+unsafe fn proc_file_task(inode: *const c_void) -> Option<(*const u8, u32)> {
     let vfs = off_opt!(PROC_INODE_VFS_INODE_OFFSET)?;
     let pid_off = off_opt!(PROC_INODE_PID_OFFSET)?;
     let tasks = off_opt!(PID_TASKS_OFFSET)?;
@@ -643,7 +736,8 @@ unsafe fn proc_file_tgid(inode: *const c_void) -> Option<u32> {
         return None;
     }
     let task = node.wrapping_sub(links);
-    bpf_probe_read_kernel::<u32>(task.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32).ok()
+    let tgid = bpf_probe_read_kernel::<u32>(task.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32).ok()?;
+    Some((task, tgid))
 }
 
 /// Sign a refusal: at the open once per attempt, at a write rate-limited
