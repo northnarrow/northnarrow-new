@@ -6,6 +6,61 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 364 (pre-alpha Phase 9, part 2): **documentation truth and the
+  tester kit**. No code of the agent changes.
+  - **`KNOWN_LIMITATIONS.md`, final for the alpha**: built from the
+    pre-alpha's residual list and the phase reports, every accepted
+    residual written as behaviour (what happens, what is signed), never
+    as a way around it, and every item ends with its evidence — a test, a
+    lab script, a golden case, a CHANGELOG lot or a named internal check.
+    New items: the signing is not forward-secure (a stolen key rewrites
+    the past; test
+    `a_history_rewritten_with_the_agent_key_verifies_only_a_kept_head_tells`);
+    the pin lock's four residuals, each signed at the next integrity
+    round (`mount_setattr(2)`, a raw namespace's copy, the units'
+    namespaces, a peer namespace that exists before the lock); the
+    verifier margin on 5.15 and 6.1 and the signed degradation when a
+    mount-guard program is refused; the FUSE sentence (below); `nn-admin
+    chain verify` saying OK with no chains; the release's provenance only
+    from the first tag. The page's mount residuals no longer give the
+    walk's bounds. Ratchet `xtask/tests/known_limitations.rs`: every item
+    names evidence, and every test, file, golden case, lot and phase it
+    names exists.
+  - **`ALPHA_TESTER_GUIDE.md`** (replaces `TESTING_THE_ALPHA.md`): for a
+    reader with no context — who the alpha is for, install and verify,
+    what observe-only means, eight harmless scenarios each with the
+    record to expect (run as written on Ubuntu 24.04 under `alpha`: eight
+    of eight drew it; the blocked-address scenario expects
+    `NN-L-NET-001_OutboundToBlockedIp`, the documentation range being in
+    the shipped blocklist, not NET-028 as the draft said), how to read
+    `nn-admin status`, diagnostics gathered with the host name, the user
+    name and IP and MAC addresses replaced, how to report, how to
+    uninstall. Issue forms in `.github/ISSUE_TEMPLATE` (bug report, false
+    positive, detection gap; a vulnerability goes to private reporting).
+    The ratchet checks each scenario's rule and severity against the
+    catalogue and the forms against the guide.
+  - **The export to a real receiver**: `export-guest.sh` phase `interop`
+    sends the same sink to a receiver that is not ours (rsyslog with a TLS
+    driver, else OpenSSL's `s_server`); the received records are checked
+    against the pinned OCSF 1.9.0 schema on the host
+    (`nn_export::schema::received::received_records_match_the_pinned_schema`,
+    a no-op without `NN_OCSF_RECEIVED`). Results in `EXPORT.md` §6.1.
+  - **README claims with proof**: the sensor self-test sentence was stale
+    ("3 of the 16 sources": it sees a live event of 13 and checks the
+    attach of 3), and C21 was listed at level 0 (the program has it at 1
+    since lot 276). `readme_figures.rs` now also checks the sources, the
+    kernel table against the lab workflow's guests, the verified matrix
+    and the deny hooks per kernel, the capability levels against the
+    program's table, and that every figure of the table of measures is in
+    its source or in the program's lot notes.
+  - **Design-doc hygiene**: the posture design's §10.5, the ransomware
+    design's residuals, the trust model, `UPGRADE_NOTES_WAVE4.md` (§42,
+    §43's race, §49, §51's walk), `ALPHA_PROFILE.md` and the program's
+    lot notes state limits as behaviour, without thresholds or steps that
+    would serve to stay under them. The descriptor race reads "refused,
+    signed once per program and caller (repeats coalesced)". Lot 355's
+    "a FUSE file never `stat`ed" / "never read through a FUSE mount" is
+    corrected: the check is lexical (`UPGRADE_NOTES_WAVE4.md` §49).
 - Lot 359 (pre-alpha, the re-check 3 of #567): the **pin directory's
   lock** (`UPGRADE_NOTES_WAVE4.md` §52). The unmount hook runs before the
   kernel's namespace lock, so a racing rbind, or a subtree wider or deeper
@@ -158,7 +213,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `/sys/fs/bpf` and `/sys/fs/cgroup` (and their copies in every slave
     namespace: the bpffs's last mount) with no refusal, a raw namespace's
     `umount -l /` the same; `sb_umount` walks the subtree in the kernel's
-    order (`common::mount_guard::umount_below`, 32 mounts; offsets
+    order (`common::mount_guard::umount_below`, a bounded walk; offsets
     `mount.mnt_mounts`, `.mnt_child`, slots 152–153), each mount judged as
     the top, a subtree wider than the walk refused in a guarded namespace or
     when a mount read is in a peer group; the read-mode ptrace record skips
@@ -1440,9 +1495,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       (device and inode, by its descriptors) and no other regular file
       under a staging directory, unlinked, on a memory or FUSE filesystem,
       or a `memfd` (each descriptor's filesystem read from its `fdinfo`,
-      a FUSE file never `stat`ed);
+      so a FUSE file there is not `stat`ed);
     - a traced daemon (`TracerPid:`, a `PTRACE_SEIZE` leaves it running)
-      ties nothing; the image's path is never read through a FUSE mount;
+      ties nothing; the image's path is not read through a FUSE mount the
+      path's text shows (lexically: lot 364 corrects the sentence, which
+      said "never" — a symbolic link or a race still reaches one;
+      `UPGRADE_NOTES_WAVE4.md` §49);
     - the pump reads the mount table only for an exec on an anonymous
       device (FUSE's) that may tie, keeps its record by pid in the order
       noted (no scan of it per check or per eviction);

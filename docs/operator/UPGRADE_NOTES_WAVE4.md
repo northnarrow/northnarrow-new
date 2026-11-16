@@ -2343,8 +2343,11 @@ detail.
 - **Residuals named by the review of #557.**
   - With `+cpuset` now enabled at the root on 5.15 (and, as before, on 6.8
     and later), root can confine the agent to one CPU through a sibling
-    cgroup in `cpuset.cpus.partition=root`: no hook sees it and no record
-    is written. The agent does not yet watch its own effective CPUs.
+    cgroup in `cpuset.cpus.partition=root`: no hook sees it, and at this
+    lot no record was written. Superseded by lot 349 (§43): the
+    confinement is still not refused, but it is detected and signed
+    (`cpu_confined`, High) and shown in `nn-admin status`; a confinement
+    made before the agent's first round is not proven.
   - The write's mark lives up to 5 s if the clean-up fexit is skipped
     (full preemption), and stale entries are not reclaimed. A user with a
     delegated cgroup can fill the 64 entries, and root's containers then
@@ -2490,14 +2493,13 @@ detail.
     then; an iterator link read later with `cat`), and an XDP or tc program
     attached over netlink (`ip link`, `tc`: no `bpf(2)` command; 6.13+
     only, where such a program can call `bpf_send_signal_task`). A
-    descriptor swapped by another thread (`dup2`) between the hook's read
-    and the kernel's, or a prog array's value rewritten in that gap, can
-    win a race. Each attempt that loses the race is refused and signed,
-    but a stall (userfaultfd or FUSE on the prog array's key copy, or on
-    perf's context lock for `SET_BPF`) can make the race deterministic,
-    and the winning attempt leaves no record at its use (re-check 2 of
-    #558, N4): the load's High and the "still loaded after the window"
-    High are then the only records. Check
+    descriptor changed by another thread between the hook's read and the
+    kernel's, or a prog array's value changed in that gap, can win a race.
+    Each attempt that loses it is refused, signed once per program and
+    caller (repeats coalesced); a root user can win it, and the winning
+    attempt leaves no record at its use (re-check 2 of #558, N4): the
+    load's High and the "still loaded after the window" High are then the
+    only records. Check
     `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
   - **Held across an agent restart, emptied as programs go.** The held set
     (`PROG_CONTENT_HELD`, 1024 ids) is pinned now: a restart keeps it. Each
@@ -2549,15 +2551,14 @@ detail.
     window to the requester's tree is one fix for all of them; until then
     open a window only on a host you trust for its length, and keep it
     short (`--window-secs`).
-  - **P2: the `dup2` race.** Another thread's `dup2` of a descriptor
-    between the agent's check and the kernel's own read (a few
-    microseconds), or a prog array's value rewritten in that gap, can
-    win. A lost attempt is refused and signed (`bpf_held_use`); but a
-    stall on the copy (userfaultfd or FUSE on the prog array's key, or
-    on perf's context lock for `SET_BPF`) makes the race deterministic,
-    and the winning use then leaves no record of its own (N4). The load
-    and the "still loaded after the window" record are signed High. No
-    hook exists that sees the resolved program for every run and attach.
+  - **P2: the descriptor race.** Another thread's change of a
+    descriptor between the agent's check and the kernel's own read, or of
+    a prog array's value in that gap, can win. An attempt that loses it
+    is refused, signed once per program and caller with its repeats
+    coalesced (`bpf_held_use`); a root user can win it, and the winning
+    use then leaves no record of its own (N4). The load and the "still
+    loaded after the window" record are signed High. No hook exists that
+    sees the resolved program for every run and attach.
   - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
     attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
     carry a map's descriptor where the agent reads a program's: on 6.8 a
@@ -3342,19 +3343,22 @@ depth.
 - **Residual.** A malicious AppImage the user runs is a user program,
   judged by its behaviour. `/proc` shows no tie of a FUSE mount to the
   process that serves it, so the pump ties the mount through the exec that
-  entered it and a daemon of the image started since. No mount namespace
-  is needed to swap what is served: a user who stops its own AppImage's
-  runtime after the mount, unmounts it, mounts its own read-only squashfs
-  there and starts the image again with `--appimage-mount` (a daemon of
-  the image, started since), then lets the runtime go on, gets its
-  squashfs's programs judged as the image's. So does a runtime made to
-  serve a file of the user's home (`TARGET_APPIMAGE` there, with the image
-  held as well). Those are programs it could run from its home, which it
-  can write: the impact stays the user's own. Every fact is checked on the
-  uid (the mount's `user_id`, the image's owner, the daemon's real uid, the
+  entered it and a daemon of the image started since. A user who controls
+  their own image's runtime can therefore have files of their own choosing
+  judged as the image's programs (no mount namespace needed). Those are
+  programs they could run from their home, which they can write: the
+  impact stays the user's own. Every fact is checked on the uid (the
+  mount's `user_id`, the image's owner, the daemon's real uid, the
   exec's), no other user inherits the mark, and root's exec from
   `/tmp/.mount_*` is still R009. A kernel record of the process the
-  connection's `/dev/fuse` file is handed to would close the swap.
+  connection's `/dev/fuse` file is handed to would close it.
+- **Limit (lot 364, the re-check of #564).** The pump keeps off FUSE by
+  the path's text and by each descriptor's file system (`fdinfo`): that
+  check is lexical, so a path that reaches a FUSE mount another way (a
+  symbolic link in it, a change between the check and the read) is not
+  caught by it, and the pump can then wait on that FUSE file system. A
+  hardening lot after the alpha resolves those paths without following
+  links (`KNOWN_LIMITATIONS.md`, "Self-protection against root").
 - **Operator action.** None: no setting, no overlay. The records name the
   program's path as before.
 
@@ -3823,7 +3827,7 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   and `/sys/fs/cgroup` through the copies below it, and the copies in every
   slave namespace (the agent's own included): the bpffs lost its last
   mount, with no refusal. The same held for a raw namespace's `umount -l
-  /`. Now the guard reads the subtree in the kernel's order (32 mounts: a
+  /`. Now the guard reads the subtree in the kernel's order (a bounded walk: a
   child, else the next sibling of the mount or of one of its parents up to
   8 levels), and refuses
   the unmount when a mount in it is held (by its id in a guarded
@@ -3913,9 +3917,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   and the create still refused; three Highs, the three pins back, three
   clears a round later.
 - **Named, not changed:** a lazy unmount in a namespace that is not PID
-  1's, the agent's or the watchdog's, of a subtree whose first 32 mounts
-  (or a chain of 9 levels) are all private, behind which lies a copy in one of the host's
-  peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
+  1's, the agent's or the watchdog's, of a subtree wider or deeper than
+  the walk reads, all private where it reads, behind which lies a copy in
+  one of the host's peer groups (root building it on purpose in a raw
   namespace) is not refused: the walk is bounded. A lazy unmount that races the
   walk (a copy grafted by a concurrent rbind after the guard read the
   subtree, in any namespace) is not refused either: the hook runs before

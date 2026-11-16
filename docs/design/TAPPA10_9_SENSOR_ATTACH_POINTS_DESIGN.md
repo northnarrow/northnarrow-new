@@ -698,7 +698,8 @@ kernels (§9, 7.4k instructions). This section is the implementation plan.
   `ProcessSpawn` (it fires twice), and ADE takes it as a focal event.
 - **Out of reach of this step:** the `comm` rules (R005–R007, R011,
   R012, R014–R016, posture's recon and lolbas). `comm` is the basename of
-  the name invoked, and a renamed copy evades them; that is the 10.9
+  the name invoked, so a program under another name is not recognised by
+  them; that is the 10.9
   "exec by inode property" item.
 
 ### 11.2 One LSM program, the file the kernel opened

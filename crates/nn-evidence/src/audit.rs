@@ -1893,6 +1893,56 @@ mod tests {
         assert_eq!(e.extra["version"], "0.0.0-test");
     }
 
+    /// Lot 364 (KNOWN_LIMITATIONS, "the signing is not forward-secure"):
+    /// a history written again from its first row with the agent's key
+    /// verifies as the original did. Only a head kept elsewhere (an
+    /// off-host verifier's, an export's) tells the two apart.
+    #[test]
+    fn a_history_rewritten_with_the_agent_key_verifies_only_a_kept_head_tells() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let draft = |op: &str| AuditEntryDraft {
+            op: op.to_string(),
+            extra: serde_json::json!({}),
+            key_fp: "00000000".to_string(),
+            cosigner_fps: vec![],
+            result: "success".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "t".to_string(),
+            client_exe: None,
+        };
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        let mut kept = String::new();
+        for op in ["unlock", "force_posture", "trusted_installer_grant"] {
+            kept = log.append(draft(op)).unwrap().entry_hash;
+        }
+        drop(log);
+        let original = verify_chain_file(&log_path, &pk, Some(&kept)).unwrap();
+        assert!(
+            original.broken.is_none() && original.head_seen,
+            "{original:?}"
+        );
+        // the same key, another past
+        fs::remove_file(&log_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        for op in ["unlock", "status"] {
+            log.append(draft(op)).unwrap();
+        }
+        drop(log);
+        let rewritten = verify_chain_file(&log_path, &pk, Some(&kept)).unwrap();
+        assert!(
+            rewritten.broken.is_none() && rewritten.rows >= 2,
+            "the rewritten history verifies with the agent's public key: {rewritten:?}"
+        );
+        assert!(
+            !rewritten.head_seen,
+            "the head kept from the first history is not in the rewritten one"
+        );
+    }
+
     fn fresh_paths() -> (TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join("agent.sig.key");

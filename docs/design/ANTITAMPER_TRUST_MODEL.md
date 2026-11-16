@@ -2825,13 +2825,13 @@ Now:
   hook with the descriptor; 6.13+, where such a type can call
   `bpf_send_signal_task`), and the other maps whose values hold program
   descriptors (a devmap's or cpumap's XDP program, a `struct_ops` map);
-- a race: another thread's `dup2` between the hook's read of the
-  descriptor and the kernel's, or a rewrite of a prog array's value in
-  that gap (the kernel copies it after the hook) — a lost attempt is
-  refused and signed, but a stall (userfaultfd or FUSE on the copied key,
-  or perf's context lock for `SET_BPF`) makes the race deterministic and
-  the winning use leaves no record of its own; the load, and the program
-  still loaded after the window, are signed High (re-check 2 of #558, N4);
+- a race: another thread's change of the descriptor between the hook's
+  read and the kernel's, or of a prog array's value in that gap (the
+  kernel copies it after the hook) — an attempt that loses it is refused,
+  signed once per program and caller (repeats coalesced); a root user can
+  win it, and the winning use leaves no record of its own; the load, and
+  the program still loaded after the window, are signed High (re-check 2
+  of #558, N4; the pre-alpha Phase 3 measured the race);
 - a program loaded before the agent started: signed High at the start
   (its baseline) but neither its handles (from 6.9) nor its loader's
   descriptor are judged. Its verified instructions carry the helpers'
@@ -3152,10 +3152,10 @@ where it starts.
 
 ### Residual
 
-- An unmount whose subtree is wider than the walk, in a namespace not
-  guarded, with only private mounts read: let through (a container
-  runtime's old root has that shape; so has a copy hidden behind 32
-  private mounts, or a chain of 9 levels). What it can take is the host's
+- An unmount whose subtree is wider or deeper than the walk, in a
+  namespace not guarded, with only private mounts read: let through (a
+  container runtime's old root has that shape; root can build one on
+  purpose). What it can take is the host's
   childless `/sys/fs/cgroup`; the bpffs, whose lock keeps it against an
   rbind copy (lot 359), only through what is still behind the lock
   ("The pin directory's lock": a raw namespace's moved copy of `/sys`, a

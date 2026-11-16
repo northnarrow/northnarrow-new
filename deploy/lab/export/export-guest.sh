@@ -4,7 +4,7 @@
 # crates/nn-export/examples/syslog_receiver.rs, built in the guest's tree).
 # Our own lab guests only.
 #
-# usage: export-guest.sh <out-dir> <phase>...  (setup arrive outage hostile slow stall rotate rewritten protected outcome shrink cost off)
+# usage: export-guest.sh <out-dir> <phase>...  (setup arrive interop outage hostile slow stall rotate rewritten protected outcome shrink cost off)
 #
 #   setup   — a lab CA and a receiver certificate (receiver.lab, 127.0.0.1),
 #             the receiver up (honest), the signed export.local (both sinks,
@@ -17,6 +17,16 @@
 #             JSONL file verifies with the agent's public key
 #             (`nn-admin export verify`), and every data row of the five
 #             chains (archives included) is in both, none that is not.
+#   interop — lot 364: the same sink to a receiver that is not ours —
+#             rsyslog's imtcp with its TLS driver (gtls or ossl) when the
+#             guest has one, else OpenSSL's s_server —, on the same address
+#             and certificate (the lab receiver stopped, the sink
+#             reconnects): every chain row written meanwhile arrives, every
+#             received record verifies; the records (with the capture and
+#             the JSONL files) are left in <out-dir> for the OCSF 1.9.0
+#             schema check on the host (nn-export's
+#             received_records_match_the_pinned_schema). The lab receiver
+#             is back at the end.
 #   outage  — the receiver killed while rows flow, events with it down (the
 #             syslog sink down, the file sink up, the agent's detections
 #             unaffected), the receiver back: every row arrives, the
@@ -739,6 +749,108 @@ phase_cost() {
         echo "worker RSS: $(grep VmRSS /proc/$w/status)"
     } | tee "$OUT/cost.txt"
     check cost-measured "the export's cost measured" test -s "$OUT/cost.txt"
+}
+
+# lot 364: a receiver that is not ours (rsyslog, else OpenSSL)
+phase_interop() {
+    local recv=none drv
+    for drv in gtls ossl; do
+        if command -v rsyslogd >/dev/null && compgen -G "/usr/lib/*/rsyslog/lmnsd_$drv.so" >/dev/null; then
+            recv=rsyslog-$drv
+            break
+        fi
+    done
+    [ "$recv" = none ] && command -v openssl >/dev/null && recv=openssl
+    echo "interop receiver: $recv $(rsyslogd -v 2>/dev/null | head -1) $(openssl version 2>/dev/null)" | tee "$OUT/interop-receiver.txt"
+    check interop-receiver "a receiver that is not ours: $recv" test "$recv" != none
+    systemctl stop nn-export-recv 2>/dev/null
+    systemctl stop nn-export-interop 2>/dev/null
+    systemctl reset-failed nn-export-interop 2>/dev/null
+    : > "$LAB/interop.log"
+    listening() { for _ in $(seq 1 20); do ss -ltn | grep -q "127.0.0.1:$PORT" && return 0; sleep 0.5; done; return 1; }
+    case $recv in
+        rsyslog-*)
+            mkdir -p "$LAB/rsyslog"
+            # a record is up to 256 KiB (nn_export::syslog::MAX_MESSAGE):
+            # rsyslog's default maxMessageSize (8 KiB) would cut the longer
+            cat > "$LAB/rsyslog.conf" <<EOF
+global(workDirectory="$LAB/rsyslog" maxMessageSize="256k"
+       defaultNetstreamDriver="${recv#rsyslog-}"
+       defaultNetstreamDriverCAFile="$PKI/ca.pem"
+       defaultNetstreamDriverCertFile="$PKI/srv.pem"
+       defaultNetstreamDriverKeyFile="$PKI/srv.key")
+module(load="imtcp" streamDriver.name="${recv#rsyslog-}" streamDriver.mode="1" streamDriver.authMode="anon")
+template(name="nnraw" type="string" string="%rawmsg%\n")
+ruleset(name="nn") { action(type="omfile" file="$LAB/interop.log" template="nnraw") }
+input(type="imtcp" address="127.0.0.1" port="$PORT" ruleset="nn")
+EOF
+            systemd-run --quiet --unit nn-export-interop --collect \
+                -p StandardOutput=append:"$OUT/interop-receiver.log" -p StandardError=append:"$OUT/interop-receiver.log" \
+                rsyslogd -n -f "$LAB/rsyslog.conf" -i "$LAB/rsyslog.pid"
+            ;;
+        openssl)
+            # stdin held open and empty: s_server writes what it reads, the
+            # RFC 5425 frames, to its stdout
+            systemd-run --quiet --unit nn-export-interop --collect \
+                -p StandardError=append:"$OUT/interop-receiver.log" \
+                bash -c "sleep infinity | exec openssl s_server -quiet -tls1_3 -groups X25519 -accept 127.0.0.1:$PORT -cert $PKI/srv.pem -key $PKI/srv.key > $LAB/interop.raw"
+            ;;
+    esac
+    # an rsyslog that does not come up (a confinement, a module missing):
+    # OpenSSL's s_server instead, named in the out file
+    if [ "$recv" != openssl ] && ! listening; then
+        echo "interop: $recv did not listen, OpenSSL instead" | tee -a "$OUT/interop-receiver.txt"
+        systemctl stop nn-export-interop 2>/dev/null
+        systemctl reset-failed nn-export-interop 2>/dev/null
+        recv=openssl
+        systemd-run --quiet --unit nn-export-interop --collect \
+            -p StandardError=append:"$OUT/interop-receiver.log" \
+            bash -c "sleep infinity | exec openssl s_server -quiet -tls1_3 -groups X25519 -accept 127.0.0.1:$PORT -cert $PKI/srv.pem -key $PKI/srv.key > $LAB/interop.raw"
+    fi
+    listening
+    check interop-up "the receiver ($recv) listens on 127.0.0.1:$PORT" bash -c "ss -ltn | grep -q '127.0.0.1:$PORT'"
+    chain_rows > "$OUT/chains-before-interop.json"
+    events 5 40
+    sleep 3
+    check interop-caught-up "both sinks caught up within 300 s" caught_up 300
+    sleep 3
+    chain_rows > "$OUT/chains-after-interop.json"
+    if [ "$recv" = openssl ]; then
+        # the frames (MSG-LEN SP SYSLOG-MSG) as one message a line
+        python3 -I - "$LAB/interop.raw" "$LAB/interop.log" <<'PY'
+import sys
+b = open(sys.argv[1], "rb").read()
+out, i = [], 0
+while i < len(b):
+    j = b.find(b" ", i)
+    if j < 0 or not b[i:j].isdigit():
+        sys.exit(f"not a frame at byte {i}")
+    n = int(b[i:j])
+    out.append(b[j + 1:j + 1 + n].replace(b"\n", b" "))
+    i = j + 1 + n
+open(sys.argv[2], "wb").write(b"".join(m + b"\n" for m in out))
+PY
+        check interop-frames "the received stream is whole RFC 5425 frames" test $? -eq 0
+    fi
+    cp "$LAB/interop.log" "$OUT/interop.log"
+    cp "$CAP" "$OUT/capture.log"
+    check interop-verify "every record the receiver wrote verifies (agent key, chain continuity)" verify interop "$LAB/interop.log"
+    record_rows "$LAB/interop.log" > "$OUT/recs-interop.json"
+    python3 -I - "$OUT/chains-before-interop.json" "$OUT/chains-after-interop.json" "$OUT/recs-interop.json" <<'PY' | tee "$OUT/compare-interop.txt"
+import json, sys
+before, after, recs = (json.load(open(f)) for f in sys.argv[1:4])
+got = recs["rows"]
+new = missing = 0
+for c, hs in after.items():
+    fresh = set(hs) - set(before.get(c, []))
+    new += len(fresh)
+    missing += len(fresh - set(got.get(c, [])))
+print(f"interop: {new} chain rows written while it listened, {missing} missing, {sum(len(v) for v in got.values())} records")
+sys.exit(0 if new > 0 and missing == 0 else 1)
+PY
+    check interop-rows "every chain row written while it listened arrived" test "${PIPESTATUS[0]}" -eq 0
+    systemctl stop nn-export-interop 2>/dev/null
+    receiver honest
 }
 
 phase_off() {

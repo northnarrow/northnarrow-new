@@ -1,0 +1,59 @@
+name: False positive
+description: A record about something harmless you did on purpose.
+title: "[false positive] <rule id> on <what you ran>"
+labels: ["false-positive", "alpha"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Under the `alpha` profile a false positive is only a record: nothing was killed or blocked. Check the rule's known false positives in `docs/detection/RULE_CATALOGUE.md` and the list in `docs/operator/KNOWN_LIMITATIONS.md` first. Redact host names, user names and addresses (the alpha tester guide, section 8).
+  - type: input
+    id: rule
+    attributes:
+      label: Rule
+      description: The record's `rule_id`, and its `severity` and `response`.
+      placeholder: "R001_ExecFromTmp, High, would have: KillProcessTree"
+    validations:
+      required: true
+  - type: textarea
+    id: action
+    attributes:
+      label: What you ran, and why it is harmless
+      description: The command or program, the user it ran as, and what it is for (a package manager, a build, a backup, a container runtime…).
+    validations:
+      required: true
+  - type: textarea
+    id: record
+    attributes:
+      label: The record
+      description: The JSON line from `nn-admin detections --key <key> --since <time>`, redacted.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Release, distribution and kernel
+      placeholder: "0.1.0-alpha (tarball), Debian 13, 6.12.57"
+    validations:
+      required: true
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often
+      options:
+        - Once
+        - Every time I run it
+        - At every boot
+        - Without anything I did
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: It is not in the rule's known false positives nor in KNOWN_LIMITATIONS.md.
+          required: true
+        - label: I removed personal data, keys and credentials from what I attached.
+          required: true

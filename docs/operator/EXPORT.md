@@ -389,6 +389,36 @@ or no record at all (`EMPTY`: an empty capture proves nothing).
 The agent's public key: `/etc/northnarrow/agent.sig.pub` on the host,
 copied off it once.
 
+### 6.1 A receiver that is not ours (lot 364)
+
+The pre-alpha checked the export end to end on the release candidate
+(Ubuntu 24.04, kernel 6.8, our own lab guest): both sinks on, the five
+chains, `start = oldest`, a local receiver of syslog over TLS
+(`deploy/lab/export/export-guest.sh` phases `setup`, `arrive`, `interop`,
+`off`: 28 checks, 28 passed).
+
+- **Our receiver** (`crates/nn-export/examples/syslog_receiver.rs`, built
+  on `rustls`): 118 chain rows in the capture and in the JSONL files, none
+  missing, none other, no duplicate; every record verified by `nn-admin
+  export verify`.
+- **OpenSSL's** (`openssl s_server` of OpenSSL 3.0.13, TLS 1.3 with
+  X25519, the same certificate and address; the agent's sink reconnected
+  to it by itself): every one of the 85 chain rows written while it
+  listened arrived, as whole RFC 5425 frames, and every record verified.
+- **The OCSF schema**: every record received — 124 from the JSONL files,
+  124 from our receiver, 92 from OpenSSL's; Detection Finding, Process
+  Activity, File System Activity, Network Activity and Base Event — passed
+  the pinned OCSF 1.9.0 schema and its rules
+  (`nn_export::schema::received::received_records_match_the_pinned_schema`,
+  run on the received files with `NN_OCSF_RECEIVED=<file>[:<file>…]`).
+- **rsyslog** was not measured: the guest's rsyslog 8.2312 had no TLS
+  driver (the `rsyslog-gnutls` or `rsyslog-openssl` package). With one,
+  rsyslog's `imtcp` reads the RFC 5425 framing; raise its
+  `maxMessageSize` to at least `256k`, since a record can be up to 256 KiB
+  (`nn_export::syslog::MAX_MESSAGE`) and rsyslog's default (8 KiB) cuts
+  longer messages. `deploy/lab/export/export-guest.sh` uses it, with that
+  setting, when the guest has the driver.
+
 ## 7. The TLS stack and its dependencies
 
 rustls with the RustCrypto provider (`rustls-rustcrypto`) — the founder's
