@@ -24,8 +24,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     self-test; a long suspend can make a record name an earlier program;
     run the agent only through its units; `nn-admin chain verify` saying
     OK with no chains; the release's provenance only from the first tag.
-    No public doc gives the unmount walk's bounds any more (this page,
-    the trust model, the upgrade notes, the program's notes). Ratchet
+    A search of the docs, this page and the README finds no numeric bound of the unmount walk, no lock sequence and no timing window any more (fix round 2). Ratchet
     `xtask/tests/known_limitations.rs`: every item names evidence, and
     every backticked word of the evidence is a test (by name or by path),
     a file or a golden case that exists, every lot (any case) is in the
@@ -78,10 +77,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     withdrawn (`UPGRADE_NOTES_WAVE4.md` §49). The posture design keeps
     that a listed unit is recognised by its name.
 - Lot 359 (pre-alpha, the re-check 3 of #567): the **pin directory's
-  lock** (`UPGRADE_NOTES_WAVE4.md` §52). The unmount hook runs before the
-  kernel's namespace lock, so a racing rbind, or a subtree wider or deeper
-  than the guard's walk, could still let a lazy unmount take the host's
-  bpffs and the pins (N4). `/sys/fs/bpf/northnarrow` is now bound onto
+  lock** (`UPGRADE_NOTES_WAVE4.md` §52). A lazy unmount that the guard did not judge
+  completely could still take the host's bpffs and the pins (N4). `/sys/fs/bpf/northnarrow` is now bound onto
   itself, private and unbindable, as the child of the host's bpffs, by a
   new step of the agent's unit (`ExecStartPre=-+… --pin-lock`, which
   enters PID 1's mount namespace, before any pin): the kernel never takes, in an unmount's
@@ -110,12 +107,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     signs `pin_lock_missing` / `pin_lock_changed` (High) and makes it again
     (a transient unit, up to three attempts within 30 s, then a back-off
     over the rounds), its result in the record.
-  - **Closes** the rbind variants for the pins (a racing rbind graft, an
-    rbind copy beyond the walk's bound). **Does not close**, each signed at
+  - **Closes** the rbind variants for the pins. **Does not close**, each signed at
     the next integrity round: the lock's flags cleared through
     `mount_setattr(2)` (no LSM hook); a raw namespace's own copy of the
-    lock, its move judged by its target only and its own recursive change
-    of propagation not judged; the units' namespaces, which
+    lock, defended by the guard's walk alone; the units' namespaces, which
     never have the lock (KNOWN_LIMITATIONS.md). Scheduled first after the
     alpha.
   - **Fixed on the way (the fix round's lab, 5.15):** the peer-group walk
@@ -196,8 +191,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     last read of the peer groups (`--make-private`, a decoy taking the
     freed number, `--make-shared`) no longer lets a raw namespace's mount
     propagate over a protected path — a group `MOUNT_GROUPS` does not hold
-    is walked in the hook (`common::mount_guard::spread`: up to 16 peers
-    and slaves; undecided counts as reaching, refused only on a protected
+    is walked in the hook (`common::mount_guard::spread`: undecided counts as reaching, refused only on a protected
     point), an unmount there walks the parent's propagation for the mount a
     held one sits under at that place (`HELD_UNDER`, by the parent mount's
     id: a chroot's own sysfs has the host's dentries; undecided, refused
@@ -225,7 +219,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     WSL's binfmt `status` lock judged by its identity (source `none`, root
     `/wsl/binfmt-status-lock`, `/run`'s device).
   - **Its re-check 2** (§51.3): an unmount is judged by the subtree it
-    takes — `mount --rbind /sys /mnt/s; umount -l /mnt/s` took the host's
+    takes — a lazy unmount of an rbind copy of `/sys` took the host's
     `/sys/fs/bpf` and `/sys/fs/cgroup` (and their copies in every slave
     namespace: the bpffs's last mount) with no refusal, a raw namespace's
     `umount -l /` the same; `sb_umount` walks the subtree in the kernel's

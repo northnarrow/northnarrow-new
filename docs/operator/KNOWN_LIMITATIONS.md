@@ -320,10 +320,10 @@ not cause as an incident.
   *Evidence:* `a_stuck_recovery_and_a_restart_loop_are_signed`;
   `a_fuse_on_the_way_is_never_read`; lot 353; internal check Phase 3
   §7.3.
-- **Run the agent and the watchdog only through their units.** An agent
-  or a watchdog started by hand in the host's own mount namespace, outside
-  its systemd unit, weakens the mount guard of the host's namespace while
-  it runs and after it exits. *For you:* start, stop and restart them only
+- **Run the agent and the watchdog only through their units.** The mount
+  guard of the host's namespace is complete only when the agent and the
+  watchdog run as their units; started by hand, outside them, the guard
+  there is not supported. *For you:* start, stop and restart them only
   with `systemctl`, inside a window. *Evidence:* lot 359.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher

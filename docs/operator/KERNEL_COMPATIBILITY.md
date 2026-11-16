@@ -1285,7 +1285,7 @@ highest; 123 programs, 116 OK, 0 failing), 6.8.0-149 (180,428; 120 OK) and
 every allowed one silent, on the three (`UPGRADE_NOTES_WAVE4.md` §51.1).
 
 **As measured, re-check 1 of #567** (the same guests and setup, the final
-tree): the propagation walk (`common::mount_guard::spread`, 16 mounts of a
+tree): the propagation walk (`common::mount_guard::spread`, a
 group the map does not hold; `struct mount`'s `mnt_slave_list` and
 `mnt_slave` an `hlist` on 6.18 and 7.0, a `list_head` before: read alike)
 and the unmount's walk by parent mount keep the six programs under the

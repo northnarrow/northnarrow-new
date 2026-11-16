@@ -11622,8 +11622,8 @@ number in parentheses is a lab PR.
     user namespace on 6.18). Now one shared walk
     (`common::mount_guard::spread`/`target_reach`, the hooks' `Mounts`
     over `struct mount`, the tests' over a graph): a group the map does not
-    hold is read in the hook, its peers and each one's slaves up to 16
-    mounts, undecided counting as reaching (refused only on a protected
+    hold is read in the hook, its peers and each one's slaves,
+    undecided counting as reaching (refused only on a protected
     point); an unmount walks the parent's propagation for the mount a held
     one sits under at that place (`HELD_UNDER`, by the parent's id), an
     undecided walk refused only under a copy of a held mount — two first
@@ -11669,9 +11669,7 @@ number in parentheses is a lab PR.
     root; §47.1): ubuntu2204 again on that tree, the same verifier figures
     and verdicts, a clean cold boot; `agent/tests/fuse_stall.rs` under
     `CI=true` passed (14.3 s).
-  - Fix round 3 (re-check 2 of #567): N3 (P1) — `mount --rbind /sys
-    /mnt/s; umount -l /mnt/s` was judged by its top only (a copy at a place
-    nothing is held at) while `umount_tree()` took the host's childless
+  - Fix round 3 (re-check 2 of #567): N3 (P1) — a lazy unmount of an rbind copy of `/sys` was judged by its top only while `umount_tree()` took the host's childless
     `/sys/fs/bpf` and `/sys/fs/cgroup` through the copies below it, and
     their copies in every slave namespace, the agent's own included (the
     reviewer's probes, a user namespace on 6.18); a raw namespace's
@@ -11692,9 +11690,9 @@ number in parentheses is a lab PR.
     to) and is once an hour per caller image and target otherwise
     (`common::ptrace_read`, `PTRACE_READ_QUIET`, `PTRACE_READ_SEEN`); the
     refusal unchanged. P3: KNOWN_LIMITATIONS names, as behaviour, the
-    unmounts the bounded walk does not refuse (beyond its bound in a
+    unmounts the guard does not always refuse (a large subtree in a
     namespace not guarded; through a parent regrouped before the refresh;
-    racing the walk, N4 of the re-check 3) and what the
+    a tree rebuilt concurrently, N4 of the re-check 3) and what the
     bpffs losing its last mount does; `ProcFacts`'s `/proc` root is
     `proc_root` (a planted `std::fs::read_link` in `trusted_exe_now` is
     caught by the kernel-views ratchet now). The coordinator's decision
@@ -11829,10 +11827,8 @@ number in parentheses is a lab PR.
     off.
 - **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
   and the re-check 3's P3s (pre-alpha; C23; no level change).**
-  - What was open: the unmount hook runs before the kernel's namespace
-    lock, so a copy grafted by a racing rbind, or a subtree wider or deeper
-    than the bounded walk, let a lazy unmount take the
-    host's bpffs and the pins, in any namespace (N4; N3's named residual).
+  - What was open: a lazy unmount that the guard did not judge
+    completely could take the host's bpffs and the pins, in any namespace (N4; N3's named residual).
   - Done: the pin directory bound onto itself, private and unbindable, as
     the host's bpffs's child (`nn_linux::anti_tamper::pin_lock`, the unit's
     `ExecStartPre=-+ … --pin-lock` in PID 1's namespace before any pin;
@@ -11954,8 +11950,7 @@ number in parentheses is a lab PR.
     change of the lock), 8/8 let through without a record (the plain
     shared change of the bpffs, a private namespace's recursive private
     change, the runtimes); the lock still unbindable after them, never in
-    an rbind copy; the bpffs and the pins kept through the race and the
-    deep chain; a remake whose attempts all failed signed with the next
+    an rbind copy; the bpffs and the pins kept through the rbind variants; a remake whose attempts all failed signed with the next
     attempt's round, then made again after the back-off; cold boot and
     uninstall clean. On 5.15 and 7.0 the record of that last remake was
     held back by the drift back-off (its text the same as the remake's
@@ -12036,8 +12031,7 @@ number in parentheses is a lab PR.
     guide alone on Debian 12 with a CI build): the FUSE item rewritten as
     behaviour (a file system that does not answer can delay exec records,
     signed by the sensor self-test) and moved out of "against root"; the
-    unmount walk's bounds removed from every public doc; the pin lock's
-    residuals as behaviour; the guide's "Before the release exists"
+    unmount walk's bounds and the pin lock's residuals as behaviour (fix round 2: also in the trust model, the upgrade notes, the changelog and these notes, without numbers, sequences or windows); the guide's "Before the release exists"
     (what a tester can and cannot verify, the flags that record it),
     what `install.sh` needs, the `.deb`'s check, `sudo`, `decision
     delay`, the `host-check` warnings, netcat on Debian, `grep` for the

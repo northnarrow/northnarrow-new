@@ -210,10 +210,13 @@ sudo nn-admin status --key "$KEY"
 The first summary line must say `OBSERVE-ONLY — profile alpha`.
 
 Run `nn-admin` with `sudo`: the agent's socket and the key are root's.
-Without `sudo`, a command that talks to the agent fails with a permission
-error; that does not mean the agent is stopped. If `sudo nn-admin status`
-exits 5 with `connecting to /run/northnarrow/admin.sock`, the agent does
-not run: see section 5.
+Without `sudo`, a command that talks to the agent is refused with exit 17
+and "Run it with sudo"; that does not mean the agent is stopped. If
+`sudo nn-admin status` exits 5 with `connecting to /run/northnarrow/admin.sock`,
+the agent is not reachable (it does not run): see section 5. `nn-admin
+chain verify` needs `sudo` too (exit 17 without it). A build older than
+the permission exit may print 5 for a denied socket: use `sudo` and look
+again.
 
 ### Before the release exists
 
@@ -297,10 +300,14 @@ Further down, among many lines:
   Boot, IMA, kexec and the cgroup v1 controllers, and for the admin key
   left on the host (section 4 tells you to leave it there); before the
   tag, `release verified at install` too. Worth a report: a WARN on the
-  BPF LSM, `nft` or bpffs rows, or on `release verified at install` after
-  you installed a tagged release as section 4 says.
+  BPF LSM or `nft` rows, or on `release verified at install` after you
+  installed a tagged release as section 4 says. A WARN on a bpffs row is
+  one an earlier build showed on every install: if you still see it on a
+  release, report it.
 - A warning from the system's C library when a command starts
-  (`GLIBC_… not found`) is worth a report, with your distribution.
+  (`GLIBC_… not found`): an earlier build showed it on some older
+  distributions. If you still see it on a release, report it, with your
+  distribution.
 
 **Postures.** OBSERVING, then ALERTED, ENGAGED and COMBAT as evidence adds
 up ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md)). Without new signals the
@@ -311,7 +318,8 @@ an unlocked COMBAT 30 minutes after its last signal. A COMBAT shown as
 ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md) §3). Under `alpha`, COMBAT is
 entered and recorded but never isolates the host.
 
-**If the agent does not run**, `sudo nn-admin status` exits 5. Look at:
+**If the agent does not run**, `sudo nn-admin status` exits 5 (17 means a
+permission was denied: run it with `sudo`). Look at:
 
 ```sh
 systemctl status northnarrow-agent northnarrow-watchdog --no-pager
@@ -536,21 +544,35 @@ sudo journalctl --namespace=northnarrow --since "@$since" --no-pager > "$d/agent
 sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "@$since" --no-pager > "$d/units-journal.txt" 2>&1
 H=$(hostname) D=$(hostname -d 2>/dev/null) U=$(id -un) M=$(cat /etc/machine-id) \
 B=$(cat /proc/sys/kernel/random/boot_id) perl -pi -e '
-  BEGIN { ($b = $ENV{B}) =~ s/-//g }
+  BEGIN {
+    ($b = $ENV{B}) =~ s/-//g;
+    $u = $ENV{U} eq "root" ? "" : $ENV{U};
+    $d = ($ENV{D} =~ /\./ && $ENV{D} !~ /^(?:local|localdomain|home|lan)$/) ? $ENV{D} : "";
+  }
   s/\Q$ENV{M}\E/machine-id/g if length $ENV{M};
   s/\Q$ENV{B}\E|\Q$b\E/boot-id/gi if length $b;
   s/\Q$ENV{H}\E/host1/g;
-  s/(?<![\w-])\Q$ENV{D}\E(?![\w-])/domain1/g if length $ENV{D};
-  s/(?<![\w-])\Q$ENV{U}\E(?![\w-])/user1/g;
+  s/(?<![\w-])\Q$d\E(?![\w-])/domain1/g if length $d;
+  if (length $u) {
+    s{(?<=/home/)\Q$u\E(?![\w-])}{user1}g;
+    s{("?\buser(?:name)?"?\s*[=:]\s*"?)\Q$u\E(?![\w-])}{${1}user1}g;
+    s{(?<![\w/-])(?<!\w\.)(?<!::)\Q$u\E(?![\w-]|\.\w|::|"\s*:|=)}{user1}g;
+  }
   s/\b(?!127\.|203\.0\.113\.)(?:\d{1,3}\.){3}\d{1,3}\b/x.x.x.x/g;
-  s/(?<![\w:])(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/x:x::x/gi;
+  s/(?<![\w:])(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/$&eq"::1"?$&:"x:x::x"/gie;
   s/\b(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}\b/x:x::x/gi' "$d"/*
 ls -l "$d"
 ```
 
-Your user name is replaced where it stands as a word (a part of a path,
-`user=`, a name in a list), never inside a longer word: with the user
-`nn`, `nn-admin` stays `nn-admin`.
+Your user name is replaced where it identifies you: as a `/home/<name>`
+path component, after `user=` or `"user":`, and as a whole word in text.
+It is never replaced inside a path, a file name or a JSON key (with the
+user `nn`, `nn-admin` stays `nn-admin`; with `admin`, `admin.sock` stays;
+with `user`, `user.slice` and `"user":` stay), and not at all when you are
+`root` (it is not personal, and `/root` and `/proc/<pid>/root` must stay
+readable). The domain is replaced only when it has a dot and is not
+`local`, `localdomain`, `home` or `lan`. The loopback `::1` stays. The
+repository tests this command on a crafted sample.
 
 Then **read every file before you attach it**. The script cannot know
 other names you consider private (a second user, a customer's host name, a
@@ -561,7 +583,7 @@ credential. The journal can be long; `grep` helps:
 
 ```sh
 grep -rlF -e "$(hostname)" -e "$(cat /etc/machine-id)" "$d"   # must print nothing
-grep -rlP "(?<![\w-])\Q$(id -un)\E(?![\w-])" "$d"            # must print nothing
+U=$(id -un); [ "$U" = root ] || grep -rnP "(?<![\w/.-])\Q$U\E(?![\w.-])" "$d"   # must print nothing
 grep -nE ' (WARN|ERROR) ' "$d/agent-journal.txt"              # the lines to read first
 ```
 
