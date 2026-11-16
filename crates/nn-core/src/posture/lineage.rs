@@ -954,6 +954,12 @@ struct InnerState {
 struct KernelFork {
     start_ns: u64,
     parent: u32,
+    /// Lot 360 (the review of #568, F1): the forker's own start, read by
+    /// the kernel at the fork (`TcpConnectRaw::fork_parent_start`; a
+    /// write's when its forker never executed either): its cached exec
+    /// answers only when it is that process's. 0: not known, not checked
+    /// (a write's record of a forker that executed).
+    parent_start: u64,
     uid: u32,
     seen_ns: u64,
 }
@@ -1065,6 +1071,19 @@ pub fn event_time_ns(event: &Event) -> u64 {
         Event::DnsAnswer(a) => a.timestamp_ns,
         Event::TlsClientHello(h) => h.timestamp_ns,
     }
+}
+
+/// Lot 360: what the kernel's fork record of a pid names it running at a
+/// time ([`AuthSessionTracker::forked_image_as`]).
+enum Forked {
+    /// Its forker's exec at the fork: in a judgement, or confirmed by
+    /// `/proc` (the fork itself shown running it).
+    Known(Entry),
+    /// At a record read right after the fact: neither process shown.
+    Unconfirmed(Entry),
+    /// No record for the time, the forker's exec not the forker's, or
+    /// `/proc` showing another file.
+    No,
 }
 
 /// What the spawn cache knows a pid ran at a time.
@@ -1412,13 +1431,31 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// same with a connect's record (`TcpConnectRaw::fork_*`, lot 352),
     /// before it names the flow's image: a fork-only process that connects
     /// and exits at once is judged on its forker's image and its mark.
-    pub fn ingest_kernel_fork(&self, pid: u32, start_ns: u64, parent: u32, uid: u32, seen_ns: u64) {
+    /// `(parent, parent_start)`: the forker and its own start as the kernel
+    /// read it at the fork (0: not known) — the review of #568 (F1): a
+    /// forker's pid an earlier process held, whose exec is still cached,
+    /// lends that exec to no fork.
+    ///
+    /// The review of #568 (F3): the pumps are separate threads, so an
+    /// earlier holder's record of the pid may be read after a later
+    /// process's: a record replaces the one held only when its process
+    /// started later. The same process's records merge (the latest time
+    /// seen, the forker's start when one of them knows it).
+    pub fn ingest_kernel_fork(
+        &self,
+        pid: u32,
+        start_ns: u64,
+        (parent, parent_start): (u32, u64),
+        uid: u32,
+        seen_ns: u64,
+    ) {
         if pid <= 1 || parent == 0 || parent == pid || start_ns == 0 {
             return;
         }
         let rec = KernelFork {
             start_ns,
             parent,
+            parent_start,
             uid,
             seen_ns,
         };
@@ -1426,7 +1463,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if let Some(k) = s.kernel_forks.get_mut(&pid) {
             if (k.start_ns, k.parent) == (start_ns, parent) {
                 k.seen_ns = k.seen_ns.max(seen_ns);
-            } else {
+                if k.parent_start == 0 {
+                    k.parent_start = parent_start;
+                }
+            } else if start_ns > k.start_ns {
                 // the pid of an earlier process: this record replaces it
                 *k = rec;
             }
@@ -1448,18 +1488,34 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// pid named at `at`: started by then, and seen running its fork's image
     /// no earlier than then (later, it may have executed: an exec event
     /// would answer). A forker that executed only after the fork is read
-    /// from its own fork record alone. `None` without one, and without a time: the sweep
-    /// enters the processes running now from `/proc`, where a pid the
-    /// recorded writer left may name another process.
+    /// from its own fork record alone. `None` without one, and without a
+    /// time: the sweep enters the processes running now from `/proc`, where
+    /// a pid the recorded writer left may name another process.
+    ///
+    /// Lot 360 (the review of #568, F1): the forker's exec answers only when
+    /// it is the forker's — its process's start the one the kernel read at
+    /// the fork (`parent_start`, when the record has it). A forker's pid an
+    /// earlier process held, whose exec the cache keeps once `/proc` no
+    /// longer shows it, lends that exec to no fork: the record does not
+    /// answer, and the lookup goes on as without one.
     fn kernel_fork_entry(&self, pid: u32, at: Option<u64>, depth: usize) -> Option<Entry> {
+        self.kernel_fork_record(pid, at, depth).map(|(_, e)| e)
+    }
+
+    /// [`Self::kernel_fork_entry`], with the record it read.
+    fn kernel_fork_record(
+        &self,
+        pid: u32,
+        at: Option<u64>,
+        depth: usize,
+    ) -> Option<(KernelFork, Entry)> {
         let t = at?;
         if depth > LINEAGE_DEPTH_CAP {
             return None;
         }
-        let k = self.inner.state.read().kernel_forks.get(&pid).copied()?;
-        if t < k.start_ns || t > k.seen_ns {
-            return None;
-        }
+        let k = self.kernel_fork_at(pid, t)?;
+        // the review of #568 (F2): not an earlier holder's exec of the
+        // forker's pid, when the forker's own record shows it forked since
         let parent = match self.cached_live(k.parent, Some(k.start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
             CachedAt::Absent => self.fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
@@ -1468,25 +1524,59 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             // shows the later image)
             CachedAt::LaterOnly => self.kernel_fork_entry(k.parent, Some(k.start_ns), depth + 1)?,
         };
-        Some(Entry {
-            ppid: k.parent,
-            exe: parent.exe,
-            spawn_ns: k.start_ns,
-            start_ns: k.start_ns,
-            // npm's own CLI is the process its exec named, never a fork of it
-            js_pm: None,
-            // lot 313 (BUG-49's residue): a forked copy runs its forker's
-            // exec, an encryption it was asked for included (as `fork_entry`)
-            encrypts: parent.encrypts,
-            argv: None,
-            runs: parent.runs,
-            start_ticks: None,
-            uid: k.uid,
-            image: parent.image,
-            exec_file: parent.exec_file,
-            fork_parent: k.parent,
-            user_image: parent.user_image,
-        })
+        if k.parent_start != 0 && !self.entry_started_at(&parent, k.parent_start) {
+            return None;
+        }
+        Some((
+            k,
+            Entry {
+                ppid: k.parent,
+                exe: parent.exe,
+                spawn_ns: k.start_ns,
+                start_ns: k.start_ns,
+                // npm's own CLI is the process its exec named, never a fork of it
+                js_pm: None,
+                // lot 313 (BUG-49's residue): a forked copy runs its forker's
+                // exec, an encryption it was asked for included (as `fork_entry`)
+                encrypts: parent.encrypts,
+                argv: None,
+                runs: parent.runs,
+                start_ticks: None,
+                uid: k.uid,
+                image: parent.image,
+                exec_file: parent.exec_file,
+                fork_parent: k.parent,
+                user_image: parent.user_image,
+            },
+        ))
+    }
+
+    /// The kernel's fork record of `pid` that describes the process the pid
+    /// named at `t`: started by then, and seen running its fork's image no
+    /// earlier than then.
+    fn kernel_fork_at(&self, pid: u32, t: u64) -> Option<KernelFork> {
+        let k = self.inner.state.read().kernel_forks.get(&pid).copied()?;
+        (k.start_ns <= t && t <= k.seen_ns).then_some(k)
+    }
+
+    /// Lot 360 (the review of #568, F1): the entry `e` is of a process that
+    /// started at `start_ns` — its exec event's exact start, or the ticks
+    /// `/proc` showed for it ([`Self::ticks_show_start`]).
+    fn entry_started_at(&self, e: &Entry, start_ns: u64) -> bool {
+        match e.start_ticks {
+            Some(ticks) => self.ticks_show_start(ticks, start_ns),
+            None => e.start_ns == start_ns,
+        }
+    }
+
+    /// Lot 360 (the review of #568, F2): the cached exec `e` of `pid` is an
+    /// earlier process's than the one the kernel's fork record of `pid`
+    /// describes at `at` — that process executed nothing since its fork,
+    /// which came after `e`'s process started: the pid was reused by a
+    /// fork, which no exec announces, and `e` is not what it ran then.
+    fn forked_since(&self, pid: u32, at: Option<u64>, e: &Entry) -> bool {
+        at.and_then(|t| self.kernel_fork_at(pid, t))
+            .is_some_and(|k| e.start_ns < k.start_ns && !self.entry_started_at(e, k.start_ns))
     }
 
     /// Lot 340 (the review of #552, F1): the digest of an exec's whole argv
@@ -2237,8 +2327,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// For a time before that process started, the cached exec is still
     /// what the pid ran then; a pid `/proc` no longer shows keeps its last
     /// record.
+    ///
+    /// Lot 360 (the review of #568, F2): nor is a cached exec held at a
+    /// time the kernel's fork record of the pid shows a later process there
+    /// ([`Self::forked_since`]: forked after that exec's process started,
+    /// nothing executed since) — the pid reused by a fork, gone or not:
+    /// not held, whatever `/proc` shows (every lookup of the lineage: a
+    /// flow's image, an ancestor's identity, a forker's exec).
     fn cached_live(&self, pid: u32, at: Option<u64>) -> CachedAt {
         let found = self.cached_at(pid, at);
+        if let CachedAt::Current(e) | CachedAt::Past(e) = &found {
+            if self.forked_since(pid, at, e) {
+                return CachedAt::Absent;
+            }
+        }
         let CachedAt::Current(e) = &found else {
             return found;
         };
@@ -4176,7 +4278,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// Lot 360 (F4b-1): a process that executed nothing since its fork,
     /// known by the kernel's record of that fork, is its forker's image
     /// ([`Self::forked_image_as`]) before any `/proc` read, and before a
-    /// later exec of it.
+    /// later exec of it — and before a cached exec of an earlier process of
+    /// its pid (the review of #568, F2: [`Self::cached_live`]). At a record
+    /// read right after the fact, a record `/proc` does not confirm names
+    /// only an image the staging judgement takes as staged
+    /// ([`Self::staged_image_as`]: no mark is taken from such a record), so
+    /// the flow is judged and the image's mark decided in the judgement:
+    /// never an image that would leave it unjudged (the review of #568, F1).
     pub fn image_path_as(&self, pid: u32, as_of: AsOf) -> Option<String> {
         if pid == 0 {
             return None;
@@ -4185,8 +4293,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if let CachedAt::Current(e) | CachedAt::Past(e) = &found {
             return Some(e.exe.to_string_lossy().into_owned());
         }
-        if let Some(e) = self.forked_image_as(pid, as_of) {
-            return Some(e.exe.to_string_lossy().into_owned());
+        match self.forked_image_as(pid, as_of) {
+            Forked::Known(e) => return Some(e.exe.to_string_lossy().into_owned()),
+            Forked::Unconfirmed(e)
+                if self.staged_image_as(pid, as_of, &e.exe.to_string_lossy()) =>
+            {
+                return Some(e.exe.to_string_lossy().into_owned())
+            }
+            Forked::Unconfirmed(_) | Forked::No => {}
         }
         match found {
             CachedAt::Absent if !self.judged_from_proc(pid, as_of) => {
@@ -4210,9 +4324,64 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// exec) closes its connection and exits within a millisecond: `/proc`
     /// read in the judgement found nothing, its image's mark was not known,
     /// and its connect was judged as a staged image's. Never `/proc` for
-    /// the process itself; `None` without such a record, or without a time.
-    fn forked_image_as(&self, pid: u32, as_of: AsOf) -> Option<Entry> {
-        self.kernel_fork_entry(pid, as_of.time(), 0)
+    /// the process itself in a judgement; nothing without such a record,
+    /// or without a time.
+    ///
+    /// The review of #568 (F1): the forker's exec is the lineage's, which
+    /// learns execs when the event loop takes them — a forker's exec in
+    /// place just before the fork (`exec /tmp/stage2` from a shell) may not
+    /// be read yet when a pump names the fork's connect. So at a record
+    /// read right after the fact ([`AsOf::Live`]) the record is
+    /// [`Forked::Known`] only when `/proc` shows the fork itself (its start
+    /// the record's) running that image; the fork, or its forker (its start
+    /// the one the kernel read at the fork), shown running another file
+    /// leaves it [`Forked::No`] (named from `/proc`, as before); shown by
+    /// neither, [`Forked::Unconfirmed`]. In a judgement the record is
+    /// known: the event loop taught the lineage every exec that reached it
+    /// before the connect (`nn_linux::sensors::bus`).
+    fn forked_image_as(&self, pid: u32, as_of: AsOf) -> Forked {
+        let Some((k, e)) = self.kernel_fork_record(pid, as_of.time(), 0) else {
+            return Forked::No;
+        };
+        if !matches!(as_of, AsOf::Live(_)) {
+            return Forked::Known(e);
+        }
+        let image = e.exe.to_string_lossy().into_owned();
+        match self.proc_shows_running(pid, k.start_ns, &image) {
+            Some(true) => return Forked::Known(e),
+            Some(false) => return Forked::No,
+            None => {}
+        }
+        match self.proc_shows_running(k.parent, k.parent_start, &image) {
+            Some(false) => Forked::No,
+            Some(true) | None => Forked::Unconfirmed(e),
+        }
+    }
+
+    /// Lot 360 (the review of #568, F1): `/proc` shows the process that
+    /// started at `start_ns` at `pid` (`None` when it does not: gone, the
+    /// pid another process's, the start not known), running a file the
+    /// walk's path `image` may name (cut names compared as cut:
+    /// `common::wire::exe::walk_may_name`) — its start read again after
+    /// its `exe` link (a reuse between the reads would mix two processes).
+    fn proc_shows_running(&self, pid: u32, start_ns: u64, image: &str) -> Option<bool> {
+        if pid == 0 || start_ns == 0 {
+            return None;
+        }
+        let shown = || {
+            self.proc_start_ticks(pid)
+                .is_some_and(|t| self.ticks_show_start(t, start_ns))
+        };
+        if !shown() {
+            return None;
+        }
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe"));
+        if !shown() {
+            return None;
+        }
+        Some(exe.is_ok_and(|x| {
+            common::wire::exe::walk_may_name(image, x.as_os_str().as_encoded_bytes())
+        }))
     }
 
     /// Lot 355: `pid` ran, as of `as_of`, the file `path` of a user's
@@ -4222,7 +4391,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// path read elsewhere — a flow's row — and an exec of another file
     /// the cache missed are not paired). Lot 360: a process that executed
     /// nothing since its fork, by the kernel's record of that fork, is its
-    /// forker's exec at the fork ([`Self::forked_image_as`]), gone or not.
+    /// forker's exec at the fork ([`Self::forked_image_as`]), gone or not —
+    /// at a record read right after the fact only when `/proc` confirms it
+    /// (the review of #568, F1: an exemption is never taken from a record
+    /// the lineage may not have caught up with).
     /// `false` when not known: a process `/proc` shows, one the cache does
     /// not hold then (the exemption needs the mark: fail-closed). The
     /// staging judgements of a flow or an ancestor by its image path
@@ -4238,7 +4410,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return of_path(e);
         }
         // lot 360: a fork that executed nothing, by the kernel's record of it
-        if let Some(e) = self.forked_image_as(pid, as_of) {
+        if let Forked::Known(e) = self.forked_image_as(pid, as_of) {
             return of_path(&e);
         }
         match found {
@@ -6272,43 +6444,63 @@ mod tests {
         assert!(t.holds(602) && !t.holds(603));
     }
 
+    /// A user image's program (an AppImage's, `USER_IMAGE`) executed by
+    /// `pid` at `start_ns` (its start), as user 1000.
+    fn exec_user_image(t: &AuthSessionTracker, pid: u32, path: &str, start_ns: u64) {
+        use common::wire::exe::exe_flags::USER_IMAGE;
+        let mut e =
+            crate::decision::rules::testutil::spawn_exe("exe", "/proc/self/exe", path, USER_IMAGE);
+        if let Event::ProcessSpawn {
+            pid: p,
+            timestamp_ns,
+            start_ns: st,
+            ..
+        } = &mut e
+        {
+            (*p, *timestamp_ns, *st) = (pid, start_ns, start_ns);
+        }
+        assert!(t.ingest_spawn_event(&e));
+    }
+
+    /// `pid` shown by the fixture's `/proc`: forked by `ppid`, started at
+    /// `start_ns` (in ticks), running `exe`.
+    fn shown(dir: &Path, pid: u32, ppid: u32, start_ns: u64, exe: &str) {
+        write_started(dir, &pid.to_string(), ppid, start_ns / H::clock_tick_ns());
+        write_exe(dir, pid, exe);
+    }
+
     /// Lot 360 (F4b-1): a process the kernel recorded forked with nothing
     /// executed since (a connect's record, a write's) is named by that record
     /// before `/proc` — at the pump (live) and in the judgement, gone or not,
     /// and before a later exec of it — with its forker's image and that
     /// image's mark. Outside the record's span, and without a record, as
-    /// before: `/proc` at the pump, not known in a judgement.
+    /// before: `/proc` at the pump, not known in a judgement. The review of
+    /// #568 (F1): at the pump the mark only when `/proc` shows the fork
+    /// itself running that image; the image's path (a staging one: judged)
+    /// when it shows neither process.
     #[test]
     fn a_recorded_fork_is_its_forker_s_image_before_proc_and_after_its_exit() {
-        use common::wire::exe::exe_flags::USER_IMAGE;
         let proc = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(proc.path());
         let app = "/tmp/.mount_k360ab/usr/bin/app";
-        let mut e =
-            crate::decision::rules::testutil::spawn_exe("exe", "/proc/self/exe", app, USER_IMAGE);
-        if let Event::ProcessSpawn {
-            pid,
-            timestamp_ns,
-            start_ns,
-            ..
-        } = &mut e
-        {
-            (*pid, *timestamp_ns, *start_ns) = (700, S, S);
-        }
-        assert!(t.ingest_spawn_event(&e));
+        exec_user_image(&t, 700, app, S);
         // its fork at 2 s, seen at its connect (3 s); `/proc` read after the
-        // fact shows another image (it executed since, or the pid was reused)
-        write_exe(proc.path(), 701, "/usr/bin/other");
-        t.ingest_kernel_fork(701, 2 * S, 700, 1000, 3 * S);
-        for as_of in [AsOf::Live(3 * S), AsOf::Judged(3 * S)] {
-            assert_eq!(
-                t.image_path_as(701, as_of).as_deref(),
-                Some(app),
-                "{as_of:?}"
-            );
-            assert!(t.runs_user_image(701, as_of, app), "{as_of:?}");
-            assert!(!t.staged_image_as(701, as_of, app), "{as_of:?}");
-        }
+        // fact shows the pid reused (a later start) by another image
+        shown(proc.path(), 701, 1, 5 * S / 2, "/usr/bin/other");
+        t.ingest_kernel_fork(701, 2 * S, (700, S), 1000, 3 * S);
+        let judged = AsOf::Judged(3 * S);
+        assert_eq!(t.image_path_as(701, judged).as_deref(), Some(app));
+        assert!(t.runs_user_image(701, judged, app));
+        assert!(!t.staged_image_as(701, judged, app));
+        let live = AsOf::Live(3 * S);
+        assert_eq!(t.image_path_as(701, live).as_deref(), Some(app));
+        assert!(!t.runs_user_image(701, live, app), "not confirmed");
+        assert!(t.staged_image_as(701, live, app), "fail-closed");
+        // `/proc` shows the fork itself running its image: confirmed
+        shown(proc.path(), 701, 700, 2 * S, app);
+        assert_eq!(t.image_path_as(701, live).as_deref(), Some(app));
+        assert!(t.runs_user_image(701, live, app), "confirmed");
+        assert!(!t.staged_image_as(701, live, app));
         fs::remove_dir_all(proc.path().join("701")).unwrap();
         assert!(t.runs_user_image(701, AsOf::Judged(3 * S), app), "gone");
         // it executes later: at its connect it still ran its forker's image
@@ -6325,9 +6517,11 @@ mod tests {
         assert!(!t.runs_user_image(701, AsOf::Judged(S + 1), app));
         // a fork of a process not of the image: its forker's mark, none
         t.ingest_exec(710, 1, "/tmp/stage2", &[], S, S, 1000);
-        t.ingest_kernel_fork(711, 2 * S, 710, 1000, 3 * S);
+        t.ingest_kernel_fork(711, 2 * S, (710, S), 1000, 3 * S);
         assert_eq!(t.image_path_as(711, judged).as_deref(), Some("/tmp/stage2"));
         assert!(t.staged_image_as(711, judged, "/tmp/stage2"));
+        // after the record was seen, it may have executed: not by the record
+        assert_eq!(t.image_path_as(711, AsOf::Judged(4 * S)), None);
         // without a record: `/proc` at the pump, and the mark not known
         write_exe(proc.path(), 703, app);
         assert_eq!(
@@ -6337,6 +6531,245 @@ mod tests {
         assert!(!t.runs_user_image(703, AsOf::Live(3 * S), app));
         assert_eq!(t.image_path_as(703, judged), None);
         assert!(t.staged_image_as(703, judged, app), "fail-closed");
+    }
+
+    /// The review of #568 (F1, case a): the forker's latest exec — a shell
+    /// that executes a staged binary in place, then forks — may not be read
+    /// yet when the pump names the fork's connect. At the pump the record
+    /// names the fork only as `/proc` confirms it: the fork shown running
+    /// another file, or its forker shown running another file, is named
+    /// from `/proc` as before; shown by neither, the record names no image
+    /// that would leave its flow unjudged. In the judgement the lineage has
+    /// read the exec: the staged image.
+    #[test]
+    fn a_fork_after_its_forker_s_unread_exec_is_not_named_by_the_earlier_exec() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let (live, judged) = (AsOf::Live(3 * S), AsOf::Judged(3 * S));
+        // the shell's exec read; its `exec /tmp/stage2` at 1.5 s not yet
+        t.ingest_exec(750, 1, "/usr/bin/bash", &[], S, S, 1000);
+        t.ingest_kernel_fork(751, 2 * S, (750, S), 1000, 3 * S);
+        // the fork shown running the staged binary: `/proc`'s
+        shown(proc.path(), 751, 750, 2 * S, "/tmp/stage2");
+        assert_eq!(t.image_path_as(751, live).as_deref(), Some("/tmp/stage2"));
+        assert!(t.staged_image_as(751, live, "/tmp/stage2"));
+        // the fork gone, its forker shown running it: not named at the pump
+        fs::remove_dir_all(proc.path().join("751")).unwrap();
+        shown(proc.path(), 750, 1, S, "/tmp/stage2");
+        assert_eq!(t.image_path_as(751, live), None, "the forker shown");
+        // neither shown: the shell is no image to name it by at the pump
+        fs::remove_dir_all(proc.path().join("750")).unwrap();
+        assert_eq!(t.image_path_as(751, live), None, "neither shown");
+        // the other way: a staged binary executes a system tool in place,
+        // which forks — the forker shown running another file than the
+        // staged one cached: not named by the staged path at the pump
+        t.ingest_exec(755, 1, "/tmp/stage3", &[], S, S, 1000);
+        t.ingest_kernel_fork(756, 2 * S, (755, S), 1000, 3 * S);
+        shown(proc.path(), 755, 1, S, "/usr/bin/sleep");
+        assert_eq!(t.image_path_as(756, live), None, "its forker shown");
+        fs::remove_dir_all(proc.path().join("755")).unwrap();
+        assert_eq!(
+            t.image_path_as(756, live).as_deref(),
+            Some("/tmp/stage3"),
+            "neither shown: a staging path"
+        );
+        // the exec read (the event loop teaches it before the connect's
+        // judgement): the staged image, at the pump and in the judgement
+        t.ingest_exec(750, 1, "/tmp/stage2", &[], 3 * S / 2, S, 1000);
+        for as_of in [live, judged] {
+            assert_eq!(
+                t.image_path_as(751, as_of).as_deref(),
+                Some("/tmp/stage2"),
+                "{as_of:?}"
+            );
+            assert!(t.staged_image_as(751, as_of, "/tmp/stage2"), "{as_of:?}");
+        }
+        // an AppImage's zygote (shown) and its fork gone at once: named by
+        // its image (a staging path: its mark decided in the judgement)
+        let app = "/tmp/.mount_k360ab/usr/bin/app";
+        exec_user_image(&t, 760, app, S);
+        t.ingest_kernel_fork(761, 2 * S, (760, S), 1000, 3 * S);
+        shown(proc.path(), 760, 1, S, app);
+        assert_eq!(t.image_path_as(761, live).as_deref(), Some(app));
+        assert!(!t.runs_user_image(761, live, app), "not at the pump");
+        assert!(t.runs_user_image(761, judged, app));
+        assert!(!t.staged_image_as(761, judged, app));
+        // a program name the walk cut (31 bytes and more): the fork shown
+        // running the whole name is confirmed, named as the exec was
+        let long = "a-program-name-of-forty-one-bytes-or-more";
+        let cut = format!("/tmp/.mount_k360ab/usr/bin/{}…", &long[..31]);
+        exec_user_image(&t, 770, &cut, S);
+        t.ingest_kernel_fork(771, 2 * S, (770, S), 1000, 3 * S);
+        shown(
+            proc.path(),
+            771,
+            770,
+            2 * S,
+            &format!("/tmp/.mount_k360ab/usr/bin/{long}"),
+        );
+        assert_eq!(t.image_path_as(771, live).as_deref(), Some(cut.as_str()));
+        assert!(t.runs_user_image(771, live, &cut));
+        // another file of that start: `/proc`'s
+        shown(
+            proc.path(),
+            771,
+            770,
+            2 * S,
+            &format!("/tmp/.mount_k360ab/usr/bin/x{long}"),
+        );
+        assert_eq!(
+            t.image_path_as(771, live),
+            Some(format!("/tmp/.mount_k360ab/usr/bin/x{long}"))
+        );
+        assert!(!t.runs_user_image(771, live, &cut));
+    }
+
+    /// The review of #568 (F1, case b): the forker's pid held earlier by
+    /// another process, whose exec the cache keeps (`/proc` no longer shows
+    /// it): the record names the forker's start, that exec is not its — no
+    /// image and no mark lent, the lookup as without a record (not known in
+    /// the judgement; the exemption fails closed).
+    #[test]
+    fn a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let judged = AsOf::Judged(3 * S);
+        t.ingest_exec(780, 1, "/usr/bin/curl", &[], S, S, 1000);
+        t.ingest_kernel_fork(781, 2 * S, (780, 3 * S / 2), 1000, 3 * S);
+        assert_eq!(t.image_path_as(781, judged), None);
+        let app = "/tmp/.mount_k360ab/usr/bin/app";
+        exec_user_image(&t, 790, app, S);
+        t.ingest_kernel_fork(791, 2 * S, (790, 3 * S / 2), 1000, 3 * S);
+        assert_eq!(t.image_path_as(791, judged), None);
+        assert!(!t.runs_user_image(791, judged, app));
+        assert!(t.staged_image_as(791, judged, app), "fail-closed");
+        // the forker's own start: its exec answers
+        t.ingest_kernel_fork(792, 2 * S, (790, S), 1000, 3 * S);
+        assert_eq!(t.image_path_as(792, judged).as_deref(), Some(app));
+        assert!(t.runs_user_image(792, judged, app));
+        // a record without the forker's start (a write's of a forker that
+        // executed) is not checked, as before
+        t.ingest_kernel_fork(793, 2 * S, (780, 0), 1000, 3 * S);
+        assert_eq!(
+            t.image_path_as(793, judged).as_deref(),
+            Some("/usr/bin/curl")
+        );
+    }
+
+    /// The review of #568 (F2): a fork on a pid whose earlier holder's exec
+    /// the cache still keeps is not that exec — the kernel's record of it
+    /// (its fork after that process started) names it, at the pump and in
+    /// the judgement. The same process's exec (a verified executor leaves
+    /// its fork record unused) is still the cache's.
+    #[test]
+    fn a_fork_on_a_pid_an_earlier_exec_holds_is_its_forker_s_image() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let judged = AsOf::Judged(3 * S);
+        t.ingest_exec(800, 1, "/tmp/stage2", &[], S, S, 1000);
+        t.ingest_exec(810, 1, "/usr/bin/curl", &[], S, S, 1000);
+        t.ingest_kernel_fork(810, 2 * S, (800, S), 1000, 3 * S);
+        for as_of in [AsOf::Live(3 * S), judged] {
+            assert_eq!(
+                t.image_path_as(810, as_of).as_deref(),
+                Some("/tmp/stage2"),
+                "{as_of:?}"
+            );
+            assert!(t.staged_image_as(810, as_of, "/tmp/stage2"), "{as_of:?}");
+        }
+        // before the fork the pid was curl's process
+        assert_eq!(
+            t.image_path_as(810, AsOf::Judged(3 * S / 2)).as_deref(),
+            Some("/usr/bin/curl")
+        );
+        // every lookup of the lineage (the mini-hunt: a transfer tool's
+        // hops, the impairment's lineage walk read the exec's identity)
+        assert_eq!(
+            t.exec_identity(810, judged).map(|id| id.exe),
+            Some("/tmp/stage2".into())
+        );
+        let hops = t.lineage_identities_seen(810, judged).unwrap_or_default();
+        assert_eq!(
+            hops.first().map(|(p, id)| (*p, id.exe.clone())),
+            Some((810, "/tmp/stage2".into())),
+            "{hops:?}"
+        );
+        // an earlier user image's exec there lends no mark
+        let app = "/tmp/.mount_k360ab/usr/bin/app";
+        exec_user_image(&t, 820, app, S);
+        t.ingest_kernel_fork(820, 2 * S, (800, S), 1000, 3 * S);
+        assert!(!t.runs_user_image(820, judged, app));
+        assert_eq!(t.image_path_as(820, judged).as_deref(), Some("/tmp/stage2"));
+        // the forker's pid too: the generator (870, a fork of rsync, its own
+        // record) on a pid curl held — the writer (871) its fork is rsync's
+        t.ingest_exec(701, 1, "/usr/bin/rsync", &[], S / 2, S / 2, 0);
+        t.ingest_exec(870, 1, "/usr/bin/curl", &[], S, S, 0);
+        t.ingest_kernel_fork(870, 3 * S, (701, S / 2), 0, 5 * S);
+        t.ingest_kernel_fork(871, 4 * S, (870, 3 * S), 0, 5 * S);
+        assert_eq!(
+            t.image_path_as(871, AsOf::Judged(9 * S / 2)).as_deref(),
+            Some("/usr/bin/rsync")
+        );
+        // the record's own process executed (its start the record's)
+        t.ingest_exec(
+            830,
+            1,
+            "/usr/lib/systemd/systemd-executor",
+            &[],
+            2 * S + 1,
+            2 * S,
+            0,
+        );
+        t.ingest_kernel_fork(830, 2 * S, (800, S), 0, 3 * S);
+        assert_eq!(
+            t.image_path_as(830, judged).as_deref(),
+            Some("/usr/lib/systemd/systemd-executor")
+        );
+    }
+
+    /// The review of #568 (F2): a process older than the agent the start's
+    /// scan entered (its start read from `/proc`, in ticks, less the time
+    /// suspended) is the process the kernel's record describes when those
+    /// ticks show the record's start: its entry answers, not the record.
+    #[test]
+    fn a_seeded_entry_of_the_record_s_own_process_is_still_its_image() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::live_on(proc.path(), S / 2);
+        t.ingest_exec(860, 1, "/tmp/stage2", &[], S, S, 1000);
+        write_started(proc.path(), "861", 860, 2 * S / H::clock_tick_ns());
+        write_exe(proc.path(), 861, "/usr/bin/seeded");
+        write_status(proc.path(), 861, 860);
+        assert_eq!(t.seed_from_proc(), 1);
+        t.ingest_kernel_fork(861, 2 * S, (860, S), 1000, 3 * S);
+        assert_eq!(
+            t.image_path_as(861, AsOf::Judged(5 * S / 2)).as_deref(),
+            Some("/usr/bin/seeded")
+        );
+    }
+
+    /// The review of #568 (F3): the pumps are separate threads — an earlier
+    /// holder's record of a pid read after a later process's does not
+    /// replace it; a later process's does. The same process's records merge
+    /// (the forker's start one of them knows is kept).
+    #[test]
+    fn a_late_record_of_an_earlier_process_does_not_replace_a_later_one() {
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        t.ingest_exec(840, 1, "/tmp/stage2", &[], S, S, 1000);
+        t.ingest_exec(850, 1, "/usr/bin/rsync", &[], S, S, 1000);
+        t.ingest_kernel_fork(841, 3 * S, (840, S), 1000, 4 * S);
+        t.ingest_kernel_fork(841, 2 * S, (850, S), 1000, 5 * S / 2);
+        let at = |ns| t.image_path_as(841, AsOf::Judged(ns));
+        assert_eq!(at(7 * S / 2).as_deref(), Some("/tmp/stage2"));
+        assert_eq!(at(9 * S / 4), None, "the earlier one: not held");
+        t.ingest_kernel_fork(841, 5 * S, (850, S), 1000, 6 * S);
+        assert_eq!(at(11 * S / 2).as_deref(), Some("/usr/bin/rsync"));
+        // a write's record without the forker's start, then the connect's:
+        // the start kept, and checked
+        t.ingest_kernel_fork(842, 2 * S, (850, 0), 1000, 3 * S);
+        t.ingest_kernel_fork(842, 2 * S, (850, 3 * S / 2), 1000, 4 * S);
+        t.ingest_kernel_fork(842, 2 * S, (850, 0), 1000, 4 * S);
+        assert_eq!(t.image_path_as(842, AsOf::Judged(7 * S / 2)), None);
     }
 
     /// Lot 310: the lineage keeps the executed file's identity the LSM

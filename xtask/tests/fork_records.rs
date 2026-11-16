@@ -12,7 +12,13 @@
 //! before the pump read it was not named at all. Each wire struct with such
 //! a record is listed here with the function of its pump that teaches it
 //! (`ingest_kernel_fork` in its body, called in that file's production
-//! code): a new one fails until it is taught and listed.
+//! code): a new one fails until it is taught and listed. The order — the
+//! record taught before its events are sent — is pinned by the pumps' own
+//! tests, not here.
+//!
+//! The review of #568 (F1): the teaching hands over the forker's start the
+//! kernel read (`fork_parent_start`), so a forker's pid an earlier process
+//! held lends that process's cached exec to no fork.
 
 mod support;
 
@@ -81,8 +87,9 @@ fn structs_with_fork_records(code: &str) -> Vec<String> {
     out
 }
 
-/// `code` defines `fn name`, whose body names `ingest_kernel_fork`, and
-/// calls `name(` outside that definition.
+/// `code` defines `fn name`, whose body names `ingest_kernel_fork` and the
+/// forker's start (`fork_parent_start`), and calls `name(` outside that
+/// definition.
 fn teaches(code: &str, name: &str) -> bool {
     let mut defined = None;
     for at in ident_uses(code, name) {
@@ -98,7 +105,9 @@ fn teaches(code: &str, name: &str) -> bool {
     let Some((start, end)) = defined else {
         return false;
     };
-    let ingests = !ident_uses(&code[start..end], "ingest_kernel_fork").is_empty();
+    let body = &code[start..end];
+    let ingests = !ident_uses(body, "ingest_kernel_fork").is_empty()
+        && !ident_uses(body, "fork_parent_start").is_empty();
     let called = ident_uses(code, name)
         .into_iter()
         .filter(|&at| at < start || at >= end)
@@ -135,8 +144,9 @@ fn every_kernel_fork_record_is_taught_to_the_lineage() {
             .unwrap_or_else(|| panic!("{record}: {file} not found"));
         assert!(
             teaches(src, f),
-            "{record}: `{f}` in {file} must call `ingest_kernel_fork` and be called \
-             by the pump before the record's events are sent"
+            "{record}: `{f}` in {file} must call `ingest_kernel_fork` with the forker's \
+             start (`fork_parent_start`) and be called in that file (the pump's tests pin \
+             that it runs before the record's events are sent)"
         );
     }
 }
@@ -149,16 +159,20 @@ fn a_fork_record_not_taught_fails_the_ratchet() {
     let wire = "pub struct XRaw {\n    pub pid: u32,\n    pub fork_start: u64,\n    pub fork_ppid: u32,\n}\n\
                 pub struct YRaw {\n    pub fork_ppid: u32,\n}\npub struct Unit;\n";
     assert_eq!(structs_with_fork_records(wire), vec!["XRaw".to_string()]);
-    let good = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, 2, 3, 4);\n}\n\
+    let good = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n\
                 fn pump(r: &XRaw, l: &L) {\n    teach(r, l);\n    send(r);\n}\n";
     assert!(teaches(good, "teach"));
     let no_ingest = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_exec(r.pid);\n}\n\
                      fn pump(r: &XRaw, l: &L) {\n    teach(r, l);\n}\n";
     assert!(!teaches(no_ingest, "teach"));
     let never_called =
-        "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, 2, 3, 4);\n}\n\
+        "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n\
                         fn pump(r: &XRaw) {\n    send(r);\n}\n";
     assert!(!teaches(never_called, "teach"));
-    let named_only = "fn pump(r: &XRaw, l: &L) {\n    let teach = 1;\n    l.ingest_kernel_fork(r.pid, 1, 2, 3, 4);\n}\n";
+    let no_start =
+        "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, 0), 3, 4);\n}\n\
+                    fn pump(r: &XRaw, l: &L) {\n    teach(r, l);\n}\n";
+    assert!(!teaches(no_start, "teach"));
+    let named_only = "fn pump(r: &XRaw, l: &L) {\n    let teach = 1;\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n";
     assert!(!teaches(named_only, "teach"));
 }

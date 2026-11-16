@@ -1828,12 +1828,15 @@ fn connect_events(
 /// that exited before the pump read it was not named at all. With the
 /// record, it is its forker's exec as of its fork, gone or not.
 /// A connect without a record (the process executed since its fork, the
-/// record was lost or not attached) teaches nothing.
+/// record was lost or not attached) teaches nothing. The review of #568
+/// (F1): with the forker's start the kernel read at the fork, so a
+/// forker's pid an earlier process held lends that process's exec to no
+/// fork.
 fn teach_connect_fork(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) {
     lineage.ingest_kernel_fork(
         raw.pid,
         raw.fork_start,
-        raw.fork_ppid,
+        (raw.fork_ppid, raw.fork_parent_start),
         raw.uid,
         raw.timestamp_ns,
     );
@@ -3295,6 +3298,17 @@ mod tests {
         /// a process forked by `ppid` at 0.5 s, as user 1000: a user image's
         /// when `user_image`.
         fn exec(l: &AuthSessionTracker, pid: u32, ppid: u32, exe: &str, user_image: bool) {
+            exec_at(l, (pid, ppid), exe, user_image, S);
+        }
+
+        /// [`exec`] at `ts` (an exec in place, after the process's first).
+        fn exec_at(
+            l: &AuthSessionTracker,
+            (pid, ppid): (u32, u32),
+            exe: &str,
+            user_image: bool,
+            ts: u64,
+        ) {
             let flags = if user_image { USER_IMAGE } else { 0 };
             let mut e =
                 nn_core::decision::rules::testutil::spawn_exe("exe", "/proc/self/exe", exe, flags);
@@ -3306,7 +3320,7 @@ mod tests {
                 ..
             } = &mut e
             {
-                (*p, *pp, *timestamp_ns, *start_ns) = (pid, ppid, S, S / 2);
+                (*p, *pp, *timestamp_ns, *start_ns) = (pid, ppid, ts, S / 2);
             }
             assert!(l.ingest_spawn_event(&e));
         }
@@ -3333,6 +3347,20 @@ mod tests {
 
         fn exited(proc: &Path, pid: u32) {
             std::fs::remove_dir_all(proc.join(pid.to_string())).unwrap();
+        }
+
+        /// The lab's process `pid` (exec'd at 1 s by [`exec`], started at
+        /// 0.5 s) shown by the fixture's `/proc`, running `exe`.
+        fn shown_since_exec(proc: &Path, pid: u32, ppid: u32, exe: &str) {
+            running(proc, pid, ppid, exe);
+            let ticks = (S / 2) / tick_ns();
+            std::fs::write(
+                proc.join(pid.to_string()).join("stat"),
+                format!(
+                    "{pid} (exe) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+                ),
+            )
+            .unwrap();
         }
 
         /// `pid`'s connect to a listener of the guest's (10.0.2.15:8000) 2 s
@@ -3599,6 +3627,113 @@ mod tests {
                     "{who}'s package manager"
                 );
             }
+        }
+
+        /// The review of #568 (F1, case a): a shell (its exec read) executes
+        /// a staged binary in place and forks; the fork connects before the
+        /// event loop has read that exec. Named from `/proc` while it runs
+        /// (`/proc` contradicts the record), or not at all when only its
+        /// forker is shown — never as the shell, which would leave it
+        /// unjudged: NN-L-NET-008 kills, alive or gone, the exec read before
+        /// the judgement or not. Before, the row was the shell and NET-008
+        /// gave no verdict.
+        #[test]
+        fn a_staged_binary_executed_in_place_before_its_fork_keeps_net_008() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            exec(&w.lineage, 4950, 1, "/usr/bin/bash", false);
+            shown_since_exec(proc.path(), 4950, 1, STAGED);
+            running(proc.path(), 4951, 4950, STAGED);
+            let r = row(&w, &connect(4951, 4950));
+            assert_eq!(r.exe.as_deref(), Some(STAGED), "the fork shown");
+            assert_eq!(net_008(&w, &r), kill, "the exec not read");
+            // the fork shown at the pump, gone by the judgement, the exec read
+            running(proc.path(), 4952, 4950, STAGED);
+            let r = row(&w, &connect(4952, 4950));
+            exited(proc.path(), 4952);
+            exec_at(&w.lineage, (4950, 1), STAGED, false, 3 * S / 2);
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), kill, "the exec read after the pump");
+            // gone before the pump, its forker shown: named in the judgement
+            exec(&w.lineage, 4960, 1, "/usr/bin/bash", false);
+            shown_since_exec(proc.path(), 4960, 1, STAGED);
+            let r = row(&w, &connect(4961, 4960));
+            assert_eq!(r.exe, None, "not the shell");
+            exec_at(&w.lineage, (4960, 1), STAGED, false, 3 * S / 2);
+            assert_eq!(net_008(&w, &r), kill, "gone before the pump");
+        }
+
+        /// The review of #568 (F1, case b): a staged binary forks A (no
+        /// exec), A forks C and exits; A's pid had held a process whose exec
+        /// the cache keeps (curl, or an AppImage's program). The record names
+        /// A's start, which is not that process's: C is named from `/proc`
+        /// and NN-L-NET-008 kills — however long after the staged exec.
+        /// Before, C was curl (no verdict) or took the AppImage's mark.
+        #[test]
+        fn a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            exec(&w.lineage, 4970, 1, "/usr/bin/curl", false);
+            running(proc.path(), 4971, 1, STAGED);
+            let mut raw = connect(4971, 4970);
+            raw.fork_parent_start = fork_start() - S;
+            raw.fork_anchor = 4900;
+            let r = row(&w, &raw);
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), kill, "an earlier curl");
+            // the earlier holder an AppImage's program: no mark lent
+            exec(&w.lineage, 4975, 1, APP, true);
+            running(proc.path(), 4976, 1, APP);
+            let mut raw = connect(4976, 4975);
+            raw.fork_parent_start = fork_start() - S;
+            raw.fork_anchor = 4900;
+            let r = row(&w, &raw);
+            exited(proc.path(), 4976);
+            assert_eq!(net_008(&w, &r), kill, "an earlier AppImage program");
+        }
+
+        /// The review of #568 (F2): a staged binary's fork-only child takes a
+        /// pid whose earlier holder ran curl (still cached), connects and
+        /// exits before the pump reads it. The connect's record (a fork after
+        /// that process started) names it: the staged image, NN-L-NET-008
+        /// kills. Before (main too), the row was curl.
+        #[test]
+        fn a_fork_on_a_reused_pid_is_not_named_by_its_earlier_holder_s_exec() {
+            let (_proc, w) = lab();
+            exec(&w.lineage, 4980, 1, "/usr/bin/curl", false);
+            let r = row(&w, &connect(4980, 4900));
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), Some(ResponseAction::KillProcess));
+        }
+
+        /// The AppImage forms with the zygote shown by `/proc` (its start the
+        /// record's forker's): its fork-only child, gone before the pump or
+        /// at once, is its image's (no NN-L-NET-008); one whose program name
+        /// the walk cut (31 bytes or more) too, named as its exec was.
+        #[test]
+        fn an_appimage_s_fork_only_child_with_its_zygote_shown_draws_no_net_008() {
+            let (proc, w) = lab();
+            shown_since_exec(proc.path(), 4800, 4790, APP);
+            let r = row(&w, &connect(4807, 4800));
+            assert_eq!(r.exe.as_deref(), Some(APP), "gone before the pump");
+            assert_eq!(net_008(&w, &r), None);
+            running(proc.path(), 4808, 4800, APP);
+            let r = row(&w, &connect(4808, 4800));
+            exited(proc.path(), 4808);
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None, "gone at once");
+            let long = "an-electron-program-name-of-31-bytes-or-more";
+            let cut = format!("/tmp/.mount_k360ab/usr/lib/{}…", &long[..31]);
+            exec(&w.lineage, 4820, 4790, &cut, true);
+            running(
+                proc.path(),
+                4821,
+                4820,
+                &format!("/tmp/.mount_k360ab/usr/lib/{long}"),
+            );
+            let r = row(&w, &connect(4821, 4820));
+            assert_eq!(r.exe.as_deref(), Some(cut.as_str()));
+            assert_eq!(net_008(&w, &r), None, "a cut program name");
         }
 
         /// A fork-only child connects, then executes: judged before or after

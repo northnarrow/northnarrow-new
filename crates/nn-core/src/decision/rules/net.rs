@@ -4339,7 +4339,7 @@ mod tests {
             }
             assert!(lineage.ingest_spawn_event(&e));
         }
-        lineage.ingest_kernel_fork(4302, 600, 4300, 1000, 2_000);
+        lineage.ingest_kernel_fork(4302, 600, (4300, 0), 1000, 2_000);
         let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage.clone()));
         assert!(rule.evaluate(&flow_from(None, 4300, 8080)).is_none());
         assert!(rule.evaluate(&flow_from(Some(app), 4300, 8080)).is_none());

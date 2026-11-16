@@ -11772,12 +11772,60 @@ number in parentheses is a lab PR.
     R001 and CHAIN-005; the home reference NET-007 only. Guests left
     clean (agent uninstalled, no `.local`, no pins, packages purged, no
     mounts), powered off.
-  - Found in the lab, not this lot's fix: an image file whose name is 31
-    bytes or more (`K360-continuous-x86_64.AppImage`) is never tied (the
-    LSM exe walk keeps 31 bytes of a name and marks it cut, so the image's
-    path names no file): every shape R001 High and CHAIN-002/005 Critical
-    on 5.15 and 6.8, the fork-only shape the same on 7.0. Common release
-    names are that long.
+  - Found in the lab, fixed in the fix round below: an image file whose
+    name is 31 bytes or more (`K360-continuous-x86_64.AppImage`) was never
+    tied (the LSM exe walk keeps 31 bytes of a name and marks it cut, so the
+    image's path named no file): every shape R001 High and CHAIN-002/005
+    Critical on 5.15 and 6.8, the fork-only shape the same on 7.0. Common
+    release names are that long.
+  - Fix round 1 (the review of #568). F1: the forker's cached exec answers
+    only when its process has the start the kernel read at the fork (a
+    forker's pid an earlier process held lends nothing); at the pump the
+    record names a fork only when `/proc` shows that fork running the
+    image, `/proc` wins when it shows the fork or its forker running another
+    file (the forker's exec in place, not yet read), and with neither shown
+    only a staging path is named (fail-closed; the mark is decided in the
+    judgement). F2: a cached exec of an earlier process of a pid the
+    kernel's record shows forked since is not held, in every lineage lookup
+    (`cached_live`: the flow's image, a hop's identity, a forker's exec). F3:
+    a record replaces another of the same pid only for a later process. Q1:
+    the tie takes the image's whole path from its daemon's `exe` link when
+    it is the walk's path name by name (`walk_may_name`, a cut name its
+    start) and under no FUSE mount; the device and inode decide. No eBPF
+    change (the object's bytes are the same). Named tests: the review's
+    probes as `a_staged_binary_executed_in_place_before_its_fork_keeps_net_008`,
+    `a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork`,
+    `a_fork_on_a_reused_pid_is_not_named_by_its_earlier_holder_s_exec`
+    (multiplexer, pump to NN-L-NET-008), five lineage tests, two
+    `app_image` tests (30, 31, 32, 60 bytes, a 40-byte directory, the LSM
+    check; another inode, another directory, a FUSE mount, another user),
+    the walk helper's; with the round's lineage logic reverted, the 10 bug
+    tests fail. Mutation: 33 mutants, 30 caught by a named test, 3 argued
+    equivalent (a start read again after the link: a pid reuse between two
+    reads; an inconsistent record; a FUSE guard ordered before a `stat` that
+    a later check repeats).
+  - Lab of the fix round (alpha profile, as above; four images: `continuous`
+    and `20251108` named in 22 bytes, `continuous` named in 31 and in 60
+    bytes, the 60-byte one's program named in 40): ubuntu2604 (7.0) on the
+    round's code with F2 in the fork's own lookup only, ubuntu2204 (5.15)
+    and ubuntu2404 (6.8) with F2 in every lookup (the round's last commit,
+    after the lab, sends the unconfirmed record through the one staging
+    door, `staged_image_as`, and changes text). On the three kernels, each
+    of the four images, the 31- and 60-byte ones included: the main process
+    connecting (twice), the zygote's fork+exec child, its fork-only child
+    exiting at once (three runs) and alive 3 s after its connect,
+    NN-L-NET-007 Medium only, every run, the listener counting one accept
+    per case; on 7.0 every main-process run drew its NET-007 (the empty
+    runs of the first round not seen again). Controls, still judged on each kernel: the AppImage
+    copied to `/tmp` R001 High and NN-L-CHAIN-002 or -005 Critical (would
+    have: KillProcessTree); a `python3` copy staged in `/tmp`, its fork-only
+    child (exiting at once, alive 3 s) and a fork after that binary was
+    executed in place, NN-L-CHAIN-005 Critical with NN-L-NET-008 among its
+    matches (R001 High besides, except the first staged run on 7.0);
+    `squashfuse` over the same squashfs R001 and CHAIN-005 with NET-008
+    among its matches; the home reference NET-007 only. Guests left clean
+    (agent uninstalled, no `.local`, packages purged, no mounts), powered
+    off.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

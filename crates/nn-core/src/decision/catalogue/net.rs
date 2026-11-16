@@ -202,7 +202,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           programs (its runtime's read-only `/tmp/.mount_*`, tied to the image \
                           by the exec pump; the spawn cache keeps it for their forks) are the \
                           image's, not staged. Lot 360: a zygote's fork-only child is its \
-                          forker's, by the connect's fork record, also when it exits at once.",
+                          forker's, by the connect's fork record, also when it exits at once; \
+                          an image whose file name is 31 bytes or more is tied as well.",
         how_to_test: "In detect-only (R001 would kill the exec first), run a copy of `python3` \
                       from `/tmp` that connects more than 5 minutes after its exec, when the \
                       chain precursor is gone: `cp /usr/bin/python3 /tmp/nn-py; /tmp/nn-py -c \
@@ -215,6 +216,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction",
             "crates/nn-linux/src/sensors/multiplexer.rs::an_appimage_s_fork_only_child_exiting_at_once_draws_no_net_008",
             "crates/nn-linux/src/sensors/multiplexer.rs::a_staged_binary_and_its_fork_only_children_keep_net_008",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_staged_binary_executed_in_place_before_its_fork_keeps_net_008",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_fork_on_a_reused_pid_is_not_named_by_its_earlier_holder_s_exec",
         ],
         attack_note: "A staged payload calling out is mapped to its likeliest purpose, \
                       fetching the next stage (T1105); the flow's protocol is not seen, and a \

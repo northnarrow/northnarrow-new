@@ -1082,38 +1082,38 @@ mod tests {
         // (no judgement in the messages: CodeQL reads it as a record)
         assert!(unknown(&judged(702)), "702 before its record");
         // the kernel's record, carried by its write: rsync's copy, vouched
-        t.ingest_kernel_fork(702, 4 * S, 701, 0, write);
+        t.ingest_kernel_fork(702, 4 * S, (701, 0), 0, write);
         let rsync = |got: Judged| matches!(got, Judged::Trusted(Trusted::PackagedProgram(p)) if p == "/usr/bin/rsync");
         assert!(rsync(judged(702)), "702 with its record");
         // under the unpackaged script's rsync: judged, the script the actor
-        t.ingest_kernel_fork(802, 4 * S, 801, 0, write);
+        t.ingest_kernel_fork(802, 4 * S, (801, 0), 0, write);
         assert!(
             matches!(judged(802), Judged::Untrusted { actor: 800, .. }),
             "802 under the script"
         );
         // seen before the write (it may have executed since), started after
         // it, a forker not known, a record of itself or of no one: not used
-        t.ingest_kernel_fork(703, 4 * S, 701, 0, write - 1);
-        t.ingest_kernel_fork(704, write + 1, 701, 0, write + 2);
-        t.ingest_kernel_fork(705, 4 * S, 999, 0, write);
-        t.ingest_kernel_fork(706, 4 * S, 706, 0, write);
-        t.ingest_kernel_fork(707, 4 * S, 0, 0, write);
+        t.ingest_kernel_fork(703, 4 * S, (701, 0), 0, write - 1);
+        t.ingest_kernel_fork(704, write + 1, (701, 0), 0, write + 2);
+        t.ingest_kernel_fork(705, 4 * S, (999, 0), 0, write);
+        t.ingest_kernel_fork(706, 4 * S, (706, 0), 0, write);
+        t.ingest_kernel_fork(707, 4 * S, (0, 0), 0, write);
         for pid in [703, 704, 705, 706, 707] {
             assert!(unknown(&judged(pid)), "pid {pid}");
         }
         // a forker that executed only after the fork (forked from rsync at
         // 3.5 s, seen unexecuted at 5 s, `gzip` at 6 s): at the fork it ran
         // rsync's image — its own fork record says so, not `/proc`
-        t.ingest_kernel_fork(900, 3 * S + S / 2, 701, 0, 5 * S);
+        t.ingest_kernel_fork(900, 3 * S + S / 2, (701, 0), 0, 5 * S);
         let mut gz = exec(900, 701, "/usr/bin/gzip", &["gzip"], 0, 3 * S + S / 2);
         if let Event::ProcessSpawn { timestamp_ns, .. } = &mut gz {
             *timestamp_ns = 6 * S;
         }
         assert!(t.ingest_spawn_event(&gz));
-        t.ingest_kernel_fork(902, 4 * S, 900, 0, write);
+        t.ingest_kernel_fork(902, 4 * S, (900, 0), 0, write);
         assert!(rsync(judged(902)), "902 through its forker's record");
         // without that record: not known
-        t.ingest_kernel_fork(904, 4 * S, 903, 0, write);
+        t.ingest_kernel_fork(904, 4 * S, (903, 0), 0, write);
         let mut gz = exec(903, 701, "/usr/bin/gzip", &["gzip"], 0, 3 * S + S / 2);
         if let Event::ProcessSpawn { timestamp_ns, .. } = &mut gz {
             *timestamp_ns = 6 * S;

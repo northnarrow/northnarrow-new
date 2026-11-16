@@ -25,8 +25,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           355: an AppImage's own programs, served read-only at its runtime's \
                           `/tmp/.mount_*` (the exec pump ties the mount to the image file the \
                           user ran, `USER_IMAGE`), are the image's: no record, as from the \
-                          home. An AppImage itself in `/tmp`, an extracted one, a writable \
-                          FUSE mount or another program's daemon stay judged.",
+                          home (lot 360: also an image whose file name is 31 bytes or more, \
+                          by its whole path as its daemon runs it). An AppImage itself in \
+                          `/tmp`, an extracted one, a writable FUSE mount or another \
+                          program's daemon stay judged.",
         how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
                       && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
