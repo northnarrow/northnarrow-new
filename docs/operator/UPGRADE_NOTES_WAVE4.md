@@ -3914,9 +3914,14 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   clears a round later.
 - **Named, not changed:** a lazy unmount in a namespace that is not PID
   1's, the agent's or the watchdog's, of a subtree whose first 32 mounts
-  are all private, behind which lies a copy in one of the host's
+  (or a chain of 9 levels) are all private, behind which lies a copy in one of the host's
   peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
-  namespace) is not refused: the walk is bounded. And the regroup window
+  namespace) is not refused: the walk is bounded. A lazy unmount that races the
+  walk (a copy grafted by a concurrent rbind after the guard read the
+  subtree, in any namespace) is not refused either: the hook runs before
+  the kernel's mount lock (re-check 3 of #567, N4); the deny links stay,
+  the loss is signed, the pins do not. To close it: the pin directory as
+  its own private, unbindable mount. And the regroup window
   of §51.2 (a peer of a regrouped held parent unmounting through it before
   the refresh) needs only one shared slave of that parent, not 16 mounts —
   every sandboxed unit's namespace is one — hiding the host's bpffs mount

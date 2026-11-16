@@ -180,14 +180,24 @@ analysis is in the
   (binds of `/var`) or a host whose `/` is a tmpfs signs its layout as not
   canonical at each start (`mount_not_canonical`) — a `systemd-sysext`,
   `confext` or composefs overlay merged at boot does not.
+- **An unmount that races the guard's read.** The kernel calls the
+  unmount hook before it takes its mount lock. A copy grafted by a slow,
+  concurrent rbind after the guard has read the subtree is taken by a lazy
+  unmount, in any namespace, the guarded ones included: `/sys/fs/bpf` can
+  lose its last mount. The deny hooks stay attached (the agent holds their
+  descriptors) and the loss is signed High, but the pins are gone: a later
+  start must load again, and the watchdog's handles on pinned maps fail.
+  Planned: the pin directory made its own private, unbindable mount, which
+  no propagation or copy can reach (re-check 3 of #567, N4).
 - **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
   takes the whole subtree of the mount it names, and the kernel carries
   the unmount of each mount in it onto the peers and slaves of its parent:
   the guard reads that subtree, 32 mounts of it (the re-check 2 of #567).
   Two unmounts it does not refuse, root building them on purpose:
   - in a namespace that is not PID 1's, the agent's or the watchdog's (a
-    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 mounts are all
-    private, behind which lies a copy (an rbind of `/sys`) in one of
+    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 mounts, or a
+    chain of 9 levels (about 10 mounts), are all private, behind which
+    lies a copy (an rbind of `/sys`) in one of
     the host's peer groups: the kernel takes the host's childless
     `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
     the watchdog's and the units' namespaces (slaves of the host's). The

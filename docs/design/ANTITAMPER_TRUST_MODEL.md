@@ -3079,7 +3079,13 @@ where it starts.
 - An unmount whose subtree is wider than the walk, in a namespace not
   guarded, with only private mounts read: let through (a container
   runtime's old root has that shape; so has a copy hidden behind 32
-  private mounts). An unmount through a regrouped parent before the
+  private mounts, or a chain of 9 levels).
+- An unmount that races the walk: the unmount hook runs before the
+  kernel's namespace lock, so a copy grafted by a concurrent rbind after
+  the walk is taken by a lazy unmount, in a guarded namespace too (N4 of
+  the re-check 3 of #567). The deny links stay (held descriptors) and
+  the loss is signed; the pins do not. The closure planned: a private,
+  unbindable mount of the pin directory. An unmount through a regrouped parent before the
   refresh: one shared slave of it ends the walk (§51.2's window).
 - A change reaches a guarded namespace through one group (the target's
   is a guarded mount's own or master group); two masters deep is not

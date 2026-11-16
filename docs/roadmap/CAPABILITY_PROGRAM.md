@@ -11691,8 +11691,9 @@ number in parentheses is a lab PR.
     to) and is once an hour per caller image and target otherwise
     (`common::ptrace_read`, `PTRACE_READ_QUIET`, `PTRACE_READ_SEEN`); the
     refusal unchanged. P3: KNOWN_LIMITATIONS names the two unmounts the
-    walk does not refuse (a copy behind 32 private mounts of a namespace
-    not guarded; the regroup window, one shared slave enough) and what the
+    walk does not refuse (a copy behind 32 private mounts, or a chain of
+    9, of a namespace not guarded; the regroup window, one shared slave
+    enough; a lazy unmount racing the walk, N4 of the re-check 3) and what the
     bpffs losing its last mount does; `ProcFacts`'s `/proc` root is
     `proc_root` (a planted `std::fs::read_link` in `trusted_exe_now` is
     caught by the kernel-views ratchet now). The coordinator's decision
