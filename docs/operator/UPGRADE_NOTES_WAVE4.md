@@ -3928,3 +3928,128 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
   the pins can still be lost or hidden, the hooks no longer detach while
   the agent runs.
+
+## 52. The pin directory is locked; three record fixes (lot 359)
+
+The re-check 3 of #567 named an unmount the guard could not stop: the
+kernel calls the unmount hook before it takes its namespace lock, so the
+subtree the guard reads can still grow (a copy grafted by a concurrent
+rbind), and the walk reads a bounded subtree only. A lazy unmount could then
+take the host's bpffs, and the pins with it, in any namespace (N4, and the
+residual of §51.3). This lot closes both for the pins.
+
+### 52.1 The lock
+
+- **What it is.** The agent's pin directory, `/sys/fs/bpf/northnarrow`, is
+  bound onto itself, made private, then unbindable, as the child of the
+  host's bpffs in PID 1's mount namespace. The kernel never takes, in an
+  unmount's propagation, a mount that keeps a child that is not itself
+  unmounted, and an rbind never copies an unbindable mount: whatever an
+  unmount elsewhere takes (a racing graft, a subtree wider or deeper than
+  the walk), the host's bpffs keeps its child, and the pins stay. A unit's
+  own namespace (the agent's and the watchdog's among them) is not
+  covered at its start: systemd builds its view with a recursive bind,
+  which skips an unbindable mount (the lab: no copy of the lock there), so
+  a racing unmount can still take that namespace's view of the bpffs —
+  not the pins, which the host's bpffs keeps; the agent and the watchdog
+  keep their anchors, and a restart builds the view again.
+- **Who makes it, and when.** A new step of the agent's unit, before the
+  agent's process exists and before any pin is written:
+  `ExecStartPre=-+/usr/local/bin/northnarrow-agent --pin-lock` (install.sh
+  rewrites the path with `BIN_DIR`). `+` runs it with full privileges,
+  outside the unit's sandbox — the agent itself has no `CAP_SYS_ADMIN` and
+  no `mount(2)` (its system call filter), on purpose, for its whole life,
+  so it could not make a mount in the host's namespace, nor `setns(2)` into
+  it. The unit's `LogNamespace=` still gives the step the unit's own mount
+  namespace, so the step enters PID 1's itself (`setns(2)`), then checks it
+  is there. `-`: a lock that cannot be made does not fail the start. The step uses the new mount API (`open_tree(OPEN_TREE_CLONE)`, then
+  `move_mount(2)`), then `MS_PRIVATE`, then `MS_UNBINDABLE`, and reads
+  PID 1's table again; one line in the unit's journal: `pin lock: made`,
+  `reused`, `repaired`, or `NOT made: <why>`.
+- **Kept across restarts.** A lock already in place, private and
+  unbindable, is reused; a reboot's new bpffs has none, and the next start
+  makes it. A lock whose propagation changed is made private and
+  unbindable again.
+- **The guard.** The lock passes the mount guard only as its maker's own
+  three steps: the agent's binary run as a unit's process (PID 1's child,
+  the main thread, in its first seconds, its start-in-cgroup and injection
+  marks clean), and exactly the self-bind of the pin directory onto itself
+  in PID 1's namespace (judged by the kernel's objects: a detached,
+  childless clone whose root is the target's own dentry, on the bpffs, not
+  stacked), then `MS_PRIVATE`, then `MS_UNBINDABLE` on the lock itself.
+  Anything else is refused and signed High (`NN-L-AT-001`, operation
+  `mount`): an unmount or a move of it (a held mount), a mount on or below
+  it, any other change of its propagation — on the lock, or on a copy of it
+  in a namespace whose changes reach the host's — and a recursive
+  `MS_SHARED` on `/`, `/sys` or `/sys/fs/bpf` that would make it shared. A
+  caller who forged the maker's identity gains nothing: each of the three
+  steps only makes the lock.
+- **The integrity round.** The start reads the lock in PID 1's table: in
+  place, or a signed degradation (the walk of §51.3 then remains the
+  defence). Each round after a start that found it in place checks it is
+  still there, private, unbindable and the child of the host's bpffs:
+  missing (`pin_lock_missing`) or changed (`pin_lock_changed`), a signed
+  High, and the lock made again by the same step, run in a transient unit
+  (`systemd-run`, at most 20 s, waited for at most 30 s), its result in
+  the record; the guard's held mounts are read again for its new id within
+  a second.
+- **Uninstall, upgrade, the window.** A mount point cannot be removed:
+  `uninstall.sh` and `install.sh` unmount the lock before they remove the
+  pin root (`rm_pin_root`), which the guard lets through only inside the
+  signed trusted-installer window (recorded, `FS_OP_MOUNT_WINDOW`). No lock
+  is left behind.
+- **What it does not cover.** The units' own views of the bpffs (above).
+  `/sys/fs/cgroup` has no such child: its
+  unmount by a racing or out-of-bound lazy unmount stays behind the walk
+  (KNOWN_LIMITATIONS.md). `mount_setattr(2)` has no hook: a change of the
+  lock's propagation made through it is seen at the next integrity round
+  (signed High, the lock made again then).
+- **For you.** `mount --make-rshared /` (or of `/sys`, `/sys/fs/bpf`) in
+  the host's namespace, or in a raw `unshare(CLONE_NEWNS)` namespace that
+  keeps the host's peer groups (`unshare -m --propagation shared` among
+  them), is refused: it would make the lock shared. A recursive
+  `MS_PRIVATE` or `MS_SLAVE` (container runtimes, `unshare -m`,
+  `systemd-nspawn`, systemd's own unit namespaces) is not judged. A tool
+  that removes `/sys/fs/bpf/northnarrow` by hand must unmount it first, in
+  a window. `findmnt /sys/fs/bpf/northnarrow` shows the lock
+  (`unbindable`).
+
+- **The root's own point (a fix found by the lab).** The host's `/` was
+  read through `/proc/1/root/` without following its link (a path's
+  trailing `/` is no component): the key registered was the link's, so
+  `/` was no point of the guard (`mount --make-rshared /` was let through
+  in the lab, and the lock repaired a round later), and no mount's place
+  directly under `/` (`/sys`, `/proc`, `/run`, `/etc`…) was held in PID 1's
+  or the watchdog's namespace. Both are read through the link now: a mount
+  on `/`, a read-only bind remount of `/`, an unmount propagating onto a
+  root-level held mount from a namespace that reaches the host's are
+  judged as the other points always were.
+
+### 52.2 The re-check 3's records (P3)
+
+- **journald's quiet reads.** The packaged journald's refused reads of the
+  agent's processes are left unrecorded only while its start-in-cgroup and
+  injection marks are clean: a process written into journald's cgroup, or
+  journald with code-injection access given to another, is recorded as any
+  caller.
+- **The dedup of a refused read carries the caller's cgroup.** An
+  interpreter is one image for every program it runs: a collector's record
+  no longer silences another program's probe of the same target, by the
+  same interpreter, for the hour.
+- **A record the budget drops is not "seen".** The once-an-hour key was
+  written before the records' budget was asked: a flood of minor refusals
+  on one CPU dropped the first record and still silenced that program and
+  target for an hour. It is written once the record is let through.
+- **The executor's identities before the fork record attaches.** A unit
+  started in the window between the fork record's attach and the identities'
+  write (at each start of the agent) carried `fork_ppid` 0 ("not known").
+  The identities are written first.
+- **The watchdog's handles on the pinned maps.** A failure of
+  `register_self_pid`, `claim_role`, `reinsert_new_agent_pid` or
+  `evict_dead_agent` (the pins out of reach) is a record the agent signs, a
+  degradation of its status (`watchdog_pin_handle_failed`), once per handle
+  and watchdog — no longer only a log line.
+- **eBPF.** The ptrace guard's record (`emit_task_read_denial`: its quiet
+  check, its dedup key, its order) and the mount guard (`sb_mount`'s change
+  of propagation, `move_mount`'s self-bind) changed; the fork record's
+  program did not.

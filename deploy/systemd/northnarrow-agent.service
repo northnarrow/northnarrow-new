@@ -79,6 +79,19 @@ LogRateLimitBurst=50000
 # next start). Lab PR 216: the watchdog's own unit has one
 # (northnarrow-watchdog-failed.service).
 ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
+# Lot 359 (the re-check 3 of #567, N4): the lock of the pin directory — it
+# bound onto itself, private and unbindable, as the child of the host's
+# bpffs, before the agent writes a pin. The kernel never takes, in an
+# unmount's propagation, a mount that keeps a child that is not itself
+# unmounted, and an rbind never copies an unbindable mount: the host's
+# bpffs and the pins stay, whatever an unmount elsewhere takes. `+`: with
+# full privileges, outside this unit's sandbox (the agent itself has no
+# CAP_SYS_ADMIN and no mount(2), on purpose); LogNamespace= still gives the
+# step this unit's mount namespace, so the step enters PID 1's itself
+# (setns). `-`: a lock that cannot be made does not fail the start (the
+# agent signs the degradation). One already in place is reused; a reboot's
+# new bpffs gets a new one.
+ExecStartPre=-+/usr/local/bin/northnarrow-agent --pin-lock
 # Lab PR 265 (review #466 F4-bis): this unit's runtime drop-in directory,
 # made (empty) before every start so that the agent registers it with its
 # deny hooks as it does the persistent one: a new drop-in there —

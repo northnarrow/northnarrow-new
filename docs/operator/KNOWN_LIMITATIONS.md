@@ -183,12 +183,24 @@ analysis is in the
 - **An unmount that races the guard's read.** The kernel calls the
   unmount hook before it takes its mount lock. A copy grafted by a slow,
   concurrent rbind after the guard has read the subtree is taken by a lazy
-  unmount, in any namespace, the guarded ones included: `/sys/fs/bpf` can
-  lose its last mount. The deny hooks stay attached (the agent holds their
-  descriptors) and the loss is signed High, but the pins are gone: a later
-  start must load again, and the watchdog's handles on pinned maps fail.
-  Planned: the pin directory made its own private, unbindable mount, which
-  no propagation or copy can reach (re-check 3 of #567, N4).
+  unmount, in any namespace, the guarded ones included. For the pins this
+  is closed (lot 359, re-check 3 of #567, N4): the pin directory is locked
+  — bound onto itself, private and unbindable, as the child of the host's
+  bpffs (the agent unit's `--pin-lock` step) — and the kernel never takes,
+  in an unmount's propagation, a mount that keeps a child that is not
+  itself unmounted, while an rbind never copies an unbindable mount: the
+  host's bpffs and the pins stay. A start that finds no lock (a kernel
+  without `open_tree(2)`, an error) signs a degradation and keeps only the
+  walk. Still open: `/sys/fs/cgroup` has no such child, so a racing lazy
+  unmount can take the host's childless cgroup mount (the integrity round
+  signs `protected_mount_gone`, High); a unit's own namespace — the
+  agent's and the watchdog's among them — gets no copy of the lock at its
+  start (systemd builds its view with a recursive bind, which skips an
+  unbindable mount), so such an unmount can take that namespace's view of
+  the bpffs (not the pins; the agent and the watchdog keep their anchors,
+  a restart builds the view again); and the lock's propagation changed
+  through `mount_setattr(2)` (no hook) is seen at the next integrity round
+  (`pin_lock_changed`, High, the lock made again), not refused.
 - **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
   takes the whole subtree of the mount it names, and the kernel carries
   the unmount of each mount in it onto the peers and slaves of its parent:
@@ -199,9 +211,11 @@ analysis is in the
     chain of 9 levels (about 10 mounts), are all private, behind which
     lies a copy (an rbind of `/sys`) in one of
     the host's peer groups: the kernel takes the host's childless
-    `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
-    the watchdog's and the units' namespaces (slaves of the host's). The
-    bpffs then loses its last mount: no path reaches its pins any more
+    `/sys/fs/cgroup` and its copies in the agent's, the watchdog's and the
+    units' namespaces (slaves of the host's). Since lot 359 the bpffs is
+    not childless — its lock keeps it, and the pins — so what follows
+    applies only when the start signed the lock's absence: the bpffs
+    then loses its last mount: no path reaches its pins any more
     (the watchdog's handles on the pinned maps fail; a later start finds
     none), while its super block, the pins in it, lives on as long as the
     agent holds a descriptor in it (its anchor of `/sys/fs/bpf`, lot 353).

@@ -1669,7 +1669,14 @@ pub fn hold_record_path(shutdown_marker: &Path) -> PathBuf {
 /// self), so an unregistered watchdog could not deliver its
 /// stuck-recovery SIGINT→SIGKILL. Best effort for the caller: no pinned
 /// map (agent without BPF-LSM) is a warn, not a fatal.
-pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
+///
+/// Lot 359 (the re-check 3 of #567, P3 e): a role not claimed is handed to
+/// `role_failed` (the caller's signed degradation, [`pin_handle_failed`]).
+pub fn register_self_pid(
+    bpffs_root: &Path,
+    own_pid: u32,
+    role_failed: impl FnOnce(&anyhow::Error),
+) -> Result<()> {
     let mut handle = ProtectedPidsHandle::open(bpffs_root).with_context(|| {
         format!(
             "opening PROTECTED_PIDS handle at {} for self-registration",
@@ -1692,9 +1699,71 @@ pub fn register_self_pid(bpffs_root: &Path, own_pid: u32) -> Result<()> {
     if let Err(e) =
         antitamper_bpf::claim_role(bpffs_root, antitamper_bpf::ROLE_SLOT_WATCHDOG, own_pid)
     {
-        debug!(target: "watchdog", error = %e, "watchdog role not recorded (the agent records it on verification)");
+        warn!(target: "watchdog", error = %e, "watchdog role not recorded (the agent records it on verification)");
+        role_failed(&e);
     }
     Ok(())
+}
+
+/// Lot 359 (the re-check 3 of #567, P3 e): the handles the watchdog takes
+/// on the agent's pinned maps whose failure is a signed degradation (a
+/// hold record [`nn_proto::watchdog_hold::REASON_PIN_HANDLE_FAILED`]).
+pub const PIN_HANDLES: [&str; 4] = [
+    "register_self_pid",
+    "claim_role",
+    "reinsert_new_agent_pid",
+    "evict_dead_agent",
+];
+
+/// Lot 359 (P3 e): the [`nn_proto::watchdog_hold::REASON_PIN_HANDLE_FAILED`]
+/// record of the handle `what` (one of [`PIN_HANDLES`]).
+pub fn pin_handle_record(
+    agent_pid: u32,
+    what: &str,
+    error: &str,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_PIN_HANDLE_FAILED.to_string(),
+        detail: format!(
+            "{what}: {} — the watchdog's handle on the agent's pinned maps failed (the pins \
+             cannot be reached: the bpffs lost its last mount?); a watchdog restarted meanwhile \
+             stays outside PROTECTED_PIDS until a reboot",
+            bounded(error, 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 359 (P3 e): a failed handle `what` on the agent's pinned maps,
+/// recorded for the agent to sign ([`record_hold`] at `hold_path`) — once
+/// per handle in this watchdog's life (a respawn loop does not flood the
+/// file); logged as before. `false` when it was not recorded (already, or
+/// the record could not be written).
+pub fn pin_handle_failed(
+    hold_path: &Path,
+    agent_pid: u32,
+    what: &str,
+    error: &anyhow::Error,
+) -> bool {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.iter().any(|w| w == what) {
+            return false;
+        }
+        seen.push(what.to_string());
+    }
+    let rec = pin_handle_record(agent_pid, what, &format!("{error:#}"), unix_now());
+    match record_hold(hold_path, &rec) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(target: "watchdog", error = %e, what, "the failed pin handle not recorded");
+            false
+        }
+    }
 }
 
 /// Lot 273: register this watchdog's unit cgroup in the agent's pinned
@@ -4652,6 +4721,38 @@ mod tests {
 
     /// External audit DEP-004: a hold leaves one JSON line per hold where
     /// the agent reads it (next to the shutdown marker).
+    #[test]
+    /// Named test (lot 359, the re-check 3 of #567, P3 e): a failed handle
+    /// on the pinned maps is a hold record the agent signs — once per handle
+    /// in a watchdog's life, whatever the respawn loop repeats.
+    fn a_failed_pin_handle_is_recorded_once_per_handle() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("holds");
+        let e = anyhow!("opening pinned PROTECTED_PIDS: No such file or directory");
+        assert!(pin_handle_failed(&path, 812, "evict_dead_agent", &e));
+        assert!(
+            !pin_handle_failed(&path, 813, "evict_dead_agent", &e),
+            "once"
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        let rec: nn_proto::watchdog_hold::HoldRecord =
+            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            rec.reason,
+            nn_proto::watchdog_hold::REASON_PIN_HANDLE_FAILED
+        );
+        assert_eq!(rec.agent_pid, 812);
+        assert!(rec
+            .detail
+            .starts_with("evict_dead_agent: opening pinned PROTECTED_PIDS"));
+        assert!(PIN_HANDLES.contains(&"evict_dead_agent"));
+        // every handle the review named is one of them
+        for h in ["register_self_pid", "claim_role", "reinsert_new_agent_pid"] {
+            assert!(PIN_HANDLES.contains(&h), "{h}");
+        }
+    }
+
     #[test]
     fn record_hold_appends_one_line_per_hold() {
         use nn_proto::watchdog_hold::{HoldRecord, HOLD_PATH};

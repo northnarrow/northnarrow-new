@@ -6,6 +6,39 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 359 (pre-alpha, the re-check 3 of #567): the **pin directory's
+  lock** (`UPGRADE_NOTES_WAVE4.md` §52). The unmount hook runs before the
+  kernel's namespace lock, so a racing rbind, or a subtree wider or deeper
+  than the guard's walk, could still let a lazy unmount take the host's
+  bpffs and the pins (N4). `/sys/fs/bpf/northnarrow` is now bound onto
+  itself, private and unbindable, as the child of the host's bpffs, by a
+  new step of the agent's unit (`ExecStartPre=-+… --pin-lock`, which
+  enters PID 1's mount namespace, before any pin): the kernel never takes, in an unmount's
+  propagation, a mount that keeps a child not itself unmounted, and an
+  rbind never copies an unbindable mount. Reused at a restart, made again
+  at a cold boot.
+  - **Guard:** only its maker's three steps pass (the agent's binary as a
+    unit's process; the self-bind judged by the kernel's objects,
+    `MS_PRIVATE`, `MS_UNBINDABLE`); any other unmount, move, mount or
+    change of propagation of it, a copy of it that reaches the host, or a
+    recursive `MS_SHARED` above it is refused, signed High
+    (`MG_WHY_LOCK`, operation `MG_OP_PROPAGATE`).
+  - **Watch:** a start without it signs a degradation (the walk remains);
+    each integrity round signs `pin_lock_missing` / `pin_lock_changed`
+    (High) and makes it again (a transient unit), its result in the record.
+  - **Scripts:** `install.sh` and `uninstall.sh` unmount it before they
+    remove the pin root (`rm_pin_root`, inside the window).
+  - `/sys/fs/cgroup` stays behind the walk (KNOWN_LIMITATIONS.md).
+  - **Fixed on the way (the lab):** the host's `/` was registered by the
+    key of its `/proc/1/root` link, not of PID 1's root (`/proc/1/root/`
+    read without following): `/` was no point of the mount guard and no
+    place under it was held; both are read through the link now.
+- Lot 359: the re-check 3's P3s — journald's quiet reads need its lot
+  277/281 marks clean; the refused-read dedup carries the caller's cgroup;
+  a record the budget drops is not marked seen; the executor's identities
+  are written before the fork record attaches; the watchdog's failed
+  handles on the pinned maps are a signed degradation
+  (`watchdog_pin_handle_failed`).
 - Lot 357 (pre-alpha): the **mount guard** — a mount on, over or below the
   paths the agent depends on is refused in PID 1's mount namespace
   (`agent-ebpf/src/mount_guard.rs`, the decision in

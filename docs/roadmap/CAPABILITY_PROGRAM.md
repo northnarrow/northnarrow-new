@@ -11727,6 +11727,93 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
+  and the re-check 3's P3s (pre-alpha; C23; no level change).**
+  - What was open: the unmount hook runs before the kernel's namespace
+    lock, so a copy grafted by a racing rbind, or a subtree wider or deeper
+    than the walk (32 mounts, a chain of 9), let a lazy unmount take the
+    host's bpffs and the pins, in any namespace (N4; N3's named residual).
+  - Done: the pin directory bound onto itself, private and unbindable, as
+    the host's bpffs's child (`nn_linux::anti_tamper::pin_lock`, the unit's
+    `ExecStartPre=-+ … --pin-lock` in PID 1's namespace before any pin;
+    the agent itself keeps no `CAP_SYS_ADMIN` and no `mount(2)`); the guard
+    lets through only its maker's three steps (`common::mount_guard::
+    lock_maker`, `lock_bind`, `lock_step`; `MG_LOCK`, `MG_LOCK_ABOVE`,
+    `MG_OP_PROPAGATE`, `MG_WHY_LOCK`), every other mount, unmount, move or
+    change of propagation of it (or of a copy that reaches the host), and a
+    recursive `MS_SHARED` above it refused; a start without it a signed
+    degradation, each integrity round `pin_lock_missing` /
+    `pin_lock_changed` (High) and a transient unit making it again; the
+    start's bpffs check, the integrity round's mount watch and the views
+    (`kernel_roots`: the locked pin directory a view of its own) take it
+    for the agent's own; `rm_pin_root` in `install.sh` and `uninstall.sh`.
+    P3s: journald's quiet reads need clean marks (`cgroup_join::clean`), the
+    read dedup's key carries the cgroup, a record the budget drops is not
+    seen (`ptrace_read::admit`), `EXECUTOR_IDS` before the fork record's
+    attach, the watchdog's failed pin handles signed
+    (`watchdog_pin_handle_failed`). `/sys/fs/cgroup` stays behind the walk.
+  - Tests: `the_agents_own_self_bind_of_its_pin_directory_passes_and_nothing_else_does`,
+    `the_lock_bind_needs_every_part_of_its_shape`,
+    `the_locks_maker_needs_each_part_of_its_identity`,
+    `a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above`,
+    `a_change_of_propagation_of_the_lock_is_refused_but_its_makers_steps`,
+    `the_lock_is_never_unmounted_or_moved_outside_a_window_by_its_maker_either`,
+    `the_lock_is_in_place_only_private_unbindable_and_the_bpffs_child`,
+    `only_the_self_bind_of_the_pin_directory_is_the_lock`,
+    `a_lost_or_changed_lock_is_a_finding_and_made_again`,
+    `a_start_without_the_lock_is_a_degradation`,
+    `the_pin_directorys_lock_is_no_mount_over_the_pin_root`,
+    `the_pin_directory_is_its_own_view_only_under_its_lock`,
+    `the_pin_directory_is_the_locks_point_and_its_ancestors_above_it`,
+    `both_scripts_unmount_the_pin_roots_lock_before_removing_it`,
+    `journald_with_marks_that_are_not_clean_is_recorded`,
+    `a_collectors_record_does_not_silence_another_programs_probe_of_the_same_image`,
+    `a_record_the_budget_drops_is_not_marked_seen`,
+    `the_executors_identities_are_in_the_kernel_before_the_fork_record_attaches`,
+    `a_failed_pin_handle_is_recorded_once_per_handle`,
+    `a_watchdog_pin_handle_failure_is_a_signed_degradation`,
+    `a_clean_mark_has_neither_placement_nor_taint_and_is_not_lost`,
+    `the_pin_directorys_lock_is_no_mount_over_protected`,
+    `the_remake_is_waited_for_within_a_deadline`,
+    `the_lock_judge_is_out_of_line_and_signs_nothing`,
+    `the_root_through_proc_pid_root_is_the_namespace_root` (the lab's find:
+    `/` was registered by its `/proc/1/root` link's key),
+    `every_watchdog_pin_handle_failure_is_signed`.
+  - Mutation: 52 mutants of the guard rule, the lock's watch, the views,
+    the scripts' order and the P3s; all caught by a named test (four after
+    new cases: `is_lock`'s and `pin_locked`'s bpffs root, a slave allowed,
+    any type at the pin root). The eBPF hooks' wiring has no host harness:
+    the lab's.
+  - Lab (as measured, our own guests; 5b8e62c6, ubuntu2204 at 859d3a50,
+    the same code): ubuntu2204 (5.15.0-203), ubuntu2404 (6.8.0-149),
+    ubuntu2604 (7.0.0-43) — the step made the lock at the install and at a
+    cold boot (`pin lock: made`), reused it at a restart; 17 refusals each
+    one High with the lock unchanged (its unmount, lazy or not, a move by
+    either API, a mount over it, root's self-bind over it, every change of
+    its propagation by root, `--make-rshared` of `/`, `/sys`,
+    `/sys/fs/bpf`, a raw namespace's change of its copy or of its `/`,
+    `unshare --propagation shared`); 7 cases let through with no record
+    (`unshare -m`, a private namespace's `rshared`, a unit sandbox,
+    `systemd-nspawn`, podman with and without `--privileged`, a tmpfs's
+    propagation); `mount_setattr` shared → `pin_lock_changed` and repaired
+    by the transient unit; lost in a window → `pin_lock_missing`, made
+    again outside it, its unmount refused again; the kernel's rule
+    (rev567-lock-probe.sh in a user namespace) as the review found it; N4's
+    race won (the unmount entered before the graft, returned after it) in
+    a raw namespace on all three and in the host's on 6.8 and 7.0 (on 5.15
+    the graft came first and the walk refused it), N3's chain of 9 — the
+    host's bpffs and the pins kept every time (round 1 on 6.8, the lock
+    not made: both gone); a freshly started agent's namespace has no copy
+    of the lock, and the race took its view of the bpffs (signed
+    `protected_mount_gone`), the agent active; the uninstall left no lock.
+    Verifier: 0 failing on all five guests, the 900k gate held — 5.15
+    `sb_mount` 863,550 (86.4 %), `move_mount` 833,357, `sb_umount` 692,576;
+    debian12 (6.1) `move_mount` 819,161 (81.9 %); 7.0 `move_mount` 600,842;
+    debian13 (6.12) 374,930; 6.8 the highest 273,029 (above 80 % on 5.15
+    and 6.1: a later lot adding to these hooks moves the lock's checks
+    further out of line). Two fixes found by
+    the lab: `sb_mount`'s chain past 512 bytes of stack (576, round 1), and
+    `/` registered by its `/proc/1/root` link's key.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

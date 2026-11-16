@@ -44,11 +44,11 @@ use northnarrow_watchdog::{
 use northnarrow_watchdog::{
     anchor_run_dir, check_shutdown_marker_bounded, evict_dead_agent, harden_self,
     hold_until_agent_returns, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited,
-    process_start_unix, register_own_cgroup, register_self_pid, reinsert_new_agent_pid,
-    sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
-    write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome, RestartBackoff,
-    ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
-    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    pin_handle_failed, process_start_unix, register_own_cgroup, register_self_pid,
+    reinsert_new_agent_pid, sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid,
+    wait_for_agent_death, write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome,
+    RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN,
+    HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
     STUCK_RECOVERY_HARDKILL_GRACE,
 };
 use northnarrow_watchdog::{
@@ -195,7 +195,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_BIN));
     let own_pid = std::process::id();
-    let self_registered = register_self_pid(&cli.bpffs_root, own_pid);
+    // lot 359 (the re-check 3 of #567, P3 e): the role not claimed is a
+    // signed degradation once the agent is known (below)
+    let mut role_error: Option<String> = None;
+    let self_registered = register_self_pid(&cli.bpffs_root, own_pid, |e| {
+        role_error = Some(format!("{e:#}"));
+    });
     let (mut agent_pid, mut agent_pidfd) =
         open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE, &agent_bin)
             .await
@@ -239,12 +244,27 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     // Self-protection + signalling rights (see register_self_pid): the
     // task_kill hook only lets a PROTECTED caller signal the protected
     // agent, so without this entry stuck recovery could not fire.
+    if let Some(e) = &role_error {
+        pin_handle_failed(
+            &hold_record_path(&cli.shutdown_marker),
+            agent_pid,
+            "claim_role",
+            &anyhow::anyhow!("{e}"),
+        );
+    }
     if let Err(e) = self_registered {
         warn!(
             target: "watchdog",
             error = %e,
             "could not register the watchdog PID in PROTECTED_PIDS — no BPF-LSM on this host? \
              stuck recovery will be refused by the task_kill hook until the agent registers us"
+        );
+        // lot 359 (P3 e): signed by the agent, not only a log line
+        pin_handle_failed(
+            &hold_record_path(&cli.shutdown_marker),
+            agent_pid,
+            "register_self_pid",
+            &e,
         );
     } else {
         // Lot 273: this unit's cgroup in PROTECTED_INODES as well (its
@@ -462,12 +482,21 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         latency_us = report.evict_latency.as_micros() as u64,
                         "layer-2 evict complete"
                     ),
-                    Err(e) => warn!(
-                        error = %e,
-                        agent_pid,
-                        bpffs_root = %cli.bpffs_root.display(),
-                        "layer-2 evict failed; widens layer-1 race window but next agent will fire evict_stale_pids"
-                    ),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            agent_pid,
+                            bpffs_root = %cli.bpffs_root.display(),
+                            "layer-2 evict failed; widens layer-1 race window but next agent will fire evict_stale_pids"
+                        );
+                        // lot 359 (P3 e): signed by the next agent
+                        pin_handle_failed(
+                            &hold_record_path(&cli.shutdown_marker),
+                            agent_pid,
+                            "evict_dead_agent",
+                            &e,
+                        );
+                    }
                 }
 
                 // A8 shutdown-authorisation check (Watchdog §13 Q4): stand
@@ -580,6 +609,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // External audit WDG-009: a stop request is honoured while
                 // the respawn runs (the start job, then up to 30 s for the
                 // new agent's pidfile), not after it.
+                let holds = hold_record_path(&cli.shutdown_marker);
                 let respawned = tokio::select! {
                     r = respawn_cycle(
                         &backend,
@@ -587,6 +617,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         &cli.bpffs_root,
                         attempt,
                         &agent_bin,
+                        &holds,
                     ) => r,
                     _ = sigint.recv() => {
                         info!(target: "watchdog", signal = "SIGINT", "shutting down during respawn");
@@ -774,6 +805,13 @@ enum SelectOutcome {
 fn recovery_failed(cli: &Cli, agent_pid: u32, error: &str) {
     if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, agent_pid) {
         debug!(target: "watchdog.stuck_recovery", error = %e, agent_pid, "PROTECTED_PIDS re-assert (no pin?)");
+        // lot 359 (P3 e)
+        pin_handle_failed(
+            &hold_record_path(&cli.shutdown_marker),
+            agent_pid,
+            "reinsert_new_agent_pid",
+            &e,
+        );
     }
     sd_notify_status(&format!(
         "DEGRADED: agent pid {agent_pid} unresponsive and could not be stopped — still protected \
@@ -890,6 +928,7 @@ async fn respawn_cycle(
     bpffs_root: &std::path::Path,
     attempt: u8,
     agent_bin: &std::path::Path,
+    hold_path: &std::path::Path,
 ) -> Result<(u32, OwnedFd)> {
     info!(
         target: "watchdog.respawn",
@@ -943,6 +982,8 @@ async fn respawn_cycle(
             bpffs_root = %bpffs_root.display(),
             "defensive PROTECTED_PIDS reinsert failed; agent's own register will retry shortly"
         );
+        // lot 359 (the re-check 3 of #567, P3 e): signed by the agent
+        pin_handle_failed(hold_path, new_pid, "reinsert_new_agent_pid", &e);
     }
 
     Ok((new_pid, new_fd))
@@ -1059,6 +1100,13 @@ async fn hold(
             if !pidfd_exited(&pidfd) {
                 if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {
                     warn!(target: "watchdog", error = %e, pid, "PROTECTED_PIDS reinsert after hold failed");
+                    // lot 359 (P3 e)
+                    pin_handle_failed(
+                        &hold_record_path(&cli.shutdown_marker),
+                        pid,
+                        "reinsert_new_agent_pid",
+                        &e,
+                    );
                 }
             }
             sd_notify_status(&format!("supervising agent pid {pid}"));

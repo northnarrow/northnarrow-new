@@ -33,7 +33,7 @@
 
 use aya_ebpf::{
     cty::{c_int, c_void},
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, generated},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, generated},
     macros::{fentry, lsm, map},
     maps::{Array, HashMap, LruHashMap},
     programs::{FEntryContext, LsmContext},
@@ -47,6 +47,8 @@ use northnarrow_common::mount_guard::{
     MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
     umount_spread, umount_takes_held, Spread, HELD_UNDER, PLACE_ANY_GROUP, REACH_OTHER_NS,
     below_of, below_takes_held, umount_below, Tree,
+    lock_bind, lock_maker, lock_step, lock_touched, lock_verdict, BindShape, MG_LOCK,
+    MG_LOCK_ABOVE, MG_OP_PROPAGATE,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
@@ -62,7 +64,8 @@ use crate::btf_offsets::{
     PATH_DENTRY_OFFSET, PATH_MNT_OFFSET, PF_KTHREAD, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET,
     SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET, SUPER_BLOCK_S_TYPE_OFFSET,
     TASK_STRUCT_COMM_OFFSET, TASK_STRUCT_CRED_OFFSET, TASK_STRUCT_FLAGS_OFFSET,
-    TASK_STRUCT_NSPROXY_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_TGID_OFFSET,
+    TASK_STRUCT_NSPROXY_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
+    TASK_STRUCT_TGID_OFFSET,
     USER_NAMESPACE_INUM_OFFSET, VFSMOUNT_MNT_ROOT_OFFSET,
 };
 
@@ -382,6 +385,34 @@ unsafe fn shutdown_stage() -> bool {
         Some(k) => k.dev == want.dev && k.ino == want.ino,
         None => false,
     }
+}
+
+/// Lot 359 (the re-check 3 of #567, N4): the caller is the pin directory's
+/// lock's maker (`common::mount_guard::lock_maker`) — the agent's binary
+/// (`bpf_defense::OWN_EXE_INODES`, by `mm->exe_file`), the main thread, a
+/// child of PID 1 (a unit's `ExecStartPre=+` step, or the transient unit
+/// the integrity round starts), in its first seconds, its lot 277/281
+/// marks clean. Asked only of an operation that is one of the lock's own
+/// steps.
+#[inline(always)]
+unsafe fn lock_maker_now() -> bool {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    let task = bpf_get_current_task() as *const u8;
+    let parent = peek_ptr(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)));
+    let ptgid = if parent.is_null() {
+        0
+    } else {
+        peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)))
+    };
+    let start = peek_u64(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)));
+    lock_maker(
+        tgid == pid_tgid as u32,
+        ptgid,
+        crate::bpf_defense::caller_role() == crate::bpf_defense::ROLE_AGENT,
+        bpf_ktime_get_ns().wrapping_sub(start),
+        crate::cgroup_join::marks_clean(tgid),
+    )
 }
 
 /// A kernel thread (`PF_KTHREAD`): the emergency remount of `SysRq-u`.
@@ -861,6 +892,19 @@ unsafe fn mount_root_flags(o: &Offs, mnt: *const u8) -> (u8, InodeKey) {
 /// Sign the verdict and return the hook's answer.
 #[inline(always)]
 fn answer(verdict: Verdict, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 {
+    answer_parts(
+        verdict,
+        op,
+        key,
+        view_of(p.magic),
+        (p.stack & 0xf) | reach << 4,
+    )
+}
+
+/// [`answer`] by its parts: the view and the record's `stack` byte (the
+/// mounts covered, the reach in its high nibble).
+#[inline(always)]
+fn answer_parts(verdict: Verdict, op: u8, key: InodeKey, view: u8, stack: u8) -> i32 {
     let (operation, why, ret) = match verdict {
         Verdict::Allow => return 0,
         Verdict::Refuse(w) => (FS_OP_MOUNT, w, -EPERM),
@@ -870,13 +914,7 @@ fn answer(verdict: Verdict, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 
     crate::inode_protect::emit_attempt(
         operation,
         InodeKey {
-            dev: record_dev(
-                key.dev,
-                op,
-                why,
-                view_of(p.magic),
-                (p.stack & 0xf) | reach << 4,
-            ),
+            dev: record_dev(key.dev, op, why, view, stack),
             ino: key.ino,
         },
     );
@@ -903,6 +941,8 @@ fn query(op: u8, c: &Caller, guard: u8) -> Query {
         kernel: false,
         src_root: true,
         restrict: false,
+        lock_maker: false,
+        lock_step: false,
     }
 }
 
@@ -933,6 +973,14 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
     if op == MG_OP_PASS {
         if regroups(flags) {
             note_propagation_change(ctx);
+            // lot 359 (the re-check 3 of #567, N4): one that reaches the pin
+            // directory's lock is judged
+            let path: *const u8 = ctx.arg(1);
+            let r = lock_propagation(path, flags);
+            if r == 0 {
+                return 0;
+            }
+            return lock_answer(path, r);
         }
         return 0;
     }
@@ -1025,6 +1073,111 @@ unsafe fn note_propagation_change(ctx: &LsmContext) {
     }
 }
 
+/// Lot 359 (the re-check 3 of #567, N4): a change of propagation (`mount(2)`
+/// with `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`) that
+/// reaches the pin directory's lock (`common::mount_guard::lock_touched`):
+/// made on the lock or a copy of it (a mount whose root and mount point are
+/// the pin directory's one dentry, [`MG_LOCK`]), judged where its parent's
+/// group lands (the place an unmount propagates through); or a recursive
+/// `MS_SHARED` on a mount rooted above it ([`MG_LOCK_ABOVE`]), judged where
+/// that mount lands. Refused but the maker's own two steps on the lock
+/// (`MS_PRIVATE`, then `MS_UNBINDABLE`). A target that is not a mount's
+/// root is the kernel's `EINVAL`: let through. Out of line, a BPF-to-BPF
+/// call: its walk's states end with its frame.
+#[inline(never)]
+fn lock_propagation(path: *const u8, flags: u64) -> u64 {
+    unsafe { try_lock_propagation(path, flags) }
+}
+
+#[inline(always)]
+unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
+    let Some(c) = caller(hook::SB_MOUNT) else {
+        return 0;
+    };
+    if !c.privileged {
+        return 0;
+    }
+    let Some(o) = Offs::load() else {
+        crate::fail_open::bump(hook::SB_MOUNT);
+        return 0;
+    };
+    if path.is_null() {
+        crate::fail_open::bump(hook::SB_MOUNT);
+        return 0;
+    }
+    let mnt = peek_ptr(path.add(o.path_mnt as usize));
+    let target = peek_ptr(path.add(o.path_dentry as usize));
+    if mnt.is_null() || target.is_null() {
+        crate::fail_open::bump(hook::SB_MOUNT);
+        return 0;
+    }
+    let root = peek_ptr(mnt.add(o.mnt_root as usize));
+    if root != target {
+        return 0;
+    }
+    let real = real_mount(o, mnt);
+    let key = key_of(o, root);
+    let rflags = flags_at(&key);
+    let on_lock = rflags & MG_LOCK != 0 && peek_ptr(real.add(o.mnt_mountpoint as usize)) == root;
+    if !lock_touched(flags, on_lock, rflags & MG_LOCK_ABOVE != 0) {
+        return 0;
+    }
+    let at = if on_lock {
+        peek_ptr(real.add(o.mnt_parent as usize))
+    } else {
+        real
+    };
+    if at.is_null() {
+        crate::fail_open::bump(hook::SB_MOUNT);
+        return 0;
+    }
+    let Some((guard, reach)) = target_of(o, at) else {
+        return 0;
+    };
+    // the maker's own step on the lock itself; the verdict without a
+    // `Query` or `decide` (whose allow-list call put this chain past 5.15's
+    // and 6.8's 512 bytes of stack: the lab's first verifier check of this
+    // lot, 576)
+    let maker_step = on_lock && lock_step(flags) && lock_maker_now();
+    let kind = match lock_verdict(
+        c.privileged,
+        guard != 0,
+        guard == 0,
+        maker_step,
+        crate::inode_protect::override_active(),
+    ) {
+        Verdict::Refuse(_) => LOCK_REFUSE,
+        Verdict::Window(_) => LOCK_WINDOW,
+        _ => return 0,
+    };
+    kind | (view_of(magic_of(o, root) as u32) as u64) << 8 | ((reach << 4) as u64) << 16
+}
+
+/// [`lock_propagation`]'s answer: refused, let through in the window (and
+/// 0: let through unrecorded).
+const LOCK_REFUSE: u64 = 1;
+const LOCK_WINDOW: u64 = 2;
+
+/// The record and the answer of [`lock_propagation`]'s verdict `r` (its
+/// kind, the view, the reach) — signed here, in the hook's own frame: the
+/// record's ring entry, zeroed by a call of its own, would have put the
+/// out-of-line judge's chain at 5.15's and 6.8's 512 bytes of stack.
+#[inline(always)]
+unsafe fn lock_answer(path: *const u8, r: u64) -> i32 {
+    let Some(o) = Offs::load() else {
+        return 0;
+    };
+    let mnt = peek_ptr(path.add(o.path_mnt as usize));
+    let key = key_of(o, peek_ptr(mnt.add(o.mnt_root as usize)));
+    let why = northnarrow_common::mount_guard::MG_WHY_LOCK;
+    let v = if r & 3 == LOCK_WINDOW {
+        Verdict::Window(why)
+    } else {
+        Verdict::Refuse(why)
+    };
+    answer_parts(v, MG_OP_PROPAGATE, key, (r >> 8) as u8, (r >> 16) as u8)
+}
+
 /// `int move_mount(const struct path *from_path, const struct path
 /// *to_path)`: `move_mount(2)` — a detached mount (`fsmount`, `open_tree`)
 /// attached at `to_path`, or an attached one moved there.
@@ -1100,6 +1253,26 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
     fstype_of(o, from_dentry, &mut q.fstype);
     let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
     q.src_root = !root.is_null() && peek_ptr(root.add(o.d_parent as usize)) == root;
+    // Lot 359 (the re-check 3 of #567, N4): onto the pin directory — its
+    // lock's self-bind by its maker (`common::mount_guard::lock_bind`: the
+    // kernel's objects compared, never a path), or the mount on the agent's
+    // directory it always was
+    if q.point.flags & MG_LOCK != 0 {
+        let to_dentry = peek_ptr(to.add(o.path_dentry as usize));
+        let head = real.add(o.mnt_mounts as usize);
+        let first = peek_ptr(head);
+        q.lock_step = lock_bind(&BindShape {
+            detached: parent.is_null() || parent == real,
+            at_root: root == from_dentry,
+            onto_itself: !to_dentry.is_null() && root == to_dentry,
+            childless: first.is_null() || first == head,
+            target_lock: true,
+            stack: q.point.stack,
+            magic: q.point.magic,
+            guard,
+        });
+        q.lock_maker = q.lock_step && lock_maker_now();
+    }
     answer(decide(&q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
 }
 

@@ -510,6 +510,14 @@ const STATICS: &[Kept] = &[
          to it at the start and at each 10 s read",
     ),
     kept(
+        "crates/nn-linux/src/anti_tamper/pin_lock.rs",
+        "AT_START",
+        Kernel,
+        "lot 359 (the re-check 3 of #567, N4): whether this boot's start found the pin \
+         directory's lock in place in PID 1's table — the one start of the process; the \
+         integrity round keeps a lock the start found",
+    ),
+    kept(
         "crates/nn-linux/src/systemd_executor.rs",
         "KERNEL",
         Kernel,

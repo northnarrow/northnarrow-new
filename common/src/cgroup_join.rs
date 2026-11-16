@@ -283,6 +283,20 @@ pub const HOW_TAINT_INHERITED: u8 = 0x40;
 /// The taint bits of a mark's `how`.
 pub const HOW_TAINT: u8 = HOW_INJECTED | HOW_TAINT_INHERITED;
 
+/// Lot 359 (the re-check 3 of #567, P3 a): a thread group's lot 277/281
+/// marks are clean — it was not moved into its cgroup, born into it by
+/// another, or forked from one that was, and no code-injection access to it
+/// (or to one it was forked from) was given to another: no mark (`how`
+/// `None`), or one with neither placement nor taint bits, and its tgid not
+/// among the lost ones (`lost`: "not known", never clean).
+pub const fn clean(how: Option<u8>, lost: bool) -> bool {
+    !lost
+        && match how {
+            None => true,
+            Some(h) => h & (HOW_PLACE | HOW_TAINT) == 0,
+        }
+}
+
 /// Lot 281: the `how` a fork gives the child of a process marked `parent`:
 /// [`HOW_INHERITED`] if the parent does not run where it started, and the
 /// taint passed on.
@@ -815,5 +829,27 @@ mod tests {
             assert!(SILENT_ARMED < SILENT_SLOTS && SILENT_UNSEEN < SILENT_SLOTS);
             assert!(SILENT_LAST_NS < SILENT_SLOTS);
         }
+    }
+
+    /// Lot 359 (the re-check 3 of #567, P3 a): only a thread group with no
+    /// placement and no taint is clean — and a lost one ("not known") never
+    /// is.
+    #[test]
+    fn a_clean_mark_has_neither_placement_nor_taint_and_is_not_lost() {
+        assert!(clean(None, false));
+        assert!(!clean(None, true), "not known");
+        for how in [
+            HOW_MOVED,
+            HOW_BORN_INTO,
+            HOW_INHERITED,
+            HOW_INJECTED,
+            HOW_TAINT_INHERITED,
+        ] {
+            assert!(!clean(Some(how), false), "{how:#x}");
+        }
+        assert!(!clean(Some(HOW_MOVED | HOW_INJECTED), false));
+        // a mark with no bit of either kind (none is written so) is clean
+        assert!(clean(Some(0), false));
+        assert!(!clean(Some(0), true));
     }
 }

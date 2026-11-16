@@ -485,4 +485,27 @@ mod tests {
         assert!(images.is_manager(file_id(&manager).unwrap()));
         assert!(!images.is_manager(file_id(&sleep).unwrap()));
     }
+
+    /// Named test (lot 359, the re-check 3 of #567, P3 d): the executor's
+    /// identities are in the kernel before the fork record attaches — after
+    /// it (lot 310), a unit started in that window (at each start of the
+    /// agent) had its executor's exec taken for its own program's.
+    #[test]
+    fn the_executors_identities_are_in_the_kernel_before_the_fork_record_attaches() {
+        let m = include_str!("sensors/multiplexer.rs");
+        let f = m
+            .find("fn attach_fork_parent(ebpf: &mut Ebpf) {")
+            .expect("attach_fork_parent");
+        let body = &m[f..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let install = body
+            .find("crate::systemd_executor::install_kernel_map(")
+            .expect("the install");
+        let attach = body.find("p.attach()").expect("the attach");
+        assert!(
+            install < attach,
+            "the identities are installed after the attach"
+        );
+        assert_eq!(body.matches("install_kernel_map(").count(), 1);
+    }
 }

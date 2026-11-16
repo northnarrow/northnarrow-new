@@ -84,3 +84,39 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
     let c = source("common/src/mount_guard.rs");
     assert!(c.contains("pub const SUBTREE_MAX: u32 = 32;"));
 }
+
+/// Lot 359 (the re-check 3 of #567, N4): the judge of a change of
+/// propagation that reaches the pin directory's lock is out of line and
+/// calls nothing that carries a frame of its own — no `decide` (its
+/// allow-list call), no record (the ring entry's zeroing call): the lab's
+/// first verifier check refused `sb_mount` on 6.8, its chain 576 bytes of
+/// 512. It returns the verdict; the hook signs it in its own frame.
+#[test]
+fn the_lock_judge_is_out_of_line_and_signs_nothing() {
+    let e = source("agent-ebpf/src/mount_guard.rs");
+    let at = e
+        .find("fn lock_propagation(path: *const u8, flags: u64) -> u64 {")
+        .expect("lock_propagation is gone");
+    let attr = e[..at].trim_end().lines().last().unwrap_or("");
+    assert_eq!(attr.trim(), "#[inline(never)]");
+    let t = e
+        .find("unsafe fn try_lock_propagation(")
+        .expect("try_lock_propagation is gone");
+    let body = &e[t..];
+    let body = &body[..body.find("\n}\n").expect("its end")];
+    for call in [
+        "decide(",
+        "answer(",
+        "answer_parts(",
+        "emit_attempt(",
+        "Query {",
+        "query(",
+    ] {
+        assert!(!body.contains(call), "the out-of-line judge calls {call}");
+    }
+    assert!(body.contains("lock_verdict("));
+    let hook = &e[e.find("unsafe fn try_sb_mount(").unwrap()..];
+    let hook = &hook[..hook.find("\n}\n").unwrap()];
+    assert!(hook.contains("let r = lock_propagation(path, flags);"));
+    assert!(hook.contains("return lock_answer(path, r);"));
+}

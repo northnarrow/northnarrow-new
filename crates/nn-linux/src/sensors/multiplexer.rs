@@ -1180,6 +1180,18 @@ fn attach_fork_parent(ebpf: &mut Ebpf) {
     const PROGRAM: &str = "fork_parent_record";
     let attached = (|| -> Result<(), String> {
         let btf = antitamper_bpf::kernel_roots::vmlinux_btf().map_err(|e| format!("BTF: {e}"))?;
+        // the re-check 4 of #539: the verified executor's identities, which
+        // the agent writes at each read (`systemd_executor::refresh`). Lot
+        // 359 (the re-check 3 of #567, P3 d): in the kernel before the
+        // attach — installed after it, a unit started in between (at each
+        // start of the agent) had its executor's exec taken for its own
+        // program's, and its program carried `fork_ppid` 0
+        let ids = ebpf
+            .take_map("EXECUTOR_IDS")
+            .ok_or_else(|| "map EXECUTOR_IDS missing from the eBPF object".to_string())?;
+        crate::systemd_executor::install_kernel_map(
+            aya::maps::HashMap::try_from(ids).map_err(|e| format!("EXECUTOR_IDS: {e}"))?,
+        );
         let p: &mut BtfTracePoint = ebpf
             .program_mut(PROGRAM)
             .ok_or_else(|| format!("program {PROGRAM} missing from the eBPF object"))?
@@ -1200,14 +1212,6 @@ fn attach_fork_parent(ebpf: &mut Ebpf) {
         since
             .set(0, monotonic_ns(), 0)
             .map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
-        // the re-check 4 of #539: the verified executor's identities, which
-        // the agent writes at each read (`systemd_executor::refresh`)
-        let ids = ebpf
-            .take_map("EXECUTOR_IDS")
-            .ok_or_else(|| "map EXECUTOR_IDS missing from the eBPF object".to_string())?;
-        crate::systemd_executor::install_kernel_map(
-            aya::maps::HashMap::try_from(ids).map_err(|e| format!("EXECUTOR_IDS: {e}"))?,
-        );
         Ok(())
     })();
     if let Err(e) = attached {

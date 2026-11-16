@@ -453,18 +453,28 @@ fn a_read_mode_refusal_is_recorded_by_image_and_never_unrefused() {
             "return;",
             "crate::bpf_defense::caller_exe_key()",
             "bpf_get_current_cgroup_id()",
-            "if ptrace_read::quiet(exe.dev, exe.ino, cgroup, |k| unsafe {",
-            "PTRACE_READ_QUIET.get(k).is_some()",
+            "if ptrace_read::quiet(",
+            "|k| unsafe { PTRACE_READ_QUIET.get(k).is_some() },",
+            // lot 359 (the re-check 3 of #567, P3 a): journald's marks
+            "crate::cgroup_join::caller_marks_clean,",
             "return;",
-            "ptrace_read::seen_key(exe.dev, exe.ino, target_tgid)",
-            "PTRACE_READ_SEEN.get_ptr_mut(&seen)",
-            "if !ptrace_read::due(Some(*last), now) {",
+            // P3 b: the caller's cgroup in the key
+            "ptrace_read::seen_key(exe.dev, exe.ino, target_tgid, cgroup)",
+            "PTRACE_READ_SEEN.get(&seen)",
+            // P3 c: due, then the budget, and only then seen
+            "if !ptrace_read::admit(last, now, || limited_budget(FS_OP_PTRACE_READ, now)) {",
+            "return;",
             "PTRACE_READ_SEEN.insert(&seen, &now, 0)",
-            "if !limited_budget(FS_OP_PTRACE_READ, now) {",
             "emit_denial(FS_OP_PTRACE_READ, key);",
         ],
     )
     .unwrap();
+    // lot 359 (P3 c): the key is written once, after the budget — never
+    // before it, never by a pointer into the map
+    let b = body(&i, "emit_task_read_denial");
+    assert_eq!(b.matches("PTRACE_READ_SEEN.insert(").count(), 1);
+    assert!(!b.contains("PTRACE_READ_SEEN.get_ptr_mut("));
+    assert!(b.find("limited_budget(").unwrap() < b.find("PTRACE_READ_SEEN.insert(").unwrap());
     // no dedup by the caller's process for it any more
     assert!(!body(&i, "emit_task_read_denial").contains("bpf_get_current_pid_tgid"));
     assert!(!body(&i, "emit_limited").contains("FS_OP_PTRACE_READ"));
@@ -478,6 +488,50 @@ fn a_read_mode_refusal_is_recorded_by_image_and_never_unrefused() {
             "if mode & PTRACE_MODE_NOAUDIT == 0 {",
             "crate::inode_protect::emit_task_read_denial(mode, target_tgid);",
             "-EPERM",
+        ],
+    )
+    .unwrap();
+}
+
+/// Lot 359 (the re-check 3 of #567, P3 e): every handle the watchdog takes
+/// on the agent's pinned maps signs its failure (`pin_handle_failed`, a hold
+/// record the agent signs as a degradation) — at each call site, none left
+/// to a log line only.
+#[test]
+fn every_watchdog_pin_handle_failure_is_signed() {
+    let m = code("watchdog/src/main.rs");
+    for (call, name) in [
+        ("register_self_pid(", "\"register_self_pid\""),
+        ("reinsert_new_agent_pid(", "\"reinsert_new_agent_pid\""),
+        ("evict_dead_agent(", "\"evict_dead_agent\""),
+    ] {
+        // (`unregister_self_pid(` at the stop is not a handle of the four)
+        let calls = m.matches(call).count() - m.matches(&format!("un{call}")).count();
+        let signed = m.matches(name).count();
+        assert!(calls > 0, "{call}");
+        assert_eq!(
+            signed, calls,
+            "{call}: {calls} calls, {signed} signed failures"
+        );
+    }
+    // the role's claim, inside register_self_pid, is handed to the caller
+    let l = code("watchdog/src/lib.rs");
+    in_order(
+        body(&l, "register_self_pid"),
+        &["antitamper_bpf::claim_role(", "role_failed(&e);"],
+    )
+    .unwrap();
+    assert_eq!(m.matches("\"claim_role\"").count(), 1);
+    // its mini-hunt: the agent's own handles on the pinned maps for the
+    // verified watchdog, a degradation of the same source
+    let t = code("agent/src/boot/tasks.rs");
+    in_order(
+        &t,
+        &[
+            "anti_tamper::register_protected_pid(bpffs_root, p)",
+            "self_integrity::PIN_HANDLE_FAILED,",
+            "anti_tamper::claim_watchdog_role(bpffs_root, p)",
+            "self_integrity::PIN_HANDLE_FAILED,",
         ],
     )
     .unwrap();

@@ -302,12 +302,29 @@ tracker_pin_dirs() {
     done
     return 0
 }
+# >>> rm_pin_root (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# Lot 359 (the re-check 3 of #567, N4): the pin root is locked — bound onto
+# itself, private and unbindable, as the child of the host's bpffs (the agent
+# unit's `--pin-lock` step) — and a mount point is never removed (EBUSY). Its
+# lock is unmounted first (a few, one stacked on another), which the mount
+# guard lets through only inside the trusted-installer window; then the pins
+# go with the directory. Outside a window both are refused: the pin root
+# stays, as before.
+rm_pin_root() {
+    local i
+    for ((i = 0; i < 4; i++)); do
+        mountpoint -q -- "$BPFFS_ROOT" 2>/dev/null || break
+        umount -- "$BPFFS_ROOT" 2>/dev/null || umount -l -- "$BPFFS_ROOT" 2>/dev/null || break
+    done
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+}
+# <<< rm_pin_root
 pins_present() {
     [[ -d "$BPFFS_ROOT" || -n "$(tracker_pin_dirs)" ]]
 }
 remove_pins() {
     local d
-    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    rm_pin_root
     for d in $(tracker_pin_dirs); do
         rm -rf "$d" 2>/dev/null || true
     done
