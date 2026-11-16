@@ -11759,8 +11759,8 @@ number in parentheses is a lab PR.
   - Lab (alpha profile, the Phase 4b app — a `python3` copy with the F3
     shapes — as a type-2 AppImage in `~/Applications`, a listener of our own
     on the guest; the AppImage project's `continuous` runtime and its tagged
-    release 20251108, each image file named in 22 bytes): ubuntu2204 (5.15)
-    and ubuntu2604 (7.0). Both runtimes: the main process connecting, the
+    release 20251108, each image file named in 22 bytes): ubuntu2204 (5.15),
+    ubuntu2404 (6.8) and ubuntu2604 (7.0). Both runtimes: the main process connecting, the
     zygote's fork+exec child, its fork-only child exiting at once (three runs
     each) and its fork-only child alive 3 s after its connect, NN-L-NET-007
     Medium only, every run (on 7.0 one main-process run of the 20251108
@@ -11776,8 +11776,8 @@ number in parentheses is a lab PR.
     bytes or more (`K360-continuous-x86_64.AppImage`) is never tied (the
     LSM exe walk keeps 31 bytes of a name and marks it cut, so the image's
     path names no file): every shape R001 High and CHAIN-002/005 Critical
-    on 5.15, the fork-only shape the same on 7.0. Common release names are
-    that long.
+    on 5.15 and 6.8, the fork-only shape the same on 7.0. Common release
+    names are that long.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
