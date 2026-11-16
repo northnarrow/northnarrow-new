@@ -264,4 +264,23 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(quiet_under(r, Some(cg.path()), me(), &no_db).len(), 1);
     }
+
+    /// Named test (fix round 3 of #567, the lab's 6.8 round): journald's
+    /// identity is in the kernel before the ptrace guard attaches — after
+    /// it, one of journald's reads (for the attach's own log lines) was
+    /// recorded in between.
+    #[test]
+    fn journalds_identity_is_in_the_kernel_before_the_hook_attaches() {
+        let at = include_str!("anti_tamper/mod.rs");
+        let install = at
+            .find("Ok(map) => crate::journald_identity::install_kernel_map(map),")
+            .expect("the install");
+        let attach = at
+            .find("reattach_fresh(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root)")
+            .expect("the ptrace attach");
+        assert!(
+            install < attach,
+            "the identity is installed after the attach"
+        );
+    }
 }

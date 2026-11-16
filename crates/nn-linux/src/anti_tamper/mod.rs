@@ -458,6 +458,26 @@ fn attach_reporting(
         deny.missing_hook(TASK_KILL_PROGRAM, format!("{e:#}"));
     }
 
+    // The re-check 2 of #567 (point 2): the packaged journald's identity,
+    // whose refused reads of the agent are not recorded (they stay refused);
+    // read again every 10 s (`journald_identity::refresh`). Fix round 3: in
+    // the kernel before the hook attaches — installed after it, the lab's
+    // 6.8 round recorded one read of journald's, made in between (journald
+    // reads the agent's image for the attach's own log lines).
+    match ebpf
+        .take_map(PTRACE_READ_QUIET_MAP_NAME)
+        .ok_or_else(|| anyhow!("map {PTRACE_READ_QUIET_MAP_NAME} missing from eBPF object"))
+        .and_then(|m| {
+            aya::maps::HashMap::try_from(m)
+                .with_context(|| format!("{PTRACE_READ_QUIET_MAP_NAME} is not a HashMap"))
+        }) {
+        Ok(map) => crate::journald_identity::install_kernel_map(map),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper: journald's refused reads of the agent are recorded (its identity \
+             is not in the kernel)"
+        ),
+    }
     if let Err(e) = reattach_fresh(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
         warn!(
             program = PTRACE_PROGRAM,
@@ -466,24 +486,6 @@ fn attach_reporting(
             "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
         );
         deny.missing_hook(PTRACE_PROGRAM, format!("{e:#}"));
-    } else {
-        // The re-check 2 of #567 (point 2): the packaged journald's
-        // identity, whose refused reads of the agent are not recorded (they
-        // stay refused); read again every 10 s (`journald_identity::refresh`)
-        match ebpf
-            .take_map(PTRACE_READ_QUIET_MAP_NAME)
-            .ok_or_else(|| anyhow!("map {PTRACE_READ_QUIET_MAP_NAME} missing from eBPF object"))
-            .and_then(|m| {
-                aya::maps::HashMap::try_from(m)
-                    .with_context(|| format!("{PTRACE_READ_QUIET_MAP_NAME} is not a HashMap"))
-            }) {
-            Ok(map) => crate::journald_identity::install_kernel_map(map),
-            Err(e) => warn!(
-                error = format!("{e:#}"),
-                "anti-tamper: journald's refused reads of the agent are recorded (its identity \
-                 is not in the kernel)"
-            ),
-        }
     }
 
     // Lot 273: the unit cgroups of the agent and of the live watchdog (and

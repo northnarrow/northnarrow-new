@@ -918,7 +918,69 @@ fn high_kind(kind: &str) -> bool {
             | "mount_attrs_changed"
             | "mount_not_canonical"
             | "state_fs_read_only"
+            | PIN_VANISHED
     )
+}
+
+/// Fix round 3 of #567: a pin of the agent's gone while it holds the object
+/// (`antitamper_bpf::held`) — High.
+const PIN_VANISHED: &str = "bpf_pin_vanished";
+
+/// Fix round 3 of #567 (the coordinator's decision): the agent's pins whose
+/// object it holds that no longer name it, as findings. A pin removed is
+/// pinned again by `repin` (from the descriptor, in the directory it was
+/// pinned in: the next start finds it); one replaced or unreadable is told
+/// as it is; the pins of a directory gone (the bpffs's last mount, or a
+/// mount laid over it) are one finding for the directory. Each object
+/// stays attached while the agent runs — its descriptor is held — and not
+/// across a restart without its pin.
+fn held_pin_findings(
+    vanished: Vec<antitamper_bpf::held::Vanished>,
+    repin: impl Fn(&antitamper_bpf::held::Vanished) -> anyhow::Result<()>,
+) -> Vec<Finding> {
+    use antitamper_bpf::held::{Kind, Lost};
+    let mut out = Vec::new();
+    let mut gone: std::collections::BTreeMap<PathBuf, (usize, usize)> = Default::default();
+    for v in vanished {
+        if v.lost == Lost::DirectoryGone {
+            let n = gone
+                .entry(v.path.parent().map(Path::to_path_buf).unwrap_or_default())
+                .or_default();
+            match v.kind {
+                Kind::Link => n.0 += 1,
+                Kind::Prog => n.1 += 1,
+            }
+            continue;
+        }
+        let after = match repin(&v) {
+            Ok(()) => "pinned again from it".to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+        out.push(Finding {
+            kind: PIN_VANISHED,
+            detail: format!(
+                "{}: the agent's {} {}: {}; its descriptor held, attached while the agent runs \
+                 (not across a restart without its pin); {after}",
+                v.path.display(),
+                v.kind.name(),
+                v.id,
+                v.lost.words()
+            ),
+        });
+    }
+    for (dir, (links, progs)) in gone {
+        out.push(Finding {
+            kind: PIN_VANISHED,
+            detail: format!(
+                "{}: gone, with the pins of {links} links and {progs} programs of the agent's \
+                 (the bpffs unmounted, or a mount over the directory); their descriptors held, \
+                 attached while the agent runs, not across a restart: not pinned again, the next \
+                 start pins them afresh",
+                dir.display()
+            ),
+        });
+    }
+    out
 }
 
 /// Lot 353 (the review of #563, F4): a kernel pseudo-file system at its
@@ -2494,6 +2556,19 @@ impl Checker {
                 .filter(|f| !self.overlay_is_signed(f)),
         );
         c.extend(self.read_mounts());
+        // Fix round 3 of #567: the pins of the objects the agent holds —
+        // outside a trusted-installer window (inside one the installer
+        // removes them; nothing is pinned again behind it)
+        if !self
+            .own_guard
+            .as_ref()
+            .is_some_and(|g| g.window.is_window_open())
+        {
+            c.extend(held_pin_findings(
+                antitamper_bpf::held::vanished(),
+                antitamper_bpf::held::repin,
+            ));
+        }
         // External audit DEP-001: an admin private key on the host (the
         // bootstrap key install.sh writes, until the operator moves it
         // offline) is a credential for whoever is root here. Seen through
@@ -4937,5 +5012,114 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Fix round 3 of #567 (the coordinator's decision): a pin removed while
+    /// the agent holds its link is a High (`bpf_pin_vanished`), pinned again
+    /// from the descriptor; one that cannot be says why.
+    #[test]
+    fn a_removed_held_pin_is_a_high_pinned_again() {
+        use antitamper_bpf::held::{Kind, Lost, Vanished};
+        let v = |lost| Vanished {
+            path: PathBuf::from("/sys/fs/bpf/northnarrow/link_task_kill"),
+            kind: Kind::Link,
+            id: 7,
+            lost,
+        };
+        let f = held_pin_findings(vec![v(Lost::Removed)], |_| Ok(()));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, "bpf_pin_vanished");
+        assert!(high_kind(f[0].kind));
+        assert!(
+            f[0].detail.starts_with(
+                "/sys/fs/bpf/northnarrow/link_task_kill: the agent's link 7: its pin is gone;"
+            ),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.contains("attached while the agent runs"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.ends_with("pinned again from it"),
+            "{}",
+            f[0].detail
+        );
+        let f = held_pin_findings(vec![v(Lost::Replaced)], |_| {
+            Err(anyhow::anyhow!(
+                "not pinned again: its pin names another object"
+            ))
+        });
+        assert!(
+            f[0].detail.contains("its pin names another object;"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail
+                .ends_with("not pinned again: its pin names another object"),
+            "{}",
+            f[0].detail
+        );
+    }
+
+    /// Fix round 3 of #567: the bpffs's last mount gone takes every pin of
+    /// the directory — one High for the directory with its counts, nothing
+    /// pinned again (never into a new bpffs or a mount over it).
+    #[test]
+    fn a_lost_pin_directory_is_one_high_never_repinned() {
+        use antitamper_bpf::held::{Kind, Lost, Vanished};
+        let v = |name: &str, kind| Vanished {
+            path: Path::new("/sys/fs/bpf/northnarrow").join(name),
+            kind,
+            id: 1,
+            lost: Lost::DirectoryGone,
+        };
+        let f = held_pin_findings(
+            vec![
+                v("link_task_kill", Kind::Link),
+                v("prog_task_kill", Kind::Prog),
+                v("link_sb_umount", Kind::Link),
+            ],
+            |_| panic!("a lost directory is never pinned into"),
+        );
+        assert_eq!(f.len(), 1);
+        assert!(high_kind(f[0].kind));
+        assert!(
+            f[0].detail.starts_with(
+                "/sys/fs/bpf/northnarrow: gone, with the pins of 2 links and 1 programs"
+            ),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail
+                .contains("attached while the agent runs, not across a restart"),
+            "{}",
+            f[0].detail
+        );
+        assert!(held_pin_findings(Vec::new(), |_| Ok(())).is_empty());
+    }
+
+    /// Fix round 3 of #567: the round reads the held pins outside a window
+    /// only, and pins again through `held::repin`.
+    #[test]
+    fn the_round_reads_held_pins_outside_a_window() {
+        let code = include_str!("self_integrity.rs");
+        let at = code.find("fn collect_round(").unwrap();
+        let end = at + code[at..].find("fn apply(").unwrap();
+        let body = &code[at..end];
+        let w = body
+            .find("is_some_and(|g| g.window.is_window_open())")
+            .expect("the window test");
+        let h = body
+            .find("antitamper_bpf::held::vanished(),")
+            .expect("the held pins read");
+        assert!(w < h);
+        assert!(body[h..].starts_with(
+            "antitamper_bpf::held::vanished(),\n                antitamper_bpf::held::repin,"
+        ));
     }
 }

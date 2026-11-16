@@ -2636,7 +2636,9 @@ mod tests {
         f.like = vec![root, sys];
         // what the hook judged on its own: the top, at /mnt/s under `/`'s
         // group — no held mount there
-        assert!(!f.places.contains(&(f.m[f.m[mnt_s].parent].group, f.m[mnt_s].place)));
+        assert!(!f
+            .places
+            .contains(&(f.m[f.m[mnt_s].parent].group, f.m[mnt_s].place)));
         assert_eq!(umount_below(&f, mnt_s), Below::Takes);
         assert!(below_takes_held(umount_below(&f, mnt_s), false));
         // the copy of /sys's own children read in the kernel's order: the
@@ -2796,7 +2798,10 @@ mod tests {
             umount_below(&f, top)
         };
         assert_eq!(chain(SUBTREE_DEPTH - 1, false), Below::Clear);
-        assert_eq!(chain(SUBTREE_DEPTH, false), Below::Unread { reaches: false });
+        assert_eq!(
+            chain(SUBTREE_DEPTH, false),
+            Below::Unread { reaches: false }
+        );
         assert_eq!(chain(SUBTREE_DEPTH, true), Below::Clear);
     }
 
@@ -2814,10 +2819,17 @@ mod tests {
         assert_eq!(below_of(9, yes, never, never, never, never), BELOW_TAKES);
         assert_eq!(below_of(0, never, yes, yes, never, never), BELOW_TAKES);
         assert_eq!(below_of(0, never, yes, no, never, never), 0);
-        assert_eq!(below_of(9, no, yes, no, yes, never), 9, "a known group: its keys decided");
+        assert_eq!(
+            below_of(9, no, yes, no, yes, never),
+            9,
+            "a known group: its keys decided"
+        );
         assert_eq!(below_of(9, no, yes, no, no, yes), BELOW_TAKES);
         assert_eq!(below_of(9, no, yes, no, no, no), 9);
-        assert!(u32::MAX as u64 & BELOW_TAKES == 0, "no group reads as taken");
+        assert!(
+            u32::MAX as u64 & BELOW_TAKES == 0,
+            "no group reads as taken"
+        );
     }
 
     /// N1: the `mount(2)` calls that change a propagation, in the kernel's

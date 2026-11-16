@@ -367,7 +367,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
     )
     .unwrap();
     let pf = code("crates/nn-linux/src/decision_host_linux.rs");
-    assert!(pf.contains("crate::cgroup_join::started_in_cgroup(&self.root, pid)"));
+    assert!(pf.contains("crate::cgroup_join::started_in_cgroup(&self.proc_root, pid)"));
     let cj = code("crates/nn-linux/src/cgroup_join.rs");
     in_order(
         body(&cj, "started_in_cgroup"),
@@ -571,8 +571,8 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "let id = p.attach()",
             "antitamper_bpf::purge_stale_pin(&link_path);",
-            "prog.pin(&prog_path)",
-            "fd_link\n        .pin(&link_path)",
+            "antitamper_bpf::held::pin_prog(fd, &prog_path)",
+            "antitamper_bpf::held::pin_link(fd_link, &link_path)",
         ],
     )
     .unwrap();
@@ -648,7 +648,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
         ],
     )
     .unwrap();
-    assert!(pf.contains("crate::cgroup_join::injected(&self.root, pid)"));
+    assert!(pf.contains("crate::cgroup_join::injected(&self.proc_root, pid)"));
 }
 
 /// The worker's single-thread check is the sandbox's first step, in both

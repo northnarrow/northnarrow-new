@@ -375,9 +375,15 @@ mod tests {
                 .functions
                 .values()
                 .map(|f| f.name.as_str())
-                .filter(|n| n.contains("mount_guard") && n.ends_with(&format!("{}{name}", name.len())))
+                .filter(|n| {
+                    n.contains("mount_guard") && n.ends_with(&format!("{}{name}", name.len()))
+                })
                 .collect();
-            assert_eq!(found.len(), 1, "{name} is not one function of the object: {found:?}");
+            assert_eq!(
+                found.len(),
+                1,
+                "{name} is not one function of the object: {found:?}"
+            );
         }
         const CALL: u8 = 0x85;
         let p = obj

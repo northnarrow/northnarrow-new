@@ -843,8 +843,8 @@ fn attach_role_exit(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<()> {
             .take_link(link_id)
             .context("taking ownership of the role_exit link")?;
         let fd_link: aya::programs::links::FdLink = link.into();
-        fd_link
-            .pin(&link_path)
+        // fix round 3 of #567: held for the agent's life too (`held`)
+        antitamper_bpf::held::pin_link(fd_link, &link_path)
             .with_context(|| format!("pinning the role_exit link to {}", link_path.display()))?;
     }
     Ok(())

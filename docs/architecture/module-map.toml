@@ -559,6 +559,9 @@ planned = false
 # Lot 357: the mount guard's decision (a mount on, over or below the agent's
 # paths in the host's namespace), shared by the eBPF programs and the agent
 "mount_guard" = "northnarrow-common"
+# The re-check 2 of #567: the read-mode ptrace record's quiet keys and its
+# dedup (the eBPF programs and the agent)
+"ptrace_read" = "northnarrow-common"
 # Lot 310 (the re-check 4 of #539): what an exec does with its process's
 # fork record — the exec program's decision, tested in the crate
 "fork_record" = "northnarrow-common"

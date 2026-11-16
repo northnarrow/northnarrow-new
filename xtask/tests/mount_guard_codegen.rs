@@ -56,8 +56,14 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
     assert!(walk < top, "the walk is folded in before the top");
     assert!(hook.contains("if below {\n        q.held = true;"));
     for (f, sig) in [
-        ("subtree_takes", "fn subtree_takes(o: &Offs, real: *const u8) -> u64 {"),
-        ("held_at", "unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {"),
+        (
+            "subtree_takes",
+            "fn subtree_takes(o: &Offs, real: *const u8) -> u64 {",
+        ),
+        (
+            "held_at",
+            "unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {",
+        ),
     ] {
         let at = e.find(sig).unwrap_or_else(|| panic!("{f} is gone"));
         let attr = e[..at].trim_end().lines().last().unwrap_or("");

@@ -50,7 +50,12 @@ pub const fn quiet_key(exe_dev: u64, exe_ino: u64, cgroup: u64) -> [u64; 3] {
 /// holds that [`quiet_key`]). A cgroup id of 0 (none read: a cgroup v1
 /// host) is never asked.
 #[inline(always)]
-pub fn quiet(exe_dev: u64, exe_ino: u64, cgroup: u64, journald: impl FnOnce(&[u64; 3]) -> bool) -> bool {
+pub fn quiet(
+    exe_dev: u64,
+    exe_ino: u64,
+    cgroup: u64,
+    journald: impl FnOnce(&[u64; 3]) -> bool,
+) -> bool {
     cgroup != 0 && journald(&quiet_key(exe_dev, exe_ino, cgroup))
 }
 
@@ -79,7 +84,10 @@ mod tests {
     impl Kernel {
         fn new() -> Kernel {
             Kernel {
-                journald: vec![quiet_key(0x0080_0001, 4242, 77), quiet_key(0x0080_0001, 4242, 78)],
+                journald: vec![
+                    quiet_key(0x0080_0001, 4242, 77),
+                    quiet_key(0x0080_0001, 4242, 78),
+                ],
                 seen: HashMap::new(),
                 records: Vec::new(),
             }
@@ -179,7 +187,10 @@ mod tests {
         assert_ne!(k, seen_key(0x0080_0001, 4243, AGENT));
         assert_ne!(k, seen_key(0x0080_0001, 4242, WATCHDOG));
         assert_ne!(seen_key(0, 0, 1), seen_key(0, 1, 0));
-        assert_eq!(seen_key(u64::MAX, 1, (1 << 22) - 1)[1] & 0xffff_ffff, (1 << 22) - 1);
+        assert_eq!(
+            seen_key(u64::MAX, 1, (1 << 22) - 1)[1] & 0xffff_ffff,
+            (1 << 22) - 1
+        );
         assert!(due(None, 0));
         assert!(!due(Some(10), 10 + DEDUP_NS - 1));
         assert!(due(Some(10), 10 + DEDUP_NS));

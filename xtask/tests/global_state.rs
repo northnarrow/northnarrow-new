@@ -574,6 +574,12 @@ const STATICS: &[Kept] = &[
         "lot 280a: the cgroup/sysctl judge this boot linked to the root cgroup (the one eBPF object's program) or why not, read by the manifest's note and the BPF guard's registration",
     ),
     kept(
+        "antitamper-bpf/src/held.rs",
+        "HELD",
+        Kernel,
+        "fix round 3 of #567: a descriptor of every link and program the one eBPF object's attach pinned, held for the agent's life so that a pin removed or hidden, or the bpffs's last mount gone, detaches nothing while it runs (the integrity round reads their pins and pins them again)",
+    ),
+    kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",
         "LINK",
         Kernel,

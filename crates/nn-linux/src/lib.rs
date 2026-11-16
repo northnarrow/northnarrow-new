@@ -438,6 +438,9 @@ pub mod shutdown_marker;
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
 pub mod host_dropins;
+/// The re-check 2 of #567: the packaged journald's identity, whose
+/// refused reads of the agent's `/proc/<pid>/exe` are not recorded.
+pub mod journald_identity;
 /// Lot 280b: the kernel's state the hooks depend on and no hook sees
 /// change — its taint flags and livepatches, the root cgroup's
 /// `cgroup/sysctl` programs — read every 5 s.
@@ -463,9 +466,6 @@ pub mod program_images;
 pub mod sysctl_cgroup;
 /// Lot 273d: the global sysctls that abort or starve the agent.
 pub mod sysctl_guard;
-/// The re-check 2 of #567: the packaged journald's identity, whose
-/// refused reads of the agent's `/proc/<pid>/exe` are not recorded.
-pub mod journald_identity;
 /// Lot 310: the identities of systemd's packaged executor, for R004.
 pub mod systemd_executor;
 pub mod systemd_reload;

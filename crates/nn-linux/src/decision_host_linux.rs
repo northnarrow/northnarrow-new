@@ -255,8 +255,8 @@ fn root_only(m: &std::fs::Metadata) -> bool {
 
 impl ActorFacts for ProcFacts {
     fn uid(&self, pid: u32) -> Option<u32> {
-        let s =
-            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("status")).ok()?;
+        let s = crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("status"))
+            .ok()?;
         s.lines()
             .find_map(|l| l.strip_prefix("Uid:"))
             .and_then(|r| r.split_whitespace().next())
@@ -264,8 +264,8 @@ impl ActorFacts for ProcFacts {
     }
 
     fn cgroup(&self, pid: u32) -> Option<String> {
-        let s =
-            crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+        let s = crate::state_read::read_state(self.proc_root.join(pid.to_string()).join("cgroup"))
+            .ok()?;
         // lot 312 (review of #543, F7): the one reader of a cgroup text
         nn_core::response::cgroup::unified_path(&s).map(str::to_string)
     }
