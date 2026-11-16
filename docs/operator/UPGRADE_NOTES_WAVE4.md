@@ -4269,14 +4269,14 @@ in `Init`; `unshare -m --propagation shared` the same.
     (its anchor) is not used: it may have executed since that fork.
 - **Operator action.** None.
 
-## 54. Release binaries for glibc 2.35, a clear permission error, no false bpffs warning (lot 365)
+## 54. Release binaries for glibc 2.34, a clear permission error, no false bpffs warning (lot 365)
 
 An external tester followed the alpha tester's guide on Debian 12 with a
 release built by CI; two of the findings are fixed here (the third, the
 masking of the diagnostics the guide collects, is the guide's own: no
 product code builds that bundle), with a false `host-check` warning.
 
-- **The release is built on Ubuntu 22.04 (glibc 2.35).** The release
+- **The release is built on Ubuntu 22.04 and holds glibc 2.34.** The release
   workflow's `package` job ran on Ubuntu 24.04 (glibc 2.39). Rust's
   standard library refers weakly to two glibc 2.39 functions
   (`pidfd_spawnp`, `pidfd_getpid`), so the agent, the watchdog and
@@ -4286,9 +4286,11 @@ product code builds that bundle), with a false `host-check` warning.
   command's output and in the agent's journal. Harmless then; but a build
   on a newer image (GitHub's `ubuntu-latest` is moving to 26.04) could
   need a newer symbol strongly, and then the binaries would not start
-  there at all. The job now runs on `ubuntu-22.04`, the image of the
-  oldest supported distribution: linked against glibc 2.35, a binary
-  cannot need a newer version. It stays a GitHub-hosted image, so the
+  there at all. The job now runs on `ubuntu-22.04`, the oldest image
+  GitHub offers (glibc 2.35), and the check below holds every need at or
+  below 2.34: AlmaLinux/RHEL 9, the oldest supported distribution, whose
+  glibc is the floor the `.deb` and the `.rpm` declare (a 22.04 build
+  tops out at `GLIBC_2.34` today). It stays a GitHub-hosted image, so the
   build provenance is unchanged: the `sign` job (which builds nothing)
   attests the same artefacts, and `gh attestation verify
   --deny-self-hosted-runners` with the tag-bound identity still applies.
@@ -4296,18 +4298,21 @@ product code builds that bundle), with a false `host-check` warning.
   `package` job, `deploy/release/glibc-baseline.sh check`, reads every ELF
   file of the tarball's tree, of the `.deb` and of the `.rpm` (the four
   binaries, the eBPF object; any shared library a later release ships)
-  and fails when one needs a glibc symbol version above 2.35 — weak needs
+  and fails when one needs a glibc symbol version above 2.34 — weak needs
   included (`readelf -V`, the `.gnu.version_r` section) — or a shared
   library other than glibc's own and `libgcc_s` (a dependency the packages
   would not declare). Its `selftest` runs first, in the same step: it
-  builds, with the release's linker, a binary with a strong and one with a
-  weak need of `GLIBC_2.39` and proves the check refuses both. The CI
+  builds, with the release's linker, binaries with a strong and a weak need
+  of `GLIBC_2.35` (one above the baseline) and of `GLIBC_2.39`, and one of
+  `GLIBC_2.34`, and proves the check refuses the first four and accepts the
+  last. The CI
   artefact the tester installed fails this check (the agent, the watchdog
   and `nn-admin`: `GLIBC_2.39`, flags `WEAK`). Ratchets in
-  `xtask/tests/supply_chain.rs`: the job's image is the baseline's
-  (`the_release_is_built_and_checked_on_the_glibc_baseline`, which also
-  holds the `.deb`'s and `.rpm`'s glibc floors at or below it) and the
-  selftest passes (`glibc_baseline_check_refuses_a_binary_that_needs_2_39`).
+  `xtask/tests/supply_chain.rs`
+  (`the_release_is_built_and_checked_on_the_glibc_baseline`: the job runs on
+  the oldest image, the glibc step carries no `if` nor `continue-on-error`,
+  and the `.deb`'s and `.rpm`'s glibc floors equal the baseline) and the
+  selftest passes (`glibc_baseline_check_refuses_a_binary_that_needs_above_2_34`).
   An operator of an earlier release: nothing to do; the warning goes away
   with the next upgrade.
 - **`nn-admin` exits 17 when this user may not reach the agent.** Without

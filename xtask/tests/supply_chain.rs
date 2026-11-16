@@ -17,7 +17,7 @@
 //! tag check's selftest (git and ssh-keygen, throwaway keys),
 //! `the_release_scripts_refuse_a_lab_build` runs the tarball's and the
 //! packages' scripts under bash with stub binaries, and
-//! `glibc_baseline_check_refuses_a_binary_that_needs_2_39` runs the glibc
+//! `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34` runs the glibc
 //! check's selftest (cc and the toolchain's rust-lld).
 
 use std::fs;
@@ -3543,6 +3543,10 @@ fn glibc_baseline() -> String {
         .expect("deploy/release/glibc-baseline.sh sets GLIBC_BASELINE=")
 }
 
+fn version_key(s: &str) -> Vec<u64> {
+    s.split('.').map(|p| p.parse().unwrap()).collect()
+}
+
 fn version_le(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap()).collect() };
     parse(a) <= parse(b)
@@ -3562,8 +3566,8 @@ fn the_release_is_built_and_checked_on_the_glibc_baseline() {
     let root = repo_root();
     let baseline = glibc_baseline();
     assert_eq!(
-        baseline, "2.35",
-        "the oldest supported distribution is Ubuntu 22.04 (glibc 2.35)"
+        baseline, "2.34",
+        "the oldest supported glibc is AlmaLinux/RHEL 9's (2.34), the packages' floor"
     );
     let wf = workflow_yaml(&root.join(".github/workflows/release.yml"));
     let package = jobs(&wf)
@@ -3581,9 +3585,21 @@ fn the_release_is_built_and_checked_on_the_glibc_baseline() {
                 "package runs on `{image}`, not a pinned image of known glibc ({RUNNER_GLIBC:?})"
             )
         });
+    // The build image is the OLDEST of the images the release could use
+    // (never ubuntu-latest): no image of a lower glibc exists on GitHub, and
+    // the check, not the image, holds the needs at the baseline.
+    let oldest = RUNNER_GLIBC
+        .iter()
+        .min_by_key(|(_, g)| version_key(g))
+        .map(|(i, _)| *i)
+        .unwrap();
     assert_eq!(
-        glibc, baseline,
-        "package runs on {image} (glibc {glibc}): the release must be linked on the baseline glibc {baseline}"
+        image, oldest,
+        "package runs on {image} (glibc {glibc}): the release is built on the oldest image ({oldest})"
+    );
+    assert!(
+        version_le(&baseline, glibc),
+        "the baseline {baseline} is above the image's glibc {glibc}: nothing could link"
     );
     let runs: Vec<String> = steps(&package)
         .iter()
@@ -3599,6 +3615,20 @@ fn the_release_is_built_and_checked_on_the_glibc_baseline() {
         at("deploy/release/glibc-baseline.sh selftest"),
         check,
         "the selftest runs in the check's step, before it"
+    );
+    // The glibc step is unconditional: no `if:`, no `continue-on-error`
+    // (`if: false` or a swallowed failure would let a release pass without
+    // the check; sign requires package's success, publish requires sign).
+    let check_step = &steps(&package)[check];
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            check_step.get(key).is_none(),
+            "the glibc step must not carry `{key}:` (it runs on every release and its failure fails the job)"
+        );
+    }
+    assert!(
+        package.get("continue-on-error").is_none(),
+        "the package job must not carry `continue-on-error:`"
     );
     let step = &runs[check];
     assert!(
@@ -3636,19 +3666,19 @@ fn the_release_is_built_and_checked_on_the_glibc_baseline() {
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
-        assert!(
-            version_le(&floor, &baseline),
-            "the {what} floor {floor} is above the build's baseline {baseline}"
+        assert_eq!(
+            floor, baseline,
+            "the {what} floor {floor} must equal the check's baseline {baseline}: one ceiling"
         );
     }
 }
 
 /// Lot 365: the check itself, against binaries built on purpose — a strong
 /// and a weak (`Flags: WEAK`, as the release's linker marks Rust's probes)
-/// need of GLIBC_2.39 refused, GLIBC_2.35 accepted, an undeclared library
-/// refused. Runs cc and the toolchain's rust-lld; no network.
+/// need of GLIBC_2.35 (one above the baseline) and of GLIBC_2.39 refused,
+/// GLIBC_2.34 (the baseline) accepted, an undeclared library refused. Runs cc and the toolchain's rust-lld; no network.
 #[test]
-fn glibc_baseline_check_refuses_a_binary_that_needs_2_39() {
+fn glibc_baseline_check_refuses_a_binary_that_needs_above_2_34() {
     let out = std::process::Command::new("bash")
         .arg(repo_root().join("deploy/release/glibc-baseline.sh"))
         .arg("selftest")
@@ -3666,7 +3696,9 @@ fn glibc_baseline_check_refuses_a_binary_that_needs_2_39() {
     for line in [
         "selftest ok    a strong need of GLIBC_2.39 is refused (exit 1)",
         "selftest ok    a weak need of GLIBC_2.39 is refused (exit 1)",
-        "selftest ok    a need of GLIBC_2.35 is accepted (exit 0)",
+        "selftest ok    a strong need of GLIBC_2.35 is refused (exit 1)",
+        "selftest ok    a weak need of GLIBC_2.35 is refused (exit 1)",
+        "selftest ok    a need of GLIBC_2.34 is accepted (exit 0)",
         "selftest ok    an undeclared shared library is refused (exit 1)",
         "glibc-baseline: selftest passed",
     ] {

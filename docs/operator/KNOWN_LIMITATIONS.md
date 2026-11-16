@@ -519,8 +519,8 @@ The `nn-admin` commands and their exit codes are in
 [NN_ADMIN.md](NN_ADMIN.md).
 
 - **The glibc baseline.** The release is built on Ubuntu 22.04 (glibc
-  2.35), and the release workflow checks that no shipped file needs a newer
-  glibc, weakly or not. Earlier builds, made on Ubuntu 24.04, printed
+  2.35), and the release workflow checks that no shipped file needs a glibc
+  newer than 2.34 (AlmaLinux/RHEL 9, the oldest supported), weakly or not. Earlier builds, made on Ubuntu 24.04, printed
   `weak version 'GLIBC_2.39' not found` at every `nn-admin` command on
   Ubuntu 22.04 and Debian 12 (harmless); a release that still does is one of
   those.

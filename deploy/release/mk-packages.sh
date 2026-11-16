@@ -174,7 +174,8 @@ Release:        ${REL}
 Summary:        ${SUMMARY}
 License:        Apache-2.0
 URL:            ${HOMEPAGE}
-# glibc 2.34 is the hard floor; newer symbols are weak (Rust std probes them),
+# glibc 2.34 is the hard floor; the release check (glibc-baseline.sh) holds every need, weak included,
+# at or below 2.34 (Rust std probes newer symbols weakly),
 # so rpm's automatic requires would over-constrain the package.
 AutoReqProv:    no
 Requires:       glibc >= 2.34

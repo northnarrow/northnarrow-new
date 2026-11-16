@@ -11827,7 +11827,7 @@ number in parentheses is a lab PR.
     (agent uninstalled, no `.local`, packages purged, no mounts), powered
     off.
 - **Lot 365 — the pre-alpha's external tester run (Debian 12, the guide of
-  #571): release binaries for glibc 2.35, a clear `nn-admin` permission
+  #571): release binaries for glibc 2.34, a clear `nn-admin` permission
   error, `host-check`'s pin lock (no level changes).**
   - What was open: on Debian 12 every start of the CI release's binaries
     printed `weak version 'GLIBC_2.39' not found` (linked on Ubuntu 24.04:
@@ -11839,11 +11839,11 @@ number in parentheses is a lab PR.
     fix round): no product code builds that bundle.
   - Done: the release's `package` job on `ubuntu-22.04`, and a step that
     checks every ELF file of the tarball, the `.deb` and the `.rpm`
-    (`deploy/release/glibc-baseline.sh`: no `GLIBC_` need above 2.35, weak
+    (`deploy/release/glibc-baseline.sh`: no `GLIBC_` need above 2.34, weak
     included, no library but glibc's and `libgcc_s`; its selftest refuses a
-    strong and a weak need of 2.39 built on purpose with the release's
+    strong and a weak need of 2.35 and of 2.39, accepts 2.34, built on purpose with the release's
     linker). Ratchets `the_release_is_built_and_checked_on_the_glibc_baseline`
-    and `glibc_baseline_check_refuses_a_binary_that_needs_2_39`. One helper
+    and `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34`. One helper
     for every command that talks to the agent (`exit_from_request_error`):
     `EACCES`/`EPERM` → exit 17 with the sudo advice; 5 unchanged otherwise.
     The mini-hunt's variants: a root-only key (17), `chain verify` without
