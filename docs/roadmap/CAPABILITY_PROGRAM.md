@@ -11864,6 +11864,37 @@ number in parentheses is a lab PR.
     — 5.15 `sb_mount` 868,535 (86.9 %), `move_mount` 830,510, `sb_umount`
     584,166; debian12 (6.1) `move_mount` 821,218; 7.0 602,885; debian13
     (6.12) 376,974; 6.8 the highest 285,254.
+  - Fix round 2 (the re-check of #569, N1): a recursive `MS_SHARED` above
+    the lock was refused in any namespace that reaches the host's, so
+    runc's `rootfsPropagation: rshared` (containerd's and CRI-O's for any
+    Kubernetes `Bidirectional` mount: Cilium's bpffs, the CSI node
+    plugins) and `unshare -m --propagation shared` failed in a fresh
+    namespace whose `/` is still a peer of PID 1's. `lock_touched` judges a
+    recursive `MS_SHARED` or `MS_PRIVATE` above the lock in PID 1's
+    namespace only; a raw namespace's own recursive change joins its
+    accepted residual (its copy of the lock behind the walk, signed at the
+    round). Test: `a_recursive_shared_change_above_the_lock_is_judged_in_pid_1s_namespace_only`
+    (fails before the fix; `a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above`'s
+    shared input now PID 1's namespace, the others asserted not judged).
+    Mutation: 4 mutants of the rule (the host condition dropped, the old
+    rule put back, the shared flag dropped, `guard != 0` for the host),
+    all caught by both named tests.
+    Lab (fix round 2, as measured, our own guests): ubuntu2204
+    (5.15.0-203), ubuntu2404 (6.8.0-149) — 19/19 refused, one signed High
+    each and the lock unchanged (among them `--make-rshared` and
+    `--make-rprivate` of `/`, `/sys`, `/sys/fs/bpf` in the host's
+    namespace); a raw namespace's `--make-rshared /` and `unshare -m
+    --propagation shared`, refused in fix round 1, let through without a
+    record; 13/13 let through without a record — fix round 1's 8, docker,
+    `docker run -v /sys/fs/bpf:/sys/fs/bpf:rshared` (the bind `shared:11`,
+    the host's group, inside the container) and a runc bundle with
+    `rootfsPropagation: rshared` and an `rbind,rshared` bind of
+    `/sys/fs/bpf`; the lock unbindable after them, never in an rbind
+    copy; the bpffs and the pins kept through the race and the chain of
+    9; cold boot and uninstall clean. Verifier: 5.15 `sb_mount` 830,908
+    (83.1 %, 69,092 under the 900k gate; its stack chain 480 of 512),
+    `move_mount` 830,510 (69,490 under); 6.8 `sb_mount` 235,430,
+    `move_mount` 269,733.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

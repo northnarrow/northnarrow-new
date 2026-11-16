@@ -122,8 +122,9 @@ fn the_lock_judge_is_out_of_line_and_signs_nothing() {
 }
 
 /// The review of #569 (F1a, F1c): the lock's judge in `sb_mount` reads the
-/// namespace before the rule — a recursive `MS_PRIVATE` above the lock is
-/// judged only where the mount changed is PID 1's (`lock_touched` with the
+/// namespace before the rule — a recursive `MS_PRIVATE` or `MS_SHARED`
+/// above the lock (the re-check of #569, N1) is judged only where the
+/// mount changed is PID 1's (`lock_touched` with the
 /// target's guard, after `target_of`), the maker's identity is asked only
 /// of its own step on the host's lock (`lock_step_at`, never `lock_step`
 /// alone), and `systemd-shutdown`'s identity only of its `switch_root()`

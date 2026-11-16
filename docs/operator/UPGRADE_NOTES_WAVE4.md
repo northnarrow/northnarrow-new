@@ -3938,7 +3938,7 @@ rbind), and the walk reads a bounded subtree only. A lazy unmount could then
 take the host's bpffs, and the pins with it, in any namespace (N4, and the
 residual of §51.3). This lot closes the rbind variants of both for the
 pins; what stays open for the alpha, each signed at the next integrity
-round, is listed in 52.1 ("What it does not cover") and 52.3.
+round, is listed in 52.1 ("What it does not cover"), 52.3 and 52.4.
 
 ### 52.1 The lock
 
@@ -3983,9 +3983,10 @@ round, is listed in 52.1 ("What it does not cover") and 52.3.
   Anything else is refused and signed High (`NN-L-AT-001`, operation
   `mount`): an unmount or a move of it (a held mount), a mount on or below
   it, any other change of its propagation — on the lock, or on a copy of it
-  in a namespace whose changes reach the host's — a recursive `MS_SHARED`
-  on `/`, `/sys` or `/sys/fs/bpf` that would make it shared, and (52.3) a
-  recursive `MS_PRIVATE` there in the host's namespace. A caller who
+  in a namespace whose changes reach the host's — and, in the host's
+  namespace, a recursive `MS_SHARED` on `/`, `/sys` or `/sys/fs/bpf` that
+  would make it shared and (52.3) a recursive `MS_PRIVATE` there (52.4:
+  in another namespace neither is judged). A caller who
   forged the maker's identity gains nothing: each of the two steps only
   makes the lock (52.3: lot 359's third step, `MS_PRIVATE`, did not).
 - **The integrity round.** The start reads the lock in PID 1's table: in
@@ -4011,8 +4012,9 @@ round, is listed in 52.1 ("What it does not cover") and 52.3.
   - `mount_setattr(2)` has no LSM hook: root can clear the lock's flags
     through it; until the round makes the lock again (`pin_lock_changed`,
     High), a racing unmount can take the host's bpffs and the pins;
-  - a raw mount namespace holds its own copy of the lock, and a move of
-    its copy of `/sys` is judged by its target only: that copy is then
+  - a raw mount namespace holds its own copy of the lock: its own
+    recursive change of propagation above it is not judged (52.4), and a
+    move of its copy of `/sys` is judged by its target only: that copy is then
     defended by the walk alone, and its unmount can still race the walk,
     or lie beyond its bound, and take the host's bpffs and the pins
     (`protected_mount_gone`, `pin_lock_missing`, High);
@@ -4021,14 +4023,12 @@ round, is listed in 52.1 ("What it does not cover") and 52.3.
   - `/sys/fs/cgroup` has no such child: its unmount by a racing or
     out-of-bound lazy unmount stays behind the walk.
 - **For you.** `mount --make-rshared /` (or of `/sys`, `/sys/fs/bpf`) in
-  the host's namespace, or in a raw `unshare(CLONE_NEWNS)` namespace that
-  keeps the host's peer groups (`unshare -m --propagation shared` among
-  them), is refused: it would make the lock shared — also on a copy that
-  does not hold it (a container's bidirectional bind of `/sys/fs/bpf`),
-  which the guard cannot tell apart. 52.3: `mount --make-rprivate` of the
-  same in the host's namespace is refused too. A recursive `MS_PRIVATE` or
-  `MS_SLAVE` in another namespace (container runtimes, `unshare -m`,
-  `systemd-nspawn`, systemd's own unit namespaces) is not judged. A tool
+  the host's namespace is refused: it would make the lock shared. 52.3:
+  `mount --make-rprivate` of the same there is refused too. 52.4: in
+  another namespace a recursive change of propagation — shared, private or
+  slave — is not judged: container runtimes (Kubernetes' `Bidirectional`
+  mounts included), `unshare -m` (with `--propagation shared` too),
+  `systemd-nspawn` and systemd's own unit namespaces work. A tool
   that removes `/sys/fs/bpf/northnarrow` by hand must unmount it first, in
   a window. `findmnt /sys/fs/bpf/northnarrow` shows the lock
   (`unbindable`).
@@ -4120,7 +4120,8 @@ bindable lock); and the lock missing at a start was never made again.
   (about 30 s) — 52.1, "What it does not cover": a change of the lock's
   flags through `mount_setattr(2)`, which has no LSM hook; a raw
   namespace's own copy of the lock, whose move is judged by its target
-  only and is then defended by the walk alone; the units' namespaces,
+  only and is then defended by the walk alone (52.4: its own recursive
+  change of propagation is not judged either); the units' namespaces,
   which never have the lock. The first lot after the alpha refuses the move of peer copies
   and signals `mount_setattr(2)` at once.
 - **Found by the lab (5.15).** With these changes the BPF back end loaded
@@ -4137,3 +4138,38 @@ bindable lock); and the lock missing at a start was never made again.
   `systemd-shutdown`'s exemption); the peer-group walk's code changed in
   `sb_mount`, `move_mount`, `sb_umount` and the lock's judge (the same
   walk).
+
+### 52.4 The re-check of #569: container runtimes and Kubernetes' `Bidirectional` mounts
+
+52.1 refused a recursive `MS_SHARED` above the lock in any namespace whose
+changes reach the host's. A container's fresh mount namespace is one: its
+`/` is still a peer of the host's `/` when the runtime makes its first
+change. So every container whose runtime makes `/` recursively shared was
+refused at its start — containerd and CRI-O do it (`rootfsPropagation:
+rshared`) for any Kubernetes `mountPropagation: Bidirectional` mount:
+Cilium's bpffs mount (its chart's default), the CSI node plugins
+(Longhorn, Rook-Ceph and others), so a node had no CNI and its pods stayed
+in `Init`; `unshare -m --propagation shared` the same.
+
+- **A recursive `MS_SHARED` above the lock is judged in the host's
+  namespace only**, as the recursive `MS_PRIVATE` of 52.3 already was. In
+  another namespace either changes that namespace's own copies only: let
+  through, without a record. Container runtimes and Kubernetes'
+  `Bidirectional` mounts work: the container's `rootfsPropagation:
+  rshared`, a bind of `/sys/fs/bpf` with `rbind,rshared`, `docker run -v
+  /sys/fs/bpf:/sys/fs/bpf:rshared`, `unshare -m --propagation shared`.
+- **Unchanged in the host's namespace.** `mount --make-rshared` and
+  `--make-rprivate` of `/`, `/sys` or `/sys/fs/bpf` stay refused and
+  signed High (`NN-L-AT-001`, operation `mount`). Every change of
+  propagation of the lock itself, or of a raw namespace's copy of it whose
+  changes reach the host's, stays refused in every namespace.
+- **What it costs.** It is inside the raw-namespace residual of 52.1: a
+  raw namespace may now also make its own copy of the lock shared through
+  a recursive change above it. That copy, like its move, is defended by
+  the walk alone, and a loss is signed at the next integrity round
+  (`protected_mount_gone`, `pin_lock_missing`, High). The units' views
+  never have the lock, so nothing is lost in the agent's or the
+  watchdog's namespace.
+- **eBPF.** `sb_mount`'s judge of a change of propagation that reaches the
+  lock changed: a recursive `MS_SHARED` above it is judged by the target's
+  namespace, as a recursive `MS_PRIVATE` was.

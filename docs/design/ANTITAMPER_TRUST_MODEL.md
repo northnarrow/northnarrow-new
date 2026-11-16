@@ -3106,11 +3106,15 @@ where it starts.
   and in any namespace: it made a lock in place, or a raw namespace's
   copy of it, bindable again — removed.) Every other unmount, move, mount
   over or below, or change of propagation of the lock (or of a copy of it
-  where a change reaches the host), a recursive `MS_SHARED` above it in
-  any namespace that reaches the host's, and a recursive `MS_PRIVATE`
-  above it in PID 1's namespace (the review of #569, F1a: it clears the
-  lock's `MNT_UNBINDABLE`; `systemd-shutdown`'s `switch_root()` excepted,
-  by its identity) is refused and signed High; inside the signed
+  where a change reaches the host), and a recursive `MS_SHARED` or
+  `MS_PRIVATE` above it in PID 1's namespace (the review of #569, F1a: the
+  private one clears the lock's `MNT_UNBINDABLE`; `systemd-shutdown`'s
+  `switch_root()` excepted, by its identity) is refused and signed High
+  (the re-check of #569, N1: in another namespace a recursive change above
+  the lock changes that namespace's own copies, and is not judged — a
+  container's `rootfsPropagation: rshared`, which containerd and CRI-O set
+  for any Kubernetes `Bidirectional` mount, runs in a fresh namespace
+  whose `/` is still a peer of PID 1's); inside the signed
   trusted-installer window it is let through and recorded (the
   uninstaller and an upgrade unmount it before they remove the
   directory).
@@ -3131,10 +3135,11 @@ where it starts.
     unmount, or one beyond the walk's bound, can take the host's bpffs and
     the pins (`pin_lock_changed`);
   - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
-    copies unbindable mounts), and a move of its copy of `/sys` is judged
-    by its target only: that copy is then defended by the walk alone, and
-    an unmount of it racing the walk, or beyond its bound, propagates to
-    the host's lock and bpffs (`protected_mount_gone`,
+    copies unbindable mounts): its own recursive change of propagation
+    above it (shared or private) is not judged, and a move of its copy of
+    `/sys` is judged by its target only: that copy is then defended by the
+    walk alone, and an unmount of it racing the walk, or beyond its bound,
+    propagates to the host's lock and bpffs (`protected_mount_gone`,
     `pin_lock_missing`);
   - the units' namespaces (the agent's, the watchdog's) never have the
     lock, for the unit's whole run (systemd builds their view with a

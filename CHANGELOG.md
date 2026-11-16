@@ -21,12 +21,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     agent's binary as a unit's process; the self-bind judged by the
     kernel's objects, then `MS_UNBINDABLE` on the host's lock); any other
     unmount, move, mount or change of propagation of it, a copy of it that
-    reaches the host, a recursive `MS_SHARED` above it, or a recursive
-    `MS_PRIVATE` above it in PID 1's namespace (`systemd-shutdown`'s
-    `switch_root()` excepted) is refused, signed High (`MG_WHY_LOCK`,
-    operation `MG_OP_PROPAGATE`). The review of #569 (F1): the maker's
-    `MS_PRIVATE` step, and a recursive `MS_PRIVATE` above the lock, left it
-    bindable without a refusal — the step is gone, the change refused.
+    reaches the host, or a recursive `MS_SHARED` or `MS_PRIVATE` above it
+    in PID 1's namespace (`systemd-shutdown`'s `switch_root()` excepted) is
+    refused, signed High (`MG_WHY_LOCK`, operation `MG_OP_PROPAGATE`). The
+    review of #569 (F1): the maker's `MS_PRIVATE` step, and a recursive
+    `MS_PRIVATE` above the lock, left it bindable without a refusal — the
+    step is gone, the change refused. Its re-check (N1): a recursive
+    `MS_SHARED` above the lock was refused in any namespace that reaches
+    the host's, so a container whose runtime makes its fresh namespace's
+    `/` recursively shared (containerd's and CRI-O's `rootfsPropagation:
+    rshared` for any Kubernetes `Bidirectional` mount: Cilium, the CSI node
+    plugins) failed to start, and so did `unshare -m --propagation shared`;
+    judged in PID 1's namespace only now — container runtimes and
+    `Bidirectional` mounts work.
   - **Watch:** a start without it signs a degradation (the walk remains;
     in the agent's unit the round then makes it); each integrity round
     signs `pin_lock_missing` / `pin_lock_changed` (High) and makes it again
@@ -36,7 +43,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     rbind copy beyond the walk's bound). **Does not close**, each signed at
     the next integrity round: the lock's flags cleared through
     `mount_setattr(2)` (no LSM hook); a raw namespace's own copy of the
-    lock, its move judged by its target only; the units' namespaces, which
+    lock, its move judged by its target only and its own recursive change
+    of propagation not judged; the units' namespaces, which
     never have the lock (KNOWN_LIMITATIONS.md). Scheduled first after the
     alpha.
   - **Fixed on the way (the fix round's lab, 5.15):** the peer-group walk

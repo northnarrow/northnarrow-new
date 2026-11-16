@@ -1065,21 +1065,27 @@ pub fn point_refusal(point: &Point, fstype: &NameKey, host: bool, src_root: bool
 /// and mount point are both the pin directory — any change, `MS_SLAVE` and
 /// `MS_UNBINDABLE` included, is judged), or a recursive one on a mount
 /// rooted above it (`above_lock`, [`MG_LOCK_ABOVE`]) that clears its
-/// `MNT_UNBINDABLE` (the kernel's `change_mnt_propagation()`): a recursive
-/// `MS_SHARED` in any namespace (it would make the lock shared, and an
-/// rbind copies a shared mount); a recursive `MS_PRIVATE` in PID 1's
-/// namespace (`guard`, [`GUARD_HOST`]: the review of #569, F1a — private
-/// but bindable, the host's lock is copied by the next rbind). A recursive
-/// `MS_PRIVATE` in another namespace changes that namespace's own copies
-/// only (what container runtimes, `unshare -m` and systemd's unit
-/// namespaces make); a recursive `MS_SLAVE` or `MS_UNBINDABLE` keeps the
+/// `MNT_UNBINDABLE` (the kernel's `change_mnt_propagation()`), made in PID
+/// 1's namespace (`guard`, [`GUARD_HOST`]): a recursive `MS_SHARED` (it
+/// would make the lock shared, and an rbind copies a shared mount) or a
+/// recursive `MS_PRIVATE` (the review of #569, F1a — private but bindable,
+/// the host's lock is copied by the next rbind). In another namespace
+/// either changes that namespace's own copies only (the re-check of #569,
+/// N1: runc's `rootfsPropagation: rshared`, which containerd and CRI-O set
+/// for any Kubernetes `Bidirectional` mount, and `unshare -m
+/// --propagation shared` make `/` recursively shared in a fresh namespace
+/// whose `/` is still a peer of PID 1's; container runtimes, `unshare -m`
+/// and systemd's unit namespaces make it recursively private): its copy of
+/// the lock is the raw namespace's residual, behind the walk and signed at
+/// the integrity round. A recursive `MS_SLAVE` or `MS_UNBINDABLE` keeps the
 /// flag; a change that is not recursive leaves the lock as it is: not
 /// judged.
 pub const fn lock_touched(flags: u64, on_lock: bool, above_lock: bool, guard: u8) -> bool {
     (on_lock && flags & MS_PROPAGATION != 0)
         || (above_lock
             && flags & MS_REC != 0
-            && (flags & MS_SHARED != 0 || (guard == GUARD_HOST && flags & MS_PRIVATE != 0)))
+            && guard == GUARD_HOST
+            && flags & (MS_SHARED | MS_PRIVATE) != 0)
 }
 
 /// The lock's own change of propagation: exactly `MS_UNBINDABLE` — no
@@ -3286,9 +3292,11 @@ mod tests {
     }
 
     /// Named test (lot 359): which changes of propagation reach the lock —
-    /// any on it (or on a copy of it), a recursive shared one above it; a
-    /// recursive private or slave one above it in another namespace than
-    /// PID 1's (a container's, `unshare -m`'s, a unit's) is not judged.
+    /// any on it (or on a copy of it), a recursive shared one above it in
+    /// PID 1's namespace; a recursive shared, private or slave one above it
+    /// in another namespace (a container's, `unshare -m`'s, a unit's) is
+    /// not judged (the re-check of #569, N1: the input of this loop's
+    /// shared case is now PID 1's namespace, the other namespaces below).
     #[test]
     fn a_change_of_propagation_reaches_the_lock_on_it_or_shared_from_above() {
         for guard in [GUARD_HOST, GUARD_AGENT, GUARD_WATCHDOG, 0] {
@@ -3302,13 +3310,14 @@ mod tests {
             ] {
                 assert!(lock_touched(f, true, false, guard), "on the lock: {f:#x}");
             }
-            assert!(lock_touched(MS_SHARED | MS_REC, false, true, guard));
             assert!(!lock_touched(MS_SHARED | MS_REC, false, false, guard));
             assert!(!lock_touched(0, true, true, guard), "no propagation flag");
         }
+        assert!(lock_touched(MS_SHARED | MS_REC, false, true, GUARD_HOST));
         for guard in [GUARD_AGENT, GUARD_WATCHDOG, 0] {
             for f in [
                 MS_SHARED,
+                MS_SHARED | MS_REC,
                 MS_PRIVATE | MS_REC,
                 MS_SLAVE | MS_REC,
                 MS_UNBINDABLE | MS_REC,
@@ -3398,6 +3407,66 @@ mod tests {
             lock_verdict(true, true, false, false, false),
             Verdict::Refuse(MG_WHY_LOCK)
         );
+    }
+
+    /// Named test (the re-check of #569, N1): runc's `prepareRoot()` with
+    /// `rootfsPropagation: rshared` — what containerd and CRI-O set for any
+    /// Kubernetes `mountPropagation: Bidirectional` mount (Cilium's bpffs,
+    /// the CSI node plugins), and `unshare -m --propagation shared` —
+    /// makes `/` recursively shared in the container's fresh namespace,
+    /// whose `/` is still a peer of PID 1's: it changes that namespace's
+    /// own copies (its copy of the lock among them, a residual behind the
+    /// walk, signed at the round) and is let through; the same change
+    /// made where the mount is PID 1's own stays refused and signed.
+    #[test]
+    fn a_recursive_shared_change_above_the_lock_is_judged_in_pid_1s_namespace_only() {
+        let flags = MS_SHARED | MS_REC;
+        // 0: PID 1's `/` (guarded), 1: the container's copy, a peer of it
+        for known in [false, true] {
+            let mut g = Graph::new(2).guard(0, GUARD_HOST).peers(1, &[0, 1]);
+            if known {
+                g = g.following(&[1]);
+            }
+            let (guard, reach) = target_reach(&g, 1).expect("reaches PID 1's");
+            assert_eq!((guard, reach), (0, REACH_OTHER_NS));
+            // the hook's widest rule first (`/` is keyed MG_LOCK_ABOVE),
+            // then the rule by the target's namespace: not judged there
+            assert!(lock_touched(flags, false, true, GUARD_HOST));
+            assert!(!lock_touched(flags, false, true, guard), "known {known}");
+        }
+        for guard in [GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            assert!(!lock_touched(flags, false, true, guard), "guard {guard}");
+            assert!(
+                !lock_touched(flags | MS_PRIVATE, false, true, guard),
+                "guard {guard}"
+            );
+        }
+        // in PID 1's namespace: still judged, refused and signed
+        assert!(lock_touched(flags, false, true, GUARD_HOST));
+        let rshared = Query {
+            lock_maker: false,
+            lock_step: false,
+            ..host(MG_OP_PROPAGATE, Point::EMPTY, "")
+        };
+        assert_eq!(decide(&rshared), Verdict::Refuse(MG_WHY_LOCK));
+        assert!(
+            !lock_shutdown_step(flags, false),
+            "not the shutdown's shape"
+        );
+        // on the lock itself, or a raw namespace's copy of it that reaches
+        // the host's: judged in every namespace, as before
+        for guard in [GUARD_HOST, GUARD_AGENT, GUARD_WATCHDOG, 0] {
+            assert!(lock_touched(MS_SHARED, true, false, guard), "guard {guard}");
+            assert!(lock_touched(flags, true, false, guard), "guard {guard}");
+        }
+        let copy = Query {
+            host: false,
+            reaches: true,
+            lock_maker: false,
+            lock_step: lock_step_at(MS_SHARED, true, 0),
+            ..host(MG_OP_PROPAGATE, pin_dir(), "")
+        };
+        assert_eq!(decide(&copy), Verdict::Refuse(MG_WHY_LOCK));
     }
 
     /// Named test (the review of #569, F1a): a plain `MS_SHARED` of the

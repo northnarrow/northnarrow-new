@@ -1079,11 +1079,12 @@ unsafe fn note_propagation_change(ctx: &LsmContext) {
 /// made on the lock or a copy of it (a mount whose root and mount point are
 /// the pin directory's one dentry, [`MG_LOCK`]), judged where its parent's
 /// group lands (the place an unmount propagates through); or a recursive
-/// `MS_SHARED` on a mount rooted above it ([`MG_LOCK_ABOVE`]), judged where
-/// that mount lands, and a recursive `MS_PRIVATE` there in PID 1's
-/// namespace (the review of #569, F1a). Refused but the maker's own step on
-/// the host's lock (`MS_UNBINDABLE`, `lock_step_at`) and `systemd-shutdown`'s
-/// `switch_root()` (`lock_shutdown_step`). A target that is not a mount's
+/// `MS_SHARED` or `MS_PRIVATE` on a mount rooted above it
+/// ([`MG_LOCK_ABOVE`]) in PID 1's namespace (the review of #569, F1a, and
+/// its re-check, N1: in a raw namespace — runc's `rootfsPropagation:
+/// rshared` — it changes that namespace's own copies). Refused but the
+/// maker's own step on the host's lock (`MS_UNBINDABLE`, `lock_step_at`)
+/// and `systemd-shutdown`'s `switch_root()` (`lock_shutdown_step`). A target that is not a mount's
 /// root is the kernel's `EINVAL`: let through. Out of line, a BPF-to-BPF
 /// call: its walk's states end with its frame.
 #[inline(never)]
@@ -1138,8 +1139,8 @@ unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
     let Some((guard, reach)) = target_of(o, at) else {
         return 0;
     };
-    // the review of #569 (F1a): a recursive MS_PRIVATE above it, in PID 1's
-    // namespace only
+    // the review of #569 (F1a) and its re-check (N1): a recursive
+    // MS_SHARED or MS_PRIVATE above it, in PID 1's namespace only
     if !lock_touched(flags, on_lock, above, guard) {
         return 0;
     }

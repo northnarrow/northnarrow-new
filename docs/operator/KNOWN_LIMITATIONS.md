@@ -202,11 +202,13 @@ analysis is in the
     and the pins; the round signs `pin_lock_changed` (High) and makes the
     lock again;
   - a raw mount namespace (`unshare(CLONE_NEWNS)` keeping the host's peer
-    groups) holds its own copy of the lock, and a move of its copy of
-    `/sys` is judged by its target only: that copy is then defended by the
-    walk alone, so its unmount can still race the walk, or lie beyond its
-    bound, and take the host's bpffs and the pins; the round signs
-    `protected_mount_gone` and `pin_lock_missing` (High);
+    groups) holds its own copy of the lock: its own recursive change of
+    propagation above that copy (shared or private) changes its own copies
+    only and is not judged, and a move of its copy of `/sys` is judged by
+    its target only: that copy is then defended by the walk alone, so its
+    unmount can still race the walk, or lie beyond its bound, and take the
+    host's bpffs and the pins; the round signs `protected_mount_gone` and
+    `pin_lock_missing` (High);
   - the units' own namespaces — the agent's and the watchdog's among them —
     never have the lock, for the unit's whole run: systemd builds their
     view with a recursive bind, which skips an unbindable mount, so such an
@@ -220,16 +222,19 @@ analysis is in the
   degradation; in the agent's unit the integrity round then makes it (a few
   attempts each round, then a back-off). `/sys/fs/cgroup` has no such
   child: a racing lazy unmount can take the host's childless cgroup mount
-  (the integrity round signs `protected_mount_gone`, High). *For you:* in
-  the host's namespace `mount --make-rprivate` (or `--make-rshared`) of
-  `/`, `/sys` or `/sys/fs/bpf` is refused — `systemd-shutdown`'s own
-  switch to its shutdown image excepted — and so is a recursive
-  `MS_SHARED` of a mount rooted there in any namespace whose changes reach
-  the host's, even where it is harmless: the guard cannot tell a copy that
-  does not hold the lock (a bind of `/` or `/sys` made `rprivate`, a
-  container's bidirectional bind of `/sys/fs/bpf`, as Kubernetes'
-  `mountPropagation: Bidirectional` makes it) from the host's tree; use
-  `rslave`, or a trusted-installer window.
+  (the integrity round signs `protected_mount_gone`, High). *For you:*
+  container runtimes and Kubernetes' `mountPropagation: Bidirectional`
+  mounts work: containerd and CRI-O make the container's `/` recursively
+  shared for them (`rootfsPropagation: rshared`), in the container's own
+  mount namespace, and a recursive shared or private change made outside
+  PID 1's namespace is not judged (the re-check of #569) — Cilium's bpffs
+  mount, the CSI node plugins, `docker run -v …:rshared` and `unshare -m
+  --propagation shared` among them. In the host's namespace itself `mount
+  --make-rprivate` (or `--make-rshared`) of `/`, `/sys` or `/sys/fs/bpf`
+  is refused and signed — `systemd-shutdown`'s own switch to its shutdown
+  image excepted — also on a bind of `/` or `/sys` made there, which the
+  guard cannot tell from the host's tree; a recursive `MS_SLAVE` of such
+  a bind (`--make-rslave`) is not judged.
 - **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
   takes the whole subtree of the mount it names, and the kernel carries
   the unmount of each mount in it onto the peers and slaves of its parent:
