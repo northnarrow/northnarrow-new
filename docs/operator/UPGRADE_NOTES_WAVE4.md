@@ -4358,15 +4358,29 @@ product code builds that bundle), with a false `host-check` warning.
   it was run from, an AppImage's image and daemon, a module tool's script
   and library path, the image of a program whose stdio is a socket.
   - **With a deadline, never on the pump.** Every exec's reads run on the
-    agent's bounded reader (one hand-over per exec); the pump waits for
-    them only up to a short deadline, then goes on. No lock the pumps share
-    is held while a file is read.
-  - **Fair between users.** Each read is for the real uid of the exec's
-    process. Reads of one uid that do not answer hold at most one of the
-    reader's helpers: that uid's next read waits for its first, within its
-    own deadline, or is refused at once while the first is held. Users,
-    the system's accounts and root each keep a share of their own, so no
-    user can make root's facts unverifiable.
+    agent's bounded reader (one hand-over per exec; two for a module tool's
+    exec or a program whose standard input is a socket); the pump waits
+    for them only up to a short deadline, then goes on. No lock the pumps
+    share is held while a file is read.
+  - **Fair between users.** Each read is for the user of the exec's
+    process: its real uid — or, for a subordinate id of `/etc/subuid` (a
+    rootless container's, `unshare --map-auto`'s), the user that owns the
+    id's range. Reads of one user that do not answer hold at most one of
+    the reader's helpers, all of that user's ids together: that user's
+    next read waits for its first, within its own deadline, or is refused
+    at once while the first is held. Users, the system's accounts (systemd's
+    dynamic users and `nobody` among them) and root each keep a share of
+    their own, so no user can make root's facts unverifiable, nor make
+    another user's facts unverifiable with its subordinate ids.
+    - The ranges are the ones the agent already publishes for the shares
+      of its kernel buffers (`/etc/subuid`, read at the start and again
+      when it or `/etc/passwd` changes): root's ranges (LXD, Incus) count as
+      one account of their own; ids no single known user holds (an owner
+      `/etc/passwd` does not name, ranges that overlap, a gap between
+      ranges) count as one account together, as does every id from 65536 up while `/etc/subuid` cannot
+      be read; a uid of no range counts as itself.
+    - No uid of the 16-bit range (root's, a system account's, a user's
+      own) is ever counted as another user's, whatever a range says.
   - **Which file systems are read.** A file's file system is told by the
     mount the kernel reached the file through, against PID 1's mount table
     (and the agent's own; for a process in another mount namespace, a
@@ -4378,7 +4392,9 @@ product code builds that bundle), with a false `host-check` warning.
       kernel clients) are read, on the bounded reader with its deadline: a
       home on NFS or CIFS keeps its AppImage tie;
     - btrfs is read as any local file system (a subvolume's files show a
-      device of their own; the mount decides, not the device);
+      device of their own; the mount decides, not the device). An
+      AppImage's image on btrfs is recognised whichever order the btrfs
+      module and the agent started in;
     - a file system no table shows (mounted in a user's own namespace, or
       since the tables were read) is not read.
   - A process's file, root and descriptors are identified by the kernel's
@@ -4387,6 +4403,19 @@ product code builds that bundle), with a false `host-check` warning.
     the fact is about a path (the directory an image was run from, an
     AppImage's image, a module tool's script), no symbolic link on the way
     is followed; a file is opened for reading only once judged.
+- **Where an exec's file is.** The path an exec record names is the file's
+  mount point and its path in that file system:
+  - a file of a btrfs subvolume, whose file system's own root no mount
+    shows (a `/home` on btrfs, as Fedora and openSUSE lay it out), is named
+    by the process's own `exe` link, when the file it leads to is the
+    exec's (by the kernel's identity, through a mount of the agent's own
+    table);
+  - a mount made just before the exec (an AppImage's own, right after its
+    image ran from such a file) is placed at once. Before, an AppImage
+    run from a btrfs home could have its zygote's re-exec (`/proc/self/exe`)
+    named by that string: the zygote was not recognised as the image's,
+    and its fork-only child's connection (the Chromium/Electron shape) was
+    judged from `/tmp` (NN-L-NET-008 High).
 - **What is judged when a fact is not read in time.** Not verified, never
   trusted:
   - no `ROOT_DIR` and no AppImage tie (`USER_IMAGE`);
@@ -4402,14 +4431,23 @@ product code builds that bundle), with a false `host-check` warning.
     it lasts.
   - `exec_readers_held`: a share of the reader (users', system accounts',
     root's) used up by reads that do not answer — once while it lasts.
-  - `exec_reads_slow`: reads that answered slowly added up, for one uid
-    (the record names it) or for every uid together, past a budget — the
-    exec pump was slowed.
+  - `exec_reads_slow`: reads that answered slowly added up, for one user
+    (the record names it, with the uid of its latest slow read) or for
+    every user together, past a budget — the exec pump was slowed. One
+    record per user and window, with its count of slow reads; when the
+    window ends the record leaves the status and its total is signed. Past
+    a few users at once, the record of every user together names how many.
   - `exec_pump_mounts_changing`: files judged not verified because the
     mounts changed and their tables were not read again yet.
   - `exec_pump_mounts`, `exec_pump_own_mounts`: PID 1's (or the agent's
     own) mount table could not be read; the table last read stays in
     force.
+  - Each of these kinds of records keeps its own room in the list of
+    degradations `nn-admin status` shows: the slow reads' records cannot
+    crowd out the reads not answered or a share held, nor any other part's
+    records, and a record past its room is still signed. A degradation
+    noted past the list's limit (the signed logs' own "appends fail" among
+    them) is signed at the next flush, as one reported is.
 - **Before this change.** A read of a process's files could hold the exec
   pumps with no deadline; and in lot 366's first form, the AppImage
   record's lock was held while the tie read, a btrfs root or home had
@@ -4418,8 +4456,13 @@ product code builds that bundle), with a false `host-check` warning.
   shared one bound.
 - **Residuals, accepted.**
   - A read that does not answer holds one of the reader's helpers until it
-    answers. A user can make the facts of their own processes not
-    verified: they are judged as such, and signed.
+    answers. A user can make the facts of their own processes (its own
+    uid's and its subordinate ids') not verified: they are judged as such,
+    and signed.
+  - Two users acting together can hold the users' share: the other users'
+    exec facts are then judged not verified until a read answers, and the
+    share held is signed (`exec_readers_held`). Root's and the system
+    accounts' are not affected.
   - On a slow disk or network file system, an exec whose reads miss the
     deadline is judged as not verified (signed); slow reads that still
     answer slow the pump, and are signed past a budget.

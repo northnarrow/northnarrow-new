@@ -85,6 +85,21 @@ const MARKERS: &[&str] = &[
     "File::open(",
     "OpenOptions",
     "use std::fs::{",
+    // the re-check of #573 (N5): a mount table read by its path, and the
+    // C library's path calls
+    "mountinfo::read(",
+    "MountTable::load",
+    "libc::stat(",
+    "libc::lstat(",
+    "libc::statx(",
+    "libc::fstatat(",
+    "libc::open(",
+    "libc::openat(",
+    "libc::access(",
+    "libc::faccessat(",
+    "libc::readlink(",
+    "libc::readlinkat(",
+    "libc::opendir(",
 ];
 
 /// An import of one of `std::fs`' functions by its own name (`use
@@ -119,10 +134,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/app_image.rs",
-        10,
+        11,
         "the `/proc` root and `/proc/<pid>/fd` listed, `stat`, `status`, `fdinfo/<n>` read, \
-         the `exe` and `fd/<n>` links' text — procfs's own, beneath the anchored `/proc` root, \
-         on the reader; `Cached::is_file` (memory)",
+         the `exe` and `fd/<n>` links' text, PID 1's `mountinfo` — procfs's own, beneath the \
+         anchored `/proc` root, on the reader; `Cached::is_file` (memory)",
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
@@ -134,9 +149,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/exe_identity.rs",
-        1,
-        "`/proc/<pid>/exe`'s text (procfs's own link: the kernel's `d_path`, nothing looked \
-         up on the file's file system)",
+        3,
+        "`/proc/<pid>/exe`'s text, twice (procfs's own link: the kernel's `d_path`, nothing \
+         looked up on the file's file system; lot 366's re-check: an exec no mount places, \
+         placed by its process's link once its identity from the kernel's cache is the \
+         exec's); the agent's own mount table (`/proc/self/mountinfo`, procfs's own: the \
+         kernel answers), each pump thread's own",
     ),
     (
         "crates/nn-linux/src/program_images.rs",
@@ -149,9 +167,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/multiplexer.rs",
-        2,
+        3,
         "the sensors' setup before any pump runs: `/sys/kernel/btf/vmlinux` (sysfs), \
-         `/proc/sys/kernel/perf_event_paranoid` (procfs) — no pump step reads by hand",
+         `/proc/sys/kernel/perf_event_paranoid` (procfs); the module-load pump's own mount \
+         table (procfs's own; not an exec pump) — no exec pump step reads by hand",
     ),
 ];
 
@@ -197,8 +216,6 @@ const READS: &[&str] = &[
     "open_exe(",
     "reopen_fd(",
     "kernel_roots::cached(",
-    "mountinfo::read(",
-    "MountTable::load",
     "read_to_end(",
     "dir_names_max(",
     "run_within(",
@@ -244,6 +261,23 @@ fn functions(text: &str) -> Vec<(String, String)> {
     }
     out
 }
+
+/// A lock taken, by any spelling (the re-check of #573, N5: a
+/// `parking_lot::Mutex::lock(&m)`, a `try_lock()`, a `RwLock`'s guards).
+const LOCKS: &[&str] = &[
+    ".lock()",
+    "Mutex::lock(",
+    "try_lock(",
+    "try_lock_for(",
+    "try_lock_until(",
+    "lock_arc(",
+    ".read()",
+    ".write()",
+    "RwLock::read(",
+    "RwLock::write(",
+    "try_read(",
+    "try_write(",
+];
 
 /// Whether `body` calls the function `name` (`name(`, after no identifier
 /// character: `f(`, `.f(`, `::f(`).
@@ -298,7 +332,7 @@ fn lock_violations(code: &BTreeMap<String, String>) -> Vec<String> {
             reading.extend(more);
         }
         for (name, body) in &fns {
-            if body.contains(".lock()") && reading.contains(name) {
+            if LOCKS.iter().any(|l| body.contains(l)) && reading.contains(name) {
                 out.push(format!(
                     "{file}: `{name}` takes a lock and reads (or waits on the reader), directly \
                      or through what it calls — take the lock only to look and to publish, read \
@@ -391,6 +425,21 @@ fn every_spelling_of_a_path_read_by_hand_fails_the_ratchet() {
         "std::fs::File::open(p)",
         "std::fs::OpenOptions::new().read(true).open(p)",
         "reader.read_state(p)",
+        // the re-check of #573 (N5): its two
+        "crate::mountinfo::read(p)",
+        "unsafe { libc::stat(c.as_ptr(), &mut st) }",
+        // and their kin
+        "crate::mountinfo::MountTable::load(p)",
+        "unsafe { libc::lstat(c.as_ptr(), &mut st) }",
+        "unsafe { libc::statx(0, c.as_ptr(), 0, 0, &mut sx) }",
+        "unsafe { libc::fstatat(0, c.as_ptr(), &mut st, 0) }",
+        "unsafe { libc::open(c.as_ptr(), 0) }",
+        "unsafe { libc::openat(0, c.as_ptr(), 0) }",
+        "unsafe { libc::access(c.as_ptr(), 0) }",
+        "unsafe { libc::faccessat(0, c.as_ptr(), 0, 0) }",
+        "unsafe { libc::readlink(c.as_ptr(), b.as_mut_ptr(), 1) }",
+        "unsafe { libc::readlinkat(0, c.as_ptr(), b.as_mut_ptr(), 1) }",
+        "unsafe { libc::opendir(c.as_ptr()) }",
     ] {
         for file in [facts, image, steps] {
             let mut code = base.clone();
@@ -452,6 +501,27 @@ fn a_lock_held_across_a_read_fails_the_ratchet() {
         (
             DOORS,
             "fn planted() { let _g = STALE.lock(); let _ = bounded(0, \"x\", || ()); }",
+        ),
+        // the re-check of #573 (N5): a lock taken by another spelling
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(record: &Mutex<AppImages>, r: &TieRead) -> bool { let g = parking_lot::Mutex::lock(record); let found = read_step(Path::new(\"/proc\"), r); drop(g); found == Found::Nothing }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(record: &Mutex<AppImages>, r: &TieRead) -> bool { let Some(_g) = record.try_lock() else { return false }; read_step(Path::new(\"/proc\"), r) == Found::Nothing }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(m: &parking_lot::RwLock<u8>, r: &TieRead) { let _g = m.read(); let _ = read_step(Path::new(\"/proc\"), r); }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(m: &parking_lot::RwLock<u8>, r: &TieRead) { let _g = m.write(); let _ = read_step(Path::new(\"/proc\"), r); }",
+        ),
+        (
+            "crates/nn-linux/src/sensors/app_image.rs",
+            "fn planted(m: &Mutex<u8>, r: &TieRead) { let _g = m.try_lock_for(std::time::Duration::ZERO); let _ = read_step(Path::new(\"/proc\"), r); }",
         ),
     ] {
         let mut code = base.clone();

@@ -442,11 +442,16 @@ not cause as an incident.
   exec pumps themselves; a FUSE file system is never read. A fact not read
   in time is judged not verified, never trusted, and the exec sensor is
   signed degraded (`exec_reads_unanswered`; `exec_readers_held` while a
-  share of the reader is held; `exec_reads_slow`, naming the uid, when
-  slow reads slowed the exec pump). *For you:* such a degradation in
-  `nn-admin status` is worth a report, with the file systems mounted at
-  the time (`findmnt -t fuse,fuseblk,nfs,nfs4,cifs`). *Evidence:*
-  `one_uid_cannot_starve_root_s_reads`;
+  share of the reader is held; `exec_reads_slow`, naming the user, when
+  slow reads slowed the exec pump). A user's subordinate ids
+  (`/etc/subuid`) count as that user: one user cannot make another
+  user's facts unverifiable; two users acting together can hold the
+  users' share, and that is signed (`exec_readers_held`). *For you:* such
+  a degradation in `nn-admin status` is worth a report, with the file
+  systems mounted at the time (`findmnt -t fuse,fuseblk,nfs,nfs4,cifs`).
+  *Evidence:* `one_uid_cannot_starve_root_s_reads`;
+  `one_user_s_subordinate_ids_starve_no_other_user`;
+  `the_slow_records_never_crowd_out_the_exec_signals`;
   `an_exec_step_that_never_answers_is_not_waited_for`; lot 366.
 - **After a long suspend, a record can name an earlier program.** A
   process id reused after the host spent a long time suspended can be

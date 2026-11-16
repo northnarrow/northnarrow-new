@@ -188,8 +188,10 @@ pub fn resolve(event: &mut Event) {
     };
     if exe.root != (0, 0) {
         let abs = MOUNTS.with_borrow_mut(|m| {
-            m.get_or_insert_with(MountTable::load)
+            let table = m.get_or_insert_with(MountTable::load);
+            table
                 .absolute(exe.root, &exe.path)
+                .or_else(|| placed_by_process(pid, (exe.dev, exe.ino), &exe.path, table))
         });
         match abs {
             Some(abs) => exe.path = abs,
@@ -210,6 +212,38 @@ pub fn resolve(event: &mut Event) {
             exe.path = path;
         }
     }
+}
+
+/// Lot 366 (the re-check of #573, btrfs): the path of an exec whose root
+/// the table does not place, by the process itself — the file
+/// `/proc/<pid>/exe` leads to, when it is the exec's file (its identity from
+/// the kernel's cache, the same as the LSM program's by the mount it is
+/// reached through: [`crate::mountinfo::same_exec_file`]) on a mount of
+/// this process's own table: that link's text (the kernel's `d_path`,
+/// nothing asked of the file system), its last name the walk's. A btrfs
+/// subvolume's file is walked by the kernel up to its file system's own
+/// root, which no mount shows when only subvolumes are mounted (a `/home`
+/// on btrfs, as Fedora and openSUSE lay it out): such an exec was unplaced,
+/// and the table's re-read for it left the next mount (an AppImage's) not
+/// placed either, its programs then judged by the caller's string. `None`
+/// when the process runs another file now, in another namespace's mount,
+/// or the file is gone.
+fn placed_by_process(
+    pid: u32,
+    kernel: (u64, u64),
+    walked: &str,
+    table: &MountTable,
+) -> Option<String> {
+    let link = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+    let (_, c) = antitamper_bpf::kernel_roots::link_target(&link).ok()?;
+    let mount = table.mount_of(c.mnt_id)?;
+    if !crate::mountinfo::same_exec_file(kernel, &c, Some(mount)) {
+        return None;
+    }
+    let text = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
+    let text = text.to_str()?;
+    let last = |p: &str| p.rsplit('/').next().map(str::to_owned);
+    (text.starts_with('/') && last(text) == last(walked)).then(|| text.to_owned())
 }
 
 /// External audit PROC-002/003: an exec path the rules can judge when the
@@ -249,6 +283,97 @@ fn lexically_normal(path: &str) -> String {
 mod tests {
     use super::*;
     use nn_model::ExeIdentity;
+
+    /// Lot 366 (the re-check of #573, btrfs): an exec whose root no mount
+    /// of the table places (a btrfs subvolume's file: the kernel walks up
+    /// to the file system's own root) is placed by the process itself —
+    /// `/proc/<pid>/exe`'s text, when that link leads to the exec's file
+    /// (by the kernel's identity) on a mount of this process's table, its
+    /// last name the walk's; else it is not placed (the caller's string, as
+    /// before). Fails where such an exec was always unplaced (a79a10b9).
+    #[test]
+    fn an_exec_no_mount_places_is_placed_by_its_process() {
+        let me = std::env::current_exe().unwrap();
+        let name = me.file_name().unwrap().to_str().unwrap().to_owned();
+        let c = antitamper_bpf::kernel_roots::cached(&std::fs::File::open(&me).unwrap()).unwrap();
+        let spawn = |dev: u64, ino: u64, walked: &str| {
+            let mut e = nn_core::decision::rules::testutil::spawn("x", "/the/caller/string");
+            if let Event::ProcessSpawn { pid, exe, .. } = &mut e {
+                *pid = std::process::id();
+                *exe = ExeIdentity {
+                    path: walked.into(),
+                    dev,
+                    ino,
+                    root: (1, 4_242_424),
+                    flags: common::wire::exe::exe_flags::KNOWN,
+                    ..Default::default()
+                };
+            }
+            resolve(&mut e);
+            match e {
+                Event::ProcessSpawn { exe, .. } => exe.path,
+                _ => unreachable!(),
+            }
+        };
+        let text = antitamper_bpf::kernel_roots::read_link(std::path::Path::new("/proc/self/exe"))
+            .unwrap();
+        assert_eq!(
+            spawn(c.dev, c.ino, &format!("/subvol/{name}")),
+            text.to_str().unwrap(),
+            "placed by the process's own link"
+        );
+        assert_eq!(
+            spawn(c.dev, c.ino + 1, &format!("/subvol/{name}")),
+            "/the/caller/string",
+            "another file: not placed"
+        );
+        assert_eq!(
+            spawn(c.dev, c.ino, "/subvol/another-name"),
+            "/the/caller/string",
+            "another name: not placed"
+        );
+        // its mount not in the table (another namespace's): not placed
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("mi"), "").unwrap();
+        let empty = MountTable::load_from(&t.path().join("mi"));
+        assert_eq!(
+            placed_by_process(
+                std::process::id(),
+                (c.dev, c.ino),
+                &format!("/subvol/{name}"),
+                &empty
+            ),
+            None
+        );
+    }
+
+    /// Lot 366 (the re-check of #573, btrfs): the LSM program's identity of
+    /// an exec's file and the kernel's cache of it agree by device and
+    /// inode — or, on btrfs, by inode on the mount the file is reached
+    /// through when the LSM program named the file system's own device
+    /// (btrfs loaded after the agent started); another inode, another
+    /// device, a mount that is not btrfs, or no mount known: not the file.
+    #[test]
+    fn an_exec_s_file_is_the_same_by_its_mount_on_btrfs() {
+        let c = antitamper_bpf::kernel_roots::Cached {
+            dev: 47,
+            ino: 258,
+            mode: libc::S_IFREG | 0o755,
+            nlink: 1,
+            uid: 1000,
+            mnt_id: 61,
+        };
+        use crate::mountinfo::same_exec_file as same;
+        assert!(same((47, 258), &c, None), "the subvolume's own device");
+        assert!(
+            same((44, 258), &c, Some((44, true))),
+            "the file system's, on btrfs"
+        );
+        assert!(!same((44, 259), &c, Some((44, true))), "another inode");
+        assert!(!same((45, 258), &c, Some((44, true))), "another device");
+        assert!(!same((44, 258), &c, Some((44, false))), "not btrfs");
+        assert!(!same((44, 258), &c, None), "no mount known");
+    }
 
     /// R13 (lab PR 271): the LSM program only when wanted on a kernel that
     /// runs BPF LSM programs; else the tracepoint, and why.

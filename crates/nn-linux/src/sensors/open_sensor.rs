@@ -1149,7 +1149,8 @@ pub fn take_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
 /// - the open `mountinfo` is polled (`POLLPRI`, no wait) at every lookup:
 ///   the kernel flags it whenever a mount or an unmount changes this
 ///   namespace's table. After a change the table is re-read, at most once
-///   per [`MOUNT_REFRESH_MIN`]; until then a hit is answered only while a
+///   per [`MOUNT_REFRESH_MIN`] — at once for a root it does not hold (lot
+///   366: a mount made since it was read); until then a hit is answered only while a
 ///   `stat()` of its mount point still shows that root, and dropped (the
 ///   path is then unplaced, never another mount's) when it does not;
 /// - whatever the poll says, the table is re-read when it is older than
@@ -1168,6 +1169,10 @@ pub struct MountTable {
     /// their daemon names the root's inode (and changes it at will), so a
     /// record of one is placed by its device.
     fuse: HashMap<u64, PathBuf>,
+    /// Lot 366 (the re-check of #573, btrfs): the mounts by id — their
+    /// superblock's device and whether it is btrfs — for the exec sensor's
+    /// placing by the process's own link ([`Self::mount_of`]).
+    by_id: HashMap<u64, (u64, bool)>,
     loaded: Option<Instant>,
     /// The `mountinfo` a refresh reads (`/proc/self/mountinfo`; a fixture
     /// in tests).
@@ -1189,6 +1194,7 @@ impl Default for MountTable {
         MountTable {
             roots: HashMap::new(),
             fuse: HashMap::new(),
+            by_id: HashMap::new(),
             loaded: None,
             source: PathBuf::from("/proc/self/mountinfo"),
             watch: None,
@@ -1202,6 +1208,11 @@ impl Default for MountTable {
 /// Re-read the table, on a miss or after a polled change, at most this
 /// often.
 const MOUNT_REFRESH_MIN: Duration = Duration::from_secs(2);
+
+/// Lot 366 (the re-check of #573): a root the table does not hold, after
+/// the kernel flagged a change, re-reads it at once — at most this often
+/// (a user's mounts and unmounts in a loop cost one read each, bounded).
+const MOUNT_MISS_MIN: Duration = Duration::from_millis(10);
 
 /// External audit SNS-004: re-read the table when it is older than this,
 /// whatever the lookups found.
@@ -1264,6 +1275,11 @@ impl MountTable {
         crate::state_read::mount_rows(&mut self.rows, &table, "the sensors' path placing");
         let mut roots: HashMap<(u64, u64), PathBuf> = HashMap::new();
         let mut fuse: HashMap<u64, PathBuf> = HashMap::new();
+        let by_id: HashMap<u64, (u64, bool)> = table
+            .entries
+            .iter()
+            .map(|m| (m.id, m.device_and_btrfs()))
+            .collect();
         // The shortest mount point wins (a bind mount of the same root
         // elsewhere is an alias).
         let shorter = |cur: &mut PathBuf, mp: &PathBuf| {
@@ -1286,8 +1302,16 @@ impl MountTable {
         }
         self.roots = roots;
         self.fuse = fuse;
+        self.by_id = by_id;
         self.loaded = Some(Instant::now());
         self.changed = false;
+    }
+
+    /// Lot 366 (the re-check of #573, btrfs): the mount `id` of this table
+    /// (this process's namespace), as read last: its superblock's device
+    /// and whether it is btrfs.
+    pub fn mount_of(&self, id: u64) -> Option<(u64, bool)> {
+        self.by_id.get(&id).copied()
     }
 
     /// Whether the mount point `mp` still shows the filesystem root `root`
@@ -1318,10 +1342,16 @@ impl MountTable {
         }
         let hit = self.roots.contains_key(&root) || self.fuse.contains_key(&root.0);
         let age = self.loaded.map(|t| t.elapsed());
+        // lot 366 (the re-check of #573): a miss after the kernel flagged a
+        // change is a mount made since the table was read (the AppImage's,
+        // just after its image ran from a file no mount places — a btrfs
+        // subvolume's): read again at once, at most once per change
         let refresh = match age {
             None => true,
             Some(age) => {
-                age >= MOUNT_HIT_TTL || ((!hit || self.changed) && age >= MOUNT_REFRESH_MIN)
+                age >= MOUNT_HIT_TTL
+                    || (!hit && self.changed && age >= MOUNT_MISS_MIN)
+                    || ((!hit || self.changed) && age >= MOUNT_REFRESH_MIN)
             }
         };
         if refresh {
@@ -2379,21 +2409,78 @@ mod tests {
             mounts.absolute(root, "/f"),
             Some(format!("{}/f", a.display()))
         );
+        // lot 366: the mount gone from the table (a root missed after a
+        // change re-reads it at once, past a floor: it is not there)
         std::fs::rename(&a, &b).unwrap();
-        one_mount(&info, &b);
+        std::fs::write(&info, "").unwrap();
         assert_eq!(mounts.absolute(root, "/f"), None);
+        mounts.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
         let r = record(open_reason::PERSIST, &["f", "/"], root);
         let Event::FileOpen { filename, .. } = &events_of(&r, &mut mounts)[0] else {
             panic!()
         };
         assert!(filename.starts_with("mnt["), "{filename}");
-        // the throttle passed: the re-read table places it again
+        // back at another mount point; the throttle passed: the re-read
+        // table places it again
+        one_mount(&info, &b);
         mounts.loaded = Instant::now().checked_sub(MOUNT_REFRESH_MIN);
         assert_eq!(
             mounts.absolute(root, "/f"),
             Some(format!("{}/f", b.display()))
         );
         assert!(!mounts.changed);
+    }
+
+    /// Lot 366 (the re-check of #573, the btrfs fork-only NN-L-NET-008): a
+    /// root the table does not hold, after the kernel flagged a change of
+    /// the mounts, is a mount made since it was read: the table is read
+    /// again at once, not after the throttle. An AppImage's runtime runs
+    /// its image from a file no mount places (a btrfs subvolume's: the
+    /// table read again for it), then mounts its image and runs from it:
+    /// its programs were unplaced for the throttle's while, a zygote's
+    /// `/proc/self/exe` named by the caller's string, unmarked, and its
+    /// fork-only child's connect judged from `/tmp`. A miss with no change
+    /// flagged still waits for the throttle (no re-read per miss). Fails
+    /// where a miss waited for the throttle whatever the kernel flagged
+    /// (a79a10b9, and main).
+    #[test]
+    fn a_mount_made_since_the_table_was_read_is_placed_at_once() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let t = tempfile::tempdir().unwrap();
+        let info = t.path().join("mi");
+        std::fs::write(&info, "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n").unwrap();
+        let mut mounts = MountTable::load_from(&info);
+        // the image's exec: a root no mount places
+        assert_eq!(mounts.absolute((46, 256), "/data/App.AppImage"), None);
+        // its runtime mounts the image; the kernel flags the change
+        std::fs::write(
+            &info,
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             61 30 0:48 / /tmp/.mount_App123 ro,nosuid,nodev - fuse.App.AppImage App.AppImage ro,user_id=1000\n",
+        )
+        .unwrap();
+        mounts.changed = true;
+        // within the floor (the table read this very moment): not yet
+        mounts.loaded = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(mounts.absolute((48, 1), "/usr/bin/app"), None, "the floor");
+        mounts.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
+        assert_eq!(
+            mounts.absolute((48, 1), "/usr/bin/app").as_deref(),
+            Some("/tmp/.mount_App123/usr/bin/app"),
+            "placed at once, not after the throttle"
+        );
+        assert!(!mounts.changed);
+        // a miss with no change flagged: no re-read before the throttle
+        std::fs::write(
+            &info,
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             62 30 0:49 / /tmp/.mount_B rw - fuse.B B rw,user_id=1000\n",
+        )
+        .unwrap();
+        mounts.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
+        assert_eq!(mounts.absolute((49, 1), "/x"), None, "throttled");
+        assert_eq!(mounts.mount_of(61), Some((48, false)));
+        assert_eq!(mounts.mount_of(62), None, "not read yet");
     }
 
     /// External audit SNS-004: a change of the mount table is polled on

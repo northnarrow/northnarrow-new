@@ -179,6 +179,10 @@ pub struct TieRead {
     /// The caller's string, when not cut.
     caller: Option<PathBuf>,
     step: Step,
+    /// The re-check of #573 (N6): the device's tie when the read was taken
+    /// — a tie it finds is published only over that one, or in an empty
+    /// place: never over a tie made since (a newer mount's).
+    seen: Option<Tied>,
 }
 
 /// What [`TieRead`] checks.
@@ -391,6 +395,7 @@ impl AppImages {
                 .map(|r| (r.clone(), true)),
             None => None,
         };
+        let seen = self.tied.get(&exe.dev).cloned();
         let step = match (self.tied.get(&exe.dev), candidate) {
             (Some(t), or_tie) => Step::Still {
                 tied: t.clone(),
@@ -406,6 +411,7 @@ impl AppImages {
             path,
             caller: (!cut).then(|| PathBuf::from(filename)),
             step,
+            seen,
         })
     }
 
@@ -415,6 +421,14 @@ impl AppImages {
     fn publish(&mut self, r: &TieRead, found: &Found) -> bool {
         match found {
             Found::Tied(t) => {
+                // the re-check of #573 (N6): a tie read late (its mount
+                // gone since, the device handed to a new image's mount and
+                // tied) never overwrites the tie made since: the exec its
+                // read tied is marked, the record keeps the newer tie
+                let now = self.tied.get(&r.dev);
+                if now.is_some() && now != r.seen.as_ref() {
+                    return true;
+                }
                 if self.tied.len() >= TIED_MAX && !self.tied.contains_key(&r.dev) {
                     self.tied.clear();
                 }
@@ -632,7 +646,7 @@ fn image_file_at(table: &MountTable, dir: &Path, uid: u32, before: &Ran, path: &
     };
     let c = w.cached;
     c.is_file()
-        && (c.dev, c.ino) == (before.dev, before.ino)
+        && same_file((before.dev, before.ino), &c, table)
         && c.uid == uid
         && c.nlink > 0
         && !table
@@ -722,7 +736,7 @@ fn daemon_facts(
     // file system by the mount the kernel reached it through — never by the
     // link's text, never asked of a FUSE daemon
     let (_, c) = antitamper_bpf::kernel_roots::link_target(&dir.join("exe")).ok()?;
-    if (c.dev, c.ino) != image || !super::pump_reads::trusted_in(table, &c) {
+    if !same_file(image, &c, table) || !super::pump_reads::trusted_in(table, &c) {
         return None;
     }
     let status = crate::state_read::read_state(dir.join("status")).ok()?;
@@ -800,7 +814,7 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         if !meta.is_file() {
             continue;
         }
-        if (meta.dev, meta.ino) == image {
+        if same_file(image, &meta, table) {
             held = true;
         } else if meta.nlink == 0
             || matches!(m.fstype.as_bytes(), b"tmpfs" | b"ramfs")
@@ -810,6 +824,23 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         }
     }
     fuse && held
+}
+
+/// The re-check of #573 (btrfs): the file the LSM program identified at an
+/// exec (`kernel`) is the file `c`, by the mount `c` was reached through in
+/// PID 1's table ([`crate::mountinfo::same_exec_file`]): an image on btrfs
+/// is tied whichever order the btrfs module and the agent started in.
+fn same_file(
+    kernel: (u64, u64),
+    c: &antitamper_bpf::kernel_roots::Cached,
+    table: &MountTable,
+) -> bool {
+    let mount = table
+        .entries
+        .iter()
+        .find(|e| e.id == c.mnt_id)
+        .map(MountEntry::device_and_btrfs);
+    crate::mountinfo::same_exec_file(kernel, c, mount)
 }
 
 /// The mount of PID 1's table the descriptor `fd` of `dir` is a file of,
@@ -1740,6 +1771,7 @@ mod tests {
                 tied: t1.clone(),
                 or_tie: None,
             },
+            seen: Some(t1.clone()),
         };
         images.tied.insert(FUSE_DEV, t2.clone());
         assert!(!images.publish(&r, &Found::Untied));
@@ -1755,6 +1787,73 @@ mod tests {
         assert!(images.publish(&r, &Found::Tied(t1.clone())));
         assert_eq!(images.tied.get(&FUSE_DEV), Some(&t1), "a late tie kept");
         assert!(!images.publish(&r, &Found::Nothing));
+    }
+
+    /// The re-check of #573 (N6): a tie read held past its deadline, its
+    /// mount gone since and the device handed to a new image's mount, tied
+    /// meanwhile: the late tie marks its own exec, never overwrites the
+    /// newer tie (the next exec without a candidate of its own — a zygote's
+    /// — would read the old one, drop it, and go unmarked). Over the tie it
+    /// was read against, or in an empty place, it is published. Fails
+    /// where a late tie was published over any (a79a10b9).
+    #[test]
+    fn a_late_tie_never_overwrites_a_newer_one() {
+        let old = Tied {
+            mount_id: 61,
+            uid: me(),
+            image: (1, 2),
+            image_path: PathBuf::from("/home/u/Old.AppImage"),
+            daemon: DAEMON,
+            daemon_ticks: 1,
+        };
+        let new = Tied {
+            mount_id: 62,
+            image: (1, 3),
+            image_path: PathBuf::from("/home/u/New.AppImage"),
+            daemon_ticks: 5,
+            ..old.clone()
+        };
+        let late = |seen: Option<Tied>| TieRead {
+            pid: RUNTIME,
+            uid: me(),
+            dev: FUSE_DEV,
+            path: PathBuf::from(apprun()),
+            caller: None,
+            step: Step::Tie {
+                before: Ran {
+                    start: 1,
+                    dev: 1,
+                    ino: 2,
+                    path: PathBuf::from("/home/u/Old.AppImage"),
+                    exec_ns: 1,
+                    seq: 0,
+                },
+                check: false,
+            },
+            seen,
+        };
+        for seen in [None, Some(old.clone())] {
+            let mut images = AppImages::default();
+            images.tied.insert(FUSE_DEV, new.clone());
+            assert!(
+                images.publish(&late(seen.clone()), &Found::Tied(old.clone())),
+                "its own exec marked"
+            );
+            assert_eq!(
+                images.tied.get(&FUSE_DEV),
+                Some(&new),
+                "the newer tie stays ({seen:?})"
+            );
+        }
+        // over the tie it was read against (a device handed out again, its
+        // exec's own tie), or in an empty place: published
+        let mut images = AppImages::default();
+        images.tied.insert(FUSE_DEV, old.clone());
+        assert!(images.publish(&late(Some(old.clone())), &Found::Tied(new.clone())));
+        assert_eq!(images.tied.get(&FUSE_DEV), Some(&new));
+        let mut images = AppImages::default();
+        assert!(images.publish(&late(None), &Found::Tied(new.clone())));
+        assert_eq!(images.tied.get(&FUSE_DEV), Some(&new));
     }
 
     /// Lot 366, the review of #573 (F1): a tie's read that does not answer
@@ -1838,6 +1937,71 @@ mod tests {
                 "{fstype}: tied"
             );
         }
+    }
+
+    /// The re-check of #573 (btrfs): an image on btrfs is tied whichever
+    /// order the btrfs module and the agent started in. Loaded after the
+    /// agent, the LSM program names a btrfs file by the file system's own
+    /// device (`statx` names the subvolume's): the mount the file is reached
+    /// through decides, with the inode. Another inode, another device, or
+    /// that device on a mount that is not btrfs: no tie. Fails where the
+    /// image was compared by device alone (a79a10b9: every AppImage of a
+    /// btrfs home judged from `/tmp` when btrfs was loaded after the agent).
+    #[test]
+    fn an_image_on_btrfs_is_tied_whatever_order_btrfs_was_loaded_in() {
+        let real = real_mounts();
+        let as_btrfs = |fstype: &str| {
+            let mut swapped = String::new();
+            for l in real.lines() {
+                let mut fields: Vec<&str> = l.split(' ').collect();
+                fields[2] = "0:31";
+                fields[7] = fstype;
+                swapped += &(fields.join(" ") + "\n");
+            }
+            swapped
+        };
+        // 0:31, the file system's own device, as the LSM program gives it
+        // when btrfs was loaded after the agent
+        let tie_with = |fstype: &str, id: fn((u64, u64)) -> (u64, u64)| {
+            let f = fixture();
+            let path = f.proc.path().join("1/mountinfo");
+            let text = std::fs::read_to_string(&path).unwrap();
+            // and a btrfs mount of that device elsewhere: the mount the file
+            // is reached through decides, not any mount of the device
+            let other = "77777 1 0:31 / /elsewhere rw - btrfs other rw\n";
+            std::fs::write(&path, text.replace(&real, &(as_btrfs(fstype) + other))).unwrap();
+            let image = f.image.to_str().unwrap();
+            let mut images = AppImages::default();
+            let mut first = exec(
+                RUNTIME,
+                me(),
+                image,
+                id(id_of(&f.image)),
+                image,
+                IMAGE_EXEC_NS,
+            );
+            images.note(f.proc.path(), &mut first);
+            let mut second = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+            images.note(f.proc.path(), &mut second);
+            user_image(&second)
+        };
+        assert!(
+            tie_with("btrfs", |id| id),
+            "btrfs loaded first: the subvolume's"
+        );
+        assert!(
+            tie_with("btrfs", |(_, ino)| (31, ino)),
+            "loaded after: the file system's"
+        );
+        assert!(
+            !tie_with("btrfs", |(_, ino)| (31, ino + 1)),
+            "another inode"
+        );
+        assert!(!tie_with("btrfs", |(_, ino)| (32, ino)), "another device");
+        assert!(
+            !tie_with("ext4", |(_, ino)| (31, ino)),
+            "not btrfs: the device decides"
+        );
     }
 
     /// Lot 366: the runtime's root a FUSE file system's that answers

@@ -16,15 +16,27 @@
 //!   that give it left out — and the condition is signed
 //!   ([`UNANSWERED`], a degradation of the exec sensor while it lasts). No
 //!   lock a pump takes is held while a read runs.
-//! - **Fair between users.** A read is for the uid of the exec's process.
-//!   One uid's reads that did not answer hold at most one of the reader's
-//!   helpers — a second read for that uid waits for the first (within its
-//!   own deadline), or is refused at once while the first is held; the
-//!   users together, the system's accounts together and root each have a
-//!   share of their own, so no user can make root's facts unverifiable.
-//!   A share used up is signed once while it lasts ([`HELD`]). The pump's
-//!   waits on reads that answered slowly add up per uid: past a budget, a
-//!   signed record names the uid and that the pump was slowed ([`SLOW`]).
+//! - **Fair between users.** A read is for the user of the exec's process:
+//!   its uid, or — a subordinate id of `/etc/subuid` (a rootless
+//!   container's) — the user that owns the id's range (`sensors::share_subuid`, as the agent's shares count it;
+//!   the re-check of #573, N3). One user's reads that did not answer hold
+//!   at most one of the reader's helpers, all of its ids together — a
+//!   second read for that user waits for the first (within its own
+//!   deadline), or is refused at once while the first is held; the users
+//!   together, the system's accounts together and root each have a share
+//!   of their own, so no user can make root's facts unverifiable, nor
+//!   another user's by its subordinate ids. A share used up is signed once
+//!   while it lasts ([`HELD`]). The pump's waits on reads that answered
+//!   slowly add up per user: past a budget, a signed record names the user
+//!   and that the pump was slowed — one record per user and window, its
+//!   reads counted, signed again with its total when the window ends
+//!   ([`SLOW`]).
+//! - **Signed, always.** Each kind of the pumps' records has a budget of
+//!   its own in the degradation registry
+//!   ([`crate::boot::degradation::note_kept`]): the slow reads' records
+//!   cannot crowd out the reads not waited for ([`UNANSWERED`]) or a share
+//!   held ([`HELD`]), nor any other part's, and a record past its budget is
+//!   still signed.
 //! - **The kernel's identity, never the path's text.** Which file system a
 //!   file is on is told by the mount the kernel reached it through (its
 //!   mount id, from the kernel's cache: [`antitamper_bpf::kernel_roots::cached`])
@@ -276,7 +288,7 @@ pub const CHANGING: &str = "exec_pump_mounts_changing";
 /// Signed while files are judged not verified for a change of the mounts
 /// not read yet (one record per hold, however often the mounts change).
 static STALE: LazyLock<Mutex<Condition>> =
-    LazyLock::new(|| Mutex::new(Condition::deferred(CHANGING, Duration::from_secs(60))));
+    LazyLock::new(|| Mutex::new(Condition::deferred(CHANGING, Duration::from_secs(60), 1)));
 
 /// Files judged not verified for a change of the mounts not read yet.
 static JUDGED_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -476,7 +488,7 @@ pub const SLOW: &str = "exec_reads_slow";
 
 /// Who a read is for: root, the system's accounts, or a user — each with a
 /// share of the reader's helpers of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Pool {
     Root,
     System,
@@ -487,11 +499,20 @@ enum Pool {
 /// user's, `login.defs`' `UID_MIN`).
 pub const FIRST_USER_UID: u32 = 1000;
 
+/// The re-check of #573 (N7): systemd's dynamic users (`DynamicUser=`) and
+/// `nobody` (65534) are the system's accounts, though above
+/// [`FIRST_USER_UID`].
+const SYSTEM_HIGH: std::ops::RangeInclusive<u32> = 61_184..=65_535;
+/// The part of [`SYSTEM_HIGH`] that is no account: the users' (`login.defs`'
+/// `UID_MAX` is 60000; 65520–65533 belong to no one in particular).
+const SYSTEM_HIGH_GAP: std::ops::RangeInclusive<u32> = 65_520..=65_533;
+
 impl Pool {
     fn of(uid: u32) -> Pool {
         match uid {
             0 => Pool::Root,
             u if u < FIRST_USER_UID => Pool::System,
+            u if SYSTEM_HIGH.contains(&u) && !SYSTEM_HIGH_GAP.contains(&u) => Pool::System,
             _ => Pool::Users,
         }
     }
@@ -522,20 +543,30 @@ impl Pool {
 /// the pumps' own waits.
 const READS_MAX: usize = 2 + 2 + 2 + 4;
 
-/// The reads under way: per uid other than root, its one read (held or
+/// Whose a read is: its pool, and in it the account it counts against — a
+/// system account's uid, a user (the owner of a subordinate id's range:
+/// [`subuid_account`]); root's reads are root's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Whose {
+    pool: Pool,
+    account: u32,
+}
+
+/// The reads under way: per account (root's aside), its one read (held or
 /// not); per pool, how many are held.
 #[derive(Debug, Default)]
 struct Pools {
-    busy: HashMap<u32, bool>,
+    busy: HashMap<Whose, bool>,
     held: [usize; 3],
 }
 
 /// Why a read was not started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refused {
-    /// The uid's earlier read is held (did not answer by its deadline).
+    /// The account's earlier read is held (did not answer by its deadline).
     UidHeld,
-    /// The uid's earlier read was still being read at this one's deadline.
+    /// The account's earlier read was still being read at this one's
+    /// deadline.
     UidBusy,
     /// The pool's share is held.
     Share(Pool),
@@ -552,7 +583,7 @@ enum Flight {
 /// A read admitted: its pool's account, settled once it is done.
 #[derive(Debug)]
 struct Ticket {
-    uid: u32,
+    whose: Whose,
     pool: Pool,
     flight: Mutex<Flight>,
     pools: Arc<Mutex<Pools>>,
@@ -572,7 +603,7 @@ impl Ticket {
             p.held[self.pool.index()] -= 1;
         }
         if self.pool != Pool::Root {
-            p.busy.remove(&self.uid);
+            p.busy.remove(&self.whose);
         }
         drop(p);
         drop(f);
@@ -589,7 +620,7 @@ impl Ticket {
         let mut p = self.pools.lock();
         p.held[self.pool.index()] += 1;
         if self.pool != Pool::Root {
-            p.busy.insert(self.uid, true);
+            p.busy.insert(self.whose, true);
         }
         true
     }
@@ -609,20 +640,36 @@ impl Drop for Settle {
 const SLOW_FLOOR: Duration = Duration::from_millis(25);
 /// The window the slow reads add up in.
 const SLOW_WINDOW: Duration = Duration::from_secs(60);
-/// One uid's slow reads past it within the window are signed.
+/// One user's slow reads past it within the window are signed.
 const SLOW_BUDGET: Duration = Duration::from_secs(1);
-/// Every uid's slow reads together past it within the window are signed.
+/// Every user's slow reads together past it within the window are signed.
 const SLOW_BUDGET_ALL: Duration = Duration::from_secs(5);
-/// The uids accounted at once: past it, the least slow is forgotten.
+/// The users accounted at once: past it, the least slow is forgotten.
 const ACCOUNTS_MAX: usize = 512;
+/// The re-check of #573 (N2): the users with a record of their own at
+/// once; past them, the record of every user's slow reads names them (it
+/// is signed by then: each of them past [`SLOW_BUDGET`], together past
+/// [`SLOW_BUDGET_ALL`]).
+const SLOW_KEPT: usize = 4;
+const _: () =
+    assert!(SLOW_BUDGET.as_millis() * (SLOW_KEPT as u128 + 1) >= SLOW_BUDGET_ALL.as_millis());
+/// The slow reads' budget of the degradation registry: the users' records
+/// and every user's.
+const SLOW_RECORDS: usize = SLOW_KEPT + 1;
+/// The shares held: one record per pool at most.
+const HELD_RECORDS: usize = 3;
 
-/// One uid's (or every uid's) slow reads in the current window.
+/// One user's (or every user's) slow reads in the current window.
 #[derive(Debug, Clone)]
 struct Account {
     since: Instant,
     waited: Duration,
-    /// The record signed in this window.
-    signed: Option<String>,
+    /// The slow reads counted.
+    reads: u32,
+    /// The uid of the latest (a user's own, or a subordinate id of its).
+    last_uid: u32,
+    /// The record signed in this window, and the wait it said.
+    signed: Option<(String, Duration)>,
 }
 
 impl Account {
@@ -630,23 +677,40 @@ impl Account {
         Account {
             since: now,
             waited: Duration::ZERO,
+            reads: 0,
+            last_uid: 0,
             signed: None,
         }
     }
+
+    fn ended(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.since) >= SLOW_WINDOW
+    }
 }
 
-/// The slow reads' accounts.
+/// The slow reads' accounts, by user.
 #[derive(Debug)]
 struct Slow {
     by_uid: HashMap<u32, Account>,
     all: Account,
+    /// The earliest end of a window with a record: none ends before it.
+    next_end: Option<Instant>,
+}
+
+impl Slow {
+    fn new(now: Instant) -> Self {
+        Slow {
+            by_uid: HashMap::new(),
+            all: Account::new(now),
+            next_end: None,
+        }
+    }
 }
 
 /// Lot 366, the review of #573 (F4): the exec pumps' reader — #563's
 /// bounded reader ([`TimedReader`]: its helpers reused, each read waited
 /// for at most its deadline) with each read's uid's share: see the
 /// module's "Fair between users".
-#[derive(Debug)]
 pub struct ExecReader {
     reader: TimedReader,
     deadline: Duration,
@@ -655,24 +719,56 @@ pub struct ExecReader {
     slow: Mutex<Slow>,
     unanswered: Mutex<Condition>,
     held: [Mutex<Condition>; 3],
+    /// The account a user's uid counts against ([`subuid_account`]).
+    owner: fn(u32) -> u32,
+}
+
+impl std::fmt::Debug for ExecReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecReader")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecReader {
-    /// A reader whose reads are waited for at most `deadline`.
+    /// A reader whose reads are waited for at most `deadline`, a uid
+    /// counted as the owner of its subordinate range ([`subuid_account`]).
     pub fn new(deadline: Duration) -> Self {
-        let held = || Mutex::new(Condition::deferred(HELD, Duration::from_secs(60)));
+        Self::with_owners(deadline, subuid_account)
+    }
+
+    /// [`Self::new`], a uid counted as the user `owner` says.
+    fn with_owners(deadline: Duration, owner: fn(u32) -> u32) -> Self {
+        let held = || {
+            Mutex::new(Condition::deferred(
+                HELD,
+                Duration::from_secs(60),
+                HELD_RECORDS,
+            ))
+        };
         ExecReader {
             reader: TimedReader::new(deadline, READS_MAX),
             deadline,
             pools: Arc::default(),
             freed: Arc::default(),
-            slow: Mutex::new(Slow {
-                by_uid: HashMap::new(),
-                all: Account::new(Instant::now()),
-            }),
-            unanswered: Mutex::new(Condition::deferred(UNANSWERED, Duration::from_secs(60))),
+            slow: Mutex::new(Slow::new(Instant::now())),
+            unanswered: Mutex::new(Condition::deferred(UNANSWERED, Duration::from_secs(60), 1)),
             held: [held(), held(), held()],
+            owner,
         }
+    }
+
+    /// Whose a read of `uid`'s processes' files is: its pool (by the uid),
+    /// and the account it counts against — a user's subordinate id, its
+    /// owner's.
+    fn whose(&self, uid: u32) -> Whose {
+        let pool = Pool::of(uid);
+        let account = match pool {
+            Pool::Users => (self.owner)(uid),
+            Pool::Root | Pool::System => uid,
+        };
+        Whose { pool, account }
     }
 
     /// `f` (reads of the files of a process of `uid`, `what` in words) run
@@ -688,11 +784,12 @@ impl ExecReader {
     ) -> Result<T, String> {
         let t0 = Instant::now();
         let until = t0 + self.deadline;
-        let out = match self.admit(uid, until) {
+        let whose = self.whose(uid);
+        let out = match self.admit(whose, until) {
             Ok(ticket) => self.read(ticket, what, until, f),
-            Err(r) => Err(self.refused(uid, what, r)),
+            Err(r) => Err(self.refused(uid, whose, what, r)),
         };
-        self.waited(uid, t0.elapsed(), Instant::now());
+        self.waited(uid, whose, t0.elapsed(), Instant::now());
         match &out {
             Ok(_) => self.answered(),
             Err(why) => self.not_waited(what, why),
@@ -722,9 +819,9 @@ impl ExecReader {
     }
 
     /// Under the pools' lock (and waiting on it, at most until `until`, for
-    /// the uid's earlier read): the read admitted, or why not.
-    fn admit(&self, uid: u32, until: Instant) -> Result<Arc<Ticket>, Refused> {
-        let pool = Pool::of(uid);
+    /// the account's earlier read): the read admitted, or why not.
+    fn admit(&self, whose: Whose, until: Instant) -> Result<Arc<Ticket>, Refused> {
+        let pool = whose.pool;
         let mut p = self.pools.lock();
         loop {
             if p.held[pool.index()] >= pool.held_max() {
@@ -733,7 +830,7 @@ impl ExecReader {
             if pool == Pool::Root {
                 break;
             }
-            match p.busy.get(&uid) {
+            match p.busy.get(&whose) {
                 None => break,
                 Some(true) => return Err(Refused::UidHeld),
                 Some(false) => {
@@ -744,10 +841,10 @@ impl ExecReader {
             }
         }
         if pool != Pool::Root {
-            p.busy.insert(uid, false);
+            p.busy.insert(whose, false);
         }
         Ok(Arc::new(Ticket {
-            uid,
+            whose,
             pool,
             flight: Mutex::new(Flight::Waited),
             pools: Arc::clone(&self.pools),
@@ -756,15 +853,16 @@ impl ExecReader {
     }
 
     /// A refusal in words; a share held signed once while it lasts.
-    fn refused(&self, uid: u32, what: &str, r: Refused) -> String {
+    fn refused(&self, uid: u32, whose: Whose, what: &str, r: Refused) -> String {
+        let of = of_whom(uid, whose);
         match r {
             Refused::UidHeld => format!(
-                "{what}: not read — an earlier read of the files of uid {uid}'s processes has \
-                 not answered"
+                "{what}: not read — an earlier read of the files of {of} processes has not \
+                 answered"
             ),
             Refused::UidBusy => format!(
-                "{what}: not read — an earlier read of the files of uid {uid}'s processes was \
-                 still running at the deadline"
+                "{what}: not read — an earlier read of the files of {of} processes was still \
+                 running at the deadline"
             ),
             Refused::Share(pool) => {
                 self.held_now(pool);
@@ -820,25 +918,32 @@ impl ExecReader {
         ));
     }
 
-    /// The pump waited `took` on a read of `uid`'s: a slow one added to the
-    /// uid's account, and to every uid's — past a budget within the window,
-    /// a signed record names the uid and that the pump was slowed.
-    fn waited(&self, uid: u32, took: Duration, now: Instant) {
-        if took <= SLOW_FLOOR {
-            return;
-        }
+    /// The pump waited `took` on a read of `uid`'s (counted as `whose`): a
+    /// slow one added to its user's account, and to every user's — past a
+    /// budget within the window, a signed record names the user and that
+    /// the pump was slowed. The windows that ended are rolled over at any
+    /// read: their records leave the status, signed again with their total
+    /// when it grew (the re-check of #573, N2).
+    fn waited(&self, uid: u32, whose: Whose, took: Duration, now: Instant) {
         let records = {
             let mut s = self.slow.lock();
-            slow_add(&mut s, uid, took, now)
+            let mut out = slow_sweep(&mut s, now);
+            if took > SLOW_FLOOR {
+                out.extend(slow_add(&mut s, uid, whose.account, took, now));
+            }
+            out
         };
         for r in records {
             match r {
                 SlowRecord::Sign(detail) => {
                     tracing::warn!(uid, detail = %detail, "exec pump slowed by slow reads");
-                    crate::boot::degradation::note(SLOW, &detail);
+                    crate::boot::degradation::note_kept(SLOW, &detail, SLOW_RECORDS);
                 }
                 SlowRecord::Retire(detail) => {
-                    crate::boot::degradation::retire_where(SLOW, |d| d == detail);
+                    crate::boot::degradation::retire_kept(SLOW, &detail);
+                }
+                SlowRecord::Ended(detail) => {
+                    crate::boot::degradation::sign_ended(SLOW, &detail);
                 }
             }
         }
@@ -865,45 +970,176 @@ impl ExecReader {
         self.held[Pool::of(uid).index()].lock().holding()
     }
 
-    /// The record signed for `uid`'s slow reads in this window, if any.
+    /// The record signed for user `owner`'s slow reads in this window, if
+    /// any.
     #[cfg(test)]
-    fn slow_signed(&self, uid: u32) -> Option<String> {
-        self.slow.lock().by_uid.get(&uid)?.signed.clone()
+    fn slow_signed(&self, owner: u32) -> Option<String> {
+        Some(self.slow.lock().by_uid.get(&owner)?.signed.clone()?.0)
     }
 }
 
-/// A record of the slow reads: to sign, or whose window ended, to retire.
+/// The re-check of #573 (N3): the account a user's uid counts against —
+/// for a subordinate id of `/etc/subuid`, its range's owner's, as the
+/// agent's shares count it ([`crate::sensors::share_subuid::account_of`]:
+/// the ranges published at the agent's start and again when the file
+/// changes; root's ranges one account of their own, a uid no single known
+/// owner holds the overflow account, every uid from 65536 up the overflow
+/// account while the file cannot be read). No uid of the 16-bit range —
+/// root's, a system account's, a user's own — is ever counted as another's.
+fn subuid_account(uid: u32) -> u32 {
+    account_in(uid, crate::sensors::share_subuid::account_of)
+}
+
+/// [`subuid_account`] with the published ranges' answer `account_of`.
+fn account_in(uid: u32, account_of: impl Fn(u32) -> Option<u32>) -> u32 {
+    if u64::from(uid) < crate::sensors::share_subuid::ACCOUNTS_END {
+        return uid;
+    }
+    account_of(uid).unwrap_or(uid)
+}
+
+/// An account of the users' share in words.
+fn account_words(account: u32) -> String {
+    use common::wire::execq::{OVERFLOW_SHARE, ROOT_SUBID_SHARE};
+    match account {
+        OVERFLOW_SHARE => "the subordinate ids of no single known user".to_string(),
+        ROOT_SUBID_SHARE => "root's subordinate ids".to_string(),
+        n => format!("user {n}"),
+    }
+}
+
+/// A uid's processes in words: `uid N's`, or `user O's (uid N)` for a
+/// subordinate id of O's.
+fn of_whom(uid: u32, whose: Whose) -> String {
+    if whose.pool == Pool::Users && whose.account != uid {
+        format!("{}'s (uid {uid})", account_words(whose.account))
+    } else {
+        format!("uid {uid}'s")
+    }
+}
+
+/// A record of the slow reads: to sign (kept while its window lasts),
+/// whose window ended (to retire), or a window's total once it ended
+/// (signed, not kept).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlowRecord {
     Sign(String),
     Retire(String),
+    Ended(String),
 }
 
-/// `a`'s window ended at `now`: begun again, its record retired.
-fn roll(a: &mut Account, now: Instant, out: &mut Vec<SlowRecord>) {
-    if now.saturating_duration_since(a.since) >= SLOW_WINDOW {
-        if let Some(d) = a.signed.take() {
-            out.push(SlowRecord::Retire(d));
-        }
-        *a = Account::new(now);
+/// Every user's slow reads: how many users are past their own budget, and
+/// the slowest.
+type Every = (usize, Option<u32>);
+
+/// A user's (or every user's: `owner` `None`, with `every`) record of `a`,
+/// its window running (`end` false) or ended.
+fn slow_detail(owner: Option<u32>, a: &Account, end: bool, every: Every) -> String {
+    let (who, whose) = match owner {
+        Some(o) => (
+            account_words(o),
+            format!(
+                "the files of that user's processes (its own uid or its subordinate ids; the \
+                 latest uid {})",
+                a.last_uid
+            ),
+        ),
+        None => (
+            "every user".to_string(),
+            format!(
+                "processes' files ({} user(s) past their own budget, the most: {})",
+                every.0,
+                every.1.map_or_else(|| "-".to_string(), account_words)
+            ),
+        ),
+    };
+    let when = if end {
+        "in the window that ended"
+    } else {
+        "within"
+    };
+    format!(
+        "{who}: the exec pumps waited {} ms {when} {} s on {} slow read{} of {whose} — the \
+         exec pump was slowed (the events behind it waited)",
+        a.waited.as_millis(),
+        SLOW_WINDOW.as_secs(),
+        a.reads,
+        if a.reads == 1 { "" } else { "s" },
+    )
+}
+
+/// `a`'s window ended at `now`: its record retired — and signed again with
+/// its total when it grew since — and the window begun again.
+fn roll(
+    owner: Option<u32>,
+    a: &mut Account,
+    now: Instant,
+    every: Every,
+    out: &mut Vec<SlowRecord>,
+) {
+    if !a.ended(now) {
+        return;
     }
+    if let Some((d, said)) = a.signed.take() {
+        out.push(SlowRecord::Retire(d));
+        if a.waited > said {
+            out.push(SlowRecord::Ended(slow_detail(owner, a, true, every)));
+        }
+    }
+    *a = Account::new(now);
 }
 
-/// Room for one more uid's account: the ones whose window ended dropped,
+/// The users past their own budget in this window, and the slowest.
+fn every(s: &Slow) -> Every {
+    (
+        s.by_uid.values().filter(|a| a.waited > SLOW_BUDGET).count(),
+        s.by_uid
+            .iter()
+            .max_by_key(|(_, a)| a.waited)
+            .map(|(u, _)| *u),
+    )
+}
+
+/// The re-check of #573 (N2): at any read, the windows with a record that
+/// ended rolled over (memory only; at most once per window end) — a
+/// record no longer stays in the status until its user is slow again.
+fn slow_sweep(s: &mut Slow, now: Instant) -> Vec<SlowRecord> {
+    let mut out = Vec::new();
+    if s.next_end.is_none_or(|t| now < t) {
+        return out;
+    }
+    let all = every(s);
+    let mut next: Option<Instant> = None;
+    for (owner, a) in s.by_uid.iter_mut() {
+        if a.signed.is_some() {
+            roll(Some(*owner), a, now, all, &mut out);
+        }
+        if a.signed.is_some() {
+            let end = a.since + SLOW_WINDOW;
+            next = Some(next.map_or(end, |n| n.min(end)));
+        }
+    }
+    s.by_uid.retain(|_, a| a.reads > 0 && !a.ended(now));
+    roll(None, &mut s.all, now, all, &mut out);
+    if s.all.signed.is_some() {
+        let end = s.all.since + SLOW_WINDOW;
+        next = Some(next.map_or(end, |n| n.min(end)));
+    }
+    s.next_end = next;
+    out
+}
+
+/// Room for one more user's account: the ones whose window ended dropped,
 /// then the least slow not signed.
 fn make_room(s: &mut Slow, now: Instant, out: &mut Vec<SlowRecord>) {
     if s.by_uid.len() < ACCOUNTS_MAX {
         return;
     }
-    s.by_uid.retain(|_, a| {
-        let ended = now.saturating_duration_since(a.since) >= SLOW_WINDOW;
-        if ended {
-            if let Some(d) = a.signed.take() {
-                out.push(SlowRecord::Retire(d));
-            }
-        }
-        !ended
-    });
+    let all = every(s);
+    for (owner, a) in s.by_uid.iter_mut() {
+        roll(Some(*owner), a, now, all, out);
+    }
+    s.by_uid.retain(|_, a| a.reads > 0);
     if s.by_uid.len() >= ACCOUNTS_MAX {
         if let Some(least) = s
             .by_uid
@@ -917,43 +1153,48 @@ fn make_room(s: &mut Slow, now: Instant, out: &mut Vec<SlowRecord>) {
     }
 }
 
-/// `took` added to `uid`'s account and to every uid's, in `s` (memory
-/// only): the records to sign, and the ones whose window ended.
-fn slow_add(s: &mut Slow, uid: u32, took: Duration, now: Instant) -> Vec<SlowRecord> {
+/// The earliest window end with a record, `end` among them.
+fn due(s: &mut Slow, end: Instant) {
+    s.next_end = Some(s.next_end.map_or(end, |n| n.min(end)));
+}
+
+/// `took`, a wait on a read of `uid`'s (user `owner`'s), added to that
+/// user's account and to every user's, in `s` (memory only): the records to
+/// sign, and the ones whose window ended. One record per user and window
+/// (the first [`SLOW_KEPT`] users past their budget; past them, every
+/// user's names how many), its reads counted.
+fn slow_add(s: &mut Slow, uid: u32, owner: u32, took: Duration, now: Instant) -> Vec<SlowRecord> {
     let mut out = Vec::new();
-    if !s.by_uid.contains_key(&uid) {
+    if !s.by_uid.contains_key(&owner) {
         make_room(s, now, &mut out);
     }
-    let a = s.by_uid.entry(uid).or_insert_with(|| Account::new(now));
-    roll(a, now, &mut out);
+    let all = every(s);
+    let signed_now = s.by_uid.values().filter(|a| a.signed.is_some()).count();
+    let a = s.by_uid.entry(owner).or_insert_with(|| Account::new(now));
+    roll(Some(owner), a, now, all, &mut out);
     a.waited += took;
-    if a.waited > SLOW_BUDGET && a.signed.is_none() {
-        let d = format!(
-            "uid {uid}: the exec pumps waited {} ms within {} s on reads of the files of that \
-             uid's processes that answered slowly — the exec pump was slowed (the events behind \
-             it waited)",
-            a.waited.as_millis(),
-            SLOW_WINDOW.as_secs()
-        );
-        a.signed = Some(d.clone());
+    a.reads = a.reads.saturating_add(1);
+    a.last_uid = uid;
+    let mut end = None;
+    if a.waited > SLOW_BUDGET && a.signed.is_none() && signed_now < SLOW_KEPT {
+        let d = slow_detail(Some(owner), a, false, (0, None));
+        a.signed = Some((d.clone(), a.waited));
+        end = Some(a.since + SLOW_WINDOW);
         out.push(SlowRecord::Sign(d));
     }
-    roll(&mut s.all, now, &mut out);
+    if let Some(end) = end {
+        due(s, end);
+    }
+    let all = every(s);
+    roll(None, &mut s.all, now, all, &mut out);
     s.all.waited += took;
+    s.all.reads = s.all.reads.saturating_add(1);
+    s.all.last_uid = uid;
     if s.all.waited > SLOW_BUDGET_ALL && s.all.signed.is_none() {
-        let most = s
-            .by_uid
-            .iter()
-            .max_by_key(|(_, a)| a.waited)
-            .map_or(uid, |(u, _)| *u);
-        let d = format!(
-            "every uid: the exec pumps waited {} ms within {} s on reads of processes' files \
-             that answered slowly, the most for uid {most} — the exec pump was slowed (the \
-             events behind it waited)",
-            s.all.waited.as_millis(),
-            SLOW_WINDOW.as_secs()
-        );
-        s.all.signed = Some(d.clone());
+        let d = slow_detail(None, &s.all, false, all);
+        s.all.signed = Some((d.clone(), s.all.waited));
+        let end = s.all.since + SLOW_WINDOW;
+        due(s, end);
         out.push(SlowRecord::Sign(d));
     }
     out
@@ -1113,7 +1354,8 @@ mod tests {
     /// root's module tool's facts refused).
     #[test]
     fn one_uid_cannot_starve_root_s_reads() {
-        let r = ExecReader::new(Duration::from_millis(50));
+        // each uid its own account (the subordinate ids' owners: below)
+        let r = ExecReader::with_owners(Duration::from_millis(50), |u| u);
         let mut releases = Vec::new();
         let (tx, rx) = channel::<()>();
         releases.push(tx);
@@ -1134,7 +1376,7 @@ mod tests {
         );
         assert!(t0.elapsed() < Duration::from_millis(50), "refused at once");
         assert_eq!(r.unanswered(), 1, "one helper held by the uid");
-        // more uids of users (a user's subordinate ids) fill the users' share
+        // more users' uids fill the users' share
         for uid in 100_000..100_010 {
             let (tx, rx) = channel::<()>();
             releases.push(tx);
@@ -1198,52 +1440,56 @@ mod tests {
     }
 
     /// Lot 366, the review of #573 (F4): the pump's waits on reads that
-    /// answered slowly add up per uid: past the budget within the window a
-    /// record names the uid and that the pump was slowed — once in the
-    /// window, retired with it; fast reads add nothing; every uid's
-    /// together past theirs is signed too, naming the slowest.
+    /// answered slowly add up per user: past the budget within the window a
+    /// record names the user and that the pump was slowed — once in the
+    /// window, its reads counted; when the window ends it is retired, and
+    /// signed again with its total when that grew (the re-check of #573,
+    /// N2); fast reads add nothing; every user's together past theirs is
+    /// signed too, naming the slowest.
     #[test]
     fn the_slow_read_budget_is_signed_naming_the_uid() {
         let t0 = Instant::now();
-        let mut s = Slow {
-            by_uid: HashMap::new(),
-            all: Account::new(t0),
-        };
+        let mut s = Slow::new(t0);
         let slow = Duration::from_millis(400);
-        assert!(slow_add(&mut s, 1234, slow, t0).is_empty());
-        assert!(slow_add(&mut s, 1234, slow, t0).is_empty());
-        let out = slow_add(&mut s, 1234, slow, t0);
+        assert!(slow_add(&mut s, 1234, 1234, slow, t0).is_empty());
+        assert!(slow_add(&mut s, 1234, 1234, slow, t0).is_empty());
+        let out = slow_add(&mut s, 1234, 1234, slow, t0);
         let [SlowRecord::Sign(d)] = out.as_slice() else {
             panic!("one record past the budget: {out:?}");
         };
-        assert!(d.starts_with("uid 1234:") && d.contains("slowed"), "{d}");
         assert!(
-            slow_add(&mut s, 1234, slow, t0).is_empty(),
+            d.starts_with("user 1234:") && d.contains("slowed") && d.contains("3 slow read"),
+            "{d}"
+        );
+        assert!(
+            slow_add(&mut s, 1234, 1234, slow, t0).is_empty(),
             "once per window"
         );
         let later = t0 + SLOW_WINDOW;
-        let out = slow_add(&mut s, 1234, slow, later);
-        assert_eq!(
-            out,
-            vec![SlowRecord::Retire(d.clone())],
-            "retired with its window"
-        );
-        // every uid's together
-        let mut s = Slow {
-            by_uid: HashMap::new(),
-            all: Account::new(t0),
+        let out = slow_add(&mut s, 1234, 1234, slow, later);
+        let [SlowRecord::Retire(gone), SlowRecord::Ended(total)] = out.as_slice() else {
+            panic!("retired with its window, its total signed: {out:?}");
         };
+        assert_eq!(gone, d, "retired with its window");
+        assert!(
+            total.starts_with("user 1234:")
+                && total.contains("1600 ms in the window that ended")
+                && total.contains("4 slow read"),
+            "{total}"
+        );
+        // every user's together
+        let mut s = Slow::new(t0);
         let mut all = None;
         for uid in 2000..2020 {
-            for r in slow_add(&mut s, uid, slow, t0) {
+            for r in slow_add(&mut s, uid, uid, slow, t0) {
                 if let SlowRecord::Sign(d) = r {
                     all = Some(d);
                 }
             }
         }
-        let all = all.expect("every uid's past theirs");
+        let all = all.expect("every user's past theirs");
         assert!(
-            all.starts_with("every uid:") && all.contains("slowed"),
+            all.starts_with("every user:") && all.contains("slowed"),
             "{all}"
         );
         // through the reader: the waits it measured
@@ -1259,8 +1505,279 @@ mod tests {
         }
         assert!(r
             .slow_signed(4321)
-            .is_some_and(|d| d.starts_with("uid 4321:")));
+            .is_some_and(|d| d.starts_with("user 4321:")));
         assert!(r.slow_signed(4322).is_none(), "fast reads add nothing");
+    }
+
+    /// The re-check of #573 (N2): a user's record leaves the status once its
+    /// window ends, at any later read — not only when that user is slow
+    /// again; one record per user, however many of its ids are slow, and
+    /// at most [`SLOW_KEPT`] users' records at once (past them, every
+    /// user's names how many).
+    #[test]
+    fn the_slow_records_are_one_per_user_and_bounded() {
+        let t0 = Instant::now();
+        let slow = Duration::from_millis(400);
+        let mut s = Slow::new(t0);
+        // one user's 70 subordinate ids, three slow reads each
+        let mut signed = Vec::new();
+        for uid in 100_000..100_070u32 {
+            for _ in 0..3 {
+                signed.extend(slow_add(&mut s, uid, 1000, slow, t0));
+            }
+        }
+        let own: Vec<_> = signed
+            .iter()
+            .filter(|r| matches!(r, SlowRecord::Sign(d) if d.starts_with("user 1000:")))
+            .collect();
+        assert_eq!(own.len(), 1, "one record for the user: {signed:?}");
+        assert_eq!(s.by_uid.len(), 1, "one account");
+        // a quiet minute: a fast read of anyone's retires it, with its total
+        let out = slow_sweep(&mut s, t0 + SLOW_WINDOW);
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, SlowRecord::Retire(d) if d.starts_with("user 1000:")))
+                && out
+                    .iter()
+                    .any(|r| matches!(r, SlowRecord::Ended(d) if d.contains("210 slow read"))),
+            "{out:?}"
+        );
+        assert!(s.by_uid.is_empty() && s.next_end.is_none());
+        assert!(slow_sweep(&mut s, t0 + SLOW_WINDOW * 2).is_empty(), "once");
+        // a user's record alone (every user's below its budget): retired too
+        let mut s = Slow::new(t0);
+        let mut own = None;
+        for _ in 0..3 {
+            for r in slow_add(&mut s, 1000, 1000, slow, t0) {
+                if let SlowRecord::Sign(d) = r {
+                    own = Some(d);
+                }
+            }
+        }
+        let own = own.expect("the user's record");
+        assert!(s.all.signed.is_none(), "every user's not signed");
+        assert!(
+            slow_sweep(&mut s, t0 + SLOW_WINDOW / 2).is_empty(),
+            "its window runs"
+        );
+        assert_eq!(
+            slow_sweep(&mut s, t0 + SLOW_WINDOW),
+            vec![SlowRecord::Retire(own)],
+            "retired at its window's end"
+        );
+        // 70 users: at most SLOW_KEPT records of users, and every user's
+        let mut s = Slow::new(t0);
+        let mut signs = 0;
+        let mut every = None;
+        for owner in 2000..2070u32 {
+            for _ in 0..3 {
+                for r in slow_add(&mut s, owner, owner, slow, t0) {
+                    if let SlowRecord::Sign(d) = r {
+                        if d.starts_with("every user:") {
+                            every = Some(d);
+                        } else {
+                            signs += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(signs, SLOW_KEPT, "the users' records bounded");
+        let every = every.expect("every user's signed");
+        assert!(every.contains("user(s) past their own budget"), "{every}");
+    }
+
+    /// The re-check of #573 (N2, the review's probe B): one user's
+    /// subordinate ids — and as many users — slow, three slow reads each,
+    /// then a minute later one more: the slow records stay within their own
+    /// budget of the registry, and the reads not waited for and a share
+    /// held are still kept and signed. Fails where the slow records filled
+    /// the registry (a79a10b9: 63 of them kept, the share held neither kept
+    /// nor signed).
+    #[test]
+    fn the_slow_records_never_crowd_out_the_exec_signals() {
+        use crate::boot::degradation as deg;
+        let _g = deg::TEST_LOCK.lock();
+        deg::reset_for_tests();
+        let _told = deg::KeptTold::new();
+        // as many users as ids (each its own account): the most records
+        let r = ExecReader::with_owners(READ_DEADLINE, |u| u);
+        let now = Instant::now();
+        for uid in 100_000..100_070u32 {
+            for _ in 0..3 {
+                r.waited(uid, r.whose(uid), Duration::from_millis(400), now);
+            }
+        }
+        let later = now + Duration::from_secs(61);
+        r.waited(200_000, r.whose(200_000), Duration::from_millis(400), later);
+        let slow = deg::snapshot()
+            .iter()
+            .filter(|l| l.starts_with(SLOW))
+            .count();
+        assert!(slow <= SLOW_RECORDS, "{slow} slow records kept");
+        // other parts' notes fill the shared room
+        for i in 0..deg::MAX_KEPT {
+            deg::note("k366_test_other", &format!("{i}"));
+        }
+        // the users' share held, and reads not waited for
+        let fast = ExecReader::new(Duration::from_millis(50));
+        let mut releases = Vec::new();
+        for uid in [1000, 1001] {
+            let (tx, rx) = channel::<()>();
+            releases.push(tx);
+            assert!(fast
+                .run(uid, "test", move || {
+                    let _ = rx.recv();
+                })
+                .is_err());
+        }
+        let lines = deg::snapshot();
+        assert!(
+            lines.iter().any(|l| l.starts_with(HELD))
+                && lines.iter().any(|l| l.starts_with(UNANSWERED)),
+            "kept for the status: {lines:#?}"
+        );
+        // and signed
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig"))
+            .unwrap();
+        let log = Arc::new(Mutex::new(
+            crate::audit::AuditLog::open(&dir.path().join("audit.log"), key, [7u8; 16]).unwrap(),
+        ));
+        deg::attach_audit_log(Some(log));
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["extra"]["kind"] == "subsystem_degraded")
+            .map(|v| v["extra"]["source"].clone())
+            .collect();
+        for source in [HELD, UNANSWERED] {
+            assert!(rows.iter().any(|s| s == source), "{source} signed");
+        }
+        drop(releases);
+        drop(_told);
+        deg::reset_for_tests();
+    }
+
+    /// The re-check of #573 (N3, the review's probe A): one user's reads —
+    /// its own uid's and its subordinate ids' (`/etc/subuid`'s range of
+    /// that user) — that do not answer hold one read of the users' share,
+    /// not the share: another user's reads are answered, and root's. Fails
+    /// where a read counted by uid (a79a10b9: the user's uid and one of its
+    /// subordinate ids held the share, every other user's reads refused).
+    #[test]
+    fn one_user_s_subordinate_ids_starve_no_other_user() {
+        fn owners(uid: u32) -> u32 {
+            if (100_000..165_536).contains(&uid) {
+                1000
+            } else {
+                uid
+            }
+        }
+        let r = ExecReader::with_owners(Duration::from_millis(100), owners);
+        let mut rel = Vec::new();
+        for uid in [1000u32, 100_000, 100_001, 165_535] {
+            let (tx, rx) = channel::<()>();
+            rel.push(tx);
+            let _ = r.run(uid, "probe", move || {
+                let _ = rx.recv();
+            });
+        }
+        assert_eq!(r.unanswered(), 1, "one read held for the user, all its ids");
+        let t0 = Instant::now();
+        let refused = r.run(100_002, "probe", || 0);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("user 1000's (uid 100002)")),
+            "{refused:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_millis(100), "refused at once");
+        for _ in 0..10 {
+            assert_eq!(r.run(1001, "probe", || 1), Ok(1), "another user's read");
+            assert_eq!(r.run(0, "probe", || 2), Ok(2), "root's");
+        }
+        assert!(!r.held_signed(1001), "the users' share not held");
+        drop(rel);
+    }
+
+    /// The re-check of #573 (N3): a subordinate id counts as the account the
+    /// published ranges give it (its owner's; root's ranges', the overflow
+    /// one); a uid of no range as itself; no uid of the 16-bit range as
+    /// another's, whatever the ranges say.
+    #[test]
+    fn a_subordinate_id_counts_as_its_owner_never_an_account_s_uid() {
+        use common::wire::execq::{OVERFLOW_SHARE, ROOT_SUBID_SHARE};
+        fn ranges(uid: u32) -> Option<u32> {
+            match uid {
+                100_000..=165_535 => Some(1000),
+                1_000_000..=1_999_999 => Some(ROOT_SUBID_SHARE),
+                300_000..=300_009 => Some(OVERFLOW_SHARE),
+                // a range that claims the accounts' own uids
+                0..=99_999 => Some(1000),
+                _ => None,
+            }
+        }
+        fn owners(uid: u32) -> u32 {
+            account_in(uid, ranges)
+        }
+        assert_eq!(account_in(100_000, ranges), 1000);
+        assert_eq!(account_in(165_535, ranges), 1000);
+        assert_eq!(account_in(1_500_000, ranges), ROOT_SUBID_SHARE);
+        assert_eq!(account_in(300_005, ranges), OVERFLOW_SHARE);
+        assert_eq!(account_in(200_000, ranges), 200_000, "no range: itself");
+        for uid in [0, 1, 999, 1001, 60_000, 65_534, 65_535] {
+            assert_eq!(account_in(uid, ranges), uid, "{uid}: never another's");
+        }
+        assert_eq!(account_in(65_536, ranges), 1000, "from the floor up");
+        let r = ExecReader::with_owners(READ_DEADLINE, owners);
+        assert_eq!(r.whose(100_001).account, 1000);
+        assert_eq!(r.whose(1001).account, 1001);
+        assert!(of_whom(1_500_000, r.whose(1_500_000)).starts_with("root's subordinate ids'"));
+    }
+
+    /// The re-check of #573 (N3): the agent's reader counts a uid by the
+    /// ranges the agent publishes (`share_subuid`'s table, kept for it):
+    /// a subordinate id as its owner's account, root's ranges as theirs.
+    #[test]
+    fn the_reader_counts_by_the_ranges_the_agent_publishes() {
+        use crate::sensors::share_subuid as s;
+        let _g = s::PUBLISHED_TEST_LOCK.lock();
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n";
+        s::keep(&s::table(
+            &s::ranges("alice:100000:65536\nroot:1000000:1000\n", passwd),
+            s::TABLE_MAX,
+        ));
+        let r = ExecReader::new(READ_DEADLINE);
+        assert_eq!(r.whose(100_005).account, 1000);
+        assert_eq!(
+            r.whose(1_000_005).account,
+            common::wire::execq::ROOT_SUBID_SHARE
+        );
+        assert_eq!(r.whose(1000).account, 1000);
+        assert_eq!(
+            r.whose(500_000).account,
+            common::wire::execq::OVERFLOW_SHARE,
+            "a gap between ranges: no single known owner"
+        );
+        assert_eq!(r.whose(2_000_000).account, 2_000_000, "past every range");
+        s::keep(&s::Table::default());
+        assert_eq!(r.whose(100_005).account, 100_005, "none published");
+    }
+
+    /// The re-check of #573 (N7): systemd's dynamic users and `nobody` are
+    /// the system's accounts, not the users'; the 16-bit gap above them and
+    /// the ids past 65535 are the users'.
+    #[test]
+    fn dynamic_users_and_nobody_are_the_system_s() {
+        for uid in [1, 999, 61_184, 63_000, 65_519, 65_534, 65_535] {
+            assert_eq!(Pool::of(uid), Pool::System, "{uid}");
+        }
+        for uid in [1000, 60_000, 61_183, 65_520, 65_533, 65_536, 100_000] {
+            assert_eq!(Pool::of(uid), Pool::Users, "{uid}");
+        }
+        assert_eq!(Pool::of(0), Pool::Root);
     }
 
     /// Lot 366: a mount made since the table was read: within

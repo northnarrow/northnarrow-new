@@ -768,6 +768,14 @@ const STATICS: &[Kept] = &[
          F1): each pump thread's own (thread-local), no lock the pumps share",
     ),
     kept(
+        "crates/nn-linux/src/sensors/share_subuid.rs",
+        "PUBLISHED",
+        HostFact,
+        "lot 366 (the re-check of #573, N3): the subordinate uid ranges as last published (the \
+         shares' table, read at the start and again when `/etc/subuid` or `/etc/passwd` \
+         changes), by which the exec pumps' reader counts a subordinate id as its owner's",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/pump_reads.rs",
         "PID1",
         HostFact,

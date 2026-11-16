@@ -257,8 +257,10 @@ fn executed_path(link: &Path, unlinked: bool) -> PathBuf {
 /// The directory `path` (absolute, in the view of the process `proc_dir`:
 /// `/proc/<pid>`) is root's and writable by no one else — walked from the
 /// process's root one name at a time, every file system on the way judged
-/// by `judge`, no symbolic link followed (lot 366: a link on the path, or a
-/// FUSE or network file system, is not walked into).
+/// by `judge`, no symbolic link followed (lot 366: a link on the path, a
+/// FUSE file system, or one no mount table shows, is not walked into; a
+/// network file system root mounted is, on the exec pumps' reader with its
+/// deadline).
 fn dir_is_root_only(proc_dir: &Path, path: &Path, judge: &super::pump_reads::Judge) -> bool {
     super::pump_reads::walk_in_root(proc_dir, path, judge)
         .is_ok_and(|w| w.cached.is_dir() && w.cached.root_only())

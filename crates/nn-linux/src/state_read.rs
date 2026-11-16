@@ -275,7 +275,10 @@ pub struct Condition {
     hold: std::time::Duration,
     since: Option<std::time::Instant>,
     reports: u32,
-    deferred: bool,
+    /// The review of #573 (F1): its records kept and signed by the next
+    /// flush, within its source's own budget of the registry (the re-check
+    /// of #573, N2): `Some(budget)`.
+    deferred: Option<usize>,
 }
 
 impl Condition {
@@ -291,32 +294,39 @@ impl Condition {
             hold,
             since: None,
             reports: 0,
-            deferred: false,
+            deferred: None,
         }
     }
 
     /// The review of #573 (F1): [`Self::with_hold`] for a thread that may
     /// never wait on I/O (an exec pump): its records are kept and signed by
-    /// the next flush ([`crate::boot::degradation::note`],
-    /// [`crate::boot::degradation::retire_where`]) — never written to the
-    /// audit log on that thread.
-    pub const fn deferred(source: &'static str, hold: std::time::Duration) -> Self {
+    /// the next flush — never written to the audit log on that thread. The
+    /// re-check of #573: within its source's own budget of the registry
+    /// (`budget` records of `source` at most, however many other parts
+    /// keep: [`crate::boot::degradation::note_kept`], N2), and its end
+    /// retires its own record only — not another condition's of the same
+    /// source ([`crate::boot::degradation::retire_kept`], N4).
+    pub const fn deferred(source: &'static str, hold: std::time::Duration, budget: usize) -> Self {
         let mut c = Self::with_hold(source, hold);
-        c.deferred = true;
+        c.deferred = Some(budget);
         c
     }
 
     fn report(&self, detail: &str) {
-        if self.deferred {
-            crate::boot::degradation::note(self.source, detail);
-        } else {
-            crate::boot::degradation::report(self.source, detail);
+        match self.deferred {
+            Some(budget) => {
+                crate::boot::degradation::note_kept(self.source, detail, budget);
+            }
+            None => {
+                crate::boot::degradation::report(self.source, detail);
+            }
         }
     }
 
-    fn withdraw(&self) {
-        if self.deferred {
-            crate::boot::degradation::retire_where(self.source, |_| true);
+    /// The record `detail` it made withdrawn.
+    fn withdraw(&self, detail: &str) {
+        if self.deferred.is_some() {
+            crate::boot::degradation::retire_kept(self.source, detail);
         } else {
             crate::boot::degradation::withdraw(self.source, &[]);
         }
@@ -332,8 +342,8 @@ impl Condition {
         if self.holding.as_deref() == Some(detail.as_str()) {
             return;
         }
-        if self.holding.is_some() {
-            self.withdraw();
+        if let Some(old) = self.holding.take() {
+            self.withdraw(&old);
         }
         tracing::warn!(source = self.source, detail = %detail, "degraded");
         self.report(&detail);
@@ -356,9 +366,11 @@ impl Condition {
         {
             return;
         }
-        self.holding = None;
+        let Some(old) = self.holding.take() else {
+            return;
+        };
         tracing::info!(source = self.source, "no longer degraded");
-        self.withdraw();
+        self.withdraw(&old);
     }
 
     /// It holds now.
@@ -828,6 +840,38 @@ mod tests {
         mount_rows(&mut rows, &good, "the test");
         assert!(mine().is_empty(), "withdrawn");
         assert!(!rows.holding());
+    }
+
+    /// Lot 366 (the re-check of #573, N4): two deferred conditions of one
+    /// source (the reader's shares held, one per pool): the end of one
+    /// retires its own record, never the other's, which stays in the status
+    /// while it holds. Fails where a deferred end retired every record of
+    /// its source (a79a10b9).
+    #[test]
+    fn a_deferred_condition_s_end_retires_its_own_record_only() {
+        use crate::boot::degradation as deg;
+        let _g = deg::TEST_LOCK.lock();
+        deg::reset_for_tests();
+        let _told = deg::KeptTold::new();
+        let mut users = Condition::deferred("k366_test_held", std::time::Duration::ZERO, 3);
+        let mut root = Condition::deferred("k366_test_held", std::time::Duration::ZERO, 3);
+        users.holds("the users' share is held".into());
+        root.holds("root's share is held".into());
+        users.ended();
+        assert!(!users.holding() && root.holding());
+        assert_eq!(
+            deg::snapshot(),
+            vec!["k366_test_held: root's share is held"],
+            "root's record stays while it holds"
+        );
+        root.holds("root's share is held, again".into());
+        assert_eq!(
+            deg::snapshot(),
+            vec!["k366_test_held: root's share is held, again"],
+            "a new detail replaces its own"
+        );
+        drop(_told);
+        deg::reset_for_tests();
     }
 
     /// The review of #538 (G2): a condition with a hold is one report while
