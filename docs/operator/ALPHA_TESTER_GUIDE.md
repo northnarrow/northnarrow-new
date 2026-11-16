@@ -115,9 +115,13 @@ them.
 ## 4. Install and verify
 
 ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §1 is the
-full guide.) These commands work on Ubuntu 24.04 as it ships: git, gpg,
-gpgv and curl are there. Download the tarball, `SHA256SUMS` and its
-signature `SHA256SUMS.asc` into one directory:
+full guide.) These commands work on Ubuntu 24.04 and Debian 12 as they
+ship: git, gpg, gpgv and curl are there. Testing before the release is
+tagged? Read "Before the release exists" at the end of this section
+first.
+
+Download the tarball, `SHA256SUMS` and its signature `SHA256SUMS.asc`
+into one directory:
 
 ```sh
 ver=<ver>                            # the release you test, e.g. 0.1.0-alpha
@@ -126,6 +130,10 @@ curl -fLO "$base/northnarrow-$ver-x86_64-linux.tar.gz"
 curl -fLO "$base/SHA256SUMS"
 curl -fLO "$base/SHA256SUMS.asc"
 ```
+
+For the `.deb` instead of the tarball, download it the same way, by the
+name the release page lists (`northnarrow_<ver>-<rel>_amd64.deb`), next
+to `SHA256SUMS` and `SHA256SUMS.asc`.
 
 Verify them with the release key committed at the release tag, never
 with a copy from the release page
@@ -143,7 +151,10 @@ sha256sum -c --ignore-missing SHA256SUMS                          # northnarrow-
 ```
 
 Each line must print what its comment says. If one does not, stop: the
-download is not the release.
+download is not the release. `sha256sum -c --ignore-missing` checks only
+the files you downloaded and says nothing of the others: make sure the
+line of each file you will install is there (with the `.deb`, also
+`northnarrow_<ver>-<rel>_amd64.deb: OK`).
 
 Then install. Leave the three downloaded files where they are, next to
 the extracted tree: the installer checks the signature and the tarball
@@ -155,15 +166,32 @@ cd "northnarrow-$ver-x86_64-linux"
 sudo ./deploy/install.sh            # alpha profile, started now and at every boot
 ```
 
-It prints `tarball matches the signed SHA256SUMS`. If it refuses the
-host, the message says why and what to do; nothing has been changed. Do
-not add `--allow-unverified` to get past a refusal of the download: that
+**What `install.sh` needs to accept the release.** One of two proofs
+([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §5.1):
+
+- the build's provenance attestation, checked with `gh` 2.49 or newer
+  (logged in, online), or with `cosign` and an attestation bundle
+  downloaded beforehand (`--attestation <file>`);
+- or, when neither tool is on the host, `SHA256SUMS.asc` next to
+  `SHA256SUMS`, a good signature by the release key, checked with `gpgv`.
+  This is the path on Ubuntu 24.04 and Debian 12 as they ship (no `gh`, or
+  a `gh` older than 2.49).
+
+With the second, it prints `tarball matches the signed SHA256SUMS`. A
+`gh` 2.49 or newer that runs and fails (not logged in, no network) is a
+refusal even with a good signature: fix what it says (`gh auth login`,
+the network), or pass the offline bundle. If it refuses the host, the
+message says why and what to do; nothing has been changed. Do not add
+`--allow-unverified` to get past a refusal of a release download: that
 flag means the files are not proven to be the release.
 
 **Keep the extracted tree**: the uninstaller is in it.
 
 From the `.deb` instead (Ubuntu 24.04, Debian 13; a package install
-starts nothing by itself):
+starts nothing by itself). dpkg and apt check no signature on a single
+package file: the `northnarrow_<ver>-<rel>_amd64.deb: OK` line of the
+verification above is its proof (or `gh attestation verify`, in
+[INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §6.1). Then:
 
 ```sh
 sudo apt-get install ./northnarrow_<ver>-<rel>_amd64.deb
@@ -179,13 +207,46 @@ KEY=/root/northnarrow-admin.key
 sudo nn-admin status --key "$KEY"
 ```
 
-The first summary line must say `OBSERVE-ONLY — profile alpha`. If the
-command exits 5 with `connecting to /run/northnarrow/admin.sock`, the
-agent does not run: see section 5.
+The first summary line must say `OBSERVE-ONLY — profile alpha`.
+
+Run `nn-admin` with `sudo`: the agent's socket and the key are root's.
+Without `sudo`, a command that talks to the agent fails with a permission
+error; that does not mean the agent is stopped. If `sudo nn-admin status`
+exits 5 with `connecting to /run/northnarrow/admin.sock`, the agent does
+not run: see section 5.
+
+### Before the release exists
+
+Until the release is tagged, there is no release page, no tag, no
+`SHA256SUMS.asc` and no attestation tied to a tag. A build you test
+before then (a CI build the project gives you, or one you build from the
+source) cannot be proven to be the release:
+
+- **What you can check:** `sha256sum -c --ignore-missing SHA256SUMS`
+  prints `OK` for each file you have. It proves the files are whole and
+  the ones the build listed, not where they were built.
+- **What you cannot check:** the tag, the release key's signature and the
+  build's provenance. `install.sh` says so and refuses.
+- **Install it only on a throwaway VM**, with the flag that records what
+  it is:
+
+  ```sh
+  sudo ./deploy/install.sh --allow-unverified    # a CI build: recorded as 'checksums'
+  sudo ./deploy/install.sh --source-tree         # a build from source: recorded as 'source-tree'
+  ```
+
+  For a CI build the installer prints `tarball matches SHA256SUMS` (not
+  "signed"), and `nn-admin host-check` shows `release verified at
+  install` as a WARN naming the flag. Both are expected for such a build.
+  Its version can read `0.0.1`.
+- A `.deb` of such a build has only its `SHA256SUMS` line: nothing
+  checks more.
+
+Or wait for the tag, and verify as above.
 
 ## 5. Read `nn-admin status`
 
-Without a key, the agent shows its posture only:
+Without a key (`sudo nn-admin status`), the agent shows its posture only:
 
 ```
 ── summary ──────────────────────────────────────────────
@@ -224,7 +285,22 @@ Further down, among many lines:
 - `deny fail-open`: should stay at 0. Another value names a kernel hook
   that let an operation through undecided: report it.
 - `ringbuf drops`, `loss by stage`: events lost under load. A few under a
-  burst are expected; losses on an idle host are worth a report.
+  burst are expected; losses on an idle host are worth a report. One
+  line of `loss by stage` is not a loss: `decision delay` counts events
+  judged later than their time budget, all of them judged. The agent's
+  start, the scenarios and a slow VM add some; a count that keeps rising
+  on an idle host is worth a report.
+- `host hardening : <n> check(s), <m> warning(s)`, the last line: settings
+  of the host that `nn-admin host-check` lists one per row, with how to
+  fix each. They are the host's, not faults of the agent. On a throwaway
+  cloud VM expect WARN rows for kernel lockdown, module signatures, Secure
+  Boot, IMA, kexec and the cgroup v1 controllers, and for the admin key
+  left on the host (section 4 tells you to leave it there); before the
+  tag, `release verified at install` too. Worth a report: a WARN on the
+  BPF LSM, `nft` or bpffs rows, or on `release verified at install` after
+  you installed a tagged release as section 4 says.
+- A warning from the system's C library when a command starts
+  (`GLIBC_… not found`) is worth a report, with your distribution.
 
 **Postures.** OBSERVING, then ALERTED, ENGAGED and COMBAT as evidence adds
 up ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md)). Without new signals the
@@ -235,7 +311,7 @@ an unlocked COMBAT 30 minutes after its last signal. A COMBAT shown as
 ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md) §3). Under `alpha`, COMBAT is
 entered and recorded but never isolates the host.
 
-**If the agent does not run**, `nn-admin status` exits 5. Look at:
+**If the agent does not run**, `sudo nn-admin status` exits 5. Look at:
 
 ```sh
 systemctl status northnarrow-agent northnarrow-watchdog --no-pager
@@ -249,8 +325,8 @@ Every `nn-admin` command and its exit codes are in [NN_ADMIN.md](NN_ADMIN.md).
 Each scenario makes the agent record something, with harmless commands
 only: copies of `/bin/true` and `/bin/sleep`, files you create and remove,
 the loopback interface and an address reserved for documentation. Nothing
-is downloaded, nothing leaves the VM, and each clean-up step puts the
-machine back as it was.
+is downloaded, nothing outside the VM answers, and each clean-up step
+puts the machine back as it was.
 
 How to run them:
 
@@ -319,8 +395,10 @@ Clean up: `rm -f ~/xmrig`
 
 ### 6.4 A netcat port check
 
-Needs netcat (`nc`), installed by default on Ubuntu. It only asks whether
-the local SSH port answers.
+Needs netcat (`nc`), installed by default on Ubuntu. On Debian, install
+it first: `sudo apt install netcat-openbsd`. Without it the command fails
+with `nc: command not found` and nothing runs, so no record appears: that
+is not a detection gap. It only asks whether the local SSH port answers.
 
 ```sh
 nc -z -w 2 127.0.0.1 22
@@ -440,9 +518,10 @@ in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md#false-positives-you-may-see).
 Status output, records and journal lines name your host, your user, your
 paths, the command lines you ran and IP addresses. The commands below
 gather what a report needs into one directory, then replace the host
-name, your user name and the IP and MAC addresses (loopback kept) with
-placeholders. Set `since` to a time before the problem (UNIX seconds; one
-hour ago here):
+name and its domain, your user name, the host's machine id and boot id,
+and the IP and MAC addresses (loopback and the documentation addresses
+of scenario 6.5 kept) with placeholders. Set `since` to a time before
+the problem (UNIX seconds; one hour ago here):
 
 ```sh
 KEY=/root/northnarrow-admin.key
@@ -455,23 +534,41 @@ sudo nn-admin chain verify > "$d/chain-verify.txt" 2>&1
 sudo nn-admin detections --key "$KEY" --since "$since" --limit 200 > "$d/records.jsonl" 2> "$d/records-summary.txt"
 sudo journalctl --namespace=northnarrow --since "@$since" --no-pager > "$d/agent-journal.txt" 2>&1
 sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "@$since" --no-pager > "$d/units-journal.txt" 2>&1
-H=$(hostname) U=$(id -un) perl -pi -e '
+H=$(hostname) D=$(hostname -d 2>/dev/null) U=$(id -un) M=$(cat /etc/machine-id) \
+B=$(cat /proc/sys/kernel/random/boot_id) perl -pi -e '
+  BEGIN { ($b = $ENV{B}) =~ s/-//g }
+  s/\Q$ENV{M}\E/machine-id/g if length $ENV{M};
+  s/\Q$ENV{B}\E|\Q$b\E/boot-id/gi if length $b;
   s/\Q$ENV{H}\E/host1/g;
-  s/\b\Q$ENV{U}\E\b/user1/g;
-  s/\b(?!127\.)(?:\d{1,3}\.){3}\d{1,3}\b/x.x.x.x/g;
+  s/(?<![\w-])\Q$ENV{D}\E(?![\w-])/domain1/g if length $ENV{D};
+  s/(?<![\w-])\Q$ENV{U}\E(?![\w-])/user1/g;
+  s/\b(?!127\.|203\.0\.113\.)(?:\d{1,3}\.){3}\d{1,3}\b/x.x.x.x/g;
   s/(?<![\w:])(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?(?![\w:])/x:x::x/gi;
   s/\b(?:[0-9a-f]{1,4}:){3,7}[0-9a-f]{1,4}\b/x:x::x/gi' "$d"/*
 ls -l "$d"
 ```
 
-Then **read every file before you attach it**. A short user name that is
-also part of other words (`nn`, `dev`) is replaced inside them too: that
-is harmless. The script cannot know
+Your user name is replaced where it stands as a word (a part of a path,
+`user=`, a name in a list), never inside a longer word: with the user
+`nn`, `nn-admin` stays `nn-admin`.
+
+Then **read every file before you attach it**. The script cannot know
 other names you consider private (a second user, a customer's host name, a
 path with a person's name, a secret passed on a command line). Replace
 them by hand, consistently (`user2`, `host2`), or delete the line. Never
 attach the admin key, any file from `/etc/northnarrow`, or a real
-credential. When you are done: `rm -rf "$d"`.
+credential. The journal can be long; `grep` helps:
+
+```sh
+grep -rlF -e "$(hostname)" -e "$(cat /etc/machine-id)" "$d"   # must print nothing
+grep -rlP "(?<![\w-])\Q$(id -un)\E(?![\w-])" "$d"            # must print nothing
+grep -nE ' (WARN|ERROR) ' "$d/agent-journal.txt"              # the lines to read first
+```
+
+Paste short files into the form's fields. Attach long ones, such as the
+journal, as files: drag them into a text box of the form (GitHub takes
+`.txt` files; rename `records.jsonl` to `records.txt`). When you are
+done: `rm -rf "$d"`.
 
 ## 9. Report what you found
 
@@ -512,9 +609,16 @@ From the extracted release tree
 sudo ./deploy/uninstall.sh --purge --grant-key /root/northnarrow-admin.key
 ```
 
-It asks for confirmation (`--yes` skips it). `--purge` removes the keys,
-the state and the records too; without it they stay for a later
-reinstall. Exit codes:
+It asks for confirmation (`--yes` skips it). It removes the agent's
+binaries from `/usr/local/bin`, its systemd units and slice, its three
+system accounts (`northnarrow-scan`, `northnarrow-worker`,
+`northnarrow-export`), its kernel programs and their pins under
+`/sys/fs/bpf`, its nftables table and `/run/northnarrow`. `--purge` also
+removes the keys, the state and the records: `/etc/northnarrow`,
+`/var/lib/northnarrow`, the admin key `/root/northnarrow-admin.key`, the
+export directory under `/var/log/northnarrow` and the agent's own journal;
+without it they stay for a later reinstall. The system journal keeps
+systemd's lines about the units, as it does for any service. Exit codes:
 
 - **0**: removed, clean;
 - **3**: the agent did not answer, so the removal finishes at the next
@@ -531,11 +635,12 @@ sudo NN_GRANT_KEY=/root/northnarrow-admin.key dpkg -P northnarrow
 ```
 
 Check that it is gone: `systemctl is-active northnarrow-agent` prints
-`inactive` (or the unit is not found) and `/etc/northnarrow` no longer
-exists. Two kernel modules the agent caused to load (`nf_tables`, and
-`unix_diag` on Ubuntu 26.04) stay loaded until the next reboot; that is
-harmless. On a throwaway VM, reverting to your snapshot is the simplest
-uninstall.
+`inactive` (or the unit is not found), `getent passwd northnarrow-scan`
+prints nothing, `ls /sys/fs/bpf` lists no `northnarrow` entry, and after
+`--purge` neither `/etc/northnarrow` nor `/var/lib/northnarrow` exists.
+Two kernel modules the agent caused to load (`nf_tables`, and `unix_diag`
+on Ubuntu 26.04) stay loaded until the next reboot; that is harmless. On
+a throwaway VM, reverting to your snapshot is the simplest uninstall.
 
 ## 11. Where to read more
 

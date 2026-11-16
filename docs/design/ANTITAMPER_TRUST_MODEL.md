@@ -3026,8 +3026,8 @@ where it starts.
   for each mount in it, the mount at the same place under every peer and
   slave of its parent — no other LSM call. The hook now walks that
   subtree in `next_mnt()`'s order (`mount.mnt_mounts`, `mnt_child`,
-  `mnt_parent`; 32 mounts, a climb back up of at most 8 levels a step,
-  `common::mount_guard::umount_below`), each mount
+  `mnt_parent`; a bounded walk, `common::mount_guard::umount_below`),
+  each mount
   judged as the top is (`below_of`: its root a held mount's, then by its
   id in a guarded namespace, then its place under its parent's group, a
   group not followed failing closed under a copy of a held mount). A walk

@@ -74,13 +74,15 @@ fn ticked(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The lots a text cites: `lot 359`, `lots 357 and 359`, `lot 273b`.
+/// The lots a text cites: `lot 359`, `lots 357 and 359`, `lot 273b`,
+/// `Lot 359` (any case: a capital at the start of a sentence is a lot too).
 fn lots(text: &str) -> Vec<String> {
     let flat = text.replace('\n', " ");
     let words: Vec<&str> = flat.split_whitespace().collect();
     let mut out = Vec::new();
     for (i, w) in words.iter().enumerate() {
-        if *w == "lot" || *w == "lots" {
+        let w = w.to_ascii_lowercase();
+        if w == "lot" || w == "lots" {
             for next in &words[i + 1..] {
                 let t = next.trim_end_matches([',', ';', '.', ')']);
                 if t == "and" {
@@ -88,7 +90,7 @@ fn lots(text: &str) -> Vec<String> {
                 }
                 if t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     out.push(t.to_string());
-                    if *w == "lot" || next.ends_with(['.', ';', ')']) {
+                    if w == "lot" || next.ends_with(['.', ';', ')']) {
                         break;
                     }
                 } else {
@@ -166,8 +168,20 @@ fn tree() -> Tree {
     }
 }
 
+/// A test's or a module's name: lower case, digits and `_`, with one `_`
+/// at least.
+fn is_snake(w: &str) -> bool {
+    w.contains('_')
+        && w.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// The page's problems: an item with no evidence, or evidence that names
-/// nothing the tree has.
+/// nothing the tree has. Every backticked word of the evidence is checked,
+/// so one citation that exists hides no dead one beside it: a file (a
+/// `/`), a test by its name or by its path (`a::b::name`: its last
+/// segment), a golden case (a `.`); any other word is refused, since it
+/// names nothing the checker can find.
 fn problems(text: &str, t: &Tree) -> Vec<String> {
     let mut out = Vec::new();
     for (line, item) in items(text) {
@@ -181,24 +195,24 @@ fn problems(text: &str, t: &Tree) -> Vec<String> {
         let ev = &item[at + EVIDENCE.len()..];
         let mut named = 0;
         for w in ticked(ev) {
+            named += 1;
+            let last = w.rsplit("::").next().unwrap_or_default();
             if w.contains('/') {
-                named += 1;
                 if !repo_root().join(&w).exists() {
                     out.push(format!("{LIMITS}:{line}: no file `{w}` in the tree"));
                 }
+            } else if w.contains("::") || is_snake(&w) {
+                if !is_snake(last) || !t.fns.contains(last) {
+                    out.push(format!("{LIMITS}:{line}: no test `{w}` in the tree"));
+                }
             } else if w.contains('.') {
-                named += 1;
                 if !t.golden.contains(&w) {
                     out.push(format!("{LIMITS}:{line}: no golden case `{w}`"));
                 }
-            } else if w.contains('_')
-                && w.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            {
-                named += 1;
-                if !t.fns.contains(&w) {
-                    out.push(format!("{LIMITS}:{line}: no test `{w}` in the tree"));
-                }
+            } else {
+                out.push(format!(
+                    "{LIMITS}:{line}: `{w}` names no test, file or golden case"
+                ));
             }
         }
         for lot in lots(ev) {
@@ -288,6 +302,21 @@ fn the_checker_refuses_missing_or_dead_evidence() {
             "## A\n\n- **One.** *Evidence:* trust us.\n",
             "names no test",
         ),
+        // a dead citation beside one that exists is still found (the
+        // review of #571, F5): a test by its path, a capital `Lot`, a
+        // word that is none of a test, a file or a golden case
+        (
+            "## A\n\n- **One.** *Evidence:* `the_checker_refuses_missing_or_dead_evidence`;\n  `nn_linux::self_integrity::no_such_test_xyz`.\n",
+            "no test `nn_linux::self_integrity::no_such_test_xyz`",
+        ),
+        (
+            "## A\n\n- **One.** *Evidence:* `the_checker_refuses_missing_or_dead_evidence`;\n  Lot 99999.\n",
+            "no lot 99999",
+        ),
+        (
+            "## A\n\n- **One.** *Evidence:* `the_checker_refuses_missing_or_dead_evidence`;\n  `NoSuchTestAtAll`.\n",
+            "`NoSuchTestAtAll` names no test, file or golden case",
+        ),
     ] {
         let p = problems(bad, &t);
         assert!(
@@ -296,6 +325,15 @@ fn the_checker_refuses_missing_or_dead_evidence() {
         );
     }
     assert_eq!(lots("lots 357 and 359; lot 273b."), ["357", "359", "273b"]);
+    assert_eq!(lots("Lot 359. Lots 1 and 2."), ["359", "1", "2"]);
+    // a test named by its path is found by its last segment
+    let by_path =
+        "## A\n\n- **One.** *Evidence:* `xtask::known_limitations::the_checker_refuses_missing_or_dead_evidence`.\n";
+    assert!(
+        problems(by_path, &t).is_empty(),
+        "{:?}",
+        problems(by_path, &t)
+    );
     assert_eq!(
         phases("Phase 3 §7.1; internal check Phase 2c §7."),
         ["3", "2c"]

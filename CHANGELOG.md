@@ -16,27 +16,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     New items: the signing is not forward-secure (a stolen key rewrites
     the past; test
     `a_history_rewritten_with_the_agent_key_verifies_only_a_kept_head_tells`);
-    the pin lock's four residuals, each signed at the next integrity
-    round (`mount_setattr(2)`, a raw namespace's copy, the units'
-    namespaces, a peer namespace that exists before the lock); the
-    verifier margin on 5.15 and 6.1 and the signed degradation when a
-    mount-guard program is refused; the FUSE sentence (below); `nn-admin
-    chain verify` saying OK with no chains; the release's provenance only
-    from the first tag. The page's mount residuals no longer give the
-    walk's bounds. Ratchet `xtask/tests/known_limitations.rs`: every item
-    names evidence, and every test, file, golden case, lot and phase it
-    names exists.
+    the pin lock's four residuals, each signed (`mount_setattr(2)`, a raw
+    namespace's copy, the units' namespaces, a namespace that was a peer
+    before the lock); the verifier margin on 5.15 and 6.1 and the signed
+    degradation when a mount-guard program is refused; a file system that
+    does not answer can delay exec records, signed by the sensor
+    self-test; a long suspend can make a record name an earlier program;
+    run the agent only through its units; `nn-admin chain verify` saying
+    OK with no chains; the release's provenance only from the first tag.
+    No public doc gives the unmount walk's bounds any more (this page,
+    the trust model, the upgrade notes, the program's notes). Ratchet
+    `xtask/tests/known_limitations.rs`: every item names evidence, and
+    every backticked word of the evidence is a test (by name or by path),
+    a file or a golden case that exists, every lot (any case) is in the
+    CHANGELOG and every phase is a known one, so a dead citation beside a
+    live one fails too.
   - **`ALPHA_TESTER_GUIDE.md`** (replaces `TESTING_THE_ALPHA.md`): for a
-    reader with no context — who the alpha is for, install and verify,
-    what observe-only means, eight harmless scenarios each with the
+    reader with no context — who the alpha is for, install and verify
+    (what `install.sh` needs to accept a release: an attestation verifier,
+    or the signed `SHA256SUMS`; the `.deb`'s own check; what can and
+    cannot be verified before the release is tagged), what observe-only
+    means, eight harmless scenarios each with the
     record to expect (run as written on Ubuntu 24.04 under `alpha`: eight
     of eight drew it; the blocked-address scenario expects
     `NN-L-NET-001_OutboundToBlockedIp`, the documentation range being in
     the shipped blocklist, not NET-028 as the draft said), how to read
-    `nn-admin status`, diagnostics gathered with the host name, the user
-    name and IP and MAC addresses replaced, how to report, how to
-    uninstall. Issue forms in `.github/ISSUE_TEMPLATE` (bug report, false
-    positive, detection gap; a vulnerability goes to private reporting).
+    `nn-admin status` (with `sudo`; `decision delay` is no loss; which
+    `host-check` warnings are worth a report), diagnostics gathered with
+    the host name and domain, the user name (as a whole word), the
+    machine id, the boot id and IP and MAC addresses replaced, how to
+    report, what the uninstall removes. Issue forms in
+    `.github/ISSUE_TEMPLATE` (bug report, false positive, detection gap;
+    a vulnerability goes to private reporting); their labels `alpha`,
+    `false-positive` and `detection-gap` exist on the repository.
+    Corrected after an outside tester's run on Debian 12: netcat is not
+    installed there (`netcat-openbsd`), and a scenario without it is no
+    detection gap.
     The ratchet checks each scenario's rule and severity against the
     catalogue and the forms against the guide.
   - **The export to a real receiver**: `export-guest.sh` phase `interop`
@@ -60,7 +75,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     would serve to stay under them. The descriptor race reads "refused,
     signed once per program and caller (repeats coalesced)". Lot 355's
     "a FUSE file never `stat`ed" / "never read through a FUSE mount" is
-    corrected: the check is lexical (`UPGRADE_NOTES_WAVE4.md` §49).
+    withdrawn (`UPGRADE_NOTES_WAVE4.md` §49). The posture design keeps
+    that a listed unit is recognised by its name.
 - Lot 359 (pre-alpha, the re-check 3 of #567): the **pin directory's
   lock** (`UPGRADE_NOTES_WAVE4.md` §52). The unmount hook runs before the
   kernel's namespace lock, so a racing rbind, or a subtree wider or deeper
@@ -1497,9 +1513,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       or a `memfd` (each descriptor's filesystem read from its `fdinfo`,
       so a FUSE file there is not `stat`ed);
     - a traced daemon (`TracerPid:`, a `PTRACE_SEIZE` leaves it running)
-      ties nothing; the image's path is not read through a FUSE mount the
-      path's text shows (lexically: lot 364 corrects the sentence, which
-      said "never" — a symbolic link or a race still reaches one;
+      ties nothing (lot 364 withdraws this entry's "the image's path is
+      never read through a FUSE mount": a file system that does not answer
+      can still delay the exec reading, signed by the sensor self-test;
       `UPGRADE_NOTES_WAVE4.md` §49);
     - the pump reads the mount table only for an exec on an anonymous
       device (FUSE's) that may tie, keeps its record by pid in the order

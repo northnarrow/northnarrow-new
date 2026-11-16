@@ -11676,9 +11676,8 @@ number in parentheses is a lab PR.
     their copies in every slave namespace, the agent's own included (the
     reviewer's probes, a user namespace on 6.18); a raw namespace's
     `umount -l /` the same. Now `sb_umount` reads the subtree in the
-    kernel's order (`common::mount_guard::umount_below`, 32 mounts, a
-    climb of at most 8 levels a step; offsets `mount.mnt_mounts`,
-    `.mnt_child`), each mount below judged as the top (a held mount at its
+    kernel's order (`common::mount_guard::umount_below`, a bounded walk;
+    offsets `mount.mnt_mounts`, `.mnt_child`), each mount below judged as the top (a held mount at its
     place under its parent's group; its root a held mount's, then by id in
     a guarded namespace or under a group not followed and a copy of a held
     parent); a subtree wider than the walk is refused in a guarded
@@ -11904,7 +11903,7 @@ number in parentheses is a lab PR.
     (rev567-lock-probe.sh in a user namespace) as the review found it; N4's
     race won (the unmount entered before the graft, returned after it) in
     a raw namespace on all three and in the host's on 6.8 and 7.0 (on 5.15
-    the graft came first and the walk refused it), N3's chain of 9 — the
+    the graft came first and the walk refused it), N3's deep chain — the
     host's bpffs and the pins kept every time (round 1 on 6.8, the lock
     not made: both gone); a freshly started agent's namespace has no copy
     of the lock, and the race took its view of the bpffs (signed
@@ -11956,7 +11955,7 @@ number in parentheses is a lab PR.
     shared change of the bpffs, a private namespace's recursive private
     change, the runtimes); the lock still unbindable after them, never in
     an rbind copy; the bpffs and the pins kept through the race and the
-    chain of 9; a remake whose attempts all failed signed with the next
+    deep chain; a remake whose attempts all failed signed with the next
     attempt's round, then made again after the back-off; cold boot and
     uninstall clean. On 5.15 and 7.0 the record of that last remake was
     held back by the drift back-off (its text the same as the remake's
@@ -12014,8 +12013,8 @@ number in parentheses is a lab PR.
     residuals, trust model, upgrade notes §42/§43/§49/§51, this file's
     notes on the DNS tunnel score, the shell copy check and lots 355,
     357 and 359).
-  - Lab, as measured (our own guest under lease k364, ubuntu2404, kernel
-    6.8.0-149; the agent installed and purged at the end, the guest off):
+  - Lab, as measured (our own guest, ubuntu2404, kernel 6.8.0-149; the
+    agent installed and purged at the end, the guest off):
     - round 1 (the lab's enforcing install), `export-guest.sh setup
       arrive interop off`: 28 checks, 28 passed; 118 chain rows in the
       capture and the JSONL files, none missing, none other, no duplicate;
@@ -12033,8 +12032,24 @@ number in parentheses is a lab PR.
       left 0 files with the host name, 0 with the user name, no
       non-loopback IPv4; `uninstall.sh --purge` left no unit, no pin, no
       `/etc/northnarrow`.
+  - Fix round 1 (the review of #571, and an outside tester's run of the
+    guide alone on Debian 12 with a CI build): the FUSE item rewritten as
+    behaviour (a file system that does not answer can delay exec records,
+    signed by the sensor self-test) and moved out of "against root"; the
+    unmount walk's bounds removed from every public doc; the pin lock's
+    residuals as behaviour; the guide's "Before the release exists"
+    (what a tester can and cannot verify, the flags that record it),
+    what `install.sh` needs, the `.deb`'s check, `sudo`, `decision
+    delay`, the `host-check` warnings, netcat on Debian, `grep` for the
+    diagnostics, what the uninstall removes; the diagnostics also mask
+    the domain, the machine id and the boot id, and the user name only as
+    a word; the forms' labels created; the ratchet checks every
+    backticked word of the evidence (three dead citations planted beside
+    live ones: the test failed on each; removed); six items cite now the
+    evidence that proves them; #568's suspend residual and the agent run
+    by hand added.
   - Not done: rsyslog as the receiver (no TLS driver in the guest); the
-    `.rpm`; a fresh agent acting as the external tester follows this lot.
+    `.rpm`.
   - Levels unchanged.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
@@ -12085,10 +12100,11 @@ number in parentheses is a lab PR.
     file itself open (device and inode) and no other regular file under a
     staging directory, unlinked, on a memory or FUSE filesystem, or a
     `memfd` (each descriptor's filesystem from its `fdinfo`, so no `stat`
-    of a FUSE file there); a traced daemon (`TracerPid:`) ties nothing; the
-    image's path is not read through a FUSE mount its text shows (a lexical
-    check: lot 364 corrects "never", `UPGRADE_NOTES_WAVE4.md` §49); the
-    mount table is read only for an
+    of a FUSE file there); a traced daemon (`TracerPid:`) ties nothing
+    (lot 364 withdraws this note's "the image's path is never read through
+    a FUSE mount": a file system that does not answer can still delay the
+    exec reading, signed by the sensor self-test;
+    `UPGRADE_NOTES_WAVE4.md` §49); the mount table is read only for an
     anonymous device's exec that may tie, the record kept by pid in the
     order noted; the flow and ancestor tests pair the spawn cache's mark
     with its own image path; the `staged_images.rs` ratchet counts the

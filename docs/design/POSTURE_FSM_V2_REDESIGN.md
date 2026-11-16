@@ -973,10 +973,11 @@ design-doc hygiene).
     root's, a file with another link), or runs in a session, still raises
     the arm;
   - *a root daemon running as a listed unit gets that unit's listed
-    directories exempt, and nothing else*: whatever runs as or in that
-    unit writes those directories unseen by the arm; its writes anywhere
-    else count, and so do the same directories written from any other
-    cgroup;
+    directories exempt, and nothing else*: the unit is recognised by its
+    name, which any root process can take by installing and starting a
+    unit of that name; whatever runs as or in that unit writes those
+    directories unseen by the arm; its writes anywhere else count, and so
+    do the same directories written from any other cgroup;
   - *own data is classified by the directory a file is in when it is
     opened* (the dentries, not the mount): a rewrite made there is judged
     as own data, whatever directory the file came from, and reaches

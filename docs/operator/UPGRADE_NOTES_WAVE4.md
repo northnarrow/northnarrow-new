@@ -3352,13 +3352,11 @@ depth.
   exec's), no other user inherits the mark, and root's exec from
   `/tmp/.mount_*` is still R009. A kernel record of the process the
   connection's `/dev/fuse` file is handed to would close it.
-- **Limit (lot 364, the re-check of #564).** The pump keeps off FUSE by
-  the path's text and by each descriptor's file system (`fdinfo`): that
-  check is lexical, so a path that reaches a FUSE mount another way (a
-  symbolic link in it, a change between the check and the read) is not
-  caught by it, and the pump can then wait on that FUSE file system. A
-  hardening lot after the alpha resolves those paths without following
-  links (`KNOWN_LIMITATIONS.md`, "Self-protection against root").
+- **Limit (lot 364, the re-check of #564).** "Never read through a FUSE
+  mount" is withdrawn. A file system the agent does not trust to answer
+  (FUSE, a network file system) can delay the exec reading; the sensor
+  self-test signs it (`subsystem_degraded`, source `sensor_selftest`). A
+  hardening lot follows (`KNOWN_LIMITATIONS.md`, "Detection coverage").
 - **Operator action.** None: no setting, no overlay. The records name the
   program's path as before.
 
@@ -3827,9 +3825,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   and `/sys/fs/cgroup` through the copies below it, and the copies in every
   slave namespace (the agent's own included): the bpffs lost its last
   mount, with no refusal. The same held for a raw namespace's `umount -l
-  /`. Now the guard reads the subtree in the kernel's order (a bounded walk: a
-  child, else the next sibling of the mount or of one of its parents up to
-  8 levels), and refuses
+  /`. Now the guard reads the subtree in the kernel's order (a bounded
+  walk: a child, else the next sibling of the mount or of one of its
+  parents), and refuses
   the unmount when a mount in it is held (by its id in a guarded
   namespace), or its unmount propagates onto a held mount (its place under
   its parent's peer group; a group not followed yet, regrouped since:

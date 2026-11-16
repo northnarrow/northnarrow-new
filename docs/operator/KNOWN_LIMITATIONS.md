@@ -40,8 +40,9 @@ how.
   and reboot before you install
   ([KERNEL_COMPATIBILITY.md](KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line)).
   A distribution outside the tested list is named, not refused.
-  *Evidence:* `install_sh_refuses_a_host_without_nft_unless_told`; lot 341;
-  internal check Phase 2 §4.6.
+  *Evidence:* `a_host_the_release_cannot_run_on_is_refused_with_what_to_do`;
+  `install_sh_refuses_a_host_without_nft_unless_told`; lot 341; internal
+  check Phase 2 §4.6.
 - **The upgrade has a short window with partial protection.** During
   `install.sh --upgrade`, for about 6 to 15 seconds, not all of the agent's
   kernel programs are attached, and the watchdog is absent for about 18
@@ -133,7 +134,9 @@ how.
 - **The release's provenance is proven only from the first tag.** The
   build-provenance attestation and the real `SHA256SUMS.asc` are produced
   by the tagged release; the release candidates were checked on CI builds
-  of the same tree, which carry neither. *Evidence:* internal check Phase
+  of the same tree, which carry neither. *For you:* before the tag, read
+  [ALPHA_TESTER_GUIDE.md](ALPHA_TESTER_GUIDE.md#before-the-release-exists)
+  for what you can and cannot verify. *Evidence:* internal check Phase
   2c §7; internal check Phase 1 §7.
 - **One architecture.** x86_64 only: no ARM64. *Evidence:* internal check
   Phase 0 §4.1.
@@ -160,7 +163,7 @@ how.
   write lines that verify, and forge the heartbeat. Hardware attestation
   is future work
   ([HEARTBEAT.md](HEARTBEAT.md#what-it-does-not-prove)). *Evidence:* the
-  same test; internal check Phase 3 §7.2 (R016, a residual of the design).
+  same test; internal check Phase 3 §7.2 (residual R016, of the design).
 - **The evidence lives on the host.** A root who stops the agent inside a
   window, or reads the disk from another system, can remove or roll back
   its files. Verification shows a cut chain only against a head you kept
@@ -177,8 +180,9 @@ how.
 
 The agent is **hardened against root, not root-proof.** Outside a signed
 trusted-installer window, its kernel hooks refuse root's attempts to stop,
-blind, freeze, trace or change it, and each refusal is a signed
-`NN-L-AT-001_AntiTamperDenial` record. Some things cannot be refused
+blind, freeze, trace or change it, and the refusals are signed
+`NN-L-AT-001_AntiTamperDenial` records (rate-limited, repeats coalesced).
+Some things cannot be refused
 without breaking the system: for those the agent records what happened,
 most within one integrity round (about 30 seconds). Below is what stays
 open for the alpha, and the record it leaves. The full analysis is in the
@@ -212,11 +216,11 @@ not cause as an incident.
   start are recorded (High for the risky types); on kernels from 6.9 their
   later use is not judged. *For you:* install on a fresh VM. *Evidence:*
   `the_start_is_the_baseline_and_a_later_unseen_program_is_signed_once`;
-  internal check Phase 3 §7.1 (R002).
+  internal check Phase 3 §7.1 (residual R002).
 - **Some BPF paths are not judged.** An XDP or tc program attached through
   netlink, and the program values of some map types, are not judged; their
-  load is still recorded. *Evidence:* internal check Phase 3 §7.1 (R002,
-  R132); lot 356.
+  load is still recorded. *Evidence:* internal check Phase 3 §7.1 (residuals
+  R002, R132); lot 356.
 - **An allowed tracing tool can read everything.** With
   `--allow-bpf-tools`, any root process that runs a named program may load
   tracing programs (for BCC that is any root Python script), and a tracing
@@ -262,36 +266,32 @@ not cause as an incident.
   `a_mount_over_protected_is_signed_high`;
   `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 357;
   internal check Phase 8b §7.
-- **The pin directory's lock: four residuals, each signed at the next
-  integrity round.** The directory that keeps the agent's kernel programs
-  pinned is locked (bound onto itself, private and unbindable), so that an
-  unmount of the bpffs cannot take it. For the alpha the lock does not
-  cover four cases. In each, the agent keeps its kernel programs attached
-  (it holds a descriptor of every one), and the next integrity round, about
-  30 seconds later, signs what happened (High):
-  - `mount_setattr(2)` has no kernel hook, so root can clear the lock's
-    flags through it; until the round makes the lock again, an unmount can
-    take the host's bpffs view and the pins. Signed `pin_lock_changed`;
-  - a raw mount namespace holds its own copy of the lock: changes of
-    propagation it makes to its own copies are not judged, and a move of
-    its copy of `/sys` is judged by its target only, so an unmount there
-    can still reach the host's bpffs and the pins. Signed
-    `protected_mount_gone` and `pin_lock_missing`;
+- **The pin directory's lock: four residuals, each signed.** The
+  directory that keeps the agent's kernel programs pinned is locked (bound
+  onto itself, private and unbindable), so that an unmount of the bpffs
+  cannot take it. For the alpha the lock does not cover four cases. In
+  each, the agent keeps its kernel programs attached (it holds a
+  descriptor of every one), and an integrity round, about 30 seconds
+  apart, signs what happened (High); a loss that comes back soon after one
+  already signed is reported again later, as every drift finding is:
+  - a change of the lock's flags through `mount_setattr(2)`, which has no
+    kernel hook, is not refused. Until the next round puts the lock back,
+    the pins are protected as they were without the lock, and the agent
+    keeps its programs. Signed `pin_lock_changed`;
+  - a raw mount namespace's own copy of the lock is not judged as the
+    host's lock. The host's bpffs view and the pins can be lost through
+    it. Signed `protected_mount_gone` and `pin_lock_missing`;
   - the systemd units' own mount namespaces, the agent's and the
-    watchdog's among them, never have the lock: an unmount there can take
-    that namespace's view of the bpffs, not the host's nor the pins; what
-    reads the pins by path there fails until a restart. Signed
-    `protected_mount_gone`;
-  - a mount namespace that already exists, as a peer of the host's, when
-    the lock is made or made again receives a copy of the lock that is
-    shared and bindable: there the lock does not hold, and an unmount can
-    take the host's bpffs view as before the lock. Signed
-    `protected_mount_gone`.
+    watchdog's among them, never have the lock. That namespace's view of
+    the bpffs can be lost, not the host's nor the pins; what reads the pins
+    by path there fails until a restart. Signed `protected_mount_gone`;
+  - a mount namespace that was already a peer of the host's when the lock
+    was made does not hold the lock. The host's bpffs view can be lost
+    through it, as before the lock. Signed `protected_mount_gone`.
 
-  The first lot after the alpha refuses the move of such copies and
-  signals a `mount_setattr(2)` at once. A start that finds no lock (a
-  kernel without `open_tree(2)`, an error) signs a degradation and the
-  round makes it. *For you:* if a `protected_mount_gone`,
+  A hardening lot after the alpha narrows the first two. A start that finds
+  no lock (a kernel without `open_tree(2)`, an error) signs a degradation
+  and the round makes it. *For you:* if a `protected_mount_gone`,
   `pin_lock_missing`, `pin_lock_changed` or `bpf_pin_vanished` appears that
   you did not cause, do not restart the agent before a reboot: its
   descriptors keep its hooks while it runs. *Evidence:*
@@ -300,32 +300,31 @@ not cause as an incident.
   `a_removed_held_pin_is_a_high_pinned_again`;
   `a_mount_gone_from_under_the_agents_paths_is_reported`; lot 359;
   internal check Phase 2c §7; internal check Phase 8b §4.2.
-- **An unmount built to outrun the guard.** The kernel asks the unmount
-  hook before it takes its own lock, and the guard reads a bounded part of
-  the mount tree. In a namespace that is not the host's, the agent's or
-  the watchdog's, an unmount built for it can take the host's
-  `/sys/fs/cgroup` mount (which has no lock), and, where the pin lock is
-  missing or one of the cases above applies, the host's bpffs view. The
-  agent's hooks stay attached while it runs; the integrity round signs
+- **The unmount guard reads a bounded part of the mount tree.** An
+  unmount is judged on the part of the mount tree the guard reads. In a
+  namespace that is not the host's, the agent's or the watchdog's, an
+  unmount can still take the host's `/sys/fs/cgroup` mount and, where the
+  pin lock does not hold (above), the host's bpffs view. The agent's hooks
+  stay attached while it runs; the integrity round signs
   `protected_mount_gone` (High). In the host's namespace an unmount wider
   than the guard reads is refused even when it is harmless: use `umount
   -R`, or a window. *Evidence:* `a_mount_gone_from_under_the_agents_paths_is_reported`;
   lots 357 and 359.
-- **A FUSE file system the agent reads.** The agent reads `/proc`, `/sys`
-  and its own state beneath views it opened at its start, with deadlines,
-  and refuses a mount over them (above). A FUSE mounted over those paths
-  before the guard attached, or on a kernel without it, is signed
-  (`mount_over_protected`); an agent stuck on one is restarted by the
-  watchdog and signed (`stuck_unresponsive`, `stuck_recovery_failed`), and
-  a FUSE connection holding it is aborted (`fuse_aborted`). The AppImage
-  check keeps off FUSE by the path's text and the descriptors' file
-  system: a path that reaches a FUSE mount another way (a symbolic link in
-  it, or a change between the check and the read) is not caught by that
-  check, and the exec pump can then wait on that FUSE file system. A
-  hardening lot after the alpha resolves those paths without following
-  links. *Evidence:* `a_stuck_recovery_and_a_restart_loop_are_signed`;
-  `a_fuse_on_the_way_is_never_read`; lots 353 and 355; internal check
-  Phase 3 §7.3.
+- **A FUSE file system over the agent's paths.** The agent reads `/proc`,
+  `/sys` and its own state beneath views it opened at its start, with
+  deadlines, and refuses a mount over them (above). A FUSE mounted over
+  those paths before the guard attached, or on a kernel without it, is
+  signed (`mount_over_protected`); an agent stuck on one is restarted by
+  the watchdog and signed (`stuck_unresponsive`, `stuck_recovery_failed`),
+  and a FUSE connection holding it is aborted (`fuse_aborted`).
+  *Evidence:* `a_stuck_recovery_and_a_restart_loop_are_signed`;
+  `a_fuse_on_the_way_is_never_read`; lot 353; internal check Phase 3
+  §7.3.
+- **Run the agent and the watchdog only through their units.** An agent
+  or a watchdog started by hand in the host's own mount namespace, outside
+  its systemd unit, weakens the mount guard of the host's namespace while
+  it runs and after it exits. *For you:* start, stop and restart them only
+  with `systemctl`, inside a window. *Evidence:* lot 359.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is
@@ -334,7 +333,7 @@ not cause as an incident.
   `daemon-reload` inside a signed window applies a drop-in already on
   disk. *Evidence:* `dropins_are_read_from_every_directory_of_the_unit_search_path`;
   `a_process_without_the_unit_s_confinement_is_drift`; internal check
-  Phase 3 §7.1 (R015).
+  Phase 3 §7.1 (residual R015).
 - **A refused `set-property` stays in systemd's memory.** systemd changes
   its own copy of the property before the agent refuses the write.
   `systemctl show` then reports the new value, and the unit's next start
@@ -356,7 +355,7 @@ not cause as an incident.
   loss end the agent without asking. The watchdog brings it back, and the
   next start records how the previous run ended (`previous_run` with
   `"ended":"abrupt"` in its signed `agent_boot` entry). *Evidence:*
-  `a_watchdog_gone_is_a_finding`; internal check Phase 3 §7.2.
+  `previous_run_none_abrupt_clean`; internal check Phase 3 §7.2.
 - **The agent's CPU time.** Heavy CPU load from root processes can slow the
   agent: its unit has no raised CPU weight yet. A stall of more than 15 s is
   a signed `agent_stalled` record. A confinement of the agent to fewer CPUs
@@ -367,7 +366,7 @@ not cause as an incident.
   CPUs taken offline are not recorded, and the watchdog's CPUs are not
   watched. *Evidence:* `a_sibling_partition_confining_the_agent_is_a_confinement`;
   `a_cpu_taken_offline_is_no_confinement`; lot 349; internal check Phase 3
-  §7.1 (R001).
+  §7.1 (residual R001).
 - **The journal can be emptied.** A root `journalctl --vacuum-*` removes
   the agent's journal lines like any other's (the anti-tamper lab's known
   gap). The signed chains are not in the journal. *Evidence:* internal
@@ -437,6 +436,24 @@ not cause as an incident.
   programs they could run from their home anyway. What the program then
   does is judged as for any user program. *Evidence:*
   `an_appimage_program_is_its_image_s`; lot 355.
+- **A file system that does not answer can delay exec records.** To
+  judge a program it runs, the agent reads facts about the program's file.
+  A program on a file system the agent does not trust to answer (FUSE, a
+  network file system) can delay that reading, and the exec records
+  behind it. The sensor self-test then finds its own
+  exec missing and signs a degradation (`subsystem_degraded`, source
+  `sensor_selftest`). *For you:* such a degradation in `nn-admin status`
+  is worth a report, with the file systems mounted at the time
+  (`findmnt -t fuse,fuseblk`). *Evidence:*
+  `a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert`;
+  lot 355.
+- **After a long suspend, a record can name an earlier program.** A
+  process id reused after the host spent a long time suspended can be
+  taken for a process that held it before the agent started (a laptop
+  whose agent restarted since). The record then names that earlier
+  process's program, while what ran is still judged by its own exec.
+  *For you:* a record whose program does not match what you ran, on a
+  host that was suspended, is worth a report. *Evidence:* lot 360.
 - **Children that only fork.** A process that forks without running a new
   program is judged by its parent's image. A forker's own later exec read
   after the child's connection is judged on the earlier image; a fork-only
@@ -527,7 +544,7 @@ lists the known false positives of each rule.
   verifier's refusal is planned before the tag).
 - **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
   build and not since many recent changes; the `.rpm` is untested (above).
-  *Evidence:* internal check Phase 8 §7 (R066).
+  *Evidence:* internal check Phase 8 §7 (residual R066).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
   active LSM list, bpffs at `/sys/fs/bpf`, systemd, `nft`. Without the BPF
   LSM the agent does not start. *Evidence:*
@@ -544,7 +561,7 @@ lists the known false positives of each rule.
   BPF program on a syscall tracepoint runs only for calls made on CPU 0.
   The agent's normal start does not use those tracepoints. Only the
   fallbacks of a start without the BPF LSM do, and they then miss what runs
-  on other CPUs. *Evidence:* internal check Phase 8 §7 (R060).
+  on other CPUs. *Evidence:* internal check Phase 8 §7 (residual R060).
 - **overlayfs, FUSE and NFS.** On these filesystems the kernel's identity of
   a file may not match what `stat()` reports, so a protected or watched
   file there may be neither protected nor watched. The agent signs a
@@ -584,11 +601,12 @@ kernel.
 - **Narrow measurements.** Overhead has been measured on Ubuntu 24.04 only,
   against one committed baseline. File-open-heavy work pays most: an `open`
   microbenchmark is about 41 % slower with the agent on, `git status` about
-  24 %. *Evidence:* `the_committed_baseline_passes_its_aa_check_with_margin`.
+  24 %. *Evidence:* lot 273b (both figures, on Ubuntu 24.04).
 - **Network.** UDP receives are about 20 % slower, TCP sends about 10 %
   (the TLS fingerprint sensor), connects about 6 %
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*
-  `the_committed_baseline_passes_its_aa_check_with_margin`.
+  `docs/operator/NETWORK_TELEMETRY.md` (§6); `deploy/lab/overhead/prog-cost.sh`;
+  lot 275.
 - **Oversized memory limits.** The agent's unit sets `MemoryHigh=9G` and
   `MemoryMax=11G`, far above what the agent uses; they have not been
   resized yet. On a VM with less memory than that the cap cannot bind, and
@@ -612,15 +630,17 @@ every record passed the OCSF 1.9.0 schema. Its limits are in
 [EXPORT.md](EXPORT.md) §8; the ones a tester meets first:
 
 - the configuration takes effect at the next start of the agent (no
-  reload). *Evidence:* `deploy/lab/export/export-guest.sh` (phase `setup`);
+  reload). *Evidence:* `deploy/lab/export/export-guest.sh` (its setup phase);
 - syslog delivery has no application-level acknowledgement: a receiver
   that stops reading and then dies can lose what its kernel had accepted.
-  *Evidence:* `deploy/lab/export/export-guest.sh` (phases `slow`, `stall`);
+  *Evidence:* `deploy/lab/export/export-guest.sh` (its slow and stall phases);
 - the receiver must speak TLS 1.3 with X25519, and there is no client
   certificate (mTLS); one record can be up to 256 KiB, so a receiver that
   cuts long messages (rsyslog's default is 8 KiB) must be told the larger
-  size. *Evidence:* `received_records_match_the_pinned_schema` (the lab's
-  records, through OpenSSL 3.0's TLS 1.3 listener);
+  size. *Evidence:* `the_provider_is_narrowed_as_the_advisories_require`
+  (TLS 1.3 and X25519 only, no client key);
+  `received_records_match_the_pinned_schema` (the lab's records, through
+  OpenSSL 3.0's TLS 1.3 listener);
 - the TLS provider is a young library that marks itself as not for
   production. The advisories in its dependencies are recorded with why
   they are not reached ([EXPORT.md](EXPORT.md) §7). *Evidence:* internal
@@ -631,21 +651,14 @@ every record passed the OCSF 1.9.0 schema. Its limits are in
   `nodns-allow.local`. *Evidence:* `deploy/lab/export/export-guest.sh`;
 - the audit log, the status events, the heartbeat, the listener log and
   the file integrity baseline are not exported. *Evidence:*
-  `deploy/lab/export/export-guest.sh` (phase `arrive`: the five chains
-  exported, none other).
+  `deploy/lab/export/export-guest.sh` (its arrive phase: the five
+  chains exported, none other).
 
 ## Operator tools
 
 The `nn-admin` commands and their exit codes are in
 [NN_ADMIN.md](NN_ADMIN.md).
 
-- **A glibc warning on Ubuntu 22.04 and Debian 12.** Every `nn-admin`
-  command prints
-  `nn-admin: /lib/x86_64-linux-gnu/libc.so.6: weak version 'GLIBC_2.39' not found (required by nn-admin)`.
-  It is harmless: the binaries are built on Ubuntu 24.04 and refer weakly
-  to two newer glibc functions, which they do without on an older glibc.
-  The hard minimum is glibc 2.34. *Evidence:* lot 354; internal check
-  Phase 2 §5.
 - **Use `nn-admin` from the same release as the agent.** An `nn-admin` of
   another release may not read the agent's answers correctly.
   *Evidence:* lot 354 (the protocol version).
@@ -661,7 +674,8 @@ The `nn-admin` commands and their exit codes are in
   yourself. A Network canary opens no listener. *Evidence:* lot 354.
 - **`nn-admin status` without `--key` shows the posture only.** The
   profile, sensors, records, trust level and degradations need a key with
-  `audit-read` or `telemetry-read`. *Evidence:*
-  `sock.status.older-agent-unsigned-telemetry`.
+  `audit-read` or `telemetry-read`. *Evidence:* `sock.status.observing`.
 - **`nn-admin` needs root.** The admin socket and the key file are root's:
-  run it with `sudo`. *Evidence:* lot 354.
+  run it with `sudo`. Without it, a command that talks to the agent fails
+  with a permission error: that does not mean the agent is stopped.
+  *Evidence:* lot 354.
