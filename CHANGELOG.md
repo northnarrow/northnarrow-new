@@ -99,7 +99,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `/sys/fs/bpf` and `/sys/fs/cgroup` (and their copies in every slave
     namespace: the bpffs's last mount) with no refusal, a raw namespace's
     `umount -l /` the same; `sb_umount` walks the subtree in the kernel's
-    order (`common::mount_guard::umount_below`, 32 steps; offsets
+    order (`common::mount_guard::umount_below`, 32 mounts; offsets
     `mount.mnt_mounts`, `.mnt_child`, slots 152–153), each mount judged as
     the top, a subtree wider than the walk refused in a guarded namespace or
     when a mount read is in a peer group; the read-mode ptrace record skips
@@ -108,8 +108,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `systemd-journald@northnarrow.service`, read every 10 s;
     `nn_linux::journald_identity`) and is once an hour per caller image and
     target for every other caller (`PTRACE_READ_SEEN`,
-    `common::ptrace_read`), the refusal unchanged; `ProcFacts`'s `/proc`
-    root is named so the kernel-views ratchet follows it.
+    `common::ptrace_read`), the refusal unchanged, journald's identity
+    written before the ptrace guard attaches; `ProcFacts`'s `/proc` root is
+    named so the kernel-views ratchet follows it. The agent holds a
+    descriptor of every link and program it pins
+    (`antitamper_bpf::held`: `pin_link`, `pin_prog`, `pin_fd`; ratchet
+    `xtask/tests/held_pins.rs`): the bpffs losing its last mount, or a pin
+    removed or hidden, no longer detaches a deny hook while the agent
+    runs; the integrity round signs `bpf_pin_vanished` (High) and pins a
+    removed one again from the descriptor, in the directory it was pinned
+    in.
 - Lot 341 (alpha 2/4): the observe-only **`alpha` profile**, and install
   and uninstall as a tester meets them (`docs/operator/ALPHA_PROFILE.md`).
   - **Profile.** `alpha` is one more input of the agent's single

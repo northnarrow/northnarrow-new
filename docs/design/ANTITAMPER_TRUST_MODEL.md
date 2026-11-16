@@ -3026,14 +3026,17 @@ where it starts.
   for each mount in it, the mount at the same place under every peer and
   slave of its parent — no other LSM call. The hook now walks that
   subtree in `next_mnt()`'s order (`mount.mnt_mounts`, `mnt_child`,
-  `mnt_parent`; 32 steps, `common::mount_guard::umount_below`), each mount
+  `mnt_parent`; 32 mounts, a climb back up of at most 8 levels a step,
+  `common::mount_guard::umount_below`), each mount
   judged as the top is (`below_of`: its root a held mount's, then by its
   id in a guarded namespace, then its place under its parent's group, a
   group not followed failing closed under a copy of a held mount). A walk
   not finished refuses in a guarded namespace, or when a mount read sits
   under a parent in a peer group (`below_takes_held`). Read before the top
-  is judged, folded into `q.held`: one state enters the walk (5.15's
-  verifier).
+  is judged, out of line (`subtree_takes`, `held_at`: inlined, each exit of
+  the walk carried its state into the hook's propagation walk and 5.15
+  processed past its million instructions; its steps carry one state, the
+  groups read OR-ed into one value), folded into `q.held`.
 - **The read-mode ptrace record (point 2).** `emit_task_read_denial`:
   nothing for the packaged journald — its image (`mm->exe_file`) and its
   cgroup id (`bpf_get_current_cgroup_id`) a key of `PTRACE_READ_QUIET`,
@@ -3043,18 +3046,32 @@ where it starts.
   read again every 10 s; every other caller once an hour per image and
   target (`PTRACE_READ_SEEN`, an exact key). The refusal is the hook's,
   after the record, whatever it did. Root running journald's binary in
-  journald's cgroup loses the record of its reads, not their refusal.
-- **If the bpffs loses its last mount.** The pins go with the super block
-  (`kill_litter_super` evicts each pinned inode, dropping its object's
-  reference). The deny programs' links (`reattach_fresh`: the link's
-  descriptor closed once pinned) are then unreferenced: every deny hook
-  detaches at once, the agent still running; its sensors (links its
-  `Ebpf` holds) and maps (its descriptors) stay. The deny self-test signs
-  the hooks it tries as missed; the integrity round signs
-  `protected_mount_gone`; the next start finds no pins (no bpffs: hooks
-  for that run only, signed; a fresh bpffs: a first start). Holding each
-  deny link's descriptor for the agent's life would keep the hooks for
-  the run (not done: named).
+  journald's cgroup loses the record of its reads, not their refusal. The
+  keys are written before the hook attaches (fix round 3: written after
+  it, one read made in between was recorded).
+- **If the bpffs loses its last mount.** No path reaches the pins; the
+  super block keeps them while a descriptor in it is open (the agent's
+  anchor of `/sys/fs/bpf`, `kernel_roots`' bpf view), and frees them
+  (`kill_litter_super` evicting each pinned inode, dropping its object's
+  reference) once the agent's descriptors close. Fix round 3 (the
+  coordinator's decision): the agent holds a
+  descriptor of every link and program it pins (`antitamper_bpf::held`:
+  `pin_link` opens its own from the pin and checks the link's id, aya's
+  kept when it cannot; `pin_prog`/`pin_fd` a copy), so the links keep a
+  reference and every deny hook stays attached while the agent runs; its
+  sensors (links its `Ebpf` holds) and maps stay as before. The integrity
+  round signs `protected_mount_gone` (the pins it reads beneath the anchor
+  are in place); the next start finds no pins (no bpffs: hooks for that
+  run only, signed; a fresh bpffs: a first start). A descriptor closes
+  with its process: between a stop and the next start, a hook whose pin is
+  gone is detached.
+- **A pin removed, replaced or hidden.** The round compares each held
+  object's pin with the inode it was pinned at and its directory's
+  (`held::judge`); a removed pin is pinned again from the descriptor in
+  that directory only (`held::repin`: never into a new bpffs or a mount
+  over it), a High each. `purge_stale_pin` drops the descriptor before it
+  unlinks, so the agent's own retirements still detach; the ratchet
+  `held_pins` refuses a link or program pinned any other way.
 
 ### Residual
 

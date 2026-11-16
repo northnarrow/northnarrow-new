@@ -3823,8 +3823,9 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   and `/sys/fs/cgroup` through the copies below it, and the copies in every
   slave namespace (the agent's own included): the bpffs lost its last
   mount, with no refusal. The same held for a raw namespace's `umount -l
-  /`. Now the guard reads the subtree in the kernel's order (32 steps: a
-  child, the next sibling, or the parent on the way back up), and refuses
+  /`. Now the guard reads the subtree in the kernel's order (32 mounts: a
+  child, else the next sibling of the mount or of one of its parents up to
+  8 levels), and refuses
   the unmount when a mount in it is held (by its id in a guarded
   namespace), or its unmount propagates onto a held mount (its place under
   its parent's peer group; a group not followed yet, regrouped since:
@@ -3852,33 +3853,72 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     install path (root's file, in a directory only root may write, not
     disowned by the package database, read again every 10 s) running in
     the cgroup of `systemd-journald.service` or of the namespace instance
-    the agent's units log to (`systemd-journald@northnarrow.service`). Its
-    reads are still refused (its lines from the agent carry no `_EXE`, as
-    before);
+    the agent's units log to (`systemd-journald@northnarrow.service`),
+    written to the kernel before the ptrace guard attaches. Its reads are
+    still refused (its lines from the agent carry no `_EXE`, as before);
   - every other caller is recorded once an hour per caller program (its
     executable's identity, not its process) and target: htop or a
     monitoring agent is one record an hour per process of the agent's, a
     tool run each minute (`pidof`, `lsof`, `ss -p`) the same, and a program
     never seen before (`nsenter -t <agent> -m`) at its first use.
+- **The agent holds what it pins (fix round 3).** A link stays attached
+  while one reference to it is left: its pin, or a descriptor. The deny
+  links were held by their pins alone once the agent's start was over, so
+  the bpffs losing its last mount, or one pin removed or hidden, detached
+  the hook while the agent ran. Now the agent keeps a descriptor of every
+  link and program it pins, for its life (`antitamper_bpf::held`: the deny
+  hooks, the BPF guard's, the mount guard's, the start-in-cgroup
+  tracker's, the sysctl judge's, the module files' write history's, the
+  liveness watch). The watchdog pins nothing of its own and loads no
+  program: its handles on the agent's pinned maps are opened per use, as
+  before (a map the agent re-creates at each start must not be held from
+  an earlier one). The agent's own purge of a pin drops the descriptor
+  first (what it retires still detaches). One more open descriptor per
+  pinned link and program (about ninety; the lab's 5.15 agent held 446 in
+  all, its soft `RLIMIT_NOFILE` 65,536, raised to the hard limit at its
+  start; `MAX_HELD` = 1,024 objects at most). The eBPF object is
+  unchanged.
 - **What happens if the bpffs loses its last mount** (what N3 did, and
-  what the residual below can still do): the kernel frees the pins with
-  the super block. The deny hooks (the kill, ptrace, file, cgroup, BPF and
-  mount guards) are held by their pins alone once the agent's start is
-  over: they detach at once, while the agent runs. The agent's sensors
-  and maps, which its process holds, go on. The deny self-test signs each
-  hook it tries (kill, ptrace, file, cgroup move, BPF) as missed at its
-  next round (a degradation, then an alert), and the integrity round signs
-  `protected_mount_gone`. The next start finds no
-  bpffs at `/sys/fs/bpf` (its hooks attach for that run only, a signed
-  degradation) or, if root mounted a fresh one, an empty pin root it takes
-  for a first start: the previous run's pins are out of its reach, as after
-  a reboot (BOOT_INTEGRITY.md).
+  what the residual below can still do): no path reaches the pins any
+  more, while the super block keeps them as long as a descriptor in it is
+  open — the agent's anchor of `/sys/fs/bpf` (lot 353's views) is one, and
+  the kernel frees the pins with the super block once the agent's
+  descriptors close. The deny hooks (the kill, ptrace, file, cgroup, BPF
+  and mount guards) stay attached while the agent runs — it holds them —
+  and so do its sensors and maps (the lab: `umount -l /sys/fs/bpf` in a
+  window, no bpffs left in any namespace, then SIGKILL of the agent, a
+  read of its `environ` and a create in `/etc/northnarrow` refused, on
+  5.15 and 6.8). The integrity round signs `protected_mount_gone`; the
+  pins it reads beneath its anchor are in place, so no `bpf_pin_vanished`.
+  The watchdog's handles on the pinned maps fail. If the agent stops
+  before a reboot, its hooks go with it: the next start finds no bpffs at
+  `/sys/fs/bpf` (its hooks attach for that run only, a signed
+  degradation) or, if root mounted a fresh one, an empty pin root it
+  takes for a first start: the previous run's pins are out of its reach,
+  as after a reboot (BOOT_INTEGRITY.md).
+- **A pin removed or hidden** (a pin root writable only inside a
+  trusted-installer window, a mount over it refused by the guard): the
+  integrity round (outside a window) compares every pin of an object the
+  agent holds with the inode it was pinned at, in the directory it was
+  pinned in. A pin gone, replaced or unreadable is a signed High
+  (`bpf_pin_vanished`) naming the pin, the object and its id; a pin
+  removed is pinned again from the descriptor, in that directory only
+  (never into a new bpffs, nor a mount laid over the directory), so the
+  next start finds it — the record says so, and a later round clears it.
+  The pin directory itself removed is one High with the number of links
+  and programs it held, nothing pinned again. The lab: three pins removed
+  in a window (`link_task_kill`, `prog_task_kill`,
+  `link_ptrace_access_check`), then outside it SIGKILL, the `environ` read
+  and the create still refused; three Highs, the three pins back, three
+  clears a round later.
 - **Named, not changed:** a lazy unmount in a namespace that is not PID
-  1's, the agent's or the watchdog's, of a subtree whose first 32 steps
-  read only private mounts, behind which lies a copy in one of the host's
+  1's, the agent's or the watchdog's, of a subtree whose first 32 mounts
+  are all private, behind which lies a copy in one of the host's
   peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
   namespace) is not refused: the walk is bounded. And the regroup window
   of §51.2 (a peer of a regrouped held parent unmounting through it before
   the refresh) needs only one shared slave of that parent, not 16 mounts —
   every sandboxed unit's namespace is one — hiding the host's bpffs mount
-  (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both.
+  (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
+  the pins can still be lost or hidden, the hooks no longer detach while
+  the agent runs.

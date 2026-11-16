@@ -183,21 +183,27 @@ analysis is in the
 - **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
   takes the whole subtree of the mount it names, and the kernel carries
   the unmount of each mount in it onto the peers and slaves of its parent:
-  the guard reads that subtree, 32 steps of it (the re-check 2 of #567).
+  the guard reads that subtree, 32 mounts of it (the re-check 2 of #567).
   Two unmounts it does not refuse, root building them on purpose:
   - in a namespace that is not PID 1's, the agent's or the watchdog's (a
-    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 steps are all
-    private mounts, behind which lies a copy (an rbind of `/sys`) in one of
+    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 mounts are all
+    private, behind which lies a copy (an rbind of `/sys`) in one of
     the host's peer groups: the kernel takes the host's childless
     `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
     the watchdog's and the units' namespaces (slaves of the host's). The
-    bpffs then loses its last mount, and its pins with it: the deny hooks,
-    which only their pins hold once the agent has started, detach at once
-    — the kill, ptrace, file, cgroup and BPF guards and the mount guard
-    itself — while the agent's sensors go on; the deny self-test signs
-    each hook it tries as missed at its next round, and the integrity
-    round signs `protected_mount_gone` (High); the next start, its pins
-    gone, starts as after a reboot;
+    bpffs then loses its last mount: no path reaches its pins any more
+    (the watchdog's handles on the pinned maps fail; a later start finds
+    none), while its super block, the pins in it, lives on as long as the
+    agent holds a descriptor in it (its anchor of `/sys/fs/bpf`, lot 353).
+    The deny hooks no longer detach: the agent holds a descriptor of every
+    link and program it pins (fix round 3 of #567, `antitamper_bpf::held`),
+    so the kill, ptrace, file, cgroup and BPF guards and the mount guard
+    itself keep refusing for as long as the agent runs — the lab measured
+    it on 5.15 and 6.8, `umount -l /sys/fs/bpf` leaving no bpffs mounted
+    in any namespace. The integrity round signs `protected_mount_gone`
+    (High). If the agent stops or is restarted before a reboot, its
+    descriptors close: the super block goes with its pins, the hooks with
+    them, and the next start, its pins gone, starts as after a reboot;
   - a peer of a held mount's parent regrouped since the agent's last
     refresh of the peer groups (a second after `mount(2)`, up to 30 s
     after `mount_setattr(2)`): one shared slave of that parent — every
@@ -207,8 +213,15 @@ analysis is in the
     pins: the regroup freed the old slaves, so the agent's and the units'
     copies stay, and so does the bpffs; the integrity round signs
     `protected_mount_gone`.
-  *For you:* treat a `protected_mount_gone` or a missed deny hook you did
-  not cause as an incident. In PID 1's namespace a lazy unmount wider than
+  The same holds for one pin removed (inside a trusted-installer window,
+  the one place root can) or hidden: the hook stays attached while the
+  agent runs, the integrity round signs `bpf_pin_vanished` (High) and pins
+  it again from the descriptor where its directory is still the one it was
+  pinned in (never into a new bpffs, nor a mount laid over the directory),
+  so the next start finds it; a pin it cannot pin again stays signed.
+  *For you:* treat a `protected_mount_gone`, a `bpf_pin_vanished` or a
+  missed deny hook you did not cause as an incident, and do not restart the
+  agent before a reboot when its pin directory is gone. In PID 1's namespace a lazy unmount wider than
   the walk is refused even when it is harmless (an rbind of `/` made
   `rslave`): use `umount -R`, or a trusted-installer window.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit

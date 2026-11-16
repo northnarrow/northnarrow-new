@@ -11667,6 +11667,65 @@ number in parentheses is a lab PR.
     root; §47.1): ubuntu2204 again on that tree, the same verifier figures
     and verdicts, a clean cold boot; `agent/tests/fuse_stall.rs` under
     `CI=true` passed (14.3 s).
+  - Fix round 3 (re-check 2 of #567): N3 (P1) — `mount --rbind /sys
+    /mnt/s; umount -l /mnt/s` was judged by its top only (a copy at a place
+    nothing is held at) while `umount_tree()` took the host's childless
+    `/sys/fs/bpf` and `/sys/fs/cgroup` through the copies below it, and
+    their copies in every slave namespace, the agent's own included (the
+    reviewer's probes, a user namespace on 6.18); a raw namespace's
+    `umount -l /` the same. Now `sb_umount` reads the subtree in the
+    kernel's order (`common::mount_guard::umount_below`, 32 mounts, a
+    climb of at most 8 levels a step; offsets `mount.mnt_mounts`,
+    `.mnt_child`), each mount below judged as the top (a held mount at its
+    place under its parent's group; its root a held mount's, then by id in
+    a guarded namespace or under a group not followed and a copy of a held
+    parent); a subtree wider than the walk is refused in a guarded
+    namespace or when a mount read sits under a parent in a peer group.
+    The walk is out of line (`subtree_takes`, `held_at`): inlined, the
+    round's first lab run refused the program on 5.15 (1,000,001
+    instructions, four mounts already too many: each exit carried its
+    state into the hook's propagation walk). Point 2 (blocking): the
+    read-mode ptrace record skips the packaged journald in its units'
+    cgroups (`systemd-journald.service`, and
+    `systemd-journald@northnarrow.service`, which the agent's units log
+    to) and is once an hour per caller image and target otherwise
+    (`common::ptrace_read`, `PTRACE_READ_QUIET`, `PTRACE_READ_SEEN`); the
+    refusal unchanged. P3: KNOWN_LIMITATIONS names the two unmounts the
+    walk does not refuse (a copy behind 32 private mounts of a namespace
+    not guarded; the regroup window, one shared slave enough) and what the
+    bpffs losing its last mount does; `ProcFacts`'s `/proc` root is
+    `proc_root` (a planted `std::fs::read_link` in `trusted_exe_now` is
+    caught by the kernel-views ratchet now). The coordinator's decision
+    (this round): the agent holds a descriptor of every link and program
+    it pins (`antitamper_bpf::held`, ratchet `held_pins`) — the deny hooks
+    no longer detach while the agent runs when the bpffs loses its last
+    mount or a pin is removed or hidden; the integrity round signs
+    `bpf_pin_vanished` (High) and pins a removed one again from the
+    descriptor. journald's identity is written before the ptrace guard
+    attaches (the round's 6.8 lab recorded one read made in between).
+    Mutation on the final tree: 54 mutants (the walk 24, `ptrace_read` 8,
+    journald's identity and its order 5, `held` 12, the round's held pins 4,
+    the purge's release 1), 54 caught by a named test — two after
+    `the_walk_reads_exactly_its_bound_and_every_group_read` (a 33rd mount
+    read; only the last group kept).
+    Lab (as measured, our own guests): ubuntu2204 (5.15.0-203) at a091aa8c
+    and 59989001 — the 900k verifier gate 123 programs, 0 failing, highest
+    `mount_guard_sb_umount` 675,751 (67.6 %), N3a refused (one High) with
+    the pins intact in the host's, the agent's and the watchdog's
+    namespaces, N3b (the copy made `rslave`) and N3c (a chroot's own mounts)
+    let through with no record, N3d (a raw namespace's `umount -l /`)
+    refused; ubuntu2404 (6.8.0-149) and ubuntu2604 (7.0.0-43) at 1edc1316
+    the same N3 verdicts, 0 failing; journald's records: 4 on 5.15 before
+    1edc1316 (the namespace instance's cgroup in its template's slice), 1 on
+    6.8 at 1edc1316 (made between the attach and the install), 0 on 7.0 at
+    1edc1316 and 0 on 5.15 and 6.8 at 59989001. The held descriptors
+    (59989001, ubuntu2204 and ubuntu2404): three pins removed in a window,
+    then SIGKILL of the agent, a read of its `environ` and a create in
+    `/etc/northnarrow` refused, three High `bpf_pin_vanished` pinned again
+    and cleared a round later; `umount -l /sys/fs/bpf` in a window (no
+    bpffs left in any namespace: 7 and 8 before), the three refusals held,
+    the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
+    cold boots.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on
