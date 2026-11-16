@@ -3567,7 +3567,10 @@ mod tests {
         #[test]
         fn a_connect_s_fork_record_keeps_the_process_s_uid() {
             let (proc, w) = lab();
-            for (pm, child, uid) in [(4960u32, 4961u32, 0u32), (4970, 4971, 1000)] {
+            for (pm, child, uid, who) in [
+                (4960u32, 4961u32, 0u32, "root"),
+                (4970, 4971, 1000, "a user"),
+            ] {
                 let mut e = nn_core::decision::rules::testutil::spawn_exe(
                     "dpkg",
                     "/usr/bin/dpkg",
@@ -3593,7 +3596,7 @@ mod tests {
                 assert_eq!(
                     w.lineage.in_package_transaction(child, judged),
                     uid == 0,
-                    "uid {uid}"
+                    "{who}'s package manager"
                 );
             }
         }
