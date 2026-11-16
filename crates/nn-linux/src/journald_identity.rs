@@ -39,11 +39,13 @@ pub const JOURNALD_PATHS: &[&str] = &[
 ];
 
 /// journald's units' cgroups, under the cgroup v2 root: the system
-/// instance, and the namespace instance the agent's units log to (no
-/// other: `systemd-journald@<other>.service` is not ours to quiet).
+/// instance, and the namespace instance the agent's units log to, in its
+/// template's slice as systemd places an instance (`system-systemd\x2d
+/// journald.slice`, the lab's guests; no other instance:
+/// `systemd-journald@<other>.service` is not ours to quiet).
 pub const JOURNALD_CGROUPS: &[&str] = &[
     "system.slice/systemd-journald.service",
-    "system.slice/systemd-journald@northnarrow.service",
+    "system.slice/system-systemd\\x2djournald.slice/systemd-journald@northnarrow.service",
 ];
 
 /// A directory `owner` owns that no one else may write.
@@ -212,10 +214,23 @@ mod tests {
         // the namespace instance the agent's units log to, and no other
         let ns = cg.path().join(JOURNALD_CGROUPS[1]);
         std::fs::create_dir_all(&ns).unwrap();
-        std::fs::create_dir_all(cg.path().join("system.slice/systemd-journald@other.service"))
-            .unwrap();
+        std::fs::create_dir_all(
+            cg.path().join(
+                "system.slice/system-systemd\\x2djournald.slice/systemd-journald@other.service",
+            ),
+        )
+        .unwrap();
+        // not the flat place an instance is not put in
+        std::fs::create_dir_all(
+            cg.path()
+                .join("system.slice/systemd-journald@northnarrow.service"),
+        )
+        .unwrap();
         let ns_id = std::fs::metadata(&ns).unwrap().ino();
-        let mut want = vec![((kernel_dev, md.ino()), id), ((kernel_dev, md.ino()), ns_id)];
+        let mut want = vec![
+            ((kernel_dev, md.ino()), id),
+            ((kernel_dev, md.ino()), ns_id),
+        ];
         want.sort_unstable();
         assert_eq!(quiet_under(r, Some(cg.path()), me(), &no_db), want);
         std::fs::remove_dir(&ns).unwrap();
