@@ -111,7 +111,9 @@ work. Four changes, each a default the signed per-rule policy can undo with
   `/tmp/.mount_*` and tied by the exec pump to the image file the user ran
   (`USER_IMAGE`), are no exec from `/tmp` at all: no R001, no staging
   chain, as the same program run from the home
-  (`UPGRADE_NOTES_WAVE4.md` §49). An extracted AppImage
+  (`UPGRADE_NOTES_WAVE4.md` §49); lot 360: its zygote's fork-only child as
+  well, by the connect's kernel fork record, also when it exits at once — no
+  NN-L-NET-008 (§53). An extracted AppImage
   (`/tmp/appimage_extracted_*`), one run from `/tmp` itself or made to
   serve a file staged there (`TARGET_APPIMAGE`), and a FUSE mount the pump
   does not tie stay a person's exec as above.

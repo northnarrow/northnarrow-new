@@ -212,6 +212,56 @@ pub fn relative_path(raw: &ExeIdentityRaw) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// Lot 360 (the review of #568, Q1): the walk's name `name` (a name of
+/// [`relative_path`]) is one the walk may have cut — its first
+/// `EXE_PATH_SLOT_LEN - 1` bytes, then [`EXE_NAME_CUT_MARK`] — and those
+/// bytes. A name of exactly 31 bytes reads the same as a longer one.
+#[cfg(feature = "std")]
+pub fn walk_name_cut(name: &str) -> Option<&str> {
+    name.strip_suffix(EXE_NAME_CUT_MARK)
+        .filter(|kept| kept.len() == EXE_PATH_SLOT_LEN - 1)
+}
+
+/// Lot 360 (the review of #568, Q1): the walk's path `walk` has a name the
+/// walk may have cut ([`walk_name_cut`]): it names no file exactly.
+#[cfg(feature = "std")]
+pub fn walk_path_cut(walk: &str) -> bool {
+    walk.split('/').any(|n| walk_name_cut(n).is_some())
+}
+
+/// Lot 360 (the review of #568, Q1): the walk's path `walk` (absolute,
+/// [`relative_path`]'s form) may be the path `full` — the kernel's whole
+/// view of a file, as a `/proc/<pid>/exe` link gives it (`d_path`) — name
+/// by name: as many names; a name the walk may have cut
+/// ([`walk_name_cut`]) is the start of `full`'s name there; any other name
+/// is `full`'s name, byte for byte. A deep path's elision (`…` alone) and a
+/// name cut inside a multibyte character (the walk's text replaced it) are
+/// no cut name: they match nothing but themselves. Only a candidate: the
+/// file's identity (device and inode) decides.
+#[cfg(feature = "std")]
+pub fn walk_may_name(walk: &str, full: &[u8]) -> bool {
+    if !walk.starts_with('/') || full.first() != Some(&b'/') {
+        return false;
+    }
+    let mut w = walk.split('/');
+    let mut f = full.split(|&b| b == b'/');
+    loop {
+        match (w.next(), f.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                let same = match walk_name_cut(a) {
+                    Some(kept) => b.starts_with(kept.as_bytes()),
+                    None => a.as_bytes() == b,
+                };
+                if !same {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
 
@@ -313,6 +363,81 @@ mod tests {
         let mut r = raw_with(&["x", "tmp", "/"], 0);
         r.path[..EXE_PATH_SLOT_LEN].fill(b'y');
         assert_eq!(relative_path(&r), format!("/tmp/{}…", "y".repeat(31)));
+    }
+
+    /// Lot 360 (the review of #568, Q1): a path the walk cut names the
+    /// kernel's whole path name by name — a cut name its start, any other
+    /// name equal, as many names — at 30, 31, 32 and 60 bytes, a directory's
+    /// name too; and nothing else.
+    #[test]
+    fn a_cut_walk_path_names_the_whole_path_name_by_name() {
+        let long = "Bitwarden-2025.1.1-x86_64.AppImage-and-more-padding-to-60-by";
+        assert_eq!(long.len(), 60);
+        let names = |n: usize| long[..n].to_string();
+        for n in [30, 31, 32, 60] {
+            let file = names(n);
+            let r = raw_with(&[&file[..n.min(31)], "Apps", "u", "home", "/"], 0);
+            let walk = relative_path(&r);
+            assert_eq!(walk_path_cut(&walk), n >= 31, "{n}: {walk}");
+            let full = format!("/home/u/Apps/{file}");
+            assert!(walk_may_name(&walk, full.as_bytes()), "{n}: {walk}");
+            // another file of the same start, cut or not
+            let other = format!("/home/u/Apps/{}X", &file[..n.min(31)]);
+            assert_eq!(walk_may_name(&walk, other.as_bytes()), n >= 31, "{n}");
+            // another directory, one more or one fewer name
+            for no in [
+                format!("/home/al/Apps/{file}"),
+                format!("/home/u/Apps/x/{file}"),
+                format!("/home/u/{file}"),
+                format!("/home/u/Apps/{}", &file[..30.min(n) - 1]),
+                format!("home/u/Apps/{file}"),
+            ] {
+                assert!(!walk_may_name(&walk, no.as_bytes()), "{n}: {no}");
+            }
+        }
+        // a directory's name of 40 bytes, the file's short
+        let dir = "a-directory-of-forty-bytes-in-the-home-x";
+        assert_eq!(dir.len(), 40);
+        let r = raw_with(&["App.AppImage", &dir[..31], "u", "home", "/"], 0);
+        let walk = relative_path(&r);
+        assert!(walk_path_cut(&walk));
+        assert!(walk_may_name(
+            &walk,
+            format!("/home/u/{dir}/App.AppImage").as_bytes()
+        ));
+        assert!(!walk_may_name(
+            &walk,
+            format!("/home/u/{dir}/App.AppImag").as_bytes()
+        ));
+        // an uncut path is the same bytes only
+        assert!(walk_may_name("/usr/bin/bash", b"/usr/bin/bash"));
+        assert!(!walk_may_name("/usr/bin/bash", b"/usr/bin/bas"));
+        assert!(!walk_may_name("/usr/bin/bash", b"/tmp/stage2"));
+        assert!(!walk_path_cut("/usr/bin/bash"));
+        // the elision of a deep path, a mark after fewer bytes: no cut name
+        assert!(!walk_may_name("/tmp/…/x", b"/tmp/a/b/x"));
+        assert!(!walk_may_name("/tmp/abc…", b"/tmp/abcdef"));
+        let thirty = "a".repeat(30);
+        assert!(!walk_may_name(
+            &format!("/tmp/{thirty}…"),
+            format!("/tmp/{thirty}b").as_bytes()
+        ));
+        // one path a prefix of the other, and paths that are not absolute
+        assert!(!walk_may_name("/usr/bin/bash", b"/usr/bin/bash/x"));
+        assert!(!walk_may_name("/usr/bin/bash", b"/usr/bin"));
+        assert!(!walk_may_name("usr/bin/bash", b"usr/bin/bash"));
+        assert!(!walk_path_cut("/tmp/…/x"));
+        // a name cut inside a multibyte character: the walk's text lost
+        // its last bytes, it names nothing but itself
+        let wide = format!("{}é-more", "a".repeat(30));
+        let mut r = raw_with(&["x", "tmp", "/"], 0);
+        r.path[..EXE_PATH_SLOT_LEN].fill(0);
+        r.path[..31].copy_from_slice(&wide.as_bytes()[..31]);
+        let walk = relative_path(&r);
+        assert!(
+            !walk_may_name(&walk, format!("/tmp/{wide}").as_bytes()),
+            "{walk}"
+        );
     }
 
     #[test]

@@ -1117,6 +1117,75 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 360 (pre-alpha Phase 4b, F4b-1, P2): **an AppImage's fork-only child
+  is judged like its AppImage, and an image named with 31 bytes or more is
+  tied** (`UPGRADE_NOTES_WAVE4.md` §53). A type-2 AppImage's zygote child
+  (fork, no exec, as Chromium's and Electron's) that connected drew
+  NN-L-NET-008 High ("would have: KillProcess") on the five kernels of the
+  rc3 round, where lot 355 promised NN-L-NET-007 only. The connect's kernel
+  fork record (lot 352) reached the chains' ancestry but never the lineage:
+  the child was named from `/proc` at the connect and, in the judgement,
+  known only while `/proc` still showed it; it closes its connection and
+  exits at once, so its image's mark was "not known" and its flow was
+  judged as a staged image's. The runtime is not the cause: the AppImage
+  project's `continuous` runtime of Phase 4b is the file lot 355 used (the
+  same SHA-256).
+  - The connect pump teaches the connect's fork record to the lineage
+    (`teach_connect_fork`, as the open sensor's `teach_fork` for a write)
+    before it names the flow's image; in a judgement the lineage names a
+    process that executed nothing since its fork by that record — its
+    forker's exec at the fork and its mark — gone or not, and before a later
+    exec of it (`AuthSessionTracker::forked_image_as`, read by
+    `image_path_as` and `runs_user_image`). Ratchet
+    `xtask/tests/fork_records.rs`: every wire record with a fork record is
+    taught by its pump, with the forker's start.
+  - The review of #568 (F1): the forker's cached exec answers only when its
+    process has the start the kernel read at the fork (a forker's pid an
+    earlier process held lends that exec to no fork); at the pump the
+    record names a fork only when `/proc` shows that fork running the
+    image, never against `/proc` (the forker's exec in place before the
+    fork, not yet read), and without either process shown only by a
+    staging path — no image or mark that would leave the flow unjudged. F2:
+    a cached exec of an earlier process of the fork's own pid is not its
+    image. F3: of two records of one pid read out of order, the later
+    process's is kept.
+  - The review of #568 (Q1): lot 355's tie of an AppImage's mount to its
+    image read the image file at the LSM walk's path, which keeps 31 bytes
+    of a name: an image named `Bitwarden-2025.1.1-x86_64.AppImage` was never
+    tied (R001 High, CHAIN-002/005 Critical on each launch). Its whole path
+    is now its daemon's `exe` link, taken when it is the walk's path name by
+    name (`common::wire::exe::walk_may_name`: a cut name its start) and
+    under no FUSE mount; the device and inode decide, the tie keeps the
+    whole path. No eBPF change (the object's bytes are the same).
+  - NN-L-NET-008: an empty or unreadable image is no path; a flow whose
+    image nothing names is not judged by a path, counted
+    by the rule (`images_not_known`) and said in the journal (debug). A
+    process named by its `/proc` link alone (no exec or fork record) is
+    still judged by that path: the exemption needs the image's mark.
+  - Not weakened, stricter: a binary staged in `/tmp`, its fork+exec child
+    and its fork-only children keep NN-L-NET-008's kill — a fork after the
+    staged binary was executed in place, one whose forker's pid or own pid
+    an earlier process held — within the residuals §53 names (the forker's
+    in-place exec read only after the connect is judged on its earlier
+    image; UDP fork-only senders as before; a fork of an exited fork-only
+    forker judged by its path). The fork-only child that exited before the
+    pump read it, which drew nothing, is now judged too. An untied FUSE
+    mount's program (`squashfuse`, a mount whose image its daemon does not
+    hold) and its forks stay judged, as in lot 355.
+  - Named tests: `sensors::multiplexer::tests::fork_only_connects::*` (the
+    main process, fork+exec, fork-only alive past 2 s and exiting at once,
+    an empty image, the staged binary and the untied mount's forks, a
+    fork of a fork-only forker, a fork executing after its connect, the
+    uid kept; the review's cases: an in-place exec before the fork, a
+    reused forker pid, a reused fork pid, the zygote shown and a cut
+    program name), `posture::lineage::tests::{a_recorded_fork_is_its_forker_s_image_before_proc_and_after_its_exit,
+    a_fork_after_its_forker_s_unread_exec_is_not_named_by_the_earlier_exec,
+    a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork,
+    a_fork_on_a_pid_an_earlier_exec_holds_is_its_forker_s_image,
+    a_late_record_of_an_earlier_process_does_not_replace_a_later_one}`,
+    `sensors::app_image::tests::{an_image_named_with_31_bytes_or_more_is_tied_by_its_whole_path,
+    a_cut_image_name_ties_only_the_image_s_own_file}`,
+    `wire::exe::tests::a_cut_walk_path_names_the_whole_path_name_by_name`.
 - Lot 353 (pre-alpha Phase 3, case X6, P1): **a FUSE over `/proc`, `/sys`
   or the cgroup root does not stall the agent's critical loops; stuck
   restarts are named and a loop is signed** (mounts over the agent's own

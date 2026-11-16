@@ -1785,6 +1785,7 @@ fn connect_events(
     let Some(w) = wiring else {
         return vec![Event::from(raw)];
     };
+    teach_connect_fork(raw, &w.lineage);
     // Resolved before the tracker's lock is taken.
     let info = tcp_connect_info_from_raw(raw, &w.lineage);
     if raw.flags & common::wire::tcp_connect_flags::DENIED != 0 {
@@ -1817,6 +1818,32 @@ fn connect_events(
         out.push(Event::NetFlow(row));
     }
     out
+}
+
+/// Lot 360 (F4b-1): the connect's fork record (lot 352: a process that
+/// executed nothing since its fork, its forker and its start, read by the
+/// kernel at the connect) taught to `lineage` before the flow's image is
+/// named and before any of its events is sent, as the open sensor does
+/// for a write (lot 340, `open_sensor::teach_fork`). Such a process has no
+/// exec record: it was named from `/proc` at the connect and, in the
+/// judgement, known only while `/proc` still showed it — an AppImage's
+/// zygote child, which closes its connection and exits at once, was judged
+/// as a staged image's (NN-L-NET-008 High), and a staged dropper's fork
+/// that exited before the pump read it was not named at all. With the
+/// record, it is its forker's exec as of its fork, gone or not.
+/// A connect without a record (the process executed since its fork, the
+/// record was lost or not attached) teaches nothing. The review of #568
+/// (F1): with the forker's start the kernel read at the fork, so a
+/// forker's pid an earlier process held lends that process's exec to no
+/// fork.
+fn teach_connect_fork(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) {
+    lineage.ingest_kernel_fork(
+        raw.pid,
+        raw.fork_start,
+        (raw.fork_ppid, raw.fork_parent_start),
+        raw.uid,
+        raw.timestamp_ns,
+    );
 }
 
 fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) -> TcpConnectInfo {
@@ -3232,6 +3259,522 @@ mod tests {
         }
         for w in [agent, no_net] {
             assert!(w.starts_with("BTF_OFFSETS map NOT armed"));
+        }
+    }
+
+    /// Lot 360 (F4b-1): the AppImage shapes of the pre-alpha's Phase 4b,
+    /// from the connect pump to NN-L-NET-008's judgement. A program of a
+    /// user's image (an AppImage's: its exec marked `USER_IMAGE` by the exec
+    /// pump, served at its runtime's `/tmp/.mount_*`), its fork+exec child,
+    /// its fork-only child (the Electron/Chromium zygote's shape: alive past
+    /// 2 s, or closing its connection and exiting at once), and the same
+    /// shapes of a binary staged in `/tmp` and of an untied FUSE mount's
+    /// program. The connect carries the kernel's fork record of a process
+    /// that executed nothing since its fork (lot 352).
+    mod fork_only_connects {
+        use super::*;
+        use common::wire::exe::exe_flags::USER_IMAGE;
+        use nn_core::decision::rules::net::NnLNet008OutboundFromTmpExec;
+        use nn_core::decision::Rule;
+        use nn_model::ResponseAction;
+        use std::path::Path;
+
+        const S: u64 = 1_000_000_000;
+        /// the AppImage's program, at its runtime's mount
+        const APP: &str = "/tmp/.mount_k360ab/usr/bin/app";
+        /// a binary staged in `/tmp`
+        const STAGED: &str = "/tmp/stage2";
+        /// `/proc`'s start of a fork, far past any suspended time of the host
+        const TICKS: u64 = 1_000_000_000;
+
+        fn tick_ns() -> u64 {
+            // SAFETY: sysconf has no preconditions.
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+            1_000_000_000 / hz
+        }
+
+        /// The fork's start as the kernel records it (`task->start_time`).
+        fn fork_start() -> u64 {
+            TICKS * tick_ns()
+        }
+
+        /// `pid`'s exec of `exe` (as the zygote's `/proc/self/exe`) at 1 s, in
+        /// a process forked by `ppid` at 0.5 s, as user 1000: a user image's
+        /// when `user_image`.
+        fn exec(l: &AuthSessionTracker, pid: u32, ppid: u32, exe: &str, user_image: bool) {
+            exec_at(l, (pid, ppid), exe, user_image, S);
+        }
+
+        /// [`exec`] at `ts` (an exec in place, after the process's first).
+        fn exec_at(
+            l: &AuthSessionTracker,
+            (pid, ppid): (u32, u32),
+            exe: &str,
+            user_image: bool,
+            ts: u64,
+        ) {
+            let flags = if user_image { USER_IMAGE } else { 0 };
+            let mut e =
+                nn_core::decision::rules::testutil::spawn_exe("exe", "/proc/self/exe", exe, flags);
+            if let Event::ProcessSpawn {
+                pid: p,
+                ppid: pp,
+                timestamp_ns,
+                start_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *pp, *timestamp_ns, *start_ns) = (pid, ppid, ts, S / 2);
+            }
+            assert!(l.ingest_spawn_event(&e));
+        }
+
+        /// `pid` running in the fixture's `/proc`: forked by `ppid` (at
+        /// [`TICKS`]), still running `exe`, as user 1000.
+        fn running(proc: &Path, pid: u32, ppid: u32, exe: &str) {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::os::unix::fs::symlink(exe, d.join("exe")).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!(
+                    "{pid} (exe) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {TICKS} 0 0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                d.join("status"),
+                format!("Name:\texe\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t1000\t1000\t1000\t1000\n"),
+            )
+            .unwrap();
+        }
+
+        fn exited(proc: &Path, pid: u32) {
+            std::fs::remove_dir_all(proc.join(pid.to_string())).unwrap();
+        }
+
+        /// The lab's process `pid` (exec'd at 1 s by [`exec`], started at
+        /// 0.5 s) shown by the fixture's `/proc`, running `exe`.
+        fn shown_since_exec(proc: &Path, pid: u32, ppid: u32, exe: &str) {
+            running(proc, pid, ppid, exe);
+            let ticks = (S / 2) / tick_ns();
+            std::fs::write(
+                proc.join(pid.to_string()).join("stat"),
+                format!(
+                    "{pid} (exe) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        /// `pid`'s connect to a listener of the guest's (10.0.2.15:8000) 2 s
+        /// after the fork, with the kernel's fork record when `forker` is
+        /// not 0 (the process executed nothing since `forker` forked it).
+        fn connect(pid: u32, forker: u32) -> TcpConnectRaw {
+            let mut raw = TcpConnectRaw::zeroed();
+            raw.pid = pid;
+            raw.uid = 1000;
+            raw.family = nn_model::netaddr::AF_INET;
+            raw.dst_port = 8000;
+            raw.dst_addr[..4].copy_from_slice(&[10, 0, 2, 15]);
+            raw.timestamp_ns = fork_start() + 2 * S;
+            raw.sk_ptr = 0x3600_0000 + u64::from(pid);
+            if forker != 0 {
+                raw.fork_start = fork_start();
+                raw.fork_ppid = forker;
+                raw.fork_parent_start = S / 2;
+                raw.fork_anchor = forker;
+            }
+            raw
+        }
+
+        /// The connect-time row the pump puts on the bus for `raw`.
+        fn row(w: &ConnectWiring, raw: &TcpConnectRaw) -> nn_model::telemetry::NetFlowEvent {
+            match connect_events(raw, Some(w), true).pop() {
+                Some(Event::NetFlow(row)) => row,
+                e => panic!("{e:?}"),
+            }
+        }
+
+        /// NN-L-NET-008's action on `row`, `None`: no verdict.
+        fn net_008(
+            w: &ConnectWiring,
+            row: &nn_model::telemetry::NetFlowEvent,
+        ) -> Option<ResponseAction> {
+            NnLNet008OutboundFromTmpExec::new(Some(w.lineage.clone()))
+                .evaluate(&Event::NetFlow(row.clone()))
+                .map(|v| v.action)
+        }
+
+        /// The lab's processes: the AppImage's program (4790) and its zygote
+        /// (4800, `/proc/self/exe`), both of the image; the staged binary
+        /// (4900); an untied FUSE mount's program (5000).
+        fn lab() -> (tempfile::TempDir, ConnectWiring) {
+            let proc = tempfile::TempDir::new().unwrap();
+            let lineage = AuthSessionTracker::new(proc.path());
+            exec(&lineage, 4790, 1, APP, true);
+            exec(&lineage, 4800, 4790, APP, true);
+            exec(&lineage, 4900, 1, STAGED, false);
+            exec(&lineage, 5000, 1, APP, false);
+            (proc, wiring(lineage))
+        }
+
+        #[test]
+        fn an_appimage_s_main_process_connecting_draws_no_net_008() {
+            let (_proc, w) = lab();
+            let r = row(&w, &connect(4790, 0));
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None);
+        }
+
+        #[test]
+        fn an_appimage_s_fork_and_exec_child_draws_no_net_008() {
+            let (_proc, w) = lab();
+            exec(&w.lineage, 4802, 4800, APP, true);
+            assert_eq!(net_008(&w, &row(&w, &connect(4802, 0))), None);
+        }
+
+        /// The zygote's child alive past 2 s: `/proc` shows it at the
+        /// connect and in the judgement.
+        #[test]
+        fn an_appimage_s_fork_only_child_alive_past_2_s_draws_no_net_008() {
+            let (proc, w) = lab();
+            running(proc.path(), 4801, 4800, APP);
+            let r = row(&w, &connect(4801, 4800));
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None);
+            // its open flow's snapshot (judged too) names the same image
+            let policy = crate::net::flow_tracker::SnapshotPolicy::default();
+            let snaps = crate::net::drain::due_snapshot_rows(
+                &w.flow_tracker,
+                &w.dns_cache,
+                &w.lineage,
+                &policy,
+                r.start_ns + policy.interval_ns + policy.min_age_ns + S,
+            );
+            assert_eq!(snaps.len(), 1, "{snaps:?}");
+            assert_eq!(snaps[0].exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &snaps[0]), None, "the snapshot");
+        }
+
+        /// F4b-1: the zygote's child closes its connection and exits at
+        /// once — `/proc` named it at the connect, it is gone by the
+        /// judgement (rc3: NN-L-NET-008 High, "would have: KillProcess", on
+        /// 5 kernels); or gone before the pump read it. Its image is its
+        /// forker's, by the connect's fork record.
+        #[test]
+        fn an_appimage_s_fork_only_child_exiting_at_once_draws_no_net_008() {
+            let (proc, w) = lab();
+            running(proc.path(), 4803, 4800, APP);
+            let r = row(&w, &connect(4803, 4800));
+            exited(proc.path(), 4803);
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None, "gone by the judgement");
+            // gone before the pump read it
+            let r = row(&w, &connect(4804, 4800));
+            assert_eq!(r.exe.as_deref(), Some(APP), "its forker's image");
+            assert_eq!(net_008(&w, &r), None, "gone before the pump");
+        }
+
+        /// The record's empty `exe` of F4b-1 is the network records' format
+        /// (`exe` is an exec's only); a row whose image is empty is no path
+        /// either: the lineage names it, or it is not known — counted, never
+        /// judged by a staging path.
+        #[test]
+        fn a_row_with_an_empty_or_unreadable_image_is_named_or_not_known() {
+            let (proc, w) = lab();
+            running(proc.path(), 4803, 4800, APP);
+            let mut r = row(&w, &connect(4803, 4800));
+            exited(proc.path(), 4803);
+            r.exe = Some(String::new());
+            assert_eq!(net_008(&w, &r), None, "the image's fork");
+            running(proc.path(), 4903, 4900, STAGED);
+            let mut r = row(&w, &connect(4903, 4900));
+            exited(proc.path(), 4903);
+            r.exe = Some(String::new());
+            assert_eq!(
+                net_008(&w, &r),
+                Some(ResponseAction::KillProcess),
+                "an empty path hides no staged image"
+            );
+            // a process nothing names: no exec, no fork record, no `/proc`
+            let rule = NnLNet008OutboundFromTmpExec::new(Some(w.lineage.clone()));
+            let mut r = row(&w, &connect(5999, 0));
+            assert_eq!(r.exe, None);
+            assert!(rule.evaluate(&Event::NetFlow(r.clone())).is_none());
+            r.exe = Some(String::new());
+            assert!(rule.evaluate(&Event::NetFlow(r.clone())).is_none());
+            assert_eq!(rule.images_not_known(), 2, "recorded as not known");
+        }
+
+        /// Not weakened: a binary staged in `/tmp`, its fork+exec child and
+        /// its fork-only children (alive, exiting at once, gone before the
+        /// pump) keep NN-L-NET-008's kill. Before, the child gone before
+        /// the pump read it was not named, and drew nothing.
+        #[test]
+        fn a_staged_binary_and_its_fork_only_children_keep_net_008() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            assert_eq!(net_008(&w, &row(&w, &connect(4900, 0))), kill, "itself");
+            exec(&w.lineage, 4902, 4900, STAGED, false);
+            assert_eq!(net_008(&w, &row(&w, &connect(4902, 0))), kill, "fork+exec");
+            running(proc.path(), 4901, 4900, STAGED);
+            assert_eq!(net_008(&w, &row(&w, &connect(4901, 4900))), kill, "alive");
+            running(proc.path(), 4903, 4900, STAGED);
+            let r = row(&w, &connect(4903, 4900));
+            exited(proc.path(), 4903);
+            assert_eq!(net_008(&w, &r), kill, "exiting at once");
+            let r = row(&w, &connect(4904, 4900));
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), kill, "gone before the pump");
+        }
+
+        /// Not weakened (#564): the program of an AppImage-like FUSE mount
+        /// the exec pump did not tie (its image not held by its daemon, a
+        /// writable mount, `squashfuse`) and its fork-only child stay
+        /// judged; so does a fork whose row names another file than its
+        /// forker's image (the review of #564, F7).
+        #[test]
+        fn an_untied_mount_s_fork_only_child_keeps_net_008() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            assert_eq!(net_008(&w, &row(&w, &connect(5000, 0))), kill);
+            running(proc.path(), 5003, 5000, APP);
+            let r = row(&w, &connect(5003, 5000));
+            exited(proc.path(), 5003);
+            assert_eq!(net_008(&w, &r), kill, "untied, exiting at once");
+            assert_eq!(
+                net_008(&w, &row(&w, &connect(5004, 5000))),
+                kill,
+                "untied, gone"
+            );
+            let mut r = row(&w, &connect(4805, 4800));
+            r.exe = Some(STAGED.into());
+            assert_eq!(net_008(&w, &r), kill, "another file than its forker's");
+        }
+
+        /// A fork of a fork-only process (a sandboxed zygote's renderer):
+        /// the connect's record names its forker, which is read as it can
+        /// be — while it runs, by `/proc` as before — and never as the
+        /// anchor's image (the anchor may have executed since that fork).
+        /// The forker gone, never recorded: not known, the row judged by its
+        /// path (fail-closed; the exemption needs the mark).
+        #[test]
+        fn a_fork_of_a_fork_only_forker_is_its_forker_s_image_while_known() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            // the zygote (4800) forks 4810, which forks 4811
+            running(proc.path(), 4810, 4800, APP);
+            running(proc.path(), 4811, 4810, APP);
+            let mut raw = connect(4811, 4810);
+            raw.fork_anchor = 4800;
+            assert_eq!(net_008(&w, &row(&w, &raw)), None, "its forker running");
+            // its forker gone: the child named by `/proc` at the pump, gone
+            // by the judgement — by its path; gone before the pump: not known
+            exited(proc.path(), 4810);
+            running(proc.path(), 4812, 4810, APP);
+            raw.pid = 4812;
+            raw.sk_ptr += 1;
+            let r = row(&w, &raw);
+            exited(proc.path(), 4812);
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), kill, "its forker gone");
+            raw.pid = 4813;
+            raw.sk_ptr += 1;
+            let r = row(&w, &raw);
+            assert_eq!(r.exe, None);
+            assert_eq!(net_008(&w, &r), None, "nothing names it");
+            // the staged binary's: judged both ways
+            running(proc.path(), 4910, 4900, STAGED);
+            let mut raw = connect(4911, 4910);
+            raw.fork_anchor = 4900;
+            running(proc.path(), 4911, 4910, STAGED);
+            assert_eq!(net_008(&w, &row(&w, &raw)), kill);
+        }
+
+        /// The connect's record keeps the connecting process's uid (the
+        /// kernel's): a user's fork of a package manager it ran itself is no
+        /// root transaction (NN-L-NET-008's and the FIM rules' carve-out),
+        /// root's is — the same record a write's teaching then refreshes.
+        #[test]
+        fn a_connect_s_fork_record_keeps_the_process_s_uid() {
+            let (proc, w) = lab();
+            for (pm, child, uid, who) in [
+                (4960u32, 4961u32, 0u32, "root"),
+                (4970, 4971, 1000, "a user"),
+            ] {
+                let mut e = nn_core::decision::rules::testutil::spawn_exe(
+                    "dpkg",
+                    "/usr/bin/dpkg",
+                    "/usr/bin/dpkg",
+                    0,
+                );
+                if let Event::ProcessSpawn {
+                    pid,
+                    uid: u,
+                    timestamp_ns,
+                    start_ns,
+                    ..
+                } = &mut e
+                {
+                    (*pid, *u, *timestamp_ns, *start_ns) = (pm, uid, S, S / 2);
+                }
+                assert!(w.lineage.ingest_spawn_event(&e));
+                running(proc.path(), child, pm, "/usr/bin/dpkg");
+                let mut raw = connect(child, pm);
+                raw.uid = uid;
+                let r = row(&w, &raw);
+                let judged = nn_core::posture::lineage::AsOf::Judged(r.start_ns);
+                assert_eq!(
+                    w.lineage.in_package_transaction(child, judged),
+                    uid == 0,
+                    "{who}'s package manager"
+                );
+            }
+        }
+
+        /// The review of #568 (F1, case a): a shell (its exec read) executes
+        /// a staged binary in place and forks; the fork connects before the
+        /// event loop has read that exec. Named from `/proc` while it runs
+        /// (`/proc` contradicts the record), or not at all when only its
+        /// forker is shown — never as the shell, which would leave it
+        /// unjudged: NN-L-NET-008 kills, alive or gone, the exec read before
+        /// the judgement or not. Before, the row was the shell and NET-008
+        /// gave no verdict.
+        #[test]
+        fn a_staged_binary_executed_in_place_before_its_fork_keeps_net_008() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            exec(&w.lineage, 4950, 1, "/usr/bin/bash", false);
+            shown_since_exec(proc.path(), 4950, 1, STAGED);
+            running(proc.path(), 4951, 4950, STAGED);
+            let r = row(&w, &connect(4951, 4950));
+            assert_eq!(r.exe.as_deref(), Some(STAGED), "the fork shown");
+            assert_eq!(net_008(&w, &r), kill, "the exec not read");
+            // the fork shown at the pump, gone by the judgement, the exec read
+            running(proc.path(), 4952, 4950, STAGED);
+            let r = row(&w, &connect(4952, 4950));
+            exited(proc.path(), 4952);
+            exec_at(&w.lineage, (4950, 1), STAGED, false, 3 * S / 2);
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), kill, "the exec read after the pump");
+            // gone before the pump, its forker shown: named in the judgement
+            exec(&w.lineage, 4960, 1, "/usr/bin/bash", false);
+            shown_since_exec(proc.path(), 4960, 1, STAGED);
+            let r = row(&w, &connect(4961, 4960));
+            assert_eq!(r.exe, None, "not the shell");
+            exec_at(&w.lineage, (4960, 1), STAGED, false, 3 * S / 2);
+            assert_eq!(net_008(&w, &r), kill, "gone before the pump");
+        }
+
+        /// The review of #568 (F1, case b): a staged binary forks A (no
+        /// exec), A forks C and exits; A's pid had held a process whose exec
+        /// the cache keeps (curl, or an AppImage's program). The record names
+        /// A's start, which is not that process's: C is named from `/proc`
+        /// and NN-L-NET-008 kills — however long after the staged exec.
+        /// Before, C was curl (no verdict) or took the AppImage's mark.
+        #[test]
+        fn a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork() {
+            let (proc, w) = lab();
+            let kill = Some(ResponseAction::KillProcess);
+            exec(&w.lineage, 4970, 1, "/usr/bin/curl", false);
+            running(proc.path(), 4971, 1, STAGED);
+            let mut raw = connect(4971, 4970);
+            raw.fork_parent_start = fork_start() - S;
+            raw.fork_anchor = 4900;
+            let r = row(&w, &raw);
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), kill, "an earlier curl");
+            // the earlier holder an AppImage's program: no mark lent
+            exec(&w.lineage, 4975, 1, APP, true);
+            running(proc.path(), 4976, 1, APP);
+            let mut raw = connect(4976, 4975);
+            raw.fork_parent_start = fork_start() - S;
+            raw.fork_anchor = 4900;
+            let r = row(&w, &raw);
+            exited(proc.path(), 4976);
+            assert_eq!(net_008(&w, &r), kill, "an earlier AppImage program");
+        }
+
+        /// The review of #568 (F2): a staged binary's fork-only child takes a
+        /// pid whose earlier holder ran curl (still cached), connects and
+        /// exits before the pump reads it. The connect's record (a fork after
+        /// that process started) names it: the staged image, NN-L-NET-008
+        /// kills. Before (main too), the row was curl.
+        #[test]
+        fn a_fork_on_a_reused_pid_is_not_named_by_its_earlier_holder_s_exec() {
+            let (_proc, w) = lab();
+            exec(&w.lineage, 4980, 1, "/usr/bin/curl", false);
+            let r = row(&w, &connect(4980, 4900));
+            assert_eq!(r.exe.as_deref(), Some(STAGED));
+            assert_eq!(net_008(&w, &r), Some(ResponseAction::KillProcess));
+        }
+
+        /// The AppImage forms with the zygote shown by `/proc` (its start the
+        /// record's forker's): its fork-only child, gone before the pump or
+        /// at once, is its image's (no NN-L-NET-008); one whose program name
+        /// the walk cut (31 bytes or more) too, named as its exec was.
+        #[test]
+        fn an_appimage_s_fork_only_child_with_its_zygote_shown_draws_no_net_008() {
+            let (proc, w) = lab();
+            shown_since_exec(proc.path(), 4800, 4790, APP);
+            let r = row(&w, &connect(4807, 4800));
+            assert_eq!(r.exe.as_deref(), Some(APP), "gone before the pump");
+            assert_eq!(net_008(&w, &r), None);
+            running(proc.path(), 4808, 4800, APP);
+            let r = row(&w, &connect(4808, 4800));
+            exited(proc.path(), 4808);
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None, "gone at once");
+            let long = "an-electron-program-name-of-31-bytes-or-more";
+            let cut = format!("/tmp/.mount_k360ab/usr/lib/{}…", &long[..31]);
+            exec(&w.lineage, 4820, 4790, &cut, true);
+            running(
+                proc.path(),
+                4821,
+                4820,
+                &format!("/tmp/.mount_k360ab/usr/lib/{long}"),
+            );
+            let r = row(&w, &connect(4821, 4820));
+            assert_eq!(r.exe.as_deref(), Some(cut.as_str()));
+            assert_eq!(net_008(&w, &r), None, "a cut program name");
+        }
+
+        /// A fork-only child connects, then executes: judged before or after
+        /// that exec is read, its connect is its forker's image (the image's
+        /// mark kept), not "not known" and not the later program.
+        #[test]
+        fn a_fork_only_child_executing_after_its_connect_is_its_forker_s_at_the_connect() {
+            let (_proc, w) = lab();
+            let r = row(&w, &connect(4806, 4800));
+            let mut later =
+                nn_core::decision::rules::testutil::spawn_exe("sh", "/bin/sh", "/usr/bin/dash", 0);
+            if let Event::ProcessSpawn {
+                pid,
+                ppid,
+                timestamp_ns,
+                start_ns,
+                ..
+            } = &mut later
+            {
+                (*pid, *ppid, *timestamp_ns, *start_ns) =
+                    (4806, 4800, fork_start() + 3 * S, fork_start());
+            }
+            assert!(w.lineage.ingest_spawn_event(&later));
+            assert_eq!(r.exe.as_deref(), Some(APP));
+            assert_eq!(net_008(&w, &r), None);
+            let mut no_row = r.clone();
+            no_row.exe = None;
+            assert_eq!(net_008(&w, &no_row), None, "named by the lineage");
+            // the staged binary's: judged on its image, not on the later one
+            let r = row(&w, &connect(4906, 4900));
+            if let Event::ProcessSpawn { pid, ppid, .. } = &mut later {
+                (*pid, *ppid) = (4906, 4900);
+            }
+            assert!(w.lineage.ingest_spawn_event(&later));
+            let mut no_row = r.clone();
+            no_row.exe = None;
+            assert_eq!(net_008(&w, &no_row), Some(ResponseAction::KillProcess));
         }
     }
 }

@@ -2433,20 +2433,23 @@ pub(crate) fn teach_fork(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>
     let Some(l) = lineage.filter(|_| raw.fork_ppid != 0) else {
         return;
     };
-    // the forker's own record first; its uid not known, the writer's taken
+    // the forker's own record first; its uid not known, the writer's taken;
+    // its forker's start not carried
     if raw.fork_pppid != 0 {
         l.ingest_kernel_fork(
             raw.fork_ppid,
             raw.fork_parent_start,
-            raw.fork_pppid,
+            (raw.fork_pppid, 0),
             raw.modifier_uid,
             raw.timestamp_ns,
         );
     }
+    // lot 360 (the review of #568, F1): the forker's start, carried for a
+    // forker that never executed either (0 otherwise: not checked)
     l.ingest_kernel_fork(
         raw.modifier_pid,
         raw.fork_start,
-        raw.fork_ppid,
+        (raw.fork_ppid, raw.fork_parent_start),
         raw.modifier_uid,
         raw.timestamp_ns,
     );
@@ -5518,6 +5521,15 @@ mod tests {
         let late = AuthSessionTracker::new(dir.path().join("no-proc"));
         late.ingest_spawn(4_000_005, 1, "/usr/bin/rsync", t - 1_500);
         assert_eq!(run(&raw, &late).modifier_exe, None);
+        // lot 360 (the review of #568, F1): the generator's pid held earlier
+        // by curl (its exec still cached), its own record since a later
+        // process's: the writer's record names the generator's start, which
+        // is not curl's — curl is lent to no drift
+        let reused = AuthSessionTracker::new(dir.path().join("no-proc"));
+        reused.ingest_spawn(4_000_005, 1, "/usr/bin/rsync", t - 3_000);
+        reused.ingest_exec(4_000_006, 1, "/usr/bin/curl", &[], t - 5_000, t - 5_000, 0);
+        reused.ingest_kernel_fork(4_000_006, t + 1_000, (4_000_009, 0), 0, t + 2_000);
+        assert_eq!(run(&raw, &reused).modifier_exe, None, "not curl's");
         // no fork record and no exec record: not known, as before
         let mut bare = fake_raw(meta.dev(), meta.ino(), FimOp::Modified as u8);
         let fresh = AuthSessionTracker::new(dir.path().join("no-proc"));

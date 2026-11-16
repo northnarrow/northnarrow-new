@@ -1791,17 +1791,25 @@ pub(crate) fn teach_fork(
     };
     // the forker's own record first (rsync's generator: never executed
     // either); its uid not known, the writer's taken (a fork changes it only
-    // by dropping root)
+    // by dropping root); its forker's start not carried
     if r.fork_pppid != 0 {
         l.ingest_kernel_fork(
             r.fork_ppid,
             r.fork_parent_start,
-            r.fork_pppid,
+            (r.fork_pppid, 0),
             r.uid,
             r.timestamp_ns,
         );
     }
-    l.ingest_kernel_fork(r.pid, r.fork_start, r.fork_ppid, r.uid, r.timestamp_ns);
+    // lot 360 (the review of #568, F1): the forker's start, carried for a
+    // forker that never executed either (0 otherwise: not checked)
+    l.ingest_kernel_fork(
+        r.pid,
+        r.fork_start,
+        (r.fork_ppid, r.fork_parent_start),
+        r.uid,
+        r.timestamp_ns,
+    );
 }
 
 /// Drain the ring onto the agent's event bus until the receiver goes away
@@ -2700,6 +2708,16 @@ mod tests {
             lineage.exec_identity(712, at).map(|id| id.exe),
             Some("/usr/bin/rsync".into())
         );
+        // lot 360 (the review of #568, F1): the generator's pid held earlier
+        // by curl (its exec still cached) and its own record replaced since
+        // by a later process's: the receiver's record names the generator's
+        // start, which is not curl's — curl is lent to no write
+        lineage.ingest_exec(731, 1, "/usr/bin/curl", &["curl".to_string()], S, S, 0);
+        lineage.ingest_kernel_fork(731, 20 * S, (1, 0), 0, 21 * S);
+        (r.pid, r.fork_ppid, r.fork_start) = (732, 731, 5 * S);
+        (r.fork_pppid, r.fork_parent_start) = (701, 4 * S);
+        teach_fork(&r, Some(&lineage));
+        assert!(lineage.exec_identity(732, at).is_none(), "not curl's");
         // the pump teaches before it decodes and sends the record's events
         let pump = pump_source();
         let taught = pump.find("teach_fork(r, lineage);").expect("taught");
