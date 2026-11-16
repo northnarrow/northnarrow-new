@@ -590,6 +590,19 @@ impl CanaryFixture {
     }
 }
 
+/// The first reader of a canary that is not a registered reader is answered
+/// with `KillProcessTree` by design, so its `cat` may be killed (SIGKILL)
+/// before it exits on its own: both outcomes are the designed ones, and
+/// which one happens is a race. Anything else (an EPERM denial exits 1, a
+/// different signal) still fails. The access row proves the trip itself.
+fn assert_reader_outcome_by_design(status: std::process::ExitStatus, what: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        status.success() || status.signal() == Some(9),
+        "{what}: expected exit 0 or SIGKILL by the canary response, got {status:?}"
+    );
+}
+
 fn parse_canary_id(stdout: &str) -> String {
     // Success line shape: "canary deploy: success (<id>)" (with
     // optional ANSI colour codes when stdout is a TTY; tests
@@ -669,7 +682,7 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
         .stdout(Stdio::null())
         .status()
         .expect("spawn cat for canary trip");
-    assert!(status.success(), "cat subprocess failed");
+    assert_reader_outcome_by_design(status, "cat subprocess");
 
     // Wait for the chained access row.
     let rows = fx.wait_access(1);
@@ -956,7 +969,7 @@ fn file_canary_deployed_at_runtime_survives_an_agent_restart() {
             .status()
             .expect("spawn cat for canary trip")
     };
-    assert!(cat().success());
+    assert_reader_outcome_by_design(cat(), "first cat of the decoy");
     let rows = fx.wait_access(1);
     assert_eq!(rows[0]["canary_id"].as_str(), Some(canary_id.as_str()));
 
@@ -1018,7 +1031,7 @@ fn a_trip_the_agent_stopped_before_recording_is_kept_across_the_restart() {
             .status()
             .expect("spawn cat for canary trip")
     };
-    assert!(cat().success());
+    assert_reader_outcome_by_design(cat(), "first cat of the decoy");
     let rows = fx.wait_access(1);
     assert_eq!(rows[0]["canary_id"].as_str(), Some(canary_id.as_str()));
     assert_eq!(rows[0]["first_trip"].as_bool(), Some(true), "{rows:?}");
