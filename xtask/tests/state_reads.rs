@@ -99,10 +99,6 @@ const KILLCG: &str = "the kill cgroups the agent creates (neutralize-*): an unre
                       cgroup.events is no 'populated' at the sweep of a leftover (removed only \
                       when empty: rmdir refuses a populated cgroup), and a wait that reads \
                       nothing waits to its deadline";
-/// Why the host-hardening check's bpffs count may default.
-const HARDEN: &str = "the host-hardening check's bpffs count: a mount table that cannot be \
-                      read is reported so by the same check (a warning naming the error), \
-                      never as 'not mounted'";
 /// Why a package list may default.
 const PKG: &str = "a package's file list or sums (dpkg's .list and .md5sums, a file rpm \
                    recorded): unreadable, its files are not owned — no trust is lent, the \
@@ -873,11 +869,6 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/fim/honeypot.rs",
         "read_to_string(state_dir.join(BOOT_ID_FILE))",
         OWN,
-    ),
-    (
-        "crates/nn-linux/src/host_hardening.rs",
-        "mountinfo::read(&root.join(\"proc/self/mountinfo\"))",
-        HARDEN,
     ),
     (
         "crates/nn-linux/src/keys/mod.rs",

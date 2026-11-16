@@ -38,7 +38,17 @@ check "tarball matches SHA256SUMS" bash -c 'printf "%s\n" "$1" | sha256sum -c --
 [ "$fail" = 0 ] || { bad "tarball not verified: nothing extracted"; exit 1; }
 sudo tar --no-same-owner --no-same-permissions -xzf "$tgz" || { bad "extract"; exit 1; }
 tree=/opt/nn-release/${tgz%.tar.gz}
-check "release binaries run here (glibc)" "$tree/target/release/northnarrow-agent" --version
+# Lot 365: every binary runs here, and without a word from the loader — a
+# weak need of a newer glibc (`weak version 'GLIBC_2.39' not found`, the
+# 24.04 build on Debian 12 and Ubuntu 22.04) still exits 0.
+loader_silent() {
+    local b err
+    for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
+        err=$("$tree/target/release/$b" --version 2>&1 >/dev/null </dev/null) || { echo "  $b --version failed: $err"; return 1; }
+        [ -z "$err" ] || { echo "  $b: $err"; return 1; }
+    done
+}
+check "release binaries run here, no glibc warning" loader_silent
 T0=$(date "+%F %T")
 # Lab PR 220: a release tree installs only when its provenance attestation
 # verifies. The tarball of a CI run is attested (if at all) for its branch,
@@ -67,7 +77,8 @@ check "binary integrity verified ($prov manifest)" agent_event INFO "binary inte
 # logged only when every deny and observe hook of this kernel attached (16
 # deny hooks on 5.15 and 6.1, 18 where the kernel has the ACL hooks, 6.2+)
 check "every deny hook attached" agent_event INFO 'anti-tamper: all LSM hooks attached deny_attached='
-check "telemetry probe armed" agent_event INFO 'telemetry probe armed'
+# lot 365's lab: lot 280c renamed the line (the probe became every sensor's self-test)
+check "sensor self-test armed" agent_event INFO 'sensor self-test armed'
 # a detection end to end: exec from /tmp (R001)
 cp /bin/true /tmp/nn-release-probe && chmod +x /tmp/nn-release-probe
 /tmp/nn-release-probe 2>/dev/null; sleep 3; rm -f /tmp/nn-release-probe

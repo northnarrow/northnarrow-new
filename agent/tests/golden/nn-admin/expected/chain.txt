@@ -614,6 +614,24 @@ exit: 1
 --- stderr
 | chain: no agent.sig.pub — deriving the agent pubkey from the signing key file agent.sig.key (refused once the agent protects it); pass --agent-pubkey <hex> when verifying off-host: reading agent.sig.key: No such file or directory (os error 2)
 
+### chain.a-chain-this-user-may-not-read
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+exit: 17
+--- stdout
+(empty)
+--- stderr
+| chain verify: reading ./netflow.jsonl: Permission denied (os error 13)
+| chain verify: permission denied: only root may use the agent's admin socket, keys and files. Run it with sudo: `sudo nn-admin chain verify …`. This does not mean the agent is stopped
+
+### chain.a-chain-this-user-may-not-read-not-asked
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key --log audit
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      heads            chain_heads.json: no head anchor to compare with
+--- stderr
+(empty)
+
 ### chain.published-key-not-hex
 $ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
 exit: 1

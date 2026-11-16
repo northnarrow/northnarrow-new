@@ -518,12 +518,12 @@ meets first:
 The `nn-admin` commands and their exit codes are in
 [NN_ADMIN.md](NN_ADMIN.md).
 
-- **A glibc warning on Ubuntu 22.04 and Debian 12.** Every `nn-admin`
-  command prints
-  `nn-admin: /lib/x86_64-linux-gnu/libc.so.6: weak version 'GLIBC_2.39' not found (required by nn-admin)`.
-  It is harmless: the binaries are built on Ubuntu 24.04 and refer weakly
-  to two newer glibc functions, which they do without on an older glibc.
-  The hard minimum is glibc 2.34.
+- **The glibc baseline.** The release is built on Ubuntu 22.04 (glibc
+  2.35), and the release workflow checks that no shipped file needs a newer
+  glibc, weakly or not. Earlier builds, made on Ubuntu 24.04, printed
+  `weak version 'GLIBC_2.39' not found` at every `nn-admin` command on
+  Ubuntu 22.04 and Debian 12 (harmless); a release that still does is one of
+  those.
 - **Use `nn-admin` from the same release as the agent.** An `nn-admin` of
   another release may not read the agent's answers correctly.
 - **The install key does not carry every role.** The key `install.sh`

@@ -45,6 +45,10 @@ pub enum Script {
     Replies(Vec<Reply>),
     /// A socket file nobody listens on (`ECONNREFUSED`).
     Refused,
+    /// Lot 365: a running agent's socket this user may not open — its
+    /// file's mode 0, a listener behind it: `EACCES` for anyone but root
+    /// (the cases run only without root, `harness::Case::needs_no_root`).
+    Denied,
 }
 
 impl Reply {
@@ -91,6 +95,7 @@ pub fn start(path: &Path, script: Script) -> Running {
         UnixListener::bind(path)
             .unwrap_or_else(|e| panic!("binding the mock agent at {}: {e}", path.display()))
     };
+    let denied = matches!(script, Script::Denied);
     let replies = match script {
         Script::Refused => {
             // Lab PR 266b: bound and closed while no child of this test is
@@ -105,12 +110,20 @@ pub fn start(path: &Path, script: Script) -> Running {
             return Running { stop, handle };
         }
         Script::Replies(r) => r,
+        Script::Denied => Vec::new(),
     };
     let listener = bind();
+    if denied {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0)).unwrap();
+    }
     listener.set_nonblocking(true).unwrap();
     let flag = stop.clone();
     let handle = std::thread::spawn(move || {
         let mut log = Vec::new();
+        if denied {
+            log.push("(a running agent's socket of mode 0: this user may not open it)".to_string());
+        }
         let mut n = 0;
         loop {
             match listener.accept() {
