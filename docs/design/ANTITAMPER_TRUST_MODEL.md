@@ -3069,7 +3069,8 @@ where it starts.
   object's pin with the inode it was pinned at and its directory's
   (`held::judge`); a removed pin is pinned again from the descriptor in
   that directory only (`held::repin`: never into a new bpffs or a mount
-  over it), a High each. `purge_stale_pin` drops the descriptor before it
+  over it), a High each (the directory itself removed: one, with its
+  counts). `purge_stale_pin` drops the descriptor before it
   unlinks, so the agent's own retirements still detach; the ratchet
   `held_pins` refuses a link or program pinned any other way.
 

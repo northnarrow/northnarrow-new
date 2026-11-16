@@ -3863,9 +3863,10 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
     never seen before (`nsenter -t <agent> -m`) at its first use.
 - **The agent holds what it pins (fix round 3).** A link stays attached
   while one reference to it is left: its pin, or a descriptor. The deny
-  links were held by their pins alone once the agent's start was over, so
-  the bpffs losing its last mount, or one pin removed or hidden, detached
-  the hook while the agent ran. Now the agent keeps a descriptor of every
+  links were held by their pins alone once the agent's start was over: one
+  pin removed detached its hook at once while the agent ran, and the bpffs
+  losing its last mount left them to whatever descriptor in it the agent
+  held (its anchor of `/sys/fs/bpf`). Now the agent keeps a descriptor of every
   link and program it pins, for its life (`antitamper_bpf::held`: the deny
   hooks, the BPF guard's, the mount guard's, the start-in-cgroup
   tracker's, the sysctl judge's, the module files' write history's, the
