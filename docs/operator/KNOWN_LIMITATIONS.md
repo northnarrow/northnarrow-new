@@ -534,7 +534,11 @@ lists the known false positives of each rule.
   High. *Evidence:* internal check Phase 0, residuals R054. A snap
   install's own units (the snap's mount and service units, written by the
   host's snapd, the process its systemd unit runs, in the unit's cgroup) are
-  recorded Low. *Evidence:*
+  recorded Low. The agent takes whatever program the snapd service runs
+  for snapd: a root user who makes that service run a program of their own
+  gets the same Low for unit files, as installing a package of their own
+  already does (the package-manager boundary above); root changing what a
+  system service runs is itself the act to watch for. *Evidence:*
   `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`,
   `snapds_identity_is_snapd_services_process_with_clean_marks`; lot
   367.
