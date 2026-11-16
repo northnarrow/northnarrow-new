@@ -301,9 +301,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        26,
+        27,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
-         `AsOf::Live`: the pumps', the admin's, the responses'), its boot-time scan \
+         `AsOf::Live`: the pumps', the admin's, the responses' — lot 360, the review of #568 \
+         (F1): at `AsOf::Live` only, the `exe` link of a fork the kernel's fork record names, \
+         or of its forker, each at the start the record gives (read before and after), to \
+         confirm the record before a pump names a connect by it), its boot-time scan \
          (`seed_from_proc`) and its sweep (`sweep` and its orphans' adoption, \
          `orphan_entry`: a thread of its own, every 5 s — the third review of #475); in a \
          judgement a process's start (`/proc/<pid>/stat`, POS-003's reuse check, and a cached \
