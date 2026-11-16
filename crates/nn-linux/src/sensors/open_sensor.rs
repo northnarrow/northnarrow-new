@@ -1150,7 +1150,8 @@ pub fn take_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
 ///   the kernel flags it whenever a mount or an unmount changes this
 ///   namespace's table. After a change the table is re-read, at most once
 ///   per [`MOUNT_REFRESH_MIN`] — at once for a root it does not hold (lot
-///   366: a mount made since it was read); until then a hit is answered only while a
+///   366: a mount made since it was read), within a budget per window
+///   ([`MOUNT_MISS_BUDGET`], signed past it); until then a hit is answered only while a
 ///   `stat()` of its mount point still shows that root, and dropped (the
 ///   path is then unplaced, never another mount's) when it does not;
 /// - whatever the poll says, the table is re-read when it is older than
@@ -1187,6 +1188,22 @@ pub struct MountTable {
     read: crate::state_read::LastGood,
     /// Lot 311 (the review of #538, F2): lines not in the kernel's shape.
     rows: crate::state_read::Condition,
+    /// The re-check 2 of #573 (M3): the at-once re-reads of the current
+    /// window ([`MOUNT_MISS_BUDGET`]).
+    at_once: AtOnce,
+    /// The at-once re-reads' budget used up: signed once while it lasts
+    /// ([`MOUNT_REREADS`]).
+    rereads: crate::state_read::Condition,
+}
+
+/// The re-check 2 of #573 (M3): a table's at-once re-reads in the current
+/// window of [`MOUNT_MISS_WINDOW`].
+#[derive(Debug, Default, Clone, Copy)]
+struct AtOnce {
+    since: Option<Instant>,
+    reads: u32,
+    /// A re-read was refused in this window (the budget used up).
+    over: bool,
 }
 
 impl Default for MountTable {
@@ -1201,6 +1218,12 @@ impl Default for MountTable {
             changed: false,
             read: crate::state_read::LastGood::new("mount_table", "the mount table"),
             rows: crate::state_read::Condition::new("mount_table_rows"),
+            at_once: AtOnce::default(),
+            rereads: crate::state_read::Condition::deferred(
+                MOUNT_REREADS,
+                Duration::from_secs(60),
+                MOUNT_REREAD_RECORDS,
+            ),
         }
     }
 }
@@ -1213,6 +1236,25 @@ const MOUNT_REFRESH_MIN: Duration = Duration::from_secs(2);
 /// the kernel flagged a change, re-reads it at once — at most this often
 /// (a user's mounts and unmounts in a loop cost one read each, bounded).
 const MOUNT_MISS_MIN: Duration = Duration::from_millis(10);
+
+/// The re-check 2 of #573 (M3): the at-once re-reads (a miss after a
+/// flagged change, [`MOUNT_MISS_MIN`]) one table makes within
+/// [`MOUNT_MISS_WINDOW`] at most. Each is the whole `mountinfo` and a look
+/// at every mount point, on the pump that asked; a user who mounts and
+/// unmounts in a loop and runs from a root no table shows drove one per
+/// 10 ms. Past the budget a miss waits for [`MOUNT_REFRESH_MIN`], as
+/// before the at-once re-read, and that is signed ([`MOUNT_REREADS`]). An
+/// AppImage's start takes one or two.
+const MOUNT_MISS_BUDGET: u32 = 5;
+const MOUNT_MISS_WINDOW: Duration = Duration::from_secs(1);
+
+/// The re-check 2 of #573 (M3): the degradation's source while a table's
+/// at-once re-reads are past their budget.
+pub const MOUNT_REREADS: &str = "mount_table_rereads";
+
+/// The tables that may sign it at once: the exec pump's, the exec-check
+/// pump's, the file-open sensor's (each record names its thread).
+const MOUNT_REREAD_RECORDS: usize = 3;
 
 /// External audit SNS-004: re-read the table when it is older than this,
 /// whatever the lookups found.
@@ -1307,6 +1349,50 @@ impl MountTable {
         self.changed = false;
     }
 
+    /// The re-check 2 of #573 (M3): the window of the at-once re-reads
+    /// begun again once [`MOUNT_MISS_WINDOW`] passed; a window that kept
+    /// within the budget ends the condition (after its hold).
+    fn at_once_roll(&mut self, now: Instant) {
+        let a = &mut self.at_once;
+        if a.since
+            .is_some_and(|t| now.saturating_duration_since(t) < MOUNT_MISS_WINDOW)
+        {
+            return;
+        }
+        if !a.over {
+            self.rereads.ended_at(now);
+        }
+        self.at_once = AtOnce {
+            since: Some(now),
+            ..AtOnce::default()
+        };
+    }
+
+    /// The re-check 2 of #573 (M3): whether an at-once re-read is within
+    /// the window's budget (counted); past it, signed once while it lasts.
+    fn at_once_take(&mut self, now: Instant) -> bool {
+        if self.at_once.reads < MOUNT_MISS_BUDGET {
+            self.at_once.reads += 1;
+            return true;
+        }
+        self.at_once.over = true;
+        let thread = std::thread::current();
+        self.rereads.holds_at(
+            format!(
+                "{}: the mount table was read again at once, after changes of the mounts, {} \
+                 times within {} ms: until such changes slow down, a mount made since the last \
+                 read is placed only after the table's throttle ({} s) — its files unplaced \
+                 meanwhile",
+                thread.name().unwrap_or("a thread"),
+                MOUNT_MISS_BUDGET,
+                MOUNT_MISS_WINDOW.as_millis(),
+                MOUNT_REFRESH_MIN.as_secs(),
+            ),
+            now,
+        );
+        false
+    }
+
     /// Lot 366 (the re-check of #573, btrfs): the mount `id` of this table
     /// (this process's namespace), as read last: its superblock's device
     /// and whether it is btrfs.
@@ -1345,13 +1431,17 @@ impl MountTable {
         // lot 366 (the re-check of #573): a miss after the kernel flagged a
         // change is a mount made since the table was read (the AppImage's,
         // just after its image ran from a file no mount places — a btrfs
-        // subvolume's): read again at once, at most once per change
+        // subvolume's): read again at once, at most once per change and
+        // within the window's budget (the re-check 2 of #573, M3) — the
+        // throttle's re-reads first, taking nothing of it
+        let now = Instant::now();
+        self.at_once_roll(now);
         let refresh = match age {
             None => true,
             Some(age) => {
                 age >= MOUNT_HIT_TTL
-                    || (!hit && self.changed && age >= MOUNT_MISS_MIN)
                     || ((!hit || self.changed) && age >= MOUNT_REFRESH_MIN)
+                    || (!hit && self.changed && age >= MOUNT_MISS_MIN && self.at_once_take(now))
             }
         };
         if refresh {
@@ -2481,6 +2571,63 @@ mod tests {
         assert_eq!(mounts.absolute((49, 1), "/x"), None, "throttled");
         assert_eq!(mounts.mount_of(61), Some((48, false)));
         assert_eq!(mounts.mount_of(62), None, "not read yet");
+    }
+
+    /// The re-check 2 of #573 (M3): the at-once re-reads a user can drive
+    /// (mounts and unmounts in a loop, and runs from a root no table shows)
+    /// are bounded: past [`MOUNT_MISS_BUDGET`] within [`MOUNT_MISS_WINDOW`]
+    /// a miss waits for the throttle, as before the at-once re-read, and
+    /// that is signed once while it lasts; the throttle's re-read is not
+    /// held back; the next window re-reads at once again, and a window kept
+    /// within the budget ends the record (after its hold). Fails where
+    /// every miss after a flagged change re-read past the 10 ms floor
+    /// (f7dd98ce: up to 100 a second, unsigned).
+    #[test]
+    fn the_at_once_re_reads_are_bounded_and_signed() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let t = tempfile::tempdir().unwrap();
+        let info = t.path().join("mi");
+        std::fs::write(&info, "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n").unwrap();
+        let mut mounts = MountTable::load_from(&info);
+        // a miss after a flagged change, past the floor: read again?
+        let miss = |m: &mut MountTable| {
+            m.changed = true;
+            m.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
+            assert_eq!(m.absolute((46, 256), "/x"), None);
+            !m.changed
+        };
+        // the throttle's re-reads take nothing of the budget
+        for _ in 0..3 {
+            mounts.changed = true;
+            mounts.loaded = Instant::now().checked_sub(MOUNT_REFRESH_MIN);
+            assert_eq!(mounts.absolute((46, 256), "/x"), None);
+            assert!(!mounts.changed, "the throttle's re-read");
+        }
+        for _ in 0..MOUNT_MISS_BUDGET {
+            assert!(miss(&mut mounts), "within the budget: read again at once");
+        }
+        assert!(!mounts.rereads.holding(), "not signed within the budget");
+        for _ in 0..10 {
+            assert!(!miss(&mut mounts), "past it: the throttle");
+        }
+        assert!(mounts.rereads.holding(), "signed");
+        assert_eq!(mounts.rereads.reports(), 1, "once while it lasts");
+        mounts.loaded = Instant::now().checked_sub(MOUNT_REFRESH_MIN);
+        assert_eq!(mounts.absolute((46, 256), "/x"), None);
+        assert!(!mounts.changed, "the throttle's re-read, as ever");
+        // past its hold: a window past the budget does not end it, the next
+        // window kept within it does
+        let later = Instant::now() + Duration::from_secs(61);
+        mounts.at_once_roll(later);
+        assert!(mounts.rereads.holding(), "the window before was past it");
+        mounts.at_once_roll(later + MOUNT_MISS_WINDOW);
+        assert!(
+            !mounts.rereads.holding(),
+            "a window within the budget ends it"
+        );
+        assert_eq!(mounts.rereads.reports(), 1);
+        // a new window: at once again
+        assert!(miss(&mut mounts), "a new window");
     }
 
     /// External audit SNS-004: a change of the mount table is polled on

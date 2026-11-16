@@ -548,7 +548,7 @@ mod tests {
     fn the_reader_s_lookup_answers_as_the_trie() {
         use common::wire::execq::ROOT_SUBID_SHARE;
         for t in [host(), unreadable()] {
-            for uid in [
+            for (case, uid) in [
                 0u32,
                 1000,
                 65_535,
@@ -570,11 +570,14 @@ mod tests {
                 1_001_000_000,
                 u32::MAX - 1,
                 u32::MAX,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 assert_eq!(
                     lookup_longest(&t.entries, uid),
                     lookup(&t.entries, uid),
-                    "{uid}"
+                    "case {case}: the reader's lookup answers as the trie's"
                 );
             }
         }

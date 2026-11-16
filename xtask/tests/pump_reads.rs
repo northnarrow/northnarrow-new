@@ -150,11 +150,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-linux/src/sensors/exe_identity.rs",
         3,
-        "`/proc/<pid>/exe`'s text, twice (procfs's own link: the kernel's `d_path`, nothing \
-         looked up on the file's file system; lot 366's re-check: an exec no mount places, \
-         placed by its process's link once its identity from the kernel's cache is the \
-         exec's); the agent's own mount table (`/proc/self/mountinfo`, procfs's own: the \
-         kernel answers), each pump thread's own",
+        "`/proc/<pid>/exe`'s text (procfs's own link: the kernel's `d_path`, nothing looked \
+         up on the file's file system); the agent's own descriptor's link \
+         (`/proc/self/fd/<n>`: the `d_path` of the file it holds — lot 366's re-checks: an \
+         exec no mount places, named by the very file whose identity from the kernel's cache \
+         is the exec's); the agent's own mount table (`/proc/self/mountinfo`, procfs's own: \
+         the kernel answers), each pump thread's own",
     ),
     (
         "crates/nn-linux/src/program_images.rs",

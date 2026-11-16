@@ -11827,7 +11827,8 @@ number in parentheses is a lab PR.
     off.
 - **Lot 366 — the pre-alpha: the exec pumps never wait on a process's
   files (the review of #571, F1; the re-check of #564, N1; the review of
-  #573, F1–F7; C14, no level changes).**
+  #573, F1–F7, its re-check, N1–N7 and the btrfs fork-only case, and its
+  re-check 2, M1–M3; C14, no level changes).**
   - What was open: the exec pump and the exec-check pump read, for each
     exec, the process's file and a few facts about it inline, with no
     deadline: a read that did not answer held the pump and every exec
@@ -11940,6 +11941,144 @@ number in parentheses is a lab PR.
       8 of 18 AppImage runs had `AppRun` judged from `/tmp`.
     - Guests left clean: agent uninstalled, no `.local`, no pins, no
       mounts, `fuse.conf` restored, the test user removed, powered off.
+  - Fix round 2 (re-check 1 of #573):
+    - N1: the exec pumps' records go into the degradation list through a
+      room of their own (`degradation::note_kept`); in the unit tests they
+      are told to the list only on a test's thread that asks, with the
+      list's lock held: the suite's other tests, which read the list, see
+      their own records alone. No assertion changed.
+    - N2: each kind of the exec pumps' records keeps its own room in the
+      list (reads not waited for, a share held, files judged while the
+      mounts changed, slow reads): none crowds out another's or any other
+      part's, and a record past its room is still signed. A note past the
+      list's limit is signed at the next flush (it was only counted). The
+      slow reads are one rolling record per user and window, with its
+      count, retired at its window's end at any read and signed again with
+      its total; past a few users, every user's record names how many.
+    - N3: a read is for the user of the exec's process — for a subordinate
+      id of `/etc/subuid`, the account the agent's shares already give it
+      (`sensors::share_subuid`'s published ranges, now kept for the reader
+      too: the owner's; root's ranges one account; ids of no single known
+      owner the overflow one; no uid of the 16-bit range ever another's).
+      One user's ids together hold one read of the users' share at most.
+    - N4: a deferred condition's end retires its own record only.
+    - N5: the ratchet reads a mount table read by path and the C library's
+      path calls as reads, and any spelling of a lock (`Mutex::lock(&m)`,
+      `try_lock`, a `RwLock`'s guards) — the review's four planted in the
+      source, failed, removed.
+    - N6: a late tie is published only over the tie it was read against,
+      or in an empty place.
+    - N7: §55's hand-overs; systemd's dynamic users and `nobody` are the
+      system's accounts.
+    - The btrfs fork-only NN-L-NET-008 (on main too), traced in the lab to
+      the exec sensor's path placing: the kernel walks a btrfs subvolume's
+      file up to its file system's own root, which no mount shows when
+      only subvolumes are mounted (Fedora's and openSUSE's `/home`); that
+      miss re-read the mount table just before the AppImage mounted its
+      image, and the table's throttle then left the image's mount
+      unplaced — the zygote's re-exec named `/proc/self/exe`, not
+      recognised as the image's, and its fork-only child's connection
+      judged from `/tmp`. Now a miss after a flagged change re-reads the
+      table at once (past a floor), and an exec no mount places is named
+      by its process's `exe` link when that link leads to the exec's file
+      (by the kernel's identity, through a mount of the agent's table, the
+      mount deciding on btrfs) — the identity the AppImage tie uses too,
+      so an image on btrfs ties whichever order btrfs and the agent started
+      in. The lineage's fork record was right and is unchanged.
+    - Named tests: `pump_reads::{the_slow_records_never_crowd_out_the_exec_signals,
+      one_user_s_subordinate_ids_starve_no_other_user,
+      the_slow_records_are_one_per_user_and_bounded,
+      dynamic_users_and_nobody_are_the_system_s}`,
+      `degradation::{a_part_s_own_budget_is_kept_and_crowds_out_no_other,
+      a_note_past_the_cap_is_signed_at_the_next_flush,
+      the_budgeted_records_are_told_only_while_a_test_asks}`,
+      `state_read::a_deferred_condition_s_end_retires_its_own_record_only`,
+      `pump_reads::a_subordinate_id_counts_as_its_owner_never_an_account_s_uid`,
+      `share_subuid::the_reader_s_lookup_answers_as_the_trie`,
+      `app_image::{a_late_tie_never_overwrites_a_newer_one,
+      an_image_on_btrfs_is_tied_whatever_order_btrfs_was_loaded_in}`,
+      `open_sensor::a_mount_made_since_the_table_was_read_is_placed_at_once`,
+      `exe_identity::{an_exec_no_mount_places_is_placed_by_its_process,
+      an_exec_s_file_is_the_same_by_its_mount_on_btrfs}`.
+    - Mutation: 51 mutants of the round's code (the registry's rooms and
+      the notes past its limit, the told records, the deferred retire, the
+      slow records and their sweep, the reader's accounts and the
+      published ranges' lookup, the late tie, the btrfs identity, the
+      placing): every one caught by a named test, eight of them by tests
+      written for the survivors of a first run (each of the floor's two
+      guards, the budgeted entries' room, a user's record alone, any mount
+      of the device, the published table and the production reader).
+    - Lab (one guest at a time; this round's code, then main fd58650e on
+      the same guest; each case a check of the defence):
+      - A cold boot after the install and a desktop-like session: Low
+        records only, on the three.
+      - Probe A (one user's own read and its subordinate ids' held in a
+        directory of its own, then another user's programs): the
+        subordinate ids refused at once as that user's, the other user's
+        reads read, the users' share never held (no `exec_readers_held`);
+        an exec from `/tmp` recorded within 11 to 21 ms meanwhile.
+      - Probe B (70 more subordinate ids, each a program whose step waits
+        there): refused as that one user's; 3 degradations listed, the
+        reads not waited for signed; root's module tool R011 Low (logged),
+        as on main.
+      - The f04b AppImage case, the user's ext4 home: no staging verdict,
+        9 of 9 on each (NN-L-NET-007; one run on 7.0 drew no record); the
+        image copied to `/tmp` R001 and CHAIN-002.
+      - A loop-backed btrfs subvolume as the user's data directory, the
+        fork-only child, 10 runs a side: NN-L-NET-008 on 6.8 0 of 10 with
+        this round (main: 8 of 10); on 5.15 0 of 10 (main: 10 of 10, and
+        one of main's main-shape runs CHAIN-002 Critical); on 7.0, btrfs loaded after the agent started, 0 of 10 (main: 10 of 10).
+        The main and fork+exec shapes NN-L-NET-007 only; the `/tmp` control
+        judged (R001, CHAIN-002 Critical) on each.
+      - The first measurement of this round found the subordinate ids
+        counted as themselves: its own reader of `/etc/subuid` ran on a
+        thread without the core's capabilities and could not read the
+        host's file; the reader now counts by the ranges the agent already
+        publishes, and probe A and B were measured again (above).
+      - Guests left clean: agent uninstalled, no `.local`, no pins, no
+        mounts, `fuse.conf` restored, the test users removed, powered off.
+  - Fix round 3 (re-check 2 of #573):
+    - M1: an id from 65536 up the published ranges give no known user —
+      none published (before the first publish; always with the file-open
+      sensor on its tracepoint, which never publishes them), an unreadable
+      `/etc/subuid`, a range whose owner `/etc/passwd` does not name, an id
+      past every range — counted as an account of its own in the users'
+      share: with one read of the user's own uid held, it held the share
+      and every other user's exec facts were judged not verified. Now such
+      ids are one account together in a share of their own (the
+      unattributed ids': one read at a time, one held at most, signed once
+      while held): they can hold each other's reads, never an attributed
+      user's, the system accounts' or root's. §55 and KNOWN_LIMITATIONS
+      say so as behaviour.
+    - M2: an exec no mount places is named by the text of the very file
+      whose identity was checked (the agent's own descriptor of it,
+      `/proc/self/fd/<n>`), not by a second lookup of the process's link.
+    - M3: the at-once re-reads of a mount table after a flagged change are
+      at most 5 a second per table; past them a miss waits for the
+      throttle (2 s), signed (`mount_table_rereads`, naming the thread).
+      The mount points `root_key` and `still_shows` open by path (a plain
+      `open` outside `/proc` and `/sys`) stay as they were: in the
+      backlog.
+    - The tests' assert messages name their case, never a uid.
+    - Named tests: `pump_reads::{unattributed_ids_none_published_starve_no_attributed_user,
+      unattributed_ids_subuid_unreadable_starve_no_attributed_user,
+      unattributed_ids_owner_not_in_passwd_starve_no_attributed_user,
+      unattributed_ids_past_every_range_starve_no_attributed_user}`,
+      `exe_identity::an_unplaced_exec_is_named_by_the_very_file_checked`,
+      `open_sensor::the_at_once_re_reads_are_bounded_and_signed`; the
+      review's probe A2 (its five cases) answered the other user's reads
+      in each, run as a unit probe on this round's tree.
+    - `multiplexer::root_s_module_tool_is_read_while_users_hold_their_share`
+      holds the users' share with users' own uids (it used subordinate ids,
+      which a range another test published could count as one account);
+      its assertions are unchanged.
+    - Mutation: 19 mutants of the round's code (the unattributed ids'
+      accounting, the placing's text, the at-once re-reads' budget), every
+      one caught by a named test, one by a step written for the survivor of
+      a first run (the throttle's re-reads take nothing of the budget).
+    - Lab: none — the round changes the reader's accounting, the text's
+      source and a re-read budget, each measured by the unit tests on the
+      host's kernel.
 
 - **Lot 365 — the pre-alpha's external tester run (Debian 12, the guide of
   #571): release binaries for glibc 2.34, a clear `nn-admin` permission

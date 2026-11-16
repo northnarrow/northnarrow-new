@@ -235,12 +235,30 @@ fn placed_by_process(
     table: &MountTable,
 ) -> Option<String> {
     let link = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
-    let (_, c) = antitamper_bpf::kernel_roots::link_target(&link).ok()?;
+    placed_by_link(&link, kernel, walked, table)
+}
+
+/// [`placed_by_process`] by the process's link `link`. The re-check 2 of
+/// #573 (M2): the text is read from the very file whose identity was
+/// checked — the agent's own descriptor of it (`/proc/self/fd/<n>`: the
+/// kernel's `d_path` of that open file) — never from the link a second
+/// time: a process that re-execs between two lookups of its link could
+/// have had an exec named by the next file's path.
+fn placed_by_link(
+    link: &std::path::Path,
+    kernel: (u64, u64),
+    walked: &str,
+    table: &MountTable,
+) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    let (file, c) = antitamper_bpf::kernel_roots::link_target(link).ok()?;
     let mount = table.mount_of(c.mnt_id)?;
     if !crate::mountinfo::same_exec_file(kernel, &c, Some(mount)) {
         return None;
     }
-    let text = antitamper_bpf::kernel_roots::read_link(&link).ok()?;
+    let own = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let text = antitamper_bpf::kernel_roots::read_link(own).ok()?;
+    drop(file);
     let text = text.to_str()?;
     let last = |p: &str| p.rsplit('/').next().map(str::to_owned);
     (text.starts_with('/') && last(text) == last(walked)).then(|| text.to_owned())
@@ -344,6 +362,39 @@ mod tests {
                 &empty
             ),
             None
+        );
+    }
+
+    /// The re-check 2 of #573 (M2): the path an unplaced exec is given is
+    /// the text of the very file whose identity was checked (the agent's
+    /// descriptor of it), never a second lookup of the link — here a link
+    /// whose own text names the file by another spelling (through a
+    /// directory link), as a re-exec between two lookups would have named
+    /// the next file: the file's own path, not the link's text. Fails where
+    /// the link was read again (f7dd98ce: `…/via/app`).
+    #[test]
+    fn an_unplaced_exec_is_named_by_the_very_file_checked() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("app"), b"x").unwrap();
+        std::os::unix::fs::symlink(&real, t.path().join("via")).unwrap();
+        let link = t.path().join("exe");
+        std::os::unix::fs::symlink(t.path().join("via").join("app"), &link).unwrap();
+        let c =
+            antitamper_bpf::kernel_roots::cached(&std::fs::File::open(real.join("app")).unwrap())
+                .unwrap();
+        let table = MountTable::load();
+        let own = std::fs::canonicalize(real.join("app")).unwrap();
+        assert_eq!(
+            placed_by_link(&link, (c.dev, c.ino), "/subvol/app", &table).as_deref(),
+            own.to_str(),
+            "the checked file's own path"
+        );
+        assert_eq!(
+            placed_by_link(&link, (c.dev, c.ino + 1), "/subvol/app", &table),
+            None,
+            "another file: not placed"
         );
     }
 

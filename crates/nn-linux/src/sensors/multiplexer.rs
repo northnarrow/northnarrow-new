@@ -2779,18 +2779,20 @@ mod tests {
     }
 
     /// Lot 366, the review of #573 (F4, its R011 case): the users' share of
-    /// the exec pumps' reader held by reads that do not answer (a user and
-    /// its subordinate ids) — root's module tool's exec is read as ever: its
-    /// facts are what was read (a clean environment), never the facts of a
-    /// read refused, which R011 kills under ENGAGED. Fails where every read
-    /// shared one bound (bad1b957).
+    /// the exec pumps' reader held by reads that do not answer (users'
+    /// reads: their own uids, which no range of `/etc/subuid` the other
+    /// tests publish can count as one account — the re-check 2 of #573) —
+    /// root's module tool's exec is read as ever: its facts are what was
+    /// read (a clean environment), never the facts of a read refused, which
+    /// R011 kills under ENGAGED. Fails where every read shared one bound
+    /// (bad1b957).
     #[test]
     fn root_s_module_tool_is_read_while_users_hold_their_share() {
         use crate::sensors::pump_reads::{ExecReader, READ_DEADLINE};
         use nn_core::decision::rules::kmod_exec_facts;
         let r = ExecReader::new(READ_DEADLINE);
         let mut releases = Vec::new();
-        for uid in [1000, 100_000, 100_001, 100_002] {
+        for uid in [1000, 1001, 1002, 1003] {
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             releases.push(tx);
             let _ = r.run(uid, "test", move || {

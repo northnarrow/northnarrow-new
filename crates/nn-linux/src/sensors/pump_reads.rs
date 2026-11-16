@@ -18,19 +18,24 @@
 //!   lock a pump takes is held while a read runs.
 //! - **Fair between users.** A read is for the user of the exec's process:
 //!   its uid, or — a subordinate id of `/etc/subuid` (a rootless
-//!   container's) — the user that owns the id's range (`sensors::share_subuid`, as the agent's shares count it;
-//!   the re-check of #573, N3). One user's reads that did not answer hold
-//!   at most one of the reader's helpers, all of its ids together — a
+//!   container's) — the user that owns the id's range, as the agent's
+//!   shares count it (`sensors::share_subuid`; the re-check of #573, N3).
+//!   An id the published ranges give no known user — none published, an
+//!   unreadable `/etc/subuid`, an owner `/etc/passwd` does not name, an id
+//!   past every range — is the unattributed ids', one account together
+//!   (the re-check 2 of #573, M1). One user's reads that did not answer
+//!   hold at most one of the reader's helpers, all of its ids together — a
 //!   second read for that user waits for the first (within its own
 //!   deadline), or is refused at once while the first is held; the users
-//!   together, the system's accounts together and root each have a share
-//!   of their own, so no user can make root's facts unverifiable, nor
-//!   another user's by its subordinate ids. A share used up is signed once
-//!   while it lasts ([`HELD`]). The pump's waits on reads that answered
-//!   slowly add up per user: past a budget, a signed record names the user
-//!   and that the pump was slowed — one record per user and window, its
-//!   reads counted, signed again with its total when the window ends
-//!   ([`SLOW`]).
+//!   together, the unattributed ids (one read held at most), the system's
+//!   accounts together and root each have a share of their own, so no user
+//!   can make root's facts unverifiable, nor another user's by any id it
+//!   holds beside its own: the unattributed ids can hold only each other's
+//!   reads. A share used up is signed once while it lasts ([`HELD`]). The
+//!   pump's waits on reads that answered slowly add up per user: past a
+//!   budget, a signed record names the user and that the pump was slowed —
+//!   one record per user and window, its reads counted, signed again with
+//!   its total when the window ends ([`SLOW`]).
 //! - **Signed, always.** Each kind of the pumps' records has a budget of
 //!   its own in the degradation registry
 //!   ([`crate::boot::degradation::note_kept`]): the slow reads' records
@@ -486,13 +491,23 @@ pub const HELD: &str = "exec_readers_held";
 /// The degradation's source of a uid whose slow reads slowed the pump.
 pub const SLOW: &str = "exec_reads_slow";
 
-/// Who a read is for: root, the system's accounts, or a user — each with a
-/// share of the reader's helpers of its own.
+/// Who a read is for: root, the system's accounts, a user, or an id no
+/// known user is given ([`Pool::Unattributed`]) — each with a share of the
+/// reader's helpers of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Pool {
     Root,
     System,
     Users,
+    /// The re-check 2 of #573 (M1): the ids of the users' range the reader
+    /// cannot give one known user ([`subuid_account`] `None`): every id
+    /// from 65536 up while no ranges are published, or while `/etc/subuid`
+    /// cannot be read; an id of a range whose owner `/etc/passwd` does not
+    /// name, of overlapping ranges or of a gap; an id past every range.
+    /// All of them one account, one read at a time and one held at most:
+    /// they can hold each other's reads, never an attributed user's, the
+    /// system accounts' or root's.
+    Unattributed,
 }
 
 /// The uids below it are the system's accounts (the distributions' first
@@ -508,6 +523,11 @@ const SYSTEM_HIGH: std::ops::RangeInclusive<u32> = 61_184..=65_535;
 const SYSTEM_HIGH_GAP: std::ops::RangeInclusive<u32> = 65_520..=65_533;
 
 impl Pool {
+    /// Every pool, in [`Self::index`]'s order.
+    const ALL: [Pool; 4] = [Pool::Root, Pool::System, Pool::Users, Pool::Unattributed];
+
+    /// The pool of `uid` by the uid alone ([`ExecReader::whose`] puts a
+    /// users' id no known user is given in [`Pool::Unattributed`]).
     fn of(uid: u32) -> Pool {
         match uid {
             0 => Pool::Root,
@@ -527,6 +547,7 @@ impl Pool {
         match self {
             Pool::Root => 2,
             Pool::System | Pool::Users => 2,
+            Pool::Unattributed => 1,
         }
     }
 
@@ -535,17 +556,19 @@ impl Pool {
             Pool::Root => "root's",
             Pool::System => "the system accounts'",
             Pool::Users => "the users'",
+            Pool::Unattributed => "the unattributed ids'",
         }
     }
 }
 
 /// How many reads may run on the reader at once: every share held, and
 /// the pumps' own waits.
-const READS_MAX: usize = 2 + 2 + 2 + 4;
+const READS_MAX: usize = 2 + 2 + 2 + 1 + 4;
 
 /// Whose a read is: its pool, and in it the account it counts against — a
 /// system account's uid, a user (the owner of a subordinate id's range:
-/// [`subuid_account`]); root's reads are root's.
+/// [`subuid_account`]), or [`UNATTRIBUTED`] for every id of
+/// [`Pool::Unattributed`]; root's reads are root's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Whose {
     pool: Pool,
@@ -557,7 +580,7 @@ struct Whose {
 #[derive(Debug, Default)]
 struct Pools {
     busy: HashMap<Whose, bool>,
-    held: [usize; 3],
+    held: [usize; 4],
 }
 
 /// Why a read was not started.
@@ -657,7 +680,7 @@ const _: () =
 /// and every user's.
 const SLOW_RECORDS: usize = SLOW_KEPT + 1;
 /// The shares held: one record per pool at most.
-const HELD_RECORDS: usize = 3;
+const HELD_RECORDS: usize = Pool::ALL.len();
 
 /// One user's (or every user's) slow reads in the current window.
 #[derive(Debug, Clone)]
@@ -718,9 +741,10 @@ pub struct ExecReader {
     freed: Arc<Condvar>,
     slow: Mutex<Slow>,
     unanswered: Mutex<Condition>,
-    held: [Mutex<Condition>; 3],
-    /// The account a user's uid counts against ([`subuid_account`]).
-    owner: fn(u32) -> u32,
+    held: [Mutex<Condition>; 4],
+    /// The account a user's uid counts against ([`subuid_account`]):
+    /// `None`, no known user's ([`Pool::Unattributed`]).
+    owner: fn(u32) -> Option<u32>,
 }
 
 impl std::fmt::Debug for ExecReader {
@@ -738,8 +762,9 @@ impl ExecReader {
         Self::with_owners(deadline, subuid_account)
     }
 
-    /// [`Self::new`], a uid counted as the user `owner` says.
-    fn with_owners(deadline: Duration, owner: fn(u32) -> u32) -> Self {
+    /// [`Self::new`], a uid counted as the user `owner` says (`None`: no
+    /// known user's).
+    fn with_owners(deadline: Duration, owner: fn(u32) -> Option<u32>) -> Self {
         let held = || {
             Mutex::new(Condition::deferred(
                 HELD,
@@ -754,21 +779,29 @@ impl ExecReader {
             freed: Arc::default(),
             slow: Mutex::new(Slow::new(Instant::now())),
             unanswered: Mutex::new(Condition::deferred(UNANSWERED, Duration::from_secs(60), 1)),
-            held: [held(), held(), held()],
+            held: [held(), held(), held(), held()],
             owner,
         }
     }
 
     /// Whose a read of `uid`'s processes' files is: its pool (by the uid),
     /// and the account it counts against — a user's subordinate id, its
-    /// owner's.
+    /// owner's; an id of the users' range no known user is given, the
+    /// unattributed ids' one account (the re-check 2 of #573, M1).
     fn whose(&self, uid: u32) -> Whose {
-        let pool = Pool::of(uid);
-        let account = match pool {
-            Pool::Users => (self.owner)(uid),
-            Pool::Root | Pool::System => uid,
-        };
-        Whose { pool, account }
+        match Pool::of(uid) {
+            Pool::Users => match (self.owner)(uid) {
+                Some(account) => Whose {
+                    pool: Pool::Users,
+                    account,
+                },
+                None => Whose {
+                    pool: Pool::Unattributed,
+                    account: UNATTRIBUTED,
+                },
+            },
+            pool => Whose { pool, account: uid },
+        }
     }
 
     /// `f` (reads of the files of a process of `uid`, `what` in words) run
@@ -895,14 +928,19 @@ impl ExecReader {
     /// A read answered: the conditions of the shares with room again, and
     /// of reads not waited for once none is held, ended (after their hold).
     fn answered(&self) {
+        self.answered_at(Instant::now());
+    }
+
+    /// [`Self::answered`] at `now`.
+    fn answered_at(&self, now: Instant) {
         let held = self.pools.lock().held;
-        for pool in [Pool::Root, Pool::System, Pool::Users] {
+        for pool in Pool::ALL {
             if held[pool.index()] < pool.held_max() {
-                self.held[pool.index()].lock().ended();
+                self.held[pool.index()].lock().ended_at(now);
             }
         }
         if held.iter().all(|n| *n == 0) {
-            self.unanswered.lock().ended();
+            self.unanswered.lock().ended_at(now);
         }
     }
 
@@ -967,7 +1005,7 @@ impl ExecReader {
     /// Whether `uid`'s pool's share is signed held now ([`HELD`]).
     #[cfg(test)]
     fn held_signed(&self, uid: u32) -> bool {
-        self.held[Pool::of(uid).index()].lock().holding()
+        self.held[self.whose(uid).pool.index()].lock().holding()
     }
 
     /// The record signed for user `owner`'s slow reads in this window, if
@@ -982,39 +1020,54 @@ impl ExecReader {
 /// for a subordinate id of `/etc/subuid`, its range's owner's, as the
 /// agent's shares count it ([`crate::sensors::share_subuid::account_of`]:
 /// the ranges published at the agent's start and again when the file
-/// changes; root's ranges one account of their own, a uid no single known
-/// owner holds the overflow account, every uid from 65536 up the overflow
-/// account while the file cannot be read). No uid of the 16-bit range —
-/// root's, a system account's, a user's own — is ever counted as another's.
-fn subuid_account(uid: u32) -> u32 {
+/// changes; root's ranges one account of their own). No uid of the 16-bit
+/// range — root's, a system account's, a user's own — is ever counted as
+/// another's.
+///
+/// The re-check 2 of #573 (M1): `None` — no known user's, the
+/// unattributed ids' account ([`Pool::Unattributed`]) — for an id from
+/// 65536 up the ranges give no single known owner: the overflow row's (an
+/// owner `/etc/passwd` does not name, overlapping ranges, a gap, every
+/// such id while `/etc/subuid` cannot be read), an id past every range,
+/// and every such id while no ranges are published. Counted as itself, it
+/// was a second account of the user that holds it: with one read of its
+/// own uid, it held the users' share.
+fn subuid_account(uid: u32) -> Option<u32> {
     account_in(uid, crate::sensors::share_subuid::account_of)
 }
 
 /// [`subuid_account`] with the published ranges' answer `account_of`.
-fn account_in(uid: u32, account_of: impl Fn(u32) -> Option<u32>) -> u32 {
+fn account_in(uid: u32, account_of: impl Fn(u32) -> Option<u32>) -> Option<u32> {
+    use common::wire::execq::OVERFLOW_SHARE;
     if u64::from(uid) < crate::sensors::share_subuid::ACCOUNTS_END {
-        return uid;
+        return Some(uid);
     }
-    account_of(uid).unwrap_or(uid)
+    account_of(uid).filter(|a| *a != OVERFLOW_SHARE)
 }
+
+/// The account of every id of [`Pool::Unattributed`] (no uid: the
+/// kernel's "no id", as the shares' overflow row).
+const UNATTRIBUTED: u32 = common::wire::execq::OVERFLOW_SHARE;
 
 /// An account of the users' share in words.
 fn account_words(account: u32) -> String {
-    use common::wire::execq::{OVERFLOW_SHARE, ROOT_SUBID_SHARE};
+    use common::wire::execq::ROOT_SUBID_SHARE;
     match account {
-        OVERFLOW_SHARE => "the subordinate ids of no single known user".to_string(),
+        UNATTRIBUTED => "the unattributed ids (no known user's)".to_string(),
         ROOT_SUBID_SHARE => "root's subordinate ids".to_string(),
         n => format!("user {n}"),
     }
 }
 
-/// A uid's processes in words: `uid N's`, or `user O's (uid N)` for a
-/// subordinate id of O's.
+/// A uid's processes in words: `uid N's`, `user O's (uid N)` for a
+/// subordinate id of O's, or the unattributed ids' ([`Pool::Unattributed`]).
 fn of_whom(uid: u32, whose: Whose) -> String {
-    if whose.pool == Pool::Users && whose.account != uid {
-        format!("{}'s (uid {uid})", account_words(whose.account))
-    } else {
-        format!("uid {uid}'s")
+    match whose.pool {
+        Pool::Unattributed => format!("the unattributed ids' (uid {uid}: no known user's)"),
+        Pool::Users if whose.account != uid => {
+            format!("{}'s (uid {uid})", account_words(whose.account))
+        }
+        _ => format!("uid {uid}'s"),
     }
 }
 
@@ -1355,7 +1408,7 @@ mod tests {
     #[test]
     fn one_uid_cannot_starve_root_s_reads() {
         // each uid its own account (the subordinate ids' owners: below)
-        let r = ExecReader::with_owners(Duration::from_millis(50), |u| u);
+        let r = ExecReader::with_owners(Duration::from_millis(50), Some);
         let mut releases = Vec::new();
         let (tx, rx) = channel::<()>();
         releases.push(tx);
@@ -1601,7 +1654,7 @@ mod tests {
         deg::reset_for_tests();
         let _told = deg::KeptTold::new();
         // as many users as ids (each its own account): the most records
-        let r = ExecReader::with_owners(READ_DEADLINE, |u| u);
+        let r = ExecReader::with_owners(READ_DEADLINE, Some);
         let now = Instant::now();
         for uid in 100_000..100_070u32 {
             for _ in 0..3 {
@@ -1668,12 +1721,12 @@ mod tests {
     /// subordinate ids held the share, every other user's reads refused).
     #[test]
     fn one_user_s_subordinate_ids_starve_no_other_user() {
-        fn owners(uid: u32) -> u32 {
-            if (100_000..165_536).contains(&uid) {
+        fn owners(uid: u32) -> Option<u32> {
+            Some(if (100_000..165_536).contains(&uid) {
                 1000
             } else {
                 uid
-            }
+            })
         }
         let r = ExecReader::with_owners(Duration::from_millis(100), owners);
         let mut rel = Vec::new();
@@ -1703,9 +1756,13 @@ mod tests {
     }
 
     /// The re-check of #573 (N3): a subordinate id counts as the account the
-    /// published ranges give it (its owner's; root's ranges', the overflow
-    /// one); a uid of no range as itself; no uid of the 16-bit range as
-    /// another's, whatever the ranges say.
+    /// published ranges give it (its owner's; root's ranges'); no uid of the
+    /// 16-bit range as another's, whatever the ranges say. The re-check 2
+    /// of #573 (M1): an id of no single known owner (the overflow row's) and
+    /// an id of no range are no known user's — the unattributed ids' one
+    /// account, never an account of their own (on f7dd98ce: the overflow
+    /// account and the id itself, each a second account of the user that
+    /// held it).
     #[test]
     fn a_subordinate_id_counts_as_its_owner_never_an_account_s_uid() {
         use common::wire::execq::{OVERFLOW_SHARE, ROOT_SUBID_SHARE};
@@ -1719,27 +1776,50 @@ mod tests {
                 _ => None,
             }
         }
-        fn owners(uid: u32) -> u32 {
+        fn owners(uid: u32) -> Option<u32> {
             account_in(uid, ranges)
         }
-        assert_eq!(account_in(100_000, ranges), 1000);
-        assert_eq!(account_in(165_535, ranges), 1000);
-        assert_eq!(account_in(1_500_000, ranges), ROOT_SUBID_SHARE);
-        assert_eq!(account_in(300_005, ranges), OVERFLOW_SHARE);
-        assert_eq!(account_in(200_000, ranges), 200_000, "no range: itself");
-        for uid in [0, 1, 999, 1001, 60_000, 65_534, 65_535] {
-            assert_eq!(account_in(uid, ranges), uid, "{uid}: never another's");
+        assert_eq!(account_in(100_000, ranges), Some(1000));
+        assert_eq!(account_in(165_535, ranges), Some(1000));
+        assert_eq!(account_in(1_500_000, ranges), Some(ROOT_SUBID_SHARE));
+        assert_eq!(account_in(300_005, ranges), None, "no single known owner");
+        assert_eq!(account_in(200_000, ranges), None, "no range");
+        for (uid, who) in [
+            (0, "root"),
+            (1, "a system account"),
+            (999, "the last system account"),
+            (1001, "a user"),
+            (60_000, "the users' last"),
+            (65_534, "nobody"),
+            (65_535, "the 16-bit range's last"),
+        ] {
+            assert_eq!(account_in(uid, ranges), Some(uid), "{who}: never another's");
         }
-        assert_eq!(account_in(65_536, ranges), 1000, "from the floor up");
+        assert_eq!(account_in(65_536, ranges), Some(1000), "from the floor up");
         let r = ExecReader::with_owners(READ_DEADLINE, owners);
         assert_eq!(r.whose(100_001).account, 1000);
         assert_eq!(r.whose(1001).account, 1001);
         assert!(of_whom(1_500_000, r.whose(1_500_000)).starts_with("root's subordinate ids'"));
+        for uid in [300_005, 200_000] {
+            assert_eq!(
+                r.whose(uid),
+                Whose {
+                    pool: Pool::Unattributed,
+                    account: UNATTRIBUTED
+                },
+                "no known user's: the unattributed ids'"
+            );
+        }
+        assert!(of_whom(200_000, r.whose(200_000)).starts_with("the unattributed ids'"));
+        assert!(account_words(UNATTRIBUTED).starts_with("the unattributed ids"));
     }
 
     /// The re-check of #573 (N3): the agent's reader counts a uid by the
     /// ranges the agent publishes (`share_subuid`'s table, kept for it):
-    /// a subordinate id as its owner's account, root's ranges as theirs.
+    /// a subordinate id as its owner's account, root's ranges as theirs;
+    /// an id of no single known owner, past every range, or of any range
+    /// while none are published, as no known user's (the re-check 2 of
+    /// #573, M1: on f7dd98ce each was an account of the users' share).
     #[test]
     fn the_reader_counts_by_the_ranges_the_agent_publishes() {
         use crate::sensors::share_subuid as s;
@@ -1757,13 +1837,150 @@ mod tests {
         );
         assert_eq!(r.whose(1000).account, 1000);
         assert_eq!(
-            r.whose(500_000).account,
-            common::wire::execq::OVERFLOW_SHARE,
+            r.whose(500_000).pool,
+            Pool::Unattributed,
             "a gap between ranges: no single known owner"
         );
-        assert_eq!(r.whose(2_000_000).account, 2_000_000, "past every range");
+        assert_eq!(
+            r.whose(2_000_000).pool,
+            Pool::Unattributed,
+            "past every range"
+        );
         s::keep(&s::Table::default());
-        assert_eq!(r.whose(100_005).account, 100_005, "none published");
+        assert_eq!(r.whose(100_005).pool, Pool::Unattributed, "none published");
+        assert_eq!(
+            r.whose(1000).account,
+            1000,
+            "a user's own uid, whatever is published"
+        );
+    }
+
+    /// A `/etc/passwd` that names root and alice (1000) alone.
+    const PASSWD_TEXT: &str =
+        "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n";
+
+    /// The re-check 2 of #573 (M1), with the production reader and the
+    /// ranges published as `t`: a read of the user's own uid `own` held, and
+    /// one of `ids[0]`, an id `t` gives no known user — another user's
+    /// reads, root's and a system account's are answered, the users' share
+    /// not held: the id counts in the unattributed ids' share, one read
+    /// held at most, so another unattributed id (`ids[1]`) is refused at
+    /// once, the share signed held once while it lasts. The unattributed
+    /// ids hold each other's reads, never an attributed user's. On f7dd98ce
+    /// the id was a second account of the users' share: with the user's
+    /// own, it held the share, every other user's reads refused (the
+    /// review's probe A2).
+    fn unattributed_ids_starve_no_attributed_user(
+        t: &crate::sensors::share_subuid::Table,
+        own: u32,
+        ids: [u32; 2],
+    ) {
+        use crate::sensors::share_subuid as s;
+        s::keep(t);
+        let r = ExecReader::new(Duration::from_millis(100));
+        for id in ids {
+            assert_eq!(r.whose(id).pool, Pool::Unattributed, "no known user's");
+        }
+        let mut rel = Vec::new();
+        for uid in [own, ids[0]] {
+            let (tx, rx) = channel::<()>();
+            rel.push(tx);
+            let got = r.run(uid, "probe", move || {
+                let _ = rx.recv();
+            });
+            assert!(got.is_err(), "held past its deadline");
+        }
+        assert_eq!(r.unanswered(), 2, "the user's read and the id's held");
+        for _ in 0..10 {
+            assert_eq!(r.run(1001, "probe", || 1), Ok(1), "another user's read");
+            assert_eq!(r.run(0, "probe", || 2), Ok(2), "root's");
+            assert_eq!(r.run(104, "probe", || 3), Ok(3), "a system account's");
+        }
+        assert!(!r.held_signed(1001), "the users' share not held");
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let refused = r.run(ids[1], "probe", || 4);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|why| why.contains("the unattributed ids' share")),
+                "another unattributed id: refused, their share held"
+            );
+        }
+        assert!(t0.elapsed() < Duration::from_millis(100), "refused at once");
+        assert!(
+            r.held_signed(ids[1]),
+            "the unattributed ids' share signed held"
+        );
+        assert_eq!(
+            r.held[Pool::Unattributed.index()].lock().reports(),
+            1,
+            "once per episode"
+        );
+        assert_eq!(r.unanswered(), 2, "no read started for them");
+        // the held reads answer: the share's record ends (past its hold)
+        drop(rel);
+        let t = Instant::now();
+        while r.unanswered() != 0 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        r.answered_at(Instant::now() + Duration::from_secs(61));
+        assert!(!r.held_signed(ids[1]), "ended once the share has room");
+        s::keep(&s::Table::default());
+    }
+
+    /// M1, no ranges published (the file-open sensor on its tracepoint,
+    /// before the first publish): every id from 65536 up is no known
+    /// user's.
+    #[test]
+    fn unattributed_ids_none_published_starve_no_attributed_user() {
+        use crate::sensors::share_subuid as s;
+        let _g = s::PUBLISHED_TEST_LOCK.lock();
+        unattributed_ids_starve_no_attributed_user(&s::Table::default(), 1000, [100_000, 165_535]);
+    }
+
+    /// M1, `/etc/subuid` unreadable: every id from 65536 up is the overflow
+    /// row's — no known user's.
+    #[test]
+    fn unattributed_ids_subuid_unreadable_starve_no_attributed_user() {
+        use crate::sensors::share_subuid as s;
+        let _g = s::PUBLISHED_TEST_LOCK.lock();
+        unattributed_ids_starve_no_attributed_user(&s::unreadable(), 1000, [100_000, 70_000]);
+    }
+
+    /// M1, a range whose owner `/etc/passwd` does not name (an sssd or
+    /// LDAP user's, by name): its ids are the overflow row's — no known
+    /// user's; the named user's ids stay its own.
+    #[test]
+    fn unattributed_ids_owner_not_in_passwd_starve_no_attributed_user() {
+        use crate::sensors::share_subuid as s;
+        let _g = s::PUBLISHED_TEST_LOCK.lock();
+        let t = s::table(
+            &s::ranges("alice:100000:65536\nldapuser:296608:65536\n", PASSWD_TEXT),
+            s::TABLE_MAX,
+        );
+        unattributed_ids_starve_no_attributed_user(&t, 5000, [296_608, 300_000]);
+        s::keep(&t);
+        let r = ExecReader::new(READ_DEADLINE);
+        assert_eq!(
+            r.whose(100_005).account,
+            1000,
+            "a named owner's id: its own"
+        );
+        s::keep(&s::Table::default());
+    }
+
+    /// M1, an id past every range (a range added since the last publish, a
+    /// transient one `/etc/subuid` does not list): no known user's.
+    #[test]
+    fn unattributed_ids_past_every_range_starve_no_attributed_user() {
+        use crate::sensors::share_subuid as s;
+        let _g = s::PUBLISHED_TEST_LOCK.lock();
+        let t = s::table(
+            &s::ranges("alice:100000:65536\nroot:1000000:1000\n", PASSWD_TEXT),
+            s::TABLE_MAX,
+        );
+        unattributed_ids_starve_no_attributed_user(&t, 1000, [2_147_483_648, 2_000_000]);
     }
 
     /// The re-check of #573 (N7): systemd's dynamic users and `nobody` are
@@ -1771,11 +1988,27 @@ mod tests {
     /// the ids past 65535 are the users'.
     #[test]
     fn dynamic_users_and_nobody_are_the_system_s() {
-        for uid in [1, 999, 61_184, 63_000, 65_519, 65_534, 65_535] {
-            assert_eq!(Pool::of(uid), Pool::System, "{uid}");
+        for (uid, who) in [
+            (1, "a system account"),
+            (999, "the last system account"),
+            (61_184, "the first dynamic user"),
+            (63_000, "a dynamic user"),
+            (65_519, "the last dynamic user"),
+            (65_534, "nobody"),
+            (65_535, "the 16-bit range's last"),
+        ] {
+            assert_eq!(Pool::of(uid), Pool::System, "{who}: the system's");
         }
-        for uid in [1000, 60_000, 61_183, 65_520, 65_533, 65_536, 100_000] {
-            assert_eq!(Pool::of(uid), Pool::Users, "{uid}");
+        for (uid, who) in [
+            (1000, "the first user"),
+            (60_000, "the users' last"),
+            (61_183, "below the dynamic users"),
+            (65_520, "the gap's first"),
+            (65_533, "the gap's last"),
+            (65_536, "the first subordinate id"),
+            (100_000, "a subordinate id"),
+        ] {
+            assert_eq!(Pool::of(uid), Pool::Users, "{who}: the users'");
         }
         assert_eq!(Pool::of(0), Pool::Root);
     }
