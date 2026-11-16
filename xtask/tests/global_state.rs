@@ -767,6 +767,42 @@ const STATICS: &[Kept] = &[
         "the host's mount table, read again when it changes",
     ),
     kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "MOUNTS",
+        HostFact,
+        "lot 366: PID 1's mount table by device (whether a file system is a FUSE or network \
+         one), read again when the kernel flags a change, which the exec pumps judge a \
+         process's files against before they ask a file system anything",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "EXEC_READER",
+        Process,
+        "lot 366: the exec pumps' bounded reader (#563's, its helpers reused, at most four \
+         reads unanswered), which runs an exec's reads under a deadline so that a file system \
+         whose server does not answer holds a helper, never a pump",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "NOT_WAITED",
+        Process,
+        "lot 366: the signed condition (a degradation of the exec pumps) while an exec's reads \
+         are not waited for",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "NOT_WAITED_COUNT",
+        Telemetry,
+        "lot 366: the exec reads not waited for since the start (a process total)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "JUDGED_STALE",
+        Telemetry,
+        "lot 366: the anonymous devices the exec pumps left unjudged because the mount table \
+         had changed and was not read again yet (a process total)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/flow_sock.rs",
         "ARMED",
         Kernel,

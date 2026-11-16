@@ -252,6 +252,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
+- Lot 366 (pre-alpha): **a user's FUSE file system cannot hold the exec
+  pumps** (`UPGRADE_NOTES_WAVE4.md` §55). The exec and exec-check pumps
+  read each exec's file and facts without asking a FUSE or network file
+  system anything: a process's file, root and descriptors by the kernel's
+  cached identity; a path walked one name at a time, each file system
+  judged by its device against PID 1's mount table before a name is looked
+  up in it, no symbolic link followed where the fact is about a path; a
+  file opened only once judged. An exec's reads run on the bounded reader
+  (500 ms, at most four unanswered); a fact not read is judged as not
+  verified, never trusted, and signed (`exec_reads_unanswered`). Before, on
+  a host with `user_allow_other` in `/etc/fuse.conf`, a program run from a
+  user's FUSE mount whose daemon stopped answering held the exec pump.
+  The bounded reader (`state_read::TimedReader`) now reuses its free helper
+  threads.
 - Lot 349 (pre-alpha self-protection blockers R001–R003, R090; rc2).
   - **The agent watches its own CPUs (R001).** Root could confine the agent
     to one CPU without touching it: a sibling cgroup put in

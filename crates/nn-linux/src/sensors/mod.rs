@@ -38,6 +38,9 @@ pub mod net_telemetry;
 pub mod open_sensor;
 /// R12b (lab PR 269): the ring pumps on threads of their own.
 pub mod pump;
+/// Lot 366: what the exec pumps may read of a process's files, and how
+/// long they wait for it.
+pub mod pump_reads;
 pub mod reject;
 pub mod ring_drops;
 /// Lot 332 (the review of #551, F1): the subordinate uid ranges the shares'

@@ -170,10 +170,18 @@ const THREADS_WITHOUT_A_CALL: &[(&str, &str, &str)] = &[
          the binaries')",
     ),
     (
+        "crates/nn-linux/src/fuse_testing.rs",
+        ".name(\"nn-test-check\".into())",
+        "lot 366: the tests' check beside a FUSE that answers nothing (`test-util` builds only, \
+         never the binaries')",
+    ),
+    (
         "crates/nn-linux/src/state_read.rs",
         ".name(\"nn-timed-read\".into())",
         "the re-check of #558 (F7): a state read with a deadline, the read its caller made itself \
-         before, on a helper the caller starts — the caller's own sets, inherited; no role",
+         before, on a helper the caller starts — the caller's own sets, inherited; no role (lot \
+         366: a helper free again serves its reader's next read, the exec pumps' too: their \
+         sets, inherited from the pump that made it)",
     ),
     (
         "crates/nn-linux/src/systemd_reload.rs",

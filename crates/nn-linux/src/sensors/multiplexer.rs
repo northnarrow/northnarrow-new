@@ -1476,8 +1476,49 @@ fn resolved<T>(_: &T, mut e: Event) -> (Event, [Option<Event>; 2]) {
 /// the posture's exec arm judges both.
 fn check_resolved(raw: &ExecCheckRaw, e: Event) -> (Event, [Option<Event>; 2]) {
     let (mut e, carried) = resolved(raw, e);
-    crate::sensors::app_image::read(&mut e);
+    // lot 366: a check whose tie reads `/proc` on the pumps' reader, with a
+    // deadline — not waited for, the check goes on unmarked (its image's
+    // program judged); any other noted at once
+    if crate::sensors::app_image::reads_proc(&e) {
+        e = bounded_step(
+            "the exec check's image tie",
+            e,
+            |mut e| {
+                crate::sensors::app_image::read(&mut e);
+                e
+            },
+            |_| {},
+        );
+    } else {
+        crate::sensors::app_image::read(&mut e);
+    }
     (e, carried)
+}
+
+/// Lot 366: an exec pump's reads of `e`'s process (`step`) run on the
+/// pumps' reader and waited for at most [`pump_reads::READ_DEADLINE`]
+/// ([`pump_reads::bounded`]): a file system whose server does not answer
+/// (a user's FUSE file system) holds that reader, never the pump. Not
+/// waited for — signed by the reader — `e` goes on as `not_read` leaves
+/// it: the facts that take trust away set, the ones that give it left out.
+///
+/// [`pump_reads::READ_DEADLINE`]: crate::sensors::pump_reads::READ_DEADLINE
+/// [`pump_reads::bounded`]: crate::sensors::pump_reads::bounded
+fn bounded_step(
+    what: &str,
+    e: Event,
+    step: impl FnOnce(Event) -> Event + Send + 'static,
+    not_read: impl FnOnce(&mut Event),
+) -> Event {
+    let copy = e.clone();
+    match crate::sensors::pump_reads::bounded(what, move || step(copy)) {
+        Ok(read) => read,
+        Err(_) => {
+            let mut e = e;
+            not_read(&mut e);
+            e
+        }
+    }
 }
 
 /// Lot 279: the exec pump's own step — an exec of a kernel-module tool
@@ -1492,13 +1533,48 @@ fn check_resolved(raw: &ExecCheckRaw, e: Event) -> (Event, [Option<Event>; 2]) {
 /// program has its running image compared with the installed shells and
 /// interpreters, first too ([`crate::program_images`]).
 fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<Event>; 2]) {
-    crate::sensors::kmod_exec::read_and_keep(&e);
-    crate::program_images::read_and_keep(&e);
+    // lot 366: each step's reads on the pumps' reader, with a deadline —
+    // only an exec they read anything of hands its step over
+    let e = if crate::sensors::kmod_exec::reads(&e) || crate::program_images::reads(&e) {
+        bounded_step(
+            "a module tool's or a socket program's image",
+            e,
+            |e| {
+                crate::sensors::kmod_exec::read_and_keep(&e);
+                crate::program_images::read_and_keep(&e);
+                e
+            },
+            |e| {
+                crate::sensors::kmod_exec::not_read(e);
+                crate::program_images::not_read(e);
+            },
+        )
+    } else {
+        e
+    };
     let (mut e, carried) = resolved(raw, e);
+    // lot 366: an exec the AppImage record notes in memory alone, at once
+    // (an image's exec noted before the exec-check pump asks for it); one
+    // whose tie reads `/proc`, with the facts below
+    let tie_reads = crate::sensors::app_image::reads_proc(&e);
+    if !tie_reads {
+        crate::sensors::app_image::read(&mut e);
+    }
     // lot 310 (the review of #539): the image, its directory, an
     // interpreter's environment and standard input, read while it runs
-    crate::sensors::exec_facts::read(&mut e);
-    crate::sensors::kmod_exec::note_exec(&e);
+    let e = bounded_step(
+        "the process's image, directory and environment",
+        e,
+        move |mut e| {
+            crate::sensors::exec_facts::read_under(std::path::Path::new("/proc"), &mut e);
+            if tie_reads {
+                crate::sensors::app_image::read(&mut e);
+            }
+            crate::sensors::kmod_exec::note_exec(&e);
+            e
+        },
+        crate::sensors::exec_facts::not_read,
+    );
     (e, carried)
 }
 
@@ -2325,6 +2401,96 @@ mod module_path_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 366: the exec pump's step notes the exec of a possible image (a
+    /// user's file, as the kernel described it) in the AppImage record —
+    /// on the pump, at once, before any reader — so that the exec-check
+    /// pump finds it when the image's program is checked.
+    #[test]
+    fn the_exec_pump_notes_an_image_s_exec() {
+        let pid = 36_620;
+        let mut e =
+            nn_core::decision::rules::testutil::spawn("App.AppImage", "/home/u/App.AppImage");
+        if let Event::ProcessSpawn {
+            pid: p,
+            start_ns,
+            exe,
+            ..
+        } = &mut e
+        {
+            *p = pid;
+            *start_ns = 7_000;
+            *exe = nn_model::ExeIdentity {
+                path: "/home/u/App.AppImage".into(),
+                dev: (8 << 20) | 1,
+                ino: 77,
+                flags: common::wire::exe::exe_flags::KNOWN
+                    | common::wire::exe::exe_flags::TASK_ROOT,
+                ..Default::default()
+            };
+        }
+        assert!(!crate::sensors::app_image::reads_proc(&e));
+        let _ = kmod_read_then_resolved(&ProcessSpawnRaw::zeroed(), e);
+        assert_eq!(
+            crate::sensors::app_image::noted(pid).as_deref(),
+            Some(std::path::Path::new("/home/u/App.AppImage"))
+        );
+    }
+
+    /// Lot 366: an exec step whose reads never answer (a user's FUSE file
+    /// system whose daemon stops answering the agent) is not waited for
+    /// past the deadline: the event goes on judged as not verified
+    /// (`not_read`: an interpreter naming nothing is taken to load the
+    /// caller's code), the read signed, the pump free for the next exec —
+    /// whose step answers.
+    #[test]
+    fn an_exec_step_that_never_answers_is_not_waited_for() {
+        use crate::sensors::pump_reads::READ_DEADLINE;
+        use common::wire::exe::exe_flags::ENV_LOADS;
+        let python = || {
+            let mut e = nn_core::decision::rules::testutil::spawn("python3", "/usr/bin/python3");
+            if let Event::ProcessSpawn { argv, .. } = &mut e {
+                *argv = vec!["python3".into()];
+            }
+            e
+        };
+        let env_loads = |e: &Event| match e {
+            Event::ProcessSpawn { exe, .. } => exe.has(ENV_LOADS),
+            _ => unreachable!(),
+        };
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let before = crate::sensors::pump_reads::counts().0;
+        let t0 = std::time::Instant::now();
+        let out = bounded_step(
+            "test",
+            python(),
+            move |e| {
+                let _ = wait.recv();
+                e
+            },
+            crate::sensors::exec_facts::not_read,
+        );
+        let took = t0.elapsed();
+        assert!(
+            took >= READ_DEADLINE && took < READ_DEADLINE * 10,
+            "{took:?}"
+        );
+        assert!(env_loads(&out), "not verified: not trusted");
+        assert!(
+            crate::sensors::pump_reads::counts().0 > before
+                && crate::sensors::pump_reads::not_waited(),
+            "signed"
+        );
+        // the next exec's step answers: its own result, not the fallback
+        let out = bounded_step(
+            "test",
+            python(),
+            |e| e,
+            crate::sensors::exec_facts::not_read,
+        );
+        assert!(!env_loads(&out));
+        release.send(()).unwrap();
+    }
 
     /// Lot 340 (named): a refused program-type load is marked a known
     /// system probe's as it is decoded only when its loader is proven; the

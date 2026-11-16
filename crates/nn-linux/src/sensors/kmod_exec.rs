@@ -100,6 +100,38 @@ pub fn read_and_keep(event: &Event) {
     }
 }
 
+/// Lot 366: whether [`read_and_keep`] reads anything of `event`: an exec
+/// whose `comm` is a module tool's.
+pub fn reads(event: &Event) -> bool {
+    matches!(event, Event::ProcessSpawn { comm, .. } if KMOD_TOOLS.contains(&comm.as_str()))
+}
+
+/// Lot 366: `event`'s reads were not waited for (a file system whose server
+/// does not answer held them): when it is an exec of a module tool, R011
+/// is told so — its program and environment not checked: refused.
+pub fn not_read(event: &mut Event) {
+    let Event::ProcessSpawn { comm, .. } = &*event else {
+        return;
+    };
+    if !KMOD_TOOLS.contains(&comm.as_str()) {
+        return;
+    }
+    let why = "the exec pump's reads of its process did not answer in time: its program and \
+               environment were not checked"
+        .to_string();
+    kmod_exec_facts::keep(
+        event,
+        ExecFacts {
+            program: Err(why.clone()),
+            environment: Environment::Refused(why),
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+            library_path: None,
+        },
+    );
+}
+
 /// What `event` (an exec) shows of its program and environment, when its
 /// `comm` is a module tool's; `root`: the host's root (`/`; a fixture tree
 /// in tests) the tools' paths are under.
@@ -325,9 +357,11 @@ fn interpreter(
     }
     let dir = proc.join(pid.to_string());
     let link = dir.join("exe");
+    // lot 366: the image's identity from the kernel's cache (a FUSE
+    // file's daemon is not asked)
     let image = antitamper_bpf::kernel_roots::read_link(&link)
         .ok()
-        .zip(antitamper_bpf::kernel_roots::metadata(&link).ok());
+        .zip(antitamper_bpf::kernel_roots::link_target(&link).ok());
     // after the image: still the exec's process (a pid is reused only once
     // it is reaped), with its memory
     let stat = crate::state_read::read_state(dir.join("stat")).ok();
@@ -336,10 +370,7 @@ fn interpreter(
         .and_then(stat_start_ticks)
         .is_some_and(|t| started_at(t, start_ns));
     let (path, id) = match image {
-        Some((path, m)) if ours => (
-            path.to_string_lossy().into_owned(),
-            (stat_dev_to_kernel_dev(m.dev()), m.ino()),
-        ),
+        Some((path, (_, c))) if ours => (path.to_string_lossy().into_owned(), (c.dev, c.ino)),
         // running, its image unreadable: nothing said
         None if ours && stat.as_deref().is_some_and(has_memory) => return None,
         _ => shebang(root, exe)?,
@@ -360,13 +391,19 @@ fn interpreter(
 /// names (`exe`'s path under `root`, opened and checked to be `exe`'s
 /// device and inode; the first 256 bytes, as `binfmt_script` reads them)
 /// — its path and the device and inode it resolves to now. `None` for a
-/// file that is not that one, or is no `#!` script.
+/// file that is not that one, or is no `#!` script. Lot 366: both paths
+/// walked from `root` one name at a time, every file system on the way
+/// judged ([`super::pump_reads`]: a user's FUSE file system is never
+/// asked), the script's through no link, and read only once it is `exe`'s
+/// file.
 fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
-    let f = std::fs::File::open(root.join(exe.path.trim_start_matches('/'))).ok()?;
-    let m = f.metadata().ok()?;
-    if (stat_dev_to_kernel_dev(m.dev()), m.ino()) != (exe.dev, exe.ino) {
+    let judge = super::pump_reads::Judge::host();
+    let w = super::pump_reads::walk_host(root, Path::new(&exe.path), false, &judge).ok()?;
+    if !w.cached.is_file() || (w.cached.dev, w.cached.ino) != (exe.dev, exe.ino) {
         return None;
     }
+    let f =
+        antitamper_bpf::kernel_roots::reopen_fd(&w.file, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
     let mut head = Vec::new();
     f.take(256).read_to_end(&mut head).ok()?;
     let line = head.strip_prefix(b"#!")?;
@@ -377,10 +414,10 @@ fn shebang(root: &Path, exe: &ExeIdentity) -> Option<(String, (u64, u64))> {
         .split(|b| *b == b' ' || *b == b'\t')
         .find(|w| !w.is_empty())?;
     let rel = std::ffi::OsStr::from_bytes(path.strip_prefix(b"/").unwrap_or(path));
-    let m = antitamper_bpf::kernel_roots::metadata(root.join(rel)).ok()?;
+    let m = super::pump_reads::walk_host(root, Path::new(rel), true, &judge).ok()?;
     Some((
         String::from_utf8_lossy(path).into_owned(),
-        (stat_dev_to_kernel_dev(m.dev()), m.ino()),
+        (m.cached.dev, m.cached.ino),
     ))
 }
 
@@ -707,29 +744,50 @@ const MAX_LIBRARY_ENTRIES: usize = 256;
 /// containerd's socket) fills containerd's `opt` directory all the same: a
 /// residual R011 names.
 fn root_only_library_path(value: &str, root: &Path) -> bool {
-    use crate::program_images::root_only_path;
-    let Ok(base) = std::fs::canonicalize(root) else {
-        return false;
-    };
+    root_only_library_path_judged(value, root, &super::pump_reads::Judge::host())
+}
+
+/// [`root_only_library_path`], the file systems judged by `judge`. Lot 366:
+/// walked from `root` one name at a time, every file system on the way
+/// judged ([`super::pump_reads`]): a directory of a user's FUSE file system
+/// named there (or a link into one) is never asked — not kept.
+fn root_only_library_path_judged(
+    value: &str,
+    root: &Path,
+    judge: &super::pump_reads::Judge,
+) -> bool {
     value.split(':').filter(|e| !e.is_empty()).all(|e| {
-        let rel = e.trim_start_matches('/');
-        let Ok(real) = std::fs::canonicalize(base.join(rel)) else {
+        // the directory itself: through no link, no `..`
+        let Ok(dir) = super::pump_reads::walk_host(root, Path::new(e), false, judge) else {
             return false;
         };
-        if real != base.join(rel) || !real.is_dir() || !root_only_path(&real, &base) {
+        let Ok(rel) = dir.path.strip_prefix(root).map(Path::to_path_buf) else {
+            return false;
+        };
+        if !dir.cached.is_dir() || !dir.owner_only {
             return false;
         }
-        let Ok(entries) = std::fs::read_dir(&real) else {
+        let Ok(names) = antitamper_bpf::kernel_roots::reopen_fd(
+            &dir.file,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NONBLOCK,
+        )
+        .and_then(|d| antitamper_bpf::kernel_roots::dir_names_max(d, MAX_LIBRARY_ENTRIES + 1)) else {
             return false;
         };
-        let mut n = 0;
-        entries.into_iter().all(|entry| {
-            n += 1;
-            n <= MAX_LIBRARY_ENTRIES
-                && entry.is_ok_and(|entry| {
-                    std::fs::canonicalize(entry.path()).is_ok_and(|f| root_only_path(&f, &base))
+        // each file in it, its links followed (`libkmod.so` → `libkmod.so.2`)
+        // to a file under the tree's root, that file and every directory
+        // above it there the owner's only
+        names.len() <= MAX_LIBRARY_ENTRIES
+            && names.iter().all(|n| {
+                let Ok(f) = super::pump_reads::walk_host(root, &rel.join(n), true, judge)
+                else {
+                    return false;
+                };
+                f.path.strip_prefix(root).is_ok_and(|rel| {
+                    super::pump_reads::walk_host(root, rel, false, judge)
+                        .is_ok_and(|w| w.owner_only && (w.cached.dev, w.cached.ino) == (f.cached.dev, f.cached.ino))
                 })
-        })
+            })
     })
 }
 
@@ -1353,6 +1411,113 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     use crate::response::proc_ref::proc_start_ns;
+
+    /// Lot 366: the tree a module tool's script and library path are read
+    /// under is a FUSE file system's that answers nothing: neither read
+    /// asks it — no interpreter, the library path not kept, at once (on
+    /// 993795e0 the script's open and the path's `canonicalize` waited on
+    /// the daemon).
+    #[test]
+    fn a_module_tool_s_reads_never_wait_on_a_fuse_that_answers_nothing() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let tmp = tempfile::tempdir().unwrap();
+            let hook = ExeIdentity {
+                path: "/usr/share/initramfs-tools/hooks/kmod".into(),
+                dev: 1,
+                ino: 1,
+                flags: exe_flags::KNOWN,
+                ..Default::default()
+            };
+            // a running process's image on the FUSE: read from the cache
+            let root = builder_root();
+            proc_entry(tmp.path(), 62, 50, 1062, 0, held);
+            interpreter(held, tmp.path(), 61, 1061 * tick(), &hook).is_none()
+                && interpreter(root.path(), tmp.path(), 62, 1062 * tick(), &hook).is_none()
+                && !root_only_library_path("/var/lib/containerd/opt/lib", held)
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor wrong (1)");
+        }
+    }
+
+    /// Lot 366: only an exec whose `comm` is a module tool's is read (and
+    /// so handed to the pumps' reader).
+    #[test]
+    fn only_a_module_tool_s_exec_is_read() {
+        let e = exec_of("modprobe", 36_603, 0, 1, 0, ExeIdentity::default());
+        assert!(reads(&e));
+        let e = exec_of("modprobe2", 36_604, 0, 1, 0, ExeIdentity::default());
+        assert!(!reads(&e));
+    }
+
+    /// Lot 366: an exec of a module tool whose reads were not waited for is
+    /// refused to R011 — its program and environment not checked; any other
+    /// exec keeps no facts.
+    #[test]
+    fn a_module_tool_not_read_in_time_is_refused() {
+        let mut e = exec_of("modprobe", 36_601, 0, 1, 0, ExeIdentity::default());
+        not_read(&mut e);
+        let facts = kmod_exec_facts::of(&e).expect("kept");
+        assert!(facts.refusal().is_some() && facts.program.is_err());
+        assert!(matches!(facts.environment, Environment::Refused(_)));
+        let mut e = exec_of("ls", 36_602, 0, 1, 0, ExeIdentity::default());
+        not_read(&mut e);
+        assert!(kmod_exec_facts::of(&e).is_none());
+    }
+
+    /// Lot 366: an exited script's `#!` line is read through a walk of its
+    /// path from the root, one name at a time, no link followed: a script
+    /// path through a directory that is a link is not read — no interpreter
+    /// said (fails on 993795e0). The same script at its own path is read.
+    #[test]
+    fn a_script_path_through_a_link_is_not_read() {
+        let root = builder_root();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("usr/lib/x")).unwrap();
+        std::fs::write(r.join("usr/lib/x/hook"), b"#!/usr/bin/dash\n").unwrap();
+        std::os::unix::fs::symlink("x", r.join("usr/lib/y")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let via = described(r, "usr/lib/x/hook", "/usr/lib/y/hook");
+        assert_eq!(interpreter(r, tmp.path(), 61, 1061 * tick(), &via), None);
+        let own = described(r, "usr/lib/x/hook", "/usr/lib/x/hook");
+        assert_eq!(
+            interpreter(r, tmp.path(), 61, 1061 * tick(), &own).as_deref(),
+            Some("/usr/bin/dash")
+        );
+    }
+
+    /// Lot 366: a library directory on a file system the judge refuses (a
+    /// user's FUSE file system, or one PID 1's table does not show) is not
+    /// walked into: not kept — the same directory judged local is.
+    #[test]
+    fn a_library_directory_the_judge_refuses_is_not_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        let lib = root.join("opt/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        for d in lib.ancestors().take_while(|d| d.starts_with(&root)) {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let host = super::super::pump_reads::Judge::host();
+        assert!(root_only_library_path_judged("/opt/lib", &root, &host));
+        let none = super::super::pump_reads::Judge::of(&crate::mountinfo::parse(b""));
+        assert!(!root_only_library_path_judged("/opt/lib", &root, &none));
+        // a directory reached through a link (relative, inside the tree,
+        // the owner's): not kept — its own path holds no link
+        std::fs::create_dir_all(root.join("alt")).unwrap();
+        std::fs::set_permissions(root.join("alt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("../opt", root.join("alt/opt")).unwrap();
+        assert!(!root_only_library_path_judged("/alt/opt/lib", &root, &host));
+        // an empty directory its group may write: not kept
+        std::fs::create_dir_all(root.join("opt/empty")).unwrap();
+        std::fs::set_permissions(
+            root.join("opt/empty"),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        assert!(!root_only_library_path_judged("/opt/empty", &root, &host));
+    }
 
     /// `sleep 30` with exactly `env` as its environment.
     /// The review of #556 (F4, named): containerd's `opt` library path is

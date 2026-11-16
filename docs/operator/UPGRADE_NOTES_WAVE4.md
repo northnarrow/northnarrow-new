@@ -4264,3 +4264,56 @@ in `Init`; `unshare -m --propagation shared` the same.
     an NN-L-NET-008 on that rare shape). The nearest process that executed
     (its anchor) is not used: it may have executed since that fork.
 - **Operator action.** None.
+
+## 55. A user's FUSE file system cannot hold the exec pumps (lot 366)
+
+- **What changed.** For each exec, the exec pump and the exec-check pump
+  read the file the process runs and a few facts about it: the directory
+  it was run from, an AppImage's image and daemon, a module tool's script
+  and library path, the image of a program whose stdio is a socket. These
+  reads no longer ask a FUSE or network file system anything:
+  - a process's file, root and descriptors are identified by the kernel's
+    cached identity of the file;
+  - a path is walked one name at a time. Before any name is looked up in a
+    directory, its file system is judged by the device the kernel reports,
+    against PID 1's mount table. FUSE (`fuse`, `fuse.*`, `fuseblk`,
+    `virtiofs`), network file systems (NFS, CIFS/SMB, 9p, Ceph, AFS, …) and
+    a file system the table does not show are not walked;
+  - where the fact is about a path (the directory an image was run from,
+    an AppImage's image, a module tool's script), no symbolic link on the
+    way is followed;
+  - a file is opened for reading only once its file system is judged.
+- **A deadline.** An exec's reads run on the agent's bounded reader:
+  500 ms at most, and at most four unanswered at once (past that, a read
+  is refused at once). The pump goes on either way. An exec the pumps read
+  nothing of (no module tool, no socket program, no AppImage tie to check)
+  is not handed over.
+- **What is judged when a fact is not read.** Not verified, never trusted:
+  - no `ROOT_DIR` and no AppImage tie (`USER_IMAGE`);
+  - an interpreter naming a system script or nothing is taken to load the
+    caller's code, as for an environment larger than the pump reads;
+  - a module tool's program and environment are not checked: R011
+    refuses it, as for an environment it could not read;
+  - the image of a program whose stdio is a socket is unverified:
+    R020 records it.
+- **Signed.**
+  - `exec_reads_unanswered`: a degradation of the exec pumps while an
+    exec's reads do not answer within the deadline (it stands at least
+    60 s once reported).
+  - `exec_pump_mounts`: PID 1's mount table could not be read. The table
+    last read stays in force; a file system mounted since is not trusted.
+- **Before this change.** On a host whose `/etc/fuse.conf` sets
+  `user_allow_other`, a program a user ran from their own FUSE mount
+  (mounted with `allow_other`) whose daemon then stopped answering held the
+  exec pump until the daemon answered; the sensor self-test signed the
+  exec source degraded. Without `user_allow_other` (the default on Debian
+  and Ubuntu) the kernel refuses root's access to a user's FUSE mount at
+  once, and nothing was held.
+- **Residuals, accepted.**
+  - A file system the administrator mounted, served from outside the
+    kernel, of a type outside the list above, is walked as a local one.
+    If its server stops answering, it holds one of the four readers; the
+    pump goes on after 500 ms.
+  - On a slow local disk, an exec whose reads take longer than 500 ms is
+    judged as not verified (signed).
+- **Operator action.** None.

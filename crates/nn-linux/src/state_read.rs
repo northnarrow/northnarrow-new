@@ -86,7 +86,35 @@ pub struct TimedReader {
     deadline: std::time::Duration,
     max: usize,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Lot 366: the helpers free again, each reused before one is made (the
+    /// exec pumps read through one for every exec).
+    idle: std::sync::Arc<parking_lot::Mutex<Vec<Helper>>>,
     stall: parking_lot::Mutex<Option<String>>,
+}
+
+/// A read handed to a helper.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Lot 366: a helper thread's channel. It hands a read over with the
+/// helper's own channel, which the helper puts back among the free ones
+/// once the read answered — and holds none while it waits for the next: a
+/// reader dropped closes them all, and its helpers end.
+#[derive(Debug, Clone)]
+struct Helper(std::sync::mpsc::SyncSender<(Job, Helper)>);
+
+/// A helper's loop: each read it is handed, then itself free again — or,
+/// its reader gone, its end.
+fn helper(
+    rx: std::sync::mpsc::Receiver<(Job, Helper)>,
+    idle: std::sync::Weak<parking_lot::Mutex<Vec<Helper>>>,
+) {
+    while let Ok((job, me)) = rx.recv() {
+        job();
+        match idle.upgrade() {
+            Some(free) => free.lock().push(me),
+            None => return,
+        }
+    }
 }
 
 /// The kernel-state round's reader ([`READ_DEADLINE`], [`STALLED_MAX`]).
@@ -101,14 +129,15 @@ impl TimedReader {
             deadline,
             max,
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            idle: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             stall: parking_lot::Mutex::new(None),
         }
     }
 
-    /// `read` (of `what`, in words) on a helper thread, its answer waited
-    /// for at most the deadline; `Err(why)` past it, or at once while
-    /// `max` earlier reads have not answered — the stall kept for
-    /// [`Self::take_stall`].
+    /// `read` (of `what`, in words) on a helper thread — a free one, or a
+    /// new one — its answer waited for at most the deadline; `Err(why)` past
+    /// it, or at once while `max` earlier reads have not answered — the
+    /// stall kept for [`Self::take_stall`].
     pub fn run<T: Send + 'static>(
         &self,
         what: &str,
@@ -125,16 +154,34 @@ impl TimedReader {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let in_flight = std::sync::Arc::clone(&self.in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("nn-timed-read".into())
-            .spawn(move || {
-                let out = read();
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                let _ = tx.send(out);
-            });
-        if let Err(e) = spawned {
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
+        let mut job: Option<Job> = Some(Box::new(move || {
+            let out = read();
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(out);
+        }));
+        // a free helper first; one gone since is passed over
+        while let Some(j) = job.take() {
+            let Some(h) = self.idle.lock().pop() else {
+                job = Some(j);
+                break;
+            };
+            if let Err(std::sync::mpsc::SendError((back, _))) = h.0.send((j, h.clone())) {
+                job = Some(back);
+            }
+        }
+        if let Some(job) = job {
+            let (htx, hrx) = std::sync::mpsc::sync_channel(1);
+            let h = Helper(htx);
+            // the channel holds one: the read waits there for its helper
+            let _ = h.0.send((job, h.clone()));
+            let idle = std::sync::Arc::downgrade(&self.idle);
+            let spawned = std::thread::Builder::new()
+                .name("nn-timed-read".into())
+                .spawn(move || helper(hrx, idle));
+            if let Err(e) = spawned {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
+            }
         }
         rx.recv_timeout(self.deadline).map_err(|_| {
             self.stalled(format!(
@@ -142,6 +189,11 @@ impl TimedReader {
                 self.deadline.as_millis()
             ))
         })
+    }
+
+    /// Lot 366: the helpers free now.
+    pub fn free_helpers(&self) -> usize {
+        self.idle.lock().len()
     }
 
     /// `path` as [`read_state`] reads it, within the deadline (a timeout is

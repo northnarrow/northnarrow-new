@@ -165,9 +165,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/app_image.rs",
-        3,
+        4,
         "the exec pump's tie itself: an exec in a staging directory is the one it reads, and \
-         a file its daemon holds there is no image it serves (the review of #564, F1)",
+         a file its daemon holds there is no image it serves (the review of #564, F1); lot \
+         366: which exec's tie reads `/proc` (`reads_proc`, the same test as the tie's)",
     ),
 ];
 

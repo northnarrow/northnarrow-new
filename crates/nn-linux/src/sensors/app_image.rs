@@ -42,7 +42,8 @@
 //!     with a cut name names no file: the image's whole path is then that
 //!     daemon's `exe` link (the kernel's `d_path`), taken when it is the
 //!     walk's path name by name (a cut name its start, every other name
-//!     equal, as many names) and through no FUSE mount, before any `stat`;
+//!     equal, as many names), its file's identity from the kernel's cache
+//!     and on a file system that is no FUSE or network one (by its device);
 //!     the image file's checks above, its device and inode, run at that
 //!     whole path, and the tie keeps it. An image named with 31 bytes or
 //!     more (`Bitwarden-2025.1.1-x86_64.AppImage`) was never tied.
@@ -69,6 +70,14 @@
 //! with a socket — is judged as any user program's: the flag takes only
 //! the staging directory away.
 //!
+//! Lot 366: every file the tie reads is read without asking a FUSE or
+//! network file system anything — the image's path walked from the
+//! process's root one name at a time, every file system judged by its
+//! device, no symbolic link followed; a daemon's image and descriptors by
+//! the kernel's cached identity ([`super::pump_reads`]) — and on the exec
+//! pumps' reader, with a deadline: a user's FUSE daemon that stops
+//! answering holds neither pump.
+//!
 //! Residual, said (the review of #564, F2): a malicious AppImage the user
 //! runs is a user program, judged by its behaviour. The kernel ties no
 //! FUSE mount to the process that serves it in a way `/proc` shows (the
@@ -93,11 +102,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use common::wire::exe::{exe_flags, kernel_dev, walk_may_name, walk_path_cut};
+use common::wire::exe::{exe_flags, walk_may_name, walk_path_cut};
 use nn_core::decision::rules::is_staging_path;
 use nn_core::posture::lineage::in_system_tree;
 use nn_model::Event;
@@ -151,6 +159,34 @@ static PUMP: LazyLock<Mutex<AppImages>> = LazyLock::new(Default::default);
 /// The exec pump's step: `event` read under `/proc`.
 pub fn read(event: &mut Event) {
     PUMP.lock().note(Path::new("/proc"), event);
+}
+
+/// Lot 366: the exec of a possible image the pumps' record keeps for the
+/// process `pid` (its path), if any (tests).
+#[cfg(test)]
+pub(crate) fn noted(pid: u32) -> Option<PathBuf> {
+    PUMP.lock().ran.get(&pid).map(|r| r.path.clone())
+}
+
+/// Lot 366: whether [`read`] of `event` reads `/proc` — the tie, or a
+/// check of one: an exec, as the kernel described it, of a file on an
+/// anonymous device (FUSE's kind) under a staging directory. Any other exec
+/// is noted in memory alone — on the pump itself, at once, so that the
+/// exec of an image is noted before the exec-check pump asks for it; one
+/// that reads `/proc` runs on the pumps' bounded reader.
+pub fn reads_proc(event: &Event) -> bool {
+    let (exe, start_ns) = match event {
+        Event::ProcessSpawn { exe, start_ns, .. } => (exe, Some(*start_ns)),
+        Event::ExecCheck { exe, .. } => (exe, None),
+        _ => return false,
+    };
+    exe.has(exe_flags::KNOWN)
+        && start_ns != Some(0)
+        && exe.flags & NOT_PLAIN == 0
+        && exe.root == (0, 0)
+        && exe.path.starts_with('/')
+        && is_staging_path(&exe.path)
+        && exe.dev >> 20 == 0
 }
 
 /// The flags of an identity whose path or file is not the kernel's plain
@@ -375,8 +411,8 @@ fn tie(
     // lot 360 (the review of #568, Q1): the image file's whole path — the
     // walk's when it cut none of its names, else the kernel's own view of it
     // in a daemon that runs that very file (`find_daemon`: its `exe` link
-    // named like the walk's path, name by name, through no FUSE mount, its
-    // device and inode the image's). The walk keeps 31 bytes of a name: an
+    // named like the walk's path, name by name, its device and inode the
+    // image's, its file system no FUSE one by its device). The walk keeps 31 bytes of a name: an
     // image named `Bitwarden-2025.1.1-x86_64.AppImage` was never tied. The
     // cut text only selects the candidates; the kernel's device and inode
     // decide, at the full path then.
@@ -402,38 +438,25 @@ fn tie(
 
 /// The image file `before` ran, at its whole path `path`, read through
 /// `dir`'s root (`/proc/<pid>/root`): still that file there (device and
-/// inode), the user's, linked, a regular file on no FUSE filesystem — and
-/// its path through no FUSE mount (its daemon answers the lookup, or never:
-/// never `stat`ed).
+/// inode), the user's, linked, a regular file on no FUSE filesystem. Lot
+/// 366: walked from that root one name at a time, every file system on the
+/// way judged by its device ([`super::pump_reads`]: a FUSE or network file
+/// system is never asked — its daemon answers a lookup, or never), no
+/// symbolic link followed (a path through a link is no image's).
 fn image_file_at(table: &MountTable, dir: &Path, uid: u32, before: &Ran, path: &Path) -> bool {
-    if under_fuse(table, path) {
-        return false;
-    }
-    let at = dir
-        .join("root")
-        .join(path.strip_prefix("/").unwrap_or(path));
-    // lot 353 (#563's census, at the merge of #564): beneath the /proc root
-    // the start anchored, as every read of the kernel's views
-    let Ok(meta) = antitamper_bpf::kernel_roots::metadata(at) else {
+    let judge = super::pump_reads::Judge::of(table);
+    let Ok(w) = super::pump_reads::walk_in_root(dir, path, &judge) else {
         return false;
     };
-    meta.is_file()
-        && (kernel_dev(meta.dev()), meta.ino()) == (before.dev, before.ino)
-        && meta.uid() == uid
-        && meta.nlink() > 0
+    let c = w.cached;
+    c.is_file()
+        && (c.dev, c.ino) == (before.dev, before.ino)
+        && c.uid == uid
+        && c.nlink > 0
         && !table
             .entries
             .iter()
             .any(|e| e.kernel_dev() == before.dev && is_fuse(&e.fstype))
-}
-
-/// `path` lies under a FUSE mount of `table` (its daemon would answer a
-/// `stat` of it, or never).
-fn under_fuse(table: &MountTable, path: &Path) -> bool {
-    table
-        .entries
-        .iter()
-        .any(|e| is_fuse(&e.fstype) && path.starts_with(&e.mount_point))
 }
 
 /// The filesystem `dev` is still tied as `t` says, for an exec of `path`
@@ -504,18 +527,20 @@ fn daemon_facts(
     image: (u64, u64),
     image_path: &Path,
 ) -> Option<(u64, PathBuf)> {
-    // the link's text first, and through no FUSE mount: its target is then
-    // the image's directory's, never a FUSE file to `stat`
+    // the link's text first: a process named so
     let text = antitamper_bpf::kernel_roots::read_link(dir.join("exe")).ok()?;
     let named = text == image_path
         || image_path
             .to_str()
             .is_some_and(|walk| walk_may_name(walk, text.as_os_str().as_bytes()));
-    if !named || under_fuse(table, &text) {
+    if !named {
         return None;
     }
-    let meta = antitamper_bpf::kernel_roots::metadata(dir.join("exe")).ok()?;
-    if (kernel_dev(meta.dev()), meta.ino()) != image {
+    // lot 366: then its file's identity from the kernel's cache, and its
+    // file system by the mount the kernel reached it through — never by the
+    // link's text, never asked of a FUSE daemon
+    let (_, c) = antitamper_bpf::kernel_roots::link_target(&dir.join("exe")).ok()?;
+    if (c.dev, c.ino) != image || !super::pump_reads::trusted_in(table, &c) {
         return None;
     }
     let status = crate::state_read::read_state(dir.join("status")).ok()?;
@@ -554,8 +579,10 @@ fn daemon_facts(
 /// descriptor of the image inherited). Refused: a regular file under a
 /// staging directory (its link's text), unlinked, on a memory filesystem,
 /// on a FUSE filesystem, or of no mount of PID 1's table (a `memfd`,
-/// another namespace's) — by the descriptor's `fdinfo` mount, so a FUSE
-/// file is never `stat`ed. A pipe, a socket, a device are no image.
+/// another namespace's) — by the descriptor's `fdinfo` mount; lot 366:
+/// each file's identity from the kernel's cache, so a FUSE file put on a
+/// descriptor since is never asked of its daemon. A pipe, a socket, a
+/// device are no image.
 fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
     let fd_dir = dir.join("fd");
     let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(&fd_dir) else {
@@ -582,15 +609,18 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         if is_fuse(&m.fstype) {
             return false;
         }
-        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&fd) else {
+        // lot 366: the file's identity from the kernel's cache (a FUSE
+        // file put on this descriptor since its `fdinfo` was read is not
+        // asked of its daemon)
+        let Ok((_, meta)) = antitamper_bpf::kernel_roots::link_target(&fd) else {
             return false;
         };
         if !meta.is_file() {
             continue;
         }
-        if (kernel_dev(meta.dev()), meta.ino()) == image {
+        if (meta.dev, meta.ino) == image {
             held = true;
-        } else if meta.nlink() == 0
+        } else if meta.nlink == 0
             || matches!(m.fstype.as_bytes(), b"tmpfs" | b"ramfs")
             || is_staging_path(&text.to_string_lossy())
         {
@@ -618,7 +648,8 @@ mod tests {
     //! Lot 355: the AppImage tie, on fixture `/proc` trees.
 
     use super::*;
-    use std::os::unix::fs::symlink;
+    use common::wire::exe::kernel_dev;
+    use std::os::unix::fs::{symlink, MetadataExt};
 
     const INIT_NS: &str = "mnt:[4026531841]";
     const MOUNT: &str = "/tmp/.mount_k355ab";
@@ -712,9 +743,33 @@ mod tests {
             "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
              30 22 0:30 / /tmp rw,nosuid - tmpfs tmpfs rw\n\
              45 30 0:40 / /tmp/sshfs rw,nosuid,nodev - fuse.sshfs h: rw,user_id={uid}\n\
-             {id} {parent} 0:{FUSE_DEV} / {MOUNT} ro,nosuid,nodev - fuse.App.AppImage App.AppImage {super_opts}\n"
+             {id} {parent} 0:{FUSE_DEV} / {MOUNT} ro,nosuid,nodev - fuse.App.AppImage App.AppImage {super_opts}\n{}",
+            real_mounts()
         );
         std::fs::write(root.join("1/mountinfo"), text).unwrap();
+    }
+
+    /// Lot 366: the mounts a walk from `/` to the fixtures' files crosses,
+    /// as the kernel reached them (mount id and device), for the fixture's
+    /// table — a walk is judged by them (a local file system's type).
+    fn real_mounts() -> String {
+        let dir = std::env::current_exe().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = String::new();
+        for a in dir.parent().unwrap().ancestors() {
+            let f = std::fs::File::open(a).unwrap();
+            let c = antitamper_bpf::kernel_roots::cached(&f).unwrap();
+            if seen.insert((c.mnt_id, c.dev)) {
+                out += &format!(
+                    "{} 1 {}:{} / /real{} rw - ext4 real rw\n",
+                    c.mnt_id,
+                    c.dev >> 20,
+                    c.dev & 0xfffff,
+                    seen.len()
+                );
+            }
+        }
+        out
     }
 
     fn fixture() -> Fixture {
@@ -1242,6 +1297,82 @@ mod tests {
         std::fs::write(root.join("1/mountinfo"), t).unwrap();
     }
 
+    /// Lot 366: only an exec whose tie reads `/proc` — a file on an
+    /// anonymous device under a staging directory, as the kernel described
+    /// it, or a check of one — is handed to the pumps' reader; any other is
+    /// noted in memory, on the pump (the image's exec at once, before the
+    /// exec-check pump asks for it). And what such an exec notes is the
+    /// same either way: the image's exec, then its program tied.
+    #[test]
+    fn only_an_exec_whose_tie_reads_proc_is_handed_over() {
+        let f = fixture();
+        let image = image_of(&f);
+        let first = exec(RUNTIME, me(), image, id_of(&f.image), image, IMAGE_EXEC_NS);
+        assert!(!reads_proc(&first), "the image's exec: noted in memory");
+        let program = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        assert!(reads_proc(&program), "a FUSE file under /tmp: the tie");
+        assert!(reads_proc(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun())));
+        let disk = exec(RUNTIME, me(), &apprun(), ((8 << 20) | 1, 2), &apprun(), 50);
+        assert!(!reads_proc(&disk), "a disk's device under /tmp: never tied");
+        let mut unknown = program.clone();
+        if let Event::ProcessSpawn { exe, .. } = &mut unknown {
+            exe.flags &= !exe_flags::KNOWN;
+        }
+        assert!(!reads_proc(&unknown), "no kernel identity");
+        let mut images = AppImages::default();
+        let mut first = first;
+        images.note(f.proc.path(), &mut first);
+        assert!(images.ran.contains_key(&RUNTIME), "noted without /proc");
+        let mut program = program;
+        images.note(f.proc.path(), &mut program);
+        assert!(user_image(&program));
+    }
+
+    /// Lot 366: the runtime's root a FUSE file system's that answers
+    /// nothing: the tie never asks it — no tie, at once (on 993795e0 the
+    /// `metadata` of that root waited on the daemon, and both exec pumps
+    /// with it, through the shared record).
+    #[test]
+    fn the_tie_never_waits_on_a_fuse_that_answers_nothing() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let f = fixture();
+            let d = f.proc.path().join(RUNTIME.to_string());
+            std::fs::remove_file(d.join("root")).unwrap();
+            symlink(held, d.join("root")).unwrap();
+            !run(&mut AppImages::default(), &f, me(), &apprun())
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor tied (1)");
+        }
+    }
+
+    /// Lot 366: the image file is walked from the process's root one name
+    /// at a time, no link followed — an image path through a directory that
+    /// is a link is no image's: no tie (fails on 993795e0).
+    #[test]
+    fn an_image_path_through_a_link_is_no_tie() {
+        let f = fixture();
+        let uid = me();
+        let fz = f._files.path().join("fz");
+        std::fs::create_dir(&fz).unwrap();
+        let real = fz.join("App.AppImage");
+        std::fs::write(&real, b"\x7fELF runtime + squashfs").unwrap();
+        let a = f._files.path().join("a");
+        symlink(&fz, &a).unwrap();
+        let via = a.join("App.AppImage");
+        daemon(f.proc.path(), DAEMON, &via, uid, "S", FRESH, true);
+        let mut images = AppImages::default();
+        let p = via.to_str().unwrap();
+        let mut first = exec(RUNTIME, uid, p, id_of(&real), p, IMAGE_EXEC_NS);
+        images.note(f.proc.path(), &mut first);
+        let mut e = exec(RUNTIME, uid, &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e), "tied through a link");
+        // the image at its own path: tied
+        let f = fixture();
+        assert!(run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
     /// No image: a `fuseblk` filesystem, one shown only by a mount of a
     /// directory of it, a file mounted as the mount point itself, an image
     /// file on a FUSE filesystem.
@@ -1251,7 +1382,8 @@ mod tests {
         let fuse = |fstype: &str, root: &str| {
             format!(
                 "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:30 / /tmp rw - tmpfs tmpfs rw\n\
-                 61 30 0:{FUSE_DEV} {root} {MOUNT} ro,nosuid - {fstype} x ro,user_id={uid}\n"
+                 61 30 0:{FUSE_DEV} {root} {MOUNT} ro,nosuid - {fstype} x ro,user_id={uid}\n{}",
+                real_mounts()
             )
         };
         for (fstype, root) in [("fuseblk", "/"), ("fuse.App.AppImage", "/sub")] {
@@ -1535,14 +1667,23 @@ mod tests {
     fn the_image_s_path_is_never_read_through_a_fuse_mount() {
         let f = fixture();
         let uid = me();
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={uid},allow_other",
-                f._files.path().display()
-            ),
-        );
+        assert_eq!(uid, me());
+        table_plus(f.proc.path(), &fuse_line(f._files.path()));
         assert!(!run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
+    /// Lot 366: a FUSE mount at `path`, of the file system the kernel
+    /// reports `path` on (its device): the pumps judge a file system by the
+    /// device the kernel reached a file through, never by a path's text.
+    fn fuse_line(path: &Path) -> String {
+        let c = antitamper_bpf::kernel_roots::cached(&std::fs::File::open(path).unwrap()).unwrap();
+        format!(
+            "70 22 {}:{} / {} rw,nosuid - fuse.sshfs h: rw,user_id={},allow_other",
+            c.dev >> 20,
+            c.dev & 0xfffff,
+            path.display(),
+            me()
+        )
     }
 
     /// The LSM walk's text of `path` (`common::wire::exe::relative_path`):
@@ -1681,14 +1822,7 @@ mod tests {
         // walk's text)
         let f = fixture_at(&format!("{dir}/{long}"));
         daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
-                f.image.parent().unwrap().display(),
-                me()
-            ),
-        );
+        table_plus(f.proc.path(), &fuse_line(f.image.parent().unwrap()));
         assert!(!run_walked(&mut AppImages::default(), &f), "a FUSE mount");
         // tied, then a FUSE mount over the image's directory: the tie ends
         // (the daemon's link is read through it: never `stat`ed)
@@ -1696,14 +1830,7 @@ mod tests {
         daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
         let mut images = AppImages::default();
         assert!(run_walked(&mut images, &f));
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
-                f.image.parent().unwrap().display(),
-                me()
-            ),
-        );
+        table_plus(f.proc.path(), &fuse_line(f.image.parent().unwrap()));
         let program = format!("{MOUNT}/usr/bin/app");
         let mut later = exec(
             RUNTIME + 1,
@@ -1764,7 +1891,8 @@ mod tests {
             f.proc.path().join("1/mountinfo"),
             format!(
                 "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:30 / /tmp rw - tmpfs tmpfs rw\n\
-                 61 30 8:{FUSE_DEV} / {MOUNT} ro,nosuid - fuse.App.AppImage x ro,user_id={uid}\n"
+                 61 30 8:{FUSE_DEV} / {MOUNT} ro,nosuid - fuse.App.AppImage x ro,user_id={uid}\n{}",
+                real_mounts()
             ),
         )
         .unwrap();

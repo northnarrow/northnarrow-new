@@ -11826,6 +11826,57 @@ number in parentheses is a lab PR.
     among its matches; the home reference NET-007 only. Guests left clean
     (agent uninstalled, no `.local`, packages purged, no mounts), powered
     off.
+- **Lot 366 — the pre-alpha: no user's FUSE file system can hold the exec
+  pumps (the review of #571, F1; the re-check of #564, N1; C14, no level
+  changes).**
+  - What was open: on a host whose `/etc/fuse.conf` sets
+    `user_allow_other`, a program a user ran from their own FUSE mount
+    (`allow_other`) whose daemon then stopped answering the agent held the
+    exec pump: it asked the daemon about the process's image and waited, and
+    the AppImage tie, the module tools' and the socket programs' reads asked
+    such a file system too. Without `user_allow_other` the kernel refuses
+    root at once.
+  - Done: `kernel_roots::cached`, `link_target` and `walk_judged` (the
+    kernel's cached identity; a process's link followed alone; a path walked
+    one name at a time, each file system judged before a name is looked up
+    in it); `sensors::pump_reads` (the judge, by device against PID 1's
+    mount table; the walks and the judged open; the pumps' bounded reader,
+    `state_read::TimedReader`, which now reuses its helpers; signed
+    `exec_reads_unanswered`); every read of `exec_facts`, `app_image`,
+    `kmod_exec` and `program_images` goes through them, and a fact not read
+    is judged as not verified. Only an exec whose step reads anything is
+    handed to the reader; the AppImage record notes an image's exec on the
+    pump itself. Ratchet `xtask/tests/pump_reads.rs`. Named tests: the four
+    sites beside a FUSE that answers nothing (`fuse_testing::
+    answers_beside_a_held_fuse`), the three path-through-a-link cases, the
+    judge, the walk, the reader, the steps' fallbacks; the seven that use
+    the existing API fail on 993795e0. Mutation on the new code: 41
+    mutants, 40 caught by a named test, one argued equivalent (the library
+    entry's second walk, over a path the first walk resolved, follows or
+    not: it holds no link).
+  - Lab (one guest at a time; an unprivileged user's FUSE mount, through
+    `fusermount3`, whose daemon answers its own user and never the agent's
+    threads, held 60 s; an exec of a program on it):
+    - Before (993795e0): with `user_allow_other` and `allow_other`, one
+      request of the exec pump's thread held for the daemon's whole 60 s
+      on ubuntu2204 (5.15, `GETATTR`), ubuntu2404 (6.8, `STATX`) and
+      ubuntu2604 (7.0, `STATX`); a later exec from `/tmp` drew no record
+      within 20 s on 5.15 and 7.0 (on 6.8 the exec-check pump judged it);
+      the sensor self-test signed `exec (process_spawn)` missed
+      (`subsystem_degraded`). Without `allow_other` (the default
+      `fuse.conf`): no request reached the daemon.
+    - After: no request reached the daemon on the three kernels; the later
+      exec was recorded within 10 to 17 ms; nothing signed degraded.
+    - The AppImage case of lot 355 (Phase 4b's, enforcing profile, three
+      runs per shape): the main process, the zygote's fork+exec child and
+      its fork-only child NN-L-NET-007 Medium only, 9 of 9 runs on each of the
+      three kernels; the image
+      copied to `/tmp` R001 and killed. Found in this lab and fixed before
+      the PR: with two reader hops per exec, the exec pump fell behind the
+      exec-check pump on 7.0 and an `AppRun` check found no image's exec
+      yet (3 of 9 runs drew R001; 993795e0 0 of 9).
+    - Guests left clean: agent uninstalled, no `.local`, no pins,
+      `fuse.conf` restored, powered off.
 - **Lot 359 — the pin directory's lock (N4 of the re-check 3 of #567),
   and the re-check 3's P3s (pre-alpha; C23; no level change).**
   - What was open: the unmount hook runs before the kernel's namespace
