@@ -309,6 +309,25 @@ fn the_decision_thread_writes_no_file_and_signals_no_other_process() {
     let _ = child.wait();
 }
 
+type Facts = (Option<u32>, Option<String>, Option<(String, [u8; 32])>);
+
+/// The three facts of `pid`/`kid`, asked again (up to 30 s) until each is
+/// there: `trusted_exe` answers "not trusted" when its bounded reader
+/// misses its deadline (a cold, large image on a loaded runner).
+fn facts_within(facts: &crate::decision_host_linux::ProcFacts, me: u32, kid: u32) -> Facts {
+    use nn_core::decision::rule_policy::ActorFacts;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let got = (facts.uid(me), facts.cgroup(me), facts.trusted_exe(kid));
+        if (got.0.is_some() && got.1.is_some() && got.2.is_some())
+            || std::time::Instant::now() >= end
+        {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Lot 353 (fix round 5, the KVM suites of #563; named): under its own
 /// filter, which refuses `openat2` whatever it asks, the decision thread
 /// reads the kernel's views beneath the roots the start anchored — a
@@ -323,7 +342,6 @@ fn the_decision_thread_writes_no_file_and_signals_no_other_process() {
 fn the_decision_thread_reads_the_kernel_s_views_under_its_filter() {
     use crate::decision_host_linux::ProcFacts;
     use antitamper_bpf::kernel_roots as kr;
-    use nn_core::decision::rule_policy::ActorFacts;
     assert!(kr::init().is_empty(), "{:?}", kr::init());
     let mut child = std::process::Command::new("/usr/bin/sleep")
         .arg("30")
@@ -331,13 +349,22 @@ fn the_decision_thread_reads_the_kernel_s_views_under_its_filter() {
         .unwrap();
     let kid = child.id();
     let me = std::process::id();
-    // the answers of a thread with no filter
+    // the answers of a thread with no filter. `trusted_exe` is bounded by
+    // a deadline (lot 357): on a runner whose `sleep` is a large multicall
+    // image (uutils on Ubuntu 26.04) read cold, the first answer can come
+    // after it, and only fills the digest cache. So the facts are asked
+    // again until they are all there, up to a generous bound: the premise
+    // is made, not assumed, and a host that never gives them fails here
+    // saying which fact is missing.
     let facts = ProcFacts::default();
-    let want = (facts.uid(me), facts.cgroup(me), facts.trusted_exe(kid));
+    let want = facts_within(&facts, me, kid);
     // (no fact printed: a uid)
     assert!(
         want.0.is_some() && want.1.is_some() && want.2.is_some(),
-        "no facts to compare here"
+        "no facts to compare here (uid: {}, cgroup: {}, exe: {})",
+        want.0.is_some(),
+        want.1.is_some(),
+        want.2.is_some()
     );
     let want_link = kr::read_link(format!("/proc/{kid}/exe")).unwrap();
     let want_names = kr::read_dir(format!("/proc/{kid}/task")).unwrap();
@@ -345,7 +372,10 @@ fn the_decision_thread_reads_the_kernel_s_views_under_its_filter() {
         let e = enter(Role::Decision).unwrap();
         assert_eq!(e.filter, Some(Ok(())), "{}", e.line());
         let facts = ProcFacts::default();
-        let got = (facts.uid(me), facts.cgroup(me), facts.trusted_exe(kid));
+        // the same bound under the filter: the image is now warm, but a
+        // slow answer must not read as a refusal; a filter that refuses
+        // every open never answers, and still fails below
+        let got = facts_within(&facts, me, kid);
         assert!(
             got == want,
             "the decision's facts under its filter are not the unfiltered thread's"
