@@ -1058,9 +1058,17 @@ mod tests {
     #[test]
     fn the_remakes_of_a_round_share_one_deadline() {
         let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        // The failure text may carry the trusted-binary check's refused paths:
+        // the messages name the expectation only, never the text itself.
         match remake(Path::new(ROOT), past) {
-            Outcome::Failed(why) => assert!(why.contains("no time left"), "{why}"),
-            o => panic!("{o:?}"),
+            Outcome::Failed(why) => assert!(
+                why.contains("no time left"),
+                "the remake past its deadline fails for the deadline"
+            ),
+            o => panic!(
+                "expected Outcome::Failed, got {:?}",
+                std::mem::discriminant(&o)
+            ),
         }
         let src = include_str!("pin_lock.rs");
         let code = &src[..src.find("#[cfg(test)]").unwrap()];
