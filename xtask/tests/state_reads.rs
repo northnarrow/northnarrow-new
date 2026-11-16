@@ -440,12 +440,12 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/decision_host_linux.rs",
-        "read_state(self.root.join(pid.to_string()).join(\"status\"))",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
         PROC,
     ),
     (
         "crates/nn-linux/src/decision_host_linux.rs",
-        "read_state(self.root.join(pid.to_string()).join(\"cgroup\"))",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"cgroup\"))",
         PROC,
     ),
     (

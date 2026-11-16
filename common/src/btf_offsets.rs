@@ -2945,13 +2945,14 @@ mod tests {
 
     /// Lockstep guard: if a const is added/removed without updating
     /// REVALIDATE (or vice-versa), this count trips. 41 offsets
-    /// (at-authz-1 added FILE_F_MODE_OFFSET).
+    /// (at-authz-1 added FILE_F_MODE_OFFSET); the re-check 2 of #567 two
+    /// more (`mount.mnt_mounts`, `.mnt_child`, slots 152–153).
     #[test]
     fn revalidate_table_is_complete() {
         assert_eq!(
             REVALIDATE.len(),
-            151,
-            "REVALIDATE must cover all 151 offsets"
+            153,
+            "REVALIDATE must cover all 153 offsets"
         );
     }
 

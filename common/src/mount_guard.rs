@@ -2731,6 +2731,45 @@ mod tests {
         assert_eq!(umount_below(&d, root), Below::Takes);
     }
 
+    /// Fix round 3 of #567, the mutation round on the final walk (two
+    /// survivors): a held mount read 32nd is found, one 33rd is not read
+    /// (the subtree then not read whole); a peer group read early counts
+    /// when the walk ends later, past private mounts.
+    #[test]
+    fn the_walk_reads_exactly_its_bound_and_every_group_read() {
+        let flat = |before: u32| {
+            let mut f = Forest::new();
+            let root = f.mount(0, "/", 1);
+            let top = f.mount(root, "old", 0);
+            for _ in 0..before {
+                f.mount(top, "m", 0);
+            }
+            let held = f.mount(top, "bpf", 0);
+            f.held_root(held);
+            f.m[held].held_id = true;
+            f.guarded = true;
+            (f, top)
+        };
+        let (f, top) = flat(SUBTREE_MAX - 1);
+        assert_eq!(umount_below(&f, top), Below::Takes, "the 32nd mount read");
+        let (f, top) = flat(SUBTREE_MAX);
+        assert_eq!(
+            umount_below(&f, top),
+            Below::Unread { reaches: false },
+            "a 33rd mount is not read"
+        );
+        // a parent in a peer group read early, private mounts past the bound
+        let mut f = Forest::new();
+        let root = f.mount(0, "/", 1);
+        let top = f.mount(root, "old", 0);
+        let shared = f.mount(top, "s", 9);
+        f.mount(shared, "c", 0);
+        for _ in 0..SUBTREE_MAX {
+            f.mount(top, "m", 0);
+        }
+        assert_eq!(umount_below(&f, top), Below::Unread { reaches: true });
+    }
+
     /// N3, the bound: a subtree wider than [`SUBTREE_MAX`] mounts. A
     /// container runtime's old root after `pivot_root` (every mount a slave:
     /// no group) is let through in its own namespace; in a guarded one it
