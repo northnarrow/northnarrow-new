@@ -463,7 +463,8 @@ mod tests {
         let v = judge(entries().into_iter(), s);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].lost, Lost::Replaced);
-        assert!(repin(&v[0]).is_err());
+        let e = repin(&v[0]).unwrap_err().to_string();
+        assert!(e.contains("its pin names another object"), "{e}");
     }
 
     /// Named test: an unreadable pin is told with its error, not taken for
@@ -505,6 +506,43 @@ mod tests {
         assert_eq!(std::mem::size_of::<ObjAttr>(), 16);
         assert_eq!(common::bpf_cmd::BPF_OBJ_PIN, 6);
         assert_eq!(common::bpf_cmd::BPF_OBJ_GET, 7);
+    }
+
+    /// Named test: a pin held again at the same path replaces the earlier
+    /// entry (the earlier object is no longer that pin's); a removed pin is
+    /// never pinned into a directory that is another one now.
+    #[test]
+    fn keep_replaces_the_same_path_and_repin_checks_the_directory() {
+        let d = std::env::temp_dir().join(format!("nn-held-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let pin = d.join("link_x");
+        std::fs::write(&pin, b"").unwrap();
+        let null = || Holder::Own(std::fs::File::open("/dev/null").unwrap().into());
+        keep(&pin, Kind::Link, 5, null());
+        keep(&pin, Kind::Link, 6, null());
+        let mine: Vec<u32> = held_now()
+            .into_iter()
+            .filter(|(p, ..)| *p == pin)
+            .map(|(_, _, id)| id)
+            .collect();
+        assert_eq!(mine, vec![6]);
+        {
+            let mut h = held();
+            let e = h.iter_mut().find(|e| e.path == pin).unwrap();
+            e.dir = (0, 0);
+        }
+        std::fs::remove_file(&pin).unwrap();
+        let v = Vanished {
+            path: pin.clone(),
+            kind: Kind::Link,
+            id: 6,
+            lost: Lost::Removed,
+        };
+        let e = repin(&v).unwrap_err().to_string();
+        assert!(e.contains("its directory is another one now"), "{e}");
+        assert!(!pin.exists());
+        assert_eq!(release(&d), 1);
+        let _ = std::fs::remove_dir(&d);
     }
 
     /// Named test: the agent's own purge drops the descriptors it holds for
