@@ -410,7 +410,7 @@ mod tests {
         // the operator's sudo, its monitor (a fork of it that executed
         // nothing, root's: the kernel's fork record), the script it forked
         lineage.ingest_host_exec(750, 700, "/usr/bin/sudo", (12, 12), 1000, 0);
-        lineage.ingest_kernel_fork(751, 13, 750, 0, 42);
+        lineage.ingest_kernel_fork(751, 13, (750, 0), 0, 42);
         lineage.ingest_first_exec(752, 751, "/home/alice/nn/deploy/uninstall.sh", 14, 0);
         let rule = R009RootExecFromUserPath::new(lineage.clone());
         let run = |pid: u32, ppid: u32, path: &str| {

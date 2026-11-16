@@ -187,8 +187,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0082", "DC0078", "DC0034"],
         observes: "An outbound flow (at its connect, while it is open, at its close) from a \
                    process whose image lies in `/tmp`, `/var/tmp` or `/dev/shm` (named from \
-                   the spawn cache or `/proc`), other than one to port 53 of a configured \
-                   resolver. A process of a root package transaction is recorded (Log), not \
+                   the spawn cache, from the connect's kernel fork record for a process that \
+                   executed nothing since its fork — its forker's image, lot 360 — or from \
+                   `/proc`), other than one to port 53 of a configured resolver. A flow whose \
+                   image is not known is not judged by a path. A process of a root package \
+                   transaction is recorded (Log), not \
                    killed. To port 53 of a server that is no configured resolver — a match new in lab PR 224, \
                    which exempts only the host's resolvers — the kill is held behind the \
                    per-rule response policy (off by default): recorded at the same severity.",
@@ -198,7 +201,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           NN-L-CHAIN-002/005's (they run first). Lot 355: an AppImage's \
                           programs (its runtime's read-only `/tmp/.mount_*`, tied to the image \
                           by the exec pump; the spawn cache keeps it for their forks) are the \
-                          image's, not staged.",
+                          image's, not staged. Lot 360: a zygote's fork-only child is its \
+                          forker's, by the connect's fork record, also when it exits at once; \
+                          an image whose file name is 31 bytes or more is tied as well.",
         how_to_test: "In detect-only (R001 would kill the exec first), run a copy of `python3` \
                       from `/tmp` that connects more than 5 minutes after its exec, when the \
                       chain precursor is gone: `cp /usr/bin/python3 /tmp/nn-py; /tmp/nn-py -c \
@@ -209,6 +214,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/net.rs::net_008_spares_an_appimage_program",
             "crates/nn-core/src/decision/rules/net.rs::net_008_covers_every_staging_directory",
             "crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction",
+            "crates/nn-linux/src/sensors/multiplexer.rs::an_appimage_s_fork_only_child_exiting_at_once_draws_no_net_008",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_staged_binary_and_its_fork_only_children_keep_net_008",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_staged_binary_executed_in_place_before_its_fork_keeps_net_008",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_reused_forker_pid_lends_its_earlier_holder_s_exec_to_no_fork",
+            "crates/nn-linux/src/sensors/multiplexer.rs::a_fork_on_a_reused_pid_is_not_named_by_its_earlier_holder_s_exec",
         ],
         attack_note: "A staged payload calling out is mapped to its likeliest purpose, \
                       fetching the next stage (T1105); the flow's protocol is not seen, and a \

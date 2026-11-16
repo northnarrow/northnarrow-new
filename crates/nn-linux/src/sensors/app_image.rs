@@ -37,6 +37,15 @@
 //!     FUSE daemon serving its own image. The runtime's documented
 //!     `TARGET_APPIMAGE` makes a legit image serve another file: its daemon
 //!     holds that file, not the image (the review of #564, F1).
+//!   - lot 360 (the review of #568, Q1): the image file's path is the
+//!     LSM walk's, which keeps 31 bytes of each name (marked cut). A path
+//!     with a cut name names no file: the image's whole path is then that
+//!     daemon's `exe` link (the kernel's `d_path`), taken when it is the
+//!     walk's path name by name (a cut name its start, every other name
+//!     equal, as many names) and through no FUSE mount, before any `stat`;
+//!     the image file's checks above, its device and inode, run at that
+//!     whole path, and the tie keeps it. An image named with 31 bytes or
+//!     more (`Bitwarden-2025.1.1-x86_64.AppImage`) was never tied.
 //! - **tied** — a later exec of a file on that filesystem (`AppRun`'s exec
 //!   of the program, a zygote's `/proc/self/exe`, a helper) by the same
 //!   user, while the mount (its id and device) is still there and still such
@@ -88,7 +97,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use common::wire::exe::{exe_flags, kernel_dev};
+use common::wire::exe::{exe_flags, kernel_dev, walk_may_name, walk_path_cut};
 use nn_core::decision::rules::is_staging_path;
 use nn_core::posture::lineage::in_system_tree;
 use nn_model::Event;
@@ -363,42 +372,68 @@ fn tie(
     {
         return None;
     }
-    // the image file: still that file at its path, the user's, linked, a
-    // regular file on no FUSE filesystem — and its path through no FUSE
-    // mount (its daemon answers the lookup, or never: never `stat`ed)
-    if table
-        .entries
-        .iter()
-        .any(|e| is_fuse(&e.fstype) && before.path.starts_with(&e.mount_point))
-    {
-        return None;
-    }
-    let at = dir
-        .join("root")
-        .join(before.path.strip_prefix("/").unwrap_or(&before.path));
-    // lot 353 (#563's census, at the merge of #564): beneath the /proc root
-    // the start anchored, as every read of the kernel's views
-    let meta = antitamper_bpf::kernel_roots::metadata(at).ok()?;
-    if !(meta.is_file()
-        && (kernel_dev(meta.dev()), meta.ino()) == (before.dev, before.ino)
-        && meta.uid() == uid
-        && meta.nlink() > 0)
-        || table
-            .entries
-            .iter()
-            .any(|e| e.kernel_dev() == before.dev && is_fuse(&e.fstype))
-    {
-        return None;
-    }
-    let (daemon, daemon_ticks) = find_daemon(proc_root, table, pid, uid, before)?;
+    // lot 360 (the review of #568, Q1): the image file's whole path — the
+    // walk's when it cut none of its names, else the kernel's own view of it
+    // in a daemon that runs that very file (`find_daemon`: its `exe` link
+    // named like the walk's path, name by name, through no FUSE mount, its
+    // device and inode the image's). The walk keeps 31 bytes of a name: an
+    // image named `Bitwarden-2025.1.1-x86_64.AppImage` was never tied. The
+    // cut text only selects the candidates; the kernel's device and inode
+    // decide, at the full path then.
+    let cut = before.path.to_str().is_some_and(walk_path_cut);
+    let (daemon, daemon_ticks, image_path) = if cut {
+        let found = find_daemon(proc_root, table, pid, uid, before)?;
+        image_file_at(table, &dir, uid, before, &found.2).then_some(found)?
+    } else {
+        if !image_file_at(table, &dir, uid, before, &before.path) {
+            return None;
+        }
+        find_daemon(proc_root, table, pid, uid, before)?
+    };
     Some(Tied {
         mount_id: m.id,
         uid,
         image: (before.dev, before.ino),
-        image_path: before.path.clone(),
+        image_path,
         daemon,
         daemon_ticks,
     })
+}
+
+/// The image file `before` ran, at its whole path `path`, read through
+/// `dir`'s root (`/proc/<pid>/root`): still that file there (device and
+/// inode), the user's, linked, a regular file on no FUSE filesystem — and
+/// its path through no FUSE mount (its daemon answers the lookup, or never:
+/// never `stat`ed).
+fn image_file_at(table: &MountTable, dir: &Path, uid: u32, before: &Ran, path: &Path) -> bool {
+    if under_fuse(table, path) {
+        return false;
+    }
+    let at = dir
+        .join("root")
+        .join(path.strip_prefix("/").unwrap_or(path));
+    // lot 353 (#563's census, at the merge of #564): beneath the /proc root
+    // the start anchored, as every read of the kernel's views
+    let Ok(meta) = antitamper_bpf::kernel_roots::metadata(at) else {
+        return false;
+    };
+    meta.is_file()
+        && (kernel_dev(meta.dev()), meta.ino()) == (before.dev, before.ino)
+        && meta.uid() == uid
+        && meta.nlink() > 0
+        && !table
+            .entries
+            .iter()
+            .any(|e| e.kernel_dev() == before.dev && is_fuse(&e.fstype))
+}
+
+/// `path` lies under a FUSE mount of `table` (its daemon would answer a
+/// `stat` of it, or never).
+fn under_fuse(table: &MountTable, path: &Path) -> bool {
+    table
+        .entries
+        .iter()
+        .any(|e| is_fuse(&e.fstype) && path.starts_with(&e.mount_point))
 }
 
 /// The filesystem `dev` is still tied as `t` says, for an exec of `path`
@@ -423,19 +458,20 @@ fn still_tied(
     }
     let d = proc_root.join(t.daemon.to_string());
     daemon_facts(proc_root, table, &d, uid, t.image, &t.image_path)
-        .is_some_and(|ticks| ticks == t.daemon_ticks)
+        .is_some_and(|(ticks, _)| ticks == t.daemon_ticks)
 }
 
 /// A daemon of the image `before` for `pid`'s exec: a process (not `pid`)
 /// that runs that image as `uid`, started at or after its exec, serving
-/// ([`daemon_facts`]). Its pid and `/proc` start.
+/// ([`daemon_facts`]). Its pid, its `/proc` start, and the image's whole
+/// path as its `exe` link names it.
 fn find_daemon(
     proc_root: &Path,
     table: &MountTable,
     pid: u32,
     uid: u32,
     before: &Ran,
-) -> Option<(u32, u64)> {
+) -> Option<(u32, u64, PathBuf)> {
     let image = (before.dev, before.ino);
     antitamper_bpf::kernel_roots::read_dir(proc_root)
         .ok()?
@@ -446,8 +482,9 @@ fn find_daemon(
                 return None;
             }
             let at = proc_root.join(&name);
-            let ticks = daemon_facts(proc_root, table, &at, uid, image, &before.path)?;
-            crate::response::proc_ref::started_since(ticks, before.exec_ns).then_some((d, ticks))
+            let (ticks, path) = daemon_facts(proc_root, table, &at, uid, image, &before.path)?;
+            crate::response::proc_ref::started_since(ticks, before.exec_ns)
+                .then_some((d, ticks, path))
         })
 }
 
@@ -455,7 +492,10 @@ fn find_daemon(
 /// link names `image_path`, and leads to that device and inode) as `uid`
 /// (real), in PID 1's mount namespace, is neither stopped, traced
 /// (`TracerPid:`) nor exited, and serves that image ([`serves_the_image`]):
-/// its `/proc` start.
+/// its `/proc` start, and the link's text. Lot 360 (the review of #568,
+/// Q1): a walk's path with a cut name (`image_path`) names the link's text
+/// when it may be that path ([`walk_may_name`]: name by name, a cut name the
+/// start of the link's); the device and inode decide.
 fn daemon_facts(
     proc_root: &Path,
     table: &MountTable,
@@ -463,10 +503,15 @@ fn daemon_facts(
     uid: u32,
     image: (u64, u64),
     image_path: &Path,
-) -> Option<u64> {
-    // the link's text first: its target is then the image's directory's,
-    // never a FUSE file to `stat`
-    if antitamper_bpf::kernel_roots::read_link(dir.join("exe")).ok()? != image_path {
+) -> Option<(u64, PathBuf)> {
+    // the link's text first, and through no FUSE mount: its target is then
+    // the image's directory's, never a FUSE file to `stat`
+    let text = antitamper_bpf::kernel_roots::read_link(dir.join("exe")).ok()?;
+    let named = text == image_path
+        || image_path
+            .to_str()
+            .is_some_and(|walk| walk_may_name(walk, text.as_os_str().as_bytes()));
+    if !named || under_fuse(table, &text) {
         return None;
     }
     let meta = antitamper_bpf::kernel_roots::metadata(dir.join("exe")).ok()?;
@@ -497,7 +542,7 @@ fn daemon_facts(
         return None;
     }
     let ticks = crate::response::proc_ref::stat_start_ticks(&stat)?;
-    serves_the_image(table, dir, image).then_some(ticks)
+    serves_the_image(table, dir, image).then_some((ticks, text))
 }
 
 /// The review of #564 (F1): the daemon `dir` holds `/dev/fuse` and the
@@ -673,12 +718,19 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_at("App.AppImage")
+    }
+
+    /// [`fixture`] with the image file at `rel` (its name, under a directory
+    /// of the fixture's own files).
+    fn fixture_at(rel: &str) -> Fixture {
         let proc = tempfile::tempdir().unwrap();
         // the image beside the test's binary: no staging directory (a temporary
         // directory under `/tmp` is one)
         let exe = std::env::current_exe().unwrap();
         let files = tempfile::tempdir_in(exe.parent().unwrap()).unwrap();
-        let image = files.path().join("App.AppImage");
+        let image = files.path().join(rel);
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
         assert!(!is_staging_path(image.to_str().unwrap()), "{image:?}");
         std::fs::write(&image, b"\x7fELF runtime + squashfs").unwrap();
         process(proc.path(), 1, INIT_NS);
@@ -1491,6 +1543,214 @@ mod tests {
             ),
         );
         assert!(!run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
+    /// The LSM walk's text of `path` (`common::wire::exe::relative_path`):
+    /// each name of 31 bytes or more cut to its first 31 and marked.
+    fn walk_of(path: &Path) -> String {
+        use common::wire::exe::{
+            exe_path_slot, relative_path, ExeIdentityRaw, EXE_PATH_SLOTS, EXE_PATH_SLOT_LEN,
+        };
+        let names: Vec<&str> = path
+            .to_str()
+            .unwrap()
+            .split('/')
+            .filter(|n| !n.is_empty())
+            .collect();
+        // level 0 is the file, the last one the root
+        let levels: Vec<&str> = names.iter().rev().copied().chain(["/"]).collect();
+        assert!(levels.len() <= EXE_PATH_SLOTS, "{path:?}");
+        let mut r = ExeIdentityRaw::zeroed();
+        r.flags = exe_flags::KNOWN;
+        r.levels = levels.len() as u16;
+        for (level, n) in levels.iter().enumerate() {
+            let at = exe_path_slot(level) * EXE_PATH_SLOT_LEN;
+            let kept = n.len().min(EXE_PATH_SLOT_LEN - 1);
+            r.path[at..at + kept].copy_from_slice(&n.as_bytes()[..kept]);
+        }
+        relative_path(&r)
+    }
+
+    /// The runtime's exec of the image file as the walk names it (its names
+    /// cut), then of `AppRun` from the mount: whether that one is the image's.
+    fn run_walked(images: &mut AppImages, f: &Fixture) -> bool {
+        let walk = walk_of(&f.image);
+        let image = image_of(f);
+        let mut first = exec(RUNTIME, me(), &walk, id_of(&f.image), image, IMAGE_EXEC_NS);
+        images.note(f.proc.path(), &mut first);
+        assert!(!user_image(&first));
+        let mut second = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut second);
+        user_image(&second)
+    }
+
+    /// Lot 360 (the review of #568, Q1): the walk keeps 31 bytes of a name,
+    /// so an image file named with 31 bytes or more (`Bitwarden-2025.1.1-
+    /// x86_64.AppImage`, every image AppImageLauncher integrates) was never
+    /// tied: R001 and CHAIN-002/005 on each launch. Its whole path is its
+    /// daemon's `exe` link, taken when it is the walk's name by name and the
+    /// file's device and inode the image's: tied at 30, 31, 32 and 60 bytes,
+    /// with a directory's name of 40, and through the LSM check of the exec;
+    /// the tie keeps the whole path (its later programs tied as well).
+    #[test]
+    fn an_image_named_with_31_bytes_or_more_is_tied_by_its_whole_path() {
+        let long = "Bitwarden-2025.1.1-x86_64.AppImage-and-more-padding-to-60-by";
+        assert_eq!(long.len(), 60);
+        let dir = "a-directory-of-forty-bytes-in-the-home-x";
+        let mut rels: Vec<String> = [30, 31, 32, 60]
+            .iter()
+            .map(|&n| long[..n].to_string())
+            .collect();
+        rels.push(format!("{dir}/App.AppImage"));
+        rels.push(format!("{dir}/{long}"));
+        for rel in rels {
+            let f = fixture_at(&rel);
+            daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
+            let walk = walk_of(&f.image);
+            assert_eq!(
+                common::wire::exe::walk_path_cut(&walk),
+                rel.split('/').any(|n| n.len() >= 31),
+                "{walk}"
+            );
+            let mut images = AppImages::default();
+            assert!(run_walked(&mut images, &f), "{rel}");
+            let t = images.tied.get(&FUSE_DEV).unwrap();
+            assert_eq!(t.image_path, f.image, "{rel}: the whole path kept");
+            let program = format!("{MOUNT}/usr/bin/app");
+            let mut later = exec(
+                RUNTIME + 1,
+                me(),
+                &program,
+                (FUSE_DEV, 9),
+                "/proc/self/exe",
+                60,
+            );
+            images.note(f.proc.path(), &mut later);
+            assert!(user_image(&later), "{rel}: a later program");
+            // the LSM program's check of the exec ties the same way
+            let mut images = AppImages::default();
+            let mut first = exec(
+                RUNTIME,
+                me(),
+                &walk,
+                id_of(&f.image),
+                image_of(&f),
+                IMAGE_EXEC_NS,
+            );
+            images.note(f.proc.path(), &mut first);
+            let mut c = check(RUNTIME, &apprun(), FUSE_DEV, &apprun());
+            images.note(f.proc.path(), &mut c);
+            assert!(user_image(&c), "{rel}: the check");
+        }
+    }
+
+    /// Lot 360 (the review of #568, Q1): the cut name only selects the
+    /// daemon; what is not the image stays untied — a daemon of another file
+    /// of the same 31-byte start (another inode), of a file of that name in
+    /// another directory, of the image's file reached through a FUSE mount
+    /// (never `stat`ed), and the image replaced at its whole path.
+    #[test]
+    fn a_cut_image_name_ties_only_the_image_s_own_file() {
+        let long = "Bitwarden-2025.1.1-x86_64.AppImage";
+        let dir = "a-directory-of-forty-bytes-in-the-home-x";
+        // another file of the same start
+        let f = fixture_at(long);
+        let other = f.image.with_file_name(format!("{long}.old"));
+        std::fs::write(&other, b"\x7fELF another").unwrap();
+        daemon(f.proc.path(), DAEMON, &other, me(), "S", FRESH, true);
+        assert!(!run_walked(&mut AppImages::default(), &f), "another inode");
+        // the same name in another directory (a hard link: the same inode)
+        let f = fixture_at(&format!("{dir}/{long}"));
+        let elsewhere = f._files.path().join(format!("b-{dir}"));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::hard_link(&f.image, elsewhere.join(long)).unwrap();
+        daemon(
+            f.proc.path(),
+            DAEMON,
+            &elsewhere.join(long),
+            me(),
+            "S",
+            FRESH,
+            true,
+        );
+        assert!(
+            !run_walked(&mut AppImages::default(), &f),
+            "another directory"
+        );
+        // the image's directory a FUSE mount (its cut name hides it from the
+        // walk's text)
+        let f = fixture_at(&format!("{dir}/{long}"));
+        daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
+        table_plus(
+            f.proc.path(),
+            &format!(
+                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
+                f.image.parent().unwrap().display(),
+                me()
+            ),
+        );
+        assert!(!run_walked(&mut AppImages::default(), &f), "a FUSE mount");
+        // tied, then a FUSE mount over the image's directory: the tie ends
+        // (the daemon's link is read through it: never `stat`ed)
+        let f = fixture_at(&format!("{dir}/{long}"));
+        daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
+        let mut images = AppImages::default();
+        assert!(run_walked(&mut images, &f));
+        table_plus(
+            f.proc.path(),
+            &format!(
+                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
+                f.image.parent().unwrap().display(),
+                me()
+            ),
+        );
+        let program = format!("{MOUNT}/usr/bin/app");
+        let mut later = exec(
+            RUNTIME + 1,
+            me(),
+            &program,
+            (FUSE_DEV, 9),
+            "/proc/self/exe",
+            60,
+        );
+        images.note(f.proc.path(), &mut later);
+        assert!(!user_image(&later), "a FUSE mount since the tie");
+        // another user's exec, mount and daemon of the user's image file
+        let f = fixture_at(long);
+        let other = me() + 1;
+        table(f.proc.path(), 61, 30, &format!("ro,user_id={other}"));
+        daemon(f.proc.path(), DAEMON, &f.image, other, "S", FRESH, true);
+        let mut images = AppImages::default();
+        let walk = walk_of(&f.image);
+        let mut first = exec(
+            RUNTIME,
+            other,
+            &walk,
+            id_of(&f.image),
+            image_of(&f),
+            IMAGE_EXEC_NS,
+        );
+        images.note(f.proc.path(), &mut first);
+        let mut e = exec(RUNTIME, other, &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e), "not that user's file");
+        // the image replaced at its whole path since its exec
+        let f = fixture_at(long);
+        daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
+        let mut images = AppImages::default();
+        let (dev, ino) = id_of(&f.image);
+        let mut first = exec(
+            RUNTIME,
+            me(),
+            &walk_of(&f.image),
+            (dev, ino + 1),
+            image_of(&f),
+            IMAGE_EXEC_NS,
+        );
+        images.note(f.proc.path(), &mut first);
+        let mut e = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e), "replaced");
     }
 
     /// The review of #564 (F4): an exec of a file on no anonymous device

@@ -3928,3 +3928,94 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
   (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
   the pins can still be lost or hidden, the hooks no longer detach while
   the agent runs.
+
+## 53. An AppImage's fork-only child is judged like its AppImage (lot 360)
+
+- **What changes.** §49 made an AppImage's programs its image's. Its
+  zygote's child — forked without an exec, as Chromium's and Electron's
+  zygotes do — was the image's only while `/proc` still showed it: it has
+  no exec record, so the connect pump named it from `/proc/<pid>/exe` and
+  the judgement found its image's mark through `/proc` again. A child that
+  closes its connection and exits at once was gone by then, its mark "not
+  known", and its flow was judged as a staged image's: NN-L-NET-008 High,
+  "would have: KillProcess" (the pre-alpha's rc3 round, five kernels).
+  The connect already carried the kernel's fork record of such a process
+  (lot 352: its forker, the forker's start and its own start, read by the
+  eBPF connect program); the connect pump now teaches it to the lineage
+  before it names the flow's image, as the open sensor does for a write
+  (lot 340). In a judgement, a process that executed nothing since its fork
+  is its forker's exec at that fork — its image and its mark — whether it
+  still runs or not; a connect made before a later exec of it stays its
+  forker's. No eBPF program changed.
+- **The forker's exec must be the forker's at the fork.** The record names
+  the forker by its pid and its start. The forker's cached exec answers
+  only when its process has that start: a forker's pid an earlier process
+  held, whose exec the lineage keeps once that process is gone, lends that
+  exec to no fork (no image, no mark; the lookup goes on as without a
+  record). A write's record carries the forker's start only for a forker
+  that never executed either; otherwise it is not checked, as before. A
+  cached exec of an earlier process of the fork's own pid (the record shows
+  the fork came after that process started) is not the fork's image
+  either: the record names it. Of two records of one pid read out of order
+  (the pumps are separate threads), the later process's is kept.
+- **At the pump, only what `/proc` confirms.** The lineage learns execs when
+  the event loop takes them, so when the connect pump names a fork's
+  connect, its forker's last exec may not be read yet (a shell that
+  executes a staged binary in place, which forks at once). There the record
+  names the fork only when `/proc` shows the fork itself (its start the
+  record's) running that image. When `/proc` shows the fork or its forker
+  running another file, the fork is named from `/proc`, as before. When it
+  shows neither, the record names the flow only by a staging path (the flow
+  is judged; the image's mark is decided in the judgement), never by an
+  image that would leave it unjudged; otherwise the row names no image and
+  the judgement reads the record against the lineage the event loop has
+  brought up to date (every exec that reached it before the connect). An
+  exemption is never taken from an unconfirmed record.
+- **An image file named with 31 bytes or more is tied (§49).** The LSM exe
+  walk keeps 31 bytes of each name, marked as possibly cut, so the path of
+  an image named `Bitwarden-2025.1.1-x86_64.AppImage` (or any image
+  AppImageLauncher integrates, `<name>_<md5>.AppImage`) named no file and
+  §49's tie never held: R001 High on each exec, CHAIN-002/005 Critical. The
+  image's whole path is now its daemon's `exe` link (the kernel's own view
+  of the file), taken only when it is the walk's path name by name (a cut
+  name its start, every other name equal, as many names) and lies under no
+  FUSE mount; the image file's checks (owner, linked, its device and inode
+  the LSM program's) run at that whole path, and the tie keeps it. The cut
+  text only selects candidates: the device and inode decide. A name cut
+  inside a multibyte character is not tied (as before). A program inside
+  the mount whose name is cut is compared the same way.
+- **An image nothing names.** NN-L-NET-008 judges a flow by its process's
+  image path. A flow whose image is empty or unreadable, and that the
+  lineage cannot name (no exec, no fork record, no `/proc` link at the
+  connect), is not judged by a path: it is counted and said in the agent's
+  journal at debug level. A process the lineage names by its `/proc` link
+  alone (no exec or fork record: the record lost, a process older than the
+  agent) is judged by that path, as before: the user image's exemption
+  needs the mark.
+- **What stays judged, and is now judged more.** A binary staged in `/tmp`,
+  `/var/tmp` or `/dev/shm`, its fork+exec child and its fork-only children
+  keep NN-L-NET-008's kill (and R001, CHAIN-002/005 as before), within the
+  residuals below. A fork-only child of a staged binary that exited before
+  the pump read it was not named, and drew nothing: it is now its forker's
+  image, judged; so is one on a pid whose earlier holder's exec was still
+  cached (that exec named it before). The programs of a FUSE mount the exec
+  pump does not tie (§49: `squashfuse`, a writable mount, a daemon that
+  does not hold its image) and their forks stay judged.
+- **Residuals, accepted.**
+  - The forker's exec in place, just before the fork, that reaches the
+    event loop only after the connect: the connect is judged on the
+    forker's earlier image. At the pump this fails closed (no image and no
+    mark from a record `/proc` does not confirm, but a staging path); it
+    remains open only in the judgement, for an exec read after the connect
+    itself. NN-L-CHAIN-002/005 judge a connect that soon after a staged
+    exec. The full closure is the connect carrying the identity of the
+    file its process runs (`mm->exe_file`), an eBPF change for a later
+    release.
+  - A UDP datagram carries no fork record: a fork-only sender is named as
+    before (`/proc` at the drain).
+  - A fork of a fork-only process whose forker has already exited without
+    a record of its own (a helper double-forked without an exec) is named
+    by its `/proc` link and judged by its path: this fails closed (at worst
+    an NN-L-NET-008 on that rare shape). The nearest process that executed
+    (its anchor) is not used: it may have executed since that fork.
+- **Operator action.** None.
