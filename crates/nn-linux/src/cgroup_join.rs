@@ -929,11 +929,13 @@ fn pin_fresh(ebpf: &mut Ebpf, root: &Path, name: &str, kind: Kind) -> Result<(),
     let prog = ebpf
         .program_mut(name)
         .ok_or_else(|| format!("program {name} missing from the eBPF object"))?;
-    prog.pin(&prog_path)
-        .map_err(|e| format!("pinning {name} to {}: {e}", prog_path.display()))?;
-    fd_link
-        .pin(&link_path)
-        .map_err(|e| format!("pinning {name}'s link to {}: {e}", link_path.display()))?;
+    // fix round 3 of #567: through `held` — a descriptor of each kept for
+    // the agent's life, attached while it runs whatever happens to the pin
+    let fd = prog.fd().map_err(|e| format!("{name}: {e}"))?;
+    antitamper_bpf::held::pin_prog(fd, &prog_path)
+        .map_err(|e| format!("pinning {name} to {}: {e:#}", prog_path.display()))?;
+    antitamper_bpf::held::pin_link(fd_link, &link_path)
+        .map_err(|e| format!("pinning {name}'s link to {}: {e:#}", link_path.display()))?;
     Ok(())
 }
 

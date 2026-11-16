@@ -1081,8 +1081,8 @@ pub const FS_OP_SIGNAL: u8 = 9;
 /// A ptrace ATTACH-mode access to a protected pid refused by the
 /// `ptrace_access_check` hook — debugger attach, `/proc/<pid>/mem`,
 /// `process_vm_readv/writev` (`target_ino` = target tgid, `target_dev` = the
-/// ptrace mode bits). READ-mode and NOAUDIT checks (`ps`, `lsof`, journald
-/// reading `/proc/<pid>/exe`) are denied silently, as before.
+/// ptrace mode bits). A READ-mode refusal is [`FS_OP_PTRACE_READ`]; NOAUDIT
+/// checks (`ps` reading `/proc/<pid>/stat`) are denied silently.
 pub const FS_OP_PTRACE: u8 = 10;
 /// Review 82: a kexec kernel image load refused by the `kernel_read_file`
 /// (`kexec_file_load`) or `kernel_load_data` (`kexec_load`) hook outside
@@ -1507,8 +1507,41 @@ impl SoleTraceSummary {
     }
 }
 
+/// Lot 357: a mount refused by the mount guard (`agent-ebpf/src/mount_guard.rs`,
+/// `crate::mount_guard`) in PID 1's mount namespace — on or over a
+/// protected point (a kernel view, the agent's directories, binaries,
+/// units, a directory above them), below the agent's directories, below a
+/// view and not the kernel's own pseudo-filesystem there, an unmount or a
+/// move of a protected mount, an old-API move, a pivot of the root.
+/// `target_dev` = `crate::mount_guard::record_dev` (the target's device,
+/// the operation, the reason, the view, the mounts covered), `target_ino`
+/// = the target dentry's inode (the mount's root for an unmount or a move
+/// away). Decisive.
+pub const FS_OP_MOUNT: u8 = 49;
+
+/// Lot 357: NOT a refusal — what [`FS_OP_MOUNT`] refuses, let through by
+/// the signed trusted-installer window (the fields as its). Minor: a
+/// window's mounts spend the minor budget, never a decisive record's.
+pub const FS_OP_MOUNT_WINDOW: u8 = 50;
+
+/// The review of #567 (F6): NOT a refusal — an unmount of the tracefs,
+/// debugfs or securityfs the agent reads, let through and recorded (the
+/// fields as [`FS_OP_MOUNT`]'s). Minor.
+pub const FS_OP_MOUNT_NOTED: u8 = 51;
+
+/// The re-check of #567 (b): a READ-mode ptrace access to one of the
+/// agent's processes refused by the `ptrace_access_check` hook (without
+/// `PTRACE_MODE_NOAUDIT`): its `/proc/<pid>/ns/*` links (`nsenter`,
+/// `systemctl bind` or `mount-image` entering the agent's namespace), `exe`,
+/// `root`, `cwd`, `fd/`, `environ`, `maps`, `io` — the fields as
+/// [`FS_OP_PTRACE`]'s. The re-check 2 of #567: recorded once an hour per
+/// caller image and target (`lsof`, `htop`, a monitoring agent's process
+/// collector meet it too), never for the packaged journald in its units'
+/// cgroups (`crate::ptrace_read`). Minor.
+pub const FS_OP_PTRACE_READ: u8 = 52;
+
 /// Lot 280b: the last denial code (the tests' loops).
-pub const FS_OP_LAST: u8 = FS_OP_SOLE_TRACE_SUMMARY;
+pub const FS_OP_LAST: u8 = FS_OP_PTRACE_READ;
 
 /// Lot 318 (the review of #545, F1 and F7; its re-check, R1 and R2): the
 /// kernel's records that are not decisive — every operation whose record
@@ -1564,6 +1597,12 @@ pub const fn is_minor_denial(operation: u8) -> bool {
             | FS_OP_SIGIO
             | FS_OP_CGROUP_JOIN
             | FS_OP_EXEMPT_INJECT
+            // lot 357: a mount the window let through
+            | FS_OP_MOUNT_WINDOW
+            // the review of #567: an unmount let through and recorded
+            | FS_OP_MOUNT_NOTED
+            // its re-check (b): a read-mode access to the agent refused
+            | FS_OP_PTRACE_READ
     )
 }
 
@@ -2877,6 +2916,10 @@ mod tests {
             FS_OP_BPF_HELD_LOAD,
             FS_OP_BPF_HELD_USE,
             FS_OP_SOLE_TRACE_SUMMARY,
+            FS_OP_MOUNT,
+            FS_OP_MOUNT_WINDOW,
+            FS_OP_MOUNT_NOTED,
+            FS_OP_PTRACE_READ,
         ];
         assert_eq!(ops.len(), FS_OP_LAST as usize);
         // lot 349 (the review of #558, F1): a held program's fields go and

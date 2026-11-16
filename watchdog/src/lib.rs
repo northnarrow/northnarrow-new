@@ -1911,6 +1911,53 @@ pub enum ShutdownVerdict {
     Refused(String),
 }
 
+/// Lot 357 (re-check 3 of #563, R3-2): the most of a marker, an honoured
+/// record list or a key file read for the check (far above any real one).
+const MARKER_MAX: u64 = 1 << 20;
+
+/// Lot 357 (re-check 3 of #563, R3-2): [`check_shutdown_marker`] on a helper
+/// thread, waited for at most [`BY_PATH_DEADLINE`]: its reads (the marker,
+/// `admin.pub`, `agent_id`, the honoured list) and its records held the
+/// watchdog's one thread under a mount that does not answer. No answer in
+/// time is a refusal: the agent is respawned (the helper's eventual answer
+/// is dropped; one is held at most).
+pub fn check_shutdown_marker_bounded(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (marker, admin_pub, agent_id_file) = (
+        c.marker.to_path_buf(),
+        c.admin_pub.to_path_buf(),
+        c.agent_id_file.to_path_buf(),
+    );
+    let (agent_pid, agent_started) = (c.agent_pid, c.agent_started);
+    let held = off_thread(
+        c.marker,
+        move || {
+            Ok(check_shutdown_marker(&ShutdownCheck {
+                marker: &marker,
+                admin_pub: &admin_pub,
+                agent_id_file: &agent_id_file,
+                agent_pid,
+                agent_started,
+            }))
+        },
+        move |r: std::io::Result<ShutdownVerdict>| {
+            let _ = tx.send(r);
+        },
+    );
+    if let Err(e) = held {
+        return ShutdownVerdict::Refused(format!("the check could not run: {e}"));
+    }
+    match rx.recv_timeout(BY_PATH_DEADLINE) {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => ShutdownVerdict::Refused(format!("the check failed: {e}")),
+        Err(_) => ShutdownVerdict::Refused(format!(
+            "the marker's check did not answer within {} s (a mount over its directory that \
+             does not answer?)",
+            BY_PATH_DEADLINE.as_secs()
+        )),
+    }
+}
+
 /// What [`check_shutdown_marker`] reads.
 #[derive(Debug, Clone)]
 pub struct ShutdownCheck<'a> {
@@ -1935,7 +1982,8 @@ pub struct ShutdownCheck<'a> {
 /// the agent is respawned.
 pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
     use nn_proto::shutdown_marker as sm;
-    let raw = match antitamper_bpf::kernel_roots::read_all(c.marker) {
+    // lot 357 (re-check 3 of #563, R3-2): beneath the run directory
+    let raw = match read_own(c.marker, MARKER_MAX) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
@@ -1979,7 +2027,9 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
         Err(e) => return refuse(c, &raw, format!("{}: {e}", c.agent_id_file.display())),
     };
     let honoured_path = c.marker.with_file_name(file_name_of(sm::HONOURED_PATH));
-    let honoured = antitamper_bpf::kernel_roots::read_to_string(&honoured_path).unwrap_or_default();
+    let honoured = read_own(&honoured_path, MARKER_MAX)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2003,7 +2053,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
                     "could not record the honoured authorisation; its replay is bounded by the signature's age only"
                 );
             }
-            let _ = std::fs::remove_file(c.marker);
+            let _ = remove_own(c.marker);
             info!(
                 target: "watchdog.shutdown_marker",
                 signed_at = auth.ts,
@@ -2033,12 +2083,151 @@ fn refuse(c: &ShutdownCheck<'_>, raw: &[u8], reason: String) -> ShutdownVerdict 
     if let Err(e) = append_line(&path, &line) {
         warn!(target: "watchdog.shutdown_marker", error = %e, path = %path.display(), "could not record the refused marker");
     }
-    let _ = std::fs::remove_file(c.marker);
+    let _ = remove_own(c.marker);
     ShutdownVerdict::Refused(reason)
 }
 
 fn file_name_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Lot 357 (re-check 3 of #563, R3-2): the watchdog's run directory
+/// (`/run/northnarrow`: its records, the stuck and shutdown markers),
+/// opened once at its start ([`anchor_run_dir`]); a name directly in it is
+/// resolved beneath that descriptor (`openat2` with `RESOLVE_BENEATH |
+/// RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`, `unlinkat`): a mount laid over
+/// the directory since is never walked, a mount over the name is `EXDEV`.
+static RUN_DIR: std::sync::OnceLock<(PathBuf, std::fs::File)> = std::sync::OnceLock::new();
+
+/// Open the run directory `dir` once (the first call wins). A directory
+/// that cannot be opened leaves the names resolved by path, as before.
+pub fn anchor_run_dir(dir: &Path) {
+    if RUN_DIR.get().is_some() {
+        return;
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(f) => {
+            let _ = RUN_DIR.set((dir.to_path_buf(), f));
+        }
+        Err(e) => warn!(
+            target: "watchdog.tamper",
+            dir = %dir.display(),
+            error = %e,
+            "the run directory could not be opened: its markers and records are resolved by path"
+        ),
+    }
+}
+
+/// The run directory's descriptor and `path`'s name in it, when `path` is
+/// directly in it.
+fn in_run_dir(path: &Path) -> Option<(&'static std::fs::File, &std::ffi::OsStr)> {
+    let (dir, f) = RUN_DIR.get()?;
+    (path.parent()? == dir.as_path()).then_some((f, path.file_name()?))
+}
+
+/// `path` opened with `flags` (plus `O_CLOEXEC | O_NOCTTY`), beneath the run
+/// directory when it is there, else by path.
+fn open_own(path: &Path, flags: i32, mode: u32) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let flags = flags | libc::O_CLOEXEC | libc::O_NOCTTY;
+    let cstr = |b: &[u8]| {
+        std::ffi::CString::new(b).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    };
+    let Some((dir, name)) = in_run_dir(path) else {
+        let c = cstr(path.as_os_str().as_bytes())?;
+        // SAFETY: a NUL-terminated path; the mode is read only with O_CREAT.
+        let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a new descriptor this call alone owns.
+        return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+    };
+    use std::os::fd::AsRawFd;
+    let c = cstr(name.as_bytes())?;
+    // SAFETY: `open_how` is plain old data, valid when zeroed.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = flags as u64;
+    how.mode = if flags & libc::O_CREAT != 0 {
+        mode as u64
+    } else {
+        0
+    };
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: a live directory fd, a NUL-terminated name and an `open_how`
+    // of its own size, read only during the call.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    } as i32;
+    if fd >= 0 {
+        // SAFETY: a new descriptor this call alone owns.
+        return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    if !matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) {
+        return Err(err);
+    }
+    // a kernel without openat2 (before 5.6) or a filter refusing it: openat,
+    // and a file on another device than the directory is a mount crossed
+    // SAFETY: as above.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    use std::os::unix::fs::MetadataExt;
+    if f.metadata()?.dev() != dir.metadata()?.dev() {
+        return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+    }
+    Ok(f)
+}
+
+/// `std::fs::remove_file` of `path` (`unlinkat`), beneath the run
+/// directory when it is there.
+fn remove_own(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let Some((dir, name)) = in_run_dir(path) else {
+        return std::fs::remove_file(path);
+    };
+    let c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: a live directory fd and a NUL-terminated name.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// At most `max` bytes of the regular file `path` (beneath the run
+/// directory when it is there, never through a link, never waiting on a
+/// FIFO); a file of another directory by its view-aware reader.
+fn read_own(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    if in_run_dir(path).is_none() {
+        return antitamper_bpf::kernel_roots::read(path, max);
+    }
+    let f = open_own(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    antitamper_bpf::kernel_roots::read_file_bounded(&f, max)
 }
 
 /// Lot 353 (re-check 2 of #563, N4): the paths whose by-path work has a
@@ -2146,14 +2335,13 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// [`append_line`]'s work, on its helper thread.
 fn append_line_now(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    use std::os::unix::fs::FileExt;
+    // lot 357 (re-check 3 of #563, R3-2): beneath the run directory
+    let mut f = open_own(
+        path,
+        libc::O_CREAT | libc::O_RDWR | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0o600,
+    )?;
     let meta = f.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::other(format!(
@@ -3055,15 +3243,38 @@ pub fn stuck_marker_path(holds: &Path) -> PathBuf {
 
 /// Lot 353: leave `record` as the one stuck marker at `path` (replaced;
 /// created 0600, never through a symlink).
+///
+/// Lot 357 (re-check 3 of #563, R3-2): the old marker's removal and the new
+/// one's write on one helper thread, beneath the run directory, waited for
+/// at most [`BY_PATH_DEADLINE`] — the removal by path, unbounded, on the
+/// watchdog's one thread held its whole loop under a mount over
+/// `/run/northnarrow` (no stuck recovery, no respawn, no `sd_notify`).
 pub fn leave_stuck_marker(path: &Path, record: &nn_proto::watchdog_hold::HoldRecord) -> Result<()> {
     let line = serde_json::to_string(record).context("serialising the stuck marker")? + "\n";
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("removing {}", path.display()))
-        }
-        _ => {}
-    }
-    append_line(path, &line).with_context(|| format!("writing {}", path.display()))
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let p = path.to_path_buf();
+    off_thread(
+        path,
+        move || {
+            match remove_own(&p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            append_line_now(&p, &line)
+        },
+        move |r| {
+            let _ = tx.send(r);
+        },
+    )
+    .with_context(|| format!("replacing {}", path.display()))?;
+    rx.recv_timeout(BY_PATH_DEADLINE)
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {} s", BY_PATH_DEADLINE.as_secs()),
+            ))
+        })
+        .with_context(|| format!("replacing {}", path.display()))
 }
 
 /// Lot 353 (pre-alpha Phase 3, X6 on 6.12): a FUSE mount a stuck agent

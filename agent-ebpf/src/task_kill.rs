@@ -311,8 +311,8 @@ pub(crate) fn kill_grant_allows(sig: c_int) -> bool {
 
 /// `comm` of `systemd-shutdown` (15 bytes and the NUL), as two words: an
 /// array compare would lower to a `memcmp` call.
-const SHUTDOWN_COMM_LO: u64 = u64::from_ne_bytes(*b"systemd-");
-const SHUTDOWN_COMM_HI: u64 = u64::from_ne_bytes(*b"shutdow\0");
+pub(crate) const SHUTDOWN_COMM_LO: u64 = u64::from_ne_bytes(*b"systemd-");
+pub(crate) const SHUTDOWN_COMM_HI: u64 = u64::from_ne_bytes(*b"shutdow\0");
 
 /// PID 1 is running `systemd-shutdown`: the comm (only PID 1 itself can
 /// set it) AND the executable the agent recorded — a comm set through

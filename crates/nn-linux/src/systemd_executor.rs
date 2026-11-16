@@ -99,11 +99,11 @@ fn link_target(path: &Path, root: &Path) -> Option<String> {
 }
 
 /// The package database's answer for `path` (`None`: no database to ask).
-type Owned<'a> = &'a dyn Fn(&Path) -> Option<bool>;
+pub(crate) type Owned<'a> = &'a dyn Fn(&Path) -> Option<bool>;
 
 /// The packaged files at `paths` under `root`: root's (`owner`'s), written
 /// by no one else, and not disowned by the package database.
-fn packaged(paths: &[&str], root: &Path, owner: u32, owned: Owned) -> Vec<(u64, u64)> {
+pub(crate) fn packaged(paths: &[&str], root: &Path, owner: u32, owned: Owned) -> Vec<(u64, u64)> {
     paths
         .iter()
         .filter(|p| owned(Path::new(p)) != Some(false))
@@ -252,10 +252,15 @@ fn apply(images: &ExecutorImages, live: Live) -> bool {
 }
 
 /// [`refresh_under`] the host's root and `/proc`, every 10 s; the
-/// [`carriers`] to the kernel.
+/// [`carriers`] to the kernel. The re-check 2 of #567 (point 2): the
+/// packaged journald's identity read again with them
+/// ([`crate::journald_identity::refresh`]).
 pub fn refresh(images: &ExecutorImages) -> bool {
     let live = live();
     carry(&live);
+    if crate::journald_identity::refresh() {
+        tracing::info!("ptrace guard: journald's identity changed (an upgrade, a restart)");
+    }
     apply(images, live)
 }
 

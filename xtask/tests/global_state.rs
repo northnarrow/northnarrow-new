@@ -448,6 +448,24 @@ const STATICS: &[Kept] = &[
          unanswered at a time), beside the process's one account table (`TABLE`)",
     ),
     kept(
+        "crates/nn-linux/src/decision_host_linux.rs",
+        "EXE_READER",
+        Process,
+        "lot 357 (item 5, on #563's code): the reader of a `trusted_exe` exemption's image \
+         checks and digest, with a deadline (500 ms), off the decision thread: one decision \
+         host per agent process, and a check a FUSE over a system directory leaves blocked is \
+         the process's helper thread, bounded once for it (4)",
+    ),
+    kept(
+        "crates/nn-linux/src/posture_host_linux.rs",
+        "HOST_FILE_READER",
+        Process,
+        "lot 357 (item 5, on #563's code): the reader of a host file's identity for the \
+         lineage's `ran_host_file`, with a deadline (200 ms), off the decision thread: one \
+         host per agent process, a read a FUSE leaves blocked the process's helper thread, \
+         bounded once for it (4)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/open_sensor.rs",
         "BUILD_READER",
         Process,
@@ -482,6 +500,14 @@ const STATICS: &[Kept] = &[
         "BOOT_KEYS",
         Kernel,
         "the inodes this boot registered in the pinned PROTECTED_INODES",
+    ),
+    kept(
+        "crates/nn-linux/src/journald_identity.rs",
+        "KERNEL",
+        Kernel,
+        "the re-check 2 of #567: the ptrace guard's PTRACE_READ_QUIET map of the one eBPF object \
+         and the packaged journald's identity last read (its images, its unit's cgroup), written \
+         to it at the start and at each 10 s read",
     ),
     kept(
         "crates/nn-linux/src/systemd_executor.rs",
@@ -546,6 +572,12 @@ const STATICS: &[Kept] = &[
         "JUDGE",
         Kernel,
         "lot 280a: the cgroup/sysctl judge this boot linked to the root cgroup (the one eBPF object's program) or why not, read by the manifest's note and the BPF guard's registration",
+    ),
+    kept(
+        "antitamper-bpf/src/held.rs",
+        "HELD",
+        Kernel,
+        "fix round 3 of #567: a descriptor of every link and program the one eBPF object's attach pinned, held for the agent's life so that a pin removed or hidden, or the bpffs's last mount gone, detaches nothing while it runs (the integrity round reads their pins and pins them again)",
     ),
     kept(
         "crates/nn-linux/src/sysctl_cgroup.rs",

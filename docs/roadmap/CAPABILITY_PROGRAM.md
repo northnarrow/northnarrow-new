@@ -11518,6 +11518,215 @@ number in parentheses is a lab PR.
     rank is its type's.
   - Levels unchanged: C23 keeps its level (a record made reliable; no new
     defence).
+- **Lot 357 — a mount on, over or below the paths the agent depends on is
+  refused (pre-alpha; C23; no level change).**
+  - What was open: four review rounds of #563 kept finding one more by-path
+    read that a root FUSE or tmpfs over `/proc`, `/sys`, the cgroup root,
+    `/etc/northnarrow` or `/run/northnarrow` could stall or blind (CM-12:
+    mounts were recorded, not refused).
+  - Done: the mount guard (`agent-ebpf/src/mount_guard.rs`, the decision in
+    `common::mount_guard`, the points in
+    `nn_linux::anti_tamper::mount_guard`): BPF-LSM `sb_mount`, `move_mount`,
+    `sb_umount`, `sb_pivotroot`, judging the target by its dentry and mount;
+    in PID 1's mount namespace and in any other whose change reaches it
+    (peers, slaves: the coordinator's propagation point); the protected
+    points and every directory above them by kernel identity (the
+    ancestors point); the kernel's own pseudo-filesystems below the views
+    allowed by type, point and what they cover; the window lets through,
+    recorded Low; a kernel without it signs the degradation.
+    `mount_setattr(2)` (no hook, `do_mount_setattr` inlined) is signed by
+    the integrity round (`mount_attrs_changed`). Defence in depth (#563's
+    re-check 3, R3-1 to R3-3, and its `trusted_exe` / host-file checks on a
+    bounded reader): on #563's code, with it. Mutation: 40 mutants of the
+    decision and the points (38 caught by a named test, two tests added for
+    the first survivors; one equivalent: an unread type never matches),
+    9 of the propagation decision (9 caught).
+  - Lab (as measured, our own guests, the lot's tree, the agent installed as
+    an operator, the alpha profile): ubuntu2604 (7.0.0-43) 40 refused cases
+    in the host's namespace and 5 from another one, each `EPERM`, no mount,
+    one High; 20 allowed cases (the kernel's own remounts of fusectl,
+    configfs, binfmt_misc; `unshare -m`; a unit's sandbox; systemd-nspawn;
+    podman; snapd; an unprivileged call; a private namespace) without a
+    record; `verifier-check` 116 OK, 0 failing, highest
+    `mount_guard_move_mount` 476,453 (47.6 %); a cold boot without a guard
+    record. ubuntu2204 (5.15.0-203, util-linux 2.37): the same, 40 and 5
+    refused, 20 allowed without a record; `verifier-check` 114 OK, 0
+    failing, `mount_guard_move_mount` 523,420 (52.3 %), the object's
+    highest `module_read_file_observe` 551,900. ubuntu2404 (6.8.0-149,
+    util-linux 2.39): with #563's re-check 4 cases (a tmpfs over
+    `/proc/<pid>/fd` and `/proc/self`, a FUSE over a cgroup directory),
+    43 and 5 refused, 22 allowed without a record; `verifier-check` 118 OK,
+    0 failing, highest `mount_guard_move_mount` 286,061 (28.6 %). Each
+    round: `systemd-nspawn` and `podman` installed for it and purged after
+    it, a read-only bpffs and a `/` made a slave by `mount_setattr` each a
+    `mount_attrs_changed` High, a cold boot without a guard record. First rounds, before the fixes:
+    on 5.15 the first shape was refused by the verifier (the fail-safe
+    measured: two hooks signed missing, the start went on), and
+    systemd-nspawn's binds below its own `/proc` were refused (its peer
+    group larger than the walk reads) until a container's own proc stopped
+    counting as the host's view.
+  - Not covered in a guest: a kernel without `move_mount` (all supported
+    kernels have it); a slave of a slave of a child's peer group.
+  - Fix round 1 (the independent review of #567, the adversarial
+    brainstorm, the cross-model check): the mounts held are mounts, by id
+    (`MOUNT_HELD`), an unmount's propagation judged by place under the
+    parent's peer group; the target mount's own namespace judged
+    (`mnt_ns`), the agent's and the watchdog's among the guarded ones
+    (`MOUNT_GUARD_NS`, dropped at their exit by the role watch), a change
+    made elsewhere judged when its peer group reaches one (`MOUNT_GROUPS`,
+    one look-up, re-read every 30 s); `sb_remount` (a fifth hook) refuses a
+    view's reconfigure and a held file system's read-only one (mount(2) and
+    fsconfig; the flags read by an `fentry` on `reconfigure_super`), `sb_mount` a
+    read-only or `noexec` bind remount of a held mount; systemd-shutdown
+    and its helpers, a kernel thread's remount exempt, PID 1's own
+    exemption scoped to its namespace; the mounts made before the guard
+    judged against the canonical layout (`mount_not_canonical`, High, and a
+    degradation); `state_fs_read_only`; the tracefs/debugfs/securityfs
+    unmount recorded; a clone of a subdirectory refused; only the binaries
+    that exist and the agent's library directories are points; overlay
+    file keys reconciled. Found by its own lab: the allow-list check,
+    inlined into the decision, stopped matching on 5.15 (every kernel's own
+    mount refused): kept out of line, with a ratchet. Mutation: 44 mutants
+    of the new decision, points, rounds and attrs, 44 caught by a named test
+    after three tests were added for the first survivors. Lab: each guest with the lot's tree installed as an operator (alpha profile),
+    the round's probe of 106 cases and a cold boot. ubuntu2204
+    (5.15.0-203, util-linux 2.37): `verifier-check` 123 programs, 116
+    OK, 0 failing, `mount_guard_move_mount` 567,031 (56.7 %), `sb_mount`
+    474,396, `sb_umount` 84,820, `sb_remount` 26,969, the fentry 132;
+    ubuntu2404 (6.8.0-149, 2.39): 123, 120 OK, 0 failing, `move_mount`
+    180,428; ubuntu2604 (7.0.0-43, 2.41): 123, 118 OK, 0 failing,
+    `move_mount` 291,642. On each: 69 refused cases (on 6.8 and 7.0 64
+    `EPERM` with one High each, on 5.15 63 — `MOVE_MOUNT_BENEATH` does
+    not exist there —; `nsenter` into the agent and the watchdog and two
+    `systemctl bind` into the agent refused by the ptrace guard,
+    unsigned; a clone of securityfs' `apparmor/` refused), 9 from inside
+    the agent's own namespace entered through a child of it (each
+    `EPERM`, 9 High "made in the agent's own mount namespace"; a former
+    agent's namespace no longer judged), 37 allowed (35 without a
+    record: a backup's bind and rbind of `/`, debootstrap, schroot,
+    arch-chroot, a chroot's cgroup2, an rbind of `/sys`, finalrd's
+    `remount,exec /run`, the kernel's own mounts back, nspawn, podman,
+    ten podman containers with a privileged and a host-network one,
+    snapd; the window's two Low), two unmounts noted Low, a window's
+    mount in the agent's namespace signed by the integrity round; the
+    cold boot: agent and watchdog active, five guard links, no guard
+    record, no ext4 recovery. An earlier round of the same tree had one
+    High at each poweroff (finalrd), closed by reading the reconfigure's
+    flags.
+  - Fix round 2 (re-check 1 of #567): N1 — a guarded mount regrouped
+    (`--make-private`, a decoy taking the freed number, `--make-shared`)
+    left `MOUNT_GROUPS` stale for up to 30 s, and a raw namespace's tmpfs
+    propagated over `/etc/northnarrow` unrefused (the reviewer's probe, a
+    user namespace on 6.18). Now one shared walk
+    (`common::mount_guard::spread`/`target_reach`, the hooks' `Mounts`
+    over `struct mount`, the tests' over a graph): a group the map does not
+    hold is read in the hook, its peers and each one's slaves up to 16
+    mounts, undecided counting as reaching (refused only on a protected
+    point); an unmount walks the parent's propagation for the mount a held
+    one sits under at that place (`HELD_UNDER`, by the parent's id), an
+    undecided walk refused only under a copy of a held mount — two first
+    versions refused a chroot's cgroup2 unmount on the lab's guests (keyed
+    by the place alone; then failing closed on any undecided walk: a
+    chroot's sysfs has the host's dentries and a copy in each unit's
+    namespace); `mount(2)`'s
+    propagation changes and a `move_mount(2)` of a grouped mount into a
+    guarded namespace wake the agent's refresh within a second
+    (`MOUNT_GUARD_CONF` slot 4); the two-masters-deep residual is gone.
+    The ptrace guard's read-mode refusals on the agent's processes are a
+    signed Low (`FS_OP_PTRACE_READ`, 60 s per caller and target, minor, no
+    trigger); `inode_key` is one function (two btrfs subvolumes, two
+    keys); sysext/confext/composefs overlays canonical at the start; the
+    allow list checked out of line in the object. Mutation: 32 mutants of the new code, 32 caught by a named test
+    after four tests were added for the first survivors (7e1a42ff's own
+    decision, `group != 0 && known(group)`, among the caught). Lab (the
+    round's probe — 76 refused and 38 allowed cases, the regroup ones
+    among them — the read-mode refusals and a cold boot), the final tree: ubuntu2204 (5.15.0-203:
+    `sb_mount` 556,211, 55.6 %, the highest, `sb_umount` 502,902,
+    `move_mount` 452,190; 116 OK, 0 failing, the headroom gate OK),
+    ubuntu2404 (6.8.0-149: `move_mount` 184,743, `sb_umount` 64,755; 120
+    OK, 0 failing), ubuntu2604 (7.0.0-43: `move_mount` 295,848,
+    `sb_umount` 61,986; 118 OK, 0 failing). On each: `/` regrouped by
+    `mount_setattr` (from `shared:1` to a new group, a decoy on 1), then
+    a raw namespace's tmpfs over `/etc/northnarrow`, `/run/northnarrow`
+    and below `/var/lib/northnarrow` — `EPERM`, one High each; the same
+    regroup by `mount(2)`, at once and after the refresh, and `/` made a
+    slave of the raw copy's group — refused; `/sys` regrouped, the raw
+    copy's `umount /sys/fs/bpf` — refused, the bpffs still there; a raw
+    namespace's tmpfs elsewhere let through; `nsenter -t <agent> -m` and
+    `readlink /proc/<agent>/exe` refused, one Low `ptrace_read` each, one
+    per caller and target over a minute (a process opening
+    `/proc/<agent>/ns/mnt` twice: one), 26–30 over a whole round (journald
+    11, needrestart 3–6). The chroot cases (a backup's bind and rbind of `/`,
+    debootstrap, schroot, arch-chroot, a chroot's cgroup2, an rbind of
+    `/sys`, a lazy sysfs) without a record; two earlier rounds of the fix
+    refused the chroot's cgroup2 unmount on all three. Cold boot: agent and
+    watchdog active, five guard links, no guard record. Then item 5 of the
+    lot on #563's merged code (the integrity round, the watchdog's markers
+    and `bpf-foreign` beneath their anchors, `trusted_exe` and host files
+    on bounded readers, the guard's own `/proc` reads beneath the anchored
+    root; §47.1): ubuntu2204 again on that tree, the same verifier figures
+    and verdicts, a clean cold boot; `agent/tests/fuse_stall.rs` under
+    `CI=true` passed (14.3 s).
+  - Fix round 3 (re-check 2 of #567): N3 (P1) — `mount --rbind /sys
+    /mnt/s; umount -l /mnt/s` was judged by its top only (a copy at a place
+    nothing is held at) while `umount_tree()` took the host's childless
+    `/sys/fs/bpf` and `/sys/fs/cgroup` through the copies below it, and
+    their copies in every slave namespace, the agent's own included (the
+    reviewer's probes, a user namespace on 6.18); a raw namespace's
+    `umount -l /` the same. Now `sb_umount` reads the subtree in the
+    kernel's order (`common::mount_guard::umount_below`, 32 mounts, a
+    climb of at most 8 levels a step; offsets `mount.mnt_mounts`,
+    `.mnt_child`), each mount below judged as the top (a held mount at its
+    place under its parent's group; its root a held mount's, then by id in
+    a guarded namespace or under a group not followed and a copy of a held
+    parent); a subtree wider than the walk is refused in a guarded
+    namespace or when a mount read sits under a parent in a peer group.
+    The walk is out of line (`subtree_takes`, `held_at`): inlined, the
+    round's first lab run refused the program on 5.15 (1,000,001
+    instructions, four mounts already too many: each exit carried its
+    state into the hook's propagation walk). Point 2 (blocking): the
+    read-mode ptrace record skips the packaged journald in its units'
+    cgroups (`systemd-journald.service`, and
+    `systemd-journald@northnarrow.service`, which the agent's units log
+    to) and is once an hour per caller image and target otherwise
+    (`common::ptrace_read`, `PTRACE_READ_QUIET`, `PTRACE_READ_SEEN`); the
+    refusal unchanged. P3: KNOWN_LIMITATIONS names the two unmounts the
+    walk does not refuse (a copy behind 32 private mounts, or a chain of
+    9, of a namespace not guarded; the regroup window, one shared slave
+    enough; a lazy unmount racing the walk, N4 of the re-check 3) and what the
+    bpffs losing its last mount does; `ProcFacts`'s `/proc` root is
+    `proc_root` (a planted `std::fs::read_link` in `trusted_exe_now` is
+    caught by the kernel-views ratchet now). The coordinator's decision
+    (this round): the agent holds a descriptor of every link and program
+    it pins (`antitamper_bpf::held`, ratchet `held_pins`) — the deny hooks
+    no longer detach while the agent runs when the bpffs loses its last
+    mount or a pin is removed or hidden; the integrity round signs
+    `bpf_pin_vanished` (High) and pins a removed one again from the
+    descriptor. journald's identity is written before the ptrace guard
+    attaches (the round's 6.8 lab recorded one read made in between).
+    Mutation on the final tree: 54 mutants (the walk 24, `ptrace_read` 8,
+    journald's identity and its order 5, `held` 12, the round's held pins 4,
+    the purge's release 1), 54 caught by a named test — two after
+    `the_walk_reads_exactly_its_bound_and_every_group_read` (a 33rd mount
+    read; only the last group kept).
+    Lab (as measured, our own guests): ubuntu2204 (5.15.0-203) at a091aa8c
+    and 59989001 — the 900k verifier gate 123 programs, 0 failing, highest
+    `mount_guard_sb_umount` 675,751 (67.6 %), N3a refused (one High) with
+    the pins intact in the host's, the agent's and the watchdog's
+    namespaces, N3b (the copy made `rslave`) and N3c (a chroot's own mounts)
+    let through with no record, N3d (a raw namespace's `umount -l /`)
+    refused; ubuntu2404 (6.8.0-149) and ubuntu2604 (7.0.0-43) at 1edc1316
+    the same N3 verdicts, 0 failing; journald's records: 4 on 5.15 before
+    1edc1316 (the namespace instance's cgroup in its template's slice), 1 on
+    6.8 at 1edc1316 (made between the attach and the install), 0 on 7.0 at
+    1edc1316 and 0 on 5.15 and 6.8 at 59989001. The held descriptors
+    (59989001, ubuntu2204 and ubuntu2404): three pins removed in a window,
+    then SIGKILL of the agent, a read of its `environ` and a create in
+    `/etc/northnarrow` refused, three High `bpf_pin_vanished` pinned again
+    and cleared a round later; `umount -l /sys/fs/bpf` in a window (no
+    bpffs left in any namespace: 7 and 8 before), the three refusals held,
+    the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
+    cold boots.
 - **Lot 355 — the pre-alpha: an AppImage's program is judged by its image,
   not by its `/tmp` mount (C14; no level changes).**
   - What was open (lot 352's lab on ubuntu2404): an AppImage-style image on

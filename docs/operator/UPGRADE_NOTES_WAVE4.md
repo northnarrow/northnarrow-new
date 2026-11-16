@@ -2748,7 +2748,8 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 ## 47. A FUSE over `/proc`, `/sys` or the cgroup root does not stall the agent's critical loops; stuck restarts are named and a loop is signed (lot 353)
 
 What this lot covers, and what it does not (mounts over the agent's own
-directories: lot 357), is stated exactly at the end of §47.1.
+directories: lot 357, §51, which closes them), is stated exactly at the
+end of §47.1.
 
 The pre-alpha's Phase 3 (case X6): root mounted a FUSE file system over
 `/sys/fs/cgroup` that never answered the agent's threads. The integrity
@@ -2997,9 +2998,8 @@ the record and the read (pre-existing); `waiting` counts every process's
 requests, not only the agent's; an `nn-kview-open` thread stuck in a FUSE
 `STATFS` at a start under the mount keeps the agent from exiting at a later
 stop; a rotation's lift of the state directory's `+i` opens the directory
-by its path (a FUSE over the agent's own directories: to be closed by the
-mount refusal, lot 357; the watchdog's abort comes only after a failed
-SIGKILL).
+by its path (a FUSE over the agent's own directories: refused since lot
+357, §51; the watchdog's abort comes only after a failed SIGKILL).
 
 Re-check 2 of #563 (fix round 3) — what re-check 1 recorded, and what the
 second re-check found, systematically: a census of every `/proc`, `/sys`
@@ -3099,11 +3099,13 @@ entropy sampler (`agent/tests/fuse_stall.rs`); nor the watchdog's ping and
 its record appends under a FUSE over `/run/northnarrow`
 (`watchdog/tests/by_path_bounds.rs`).
 
-**Not covered** — a mount over the agent's own directories (or, for the
-decision thread, over a system directory) still holds these. Each is **to
-be closed by the mount refusal, lot 357**: a BPF-LSM refusal, in the host's
-mount namespace, of a mount over `/proc`, `/sys`, the cgroup root and the
-agent's own directories.
+**Not covered by this lot — closed by lot 357 (§51).** A mount over the
+agent's own directories (or, for the decision thread, over a system
+directory) held these. Lot 357 refuses the mount itself (the mount guard:
+a BPF-LSM refusal, in the host's mount namespace, of a mount on, over or
+below `/proc`, `/sys`, the cgroup root, the bpffs and the agent's own
+directories, binaries and units), and bounds each site below as defence in
+depth.
 - **The integrity round reads our directories by path before it signs.**
   `/etc/northnarrow` (the overlays, `read_dir`) and
   `/run/northnarrow/watchdog.pid` (the limits) are read by path before the
@@ -3111,8 +3113,11 @@ agent's own directories.
   shutdowns there are taken and removed by path (`rename`, `remove_file`)
   after. A FUSE over either directory (root) holds the round for as long as
   it stays — off the runtime, with no stall watch, silently: nothing is
-  signed meanwhile, that mount's own `mount_over_protected` included. To be
-  closed by the mount refusal, lot 357.
+  signed meanwhile, that mount's own `mount_over_protected` included.
+  Closed by lot 357: the mount is refused, and the round's reads, renames
+  and removals resolve beneath the directories' anchors (`crate::anchored`:
+  `openat2` `RESOLVE_BENEATH | RESOLVE_NO_XDEV`, `renameat2`, `unlinkat`,
+  bounded reads).
 - **The watchdog's stuck marker and the shutdown marker, by path.** After a
   stuck signal the watchdog removes its marker
   (`/run/northnarrow/watchdog.stuck`) by path, unbounded, on its one
@@ -3122,21 +3127,30 @@ agent's own directories.
   respawn, no `sd_notify`. The FUSE abort does not come before these: it
   runs only after a **failed** SIGKILL (`recovery_failed`); an agent the
   stuck recovery's SIGKILL ended is respawned through these reads with no
-  abort before them. To be closed by the mount refusal, lot 357.
+  abort before them. Closed by lot 357: the mount is refused; the stuck
+  marker's removal and write, and the shutdown check (marker, `admin.pub`,
+  `agent_id`, the honoured list), run on a helper thread waited for at most
+  2 s (no answer: a refusal, and a respawn), beneath the run directory
+  opened at the watchdog's start. The respawn's pidfile reads stay by path
+  (the mount guard covers them).
 - **`bpf-foreign` is written by path every round.** The kernel-state round
   writes `/run/northnarrow/bpf-foreign` (`atomic_file::replace`: remove,
   create, rename by path) at the end of every round (5 s), off the runtime:
   a FUSE over `/run/northnarrow` holds the round that signs the taint,
-  livepatch, root-cgroup program and foreign BPF findings. To be closed by
-  the mount refusal, lot 357.
+  livepatch, root-cgroup program and foreign BPF findings. Closed by lot
+  357: the mount is refused, and the file is replaced beneath the run
+  directory's anchor (`anchored::replace_file`).
 - **`trusted_exe` and `ran_host_file`, on the decision thread.** A rule's
   `exe … sha256` exemption checks the image's path and its parents by path
   in the agent's mount namespace; the lineage's `ran_host_file`
   (FIM-005/-019 with `logrotate` only) reads a packaged program's file at
   its path. A FUSE over a system directory (root) holds the decision there.
-  To be closed by the mount refusal, lot 357 — for these two only if its
-  list takes the system directories an exemption or a packaged program
-  names; otherwise on a bounded reader, as the account database's.
+  Closed by lot 357 on a bounded reader, as the account database's (not by
+  the mount refusal: covering `/usr/sbin`, `/usr/lib` and every directory a
+  packaged program lives in would refuse too much): the image's checks and
+  digest wait at most 500 ms (unanswered: not trusted, the exemption does
+  not hold for that event), a host file's identity at most 200 ms
+  (unanswered: not the host's file).
 - **The ratchet's bypasses.** `xtask/tests/kernel_views.rs` is lexical and
   does not see: a helper returning a view path as `&'static str` (or
   `CStr`, `OsStr`); `std::fs` or one of its functions imported under
@@ -3144,9 +3158,9 @@ agent's own directories.
   libc's `*64` calls (`open64`); a `String` built from `"/proc/"` and read
   in another file. `decision_path_io` does not scan nn-linux's decision
   hosts (`decision_host_linux.rs`, `accounts.rs`, `canary_host_linux.rs`). A
-  by-path read of a view written in one of these shapes passes both. To be
-  closed by the mount refusal, lot 357 (no mount over a view left to hold
-  such a read).
+  by-path read of a view written in one of these shapes passes both.
+  Closed by lot 357's mount refusal: no mount over or below a view is left
+  to hold such a read (the ratchet's shapes stay a named residual).
 
 ### 47.2 Fix round 5 of #563: the decision thread's reads, the bpffs's view
 
@@ -3449,3 +3463,468 @@ signed per-rule policy, or keeps its defence in the kernel's mark:
 | `bpf_held_load` (and its outliving; a held program found unseen or in the baseline) | no | **yes**: the only record of a program that can signal the agent | sole trace, never under the round's quota |
 | `kernel_taint`, `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined` | no (found by the kernel-state round) | **yes**: the only record of foreign kernel code, a program the agent never saw, the agent confined | sole trace, 32 a kind a round by name, the most dangerous first; the rest carried to the next rounds |
 | `sole_trace_summary` | no (the round's findings past its quota) | **yes**: the only signed count of those findings, naming each kind's highest-ranked, first and last | sole trace, one a round |
+
+## 51. A mount on, over or below the agent's paths is refused (lot 357)
+
+- **What changes.** In PID 1's mount namespace — and in the agent's and the
+  watchdog's own (§51.1) — for root (`CAP_SYS_ADMIN` in PID 1's user
+  namespace), the agent's kernel hooks now refuse
+  (`EPERM`, signed High: NN-L-AT-001, operation `mount`):
+  - a mount on or over `/proc`, `/sys`, `/sys/fs/cgroup`, `/sys/fs/bpf`,
+    `/etc/northnarrow`, `/var/lib/northnarrow`, `/run/northnarrow`, the
+    agent's pin directory, its binaries, its units and their drop-in
+    directories, and every directory above them (`/`, `/etc`, `/var`,
+    `/var/lib`, `/run`, `/usr`, `/usr/local/bin`…);
+  - a mount anywhere below the agent's own directories;
+  - a mount below `/proc`, `/sys`, the cgroup root or the bpffs that is not
+    one of the kernel's own pseudo-filesystems at its usual point
+    (binfmt_misc and systemd's automount for it, nfsd, xenfs, debugfs,
+    tracefs, securityfs, configfs, fusectl, pstore, efivarfs, bpffs,
+    selinuxfs, smackfs, resctrl, a hybrid host's cgroup hierarchies), and
+    any mount inside the tracefs, the debugfs or the securityfs —
+    `/proc/<pid>/…` (a tmpfs over `/proc/<agent>/fd` fed the agent false
+    facts) and a cgroup directory are never one;
+  - an unmount (lazy too) or a move of one of those mounts — the mounts
+    themselves, by their id, not a copy of one (§51.1) — and an unmount
+    that takes one with it (§51.3: what a lazy unmount takes below the
+    mount it names), a move through `mount(2)`'s `MS_MOVE`, `pivot_root`;
+  - a remount of the super block of a view or of a file system the agent's
+    paths are on, and a bind remount making one of those mounts read-only
+    or `noexec` (§51.1).
+- **Also from another mount namespace whose change reaches the host's**
+  (a raw `unshare(CLONE_NEWNS)` keeps the shared peer groups: a mount there
+  is copied into the host's view): judged as in the host's. A container,
+  `unshare -m` and a unit's sandbox are private or slaves: untouched.
+- **`mount_setattr(2)`** (read-only, propagation) has no kernel hook: not
+  refused, signed High (`integrity_drift` `mount_attrs_changed`) within one
+  integrity round when it changes a mount that holds the agent's paths. A
+  write the agent can no longer make there is already a signed degradation
+  (lot 353).
+- **What does not change.** Containers, `unshare -m`, systemd's sandboxes
+  of its units, snapd's and the container runtimes' mounts elsewhere
+  (`/var/lib/docker`, `/snap`, `/run/netns`, `/run/user`…) are not judged;
+  nor are propagation changes, PID 1's unmounts, systemd-shutdown's last
+  pass (§51.1) or an unprivileged caller's mount (the kernel refuses it).
+  The mount watch (`integrity_drift` `mount_over_protected`) stays: it
+  signs a mount the guard does not see (one propagated from another
+  namespace, one on a kernel without the guard).
+- **For you.**
+  - To mount, unmount or move one of these on purpose (a maintenance step,
+    `systemd-sysext refresh` or `systemd-confext refresh` at run time),
+    open a trusted-installer window: inside it the guard lets everything
+    through and records what it let through (operation `mount_window`,
+    Low).
+  - On Ubuntu 22.04 (util-linux 2.37), `mount --move` in the host's
+    namespace is refused: `mount(2)` names the moved mount by a string the
+    hook cannot resolve. From util-linux 2.39 (Ubuntu 24.04, Debian 13)
+    `mount --move` uses `move_mount(2)` and only a protected mount is
+    refused.
+  - A separate `/var` (or `/usr`) partition: its mount unit cannot unmount
+    it at shutdown (refused, the unit is marked failed); systemd-shutdown's
+    own pass (PID 1 and the helpers it forks) unmounts or remounts it
+    read-only as before.
+  - A kernel without the hooks (`sb_mount`, `move_mount`, `sb_umount`,
+    `sb_pivotroot`, `sb_remount`) or the offsets they read: the start signs
+    `mount guard not attached` (a degradation, not a refused start) and the
+    mount watch alone records such mounts.
+
+### 51.1 The review of #567: the mounts themselves, the units' namespaces, remounts
+
+- **The mounts held are mounts (F1).** The guard used to recognise a
+  protected mount by its root's dentry, so the unmount of any copy of `/`,
+  `/run` or `/sys` was refused. It now holds the mounts the protected paths
+  resolve through, by their id, in each namespace it guards. A backup's
+  `mount --bind / /mnt/snap`, a chroot's `mount -t proc`, `mount -t sysfs`
+  (the host's super block), `mount -t cgroup2` below it, its `--bind /run`
+  and `--bind /sys`, and their teardown (debootstrap, pbuilder, schroot,
+  arch-chroot, live-build, diskimage-builder) are let through, with no
+  record. What is still refused is an unmount the kernel would propagate
+  onto a held mount: an `rbind` of `/sys` that was not made `rslave`
+  first, unmounted with `umount -R`, takes the host's childless
+  `/sys/fs/cgroup` and `/sys/fs/bpf` with it. Make the copy `rslave` (or
+  `private`) before unmounting it, as the distributions' guides do.
+- **The agent's and the watchdog's own namespaces (F2).** Their units'
+  `ProtectSystem=strict` gives each a mount namespace of its own: the one
+  they read their paths through. Once the agent holds its role (the BPF
+  self-defence's liveness watch), its namespace is judged as PID 1's;
+  the watchdog's is, from the agent's watchdog refresh (at most 30 s after
+  the watchdog starts). Each is dropped at the process's exit, before the
+  kernel can give its number to another namespace. Records name it
+  (`made in the agent's own mount namespace`). The integrity round also
+  reads both namespaces' mount tables, besides PID 1's.
+- **Remounts (F3).** A reconfigure of the super block of `/proc`, `/sys`,
+  the cgroup root or the bpffs is refused whatever its options (proc's
+  `subset=pid`, `hidepid=`); one of a file system the agent's state, run,
+  configuration or binaries are on is refused when it makes it read-only —
+  `mount -o remount` and `fsconfig(FSCONFIG_CMD_RECONFIGURE)` (util-linux
+  2.39 and later) alike, both through the kernel's `sb_remount` hook, the
+  new flags read at `reconfigure_super()` by an `fentry` (without it,
+  every such reconfigure is refused, signed). A writable one passes:
+  Ubuntu's finalrd remounts `/run` `exec` at every shutdown; `size=` of
+  `/run` and `commit=` of `/` pass. A bind remount
+  (`mount -o remount,bind`) that makes one of the held mounts read-only or
+  `noexec` is refused too. util-linux 2.39 and later make a bind remount
+  with `mount_setattr(2)`, which has no hook: the integrity round signs it
+  (`mount_attrs_changed`, High), and now compares the super block's
+  options as well. A state, run or configuration directory found on a
+  read-only file system is signed High (`state_fs_read_only`). Exempt: a
+  kernel thread (`SysRq-u`'s emergency remount) and systemd-shutdown at the
+  end of a shutdown. The emergency path is named, not closed: root can
+  trigger it (`echo u > /proc/sysrq-trigger`, the SysRq key with
+  `kernel.sysrq` allowing it) and every block-backed file system goes
+  read-only, unrefused — `state_fs_read_only` (High) records it; a
+  `kernel.sysrq` value that forbids `u` closes it on a host that needs no
+  emergency remount.
+- **systemd-shutdown (F4).** PID 1 running systemd-shutdown (the kill
+  guard's identity: its comm and the file the agent recorded) and the
+  helpers it forks (`(sd-umount)`, `(sd-remount)`) unmount, remount
+  read-only, move the API mounts and pivot to `/run/initramfs` (dracut)
+  unjudged. PID 1 at any other time is judged for a pivot or a move:
+  `systemctl soft-reboot` needs a window.
+- **Mounts made before the guard attached.** At arming, every mount of
+  PID 1's and the agent's namespaces (the watchdog's at its refresh) that
+  covers a protected path or a directory above one, or lies below the
+  agent's directories or a view, is judged against the canonical layout by
+  its type, point and root: a view holds its own type whole, `/` anything
+  but a FUSE, a directory above the agent's paths no memory, FUSE or
+  stacking file system and no bind of another directory (a subvolume and a
+  unit's bind of a directory onto itself are canonical). Each other one is
+  a signed degradation of the start and a High of the integrity round's
+  first read (`mount_not_canonical`). An ostree host's binds of `/var` and
+  a NixOS impermanence host's `/` on tmpfs are named so: known false
+  positives. The overlays a host's image tooling merges at boot are the
+  canonical layout (§51.2): `systemd-sysext` over `/usr` or `/opt`,
+  `systemd-confext` over `/etc`, composefs over `/usr` (an overlay whose
+  source is `sysext`, `confext`, `composefs`).
+- **The tracefs, debugfs and securityfs the agent reads.** Their unmount is
+  let through and recorded Low (`mount_noted`). A clone of a subdirectory
+  of the kernel's own type moved onto its canonical point (securityfs'
+  `apparmor/` onto `/sys/kernel/security`) is refused.
+- **`/usr/local`.** Only the agent's binaries and units that exist are
+  points. With the package (`/usr/bin`), an NFS or automounted
+  `/usr/local` (an HPC host) is the host's business; with `install.sh`
+  (`/usr/local/bin`), a mount over `/usr/local` hides the agent and is
+  refused: install the package on such a host.
+- **The agent's libraries.** The directories of the shared libraries the
+  agent has mapped (`libc`, `libgcc_s`, the loader: `/usr/lib/<triplet>`,
+  `/usr/lib64`) are points too: a mount over one would swap what the
+  agent's or the watchdog's restart loads.
+- **Overlay root.** On an overlay of layers on more than one file system
+  (without `xino`), `stat(2)` gives a file the layer's device and the hook
+  reads the overlay's: the agent's binaries and units are registered under
+  both.
+- **Which namespace is judged (the cross-model check).** The namespace
+  that owns the target mount, never the caller's: a path through
+  `/proc/<pid>/root`, or an `O_PATH` descriptor of one passed to
+  `move_mount(2)`, names a mount of another namespace, and is judged there.
+  A change made elsewhere is judged when it propagates into a guarded
+  namespace: its target mount's peer group is the own group or the
+  master's group of a mount there that holds a protected point or is a
+  view (`MOUNT_GROUPS`, one look-up), or — a group the map does not hold
+  yet (§51.2: a guarded mount regrouped since the last refresh) — its
+  peers and each one's slaves, read in the hook up to 16 mounts, include a
+  mount of a guarded namespace, or cannot be read whole (more mounts, a
+  slave that is itself shared or a master: counted as reaching, and then
+  refused only on, over or below a protected point, so a host with many
+  containers is not judged wholesale). The groups, the held mounts and
+  their super blocks are read again every 30 s (an automounted tracefs, a
+  mount a window left) and within a second of a propagation change the
+  hooks let through (§51.2).
+- **PID 1 (the cross-model check).** Its exemption is an unmount of a mount
+  of its own namespace that is not one of the agent's directories. In the
+  agent's and the watchdog's namespaces PID 1 and its helpers are judged:
+  `systemctl bind northnarrow-agent.service … /run/northnarrow` (and
+  `mount-image`) fail at entering the agent's namespace — the ptrace guard
+  refuses the open of its `/proc/<pid>/ns/mnt` (a read-mode access), a
+  signed Low record (`ptrace_read`) since §51.2 (once an hour per caller
+  program and target since §51.3); before it, that refusal left no record —
+  and would be refused there.
+- **The units' drop-in directories.** `install.sh` and the agent's
+  `ExecStartPre=+` lines make `/etc/systemd/system/<unit>.service.d`,
+  `/run/systemd/system/<unit>.service.d` and their `system.control`
+  twins for the agent and the watchdog; they are the agent's own
+  directories (no new file, no mount on or below them, outside a window;
+  lots 273d and 330), and every drop-in found there at a start or a round
+  is judged (`own_dropin_*`). A drop-in with `InaccessiblePaths=`,
+  `TemporaryFileSystem=`, `BindPaths=` or `ExecStartPre=` is refused at its
+  write.
+- **A self-test of the guard at the start is not possible**: the agent's
+  unit filters `mount(2)` (`SystemCallFilter=`), and every other mount
+  call checks `CAP_SYS_ADMIN` before the hook. The lab proves the hooks;
+  the start signs what was not attached.
+- **The persistence vector of a mount made before the guard.** `/etc/fstab`
+  is in the FIM watch set (`fim-paths.v1`; a change is a Medium drift, no
+  rule of its own), and a `.mount` or `.automount` unit in
+  `/etc/systemd/system`, `/lib/systemd/system` or `/usr/lib/systemd/system`
+  is NN-L-FIM-009 (High). Not watched: `/run/systemd/system` and
+  `/run/systemd/transient` (runtime units), the generator directories
+  (`/etc/systemd/system-generators`, `/usr/lib/systemd/system-generators`,
+  `/usr/local/lib/systemd/system-generators`) and the automounter's maps
+  (`/etc/auto.master`, `/etc/auto.master.d`) — the next items below.
+- **What the kernel source says (verified on 5.15, 6.1, 6.5, 6.8, 6.12,
+  7.3, 7.4-rc2; systemd v247–v262):**
+  - a mount through `/proc/<pid>/root` into another namespace is the
+    kernel's `EINVAL` (`check_mnt`, `may_use_mount` from 6.15); the guard
+    judges the target's own namespace anyway (the hook runs first). The
+    real ways in are `setns(2)` (no LSM hook before 7.4: what is mounted
+    after it in the agent's or the watchdog's namespace is judged, and
+    opening their namespace is the ptrace guard's refusal),
+    `MOVE_MOUNT_SET_GROUP` and shared propagation (the peer groups);
+  - `move_mount`'s hook does not see its flags: `MOVE_MOUNT_SET_GROUP` and
+    `MOVE_MOUNT_BENEATH` onto a protected mount are refused by their
+    target (the protected mount's root), recorded as `move_mount(2)`
+    without the flag; `SET_GROUP` onto another mount of a guarded
+    namespace gives it a group: the hook wakes the refresh (§51.2), and
+    walks that group until the refresh holds it;
+  - `MS_REMOUNT | MS_BIND` reaches `sb_mount` only, `fsconfig`'s
+    reconfigure `sb_remount` (and `fs_context_parse_param`) only, and
+    `sb_remount` does not see the new options: every reconfigure of a held
+    super block is refused there, whatever the options;
+  - `mount_setattr(2)`, `open_tree_attr(2)` and `fsmount(2)`'s attributes
+    have no LSM hook up to 7.4-rc2: observed by the integrity round (High
+    within one round); a control at the system call would decide on the
+    caller's string, not done;
+  - btrfs: the hooks key a dentry by its subvolume's `anon_dev` and inode,
+    as `stat(2)` does — unique across subvolumes; the super block keys are
+    `s_dev` on both sides (not measured on a btrfs guest);
+  - systemd's live mounts (`systemctl bind`, `mount-image`, v248+) are made
+    by a grandchild of PID 1 (or of the `(sd-mount-in-ns)` worker, v257+)
+    after `setns(2)`: no exemption is tied to PID 1 there; the shutdown one
+    is PID 1 running systemd-shutdown;
+  - procfs: since 5.8 each mount is its own super block; the host's
+    `/proc` remount is refused. A private procfs instance for the agent
+    (`ProtectProc=`/`ProcSubset=` in its unit) would change what it sees:
+    not done, named.
+- **Public techniques, checked:** an overmount of `/proc/<pid>` (MITRE
+  T1564.013): refused; a `/proc` remount with `hidepid=`: refused; the
+  bpffs or a tracefs overmounted: refused; `mount_setattr(2)`: signed
+  High (not refused); `kernel.ftrace_enabled=0` and
+  `/sys/kernel/debug/kprobes/enabled=0`: refused by the sysctl guard
+  (lot 280b); the agent's BPF maps written: the BPF guard; runc's
+  redirected procfs writes (CVE-2025-52881): the agent does not write
+  `/proc/sys`; io_uring: no mount operation.
+- **Later (named for the backlog):** a device-mapper table swap and raw
+  block-device writes below a mounted file system; an overlay's upper
+  directory written directly; `systemctl soft-reboot` (systemd 254 and
+  later) and the guard's keys across it; the time sources (`machine-id`,
+  the RTC, PTP).
+- **The next items** (the adversarial review's persistence knobs, outside
+  the mount guard; what the FIM watch set covers today):
+  - `binfmt_misc`'s `register` (an interpreter for the ELF magic runs at
+    every exec, the agent's restart included): not watched — neither the
+    write to `/proc/sys/fs/binfmt_misc/register` nor `/etc/binfmt.d`,
+    `/usr/lib/binfmt.d`, `/run/binfmt.d`.
+  - `kernel.core_pattern` and `kernel.modprobe`: not in the sysctl guard's
+    list, and `/etc/sysctl.conf` and `/etc/sysctl.d` are not watched.
+  - `/etc/ld.so.preload`: watched, NN-L-FIM-022 (Critical); `/etc/ld.so.conf`
+    and `/etc/ld.so.conf.d`: not watched.
+  - The CA store (`/etc/ssl/certs`, `/usr/local/share/ca-certificates`,
+    `/etc/pki/ca-trust`) that the uplink trusts: not watched.
+  - `/etc/resolv.conf`: watched (`fim-paths.v1`, a Medium drift), no rule
+    of its own; `/etc/hosts` and `/etc/nsswitch.conf` likewise.
+  - An overlay's upper and work directories (an overlay root or `/usr`):
+    a change there changes what a protected path shows with no mount;
+    not watched.
+
+### 51.2 The re-check of #567: a regrouped mount, the read-mode refusals
+
+- **A regrouped guarded mount (N1).** The peer groups through which a
+  change made in another namespace reaches a guarded one were read every
+  30 s only. Root in the host could regroup a guarded mount — `mount
+  --make-private /`, a decoy `mount --make-shared` taking the freed
+  number, `mount --make-shared /` — and a raw `unshare(CLONE_NEWNS)` copy
+  of it, a peer in the new group, then mounted a tmpfs over
+  `/etc/northnarrow` that the kernel propagated into PID 1's namespace with
+  no refusal (recorded only at the next round). Now:
+  - a group the map does not hold is walked in the hook — the target
+    mount's peers and each one's slaves, up to 16 mounts: a mount of a
+    guarded namespace among them, or a walk that cannot be finished (more
+    mounts, a slave that is itself shared or a master, a peer ring
+    unreadable), counts as reaching, and the mount is refused there on,
+    over or below a protected point (anything else is let through);
+  - an unmount whose parent is in such a group is refused when it would
+    take a held mount: each held mount's place is also registered under
+    its parent mount itself (by its id), and the hook walks the parent's
+    peers and their slaves for that mount; a walk it cannot finish is
+    refused only when the mount unmounted has a held mount's root and its
+    parent is a copy of a held mount (its namespace's root, or sitting at
+    a held mount's place: a raw namespace's `/sys`). A chroot's own sysfs
+    (the host's dentries, another mount, a copy of it in each sandboxed
+    unit's namespace) unmounting its `sys/fs/cgroup` is let through: two
+    first versions refused it on every lab guest (keyed by the place
+    alone; then failing closed on any undecided walk);
+  - `mount(2)`'s `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` and
+    `MS_UNBINDABLE` on a mount of a guarded namespace (or of a group the
+    map holds), and a `move_mount(2)` into one of a mount in a peer group
+    (`MOVE_MOUNT_SET_GROUP` among them), are counted by the hooks (they
+    run before the change: the new group has no number yet); the agent
+    reads the count each second and reads the guarded namespaces' groups
+    again when it moved. `mount_setattr(2)` has no hook: until the 30 s
+    refresh, the walk;
+  - a propagation chain two masters deep is no longer a residual: the
+    slave that carries the change on makes the walk undecided, so it
+    counts as reaching.
+  Named: a peer of a regrouped held parent made at another place (a
+  bind of `/sys` elsewhere, in a group the map does not hold yet), behind
+  more than 16 mounts of propagation, can unmount a childless held mount
+  (`/sys/fs/bpf`) through it within the window before the refresh (a
+  second after `mount(2)`, up to 30 s after `mount_setattr(2)`): signed by
+  the integrity round, not refused.
+  The false-positive side: a mount in a group the map does not hold and
+  the walk cannot finish (a container running systemd, whose mounts have
+  more than 16 peers and slaves) is judged as reaching — refused only on a
+  protected point, which a container's own file systems never are, or on
+  the host's own view super block (`systemd-nspawn` sharing the host's
+  network namespace, a mount below its `/sys` that is not the kernel's
+  own).
+- **The read-mode refusals of the ptrace guard (b).** Opening an agent's
+  process's `/proc/<pid>/ns/*` (`nsenter -t <agent> -m`, `systemctl bind`
+  or `mount-image` into its namespace), `exe`, `root`, `cwd`, `fd/`,
+  `environ`, `maps` or `io` is refused (as before) and now recorded: a
+  signed Low `NN-L-AT-001` (`ptrace_read`), once a minute per caller and
+  target, through the non-decisive budget, raising no posture trigger.
+  journald reading the agent's executable for its log lines, `lsof` and a
+  monitoring agent's process collector meet it too: a few Low records a
+  minute on a host that runs them (§51.3: once an hour per caller program,
+  none from journald). A `PTRACE_MODE_NOAUDIT` check (`ps`
+  reading `/proc/<pid>/stat`) stays silent.
+- **btrfs (d).** The guard's key of an inode is now one function
+  (`common::mount_guard::inode_key`), the hooks' and the unit tests': two
+  subvolumes of one file system, whose roots are both inode 256, are two
+  keys (each the subvolume's device, as `stat(2)` gives it), and a point on
+  one never matches the other. Without the btrfs offsets the key is the
+  super block's, which matches no point on a subvolume: not measured on a
+  btrfs guest yet.
+- **The image tooling's overlays.** The start's audit of the mounts made
+  before the guard took a `systemd-sysext` overlay over `/usr` (Flatcar),
+  a `confext` over `/etc` or a composefs over `/usr` (Silverblue-like
+  hosts) for a stacking file system over the agent's paths: a High at each
+  start. These are the canonical layout now, by type and source (an
+  overlay whose source is the tool's); root names a mount's source as it
+  likes, so this is a layout, not a proof, and a merge at runtime
+  (`systemd-sysext refresh`) is still refused outside a window.
+- **The allow list out of line.** The object itself is checked now: the
+  embedded eBPF object has `allowed_kernel_mount` as a function of its own,
+  and the `sb_mount` and `move_mount` programs make a function call (the
+  source's `#[inline(never)]` stays pinned too).
+- **Named, not changed:** `MOVE_MOUNT_SET_GROUP` from a held mount (not
+  `/`) to another one is refused as a move away (CRIU or podman restoring
+  external slave mounts of `/sys` or `/run`: niche); SysRq-u (§51.1,
+  remounts).
+
+### 51.3 The re-check 2 of #567: what an unmount takes below, journald's reads
+
+- **A lazy unmount is judged by the subtree it takes (N3).** `umount -l`
+  (`MNT_DETACH`) calls the kernel's hook once, for the mount it names; the
+  kernel then takes that mount's whole subtree and propagates the unmount
+  of each mount in it to the peers and slaves of that mount's parent, with
+  no other check. `mount --rbind /sys /mnt/s; umount -l /mnt/s` — the copy
+  at a place nothing is held at — took the host's childless `/sys/fs/bpf`
+  and `/sys/fs/cgroup` through the copies below it, and the copies in every
+  slave namespace (the agent's own included): the bpffs lost its last
+  mount, with no refusal. The same held for a raw namespace's `umount -l
+  /`. Now the guard reads the subtree in the kernel's order (32 mounts: a
+  child, else the next sibling of the mount or of one of its parents up to
+  8 levels), and refuses
+  the unmount when a mount in it is held (by its id in a guarded
+  namespace), or its unmount propagates onto a held mount (its place under
+  its parent's peer group; a group not followed yet, regrouped since:
+  under a copy of a held mount), or — the subtree wider than the walk — it
+  is in PID 1's, the agent's or the watchdog's namespace, or a mount read
+  in it sits under a parent in a peer group. A refusal is the usual signed
+  High (`NN-L-AT-001`, operation `mount`, an unmount).
+- **What goes through.** An rbind made `rslave` before its lazy unmount
+  (its copies propagate nothing), a chroot's own mounts (`mount -t sysfs`,
+  its cgroup2, a proc at `$T`: new mounts, at no held mount's place), a
+  container runtime's old root after `pivot_root` (every mount a slave or
+  private, in a namespace of its own), `umount -R` (one mount at a time,
+  each judged as before).
+- **For you.** In PID 1's namespace, a lazy unmount of more than the walk
+  reads at once (an rbind of `/` and its submounts) is refused even when
+  `rslave`: unmount it with `umount -R`, or inside a trusted-installer
+  window. Two new optional offsets (`struct mount`'s `mnt_mounts` and
+  `mnt_child`): a kernel without them does not attach the guard (a signed
+  degradation, as for the others).
+- **The refused reads of the agent's processes (point 2).** The read-mode
+  ptrace record (§51.2) was once a minute per caller process and target:
+  about 2,880 Low records a day from journald alone, and as many from each
+  periodic reader. Now:
+  - the packaged `systemd-journald` is not recorded — its image at its
+    install path (root's file, in a directory only root may write, not
+    disowned by the package database, read again every 10 s) running in
+    the cgroup of `systemd-journald.service` or of the namespace instance
+    the agent's units log to (`systemd-journald@northnarrow.service`),
+    written to the kernel before the ptrace guard attaches. Its reads are
+    still refused (its lines from the agent carry no `_EXE`, as before);
+  - every other caller is recorded once an hour per caller program (its
+    executable's identity, not its process) and target: htop or a
+    monitoring agent is one record an hour per process of the agent's, a
+    tool run each minute (`pidof`, `lsof`, `ss -p`) the same, and a program
+    never seen before (`nsenter -t <agent> -m`) at its first use.
+- **The agent holds what it pins (fix round 3).** A link stays attached
+  while one reference to it is left: its pin, or a descriptor. The deny
+  links were held by their pins alone once the agent's start was over: one
+  pin removed detached its hook at once while the agent ran, and the bpffs
+  losing its last mount left them to whatever descriptor in it the agent
+  held (its anchor of `/sys/fs/bpf`). Now the agent keeps a descriptor of every
+  link and program it pins, for its life (`antitamper_bpf::held`: the deny
+  hooks, the BPF guard's, the mount guard's, the start-in-cgroup
+  tracker's, the sysctl judge's, the module files' write history's, the
+  liveness watch). The watchdog pins nothing of its own and loads no
+  program: its handles on the agent's pinned maps are opened per use, as
+  before (a map the agent re-creates at each start must not be held from
+  an earlier one). The agent's own purge of a pin drops the descriptor
+  first (what it retires still detaches). One more open descriptor per
+  pinned link and program (about ninety; the lab's 5.15 agent held 446 in
+  all, its soft `RLIMIT_NOFILE` 65,536, raised to the hard limit at its
+  start; `MAX_HELD` = 1,024 objects at most). The eBPF object is
+  unchanged.
+- **What happens if the bpffs loses its last mount** (what N3 did, and
+  what the residual below can still do): no path reaches the pins any
+  more, while the super block keeps them as long as a descriptor in it is
+  open — the agent's anchor of `/sys/fs/bpf` (lot 353's views) is one, and
+  the kernel frees the pins with the super block once the agent's
+  descriptors close. The deny hooks (the kill, ptrace, file, cgroup, BPF
+  and mount guards) stay attached while the agent runs — it holds them —
+  and so do its sensors and maps (the lab: `umount -l /sys/fs/bpf` in a
+  window, no bpffs left in any namespace, then SIGKILL of the agent, a
+  read of its `environ` and a create in `/etc/northnarrow` refused, on
+  5.15 and 6.8). The integrity round signs `protected_mount_gone`; the
+  pins it reads beneath its anchor are in place, so no `bpf_pin_vanished`.
+  The watchdog's handles on the pinned maps fail. If the agent stops
+  before a reboot, its hooks go with it: the next start finds no bpffs at
+  `/sys/fs/bpf` (its hooks attach for that run only, a signed
+  degradation) or, if root mounted a fresh one, an empty pin root it
+  takes for a first start: the previous run's pins are out of its reach,
+  as after a reboot (BOOT_INTEGRITY.md).
+- **A pin removed or hidden** (a pin root writable only inside a
+  trusted-installer window, a mount over it refused by the guard): the
+  integrity round (outside a window) compares every pin of an object the
+  agent holds with the inode it was pinned at, in the directory it was
+  pinned in. A pin gone, replaced or unreadable is a signed High
+  (`bpf_pin_vanished`) naming the pin, the object and its id; a pin
+  removed is pinned again from the descriptor, in that directory only
+  (never into a new bpffs, nor a mount laid over the directory), so the
+  next start finds it — the record says so, and a later round clears it.
+  The pin directory itself removed is one High with the number of links
+  and programs it held, nothing pinned again. The lab: three pins removed
+  in a window (`link_task_kill`, `prog_task_kill`,
+  `link_ptrace_access_check`), then outside it SIGKILL, the `environ` read
+  and the create still refused; three Highs, the three pins back, three
+  clears a round later.
+- **Named, not changed:** a lazy unmount in a namespace that is not PID
+  1's, the agent's or the watchdog's, of a subtree whose first 32 mounts
+  (or a chain of 9 levels) are all private, behind which lies a copy in one of the host's
+  peer groups (root building it on purpose in a raw `unshare(CLONE_NEWNS)`
+  namespace) is not refused: the walk is bounded. A lazy unmount that races the
+  walk (a copy grafted by a concurrent rbind after the guard read the
+  subtree, in any namespace) is not refused either: the hook runs before
+  the kernel's mount lock (re-check 3 of #567, N4); the deny links stay,
+  the loss is signed, the pins do not. To close it: the pin directory as
+  its own private, unbindable mount. And the regroup window
+  of §51.2 (a peer of a regrouped held parent unmounting through it before
+  the refresh) needs only one shared slave of that parent, not 16 mounts —
+  every sandboxed unit's namespace is one — hiding the host's bpffs mount
+  (not the agent's copy, nor the pins). KNOWN_LIMITATIONS.md names both:
+  the pins can still be lost or hidden, the hooks no longer detach while
+  the agent runs.

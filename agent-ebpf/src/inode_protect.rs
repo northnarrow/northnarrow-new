@@ -57,12 +57,13 @@ use aya_ebpf::{
 
 use northnarrow_common::cgroup_limits::same_value;
 use northnarrow_common::fail_open::hook;
+use northnarrow_common::ptrace_read;
 use northnarrow_common::wire::{
     fs_protect_denied_op, fs_protect_init_may, fs_protect_init_may_open, fs_protect_required,
     fs_protect_thaw_value, FsGrant, FsProtectDenialRaw,
     InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
-    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
+    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE_READ, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR,
+    FS_OP_SETATTR, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, READ_PROTECTED_SLOTS, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -276,6 +277,25 @@ pub(crate) fn override_active() -> bool {
 #[map]
 static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
 
+/// The re-check 2 of #567 (point 2): a refused read-mode ptrace access's
+/// last record by caller IMAGE and target
+/// (`northnarrow_common::ptrace_read::seen_key`) → monotonic ns, one an
+/// hour ([`emit_task_read_denial`]). By image, not by process: a
+/// short-lived tool (`pidof`, `lsof`) is a new process at each run.
+#[map]
+static PTRACE_READ_SEEN: LruHashMap<[u64; 2], u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// The re-check 2 of #567 (point 2): the packaged `systemd-journald`'s
+/// identities — its images (the kernel's `(dev, ino)`, as `mm->exe_file`
+/// gives them) each in its units' cgroups (`systemd-journald.service`,
+/// `systemd-journald@northnarrow.service`), by id
+/// (`northnarrow_common::ptrace_read::quiet_key`) — written by the agent
+/// at its start and at each 10 s re-read (`nn_linux::journald_identity`).
+/// Their refused reads of the agent's `/proc/<pid>/exe` are not recorded;
+/// they stay refused.
+#[map]
+pub static PTRACE_READ_QUIET: HashMap<[u64; 3], u8> = HashMap::with_max_entries(8, 0);
+
 /// Budget for task-denial records, per CPU: `[window start (ns), records
 /// in the window]`. A loop of fresh `/bin/kill` processes defeats the
 /// per-caller dedup; this caps it at [`TASK_DENIAL_PER_SEC`] per CPU so
@@ -416,6 +436,56 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
             ino: target_tgid as u64,
         },
     );
+}
+
+/// The re-check of #567 (b): a refused read-mode ptrace access to one of
+/// the agent's processes (`FS_OP_PTRACE_READ`: its `/proc/<pid>/ns/*` for
+/// `nsenter` or `systemctl bind`, `exe`, `fd/` …), `target_ino` = target
+/// tgid, `target_dev` = the ptrace mode. The re-check 2 of #567 (point 2,
+/// `northnarrow_common::ptrace_read`): not recorded for the packaged
+/// journald in its unit's cgroup ([`PTRACE_READ_QUIET`]; journald reads the
+/// agent's `/proc/<pid>/exe` for every line it takes, all day), recorded
+/// once an hour per caller image and target ([`PTRACE_READ_SEEN`]) for
+/// every other caller — behind the self-test's bypass and the
+/// non-decisive records' budget ([`limited_budget`]). The refusal never
+/// depends on the record.
+#[inline(always)]
+pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
+    let key = InodeKey {
+        dev: mode as u64,
+        ino: target_tgid as u64,
+    };
+    if caller_is_self_test() {
+        emit_denial(FS_OP_PTRACE_READ, key);
+        return;
+    }
+    let exe = match unsafe { crate::bpf_defense::caller_exe_key() } {
+        Some(k) => k,
+        None => InodeKey { dev: 0, ino: 0 },
+    };
+    let cgroup = unsafe { aya_ebpf::helpers::generated::bpf_get_current_cgroup_id() };
+    if ptrace_read::quiet(exe.dev, exe.ino, cgroup, |k| unsafe {
+        PTRACE_READ_QUIET.get(k).is_some()
+    }) {
+        return;
+    }
+    let now = unsafe { bpf_ktime_get_ns() };
+    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid);
+    match PTRACE_READ_SEEN.get_ptr_mut(&seen) {
+        Some(last) => unsafe {
+            if !ptrace_read::due(Some(*last), now) {
+                return;
+            }
+            *last = now;
+        },
+        None => {
+            let _ = PTRACE_READ_SEEN.insert(&seen, &now, 0);
+        }
+    }
+    if !limited_budget(FS_OP_PTRACE_READ, now) {
+        return;
+    }
+    emit_denial(FS_OP_PTRACE_READ, key);
 }
 
 /// [`emit_denial`] behind the per-caller dedup and the per-CPU budget of

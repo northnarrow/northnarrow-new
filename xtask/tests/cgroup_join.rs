@@ -367,7 +367,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
     )
     .unwrap();
     let pf = code("crates/nn-linux/src/decision_host_linux.rs");
-    assert!(pf.contains("crate::cgroup_join::started_in_cgroup(&self.root, pid)"));
+    assert!(pf.contains("crate::cgroup_join::started_in_cgroup(&self.proc_root, pid)"));
     let cj = code("crates/nn-linux/src/cgroup_join.rs");
     in_order(
         body(&cj, "started_in_cgroup"),
@@ -571,8 +571,8 @@ fn the_agent_asks_the_marks_where_it_decides() {
         &[
             "let id = p.attach()",
             "antitamper_bpf::purge_stale_pin(&link_path);",
-            "prog.pin(&prog_path)",
-            "fd_link\n        .pin(&link_path)",
+            "antitamper_bpf::held::pin_prog(fd, &prog_path)",
+            "antitamper_bpf::held::pin_link(fd_link, &link_path)",
         ],
     )
     .unwrap();
@@ -607,8 +607,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
     // (lot 290: nor a loader opt-out's load, nor the BPF cross-view's findings)
     // (lot 349: nor the agent's own CPU watch's, nor a window's held load)
     // (the review of #565: nor any sole trace, the round's summary included)
+    // (lot 357: nor a mount the signed window let through)
+    // (the review of #567: nor an unmount let through and recorded)
     assert!(tr.contains(
-        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n                    | nn_model::FsProtectOperation::ExemptInjection\n                    | nn_model::FsProtectOperation::BpfProgOptOut\n                    | nn_model::FsProtectOperation::BpfUnseen\n                    | nn_model::FsProtectOperation::BpfBaseline\n                    | nn_model::FsProtectOperation::CpuConfined\n                    | nn_model::FsProtectOperation::BpfHeldLoad\n            ) && !operation.is_sole_trace()\n            {"
+        "if !matches!(\n                operation,\n                nn_model::FsProtectOperation::CgroupJoin\n                    | nn_model::FsProtectOperation::SysctlOptOut\n                    | nn_model::FsProtectOperation::KernelTaint\n                    | nn_model::FsProtectOperation::SysctlRootProg\n                    | nn_model::FsProtectOperation::ExemptInjection\n                    | nn_model::FsProtectOperation::BpfProgOptOut\n                    | nn_model::FsProtectOperation::BpfUnseen\n                    | nn_model::FsProtectOperation::BpfBaseline\n                    | nn_model::FsProtectOperation::CpuConfined\n                    | nn_model::FsProtectOperation::BpfHeldLoad\n                    | nn_model::FsProtectOperation::MountWindow\n                    | nn_model::FsProtectOperation::MountNoted\n            ) && !operation.is_sole_trace()\n            {"
     ));
     let pe = code("agent/src/pipeline/process_event.rs");
     assert!(pe.contains("let joined = *operation == nn_model::FsProtectOperation::CgroupJoin;"));
@@ -646,7 +648,7 @@ fn the_agent_asks_the_marks_where_it_decides() {
         ],
     )
     .unwrap();
-    assert!(pf.contains("crate::cgroup_join::injected(&self.root, pid)"));
+    assert!(pf.contains("crate::cgroup_join::injected(&self.proc_root, pid)"));
 }
 
 /// The worker's single-thread check is the sandbox's first step, in both

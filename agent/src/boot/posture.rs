@@ -17,7 +17,10 @@ use tracing::{debug, info, warn};
 
 use super::cli::Cli;
 use super::evidence::AuditHandle;
-use super::tasks::{spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh, WatchdogAudit};
+use super::tasks::{
+    spawn_mount_guard_regroup_watch, spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh,
+    MountGuardRefresh, WatchdogAudit,
+};
 use crate::pipeline::{systemd_watch, HostStopping, SystemdSnapshot};
 
 /// What [`machine`] built.
@@ -285,18 +288,25 @@ pub(crate) fn machine(
     // to, set once it is open (below).
     let watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>> =
         Arc::new(std::sync::OnceLock::new());
+    // The re-check of #567 (N1): one refresh of the mount guard's maps at a
+    // time, the watchdog refresh's and the regroup watch's.
+    let mount_refresh: MountGuardRefresh = Arc::new(parking_lot::Mutex::new(()));
     if isolator.is_some() {
         spawn_watchdog_exempt_refresh(
             exempt.clone(),
             cli.watchdog_pidfile.clone(),
             cli.resolved_watchdog_exe(),
             Arc::clone(&watchdog_audit),
+            Arc::clone(&mount_refresh),
         );
     }
     // External audit EBPF-001: PID 1 may signal the agent at the very end
     // of a shutdown only while it runs the `systemd-shutdown` the hook
     // knows; follow a systemd upgrade that replaces it.
     spawn_shutdown_exe_refresh();
+    // The re-check of #567 (N1): the mount guard's peer groups followed at
+    // each propagation change the hooks let through.
+    spawn_mount_guard_regroup_watch(mount_refresh);
 
     // Beta Step 4a: reconcile a stale COMBAT chain left by a crash.
     // The agent always boots into OBSERVING, so if the

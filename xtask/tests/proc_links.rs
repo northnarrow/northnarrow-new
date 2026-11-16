@@ -93,6 +93,20 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "the security-tool list's `proc` key (a field of the signed list), no path segment",
     ),
     (
+        "crates/nn-linux/src/anti_tamper/mount_guard.rs",
+        4,
+        "the review of #567 (F1, F2): a guarded namespace's own mount table, its namespace link \
+         and its root (`/proc/<pid>/mountinfo`, `/proc/<pid>/ns/mnt`, `/proc/<pid>/root`) read for \
+         the mount guard's registration: read, no match",
+    ),
+    (
+        "crates/nn-linux/src/posture_host_linux.rs",
+        2,
+        "lot 357's item 5: which reader a host file's identity takes — at once beneath a kernel \
+         view, on the bounded host-file reader through PID 1's root (`/proc/1/root/…`, the \
+         host's own files, out of the view): the reader chosen, no path a caller wrote matched",
+    ),
+    (
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
         1,
         "the agent's own descriptors listed (`/proc/self/fd`): read, no match",

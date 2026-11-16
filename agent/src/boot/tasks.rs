@@ -271,6 +271,43 @@ pub(crate) fn spawn_shutdown_exe_refresh() {
     });
 }
 
+/// The re-check of #567 (N1): the mount guard's peer groups followed at a
+/// propagation change, not only at the 30 s watchdog refresh — each second
+/// the count of the changes the hooks let through (`MOUNT_GUARD_CONF`) is
+/// read, and when it moved every guarded namespace's held mounts and groups
+/// are read again (until then the hooks walk a group they do not hold).
+pub(crate) fn spawn_mount_guard_regroup_watch(mount_refresh: MountGuardRefresh) {
+    let Some(root) = northnarrow_agent::anti_tamper::prepare_pin_root() else {
+        return;
+    };
+    tokio::spawn(async move {
+        use northnarrow_agent::anti_tamper::mount_guard::{refresh_now, RegroupWatch};
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut watch: Option<RegroupWatch> = None;
+        loop {
+            tick.tick().await;
+            let Some(w) = watch.as_mut() else {
+                // the guard's pins (not attached: nothing to follow)
+                watch = RegroupWatch::open(root).ok();
+                continue;
+            };
+            if w.moved() {
+                // the mount tables read by path — off the runtime's worker
+                let done = nn_linux::runtime::off_the_runtime(|| {
+                    let _one = mount_refresh.lock();
+                    refresh_now(root)
+                });
+                if let Err(e) = done {
+                    debug!(
+                        error = format!("{e:#}"),
+                        "anti-tamper mount guard: refresh at a propagation change skipped"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Lot 310 (BUG-103): the packaged `systemd-executor`'s identities read
 /// again every 10 s — its files at the install paths and the copies the
 /// managers hold open — in place of the ones before (the review of #539,
@@ -330,6 +367,12 @@ pub(crate) fn spawn_program_images_refresh() {
 /// The signed audit log, as the watchdog refresh gets it once it is open.
 pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 
+/// The re-check of #567 (N1): one refresh of the mount guard's maps at a
+/// time — the watchdog refresh's and the regroup watch's each replace a
+/// namespace's entries (new ones first, then the stale ones go). Made at
+/// the start, handed to both tasks.
+pub(crate) type MountGuardRefresh = Arc<parking_lot::Mutex<()>>;
+
 /// Beta Step 3: background task that keeps the watchdog PID slot of
 /// `exempt` in sync with the live, exe-verified watchdog.
 ///
@@ -343,6 +386,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
     pidfile: PathBuf,
     expected_exe: PathBuf,
     audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
+    mount_refresh: MountGuardRefresh,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -361,6 +405,18 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // watchdog's binary and the pins read by path — run off the
         // runtime's worker
         let mut tick_once = || {
+            // The review of #567 (the cross-model check): the mount guard's
+            // held mounts and peer groups followed (a propagation change, an
+            // automounted tracefs)
+            if let Some(root) = bpffs_root {
+                let _one = mount_refresh.lock();
+                if let Err(e) = northnarrow_agent::anti_tamper::mount_guard::refresh(root) {
+                    debug!(
+                        error = format!("{e:#}"),
+                        "anti-tamper mount guard: refresh skipped"
+                    );
+                }
+            }
             let resolution = resolve_verified_watchdog_pid(&pidfile, &expected_exe);
             let new_pid = match &resolution {
                 WatchdogResolution::Verified { pid, .. } => Some(*pid),
@@ -372,6 +428,14 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 // same PID).
                 if let WatchdogResolution::Verified { pid, start_ticks } = &resolution {
                     exempt.set_watchdog(*pid, *start_ticks);
+                    // the review of #567: its mount namespace's held mounts
+                    // and peer groups followed too (quietly: its findings
+                    // were signed at its registration)
+                    if let Some(root) = bpffs_root {
+                        let _one = mount_refresh.lock();
+                        let _ =
+                            northnarrow_agent::anti_tamper::mount_guard::guard_watchdog(root, *pid);
+                    }
                 }
                 return; // no change — stay quiet on the hot path
             }
@@ -427,6 +491,40 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     p,
                     &cgroup_keys,
                 );
+                // The review of #567 (F2): its mount namespace judged as
+                // PID 1's, its held mounts registered; a mount there that is
+                // not the canonical one is signed (the brainstorm's 3rd point).
+                if let Some(root) = bpffs_root {
+                    let registered = {
+                        let _one = mount_refresh.lock();
+                        northnarrow_agent::anti_tamper::mount_guard::guard_watchdog(root, p)
+                    };
+                    match registered {
+                        Ok(g) => {
+                            info!(
+                                watchdog_pid = p,
+                                watchdog_mnt_ns = g.mnt_ns,
+                                "anti-tamper mount guard: the watchdog's mount namespace is \
+                                 judged as PID 1's"
+                            );
+                            let log = audit.get().and_then(|l| l.as_ref());
+                            for f in g.not_canonical {
+                                northnarrow_agent::self_integrity::report_event(
+                                    log,
+                                    &northnarrow_agent::self_integrity::Finding {
+                                        kind: "mount_not_canonical",
+                                        detail: format!("in the watchdog's mount namespace: {f}"),
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            watchdog_pid = p,
+                            error = format!("{e:#}"),
+                            "anti-tamper mount guard: the watchdog's mount namespace NOT guarded"
+                        ),
+                    }
+                }
             }
             match &resolution {
                 WatchdogResolution::Verified {

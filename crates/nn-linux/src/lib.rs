@@ -394,6 +394,7 @@ pub mod worker;
 
 // Lab PR 265 (review of #468 R1, R3): the one `mountinfo` reader, byte by
 // byte, of the start's mount check and the self-integrity watcher.
+pub mod mount_attrs;
 pub mod mountinfo;
 
 // Lot 311 (third bug hunt, F4 and N6): the kernel's state files read as
@@ -437,6 +438,9 @@ pub mod shutdown_marker;
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
 pub mod host_dropins;
+/// The re-check 2 of #567: the packaged journald's identity, whose
+/// refused reads of the agent's `/proc/<pid>/exe` are not recorded.
+pub mod journald_identity;
 /// Lot 280b: the kernel's state the hooks depend on and no hook sees
 /// change — its taint flags and livepatches, the root cgroup's
 /// `cgroup/sysctl` programs — read every 5 s.

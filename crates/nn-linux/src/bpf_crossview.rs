@@ -711,7 +711,11 @@ impl CrossView {
         };
         if let Some(path) = &self.status {
             let body = render_status(&self.watch, &foreign);
-            if let Err(e) = crate::atomic_file::replace(path, body.as_bytes(), 0o600) {
+            // Lot 357 (re-check 3 of #563, R3-3): beneath the run
+            // directory's anchor (`*at`), never by path — a mount over
+            // `/run/northnarrow` no longer holds the kernel-state round
+            let path = crate::anchored::anchor(path);
+            if let Err(e) = crate::anchored::replace_file(&path, body.as_bytes(), 0o600) {
                 tracing::debug!(error = %e, path = %path.display(), "BPF cross-view: status file not written");
             }
         }

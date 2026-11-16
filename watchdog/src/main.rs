@@ -42,10 +42,10 @@ use northnarrow_watchdog::{
     CoveringFuse, RestartLoop, FUSE_CONNECTIONS,
 };
 use northnarrow_watchdog::{
-    check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
-    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, process_start_unix,
-    register_own_cgroup, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
-    sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
+    anchor_run_dir, check_shutdown_marker_bounded, evict_dead_agent, harden_self,
+    hold_until_agent_returns, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited,
+    process_start_unix, register_own_cgroup, register_self_pid, reinsert_new_agent_pid,
+    sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
     write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome, RestartBackoff,
     ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
     PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
@@ -167,6 +167,11 @@ fn record_unit_failure(cli: &Cli) -> ExitCode {
 /// Body of the watchdog boot/wait/teardown cycle, extracted so
 /// the binary surface stays a thin error→exit-code mapper.
 async fn run(cli: Cli) -> std::result::Result<(), Failure> {
+    // Lot 357 (re-check 3 of #563, R3-2): the run directory opened now; its
+    // markers and records are resolved beneath it from here on.
+    if let Some(dir) = cli.shutdown_marker.parent() {
+        anchor_run_dir(dir);
+    }
     harden_self()
         .context("harden_self (prctl PR_SET_DUMPABLE + PR_SET_NAME)")
         .exit_as(ExitReason::Harden)?;
@@ -477,7 +482,8 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     agent_pid,
                     agent_started,
                 };
-                match check_shutdown_marker(&check) {
+                // lot 357 (re-check 3 of #563, R3-2): bounded, off this thread
+                match check_shutdown_marker_bounded(&check) {
                     ShutdownVerdict::Authorised => {
                         info!(
                             target: "watchdog.shutdown_marker",

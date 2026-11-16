@@ -234,8 +234,8 @@ fn the_bpf_guard_s_hooks_are_pinned() {
         &[
             "prog.attach()",
             "purge_stale_pin(&link_path);",
-            "prog.pin(&prog_path)",
-            "fd_link.pin(&link_path)",
+            "held::pin_prog(prog.fd()?, &prog_path)",
+            "held::pin_link(fd_link, &link_path)",
         ],
     )
     .unwrap();

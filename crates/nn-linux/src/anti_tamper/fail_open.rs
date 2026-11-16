@@ -272,6 +272,8 @@ mod tests {
         let mut hooks: Vec<&str> = super::super::DENY_HOOKS.to_vec();
         hooks.extend(super::super::OPTIONAL_DENY_HOOKS);
         hooks.push(super::super::bpf_defense::OBSERVE_HOOK);
+        // lot 357: the mount guard's (degradable, not in the deny count)
+        hooks.extend(super::super::mount_guard::HOOKS);
         hooks.sort_unstable();
         let mut slots = FAIL_OPEN_HOOKS.to_vec();
         slots.sort_unstable();

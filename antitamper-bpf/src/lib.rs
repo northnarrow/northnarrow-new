@@ -76,6 +76,11 @@ pub mod cgroup_guard;
 /// Lot 311: a configuration file the host names, read bounded, as bytes,
 /// a regular file only.
 pub mod config_read;
+/// The re-check 2 of #567, fix round 3: a descriptor of every link and
+/// program the agent pins, held for its life — attached while it runs,
+/// whatever happens to the pin.
+#[cfg(target_os = "linux")]
+pub mod held;
 /// Lot 273c/273d: the host's drop-ins judged by their value for our units
 /// (the agent's integrity round, its reloads, the watchdog's).
 pub mod host_dropins;
@@ -374,7 +379,13 @@ pub fn lsm_pin_paths(root: &Path, hook_name: &str) -> (PathBuf, PathBuf) {
 /// file whose backing kernel object is gone (or is corrupt on disk)
 /// must never wedge agent startup: we remove it and fall through to
 /// a fresh attach. `NotFound` is success (already gone).
+///
+/// Fix round 3 of #567: the descriptor the agent holds for that pin (or
+/// for the pins below it, a directory) is dropped first ([`held::release`]):
+/// the agent's own purge still detaches what it retires.
 pub fn purge_stale_pin(path: &Path) {
+    #[cfg(target_os = "linux")]
+    held::release(path);
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -491,8 +502,11 @@ pub fn reattach_fresh_held(
     purge_stale_pin(&prog_path);
 
     // Step 3 — pin the fresh program + link so this boot's hook survives the
-    // next death→respawn gap (split-brain persistence preserved).
-    prog.pin(&prog_path).with_context(|| {
+    // next death→respawn gap (split-brain persistence preserved). Fix round
+    // 3 of #567: both through `held`, a descriptor of each kept for the
+    // agent's life — attached while it runs, its pin removed, hidden or its
+    // bpffs unmounted.
+    held::pin_prog(prog.fd()?, &prog_path).with_context(|| {
         format!(
             "pinning fresh LSM program `{program_name}` to {}",
             prog_path.display()
@@ -502,7 +516,7 @@ pub fn reattach_fresh_held(
         .take_link(link_id)
         .with_context(|| format!("taking ownership of fresh `{hook_name}` LSM link"))?;
     let fd_link: FdLink = link.into();
-    let pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+    let pinned = held::pin_link(fd_link, &link_path).with_context(|| {
         format!(
             "pinning fresh LSM link `{hook_name}` to {}",
             link_path.display()
@@ -512,7 +526,7 @@ pub fn reattach_fresh_held(
         hook = hook_name,
         "anti-tamper: deny hook re-attached FRESH (attach-before-purge, zero-window) + re-pinned"
     );
-    Ok(Some(pinned))
+    Ok(pinned)
 }
 
 /// Lot 273: [`reattach_fresh`] for an `fexit` program of the deny set (the
@@ -548,7 +562,7 @@ pub fn reattach_fresh_fexit(
     let (prog_path, link_path) = lsm_pin_paths(root, function);
     purge_stale_pin(&link_path);
     purge_stale_pin(&prog_path);
-    prog.pin(&prog_path).with_context(|| {
+    held::pin_prog(prog.fd()?, &prog_path).with_context(|| {
         format!(
             "pinning fresh fexit program `{program_name}` to {}",
             prog_path.display()
@@ -558,7 +572,7 @@ pub fn reattach_fresh_fexit(
         .take_link(link_id)
         .with_context(|| format!("taking ownership of fresh `{function}` fexit link"))?;
     let fd_link: FdLink = link.into();
-    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+    held::pin_link(fd_link, &link_path).with_context(|| {
         format!(
             "pinning fresh fexit link `{function}` to {}",
             link_path.display()
@@ -603,7 +617,7 @@ pub fn reattach_fresh_fentry(
     let (prog_path, link_path) = lsm_pin_paths(root, function);
     purge_stale_pin(&link_path);
     purge_stale_pin(&prog_path);
-    prog.pin(&prog_path).with_context(|| {
+    held::pin_prog(prog.fd()?, &prog_path).with_context(|| {
         format!(
             "pinning fresh fentry program `{program_name}` to {}",
             prog_path.display()
@@ -613,7 +627,7 @@ pub fn reattach_fresh_fentry(
         .take_link(link_id)
         .with_context(|| format!("taking ownership of fresh `{function}` fentry link"))?;
     let fd_link: FdLink = link.into();
-    let _pinned: PinnedLink = fd_link.pin(&link_path).with_context(|| {
+    held::pin_link(fd_link, &link_path).with_context(|| {
         format!(
             "pinning fresh fentry link `{function}` to {}",
             link_path.display()

@@ -1230,6 +1230,25 @@ pub enum FsProtectOperation {
     /// `target_dev`, `target_ino`); each object listed in the cross-view's
     /// status file.
     SoleTraceSummary,
+    /// Lot 357: a mount refused by the mount guard in PID 1's mount
+    /// namespace — on, over or below the paths the agent depends on, an
+    /// unmount or move of a protected mount, an old-API move, a pivot:
+    /// `target_dev` the target's device, the operation, the reason, the view
+    /// and the mounts covered (`common::mount_guard::record_of`),
+    /// `target_ino` the target's inode.
+    Mount,
+    /// Lot 357: NOT a refusal — what [`Self::Mount`] refuses, let through by
+    /// the signed trusted-installer window (the fields as its).
+    MountWindow,
+    /// The review of #567 (F6): NOT a refusal — an unmount of the tracefs,
+    /// debugfs or securityfs the agent reads, let through and recorded.
+    MountNoted,
+    /// The re-check of #567 (b): a READ-mode ptrace access to one of the
+    /// agent's processes refused (its `/proc/<pid>/ns/*`, `exe`, `fd/` …),
+    /// recorded once an hour per caller image and target (the re-check 2:
+    /// never for the packaged journald in its units). `target_dev` the
+    /// ptrace mode, `target_ino` the target tgid.
+    PtraceRead,
     /// Wire byte the agent does not recognise (forward-compatible
     /// safety net).
     Unknown(u8),
@@ -1286,6 +1305,10 @@ impl FsProtectOperation {
             crate::wire::FS_OP_BPF_HELD_LOAD => Self::BpfHeldLoad,
             crate::wire::FS_OP_BPF_HELD_USE => Self::BpfHeldUse,
             crate::wire::FS_OP_SOLE_TRACE_SUMMARY => Self::SoleTraceSummary,
+            crate::wire::FS_OP_MOUNT => Self::Mount,
+            crate::wire::FS_OP_MOUNT_WINDOW => Self::MountWindow,
+            crate::wire::FS_OP_MOUNT_NOTED => Self::MountNoted,
+            crate::wire::FS_OP_PTRACE_READ => Self::PtraceRead,
             other => Self::Unknown(other),
         }
     }
@@ -1340,6 +1363,10 @@ impl FsProtectOperation {
             Self::BpfHeldLoad => "bpf_held_load",
             Self::BpfHeldUse => "bpf_held_use",
             Self::SoleTraceSummary => "sole_trace_summary",
+            Self::Mount => "mount",
+            Self::MountWindow => "mount_window",
+            Self::MountNoted => "mount_noted",
+            Self::PtraceRead => "ptrace_read",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -2199,6 +2226,25 @@ mod tests {
                 crate::wire::FS_OP_SOLE_TRACE_SUMMARY,
                 FsProtectOperation::SoleTraceSummary,
                 "sole_trace_summary",
+            ),
+            // lot 357
+            (crate::wire::FS_OP_MOUNT, FsProtectOperation::Mount, "mount"),
+            (
+                crate::wire::FS_OP_MOUNT_WINDOW,
+                FsProtectOperation::MountWindow,
+                "mount_window",
+            ),
+            // the review of #567 (F6)
+            (
+                crate::wire::FS_OP_MOUNT_NOTED,
+                FsProtectOperation::MountNoted,
+                "mount_noted",
+            ),
+            // its re-check (b)
+            (
+                crate::wire::FS_OP_PTRACE_READ,
+                FsProtectOperation::PtraceRead,
+                "ptrace_read",
             ),
         ];
         for (byte, op, name) in cases {

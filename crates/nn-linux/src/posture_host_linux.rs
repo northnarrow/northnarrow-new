@@ -15,6 +15,33 @@
 //! the posture; R08c (lab PR 252): so did the ransomware and security-tool
 //! judges, which the posture names itself.
 
+/// Lot 357 (#563's §47.1, the coordinator's choice of 15/11): how long a
+/// host file's identity is waited for, and its reader (one unanswered at
+/// most four, a stalled one holding its slot). A path below a kernel view is read beneath the root the start
+/// anchored (`kernel_roots`), at once; any other — a packaged program's
+/// file the lineage's `ran_host_file` compares (FIM-005/-019 with
+/// logrotate, cloud-init's shell, R011's hook), a script's directory — on a
+/// helper thread: a FUSE over a system directory (`/usr/sbin`, `/usr/lib`:
+/// not ones the mount guard covers) held the decision on it. Unanswered:
+/// `None` — not the host's file, so nothing it would exempt is.
+const HOST_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
+static HOST_FILE_READER: std::sync::LazyLock<crate::state_read::TimedReader> =
+    std::sync::LazyLock::new(|| crate::state_read::TimedReader::new(HOST_FILE_DEADLINE, 4));
+
+fn host_bounded<T: Send + 'static>(
+    path: &Path,
+    look: impl FnOnce(&Path) -> Option<T> + Send + 'static,
+) -> Option<T> {
+    if antitamper_bpf::kernel_roots::view_of(path).is_some() && !path.starts_with("/proc/1/root") {
+        return look(path);
+    }
+    let p = path.to_path_buf();
+    HOST_FILE_READER
+        .run(&path.display().to_string(), move || look(&p))
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 use std::fs;
 use std::io;
@@ -67,17 +94,25 @@ impl PostureHost for LinuxHost {
     /// `/proc/<pid>/exe` opens the image the kernel executed (its magic
     /// link, no path walked in the process's mount namespace), a host path
     /// the file the agent sees there.
+    /// Lot 357 (#563's §47.1): a host file's identity (not a view's)
+    /// through [`host_bounded`].
     fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        let file = antitamper_bpf::kernel_roots::open(path, libc::O_PATH).ok()?;
-        let meta = file.metadata().ok()?;
-        Some((meta.dev(), meta.ino()))
+        host_bounded(path.as_ref(), |p| {
+            use std::os::unix::fs::MetadataExt;
+            let file = antitamper_bpf::kernel_roots::open(p, libc::O_PATH).ok()?;
+            let meta = file.metadata().ok()?;
+            Some((meta.dev(), meta.ino()))
+        })
     }
 
     fn dir_is_root_only<P: AsRef<Path>>(path: P) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        antitamper_bpf::kernel_roots::metadata(path)
-            .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+        host_bounded(path.as_ref(), |p| {
+            use std::os::unix::fs::MetadataExt;
+            antitamper_bpf::kernel_roots::metadata(p)
+                .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+                .then_some(())
+        })
+        .is_some()
     }
 
     fn suspended_ns() -> u64 {
@@ -138,6 +173,74 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    /// Lot 357 (#563's §47.1: `trusted_exe` and `ran_host_file` on the
+    /// decision thread): under a FUSE that never answers over a system
+    /// directory (`/usr/local/sbin` here, in the child's own namespaces), a
+    /// host file's identity and directory check, and an image's trust,
+    /// give up within their deadlines — `None`, not trusted — and the next
+    /// ones at once; they used to hold the caller for as long as the mount
+    /// stayed.
+    #[test]
+    fn host_file_checks_never_hold_the_decision_under_a_fuse() {
+        use nn_core::decision::rule_policy::ActorFacts as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let proc_root = dir.path().join("proc");
+        std::fs::create_dir_all(proc_root.join("1")).unwrap();
+        symlink("/usr/local/sbin/nn357-image", proc_root.join("1/exe")).unwrap();
+        let rc = crate::fuse_testing::in_userns(|| {
+            // SAFETY: alarm has no preconditions; a held check ends the child.
+            unsafe { libc::alarm(30) };
+            let target = Path::new("/usr/local/sbin");
+            let Some(fuse) = crate::fuse_testing::smart_fuse_over(target, 0) else {
+                return 99;
+            };
+            // the checks on a thread of their own: a check the FUSE holds
+            // (its daemon read the request) cannot be killed, so the child
+            // gives up on it at 10 s and aborts the connection instead
+            let (tx, rx) = std::sync::mpsc::channel();
+            let proc_root = proc_root.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let id = LinuxHost::file_id(target.join("logrotate"));
+                let root_only = LinuxHost::dir_is_root_only(target);
+                let facts = crate::decision_host_linux::ProcFacts::new(&proc_root);
+                let exe_ok = facts.trusted_exe(1).is_some();
+                let first = t.elapsed();
+                let t = std::time::Instant::now();
+                let again = LinuxHost::file_id(target.join("logrotate")).is_some()
+                    || facts.trusted_exe(1).is_some();
+                let _ = tx.send((id.is_some(), root_only, exe_ok, first, again, t.elapsed()));
+            });
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(fuse);
+            let Ok((id, root_only, exe_ok, first, again, second)) = answer else {
+                eprintln!("a check held for 10 s");
+                return 5;
+            };
+            // booleans only: no file identity or digest in the test's log
+            eprintln!(
+                "answered {id} {root_only} {exe_ok} in {first:?}; again {again} in {second:?}"
+            );
+            if id || root_only || exe_ok || again {
+                return 2;
+            }
+            // 200 ms + 200 ms + 500 ms, then the slots held: at once
+            if first > std::time::Duration::from_secs(3) {
+                return 3;
+            }
+            if second > std::time::Duration::from_secs(2) {
+                return 4;
+            }
+            0
+        });
+        if let Some(rc) = crate::fuse_testing::ran(rc) {
+            assert_eq!(
+                rc, 0,
+                "a host file check held its caller (see the child's line)"
+            );
+        }
+    }
 
     fn clock(id: libc::clockid_t) -> u64 {
         let mut ts = libc::timespec {

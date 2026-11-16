@@ -949,7 +949,9 @@ fn fresh_instance_may_load() -> bool {
 }
 
 /// `sched_process_exit` (raw tracepoint): when the group leader of the
-/// live agent or watchdog exits, its role is vacant ([`ROLE_TGIDS`]). The
+/// live agent or watchdog exits, its role is vacant ([`ROLE_TGIDS`]), and
+/// its mount namespace is no longer one the mount guard judges as PID 1's
+/// (`mount_guard::vacate`). The
 /// link is pinned by userland, so it keeps firing after the agent that
 /// attached it has released its own objects (a clean exit drops them
 /// before the process ends) or died.
@@ -965,6 +967,9 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
         if let Some(t) = ROLE_TGIDS.get_ptr_mut(slot) {
             if unsafe { *t } == tgid {
                 unsafe { *t = 0 };
+                // the review of #567 (F2): its mount namespace is no longer
+                // judged as PID 1's
+                crate::mount_guard::vacate(slot);
             }
         }
         slot += 1;

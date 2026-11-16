@@ -440,12 +440,12 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/nn-linux/src/decision_host_linux.rs",
-        "read_state(self.root.join(pid.to_string()).join(\"status\"))",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"status\"))",
         PROC,
     ),
     (
         "crates/nn-linux/src/decision_host_linux.rs",
-        "read_state(self.root.join(pid.to_string()).join(\"cgroup\"))",
+        "read_state(self.proc_root.join(pid.to_string()).join(\"cgroup\"))",
         PROC,
     ),
     (
@@ -629,6 +629,13 @@ const KNOWN: &[(&str, &str, &str)] = &[
         KNOB,
     ),
     (
+        "crates/nn-linux/src/anti_tamper/mount_guard.rs",
+        "read_to_string(\"/proc/self/maps\")",
+        "the agent's own mappings (the review of #567): unreadable, no library directory is \
+         added to the mount guard's points — the binaries', units' and directories' points \
+         remain; no state is defaulted",
+    ),
+    (
         "crates/nn-linux/src/self_integrity.rs",
         "read_to_string(\"/proc/self/limits\")",
         KNOB,
@@ -805,7 +812,6 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(format!(\"/proc/{pid}/stat\"))",
         PROC,
     ),
-    ("watchdog/src/lib.rs", "read_to_string(&honoured_path)", OWN),
     // lot 353: a FUSE connection's waiting count (fusectl, the kernel's):
     // unreadable, no request is known waiting and nothing is aborted
     (

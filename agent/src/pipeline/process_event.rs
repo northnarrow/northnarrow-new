@@ -766,6 +766,32 @@ pub(crate) fn process_event(
                             "denied in kernel (cgroup/sysctl on the root cgroup, the kernel's \
                              copy of the write)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::Mount {
+                            // Lot 357: the operation and why, for the record
+                            let (_, op, why, _, _) = common::mount_guard::record_of(*target_dev);
+                            format!(
+                                "denied in kernel (the mount guard: {}, {} — {})",
+                                common::mount_guard::op_name(op),
+                                common::mount_guard::reach_name(common::mount_guard::reach_of(
+                                    *target_dev
+                                )),
+                                common::mount_guard::why_name(why)
+                            )
+                        } else if *operation == nn_model::FsProtectOperation::MountNoted {
+                            // the review of #567 (F6)
+                            let (_, op, _, _, _) = common::mount_guard::record_of(*target_dev);
+                            format!(
+                                "not refused: {} of a kernel file system the agent reads, \
+                                 recorded",
+                                common::mount_guard::op_name(op)
+                            )
+                        } else if *operation == nn_model::FsProtectOperation::MountWindow {
+                            let (_, op, _, _, _) = common::mount_guard::record_of(*target_dev);
+                            format!(
+                                "not refused: {} let through by the signed trusted-installer \
+                                 window (the mount guard refuses it outside one)",
+                                common::mount_guard::op_name(op)
+                            )
                         } else {
                             "denied in kernel (anti-tamper LSM hook)".to_string()
                         };

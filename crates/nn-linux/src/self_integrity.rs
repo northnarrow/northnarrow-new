@@ -658,15 +658,15 @@ fn is_unit_sandbox(m: &Mount, mounts: &[Mount], sandbox: &[String]) -> bool {
 
 /// The directories the agent's unit makes writable (and so binds onto
 /// themselves in its own namespace).
-fn unit_sandbox_dirs() -> Vec<String> {
+fn unit_sandbox_dirs(unit: &str) -> Vec<String> {
     // every ReadWritePaths= line (lot 273d: our drop-in directories on a
     // second one)
-    let mut out: Vec<String> = unit_directives(AGENT_UNIT, "ReadWritePaths")
+    let mut out: Vec<String> = unit_directives(unit, "ReadWritePaths")
         .into_iter()
         .flat_map(str::split_whitespace)
         .map(|d| d.trim_start_matches(['-', '+']).to_string())
         .collect();
-    if let Some(rt) = unit_directive(AGENT_UNIT, "RuntimeDirectory") {
+    if let Some(rt) = unit_directive(unit, "RuntimeDirectory") {
         out.extend(rt.split_whitespace().map(|d| format!("/run/{d}")));
     }
     out
@@ -723,8 +723,20 @@ fn mounts_over_protected(
     sandbox: &[String],
     host: bool,
 ) -> Vec<Finding> {
+    mounts_over_protected_in(mounts, mounts, extra_files, sandbox, host)
+}
+
+/// [`mounts_over_protected`] on `judged`, a part of the table `mounts`
+/// (where a sandbox mount's parent is found).
+fn mounts_over_protected_in(
+    judged: &[Mount],
+    mounts: &[Mount],
+    extra_files: &[String],
+    sandbox: &[String],
+    host: bool,
+) -> Vec<Finding> {
     let mut out = Vec::new();
-    for m in mounts {
+    for m in judged {
         let (mp, root, fstype) = (&m.mount_point, &m.root, m.fstype.as_str());
         if covers_protected(mp, extra_files) {
             if !sandbox.is_empty() && is_unit_sandbox(m, mounts, sandbox) {
@@ -749,6 +761,58 @@ fn mounts_over_protected(
         }
     }
     out
+}
+
+/// The review of #567 (F2): the watchdog the pidfile names, while it is
+/// one (its comm, as `prctl` sets it: another process's namespace is not
+/// read for it).
+fn watchdog_of(pidfile: &Path) -> Option<u32> {
+    // lot 357's item 5 (R3-1): the pidfile beneath its anchor, its comm
+    // beneath the `/proc` root the start anchored — both bounded
+    let text = |b: Vec<u8>| String::from_utf8(b).ok().map(|s| s.trim().to_string());
+    let pid = text(crate::anchored::read_bounded(pidfile, 64).ok()?)?
+        .parse::<u32>()
+        .ok()?;
+    let comm = text(
+        antitamper_bpf::kernel_roots::read(Path::new(&format!("/proc/{pid}/comm")), 64).ok()?,
+    )?;
+    (comm == crate::anti_tamper::WATCHDOG_COMM).then_some(pid)
+}
+
+/// The directories the agent writes its state, its run files and its
+/// configuration in.
+const STATE_DIRS: [&str; 3] = [
+    "/var/lib/northnarrow",
+    "/run/northnarrow",
+    "/etc/northnarrow",
+];
+
+/// The review of #567 (F3): a state, run or config directory on a
+/// read-only file system (its super block or its mount: `statvfs`'s
+/// `ST_RDONLY`), in the agent's own view — what the mount guard refuses to
+/// make so (a remount) but the kernel may (`errors=remount-ro`), or a
+/// window let through: the agent's records, state and audit chain are not
+/// written there, signed while they still can be elsewhere (the uplink,
+/// the journal).
+fn read_only_state() -> Vec<Finding> {
+    STATE_DIRS
+        .iter()
+        .filter_map(|d| {
+            let c = std::ffi::CString::new(*d).ok()?;
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a zeroed out-buffer.
+            if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+                return None;
+            }
+            (st.f_flag & libc::ST_RDONLY != 0).then(|| Finding {
+                kind: "state_fs_read_only",
+                detail: format!(
+                    "{d} is on a read-only file system: the agent's writes there (records, \
+                     state, the audit chain) fail"
+                ),
+            })
+        })
+        .collect()
 }
 
 /// Lot 353 (pre-alpha Phase 3, X6): the kernel's views the agent reads —
@@ -815,7 +879,7 @@ fn over_kernel_view(m: &Mount, mounts: &[Mount], host: bool) -> Option<Finding> 
             });
     }
     let below = ["/proc/", "/sys/"].iter().find(|v| mp.starts_with(*v))?;
-    if host && canonical_below_view(m, parent) {
+    if host && canonical_below_view(m, parent, mounts) {
         return None;
     }
     let kernel = antitamper_bpf::kernel_roots::KERNEL_MAGICS
@@ -844,6 +908,81 @@ fn refused_views(why: Vec<String>) -> Vec<Finding> {
         .collect()
 }
 
+/// The review of #567: the mount guard's drift kinds signed High (beside
+/// lot 353's, `Checker::record_detected`; the rest are the audit chain's
+/// default).
+fn high_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "own_dropin_weakening"
+            | "mount_attrs_changed"
+            | "mount_not_canonical"
+            | "state_fs_read_only"
+            | PIN_VANISHED
+    )
+}
+
+/// Fix round 3 of #567: a pin of the agent's gone while it holds the object
+/// (`antitamper_bpf::held`) — High.
+const PIN_VANISHED: &str = "bpf_pin_vanished";
+
+/// Fix round 3 of #567 (the coordinator's decision): the agent's pins whose
+/// object it holds that no longer name it, as findings. A pin removed is
+/// pinned again by `repin` (from the descriptor, in the directory it was
+/// pinned in: the next start finds it); one replaced or unreadable is told
+/// as it is; the pins of a directory gone (the bpffs's last mount, or a
+/// mount laid over it) are one finding for the directory. Each object
+/// stays attached while the agent runs — its descriptor is held — and not
+/// across a restart without its pin.
+fn held_pin_findings(
+    vanished: Vec<antitamper_bpf::held::Vanished>,
+    repin: impl Fn(&antitamper_bpf::held::Vanished) -> anyhow::Result<()>,
+) -> Vec<Finding> {
+    use antitamper_bpf::held::{Kind, Lost};
+    let mut out = Vec::new();
+    let mut gone: std::collections::BTreeMap<PathBuf, (usize, usize)> = Default::default();
+    for v in vanished {
+        if v.lost == Lost::DirectoryGone {
+            let n = gone
+                .entry(v.path.parent().map(Path::to_path_buf).unwrap_or_default())
+                .or_default();
+            match v.kind {
+                Kind::Link => n.0 += 1,
+                Kind::Prog => n.1 += 1,
+            }
+            continue;
+        }
+        let after = match repin(&v) {
+            Ok(()) => "pinned again from it".to_string(),
+            Err(e) => format!("{e:#}"),
+        };
+        out.push(Finding {
+            kind: PIN_VANISHED,
+            detail: format!(
+                "{}: the agent's {} {}: {}; its descriptor held, attached while the agent runs \
+                 (not across a restart without its pin); {after}",
+                v.path.display(),
+                v.kind.name(),
+                v.id,
+                v.lost.words()
+            ),
+        });
+    }
+    for (dir, (links, progs)) in gone {
+        out.push(Finding {
+            kind: PIN_VANISHED,
+            detail: format!(
+                "{}: gone, with the pins of {links} links and {progs} programs of the agent's \
+                 (the bpffs unmounted, or a mount over the directory); their descriptors held, \
+                 attached while the agent runs, not across a restart: not pinned again, the next \
+                 start pins them afresh",
+                dir.display()
+            ),
+        });
+    }
+    out
+}
+
 /// Lot 353 (the review of #563, F4): a kernel pseudo-file system at its
 /// canonical mount point below a view, by its type AND its point (and,
 /// for the one that is a tmpfs, its parent and source root) — never a path
@@ -856,13 +995,30 @@ fn refused_views(why: Vec<String>) -> Vec<Finding> {
 /// ([`on_wsl`]) — any root could name a directory of its own tmpfs `/wsl/…`
 /// and bind it there, hiding `status` (and swallowing the `-1` that clears
 /// the handlers) on any host.
-fn canonical_below_view(m: &Mount, parent: Option<&Mount>) -> bool {
+///
+/// Lot 357 (the F4 identity of #563, fixed): by type, point, source and the
+/// mount it comes from, in PID 1's table (`host`, the caller's), never by
+/// its path alone — WSL's lock is the file `/wsl/binfmt-status-lock` of the
+/// host's `/run` (the same device and peer group as PID 1's `/run`
+/// tmpfs, source `none`), bound over `status`. A root's own tmpfs, a
+/// directory of it named `/wsl/…`, is another device: a finding on WSL
+/// too. (The kernel's mount guard leaves binfmt_misc's files alone: no
+/// view is below them.)
+fn canonical_below_view(m: &Mount, parent: Option<&Mount>, mounts: &[Mount]) -> bool {
     const BINFMT: &str = "/proc/sys/fs/binfmt_misc";
+    const WSL_LOCK: &str = "/wsl/binfmt-status-lock";
     match (m.fstype.as_str(), m.mount_point.as_str()) {
         ("binfmt_misc", BINFMT) => true,
         ("tmpfs", p) if p == format!("{BINFMT}/status") => {
-            m.root.starts_with("/wsl/")
+            m.root == WSL_LOCK
+                && m.entry.source.as_os_str() == "none"
                 && parent.is_some_and(|p| p.fstype == "binfmt_misc" && p.mount_point == BINFMT)
+                && mounts.iter().any(|r| {
+                    r.mount_point == "/run"
+                        && r.fstype == "tmpfs"
+                        && r.root == "/"
+                        && r.dev == m.dev
+                })
                 && on_wsl()
         }
         _ => false,
@@ -909,6 +1065,19 @@ enum MountSource {
     Host,
     /// The agent's own ([`MOUNTINFO_OWN`]).
     Own,
+    /// The review of #567 (F2): the watchdog's (`/proc/<pid>/mountinfo`).
+    Watchdog,
+}
+
+impl MountSource {
+    /// The words a finding of another namespace than PID 1's starts with.
+    fn prefix(self) -> &'static str {
+        match self {
+            MountSource::Host => "",
+            MountSource::Own => "in the agent's own mount namespace: ",
+            MountSource::Watchdog => "in the watchdog's mount namespace: ",
+        }
+    }
 }
 
 /// External audit EVD-014 (lab PR 180): how each watched path resolved
@@ -919,6 +1088,24 @@ enum MountSource {
 pub struct MountWatch {
     source: Option<MountSource>,
     chains: BTreeMap<String, Vec<Mount>>,
+    /// Lot 357: the attributes of the mounts the watched paths resolve
+    /// through ([`crate::mount_attrs`]).
+    attrs: crate::mount_attrs::AttrWatch,
+    /// The brainstorm's 3rd point (the review of #567): the mount guard's
+    /// protected points, against which the mounts already there at the
+    /// first read are judged (`mount_not_canonical`); `None`: not judged.
+    audit_points: Option<Vec<(String, u8)>>,
+}
+
+impl MountWatch {
+    /// A watch whose first read judges the mounts already there against
+    /// the canonical layout of `points` (the mount guard's).
+    pub fn auditing(points: Vec<(String, u8)>) -> Self {
+        MountWatch {
+            audit_points: Some(points),
+            ..Default::default()
+        }
+    }
 }
 
 /// One round of the mount check. `primary` is [`MOUNTINFO_HOST`]; when it
@@ -951,12 +1138,55 @@ pub fn mount_round<T: AsRef<[u8]>>(
             }
         },
     };
-    let mounts = parse_mountinfo(text.as_ref());
+    mount_round_on(text.as_ref(), source, own_files, watch, None, "")
+}
+
+/// The review of #567 (F2): one round of the mount check on a guarded
+/// namespace's own table — the agent's (its unit's `ProtectSystem=strict`)
+/// or the watchdog's, each its own baseline. A mount `host` shows too (the
+/// same mount point, device, root and type: the host's, propagated into
+/// the unit's namespace) is the host round's finding, not this one's.
+pub fn mount_round_in(
+    text: &[u8],
+    whose: &str,
+    own_files: &[String],
+    watch: &mut MountWatch,
+    host: &[u8],
+) -> Vec<Finding> {
+    let source = if whose == "watchdog" {
+        MountSource::Watchdog
+    } else {
+        MountSource::Own
+    };
+    let host = parse_mountinfo(host);
+    mount_round_on(text, source, own_files, watch, Some(&host), source.prefix())
+}
+
+fn mount_round_on(
+    text: &[u8],
+    source: MountSource,
+    own_files: &[String],
+    watch: &mut MountWatch,
+    host: Option<&[Mount]>,
+    prefix: &str,
+) -> Vec<Finding> {
+    let mounts = parse_mountinfo(text);
+    let hosts = |m: &Mount| {
+        host.is_some_and(|h| {
+            h.iter().any(|x| {
+                x.mount_point == m.mount_point
+                    && x.dev == m.dev
+                    && x.root == m.root
+                    && x.fstype == m.fstype
+            })
+        })
+    };
     let watched: Vec<String> = MOUNT_WATCHED
         .iter()
         .map(|p| p.to_string())
         .chain(own_files.iter().cloned())
         .collect();
+    let first_read = watch.source != Some(source);
     if watch.source != Some(source) {
         if watch.source.is_some() {
             warn!(
@@ -968,6 +1198,7 @@ pub fn mount_round<T: AsRef<[u8]>>(
         }
         watch.source = Some(source);
         watch.chains.clear();
+        watch.attrs = Default::default();
     }
     for p in &watched {
         // A chain not resolved yet (no root mount in an odd read) is taken
@@ -979,16 +1210,75 @@ pub fn mount_round<T: AsRef<[u8]>>(
     }
     let sandbox = match source {
         MountSource::Host => Vec::new(),
-        MountSource::Own => unit_sandbox_dirs(),
+        MountSource::Own => unit_sandbox_dirs(AGENT_UNIT),
+        MountSource::Watchdog => unit_sandbox_dirs(WATCHDOG_UNIT),
     };
-    let mut out = mounts_over_protected(&mounts, own_files, &sandbox, source == MountSource::Host);
-    out.extend(malformed_over_protected(text.as_ref(), own_files));
+    let mine: Vec<Mount> = mounts.iter().filter(|m| !hosts(m)).cloned().collect();
+    let mut out = mounts_over_protected_in(
+        &mine,
+        &mounts,
+        own_files,
+        &sandbox,
+        source == MountSource::Host,
+    );
+    if source != MountSource::Watchdog && host.is_none() {
+        out.extend(malformed_over_protected(text, own_files));
+    }
+    // The brainstorm's 3rd point (the review of #567): at the first read,
+    // the mounts already there that are not the canonical ones (an fstab
+    // line, a `.mount` unit, the initramfs) — what is over the agent's own
+    // paths is a `mount_over_protected` already
+    if first_read {
+        if let Some(points) = &watch.audit_points {
+            let entries: Vec<crate::mountinfo::MountEntry> =
+                mine.iter().map(|m| m.entry.clone()).collect();
+            for f in crate::anti_tamper::mount_guard::not_canonical(&entries, points) {
+                let mp = f.split(" (").next().unwrap_or("");
+                if covers_protected(mp, own_files) {
+                    continue;
+                }
+                out.push(Finding {
+                    kind: "mount_not_canonical",
+                    detail: format!(
+                        "{f} — already there when the agent started: made before the mount \
+                         guard attached (an fstab line, a .mount unit, the initramfs), it is \
+                         taken for the host's own"
+                    ),
+                });
+            }
+        }
+    }
+    // Lot 357 (the coordinator's mount_setattr point): a mount a watched
+    // path resolves through made read-only, or its propagation changed —
+    // no LSM hook refuses `mount_setattr(2)`; signed High
+    let ids: std::collections::BTreeSet<u64> = watched
+        .iter()
+        .flat_map(|p| mount_chain(&mounts, p).into_iter().map(|m| m.id))
+        .collect();
+    out.extend(
+        watch
+            .attrs
+            .round(text, &ids)
+            .into_iter()
+            .map(|(mp, what)| Finding {
+                kind: "mount_attrs_changed",
+                detail: format!(
+                    "{mp}: {what} since the agent started — a mount that holds the agent's \
+                     paths (read-only: its writes there fail; propagation: what lets a mount made \
+                     in another namespace reach the host's view, which the mount guard follows)"
+                ),
+            }),
+    );
     out.extend(hidden_by_mounts(
         &mounts,
         &watched,
         &watch.chains,
         own_files,
+        &hosts,
     ));
+    for f in &mut out {
+        f.detail = format!("{prefix}{}", f.detail);
+    }
     out
 }
 
@@ -999,6 +1289,7 @@ fn hidden_by_mounts(
     watched: &[String],
     base: &BTreeMap<String, Vec<Mount>>,
     own_files: &[String],
+    hosts: &dyn Fn(&Mount) -> bool,
 ) -> Vec<Finding> {
     // (new?, mount id, mount point) -> (mount, paths)
     let mut by_mount: BTreeMap<(bool, u64, String), (Mount, Vec<String>)> = BTreeMap::new();
@@ -1018,6 +1309,8 @@ fn hidden_by_mounts(
         let (new, m) = match now.get(same) {
             // Already reported as a mount over the protected path itself.
             Some(m) if covers_protected(&m.mount_point, own_files) => continue,
+            // the host's, propagated: the host round's finding
+            Some(m) if hosts(m) => continue,
             Some(m) => (true, (*m).clone()),
             None => (false, before[same].clone()),
         };
@@ -1073,7 +1366,12 @@ fn covers_tracefs(mp: &str, source_root: &str, fstype: &str) -> bool {
 pub fn config_overlays(dir: &Path) -> Vec<Finding> {
     use sha2::{Digest, Sha256};
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // Lot 357 (re-check 3 of #563, R3-1): the names beneath the directory's
+    // anchor (the start's descriptor), never by path — a mount over
+    // `/etc/northnarrow` (now refused, the mount guard) no longer holds or
+    // blinds the round before it signs; each overlay is opened beneath it
+    // too (`LinuxHost::open_read_nofollow`).
+    let Ok(names) = crate::anchored::read_dir_names(dir) else {
         return out;
     };
     // External audit ATP-001 / DEP-003: the COMBAT files too, reported as
@@ -1085,9 +1383,9 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
             .and_then(nn_proto::admin_signed_payload::OverlayKind::from_keyword)
             .filter(|k| crate::config::overlay_auth::shipped_default(*k).is_some())
     };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
+    let mut paths: Vec<PathBuf> = names
+        .into_iter()
+        .map(|n| dir.join(n))
         .filter(|p| {
             p.extension().and_then(|x| x.to_str()) == Some("local") || combat_kind(p).is_some()
         })
@@ -1183,7 +1481,13 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
     {
         v.push((LIMIT_CORE.to_string(), x));
     }
-    if let Some(pid) = read_trim(watchdog_pidfile).and_then(|p| p.parse::<u32>().ok()) {
+    // Lot 357 (re-check 3 of #563, R3-1): the agent's own run directory,
+    // beneath its anchor (64 bytes at most), never by path
+    let pid = crate::anchored::read_bounded(watchdog_pidfile, 64)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|p| p.trim().parse::<u32>().ok());
+    if let Some(pid) = pid {
         if let Some(x) = read_trim(&PathBuf::from(format!("/proc/{pid}/oom_score_adj"))) {
             v.push((LIMIT_WATCHDOG_OOM.to_string(), x));
         }
@@ -1213,7 +1517,8 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
 pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
     // lot 311 (F4): read as bytes — one byte that is not UTF-8 hid every
     // line of the file; a line that does not parse costs itself only
-    let Ok(body) = crate::state_read::read_state(path) else {
+    // lot 357 (re-check 3 of #563, R3-1): beneath the run directory's anchor
+    let Ok(body) = crate::anchored::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1248,8 +1553,9 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
 /// after its recovery) and `respawn_argv_degraded` (WDG-008: the exec
 /// backend respawns with a recorded or the minimal argv).
 pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
-    // lot 311 (F4): read as bytes, as `rejected_shutdowns`
-    let Ok(body) = crate::state_read::read_state(path) else {
+    // lot 311 (F4): read as bytes, as `rejected_shutdowns`; lot 357: beneath
+    // the run directory's anchor
+    let Ok(body) = crate::anchored::read_state(path) else {
         return Vec::new();
     };
     body.lines()
@@ -1369,16 +1675,20 @@ pub fn take_holds(holds: &Path, sign: impl FnOnce(Vec<Finding>) -> bool) {
     let mut taken = holds.as_os_str().to_os_string();
     taken.push(".taken");
     let taken = PathBuf::from(taken);
-    if !antitamper_bpf::kernel_roots::exists(&taken).unwrap_or(true)
-        && std::fs::rename(holds, &taken).is_err()
-    {
+    // Lot 357 (re-check 3 of #563, R3-1): each step beneath the run
+    // directory's anchor (`*at`), never by path
+    let taken_there = match crate::anchored::symlink_metadata(&taken) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    };
+    if !taken_there && crate::anchored::rename_noreplace(holds, &taken).is_err() {
         return; // no holds (or the rename refused: read again next round)
     }
     // unreadable: kept (never removed unread)
-    let readable = crate::state_read::read_state(&taken).is_ok();
+    let readable = crate::anchored::read_state(&taken).is_ok();
     let found = watchdog_holds(&taken);
     if readable && (found.is_empty() || sign(found)) {
-        let _ = std::fs::remove_file(&taken);
+        let _ = crate::anchored::remove_file(&taken);
     }
 }
 
@@ -1915,6 +2225,10 @@ struct Checker {
     limits: LimitWatch,
     /// External audit EVD-014: how the watched paths resolved at start.
     mounts: MountWatch,
+    /// The review of #567 (F2): the agent's own namespace's, and the
+    /// watchdog's (with the pid it was read for).
+    own_mounts: MountWatch,
+    watchdog_mounts: (Option<u32>, MountWatch),
     watchdog_pidfile: PathBuf,
     own_files: Vec<String>,
     audit_log: Option<Arc<Mutex<AuditLog>>>,
@@ -2034,14 +2348,54 @@ impl Checker {
         }
     }
 
-    /// This round's mount findings ([`mount_round`] on the live files).
+    /// This round's mount findings ([`mount_round`] on the live files);
+    /// the review of #567 (F2): and the agent's own namespace's and the
+    /// watchdog's ([`mount_round_in`]), where the agent and the watchdog
+    /// read their paths; the review of #567 (F3): a state, run or config
+    /// directory on a read-only file system.
     fn read_mounts(&mut self) -> Vec<Finding> {
+        let host = crate::mountinfo::read_bytes(Path::new(MOUNTINFO_HOST));
+        let host_copy = host.as_ref().ok().cloned();
         let mut out = mount_round(
-            crate::mountinfo::read_bytes(Path::new(MOUNTINFO_HOST)),
+            host,
             || crate::mountinfo::read_bytes(Path::new(MOUNTINFO_OWN)),
             &self.own_files,
             &mut self.mounts,
         );
+        if let Some(host) = &host_copy {
+            if let Ok(own) = crate::mountinfo::read_bytes(Path::new(MOUNTINFO_OWN)) {
+                out.extend(mount_round_in(
+                    &own,
+                    "agent",
+                    &self.own_files,
+                    &mut self.own_mounts,
+                    host,
+                ));
+            }
+            match watchdog_of(&self.watchdog_pidfile) {
+                Some(pid) => {
+                    if self.watchdog_mounts.0 != Some(pid) {
+                        self.watchdog_mounts = (
+                            Some(pid),
+                            MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+                        );
+                    }
+                    if let Ok(wd) =
+                        crate::mountinfo::read_bytes(Path::new(&format!("/proc/{pid}/mountinfo")))
+                    {
+                        out.extend(mount_round_in(
+                            &wd,
+                            "watchdog",
+                            &self.own_files,
+                            &mut self.watchdog_mounts.1,
+                            host,
+                        ));
+                    }
+                }
+                None => self.watchdog_mounts.0 = None,
+            }
+        }
+        out.extend(read_only_state());
         out.extend(refused_views(antitamper_bpf::kernel_roots::unanchored()));
         out
     }
@@ -2094,7 +2448,8 @@ impl Checker {
         let mut extra =
             serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
         // lot 353: a mount over the agent's paths or the kernel's views it
-        // reads (pre-alpha R003, X6) is High too
+        // reads (pre-alpha R003, X6) is High too; lot 357: the mount guard's
+        // kinds ([`high_kind`])
         if f.kind == "own_dropin_weakening"
             || f.kind == "mount_over_protected"
             || f.kind == "agent_restart_loop"
@@ -2102,6 +2457,7 @@ impl Checker {
             || f.kind == "stuck_recovery_failed"
             || f.kind == "signed_records_failed"
             || f.kind == "cgroup_root_changed"
+            || high_kind(f.kind)
         {
             extra["severity"] = "high".into();
         }
@@ -2200,6 +2556,19 @@ impl Checker {
                 .filter(|f| !self.overlay_is_signed(f)),
         );
         c.extend(self.read_mounts());
+        // Fix round 3 of #567: the pins of the objects the agent holds —
+        // outside a trusted-installer window (inside one the installer
+        // removes them; nothing is pinned again behind it)
+        if !self
+            .own_guard
+            .as_ref()
+            .is_some_and(|g| g.window.is_window_open())
+        {
+            c.extend(held_pin_findings(
+                antitamper_bpf::held::vanished(),
+                antitamper_bpf::held::repin,
+            ));
+        }
         // External audit DEP-001: an admin private key on the host (the
         // bootstrap key install.sh writes, until the operator moves it
         // offline) is a credential for whoever is root here. Seen through
@@ -2295,7 +2664,7 @@ impl Checker {
             for f in cap_per_kind(found) {
                 self.report_once(f, at_boot);
             }
-            let _ = std::fs::remove_file(rejected);
+            let _ = crate::anchored::remove_file(rejected);
         }
         // External audit DEP-004: the watchdog's holds (no agent after a
         // respawn, or the restart ceiling) while the agent was down.
@@ -2353,12 +2722,11 @@ pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
         at_boot = false,
         "INTEGRITY DRIFT — the agent's runtime state changed outside the agent"
     );
-    append_entry(
-        audit_log,
-        AUDIT_OP,
-        serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false }),
-        "detected",
-    );
+    let mut extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false });
+    if high_kind(f.kind) {
+        extra["severity"] = "high".into();
+    }
+    append_entry(audit_log, AUDIT_OP, extra, "detected");
 }
 
 /// Start the check (from `main`, once the audit log exists). R09c (lab PR
@@ -2379,12 +2747,21 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
             }
         }
     }
+    // Lot 357 (re-check 3 of #563, R3-1): the integrity round reads the
+    // agent's configuration and run directories beneath descriptors taken
+    // now (`crate::anchored`): the watchdog's pidfile, holds and refused
+    // markers, the overlays. Already anchored by their logs, a no-op.
+    crate::anchored::anchor(&watchdog_pidfile);
+    crate::anchored::anchor(Path::new(nn_proto::watchdog_hold::HOLD_PATH));
+    crate::anchored::anchor(&Path::new(CONFIG_DIR).join("audit.log"));
     let mut checker = Checker {
         once: HashSet::new(),
         active: ActiveSet::default(),
         overlay_gate: overlay_gate.map(|g| g as Arc<dyn nn_core::config::overlay_auth::Vouch>),
         limits: LimitWatch::default(),
-        mounts: MountWatch::default(),
+        mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+        own_mounts: MountWatch::auditing(crate::anti_tamper::mount_guard::points_now()),
+        watchdog_mounts: (None, MountWatch::default()),
         watchdog_pidfile,
         own_files,
         audit_log,
@@ -2443,6 +2820,63 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 357 (re-check 3 of #563, R3-1 and R3-3): the integrity round's
+    /// reads and writes of the agent's own directories — the overlays, the
+    /// watchdog's pidfile, its holds and refused markers, the cross-view's
+    /// status — resolve beneath the directory the start anchored. The
+    /// directory moved away and another laid at its path is what a mount
+    /// over it is to a by-path read: each step still meets the anchored one.
+    #[test]
+    fn the_integrity_round_reads_its_directories_beneath_their_anchors() {
+        let t = tempfile::TempDir::new().unwrap();
+        let run = t.path().join("run");
+        let away = t.path().join("away");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("watchdog.pid"), "4242\n").unwrap();
+        std::fs::write(run.join("x.local"), "anchored").unwrap();
+        let rejected = nn_proto::shutdown_marker::RejectedRecord {
+            at: 1_800_000_000,
+            agent_pid: 7,
+            reason: "replayed".into(),
+            sha256: "ab".into(),
+        };
+        std::fs::write(
+            run.join("agent.shutdown_rejected"),
+            serde_json::to_string(&rejected).unwrap() + "\n",
+        )
+        .unwrap();
+        std::fs::write(run.join("watchdog.hold"), "not json\n").unwrap();
+        crate::anchored::anchor(&run.join("watchdog.pid"));
+        std::fs::rename(&run, &away).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("watchdog.pid"), "1\n").unwrap();
+        std::fs::write(run.join("y.local"), "laid over").unwrap();
+
+        let overlays = config_overlays(&run);
+        assert_eq!(overlays.len(), 1, "{overlays:?}");
+        assert!(overlays[0].detail.contains("x.local"), "{overlays:?}");
+        assert_eq!(
+            crate::anchored::read_bounded(&run.join("watchdog.pid"), 64).unwrap(),
+            b"4242\n"
+        );
+        let found = rejected_shutdowns(&run.join("agent.shutdown_rejected"));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].detail.contains("agent pid 7"));
+        let mut signed = 0;
+        take_holds(&run.join("watchdog.hold"), |f| {
+            signed = f.len();
+            true
+        });
+        assert_eq!(signed, 1);
+        assert!(!away.join("watchdog.hold").exists() && !away.join("watchdog.hold.taken").exists());
+        crate::anchored::replace_file(&run.join("bpf-foreign"), b"status", 0o600).unwrap();
+        assert_eq!(std::fs::read(away.join("bpf-foreign")).unwrap(), b"status");
+        assert!(!run.join("bpf-foreign").exists());
+        assert!(!away.join(".bpf-foreign.tmp").exists());
+        // the path laid over is untouched
+        assert_eq!(std::fs::read(run.join("watchdog.pid")).unwrap(), b"1\n");
+    }
 
     #[test]
     fn rejected_shutdown_markers_become_findings() {
@@ -3136,6 +3570,7 @@ mod tests {
 114 85 0:2 /init /init ro - rootfs rootfs rw
 116 85 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
 117 85 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+119 85 0:63 / /run rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
 124 117 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
 125 116 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:23 - cgroup2 cgroup2 rw,nsdelegate
 136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
@@ -3166,6 +3601,31 @@ mod tests {
         ] {
             assert!(
                 !mount_findings(format!("{wsl}{extra}"), &[]).is_empty(),
+                "{why}"
+            );
+        }
+        // Lot 357 (the F4 identity, fixed): on WSL too, the lock only from
+        // the host's /run, its own source — never by its path alone
+        let without = wsl.replace(
+            "136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755\n",
+            "",
+        );
+        for (extra, why) in [
+            (
+                "936 124 0:96 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw shared:506 - tmpfs none rw\n",
+                "a root's own tmpfs with a /wsl/binfmt-status-lock of its own",
+            ),
+            (
+                "937 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw shared:18 - tmpfs tmpfs rw\n",
+                "the right file under another source",
+            ),
+            (
+                "938 124 0:63 /wsl/other /proc/sys/fs/binfmt_misc/status rw shared:18 - tmpfs none rw\n",
+                "another file of /run",
+            ),
+        ] {
+            assert!(
+                !mount_findings(format!("{without}{extra}"), &[]).is_empty(),
                 "{why}"
             );
         }
@@ -3202,10 +3662,26 @@ mod tests {
             "{}",
             f[0].detail
         );
+        // lot 357 (the F4 identity, fixed): on WSL's kernel, WSL's own lock
+        // (the host's /run file, source `none`) is exempt — a root's own
+        // tmpfs named `/wsl/…` is not, there either
+        let wsl_own = "\
+85 77 8:32 / / rw,relatime shared:9 - ext4 /dev/sda1 rw
+116 85 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
+117 85 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+119 85 0:63 / /run rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
+124 117 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
+136 124 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw
+";
         WSL_FOR_TESTS.with(|w| w.set(Some(true)));
-        let f = mount_findings(forged, &[]);
+        let own = mount_findings(wsl_own, &[]);
+        let forged_on_wsl = mount_findings(forged, &[]);
+        WSL_FOR_TESTS.with(|w| w.set(Some(false)));
+        let own_elsewhere = mount_findings(wsl_own, &[]);
         WSL_FOR_TESTS.with(|w| w.set(None));
-        assert!(f.is_empty(), "on WSL's kernel: {f:?}");
+        assert!(own.is_empty(), "on WSL's kernel: {own:?}");
+        assert_eq!(forged_on_wsl.len(), 1, "{forged_on_wsl:?}");
+        assert_eq!(own_elsewhere.len(), 1, "{own_elsewhere:?}");
     }
 
     /// External audit NN-AUD-098: the tracefs a stock host mounts (and the
@@ -3321,6 +3797,93 @@ mod tests {
         );
         // The same lines read as the host's view: the binds are reported.
         assert_eq!(mount_findings(own, &[]).len(), 5);
+    }
+
+    /// The review of #567 (F2): the agent's own namespace (its unit's
+    /// `ProtectSystem=strict`) and the watchdog's are watched every round,
+    /// besides PID 1's — a FUSE or a tmpfs laid there, where the agent and
+    /// the watchdog read their paths, is a finding naming that namespace;
+    /// the unit's own binds and what the host's table shows too (the host
+    /// round's finding) are not.
+    #[test]
+    fn a_mount_in_the_agents_or_the_watchdogs_own_namespace_is_reported() {
+        let own = "\
+400 380 8:2 / / ro,relatime shared:200 master:1 - ext4 /dev/sda2 rw
+401 400 0:25 / /run rw,nosuid,nodev shared:201 master:2 - tmpfs tmpfs rw
+402 400 8:3 / /var ro,relatime shared:202 master:3 - ext4 /dev/sda3 rw
+403 401 0:25 /northnarrow /run/northnarrow rw,nosuid,nodev shared:203 master:2 - tmpfs tmpfs rw
+404 402 8:3 /lib/northnarrow /var/lib/northnarrow rw,relatime shared:204 master:3 - ext4 /dev/sda3 rw
+405 400 8:2 /etc/northnarrow /etc/northnarrow rw,relatime shared:205 master:1 - ext4 /dev/sda2 rw
+";
+        let mut w = MountWatch::default();
+        assert!(
+            mount_round_in(own.as_bytes(), "agent", &[], &mut w, HOST_MI.as_bytes()).is_empty()
+        );
+        // root enters the namespace (a child of the agent's, setns) and
+        // lays a FUSE over the config directory
+        let fused = format!("{own}410 405 0:70 / /etc/northnarrow rw - fuse.x x rw\n");
+        let f = mount_round_in(fused.as_bytes(), "agent", &[], &mut w, HOST_MI.as_bytes());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(
+            f[0].detail
+                .starts_with("in the agent's own mount namespace: /etc/northnarrow (fuse.x"),
+            "{f:?}"
+        );
+        // a mount the host's table shows too is the host round's
+        let host = format!("{HOST_MI}31 26 0:71 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let both = format!("{own}411 403 0:71 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let mut w = MountWatch::default();
+        assert!(mount_round_in(own.as_bytes(), "agent", &[], &mut w, host.as_bytes()).is_empty());
+        assert!(
+            mount_round_in(both.as_bytes(), "agent", &[], &mut w, host.as_bytes()).is_empty(),
+            "propagated from the host"
+        );
+        // the watchdog's: its unit's own binds (ReadWritePaths=/run/northnarrow)
+        let wd = "\
+500 480 8:2 / / ro,relatime shared:300 master:1 - ext4 /dev/sda2 rw
+501 500 0:25 / /run rw,nosuid,nodev shared:301 master:2 - tmpfs tmpfs rw
+502 501 0:25 /northnarrow /run/northnarrow rw,nosuid,nodev shared:302 master:2 - tmpfs tmpfs rw
+";
+        let mut w = MountWatch::default();
+        assert!(
+            mount_round_in(wd.as_bytes(), "watchdog", &[], &mut w, HOST_MI.as_bytes()).is_empty()
+        );
+        let over = format!("{wd}510 502 0:72 / /run/northnarrow rw - tmpfs tmpfs rw\n");
+        let f = mount_round_in(over.as_bytes(), "watchdog", &[], &mut w, HOST_MI.as_bytes());
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(
+            f[0].detail
+                .starts_with("in the watchdog's mount namespace: /run/northnarrow (tmpfs"),
+            "{f:?}"
+        );
+    }
+
+    /// The brainstorm's 3rd point: at the first read, a mount already
+    /// there over a directory above the agent's paths (an fstab tmpfs over
+    /// /var/lib) is `mount_not_canonical`, High; the host's own layout is
+    /// not; a later round does not repeat it.
+    #[test]
+    fn a_mount_made_before_the_agent_started_is_signed_at_the_first_read() {
+        let points = crate::anti_tamper::mount_guard::protected_points(None, &|_| true);
+        let mut w = MountWatch::auditing(points.clone());
+        assert!(round(HOST_MI, &mut w).is_empty());
+        let fstab = format!("{HOST_MI}40 27 0:80 / /var/lib rw - tmpfs tmpfs rw\n");
+        let mut w = MountWatch::auditing(points);
+        let f = round(&fstab, &mut w);
+        assert!(
+            f.iter()
+                .any(|(k, d)| *k == "mount_not_canonical" && d.contains("/var/lib (tmpfs")),
+            "{f:?}"
+        );
+        assert!(high_kind("mount_not_canonical"));
+        assert!(high_kind("state_fs_read_only"));
+        assert!(
+            !round(&fstab, &mut w)
+                .iter()
+                .any(|(k, _)| *k == "mount_not_canonical"),
+            "once, at the first read"
+        );
     }
 
     /// External audit EVD-014 (lab PR 180): a mount laid after the start
@@ -3543,7 +4106,7 @@ mod tests {
 
     #[test]
     fn the_unit_sandbox_is_the_shipped_units_writable_paths() {
-        let d = unit_sandbox_dirs();
+        let d = unit_sandbox_dirs(AGENT_UNIT);
         for p in [
             "/run/northnarrow",
             "/var/lib/northnarrow",
@@ -3853,6 +4416,8 @@ mod tests {
             overlay_gate: None,
             limits: LimitWatch::default(),
             mounts: MountWatch::default(),
+            own_mounts: MountWatch::default(),
+            watchdog_mounts: (None, MountWatch::default()),
             watchdog_pidfile: dir.join("watchdog.pid"),
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
@@ -4447,5 +5012,114 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Fix round 3 of #567 (the coordinator's decision): a pin removed while
+    /// the agent holds its link is a High (`bpf_pin_vanished`), pinned again
+    /// from the descriptor; one that cannot be says why.
+    #[test]
+    fn a_removed_held_pin_is_a_high_pinned_again() {
+        use antitamper_bpf::held::{Kind, Lost, Vanished};
+        let v = |lost| Vanished {
+            path: PathBuf::from("/sys/fs/bpf/northnarrow/link_task_kill"),
+            kind: Kind::Link,
+            id: 7,
+            lost,
+        };
+        let f = held_pin_findings(vec![v(Lost::Removed)], |_| Ok(()));
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].kind, "bpf_pin_vanished");
+        assert!(high_kind(f[0].kind));
+        assert!(
+            f[0].detail.starts_with(
+                "/sys/fs/bpf/northnarrow/link_task_kill: the agent's link 7: its pin is gone;"
+            ),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.contains("attached while the agent runs"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail.ends_with("pinned again from it"),
+            "{}",
+            f[0].detail
+        );
+        let f = held_pin_findings(vec![v(Lost::Replaced)], |_| {
+            Err(anyhow::anyhow!(
+                "not pinned again: its pin names another object"
+            ))
+        });
+        assert!(
+            f[0].detail.contains("its pin names another object;"),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail
+                .ends_with("not pinned again: its pin names another object"),
+            "{}",
+            f[0].detail
+        );
+    }
+
+    /// Fix round 3 of #567: the bpffs's last mount gone takes every pin of
+    /// the directory — one High for the directory with its counts, nothing
+    /// pinned again (never into a new bpffs or a mount over it).
+    #[test]
+    fn a_lost_pin_directory_is_one_high_never_repinned() {
+        use antitamper_bpf::held::{Kind, Lost, Vanished};
+        let v = |name: &str, kind| Vanished {
+            path: Path::new("/sys/fs/bpf/northnarrow").join(name),
+            kind,
+            id: 1,
+            lost: Lost::DirectoryGone,
+        };
+        let f = held_pin_findings(
+            vec![
+                v("link_task_kill", Kind::Link),
+                v("prog_task_kill", Kind::Prog),
+                v("link_sb_umount", Kind::Link),
+            ],
+            |_| panic!("a lost directory is never pinned into"),
+        );
+        assert_eq!(f.len(), 1);
+        assert!(high_kind(f[0].kind));
+        assert!(
+            f[0].detail.starts_with(
+                "/sys/fs/bpf/northnarrow: gone, with the pins of 2 links and 1 programs"
+            ),
+            "{}",
+            f[0].detail
+        );
+        assert!(
+            f[0].detail
+                .contains("attached while the agent runs, not across a restart"),
+            "{}",
+            f[0].detail
+        );
+        assert!(held_pin_findings(Vec::new(), |_| Ok(())).is_empty());
+    }
+
+    /// Fix round 3 of #567: the round reads the held pins outside a window
+    /// only, and pins again through `held::repin`.
+    #[test]
+    fn the_round_reads_held_pins_outside_a_window() {
+        let code = include_str!("self_integrity.rs");
+        let at = code.find("fn collect_round(").unwrap();
+        let end = at + code[at..].find("fn apply(").unwrap();
+        let body = &code[at..end];
+        let w = body
+            .find("is_some_and(|g| g.window.is_window_open())")
+            .expect("the window test");
+        let h = body
+            .find("antitamper_bpf::held::vanished(),")
+            .expect("the held pins read");
+        assert!(w < h);
+        assert!(body[h..].starts_with(
+            "antitamper_bpf::held::vanished(),\n                antitamper_bpf::held::repin,"
+        ));
     }
 }

@@ -24,9 +24,7 @@
 //!   the agent verified; [`opt_out_for`] is the integrity round's view of
 //!   them (a value they allow is left, not put back).
 
-use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -187,14 +185,6 @@ struct LinkCreateAttr {
     flags: u32,
 }
 
-/// `BPF_OBJ_PIN`'s head of `union bpf_attr`.
-#[repr(C)]
-struct ObjPinAttr {
-    pathname: u64,
-    bpf_fd: u32,
-    file_flags: u32,
-}
-
 /// `BPF_PROG_QUERY`'s head of `union bpf_attr` (5.15's last field is
 /// `prog_cnt`; the pad and the rest are zero for later kernels).
 #[repr(C)]
@@ -239,18 +229,6 @@ fn link_create(prog_fd: i32, cgroup_fd: i32) -> std::io::Result<OwnedFd> {
     let fd = sys_bpf(common::bpf_cmd::BPF_LINK_CREATE, &mut attr)?;
     // SAFETY: a new descriptor the kernel just returned, owned here only.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
-}
-
-/// Pin `fd` at `path`.
-fn obj_pin(fd: i32, path: &Path) -> std::io::Result<()> {
-    let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut attr = ObjPinAttr {
-        pathname: c.as_ptr() as u64,
-        bpf_fd: fd as u32,
-        file_flags: 0,
-    };
-    sys_bpf(common::bpf_cmd::BPF_OBJ_PIN, &mut attr).map(drop)
 }
 
 /// The root cgroup's `cgroup/sysctl` programs and mode.
@@ -395,10 +373,13 @@ fn attach_inner(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<Vec<u32>, St
         // this boot's link runs: the prior one goes now (its last
         // reference, the pin: it detaches in the unlink)
         purge_pins(d, false);
-        prog.pin(&prog_pin)
-            .map_err(|e| format!("pinning {PROGRAM} to {}: {e}", prog_pin.display()))?;
-        obj_pin(link.as_raw_fd(), &link_pin)
-            .map_err(|e| format!("pinning {PROGRAM}'s link to {}: {e}", link_pin.display()))?;
+        // fix round 3 of #567: through `held` — a descriptor of each kept
+        // for the agent's life (the link's beside `LINK`)
+        let fd = prog.fd().map_err(|e| format!("{PROGRAM} fd: {e}"))?;
+        antitamper_bpf::held::pin_prog(fd, &prog_pin)
+            .map_err(|e| format!("pinning {PROGRAM} to {}: {e:#}", prog_pin.display()))?;
+        antitamper_bpf::held::pin_fd(antitamper_bpf::held::Kind::Link, link.as_fd(), &link_pin)
+            .map_err(|e| format!("pinning {PROGRAM}'s link to {}: {e:#}", link_pin.display()))?;
     }
     // what the kernel reports for the root now: multi, ours among them. The
     // prior link removed above goes through the kernel's workqueue
@@ -645,7 +626,6 @@ mod tests {
         assert_eq!(BPF_F_ALLOW_MULTI, M);
         assert_eq!(BPF_F_ALLOW_OVERRIDE, O);
         assert_eq!(std::mem::size_of::<LinkCreateAttr>(), 16);
-        assert_eq!(std::mem::size_of::<ObjPinAttr>(), 16);
         assert_eq!(std::mem::size_of::<ProgQueryAttr>(), 32);
     }
 

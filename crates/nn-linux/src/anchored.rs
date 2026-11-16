@@ -42,7 +42,7 @@ use std::fs::{File, Metadata};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -101,6 +101,76 @@ pub fn anchor(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Lot 357 (re-check 3 of #563, R3-3): `body` written to `path` whole —
+/// `atomic_file::replace`'s steps (a `.<name>.tmp` beside it, created
+/// fresh, `fsync`, renamed over the name, the directory synced) — each
+/// beneath its anchored directory: a mount laid over the directory since
+/// it was anchored is never walked, a mount over the name is `EXDEV`. Not
+/// anchored: `atomic_file::replace`, by path.
+pub fn replace_file(path: &Path, body: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    let Some((dir, name)) = beneath(path) else {
+        return crate::atomic_file::replace(path, body, mode);
+    };
+    let mut tmp = OsString::from(".");
+    tmp.push(name);
+    tmp.push(".tmp");
+    match unlink_beneath(dir, &tmp, 0) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = (|| {
+        let mut f = openat_beneath(
+            dir,
+            &tmp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            mode,
+        )?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        let (c_tmp, c_name) = (cstr(tmp.as_bytes())?, cstr(name.as_bytes())?);
+        // SAFETY: a live directory fd and NUL-terminated names.
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                c_tmp.as_ptr(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        dir.sync_all()
+    })();
+    if written.is_err() {
+        let _ = unlink_beneath(dir, &tmp, 0);
+    }
+    written
+}
+
+/// Lot 357 (re-check 3 of #563, R3-1): at most `max` bytes of the regular
+/// file `path` — opened beneath its anchored directory (never through a
+/// link, never waiting on a FIFO planted at the name), else by path.
+pub fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let f = open(
+        path,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    crate::state_read::read_file_bounded(&f, max)
+}
+
+/// [`read_bounded`] as the state files are read
+/// (`state_read::read_state`'s bound and text).
+pub fn read_state(path: &Path) -> io::Result<String> {
+    read_bounded(path, crate::state_read::STATE_MAX_BYTES).map(nn_core::posture::host::state_text)
 }
 
 /// Whether the directory of `path` is anchored (its name is resolved

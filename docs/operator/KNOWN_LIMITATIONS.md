@@ -145,12 +145,95 @@ analysis is in the
   tracing programs (for BCC that is any root Python script), and a tracing
   program can read the memory of every process, the agent's keys included.
   *For you:* use the opt-out on a test VM only.
-- **Mounts are recorded, not refused.** A mount over the agent's
-  configuration, state, unit or binary directories is not refused:
-  refusing it would also break
-  the mounts of systemd and container runtimes. It is a signed
-  `integrity_drift` (`mount_over_protected`) within one integrity round
-  (about 30 s).
+- **Mounts are refused in the guarded namespaces only.** A mount on, over or
+  below the agent's directories, binaries, units, `/proc`, `/sys`, the
+  cgroup root or the bpffs is refused in PID 1's mount namespace and in the
+  agent's and the watchdog's own (lot 357, the mount guard, and the review
+  of #567), and so are an unmount or a move of the mounts themselves,
+  `pivot_root`, a remount of their super blocks and a read-only bind
+  remount — and so is one made in another namespace that propagates into a
+  guarded one (a raw `unshare(CLONE_NEWNS)`, a container's `rshared` bind
+  of a host directory, an unmount of an rbind copy that the kernel carries
+  onto a held mount): its peer group is one the agent follows (read every
+  30 s and within a second of a propagation change made by `mount(2)` or
+  `move_mount(2)`), or — a guarded mount regrouped since — the hook walks
+  the group's peers and their slaves; a group wider or deeper than the 16
+  mounts it reads counts as reaching a guarded namespace, and a mount there
+  is then refused on, over or below a protected point only.
+  `mount_setattr(2)` (read-only, propagation) has no kernel hook: it is not
+  refused, it is a signed `integrity_drift` (`mount_attrs_changed`, High)
+  within one integrity round (about 30 s), as is any mount on a kernel
+  where the guard is not attached (a signed degradation). The watchdog's
+  namespace is guarded from the agent's watchdog refresh, up to 30 s after
+  the watchdog starts. The emergency remount (`SysRq-u`, a kernel thread,
+  which root can trigger through `/proc/sysrq-trigger`) is not refused: it
+  makes every block-backed file system read-only, signed High
+  (`state_fs_read_only`); restrict `kernel.sysrq` if the host needs no
+  emergency remount. *For
+  you:* on Ubuntu 22.04, `mount --move` in the host's namespace is refused
+  (util-linux 2.37 names the source by a string only); a runtime
+  `systemd-sysext refresh` or `systemd-confext refresh`, a
+  `mount -o remount` of `/proc`, `/sys`, the cgroup root or the bpffs, a
+  read-only remount of `/`, `/run` or the agent's file systems and
+  `systemctl soft-reboot` need a trusted-installer window; an rbind of
+  `/sys` or `/` is made `rslave` before its `umount -R`; an ostree host
+  (binds of `/var`) or a host whose `/` is a tmpfs signs its layout as not
+  canonical at each start (`mount_not_canonical`) — a `systemd-sysext`,
+  `confext` or composefs overlay merged at boot does not.
+- **An unmount that races the guard's read.** The kernel calls the
+  unmount hook before it takes its mount lock. A copy grafted by a slow,
+  concurrent rbind after the guard has read the subtree is taken by a lazy
+  unmount, in any namespace, the guarded ones included: `/sys/fs/bpf` can
+  lose its last mount. The deny hooks stay attached (the agent holds their
+  descriptors) and the loss is signed High, but the pins are gone: a later
+  start must load again, and the watchdog's handles on pinned maps fail.
+  Planned: the pin directory made its own private, unbindable mount, which
+  no propagation or copy can reach (re-check 3 of #567, N4).
+- **An unmount the guard cannot read whole.** A lazy unmount (`umount -l`)
+  takes the whole subtree of the mount it names, and the kernel carries
+  the unmount of each mount in it onto the peers and slaves of its parent:
+  the guard reads that subtree, 32 mounts of it (the re-check 2 of #567).
+  Two unmounts it does not refuse, root building them on purpose:
+  - in a namespace that is not PID 1's, the agent's or the watchdog's (a
+    raw `unshare(CLONE_NEWNS)`), a subtree whose first 32 mounts, or a
+    chain of 9 levels (about 10 mounts), are all private, behind which
+    lies a copy (an rbind of `/sys`) in one of
+    the host's peer groups: the kernel takes the host's childless
+    `/sys/fs/bpf` and `/sys/fs/cgroup`, and their copies in the agent's,
+    the watchdog's and the units' namespaces (slaves of the host's). The
+    bpffs then loses its last mount: no path reaches its pins any more
+    (the watchdog's handles on the pinned maps fail; a later start finds
+    none), while its super block, the pins in it, lives on as long as the
+    agent holds a descriptor in it (its anchor of `/sys/fs/bpf`, lot 353).
+    The deny hooks no longer detach: the agent holds a descriptor of every
+    link and program it pins (fix round 3 of #567, `antitamper_bpf::held`),
+    so the kill, ptrace, file, cgroup and BPF guards and the mount guard
+    itself keep refusing for as long as the agent runs — the lab measured
+    it on 5.15 and 6.8, `umount -l /sys/fs/bpf` leaving no bpffs mounted
+    in any namespace. The integrity round signs `protected_mount_gone`
+    (High). If the agent stops or is restarted before a reboot, its
+    descriptors close: the super block goes with its pins, the hooks with
+    them, and the next start, its pins gone, starts as after a reboot;
+  - a peer of a held mount's parent regrouped since the agent's last
+    refresh of the peer groups (a second after `mount(2)`, up to 30 s
+    after `mount_setattr(2)`): one shared slave of that parent — every
+    sandboxed unit's namespace is one — is enough to hide the walk's end,
+    not 16 mounts. Its unmount can take the host's childless `/sys/fs/bpf`
+    or `/sys/fs/cgroup`. It hides the host's mount of the pins, not the
+    pins: the regroup freed the old slaves, so the agent's and the units'
+    copies stay, and so does the bpffs; the integrity round signs
+    `protected_mount_gone`.
+  The same holds for one pin removed (inside a trusted-installer window,
+  the one place root can) or hidden: the hook stays attached while the
+  agent runs, the integrity round signs `bpf_pin_vanished` (High) and pins
+  it again from the descriptor where its directory is still the one it was
+  pinned in (never into a new bpffs, nor a mount laid over the directory),
+  so the next start finds it; a pin it cannot pin again stays signed.
+  *For you:* treat a `protected_mount_gone`, a `bpf_pin_vanished` or a
+  missed deny hook you did not cause as an incident, and do not restart the
+  agent before a reboot when its pin directory is gone. In PID 1's namespace a lazy unmount wider than
+  the walk is refused even when it is harmless (an rbind of `/` made
+  `rslave`): use `umount -R`, or a trusted-installer window.
 - **Changes systemd needs are recorded, not refused.** A drop-in in a unit
   directory the agent does not guard, `systemctl set-property`, a higher
   `oom_score_adj`, an edit in place of an existing `.local` overlay: each is

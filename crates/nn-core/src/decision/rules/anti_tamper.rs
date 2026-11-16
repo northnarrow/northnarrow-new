@@ -447,6 +447,64 @@ impl Rule for NnLAt001AntiTamperDenial {
             FsProtectOperation::SoleTraceSummary => {
                 return Some(sole_trace_summary_verdict(self, event, *target_dev, *target_ino));
             }
+            // Lot 357: the mount guard, in PID 1's mount namespace.
+            FsProtectOperation::Mount => mount_text(*target_dev, *target_ino),
+            FsProtectOperation::MountWindow => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) made {}, which the mount guard refuses outside a \
+                     trusted-installer window; the signed window let it through (recorded, not \
+                     refused). Check that the installer or the operator meant it: a mount there \
+                     hides what the agent reads by path.",
+                    mount_text(*target_dev, *target_ino)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
+            // The review of #567 (F6): not refused — the tracefs, debugfs
+            // or securityfs the agent reads, unmounted.
+            FsProtectOperation::MountNoted => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) made {} (let through and recorded, not refused). \
+                     The agent reads the tracepoint formats, the kprobes switch or the lockdown \
+                     state there: until the kernel's own file system is mounted back, those \
+                     reads find nothing.",
+                    mount_text(*target_dev, *target_ino)
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
+            // The re-check of #567 (b): a read-mode access refused, recorded
+            // — Low; the re-check 2 (point 2): once an hour per caller image
+            // and target, never for the packaged journald in its units'
+            // cgroups (its metadata reads of the agent's log lines, all day).
+            FsProtectOperation::PtraceRead => {
+                let reasoning = format!(
+                    "`{comm}` (pid {pid}) was refused a read-mode access (ptrace mode \
+                     {target_dev:#x}) to the agent's process {target_ino}: one of its \
+                     /proc/<pid>/ links — ns/* (nsenter, `systemctl bind` or `mount-image` \
+                     entering its namespace), exe, root, cwd, fd/, environ, maps or io. Recorded \
+                     once an hour per caller program and process; lsof, htop and a monitoring \
+                     agent's process collector are refused the same way, and journald (its \
+                     reads of the agent's executable for its log lines) unrecorded."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             other => format!("{other} on protected inode {target_dev}:{target_ino}"),
         };
         let reasoning = format!(
@@ -461,6 +519,30 @@ impl Rule for NnLAt001AntiTamperDenial {
             &reasoning,
         ))
     }
+}
+
+/// Lot 357: a mount guard record's words — the operation, why it is
+/// refused, the view and the mounts covered, the target by device and
+/// inode (`common::mount_guard::record_of`).
+fn mount_text(target_dev: u64, target_ino: u64) -> String {
+    use common::mount_guard::{op_name, reach_name, reach_of, record_of, view_name, why_name};
+    let (dev, op, why, view, stack) = record_of(target_dev);
+    let reach = reach_name(reach_of(target_dev));
+    let view = match view_name(view) {
+        "" => String::new(),
+        v => format!(", in {v}"),
+    };
+    let stacked = match stack {
+        0 => String::new(),
+        1 => ", stacked over one mount".to_string(),
+        n => format!(", stacked over {n} mounts"),
+    };
+    format!(
+        "a {} ({reach}) — {}{view}{stacked} (target inode {dev}:{target_ino}); such a mount \
+         would hide or stall what the agent reads by path",
+        op_name(op),
+        why_name(why)
+    )
 }
 
 /// The review of #565 (F2): one kernel-state round's findings past its
@@ -1050,6 +1132,107 @@ mod tests {
             operation: op,
             timestamp_ns: 1,
         }
+    }
+
+    /// Lot 357: a refused mount names the operation, the reason, the view
+    /// and the target; High. The same mount let through by the window is
+    /// Low, never a refusal.
+    #[test]
+    fn a_refused_mount_names_what_it_would_have_hidden() {
+        use common::mount_guard::{
+            record_dev, MG_OP_MOUNT, MG_OP_UMOUNT, MG_WHY_BELOW_VIEW, MG_WHY_UMOUNT,
+        };
+        let mut e = denial(FsProtectOperation::Mount);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x803, MG_OP_MOUNT, MG_WHY_BELOW_VIEW, 1, 1);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        for words in [
+            "`bash` attempted a mount(2) of a new file system (made in PID 1's mount namespace)",
+            "below a kernel view",
+            "in /proc",
+            "stacked over one mount",
+            "target inode 2051:709",
+            "the kernel refused it",
+        ] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        let mut e = denial(FsProtectOperation::MountWindow);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x803, MG_OP_UMOUNT, MG_WHY_UMOUNT, 0, 0);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert!(v.reasoning.contains("umount(2)"), "{}", v.reasoning);
+        assert!(v.reasoning.contains("the signed window let it through"));
+        assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    /// The review of #567 (F2, F3, F6): a refusal in the agent's own
+    /// namespace and a super block's remount say so; an unmount of the
+    /// tracefs the agent reads is Low, recorded, never a refusal.
+    #[test]
+    fn a_mount_in_the_agents_namespace_and_a_noted_unmount_say_what_they_are() {
+        use common::mount_guard::{
+            record_dev, MG_OP_REMOUNT, MG_OP_UMOUNT, MG_WHY_REMOUNT_SB, MG_WHY_UMOUNT_NOTED,
+            REACH_AGENT_NS,
+        };
+        let mut e = denial(FsProtectOperation::Mount);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(
+                0x16,
+                MG_OP_REMOUNT,
+                MG_WHY_REMOUNT_SB,
+                1,
+                REACH_AGENT_NS << 4,
+            );
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::High);
+        for words in [
+            "remount of a super block",
+            "made in the agent's own mount namespace",
+            "subset=pid",
+            "the kernel refused it",
+        ] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        let mut e = denial(FsProtectOperation::MountNoted);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = record_dev(0x0c, MG_OP_UMOUNT, MG_WHY_UMOUNT_NOTED, 5, 0);
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert!(
+            v.reasoning.contains("let through and recorded"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("in the tracefs"), "{}", v.reasoning);
+        assert!(!v.reasoning.contains("the kernel refused it"));
+    }
+
+    /// The re-check of #567 (b): a refused read-mode access to the agent's
+    /// process (`nsenter -t <agent> -m`, `systemctl bind` into its
+    /// namespace) is a signed record — Low, the mode and the target named,
+    /// never the attach's words — and an attach stays High.
+    #[test]
+    fn a_refused_read_mode_access_to_the_agent_is_a_low_record() {
+        let mut e = denial(FsProtectOperation::PtraceRead);
+        if let Event::FsProtectDenial { target_dev, .. } = &mut e {
+            *target_dev = 0x09; // PTRACE_MODE_READ_FSCREDS
+        }
+        let v = NnLAt001AntiTamperDenial.evaluate(&e).expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        for words in ["read-mode access", "0x9", "process 709", "ns/*", "nsenter"] {
+            assert!(v.reasoning.contains(words), "{words}: {}", v.reasoning);
+        }
+        assert!(!v.reasoning.contains("ptrace attach"), "{}", v.reasoning);
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&denial(FsProtectOperation::Ptrace))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::High);
     }
 
     /// Review 82: the kexec wire byte decodes to `Kexec`, and an unknown

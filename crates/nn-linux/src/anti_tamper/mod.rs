@@ -50,6 +50,7 @@ pub use nn_core::anti_tamper::combat_allow;
 /// Lab PR 215: the deny hooks' fail-open counters (`DENY_FAIL_OPEN`).
 pub mod fail_open;
 pub mod filesystem;
+pub mod mount_guard;
 pub mod network_isolate;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
 /// trusted-installer FS-pin override (fills the `FS_GRANT`
@@ -206,6 +207,9 @@ const PTRACE_OVERRIDE_MAP_NAME: &str = "PTRACE_OVERRIDE";
 const TASK_KILL_PROGRAM: &str = "task_kill";
 pub(crate) const TASK_KILL_HOOK: &str = "task_kill";
 const PTRACE_PROGRAM: &str = "ptrace_access_check";
+/// The re-check 2 of #567 (point 2): the packaged journald's images and
+/// its unit's cgroup (`nn_linux::journald_identity`).
+const PTRACE_READ_QUIET_MAP_NAME: &str = "PTRACE_READ_QUIET";
 pub(crate) const PTRACE_HOOK: &str = "ptrace_access_check";
 
 /// Populate `PROTECTED_PIDS` and attach the two Tappa 7 LSM hooks.
@@ -454,6 +458,26 @@ fn attach_reporting(
         deny.missing_hook(TASK_KILL_PROGRAM, format!("{e:#}"));
     }
 
+    // The re-check 2 of #567 (point 2): the packaged journald's identity,
+    // whose refused reads of the agent are not recorded (they stay refused);
+    // read again every 10 s (`journald_identity::refresh`). Fix round 3: in
+    // the kernel before the hook attaches — installed after it, the lab's
+    // 6.8 round recorded one read of journald's, made in between (journald
+    // reads the agent's image for the attach's own log lines).
+    match ebpf
+        .take_map(PTRACE_READ_QUIET_MAP_NAME)
+        .ok_or_else(|| anyhow!("map {PTRACE_READ_QUIET_MAP_NAME} missing from eBPF object"))
+        .and_then(|m| {
+            aya::maps::HashMap::try_from(m)
+                .with_context(|| format!("{PTRACE_READ_QUIET_MAP_NAME} is not a HashMap"))
+        }) {
+        Ok(map) => crate::journald_identity::install_kernel_map(map),
+        Err(e) => warn!(
+            error = format!("{e:#}"),
+            "anti-tamper: journald's refused reads of the agent are recorded (its identity \
+             is not in the kernel)"
+        ),
+    }
     if let Err(e) = reattach_fresh(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
         warn!(
             program = PTRACE_PROGRAM,
@@ -555,6 +579,14 @@ fn attach_reporting(
         ));
     }
 
+    // Lot 357: the mount guard — a mount on, over or below the paths the
+    // agent depends on, refused in PID 1's mount namespace. Not a deny hook
+    // of the count: a kernel without it (or part of it) signs the guard's
+    // absence and the start goes on; the by-path defences remain.
+    report
+        .degraded
+        .extend(mount_guard::attach(ebpf, &btf, pin_root).degraded);
+
     // Lot 277: the start-in-cgroup tracker (the per-rule policy's
     // exemptions by cgroup or unit hold for processes started in their
     // cgroup only). Not a deny hook: without it those exemptions are
@@ -649,6 +681,13 @@ fn attach_reporting(
                 format!("own objects not registered, nothing to protect: {e:#}"),
             );
         }
+    }
+    // The review of #567 (F2): the agent's role is claimed now — its own
+    // mount namespace is judged as PID 1's (the role's liveness watch drops
+    // it at the agent's exit).
+    if let Some(why) = mount_guard::guard_own_namespace(ebpf) {
+        warn!(reason = %why, "anti-tamper mount guard: the agent's namespace not guarded");
+        report.degraded.push(why);
     }
     // Review entry 39: now that every pin of this boot exists, protect the
     // pin root against unlink/rename by foreign callers.
