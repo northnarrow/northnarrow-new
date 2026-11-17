@@ -4,7 +4,7 @@
 > FP-1 = NN-L-FIM-005 rsyslogd (commit `171018a`), FP-2 = mass-write/npm (`353199d`),
 > **FP-3 = this (NN-L-NET-004)**, FP-4 = NN-L-FIM-007 dedup.
 
-- **Status:** REPORT-ONLY — analysis + proposal. **No rule/attribution code changed.** Needs Fortunato's architectural sign-off (the fix touches the DNS event shape + a new attribution path).
+- **Status:** REPORT-ONLY — analysis + proposal. **No rule/attribution code changed.** Needs the Architect's sign-off (the fix touches the DNS event shape + a new attribution path).
 - **Date:** 2026-06-07
 - **Branch:** `benchmark/cc-t7-13-fix`
 - **Severity of the FP:** **High.** The rule's action is `KillProcess`; mis-attributed to the local forwarder it would `SIGKILL` `systemd-resolved` (pid 673 on the dev host) → **host-wide DNS outage.** The forwarder is **not** in any kill-protection set (see §4), so the outage is real, not hypothetical.

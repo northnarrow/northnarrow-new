@@ -382,7 +382,7 @@ accept-GPL) is resolved to **drop**. P2 proceeds with **MITRE ATT&CK
 v18.1 + Sigma + the 6.7 in-repo notes ONLY**; LOLBAS is not fetched,
 canonicalised, indexed, or referenced in any artifact.
 
-<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
+<<<VERBATIM — Owner: Architect&Claudie, 2026-05-17>>>
 
 ### §4.2.3 — LOLBAS drop ruling (Q2/Q5 re-ruling, post-P1.3 verification)
 
@@ -573,7 +573,7 @@ existing `prompt_sha256`?
   re-derives the P1.1 byte-lock, needs migration notes — a deliberate
   breaking change to a *closed, shipped* regulatory artifact.
 
-<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
+<<<VERBATIM — Owner: Architect&Claudie, 2026-05-17>>>
 
 ### §5.1 — Ruling rationale (Option A: XAI 1.0.0 frozen)
 
@@ -1017,7 +1017,7 @@ tantivy = "=0.25.0"
 
 ---
 
-<<<VERBATIM — Owner: Fortunato Milani via Claude Opus 4.7, 2026-05-17>>>
+<<<VERBATIM — Owner: Architect&Claudie, 2026-05-17>>>
 
 ## §13 — Canary default-flip checklist (8 points)
 
