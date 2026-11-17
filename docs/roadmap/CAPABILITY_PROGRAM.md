@@ -11726,6 +11726,122 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 367 — the pre-alpha's Phase 3-bis (self-protection on five
+  kernels): the agent's memory views on 7.0, snapd's own units, the lock's
+  and the watchdog's causes in `nn-admin status` (C23; no level change).**
+  - What was open: on 7.0 root read the agent's `environ`, `maps`, `smaps`,
+    `pagemap` and `auxv` while the ptrace hook refused them — from 6.16
+    `mm_access()` (`may_access_mm()`, `kernel/fork.c`) lets a
+    `perfmon_capable()` caller through a read-mode check a security module
+    refused — and the signed `ptrace_read` said "denied in kernel" (F3b-1,
+    P2); a `snap install` gave 4–8 `NN-L-FIM-009` High (snapd re-executed
+    from the snapd snap, unknown to the package carve-out; F3b-5); a lost
+    pin lock was a High in the registry only, `degradations: none` in the
+    status (F3b-6); a refused `--watchdog-exe` left its cause in the journal
+    only (F3b-7); the suite's C14/C26 and the kcore limit (F3b-3, F3b-4).
+  - Done: the `file_open` deny refuses the open of the memory views
+    (`cgroup_files::refuse_memory_view`; names `common::ptrace_read::
+    MEMORY_VIEWS`) through the ptrace hook's own decisions, now two shared
+    helpers (`ptrace_check::target_is_protected`, `caller_may_access`),
+    a process's own views let through as the kernel does; its record
+    carries `ptrace_read::VIEW_OPEN`, and the response text is the shared
+    `ptrace_read::response` ("denied" for the open only, "the hook refused;
+    the kernel's outcome not observed" otherwise). Two programs changed
+    (`protected_open_deny`, `ptrace_access_check`), none added, the mount
+    guard's untouched. `fim::rules::SnapdOwnUnits` around NN-L-FIM-009:
+    snapd's own unit names (`is_snapd_unit_file`) written by the host's
+    snapd (`AuthSessionTracker::is_snapd_write`: the nearest snapd in the
+    lineage by its executed file, the package's or the snapd/core snap's
+    at a revision or `current`, the host's file, root, its run covering
+    the write) Low. `pin_lock::Keeper::status_line` and
+    `self_integrity::show_pin_lock`: source `pin_lock` while the round
+    cannot make the lock again, withdrawn (with the start's own line) once
+    it is in place. The `--watchdog-exe` refusal through
+    `refusal::Context::refuse` (`refused_by: watchdog_exe`);
+    `admin_cli::last_refused_start`: `nn-admin status` with the agent
+    unreachable names the cause of a refused last start from the audit
+    log, its row's signature checked. Ratchets in
+    `xtask/tests/self_defense.rs`, `cgroup_guard.rs` (the hook's lines now
+    in the helpers), `deny_routes.rs` (the new deny site).
+  - Lab (as measured, our own guests, alpha profile, the lot's tree
+    checked by hash after each sync): ubuntu2604 (7.0.0-43, two rounds)
+    and ubuntu2204 (5.15.0-203): root's reads of the agent's `environ` (×3,
+    then `head`), `maps`, `smaps`, `smaps_rollup`, `numa_maps`, `pagemap`,
+    `auxv`, a thread's `environ` and `maps`, and `maps` through a private
+    namespace's own procfs refused (EPERM), `mem` refused (attach), a
+    process's own `/proc/self/maps` read; the records "denied in kernel (the
+    open of a memory view …)" for `python3` and `head`, and on 5.15
+    `readlink`'s of `exe` "the hook refused; the kernel's outcome not
+    observed" (on 7.0 `readlink` and `head` are one uutils image: one record
+    an hour); no `ptrace_read` record left saying the old "denied in kernel
+    (anti-tamper LSM hook)"; the same agent process throughout. `snap
+    install hello-world` (and its run, `snap remove --purge`): 4 Low
+    `NN-L-FIM-009` by snapd on 7.0 (two rounds), 3 on 5.15, 0 High; a root
+    shell writing `snap-k367probe-1.mount`: High. The lock unmounted inside
+    a window with the remake unit masked: `pin_lock: …` in `nn-admin status`
+    15 s (5.15) and 31 s (7.0) after, gone 61 s and 55 s after the unmask,
+    the lock in place, `pin_lock_missing` (High) and the `pin_lock`
+    `subsystem_degraded` signed. `--watchdog-exe` the agent's binary
+    (runtime drop-in, in a window): the start refused, `agent_boot`
+    `refused_by: watchdog_exe` signed, `nn-admin status` exit 5 naming that
+    cause, "its signature verifies with the agent's key" (7.0); undone, the
+    agent back. ubuntu2404 (6.8.0-149): the same — every view refused,
+    the three records (`python3`, `head`, `readlink`'s "not observed"), the
+    snap install 2 Low and 0 High, the lock's line 16 s after and gone 55 s
+    after the unmask, the refused start named with its signature verified.
+    Verifier check of the object (every program within the 900,000
+    instructions' gate; the shares below are of that gate): 5.15 highest
+    `mount_guard_sb_mount` 830,908 (92.3%), `protected_open_deny` 27,991,
+    `ptrace_access_check` 3,375; 6.1 (debian12) highest
+    `mount_guard_move_mount` 91.2%, `protected_open_deny` 26,077; 6.8
+    31.7%, `protected_open_deny` 18,380; 6.12 (debian13) 41.9%,
+    `protected_open_deny` 17,958; 7.0 67.0% (602,885),
+    `protected_open_deny` 26,016, `ptrace_access_check` 2,484. Uninstalled
+    (`--purge`), no `.local`, no pins, no mask or drop-in left, guests
+    powered off.
+  - Fix round 1 (the review of #574): the view deny looked at read-only
+    opens only — a read-write or write-only open of a view read the memory,
+    or answered the maps layout query, on 7.0 (F1); snapd's identity was a
+    file root can put at a snap's revision path (F2); the read-mode
+    record's hourly dedup let one kind of refusal hide the other (F3); the
+    `process_madvise` limit under-stated the layout it can reveal (F4); the
+    refused-start line checked the row's signature only (F5). Done:
+    `refuse_memory_view` called once at every open, before the access mode
+    is read (ratchet
+    `the_memory_views_are_refused_whatever_the_opens_access_mode`);
+    `is_snapd_write` takes the process systemd's `snapd.service` started —
+    its main process, the package's binary on the host — with it and every
+    process from the writer up to it in the unit's cgroup, started there,
+    nothing injected (the lot 277/281 marks through the per-rule policy's
+    facts) (`a_root_made_snapd_revision_path_keeps_high`,
+    `snapds_identity_is_snapd_services_process_with_clean_marks`); the
+    dedup key's kind bit `ptrace_read::SEEN_VIEW_OPEN`
+    (`the_hourly_dedup_keeps_the_two_refusal_kinds_apart`);
+    `admin_cli::tail_linked` (`status_says_whether_the_refused_start_row_is_in_the_chain`).
+    Mutation: 21 mutants on the new code, 21 caught by a named test (two
+    only after two cases were added: marks partly not known, a daemon seen
+    only as the snap's image on a host without the package). Lab (as
+    measured): ubuntu2604 (7.0.0-43): root's opens of the agent's
+    `environ`, `auxv`, `maps`, `smaps`, `smaps_rollup`, `numa_maps`,
+    `pagemap`, and of a thread's, each read-only, read-write, write-only and
+    with no access mode, refused (EPERM: 56 of 56), and an `O_PATH`
+    descriptor of `environ` and `maps` reopened read-only and read-write
+    through `/proc/self/fd` refused; a process's own `maps` opened
+    read-write read; one record "denied in kernel (the open …)" for
+    `python3`; `snap install hello-world` and `snap remove --purge`: 3 Low
+    `NN-L-FIM-009` by snapd (its main process re-executed from the snapd
+    snap, in `snapd.service`'s cgroup), 0 High; the review's probe (a shell
+    copied by root to `/snap/snapd/99999/usr/lib/snapd/snapd`, writing
+    `snap.k367fr1.b.service` and its `.wants` link): High `NN-L-FIM-009`,
+    removed after; verifier highest `mount_guard_move_mount` 602,885
+    (67.0%), `protected_open_deny` 26,034.
+    ubuntu2204 (5.15.0-203): the same 56 opens and the two reopens refused
+    (EPERM), the own `maps` read, one "denied in kernel (the open …)"
+    record; the snap install 4 Low and 0 High; the review's probe High;
+    verifier `mount_guard_sb_mount` 830,908 (92.3%, unchanged: the mount
+    guard untouched), `protected_open_deny` 27,742, `ptrace_access_check`
+    3,375. Both guests uninstalled (`--purge`), the probe's files removed,
+    powered off.
 - **Lot 360 — the pre-alpha's Phase 4b, F4b-1 (P2): an AppImage's fork-only
   child is judged like its AppImage (C14; no level changes).**
   - What was open (rc3, Phase 4b, five kernels, alpha profile): a type-2

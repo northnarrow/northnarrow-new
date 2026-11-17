@@ -17,6 +17,16 @@
 //! (`arg(2)`), 0 if this is the first hook on the path. We honour
 //! any prior denial by passing it through.
 //!
+//! Lot 367 (pre-alpha Phase 3-bis, F3b-1): the hook alone no longer
+//! holds for the memory views on 6.16 and later. There `mm_access()`
+//! (`kernel/fork.c`, `may_access_mm()`) lets a caller with `CAP_PERFMON`
+//! or `CAP_SYS_ADMIN` through a READ-mode check the hook refused, so root
+//! read the agent's `/proc/<pid>/environ`, `maps`, `smaps`, `pagemap` and
+//! `auxv` on 7.0 while this hook said no. Their open is refused by
+//! `file_open` (`cgroup_files::refuse_memory_view`), to the same callers
+//! ([`target_is_protected`], [`caller_may_access`]); a READ-mode record
+//! of this hook says only that the hook refused.
+//!
 //! Why deny `PTRACE_MODE_READ` and not just `PTRACE_MODE_ATTACH`:
 //! a memory read of the agent process is sufficient to lift
 //! in-memory secrets (Tappa 8 Ed25519 admin pubkey state, posture
@@ -121,14 +131,8 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         }
     };
 
-    // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
-    // hash map (see task_kill.rs for the rationale on the Tappa 7
-    // task 6 single-PID → hash-set migration).
-    // External audit EBPF-002: a process running the agent's or the
-    // watchdog's binary is protected before it registers (its first moments
-    // are when it may still take the agent's maps).
-    // R14a: a worker is a protected target too (and runs the agent's binary).
-    // Lot 273c (the review of #490): and PID 1, in attach mode only — a
+    // The protected processes ([`target_is_protected`]); lot 273c (the
+    // review of #490): and PID 1, in attach mode only — a
     // debugger, `/proc/1/mem`, `process_vm_writev`. The deny hooks let PID 1
     // write back a unit's resource values and thaw a slice on the bytes
     // its `write(2)` carries; a PID 1 whose memory root could write would
@@ -137,13 +141,54 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // debugger attach.
     let mode: u32 = ctx.arg(1);
     let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
-    if !init_attach
-        && !crate::task_kill::is_protected_pid(target_tgid)
-        && !crate::bpf_defense::task_runs_own_binary(target as *const u8)
-    {
+    if !init_attach && !target_is_protected(target_tgid, target as *const u8) {
+        return 0;
+    }
+    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if caller_may_access(caller_tgid, init_attach) {
         return 0;
     }
 
+    // Evidence: an ATTACH-mode access (debugger attach, /proc/<pid>/mem,
+    // process_vm_readv/writev) at each attempt (the per-caller dedup); the
+    // re-check of #567 (b): a READ-mode one (`nsenter` or `systemctl bind`
+    // opening /proc/<pid>/ns/mnt, `lsof`, journald's /proc/<pid>/exe) once a
+    // minute per caller and target. NOAUDIT asks LSMs explicitly not to
+    // report (`ps` reading /proc/<pid>/stat): a silent denial.
+    if mode & PTRACE_MODE_NOAUDIT == 0 {
+        if mode & PTRACE_MODE_ATTACH != 0 {
+            crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
+        } else {
+            crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);
+        }
+    }
+    -EPERM
+}
+
+/// Whether `target` (its tgid `target_tgid`) is one of the processes the
+/// hook refuses access to: a protected pid, or a process running the
+/// agent's or the watchdog's binary before it registered (external audit
+/// EBPF-002). Lot 367: shared with the open of the agent's memory views
+/// (`cgroup_files::refuse_memory_view`), which must refuse the same
+/// processes the hook does.
+#[inline(always)]
+pub(crate) unsafe fn target_is_protected(target_tgid: u32, target: *const u8) -> bool {
+    // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
+    // hash map (see task_kill.rs for the rationale on the Tappa 7
+    // task 6 single-PID → hash-set migration).
+    // External audit EBPF-002: a process running the agent's or the
+    // watchdog's binary is protected before it registers (its first moments
+    // are when it may still take the agent's maps).
+    // R14a: a worker is a protected target too (and runs the agent's binary).
+    crate::task_kill::is_protected_pid(target_tgid) || crate::bpf_defense::task_runs_own_binary(target)
+}
+
+/// Whether the caller `caller_tgid` may access a protected process anyway
+/// (`init_attach`: the target is PID 1, in attach mode). Lot 367: shared
+/// with the open of the agent's memory views, so both let through the
+/// same callers.
+#[inline(always)]
+pub(crate) fn caller_may_access(caller_tgid: u32, init_attach: bool) -> bool {
     // PHASE_D_002: caller-side mutual whitelist. If the CALLER's
     // tgid is itself in PROTECTED_PIDS, allow the ptrace_access —
     // this is the symmetric counterpart to W6's mutual PID
@@ -160,12 +205,11 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // semantics (which checks target *tgid*, not pid).
     // R14a: an exempt caller only — a worker may not trace the agent, the
     // watchdog or another worker.
-    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if crate::task_kill::is_exempt_pid(caller_tgid) {
-        return 0;
+        return true;
     }
     if init_attach && crate::inode_protect::override_active() {
-        return 0;
+        return true;
     }
 
     // BUG-011 (PHASE 15.1): trusted-observer carve-out. The agent
@@ -183,8 +227,9 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     // would fail the agent's next refresh-cycle exe-check and be
     // evicted before the next ptrace attempt — minimal race
     // window (eviction latency, single agent timer cycle).
-    if PROTECTED_OBSERVERS.get(&caller_tgid).is_some() {
-        return 0;
+    // SAFETY: a lookup of this program's map.
+    if unsafe { PROTECTED_OBSERVERS.get(&caller_tgid) }.is_some() {
+        return true;
     }
 
     // Tappa 8 escape hatch. The map is empty in the shipped Tappa 7
@@ -199,24 +244,7 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
         Some(v) => *v,
         None => 0,
     };
-    if override_value != 0 && override_value == session {
-        return 0;
-    }
-
-    // Evidence: an ATTACH-mode access (debugger attach, /proc/<pid>/mem,
-    // process_vm_readv/writev) at each attempt (the per-caller dedup); the
-    // re-check of #567 (b): a READ-mode one (`nsenter` or `systemctl bind`
-    // opening /proc/<pid>/ns/mnt, `lsof`, journald's /proc/<pid>/exe) once a
-    // minute per caller and target. NOAUDIT asks LSMs explicitly not to
-    // report (`ps` reading /proc/<pid>/stat): a silent denial.
-    if mode & PTRACE_MODE_NOAUDIT == 0 {
-        if mode & PTRACE_MODE_ATTACH != 0 {
-            crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
-        } else {
-            crate::inode_protect::emit_task_read_denial(mode, target_tgid);
-        }
-    }
-    -EPERM
+    override_value != 0 && override_value == session
 }
 
 /// `include/linux/ptrace.h`.

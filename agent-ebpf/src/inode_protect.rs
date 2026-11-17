@@ -283,7 +283,8 @@ static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(102
 /// hour ([`emit_task_read_denial`]). By image, not by process: a
 /// short-lived tool (`pidof`, `lsof`) is a new process at each run. Lot
 /// 359 (P3 b): and by the caller's cgroup — an interpreter is one image for
-/// every program it runs.
+/// every program it runs. The review of #574 (F3): and by the refusal's
+/// kind — a memory view's refused open, or the hook's verdict.
 #[map]
 static PTRACE_READ_SEEN: LruHashMap<[u64; 3], u64> = LruHashMap::with_max_entries(1024, 0);
 
@@ -443,7 +444,11 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// The re-check of #567 (b): a refused read-mode ptrace access to one of
 /// the agent's processes (`FS_OP_PTRACE_READ`: its `/proc/<pid>/ns/*` for
 /// `nsenter` or `systemctl bind`, `exe`, `fd/` …), `target_ino` = target
-/// tgid, `target_dev` = the ptrace mode. The re-check 2 of #567 (point 2,
+/// tgid, `target_dev` = the ptrace mode — lot 367: with
+/// `northnarrow_common::ptrace_read::VIEW_OPEN` when it is the open of a
+/// memory view that was refused (`cgroup_files::refuse_memory_view`), a
+/// real denial; without, the hook's verdict, whose outcome the kernel
+/// decides. The re-check 2 of #567 (point 2,
 /// `northnarrow_common::ptrace_read`): not recorded for the packaged
 /// journald in its unit's cgroup ([`PTRACE_READ_QUIET`]; journald reads the
 /// agent's `/proc/<pid>/exe` for every line it takes, all day), recorded
@@ -452,9 +457,9 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
 /// non-decisive records' budget ([`limited_budget`]). The refusal never
 /// depends on the record.
 #[inline(always)]
-pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
+pub fn emit_task_read_denial(detail: u64, target_tgid: u32) {
     let key = InodeKey {
-        dev: mode as u64,
+        dev: detail,
         ino: target_tgid as u64,
     };
     if caller_is_self_test() {
@@ -479,8 +484,10 @@ pub fn emit_task_read_denial(mode: u32, target_tgid: u32) {
     }
     let now = unsafe { bpf_ktime_get_ns() };
     // lot 359 (P3 b): the caller's cgroup in the key — one collector's
-    // record does not silence another program's probe of the same image
-    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid, cgroup);
+    // record does not silence another program's probe of the same image;
+    // the review of #574 (F3): and where the refusal was made (a memory
+    // view's open or the hook's verdict) — one kind never hides the other
+    let seen = ptrace_read::seen_key(exe.dev, exe.ino, target_tgid, detail, cgroup);
     // SAFETY: a lookup of this program's map, the value copied out at once.
     let last = unsafe { PTRACE_READ_SEEN.get(&seen) }.copied();
     // lot 359 (P3 c): due, then the budget — and seen only once the budget
@@ -987,7 +994,9 @@ unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
 /// `MAP_SHARED|PROT_WRITE` mapping requires `FMODE_WRITE` (`do_mmap`
 /// returns `-EACCES` otherwise), which this deny refuses. Reads
 /// (`FMODE_READ` only — the agent's own O_RDONLY admin.pub load, `cat`,
-/// the init system reading a unit) pass through. Routes through the
+/// the init system reading a unit) pass through, but for the
+/// READ-protected inodes and (lot 367) a protected process's memory views,
+/// refused at any open. Routes through the
 /// shared `deny_if_protected`, so the FS_GRANT +
 /// PROTECTED_PIDS exemptions (the agent's own rename-based rotation /
 /// chain-log appends / signed self-upgrade) are inherited, not
@@ -1007,21 +1016,30 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
         return 0;
     }
 
+    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::fail_open::bump(hook::FILE_OPEN);
+            return 0;
+        }
+    };
+    // Lot 367 (F3b-1): a protected process's memory views, refused at
+    // their open — the ptrace hook's read-mode refusal is let through by
+    // the kernel from 6.16 for a caller with CAP_PERFMON. Before the access
+    // mode is read (the review of #574, F1): a read-write, write-only or
+    // no-access open of a view takes the process's memory as a read-only
+    // one does, and reads it.
+    if crate::cgroup_files::refuse_memory_view(file, inode) {
+        return -EPERM;
+    }
+
     // Only write-intent opens can mutate the file; a read-only open
     // matters only for the few READ-protected inodes (external audit
     // EVD-001), matched on the inode number before any map lookup.
     let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
     let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
         Ok(m) => m,
-        Err(_) => {
-            crate::fail_open::bump(hook::FILE_OPEN);
-            return 0;
-        }
-    };
-
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) => p,
         Err(_) => {
             crate::fail_open::bump(hook::FILE_OPEN);
             return 0;

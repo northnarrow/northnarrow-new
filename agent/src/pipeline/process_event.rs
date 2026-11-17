@@ -766,6 +766,12 @@ pub(crate) fn process_event(
                             "denied in kernel (cgroup/sysctl on the root cgroup, the kernel's \
                              copy of the write)"
                                 .to_string()
+                        } else if *operation == nn_model::FsProtectOperation::PtraceRead {
+                            // Lot 367 (F3b-1): "denied" only when the open
+                            // of a memory view was refused; the hook's own
+                            // read-mode verdict, which the kernel may let
+                            // through, is said as such
+                            common::ptrace_read::response(*target_dev).to_string()
                         } else if *operation == nn_model::FsProtectOperation::Mount {
                             // Lot 357: the operation and why, for the record
                             let (_, op, why, _, _) = common::mount_guard::record_of(*target_dev);

@@ -269,8 +269,15 @@ pub(crate) async fn load(
     // hook's agent and watchdog roles (its fresh-instance window).
     let agent_pid = std::process::id();
     let own = cli.own_exes();
-    // lot 348 (the re-check of #554): never one binary in both roles
-    cli.refuse_one_binary_in_both_roles(&own)?;
+    // lot 348 (the re-check of #554): never one binary in both roles —
+    // lot 367 (pre-alpha Phase 3-bis, F3b-7): a signed refusal, its cause
+    // in the audit chain (and in `nn-admin status`'s answer while the agent
+    // is down), not only in the journal
+    if let Err(e) = cli.refuse_one_binary_in_both_roles(&own) {
+        let why = format!("{e:#}");
+        error!(error = %why, "refusing to start: one binary in the agent's and the watchdog's roles");
+        refusals.refuse(audit.log_mut(), Refusal::new("watchdog_exe", why));
+    }
     let pids = vec![agent_pid];
     // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
     // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside

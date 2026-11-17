@@ -775,6 +775,27 @@ fn mounts_over_protected_in(
     out
 }
 
+/// Lot 367 (pre-alpha Phase 3-bis, F3b-6): the pin directory's lock in
+/// `nn-admin status` — a degradation while the integrity round knows it is
+/// not in place (`pin_lock::Keeper::status_line`), withdrawn once a round
+/// finds it in place, with the start's own line of a lock it did not find.
+/// The High findings of its loss stay in the signed chain either way.
+fn show_pin_lock(line: crate::anti_tamper::pin_lock::StatusLine) {
+    use crate::anti_tamper::pin_lock::{StatusLine, DEGRADATION_SOURCE, START_DEGRADATION_PREFIX};
+    match line {
+        StatusLine::NotInPlace(detail) => {
+            crate::boot::degradation::report(DEGRADATION_SOURCE, &detail);
+        }
+        StatusLine::InPlace => {
+            crate::boot::degradation::withdraw(DEGRADATION_SOURCE, &[]);
+            crate::boot::degradation::retire_where("anti_tamper", |d| {
+                d.starts_with(START_DEGRADATION_PREFIX)
+            });
+        }
+        StatusLine::Unwatched => {}
+    }
+}
+
 /// Lot 359: `m` is the pin directory's lock in the table `mounts`
 /// (`anti_tamper::pin_lock::is_lock`).
 fn is_pin_lock(m: &Mount, mounts: &[Mount]) -> bool {
@@ -2462,6 +2483,9 @@ impl Checker {
                 ) {
                     out.push(Finding { kind, detail });
                 }
+                // lot 367 (F3b-6): and in `nn-admin status` while it is
+                // not in place
+                show_pin_lock(self.pin_lock.status_line());
             }
         }
         out.extend(read_only_state());
@@ -3702,6 +3726,44 @@ mod tests {
         );
         let high = &code[code.find("fn record_detected(").unwrap()..];
         assert!(high[..2000].contains("f.kind == \"mount_over_protected\""));
+    }
+
+    /// Named test (lot 367, pre-alpha Phase 3-bis F3b-6): the lock not in
+    /// place is a degradation of the status, the same line kept once; a
+    /// round that finds it in place withdraws it, and the start's own line
+    /// of a lock it did not find; other degradations stay.
+    #[test]
+    fn a_pin_lock_not_in_place_is_in_the_status_until_it_is_in_place() {
+        use crate::anti_tamper::pin_lock::StatusLine;
+        use crate::boot::degradation;
+        let _g = degradation::TEST_LOCK.lock();
+        degradation::reset_for_tests();
+        degradation::report("anti_tamper", "pin lock: missing at the start (x)");
+        degradation::report("anti_tamper", "another hook absent");
+        let line = "the lock of the pin directory is missing: …".to_string();
+        show_pin_lock(StatusLine::NotInPlace(line.clone()));
+        show_pin_lock(StatusLine::NotInPlace(line.clone()));
+        let s = degradation::snapshot();
+        assert_eq!(s.iter().filter(|l| l.contains(&line)).count(), 1, "{s:?}");
+        assert!(s.contains(&format!("pin_lock: {line}")), "{s:?}");
+        show_pin_lock(StatusLine::Unwatched);
+        assert_eq!(degradation::snapshot(), s);
+        show_pin_lock(StatusLine::InPlace);
+        assert_eq!(
+            degradation::snapshot(),
+            vec!["anti_tamper: another hook absent".to_string()]
+        );
+        degradation::reset_for_tests();
+        // the round shows it after each of its keeper's rounds
+        let code = include_str!("self_integrity.rs");
+        let read = &code[code.find("fn read_mounts(&mut self)").unwrap()..];
+        let watched = &read[read.find("if self.pin_lock.watches(in_unit) {").unwrap()..];
+        let keeper = watched.find("self.pin_lock.round(").unwrap();
+        let shown = watched
+            .find("show_pin_lock(self.pin_lock.status_line());")
+            .unwrap();
+        assert!(keeper < shown);
+        assert!(shown < watched.find("out.extend(read_only_state());").unwrap());
     }
 
     /// Named test (the review of #569, F3 and F5): the round keeps the pin

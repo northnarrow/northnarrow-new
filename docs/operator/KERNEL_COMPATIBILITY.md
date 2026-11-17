@@ -399,7 +399,9 @@ against `btf_vmlinux`, which exists only when the kernel was built with
 refuses to start (review 53). The anti-tamper attach reports it as a
 deny-hook shortfall, and only `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` starts a
 degraded agent. A mount that hides `/sys/kernel/btf` while the agent runs
-is reported as `integrity_drift` (`tamper-check` C26).
+is refused by the mount guard and signed (`tamper-check` C26; lot 367: the
+suite expects the refusal), and reported as `integrity_drift` where the
+guard is not attached.
 
 **External BTF (BTFHub) — assessed 2026-10-11, not pursued without a
 decision.** A BTF file from outside the kernel can feed the userland
