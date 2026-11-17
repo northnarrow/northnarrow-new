@@ -698,7 +698,7 @@ so `bpftool map dump` on the agent's maps fails too: use `nn-admin status
 is not an exemption (external audit EBPF-002: root could preload its own
 library into one). Only the successor of an agent or a watchdog that
 exited may take write handles before it is a protected pid — while no live
-process holds that role, from its main thread, in its first minute — and
+process holds that role, and only one that has just started — and
 no process gets a handle on the agent's links (by id or through a pin; a
 symlink to a pin still yields one, which can neither detach nor replace the
 hook: since external audit EBPF-010 `BPF_LINK_DETACH` / `BPF_LINK_UPDATE` on

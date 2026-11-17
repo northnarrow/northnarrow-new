@@ -75,10 +75,9 @@ the agent could not compare because the process was gone, every one on an
 agent in tracepoint mode (no seals read at the exec) and every one on a
 kernel whose BTF lacks `shmem_inode_info` stay Critical.
 
-The compares have a budget of their own: each user but root may spend
-64 MiB a second (about two runc 1.1 starts: runc is read twice, ~30 MiB),
-all of them together leave root 256 MiB of the 512 MiB a second, and root's
-starts (Docker's, rootful Podman's) may spend the rest. A memfd past the
+The compares have a budget of their own, per user, with a share kept for
+root's starts (Docker's, rootful Podman's) that other users cannot take;
+normal container starts stay well inside it. A memfd past the
 budget — every fact above holds, its bytes not compared, so it may be any
 program of the runtime's length — is "not compared (budget)": root's (uid 0
 of the initial user namespace) is recorded High, never killed; any other

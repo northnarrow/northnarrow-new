@@ -495,8 +495,8 @@ registers. It used to create its missing files (key, `audit.log`,
 map whose pin is missing in the pin root: with NOCREATE these would be
 refused — a missing map pin would keep the agent from starting until a
 reboot. The agent now inserts itself into the pinned `PROTECTED_PIDS`
-first thing (`anti_tamper::preregister_self`: from its main thread, in its
-first minute, the successor right of EBPF-002), and the registration in
+first thing (`anti_tamper::preregister_self`: while it has only just
+started, the successor right of EBPF-002), and the registration in
 `attach` stays the authoritative one.
 
 ### Residual
