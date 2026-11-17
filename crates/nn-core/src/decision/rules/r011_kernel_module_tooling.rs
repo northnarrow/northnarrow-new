@@ -1217,13 +1217,11 @@ mod tests {
             assert_eq!(
                 (v.action.clone(), v.severity),
                 (ResponseAction::Log, Severity::Low),
-                "{why}: {}",
-                v.reasoning
+                "{why}: a person's read is recorded at Low",
             );
             assert!(
                 v.reasoning.contains("it cannot load a module"),
-                "{}",
-                v.reasoning
+                "the reasoning says the process cannot load a module",
             );
         }
         // the attack shapes: High, as before
@@ -1259,7 +1257,11 @@ mod tests {
                 "{why}: {creds:?}"
             );
             let v = r.evaluate(&read_as(user(), read(creds))).expect("recorded");
-            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+            assert_eq!(
+                v.severity,
+                Severity::High,
+                "{why}: a process that can load a module is High"
+            );
         }
         let mixed = "Uid:\t1000\t0\t1000\t1000\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\n";
         assert_eq!(
@@ -1294,10 +1296,17 @@ mod tests {
                 },
             ),
         ] {
-            let what = format!("{e:?}");
             let v = r.evaluate(&read_as(e, facts)).expect("killed");
-            assert_ne!(v.action, ResponseAction::Log, "{what}");
-            assert_eq!(v.severity, Severity::High, "{what}");
+            assert_ne!(
+                v.action,
+                ResponseAction::Log,
+                "a process that can load a module is not only logged"
+            );
+            assert_eq!(
+                v.severity,
+                Severity::High,
+                "a process that can load a module is High"
+            );
         }
     }
 

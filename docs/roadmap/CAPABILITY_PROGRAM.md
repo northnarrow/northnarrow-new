@@ -11844,6 +11844,14 @@ number in parentheses is a lab PR.
     soak holds debian13; one guest for this round). Mutation: 17 mutants,
     16 caught by a named test, one argued equivalent (the work-directory
     layout checked when the link is noted: the lookup checks it again).
+    Fix round 2 (the re-check of #576): the DNS sensor (`udp_sendmsg`)
+    reads an `AF_UNSPEC` name as the UDP sensor does (v4, from 16 bytes
+    up), so a query to port 53 sent that way is seen (N1; test
+    `net_dns_query_sent_with_an_unspec_name_is_seen_by_the_dns_sensor`,
+    privileged, not run in a guest). Verifier on 5.15 (ubuntu2204, as
+    measured): `udp_sendmsg` 25,705 instructions processed (25,505
+    before), `udp_sendmsg_outbound` 33,135 (gate 900k). The eight CodeQL
+    alerts of the tests' messages: reworded, none dismissed.
 - **Lot 367 — the pre-alpha's Phase 3-bis (self-protection on five
   kernels): the agent's memory views on 7.0, snapd's own units, the lock's
   and the watchdog's causes in `nn-admin status` (C23; no level change).**

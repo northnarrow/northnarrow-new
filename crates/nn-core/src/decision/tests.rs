@@ -2042,20 +2042,24 @@ fn a_service_account_s_or_root_s_go_build_output_stays_judged() {
                 .matches
                 .iter()
                 .find(|m| m.rule_id == rule)
-                .unwrap_or_else(|| panic!("{uid} {posture}: {:?}", ids(&d)));
-            assert_ne!(m.verdict.severity, Severity::Low, "{uid} {posture} {out}");
+                .unwrap_or_else(|| panic!("the rule must match in every posture: {:?}", ids(&d)));
+            assert_ne!(
+                m.verdict.severity,
+                Severity::Low,
+                "go-built output is never Low here"
+            );
             if uid == 0 && posture < PostureKind::Combat {
                 // root's: R009's record first, R001's kill held (lot 278)
                 assert_eq!(
                     m.held_action,
                     Some(ResponseAction::KillProcessTree),
-                    "root {posture}"
+                    "root's kill is held before COMBAT"
                 );
             } else {
                 assert_eq!(
                     (d.verdict.action.clone(), d.responses.len()),
                     (ResponseAction::KillProcessTree, 1),
-                    "{uid} {posture} {out}"
+                    "the kill is one response"
                 );
             }
         }

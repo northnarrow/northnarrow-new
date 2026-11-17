@@ -222,7 +222,7 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     // Resolve the destination: prefer an explicit `msg_name`
     // (connectionless `sendto`); fall back to the socket destination
     // for connected UDP (`connect()` + `send()`, what glibc uses).
-    let dest = match dest_from_msg_name(msg_ptr, false)? {
+    let dest = match dest_from_msg_name(msg_ptr, true)? {
         Some(d) => d,
         None => match dest_from_sock(sk_ptr)? {
             Some(d) => d,

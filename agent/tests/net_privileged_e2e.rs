@@ -1064,6 +1064,100 @@ r.close()
     fx.wait_netflow_matching(1, to(UDP_UNSPEC_PORT));
 }
 
+/// Lot 369 (the review of #576, N1): the DNS sensor reads the name of a send
+/// as `udp_sendmsg` does, an `AF_UNSPEC` name of 16 bytes or more being an
+/// `AF_INET` one. A query to port 53 sent that way, on an unconnected socket,
+/// was recorded by no sensor, so the process that asked and then connected to
+/// the answer drew NN-L-NET-028 as if it had never asked. Now the query is
+/// seen and that connect is not recorded; the control (a literal address, no
+/// lookup) is. Fails on main (the resolved connect is recorded).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_dns_query_sent_with_an_unspec_name_is_seen_by_the_dns_sensor() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+    let server = std::net::UdpSocket::bind("127.0.0.3:53").expect("bind 127.0.0.3:53");
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        if let Ok((n, from)) = server.recv_from(&mut buf) {
+            if n > 12 {
+                let _ = server.send_to(&dns_response(&buf[..n], [198, 51, 100, 212]), from);
+            }
+        }
+    });
+    let resolved = r#"
+import ctypes, os, socket, struct
+q = struct.pack(">HHHHHH", 0x4e43, 0x0100, 1, 0, 0, 0)
+q += b"\x07unspec1\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+libc = ctypes.CDLL(None, use_errno=True)
+sa = struct.pack("=HH4s8x", 0, socket.htons(53), socket.inet_aton("127.0.0.3"))
+if libc.sendto(u.fileno(), q, len(q), 0, sa, len(sa)) != len(q):
+    raise SystemExit("AF_UNSPEC sendto: errno %d" % ctypes.get_errno())
+a, _ = u.recvfrom(512)
+ip = ".".join(str(b) for b in a[-4:])
+print(os.getpid(), ip, flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect((ip, 9))
+except Exception:
+    pass
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(resolved)
+        .output()
+        .expect("spawn the resolved client");
+    let _ = server_thread.join();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut parts = text.split_whitespace();
+    let resolved_pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
+    assert_eq!(parts.next(), Some("198.51.100.212"), "the answer read");
+    let literal = r#"
+import os, socket
+print(os.getpid(), flush=True)
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("198.51.100.213", 9))
+except Exception:
+    pass
+"#;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(literal)
+        .output()
+        .expect("spawn the literal client");
+    let literal_pid: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("its pid");
+    let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
+    let mine = |pid: u64| -> Vec<serde_json::Value> {
+        common::records_of(&fx.detections_log, NET_028)
+            .into_iter()
+            .filter(|r| r["principal"]["pid"].as_u64() == Some(pid))
+            .collect()
+    };
+    while mine(literal_pid).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert_eq!(
+        mine(literal_pid).len(),
+        1,
+        "the literal connect's NN-L-NET-028 record (the control)"
+    );
+    assert!(
+        mine(resolved_pid).is_empty(),
+        "the connect to an answer asked with an AF_UNSPEC name drew NN-L-NET-028"
+    );
+}
+
 // ── Lot 275 (C07): inbound connections, TLS ClientHellos, NN-L-NET-028 ──
 
 /// Lot 275 — an accepted connection is an inbound row of the netflow log

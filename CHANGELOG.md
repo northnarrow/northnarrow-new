@@ -30,11 +30,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     destination a send names (`sendto()`), on a connected socket too, and
     an `AF_UNSPEC` name as `udp_sendmsg` reads it: a socket connected to
     itself that names a local relay is no longer recorded as sending to
-    itself (the review of #576). Tests
+    itself (the review of #576). The DNS sensor reads an `AF_UNSPEC` name
+    the same way (v4, from 16 bytes up), so a query to port 53 sent with
+    one is seen. Tests
     `net_013_a_socket_sending_to_itself_is_no_beacon`,
     `net_013_records_one_beacon_per_program_destination_and_hour`,
     `net_013_an_interpreter_s_beacons_are_keyed_by_its_script`,
-    `net_udp_a_connected_socket_s_named_send_is_recorded_to_the_name`
+    `net_udp_a_connected_socket_s_named_send_is_recorded_to_the_name`,
+    `net_dns_query_sent_with_an_unspec_name_is_seen_by_the_dns_sensor`
     (privileged).
   - **R011.** The module tool's credentials read at the exec; a non-root
     `modprobe` that cannot load a module (no uid 0, no `CAP_SYS_MODULE` in
