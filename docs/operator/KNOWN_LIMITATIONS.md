@@ -206,14 +206,11 @@ not cause as an incident.
 - **A refused use of a held program is signed once.** When a program
   held from a window is used again, the use is refused; repeats by the same
   caller are coalesced into one signed record per program and caller, so
-  the count of records is not the count of attempts. A use that races a
-  change of its descriptor can get through: it is not refused and leaves
-  no record of its own, and the program's load record and its "still
+  the count of records is not the count of attempts. In rare cases a use can get through: it is not refused and leaves no record of its own, and the program's load record and its "still
   loaded after the window" record remain. *Evidence:* internal check Phase
-  3 §7.1 and §7.3 (the race measured on 6.8, 6.12 and 7.0); lot 356.
+  3 §7.1 and §7.3 (measured on 6.8, 6.12 and 7.0); lot 356.
 - **What was loaded before the agent started.** A kernel module loaded
-  before the agent started is beyond its reach. BPF programs present at its
-  start are recorded (High for the risky types); on kernels from 6.9 their
+  before the agent started is beyond its reach. BPF programs present at its start are recorded (High for the types refused outside a window, Low for the others); on kernels from 6.9 their
   later use is not judged. *For you:* install on a fresh VM. *Evidence:*
   `the_start_is_the_baseline_and_a_later_unseen_program_is_signed_once`;
   internal check Phase 3 §7.1 (residual R002).
@@ -477,7 +474,7 @@ not cause as an incident.
   file-open sensor on its tracepoint), or while `/etc/subuid` cannot be
   read; an id of a range whose owner `/etc/passwd` does not name (an sssd
   or LDAP user's), of overlapping ranges or of a gap; an id past every
-  range (a range added in the last 2 seconds, a domain account with a high
+  range (a range added since the agent last read the file, a domain account with a high
   uid). The unattributed ids have one share of the reader together, one
   read at a time: they can make each other's facts unverifiable, never an
   attributed user's, root's or the system accounts', and that share held

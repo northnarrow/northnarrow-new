@@ -183,22 +183,12 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       pointer of a `syscall` program's own update — is refused too, signed
       `bpf_held_use` naming the prog array: fail closed). So a `syscall`
       program calling `bpf_send_signal_task`, or a kprobe calling
-      `bpf_send_signal`, loaded in a window cannot be run or attached after
-      it. What stays open: what was attached INSIDE the window keeps
-      running (a link, pinned or not, a perf event, a prog array filled
-      then, an iterator link read later), a netlink attach (an XDP or tc
-      program through `ip link` / `tc`, no `bpf(2)` command), and a race
-      (another thread's change of the descriptor between the agent's
-      check and the kernel's: an attempt that loses it is refused, signed
-      once per program and caller with its repeats coalesced; one that
-      wins it leaves no record of its own) — each
+      `bpf_send_signal`, loaded in a window is refused when run or attached after it (see below for what stays open). What stays open: what was attached INSIDE the window keeps running (a link, a perf event, a prog array or an iterator set up then), some attachments are not judged at their use, and a refused use is signed once per program and caller with its repeats coalesced while, in rare cases measured in the lab, a use can pass without a record of its own — each
       such program's load is the signed High record above, and once the
       window has closed the agent signs each one still loaded (High,
       `bpf_held_load` "still loaded after the window", with where it is
       attached). The window itself is the host's: while it lasts every
-      root process, not only the installer, gets what it lifts. A
-      program loaded before the agent started is signed High at its start
-      (the cross-view's baseline); from 6.9 its handles, runs and attaches
+      root process, not only the installer, gets what it lifts. A program loaded before the agent started is signed at its start (the cross-view's baseline: High for the types refused outside a window, Low for the others); from 6.9 its handles, runs and attaches
       are not judged (the agent cannot read its calls: it has no
       `CAP_SYSLOG`, so the kernel blanks them in a dump).
   - Each refusal is a signed `bpf_prog_type` record (High) that names the

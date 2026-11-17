@@ -448,11 +448,7 @@ user-writable path, R009's match. What the running agent does with them:
   one that vouches must have its image (a root-only directory, PID 1's
   mount namespace and root directory): a fake `/usr/bin/sudo` in a chroot
   or a mount namespace is R009 High, the journal saying "was not executed
-  from the host's root-only directory". **Residual (P2):** an escalation
-  that first sets its real uid to a sudoer's whose sudo asks for nothing (a
-  `NOPASSWD` sudoer, the default user of cloud images; or a sudo timestamp
-  root forges in `/run/sudo/ts`) and then runs the host's sudo is still
-  seen as an administrator's `sudo ~/payload`: Low, no kill
+  from the host's root-only directory". **Residual (P2):** a process that reaches root and hands its payload to an administrator's sudo can be judged as that administrator's session: Low, no kill; closing it is planned after the alpha
   (`UPGRADE_NOTES_WAVE4.md` §45). The operator's `sudo
   ./deploy/uninstall.sh` from a user's terminal, and `sudo -i` then the
   script, stay Low.

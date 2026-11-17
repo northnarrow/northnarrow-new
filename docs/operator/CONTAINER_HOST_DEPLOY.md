@@ -88,9 +88,7 @@ padded to runc's length). No user's container loop can make root's Docker
 starts Critical; a rootless user's container start past its own share (a
 third runc 1.1 start in a second) is killed as before lot 347.
 
-Residual, named: root spending its own budget (512 MiB a second of
-compares), then executing a memfd of its own under the runtime, is recorded
-High, not killed — root, who needs no such route.
+Residual, named: a root memfd past the comparison budget is recorded High, not killed — root, who needs no such route.
 
 `nn-admin status --key` counts what the exec pump did with these clones
 since the agent's start (lot 369), once one was seen: `runtime clones : N

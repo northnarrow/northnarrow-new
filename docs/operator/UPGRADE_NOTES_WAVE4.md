@@ -1771,10 +1771,7 @@ are judged as before; `CHANGELOG.md` has the detail.
   one build; nothing to do).
 - **`npm ci` / `go test`** do not raise ENGAGED any more: npm's CLI run
   through `/usr/bin/npm` (the package's link) or npm's CLI under a system
-  path prefix, with no `NODE_OPTIONS`/`NODE_PATH` loading code (known limit:
-  the prefix is not a proof of root ownership, and npm loads
-  `~/.npm-init.js` itself; a follow-up narrows the exemption to npm's own
-  write paths), and the packaged `go`
+  path prefix, with no `NODE_OPTIONS`/`NODE_PATH` loading code (known limit: the exemption trusts the packaged tool by identity; a follow-up narrows it to npm's own write paths), and the packaged `go`
   command writing in its work directory (`$TMPDIR/go-build<digits>/`), its
   build cache or its module cache. A `go` in a home (`GOTOOLCHAIN`), what
   `go` runs, and node running any other script still count.
@@ -2036,14 +2033,9 @@ upgrade. Each benign case is told by what the kernel proves; the attack
 beside it is judged as before. `CHANGELOG.md` has the detail.
 
 - **The watchdog's start**: no NN-L-BPF-002 High any more for our own
-  watchdog opening `PROTECTED_PIDS`' pin before it is a protected pid (its
-  binary by device and inode, its role vacant, its main thread, its first
-  minute — the exemption the refusal already applied): one NN-L-BPF-002
+  watchdog opening `PROTECTED_PIDS`' pin before it is a protected pid (the exemption the refusal already applied): one NN-L-BPF-002
   **Low** record at each start of the agent or the watchdog instead
-  (`fresh_instance_get_fd`). A Low one with no such start beside it is a
-  program that made itself the watchdog's binary while the role was vacant
-  — worth a look. A second watchdog binary started beside the live one, one
-  past its first minute, and any handle on a link of the agent's are
+  (`fresh_instance_get_fd`). A Low one with no such start beside it is a process taken for the watchdog while the role was vacant — worth a look. A second watchdog binary started beside the live one that is not new, and any handle on a link of the agent's are
   recorded High (and refused) as before.
 - **A reboot**: systemd's SIGTERM to the watchdog and the agent during a
   shutdown is still refused until `systemd-shutdown`, and no longer
@@ -2117,11 +2109,7 @@ detail.
   upgrade**: npm from a user prefix (nvm, volta) is judged as any process;
   `npm ci` from such a node in a CI runner raises ENGAGED as before. A
   cache moved out of its default place (`npm_config_cache`) is no longer
-  npm's own. **Residual**: the arm judges the one file that crossed its
-  threshold (the kernel reports a window's crossing once per process), so
-  code running inside npm (`npm init`'s `~/.npm-init.js`) that puts each
-  window's crossing in `node_modules` pads the window — the documents it
-  rewrites beside it are not counted by the arm.
+  npm's own. **Residual**: npm's exemption trusts the packaged tool by identity: code npm runs on a user's behalf writes under that exemption, and the mass-write arm may not judge it. A follow-up narrows it to npm's own write paths.
 - **yarn, pnpm and bun** are judged as any writer, as before: an install
   that crosses a threshold still raises ENGAGED. They load a project's
   code in their own process on every install (`.pnpmfile.cjs`, yarn
@@ -2134,10 +2122,7 @@ detail.
   (`/usr/lib/postgresql/<N>/bin`, `/usr/pgsql-<N>/bin`, `/usr/bin`) and
   the bootstrap `postgres` it starts, as a service account, writing only
   that account's own data. Any other program of the account in a session
-  still counts. **Residual**: `initdb -L <dir>` has the exempt bootstrap
-  run the SQL files of a directory the caller names, as superuser, which
-  can rewrite the account's live cluster unjudged — as `psql` to the
-  running server can, whose writes are exempt by design.
+  still counts. **Residual**: the account's own cluster tooling writes under the account's exemption, as its running server does.
 - **Kubernetes' NodeLocal DNSCache and kube-dns** are known resolvers, as
   CoreDNS: their legs are recorded, never their own tunnel, never killed.
 - **A resolver daemon that forked itself** (`Type=forking`) is its unit's
@@ -2181,11 +2166,7 @@ detail.
   opt-out — at the `bpf_prog_load` hook (`EPERM`, before the verifier), a
   signed `bpf_prog_type` record (High) naming the kfunc. The kfuncs the
   kernel's BTF has are read; a program the judge cannot read whole is
-  refused. Before this release, on 6.13 and later, **any root process**
-  could kill the agent and its watchdog this way: a `syscall` program doing
-  `bpf_task_from_pid(agent)` then `bpf_send_signal_task(…, SIGKILL, …)`
-  signals as `SI_KERNEL`, which no `task_kill` hook sees, and the judge
-  read only the types refused by default. Per kernel: before 6.13 none of
+  refused. Before this release, on 6.13 and later, a program of a type the judge did not read could signal the agent past its signal hook, and the judge read only the types refused by default. Per kernel: before 6.13 none of
   these kfuncs exists (nothing to refuse); on 6.9 to 6.12 a type let
   through by default is not read at all (no cost); from 6.13 each foreign
   load of such a type is read once, at the load (no cost per packet).
@@ -2436,9 +2417,7 @@ detail.
       a round with such a read is one the CPU watch cannot judge — three
       in a row are the signed `cpu_confined` "could not judge" record,
       naming the read.
-    - Still open: another sysfs or procfs file bound over the online file
-      BEFORE the agent starts passes the magic check (the union keeps it
-      from narrowing unless both sources are faked); a FUSE regular file
+    - Still open: a confinement of the agent's CPUs set up before its first round, or through the sources the watch reads at its start, may not be proven; a FUSE regular file
       bound over a file the round reads costs each round its 2 s deadline
       (reads outside that round are not timed); a slice's `cpuset.cpus`
       written inside a window narrows the expectation; `CPUAffinity=numa` is not read;
@@ -2493,15 +2472,7 @@ detail.
     its call and where it is attached; once per program and per agent
     start (an agent restart signs it again).
   - **What stays open:** what was attached INSIDE the window keeps running
-    after it (a link, pinned or not; a perf event; a prog array filled
-    then; an iterator link read later with `cat`), and an XDP or tc program
-    attached over netlink (`ip link`, `tc`: no `bpf(2)` command; 6.13+
-    only, where such a program can call `bpf_send_signal_task`). A
-    descriptor changed by another thread between the hook's read and the
-    kernel's, or a prog array's value changed in that gap, can win a race.
-    Each attempt that loses it is refused, signed once per program and
-    caller (repeats coalesced); a root user can win it, and the winning
-    attempt leaves no record at its use (re-check 2 of #558, N4): the
+    after it (a link, a perf event, a prog array or an iterator set up then), and some attachments of a held program are not judged at their use. Each refused use is signed once per program and caller (repeats coalesced); in rare cases, measured in the lab, a use can pass without a record at its use (re-check 2 of #558, N4): the
     load's High and the "still loaded after the window" High are then the
     only records. Check
     `bpftool link` and `bpftool prog` for the ids a `bpf_held_load` names.
@@ -2510,15 +2481,11 @@ detail.
     kernel-state round removes the ids no longer loaded. When it is full,
     a window's forbidden load is refused (`bpf_held_use`, "held set full":
     fail closed) instead of being kept nowhere.
-  - **A program loaded before the agent started** is signed High at the
-    agent's start when its type is one the agent refuses outside a window
-    (the cross-view's baseline, `bpf_baseline`, naming its id, name, tag and
+  - **A program loaded before the agent started** is signed at the agent's start, High when its type is one the agent refuses outside a window and Low otherwise (the cross-view's baseline, `bpf_baseline`, naming its id, name, tag and
     attach point); before 6.9 its handles are judged and refused like any,
     from 6.9 they are not, nor (on any kernel) the runs and attaches of the
     descriptor its loader kept: its content cannot be read without the
-    calibration the older kernels need, and a dump of it
-    (`BPF_OBJ_GET_INFO_BY_FD`) has its calls blanked for a reader without
-    `CAP_SYSLOG`, which the agent's unit does not grant. Remove such a
+    calibration the older kernels need, and the agent's unit cannot read its calls. Remove such a
     program, or reboot, before you trust the host.
 - **A copy of `/etc` over `/etc` is signed, as before.** Mounted after the
   agent loaded its key, it is `integrity_drift` `mount_over_protected` in
@@ -2555,25 +2522,14 @@ detail.
     window to the requester's tree is one fix for all of them; until then
     open a window only on a host you trust for its length, and keep it
     short (`--window-secs`).
-  - **P2: the descriptor race.** Another thread's change of a
-    descriptor between the agent's check and the kernel's own read, or of
-    a prog array's value in that gap, can win. An attempt that loses it
-    is refused, signed once per program and caller with its repeats
-    coalesced (`bpf_held_use`); a root user can win it, and the winning
-    use then leaves no record of its own (N4). The load and the "still
-    loaded after the window" record are signed High. No hook exists that
-    sees the resolved program for every run and attach.
+  - **P2: a rare use that passes unrecorded.** A refused use of a held program is signed once per program and caller with its repeats coalesced (`bpf_held_use`); in rare cases, measured in the lab, a use can pass without a record of its own (N4). The load and the "still loaded after the window" record are signed High.
   - **P3: a `struct_ops` map read as a program.** `BPF_LINK_CREATE` with
     attach type `BPF_STRUCT_OPS` and `BPF_LINK_UPDATE` of such a link
     carry a map's descriptor where the agent reads a program's: on 6.8 a
     counted fail-open (with a rate-limited `deny_fail_open` record), on
     7.0 a random id that is never held in practice — noise on hosts with
     sched_ext or a BPF TCP congestion control, never a false refusal.
-  - **P3: the CPU watch's sources trusted by filesystem type.** A file of
-    the same filesystem bound over the online list and `/proc/stat` (or a
-    cgroup2 subtree over `/sys/fs/cgroup`) BEFORE the agent's first round
-    passes the check and can narrow what it expects; it needs a boot unit
-    or an upgrade, since the agent does not restart outside a window.
+  - **P3: the CPU watch's sources trusted by filesystem type.** A confinement of the agent's CPUs set up before its first round may not be proven.
 
 ## 44. Our own install, boot and uninstall: no High; a purge leaves nothing undeclared (lot 350)
 
@@ -2670,13 +2626,7 @@ detail.
   read gives sudo its image as before. The operator's `sudo
   ./deploy/uninstall.sh` and `sudo -i` stay Low.
 - **This does not close every LPE (P2, residual below).** An escalation
-  that keeps real uid 0 and runs sudo is High; one that first sets its real
-  uid to a sudoer's whose sudo asks for nothing — a `NOPASSWD` sudoer (the
-  default user of cloud images), or any sudoer once root forges sudo's
-  timestamp in `/run/sudo/ts` (FIM does not watch it) — and then runs the
-  host's sudo still gets the session's cover (R009 Low, the FIM kill hold,
-  the impair sanction): sudo authorizes by the real uid, and the agent sees
-  an administrator's `sudo payload`.
+  that keeps real uid 0 and runs sudo is High; one that hands its payload to an administrator's sudo can still get the session's cover (R009 Low, the FIM kill hold, the impair sanction): the agent sees an administrator's `sudo payload`.
 - **`uninstall.sh` and the agent's containment cgroups.** `blocked.scope`
   and `throttled.scope` under `northnarrow.slice` are removed when empty.
   One holding a process the agent contained is left with it — not killed,
@@ -2705,7 +2655,7 @@ Known residuals of lot 351 (P3 unless marked, named for later lots):
 
 | Residual | Where | What would close it |
 |---|---|---|
-| **P2 (the re-check 1 of #560, H(a)).** A local privilege escalation that sets its real uid to a sudoer's whose sudo asks for nothing (`NOPASSWD`: a cloud image's default user; or a timestamp root forges in `/run/sudo/ts`, which FIM does not watch), then executes the host's sudo: sudo authorizes by the real uid, forks the payload as root, and the agent sees an administrator's `sudo payload` — R009 Low, the FIM kill hold, the impair sanction | the session check (`is_interactive_admin`) | the real uid stays the same along the walk, from the sudo or su up to the login or authentication hop (a uid change with no elevation hop between is no session) |
+| **P2 (the re-check 1 of #560, H(a)).** A local privilege escalation that hands its payload to an administrator's sudo is seen as an administrator's `sudo payload` — R009 Low, the FIM kill hold, the impair sanction | the session check (`is_interactive_admin`) | the session check follows the identity along the whole chain, from the sudo or su up to the login |
 | **F (the re-check 1 of #560).** Without the kernel's fork record (`FORK_PARENT_DEGRADED`: an eBPF object or kernel that cannot attach it) no sudo session is an administrator's — fail-closed: an administrator's `sudo ./deploy.sh` from a home is R009 High and killed outside `alpha`, and the FIM kill hold is lost — and the degradation's text does not say so; the fork record is not re-checked on 5.15 or Debian since lot 351 | `FORK_PARENT_DEGRADED` (`nn-linux` multiplexer), the lab | the degradation's text names both effects; a lab round on a 5.15 kernel and on Debian |
 | **G (the re-check 1 of #560, hardening).** The start's scan enters a process whose `/proc` shows no uid as real uid 0 (`uid.unwrap_or(0)` in the seed); `ELEVATION_EXES` is `pub`, outside the ratchet that keeps the elevation walk its only reader. No user can cause either, and nothing outside tests reads the constant | `posture::lineage` | a process with no uid read is not entered (or entered as unknown); the constant private to the crate, or named in the ratchet |
 | A growth the drain never read, then a truncation back to the baseline's content: after the agent's start (until the first close of the log), and, **for a log whose signed baseline is empty, after every rotation** (`copytruncate`, `create`: the last read is 0 again, a wipe to 0 matches both) | the FIM drain (`TAPPA9_FIM_TRUST_MODEL.md`) | the kernel's size before the setattr in the record (eBPF + wire) |
@@ -3357,10 +3307,7 @@ depth.
   `/tmp/.mount_*` is still R009. A kernel record of the process the
   connection's `/dev/fuse` file is handed to would close it.
 - **Limit (lot 364, the re-check of #564).** "Never read through a FUSE
-  mount" is withdrawn. A file system the agent does not trust to answer
-  (FUSE, a network file system) can delay the exec reading; the sensor
-  self-test signs it (`subsystem_degraded`, source `sensor_selftest`). A
-  hardening lot follows (`KNOWN_LIMITATIONS.md`, "Detection coverage").
+  mount" is withdrawn. Since lot 366 (§55) the exec pumps never wait on a file system; a FUSE file is never read.
 - **Operator action.** None: no setting, no overlay. The records name the
   program's path as before.
 
@@ -3391,12 +3338,7 @@ depth.
   the window"); the round releases the id when it is no longer loaded. An
   installer that sees a window load refused with `EPERM` and
   `held_load_unsigned` > 0 in `nn-admin status` met a full ring: retry the
-  load. Residual (lot 349's, unchanged): with the held set full (1,024
-  ids) there is no room to hold the id, and a handle taken by id in the
-  same race keeps the refused program un-held — the load's `bpf_held_use`
-  record (held set full) names it, and the cross-view signs it
-  `bpf_unseen` once it is in two enumerations (its load was refused before
-  the hook recorded it).
+  load. Residual (lot 349's, unchanged): with the held set full a window's load is refused and signed (`bpf_held_use`, held set full); the cross-view signs a program that still got through as `bpf_unseen` once it is in two enumerations.
 - **A sole trace in the agent too.** The held load, its "still loaded after
   the window" record and the kernel-state round's findings (`kernel_taint`,
   `sysctl_root_prog`, `bpf_unseen`, `bpf_baseline`, `cpu_confined`) are the
@@ -4387,8 +4329,7 @@ product code builds that bundle), with a false `host-check` warning.
       - an id of a range whose owner `/etc/passwd` does not name (an sssd
         or LDAP user's range, by name), of ranges that overlap, or of a gap
         between ranges;
-      - an id past every range: a range added within the last 2 seconds
-        (the ranges are checked that often), a range `/etc/subuid` does not
+      - an id past every range: a range added since the agent last read the file, a range `/etc/subuid` does not
         list, a domain account whose uid is that high.
 
       The unattributed ids together are one account, in a share of their
@@ -4655,9 +4596,7 @@ its verdict.
   to itself that named a local relay in each send was recorded as sending
   to itself — and the socket's peer only when the send names none
   (`udp_sendmsg` reads an `AF_UNSPEC` name as an `AF_INET` one, as the
-  sensor now does). Residual, said: another socket bound to the same
-  endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive such a datagram;
-  that relay's own flows are judged. A loopback destination of another
+  sensor now does). Residual, said: a datagram to the sender's own loopback endpoint is no beacon; whatever forwards it is judged by its own flows. A loopback destination of another
   socket (a local SOCKS or Tor proxy, a relay) and every remote host keep
   firing — once per program (the kernel's image; an interpreter's image
   and the script it runs, an interpreter running no script file its
@@ -4713,12 +4652,10 @@ its verdict.
   appears.** The kernel watches inodes, and nothing told the drain a path
   had come into being: on a host without cron at the agent's start, `apt
   install cron` made `/var/spool/cron/crontabs` and a user's crontab drew no
-  NN-L-FIM-007 (Debian 13). Such paths are looked at with the renamed-away
-  ones, once a second, and watched as paths of the list once there (an
+  NN-L-FIM-007 (Debian 13). Such paths are looked at with the renamed-away ones, and watched as paths of the list once there (an
   operator's re-baseline queues the paths it finds absent too). Residual,
   said: the path's own appearance is not reported (a package makes most
-  such paths, and the look does not know its writer), nor is a file put in
-  such a directory within that second of the directory's creation.
+  such paths, and the look does not know its writer), nor may a file made together with it be.
 - **Not changed:** NN-L-NET-019 for `pg_createcluster`'s port probe (a
   wildcard listener of a root-run packaged script: telling it from a
   backdoor needs more than its identity gives); every kill and every

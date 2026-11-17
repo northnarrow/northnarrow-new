@@ -1060,7 +1060,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
-**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369: looked at once a second), its own appearance not reported, and /etc is not watched as a directory.
+**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369), its own appearance not reported, and /etc is not watched as a directory.
 
 ### NN-L-FIM-023_SystemdTimerCreated
 
@@ -1142,7 +1142,7 @@ Kernel module configuration written — category `fim_persistence`.
 
 **Observes.** Lot 285: a file of kmod's configuration directories (/etc, /run, /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, renamed in, linked or removed: an `install` or `remove` directive runs a command as root whenever the module is asked for. High outside a package transaction (the writer's lineage at the write), Low inside one; never a kill (the write is done).
 
-**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: within a second; a file put in it within that second is not reported).
+**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: its own appearance, and a file made together with it, may not be reported).
 
 **How to test.** `echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, then remove it; expect High, Log.
 
@@ -1469,7 +1469,7 @@ Periodic outbound beacon (low jitter) — category `net_high`.
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0078 Network Traffic Flow, DC0082 Network Connection Creation |
 | Validation | unit |
 
-**Observes.** Outbound flows from one process to one destination at regular intervals: at least 4 of them, a mean interval of a second or more and a coefficient of variation of 0.15 or less, within an hour. Lot 369: one record per program (the kernel's image; an interpreter's image and the script it runs, else its process), destination and hour, the next counting the periodic flows folded since; a datagram sent to the sending socket's own bound endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon — the destination the send names (`sendto()`, connected socket or not), the socket's peer only when it names none. Residual: another socket bound to the same endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive it; that relay's own flows are judged.
+**Observes.** Outbound flows from one process to one destination at regular intervals: at least 4 of them, a mean interval of a second or more and a coefficient of variation of 0.15 or less, within an hour. Lot 369: one record per program (the kernel's image; an interpreter's image and the script it runs, else its process), destination and hour, the next counting the periodic flows folded since; a datagram sent to the sending socket's own bound endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon — the destination the send names (`sendto()`, connected socket or not), the socket's peer only when it names none. Residual: a datagram to the sender's own loopback endpoint is no beacon; whatever forwards it is judged by its own flows.
 
 **Known false positives.** Pollers, health checks, metrics exporters and update checkers not in the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).
 
@@ -2151,7 +2151,7 @@ Security tool's process killed or stopped — category `defense_impairment`.
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls); exec (sched_process_exec, bprm_check_security) — DC0021 OS API Execution, DC0032 Process Creation |
 | Validation | unit+lab |
 
-**Observes.** A stop or end signal to a listed tool's process: on `task_kill` (SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP only; never one from PID 1 or from another registered tool; `DEFENDER_PIDS`, filled at boot and from the tools' execs, and from `/proc` scans after each for the daemon it forks; reported, never refused — a shell's builtin `kill` included), or a `kill`, `pkill`, `killall` exec. Lot 316: their options read by their tables (BUG-89: pkill's `-n`, `-o`, `-c`, killall's `-g` take no value; killall's `-signal`), the name matched as the tool matches it (pkill's pattern a part of the name, at least half of it, unless `-x`, `-f` the full command line, `-i`/`-I` any case, killall's `/path` the executable, folded as stat() walks it; procps' `kill`: the last `-s` over the first `-SIGNAL`, a pid with blanks; pgrep's binary run as `lt-pkill`).
+**Observes.** A stop or end signal to a listed tool's process: on `task_kill` (SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP; never one from PID 1 or from another registered tool; `DEFENDER_PIDS`, filled at boot and from the tools' execs, and from `/proc` scans after each for the daemon it forks; reported, never refused — a shell's builtin `kill` included), or a `kill`, `pkill`, `killall` exec. Lot 316: their options read by their tables (BUG-89: pkill's `-n`, `-o`, `-c`, killall's `-g` take no value; killall's `-signal`), the name matched as the tool matches it (pkill's pattern a part of the name, at least half of it, unless `-x`, `-f` the full command line, `-i`/`-I` any case, killall's `/path` the executable, folded as stat() walks it; procps' `kill`: the last `-s` over the first `-SIGNAL`, a pid with blanks; pgrep's binary run as `lt-pkill`).
 
 **Known false positives.** As NN-L-EVA-001; a service manager's own stop of a unit it restarts.
 

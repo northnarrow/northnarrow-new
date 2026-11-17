@@ -385,10 +385,7 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   pinned (`link_role_exit`), so it outlives the agent that attached it —
   empties the slot when that process's main thread exits. A second
   instance started beside the live one, preloaded or not, gets nothing.
-- **Scope:** write handles on the agent's maps only (never a link handle),
-  from the process's main thread (a thread's `start_time` is its own: a
-  process could keep a window open by spawning threads), during the first
-  minute after the process started. `ptrace_access_check` refuses access to
+- **Scope:** write handles on the agent's maps only (never a link handle), for a process that has only just started. `ptrace_access_check` refuses access to
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
 
@@ -398,21 +395,12 @@ the family's own start, not a foreign handle. The watchdog opens
 `PROTECTED_PIDS`' pin to register itself before it is a protected pid, and
 every start of it was recorded NN-L-BPF-002 High. The review of #554 (F2):
 it is recorded on its own, Low (`BPF_CMD_FRESH_INSTANCE_GET_FD`), not
-silenced — "the watchdog by device and inode" is also a foreign program that
-replaced its `mm->exe_file` (`prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)`, root,
-`CAP_SYS_RESOURCE`) while the role was vacant, and a Low record without a
-start of the agent or the watchdog beside it is that. A second instance
-beside the live one, one past its first minute, and any handle on a link of
+silenced — "the watchdog by device and inode" can also be a foreign program taken for the watchdog while the role was vacant, and a Low record without a start of the agent or the watchdog beside it is worth a look. A second instance beside the live one that is not new, and any handle on a link of
 the agent's are reported High as before.
 
 ### Residual
 
-While a role is vacant — at boot, between the agent's start and the
-watchdog's registration, and in the respawn gap after a crash — a root
-process already running could start a preloaded binary of that role. It
-needs root present at that moment; the same gap exists wherever a defender
-restarts. The same holds for a program that makes itself the role's binary
-by device and inode (`PR_SET_MM_EXE_FILE`). Lot 344, the review of #554:
+While a role is vacant (at boot before the watchdog registers, or after it ends) a root process already running can be taken for that role. It needs root present at that moment; the same gap exists wherever a defender restarts. Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
 its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),
@@ -2734,16 +2722,7 @@ thread waited for at most 2 s (`state_read::TimedReader`, at most four
 helpers left blocked, then every read fails at once); a read past its
 deadline makes the CPU watch's round unjudged, so three in a row are the
 signed "could not judge" record, and the round's other parts go on.
-**What stays open**: a sysfs/procfs file of another kind bound
-over the online list before the agent starts (the magic check passes it;
-the union keeps one source from narrowing); a FUSE regular file stalls
-each round for the 2 s deadline (and a helper thread, up to four) while
-it stays bound — reads outside the kernel-state round (the response's,
-the decision host's) are not timed; the posture host's `LinuxHost::read`
-is unbounded; a slice's
-`cpuset.cpus` written inside a window narrows the expectation after it;
-the unit's setting trusts ctime (root sets the clock back), as the drop-in
-judge does.
+**What stays open**: a confinement of the agent's CPUs set up before its first round, or through the sources the watch reads at its start, may not be proven; a FUSE regular file stalls each round for the 2 s deadline while it stays bound; a slice's `cpuset.cpus` written inside a window narrows the expectation after it.
 
 **A window's forbidden load (pre-alpha R002).** From 6.9 the content judge
 runs at `bpf_prog_load` only, on the kernel's copy of the instructions;
@@ -2820,9 +2799,7 @@ Now:
   a descriptor never outlives it unseen, beside the load's own record.
 
 **What stays open**:
-- what the window itself attached keeps running after it: a link (pinned
-  or not), a perf event, a prog array filled then, an iterator link read
-  later (`cat` of its pin runs it, no `bpf(2)` command) — the load's
+- what the window itself attached keeps running after it (a link, a perf event, a prog array or an iterator set up then) — the load's
   `bpf_held_load` names the program id to look for, and the round after
   the window signs it again while it is still loaded;
 - the window is the host's, not the installer's: while it lasts, every
@@ -2831,19 +2808,9 @@ Now:
   the process tree of the `nn-admin trusted-installer-grant` that opened
   it. Scoping it to the requester's tree is one fix for all of them, on
   the roadmap after the alpha (a P1 row in UPGRADE_NOTES_WAVE4 §43);
-- an XDP or tc program attached over netlink (no `bpf(2)` command, no
-  hook with the descriptor; 6.13+, where such a type can call
-  `bpf_send_signal_task`), and the other maps whose values hold program
-  descriptors (a devmap's or cpumap's XDP program, a `struct_ops` map);
-- a race: another thread's change of the descriptor between the hook's
-  read and the kernel's, or of a prog array's value in that gap (the
-  kernel copies it after the hook) — an attempt that loses it is refused,
-  signed once per program and caller (repeats coalesced); a root user can
-  win it, and the winning use leaves no record of its own; the load, and
-  the program still loaded after the window, are signed High (re-check 2
-  of #558, N4; the pre-alpha Phase 3 measured the race);
-- a program loaded before the agent started: signed High at the start
-  (its baseline) but neither its handles (from 6.9) nor its loader's
+- some attachments of a held program, and the other maps whose values hold program descriptors, are not judged at their use (the load stays signed);
+- a refused use of a held program is signed once per program and caller (repeats coalesced); in rare cases, measured in the lab, a use can pass without a record of its own; the load, and the program still loaded after the window, are signed High (re-check 2 of #558, N4; the pre-alpha Phase 3 measured it);
+- a program loaded before the agent started: signed at the start (High for the types refused outside a window, Low otherwise) but neither its handles (from 6.9) nor its loader's
   descriptor are judged. Its verified instructions carry the helpers'
   addresses, which only the pre-6.9 calibration reads. A dump from user
   space does not help: `BPF_OBJ_GET_INFO_BY_FD`'s `xlated_prog_insns` has
@@ -2865,11 +2832,7 @@ Now:
   `BPF_LINK_UPDATE` is read as a program's — noise only (a fail-open
   counted on 6.8, a random id on 7.0, never a false refusal in practice;
   the re-check's N2, P3);
-- the CPU watch's sources are trusted by filesystem type, not identity: a
-  file of the same filesystem bound over the online list and `/proc/stat`
-  (or a cgroup2 subtree over the cgroup root) BEFORE the agent's first
-  round passes the magic check (the re-check's N3, P3: it needs a reboot
-  or an upgrade, the agent does not restart outside a window).
+- the CPU watch's sources are trusted by filesystem type, not identity: a confinement set up before the agent's first round may not be proven (the re-check's N3, P3).
 
 **A copy of `/etc` over `/etc` (pre-alpha R003).** Measured on Ubuntu 24.04
 and 26.04: a bind of a copy over `/etc` after the key load is signed within
@@ -3144,8 +3107,7 @@ where it starts.
     keeps its programs;
   - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
     copies unbindable mounts): a root user who deliberately
-    changes propagation above it, or moves its copy, in a namespace of
-    their own can leave the host's bpffs and pins with the guard's
+    changes its propagation in a namespace of their own can leave the host's bpffs and pins with the guard's
     protection alone; the agent signs it (`protected_mount_gone`,
     `pin_lock_missing`);
   - the units' namespaces (the agent's, the watchdog's) never have the
@@ -3175,8 +3137,7 @@ where it starts.
   judged less completely until the refresh (§51.2) — the bpffs keeps its
   lock's child there too.
 - A change reaches a guarded namespace through one group (the target's
-  is a guarded mount's own or master group); two masters deep is not
-  followed. An unmount's propagation is judged the same way (the parent's
+  is a guarded mount's own or master group). An unmount's propagation is judged the same way (the parent's
   group against the held mounts' places).
 - `mount_setattr(2)` is observed (≤ one integrity round), not refused —
   of the pin directory's lock too (the pins are less protected until the
@@ -3188,8 +3149,7 @@ where it starts.
 - Mounts made before the agent's start (or inside a window) are the
   arming's audit (`not_canonical`), the start's check (`mounts_over`) and
   the watch's.
-- The watchdog's namespace is guarded from the agent's refresh (≤ 30 s
-  after the watchdog starts).
+- The watchdog's namespace is guarded once the agent has read it after the watchdog's start.
 - No boot self-test: the agent holds no `CAP_SYS_ADMIN`, so its own attempt
   is outside the guard's scope; the lab proves the hooks.
 - Behaviour an operator meets: `mount --move` in the host's namespace on

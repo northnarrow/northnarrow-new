@@ -413,15 +413,13 @@ refused at restore, never written back.
   a pre-delete hook (BPF LSM `inode_unlink`/`inode_rename` keeping a link),
   a follow-up. So does `truncate(2)` by path (no open).
 - **An io_uring open run in a user thread's task_work** (§2.1, the
-  declared limit of lot 315): read as that thread's own syscall — a
-  read-only `openat` makes it a read, answered without a copy. A follow-up
+  declared limit of lot 315): read as that thread's own syscall, and may be answered without a copy. A follow-up
   lot takes the open's mode from the BPF LSM `file_open` hook.
 - **No birth time** (§2.3: v9fs, ext4 with 128-byte inodes, XFS v4, some
   NFS/FUSE) or **overlayfs**: a restore never writes a file in place there
   (kept both, the original beside it), and an attack's renamed copy is left
   where it is.
-- **What the guard does not see**: a directory created after the last
-  rescan (60 s), past the mark cap, on another filesystem below the scope
+- **What the guard does not see**: a directory created since the last rescan, past the mark cap, on another filesystem below the scope
   (`mark=dirs` stays on the scope's filesystem), opens through another mount
   of a `mark=mount` scope (use `filesystem`).
 - **Degradations, signed** (audit op `integrity_drift`, kind
