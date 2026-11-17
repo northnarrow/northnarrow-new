@@ -218,7 +218,12 @@ fn parse_line(line: &[u8]) -> Result<MountEntry, &'static str> {
     let (major, minor) = device(fields[2]).ok_or("the device is not major:minor")?;
     let root = unescape(fields[3]);
     let mount_point = unescape(fields[4]);
-    if !root.is_absolute() || !mount_point.is_absolute() {
+    // lot 369 (the soak of rc5: a degradation at every container's start
+    // and stop): a namespace file bound somewhere (`nsfs`: docker's
+    // `/run/docker/netns/<id>`, `ip netns add`) shows its namespace as its
+    // root — `net:[4026532613]`, the kernel's own name for it, no path
+    let ns_root = fields[sep + 1] == b"nsfs" && is_namespace_name(fields[3]);
+    if !(root.is_absolute() || ns_root) || !mount_point.is_absolute() {
         return Err("a path that is not absolute");
     }
     Ok(MountEntry {
@@ -233,6 +238,21 @@ fn parse_line(line: &[u8]) -> Result<MountEntry, &'static str> {
         source: OsString::from_vec(unescape_bytes(fields[sep + 2])),
         super_options: OsString::from_vec(unescape_bytes(fields[sep + 3])),
     })
+}
+
+/// Lot 369: `b` is the name nsfs gives a namespace (`ns_dname`:
+/// `<type>:[<inode>]`, the type lowercase letters and `_`).
+fn is_namespace_name(b: &[u8]) -> bool {
+    let Some(open) = b.iter().position(|c| *c == b':') else {
+        return false;
+    };
+    let (kind, rest) = (&b[..open], &b[open + 1..]);
+    !kind.is_empty()
+        && kind.iter().all(|c| c.is_ascii_lowercase() || *c == b'_')
+        && rest.len() > 2
+        && rest[0] == b'['
+        && rest[rest.len() - 1] == b']'
+        && rest[1..rest.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
 fn number<T: std::str::FromStr>(b: &[u8]) -> Option<T> {
@@ -431,6 +451,45 @@ mod tests {
                 "{text}: {:?}",
                 t.malformed[0]
             );
+        }
+    }
+
+    /// Lot 369 (the soak of rc5, Debian 13: `mount_table_rows` degraded and
+    /// the capability manifest changed at every container's start and
+    /// stop): a namespace file bound by docker (`/run/docker/netns/<id>`)
+    /// or `ip netns` is an nsfs mount whose root is the namespace's name,
+    /// `net:[4026532613]` — a mount, read as such. A root of that shape on
+    /// any other file system, or nsfs with a root of any other shape, or a
+    /// relative mount point, stays a line not in the kernel's shape. Fails
+    /// on main (kept apart).
+    #[test]
+    fn a_namespace_file_bound_by_docker_is_a_mount() {
+        for (text, root) in [
+            (
+                "612 29 0:4 net:[4026532613] /run/docker/netns/1b6151116fd1 rw shared:263 - nsfs nsfs rw",
+                "net:[4026532613]",
+            ),
+            (
+                "613 29 0:4 pid_for_children:[4026532700] /run/x/pidns rw - nsfs nsfs rw",
+                "pid_for_children:[4026532700]",
+            ),
+        ] {
+            let t = line(text);
+            assert!(t.malformed.is_empty(), "{text}: {:?}", t.malformed);
+            assert_eq!(t.entries[0].root, Path::new(root));
+            assert_eq!(t.entries[0].fstype, "nsfs");
+        }
+        for text in [
+            "614 29 0:4 net:[4026532613] /run/x rw - tmpfs tmpfs rw",
+            "615 29 0:4 net:[40265x] /run/x rw - nsfs nsfs rw",
+            "616 29 0:4 Net:[1] /run/x rw - nsfs nsfs rw",
+            "617 29 0:4 net:[] /run/x rw - nsfs nsfs rw",
+            "618 29 0:4 net:[1] run/x rw - nsfs nsfs rw",
+            "619 29 0:4 relative /run/x rw - nsfs nsfs rw",
+        ] {
+            let t = line(text);
+            assert!(t.entries.is_empty(), "{text}");
+            assert_eq!(t.malformed.len(), 1, "{text}");
         }
     }
 

@@ -1426,7 +1426,20 @@ impl MountTable {
         if self.watch.as_ref().is_some_and(mounts_changed) {
             self.changed = true;
         }
-        let hit = self.roots.contains_key(&root) || self.fuse.contains_key(&root.0);
+        // lot 369 (the soak of rc5): a FUSE file system is placed by its
+        // device alone — never `stat`ed, its daemon may stall the caller —
+        // and the kernel hands an anonymous device out again at once: an
+        // AppImage relaunched within the throttle mounts its image at a new
+        // `/tmp/.mount_*` with the device of the mount just gone. After a
+        // change the kernel flagged, such a placement is no hit: the table
+        // is read again (at once, within the budget), or the file stays
+        // unplaced — never the old mount point (its programs were placed
+        // under the first launch's mount, the tie refused them: R001 and
+        // CHAIN-002/005 at every quick relaunch; and a user's FUSE mount
+        // in its home, unmounted, gave its device to one in `/tmp`)
+        let in_roots = self.roots.contains_key(&root);
+        let fuse_only = !in_roots && self.fuse.contains_key(&root.0);
+        let hit = in_roots || (fuse_only && !self.changed);
         let age = self.loaded.map(|t| t.elapsed());
         // lot 366 (the re-check of #573): a miss after the kernel flagged a
         // change is a mount made since the table was read (the AppImage's,
@@ -1446,11 +1459,14 @@ impl MountTable {
         };
         if refresh {
             self.refresh();
-        } else if hit && self.changed {
+        } else if self.changed {
             if let Some(mp) = self.roots.get(&root) {
                 if !Self::still_shows(mp, root) {
                     self.roots.remove(&root);
                 }
+            } else if fuse_only {
+                // not read again (the floor, the budget): unplaced
+                return None;
             }
         }
         let mp = self.roots.get(&root).or_else(|| self.fuse.get(&root.0))?;
@@ -2571,6 +2587,80 @@ mod tests {
         assert_eq!(mounts.absolute((49, 1), "/x"), None, "throttled");
         assert_eq!(mounts.mount_of(61), Some((48, false)));
         assert_eq!(mounts.mount_of(62), None, "not read yet");
+    }
+
+    /// Lot 369 (the soak of rc5: the AppImage relaunched 70 ms after its
+    /// first run): the kernel hands an anonymous device out again at once,
+    /// so a new FUSE mount may have the device of the one just gone. After
+    /// a change the kernel flagged, a FUSE placement by device is no hit:
+    /// the table is read again at once (within its budget) and the file is
+    /// placed at its new mount point — or, not read again (the floor),
+    /// unplaced: never the old mount point. Main placed the relaunch's
+    /// programs under the first launch's `/tmp/.mount_*` for the throttle's
+    /// two seconds; the AppImage tie refused them (R001, CHAIN-002/005
+    /// Critical at every quick relaunch), and a user's FUSE mount in its
+    /// home, unmounted, gave its device and its path to the next one in
+    /// `/tmp` (an exec there placed in the home: no staging rule). Fails on
+    /// main (the old mount point).
+    #[test]
+    fn a_fuse_device_handed_to_a_new_mount_is_placed_at_its_new_mount_point() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let t = tempfile::tempdir().unwrap();
+        let info = t.path().join("mi");
+        let table = |lines: &[&str]| {
+            let mut text = String::from("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n");
+            for l in lines {
+                text.push_str(l);
+                text.push('\n');
+            }
+            std::fs::write(&info, text).unwrap();
+        };
+        let first = "61 30 0:48 / /tmp/.mount_F05-x8EknEGp ro,nosuid,nodev - fuse.F05 F05 \
+                     ro,user_id=1000";
+        let second = "63 30 0:48 / /tmp/.mount_F05-x8iBBlIE ro,nosuid,nodev - fuse.F05 F05 \
+                      ro,user_id=1000";
+        table(&[first]);
+        let mut mounts = MountTable::load_from(&info);
+        assert_eq!(
+            mounts.absolute((48, 1), "/AppRun").as_deref(),
+            Some("/tmp/.mount_F05-x8EknEGp/AppRun")
+        );
+        // the first run's mount gone, the relaunch's made with its device
+        table(&[second]);
+        // within the floor (the table read this very moment): unplaced
+        mounts.changed = true;
+        mounts.loaded = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(mounts.absolute((48, 1), "/AppRun"), None, "the floor");
+        // past the floor, within the throttle: read again at once
+        mounts.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
+        assert_eq!(
+            mounts.absolute((48, 1), "/AppRun").as_deref(),
+            Some("/tmp/.mount_F05-x8iBBlIE/AppRun"),
+            "the relaunch's mount point"
+        );
+        assert!(!mounts.changed);
+        // no change flagged: the placement answers as read (no re-read per
+        // hit, as before)
+        assert_eq!(
+            mounts.absolute((48, 1), "/usr/bin/app").as_deref(),
+            Some("/tmp/.mount_F05-x8iBBlIE/usr/bin/app")
+        );
+        // the evasion shape: a FUSE mount in a home, gone, its device given
+        // to one in /tmp — the exec there is placed in /tmp
+        table(&["64 30 0:50 / /home/u/mnt ro,nosuid,nodev - fuse.x x ro,user_id=1000"]);
+        mounts.loaded = Instant::now().checked_sub(MOUNT_REFRESH_MIN);
+        mounts.changed = true;
+        assert_eq!(
+            mounts.absolute((50, 1), "/payload").as_deref(),
+            Some("/home/u/mnt/payload")
+        );
+        table(&["65 30 0:50 / /tmp/x ro,nosuid,nodev - fuse.x x ro,user_id=1000"]);
+        mounts.changed = true;
+        mounts.loaded = Instant::now().checked_sub(MOUNT_MISS_MIN);
+        assert_eq!(
+            mounts.absolute((50, 1), "/payload").as_deref(),
+            Some("/tmp/x/payload")
+        );
     }
 
     /// The re-check 2 of #573 (M3): the at-once re-reads a user can drive

@@ -8,7 +8,19 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
-pub struct R003ExecFromVarTmp;
+#[derive(Debug, Default)]
+pub struct R003ExecFromVarTmp {
+    /// Lot 369: the packaged `go`'s own build output, recorded Low.
+    go: super::GoBuilds,
+}
+
+impl R003ExecFromVarTmp {
+    /// This rule with lot 346's identity of `go`'s build output (lot 369).
+    pub fn with_go_builds(mut self, go: super::GoBuilds) -> Self {
+        self.go = go;
+        self
+    }
+}
 
 impl Rule for R003ExecFromVarTmp {
     fn id(&self) -> &'static str {
@@ -36,6 +48,10 @@ impl Rule for R003ExecFromVarTmp {
         if !filename.starts_with("/var/tmp/") {
             return None;
         }
+        // lot 369: `go test`'s binary and `go run`'s program, by identity
+        if self.go.runs(event, filename) {
+            return Some(super::go_build_record(self, event, "/var/tmp/"));
+        }
         Some(build_verdict(
             self,
             event,
@@ -53,7 +69,7 @@ mod tests {
 
     #[test]
     fn fires_on_var_tmp() {
-        let v = R003ExecFromVarTmp
+        let v = R003ExecFromVarTmp::default()
             .evaluate(&spawn("loader", "/var/tmp/loader"))
             .expect("fires");
         assert_eq!(v.severity, Severity::Medium);
@@ -63,7 +79,7 @@ mod tests {
     /// Lab PR 166: the payload's forked children die with it.
     #[test]
     fn r003_kills_the_process_tree() {
-        let v = R003ExecFromVarTmp
+        let v = R003ExecFromVarTmp::default()
             .evaluate(&spawn("loader", "/var/tmp/loader"))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
@@ -72,18 +88,20 @@ mod tests {
     #[test]
     fn ignores_plain_tmp_and_legit_paths() {
         // /tmp/ is R001's job; /usr/bin/ is fine.
-        assert!(R003ExecFromVarTmp.evaluate(&spawn("x", "/tmp/x")).is_none());
-        assert!(R003ExecFromVarTmp
+        assert!(R003ExecFromVarTmp::default()
+            .evaluate(&spawn("x", "/tmp/x"))
+            .is_none());
+        assert!(R003ExecFromVarTmp::default()
             .evaluate(&spawn("ls", "/usr/bin/ls"))
             .is_none());
     }
 
     #[test]
     fn does_not_match_var_root_or_lookalikes() {
-        assert!(R003ExecFromVarTmp
+        assert!(R003ExecFromVarTmp::default()
             .evaluate(&spawn("x", "/var/tmpfoo/x"))
             .is_none());
-        assert!(R003ExecFromVarTmp
+        assert!(R003ExecFromVarTmp::default()
             .evaluate(&spawn("x", "/var/log/syslog"))
             .is_none());
     }

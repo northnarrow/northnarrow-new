@@ -90,6 +90,15 @@ impl PostureHost for LinuxHost {
             .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
     }
 
+    /// Lot 369: `lstat(2)`'s `st_ino`, for a directory only (a cgroup's
+    /// directory in cgroupfs: its cgroup v2 id), beneath the anchored views.
+    fn dir_ino<P: AsRef<Path>>(path: P) -> Option<u64> {
+        antitamper_bpf::kernel_roots::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+    }
+
     /// `open(2)` with `O_PATH | O_CLOEXEC` and `fstat(2)` of that file:
     /// `/proc/<pid>/exe` opens the image the kernel executed (its magic
     /// link, no path walked in the process's mount namespace), a host path

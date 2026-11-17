@@ -102,7 +102,7 @@ use crate::decision::rules::program_identity::{self, ProgramKind};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::rules::kmod_exec_facts::{self, KMOD_TOOLS};
+use crate::decision::rules::kmod_exec_facts::{self, Credentials, KMOD_TOOLS};
 use crate::decision::rules::kmod_invocation::{self, Syntax};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::host::PostureHost;
@@ -447,10 +447,23 @@ fn is_module_tool_image(exe: &str) -> bool {
 /// `modprobe` of a module already loaded, or built in, exits at once: on an
 /// active host that was most of R011's High records). A variable that WAS
 /// read stays a kill, a non-root exec stays High.
-pub fn plain_root_record_severity(judged: &Result<(String, bool), String>, uid: u32) -> Severity {
+///
+/// Lot 369 (the soak of rc5: `modprobe` as uid 1000 at every session start
+/// on Ubuntu 22.04, under rootless Podman on 24.04): the same plain exec by
+/// a process that CANNOT load a module — no uid 0 among its ids, and no
+/// `CAP_SYS_MODULE` in the initial user namespace, as the exec pump read
+/// its credentials from the running exec ([`Credentials::CannotLoad`]) — is
+/// Low too: the kernel refuses its every load. Credentials not read, uid 0,
+/// `CAP_SYS_MODULE` held: judged as before (High for a non-root exec).
+pub fn plain_root_record_severity(
+    judged: &Result<(String, bool), String>,
+    uid: u32,
+    credentials: &Credentials,
+) -> Severity {
     match judged {
         Ok((_, false)) if uid == 0 => Severity::Low,
         Ok((_, true)) if uid == 0 => Severity::Medium,
+        Ok((_, false)) if matches!(credentials, Credentials::CannotLoad(_)) => Severity::Low,
         _ => Severity::High,
     }
 }
@@ -627,7 +640,11 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
         // round left 369 High lines of it: xtables, container runtimes and
         // udev ask for modules by name); the rest keeps High.
         let judged = judge(event);
-        let severity = plain_root_record_severity(&judged, *uid);
+        // lot 369: the credentials the exec pump read at the exec
+        let credentials = kmod_exec_facts::of(event)
+            .map(|f| f.credentials)
+            .unwrap_or_default();
+        let severity = plain_root_record_severity(&judged, *uid, &credentials);
         let (action, mut reasoning) = match judged {
             Ok((what, false)) => (
                 ResponseAction::Log,
@@ -635,7 +652,12 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
                     "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
                      tool, nothing moved or forced, no MODPROBE_OPTIONS or LD_* — recorded, not \
                      killed (lot 279): what the names load is the kernel's to judge (its \
-                     signature policy; R018 judges the load it reports, after it) (T1547.006)"
+                     signature policy; R018 judges the load it reports, after it){} (T1547.006)",
+                    match (&credentials, *uid) {
+                        (Credentials::CannotLoad(why), u) if u != 0 =>
+                            format!("; it cannot load a module — {why} (lot 369)"),
+                        _ => String::new(),
+                    }
                 ),
             ),
             Ok((what, true)) => (
@@ -1011,6 +1033,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: library_path.map(str::to_string),
+            credentials: Default::default(),
         };
         let opt = "/var/lib/containerd/opt/lib:";
         let ld = |v: &str| {
@@ -1137,6 +1160,156 @@ mod tests {
         e
     }
 
+    /// Lot 369 (named, the soak of rc5: the system's `modprobe` as uid 1000
+    /// at every session start on Ubuntu 22.04 and under rootless Podman on
+    /// 24.04, High on main): a non-root exec of the system's tool by module
+    /// name, its environment read clean, whose credentials the exec pump
+    /// read from the running exec and which CANNOT load a module — no uid 0,
+    /// no CAP_SYS_MODULE in its permitted, effective or ambient set, or only
+    /// that of a user namespace other than PID 1's — is Low, said so. The
+    /// attack shapes keep High: CAP_SYS_MODULE held in PID 1's namespace (a
+    /// service given it as an ambient capability: `capsh --addamb`), its
+    /// namespace not known, a uid 0 among its ids, credentials not read;
+    /// and every kill stays a kill (a file, `-d`, `LD_PRELOAD`, a copy).
+    #[test]
+    fn a_user_s_modprobe_that_cannot_load_a_module_is_low() {
+        let r = rule();
+        let status = |uid: u32, prm: u64, eff: u64, amb: u64| {
+            format!(
+                "Name:\tmodprobe\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapInh:\t0000000000000000\n\
+                 CapPrm:\t{prm:016x}\nCapEff:\t{eff:016x}\nCapBnd:\t000001ffffffffff\n\
+                 CapAmb:\t{amb:016x}\n"
+            )
+        };
+        let module = 1u64 << super::kmod_exec_facts::CAP_SYS_MODULE;
+        let full = 0x0000_01ff_ffff_ffffu64;
+        let read = |credentials: Credentials| ExecFacts {
+            program: Ok(()),
+            environment: Environment::Clean,
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+            library_path: None,
+            credentials,
+        };
+        let user = || as_uid(modprobe(&["overlay"]), 1000);
+        // a session's modprobe, no capability; rootless Podman's, every
+        // capability of its own user namespace
+        for (creds, why) in [
+            (
+                Credentials::of_status(&status(1000, 0, 0, 0), Some(false)),
+                "no capability",
+            ),
+            (
+                Credentials::of_status(&status(1000, full, full, 0), Some(true)),
+                "a user namespace",
+            ),
+            (
+                Credentials::of_status(&status(1000, 0, 0, 0), None),
+                "namespace unknown, no cap",
+            ),
+        ] {
+            assert!(
+                matches!(creds, Credentials::CannotLoad(_)),
+                "{why}: {creds:?}"
+            );
+            let v = r.evaluate(&read_as(user(), read(creds))).expect("recorded");
+            assert_eq!(
+                (v.action.clone(), v.severity),
+                (ResponseAction::Log, Severity::Low),
+                "{why}: a person's read is recorded at Low",
+            );
+            assert!(
+                v.reasoning.contains("it cannot load a module"),
+                "the reasoning says the process cannot load a module",
+            );
+        }
+        // the attack shapes: High, as before
+        for (creds, why) in [
+            (
+                Credentials::of_status(&status(1000, module, module, module), Some(false)),
+                "ambient",
+            ),
+            (
+                Credentials::of_status(&status(1000, module, 0, 0), Some(false)),
+                "permitted only",
+            ),
+            (
+                Credentials::of_status(&status(1000, 0, module, 0), Some(false)),
+                "effective",
+            ),
+            (
+                Credentials::of_status(&status(1000, module, module, 0), None),
+                "namespace unknown",
+            ),
+            (
+                Credentials::of_status(&status(0, 0, 0, 0), Some(true)),
+                "a uid 0",
+            ),
+            (
+                Credentials::of_status("Uid:\t1000\t1000\t1000\n", Some(false)),
+                "cut",
+            ),
+            (Credentials::NotRead, "not read"),
+        ] {
+            assert!(
+                !matches!(creds, Credentials::CannotLoad(_)),
+                "{why}: {creds:?}"
+            );
+            let v = r.evaluate(&read_as(user(), read(creds))).expect("recorded");
+            assert_eq!(
+                v.severity,
+                Severity::High,
+                "{why}: a process that can load a module is High"
+            );
+        }
+        let mixed = "Uid:\t1000\t0\t1000\t1000\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\n";
+        assert_eq!(
+            Credentials::of_status(mixed, Some(false)),
+            Credentials::MayLoad
+        );
+        // root: as before (Low), whatever its credentials say
+        let v = r
+            .evaluate(&read_as(modprobe(&["overlay"]), read(Credentials::MayLoad)))
+            .expect("recorded");
+        assert_eq!(v.severity, Severity::Low);
+        // the kills stay kills, credentials or not
+        let cannot = || read(Credentials::of_status(&status(1000, 0, 0, 0), Some(false)));
+        for (e, facts) in [
+            (as_uid(modprobe(&["/tmp/rk.ko"]), 1000), cannot()),
+            (as_uid(modprobe(&["-d", "/tmp/x", "loop"]), 1000), cannot()),
+            (
+                as_uid(modprobe(&["loop"]), 1000),
+                ExecFacts {
+                    environment: Environment::Refused("LD_PRELOAD='/tmp/x.so'".into()),
+                    ..cannot()
+                },
+            ),
+            (
+                as_uid(
+                    exec("/tmp/modprobe", "/tmp/modprobe", &["modprobe", "loop"]),
+                    1000,
+                ),
+                ExecFacts {
+                    program: Err("not the system's tool".to_string()),
+                    ..cannot()
+                },
+            ),
+        ] {
+            let v = r.evaluate(&read_as(e, facts)).expect("killed");
+            assert_ne!(
+                v.action,
+                ResponseAction::Log,
+                "a process that can load a module is not only logged"
+            );
+            assert_eq!(
+                v.severity,
+                Severity::High,
+                "a process that can load a module is High"
+            );
+        }
+    }
+
     /// Lot 340 (named, the alpha's daily false positives): the system's
     /// `modprobe` by module name, run by root, whose process exited before
     /// the exec pump could read its environment (a module already loaded, or
@@ -1155,6 +1328,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         };
         let v = r
             .evaluate(&read_as(modprobe(&["loop"]), exited()))
@@ -1227,6 +1401,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         };
         let v = rule()
             .evaluate(&read_as(
@@ -1280,6 +1455,7 @@ mod tests {
             initramfs_builder: builder.map(str::to_string),
             interpreter: interpreter.map(str::to_string),
             library_path: None,
+            credentials: Default::default(),
         }
     }
 
@@ -1434,6 +1610,7 @@ mod tests {
                 initramfs_builder: builder.map(str::to_string),
                 interpreter: interpreter.map(str::to_string),
                 library_path: None,
+                credentials: Default::default(),
             };
         let (dpkg, b, dash) = (
             Some("/usr/bin/dpkg"),
@@ -1788,6 +1965,7 @@ mod tests {
                 initramfs_builder: None,
                 interpreter: None,
                 library_path: None,
+                credentials: Default::default(),
             },
         )
     }
@@ -2026,6 +2204,7 @@ mod tests {
                     initramfs_builder: None,
                     interpreter: None,
                     library_path: None,
+                    credentials: Default::default(),
                 },
                 "not the system's tool's",
             ),
@@ -2039,6 +2218,7 @@ mod tests {
                     initramfs_builder: None,
                     interpreter: None,
                     library_path: None,
+                    credentials: Default::default(),
                 },
                 "MODPROBE_OPTIONS='-d /tmp/x'",
             ),
@@ -2052,6 +2232,7 @@ mod tests {
                     initramfs_builder: None,
                     interpreter: None,
                     library_path: None,
+                    credentials: Default::default(),
                 },
                 "could not be read",
             ),
@@ -2065,6 +2246,7 @@ mod tests {
                     initramfs_builder: None,
                     interpreter: None,
                     library_path: None,
+                    credentials: Default::default(),
                 },
                 "LD_PRELOAD='/tmp/x.so'",
             ),
@@ -2078,6 +2260,7 @@ mod tests {
                     initramfs_builder: None,
                     interpreter: None,
                     library_path: None,
+                    credentials: Default::default(),
                 },
                 "its start is unknown",
             ),
@@ -2114,6 +2297,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         };
         let v = r
             .evaluate(&read_as(as_uid(modprobe(&["br_netfilter"]), 1000), exited))
@@ -2128,14 +2312,20 @@ mod tests {
         assert_eq!(v.severity, Severity::High);
         assert_ne!(v.action, ResponseAction::Log);
         let ok = Ok(("modprobe of 'x'".to_string(), false));
-        assert_eq!(plain_root_record_severity(&ok, 0), Severity::Low);
-        assert_eq!(plain_root_record_severity(&ok, 1000), Severity::High);
         assert_eq!(
-            plain_root_record_severity(&Ok(("x".to_string(), true)), 1000),
+            plain_root_record_severity(&ok, 0, &Credentials::NotRead),
+            Severity::Low
+        );
+        assert_eq!(
+            plain_root_record_severity(&ok, 1000, &Credentials::NotRead),
             Severity::High
         );
         assert_eq!(
-            plain_root_record_severity(&Err("names a file".to_string()), 0),
+            plain_root_record_severity(&Ok(("x".to_string(), true)), 1000, &Credentials::NotRead),
+            Severity::High
+        );
+        assert_eq!(
+            plain_root_record_severity(&Err("names a file".to_string()), 0, &Credentials::NotRead),
             Severity::High
         );
     }
@@ -2155,6 +2345,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         };
         for (e, what) in [
             (modprobe(&["overlay"]), "modprobe of 'overlay'"),
@@ -2598,6 +2789,7 @@ mod bug119 {
                 initramfs_builder: None,
                 interpreter: None,
                 library_path: None,
+                credentials: Default::default(),
             },
         );
         let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))
@@ -2684,6 +2876,7 @@ mod bug119 {
                 initramfs_builder: None,
                 interpreter: None,
                 library_path: None,
+                credentials: Default::default(),
             },
         );
         let v = R011KernelModuleTooling::<H>::new(Arc::new(CommAllowlist::<H>::default()))

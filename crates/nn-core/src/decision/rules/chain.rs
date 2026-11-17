@@ -3386,7 +3386,7 @@ mod tests {
     fn judged(rules: &[Box<dyn Rule>], e: &Event) -> Vec<String> {
         let mut ids = fire_ids(rules, e);
         ids.extend(
-            crate::decision::rules::R001ExecFromTmp
+            crate::decision::rules::R001ExecFromTmp::default()
                 .evaluate(e)
                 .map(|v| v.rule_id),
         );

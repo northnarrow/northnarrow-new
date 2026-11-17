@@ -153,6 +153,12 @@ pub(crate) unsafe fn dns_admit() -> Option<Admitted> {
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+/// Lot 369 (the review of #576, F2): no family — to `udp_sendmsg`, an
+/// `AF_INET` name.
+const AF_UNSPEC: u16 = 0;
+/// `sizeof(struct sockaddr_in)`: the least `msg_namelen` `udp_sendmsg`
+/// accepts.
+const SOCKADDR_IN_LEN: i32 = 16;
 
 // `iov_iter.iter_type` discriminant value for a single inline user
 // buffer (the connected-UDP `send()` shape). See `btf_offsets.rs`.
@@ -216,7 +222,7 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
     // Resolve the destination: prefer an explicit `msg_name`
     // (connectionless `sendto`); fall back to the socket destination
     // for connected UDP (`connect()` + `send()`, what glibc uses).
-    let dest = match dest_from_msg_name(msg_ptr)? {
+    let dest = match dest_from_msg_name(msg_ptr, true)? {
         Some(d) => d,
         None => match dest_from_sock(sk_ptr)? {
             Some(d) => d,
@@ -292,8 +298,16 @@ fn try_udp_sendmsg(ctx: &ProbeContext) -> Result<(), i64> {
 /// connectionless `sendto(addr)` path). Returns `None` when there is
 /// no usable address (NULL pointer or `namelen < 4`), signalling the
 /// caller to fall back to the socket.
+///
+/// Lot 369 (the review of #576, F2): `unspec_inet` — `udp_sendmsg`'s
+/// reading of a name: it sends to the address of an `AF_UNSPEC` name as to
+/// an `AF_INET` one (a `sockaddr_in`, at least its size), where
+/// `udpv6_sendmsg` takes `AF_UNSPEC` for "no name" (the socket's peer).
 #[inline(always)]
-pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64> {
+pub(crate) fn dest_from_msg_name(
+    msg_ptr: *const u8,
+    unspec_inet: bool,
+) -> Result<Option<Dest>, i64> {
     let name_ptr: *const u8 = match unsafe {
         bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const _)
     } {
@@ -320,6 +334,11 @@ pub(crate) fn dest_from_msg_name(msg_ptr: *const u8) -> Result<Option<Dest>, i64
         Err(_) => return Ok(None),
     };
     let mut addr = [0u8; ADDR_LEN];
+    let family = if unspec_inet && family == AF_UNSPEC && namelen >= SOCKADDR_IN_LEN {
+        AF_INET
+    } else {
+        family
+    };
     match family {
         AF_INET => {
             let sa: SockaddrIn =

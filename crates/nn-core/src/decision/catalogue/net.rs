@@ -135,14 +135,16 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-NET-006_UncommonListener",
-        severities: &[Severity::Medium],
+        severities: &[Severity::Medium, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0021"],
         observes: "A new TCP listener on a port outside 22, 53, 80, 443, 8080 and 8443 — or on \
                    one of them from a program not installed in a root-owned system tree — by a \
                    process outside the netflow comm allowlist. A wildcard bind is \
-                   NN-L-NET-019's.",
+                   NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the \
+                   kernel's image), in a system service's own cgroup, listening on loopback \
+                   only (a packaged database or mail daemon) is recorded Low.",
         false_positives: "Developer servers, test fixtures and user services that listen on \
                           high ports; the netflow comm allowlist (judged on the executed \
                           program, not on `comm`) answers the known daemons.",
@@ -151,6 +153,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/net.rs::\
              net_006_fires_on_uncommon_port_non_allowlist_comm",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_006_a_packaged_service_daemon_on_loopback_is_low",
             "agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event",
         ],
         attack_note: "A bind shell or a backdoor listener has no ATT&CK technique of its own; \
@@ -302,14 +306,29 @@ pub(super) const DOCS: &[RuleDoc] = &[
         data_components: &["DC0078", "DC0082"],
         observes: "Outbound flows from one process to one destination at regular intervals: \
                    at least 4 of them, a mean interval of a second or more and a coefficient \
-                   of variation of 0.15 or less, within an hour.",
+                   of variation of 0.15 or less, within an hour. Lot 369: one record per \
+                   program (the kernel's image; an interpreter's image and the script it runs, \
+                   else its process), destination and hour, the next counting the periodic \
+                   flows folded since; a datagram sent to the sending socket's own bound \
+                   endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon \
+                   — the destination the send names (`sendto()`, connected socket or not), \
+                   the socket's peer only when it names none. Residual: another socket bound \
+                   to the same endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive it; that \
+                   relay's own flows are judged.",
         false_positives: "Pollers, health checks, metrics exporters and update checkers not in \
                           the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).",
         how_to_test: "From one process, connect to the same address every 5 seconds: \
                       `python3 -c 'import socket, time; \
                       [(socket.create_connection((\"<peer>\", 80)).close(), time.sleep(5)) \
                       for _ in range(6)]'`.",
-        tests: &["crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow"],
+        tests: &[
+            "crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow",
+            "crates/nn-core/src/decision/rules/net.rs::net_013_a_socket_sending_to_itself_is_no_beacon",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_013_records_one_beacon_per_program_destination_and_hour",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_013_an_interpreter_s_beacons_are_keyed_by_its_script",
+        ],
         attack_note: "The timing is the signal: a C2 beacon over an application protocol \
                       (T1071) or a scheduled transfer (T1029).",
     },

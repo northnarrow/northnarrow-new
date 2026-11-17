@@ -67,7 +67,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use common::wire::exe::exe_flags;
-use nn_core::decision::rules::kmod_exec_facts::{self, Environment, ExecFacts, KMOD_TOOLS};
+use nn_core::decision::rules::kmod_exec_facts::{
+    self, Credentials, Environment, ExecFacts, KMOD_TOOLS,
+};
 use nn_core::posture::lineage::{in_system_tree, PACKAGE_MANAGER_EXES};
 use nn_model::{Event, ExeIdentity};
 use parking_lot::Mutex;
@@ -128,6 +130,7 @@ pub fn not_read(event: &mut Event) {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         },
     );
 }
@@ -169,6 +172,8 @@ fn facts_in(
     }
     // the environment first: the process may be short-lived
     let (environment, library_path) = environment_read(proc, *pid, *start_ns);
+    // lot 369: then its credentials, tied to the exec the same way
+    let credentials = credentials(proc, *pid, *start_ns);
     // the review of #556 (F4): kept only when what it names only root can
     // change
     let library_path = library_path.filter(|v| root_only_library_path(v, root));
@@ -183,7 +188,47 @@ fn facts_in(
         initramfs_builder,
         interpreter: interpreter(root, proc, *pid, *start_ns, exe),
         library_path,
+        credentials,
     })
+}
+
+/// Lot 369: the credentials of `pid`'s process ([`Credentials`]) — its
+/// `status` and its user namespace (`ns/user`'s link against PID 1's), read
+/// while a pidfd holds it, the process the exec's by its start before and
+/// after the reads and still running after them; anything else is
+/// [`Credentials::NotRead`] (R011 judges the exec as before).
+fn credentials(proc: &Path, pid: u32, start_ns: u64) -> Credentials {
+    if start_ns == 0 {
+        return Credentials::NotRead;
+    }
+    let Ok(raw) = pidfd_open(pid) else {
+        return Credentials::NotRead;
+    };
+    // SAFETY: pidfd_open returned this fd to us; we own it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let the_exec_s = || {
+        crate::state_read::read_state(proc.join(format!("{pid}/stat")))
+            .ok()
+            .as_deref()
+            .and_then(stat_start_ticks)
+            .is_some_and(|ticks| started_at(ticks, start_ns))
+    };
+    if !the_exec_s() {
+        return Credentials::NotRead;
+    }
+    let Ok(status) = crate::state_read::read_state(proc.join(format!("{pid}/status"))) else {
+        return Credentials::NotRead;
+    };
+    let ns =
+        |p: u32| antitamper_bpf::kernel_roots::read_link(proc.join(format!("{p}/ns/user"))).ok();
+    let other_user_ns = match (ns(pid), ns(1)) {
+        (Some(own), Some(init)) => Some(own != init),
+        _ => None,
+    };
+    if pidfd_exited(&fd) || !the_exec_s() {
+        return Credentials::NotRead;
+    }
+    Credentials::of_status(&status, other_user_ns)
 }
 
 /// Lot 287: the initramfs builders, as the distributions package them —
@@ -2013,6 +2058,50 @@ mod tests {
         assert_eq!(judged(Ok(()), &big, false), Environment::Clean);
         assert!(refused(judged(denied(), b"", false)).contains("could not be read"));
         assert!(exited(judged(denied(), b"", true)).contains("exited as"));
+    }
+
+    /// Lot 369: the credentials of a running exec are read from its
+    /// `/proc` entry, tied to it by its start: this test's own child, run
+    /// by an unprivileged user — no uid 0, no `CAP_SYS_MODULE` — cannot load
+    /// a module; another process at its pid (a start that is not the
+    /// exec's), an exec reaped since, an unknown start are not read (R011
+    /// judges them as before). Run as root, the child is root's: it may.
+    #[test]
+    fn the_credentials_of_a_running_exec_are_read_tied_to_it() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        let start = proc_start_ns(pid).expect("its start");
+        let proc = Path::new("/proc");
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        match credentials(proc, pid, start) {
+            Credentials::CannotLoad(why) => {
+                assert!(!root, "{why}");
+                assert!(why.contains("CAP_SYS_MODULE"), "{why}");
+            }
+            Credentials::MayLoad => assert!(root),
+            Credentials::NotRead => panic!("a running exec's credentials not read"),
+        }
+        assert_eq!(
+            credentials(proc, pid, 0),
+            Credentials::NotRead,
+            "start unknown"
+        );
+        assert_eq!(
+            credentials(proc, pid, start + 10_000_000_000),
+            Credentials::NotRead,
+            "another start"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            credentials(proc, pid, start),
+            Credentials::NotRead,
+            "reaped"
+        );
     }
 
     /// Another user's process, which an unprivileged reader may not read

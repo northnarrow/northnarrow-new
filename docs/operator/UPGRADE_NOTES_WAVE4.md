@@ -4610,3 +4610,120 @@ Four behaviours from the pre-alpha self-protection round on five kernels
   `nn-admin host-check` warns about lockdown.
 - **Not changed:** the units, `install.sh`, the mount guard's programs, the
   ptrace hook's refusals (each one stands), every other protection.
+
+## 57. The soak's false positives: runc's clone, AppImage relaunches, loopback beacons, unprivileged modprobe, go test, service writes (lot 369)
+
+The first hours of the pre-alpha soak on rc5 (Ubuntu 22.04 and 24.04,
+Debian 13) left High and Critical records with a cause and no threat behind
+them. Each is now told by identity — the kernel's facts about the process,
+its lineage and its file — and the attack shape each rule exists for keeps
+its verdict.
+
+- **runc 1.1's sealed clone of itself is compared again (R004).** Lot 366
+  handed the exec pump's reads only the execs whose standard input or
+  output is an inet socket, so the sealed memfd copy runc 1.1 executes at
+  every `docker run`, `exec` and build and every Podman run (Debian 12 and
+  13) was never compared with the installed runc: R004 Critical ("would
+  have KillProcessTree") at every container start. The pump's hand-over is
+  now the union of its steps' own gates (one predicate per step, shared
+  with the step). `nn-admin status --key` counts the clones (`runtime
+  clones`, JSON `runtime_clones`: compared, kept, not compared for the
+  budget, not read in time). The status reply grew by that field:
+  `PROTOCOL_VERSION` 4, the oldest decoded 4 — `nn-admin` and the agent
+  come from the same release.
+- **A relaunched AppImage is tied to its image again.** The kernel hands a
+  FUSE mount's anonymous device out again at once: an AppImage relaunched
+  within two seconds mounted its image at a new `/tmp/.mount_*` with the
+  device of the mount just gone, and the exec sensor placed its programs
+  under the old mount point (a FUSE file system is placed by its device
+  alone, never `stat`ed) until the throttled re-read of the mount table.
+  The tie refused them: R001 High, CHAIN-002/005 Critical at every quick
+  relaunch, second instance or Electron-style restart. After a change of
+  the mounts the kernel flagged, a FUSE placement by device is no hit: the
+  table is read again at once (within its existing budget), or the file
+  stays unplaced — never the old mount point. A user's FUSE mount in its
+  home, unmounted, can no longer lend its path to the next one in `/tmp`.
+- **A socket sending to itself is no beacon; one beacon record per
+  program, destination and hour (NN-L-NET-013).** PostgreSQL ≤ 14's
+  statistics collector — one UDP socket bound to loopback and connected to
+  its own address — was a High record every 20 seconds (Ubuntu 22.04: 872
+  in four hours). A datagram sent to the sending socket's own bound
+  endpoint on loopback (its local address and port at the send) is no
+  beacon. The destination is the one the kernel sends to: the address the
+  send names (`sendto()`, `sendmsg()`), on a connected socket too — the UDP
+  flow sensor read a connected socket's peer before, so a socket connected
+  to itself that named a local relay in each send was recorded as sending
+  to itself — and the socket's peer only when the send names none
+  (`udp_sendmsg` reads an `AF_UNSPEC` name as an `AF_INET` one, as the
+  sensor now does). Residual, said: another socket bound to the same
+  endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive such a datagram;
+  that relay's own flows are judged. A loopback destination of another
+  socket (a local SOCKS or Tor proxy, a relay) and every remote host keep
+  firing — once per program (the kernel's image; an interpreter's image
+  and the script it runs, an interpreter running no script file its
+  process; else the process), destination and hour, the next record
+  counting the periodic flows folded into the one before.
+- **A `modprobe` that cannot load a module is Low (R011).** The exec pump
+  reads the module tool's credentials with its environment, tied to the
+  exec the same way (`/proc/<pid>/status`: its four uids and its
+  permitted, effective and ambient sets; its user namespace against PID
+  1's). A non-root exec of the system's tool by module name, its
+  environment clean, with no uid 0 among its ids and no `CAP_SYS_MODULE` in
+  PID 1's user namespace — a session's `systemd --user`, rootless Podman's
+  storage probe — is recorded Low ("it cannot load a module"): the kernel
+  refuses it every load. Credentials not read (the process gone first), a
+  uid 0, `CAP_SYS_MODULE` held (an ambient capability given by a unit), and
+  every kill (`insmod`, a file, `-d`, `LD_*`, a copy) are judged as before.
+- **A person's `go test` and `go run` are Low (R001, R003).** What the
+  packaged `go` itself built and then runs is R001's (or R003's,
+  `TMPDIR=/var/tmp`) Low record, never a kill, in every posture (decision
+  283b recorded it High) — when every fact holds: the file is the output
+  the packaged toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`,
+  its image in a root-only system tree, as lot 346 identifies `go`) was run
+  to write by that very `go` process; it lies in the layout of its work
+  directory; that `go` runs it, by its path, not unlinked; and the account
+  is a person's (`UID_MIN` and up with a login shell). What `go` only
+  launches — a `-vettool`, an `-exec` wrapper, a `-toolexec` program, a
+  `go generate` command, a file another process dropped in a `go-build`
+  directory — is judged as before (a service account's killed in every
+  posture), as are root's and a service account's own build output (a web
+  shell's `go run` from `/tmp`), and the same file run by a shell, by
+  another parent or by a `go` in a home. The posture's exec arm keeps lot
+  346's exemption, unchanged.
+- **A service account's own data written by a writer already gone does
+  not escalate.** The mass-write arm's own-data exemption needs the
+  writer's system service; a short-lived PostgreSQL backend (`createdb`'s,
+  pgbench's setup connection) was often gone by the time its crossing was
+  judged, its `/proc` entry with it — and a gone writer was no one's:
+  ConfirmedIntrusion → ENGAGED during pgbench (Ubuntu 24.04, Debian 13).
+  Its service is now the one whose cgroup the kernel recorded at the write
+  (the crossing's cgroup v2 id: the inode of the unit's cgroup directory,
+  found among `system.slice`'s). The same crossing from a session's scope,
+  a cgroup a service made below itself, a person's uid, or with a file
+  outside the account's own data still counts; the ransomware tracker
+  judges every crossing.
+- **Smaller ones.** NN-L-NET-006 records a program of a root-owned system
+  tree (the kernel's image), in a system service's own cgroup, listening on
+  loopback only (a packaged database or mail daemon) Low instead of
+  Medium. A namespace file bound by Docker (`/run/docker/netns/<id>`, nsfs,
+  its root `net:[…]`) is a mount of the table, not a malformed line: no
+  `mount_table_rows` degradation and no signed manifest change at every
+  container start and stop.
+- **A path of the FIM watch list absent at the start is watched once it
+  appears.** The kernel watches inodes, and nothing told the drain a path
+  had come into being: on a host without cron at the agent's start, `apt
+  install cron` made `/var/spool/cron/crontabs` and a user's crontab drew no
+  NN-L-FIM-007 (Debian 13). Such paths are looked at with the renamed-away
+  ones, once a second, and watched as paths of the list once there (an
+  operator's re-baseline queues the paths it finds absent too). Residual,
+  said: the path's own appearance is not reported (a package makes most
+  such paths, and the look does not know its writer), nor is a file put in
+  such a directory within that second of the directory's creation.
+- **Not changed:** NN-L-NET-019 for `pg_createcluster`'s port probe (a
+  wildcard listener of a root-run packaged script: telling it from a
+  backdoor needs more than its identity gives); every kill and every
+  protection above stands, but one: R001's and R003's kill of a person's
+  own `go test` and `go run` build output, linked and run by the packaged
+  `go` (Low in every posture, COMBAT included; below COMBAT it was held
+  already). A `go test` binary that connects out still meets
+  NN-L-CHAIN-002/005 (Critical): the chains judge every staged exec.

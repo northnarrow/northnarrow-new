@@ -383,8 +383,12 @@ pub fn populate_watched_paths(
                 }
                 tracing::debug!(
                     path = %path.display(),
-                    "fim populate_watched_paths: path absent on this host — skip"
+                    "fim populate_watched_paths: path absent on this host — watched once it \
+                     appears"
                 );
+                // lot 369: watched once it is there (`apt install cron`
+                // after the start makes the cron spool)
+                crate::fim::drain::await_appearance(&inode_map, &path.to_string_lossy());
                 skipped += 1;
                 continue;
             }

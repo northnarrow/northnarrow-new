@@ -520,9 +520,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out",
         ],
         attack_note: "T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out \
-            of Persistence). On a host without the file the first creation is not seen: \
-            fim::attach::populate_watched_paths skips a path that does not exist, and /etc is not \
-            watched as a directory.",
+            of Persistence). On a host without the file the first creation is not seen: a path \
+            absent at the agent's start is watched once it appears (lot 369: looked at once a \
+            second), its own appearance not reported, and /etc is not watched as a directory.",
     },
     RuleDoc {
         id: "NN-L-FIM-023_SystemdTimerCreated",
@@ -610,7 +610,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
             root whenever the module is asked for. High outside a package transaction (the \
             writer's lineage at the write), Low inside one; never a kill (the write is done).",
         false_positives: "An administrator's own blacklist or options file is recorded at High; \
-            a package's at Low. A directory absent at the agent's start is not watched.",
+            a package's at Low. A directory absent at the agent's start is watched once it \
+            appears (lot 369: within a second; a file put in it within that second is not \
+            reported).",
         how_to_test: "`echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, \
             then remove it; expect High, Log.",
         tests: &["crates/nn-core/src/fim/rules.rs::\

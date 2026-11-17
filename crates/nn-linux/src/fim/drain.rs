@@ -914,6 +914,8 @@ struct DrainQueues {
     awaiting_return: Vec<(String, WatchClass)>,
     /// See [`await_chain_repair`].
     chain_awaiting: Vec<String>,
+    /// Lot 369: see [`await_appearance`].
+    appearing: Vec<String>,
 }
 
 impl std::fmt::Debug for DrainQueues {
@@ -922,6 +924,7 @@ impl std::fmt::Debug for DrainQueues {
             .field("replacements", &self.replacements.len())
             .field("awaiting_return", &self.awaiting_return.len())
             .field("chain_awaiting", &self.chain_awaiting.len())
+            .field("appearing", &self.appearing.len())
             .finish_non_exhaustive()
     }
 }
@@ -936,6 +939,7 @@ impl DrainQueues {
             replacements: Vec::new(),
             awaiting_return: Vec::new(),
             chain_awaiting: Vec::new(),
+            appearing: Vec::new(),
         }
     }
 }
@@ -1415,11 +1419,56 @@ fn repaired_chains(
     back
 }
 
+/// Lot 369 (the soak of rc5, Debian 13: a user's crontab installed after
+/// `apt install cron` drew no NN-L-FIM-007): a path of the watch list
+/// absent at the agent's start (`/var/spool/cron/crontabs` on a host
+/// without cron) was never watched — the kernel watches inodes, and nothing
+/// told the drain the path had come into being. Such paths are looked at
+/// with the renamed-away ones, once a second ([`AWAITING_RETURN_EVERY`]),
+/// and watched as a path of the list once there — a directory then reports
+/// every file put in it, as at the start. Residual, said: what appears at
+/// the path itself is watched from then on, not reported (a package makes
+/// most such paths: its writer is not known to the look), nor is a file put
+/// in a directory of the list within that second of the directory's own
+/// creation.
+const APPEARING_MAX: usize = 512;
+
+/// Lot 369: watch `path` (of the watch list) once it exists.
+pub fn await_appearance(path_map: &InodePathMap, path: &str) {
+    queues(path_map, |q| {
+        let awaiting = &mut q.appearing;
+        if !awaiting.iter().any(|p| p == path) && awaiting.len() < APPEARING_MAX {
+            awaiting.push(path.to_string());
+        }
+    });
+}
+
+/// Lot 369: the paths of the watch list there since the last look, watched
+/// now (as a path of the list: its links and target too); how many.
+fn appeared_paths(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+) -> usize {
+    let todo = queues(path_map, |q| std::mem::take(&mut q.appearing));
+    let mut n = 0;
+    for path in todo {
+        if key_for_path(&fs_path(&path)).is_ok()
+            && enroll_path(&path, WatchClass::Configured, path_map, watched_paths)
+        {
+            n += 1;
+            info!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a path of the watch list absent at the start is there now: watched");
+        } else {
+            await_appearance(path_map, &path);
+        }
+    }
+    n
+}
+
 /// `true` while a renamed-away path waits for its file, or a symlinked one
-/// for its target.
+/// for its target, or (lot 369) a path of the list absent at the start.
 fn awaiting_returns(path_map: &InodePathMap) -> bool {
     queues(path_map, |q| {
-        !q.awaiting_return.is_empty() || !q.chain_awaiting.is_empty()
+        !q.awaiting_return.is_empty() || !q.chain_awaiting.is_empty() || !q.appearing.is_empty()
     })
 }
 
@@ -2860,6 +2909,8 @@ pub async fn drain_loop(
         // NN-AUD-122: so is a symlinked path whose target is back.
         if awaiting_returns(&inode_map) && returns_pacer.due(now) {
             let back = off_the_runtime(|| {
+                // lot 369: the paths of the list absent at the start, there now
+                appeared_paths(inode_map.as_ref(), watched_paths.as_deref());
                 let mut back = returned_paths(inode_map.as_ref(), watched_paths.as_deref());
                 back.extend(repaired_chains(
                     inode_map.as_ref(),
@@ -5110,6 +5161,68 @@ mod tests {
         std::fs::write(&f, b"third").unwrap();
         let recent = content_after(&p, monotonic_ns()).unwrap();
         assert_eq!(recent.sha256, hex::encode(Sha256::digest(b"third")));
+    }
+
+    /// Lot 369 (the soak of rc5, Debian 13: `apt install cron` after the
+    /// agent's start, then a user's `crontab`: no NN-L-FIM-007). A path of
+    /// the watch list absent at the start is watched once it is there — the
+    /// next look after it appears — and a crontab dropped in it then is
+    /// NN-L-FIM-007's, as on a host where cron was there first. On main
+    /// the path was never watched (no drain step looked again: fails
+    /// there, nothing enrolled). Nothing is enrolled while it is absent,
+    /// and the look is bounded.
+    #[test]
+    fn a_path_of_the_list_absent_at_the_start_is_watched_once_it_appears() {
+        use crate::decision::Rule;
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let path_map = InodePathMap::new();
+        let spool = dir.path().join("spool/cron/crontabs");
+        let spool_s = spool.to_string_lossy().into_owned();
+        await_appearance(&path_map, &spool_s);
+        await_appearance(&path_map, &spool_s);
+        assert!(awaiting_returns(&path_map), "looked at once a second");
+        assert_eq!(appeared_paths(&path_map, None), 0, "not there yet");
+        assert!(path_map.keys_for_path(&spool_s).is_empty());
+        // `apt install cron` makes the spool
+        std::fs::create_dir_all(&spool).unwrap();
+        assert_eq!(appeared_paths(&path_map, None), 1);
+        assert!(!awaiting_returns(&path_map), "watched: no longer awaited");
+        let key = key_for_path(&spool).unwrap();
+        assert_eq!(path_map.lookup(&key), Some(spool_s.clone()));
+        assert_eq!(path_map.class_of(&key), Some(WatchClass::Configured));
+        // then the user's crontab: the directory's create event names it
+        let mut raw = fake_raw(key.dev, key.ino, FimOp::Created as u8);
+        raw.child_name[..6].copy_from_slice(b"tmp.Xy");
+        std::fs::write(spool.join("tmp.Xy"), b"17 3 * * * true\n").unwrap();
+        let mut out = Vec::new();
+        process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        let Some(Event::Fim(mut fe)) = out.pop() else {
+            panic!("the crontab's creation is an event")
+        };
+        fe.path = fe.path.replace(&spool_s, "/var/spool/cron/crontabs");
+        let rule = crate::fim::rules::NnLFim007CronDropInCreated::with_fresh_window();
+        assert!(
+            rule.evaluate(&Event::Fim(fe.clone())).is_some(),
+            "NN-L-FIM-007: {fe:?}"
+        );
+        // bounded
+        let m = InodePathMap::new();
+        for i in 0..(APPEARING_MAX + 10) {
+            await_appearance(&m, &format!("/nonexistent-k369/{i}"));
+        }
+        assert_eq!(queues(&m, |q| q.appearing.len()), APPEARING_MAX);
     }
 
     /// External audit FIMP-004: re-enrolling a path watches the inode it

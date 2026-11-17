@@ -425,7 +425,53 @@ pub struct BeaconWindow {
     observes: u32,
     lost: LossCounter,
     over_quota: LossCounter,
+    /// Lot 369: the beacons recorded, by (program, destination): the start
+    /// of the window of the last record and the periodic flows folded into
+    /// it since ([`BeaconWindow::report`]).
+    reported: HashMap<(BeaconIdentity, IpAddr), (u64, u64)>,
 }
+
+/// Lot 369: who a beacon record is for — the image the kernel executed
+/// (device, inode), as the lineage holds it; else the process (pid and its
+/// start), when the lineage holds no image. The review of #576 (F5): an
+/// interpreter's image is many programs — the script it runs keys it too;
+/// an interpreter running no script file (`-c`, a REPL, standard input,
+/// options not read) is its process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BeaconIdentity {
+    Image(u64, u64),
+    Script(u64, u64, Box<str>),
+    Process(u32, u64),
+}
+
+impl BeaconIdentity {
+    /// The identity of `pid` (started at `start_ns`) as `allowlist`'s
+    /// lineage holds it as of `as_of`.
+    pub fn of<H: PostureHost>(
+        allowlist: &CommAllowlist<H>,
+        pid: u32,
+        start_ns: u64,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> Self {
+        let process = BeaconIdentity::Process(pid, start_ns);
+        let Some((dev, ino)) = allowlist.exec_image(pid, as_of) else {
+            return process;
+        };
+        match allowlist.exec_identity(pid, as_of) {
+            Some(id) if id.interprets() => match id.script() {
+                Some(script) => BeaconIdentity::Script(dev, ino, script.into()),
+                None => process,
+            },
+            Some(_) => BeaconIdentity::Image(dev, ino),
+            None => process,
+        }
+    }
+}
+
+/// Lot 369: the beacons recorded at once ([`BeaconWindow::report`]); past
+/// it, those whose window ended go first, then the oldest — a record
+/// forgotten is only written again, never lost.
+const BEACON_MAX_REPORTED: usize = 4096;
 
 impl Default for BeaconWindow {
     fn default() -> Self {
@@ -435,6 +481,7 @@ impl Default for BeaconWindow {
             observes: 0,
             lost: LossCounter::new(&BEACON_LIVE_EVICTIONS),
             over_quota: LossCounter::new(&BEACON_QUOTA_EVICTIONS),
+            reported: HashMap::new(),
         }
     }
 }
@@ -529,6 +576,42 @@ impl BeaconWindow {
             return false;
         }
         Self::is_periodic(q)
+    }
+
+    /// Lot 369: a beacon of `id` to `dst` seen at `ts_ns` — `Some(folded)`
+    /// when it is to be recorded (the first in [`BEACON_WINDOW_NS`] for that
+    /// program and destination; `folded`: the periodic flows the previous
+    /// record took since), `None` when the window's record already names it
+    /// (counted). One record per program, destination and hour, never one
+    /// per flow: PostgreSQL 14's statistics, 190 records an hour.
+    pub fn report(&mut self, id: BeaconIdentity, dst: IpAddr, ts_ns: u64) -> Option<u64> {
+        let key = (id, dst);
+        if let Some((since, folded)) = self.reported.get_mut(&key) {
+            if ts_ns.saturating_sub(*since) < BEACON_WINDOW_NS {
+                *folded += 1;
+                return None;
+            }
+            let before = *folded;
+            (*since, *folded) = (ts_ns, 0);
+            return Some(before);
+        }
+        if self.reported.len() >= BEACON_MAX_REPORTED {
+            let cutoff = ts_ns.saturating_sub(BEACON_WINDOW_NS);
+            self.reported.retain(|_, (since, _)| *since > cutoff);
+            while self.reported.len() >= BEACON_MAX_REPORTED {
+                let Some(oldest) = self
+                    .reported
+                    .iter()
+                    .min_by_key(|(_, (since, _))| *since)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                self.reported.remove(&oldest);
+            }
+        }
+        self.reported.insert(key, (ts_ns, 0));
+        Some(0)
     }
 
     /// Number of `(pid, dst)` flows currently tracked (test/metrics hook).
@@ -1539,15 +1622,28 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
         if judged == Judgement::Allowed {
             return None;
         }
+        // lot 369: a packaged daemon of a system service on loopback only
+        let packaged = packaged_loopback_daemon(nl, self.lineage.as_ref());
         Some(judged.apply(
             net_verdict(
                 self,
                 ResponseAction::Log,
-                Severity::Medium,
+                if packaged {
+                    Severity::Low
+                } else {
+                    Severity::Medium
+                },
                 &format!(
-                    "Process opened a TCP listener {} without operator allowlist coverage \
+                    "Process opened a TCP listener {} without operator allowlist coverage{} \
                      — posture → ALERTED",
-                    listener_port_text(nl, common.is_some())
+                    listener_port_text(nl, common.is_some()),
+                    if packaged {
+                        " — a program of a root-owned system tree (the kernel's image), in a \
+                         system service's own cgroup, listening on loopback only: recorded Low \
+                         (lot 369)"
+                    } else {
+                        ""
+                    }
                 ),
                 nl.pid,
                 nl.comm.clone(),
@@ -1556,6 +1652,31 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
             &nl.comm,
         ))
     }
+}
+
+/// Lot 369 (the soak of rc5: `postgres` on 127.0.0.1:5444 and [::1]:5444
+/// at every cluster start, `exim4` on 127.0.0.1:25 — NN-L-NET-006 Medium):
+/// the listener is bound to a loopback address only, and its process runs,
+/// by the lineage, a program installed in a root-owned system tree — the
+/// kernel's image of it known (`exec_image`), the script an interpreter
+/// runs in such a tree too — in a systemd system service's own cgroup
+/// (`/system.slice/…/<unit>.service`, where only systemd places a
+/// process). Without a lineage, or any fact missing (a session's scope, a
+/// program from a home, `python3 -m http.server`, a wildcard or external
+/// address): not.
+fn packaged_loopback_daemon<H: PostureHost>(
+    nl: &nn_model::telemetry::NetListenerEvent,
+    lineage: Option<&crate::posture::lineage::AuthSessionTracker<H>>,
+) -> bool {
+    let Some(l) = lineage else {
+        return false;
+    };
+    let as_of = crate::posture::lineage::AsOf::judged(nl.timestamp_ns);
+    nl.bind_addr.is_loopback()
+        && l.exec_image(nl.pid, as_of).is_some()
+        && l.exec_identity(nl.pid, as_of)
+            .is_some_and(|id| id.is_installed_program())
+        && l.system_service(nl.pid).is_some()
 }
 
 // ── NN-L-NET-007 — Outbound to RFC1918 from unusual process ──────────
@@ -2161,6 +2282,13 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
         if nf.phase != FlowPhase::Closed {
             return None;
         }
+        // lot 369: a socket that sends to itself — its destination its own
+        // bound endpoint, on loopback (PostgreSQL ≤ 14's statistics
+        // collector: one socket, connected to its own address, shared by
+        // the backends) — reaches no other program: no beacon
+        if to_its_own_socket(nf) {
+            return None;
+        }
         let is_beacon = self.window.lock().observe(nf.pid, nf.dst_addr, nf.start_ns);
         if !is_beacon {
             return None;
@@ -2177,14 +2305,27 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
         if judged == Judgement::Allowed {
             return None;
         }
+        // lot 369: one record per program, destination and window, the
+        // periodic flows it took since counted in the next
+        let as_of = crate::posture::lineage::AsOf::of_event(event);
+        let id = BeaconIdentity::of(&self.allowlist, nf.pid, nf.proc_start_ns, as_of);
+        let folded = self.window.lock().report(id, nf.dst_addr, nf.start_ns)?;
+        let mut reasoning = "Periodic low-jitter outbound flows to a single destination \
+             from one process — C2-beacon timing pattern (T1071/T1029); \
+             posture → ENGAGED"
+            .to_string();
+        if folded > 0 {
+            reasoning.push_str(&format!(
+                "; {folded} more periodic flows of this program to this destination since its \
+                 last record (one record per program, destination and hour)"
+            ));
+        }
         Some(judged.apply(
             net_verdict(
                 self,
                 ResponseAction::Log,
                 Severity::High,
-                "Periodic low-jitter outbound flows to a single destination \
-                 from one process — C2-beacon timing pattern (T1071/T1029); \
-                 posture → ENGAGED",
+                &reasoning,
                 nf.pid,
                 nf.comm.clone(),
                 nf.start_ns,
@@ -2192,6 +2333,18 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
             &nf.comm,
         ))
     }
+}
+
+/// Lot 369: the flow's destination is the sending socket's own bound
+/// endpoint on loopback (the kernel's: its local address and port, read
+/// from the socket at the send) — the datagram goes back to that socket,
+/// which no other program holds. A loopback destination of another
+/// socket (a local SOCKS or Tor proxy), a wildcard-bound sender, a port
+/// not known: not.
+pub fn to_its_own_socket(nf: &nn_model::telemetry::NetFlowEvent) -> bool {
+    nf.dst_addr.is_loopback()
+        && nf.dst_port != 0
+        && (nf.src_addr, nf.src_port) == (nf.dst_addr, nf.dst_port)
 }
 
 // ── NN-L-NET-018 — RFC1918 outbound on a lateral-movement port ───────
@@ -4109,6 +4262,106 @@ mod tests {
         assert!(rule.evaluate(&listener(443, "anycomm")).is_none());
     }
 
+    /// Lot 369 (the soak of rc5: `postgres` on loopback at every cluster
+    /// start, `exim4` on 127.0.0.1:25 — Medium): a program of a root-owned
+    /// system tree (the kernel's image), in a system service's own cgroup,
+    /// listening on loopback only, is recorded Low. Medium as before: the
+    /// same daemon on the wildcard address; the same program in a
+    /// session's scope; `python3 -m http.server` (no script in a system
+    /// tree) in a service; a program from a home in a service; no image
+    /// (the kernel's identity not known); no lineage. Fails on main
+    /// (Medium).
+    #[test]
+    fn net_006_a_packaged_service_daemon_on_loopback_is_low() {
+        use common::wire::exe::exe_flags::ROOT_DIR;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let exec = |pid: u32, path: &str, argv: &[&str], image: bool, cgroup: &str| {
+            let mut e = crate::decision::rules::testutil::spawn_exe("x", path, path, ROOT_DIR);
+            if let Event::ProcessSpawn {
+                pid: p,
+                argv: a,
+                exe,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *timestamp_ns) = (pid, 50);
+                *a = argv.iter().map(|s| s.to_string()).collect();
+                if image {
+                    (exe.dev, exe.ino) = (2049, u64::from(pid));
+                } else {
+                    exe.flags = 0;
+                }
+            }
+            lineage.ingest_spawn_event(&e);
+            let d = tmp.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+        };
+        let pg = "/system.slice/system-postgresql.slice/postgresql@16-main.service";
+        exec(
+            700,
+            "/usr/lib/postgresql/16/bin/postgres",
+            &["postgres"],
+            true,
+            pg,
+        );
+        exec(
+            701,
+            "/usr/lib/postgresql/16/bin/postgres",
+            &["postgres"],
+            true,
+            "/user.slice/user-1000.slice/session-3.scope",
+        );
+        exec(
+            702,
+            "/usr/bin/python3",
+            &["python3", "-m", "http.server"],
+            true,
+            pg,
+        );
+        exec(703, "/home/u/bin/srv", &["srv"], true, pg);
+        exec(
+            704,
+            "/usr/lib/postgresql/16/bin/postgres",
+            &["postgres"],
+            false,
+            pg,
+        );
+        let rule = NnLNet006UncommonListener::new(al()).with_lineage(Some(lineage.clone()));
+        let sev = |pid: u32, addr: IpAddr| {
+            let mut e = listener_bind(addr, 5444, "postgres");
+            if let Event::NetListener(nl) = &mut e {
+                nl.pid = pid;
+            }
+            rule.evaluate(&e).map(|v| v.severity)
+        };
+        let lo4 = v4(127, 0, 0, 1);
+        let lo6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(sev(700, lo4), Some(Severity::Low));
+        assert_eq!(sev(700, lo6), Some(Severity::Low));
+        for (pid, addr) in [
+            (700, v4(0, 0, 0, 0)),
+            (700, v4(192, 0, 2, 10)),
+            (701, lo4),
+            (702, lo4),
+            (703, lo4),
+            (704, lo4),
+        ] {
+            assert_eq!(sev(pid, addr), Some(Severity::Medium), "{pid} {addr}");
+        }
+        let bare = NnLNet006UncommonListener::new(al());
+        let mut e = listener_bind(lo4, 5444, "postgres");
+        if let Event::NetListener(nl) = &mut e {
+            nl.pid = 700;
+        }
+        assert_eq!(
+            bare.evaluate(&e).map(|v| v.severity),
+            Some(Severity::Medium)
+        );
+    }
+
     // ── NN-L-NET-007 ─────────────────────────────────────────────
 
     #[test]
@@ -5119,6 +5372,203 @@ mod tests {
             }
         }
         assert!(fired, "periodic low-jitter flow must trip the beacon");
+    }
+
+    /// Lot 369 (the soak of rc5, Ubuntu 22.04): PostgreSQL ≤ 14's
+    /// statistics collector — one UDP socket bound to `[::1]` and connected
+    /// to its own address, the backends sending on it every 20 s — is no
+    /// beacon: the datagrams go back to the very socket that sent them.
+    /// 872 High records in four hours on main (fails there). The attack
+    /// shapes keep firing: a loopback destination of ANOTHER socket (a local
+    /// SOCKS or Tor proxy at 127.0.0.1:9050), a remote host, a socket bound
+    /// to the wildcard sending to a loopback port.
+    #[test]
+    fn net_013_a_socket_sending_to_itself_is_no_beacon() {
+        let pg = |src: (IpAddr, u16), dst: (IpAddr, u16), pid: u32, t: u64| {
+            let mut e = flow_pid(pid, dst.0, dst.1, "postgres", t);
+            if let Event::NetFlow(nf) = &mut e {
+                (nf.src_addr, nf.src_port, nf.proto) = (src.0, src.1, 17);
+                nf.family = if src.0.is_ipv4() { 2 } else { 10 };
+            }
+            e
+        };
+        let lo6: IpAddr = "::1".parse().unwrap();
+        let lo4: IpAddr = "127.0.0.1".parse().unwrap();
+        let fired = |src: (IpAddr, u16), dst: (IpAddr, u16), every: u64| {
+            let rule = NnLNet013Beacon::new(Arc::new(Mutex::new(BeaconWindow::new())), al());
+            (0..12u64)
+                .filter(|i| {
+                    rule.evaluate(&pg(src, dst, 10_876, i * every * SEC))
+                        .is_some()
+                })
+                .count()
+        };
+        assert_eq!(
+            fired((lo6, 42_919), (lo6, 42_919), 20),
+            0,
+            "PG 14's statistics"
+        );
+        assert_eq!(
+            fired((lo4, 42_919), (lo4, 42_919), 20),
+            0,
+            "the same over IPv4"
+        );
+        // the mini-hunt: a TCP socket connected to itself (simultaneous
+        // open) is told the same way, by its endpoints
+        let rule = NnLNet013Beacon::new(Arc::new(Mutex::new(BeaconWindow::new())), al());
+        let tcp = |t: u64| {
+            let mut e = pg((lo4, 40_001), (lo4, 40_001), 4_242, t);
+            if let Event::NetFlow(nf) = &mut e {
+                nf.proto = 6;
+            }
+            e
+        };
+        assert!((0..8u64).all(|i| rule.evaluate(&tcp(i * 20 * SEC)).is_none()));
+        // CONTROLS: still a beacon
+        assert!(
+            fired((lo4, 40_000), (lo4, 9050), 5) > 0,
+            "a local proxy's port"
+        );
+        // the review of #576 (F2): a socket connected to itself that
+        // `sendto()`s a local relay — the sensor records the name the
+        // kernel sends to, not the socket's peer
+        assert!(
+            fired((lo4, 42_919), (lo4, 5335), 20) > 0,
+            "a relay named by a socket connected to itself"
+        );
+        let unspec: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(
+            fired((unspec, 9050), (lo4, 9050), 5) > 0,
+            "a wildcard-bound sender"
+        );
+        assert!(
+            fired(
+                (v4(192, 0, 2, 10), 42_919),
+                (v4(203, 0, 113, 7), 42_919),
+                20
+            ) > 0,
+            "a remote host"
+        );
+        let own = v4(198, 51, 100, 7);
+        assert!(
+            fired((own, 42_919), (own, 42_919), 20) > 0,
+            "the same endpoint on an address that is no loopback"
+        );
+        assert!(!to_its_own_socket(match &pg((lo4, 0), (lo4, 0), 1, 1) {
+            Event::NetFlow(nf) => nf,
+            _ => unreachable!(),
+        }));
+    }
+
+    /// Lot 369: a beacon is recorded once per program, destination and
+    /// hour, never once per flow — the next record counts the periodic
+    /// flows folded into the one before. A remote beacon keeps firing: its
+    /// first record at the first periodic flow, again each hour; another
+    /// program to the same destination has a record of its own. Main wrote
+    /// one record per flow (fails there: 179 more).
+    #[test]
+    fn net_013_records_one_beacon_per_program_destination_and_hour() {
+        let rule = NnLNet013Beacon::new(Arc::new(Mutex::new(BeaconWindow::new())), al());
+        let dst = v4(203, 0, 113, 7);
+        let records: Vec<(u64, Verdict)> = (0..200u64)
+            .filter_map(|i| {
+                rule.evaluate(&flow_pid(4242, dst, 443, "implant", i * 20 * SEC))
+                    .map(|v| (i, v))
+            })
+            .collect();
+        assert_eq!(
+            records.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![3, 183],
+            "the first periodic flow, then an hour later"
+        );
+        assert_eq!(records[0].1.severity, Severity::High);
+        assert!(!records[0].1.reasoning.contains("more periodic flows"));
+        assert!(
+            records[1].1.reasoning.contains("; 179 more periodic flows"),
+            "{}",
+            records[1].1.reasoning
+        );
+        // another program to the same destination: its own record
+        let other = (0..5u64)
+            .filter(|i| {
+                rule.evaluate(&flow_pid(5151, dst, 443, "other", i * 20 * SEC))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(other, 1);
+        // the window's bound: past it, the expired go first, then the oldest
+        let mut w = BeaconWindow::new();
+        for pid in 0..(BEACON_MAX_REPORTED as u32 + 10) {
+            assert_eq!(
+                w.report(BeaconIdentity::Process(pid, 0), dst, u64::from(pid)),
+                Some(0)
+            );
+        }
+        assert!(w.reported.len() <= BEACON_MAX_REPORTED);
+        assert_eq!(
+            w.report(BeaconIdentity::Process(0, 0), dst, 20),
+            Some(0),
+            "forgotten: again"
+        );
+    }
+
+    /// The review of #576 (F5): an interpreter's image is many programs.
+    /// Its beacons are keyed by the script it runs as well: two scripts of
+    /// one `python3` beaconing to one destination are two records (on the
+    /// head of #576, one: the second folded — fails there); the same script
+    /// in a second process folds as one program; an interpreter running no
+    /// script file (`-c`) is its own process; a binary stays one program.
+    #[test]
+    fn net_013_an_interpreter_s_beacons_are_keyed_by_its_script() {
+        use common::wire::exe::exe_flags::ROOT_DIR;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let exec = |pid: u32, path: &str, argv: &[&str]| {
+            let mut e = crate::decision::rules::testutil::spawn_exe("x", path, path, ROOT_DIR);
+            if let Event::ProcessSpawn {
+                pid: p,
+                argv: a,
+                exe,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *timestamp_ns) = (pid, 1);
+                *a = argv.iter().map(|s| s.to_string()).collect();
+                // one image per program file
+                exe.ino = if path.ends_with("python3.12") { 77 } else { 78 };
+                exe.dev = 2049;
+            }
+            lineage.ingest_spawn_event(&e);
+        };
+        let py = "/usr/bin/python3.12";
+        exec(800, py, &["python3", "/home/u/a.py"]);
+        exec(801, py, &["python3", "/home/u/b.py"]);
+        exec(802, py, &["python3", "/home/u/a.py"]);
+        exec(803, py, &["python3", "-c", "import socket"]);
+        exec(804, py, &["python3", "-c", "import socket"]);
+        exec(805, "/usr/sbin/beacond", &["beacond", "-x"]);
+        exec(806, "/usr/sbin/beacond", &["beacond", "-y"]);
+        let rule = NnLNet013Beacon::new(
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::new(al().as_ref().clone().with_identity(lineage.clone())),
+        );
+        let dst = v4(203, 0, 113, 7);
+        let records = |pid: u32| {
+            (0..6u64)
+                .filter(|i| {
+                    rule.evaluate(&flow_pid(pid, dst, 443, "x", 1 + i * 20 * SEC))
+                        .is_some()
+                })
+                .count()
+        };
+        assert_eq!(records(800), 1, "a.py");
+        assert_eq!(records(801), 1, "b.py: another program of the same image");
+        assert_eq!(records(802), 0, "a.py again: the same program, folded");
+        assert_eq!(records(803), 1, "-c: its process");
+        assert_eq!(records(804), 1, "-c: another process");
+        assert_eq!(records(805), 1, "a binary");
+        assert_eq!(records(806), 0, "the binary again: one program");
     }
 
     #[test]

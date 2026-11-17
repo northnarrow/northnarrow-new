@@ -1019,6 +1019,26 @@ pub struct StatusResponse {
     /// Appended after lot 313's counters.
     #[serde(default)]
     pub kernel_state_held_back: Option<Vec<(String, u64)>>,
+    /// Lot 369: the container runtimes' sealed clones of themselves the
+    /// exec pump judged since the agent's start (R004's exemption, lot
+    /// 347); `None` from an agent older than the field. Appended after the
+    /// review of #565's `kernel_state_held_back`.
+    #[serde(default)]
+    pub runtime_clones: Option<RuntimeClones>,
+}
+
+/// Lot 369: [`StatusResponse::runtime_clones`] — sealed memfd execs
+/// compared whole with an installed runtime (`compared`), kept as its
+/// clone (`kept`: R004 has no verdict on them), not compared for the
+/// budget (`unverified`), and those whose reads the exec pump did not wait
+/// for (`not_read`: R004 judges them fileless). A container host whose
+/// containers start while `kept` stays 0 has lost the exemption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeClones {
+    pub compared: u64,
+    pub kept: u64,
+    pub unverified: u64,
+    pub not_read: u64,
 }
 
 /// Lot 341 (alpha 2/4): the detection records of the current UTC day this
@@ -1421,6 +1441,7 @@ impl StatusResponse {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2089,8 +2110,9 @@ pub const MAX_FRAME_BODY: usize = 64 * 1024;
 /// marks the formats that changed incompatibly since 1. The live admin
 /// socket still speaks bare frames ([`encode_frame`]), so `nn-admin` and
 /// the agent must come from the same release. 3 (the review of #565, F2):
-/// the status reply grew by `kernel_state_held_back`.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// the status reply grew by `kernel_state_held_back`. 4 (lot 369): by
+/// `runtime_clones`.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The oldest envelope version this build decodes. Version 1 named
 /// formats this build would misread (fields appended to the status reply
@@ -2098,8 +2120,9 @@ pub const PROTOCOL_VERSION: u16 = 3;
 /// [`FrameError::ProtocolVersionUnsupported`], not a guess. Raise it with
 /// [`PROTOCOL_VERSION`] whenever the older format can no longer be decoded.
 /// 3 (the review of #565, F2): a version 2 status reply lacks the appended
-/// `kernel_state_held_back`, which this build would read past its end.
-pub const OLDEST_PROTOCOL_VERSION: u16 = 3;
+/// `kernel_state_held_back`, which this build would read past its end. 4
+/// (lot 369): a version 3 one lacks `runtime_clones`.
+pub const OLDEST_PROTOCOL_VERSION: u16 = 4;
 
 /// Errors that can occur when encoding or decoding a frame.
 #[derive(Debug)]
@@ -2554,6 +2577,7 @@ mod tests {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2644,6 +2668,7 @@ mod tests {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -2911,6 +2936,7 @@ mod tests {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -3025,6 +3051,7 @@ mod tests {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -3128,17 +3155,17 @@ mod tests {
         });
         let a = postcard::to_allocvec(&without).unwrap();
         let b = postcard::to_allocvec(&with).unwrap();
-        // the fifteen appended fields' tags: R12a's bus, R12b's decision
+        // the sixteen appended fields' tags: R12a's bus, R12b's decision
         // delay, R12c's response dispatch (lab PR 270), lot 276's export,
         // lot 322's two exec-guard counters, lot 325's four, lot 341's two,
-        // lot 313's two content-check counters and the review of #565's
-        // `kernel_state_held_back`
-        assert!(a.ends_with(&[0; 15]), "the absent fields' tags");
-        assert!(b.starts_with(&a[..a.len() - 15]) && b.len() > a.len());
+        // lot 313's two content-check counters, the review of #565's
+        // `kernel_state_held_back` and lot 369's `runtime_clones`
+        assert!(a.ends_with(&[0; 16]), "the absent fields' tags");
+        assert!(b.starts_with(&a[..a.len() - 16]) && b.len() > a.len());
         assert!(
-            b.ends_with(&[0; 14]),
-            "R12b's, R12c's, lot 276's, lot 322's, lot 325's, lot 341's, lot 313's and the review \
-             of #565's fields, absent"
+            b.ends_with(&[0; 15]),
+            "R12b's, R12c's, lot 276's, lot 322's, lot 325's, lot 341's, lot 313's, the review \
+             of #565's and lot 369's fields, absent"
         );
         assert_eq!(postcard::from_bytes::<StatusResponse>(&b).unwrap(), with);
         let public = StatusResponse::public(PostureKind::Observing, false, None, None, None);
@@ -3165,10 +3192,11 @@ mod tests {
             cap_per_uid: 256,
         });
         let c = postcard::to_allocvec(&with_delay).unwrap();
-        // (b's last fourteen: the decision's delay, the dispatch, lot 276's
+        // (b's last fifteen: the decision's delay, the dispatch, lot 276's
         // export, lot 322's two counters, lot 325's four, lot 341's two,
-        // lot 313's two, the review of #565's one — all absent)
-        assert!(c.starts_with(&b[..b.len() - 14]) && c.len() > b.len());
+        // lot 313's two, the review of #565's one, lot 369's one — all
+        // absent)
+        assert!(c.starts_with(&b[..b.len() - 15]) && c.len() > b.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&c).unwrap(),
             with_delay
@@ -3228,10 +3256,10 @@ mod tests {
             ransomware_inline: 0,
         });
         let d = postcard::to_allocvec(&with_dispatch).unwrap();
-        // (c's last thirteen: the dispatch, lot 276's export, lot 322's two
-        // counters, lot 325's four, lot 341's two, lot 313's two and the
-        // review of #565's one, absent)
-        assert!(d.starts_with(&c[..c.len() - 13]) && d.len() > c.len());
+        // (c's last fourteen: the dispatch, lot 276's export, lot 322's two
+        // counters, lot 325's four, lot 341's two, lot 313's two, the
+        // review of #565's one and lot 369's one, absent)
+        assert!(d.starts_with(&c[..c.len() - 14]) && d.len() > c.len());
         assert_eq!(
             postcard::from_bytes::<StatusResponse>(&d).unwrap(),
             with_dispatch
@@ -3797,8 +3825,9 @@ mod tests {
         // `execpol_env_unread_total` and `execpol_lost_total`, lot 325's
         // four, lot 341's `profile` and `records_today`, lot 313's
         // `program_copy_compared_total` and `program_copy_skipped_total`,
-        // the review of #565's `kernel_state_held_back`.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2 + 2 + 1;
+        // the review of #565's `kernel_state_held_back`, lot 369's
+        // `runtime_clones`.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10 + 1 + 1 + 1 + 1 + 2 + 4 + 2 + 2 + 1 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -3824,15 +3853,15 @@ mod tests {
         status.execpol_env_unread_total = Some(300);
         status.execpol_lost_total = Some(5);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 325's four fields, lot 341's two, lot 313's two and the
-        // review of #565's one follow them, absent here
-        let before = without.len() - 11;
+        // lot 325's four fields, lot 341's two, lot 313's two, the review
+        // of #565's one and lot 369's one follow them, absent here
+        let before = without.len() - 12;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
         assert_eq!(
             &with[before..],
-            &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[1, 0xac, 0x02, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -3852,17 +3881,17 @@ mod tests {
         status.execpol_env_changed_total = Some(4);
         status.execpol_lost_open_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        // the review of #547's field, lot 341's two, lot 313's two and the
-        // review of #565's one follow them, absent here
-        let before = without.len() - 9;
+        // the review of #547's field, lot 341's two, lot 313's two, the
+        // review of #565's one and lot 369's one follow them, absent here
+        let before = without.len() - 10;
         assert_eq!(&with[..before], &without[..before]);
         assert_eq!(
             &without[before - 4..],
-            &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
             &with[before..],
-            &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0, 0, 0, 0]
+            &[1, 3, 1, 4, 1, 0xac, 0x02, 0, 0, 0, 0, 0, 0, 0]
         );
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -3876,12 +3905,12 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.open_sensor_per_call_total = Some(6);
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 341's two fields, lot 313's two counters and the review of
-        // #565's field follow it, absent here
-        let before = without.len() - 6;
+        // lot 341's two fields, lot 313's two counters, the review of
+        // #565's field and lot 369's follow it, absent here
+        let before = without.len() - 7;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 6, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 6, 0, 0, 0, 0, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3897,12 +3926,12 @@ mod tests {
         status.program_copy_compared_total = Some(3);
         status.program_copy_skipped_total = Some(300);
         let with = postcard::to_allocvec(&status).unwrap();
-        // the review of #565's field follows them, absent
-        let before = without.len() - 3;
+        // the review of #565's field and lot 369's follow them, absent
+        let before = without.len() - 4;
         assert_eq!(&with[..before], &without[..before]);
         // lot 341's two fields, absent, between them
-        assert_eq!(&without[before - 4..], &[1, 5, 0, 0, 0, 0, 0]);
-        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02, 0]);
+        assert_eq!(&without[before - 4..], &[1, 5, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&with[before..], &[1, 3, 1, 0xac, 0x02, 0, 0]);
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
@@ -3916,14 +3945,38 @@ mod tests {
         let without = postcard::to_allocvec(&status).unwrap();
         status.kernel_state_held_back = Some(vec![("bpf_unseen".to_string(), 300)]);
         let with = postcard::to_allocvec(&status).unwrap();
-        let before = without.len() - 1;
+        // lot 369's field follows it, absent
+        let before = without.len() - 2;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 4, 0]);
+        assert_eq!(&without[before - 2..], &[1, 4, 0, 0]);
         // Some, one pair: the name's length and bytes, varint 300
         let mut tail = vec![1, 1, 10];
         tail.extend_from_slice(b"bpf_unseen");
-        tail.extend_from_slice(&[0xac, 0x02]);
+        tail.extend_from_slice(&[0xac, 0x02, 0]);
         assert_eq!(&with[before..], tail.as_slice());
+        assert!(!status.telemetry_withheld());
+        roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// Lot 369: the runtimes' sealed clones are the status's last field,
+    /// after the review of #565's held-back counts — an older `nn-admin`
+    /// reads every field it knows.
+    #[test]
+    fn the_runtime_clones_are_appended_last() {
+        let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
+        status.kernel_state_held_back = Some(vec![]);
+        let without = postcard::to_allocvec(&status).unwrap();
+        status.runtime_clones = Some(RuntimeClones {
+            compared: 6,
+            kept: 5,
+            unverified: 300,
+            not_read: 1,
+        });
+        let with = postcard::to_allocvec(&status).unwrap();
+        let before = without.len() - 1;
+        assert_eq!(&with[..before], &without[..before]);
+        assert_eq!(&without[before - 2..], &[1, 0, 0]);
+        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1]);
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -3945,11 +3998,11 @@ mod tests {
             would_have: vec![],
         });
         let with = postcard::to_allocvec(&status).unwrap();
-        // lot 313's two counters and the review of #565's field follow
-        // them, absent here
-        let before = without.len() - 5;
+        // lot 313's two counters, the review of #565's field and lot
+        // 369's follow them, absent here
+        let before = without.len() - 6;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0]);
+        assert_eq!(&without[before - 2..], &[1, 9, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
             &with[before..before + 2],
             &[1, 24],
@@ -4767,10 +4820,12 @@ mod tests {
     // The review of #565 (F2): one more (0x5a), the absent tag of
     // `kernel_state_held_back`, appended last; every byte before it is lot
     // 313's pin.
+    // Lot 369: one more (0x5b), the absent tag of `runtime_clones`,
+    // appended last; every byte before it is the review of #565's pin.
     const STATUS_RESPONSE: &str = concat!(
-        "0000005a050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+        "0000005b050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
         "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
-        "0000000000000000000000000000",
+        "000000000000000000000000000000",
     );
     const SHUTDOWN_REQUEST: &str = concat!(
         "0000007a0602abababababababababababababababababababababababababababababababab808f",
@@ -4783,8 +4838,9 @@ mod tests {
         "b2af0602020202020202020202020202020202020200",
     );
     // Lot 354: the envelope at PROTOCOL_VERSION 2 (its second byte; it was
-    // 01 before the version moved). The review of #565 (F2): at 3.
-    const QUORUM_NOT_MET_VERSIONED: &str = "000000050307050201";
+    // 01 before the version moved). The review of #565 (F2): at 3. Lot
+    // 369: at 4.
+    const QUORUM_NOT_MET_VERSIONED: &str = "000000050407050201";
 
     /// Wave 4 restructure, R03 (lab PR 240): whole frames pinned, byte for
     /// byte, as `main` 2e1438f encoded them before this module left
@@ -4847,13 +4903,14 @@ mod tests {
     /// 1 is the frames as lab PR 240 first pinned them (the status reply was
     /// 0x4b bytes long then); row 2 the frames when the version moved to
     /// mark the formats changed since; row 3 (the review of #565, F2) the
-    /// status reply with `kernel_state_held_back` appended.
+    /// status reply with `kernel_state_held_back` appended; row 4 (lot 369)
+    /// with `runtime_clones`.
     const _: () = assert!(
         OLDEST_PROTOCOL_VERSION >= 1 && OLDEST_PROTOCOL_VERSION <= PROTOCOL_VERSION,
         "the oldest version decoded is at most the current one"
     );
 
-    const PINNED_FRAMES_AT_VERSION: [(u16, &str); 3] = [
+    const PINNED_FRAMES_AT_VERSION: [(u16, &str); 4] = [
         (
             1,
             "e9acc80ae2d89bd2a65f21b5a336c6e1ca2bd3edde7c43006a322b112e6f35f3",
@@ -4865,6 +4922,10 @@ mod tests {
         (
             3,
             "9cf9c1dabab1d292d83d0c69661faf81ce3cb582d21044b0cc1e314ce4e29739",
+        ),
+        (
+            4,
+            "a8f06c633972b30f52b3d8e85cbcb1a7965f5f1c55ec06b79e958bc3da96f879",
         ),
     ];
 

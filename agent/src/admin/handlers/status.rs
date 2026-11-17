@@ -137,6 +137,16 @@ fn telemetry_status(
         program_copy_skipped_total: Some(nn_linux::program_images::counts().1),
         // the review of #565 (F2): the kernel-state round's quota
         kernel_state_held_back: Some(nn_linux::kernel_state::held_back_counts()),
+        // lot 369: the runtimes' sealed clones (R004's exemption)
+        runtime_clones: Some({
+            let c = nn_linux::program_images::runtime_clone_counts();
+            nn_proto::admin_protocol::RuntimeClones {
+                compared: c.compared,
+                kept: c.kept,
+                unverified: c.unverified,
+                not_read: c.not_read,
+            }
+        }),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles

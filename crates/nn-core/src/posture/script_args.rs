@@ -2401,6 +2401,31 @@ pub fn encrypts(exe: &Path, argv: &[String]) -> bool {
     }
 }
 
+/// Lot 369 (the review of #576, F1): the one output the Go toolchain's
+/// linker's argv names ([`crate::posture::lineage`]'s identity of what the
+/// packaged `go` built) —
+/// `-o <path>` or `-o=<path>` (`--o` too: Go's flag syntax); `None`
+/// for none, or for more than one (the last would win: `-ldflags` passed
+/// after `go`'s own `-o`).
+pub fn go_link_output(argv: &[String]) -> Option<&str> {
+    let mut out = None;
+    let mut n = 0;
+    let mut args = argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        let value = match a.as_str() {
+            "-o" | "--o" => args.next().map(String::as_str),
+            s => s.strip_prefix("-o=").or_else(|| s.strip_prefix("--o=")),
+        };
+        if let Some(v) = value {
+            n += 1;
+            out = Some(v);
+        } else if matches!(a.as_str(), "-o" | "--o") {
+            return None;
+        }
+    }
+    out.filter(|_| n == 1)
+}
+
 /// The first argument that is not an option, at `at`: the script; after a
 /// shell's `-c`, its program ([`Runs::Code`]; none: the shell refuses,
 /// [`Runs::Unknown`]); after `-s`, the standard input's ([`Runs::Code`]);

@@ -12,9 +12,9 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 
 | Rule | Name | Severity | Response | ATT&CK |
 |---|---|---|---|---|
-| [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | High, Medium | KillProcessTree, Log | T1059 |
+| [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
 | [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High | KillProcessTree | T1059, T1027.011 |
-| [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium | KillProcessTree, Log | T1059 |
+| [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
 | [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical | KillProcessTree | T1620 |
 | [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High, Low | Log | T1095 |
 | [`R006_ReverseShellTooling`](#r006_reverseshelltooling) | Reverse shell tooling | Critical, High | KillProcessTree, Log | T1095, T1059.004 |
@@ -43,7 +43,7 @@ Exec from /tmp/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | High, Medium |
+| Severity | High, Medium, Low |
 | Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
@@ -51,11 +51,11 @@ Exec from /tmp/ — category `execution`.
 
 **Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it).
 
-**Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot 355: an AppImage's own programs, served read-only at its runtime's `/tmp/.mount_*` (the exec pump ties the mount to the image file the user ran, `USER_IMAGE`), are the image's: no record, as from the home (lot 360: also an image whose file name is 31 bytes or more, by its whole path as its daemon runs it). An AppImage itself in `/tmp`, an extracted one, a writable FUSE mount or another program's daemon stay judged.
+**Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot 355: an AppImage's own programs, served read-only at its runtime's `/tmp/.mount_*` (the exec pump ties the mount to the image file the user ran, `USER_IMAGE`), are the image's: no record, as from the home (lot 360: also an image whose file name is 31 bytes or more, by its whole path as its daemon runs it). An AppImage itself in `/tmp`, an extracted one, a writable FUSE mount or another program's daemon stay judged. Lot 369: what the packaged `go` itself built and then runs, for a person's account — `go test`'s test binary, `go run`'s program: the file the packaged toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`) was run to write by that very `go`, in the layout of its work directory (`go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), run by it from its path, not unlinked — is recorded Low, never killed. What `go` only launches (a `-vettool`, an `-exec` wrapper, a `-toolexec` program, a `go generate` command, a file dropped in a `go-build` directory), root's and a service account's build output, and the same file run by a shell, by another parent or by a `go` in a home are judged as above.
 
 **How to test.** As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. Run as root it is R009's verdict.
 
-**Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged`, `crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
+**Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged`, `crates/nn-core/src/decision/tests.rs::go_test_and_go_run_built_by_the_packaged_go_are_recorded_low`, `crates/nn-core/src/decision/tests.rs::a_program_go_only_launches_from_a_go_build_dir_stays_judged`, `crates/nn-core/src/decision/tests.rs::a_service_account_s_or_root_s_go_build_output_stays_judged`, `crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
 
 **ATT&CK note.** No technique is "execution from a staging directory": T1059 follows design §7.1 and V2 row TQ18 (the script or shell a dropper runs). A native payload is evidence of the Execution tactic, not of an interpreter.
 
@@ -87,7 +87,7 @@ Exec from /var/tmp/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | High, Medium |
+| Severity | High, Medium, Low |
 | Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
@@ -95,7 +95,7 @@ Exec from /var/tmp/ — category `execution`.
 
 **Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed.
 
-**Known false positives.** As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at High below COMBAT; a system account's (a package scriptlet run as one) is killed; run as root in a package transaction or an administrator's session it is R009's Low record.
+**Known false positives.** As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at High below COMBAT; a system account's (a package scriptlet run as one) is killed; run as root in a package transaction or an administrator's session it is R009's Low record. Lot 369: the packaged `go`'s own build output in `/var/tmp` (`TMPDIR=/var/tmp`) as R001's: a person's, linked and run by that `go`.
 
 **How to test.** As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && /var/tmp/nn-r003`.
 
@@ -267,7 +267,7 @@ Kernel-module tooling exec — category `persistence`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit+e2e+lab |
 
-**Observes.** The exec of `insmod`, `modprobe` or `kmod` whose parent is not a kernel thread (`PF_KTHREAD`, read by the sensor), judged on its command line's syntax and on what the exec pump reads at the exec (lot 279). Killed: `insmod`; a `modprobe` argument with a `/` or a `.ko*` suffix; `-C`/`-d`/`-S`/`--force*`/`-o`/`--remove-holders`/`--remove-dependencies` (and their abbreviations); any argument starting with `-` after the first module name; a `kmod` command that is not `help`/`list`/`static-nodes`/the version; a program that is not the system's tool (its path; its device and inode not those of the file `/usr/bin/kmod` resolves to; `/usr/bin/kmod` and `/bin/kmod` two different files), of another mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read: killed even if the process has since exited — evidence; a leader that exited while a thread runs on is read through that thread, refused when none is read whole), a running process's environment not read, over 1 MiB, an unknown start; an argv not read whole. Recorded otherwise: the system's tool by module name, nothing moved or forced — no `modprobe.d` or index is read, what the names load is the kernel's to judge (its signature policy; R018's verdict on the load it reports, after it, where R018 gives one) — Low when run by root with its environment read clean (lot 290; High before: a lab round left 369 such lines), Medium when run by root but exited before its environment could be read (lot 340: a module already loaded or built in), High otherwise. A process that had exited before its environment could be read is recorded, its environment not verified (its kill would reach no one): the environment's check is best effort for a short-lived `modprobe`. A copy run from a staging directory is killed with its tree, the tool elsewhere alone. Lot 285: a child of the module tool (the command of a `modprobe.d` `install`/`remove` directive, `/bin/sh -c …`) is recorded (Medium).
+**Observes.** The exec of `insmod`, `modprobe` or `kmod` whose parent is not a kernel thread (`PF_KTHREAD`, read by the sensor), judged on its command line's syntax and on what the exec pump reads at the exec (lot 279). Killed: `insmod`; a `modprobe` argument with a `/` or a `.ko*` suffix; `-C`/`-d`/`-S`/`--force*`/`-o`/`--remove-holders`/`--remove-dependencies` (and their abbreviations); any argument starting with `-` after the first module name; a `kmod` command that is not `help`/`list`/`static-nodes`/the version; a program that is not the system's tool (its path; its device and inode not those of the file `/usr/bin/kmod` resolves to; `/usr/bin/kmod` and `/bin/kmod` two different files), of another mount namespace; `MODPROBE_OPTIONS`, `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` in its environment (read: killed even if the process has since exited — evidence; a leader that exited while a thread runs on is read through that thread, refused when none is read whole), a running process's environment not read, over 1 MiB, an unknown start; an argv not read whole. Recorded otherwise: the system's tool by module name, nothing moved or forced — no `modprobe.d` or index is read, what the names load is the kernel's to judge (its signature policy; R018's verdict on the load it reports, after it, where R018 gives one) — Low when run by root with its environment read clean (lot 290; High before: a lab round left 369 such lines), Medium when run by root but exited before its environment could be read (lot 340: a module already loaded or built in), Low too when run by a process that cannot load a module (lot 369: no uid 0 among its ids and no `CAP_SYS_MODULE` in its permitted, effective or ambient set in PID 1's user namespace, as the exec pump read its credentials from the running exec — a session's `systemd --user`, rootless Podman), High otherwise. A process that had exited before its environment could be read is recorded, its environment not verified (its kill would reach no one): the environment's check is best effort for a short-lived `modprobe`. A copy run from a staging directory is killed with its tree, the tool elsewhere alone. Lot 285: a child of the module tool (the command of a `modprobe.d` `install`/`remove` directive, `/bin/sh -c …`) is recorded (Medium).
 
 **Known false positives.** Kernel-driven loads (a kworker's modprobe at boot or hot-plug) are exempt. The container runtimes', kube-proxy's and an administrator's `modprobe <name>` are recorded, not killed (lot 279), and so is a root exec of the system's tool under a trusted actor of `process-comm-allowlist` (DKMS under apt or dpkg); in an initramfs build (the packaged `update-initramfs`, `mkinitramfs` or `dracut` run by root, read by the exec pump; lot 287), the hook `kmod` and modprobe's dry runs (`--show-depends`, `--dry-run`, `-S` beside them) are recorded too — at Low when the build runs in a package transaction (a dpkg trigger's `update-initramfs`; lot 348: the hook the host's file at its path by its device and inode in a root-only directory, the modprobe the system's tool), High in an administrator's own build. Killed still: an administrator's `insmod` of a built module, a `modprobe -S` that may load, a quiet probe written `modprobe <name> -q`, a module parameter with a `/`, a `modprobe` run from a shell whose environment sets `LD_LIBRARY_PATH` (or `LD_PRELOAD`, `LD_AUDIT`), and every module tool's exec on a host whose `/usr/bin/kmod` and `/bin/kmod` are two different files.
 
@@ -1060,7 +1060,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
-**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: fim::attach::populate_watched_paths skips a path that does not exist, and /etc is not watched as a directory.
+**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369: looked at once a second), its own appearance not reported, and /etc is not watched as a directory.
 
 ### NN-L-FIM-023_SystemdTimerCreated
 
@@ -1142,7 +1142,7 @@ Kernel module configuration written — category `fim_persistence`.
 
 **Observes.** Lot 285: a file of kmod's configuration directories (/etc, /run, /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, renamed in, linked or removed: an `install` or `remove` directive runs a command as root whenever the module is asked for. High outside a package transaction (the writer's lineage at the write), Low inside one; never a kill (the write is done).
 
-**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is not watched.
+**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: within a second; a file put in it within that second is not reported).
 
 **How to test.** `echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, then remove it; expect High, Log.
 
@@ -1201,7 +1201,7 @@ Burst of renames to a new extension — category `impact_ransomware`.
 | [`NN-L-NET-003_BadJa3`](#nn-l-net-003_badja3) | TLS fingerprint (JA3 or JA4) in the operator's blocklist | Medium | Log | T1573.002 |
 | [`NN-L-NET-004_SuspiciousDnsQname`](#nn-l-net-004_suspiciousdnsqname) | Unusually long DNS qname (recorded) | High, Medium | Log | T1071.004 |
 | [`NN-L-NET-005_DnsTxtNullBurst`](#nn-l-net-005_dnstxtnullburst) | DNS TXT/NULL burst (tunnelling shape) | High | Log | T1071.004 |
-| [`NN-L-NET-006_UncommonListener`](#nn-l-net-006_uncommonlistener) | New listener on uncommon port | Medium | Log | T1571 |
+| [`NN-L-NET-006_UncommonListener`](#nn-l-net-006_uncommonlistener) | New listener on uncommon port | Medium, Low | Log | T1571 |
 | [`NN-L-NET-007_Rfc1918FromUnusualProc`](#nn-l-net-007_rfc1918fromunusualproc) | Outbound to RFC1918 from non-allowlist process | Medium | Log | T1021, T1046 |
 | [`NN-L-NET-008_OutboundFromTmpExec`](#nn-l-net-008_outboundfromtmpexec) | Outbound from a staging-directory exec to non-resolver | High | KillProcess, Log | T1105 |
 | [`NN-L-NET-009_ByteAnomaly`](#nn-l-net-009_byteanomaly) | Flow byte-count anomaly (possible exfiltration) | High | Log | T1048, T1041 |
@@ -1331,19 +1331,19 @@ New listener on uncommon port — category `net_medium`.
 
 | | |
 |---|---|
-| Severity | Medium |
+| Severity | Medium, Low |
 | Response | Log |
 | ATT&CK | T1571 Non-Standard Port (Command and Control) |
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0021 OS API Execution |
 | Validation | unit+e2e |
 
-**Observes.** A new TCP listener on a port outside 22, 53, 80, 443, 8080 and 8443 — or on one of them from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist. A wildcard bind is NN-L-NET-019's.
+**Observes.** A new TCP listener on a port outside 22, 53, 80, 443, 8080 and 8443 — or on one of them from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist. A wildcard bind is NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the kernel's image), in a system service's own cgroup, listening on loopback only (a packaged database or mail daemon) is recorded Low.
 
 **Known false positives.** Developer servers, test fixtures and user services that listen on high ports; the netflow comm allowlist (judged on the executed program, not on `comm`) answers the known daemons.
 
 **How to test.** Listen on loopback on an uncommon port from `python3`: `python3 -m http.server 18080 --bind 127.0.0.1`.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `crates/nn-core/src/decision/rules/net.rs::net_006_a_packaged_service_daemon_on_loopback_is_low`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
 
 **ATT&CK note.** A bind shell or a backdoor listener has no ATT&CK technique of its own; mapped to T1571 as the code names it. The protocol served on the port is not seen.
 
@@ -1469,13 +1469,13 @@ Periodic outbound beacon (low jitter) — category `net_high`.
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0078 Network Traffic Flow, DC0082 Network Connection Creation |
 | Validation | unit |
 
-**Observes.** Outbound flows from one process to one destination at regular intervals: at least 4 of them, a mean interval of a second or more and a coefficient of variation of 0.15 or less, within an hour.
+**Observes.** Outbound flows from one process to one destination at regular intervals: at least 4 of them, a mean interval of a second or more and a coefficient of variation of 0.15 or less, within an hour. Lot 369: one record per program (the kernel's image; an interpreter's image and the script it runs, else its process), destination and hour, the next counting the periodic flows folded since; a datagram sent to the sending socket's own bound endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon — the destination the send names (`sendto()`, connected socket or not), the socket's peer only when it names none. Residual: another socket bound to the same endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive it; that relay's own flows are judged.
 
 **Known false positives.** Pollers, health checks, metrics exporters and update checkers not in the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).
 
 **How to test.** From one process, connect to the same address every 5 seconds: `python3 -c 'import socket, time; [(socket.create_connection(("<peer>", 80)).close(), time.sleep(5)) for _ in range(6)]'`.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow`, `crates/nn-core/src/decision/rules/net.rs::net_013_a_socket_sending_to_itself_is_no_beacon`, `crates/nn-core/src/decision/rules/net.rs::net_013_records_one_beacon_per_program_destination_and_hour`, `crates/nn-core/src/decision/rules/net.rs::net_013_an_interpreter_s_beacons_are_keyed_by_its_script`
 
 **ATT&CK note.** The timing is the signal: a C2 beacon over an application protocol (T1071) or a scheduled transfer (T1029).
 

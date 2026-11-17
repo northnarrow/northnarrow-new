@@ -212,7 +212,9 @@ pub async fn run_recompute_task<F>(
                         &inode_map,
                         watched_paths.as_deref(),
                     ) {
-                        debug!(path = %path.display(), "fim recompute: nothing at the path to watch");
+                        debug!(path = %path.display(), "fim recompute: nothing at the path to watch yet");
+                        // lot 369: watched once it is there
+                        crate::fim::drain::await_appearance(&inode_map, &path.to_string_lossy());
                     }
                     let mut db = baseline_db.lock();
                     for draft in drafts {

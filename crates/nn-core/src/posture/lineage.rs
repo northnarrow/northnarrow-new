@@ -71,7 +71,7 @@ use parking_lot::RwLock;
 
 use super::host::PostureHost;
 pub use super::script_args::Runs;
-use super::script_args::{family_of, runs_of};
+use super::script_args::{family_of, go_link_output, runs_of};
 
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
@@ -945,7 +945,33 @@ struct InnerState {
     /// [`KERNEL_FORKS_CAP`], oldest dropped first.
     kernel_forks: HashMap<u32, KernelFork>,
     kernel_fork_order: VecDeque<u32>,
+    /// Lot 369 (the review of #576, F1): the outputs the packaged Go
+    /// toolchain's own linker was run to write, each by the `go` process
+    /// that forked it ([`AuthSessionTracker::runs_go_linked_output`]): the
+    /// output path's keyed digest → the link. At most [`GO_LINKS_CAP`],
+    /// oldest dropped first.
+    go_links: HashMap<u64, GoLink>,
+    go_link_order: VecDeque<u64>,
 }
+
+/// Lot 369 (the review of #576, F1): an exec of the packaged Go toolchain's
+/// linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`, its image in a root-only
+/// system tree, run as itself) with one output (`-o`) in a work directory's
+/// layout, forked by the packaged `go` of the same `GOROOT` (its exec seen,
+/// run as itself, before the fork): that `go` process — its pid, its own
+/// start and the time it executed `go` — and when the link executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GoLink {
+    go_pid: u32,
+    go_start: u64,
+    go_exec: u64,
+    link_ns: u64,
+}
+
+/// Lot 369 (the review of #576, F1): links kept ([`GoLink`]): one per
+/// package `go test` links, one per `go run`. Each costs about 48 bytes; a
+/// link forgotten only leaves its output judged as any staged exec.
+const GO_LINKS_CAP: usize = 4096;
 
 /// Lot 340: a process the kernel recorded forked by `parent` at `start_ns`
 /// and seen, at `seen_ns`, still running what it was forked with (no exec
@@ -1098,11 +1124,21 @@ enum CachedAt {
     Absent,
 }
 
+/// Lot 369: where the cgroup v2 hierarchy is mounted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Lot 369: the cgroup directories [`AuthSessionTracker::system_service_of_cgroup`]
+/// looks at, at most (a host runs a few hundred services).
+const CGROUP_SERVICES_MAX: usize = 4096;
+
 #[derive(Debug)]
 struct Inner {
     state: RwLock<InnerState>,
     /// Injectable for tests; `"/proc"` in production.
     proc_root: PathBuf,
+    /// Lot 369: the cgroup v2 hierarchy's mount (`/sys/fs/cgroup`, its
+    /// `unified/` on a hybrid layout); injectable for tests.
+    cgroup_root: PathBuf,
     /// External audit POS-003: check a cached exec against the process
     /// its pid names now ([`AuthSessionTracker::for_host`]).
     live: bool,
@@ -1164,8 +1200,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     seeded_images: HashMap::new(),
                     kernel_forks: HashMap::new(),
                     kernel_fork_order: VecDeque::new(),
+                    go_links: HashMap::new(),
+                    go_link_order: VecDeque::new(),
                 }),
                 proc_root,
+                cgroup_root: PathBuf::from(CGROUP_ROOT),
                 live,
                 observer_start: std::sync::OnceLock::new(),
                 #[cfg(test)]
@@ -1369,6 +1408,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // the kernel's record (the re-check 4 of #539: carried through a
         // verified systemd-executor in the kernel, at the exec)
         let fork_parent = exe.fork_parent;
+        let inline = runs == Runs::Inline;
         self.ingest_inner(
             *pid,
             *ppid,
@@ -1380,8 +1420,78 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *uid,
             (image, fork_parent, exec_file, exe.has(USER_IMAGE)),
         );
+        // lot 369 (the review of #576, F1): the packaged go's linker, and
+        // the file it was run to write
+        if !*argv_truncated {
+            self.note_go_link(
+                *pid,
+                *timestamp_ns,
+                Path::new(path),
+                argv,
+                image.is_some() && inline,
+            );
+        }
         let _ = filename;
         true
+    }
+
+    /// Lot 369 (the review of #576, F1): `pid`'s exec, just entered at
+    /// `ts`, runs the packaged Go toolchain's own linker ([`go_linker_root`]:
+    /// `<GOROOT>/pkg/tool/<os>_<arch>/link` of a `GOROOT` whose `bin/go` is
+    /// the packaged `go`), its image in a root-only system tree,
+    /// run as itself, with exactly one output
+    /// ([`crate::posture::script_args::go_link_output`], argv whole)
+    /// in a work directory's layout ([`in_go_work_dir`]); and the process
+    /// that forked it, the one hop above, ran that `GOROOT`'s `go` (its
+    /// exec seen with its image, run as itself) before the fork. Then that
+    /// `go` process asked the linker for that file: noted
+    /// ([`Self::runs_go_linked_output`]). A link run by a `-toolexec`
+    /// program, by a shell or by another toolchain's `go`, two outputs, an
+    /// output elsewhere: nothing noted.
+    fn note_go_link(&self, pid: u32, ts: u64, exe: &Path, argv: &[String], rooted_inline: bool) {
+        let Some(goroot) = go_linker_root(exe) else {
+            return;
+        };
+        if pid <= 1 || !rooted_inline {
+            return;
+        }
+        let Some(out) = go_link_output(argv).filter(|o| in_go_work_dir(o)) else {
+            return;
+        };
+        let go = Path::new(goroot).join("bin/go");
+        let Some(Some(hop)) = self.lineage_walk(pid, AsOf::judged(ts), |hop| hop.pid != pid, 1)
+        else {
+            return;
+        };
+        if !(hop.cached && hop.rooted && hop.runs == Runs::Inline && hop.exe == go) {
+            return;
+        }
+        let key = self.path_key(out);
+        let rec = GoLink {
+            go_pid: hop.pid,
+            go_start: hop.start_ns,
+            go_exec: hop.spawn_ns,
+            link_ns: ts,
+        };
+        let mut s = self.inner.state.write();
+        if s.go_links.insert(key, rec).is_none() {
+            s.go_link_order.push_back(key);
+        }
+        while s.go_link_order.len() > GO_LINKS_CAP {
+            if let Some(old) = s.go_link_order.pop_front() {
+                s.go_links.remove(&old);
+            }
+        }
+    }
+
+    /// Lot 369 (the review of #576, F1): a path's keyed digest (the argv
+    /// digest's key: [`Self::argv_digest`]), so the bounded table of links
+    /// keeps no path.
+    fn path_key(&self, path: &str) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = self.inner.argv_key.build_hasher();
+        h.write(path.as_bytes());
+        h.finish()
     }
 
     /// External audit POS-003: [`Self::ingest_spawn_with_argv`] with the
@@ -3217,6 +3327,65 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         crate::posture::daemon_data::system_service(&path).map(str::to_string)
     }
 
+    /// Lot 369: the systemd service whose cgroup the kernel's cgroup v2 id
+    /// `id` is (`bpf_get_current_cgroup_id` at a write: the inode number of
+    /// that cgroup's directory) — `/system.slice/<unit>.service` or one in a
+    /// slice below it, found by the id among those directories (at most
+    /// [`CGROUP_SERVICES_MAX`] of them looked at); `None` otherwise. For a
+    /// writer gone by the time its crossing is judged (a short-lived
+    /// PostgreSQL backend: `createdb`'s, pgbench's setup connection), whose
+    /// `/proc` entry names no cgroup any more.
+    pub fn system_service_of_cgroup(&self, id: u64) -> Option<String> {
+        if id <= 1 {
+            return None;
+        }
+        let root = &self.inner.cgroup_root;
+        let base = [root.join("system.slice"), root.join("unified/system.slice")]
+            .into_iter()
+            .find(|p| H::is_dir(p))?;
+        let mut looked = 0usize;
+        let mut level: Vec<(PathBuf, String)> = vec![(base, "/system.slice".to_string())];
+        // the unit's directory, under at most two slices below system.slice
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for (dir, cg) in level {
+                let Ok(names) = H::read_dir(&dir) else {
+                    continue;
+                };
+                for name in names {
+                    looked += 1;
+                    if looked > CGROUP_SERVICES_MAX {
+                        return None;
+                    }
+                    let Some(name) = name.to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    let path = dir.join(&name);
+                    let cgroup = format!("{cg}/{name}");
+                    if name.ends_with(".service") {
+                        if H::dir_ino(&path) == Some(id) {
+                            return crate::posture::daemon_data::system_service(&cgroup)
+                                .map(str::to_string);
+                        }
+                    } else if name.ends_with(".slice") {
+                        next.push((path, cgroup));
+                    }
+                }
+            }
+            level = next;
+        }
+        None
+    }
+
+    /// Lot 369: this tracker with the cgroup v2 hierarchy at `root` (tests).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("set before the tracker is shared")
+            .cgroup_root = root.into();
+        self
+    }
+
     /// Lot 350 (F2-3): [`Self::system_service`] of the process that started
     /// at `start_ns` (an exec event's own start, the kernel's monotonic
     /// clock) — `/proc/<pid>/stat` shows that start before and after its
@@ -3499,6 +3668,39 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 && hop.runs == Runs::Inline
                 && is_go_toolchain(&hop.exe)
         )
+    }
+
+    /// Lot 369 (the review of #576, F1): `pid` runs a file the packaged Go
+    /// toolchain's own linker was run to write, run by the `go` process that
+    /// ran that linker — what `go test` and `go run` build and then run:
+    /// [`Self::runs_go_build_output`] (`image` in a work directory's layout,
+    /// the one hop above runs the packaged `go`, its exec seen with its
+    /// image, before the fork), and that very `go` process (its pid, its own
+    /// start, the time it executed `go`) forked the packaged linker of its
+    /// own `GOROOT` with `image` as its one output before `pid`'s exec
+    /// ([`Self::note_go_link`]). What `go` only launches — a `-vettool`, an
+    /// `-exec` wrapper, a `-toolexec` program, a `go generate` command, a
+    /// file another process dropped in a `go-build` directory — no linker of
+    /// that `go` was run to write: not. As of `as_of` (a time needed).
+    pub fn runs_go_linked_output(&self, pid: u32, as_of: AsOf, image: &str) -> bool {
+        let Some(t) = as_of.time() else {
+            return false;
+        };
+        if pid <= 1 || !in_go_work_dir(image) {
+            return false;
+        }
+        let Some(Some(hop)) = self.lineage_walk(pid, as_of, |hop| hop.pid != pid, 1) else {
+            return false;
+        };
+        if !(hop.cached && hop.rooted && hop.runs == Runs::Inline && is_go_toolchain(&hop.exe)) {
+            return false;
+        }
+        let key = self.path_key(image);
+        let s = self.inner.state.read();
+        s.go_links.get(&key).is_some_and(|l| {
+            (l.go_pid, l.go_start, l.go_exec) == (hop.pid, hop.start_ns, hop.spawn_ns)
+                && l.link_ns < t
+        })
     }
 
     /// Lot 346 (the lab of item 1): [`Self::runs_go_build_output`] for the
@@ -4845,6 +5047,27 @@ fn in_go_work_dir(path: &str) -> bool {
     })
 }
 
+/// Lot 369 (the review of #576, F1): `exe` is the Go toolchain's own
+/// linker of a packaged `GOROOT` — `<GOROOT>/pkg/tool/<os>_<arch>/link`,
+/// where `<GOROOT>/bin/go` is the packaged `go` ([`is_go_toolchain`]); that
+/// `GOROOT`. No `.` or `..` segment.
+fn go_linker_root(exe: &Path) -> Option<&str> {
+    let e = exe.to_str()?;
+    if e.split('/').any(|s| s == ".." || s == ".") {
+        return None;
+    }
+    let (pkg_tool, platform) = e.strip_suffix("/link")?.rsplit_once('/')?;
+    let root = pkg_tool.strip_suffix("/pkg/tool")?;
+    let platform_ok = platform.split_once('_').is_some_and(|(os, arch)| {
+        !os.is_empty()
+            && !arch.is_empty()
+            && platform
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    });
+    (platform_ok && is_go_toolchain(&Path::new(root).join("bin/go"))).then_some(root)
+}
+
 /// Lot 346: `exe` is a packaged PostgreSQL server program — its directory
 /// (a distribution's `/usr/lib/postgresql/<version>/bin`, PGDG's
 /// `/usr/pgsql-<version>/bin`, or `/usr/bin`: each exactly, a version of
@@ -5017,6 +5240,126 @@ mod tests {
 
     /// R08a (lab PR 250): the tracker on the portable test host.
     type AuthSessionTracker = super::AuthSessionTracker<H>;
+
+    /// The review of #576 (F1): the packaged toolchain's linker is told by
+    /// its place in a packaged `GOROOT` (`pkg/tool/<os>_<arch>/link`, that
+    /// root's `bin/go` the packaged `go`), and its output by the one `-o`
+    /// its argv names; the table of links is bounded, the oldest dropped.
+    #[test]
+    fn the_packaged_go_s_linker_and_its_one_output_are_told() {
+        for (link, root) in [
+            (
+                "/usr/lib/go-1.22/pkg/tool/linux_amd64/link",
+                "/usr/lib/go-1.22",
+            ),
+            ("/usr/lib/go/pkg/tool/linux_386/link", "/usr/lib/go"),
+            ("/usr/local/go/pkg/tool/linux_arm64/link", "/usr/local/go"),
+            (
+                "/snap/go/10535/pkg/tool/linux_ppc64le/link",
+                "/snap/go/10535",
+            ),
+        ] {
+            assert_eq!(go_linker_root(Path::new(link)), Some(root), "{link}");
+        }
+        for not in [
+            "/home/u/go/pkg/tool/linux_amd64/link",
+            "/tmp/go/pkg/tool/linux_amd64/link",
+            "/usr/lib/go-1.22/pkg/tool/linux_amd64/compile",
+            "/usr/lib/go-1.22/pkg/tool/link",
+            "/usr/lib/go-1.22/pkg/tool/linuxamd64/link",
+            "/usr/lib/go-1.22/pkg/tool/Linux_amd64/link",
+            "/usr/lib/go-1.22/pkg/tool/linux.amd64_x/link",
+            "/usr/lib/go-1.22/pkg/tool/_amd64/link",
+            "/usr/lib/go-1.22/pkg/tool/linux_/link",
+            "/usr/lib/go-1.22/pkg/tools/linux_amd64/link",
+            "/usr/lib/go-1.22/pkg/tool/linux_amd64/x/link",
+            "/usr/lib/go-1.22/./pkg/tool/linux_amd64/link",
+            "/usr/lib/x/../go-1.22/pkg/tool/linux_amd64/link",
+        ] {
+            assert_eq!(go_linker_root(Path::new(not)), None, "{not}");
+        }
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let out = "/tmp/go-build1/b001/exe/a";
+        for v in [
+            &["link", "-o", out, "-importcfg", "/x", "/m.a"][..],
+            &["link", "-o=/tmp/go-build1/b001/exe/a", "/m.a"],
+            &["link", "--o", out],
+            &["link", "--o=/tmp/go-build1/b001/exe/a"],
+        ] {
+            assert_eq!(go_link_output(&a(v)), Some(out), "{v:?}");
+        }
+        for v in [
+            &["link", "/m.a"][..],
+            &["link", "-o", out, "-o", "/elsewhere"],
+            &["link", "-o=/x", "-o", "/x"],
+            &["link", "-importcfg", "/x", "-o"],
+            &["link", "-o", out, "-o"],
+            &["-o", out],
+        ] {
+            assert_eq!(go_link_output(&a(v)), None, "{v:?}");
+        }
+        // bounded: the oldest link is forgotten first
+        let proc = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(proc.path());
+        let go = "/usr/lib/go-1.22/bin/go";
+        let link = "/usr/lib/go-1.22/pkg/tool/linux_amd64/link";
+        let spawn = |pid: u32, ppid: u32, path: &str, argv: &[&str], ts: u64| {
+            let mut e = crate::decision::rules::testutil::spawn_exe(
+                "x",
+                path,
+                path,
+                common::wire::exe::exe_flags::ROOT_DIR,
+            );
+            if let Event::ProcessSpawn {
+                pid: p,
+                ppid: pp,
+                argv: av,
+                timestamp_ns,
+                exe,
+                ..
+            } = &mut e
+            {
+                (*p, *pp, *timestamp_ns) = (pid, ppid, ts);
+                *av = argv.iter().map(|s| s.to_string()).collect();
+                (exe.dev, exe.ino) = (2049, u64::from(pid));
+            }
+            e
+        };
+        t.ingest_spawn_event(&spawn(100, 1, go, &["go", "test"], S));
+        let output = |i: usize| format!("/tmp/go-build1/b{i}/x.test");
+        for i in 0..=GO_LINKS_CAP {
+            let o = output(i);
+            t.ingest_spawn_event(&spawn(1000, 100, link, &[link, "-o", &o], 2 * S));
+        }
+        let at = AsOf::judged(3 * S);
+        t.ingest_spawn_event(&spawn(2000, 100, &output(0), &[], 3 * S));
+        assert!(
+            !t.runs_go_linked_output(2000, at, &output(0)),
+            "the oldest forgotten"
+        );
+        t.ingest_spawn_event(&spawn(2001, 100, &output(1), &[], 3 * S));
+        assert!(t.runs_go_linked_output(2001, at, &output(1)));
+        assert!(
+            !t.runs_go_linked_output(2001, AsOf::Now, &output(1)),
+            "a time needed"
+        );
+        assert!(
+            !t.runs_go_linked_output(2001, at, "/tmp/go-build1/b9999/x.test"),
+            "a path no link of that go was run to write"
+        );
+        // the go's pid taken by a later process that runs go too: not the
+        // go that ran the link
+        let mut again = spawn(100, 1, go, &["go", "test"], 4 * S);
+        if let Event::ProcessSpawn { start_ns, .. } = &mut again {
+            *start_ns = 4 * S;
+        }
+        t.ingest_spawn_event(&again);
+        t.ingest_spawn_event(&spawn(2002, 100, &output(1), &[], 5 * S));
+        assert!(
+            !t.runs_go_linked_output(2002, AsOf::judged(5 * S), &output(1)),
+            "another go process"
+        );
+    }
 
     /// Review #471 A1: judged as of an event's time, a pid that executed
     /// again later answers with the image it ran then — its identity, its

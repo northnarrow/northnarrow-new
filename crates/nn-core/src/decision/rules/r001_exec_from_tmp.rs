@@ -16,7 +16,19 @@ use crate::decision::{rules::build_verdict, Rule};
 /// touching the rule body.
 const TMP_WHITELIST: &[&str] = &[];
 
-pub struct R001ExecFromTmp;
+#[derive(Debug, Default)]
+pub struct R001ExecFromTmp {
+    /// Lot 369: the packaged `go`'s own build output, recorded Low.
+    go: super::GoBuilds,
+}
+
+impl R001ExecFromTmp {
+    /// This rule with lot 346's identity of `go`'s build output (lot 369).
+    pub fn with_go_builds(mut self, go: super::GoBuilds) -> Self {
+        self.go = go;
+        self
+    }
+}
 
 impl Rule for R001ExecFromTmp {
     fn id(&self) -> &'static str {
@@ -47,6 +59,10 @@ impl Rule for R001ExecFromTmp {
         if TMP_WHITELIST.contains(&filename) {
             return None;
         }
+        // lot 369: `go test`'s binary and `go run`'s program, by identity
+        if self.go.runs(event, filename) {
+            return Some(super::go_build_record(self, event, "/tmp/"));
+        }
         Some(build_verdict(
             self,
             event,
@@ -73,18 +89,20 @@ mod tests {
             "/usr/bin/../../tmp/payload",
         ] {
             let event = spawn_exe("payload", caller, "/tmp/payload", 0);
-            let v = R001ExecFromTmp.evaluate(&event).expect(caller);
+            let v = R001ExecFromTmp::default().evaluate(&event).expect(caller);
             assert_eq!(v.event_filename, "/tmp/payload", "{caller}");
         }
         // and a `/tmp/…` string that resolves elsewhere does not fire
         let event = spawn_exe("ls", "/tmp/ls-link", "/usr/bin/ls", 0);
-        assert!(R001ExecFromTmp.evaluate(&event).is_none());
+        assert!(R001ExecFromTmp::default().evaluate(&event).is_none());
     }
 
     #[test]
     fn fires_on_exec_from_tmp() {
         let event = spawn("payload", "/tmp/payload");
-        let v = R001ExecFromTmp.evaluate(&event).expect("should fire");
+        let v = R001ExecFromTmp::default()
+            .evaluate(&event)
+            .expect("should fire");
         assert_eq!(v.rule_id, "R001_ExecFromTmp");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert_eq!(v.severity, Severity::Medium);
@@ -95,7 +113,7 @@ mod tests {
     #[test]
     fn r001_kills_the_process_tree() {
         for (case, uid) in [0, 998, 1000].into_iter().enumerate() {
-            let v = R001ExecFromTmp
+            let v = R001ExecFromTmp::default()
                 .evaluate(&spawn_as(uid, "payload", "/tmp/payload"))
                 .expect("fires");
             assert_eq!(v.action, ResponseAction::KillProcessTree, "case {case}");
@@ -112,7 +130,8 @@ mod tests {
         use crate::decision::rules::testutil::spawn_exe;
         use crate::decision::rules::{R002ExecFromDevShm, R003ExecFromVarTmp};
         use common::wire::exe::exe_flags::USER_IMAGE;
-        let rules: [&dyn Rule; 3] = [&R001ExecFromTmp, &R002ExecFromDevShm, &R003ExecFromVarTmp];
+        let (r1, r3) = (R001ExecFromTmp::default(), R003ExecFromVarTmp::default());
+        let rules: [&dyn Rule; 3] = [&r1, &R002ExecFromDevShm, &r3];
         for (rule, dir) in rules.iter().zip(["/tmp", "/dev/shm", "/var/tmp"]) {
             let app = format!("{dir}/.mount_k355ab/AppRun");
             let marked = spawn_exe("AppRun", &app, &app, USER_IMAGE);
@@ -122,20 +141,65 @@ mod tests {
         }
     }
 
+    /// Lot 369: R001's own record of an exec the go identity vouches for
+    /// (the packaged `go`'s build output, linked and run by it, for a
+    /// person) is Low, not killed — but never for a file unlinked or a memfd
+    /// when the kernel ran it, nor (the review of #576, F1) for a file the
+    /// kernel did not run by its path (no `KNOWN` canonical path: the
+    /// caller's string alone), and never without the identity. The
+    /// predicate is asked with the exec's own pid, uid and path.
+    #[test]
+    fn the_go_build_record_needs_the_identity_and_a_linked_file() {
+        use crate::decision::rules::testutil::spawn_exe;
+        use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
+        let built = "/tmp/go-build1/b001/calc.test";
+        let go = R001ExecFromTmp::default().with_go_builds(super::super::GoBuilds::of_fn(
+            |pid, uid, _, image| (pid, uid) == (1234, 1000) && image.contains("go-build"),
+        ));
+        let v = go
+            .evaluate(&spawn_exe("calc.test", built, built, 0))
+            .unwrap();
+        assert_eq!((v.severity, v.action), (Severity::Low, ResponseAction::Log));
+        for flag in [DELETED, MEMFD] {
+            let v = go
+                .evaluate(&spawn_exe("calc.test", built, built, flag))
+                .unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{flag:#x}");
+            assert_eq!(v.severity, Severity::Medium);
+        }
+        // the caller's string alone, or a canonical path not yet placed
+        let mut unknown = spawn_exe("calc.test", built, built, 0);
+        if let Event::ProcessSpawn { exe, .. } = &mut unknown {
+            exe.flags &= !KNOWN;
+        }
+        let mut unplaced = spawn_exe("calc.test", built, "b001/calc.test", 0);
+        if let Event::ProcessSpawn { exe, .. } = &mut unplaced {
+            exe.root = (9, 9);
+        }
+        for e in [unknown, unplaced] {
+            let v = go.evaluate(&e).unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{e:?}");
+        }
+        let v = R001ExecFromTmp::default()
+            .evaluate(&spawn_exe("calc.test", built, built, 0))
+            .unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "no identity");
+    }
+
     #[test]
     fn ignores_legitimate_paths() {
         let event = spawn("ls", "/usr/bin/ls");
-        assert!(R001ExecFromTmp.evaluate(&event).is_none());
+        assert!(R001ExecFromTmp::default().evaluate(&event).is_none());
     }
 
     #[test]
     fn does_not_match_path_named_like_tmp_elsewhere() {
         // `/var/tmp/...` is R003's job, not R001's. `/tmpfoo/...`
         // (no trailing slash) is unrelated.
-        assert!(R001ExecFromTmp
+        assert!(R001ExecFromTmp::default()
             .evaluate(&spawn("x", "/var/tmp/x"))
             .is_none());
-        assert!(R001ExecFromTmp
+        assert!(R001ExecFromTmp::default()
             .evaluate(&spawn("tmpfoo", "/tmpfoo/payload"))
             .is_none());
     }
