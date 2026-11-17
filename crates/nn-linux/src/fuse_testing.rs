@@ -25,6 +25,10 @@ pub fn in_userns(body: impl FnOnce() -> i32) -> Option<i32> {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
+        // a child held (a lock another test's thread held at the fork) ends,
+        // failing its test, never holding the run
+        // SAFETY: alarm has no preconditions.
+        unsafe { libc::alarm(60) };
         // SAFETY: the child's own namespaces; no data.
         let refused = unsafe {
             libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0
@@ -202,6 +206,78 @@ fn serve(mut dev: File, answered: usize, stop: &AtomicBool) {
             _ => {}
         }
     }
+}
+
+/// Lot 366: `check` run in a user and mount namespace of the test's own,
+/// beside a FUSE that answers nothing ([`smart_fuse_over`] a directory of
+/// its own, no lookup answered): `check` is handed the path of a
+/// descriptor of that FUSE's root (`/proc/<pid>/fd/<n>`) — a link, as a
+/// process's `exe`, `root` or `fd/<n>` is one — and runs on a thread of
+/// its own. Its exit code: 0
+/// when `check` answered `true` within 10 s, 1 when it answered `false`, 5
+/// when it was held (the FUSE is then dropped: the held request fails and
+/// the thread goes on); `None` when the namespaces or the FUSE are refused
+/// and [`ran`] allows the skip (a developer's host; under CI it fails).
+pub fn answers_beside_a_held_fuse(
+    check: impl FnOnce(&Path) -> bool + Send + 'static,
+) -> Option<i32> {
+    // the views the checks read through made before the fork: views
+    // another test's thread is making at the fork would never be made in
+    // the child (their maker is not there), and the child would wait on
+    // them for ever (a test that anchors its own in the child calls
+    // `in_userns` itself)
+    let _ = antitamper_bpf::kernel_roots::views();
+    ran(in_userns(move || {
+        // SAFETY: alarm has no preconditions; a held check ends the child.
+        unsafe { libc::alarm(30) };
+        // SAFETY: getpid has no preconditions.
+        let dir = std::env::temp_dir().join(format!("nn-held-fuse-{}", unsafe { libc::getpid() }));
+        if std::fs::create_dir(&dir).is_err() {
+            return 99;
+        }
+        let Some(fuse) = smart_fuse_over(&dir, 0) else {
+            let _ = std::fs::remove_dir(&dir);
+            return 99;
+        };
+        // its root, reached by the walk to the mount point: nothing asked
+        let Ok(root) = std::os::unix::fs::OpenOptionsExt::custom_flags(
+            std::fs::OpenOptions::new().read(true),
+            libc::O_PATH | libc::O_DIRECTORY,
+        )
+        .open(&dir) else {
+            return 99;
+        };
+        let held = std::path::PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            root.as_raw_fd()
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("nn-test-check".into())
+            .spawn(move || {
+                let _ = tx.send(check(&held));
+            });
+        if spawned.is_err() {
+            return 99;
+        }
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(fuse);
+        drop(root);
+        if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
+            // SAFETY: a NUL-terminated path; the mount, ours, detached.
+            unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+        }
+        let _ = std::fs::remove_dir(&dir);
+        match answer {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(_) => {
+                eprintln!("held for 10 s by the FUSE that answers nothing");
+                5
+            }
+        }
+    }))
 }
 
 #[cfg(test)]

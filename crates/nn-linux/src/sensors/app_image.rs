@@ -42,7 +42,9 @@
 //!     with a cut name names no file: the image's whole path is then that
 //!     daemon's `exe` link (the kernel's `d_path`), taken when it is the
 //!     walk's path name by name (a cut name its start, every other name
-//!     equal, as many names) and through no FUSE mount, before any `stat`;
+//!     equal, as many names), its file's identity from the kernel's cache
+//!     and on a file system that is no FUSE one (by the mount the kernel
+//!     reached it through: lot 366);
 //!     the image file's checks above, its device and inode, run at that
 //!     whole path, and the tie keeps it. An image named with 31 bytes or
 //!     more (`Bitwarden-2025.1.1-x86_64.AppImage`) was never tied.
@@ -69,6 +71,15 @@
 //! with a socket — is judged as any user program's: the flag takes only
 //! the staging directory away.
 //!
+//! Lot 366: every file the tie reads is read without asking a FUSE or
+//! network file system anything — the image's path walked from the
+//! process's root one name at a time, every file system judged by the
+//! mount the kernel reached it through, no symbolic link followed; a
+//! daemon's image and descriptors by the kernel's cached identity
+//! ([`super::pump_reads`]) — and on the exec pumps' reader, with a
+//! deadline, the record's lock never held while a file is read: a read
+//! that does not answer holds neither pump.
+//!
 //! Residual, said (the review of #564, F2): a malicious AppImage the user
 //! runs is a user program, judged by its behaviour. The kernel ties no
 //! FUSE mount to the process that serves it in a way `/proc` shows (the
@@ -93,11 +104,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use common::wire::exe::{exe_flags, kernel_dev, walk_may_name, walk_path_cut};
+use common::wire::exe::{exe_flags, walk_may_name, walk_path_cut};
 use nn_core::decision::rules::is_staging_path;
 use nn_core::posture::lineage::in_system_tree;
 use nn_model::Event;
@@ -143,14 +153,113 @@ pub struct AppImages {
     order: BTreeMap<u64, u32>,
     seq: u64,
     tied: HashMap<u64, Tied>,
+    /// The review of #573 (F1): by pid, the latest check of an exec of a
+    /// possible image the exec-check pump read (its start not known: `0`),
+    /// so that the check of the image's program ties whichever pump is
+    /// ahead.
+    checked: HashMap<u32, Ran>,
+    /// The pids of `checked` in the order noted.
+    checked_order: BTreeMap<u64, u32>,
 }
 
-/// The exec pump's record (one pump thread).
+/// The exec pumps' record. The review of #573 (F1): its lock is taken to
+/// note an exec and to publish what a read found — memory only, never
+/// while a file is read ([`note`], [`read_tie`]).
 static PUMP: LazyLock<Mutex<AppImages>> = LazyLock::new(Default::default);
 
-/// The exec pump's step: `event` read under `/proc`.
-pub fn read(event: &mut Event) {
-    PUMP.lock().note(Path::new("/proc"), event);
+/// What the mark of one exec needs read of `/proc`, taken from the record
+/// when the exec was noted ([`note`]): read by [`read_tie`] with no lock
+/// held, its finding then published to the record.
+#[derive(Clone, Debug)]
+pub struct TieRead {
+    pid: u32,
+    uid: u32,
+    dev: u64,
+    path: PathBuf,
+    /// The caller's string, when not cut.
+    caller: Option<PathBuf>,
+    step: Step,
+    /// The re-check of #573 (N6): the device's tie when the read was taken
+    /// — a tie it finds is published only over that one, or in an empty
+    /// place: never over a tie made since (a newer mount's).
+    seen: Option<Tied>,
+}
+
+/// What [`TieRead`] checks.
+#[derive(Clone, Debug)]
+enum Step {
+    /// The filesystem is tied already: still so? If not, the tie of
+    /// `or_tie` (a device is handed out again: the tie may be an earlier
+    /// mount's, and this exec the first of a new image's).
+    Still {
+        tied: Tied,
+        or_tie: Option<(Ran, bool)>,
+    },
+    /// Not tied yet: the tie to the process's exec of an image, `before`
+    /// — a check's taken from the record, its `/proc` start that exec's
+    /// process's checked by the read (`check`).
+    Tie { before: Ran, check: bool },
+}
+
+/// What a [`TieRead`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Found {
+    /// Tied now, as this says.
+    Tied(Tied),
+    /// Still tied.
+    Still,
+    /// No longer tied.
+    Untied,
+    /// No tie, or nothing read (the mount table unreadable).
+    Nothing,
+}
+
+/// Lot 366, the review of #573 (F1): the exec pumps' step — `event` noted
+/// in the record, memory only, on the pump at once (an image's exec noted
+/// before the exec-check pump asks for it). What its mark needs read, if
+/// anything: an exec, as the kernel described it, of a file on an
+/// anonymous device (FUSE's kind) under a staging directory, tied or with
+/// the process's exec of an image — read by [`read_tie`] on the pumps'
+/// reader.
+pub fn note(event: &Event) -> Option<TieRead> {
+    note_in(&PUMP, event)
+}
+
+/// [`note`] in the record `record`.
+fn note_in(record: &Mutex<AppImages>, event: &Event) -> Option<TieRead> {
+    record.lock().take(event)
+}
+
+/// Lot 366, the review of #573 (F1): `r` read under `/proc` — no lock
+/// held — then its finding published to the record: whether the exec is
+/// the image's ([`mark`] it).
+pub fn read_tie(r: &TieRead) -> bool {
+    read_tie_in(&PUMP, Path::new("/proc"), r)
+}
+
+/// [`read_tie`] with the processes under `proc_root`, the record `record`.
+fn read_tie_in(record: &Mutex<AppImages>, proc_root: &Path, r: &TieRead) -> bool {
+    let found = read_step(proc_root, r);
+    publish_in(record, r, &found)
+}
+
+/// `found` published to the record `record`.
+fn publish_in(record: &Mutex<AppImages>, r: &TieRead, found: &Found) -> bool {
+    record.lock().publish(r, found)
+}
+
+/// `event` marked as its image's ([`exe_flags::USER_IMAGE`]).
+pub fn mark(event: &mut Event) {
+    if let Event::ProcessSpawn { exe, .. } | Event::ExecCheck { exe, .. } = event {
+        exe.flags |= exe_flags::USER_IMAGE;
+    }
+}
+
+/// Lot 366: the exec of a possible image the pumps' record keeps for the
+/// process `pid` (its path), if any (tests).
+#[cfg(test)]
+pub(crate) fn noted(pid: u32) -> Option<PathBuf> {
+    PUMP.lock().ran.get(&pid).map(|r| r.path.clone())
 }
 
 /// The flags of an identity whose path or file is not the kernel's plain
@@ -166,10 +275,10 @@ const NOT_PLAIN: u32 = exe_flags::TMPFS
 impl AppImages {
     /// `event` noted — an exec (`ProcessSpawn`), or the LSM program's check
     /// of one before it runs (`ExecCheck`, which the posture's exec arm
-    /// judges too) — and marked [`exe_flags::USER_IMAGE`] when its file is
-    /// a tied image's, the processes under `proc_root`.
-    pub fn note(&mut self, proc_root: &Path, event: &mut Event) {
-        let (pid, uid, filename, exe, start_ns, exec_ns, cut) = match event {
+    /// judges too) — memory only: what its mark ([`exe_flags::USER_IMAGE`],
+    /// when its file is a tied image's) needs read, if anything.
+    fn take(&mut self, event: &Event) -> Option<TieRead> {
+        let (pid, uid, filename, exe, start_ns, cut) = match event {
             Event::ProcessSpawn {
                 pid,
                 uid,
@@ -184,8 +293,7 @@ impl AppImages {
                 *uid,
                 filename.as_str(),
                 exe,
-                Some(*start_ns),
-                *timestamp_ns,
+                Some((*start_ns, *timestamp_ns)),
                 *filename_truncated,
             ),
             // the check carries no cut flag: a string as long as the
@@ -198,27 +306,62 @@ impl AppImages {
                 ..
             } => {
                 let cut = filename.len() >= common::wire::FILENAME_LEN - 1;
-                (*pid, *uid, filename.as_str(), exe, None, 0, cut)
+                (*pid, *uid, filename.as_str(), exe, None, cut)
             }
-            _ => return,
+            _ => return None,
         };
-        // the process's exec before this one, if it ran a possible image:
-        // an exec replaces it (one at its pid, the same process's or not)
+        let plain = exe.has(exe_flags::KNOWN)
+            && start_ns.is_none_or(|(start, _)| start != 0)
+            && exe.flags & NOT_PLAIN == 0
+            && exe.root == (0, 0)
+            && exe.path.starts_with('/');
+        // a file on an anonymous device (FUSE's kind) under a staging
+        // directory: an image's program, perhaps
+        let staging = is_staging_path(&exe.path);
+        let staged = plain && staging && exe.dev >> 20 == 0;
+        // the process's exec before this one, if it ran a possible image: an
+        // exec replaces it (one at its pid, the same process's or not) — but
+        // an exec of the same process from a staging FUSE file keeps it (the
+        // review of #573, F1: the exec pump notes `AppRun`'s exec at once, and
+        // the exec-check pump may read `AppRun`'s check, or its program's,
+        // after it: the image's exec stays the process's until it executes
+        // something else)
         let before = match start_ns {
-            Some(start) => self.forget(pid).filter(|r| r.start == start),
-            None => None,
+            Some((start, _)) if staged => match self.ran.get(&pid) {
+                Some(r) if r.start == start => Some(r.clone()),
+                Some(_) => self.forget(pid).and(None),
+                None => None,
+            },
+            Some((start, _)) => self.forget(pid).filter(|r| r.start == start),
+            // the exec-check pump: the check of an exec replaces the
+            // process's checked one, but one of a staging FUSE file
+            None if staged => None,
+            None => {
+                self.forget_checked(pid);
+                if plain && !staging && !in_system_tree(&exe.path) {
+                    if let Event::ExecCheck { timestamp_ns, .. } = event {
+                        self.remember_checked(
+                            pid,
+                            Ran {
+                                start: 0,
+                                dev: exe.dev,
+                                ino: exe.ino,
+                                path: PathBuf::from(&exe.path),
+                                exec_ns: *timestamp_ns,
+                                seq: 0,
+                            },
+                        );
+                    }
+                }
+                None
+            }
         };
-        if !exe.has(exe_flags::KNOWN)
-            || start_ns == Some(0)
-            || exe.flags & NOT_PLAIN != 0
-            || exe.root != (0, 0)
-            || !exe.path.starts_with('/')
-        {
-            return;
+        if !plain {
+            return None;
         }
         let path = PathBuf::from(&exe.path);
-        if !is_staging_path(&exe.path) {
-            if let Some(start) = start_ns.filter(|_| !in_system_tree(&exe.path)) {
+        if !staging {
+            if let Some((start, exec_ns)) = start_ns.filter(|_| !in_system_tree(&exe.path)) {
                 self.remember(
                     pid,
                     Ran {
@@ -231,63 +374,78 @@ impl AppImages {
                     },
                 );
             }
-            return;
+            return None;
         }
         // the review of #564 (F4): no more is read for a file that cannot
         // be a tied image's — FUSE's device is an anonymous one (major 0),
         // and a filesystem not yet tied needs the process's exec of an
         // image (a check reads it, not taken)
-        if exe.dev >> 20 != 0 {
-            return;
+        if !staged {
+            return None;
         }
-        let tied = self.tied.contains_key(&exe.dev);
-        let before = match before {
-            None if !tied && start_ns.is_none() => self.ran_by(proc_root, pid),
-            b => b,
+        // the process's exec of an image a tie would be made to: an exec's
+        // own; a check's, the latest the exec pump noted or the exec-check
+        // pump's own check of it
+        let candidate = match before {
+            Some(before) => Some((before, false)),
+            None if start_ns.is_none() => [self.ran.get(&pid), self.checked.get(&pid)]
+                .into_iter()
+                .flatten()
+                .max_by_key(|r| r.exec_ns)
+                .map(|r| (r.clone(), true)),
+            None => None,
         };
-        if !tied && before.is_none() {
-            return;
-        }
-        let Ok(table) = crate::mountinfo::read(&proc_root.join("1/mountinfo")) else {
-            return;
+        let seen = self.tied.get(&exe.dev).cloned();
+        let step = match (self.tied.get(&exe.dev), candidate) {
+            (Some(t), or_tie) => Step::Still {
+                tied: t.clone(),
+                or_tie,
+            },
+            (None, Some((before, check))) => Step::Tie { before, check },
+            (None, None) => return None,
         };
-        let user = match self.tied.get(&exe.dev) {
-            Some(t) => {
-                let still = still_tied(proc_root, &table, exe.dev, uid, &path, t);
-                if !still {
-                    self.tied.remove(&exe.dev);
-                }
-                still
-            }
-            None => {
-                let caller = (!cut).then_some(Path::new(filename));
-                match before
-                    .and_then(|b| tie(proc_root, &table, pid, uid, (exe.dev, &path), caller, &b))
-                {
-                    Some(t) => {
-                        if self.tied.len() >= TIED_MAX {
-                            self.tied.clear();
-                        }
-                        self.tied.insert(exe.dev, t);
-                        true
-                    }
-                    None => false,
-                }
-            }
-        };
-        if user {
-            exe.flags |= exe_flags::USER_IMAGE;
-        }
+        Some(TieRead {
+            pid,
+            uid,
+            dev: exe.dev,
+            path,
+            caller: (!cut).then(|| PathBuf::from(filename)),
+            step,
+            seen,
+        })
     }
 
-    /// The latest exec of a possible image of the process `pid` runs now
-    /// (its `/proc` start that exec's process's), for its check.
-    fn ran_by(&self, proc_root: &Path, pid: u32) -> Option<Ran> {
-        let ran = self.ran.get(&pid)?;
-        let stat =
-            crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat")).ok()?;
-        let ticks = crate::response::proc_ref::stat_start_ticks(&stat)?;
-        crate::response::proc_ref::started_at(ticks, ran.start).then(|| ran.clone())
+    /// What a read of `r` found, published — memory only: a tie kept, a
+    /// tie that no longer holds dropped (the one read, not one made since).
+    /// Whether the exec is the image's.
+    fn publish(&mut self, r: &TieRead, found: &Found) -> bool {
+        match found {
+            Found::Tied(t) => {
+                // the re-check of #573 (N6): a tie read late (its mount
+                // gone since, the device handed to a new image's mount and
+                // tied) never overwrites the tie made since: the exec its
+                // read tied is marked, the record keeps the newer tie
+                let now = self.tied.get(&r.dev);
+                if now.is_some() && now != r.seen.as_ref() {
+                    return true;
+                }
+                if self.tied.len() >= TIED_MAX && !self.tied.contains_key(&r.dev) {
+                    self.tied.clear();
+                }
+                self.tied.insert(r.dev, t.clone());
+                true
+            }
+            Found::Still => true,
+            Found::Untied => {
+                if let Step::Still { tied: t, .. } = &r.step {
+                    if self.tied.get(&r.dev) == Some(t) {
+                        self.tied.remove(&r.dev);
+                    }
+                }
+                false
+            }
+            Found::Nothing => false,
+        }
     }
 
     /// `ran` noted as `pid`'s latest exec of a possible image; the oldest
@@ -311,6 +469,79 @@ impl AppImages {
         self.order.remove(&ran.seq);
         Some(ran)
     }
+
+    /// `ran` noted as `pid`'s latest check of an exec of a possible image;
+    /// the oldest noted is forgotten first when the record is full.
+    fn remember_checked(&mut self, pid: u32, mut ran: Ran) {
+        self.forget_checked(pid);
+        if self.checked.len() >= RAN_MAX {
+            if let Some((_, oldest)) = self.checked_order.pop_first() {
+                self.checked.remove(&oldest);
+            }
+        }
+        self.seq += 1;
+        ran.seq = self.seq;
+        self.checked_order.insert(self.seq, pid);
+        self.checked.insert(pid, ran);
+    }
+
+    /// `pid`'s checked exec forgotten.
+    fn forget_checked(&mut self, pid: u32) {
+        if let Some(r) = self.checked.remove(&pid) {
+            self.checked_order.remove(&r.seq);
+        }
+    }
+}
+
+/// What `r` finds under `proc_root` — the reads, no record at hand: PID 1's
+/// mount table, then whether the filesystem is still tied, or the tie.
+fn read_step(proc_root: &Path, r: &TieRead) -> Found {
+    let Ok(table) = crate::mountinfo::read(&proc_root.join("1/mountinfo")) else {
+        return Found::Nothing;
+    };
+    let fresh = |before: &Ran, check: bool| {
+        if check && !runs_since(proc_root, r.pid, before) {
+            return None;
+        }
+        tie(
+            proc_root,
+            &table,
+            r.pid,
+            r.uid,
+            (r.dev, &r.path),
+            r.caller.as_deref(),
+            before,
+        )
+    };
+    match &r.step {
+        Step::Still { tied, or_tie } => {
+            if still_tied(proc_root, &table, r.dev, r.uid, &r.path, tied) {
+                Found::Still
+            } else {
+                // the tie no longer holds: this exec's own, if it has one
+                or_tie
+                    .as_ref()
+                    .and_then(|(before, check)| fresh(before, *check))
+                    .map_or(Found::Untied, Found::Tied)
+            }
+        }
+        Step::Tie { before, check } => fresh(before, *check).map_or(Found::Nothing, Found::Tied),
+    }
+}
+
+/// The process `pid` is the one whose exec `ran` is, for its check: its
+/// `/proc` start that exec's process's — or, an exec the exec-check pump
+/// noted from its check (start not known), it started by that check (a
+/// pid is not handed out again while its process runs).
+fn runs_since(proc_root: &Path, pid: u32, ran: &Ran) -> bool {
+    use crate::response::proc_ref::{started_at, started_by, stat_start_ticks};
+    crate::state_read::read_state(proc_root.join(pid.to_string()).join("stat"))
+        .ok()
+        .and_then(|stat| stat_start_ticks(&stat))
+        .is_some_and(|ticks| match ran.start {
+            0 => started_by(ticks, ran.exec_ns),
+            start => started_at(ticks, start),
+        })
 }
 
 /// The mounts of the filesystem `dev` when each is a user image's mount of
@@ -375,8 +606,8 @@ fn tie(
     // lot 360 (the review of #568, Q1): the image file's whole path — the
     // walk's when it cut none of its names, else the kernel's own view of it
     // in a daemon that runs that very file (`find_daemon`: its `exe` link
-    // named like the walk's path, name by name, through no FUSE mount, its
-    // device and inode the image's). The walk keeps 31 bytes of a name: an
+    // named like the walk's path, name by name, its device and inode the
+    // image's, its file system no FUSE one by its mount). The walk keeps 31 bytes of a name: an
     // image named `Bitwarden-2025.1.1-x86_64.AppImage` was never tied. The
     // cut text only selects the candidates; the kernel's device and inode
     // decide, at the full path then.
@@ -402,38 +633,26 @@ fn tie(
 
 /// The image file `before` ran, at its whole path `path`, read through
 /// `dir`'s root (`/proc/<pid>/root`): still that file there (device and
-/// inode), the user's, linked, a regular file on no FUSE filesystem — and
-/// its path through no FUSE mount (its daemon answers the lookup, or never:
-/// never `stat`ed).
+/// inode), the user's, linked, a regular file on no FUSE filesystem. Lot
+/// 366: walked from that root one name at a time, every file system on the
+/// way judged by the mount the kernel reached it through
+/// ([`super::pump_reads`]: a FUSE file system is never asked; a network one
+/// root mounted is, on the reader, with its deadline), no symbolic link
+/// followed (a path through a link is no image's).
 fn image_file_at(table: &MountTable, dir: &Path, uid: u32, before: &Ran, path: &Path) -> bool {
-    if under_fuse(table, path) {
-        return false;
-    }
-    let at = dir
-        .join("root")
-        .join(path.strip_prefix("/").unwrap_or(path));
-    // lot 353 (#563's census, at the merge of #564): beneath the /proc root
-    // the start anchored, as every read of the kernel's views
-    let Ok(meta) = antitamper_bpf::kernel_roots::metadata(at) else {
+    let judge = super::pump_reads::Judge::of(table);
+    let Ok(w) = super::pump_reads::walk_in_root(dir, path, &judge) else {
         return false;
     };
-    meta.is_file()
-        && (kernel_dev(meta.dev()), meta.ino()) == (before.dev, before.ino)
-        && meta.uid() == uid
-        && meta.nlink() > 0
+    let c = w.cached;
+    c.is_file()
+        && same_file((before.dev, before.ino), &c, table)
+        && c.uid == uid
+        && c.nlink > 0
         && !table
             .entries
             .iter()
             .any(|e| e.kernel_dev() == before.dev && is_fuse(&e.fstype))
-}
-
-/// `path` lies under a FUSE mount of `table` (its daemon would answer a
-/// `stat` of it, or never).
-fn under_fuse(table: &MountTable, path: &Path) -> bool {
-    table
-        .entries
-        .iter()
-        .any(|e| is_fuse(&e.fstype) && path.starts_with(&e.mount_point))
 }
 
 /// The filesystem `dev` is still tied as `t` says, for an exec of `path`
@@ -504,18 +723,20 @@ fn daemon_facts(
     image: (u64, u64),
     image_path: &Path,
 ) -> Option<(u64, PathBuf)> {
-    // the link's text first, and through no FUSE mount: its target is then
-    // the image's directory's, never a FUSE file to `stat`
+    // the link's text first: a process named so
     let text = antitamper_bpf::kernel_roots::read_link(dir.join("exe")).ok()?;
     let named = text == image_path
         || image_path
             .to_str()
             .is_some_and(|walk| walk_may_name(walk, text.as_os_str().as_bytes()));
-    if !named || under_fuse(table, &text) {
+    if !named {
         return None;
     }
-    let meta = antitamper_bpf::kernel_roots::metadata(dir.join("exe")).ok()?;
-    if (kernel_dev(meta.dev()), meta.ino()) != image {
+    // lot 366: then its file's identity from the kernel's cache, and its
+    // file system by the mount the kernel reached it through — never by the
+    // link's text, never asked of a FUSE daemon
+    let (_, c) = antitamper_bpf::kernel_roots::link_target(&dir.join("exe")).ok()?;
+    if !same_file(image, &c, table) || !super::pump_reads::trusted_in(table, &c) {
         return None;
     }
     let status = crate::state_read::read_state(dir.join("status")).ok()?;
@@ -554,8 +775,10 @@ fn daemon_facts(
 /// descriptor of the image inherited). Refused: a regular file under a
 /// staging directory (its link's text), unlinked, on a memory filesystem,
 /// on a FUSE filesystem, or of no mount of PID 1's table (a `memfd`,
-/// another namespace's) — by the descriptor's `fdinfo` mount, so a FUSE
-/// file is never `stat`ed. A pipe, a socket, a device are no image.
+/// another namespace's) — by the descriptor's `fdinfo` mount; lot 366:
+/// each file's identity from the kernel's cache, so a FUSE file put on a
+/// descriptor since is never asked of its daemon. A pipe, a socket, a
+/// device are no image.
 fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
     let fd_dir = dir.join("fd");
     let Ok(fds) = antitamper_bpf::kernel_roots::read_dir(&fd_dir) else {
@@ -582,15 +805,18 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         if is_fuse(&m.fstype) {
             return false;
         }
-        let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&fd) else {
+        // lot 366: the file's identity from the kernel's cache (a FUSE
+        // file put on this descriptor since its `fdinfo` was read is not
+        // asked of its daemon)
+        let Ok((_, meta)) = antitamper_bpf::kernel_roots::link_target(&fd) else {
             return false;
         };
         if !meta.is_file() {
             continue;
         }
-        if (kernel_dev(meta.dev()), meta.ino()) == image {
+        if same_file(image, &meta, table) {
             held = true;
-        } else if meta.nlink() == 0
+        } else if meta.nlink == 0
             || matches!(m.fstype.as_bytes(), b"tmpfs" | b"ramfs")
             || is_staging_path(&text.to_string_lossy())
         {
@@ -598,6 +824,23 @@ fn serves_the_image(table: &MountTable, dir: &Path, image: (u64, u64)) -> bool {
         }
     }
     fuse && held
+}
+
+/// The re-check of #573 (btrfs): the file the LSM program identified at an
+/// exec (`kernel`) is the file `c`, by the mount `c` was reached through in
+/// PID 1's table ([`crate::mountinfo::same_exec_file`]): an image on btrfs
+/// is tied whichever order the btrfs module and the agent started in.
+fn same_file(
+    kernel: (u64, u64),
+    c: &antitamper_bpf::kernel_roots::Cached,
+    table: &MountTable,
+) -> bool {
+    let mount = table
+        .entries
+        .iter()
+        .find(|e| e.id == c.mnt_id)
+        .map(MountEntry::device_and_btrfs);
+    crate::mountinfo::same_exec_file(kernel, c, mount)
 }
 
 /// The mount of PID 1's table the descriptor `fd` of `dir` is a file of,
@@ -618,7 +861,21 @@ mod tests {
     //! Lot 355: the AppImage tie, on fixture `/proc` trees.
 
     use super::*;
-    use std::os::unix::fs::symlink;
+    use common::wire::exe::kernel_dev;
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    impl AppImages {
+        /// `event` noted, read and marked at once, the processes under
+        /// `proc_root` (the fixtures' record: no pump shares it).
+        pub(super) fn note(&mut self, proc_root: &Path, event: &mut Event) {
+            if let Some(r) = self.take(event) {
+                let found = read_step(proc_root, &r);
+                if self.publish(&r, &found) {
+                    mark(event);
+                }
+            }
+        }
+    }
 
     const INIT_NS: &str = "mnt:[4026531841]";
     const MOUNT: &str = "/tmp/.mount_k355ab";
@@ -712,9 +969,33 @@ mod tests {
             "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
              30 22 0:30 / /tmp rw,nosuid - tmpfs tmpfs rw\n\
              45 30 0:40 / /tmp/sshfs rw,nosuid,nodev - fuse.sshfs h: rw,user_id={uid}\n\
-             {id} {parent} 0:{FUSE_DEV} / {MOUNT} ro,nosuid,nodev - fuse.App.AppImage App.AppImage {super_opts}\n"
+             {id} {parent} 0:{FUSE_DEV} / {MOUNT} ro,nosuid,nodev - fuse.App.AppImage App.AppImage {super_opts}\n{}",
+            real_mounts()
         );
         std::fs::write(root.join("1/mountinfo"), text).unwrap();
+    }
+
+    /// Lot 366: the mounts a walk from `/` to the fixtures' files crosses,
+    /// as the kernel reached them (mount id and device), for the fixture's
+    /// table — a walk is judged by them (a local file system's type).
+    fn real_mounts() -> String {
+        let dir = std::env::current_exe().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = String::new();
+        for a in dir.parent().unwrap().ancestors() {
+            let f = std::fs::File::open(a).unwrap();
+            let c = antitamper_bpf::kernel_roots::cached(&f).unwrap();
+            if seen.insert((c.mnt_id, c.dev)) {
+                out += &format!(
+                    "{} 1 {}:{} / /real{} rw - ext4 real rw\n",
+                    c.mnt_id,
+                    c.dev >> 20,
+                    c.dev & 0xfffff,
+                    seen.len()
+                );
+            }
+        }
+        out
     }
 
     fn fixture() -> Fixture {
@@ -1242,6 +1523,532 @@ mod tests {
         std::fs::write(root.join("1/mountinfo"), t).unwrap();
     }
 
+    /// Lot 366: only an exec whose mark reads `/proc` — a file on an
+    /// anonymous device under a staging directory, as the kernel described
+    /// it, tied or with the process's exec of an image (a check of one) —
+    /// hands a read over; any other is noted in memory, on the pump (the
+    /// image's exec at once, before the exec-check pump asks for it). And
+    /// what such an exec notes is the same either way: the image's exec,
+    /// then its program tied.
+    #[test]
+    fn only_an_exec_whose_tie_reads_proc_is_handed_over() {
+        let f = fixture();
+        let image = image_of(&f);
+        let first = exec(RUNTIME, me(), image, id_of(&f.image), image, IMAGE_EXEC_NS);
+        let noted = || {
+            let mut i = AppImages::default();
+            assert!(
+                i.take(&first).is_none(),
+                "the image's exec: noted in memory"
+            );
+            i
+        };
+        let mut images = noted();
+        assert!(images.ran.contains_key(&RUNTIME), "noted without /proc");
+        let program = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        assert!(
+            noted().take(&program).is_some(),
+            "a FUSE file under /tmp: the tie"
+        );
+        assert!(noted()
+            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+            .is_some());
+        assert!(
+            AppImages::default().take(&program).is_none(),
+            "no image's exec before it, nothing tied: nothing to read"
+        );
+        let disk = exec(RUNTIME, me(), &apprun(), ((8 << 20) | 1, 2), &apprun(), 50);
+        assert!(
+            noted().take(&disk).is_none(),
+            "a disk's device under /tmp: never tied"
+        );
+        let mut unknown = program.clone();
+        if let Event::ProcessSpawn { exe, .. } = &mut unknown {
+            exe.flags &= !exe_flags::KNOWN;
+        }
+        assert!(noted().take(&unknown).is_none(), "no kernel identity");
+        let mut program = program;
+        images.note(f.proc.path(), &mut program);
+        assert!(user_image(&program));
+    }
+
+    /// Lot 366, the review of #573 (F1): the exec pump notes an exec at
+    /// once, and the exec-check pump may read a check after it — `AppRun`'s
+    /// check after `AppRun`'s exec, `app`'s check after `app`'s exec, both
+    /// before a tie is published: the image's exec stays the process's
+    /// across its execs from a staging FUSE file, each check and exec then
+    /// tied; an exec of something else forgets it. Fails where `AppRun`'s
+    /// exec forgot it (the lab: whole AppImage runs judged from `/tmp`).
+    #[test]
+    fn the_image_s_exec_stays_the_process_s_for_its_checks() {
+        let f = fixture();
+        let uid = me();
+        let image = image_of(&f);
+        let mut images = AppImages::default();
+        let first = exec(RUNTIME, uid, image, id_of(&f.image), image, IMAGE_EXEC_NS);
+        assert!(images.take(&first).is_none());
+        let apprun_exec = exec(RUNTIME, uid, &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        let program = format!("{MOUNT}/usr/bin/app");
+        let app_exec = exec(RUNTIME, uid, &program, (FUSE_DEV, 9), &program, 60);
+        // the exec pump: `AppRun`'s exec and `app`'s, noted before any check
+        let r1 = images.take(&apprun_exec).expect("AppRun's exec read");
+        let r2 = images.take(&app_exec).expect("app's exec read");
+        // the exec-check pump, after: each check still finds the image's exec
+        let c1 = images
+            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+            .expect("AppRun's check read");
+        let c2 = images
+            .take(&check(RUNTIME, &program, FUSE_DEV, &program))
+            .expect("app's check read");
+        for r in [&r1, &r2, &c1, &c2] {
+            let found = read_step(f.proc.path(), r);
+            assert!(images.publish(r, &found), "{:?}: {found:?}", r.path);
+        }
+        // an exec of something else: forgotten
+        let other = exec(
+            RUNTIME,
+            uid,
+            "/usr/bin/true",
+            ((8 << 20) | 1, 5),
+            "/usr/bin/true",
+            70,
+        );
+        assert!(images.take(&other).is_none());
+        assert!(!images.ran.contains_key(&RUNTIME), "forgotten");
+    }
+
+    /// Lot 366, the review of #573 (F1): the exec-check pump ties the
+    /// check of an image's program by itself — from its own check of the
+    /// image's exec — whichever pump is ahead: `AppRun`'s check read before
+    /// the exec pump noted the image's exec ties. Fails where the check
+    /// needed the exec pump's note (the lab: `AppRun`'s check judged from
+    /// `/tmp` in some runs).
+    #[test]
+    fn the_check_pump_ties_without_the_exec_pump_s_note() {
+        let f = fixture();
+        let uid = me();
+        let image = image_of(&f).to_string();
+        let (dev, ino) = id_of(&f.image);
+        let image_check = Event::ExecCheck {
+            pid: RUNTIME,
+            ppid: 1,
+            uid,
+            comm: "x".into(),
+            filename: image.clone(),
+            timestamp_ns: IMAGE_EXEC_NS,
+            exe: nn_model::ExeIdentity {
+                path: image.clone(),
+                dev,
+                ino,
+                flags: exe_flags::KNOWN | exe_flags::TASK_ROOT,
+                ..Default::default()
+            },
+        };
+        let mut images = AppImages::default();
+        assert!(images.take(&image_check).is_none());
+        assert!(images.ran.is_empty(), "the exec pump noted nothing");
+        let r = images
+            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+            .expect("AppRun's check read");
+        let found = read_step(f.proc.path(), &r);
+        assert!(images.publish(&r, &found), "{found:?}");
+        // the pid's process now one that started after the image's check
+        // (the pid handed out again): no tie
+        let mut images = AppImages::default();
+        assert!(images.take(&image_check).is_none());
+        let stat = f.proc.path().join(RUNTIME.to_string()).join("stat");
+        let kept = std::fs::read_to_string(&stat).unwrap();
+        std::fs::write(
+            &stat,
+            format!("{RUNTIME} (App) S {}{FRESH}\n", "0 ".repeat(18)),
+        )
+        .unwrap();
+        let r = images
+            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+            .expect("AppRun's check read");
+        assert_eq!(
+            read_step(f.proc.path(), &r),
+            Found::Nothing,
+            "another process"
+        );
+        std::fs::write(&stat, kept).unwrap();
+        // another program's check since: the image's check is forgotten
+        let mut images = AppImages::default();
+        assert!(images.take(&image_check).is_none());
+        assert!(images
+            .take(&check(
+                RUNTIME,
+                "/usr/bin/true",
+                (8 << 20) | 1,
+                "/usr/bin/true"
+            ))
+            .is_none());
+        assert!(images
+            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+            .is_none());
+    }
+
+    /// Lot 366, the review of #573 (F1): a FUSE device is handed out again
+    /// — the next AppImage's mount often gets the last one's — and the
+    /// record still holds the last mount's tie for it: the first exec from
+    /// the new mount (`AppRun`'s) finds that tie no longer holds and is tied
+    /// to its own image's exec in the same read, never left judged. Fails
+    /// where a tie that no longer held left the exec unmarked (the lab:
+    /// `AppRun` judged from `/tmp` in some runs).
+    #[test]
+    fn a_device_handed_out_again_is_tied_to_its_new_image() {
+        let f = fixture();
+        let uid = me();
+        let image = image_of(&f);
+        let mut images = AppImages::default();
+        // the last run's tie of the device: its mount and daemon gone
+        images.tied.insert(
+            FUSE_DEV,
+            Tied {
+                mount_id: 9_999,
+                uid,
+                image: id_of(&f.image),
+                image_path: f.image.clone(),
+                daemon: 4_242,
+                daemon_ticks: 1,
+            },
+        );
+        let mut first = exec(RUNTIME, uid, image, id_of(&f.image), image, IMAGE_EXEC_NS);
+        images.note(f.proc.path(), &mut first);
+        let mut check = check(RUNTIME, &apprun(), FUSE_DEV, &apprun());
+        images.note(f.proc.path(), &mut check);
+        assert!(
+            user_image(&check),
+            "AppRun's check, the device's last tie gone"
+        );
+        images.tied.insert(
+            FUSE_DEV,
+            Tied {
+                mount_id: 9_999,
+                uid,
+                image: id_of(&f.image),
+                image_path: f.image.clone(),
+                daemon: 4_242,
+                daemon_ticks: 1,
+            },
+        );
+        let mut e = exec(RUNTIME, uid, &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(user_image(&e), "AppRun's exec, the device's last tie gone");
+        assert_eq!(
+            images.tied.get(&FUSE_DEV).map(|t| t.daemon),
+            Some(DAEMON),
+            "tied anew"
+        );
+    }
+
+    /// Lot 366, the review of #573 (F1): a read's finding is published once
+    /// it answers, the record's lock not held meanwhile — so a late "no
+    /// longer tied" drops the tie it read, never one made since; a late tie
+    /// is kept.
+    #[test]
+    fn a_late_untie_drops_only_the_tie_it_read() {
+        let mut images = AppImages::default();
+        let t1 = Tied {
+            mount_id: 61,
+            uid: me(),
+            image: (1, 2),
+            image_path: PathBuf::from("/home/u/App.AppImage"),
+            daemon: DAEMON,
+            daemon_ticks: 1,
+        };
+        let t2 = Tied {
+            daemon_ticks: 2,
+            ..t1.clone()
+        };
+        let r = TieRead {
+            pid: RUNTIME,
+            uid: me(),
+            dev: FUSE_DEV,
+            path: PathBuf::from(apprun()),
+            caller: None,
+            step: Step::Still {
+                tied: t1.clone(),
+                or_tie: None,
+            },
+            seen: Some(t1.clone()),
+        };
+        images.tied.insert(FUSE_DEV, t2.clone());
+        assert!(!images.publish(&r, &Found::Untied));
+        assert_eq!(
+            images.tied.get(&FUSE_DEV),
+            Some(&t2),
+            "a tie made since stays"
+        );
+        images.tied.insert(FUSE_DEV, t1.clone());
+        assert!(images.publish(&r, &Found::Still));
+        assert!(!images.publish(&r, &Found::Untied));
+        assert_eq!(images.tied.get(&FUSE_DEV), None, "the tie it read: dropped");
+        assert!(images.publish(&r, &Found::Tied(t1.clone())));
+        assert_eq!(images.tied.get(&FUSE_DEV), Some(&t1), "a late tie kept");
+        assert!(!images.publish(&r, &Found::Nothing));
+    }
+
+    /// The re-check of #573 (N6): a tie read held past its deadline, its
+    /// mount gone since and the device handed to a new image's mount, tied
+    /// meanwhile: the late tie marks its own exec, never overwrites the
+    /// newer tie (the next exec without a candidate of its own — a zygote's
+    /// — would read the old one, drop it, and go unmarked). Over the tie it
+    /// was read against, or in an empty place, it is published. Fails
+    /// where a late tie was published over any (a79a10b9).
+    #[test]
+    fn a_late_tie_never_overwrites_a_newer_one() {
+        let old = Tied {
+            mount_id: 61,
+            uid: me(),
+            image: (1, 2),
+            image_path: PathBuf::from("/home/u/Old.AppImage"),
+            daemon: DAEMON,
+            daemon_ticks: 1,
+        };
+        let new = Tied {
+            mount_id: 62,
+            image: (1, 3),
+            image_path: PathBuf::from("/home/u/New.AppImage"),
+            daemon_ticks: 5,
+            ..old.clone()
+        };
+        let late = |seen: Option<Tied>| TieRead {
+            pid: RUNTIME,
+            uid: me(),
+            dev: FUSE_DEV,
+            path: PathBuf::from(apprun()),
+            caller: None,
+            step: Step::Tie {
+                before: Ran {
+                    start: 1,
+                    dev: 1,
+                    ino: 2,
+                    path: PathBuf::from("/home/u/Old.AppImage"),
+                    exec_ns: 1,
+                    seq: 0,
+                },
+                check: false,
+            },
+            seen,
+        };
+        for seen in [None, Some(old.clone())] {
+            let mut images = AppImages::default();
+            images.tied.insert(FUSE_DEV, new.clone());
+            assert!(
+                images.publish(&late(seen.clone()), &Found::Tied(old.clone())),
+                "its own exec marked"
+            );
+            assert_eq!(
+                images.tied.get(&FUSE_DEV),
+                Some(&new),
+                "the newer tie stays ({seen:?})"
+            );
+        }
+        // over the tie it was read against (a device handed out again, its
+        // exec's own tie), or in an empty place: published
+        let mut images = AppImages::default();
+        images.tied.insert(FUSE_DEV, old.clone());
+        assert!(images.publish(&late(Some(old.clone())), &Found::Tied(new.clone())));
+        assert_eq!(images.tied.get(&FUSE_DEV), Some(&new));
+        let mut images = AppImages::default();
+        assert!(images.publish(&late(None), &Found::Tied(new.clone())));
+        assert_eq!(images.tied.get(&FUSE_DEV), Some(&new));
+    }
+
+    /// Lot 366, the review of #573 (F1): a tie's read that does not answer
+    /// (here PID 1's table, made a file of a FUSE file system that answers
+    /// nothing) holds its reader only — the record's lock is not held while
+    /// it reads: the next exec is noted at once on the exec pump, and the
+    /// next check on the exec-check pump, while that read still waits.
+    /// Fails where the record's lock was held across the tie's reads
+    /// (bad1b957: both pumps waited on it, with no deadline).
+    #[test]
+    fn the_pump_never_waits_on_a_tie_read_that_is_stuck() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let f = fixture();
+            let record = std::sync::Arc::new(Mutex::new(AppImages::default()));
+            let image = image_of(&f).to_string();
+            let first = exec(
+                RUNTIME,
+                me(),
+                &image,
+                id_of(&f.image),
+                &image,
+                IMAGE_EXEC_NS,
+            );
+            assert!(note_in(&record, &first).is_none());
+            let program = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+            let Some(r) = note_in(&record, &program) else {
+                return false;
+            };
+            let table = f.proc.path().join("1/mountinfo");
+            std::fs::remove_file(&table).unwrap();
+            symlink(held.join("mountinfo"), &table).unwrap();
+            let (rec, proc_root) = (std::sync::Arc::clone(&record), f.proc.path().to_path_buf());
+            let reader = std::thread::spawn(move || read_tie_in(&rec, &proc_root, &r));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let t0 = std::time::Instant::now();
+            let next = exec(
+                RUNTIME + 1,
+                me(),
+                &image,
+                id_of(&f.image),
+                &image,
+                IMAGE_EXEC_NS,
+            );
+            let noted =
+                note_in(&record, &next).is_none() && record.lock().ran.contains_key(&(RUNTIME + 1));
+            let checked =
+                note_in(&record, &check(RUNTIME + 1, &apprun(), FUSE_DEV, &apprun())).is_some();
+            let at_once = t0.elapsed() < std::time::Duration::from_millis(200);
+            !reader.is_finished() && noted && checked && at_once
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "noted at once (0), not held (5) nor slow (1)");
+        }
+    }
+
+    /// Lot 366, the review of #573 (F2): an image in a home on btrfs (a
+    /// subvolume's files show a device of their own, which no table shows)
+    /// or on NFS (a network file system root mounted) is tied as on ext4:
+    /// its walk judged by the mount the kernel reached each file through.
+    /// Fails where the judge went by the device and refused network file
+    /// systems (bad1b957: every such AppImage's program killed by R001).
+    #[test]
+    fn an_image_in_a_btrfs_or_nfs_home_is_tied() {
+        let real = real_mounts();
+        for (fstype, dev) in [("btrfs", Some("0:31")), ("nfs4", None), ("cifs", None)] {
+            let f = fixture();
+            let path = f.proc.path().join("1/mountinfo");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut swapped = String::new();
+            for l in real.lines() {
+                let mut fields: Vec<&str> = l.split(' ').collect();
+                if let Some(d) = dev {
+                    fields[2] = d;
+                }
+                fields[7] = fstype;
+                swapped += &(fields.join(" ") + "\n");
+            }
+            std::fs::write(&path, text.replace(&real, &swapped)).unwrap();
+            assert!(
+                run(&mut AppImages::default(), &f, me(), &apprun()),
+                "{fstype}: tied"
+            );
+        }
+    }
+
+    /// The re-check of #573 (btrfs): an image on btrfs is tied whichever
+    /// order the btrfs module and the agent started in. Loaded after the
+    /// agent, the LSM program names a btrfs file by the file system's own
+    /// device (`statx` names the subvolume's): the mount the file is reached
+    /// through decides, with the inode. Another inode, another device, or
+    /// that device on a mount that is not btrfs: no tie. Fails where the
+    /// image was compared by device alone (a79a10b9: every AppImage of a
+    /// btrfs home judged from `/tmp` when btrfs was loaded after the agent).
+    #[test]
+    fn an_image_on_btrfs_is_tied_whatever_order_btrfs_was_loaded_in() {
+        let real = real_mounts();
+        let as_btrfs = |fstype: &str| {
+            let mut swapped = String::new();
+            for l in real.lines() {
+                let mut fields: Vec<&str> = l.split(' ').collect();
+                fields[2] = "0:31";
+                fields[7] = fstype;
+                swapped += &(fields.join(" ") + "\n");
+            }
+            swapped
+        };
+        // 0:31, the file system's own device, as the LSM program gives it
+        // when btrfs was loaded after the agent
+        let tie_with = |fstype: &str, id: fn((u64, u64)) -> (u64, u64)| {
+            let f = fixture();
+            let path = f.proc.path().join("1/mountinfo");
+            let text = std::fs::read_to_string(&path).unwrap();
+            // and a btrfs mount of that device elsewhere: the mount the file
+            // is reached through decides, not any mount of the device
+            let other = "77777 1 0:31 / /elsewhere rw - btrfs other rw\n";
+            std::fs::write(&path, text.replace(&real, &(as_btrfs(fstype) + other))).unwrap();
+            let image = f.image.to_str().unwrap();
+            let mut images = AppImages::default();
+            let mut first = exec(
+                RUNTIME,
+                me(),
+                image,
+                id(id_of(&f.image)),
+                image,
+                IMAGE_EXEC_NS,
+            );
+            images.note(f.proc.path(), &mut first);
+            let mut second = exec(RUNTIME, me(), &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+            images.note(f.proc.path(), &mut second);
+            user_image(&second)
+        };
+        assert!(
+            tie_with("btrfs", |id| id),
+            "btrfs loaded first: the subvolume's"
+        );
+        assert!(
+            tie_with("btrfs", |(_, ino)| (31, ino)),
+            "loaded after: the file system's"
+        );
+        assert!(
+            !tie_with("btrfs", |(_, ino)| (31, ino + 1)),
+            "another inode"
+        );
+        assert!(!tie_with("btrfs", |(_, ino)| (32, ino)), "another device");
+        assert!(
+            !tie_with("ext4", |(_, ino)| (31, ino)),
+            "not btrfs: the device decides"
+        );
+    }
+
+    /// Lot 366: the runtime's root a FUSE file system's that answers
+    /// nothing: the tie never asks it — no tie, at once (on 993795e0 the
+    /// `metadata` of that root waited on the daemon, and both exec pumps
+    /// with it, through the shared record).
+    #[test]
+    fn the_tie_never_waits_on_a_fuse_that_answers_nothing() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let f = fixture();
+            let d = f.proc.path().join(RUNTIME.to_string());
+            std::fs::remove_file(d.join("root")).unwrap();
+            symlink(held, d.join("root")).unwrap();
+            !run(&mut AppImages::default(), &f, me(), &apprun())
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor tied (1)");
+        }
+    }
+
+    /// Lot 366: the image file is walked from the process's root one name
+    /// at a time, no link followed — an image path through a directory that
+    /// is a link is no image's: no tie (fails on 993795e0).
+    #[test]
+    fn an_image_path_through_a_link_is_no_tie() {
+        let f = fixture();
+        let uid = me();
+        let fz = f._files.path().join("fz");
+        std::fs::create_dir(&fz).unwrap();
+        let real = fz.join("App.AppImage");
+        std::fs::write(&real, b"\x7fELF runtime + squashfs").unwrap();
+        let a = f._files.path().join("a");
+        symlink(&fz, &a).unwrap();
+        let via = a.join("App.AppImage");
+        daemon(f.proc.path(), DAEMON, &via, uid, "S", FRESH, true);
+        let mut images = AppImages::default();
+        let p = via.to_str().unwrap();
+        let mut first = exec(RUNTIME, uid, p, id_of(&real), p, IMAGE_EXEC_NS);
+        images.note(f.proc.path(), &mut first);
+        let mut e = exec(RUNTIME, uid, &apprun(), (FUSE_DEV, 2), &apprun(), 50);
+        images.note(f.proc.path(), &mut e);
+        assert!(!user_image(&e), "tied through a link");
+        // the image at its own path: tied
+        let f = fixture();
+        assert!(run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
     /// No image: a `fuseblk` filesystem, one shown only by a mount of a
     /// directory of it, a file mounted as the mount point itself, an image
     /// file on a FUSE filesystem.
@@ -1251,7 +2058,8 @@ mod tests {
         let fuse = |fstype: &str, root: &str| {
             format!(
                 "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:30 / /tmp rw - tmpfs tmpfs rw\n\
-                 61 30 0:{FUSE_DEV} {root} {MOUNT} ro,nosuid - {fstype} x ro,user_id={uid}\n"
+                 61 30 0:{FUSE_DEV} {root} {MOUNT} ro,nosuid - {fstype} x ro,user_id={uid}\n{}",
+                real_mounts()
             )
         };
         for (fstype, root) in [("fuseblk", "/"), ("fuse.App.AppImage", "/sub")] {
@@ -1535,14 +2343,26 @@ mod tests {
     fn the_image_s_path_is_never_read_through_a_fuse_mount() {
         let f = fixture();
         let uid = me();
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={uid},allow_other",
-                f._files.path().display()
-            ),
-        );
+        assert_eq!(uid, me());
+        table_plus(f.proc.path(), &fuse_line(f._files.path()));
         assert!(!run(&mut AppImages::default(), &f, uid, &apprun()));
+    }
+
+    /// Lot 366: a FUSE mount at `path`, of the file system the kernel
+    /// reports `path` on (its device): the pumps judge a file system by the
+    /// device the kernel reached a file through, never by a path's text.
+    fn fuse_line(path: &Path) -> String {
+        // lot 366 (the review of #573, F2): the mount the kernel reaches
+        // `path` through, by its id — the judge's key — now a FUSE one
+        let c = antitamper_bpf::kernel_roots::cached(&std::fs::File::open(path).unwrap()).unwrap();
+        format!(
+            "{} 22 {}:{} / {} rw,nosuid - fuse.sshfs h: rw,user_id={},allow_other",
+            c.mnt_id,
+            c.dev >> 20,
+            c.dev & 0xfffff,
+            path.display(),
+            me()
+        )
     }
 
     /// The LSM walk's text of `path` (`common::wire::exe::relative_path`):
@@ -1681,14 +2501,7 @@ mod tests {
         // walk's text)
         let f = fixture_at(&format!("{dir}/{long}"));
         daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
-                f.image.parent().unwrap().display(),
-                me()
-            ),
-        );
+        table_plus(f.proc.path(), &fuse_line(f.image.parent().unwrap()));
         assert!(!run_walked(&mut AppImages::default(), &f), "a FUSE mount");
         // tied, then a FUSE mount over the image's directory: the tie ends
         // (the daemon's link is read through it: never `stat`ed)
@@ -1696,14 +2509,7 @@ mod tests {
         daemon(f.proc.path(), DAEMON, &f.image, me(), "S", FRESH, true);
         let mut images = AppImages::default();
         assert!(run_walked(&mut images, &f));
-        table_plus(
-            f.proc.path(),
-            &format!(
-                "70 22 0:88 / {} rw,nosuid - fuse.sshfs h: rw,user_id={}",
-                f.image.parent().unwrap().display(),
-                me()
-            ),
-        );
+        table_plus(f.proc.path(), &fuse_line(f.image.parent().unwrap()));
         let program = format!("{MOUNT}/usr/bin/app");
         let mut later = exec(
             RUNTIME + 1,
@@ -1764,7 +2570,8 @@ mod tests {
             f.proc.path().join("1/mountinfo"),
             format!(
                 "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:30 / /tmp rw - tmpfs tmpfs rw\n\
-                 61 30 8:{FUSE_DEV} / {MOUNT} ro,nosuid - fuse.App.AppImage x ro,user_id={uid}\n"
+                 61 30 8:{FUSE_DEV} / {MOUNT} ro,nosuid - fuse.App.AppImage x ro,user_id={uid}\n{}",
+                real_mounts()
             ),
         )
         .unwrap();

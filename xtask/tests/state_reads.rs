@@ -73,6 +73,9 @@ const APPIMG: &str = "PID 1's mount table, read for the AppImage tie (lot 355): 
                       filesystem is tied to an image and the exec is judged staged, as before \
                       (the stricter side), never an emptied protection";
 /// Why a kernel-written ASCII file may default.
+const JUDGE: &str = "a process's own mount table, read for the exec pumps' judge when no host \
+    table shows a mount it reached (lot 366, the review of #573, F2): unreadable, no table — the \
+    mount is not asked and the facts it would give are judged not verified, never trusted";
 const KNOB: &str = "written by the kernel in ASCII (/proc/sys, /sys, meminfo, /proc/stat, fdinfo, \
                     the boot id, the agent's own /proc/self): no user writes it; unreadable, the \
                     built-in value applies (a bound, a new boot, no finding)";
@@ -700,6 +703,11 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "crates/nn-linux/src/sensors/app_image.rs",
         "mountinfo::read(&proc_root.join(\"1/mountinfo\"))",
         APPIMG,
+    ),
+    (
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "mountinfo::read(&dir.join(\"mountinfo\"))",
+        JUDGE,
     ),
     (
         "crates/nn-linux/src/sensors/app_image.rs",

@@ -463,17 +463,38 @@ not cause as an incident.
   programs they could run from their home anyway. What the program then
   does is judged as for any user program. *Evidence:*
   `an_appimage_program_is_its_image_s`; lot 355.
-- **A file system that does not answer can delay exec records.** To
-  judge a program it runs, the agent reads facts about the program's file.
-  A program on a file system the agent does not trust to answer (FUSE, a
-  network file system) can delay that reading, and the exec records
-  behind it. The sensor self-test then finds its own
-  exec missing and signs a degradation (`subsystem_degraded`, source
-  `sensor_selftest`). *For you:* such a degradation in `nn-admin status`
-  is worth a report, with the file systems mounted at the time
-  (`findmnt -t fuse,fuseblk`). *Evidence:*
-  `a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert`;
-  lot 355.
+- **A file system that does not answer leaves exec facts not verified.**
+  To judge a program it runs, the agent reads facts about the program's
+  files, with a short deadline and fairly between users, never on the
+  exec pumps themselves; a FUSE file system is never read. A fact not read
+  in time is judged not verified, never trusted, and the exec sensor is
+  signed degraded (`exec_reads_unanswered`; `exec_readers_held` while a
+  share of the reader is held; `exec_reads_slow`, naming the user, when
+  slow reads slowed the exec pump). A user's subordinate ids
+  (`/etc/subuid`) count as that user. An id from 65536 up that the agent
+  cannot give one known user is *unattributed*: every such id while the
+  ranges are not published (before the first publish, and always with the
+  file-open sensor on its tracepoint), or while `/etc/subuid` cannot be
+  read; an id of a range whose owner `/etc/passwd` does not name (an sssd
+  or LDAP user's), of overlapping ranges or of a gap; an id past every
+  range (a range added in the last 2 seconds, a domain account with a high
+  uid). The unattributed ids have one share of the reader together, one
+  read at a time: they can make each other's facts unverifiable, never an
+  attributed user's, root's or the system accounts', and that share held
+  is signed once while it lasts (`exec_readers_held`). One user cannot
+  make another user's facts unverifiable; two users acting together can
+  hold the users' share, and that is signed (`exec_readers_held`). *For
+  you:* such a degradation in `nn-admin status` is worth a report, with
+  the file systems mounted at the time
+  (`findmnt -t fuse,fuseblk,nfs,nfs4,cifs`).
+  *Evidence:* `one_uid_cannot_starve_root_s_reads`;
+  `one_user_s_subordinate_ids_starve_no_other_user`;
+  `unattributed_ids_none_published_starve_no_attributed_user`;
+  `unattributed_ids_subuid_unreadable_starve_no_attributed_user`;
+  `unattributed_ids_owner_not_in_passwd_starve_no_attributed_user`;
+  `unattributed_ids_past_every_range_starve_no_attributed_user`;
+  `the_slow_records_never_crowd_out_the_exec_signals`;
+  `an_exec_step_that_never_answers_is_not_waited_for`; lot 366.
 - **After a long suspend, a record can name an earlier program.** A
   process id reused after the host spent a long time suspended can be
   taken for a process that held it before the agent started (a laptop

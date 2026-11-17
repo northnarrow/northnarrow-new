@@ -41,8 +41,13 @@ pub const SIGNED_WITHIN: Duration = Duration::from_secs(60);
 const _: () = assert!(FLUSH_PERIOD.as_secs() * 2 < SIGNED_WITHIN.as_secs());
 
 /// Degradations kept for the status; past it they are counted only (and
-/// still signed).
+/// still signed). The parts with a budget of their own ([`note_kept`]) are
+/// kept outside it.
 pub const MAX_KEPT: usize = 64;
+
+/// Lot 366 (the re-check of #573, N2): the source of the signed count of
+/// the notes past [`MAX_KEPT`] that could not wait for the flush.
+pub const NOTES_DROPPED: &str = "degradation_notes";
 
 /// One degradation of this run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +60,9 @@ pub struct Degradation {
     pub at_boot: bool,
     /// Its signed record is written.
     pub signed: bool,
+    /// Lot 366 (the re-check of #573, N2): kept within its source's own
+    /// budget ([`note_kept`]), not against [`MAX_KEPT`].
+    own_budget: bool,
 }
 
 impl Degradation {
@@ -83,6 +91,14 @@ struct Registry {
     repairs: Vec<(PathBuf, TailRepair)>,
     /// Repairs past [`MAX_KEPT`] waiting: not signed (an ERROR each).
     repairs_dropped: u64,
+    /// Lot 366 (the re-check of #573, N2): notes not kept — past
+    /// [`MAX_KEPT`], or past their source's own budget — waiting for the
+    /// next flush, which signs them: a note is never only counted. At most
+    /// [`MAX_KEPT`] wait.
+    unkept: Vec<Degradation>,
+    /// Notes past that bound: their count is signed at the next flush
+    /// ([`NOTES_DROPPED`]).
+    unkept_dropped: u64,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -93,6 +109,8 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     boot_over: false,
     repairs: Vec::new(),
     repairs_dropped: 0,
+    unkept: Vec::new(),
+    unkept_dropped: 0,
 });
 
 /// A degradation found by a part of the agent without the audit log at
@@ -115,6 +133,7 @@ pub fn report(source: &str, detail: &str) -> bool {
                 detail: detail.to_string(),
                 at_boot,
                 signed: false,
+                own_budget: false,
             },
         )
     };
@@ -124,29 +143,164 @@ pub fn report(source: &str, detail: &str) -> bool {
 
 /// Lot 353 (the review of #563, F1): [`report`] for a caller that may hold
 /// the audit log's lock (a signed log's writer telling its failure): it
-/// never signs here — past [`MAX_KEPT`] it is counted only, never signed
-/// at once (that would take the lock its caller holds). Signed at the next
-/// flush like every report. Returns whether it is new.
+/// never signs here — at the next flush like every report. Lot 366 (the
+/// re-check of #573, N2): past [`MAX_KEPT`] it is not kept for the status
+/// but waits for that flush all the same (counted, and signed then), never
+/// only counted. Returns whether it is new.
 pub fn note(source: &str, detail: &str) -> bool {
     let mut r = REGISTRY.lock();
-    if r.entries
-        .iter()
-        .any(|d| d.source == source && d.detail == detail)
-    {
+    if noted(&r, source, detail) {
         return false;
     }
-    if r.entries.len() >= MAX_KEPT {
-        r.overflow += 1;
-        return true;
-    }
-    let at_boot = !r.boot_over;
-    r.entries.push(Degradation {
+    let d = Degradation {
         source: source.to_string(),
         detail: detail.to_string(),
-        at_boot,
+        at_boot: !r.boot_over,
         signed: false,
-    });
+        own_budget: false,
+    };
+    if shared_len(&r) >= MAX_KEPT {
+        unkept(&mut r, d);
+    } else {
+        r.entries.push(d);
+    }
     true
+}
+
+/// Lot 366 (the re-check of #573, N2): [`note`] for a part that keeps its
+/// own bounded share of the registry — at most `budget` records of
+/// `source` kept at once, outside [`MAX_KEPT`] and never counted against
+/// it: no other part's records crowd its records out, and its records
+/// crowd out no other part's. Past its budget a record is not kept but is
+/// signed at the next flush all the same. The exec pumps' conditions, made
+/// on a thread that never waits on the audit log. Returns whether it is
+/// new.
+pub fn note_kept(source: &str, detail: &str, budget: usize) -> bool {
+    if !kept_told() {
+        return true;
+    }
+    let mut r = REGISTRY.lock();
+    if noted(&r, source, detail) {
+        return false;
+    }
+    let d = Degradation {
+        source: source.to_string(),
+        detail: detail.to_string(),
+        at_boot: !r.boot_over,
+        signed: false,
+        own_budget: true,
+    };
+    let held = r
+        .entries
+        .iter()
+        .filter(|e| e.own_budget && e.source == source)
+        .count();
+    if held >= budget {
+        unkept(&mut r, d);
+    } else {
+        r.entries.push(d);
+    }
+    true
+}
+
+/// Lot 366 (the re-check of #573, N4): the record `detail` of `source` made
+/// with [`note_kept`] leaves the status — that record only, not the
+/// source's others — and is signed at the next flush if it was not yet.
+/// Returns how many left.
+pub fn retire_kept(source: &str, detail: &str) -> usize {
+    if !kept_told() {
+        return 0;
+    }
+    retire_where(source, |d| d == detail)
+}
+
+/// Lot 366 (the re-check of #573, N2): a record of a condition that held
+/// and has ended (a window of the exec pumps' slow reads, with its total),
+/// for the signed log only: not kept for the status, signed at the next
+/// flush.
+pub fn sign_ended(source: &str, detail: &str) {
+    if !kept_told() {
+        return;
+    }
+    let mut r = REGISTRY.lock();
+    let d = Degradation {
+        source: source.to_string(),
+        detail: detail.to_string(),
+        at_boot: !r.boot_over,
+        signed: false,
+        own_budget: true,
+    };
+    if r.unkept.len() < MAX_KEPT {
+        r.unkept.push(d);
+    } else {
+        r.unkept_dropped += 1;
+    }
+}
+
+/// `(source, detail)` is kept already, or waits for the flush.
+fn noted(r: &Registry, source: &str, detail: &str) -> bool {
+    r.entries
+        .iter()
+        .chain(&r.unkept)
+        .any(|d| d.source == source && d.detail == detail)
+}
+
+/// The entries kept against [`MAX_KEPT`] (not within a budget of their own).
+fn shared_len(r: &Registry) -> usize {
+    r.entries.iter().filter(|d| !d.own_budget).count()
+}
+
+/// A note not kept: counted, and signed at the next flush — at most
+/// [`MAX_KEPT`] wait, the count of the others signed then.
+fn unkept(r: &mut Registry, d: Degradation) {
+    r.overflow += 1;
+    if r.unkept.len() < MAX_KEPT {
+        r.unkept.push(d);
+    } else {
+        r.unkept_dropped += 1;
+    }
+}
+
+/// Lot 366 (the re-check of #573, N1): whether the records of the parts
+/// with a budget of their own go into the registry — always in the agent.
+/// In the unit tests the exec pumps' records (made by any test that runs a
+/// pump step) are told only on a thread whose test asked ([`KeptTold`],
+/// with [`TEST_LOCK`] held): the tests that read the registry see their
+/// own records alone, whatever runs beside them.
+fn kept_told() -> bool {
+    #[cfg(test)]
+    {
+        KEPT_TOLD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEPT_TOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests (with [`TEST_LOCK`] held): this thread's records of the parts with
+/// a budget of their own are told to the registry while this is held.
+#[cfg(test)]
+pub(crate) struct KeptTold;
+
+#[cfg(test)]
+impl KeptTold {
+    pub(crate) fn new() -> Self {
+        KEPT_TOLD.with(|t| t.set(true));
+        KeptTold
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeptTold {
+    fn drop(&mut self) {
+        KEPT_TOLD.with(|t| t.set(false));
+    }
 }
 
 /// A degradation whose finder holds the audit log: signed now (every time,
@@ -179,6 +333,7 @@ pub fn report_signed(
             detail: detail.to_string(),
             at_boot,
             signed,
+            own_budget: false,
         },
     );
     drop(r);
@@ -213,6 +368,7 @@ pub fn keep(source: &str, detail: &str, signed: bool) {
             detail: detail.to_string(),
             at_boot,
             signed: true,
+            own_budget: false,
         },
     );
 }
@@ -221,7 +377,7 @@ pub fn keep(source: &str, detail: &str, signed: bool) {
 /// sink, to be signed once the registry's lock is released (it is not kept,
 /// so no flush would sign it).
 fn push(r: &mut Registry, d: Degradation) -> Option<(Arc<Mutex<AuditLog>>, Degradation)> {
-    if r.entries.len() < MAX_KEPT {
+    if shared_len(r) < MAX_KEPT {
         r.entries.push(d);
         None
     } else {
@@ -386,7 +542,23 @@ fn flush_reports() -> usize {
             d.signed = true;
             pending.push(d.clone());
         }
-        let withdrawn = std::mem::take(&mut r.withdrawn_unsigned);
+        let mut withdrawn = std::mem::take(&mut r.withdrawn_unsigned);
+        // lot 366 (the re-check of #573, N2): the notes not kept, then the
+        // count of those that could not wait
+        withdrawn.append(&mut r.unkept);
+        let dropped = std::mem::take(&mut r.unkept_dropped);
+        if dropped > 0 {
+            withdrawn.push(Degradation {
+                source: NOTES_DROPPED.to_string(),
+                detail: format!(
+                    "{dropped} degradation note(s) not kept and not signed one by one: more \
+                     than {MAX_KEPT} waited for the audit log"
+                ),
+                at_boot: !r.boot_over,
+                signed: false,
+                own_budget: false,
+            });
+        }
         (sink, (pending, withdrawn))
     };
     let (pending, withdrawn) = pending;
@@ -536,6 +708,8 @@ pub(crate) fn reset_for_tests() {
     r.boot_over = false;
     r.repairs.clear();
     r.repairs_dropped = 0;
+    r.unkept.clear();
+    r.unkept_dropped = 0;
 }
 
 /// The registry is one per process: the tests that read it run one at a
@@ -864,6 +1038,125 @@ mod tests {
         assert_eq!(snapshot(), vec!["host_dropins: b", "systemd_reload: c"]);
         assert_eq!(withdraw("systemd_reload", &[]), 1);
         assert_eq!(count(), 1);
+        reset_for_tests();
+    }
+
+    /// Lot 366 (the re-check of #573, N2): a note past [`MAX_KEPT`] is not
+    /// kept for the status but is signed at the next flush — counted, never
+    /// only counted (the signed log's own "appends fail" note among them).
+    /// Fails where a note past the cap was counted and dropped (a79a10b9).
+    #[test]
+    fn a_note_past_the_cap_is_signed_at_the_next_flush() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        for i in 0..MAX_KEPT {
+            assert!(note("k366_fill", &format!("{i}")));
+        }
+        assert!(note("signed_log", "audit.jsonl: appends fail: EIO"));
+        assert!(
+            !note("signed_log", "audit.jsonl: appends fail: EIO"),
+            "one, waiting or kept"
+        );
+        assert!(
+            snapshot().last().unwrap().contains("1 more"),
+            "{:?}",
+            snapshot()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(attach_audit_log(Some(open_log(dir.path()))), MAX_KEPT + 1);
+        let rows = degraded_rows(dir.path());
+        assert!(
+            rows.iter().any(|r| r["source"] == "signed_log"),
+            "signed though not kept"
+        );
+        assert_eq!(flush(), 0, "once");
+        reset_for_tests();
+    }
+
+    /// Lot 366 (the re-check of #573, N2): a part with a budget of its own
+    /// keeps its records whatever the other parts keep, and crowds out
+    /// none of theirs; past its budget a record is still signed at the next
+    /// flush. Fails where every note shared one cap (a79a10b9: the exec
+    /// pumps' slow records filled it, a share held was then dropped).
+    #[test]
+    fn a_part_s_own_budget_is_kept_and_crowds_out_no_other() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        let _told = KeptTold::new();
+        for i in 0..MAX_KEPT {
+            report("k366_fill", &format!("{i}"));
+        }
+        assert!(note_kept("k366_held", "the users' share", 2));
+        assert!(note_kept("k366_held", "root's share", 2));
+        assert!(!note_kept("k366_held", "root's share", 2), "one entry");
+        let lines = snapshot();
+        assert!(
+            lines.contains(&"k366_held: the users' share".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"k366_held: root's share".to_string()));
+        assert_eq!(lines.len(), MAX_KEPT + 2, "kept beside a full registry");
+        // past its budget: not kept, still signed
+        assert!(note_kept("k366_held", "the system's share", 2));
+        assert!(!snapshot().iter().any(|l| l.contains("the system's share")));
+        // the other parts' room is theirs: the budgeted ones take none of it
+        reset_for_tests();
+        for i in 0..2 {
+            note_kept("k366_slow", &format!("{i}"), 2);
+        }
+        for i in 0..MAX_KEPT {
+            report("k366_fill", &format!("{i}"));
+        }
+        assert_eq!(count(), MAX_KEPT + 2);
+        let lines = snapshot();
+        assert_eq!(lines.len(), MAX_KEPT + 2, "nothing of theirs only counted");
+        assert!(!lines.iter().any(|l| l.contains(" more ")), "{lines:?}");
+        assert!(note_kept("k366_slow", "2", 2));
+        assert!(
+            note_kept("k366_held", "the users' share", 2),
+            "another part's budget"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        attach_audit_log(Some(open_log(dir.path())));
+        let rows = degraded_rows(dir.path());
+        for (source, detail) in [("k366_slow", "2"), ("k366_held", "the users' share")] {
+            assert!(
+                rows.iter()
+                    .any(|r| r["source"] == source && r["detail"] == detail),
+                "{source}: {detail} signed"
+            );
+        }
+        // a record retired leaves the status alone: the source's others stay
+        assert_eq!(retire_kept("k366_slow", "0"), 1);
+        assert!(snapshot().contains(&"k366_slow: 1".to_string()));
+        // a window's total: signed, not kept
+        sign_ended("k366_slow", "the total");
+        assert!(!snapshot().iter().any(|l| l.contains("the total")));
+        assert_eq!(flush(), 1);
+        drop(_told);
+        reset_for_tests();
+    }
+
+    /// Lot 366 (the re-check of #573, N1): in the unit tests, the records
+    /// of the parts with a budget of their own (the exec pumps', made by
+    /// any test that runs a pump step, on any thread) stay out of the
+    /// registry the other tests read, unless a test holding [`TEST_LOCK`]
+    /// has them told.
+    #[test]
+    fn the_budgeted_records_are_told_only_while_a_test_asks() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        assert!(note_kept("k366_slow", "not told", 1));
+        assert!(snapshot().is_empty());
+        let told = KeptTold::new();
+        assert!(note_kept("k366_slow", "told", 1));
+        assert_eq!(snapshot(), vec!["k366_slow: told"]);
+        drop(told);
+        assert_eq!(
+            retire_kept("k366_slow", "told"),
+            0,
+            "not told: nothing done"
+        );
         reset_for_tests();
     }
 }

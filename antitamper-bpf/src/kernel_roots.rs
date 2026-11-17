@@ -1552,6 +1552,12 @@ pub fn chmod_fd(f: &File, mode: u32) -> io::Result<()> {
     })
 }
 
+/// Lot 366: [`dir_names`], at most `max` names (the first the directory
+/// gives).
+pub fn dir_names_max(f: File, max: usize) -> io::Result<Vec<OsString>> {
+    names_of(f, max)
+}
+
 /// Lot 353 (the review of #563, F2): the file `f` refers to (an `O_PATH`
 /// descriptor too) opened again with `flags`, through its entry in this
 /// thread's own descriptor directory, as [`chmod_fd`] — and (re-check 4)
@@ -1868,6 +1874,257 @@ pub fn stat_cached(f: &File) -> io::Result<(u64, u64, u32)> {
     }
     let dev = (u64::from(sx.stx_dev_major) << 20) | u64::from(sx.stx_dev_minor);
     Ok((dev, sx.stx_ino, u32::from(sx.stx_mode)))
+}
+
+/// Lot 366: a file's identity as the kernel has it cached, never asked of
+/// its file system ([`cached`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cached {
+    /// The device, in the kernel's encoding (`major << 20 | minor`).
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    /// The mount the file was reached through (`/proc/<pid>/mountinfo`'s
+    /// first field).
+    pub mnt_id: u64,
+}
+
+impl Cached {
+    fn kind(&self) -> u32 {
+        self.mode & libc::S_IFMT
+    }
+
+    /// A directory.
+    pub fn is_dir(&self) -> bool {
+        self.kind() == libc::S_IFDIR
+    }
+
+    /// A regular file.
+    pub fn is_file(&self) -> bool {
+        self.kind() == libc::S_IFREG
+    }
+
+    /// A symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.kind() == libc::S_IFLNK
+    }
+
+    /// Root's, and writable by no one else (no group or other write bit).
+    pub fn root_only(&self) -> bool {
+        self.uid == 0 && self.mode & 0o022 == 0
+    }
+}
+
+/// Lot 366: the identity of the open `f` (an `O_PATH` descriptor too) as
+/// the kernel has it cached — `statx` with `AT_STATX_DONT_SYNC`, as
+/// [`stat_cached`]: a FUSE file system's daemon (or a network file
+/// system's server) is never asked, so it cannot hold the caller. A FUSE
+/// file system that refuses the caller (mounted by a user without
+/// `allow_other`) answers `EACCES` at once.
+pub fn cached(f: &File) -> io::Result<Cached> {
+    // SAFETY: `statx` is plain old data, valid when zeroed.
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the fd is live, the empty path NUL-terminated, `sx` writable.
+    let rc = unsafe {
+        libc::statx(
+            f.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE
+                | libc::STATX_MODE
+                | libc::STATX_NLINK
+                | libc::STATX_UID
+                | libc::STATX_INO
+                | libc::STATX_MNT_ID,
+            &mut sx,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Cached {
+        dev: (u64::from(sx.stx_dev_major) << 20) | u64::from(sx.stx_dev_minor),
+        ino: sx.stx_ino,
+        mode: u32::from(sx.stx_mode),
+        nlink: sx.stx_nlink,
+        uid: sx.stx_uid,
+        mnt_id: if sx.stx_mask & libc::STATX_MNT_ID != 0 {
+            sx.stx_mnt_id
+        } else {
+            0
+        },
+    })
+}
+
+/// Lot 366: the file a link of a process names — `/proc/<pid>/exe`,
+/// `root`, `cwd`, `fd/<n>`: the last name of `path` — opened `O_PATH`, and
+/// its identity from the kernel's cache ([`cached`]). The link's directory
+/// is opened beneath its view (crossing nothing, [`open`]); the link alone
+/// is followed from there: nothing is looked up on the file system the
+/// file is on, nothing opened, nothing asked of a FUSE daemon (a
+/// `metadata` of the link asked the file's file system, and its caller
+/// waited for the answer).
+pub fn link_target(path: &Path) -> io::Result<(File, Cached)> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    };
+    // the directory beneath its view, no magic link on the way (`ELOOP`):
+    // only the last name is followed
+    let dir = match view_of(dir) {
+        Some((view, rel)) => {
+            let root = view.root.as_ref().map_err(|why| not_anchored(dir, why))?;
+            openat2(root, &rel, libc::O_PATH | libc::O_DIRECTORY, NO_CROSSING)?
+        }
+        None => open_path(dir, libc::O_PATH | libc::O_DIRECTORY)?,
+    };
+    let f = openat(&dir, Path::new(name), libc::O_PATH)?;
+    let c = cached(&f)?;
+    Ok((f, c))
+}
+
+/// Lot 366: what [`walk_judged`] reached: the file (`O_PATH`), its cached
+/// identity, its path from the walk's start, and whether it, every
+/// directory on that path and the start are the start's owner's (root's,
+/// from `/`) and writable by no one else.
+#[derive(Debug)]
+pub struct Walked {
+    pub file: File,
+    pub cached: Cached,
+    pub path: PathBuf,
+    pub owner_only: bool,
+}
+
+/// How many symbolic links one [`walk_judged`] follows at most (the
+/// kernel's `MAXSYMLINKS`).
+const LINKS_MAX: usize = 40;
+
+/// Lot 366: `rel` reached from the directory `root` (at `root_path` in the
+/// agent's view), one name at a time, and judged: `root` and every
+/// directory reached — before any name is looked up in it — and the file
+/// reached are `judge`d by their cached identity ([`cached`]: device and
+/// mount), and a name is looked up only in a directory `judge` accepts (a
+/// file system the agent trusts to answer: not a user's FUSE, not a network
+/// one). Each name is opened `O_PATH | O_NOFOLLOW` with `openat2`
+/// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`): a
+/// mount below is crossed only to be judged there, nothing opened, nothing
+/// asked of it. A symbolic link is refused unless `follow`: then its target
+/// (read from the link, on a file system judged) is walked the same way —
+/// an absolute one from the agent's `/`, as the kernel resolves it, at most
+/// [`LINKS_MAX`] links, a `..` never above where the walk stands on. A `..`
+/// or `.` of `rel` itself is `EINVAL`. A file system `judge` refuses is
+/// `PermissionDenied`: not verified. `rel` may start with `/` (taken from
+/// `root`).
+pub fn walk_judged(
+    root: &File,
+    root_path: &Path,
+    rel: &Path,
+    follow: bool,
+    judge: &mut dyn FnMut(&Cached) -> bool,
+) -> io::Result<Walked> {
+    let refused = |c: &Cached| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "on a file system the agent does not ask (device {}:{}, mount {}): not verified",
+                c.dev >> 20,
+                c.dev & 0xfffff,
+                c.mnt_id
+            ),
+        )
+    };
+    let start = cached(root)?;
+    if !judge(&start) {
+        return Err(refused(&start));
+    }
+    let owners = |c: &Cached| c.uid == start.uid && c.mode & 0o022 == 0;
+    // the steps left; a `None` is a `..` of a link's target
+    let mut todo: std::collections::VecDeque<Option<OsString>> = std::collections::VecDeque::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(n) => todo.push_back(Some(n.to_os_string())),
+            Component::RootDir => {}
+            _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        }
+    }
+    // where the walk stands on (`root`, or `/` after an absolute link), and
+    // the directories walked from there: their descriptor, identity, name,
+    // and whether they and every one above are the owner's only
+    let mut base: (Option<File>, Cached, PathBuf) = (None, start, root_path.to_path_buf());
+    let mut stack: Vec<(File, Cached, OsString, bool)> = Vec::new();
+    let mut links = 0;
+    while let Some(step) = todo.pop_front() {
+        let Some(name) = step else {
+            stack.pop();
+            continue;
+        };
+        let (dir, here, ro) = match stack.last() {
+            Some((f, c, _, ro)) => (f, *c, *ro),
+            None => (base.0.as_ref().unwrap_or(root), base.1, owners(&base.1)),
+        };
+        if !here.is_dir() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let f = openat2(
+            dir,
+            Path::new(&name),
+            libc::O_PATH | libc::O_NOFOLLOW,
+            libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+        )?;
+        let c = cached(&f)?;
+        if !judge(&c) {
+            return Err(refused(&c));
+        }
+        if !c.is_symlink() {
+            stack.push((f, c, name, ro && owners(&c)));
+            continue;
+        }
+        links += 1;
+        if !follow || links > LINKS_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a symbolic link on the way: not followed",
+            ));
+        }
+        let target = link_of(&f)?;
+        if target.is_absolute() {
+            let slash = open_path(Path::new("/"), libc::O_PATH | libc::O_DIRECTORY)?;
+            let c = cached(&slash)?;
+            if !judge(&c) {
+                return Err(refused(&c));
+            }
+            base = (Some(slash), c, PathBuf::from("/"));
+            stack.clear();
+        }
+        for part in target.components().rev() {
+            match part {
+                Component::Normal(n) => todo.push_front(Some(n.to_os_string())),
+                Component::ParentDir => todo.push_front(None),
+                _ => {}
+            }
+        }
+    }
+    let path: PathBuf = std::iter::once(base.2.as_os_str())
+        .chain(stack.iter().map(|(_, _, n, _)| n.as_os_str()))
+        .collect();
+    Ok(match stack.pop() {
+        Some((file, cached, _, owner_only)) => Walked {
+            file,
+            cached,
+            path,
+            owner_only,
+        },
+        None => Walked {
+            file: match base.0 {
+                Some(f) => f,
+                None => root.try_clone()?,
+            },
+            cached: base.1,
+            path,
+            owner_only: owners(&base.1),
+        },
+    })
 }
 
 /// The cgroup2 hierarchy's root directory, opened read-only beneath the
@@ -3061,5 +3318,109 @@ mod tests {
     /// The errno of a failed open.
     fn errno_of(r: io::Result<File>) -> Option<i32> {
         r.err().and_then(|e| e.raw_os_error())
+    }
+
+    /// Lot 366: a walk asks a file system nothing once `judge` refuses it:
+    /// the directory refused is judged before any name is looked up in it
+    /// (the walk stops there, `PermissionDenied`: not verified), and so is
+    /// the file reached. No symbolic link is followed unless asked; one
+    /// followed is judged where it leads; a `..` of the caller's is
+    /// refused. What the walk reached is the kernel's own identity of it.
+    #[test]
+    fn a_walk_judged_asks_nothing_of_a_file_system_it_refuses() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("a/b")).unwrap();
+        std::fs::write(r.join("a/b/f"), b"x").unwrap();
+        symlink("b", r.join("a/l")).unwrap();
+        for d in [r.to_path_buf(), r.join("a"), r.join("a/b")] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // as the owner's tree has them, whatever the test's umask
+        std::fs::set_permissions(r.join("a/b/f"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let root = File::open(r).unwrap();
+        let ino = |p: &Path| std::fs::symlink_metadata(p).unwrap().ino();
+        let (a, b, f) = (
+            ino(&r.join("a")),
+            ino(&r.join("a/b")),
+            ino(&r.join("a/b/f")),
+        );
+        // every file system accepted: the file, the kernel's identity
+        let mut asked = Vec::new();
+        let w = walk_judged(&root, r, Path::new("a/b/f"), false, &mut |c| {
+            asked.push(c.ino);
+            true
+        })
+        .unwrap();
+        let m = std::fs::metadata(r.join("a/b/f")).unwrap();
+        assert_eq!((w.cached.ino, w.cached.is_file()), (m.ino(), true));
+        assert_eq!(w.path, r.join("a/b/f"));
+        assert!(w.owner_only, "the owner's tree, 0755");
+        assert_eq!(
+            asked,
+            vec![ino(r), a, b, f],
+            "each directory, then the file"
+        );
+        // `a` refused: nothing looked up in it — `b` never reached
+        let mut asked = Vec::new();
+        let e = walk_judged(&root, r, Path::new("a/b/f"), false, &mut |c| {
+            asked.push(c.ino);
+            c.ino != a
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(asked, vec![ino(r), a]);
+        // the start refused: nothing at all
+        let e = walk_judged(&root, r, Path::new("a"), false, &mut |_| false).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        // the file itself refused
+        let e = walk_judged(&root, r, Path::new("a/b/f"), false, &mut |c| c.ino != f).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        // a link on the way: refused, unless followed — and judged there
+        let e = walk_judged(&root, r, Path::new("a/l/f"), false, &mut |_| true).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let w = walk_judged(&root, r, Path::new("a/l/f"), true, &mut |_| true).unwrap();
+        assert_eq!((w.cached.ino, w.path.clone()), (f, r.join("a/b/f")));
+        let e = walk_judged(&root, r, Path::new("a/l/f"), true, &mut |c| c.ino != b).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        // a link's `..` goes back up, never above the walk's start; an
+        // absolute one is walked from `/`, as the kernel walks it
+        symlink("../a/b", r.join("a/up")).unwrap();
+        let w = walk_judged(&root, r, Path::new("a/up/f"), true, &mut |_| true).unwrap();
+        assert_eq!((w.cached.ino, w.path.clone()), (f, r.join("a/b/f")));
+        symlink("../../../../../../../..", r.join("a/top")).unwrap();
+        let w = walk_judged(&root, r, Path::new("a/top"), true, &mut |_| true).unwrap();
+        assert_eq!((w.cached.ino, w.path.clone()), (ino(r), r.to_path_buf()));
+        symlink(r.join("a/b"), r.join("a/abs")).unwrap();
+        let w = walk_judged(&root, r, Path::new("a/abs/f"), true, &mut |_| true).unwrap();
+        assert_eq!((w.cached.ino, w.path.clone()), (f, r.join("a/b/f")));
+        // a `..` of the caller's
+        let e = walk_judged(&root, r, Path::new("a/../a"), false, &mut |_| true).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        // a directory another may write: not the owner's only
+        std::fs::set_permissions(r.join("a"), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let w = walk_judged(&root, r, Path::new("a/b/f"), false, &mut |_| true).unwrap();
+        assert!(!w.owner_only);
+    }
+
+    /// Lot 366: a process's link is followed alone, and its target's
+    /// identity is the kernel's cached one: this process's image, by
+    /// `/proc/self/exe`, is the test binary (device, inode, a regular
+    /// file); its root, `/`. A link that is not the path's last name is not
+    /// followed (`/proc/self/root/etc`: nothing looked up beyond the link).
+    #[test]
+    fn a_process_link_is_followed_alone_and_read_from_the_cache() {
+        use std::os::unix::fs::MetadataExt;
+        let (_, c) = link_target(Path::new("/proc/self/exe")).unwrap();
+        let m = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        let dev = (u64::from(libc::major(m.dev())) << 20) | u64::from(libc::minor(m.dev()));
+        assert_eq!((c.dev, c.ino, c.is_file()), (dev, m.ino(), true));
+        assert!(c.mnt_id != 0, "the mount it was reached through");
+        let (_, c) = link_target(Path::new("/proc/self/root")).unwrap();
+        let m = std::fs::metadata("/").unwrap();
+        assert_eq!((c.ino, c.is_dir()), (m.ino(), true));
+        assert!(link_target(Path::new("/proc/self/root/etc")).is_err());
+        assert!(link_target(Path::new("/proc/self/exe/x")).is_err());
     }
 }

@@ -34,6 +34,11 @@
 //!   either changed — a range added a moment ago is keyed by its uids
 //!   until then.
 //!
+//! Lot 366 (the re-check of #573, N3): the table published last is kept
+//! for the exec pumps' reader too ([`account_of`], memory only): a
+//! subordinate id's reads count as its owner's — the same account the
+//! shares give it.
+//!
 //! `/etc/subgid` is not read: the key is a uid (the real uid, a
 //! namespace's creator), never a gid. A range's start and count are read
 //! in decimal, as `useradd` writes them; `newuidmap` reads them with
@@ -45,6 +50,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -260,6 +266,49 @@ pub fn lookup(entries: &BTreeMap<(u32, u32), u32>, uid: u32) -> Option<u32> {
         .map(|(_, v)| *v)
 }
 
+/// Lot 366 (the re-check of #573, N3): [`lookup`]'s answer, by the longest
+/// prefix first — at most 33 lookups of the map, whatever its size (the
+/// exec pumps' reader asks for each read).
+pub fn lookup_longest(entries: &BTreeMap<(u32, u32), u32>, uid: u32) -> Option<u32> {
+    (0..=32u32).rev().find_map(|len| {
+        let base = if len == 0 {
+            0
+        } else {
+            uid & (u32::MAX << (32 - len))
+        };
+        entries.get(&(len, base)).copied()
+    })
+}
+
+/// The trie's entries: `(prefix length, base) → row`.
+type Entries = BTreeMap<(u32, u32), u32>;
+
+/// Lot 366 (the re-check of #573, N3): the table published last (none
+/// before the first publish).
+static PUBLISHED: LazyLock<parking_lot::Mutex<Arc<Entries>>> = LazyLock::new(Default::default);
+
+/// Lot 366 (the re-check of #573, N3): the account the ranges published
+/// last give `uid` — its range's owner's row ([`subuid_row`]: the owner's
+/// uid; root's ranges [`ROOT_SUBID_SHARE`](common::wire::execq::ROOT_SUBID_SHARE));
+/// [`OVERFLOW_SHARE`] for a uid of the ranges' span no single known owner
+/// holds, and for every uid from [`ACCOUNTS_END`] up while `/etc/subuid`
+/// cannot be read; `None` outside every range. Memory only.
+pub fn account_of(uid: u32) -> Option<u32> {
+    let table = Arc::clone(&PUBLISHED.lock());
+    lookup_longest(&table, uid)
+}
+
+/// The table the exec pumps' reader looks uids up in (the publisher's, and
+/// tests').
+pub(crate) fn keep(t: &Table) {
+    *PUBLISHED.lock() = Arc::new(t.entries.clone());
+}
+
+/// Tests: the published table is the process's; the tests that write it run
+/// one at a time.
+#[cfg(test)]
+pub(crate) static PUBLISHED_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// The trie as [`write_trie`] writes it (a trait, so a test can stand in).
 pub trait SubuidTrie {
     fn keys(&self) -> Result<Vec<(u32, u32)>>;
@@ -382,6 +431,9 @@ impl Publisher {
             return false;
         }
         let t = read();
+        // lot 366 (the re-check of #573, N3): the exec pumps' reader's copy,
+        // whatever the trie's write does
+        keep(&t);
         let mut told = false;
         match write_trie(trie, &t) {
             Ok(()) => {
@@ -485,6 +537,63 @@ mod tests {
         let sub = common::wire::execq::share_account(uid, level, owner)
             .and_then(|a| lookup(&t.entries, a));
         share_key(uid, level, owner, inum, sub)
+    }
+
+    /// Lot 366 (the re-check of #573, N3): the reader's lookup by the
+    /// longest prefix first answers as the trie's ([`lookup`]): every uid
+    /// of the host's ranges, their bounds, the gaps, outside; and with
+    /// `/etc/subuid` unreadable, every uid from the accounts' end up the
+    /// overflow row's.
+    #[test]
+    fn the_reader_s_lookup_answers_as_the_trie() {
+        use common::wire::execq::ROOT_SUBID_SHARE;
+        for t in [host(), unreadable()] {
+            for (case, uid) in [
+                0u32,
+                1000,
+                65_535,
+                65_536,
+                99_999,
+                100_000,
+                100_001,
+                165_535,
+                165_536,
+                231_071,
+                231_072,
+                296_607,
+                296_608,
+                362_143,
+                362_144,
+                999_999,
+                1_000_000,
+                1_000_999_999,
+                1_001_000_000,
+                u32::MAX - 1,
+                u32::MAX,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    lookup_longest(&t.entries, uid),
+                    lookup(&t.entries, uid),
+                    "case {case}: the reader's lookup answers as the trie's"
+                );
+            }
+        }
+        let h = host();
+        assert_eq!(lookup_longest(&h.entries, 100_005), Some(1000));
+        assert_eq!(
+            lookup_longest(&h.entries, 1_000_005),
+            Some(ROOT_SUBID_SHARE)
+        );
+        assert_eq!(lookup_longest(&h.entries, 300_000), Some(OVERFLOW_SHARE));
+        assert_eq!(lookup_longest(&h.entries, 50_000), None);
+        assert_eq!(
+            lookup_longest(&unreadable().entries, 70_000),
+            Some(OVERFLOW_SHARE)
+        );
+        assert_eq!(lookup_longest(&unreadable().entries, 65_535), None);
     }
 
     #[test]
@@ -887,6 +996,7 @@ mod tests {
 
     #[test]
     fn publishing_rewrites_the_trie_to_the_table() {
+        let _g = PUBLISHED_TEST_LOCK.lock();
         let mut f = Fake::default();
         let a = host();
         write_trie(&mut f, &a).unwrap();
@@ -918,6 +1028,8 @@ mod tests {
             &mut f,
         );
         assert_eq!((reads, &f.m), (1, &a.entries));
+        // lot 366 (the re-check of #573, N3): kept for the exec pumps' reader
+        assert_eq!(account_of(100_005), Some(1000));
         p.tick_with(
             s1,
             || {
@@ -981,6 +1093,10 @@ mod tests {
             "the same table, not said again"
         );
         assert!(p.tick_with(s1, || b.clone(), &mut f), "a new one is said");
+        // lot 366 (the re-check of #573, N3): the table published last is
+        // the exec pumps' reader's
+        assert_eq!(account_of(100_005), lookup(&b.entries, 100_005));
+        keep(&Table::default());
     }
 
     /// The re-check of #551 (G2): a kernel before the upstream in-place fix

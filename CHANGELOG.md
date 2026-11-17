@@ -407,6 +407,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     installs as an operator would.
 
 ### Security
+- Lot 366 (pre-alpha): **the exec pumps never wait on a process's files**
+  (`UPGRADE_NOTES_WAVE4.md` §55). Every exec's reads (its file, its
+  directory, an AppImage's image and daemon, a module tool's script and
+  library path, a socket program's image) run on the bounded reader with a
+  deadline, never on the pump, and no lock the pumps share is held while a
+  file is read; reads are fair between users (one user's unanswered reads
+  hold at most one helper, its subordinate ids of `/etc/subuid` counted as
+  that user; an id from 65536 up the published ranges give no known user —
+  none published, as with the file-open sensor on its tracepoint, an
+  unreadable `/etc/subuid`, an owner `/etc/passwd` does not name, an id
+  past every range — counts in one unattributed share with a single read,
+  so such ids hold each other's reads, never an attributed user's; users,
+  the unattributed ids, system accounts — systemd's dynamic users and
+  `nobody` among them — and root keep shares of their own, each signed
+  once while held); a fact not read in time
+  is judged not verified and signed (`exec_reads_unanswered`,
+  `exec_readers_held`; slow reads past a budget, `exec_reads_slow`, one
+  record per user and window, its total signed when the window ends). Each
+  kind of these records keeps its own room in the degradation list, so
+  none crowds out another's or any other part's; a degradation note past
+  the list's limit is signed at the next flush (it was only counted). A
+  file's file system is told by the mount the kernel reached it through,
+  against the mount tables: FUSE is never read; network file systems
+  mounted by root are read, with the deadline; btrfs subvolumes are read as
+  local, and an AppImage image on btrfs is recognised whichever order btrfs
+  and the agent started in. An exec of a btrfs subvolume's file (a `/home`
+  on btrfs, as Fedora and openSUSE lay it out) is named by its process's
+  own `exe` link when that link leads to the exec's file (its text read
+  from the agent's descriptor of the very file checked), and a mount made
+  just before an exec is placed at once (at most 5 such re-reads of the
+  table a second, then its throttle, signed `mount_table_rereads`): an
+  AppImage run from such a home
+  had its zygote's re-exec named `/proc/self/exe`, and its fork-only
+  child's connection judged from `/tmp` (NN-L-NET-008 High; on main too).
+  The bounded reader (`state_read::TimedReader`)
+  reuses its free helper threads, each free again before its answer is
+  handed over.
 - Lot 349 (pre-alpha self-protection blockers R001–R003, R090; rc2).
   - **The agent watches its own CPUs (R001).** Root could confine the agent
     to one CPU without touching it: a sibling cgroup put in

@@ -86,7 +86,44 @@ pub struct TimedReader {
     deadline: std::time::Duration,
     max: usize,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Lot 366: the helpers free again, each reused before one is made (the
+    /// exec pumps read through one for every exec).
+    idle: std::sync::Arc<parking_lot::Mutex<Vec<Helper>>>,
     stall: parking_lot::Mutex<Option<String>>,
+}
+
+/// A read handed to a helper: it reads, and gives back how to hand its
+/// answer over.
+type Job = Box<dyn FnOnce() -> Answer + Send>;
+
+/// A read's answer, handed over once its helper is free again.
+type Answer = Box<dyn FnOnce() + Send>;
+
+/// Lot 366: a helper thread's channel. It hands a read over with the
+/// helper's own channel, which the helper puts back among the free ones
+/// once the read answered — and holds none while it waits for the next: a
+/// reader dropped closes them all, and its helpers end.
+#[derive(Debug, Clone)]
+struct Helper(std::sync::mpsc::SyncSender<(Job, Helper)>);
+
+/// A helper's loop: each read it is handed, then itself free again, then
+/// the answer handed over — or, its reader gone, its end. The review of
+/// #573 (F3): free before the answer, so a caller that has its answer finds
+/// the helper free (none made for its next read, none counted unanswered).
+fn helper(
+    rx: std::sync::mpsc::Receiver<(Job, Helper)>,
+    idle: std::sync::Weak<parking_lot::Mutex<Vec<Helper>>>,
+) {
+    while let Ok((job, me)) = rx.recv() {
+        let answer = job();
+        let Some(free) = idle.upgrade() else {
+            answer();
+            return;
+        };
+        free.lock().push(me);
+        drop(free);
+        answer();
+    }
 }
 
 /// The kernel-state round's reader ([`READ_DEADLINE`], [`STALLED_MAX`]).
@@ -101,17 +138,29 @@ impl TimedReader {
             deadline,
             max,
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            idle: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             stall: parking_lot::Mutex::new(None),
         }
     }
 
-    /// `read` (of `what`, in words) on a helper thread, its answer waited
-    /// for at most the deadline; `Err(why)` past it, or at once while
-    /// `max` earlier reads have not answered — the stall kept for
-    /// [`Self::take_stall`].
+    /// `read` (of `what`, in words) on a helper thread — a free one, or a
+    /// new one — its answer waited for at most the deadline; `Err(why)` past
+    /// it, or at once while `max` earlier reads have not answered — the
+    /// stall kept for [`Self::take_stall`].
     pub fn run<T: Send + 'static>(
         &self,
         what: &str,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        self.run_within(what, self.deadline, read)
+    }
+
+    /// The review of #573 (F4): [`Self::run`], its answer waited for at most
+    /// `wait` (what is left of a caller's deadline).
+    pub fn run_within<T: Send + 'static>(
+        &self,
+        what: &str,
+        wait: std::time::Duration,
         read: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, String> {
         use std::sync::atomic::Ordering;
@@ -125,23 +174,48 @@ impl TimedReader {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let in_flight = std::sync::Arc::clone(&self.in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("nn-timed-read".into())
-            .spawn(move || {
-                let out = read();
-                in_flight.fetch_sub(1, Ordering::SeqCst);
+        let mut job: Option<Job> = Some(Box::new(move || {
+            let out = read();
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Box::new(move || {
                 let _ = tx.send(out);
-            });
-        if let Err(e) = spawned {
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
+            }) as Answer
+        }));
+        // a free helper first; one gone since is passed over
+        while let Some(j) = job.take() {
+            let Some(h) = self.idle.lock().pop() else {
+                job = Some(j);
+                break;
+            };
+            if let Err(std::sync::mpsc::SendError((back, _))) = h.0.send((j, h.clone())) {
+                job = Some(back);
+            }
         }
-        rx.recv_timeout(self.deadline).map_err(|_| {
+        if let Some(job) = job {
+            let (htx, hrx) = std::sync::mpsc::sync_channel(1);
+            let h = Helper(htx);
+            // the channel holds one: the read waits there for its helper
+            let _ = h.0.send((job, h.clone()));
+            let idle = std::sync::Arc::downgrade(&self.idle);
+            let spawned = std::thread::Builder::new()
+                .name("nn-timed-read".into())
+                .spawn(move || helper(hrx, idle));
+            if let Err(e) = spawned {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return Err(self.stalled(format!("{what}: not read — no helper thread ({e})")));
+            }
+        }
+        rx.recv_timeout(wait).map_err(|_| {
             self.stalled(format!(
                 "{what} did not answer within {} ms (a FUSE file bound over it?): not read",
-                self.deadline.as_millis()
+                wait.as_millis()
             ))
         })
+    }
+
+    /// Lot 366: the helpers free now.
+    pub fn free_helpers(&self) -> usize {
+        self.idle.lock().len()
     }
 
     /// `path` as [`read_state`] reads it, within the deadline (a timeout is
@@ -201,6 +275,10 @@ pub struct Condition {
     hold: std::time::Duration,
     since: Option<std::time::Instant>,
     reports: u32,
+    /// The review of #573 (F1): its records kept and signed by the next
+    /// flush, within its source's own budget of the registry (the re-check
+    /// of #573, N2): `Some(budget)`.
+    deferred: Option<usize>,
 }
 
 impl Condition {
@@ -216,6 +294,41 @@ impl Condition {
             hold,
             since: None,
             reports: 0,
+            deferred: None,
+        }
+    }
+
+    /// The review of #573 (F1): [`Self::with_hold`] for a thread that may
+    /// never wait on I/O (an exec pump): its records are kept and signed by
+    /// the next flush — never written to the audit log on that thread. The
+    /// re-check of #573: within its source's own budget of the registry
+    /// (`budget` records of `source` at most, however many other parts
+    /// keep: [`crate::boot::degradation::note_kept`], N2), and its end
+    /// retires its own record only — not another condition's of the same
+    /// source ([`crate::boot::degradation::retire_kept`], N4).
+    pub const fn deferred(source: &'static str, hold: std::time::Duration, budget: usize) -> Self {
+        let mut c = Self::with_hold(source, hold);
+        c.deferred = Some(budget);
+        c
+    }
+
+    fn report(&self, detail: &str) {
+        match self.deferred {
+            Some(budget) => {
+                crate::boot::degradation::note_kept(self.source, detail, budget);
+            }
+            None => {
+                crate::boot::degradation::report(self.source, detail);
+            }
+        }
+    }
+
+    /// The record `detail` it made withdrawn.
+    fn withdraw(&self, detail: &str) {
+        if self.deferred.is_some() {
+            crate::boot::degradation::retire_kept(self.source, detail);
+        } else {
+            crate::boot::degradation::withdraw(self.source, &[]);
         }
     }
 
@@ -229,11 +342,11 @@ impl Condition {
         if self.holding.as_deref() == Some(detail.as_str()) {
             return;
         }
-        if self.holding.is_some() {
-            crate::boot::degradation::withdraw(self.source, &[]);
+        if let Some(old) = self.holding.take() {
+            self.withdraw(&old);
         }
         tracing::warn!(source = self.source, detail = %detail, "degraded");
-        crate::boot::degradation::report(self.source, &detail);
+        self.report(&detail);
         self.holding = Some(detail);
         self.since = Some(now);
         self.reports = self.reports.saturating_add(1);
@@ -253,9 +366,11 @@ impl Condition {
         {
             return;
         }
-        self.holding = None;
+        let Some(old) = self.holding.take() else {
+            return;
+        };
         tracing::info!(source = self.source, "no longer degraded");
-        crate::boot::degradation::withdraw(self.source, &[]);
+        self.withdraw(&old);
     }
 
     /// It holds now.
@@ -589,6 +704,41 @@ mod tests {
     /// deadline, keeps the stall for the round, and past `max` unanswered
     /// reads fails at once without a thread; once the stalled read
     /// answers, reads go through again.
+    /// Lot 366, the review of #573 (F3): a helper is free again — back
+    /// among the free ones, its read counted down — before its answer is
+    /// handed over: with the free helpers' list held while the read answers,
+    /// the answer waits for it. Deterministic, where the racing test was not.
+    #[test]
+    fn a_helper_is_free_again_before_its_answer_is_handed_over() {
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+        let r = std::sync::Arc::new(TimedReader::new(Duration::from_secs(5), 4));
+        assert_eq!(r.run("warm", || 0), Ok(0));
+        assert_eq!(r.free_helpers(), 1);
+        let (started_tx, started_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let r2 = std::sync::Arc::clone(&r);
+        let caller = std::thread::spawn(move || {
+            let v = r2.run("test", move || {
+                started_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                7
+            });
+            (v, Instant::now())
+        });
+        started_rx.recv().unwrap();
+        let held = r.idle.lock();
+        go_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(r.unanswered(), 0, "counted down as it answered");
+        let released = Instant::now();
+        drop(held);
+        let (v, answered) = caller.join().unwrap();
+        assert_eq!(v, Ok(7));
+        assert!(answered >= released, "answered before its helper was free");
+        assert_eq!(r.free_helpers(), 1, "the one helper, free again");
+    }
+
     #[test]
     fn a_read_that_never_answers_is_bounded_in_time() {
         let d = tempfile::tempdir().unwrap();
@@ -690,6 +840,38 @@ mod tests {
         mount_rows(&mut rows, &good, "the test");
         assert!(mine().is_empty(), "withdrawn");
         assert!(!rows.holding());
+    }
+
+    /// Lot 366 (the re-check of #573, N4): two deferred conditions of one
+    /// source (the reader's shares held, one per pool): the end of one
+    /// retires its own record, never the other's, which stays in the status
+    /// while it holds. Fails where a deferred end retired every record of
+    /// its source (a79a10b9).
+    #[test]
+    fn a_deferred_condition_s_end_retires_its_own_record_only() {
+        use crate::boot::degradation as deg;
+        let _g = deg::TEST_LOCK.lock();
+        deg::reset_for_tests();
+        let _told = deg::KeptTold::new();
+        let mut users = Condition::deferred("k366_test_held", std::time::Duration::ZERO, 3);
+        let mut root = Condition::deferred("k366_test_held", std::time::Duration::ZERO, 3);
+        users.holds("the users' share is held".into());
+        root.holds("root's share is held".into());
+        users.ended();
+        assert!(!users.holding() && root.holding());
+        assert_eq!(
+            deg::snapshot(),
+            vec!["k366_test_held: root's share is held"],
+            "root's record stays while it holds"
+        );
+        root.holds("root's share is held, again".into());
+        assert_eq!(
+            deg::snapshot(),
+            vec!["k366_test_held: root's share is held, again"],
+            "a new detail replaces its own"
+        );
+        drop(_told);
+        deg::reset_for_tests();
     }
 
     /// The review of #538 (G2): a condition with a hold is one report while

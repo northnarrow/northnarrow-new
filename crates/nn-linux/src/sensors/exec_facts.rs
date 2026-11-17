@@ -44,10 +44,9 @@
 //! variable (python's user site `.pth` and `usercustomize`, zsh's
 //! `~/.zshenv`) is not seen.
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use common::wire::exe::{exe_flags, kernel_dev};
+use common::wire::exe::exe_flags;
 use nn_core::impair::reads_posixly_correct;
 use nn_core::posture::lineage::{in_system_tree, ExecIdentity, Runs};
 use nn_core::posture::script_args::{node_options_load, reads_a_program};
@@ -94,16 +93,19 @@ const INTERACTIVE_VARS: &[&str] = &["PYTHONSTARTUP", "ENV", "NODE_REPL_EXTERNAL_
 /// first MiB loaded its `sitecustomize` unseen).
 const MAX_ENVIRON: u64 = 1 << 20;
 
-/// The exec pump's step: `event`'s process read under `/proc`. Lot 355:
-/// then an exec of an AppImage's program marked as its image's
-/// ([`super::app_image`]).
-pub fn read(event: &mut Event) {
-    read_under(Path::new("/proc"), event);
-    super::app_image::read(event);
+/// The exec pump's step: `event`'s process read under `proc_root`
+/// (`/proc`; a fixture tree in tests) — on the exec pumps' reader
+/// ([`super::pump_reads::bounded`]).
+pub fn read_under(proc_root: &Path, event: &mut Event) {
+    read_judged(proc_root, event, &super::pump_reads::Judge::host());
 }
 
-/// [`read`] with the processes under `proc_root` (a fixture tree in tests).
-pub fn read_under(proc_root: &Path, event: &mut Event) {
+/// Lot 366: [`read_under`], the file systems a path is walked through
+/// judged by `judge` ([`super::pump_reads`]): the image's identity from the
+/// kernel's cache, its directory walked from the process's root one name
+/// at a time, no symbolic link followed, nothing asked of a file system
+/// `judge` refuses. What is not read is not trusted: no `ROOT_DIR`.
+pub fn read_judged(proc_root: &Path, event: &mut Event, judge: &super::pump_reads::Judge) {
     let Event::ProcessSpawn {
         pid,
         filename,
@@ -117,10 +119,10 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     };
     let dir = proc_root.join(pid.to_string());
     let image = dir.join("exe");
-    let Ok(meta) = antitamper_bpf::kernel_roots::metadata(&image) else {
+    let Ok((_, meta)) = antitamper_bpf::kernel_roots::link_target(&image) else {
         return;
     };
-    let now = (kernel_dev(meta.dev()), meta.ino());
+    let now = (meta.dev, meta.ino);
     let link = antitamper_bpf::kernel_roots::read_link(&image).ok();
     // LSM mode: the image is still the exec's own (else the process
     // executed something else since, or is another one: no `ROOT_DIR`)
@@ -128,7 +130,7 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     if !exe.has(exe_flags::KNOWN) {
         (exe.dev, exe.ino) = now;
         exe.flags |= exe_flags::PROC_EXE;
-        if meta.nlink() == 0 {
+        if meta.nlink == 0 {
             exe.flags |= exe_flags::DELETED;
         }
         if link
@@ -148,12 +150,12 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
     if let Some(path) = link
         .as_deref()
         .filter(|_| own && init_mounts)
-        .map(|l| executed_path(l, meta.nlink() == 0))
+        .map(|l| executed_path(l, meta.nlink == 0))
     {
-        let view = dir
-            .join("root")
-            .join(path.strip_prefix("/").unwrap_or(&path));
-        if view.parent().is_some_and(dir_is_root_only) {
+        if path
+            .parent()
+            .is_some_and(|parent| dir_is_root_only(&dir, parent, judge))
+        {
             exe.flags |= exe_flags::ROOT_DIR;
         }
     }
@@ -178,6 +180,32 @@ pub fn read_under(proc_root: &Path, event: &mut Event) {
                 exe.flags |= exe_flags::POSIXLY_CORRECT;
             }
         }
+    }
+}
+
+/// Lot 366: `event`'s facts when its process's reads were not waited for
+/// (a file system whose server does not answer held them): not verified —
+/// an interpreter naming a system script or nothing is taken to load the
+/// caller's code (`ENV_LOADS`, as an environment larger than the pump
+/// reads); nothing that gives trust (`ROOT_DIR`, an AppImage's
+/// `USER_IMAGE`, the tracepoint mode's image) is set.
+pub fn not_read(event: &mut Event) {
+    let Event::ProcessSpawn {
+        filename,
+        argv,
+        exe,
+        ..
+    } = event
+    else {
+        return;
+    };
+    let path = exe.path_or(filename).to_string();
+    let id = ExecIdentity::of_exec(&path, argv);
+    let names_a_system_script =
+        matches!(&id.runs, Runs::Script(s) if s.starts_with('/') && in_system_tree(s));
+    let names_nothing = id.runs == Runs::Inline && reads_a_program(Path::new(&path), argv);
+    if names_a_system_script || names_nothing {
+        exe.flags |= exe_flags::ENV_LOADS;
     }
 }
 
@@ -226,10 +254,16 @@ fn executed_path(link: &Path, unlinked: bool) -> PathBuf {
     }
 }
 
-/// `dir` is root's and writable by no one else.
-fn dir_is_root_only(dir: &Path) -> bool {
-    antitamper_bpf::kernel_roots::metadata(dir)
-        .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+/// The directory `path` (absolute, in the view of the process `proc_dir`:
+/// `/proc/<pid>`) is root's and writable by no one else — walked from the
+/// process's root one name at a time, every file system on the way judged
+/// by `judge`, no symbolic link followed (lot 366: a link on the path, a
+/// FUSE file system, or one no mount table shows, is not walked into; a
+/// network file system root mounted is, on the exec pumps' reader with its
+/// deadline).
+fn dir_is_root_only(proc_dir: &Path, path: &Path, judge: &super::pump_reads::Judge) -> bool {
+    super::pump_reads::walk_in_root(proc_dir, path, judge)
+        .is_ok_and(|w| w.cached.is_dir() && w.cached.root_only())
 }
 
 /// The process's environment loads code into it: one of [`LOADING_VARS`]
@@ -286,10 +320,12 @@ pub(super) fn same_mount_namespace(proc_root: &Path, dir: &Path) -> bool {
 /// (`/proc/<pid>/root`, followed) is PID 1's — the same device and inode:
 /// not a chroot. Not readable: not known, so no.
 pub(super) fn same_root(proc_root: &Path, dir: &Path) -> bool {
+    // lot 366: the root's identity from the kernel's cache (a chroot into
+    // a user's FUSE directory: its daemon is not asked)
     let id = |d: &Path| {
-        antitamper_bpf::kernel_roots::metadata(d.join("root"))
+        antitamper_bpf::kernel_roots::link_target(&d.join("root"))
             .ok()
-            .map(|m| (m.dev(), m.ino()))
+            .map(|(_, c)| (c.dev, c.ino))
     };
     match (id(dir), id(&proc_root.join("1"))) {
         (Some(a), Some(b)) => a == b,
@@ -313,7 +349,8 @@ fn stdin_is_a_program(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use common::wire::exe::kernel_dev;
+    use std::os::unix::fs::{symlink, MetadataExt};
 
     fn spawn(pid: u32, exe: nn_model::ExeIdentity, filename: &str, argv: &[&str]) -> Event {
         Event::ProcessSpawn {
@@ -402,6 +439,103 @@ mod tests {
         let mut e = spawn(12, Default::default(), "/proc/self/fd/3", &["x"]);
         read_under(proc.path(), &mut e);
         assert_eq!(flags(&e).0, 0);
+    }
+
+    /// Lot 366: the directory an image was run from is walked from the
+    /// process's root one name at a time, no link followed: a directory of
+    /// the image's path that is a link (here to `/usr/bin`) is not taken for
+    /// a root-only directory — no `ROOT_DIR` (fails on 993795e0).
+    #[test]
+    fn a_directory_replaced_by_a_link_since_the_exec_is_not_root_s() {
+        let proc = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let a = home.path().join("a");
+        symlink("/usr/bin", &a).unwrap();
+        proc_with(proc.path(), 30, &a.join("env"), &[], None);
+        let mut e = spawn(30, Default::default(), "/proc/self/fd/3", &["x"]);
+        read_under(proc.path(), &mut e);
+        let f = flags(&e).0;
+        assert!(f & exe_flags::PROC_EXE != 0, "the image read");
+        assert!(f & exe_flags::ROOT_DIR == 0, "no ROOT_DIR through a link");
+    }
+
+    /// Lot 366: a file system the judge refuses (a user's FUSE file system,
+    /// a network one, one PID 1's table does not show) is not walked: the
+    /// image's identity is still the kernel's (its cache), no `ROOT_DIR` —
+    /// the same exec judged by the host's table has it.
+    #[test]
+    fn a_file_system_the_judge_refuses_is_not_walked() {
+        let proc = tempfile::tempdir().unwrap();
+        proc_with(proc.path(), 31, Path::new("/usr/bin/env"), &[], None);
+        let none = super::super::pump_reads::Judge::of(&crate::mountinfo::parse(b""));
+        let mut e = spawn(31, Default::default(), "/usr/bin/env", &["env"]);
+        read_judged(proc.path(), &mut e, &none);
+        let m = std::fs::metadata("/usr/bin/env").unwrap();
+        let (f, dev, ino) = flags(&e);
+        assert_eq!((dev, ino), (kernel_dev(m.dev()), m.ino()));
+        assert!(f & exe_flags::PROC_EXE != 0 && f & exe_flags::ROOT_DIR == 0);
+        let mut e = spawn(31, Default::default(), "/usr/bin/env", &["env"]);
+        read_under(proc.path(), &mut e);
+        assert!(flags(&e).0 & exe_flags::ROOT_DIR != 0, "the host's table");
+    }
+
+    /// Lot 366: a process whose root, or whose image, is a FUSE file
+    /// system's that answers nothing: the exec pump's facts never ask it —
+    /// answered at once, the image's identity read, no `ROOT_DIR` under that
+    /// root (on 993795e0 the `metadata` of its root waited on the daemon,
+    /// and the pump with it).
+    #[test]
+    fn the_exec_facts_never_wait_on_a_fuse_that_answers_nothing() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let proc = tempfile::tempdir().unwrap();
+            // its root on the FUSE, its image a host file
+            proc_with(proc.path(), 77, Path::new("/usr/bin/env"), &[], None);
+            let d = proc.path().join("77");
+            std::fs::remove_file(d.join("root")).unwrap();
+            symlink(held, d.join("root")).unwrap();
+            let mut e = spawn(77, Default::default(), "/usr/bin/env", &["env"]);
+            read_under(proc.path(), &mut e);
+            let rooted = flags(&e).0;
+            // its image on the FUSE
+            proc_with(proc.path(), 78, held, &[], None);
+            let mut e = spawn(78, Default::default(), "/x", &["x"]);
+            read_under(proc.path(), &mut e);
+            let imaged = flags(&e).0;
+            // (the image's link text here is the descriptor's path, not a
+            // FUSE file's: its directory says nothing of the FUSE)
+            rooted & exe_flags::PROC_EXE != 0
+                && rooted & exe_flags::ROOT_DIR == 0
+                && imaged & exe_flags::PROC_EXE != 0
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor wrong (1)");
+        }
+    }
+
+    /// Lot 366: an exec whose reads were not waited for is not trusted: an
+    /// interpreter naming nothing or a system script is taken to load the
+    /// caller's code (`ENV_LOADS`); nothing that gives trust is set; any
+    /// other program is left as it was.
+    #[test]
+    fn an_exec_not_read_in_time_is_not_trusted() {
+        for (path, argv, loads) in [
+            ("/usr/bin/python3", &["python3"][..], true),
+            (
+                "/usr/bin/python3",
+                &["python3", "/usr/bin/unattended-upgrade"][..],
+                true,
+            ),
+            ("/usr/bin/true", &["true"][..], false),
+        ] {
+            let mut e = spawn(40, Default::default(), path, argv);
+            not_read(&mut e);
+            let f = flags(&e).0;
+            assert_eq!(f & exe_flags::ENV_LOADS != 0, loads, "{path} {argv:?}");
+            assert_eq!(
+                f & (exe_flags::ROOT_DIR | exe_flags::USER_IMAGE | exe_flags::PROC_EXE),
+                0
+            );
+        }
     }
 
     /// LSM mode: a `ROOT_DIR` only when `/proc/<pid>/exe` is still the
@@ -658,20 +792,22 @@ mod tests {
     #[test]
     fn a_chrooted_process_has_no_root_dir() {
         let proc = tempfile::tempdir().unwrap();
-        proc_with(proc.path(), 70, Path::new("/bin/sh"), &[], None);
-        let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
+        // lot 366: the kernel's `exe` text names no link (`/bin` is one on a
+        // merged-`/usr` host, and the walk follows none): PID 1's root's
+        // control is `/usr/bin/env`
+        proc_with(proc.path(), 71, Path::new("/usr/bin/env"), &[], None);
+        let mut e = spawn(71, Default::default(), "/usr/bin/env", &["env"]);
         read_under(proc.path(), &mut e);
         assert!(flags(&e).0 & exe_flags::ROOT_DIR != 0, "PID 1's root");
+        proc_with(proc.path(), 70, Path::new("/bin/sh"), &[], None);
         let d = proc.path().join("70");
         std::fs::remove_file(d.join("root")).unwrap();
         symlink("/usr", d.join("root")).unwrap();
         let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
         read_under(proc.path(), &mut e);
         assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "a chroot");
-        std::fs::remove_file(d.join("root")).unwrap();
-        symlink("/", d.join("root")).unwrap();
         std::fs::remove_file(proc.path().join("1/root")).unwrap();
-        let mut e = spawn(70, Default::default(), "/bin/sh", &["sh"]);
+        let mut e = spawn(71, Default::default(), "/usr/bin/env", &["env"]);
         read_under(proc.path(), &mut e);
         assert_eq!(flags(&e).0 & exe_flags::ROOT_DIR, 0, "not known");
     }

@@ -764,7 +764,73 @@ const STATICS: &[Kept] = &[
         "crates/nn-linux/src/sensors/exe_identity.rs",
         "MOUNTS",
         HostFact,
-        "the host's mount table, read again when it changes",
+        "the host's mount table, read again when it changes — lot 366 (the review of #573, \
+         F1): each pump thread's own (thread-local), no lock the pumps share",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/share_subuid.rs",
+        "PUBLISHED",
+        HostFact,
+        "lot 366 (the re-check of #573, N3): the subordinate uid ranges as last published (the \
+         shares' table, read at the start and again when `/etc/subuid` or `/etc/passwd` \
+         changes), by which the exec pumps' reader counts a subordinate id as its owner's",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "PID1",
+        HostFact,
+        "lot 366 (the review of #573, F2): PID 1's mount table by mount id, read again when the \
+         kernel flags a change (no lock held while it is read), which the exec pumps judge a \
+         process's files against before they ask a file system anything",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "OWN",
+        HostFact,
+        "lot 366 (the review of #573, F2): the agent's own mount table (its unit's namespace: \
+         a walk from its own root) by mount id, read again when it changes",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "PID1_READ",
+        Process,
+        "lot 366: the signed condition while PID 1's mount table cannot be read (the last one \
+         read stays in force)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "OWN_READ",
+        Process,
+        "lot 366: the signed condition while the agent's own mount table cannot be read",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "STALE",
+        Process,
+        "lot 366 (the review of #573, F7): the signed condition while files are judged not \
+         verified because the mounts changed and their tables were not read again yet",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "EXEC_READER",
+        Process,
+        "lot 366: the exec pumps' bounded reader (#563's, its helpers reused; the review of #573, \
+         F4: a share per pool — root, the system's accounts, the users — one read per uid at \
+         once, the slow reads' budget), which runs an exec's reads under a deadline so that a \
+         read that does not answer holds a helper, never a pump",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "NOT_WAITED_COUNT",
+        Telemetry,
+        "lot 366: the exec reads not waited for since the start (a process total)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/pump_reads.rs",
+        "JUDGED_STALE",
+        Telemetry,
+        "lot 366: the files the exec pumps judged not verified because the mounts had changed \
+         and their tables were not read again yet (a process total)",
     ),
     kept(
         "crates/nn-linux/src/sensors/flow_sock.rs",

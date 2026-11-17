@@ -492,7 +492,7 @@ pub(crate) fn started_at(ticks: u64, start_ns: u64) -> bool {
 /// Could a process with `/proc` start `ticks` (BOOTTIME) have started by
 /// `seen_ns` (MONOTONIC)? False only when it surely started later, with
 /// the host's suspended time and two ticks of slack in its favour.
-fn started_by(ticks: u64, seen_ns: u64) -> bool {
+pub(crate) fn started_by(ticks: u64, seen_ns: u64) -> bool {
     let tick = tick_ns();
     ticks.saturating_mul(tick) <= seen_ns + suspended_ns() + 2 * tick
 }

@@ -4351,6 +4351,166 @@ product code builds that bundle), with a false `host-check` warning.
   every protection. The release's contents are the same programs, linked
   on another image.
 
+## 55. The exec pumps never wait on a process's files (lot 366)
+
+- **What changed.** For each exec, the exec pump and the exec-check pump
+  read the file the process runs and a few facts about it: the directory
+  it was run from, an AppImage's image and daemon, a module tool's script
+  and library path, the image of a program whose stdio is a socket.
+  - **With a deadline, never on the pump.** Every exec's reads run on the
+    agent's bounded reader (one hand-over per exec; two for a module tool's
+    exec or a program whose standard input is a socket); the pump waits
+    for them only up to a short deadline, then goes on. No lock the pumps
+    share is held while a file is read.
+  - **Fair between users.** Each read is for the user of the exec's
+    process: its real uid — or, for a subordinate id of `/etc/subuid` (a
+    rootless container's, `unshare --map-auto`'s), the user that owns the
+    id's range. Reads of one user that do not answer hold at most one of
+    the reader's helpers, all of that user's ids together: that user's
+    next read waits for its first, within its own deadline, or is refused
+    at once while the first is held. Users, the unattributed ids (below),
+    the system's accounts (systemd's dynamic users and `nobody` among
+    them) and root each keep a share of their own, so no user can make
+    root's facts unverifiable, nor make another user's facts unverifiable
+    with any id it holds besides its own uid.
+    - The ranges are the ones the agent already publishes for the shares
+      of its kernel buffers (`/etc/subuid`, read at the start and again
+      when it or `/etc/passwd` changes): root's ranges (LXD, Incus) count as
+      one account of their own.
+    - **Unattributed ids.** An id from 65536 up that the ranges give no
+      single known user is unattributed:
+      - every such id while no ranges are published: before the first
+        publish, and always when the file-open sensor runs on its
+        tracepoint (`--file-open-sensor tracepoint`, or no BPF LSM: the
+        ranges are published with the LSM file-open program only);
+      - every such id while `/etc/subuid` cannot be read;
+      - an id of a range whose owner `/etc/passwd` does not name (an sssd
+        or LDAP user's range, by name), of ranges that overlap, or of a gap
+        between ranges;
+      - an id past every range: a range added within the last 2 seconds
+        (the ranges are checked that often), a range `/etc/subuid` does not
+        list, a domain account whose uid is that high.
+
+      The unattributed ids together are one account, in a share of their
+      own: one read at a time, one read held at most. Their reads that do
+      not answer can make each other's facts unverifiable — a rootless
+      container's while another's read is held, a domain account's — but
+      never an attributed user's, the system accounts' or root's. That
+      share held is signed once while it lasts (`exec_readers_held`, "the
+      unattributed ids' share"). Before this, such an id counted as an
+      account of the users' share: with one read of the user's own uid
+      held, it held the users' share, and every other user's exec facts
+      were judged not verified.
+    - No uid of the 16-bit range (root's, a system account's, a user's
+      own) is ever counted as another user's, whatever a range says.
+  - **Which file systems are read.** A file's file system is told by the
+    mount the kernel reached the file through, against PID 1's mount table
+    (and the agent's own; for a process in another mount namespace, a
+    container's, that process's own table, for a file system the host's
+    tables show):
+    - FUSE (`fuse`, `fuse.*`, `fuseblk`) is never read: a fact that needs
+      it is not verified;
+    - network file systems mounted by root (NFS, CIFS/SMB and the other
+      kernel clients) are read, on the bounded reader with its deadline: a
+      home on NFS or CIFS keeps its AppImage tie;
+    - btrfs is read as any local file system (a subvolume's files show a
+      device of their own; the mount decides, not the device). An
+      AppImage's image on btrfs is recognised whichever order the btrfs
+      module and the agent started in;
+    - a file system no table shows (mounted in a user's own namespace, or
+      since the tables were read) is not read.
+  - A process's file, root and descriptors are identified by the kernel's
+    cached identity of the file; a path is walked one name at a time, each
+    directory's file system judged before a name is looked up in it; where
+    the fact is about a path (the directory an image was run from, an
+    AppImage's image, a module tool's script), no symbolic link on the way
+    is followed; a file is opened for reading only once judged.
+- **Where an exec's file is.** The path an exec record names is the file's
+  mount point and its path in that file system:
+  - a file of a btrfs subvolume, whose file system's own root no mount
+    shows (a `/home` on btrfs, as Fedora and openSUSE lay it out), is named
+    by the process's own `exe` link, when the file it leads to is the
+    exec's (by the kernel's identity, through a mount of the agent's own
+    table);
+  - a mount made just before the exec (an AppImage's own, right after its
+    image ran from such a file) is placed at once — up to 5 such re-reads
+    of the table a second, then after the table's throttle (2 s), signed
+    (`mount_table_rereads`). Before, an AppImage run from a btrfs home
+    could have its zygote's re-exec (`/proc/self/exe`) named by that
+    string: the zygote was not recognised as the image's, and its
+    fork-only child's connection (the Chromium/Electron shape) was judged
+    from `/tmp` (NN-L-NET-008 High);
+  - a path given by the process's `exe` link is the text of the very file
+    whose identity was checked (the agent's own descriptor of it), never a
+    second lookup of the link: a process that re-executes meanwhile cannot
+    have its earlier exec named by the next file's path.
+- **What is judged when a fact is not read in time.** Not verified, never
+  trusted:
+  - no `ROOT_DIR` and no AppImage tie (`USER_IMAGE`);
+  - an interpreter naming a system script or nothing is taken to load the
+    caller's code, as for an environment larger than the pump reads;
+  - a module tool's program and environment are not checked: R011
+    refuses it, as for an environment it could not read;
+  - the image of a program whose stdio is a socket is unverified:
+    R020 records it.
+- **Signed.**
+  - `exec_reads_unanswered`: reads not answered in time, or refused while
+    earlier ones had not answered — a degradation of the exec pumps while
+    it lasts.
+  - `exec_readers_held`: a share of the reader (users', the unattributed
+    ids', system accounts', root's) used up by reads that do not answer —
+    once while it lasts.
+  - `exec_reads_slow`: reads that answered slowly added up, for one user
+    (the record names it, with the uid of its latest slow read) or for
+    every user together, past a budget — the exec pump was slowed. One
+    record per user and window, with its count of slow reads; when the
+    window ends the record leaves the status and its total is signed. Past
+    a few users at once, the record of every user together names how many.
+  - `exec_pump_mounts_changing`: files judged not verified because the
+    mounts changed and their tables were not read again yet.
+  - `exec_pump_mounts`, `exec_pump_own_mounts`: PID 1's (or the agent's
+    own) mount table could not be read; the table last read stays in
+    force.
+  - `mount_table_rereads`: a pump's (or the file-open sensor's) table of
+    where files are was read again at once, after changes of the mounts,
+    more than 5 times within a second (a user mounting and unmounting in a
+    loop); until that slows down, a mount made since the last read is
+    placed after the table's throttle (2 s), its files unplaced
+    meanwhile. The record names the thread.
+  - Each of these kinds of records keeps its own room in the list of
+    degradations `nn-admin status` shows: the slow reads' records cannot
+    crowd out the reads not answered or a share held, nor any other part's
+    records, and a record past its room is still signed. A degradation
+    noted past the list's limit (the signed logs' own "appends fail" among
+    them) is signed at the next flush, as one reported is.
+- **Before this change.** A read of a process's files could hold the exec
+  pumps with no deadline; and in lot 366's first form, the AppImage
+  record's lock was held while the tie read, a btrfs root or home had
+  every file refused (every AppImage's program judged from `/tmp`), NFS
+  and CIFS homes lost their AppImage tie, and the reads of all users
+  shared one bound.
+- **Residuals, accepted.**
+  - A read that does not answer holds one of the reader's helpers until it
+    answers. A user can make the facts of their own processes (its own
+    uid's and its subordinate ids') not verified: they are judged as such,
+    and signed.
+  - Two users acting together can hold the users' share: the other users'
+    exec facts are then judged not verified until a read answers, and the
+    share held is signed (`exec_readers_held`). Root's and the system
+    accounts' are not affected.
+  - One unattributed id's read that does not answer holds the unattributed
+    ids' share: every other unattributed id's exec facts (other rootless
+    containers' while no ranges are published, domain accounts with high
+    uids) are judged not verified until it answers, signed. Attributed
+    users', root's and the system accounts' are not affected.
+  - On a slow disk or network file system, an exec whose reads miss the
+    deadline is judged as not verified (signed); slow reads that still
+    answer slow the pump, and are signed past a budget.
+  - Right after a change of the mounts, before the tables are read again,
+    files on a file system with an anonymous device (tmpfs, overlay,
+    btrfs) are judged not verified (signed).
+- **Operator action.** None.
+
 ## 56. The agent's memory views on 7.0, snapd's own units, lock and watchdog causes in status (lot 367)
 
 Four behaviours from the pre-alpha self-protection round on five kernels

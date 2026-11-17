@@ -46,7 +46,39 @@ pub struct MountEntry {
     pub super_options: OsString,
 }
 
+/// Lot 366 (the re-check of #573, btrfs): the file the LSM program
+/// identified at an exec (`kernel`: its device in the kernel's form, its
+/// inode) is the file `c` (its identity from the kernel's cache, reached
+/// through the mount `c.mnt_id`, whose superblock's device and type
+/// `mount` gives: `(kernel_dev, is btrfs)`): the same device and inode — or,
+/// on btrfs, the same inode on that very mount of the file system the LSM
+/// program named. The LSM program names a btrfs file by its subvolume's
+/// device only when the btrfs module was loaded before the agent started
+/// (its layout is read at the start); loaded later, by the file system's
+/// own, where `statx` gives the subvolume's. The mount decides, as for the
+/// exec pumps' judge (`sensors::pump_reads::Judge`), never the device
+/// alone, and the identity does not hang on the order the two started in.
+pub fn same_exec_file(
+    kernel: (u64, u64),
+    c: &antitamper_bpf::kernel_roots::Cached,
+    mount: Option<(u64, bool)>,
+) -> bool {
+    if (c.dev, c.ino) == kernel {
+        return true;
+    }
+    c.ino == kernel.1 && mount.is_some_and(|(dev, btrfs)| btrfs && dev == kernel.0)
+}
+
 impl MountEntry {
+    /// The superblock's device in the kernel's form and whether it is
+    /// btrfs ([`same_exec_file`]).
+    pub fn device_and_btrfs(&self) -> (u64, bool) {
+        (
+            self.kernel_dev(),
+            self.fstype.as_encoded_bytes() == b"btrfs",
+        )
+    }
+
     /// `major:minor`, as the table spells it.
     pub fn dev(&self) -> String {
         format!("{}:{}", self.major, self.minor)

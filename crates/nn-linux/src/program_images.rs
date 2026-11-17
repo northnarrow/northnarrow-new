@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::sensors::pump_reads::Judge;
 use nn_core::decision::rules::program_identity::{self, InstalledImage, ProgramKind};
 use nn_model::Event;
 
@@ -446,6 +447,26 @@ pub fn read_and_keep(event: &Event) {
     read_runtime_clone(event);
 }
 
+/// Lot 366: whether [`read_and_keep`] reads anything of `event`: an exec
+/// with its stdio, or its parent's, on an inet socket.
+pub fn reads(event: &Event) -> bool {
+    matches!(event, Event::ProcessSpawn { stdio, .. }
+        if stdio.own.stdin_or_stdout_inet() || stdio.parent.stdin_or_stdout_inet())
+}
+
+/// Lot 366: `event`'s reads were not waited for (a file system whose server
+/// does not answer held them): an exec with its stdio on an inet socket is
+/// kept unverified — R020 records it, as an image it could not open.
+pub fn not_read(event: &mut Event) {
+    if let Event::ProcessSpawn { stdio, exe, .. } = &*event {
+        let installed = exe.has(common::wire::exe::exe_flags::KNOWN)
+            && program_identity::installed_kind((exe.dev, exe.ino)).is_some();
+        if !installed && (stdio.own.stdin_or_stdout_inet() || stdio.parent.stdin_or_stdout_inet()) {
+            program_identity::keep_unverified(event);
+        }
+    }
+}
+
 /// [`read_and_keep`] with `/proc` at `proc_root` (tests).
 fn read_and_keep_at(event: &Event, proc_root: &Path) {
     read_and_keep_with(event, proc_root, &BOUNDS);
@@ -463,18 +484,18 @@ enum Unverified {
     Budget,
 }
 
-/// What the file at `path` is (`None`: no installed program's copy),
+/// What the file `file` opened is (`None`: no installed program's copy),
 /// bounded by `bounds` for `uid`; `expect`: the identity the hook gave.
+/// Lot 366: the caller opens it only once its file system is judged one
+/// the agent asks ([`crate::sensors::pump_reads`]): a user's FUSE file is
+/// never opened through its daemon — unverified, R020 records it.
 fn identify(
-    path: &Path,
+    file: std::io::Result<std::fs::File>,
     expect: Option<(u64, u64)>,
     uid: u32,
     bounds: &Bounds,
 ) -> Result<Option<ProgramKind>, Unverified> {
-    // lot 353 (#563, the lab's FUSE over /proc): `/proc/<pid>/exe`
-    // beneath the anchored root
-    let file = antitamper_bpf::kernel_roots::open(path, libc::O_RDONLY)
-        .map_err(|_| Unverified::Unreadable)?;
+    let file = file.map_err(|_| Unverified::Unreadable)?;
     let m = file.metadata().map_err(|_| Unverified::Unreadable)?;
     let id = (
         crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev()),
@@ -517,6 +538,40 @@ fn identify(
 
 /// [`read_and_keep`] with `/proc` at `proc_root` and `bounds` (tests).
 fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
+    read_and_keep_judged(
+        event,
+        proc_root,
+        bounds,
+        &crate::sensors::pump_reads::Judge::host(),
+    );
+}
+
+/// Lot 366: the loader's operand `program` of the process `dir`
+/// (`/proc/<pid>`): walked from the process's root (an absolute one) or its
+/// working directory, one name at a time, every file system on the way
+/// judged by `judge` (links followed, each judged where it leads; a `..`
+/// refused), then opened — never a lookup through `root` or `cwd` by path
+/// on a user's FUSE file system.
+fn open_operand(dir: &Path, program: &str, judge: &Judge) -> std::io::Result<std::fs::File> {
+    use antitamper_bpf::kernel_roots;
+    let (link, rel) = match program.strip_prefix('/') {
+        Some(abs) => ("root", abs),
+        None => ("cwd", program),
+    };
+    let (from, c) = kernel_roots::link_target(&dir.join(link))?;
+    if !c.is_dir() {
+        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    // the process's own mounts (a container's) judged by its own table
+    let judge = judge.of_process(dir);
+    let w = kernel_roots::walk_judged(&from, Path::new("/"), Path::new(rel), true, &mut |c| {
+        judge.trusts(c)
+    })?;
+    kernel_roots::reopen_fd(&w.file, libc::O_RDONLY)
+}
+
+/// [`read_and_keep_with`], the file systems judged by `judge`.
+fn read_and_keep_judged(event: &Event, proc_root: &Path, bounds: &Bounds, judge: &Judge) {
     let Event::ProcessSpawn {
         pid,
         uid,
@@ -546,7 +601,8 @@ fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
         Some(kind) => Some(kind),
         None if named_loader => Some(ProgramKind::Loader),
         None => match identify(
-            &dir.join("exe"),
+            crate::sensors::pump_reads::open_exe(&dir.join("exe"), libc::O_RDONLY, judge)
+                .map(|(f, _)| f),
             known.then_some((exe.dev, exe.ino)),
             *uid,
             bounds,
@@ -574,11 +630,7 @@ fn read_and_keep_with(event: &Event, proc_root: &Path, bounds: &Bounds) {
     let Some((program, _)) = nn_core::posture::script_args::loader_program(argv) else {
         return;
     };
-    let path = match program.strip_prefix('/') {
-        Some(abs) => dir.join("root").join(abs),
-        None => dir.join("cwd").join(program),
-    };
-    match identify(&path, None, *uid, bounds) {
+    match identify(open_operand(&dir, program, judge), None, *uid, bounds) {
         Ok(Some(kind)) if kind != ProgramKind::Loader => program_identity::keep_copy(event, kind),
         // no copy: a loader known by its content is said so, the operand then
         // judged by its name
@@ -649,16 +701,23 @@ impl RuntimeChecks {
     /// The runtimes under `root` recorded, unless done in the last
     /// [`RUNTIME_REFRESH_EVERY`].
     fn refresh(&self, root: &Path, now: Instant) {
-        {
-            let mut at = self.refreshed.lock();
-            if at.is_some_and(|t| now.duration_since(t) < RUNTIME_REFRESH_EVERY) {
-                return;
-            }
-            *at = Some(now);
+        if !self.due(now) {
+            return;
         }
         for image in installed_runtimes_under(root) {
             program_identity::record_installed(image);
         }
+    }
+
+    /// Whether a refresh is due at `now` (then it is this caller's) —
+    /// memory only: the lock is never held while the runtimes are read.
+    fn due(&self, now: Instant) -> bool {
+        let mut at = self.refreshed.lock();
+        if at.is_some_and(|t| now.duration_since(t) < RUNTIME_REFRESH_EVERY) {
+            return false;
+        }
+        *at = Some(now);
+        true
     }
 }
 
@@ -764,10 +823,12 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     }
     checks.refresh(root, Instant::now());
     // first the parent, one `stat` of its image: a runtime's or a manager's
+    // lot 366: from the kernel's cache (a parent run from a user's FUSE
+    // file system: its daemon is not asked)
     let image = |pid: u32| {
-        antitamper_bpf::kernel_roots::metadata(proc_root.join(pid.to_string()).join("exe"))
+        antitamper_bpf::kernel_roots::link_target(&proc_root.join(pid.to_string()).join("exe"))
             .ok()
-            .map(|m| kernel_id(&m))
+            .map(|(_, c)| (c.dev, c.ino))
     };
     let Some(parent) = image(*ppid).filter(|id| installed_at_its_path(*id).is_some()) else {
         return;
@@ -786,11 +847,19 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
             seen.push((grand, id));
         }
     }
-    // lot 353: through the `/proc` root the agent's start anchored
-    let Ok(file) = antitamper_bpf::kernel_roots::open(
-        proc_root.join(pid.to_string()).join("exe"),
-        libc::O_RDONLY,
-    ) else {
+    // lot 353: through the `/proc` root the agent's start anchored; lot
+    // 366: opened only once it is the file the kernel executed — a memfd
+    // (the kernel's own memory, no file system's daemon to ask) — by its
+    // cached identity, then again through this thread's descriptor
+    let Ok((link, id)) =
+        antitamper_bpf::kernel_roots::link_target(&proc_root.join(pid.to_string()).join("exe"))
+    else {
+        return;
+    };
+    if (id.dev, id.ino) != (exe.dev, exe.ino) {
+        return;
+    }
+    let Ok(file) = antitamper_bpf::kernel_roots::reopen_fd(&link, libc::O_RDONLY) else {
         return;
     };
     let Ok(m) = file.metadata() else {
@@ -868,6 +937,40 @@ fn parent_and_start(proc_root: &Path, pid: u32) -> Option<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 366, the review of #573 (F2): a loader's operand is walked from
+    /// its process's root or working directory, each mount judged by that
+    /// process's own table when no host table shows it (a container's
+    /// mounts) — opened when the host's tables show its file system.
+    #[test]
+    fn a_loader_s_operand_is_judged_by_its_process_s_own_mounts() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("prog"), b"x").unwrap();
+        let c =
+            antitamper_bpf::kernel_roots::cached(&std::fs::File::open(t.path()).unwrap()).unwrap();
+        let proc = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(t.path(), proc.path().join("root")).unwrap();
+        std::os::unix::fs::symlink(t.path(), proc.path().join("cwd")).unwrap();
+        let line = |id: u64| {
+            format!(
+                "{id} 1 {}:{} / /x rw - ext4 src rw\n",
+                c.dev >> 20,
+                c.dev & 0xfffff
+            )
+        };
+        let host = Judge::of(&crate::mountinfo::parse(line(c.mnt_id + 9000).as_bytes()));
+        assert!(open_operand(proc.path(), "prog", &host).is_err());
+        std::fs::write(proc.path().join("mountinfo"), line(c.mnt_id)).unwrap();
+        assert!(
+            open_operand(proc.path(), "prog", &host).is_ok(),
+            "by its cwd"
+        );
+        assert!(
+            open_operand(proc.path(), "/prog", &host).is_ok(),
+            "by its root"
+        );
+    }
+
     use nn_model::{StdioSocket, StdioSockets};
     use std::os::unix::fs::symlink;
 
@@ -1786,6 +1889,108 @@ mod tests {
         let gone = exec(31_503, 1, outbound());
         read_and_keep_with(&gone, &proc_root, &bounds);
         assert!(program_identity::unverified(&gone));
+    }
+
+    /// Lot 366: an exec's image a FUSE file system's that answers nothing:
+    /// it is never opened through its daemon — unverified (R020 records
+    /// it), at once (on 993795e0 the open waited on the daemon).
+    #[test]
+    fn an_image_on_a_fuse_that_answers_nothing_is_unverified_at_once() {
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let t = tempfile::tempdir().unwrap();
+            let proc_root = t.path().join("proc");
+            std::fs::create_dir_all(proc_root.join("31700")).unwrap();
+            symlink(held, proc_root.join("31700/exe")).unwrap();
+            let e = exec(31_700, 9, outbound());
+            read_and_keep_with(&e, &proc_root, &Bounds::new(1 << 20, 1 << 20));
+            program_identity::unverified(&e)
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor verified (1)");
+        }
+    }
+
+    /// Lot 366: a sealed memfd's exec whose process runs another file by
+    /// the pump's read (it executed again: here a FUSE file system's that
+    /// answers nothing) is not opened — no clone, at once.
+    #[test]
+    fn a_memfd_exec_running_another_file_is_not_opened() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let rc = crate::fuse_testing::answers_beside_a_held_fuse(|held| {
+            let t = tempfile::tempdir().unwrap();
+            let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+            let mut image: Vec<u8> = (0..(1u32 << 16)).map(|i| (i % 251) as u8).collect();
+            image[..4].copy_from_slice(b"runc");
+            let runc = put(&root, "/usr/sbin/runc", &image);
+            for (pid, to) in [(36_610u32, runc.as_path()), (36_611, held)] {
+                std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+                symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+            }
+            let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+            let e = memfd_exec(36_611, 36_610, 366, &clone);
+            let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+            read_runtime_clone_with(&e, &proc, &root, &checks);
+            runtime_clone_of(&e).is_none()
+        });
+        if let Some(rc) = rc {
+            assert_eq!(rc, 0, "answered (0), not held (5) nor a clone (1)");
+        }
+    }
+
+    /// Lot 366: only an exec with its stdio (or its parent's) on an inet
+    /// socket is read (and so handed to the pumps' reader).
+    #[test]
+    fn only_a_socket_program_s_exec_is_read() {
+        assert!(reads(&exec(31_810, 13, outbound())));
+        assert!(!reads(&exec(31_811, 14, StdioSocket::default())));
+        let mut e = exec(31_812, 15, StdioSocket::default());
+        if let Event::ProcessSpawn { stdio, .. } = &mut e {
+            stdio.parent = outbound();
+        }
+        assert!(reads(&e), "the parent's");
+    }
+
+    /// Lot 366: an exec with its stdio on a socket whose reads were not
+    /// waited for is unverified (R020 records it) — unless the kernel's
+    /// identity is an installed program's; one with no socket keeps nothing.
+    #[test]
+    fn an_exec_not_read_in_time_is_unverified() {
+        let mut e = exec(31_800, 11, outbound());
+        not_read(&mut e);
+        assert!(program_identity::unverified(&e));
+        let mut quiet = exec(31_801, 12, StdioSocket::default());
+        not_read(&mut quiet);
+        assert!(!program_identity::unverified(&quiet));
+    }
+
+    /// Lot 366: an exec's image on a file system the judge refuses (a
+    /// user's FUSE file system — its daemon would answer the open, or never
+    /// — a network one, one PID 1's table does not show) is not opened:
+    /// unverified (R020 records it), where the same image judged by the
+    /// host's table is compared.
+    #[test]
+    fn an_image_on_a_file_system_the_agent_does_not_ask_is_unverified() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        let content: Vec<u8> = (0..4462u32).map(|i| (i % 251) as u8).collect();
+        put(r, "/usr/bin/perl5.41", &content);
+        refresh_under(r);
+        let proc_root = r.join("proc");
+        let x = put(r, "/home/u/x", &content);
+        std::fs::create_dir_all(proc_root.join("31600")).unwrap();
+        symlink(&x, proc_root.join("31600/exe")).unwrap();
+        let bounds = Bounds::new(1 << 20, 1 << 20);
+        let none = Judge::of(&crate::mountinfo::parse(b""));
+        let e = exec(31_600, 7, outbound());
+        read_and_keep_judged(&e, &proc_root, &bounds, &none);
+        assert!(program_identity::unverified(&e), "not opened: unverified");
+        assert_eq!(bounds.compared.load(Ordering::Relaxed), 0);
+        let e = exec(31_600, 8, outbound());
+        read_and_keep_judged(&e, &proc_root, &bounds, &Judge::host());
+        assert!(
+            !program_identity::unverified(&e),
+            "the host's table: compared"
+        );
     }
 
     /// The re-check 2 of #549 (N1), the reviewer's probe: 300 uids (the
