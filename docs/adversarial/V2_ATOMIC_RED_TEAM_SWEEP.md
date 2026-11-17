@@ -57,7 +57,7 @@ Consequences, recorded so the reframing is auditable, not silent:
   Network; the target has **no NAT**, ever. Kali's NAT was detached
   before the `v2-toolkit-installed` snapshot. C2 beacons (T1041/T1071)
   egress **only** to `192.168.56.10` — never the public internet.
-- **Access:** `kali@kalidev` → `forty@192.168.56.20` over SSH key auth
+- **Access:** `kali@kalidev` → `<user>@192.168.56.20` over SSH key auth
   (passwordless). TTPs are launched either (a) **remotely** — Kali drives
   a tool that reaches across the wire (Sliver/MSF/scans), or (b)
   **locally on target** — Kali SSHes in and runs the atomic on

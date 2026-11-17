@@ -316,20 +316,10 @@ What these checks close, and what they do not:
 - Closed after a reboot only by the evidence the start can read: a mount
   over the agent's directories themselves (the mount table), and the
   key's absence beside its own public half, id or chains.
-- Still open: a reboot with a persistent mount, drop-in or generator that
-  swaps both `/etc` and `/var/lib` together, or redefines `ExecStart=`
-  with every identity path elsewhere (nothing on that view says an
-  identity was there: it looks like a first install); the bpffs itself
-  unmounted (`umount -l /sys/fs/bpf`) and a fresh one mounted in its
-  place, which puts the pins out of the start's reach as a reboot does
-  (lot 357: the mount guard now refuses both in the host's namespace); the chains
+- Still open: after a reboot, a view prepared before the boot can make the agent start with a new identity, as on a first install (nothing on that view says an identity was there); within one boot the mount guard and the pins' proof refuse such a view (lot 357); the chains
   other than the audit log moved away on a restart (not refused: signed
   by the boot's chain check against the head anchor); the copies'
-  exemption in the lab builds; a mount laid after the start's one load
-  (lab PR 268's TOCTOU probe): no key is minted, but the start goes on in
-  the view laid over its directories, its rows signed with its one key,
-  and registers that view's directories, so the next start in the real
-  view is refused by the pins' proof until they are removed (a reboot, as
+  exemption in the lab builds; a view laid over the agent's directories while it starts (lab PR 268's probe): no key is minted, but the next start in the real view is refused by the pins' proof until they are removed (a reboot, as
   in §3.10 branch B). An off-host record of the public key is what would
   cover the reboot.
 

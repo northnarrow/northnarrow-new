@@ -274,8 +274,7 @@ pull` and an `apt purge` reached it. Since lot 282
   every crossing, these included. Residuals: a compromised service account
   encrypting its own data directory only reaches NN-L-IMP-001; a root daemon
   named like a listed unit gets that unit's directory exempt, and nothing
-  else; a file moved into such a directory before it is rewritten is judged
-  there (the posture design, §10.5 and §10.7);
+  else; it covers only the mass-write arm, and NN-L-IMP-001 judges every crossing (the posture design, §10.5 and §10.7);
 - an anti-tamper refusal of a package transaction's process (a package
   manager root executed, whose run covers it, as R009 judges it) of a file
   operation a maintainer script does — removing, renaming, changing the

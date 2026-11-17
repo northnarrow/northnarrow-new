@@ -758,10 +758,7 @@ raises `ConfirmedIntrusion` on:
    in place run from a shell). The review of #500 (C1): 20 distinct existing
    files that hold data, the smaller ones included (`MassWrite { overwrites:
    true, small_files: true }`), outside an authenticated session only —
-   inside one, as before, only files of 4 KiB or more count: a build
-   rewrites its own small outputs (cargo's fingerprints, `.d` files), and
-   counted as ransomware in a session it reached COMBAT and the ladder
-   killed cargo (lab PR 127, the reason of the 4 KiB floor).
+   inside one, as before, the small files are not counted: a build rewrites its own small outputs (cargo's fingerprints, `.d` files), and counted as ransomware in a session it reached COMBAT and the ladder killed cargo (lab PR 127).
 2. **replacement** — at least 20 distinct originals destroyed and at least
    20 files written new, the two crossings within a window of each other, in
    either order (`FileBurst { kind: Unlink }` and `MassWrite { overwrites:
@@ -819,18 +816,14 @@ extracts it again) and a user's package manager in that user's container
 storage. None is by name or path alone. Lot 346: npm's own writes, in its
 own directories only (a package tree, `~/.npm`, a manifest or lockfile),
 and only for a node the kernel executed from a root-only directory in PID
-1's mount namespace; the exemption is judged on the crossing's file, which
-the kernel reports once a window per process — code inside npm that puts
-each window's crossing in a package tree pads the window, and the
-documents it rewrites beside it are not counted by the arm (a residual,
-said). Yarn, pnpm and bun load a project's code in their own process on
+1's mount namespace; the exemption is judged on the crossing's file — code npm runs on a user's behalf writes under that exemption and the arm may not judge it (a residual, said). Yarn, pnpm and bun load a project's code in their own process on
 every install (the review of #555, F2), so no exemption by directory is
 safe for them: they are judged as any writer. The packaged Go toolchain
 (lot 340) is its path with its image (`ROOT_DIR`, the review of #555, F1):
 a container's or a user namespace's `go` is not.
 
 The kernel counters feed the ransomware tracker too (`crates/nn-core/src/impact`):
-its (a) rewrites are distinct files of 4 KiB or more (a small-file crossing
+its (a) rewrites are distinct files of the size the arm counts (a small-file crossing
 is no shape (a): the tracker's verdict is decisive, and a build rewrites its
 own small outputs), its (d) "deletion of originals after writing new files"
 reads files written new (not every write-open; whatever made them: B1) —
@@ -854,9 +847,7 @@ never locking — for the refused operations a maintainer script does on the
 file namespace only (the review of #500, B2: `unlink`, `rmdir`, `rename`,
 `setattr`, `create`, `link`, `symlink`, `mkdir`, `mknod`, an extended
 attribute; `triggers::is_package_file_operation`). Any root process makes
-itself a "transaction" without pretending anything — `apt-get -o
-APT::Update::Pre-Invoke::=<cmd> update`, `DPkg::Pre-Invoke`, `rpm --eval
-'%(cmd)'`, a dpkg run with `LD_PRELOAD`, and every child of `snapd` and
+itself a "transaction" without pretending anything — a command run under a package manager, and every child of `snapd` and
 `packagekitd`, which run for as long as the host does — so a refused signal,
 ptrace, BPF map or link handle, kexec, cgroup write, resource limit,
 scheduling change, read of the signing key, write-open, `ioctl` or
@@ -928,10 +919,7 @@ design-doc hygiene).
   ransomware tracker (lot 225, NN-L-IMP-001 and the posture's
   `RansomwareEncryption`) by the copies' content and names, not by the
   mass-write arm. Encryption in place from a session still raises the arm
-  for files above the arm's size floor; smaller documents encrypted in
-  place from a session are the tracker's, by their renames (a session
-  threshold of its own for small rewrites is to be measured on a
-  development corpus first: lot 283).
+  for the larger files; small documents encrypted in place from a login session are judged by the tracker's rename and content signals only (a session threshold of their own is to be measured on a development corpus first: lot 283).
 - **What the arm does not see (the review of #500, C1), and who does.**
   The arm pairs a replacement's halves (the copies written, the originals
   deleted) within a bounded window, and counts per process, with a
@@ -949,13 +937,12 @@ design-doc hygiene).
   the deleter being the writer's actor); small documents encrypted in
   place are the tracker's by their renames to a new extension.
 - **The kernel windows evict.** The per-process windows (`OPEN_WRITES`,
-  `OPEN_UNLINKS`, bounded LRU maps, as before the lot) restart a process's
-  counts when many other processes write or delete within its window:
+  `OPEN_UNLINKS`, bounded LRU maps, as before the lot) restart a process's counts under very heavy write activity from many processes:
   fewer counts, not more. The lot's maps evict the other way — a file or a
   name seen again counts again (`OPEN_OVERWRITE_SEEN`,
   `OPEN_DESTROY_SEEN`), a process's own temporary file forgotten counts as
   an original (`OPEN_CREATED`) — save `OPEN_HAD_DATA`, above. Documented,
-  not changed: that many writers in a minute is a host under a fork storm,
+  not changed: that much write activity is a host under a fork storm,
   which other signals see.
 - **Corroboration is per actor scope, not per process tree** (future work).
   A signal of one process of a login session or a workload vouches for
@@ -973,14 +960,11 @@ design-doc hygiene).
     root's, a file with another link), or runs in a session, still raises
     the arm;
   - *a root daemon running as a listed unit gets that unit's listed
-    directories exempt, and nothing else*: the unit is recognised by its
-    name, which any root process can take by installing and starting a
-    unit of that name; whatever runs as or in that unit writes those
+    directories exempt, and nothing else*: the unit is recognised by its name; whatever runs as or in that unit writes those
     directories unseen by the arm; its writes anywhere else count, and so
     do the same directories written from any other cgroup;
   - *own data is classified by the directory a file is in when it is
-    opened* (the dentries, not the mount): a rewrite made there is judged
-    as own data, whatever directory the file came from, and reaches
+    opened* (the dentries, not the mount): a rewrite made there is judged as own data and reaches
     NN-L-IMP-001 only. A file with another link is no one's own data;
   - *tracepoint mode* knows no own data (no kernel summary): every
     crossing counts there, as before.

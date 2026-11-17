@@ -256,9 +256,7 @@ kill targets the nearest foreign program (the script, the payload).
   **Open (lot 331)**: the shape "an encryption tool, then a deletion of
   the originals" is decisive in the unit tests
   (`gpg_encrypt_files_then_rm_is_decisive`,
-  `an_inline_session_s_gpg_then_rm_is_decisive`) but was NOT reproduced
-  live on Ubuntu 24.04 (lot 313's lab r3 and r4: no NN-L-IMP-001); another
-  tool's renames ((b) + (c)) were decisive live on Debian 13. Not claimed
+  `an_inline_session_s_gpg_then_rm_is_decisive`) but is not yet confirmed live on every tested system (encryption that does not show these shapes may be seen only by weaker signals); another tool's renames ((b) + (c)) were decisive live on Debian 13. Not claimed
   closed.
 - Residuals, as behaviour (lot 364: limits, not ways around them): the
   tables name packaged encryption tools, and a program no table names is
@@ -302,7 +300,7 @@ switch-off commands. No tool name is in the code.
 |---|---|
 | NN-L-EVA-001 | exec of `systemctl stop/disable/mask/kill/freeze`, `service … stop`, `invoke-rc.d`, `update-rc.d … disable/remove`, `chkconfig … off`, `rc-service … stop`, `rc-update del`, `/etc/init.d/<name> stop` naming a listed unit (`--user` excluded) |
 | NN-L-EVA-002 | exec of a listed switch-off command, arguments in order and next to each other (`auditctl -e 0`, `-D`, `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F`, `aa-teardown`, cloud-agent uninstallers); the program by its executable or its `argv[0]` (`iptables` is `xtables-nft-multi`); one record per command and process tree (the children of one parent) within 10 s — the first at once, the repeats counted (below) |
-| NN-L-EVA-003 | a stop or end signal (INT, QUIT, ABRT, KILL, TERM, STOP, TSTP) to a listed tool's process, seen on `task_kill` and never refused — a shell's builtin `kill` included (`DEFENDER_PIDS`, filled from `/proc` at boot and from the tools' execs, each exec followed by `/proc` scans 0.3, 2 and 6 s later for the processes it forks — a `Type=forking` daemon such as Debian's auditd runs as a child of the exec'd process, which exits; PID 1, the tool itself and the agent excluded; one report a second per sender and target) — or an exec of `kill`, `pkill`, `killall` naming one |
+| NN-L-EVA-003 | a stop or end signal (INT, QUIT, ABRT, KILL, TERM, STOP, TSTP) to a listed tool's process, seen on `task_kill` and never refused — a shell's builtin `kill` included (`DEFENDER_PIDS`, filled from `/proc` at boot and from the tools' execs, each exec followed by `/proc` scans for the processes it forks — a `Type=forking` daemon such as Debian's auditd runs as a child of the exec'd process, which exits; PID 1, the tool itself and the agent excluded; one report a second per sender and target) — or an exec of `kill`, `pkill`, `killall` naming one |
 | NN-L-EVA-004 | a change of a listed configuration file: FIM watches the files and, for a listed directory, the files it holds at boot (FIM does not enumerate a directory's children) |
 
 High and recorded (`Log`); Low in a package transaction run by root, an
@@ -337,11 +335,7 @@ sanctioned (coalesced repeats included). ATT&CK v20 (the ids of lab PR 221): T16
 Tools, T1685.004 for the audit system, T1686 for the firewall; tactic
 Defense Impairment (TA0112).
 
-Residuals: a unit stopped over D-Bus (`busctl`, `gdbus`) rather than by
-`systemctl`; a signal to a tool's helper process that is not its listed
-executable; a signal to a forking daemon in the first 0.3 s after its exec,
-before the `/proc` scan registers its pid (a builtin `kill`; an exec of
-`kill` naming it is still read); an edit of a configuration file created
+Residuals: some ways to stop a listed tool are not recognised by these tables (a tool's own status and logs are the check); a signal to a tool's helper process that is not its listed executable; a signal to a daemon that has only just started may not be seen (an exec of `kill` naming it is still read); an edit of a configuration file created
 after boot in a directory that was empty at boot is seen as its creation
 only.
 

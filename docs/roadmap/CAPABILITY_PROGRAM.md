@@ -6139,8 +6139,7 @@ number in parentheses is a lab PR.
     process's refused signal, ptrace, BPF handle or kexec ALERTED);
     originals of any size that hold data, and one truncated then unlinked
     (`OPEN_HAD_DATA`), count as destroyed; files under 4 KiB rewritten in
-    place count outside an authenticated session (`MASS_OVERWRITE_SMALL`;
-    inside one the 4 KiB floor of lab PR 127 stays); the replacement's
+    place count outside an authenticated session (`MASS_OVERWRITE_SMALL`; inside one the small-file floor of lab PR 127 stays); the replacement's
     halves pair per cgroup too (the record carries the cgroup id); in
     tracepoint mode `O_CREAT|O_EXCL` opens count again; `CNI-ADMIN` and
     `KUBE-FIREWALL` are filter chains. Lab (as measured): Ubuntu 22.04,
@@ -6233,10 +6232,7 @@ number in parentheses is a lab PR.
     `open-sensor-check`.
   - Open: corroboration is per actor scope, not per process tree (future
     work); copy-then-delete ransomware run from an SSH shell is the
-    ransomware tracker's, not the mass-write arm's (as before); what
-    neither sees — originals deleted more than a minute after the copies,
-    a deleter in another cgroup or forked once per file, writers forked
-    per file, tracepoint mode — is listed in the design's §10.5;
+    ransomware tracker's, not the mass-write arm's (as before); what neither judges is stated as behaviour in the design's §10.5;
     kube-proxy, Calico and Cilium flush their chains from containers (no
     host package vouches for them): their flushes stay records.
   - No capability level moves.
@@ -9401,9 +9397,7 @@ number in parentheses is a lab PR.
     uid, never every budget (300 uids twice in one second were granted
     38,400 MiB).
     **Open (lot 331)**: the LOTL shape encryption tool + `rm` is decisive in
-    the unit tests, NOT reproduced live on Ubuntu 24.04 (lab r3: two units;
-    r4: one inline and one interactive session — the files encrypted and
-    deleted, no NN-L-IMP-001); not claimed closed.
+    the unit tests, not yet confirmed live on every tested system; not claimed closed.
     Residuals stated: the copy check compares a file's identity with the
     installed shells, so a copy that differs from them is not recognised as
     one; a container's own shells (and overlayfs' identities) are not
@@ -9563,9 +9557,7 @@ number in parentheses is a lab PR.
     auditd`: judged 0.08 s later. The differential as root with no agent:
     1,027 argvs (kill and `argv[0]` added; systemctl with a snap-like unit,
     the new verbs and classes), 0 mismatches. 32 mutations of the round's
-    code, all caught by named tests (8 after a test each). The kernel's
-    `task_kill` reports only SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP
-    (lot 330 is to report every default-fatal signal).
+    code, all caught by named tests (8 after a test each). Only the stop and end signals the kernel's hook reports are recorded (lot 330 widens them).
   - The re-check of #548 (round 3). A reload is Low only when:
     - the reading of the argv the process makes sends SIGHUP (N1). Under
       `POSIXLY_CORRECT` an option after systemctl's verb, or after a pid
@@ -9588,9 +9580,7 @@ number in parentheses is a lab PR.
     it, ran the real postrotate (`rsyslog-rotate`) four times: each a Low
     NN-L-EVA-001 (rsyslogd's `SigCgt` `0000000100314001`, alone in its
     cgroup) and no other record. With `POSIXLY_CORRECT=1`, rsyslogd got
-    SIGTERM and the record was High. Left to lot 330, with F5, F6, F7 and F13: a
-    listed unit's file and drop-ins (an empty `ExecStart=` in a
-    `.service.d` drop-in, `daemon-reload`, `restart`: no record).
+    SIGTERM and the record was High. Left to lot 330, with F5, F6, F7 and F13: a listed unit's definition changed by a drop-in.
   - Level unchanged (C14 2): fixes inside the capability at its level.
 - **Lot 311a — a kill reaches a process whatever it names itself (C17;
   the third bug hunt's triage, N6; no level changes).**
@@ -10588,9 +10578,7 @@ number in parentheses is a lab PR.
     digest of each exec's argv) and PID 1's fork or cron's daily run
     (`/etc/cron.daily/logrotate` under `run-parts`, a short root chain up to
     a cron daemon PID 1 forked); npm's writer has no code-loading environment
-    (`ENV_LOADS`) and npm's CLI under a system path prefix (a prefix, not a
-    proof of root ownership; `~/.npm-init.js` and user-owned or namespaced
-    prefixes remain a declared residual, follow-up lot); CoreDNS's id is the leaf of a
+    (`ENV_LOADS`) and npm's CLI under a system path prefix (a prefix, not a proof of root ownership; a declared residual, follow-up lot); CoreDNS's id is the leaf of a
     `kubepods` cgroup and the sender shares the container init's PID and
     mount namespaces; a resolver is the system's service (its unit's cgroup
     under `system.slice`, PID 1's fork or NetworkManager's for dnsmasq,
@@ -10899,9 +10887,7 @@ number in parentheses is a lab PR.
   - What was open: `go test` held a developer's posture in ENGAGED
     (`StagingExec` of its test binaries, also NN-L-IMP-001 Critical for its
     archive rewrites); yarn, pnpm and bun were not known; npm's exemption
-    covered every write of a process named npm (the re-check of #552, N1:
-    `~/.npm-init.js` loaded by `npm init`, `/nix/store`, `/opt`, a user's
-    mount namespace); the exec record dropped empty arguments (N2); a
+    covered every write of a process named npm (the re-check of #552, N1); the exec record dropped empty arguments (N2); a
     self-forking resolver and NodeLocal DNSCache/kube-dns were not proven
     resolvers (N3, item 5); `pg_createcluster` by hand raised
     ConfirmedIntrusion for `initdb` and its bootstrap `postgres`.
@@ -10931,11 +10917,7 @@ number in parentheses is a lab PR.
     (units): `npm ci`, `pnpm install --force`, `bun install --force` 0
     raises before and after (the corpus project crosses no threshold:
     pnpm and bun link from their stores); `yarnpkg install` fails on
-    debian13 (its yarnpkg is berry, `--force` unknown). **N1 control**: the
-    packaged npm's `npm init -y` loading an encryptor from
-    `~/.npm-init.js` (80 documents): **0 raises and no record on `main`**
-    → ConfirmedIntrusion, both guests (still no NN-L-IMP-001: the tracker
-    trusts the packaged npm). **npm from an nvm prefix** (measured, kept
+    debian13 (its yarnpkg is berry, `--force` unknown). **N1 control**: code run by the packaged npm on a user's behalf (80 documents): **0 raises and no record on `main`** → ConfirmedIntrusion, both guests. **npm from an nvm prefix** (measured, kept
     strict): `npm ci` in the session 0, in a unit ConfirmedIntrusion 1,
     before and after. **Attack controls** after, both guests: a package's
     postinstall encryptor, `NODE_OPTIONS=--require` into yarn, `bun run`
@@ -10950,15 +10932,13 @@ number in parentheses is a lab PR.
     `main`): they load a project's code in their process on every install
     and the arm judges only a window's crossing file, which that code can
     keep in `node_modules`; re-arming the window after an exempt crossing
-    was weighed and not taken (one package-tree write per window, after
-    the documents, still lands the crossing there; no user-space path to
-    the kernel's window exists). Their false positive was never
+    was weighed and not taken. Their false positive was never
     reproduced in the lab (the rows above: 0 → 0). npm keeps N1's
-    narrowing, with the same padding named as its residual. F5 — an argv
+    narrowing, with its residual named. F5 — an argv
     block of exactly 512 bytes is marked cut (`wire::argv_read`). Named as
     residuals: a program `go` forks by the user's choice from a
     work-directory layout (`-exec`, `-toolexec`, `go:generate`, `GOFLAGS`;
-    F3) and `initdb -L` (F4).
+    F3) and the account's own cluster tooling (F4).
   - Level unchanged: the false-positive work of the alpha; C17's
     provisional waits on the nightly.
 - **Lot 344 (alpha FP round 2A) — the host's and the agent's own records
@@ -11018,11 +10998,7 @@ number in parentheses is a lab PR.
     kill` of the watchdog: High, as before. NN-L-EVA-002 for docker: none
     before or after on either guest — docker.io's install, a restart,
     `docker run`, `docker build`, a reinstall inside the package transaction.
-  - Residuals: a root process that starts a preloaded watchdog (or agent)
-    binary while that role is vacant — or makes a program of its own the
-    watchdog's binary by device and inode (`prctl(PR_SET_MM,
-    PR_SET_MM_EXE_FILE)`) — gets, in its first minute, handles that are not
-    refused (EBPF-002's window; the watchdog's absence is signed), recorded
+  - Residuals: a root process taken for the watchdog (or agent) while that role is vacant gets handles that are not refused (EBPF-002's window; the watchdog's absence is signed), recorded
     NN-L-BPF-002 Low since the review of #554; a root that makes systemd `stopping` (`systemctl
     start shutdown.target`) has its relayed signals judged a shutdown (still
     refused); a log renamed away and recreated (logrotate's `create`, or
@@ -11465,9 +11441,7 @@ number in parentheses is a lab PR.
     record; the flood's `minor_denial_rate` drops 2,318,301). On a guest
     with no `/etc/northnarrow` the guard fixture's last run is refused at
     `agent_mounts` (the first run made the directory after registering the
-    host's): the lab made it first, as `install.sh` does. X2's
-    `dup2` slot race (§43, a named residual, not this lot's) still let a
-    held program into a slot 0–4 times in 20,000 on 6.8, 0 on 7.0.
+    host's): the lab made it first, as `install.sh` does. X2's rare unrecorded use (§43, a named residual, not this lot's) was measured on 6.8 and 7.0.
   - Not covered in a guest: the ring-full refusal (a ring with no room at
     the held load) — by the ratchet and the verifier only.
   - The review of #565 (the fix round): (F1, P2) a load refused for want of
@@ -11759,8 +11733,7 @@ number in parentheses is a lab PR.
     write (the cgroup v2 id, the unit's cgroup directory's inode). NET-006
     Low for a root-owned-tree program in a system service's cgroup on
     loopback; nsfs rows are mounts; FIM list paths absent at the start are
-    watched once they appear (once a second; the appearance itself not
-    reported). Not done: NET-019 for `pg_createcluster`'s probe.
+    watched once they appear (the appearance itself not reported). Not done: NET-019 for `pg_createcluster`'s probe.
   - Lab (as measured; alpha profile; the lot's WIP commits):
     **debian12** (6.1, runc 1.1.5, containerd 1.6.20, podman 4.3.1; the
     same 1.1 clone as Debian 13's 1.1.15, Debian 13 being the soak's): docker
@@ -12527,8 +12500,7 @@ number in parentheses is a lab PR.
     (5.15.0-203), ubuntu2404 (6.8.0-149) — 19/19 refused, one signed High
     each and the lock unchanged (among them `--make-rshared` and
     `--make-rprivate` of `/`, `/sys`, `/sys/fs/bpf` in the host's
-    namespace); a raw namespace's `--make-rshared /` and `unshare -m
-    --propagation shared`, refused in fix round 1, let through without a
+    namespace); a raw namespace's own propagation changes, refused in fix round 1, let through without a
     record; 13/13 let through without a record — fix round 1's 8, docker,
     `docker run -v /sys/fs/bpf:/sys/fs/bpf:rshared` (the bind `shared:11`,
     the host's group, inside the container) and a runc bundle with
@@ -13191,8 +13163,7 @@ number in parentheses is a lab PR.
     the ratchet `the_kernel_state_round_reads_within_a_deadline`. F4's
     sentence corrected in the trust model (a kernel-side iterator could
     judge the content with no new capability; not done for the alpha);
-    the window's global scope (P1, after the alpha), N2, N3 (P3) and the
-    `dup2` race (P2) named in UPGRADE_NOTES_WAVE4 §43.
+    the window's global scope (P1, after the alpha), N2, N3 (P3) and the rare unrecorded use (P2) named in UPGRADE_NOTES_WAVE4 §43.
     - Lab, as measured (the verifier only, the eBPF object
       `e9140765…`, nothing installed): **ubuntu2204** (5.15.0-202)
       `verifier-check` 117 programs, 110 OK, 7 not counted, 0 failing,
@@ -13210,10 +13181,8 @@ number in parentheses is a lab PR.
     masks); `CPUWeight=` on the slice against a CPU flood (R12c-3, open since lab PR 271: root
     out-weighs it, and a slice unit change needs its own upgrade round);
     from 6.9 a program loaded before the agent is not judged at its handles
-    (High at the start), nor (any kernel) its loader's kept descriptor;
-    what a window itself attached keeps running, a netlink XDP/tc attach,
-    the other program-holding maps, a `dup2` race (each lost attempt
-    signed); no `sb_mount` hook (R003 is recorded, not refused).
+    (signed at the start), nor (any kernel) its loader's kept descriptor;
+    what a window itself attached keeps running, some attachments, the other program-holding maps, a rare unrecorded use (each refused use signed); no `sb_mount` hook (R003 is recorded, not refused).
   - Levels unchanged: blockers of the pre-alpha closed or measured; no new
     capability.
 

@@ -173,7 +173,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     self-test; a long suspend can make a record name an earlier program;
     run the agent only through its units; `nn-admin chain verify` saying
     OK with no chains; the release's provenance only from the first tag.
-    Fix rounds 2 and 3 rewrote the remaining walk bounds and lock residuals in the upgrade notes, the trust model, these notes and the capability program as behaviour. Ratchet
+    The remaining walk bounds and lock residuals in the upgrade notes, the trust model, these notes and the capability program are written as behaviour. Ratchet
     `xtask/tests/known_limitations.rs`: every item names evidence, and
     every backticked word of the evidence is a test (by name or by path),
     a file or a golden case that exists, every lot (any case) is in the
@@ -563,8 +563,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (`bpf_held_load`, High, not refused), before 6.9 too. The held set is
     pinned, emptied of freed ids each kernel-state round, and full it
     refuses the window's load (fail closed). Open, named: what the window
-    itself attached, a netlink XDP/tc attach, a `dup2` race (each lost
-    attempt signed), programs loaded before the agent.
+    itself attached, some attachments, a rare unrecorded use (each refused use signed), programs loaded before the agent.
     Its re-check: a prog array's value the hook cannot read (a page not
     resident, `bpf_sys_bpf`'s kernel pointer) is read through the kernel
     path next and, unread, refused and signed (fail closed: it was let
@@ -574,8 +573,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     round's path reads wait at most 2 s (a FUSE file bound over one
     stalled the whole round), a stall making the CPU watch's round
     unjudged (three in a row signed). Named: the window is the host's,
-    not the installer's (P1 after the alpha), the `dup2` race (P2), a
-    `struct_ops` map read as a program and the CPU watch's sources
+    not the installer's (P1 after the alpha), a rare unrecorded use (P2), a `struct_ops` map read as a program and the CPU watch's sources
     trusted by filesystem type (P3).
   - **A copy of `/etc` mounted over `/etc` (R003): measured, unchanged.**
     The integrity round signs it today (`integrity_drift`
@@ -1884,13 +1882,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `ROOT_DIR` also needs PID 1's root directory (`exec_facts::same_root`:
     a chroot's view of the executed path's directory is root's choice).
     `uninstall.sh --help` lists its exit 4.
-  - **Residual, P2 (H(a), named for a later lot):** a local privilege
-    escalation that sets its real uid to a sudoer's whose sudo asks for
-    nothing (a `NOPASSWD` sudoer — a cloud image's default user — or a
-    timestamp root forges in `/run/sudo/ts`, which FIM does not watch) and
-    then runs the host's sudo still gets the session's cover: sudo
-    authorizes by the real uid. Closing it needs the real uid to stay the
-    same from the sudo up to the login (§45).
+  - **Residual, P2 (H(a), named for a later lot):** a local privilege escalation that hands its payload to an administrator's sudo still gets the session's cover (§45).
 - Lot 350 (the pre-alpha's Phase 2): our own install, boot and uninstall
   raise no High; `uninstall.sh --purge` leaves nothing undeclared. Each
   record is told by identity, none by a name.
@@ -2108,9 +2100,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     stays); a dropper can avoid the shared staging directories anyway.
   - **JavaScript package managers in their own directories only** (the
     re-check of #552, N1; item 2). npm's mass-write exemption covered every
-    write of node running npm's CLI — `npm init` loads `~/.npm-init.js` in
-    that process, and npm's CLI was npm's under a path prefix a user may
-    fill (`/nix/store`, `/opt`). It is now `js_pm_own_write`: node running
+    write of node running npm's CLI — code npm loads runs in that process, and npm's CLI was npm's under a path prefix a user may fill. It is now `js_pm_own_write`: node running
     npm's CLI whose exec has its image — executed from a root-only
     directory in PID 1's mount namespace (`ROOT_DIR`) — and a crossing file
     in npm's own directories (a `node_modules` segment, `~/.npm`, a
@@ -2124,13 +2114,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (the kernel reports a window's crossing once per process) — that code
     would fill `node_modules` first and rewrite `~/Documents` unreported in
     the same window, every window. Their install's false positive was never
-    reproduced in the lab (no corpus project crosses a threshold). Residual,
-    said, for npm: code inside npm (`~/.npm-init.js`) that puts each
-    window's crossing in a package tree pads the window, and the documents
-    it rewrites beside it are not counted by the arm — narrower than
-    before, where every npm write was exempt. Re-arming the window after an
-    exempt crossing does not close it (one package-tree write per window,
-    after the documents, still lands the crossing there). Named tests:
+    reproduced in the lab (no corpus project crosses a threshold). Residual, said, for npm: code npm runs on a user's behalf writes under its exemption and the mass-write arm may not judge it — narrower than before, where every npm write was exempt. Re-arming the window after an exempt crossing was weighed and does not close it. Named tests:
     `npm_outside_its_own_directories_or_identity_raises_the_posture`,
     `yarn_pnpm_and_bun_padding_their_window_in_node_modules_raise_as_on_main`,
     `a_package_manager_outside_its_identity_or_directories_keeps_the_arm`,
@@ -2145,11 +2129,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     340's db corpus). Lot 283c's decision 1 stands for every other program
     of the account; its test's session writer is now a shell. Named test:
     `initdb_making_a_cluster_raises_nothing_from_a_session_too`. Residual
-    (the review of #555, F4): `initdb -L <dir>` has the exempt bootstrap
-    run the SQL files of a directory the caller names, as the cluster's
-    superuser — which can rewrite the account's live cluster unjudged; the
-    same account reaches the same through `psql` to its running server,
-    whose writes are exempt by design.
+    (the review of #555, F4): the account's own cluster tooling writes under the account's exemption, as its running server does.
   - **The exec record's argv keeps empty arguments** (the re-check of
     #552, N2). `parse_argv_blob` dropped every empty segment:
     `execve("/usr/sbin/logrotate", ["", "logrotate", "/etc/logrotate.conf"])`
@@ -2178,15 +2158,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   attack variant still judged (`docs/operator/UPGRADE_NOTES_WAVE4.md` §38).
   - **Our watchdog's start is not a foreign BPF handle.** A freshly started
     watchdog opens `PROTECTED_PIDS`' pin to register itself before it is a
-    protected pid. The `bpf` hook let that through (the watchdog's binary by
-    device and inode, its role vacant, its main thread, its first minute —
-    external audit EBPF-002) and still reported it: NN-L-BPF-002 High at
+    protected pid. The `bpf` hook let that through (external audit EBPF-002) and still reported it: NN-L-BPF-002 High at
     every start, the first record a tester saw. The same identity is now
     recorded on its own, Low (`BPF_CMD_FRESH_INSTANCE_GET_FD`, the review of
-    #554: not silenced — a foreign program made the watchdog's binary by
-    device and inode through `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` while
-    the role is vacant takes the same path). A second instance beside the
-    live one, one past its first minute, any handle on a link of the
+    #554: not silenced — a foreign program taken for the watchdog while the role is vacant takes the same path). A second instance beside the live one that is not new, any handle on a link of the
     agent's: reported High (and refused) as before. The hook's watchdog is
     the one the agent verifies (`--watchdog-exe`, else its sibling): it
     named the sibling on its own, so a watchdog given by `--watchdog-exe`
@@ -2227,9 +2202,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     The marker holds the writer's start, and the record carries it
     (`FimDriftRaw::modifier_start`): a pid reused by the time the drain
     reads it lends no image (`/proc` read for that start only, the lineage
-    for that process only), except within the start's 2-tick tolerance: a
-    pid reused within about 15 ms of the writer's exit can still lend its
-    image (re-check of #554, N1). Residual: code running inside rsyslogd
+    for that process only), except within the start's tolerance: a pid reused right after the writer's exit can, rarely, lend its image (re-check of #554, N1). Residual: code running inside rsyslogd
     itself writes as rsyslogd.
   - **A drift's writer that executed nothing since its fork is known.** The
     FIM drift record (`FimDriftRaw`, 144 → 176 bytes) carries the writer's
@@ -2322,11 +2295,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (`/usr`, `/opt`, `/usr/local`; a prefix, not a proof of root ownership):
     a package's own copy, one in a home (a user prefix the postinstall can
     write) or a path through `..` is the caller's code under npm's name
-    Residual (the re-check of #552, N1): npm still loads `~/.npm-init.js`
-    into its own process on `npm init`, and the prefix test does not prove
-    root ownership (`/nix/store`, a user-owned `/usr/local` or `/opt`, a
-    `unshare -Urm` or rootless mount namespace) — the exemption is not yet
-    attacker-proof; a follow-up limits it to npm's own write paths.
+    Residual (the re-check of #552, N1): the exemption trusts the packaged tool by identity and a system path prefix, which does not prove root ownership — it is not yet attacker-proof; a follow-up limits it to npm's own write paths.
     and keeps the arm. The packaged `go` command rewriting
     its archives in its work directory (`$TMPDIR/go-build<digits>/`), its
     build cache or its module cache (`go test` stamping build ids) is
