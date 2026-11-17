@@ -646,7 +646,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::AntiTamper, Sensor::Exec],
         data_components: &["DC0021", "DC0032"],
         observes: "A stop or end signal to a listed tool's process: on `task_kill` \
-                   (SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP only; never one from PID 1 \
+                   (SIGINT, QUIT, ABRT, KILL, TERM, STOP, TSTP; never one from PID 1 \
                    or from another registered tool; `DEFENDER_PIDS`, filled at boot and \
                    from the tools' execs, and from \
                    `/proc` scans after each for the daemon it forks; reported, never \

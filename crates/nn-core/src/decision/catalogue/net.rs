@@ -312,9 +312,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    flows folded since; a datagram sent to the sending socket's own bound \
                    endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon \
                    — the destination the send names (`sendto()`, connected socket or not), \
-                   the socket's peer only when it names none. Residual: another socket bound \
-                   to the same endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive it; that \
-                   relay's own flows are judged.",
+                   the socket's peer only when it names none. Residual: a datagram to the \
+                   sender's own loopback endpoint is no beacon; whatever forwards it is judged \
+                   by its own flows.",
         false_positives: "Pollers, health checks, metrics exporters and update checkers not in \
                           the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).",
         how_to_test: "From one process, connect to the same address every 5 seconds: \

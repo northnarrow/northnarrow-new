@@ -1060,7 +1060,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
-**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369), its own appearance not reported, and /etc is not watched as a directory.
+**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369: looked at once a second), its own appearance not reported, and /etc is not watched as a directory.
 
 ### NN-L-FIM-023_SystemdTimerCreated
 
@@ -1142,7 +1142,7 @@ Kernel module configuration written — category `fim_persistence`.
 
 **Observes.** Lot 285: a file of kmod's configuration directories (/etc, /run, /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, renamed in, linked or removed: an `install` or `remove` directive runs a command as root whenever the module is asked for. High outside a package transaction (the writer's lineage at the write), Low inside one; never a kill (the write is done).
 
-**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: its own appearance, and a file made together with it, may not be reported).
+**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: within a second; a file put in it within that second is not reported).
 
 **How to test.** `echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, then remove it; expect High, Log.
 
