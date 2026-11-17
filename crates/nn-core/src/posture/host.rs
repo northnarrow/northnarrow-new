@@ -95,6 +95,14 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// opened (the final check of #495, C1).
     fn file_id<P: AsRef<Path>>(path: P) -> Option<(u64, u64)>;
 
+    /// Lot 369: the inode number of the directory `path` names, its final
+    /// symlink not followed (a cgroup's directory: its cgroup v2 id);
+    /// `None` when it is not a directory or cannot be read. The portable
+    /// hosts know none.
+    fn dir_ino<P: AsRef<Path>>(_path: P) -> Option<u64> {
+        None
+    }
+
     /// Lot 310: the directory `path` names (followed) is root's and
     /// writable by no one else — no user can unlink a file in it. `false`
     /// when it cannot be read; the portable hosts know no owners.
@@ -218,6 +226,22 @@ pub(crate) mod testing {
                 .ok()
                 .filter(|m| m.is_dir())
                 .map(|_| TEST_OWNER)
+        }
+
+        /// Lot 369: a directory's stand-in inode number — the portable
+        /// host has none: a hash of its path (FNV-1a), stable for a test.
+        fn dir_ino<P: AsRef<Path>>(path: P) -> Option<u64> {
+            let path = path.as_ref();
+            std::fs::symlink_metadata(path)
+                .ok()
+                .filter(|m| m.is_dir())
+                .map(|_| {
+                    path.to_string_lossy()
+                        .bytes()
+                        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                        })
+                })
         }
 
         /// No file's identity on the portable host (a device and an inode

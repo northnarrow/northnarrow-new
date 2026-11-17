@@ -95,6 +95,97 @@ pub fn is_staged_exec(exe: &nn_model::ExeIdentity, filename: &str) -> bool {
     staging_judged_path(exe, filename).is_some_and(is_staging_path)
 }
 
+/// Lot 369: lot 346's identity of the packaged `go`'s own build output, as
+/// the staging rules R001 and R003 apply it to the record (decision 283b
+/// held a person's exec from `/tmp` at High below COMBAT; the posture's
+/// exec arm already left it out): `go test`'s test binary and `go run`'s
+/// program, a file in the layout of `go`'s work directory
+/// (`<TMPDIR>/go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), forked
+/// by a process that ran the packaged `go` (a root-only system tree, its
+/// exec's image seen, run as itself) before the fork, the one hop above
+/// ([`crate::posture::lineage::AuthSessionTracker::runs_go_build_output`]),
+/// and not unlinked or a memfd when the kernel ran it. What `go` builds is
+/// the user's own code, as `go build && ./prog` from a home, which no
+/// staging rule judges. The same file run from a shell, by another parent
+/// or by the test binary itself, a `go` in a home, a layout that does not
+/// hold: judged as before. Without a lineage (tests, the boot-time rule
+/// set): never.
+#[derive(Clone, Default)]
+pub struct GoBuilds(Option<GoBuildCheck>);
+
+/// Lot 369: [`GoBuilds`]'s predicate: `pid`'s exec of `image` as of the
+/// time given is the packaged `go`'s own build output.
+type GoBuildCheck = Arc<dyn Fn(u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync>;
+
+impl GoBuilds {
+    /// The predicate, on `lineage`.
+    pub fn of<H: DecisionHost>(lineage: crate::posture::lineage::AuthSessionTracker<H>) -> Self {
+        GoBuilds(Some(Arc::new(move |pid, as_of, image| {
+            lineage.runs_go_build_output(pid, as_of, image)
+        })))
+    }
+
+    /// A predicate given as is (tests).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn of_fn(
+        f: impl Fn(u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        GoBuilds(Some(Arc::new(f)))
+    }
+
+    /// `event`, an exec of `image`, is the packaged `go`'s own build
+    /// output, run by it.
+    pub fn runs(&self, event: &Event, image: &str) -> bool {
+        use common::wire::exe::exe_flags::{DELETED, MEMFD};
+        let Event::ProcessSpawn {
+            pid,
+            exe,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        if exe.has(DELETED) || exe.has(MEMFD) {
+            return false;
+        }
+        self.0.as_ref().is_some_and(|f| {
+            f(
+                *pid,
+                crate::posture::lineage::AsOf::judged(*timestamp_ns),
+                image,
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for GoBuilds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "GoBuilds(lineage)"
+        } else {
+            "GoBuilds(none)"
+        })
+    }
+}
+
+/// Lot 369: the record of an exec [`GoBuilds::runs`] vouches for — Low, not
+/// killed, in every posture (the kill floor of decision 283b holds kills
+/// only: a record left as it is).
+pub(crate) fn go_build_record(rule: &dyn Rule, event: &Event, dir: &str) -> Verdict {
+    build_verdict(
+        rule,
+        event,
+        ResponseAction::Log,
+        Severity::Low,
+        &format!(
+            "Process executed from {dir} — the packaged go's own build output in its work \
+             directory (go test's test binary, go run's program), forked by that go: the user's \
+             code as go build and ./prog from a home — recorded Low, not killed (lot 369)"
+        ),
+    )
+}
+
 /// Lab PR 166: the kill of the tool rules R011..R013 for an exec of
 /// `image`. A copy run from a staging directory is the payload itself, as
 /// for R001..R003, which those rules outrank (PROC-009): its tree, so a
@@ -479,6 +570,8 @@ fn spawn_rules<H: DecisionHost>(
     let r006_lineage = lineage.clone();
     // lot 350 (F2-3): cloud-init's own netcat on its unix socket
     let r005_lineage = lineage.clone();
+    // lot 369: lot 346's identity of the packaged go's own build output
+    let go = lineage.clone().map(GoBuilds::of).unwrap_or_default();
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -505,8 +598,8 @@ fn spawn_rules<H: DecisionHost>(
         Box::new(R013NamespaceEscapeTooling::new(al())),
         Box::new(R017ShellFromNonstandardPath::new(al())),
         Box::new(R002ExecFromDevShm),
-        Box::new(R001ExecFromTmp),
-        Box::new(R003ExecFromVarTmp),
+        Box::new(R001ExecFromTmp::default().with_go_builds(go.clone())),
+        Box::new(R003ExecFromVarTmp::default().with_go_builds(go)),
         // Records, the High ones first.
         Box::new(R005NetcatExec::default().with_lineage(r005_lineage)),
         Box::new(R007CryptoMiner::name_fragments(al())),

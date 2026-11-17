@@ -1098,11 +1098,21 @@ enum CachedAt {
     Absent,
 }
 
+/// Lot 369: where the cgroup v2 hierarchy is mounted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Lot 369: the cgroup directories [`AuthSessionTracker::system_service_of_cgroup`]
+/// looks at, at most (a host runs a few hundred services).
+const CGROUP_SERVICES_MAX: usize = 4096;
+
 #[derive(Debug)]
 struct Inner {
     state: RwLock<InnerState>,
     /// Injectable for tests; `"/proc"` in production.
     proc_root: PathBuf,
+    /// Lot 369: the cgroup v2 hierarchy's mount (`/sys/fs/cgroup`, its
+    /// `unified/` on a hybrid layout); injectable for tests.
+    cgroup_root: PathBuf,
     /// External audit POS-003: check a cached exec against the process
     /// its pid names now ([`AuthSessionTracker::for_host`]).
     live: bool,
@@ -1166,6 +1176,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     kernel_fork_order: VecDeque::new(),
                 }),
                 proc_root,
+                cgroup_root: PathBuf::from(CGROUP_ROOT),
                 live,
                 observer_start: std::sync::OnceLock::new(),
                 #[cfg(test)]
@@ -3215,6 +3226,65 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     pub fn system_service(&self, pid: u32) -> Option<String> {
         let path = self.cgroup_path(pid)?;
         crate::posture::daemon_data::system_service(&path).map(str::to_string)
+    }
+
+    /// Lot 369: the systemd service whose cgroup the kernel's cgroup v2 id
+    /// `id` is (`bpf_get_current_cgroup_id` at a write: the inode number of
+    /// that cgroup's directory) — `/system.slice/<unit>.service` or one in a
+    /// slice below it, found by the id among those directories (at most
+    /// [`CGROUP_SERVICES_MAX`] of them looked at); `None` otherwise. For a
+    /// writer gone by the time its crossing is judged (a short-lived
+    /// PostgreSQL backend: `createdb`'s, pgbench's setup connection), whose
+    /// `/proc` entry names no cgroup any more.
+    pub fn system_service_of_cgroup(&self, id: u64) -> Option<String> {
+        if id <= 1 {
+            return None;
+        }
+        let root = &self.inner.cgroup_root;
+        let base = [root.join("system.slice"), root.join("unified/system.slice")]
+            .into_iter()
+            .find(|p| H::is_dir(p))?;
+        let mut looked = 0usize;
+        let mut level: Vec<(PathBuf, String)> = vec![(base, "/system.slice".to_string())];
+        // the unit's directory, under at most two slices below system.slice
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for (dir, cg) in level {
+                let Ok(names) = H::read_dir(&dir) else {
+                    continue;
+                };
+                for name in names {
+                    looked += 1;
+                    if looked > CGROUP_SERVICES_MAX {
+                        return None;
+                    }
+                    let Some(name) = name.to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    let path = dir.join(&name);
+                    let cgroup = format!("{cg}/{name}");
+                    if name.ends_with(".service") {
+                        if H::dir_ino(&path) == Some(id) {
+                            return crate::posture::daemon_data::system_service(&cgroup)
+                                .map(str::to_string);
+                        }
+                    } else if name.ends_with(".slice") {
+                        next.push((path, cgroup));
+                    }
+                }
+            }
+            level = next;
+        }
+        None
+    }
+
+    /// Lot 369: this tracker with the cgroup v2 hierarchy at `root` (tests).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_cgroup_root(mut self, root: impl Into<PathBuf>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("set before the tracker is shared")
+            .cgroup_root = root.into();
+        self
     }
 
     /// Lot 350 (F2-3): [`Self::system_service`] of the process that started

@@ -197,9 +197,9 @@ fn miner_match_routes_to_r007() {
 fn rules_share_consistent_metadata() {
     // Sanity: each rule has a non-empty id, name, and category.
     let rules: Vec<Box<dyn Rule>> = vec![
-        Box::new(R001ExecFromTmp),
+        Box::new(R001ExecFromTmp::default()),
         Box::new(R002ExecFromDevShm),
-        Box::new(R003ExecFromVarTmp),
+        Box::new(R003ExecFromVarTmp::default()),
         Box::new(R004ExecFromProcSelfFd::default()),
         Box::new(R005NetcatExec::default()),
         Box::new(R006ReverseShellTooling::new(Default::default())),
@@ -242,9 +242,9 @@ fn ordering_is_deterministic() {
 // (telemetry, alert dedup, future correlation) silently regress.
 #[test]
 fn rule_ids_are_pinned() {
-    assert_eq!(R001ExecFromTmp.id(), "R001_ExecFromTmp");
+    assert_eq!(R001ExecFromTmp::default().id(), "R001_ExecFromTmp");
     assert_eq!(R002ExecFromDevShm.id(), "R002_ExecFromDevShm");
-    assert_eq!(R003ExecFromVarTmp.id(), "R003_ExecFromVarTmp");
+    assert_eq!(R003ExecFromVarTmp::default().id(), "R003_ExecFromVarTmp");
     assert_eq!(
         R004ExecFromProcSelfFd::default().id(),
         "R004_ExecFromProcSelfFd"
@@ -1112,7 +1112,7 @@ fn the_engine_returns_the_attack_references_of_the_rule_that_fired() {
         .evaluate_with_attack(&spawn("payload", "/tmp/payload"))
         .expect("R001 fires");
     assert_eq!(v.rule_id, "R001_ExecFromTmp");
-    assert_eq!(refs, R001ExecFromTmp.attack());
+    assert_eq!(refs, R001ExecFromTmp::default().attack());
     assert!(!refs.is_empty());
     assert!(engine
         .evaluate_with_attack(&spawn("ls", "/usr/bin/ls"))
@@ -1671,6 +1671,95 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
         .expect("a decision");
     assert_eq!(d.responses.len(), 1);
     assert_eq!(d.responses[0].rule_id, "R001_ExecFromTmp");
+}
+
+/// Lot 369 (the soak of rc5: R001 High at every `go test` and `go run` on
+/// the three guests): the packaged `go`'s own build output — `go test`'s
+/// test binary, `go run`'s program, in the layout of its work directory in
+/// `/tmp` or `/var/tmp`, forked by the packaged `go` (a root-only system
+/// tree, its exec's image seen) — is R001's or R003's Low record, never a
+/// kill, in every posture (lot 346 left it out of the posture's exec arm
+/// only; decision 283b recorded it High). The attack shapes stay judged:
+/// the same file run by a shell, by the test binary itself, by a `go` in a
+/// home, a file outside the work directory's layout, the test binary
+/// unlinked when the kernel ran it — High below COMBAT (the kill held), as
+/// before. Fails on main (High).
+#[test]
+fn go_test_and_go_run_built_by_the_packaged_go_are_recorded_low() {
+    use common::wire::exe::exe_flags;
+    let p = prod("");
+    let exec = |pid: u32, ppid: u32, path: &str, ts: u64, rooted: bool| {
+        let mut e = spawn_as(1000, "x", path);
+        if let Event::ProcessSpawn {
+            pid: pp,
+            ppid: parent,
+            timestamp_ns,
+            exe,
+            ..
+        } = &mut e
+        {
+            (*pp, *parent, *timestamp_ns) = (pid, ppid, ts);
+            if rooted {
+                exe.path = path.into();
+                (exe.dev, exe.ino) = (2049, u64::from(pid));
+                exe.flags |= exe_flags::KNOWN | exe_flags::ROOT_DIR;
+            }
+        }
+        e
+    };
+    p.lineage
+        .ingest_spawn_event(&exec(300, 1, "/usr/bin/bash", 1, true));
+    p.lineage
+        .ingest_spawn_event(&exec(8000, 300, "/usr/lib/go-1.22/bin/go", 2, true));
+    p.lineage
+        .ingest_spawn_event(&exec(8010, 300, "/home/u/sdk/go1.23.0/bin/go", 2, true));
+    let mut pid = 9000;
+    let mut judged = |ppid: u32, image: &str, posture: PostureKind, deleted: bool| {
+        pid += 1;
+        let mut e = exec(pid, ppid, image, 5, false);
+        if deleted {
+            if let Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.path = image.into();
+                exe.flags |= exe_flags::KNOWN | exe_flags::DELETED;
+            }
+        }
+        let d = p.decide_in(&e, posture).expect("a decision");
+        (d.verdict.severity, d.verdict.action, d.responses.len())
+    };
+    for posture in [
+        PostureKind::Observing,
+        PostureKind::Alerted,
+        PostureKind::Engaged,
+        PostureKind::Combat,
+    ] {
+        for image in [
+            "/tmp/go-build2618259110/b053/calc.test",
+            "/tmp/go-build4098838642/b001/exe/nncorpus",
+            "/var/tmp/go-build77/b012/x.test",
+        ] {
+            assert_eq!(
+                judged(8000, image, posture, false),
+                (Severity::Low, ResponseAction::Log, 0),
+                "{posture} {image}"
+            );
+        }
+    }
+    // the attack shapes: High (the kill held below COMBAT), as before
+    let built = "/tmp/go-build2618259110/b053/calc.test";
+    for (ppid, image, deleted) in [
+        (300, built, false),
+        (9001, built, false),
+        (8010, built, false),
+        (8000, "/tmp/go-build1/evil/calc.test", false),
+        (8000, "/tmp/evil", false),
+        (8000, built, true),
+    ] {
+        let (sev, action, _) = judged(ppid, image, PostureKind::Engaged, deleted);
+        assert!(
+            matches!(sev, Severity::High | Severity::Critical),
+            "{ppid} {image} {deleted}: {sev:?} {action:?}"
+        );
+    }
 }
 
 /// Lot 283b: a person's exec from /tmp (uid 1000: `go test`'s binary, an

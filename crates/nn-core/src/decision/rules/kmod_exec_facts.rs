@@ -109,6 +109,78 @@ pub struct ExecFacts {
     /// (`/var/lib/containerd/opt/lib:` on Debian), which R011's runtime
     /// exemption judges. `None` otherwise.
     pub library_path: Option<String>,
+    /// Lot 369: what the process's credentials allow, read with its
+    /// environment, tied to the exec the same way ([`Credentials`]).
+    pub credentials: Credentials,
+}
+
+/// Lot 369: the kernel's credentials of a module tool's process, read by
+/// the exec pump at the exec (`/proc/<pid>/status`: its four uids and its
+/// permitted, effective and ambient capability sets; its user namespace
+/// against PID 1's), the process tied to the exec by a pidfd and its start
+/// before and after the read. Loading a module takes `CAP_SYS_MODULE` in
+/// the initial user namespace (`init_module`, `finit_module`): without it
+/// `modprobe` loads nothing (EPERM), and one of a module already loaded
+/// exits 0 having done nothing. A process without uid 0 and without that
+/// capability in any of its sets cannot gain it but by a new exec (of a
+/// set-id or capability-bearing file: an exec judged on its own).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Credentials {
+    /// Not read whole from the running exec (it exited first, its start
+    /// unknown, a file unreadable): R011 judges it as before.
+    #[default]
+    NotRead,
+    /// It cannot load a module (why).
+    CannotLoad(String),
+    /// It may: a uid 0 among its ids, or `CAP_SYS_MODULE` in one of its
+    /// sets in PID 1's user namespace (or its namespace not known).
+    MayLoad,
+}
+
+/// `CAP_SYS_MODULE`'s bit (`linux/capability.h`).
+pub const CAP_SYS_MODULE: u32 = 16;
+
+impl Credentials {
+    /// What `status` (a `/proc/<pid>/status` read from the running exec)
+    /// says the process may do; `other_user_ns`: its user namespace is not
+    /// PID 1's (`None`: not known).
+    pub fn of_status(status: &str, other_user_ns: Option<bool>) -> Credentials {
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(str::trim)
+        };
+        let uids: Option<Vec<u32>> = field("Uid:")
+            .map(|v| v.split_whitespace().map(|u| u.parse().ok()).collect())
+            .and_then(|v: Option<Vec<u32>>| v.filter(|v| v.len() == 4));
+        let caps: Option<Vec<u64>> = ["CapPrm:", "CapEff:", "CapAmb:"]
+            .iter()
+            .map(|n| field(n).and_then(|v| u64::from_str_radix(v, 16).ok()))
+            .collect();
+        let (Some(uids), Some(caps)) = (uids, caps) else {
+            return Credentials::NotRead;
+        };
+        if uids.contains(&0) {
+            return Credentials::MayLoad;
+        }
+        let held = caps.iter().any(|c| c & (1 << CAP_SYS_MODULE) != 0);
+        if !held {
+            return Credentials::CannotLoad(
+                "no uid 0 among its ids and no CAP_SYS_MODULE in its permitted, effective or \
+                 ambient set: the kernel refuses it any module load"
+                    .to_string(),
+            );
+        }
+        if other_user_ns == Some(true) {
+            return Credentials::CannotLoad(
+                "no uid 0 among its ids, and its CAP_SYS_MODULE is that of a user namespace \
+                 other than PID 1's, which loads no module"
+                    .to_string(),
+            );
+        }
+        Credentials::MayLoad
+    }
 }
 
 impl ExecFacts {
@@ -208,6 +280,7 @@ mod tests {
             initramfs_builder: None,
             interpreter: None,
             library_path: None,
+            credentials: Default::default(),
         }
     }
 

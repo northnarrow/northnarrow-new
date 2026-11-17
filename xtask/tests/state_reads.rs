@@ -744,6 +744,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(proc.join(format!(\"{pid}/status\")))",
         PROC,
     ),
+    // lot 369: the module tool's credentials at the exec (its start, then
+    // its uids and capability sets), procfs's own
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(format!(\"{pid}/stat\")))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(format!(\"{pid}/status\")))",
+        PROC,
+    ),
     (
         "crates/nn-linux/src/sensors/multiplexer.rs",
         "read_to_string(\"/proc/sys/kernel/perf_event_paranoid\")",

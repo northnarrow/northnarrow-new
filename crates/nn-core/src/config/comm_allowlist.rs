@@ -240,6 +240,13 @@ impl<H: PostureHost> CommAllowlist<H> {
         self.identity.as_ref()?.start_ticks(pid)
     }
 
+    /// Lot 369: the image (device, inode) the kernel executed for `pid`, as
+    /// the lineage holds it as of `as_of` — `None` without an identity
+    /// source or when the lineage holds none.
+    pub fn exec_image(&self, pid: u32, as_of: crate::posture::lineage::AsOf) -> Option<(u64, u64)> {
+        self.identity.as_ref()?.exec_image(pid, as_of)
+    }
+
     /// [`Self::judge`] for an exec event's own process, whose identity the
     /// event carries ([`crate::posture::lineage::ExecIdentity::of_exec`]):
     /// no lookup, so never [`Judgement::Unverified`]. `comm` only says

@@ -447,21 +447,48 @@ pub fn read_and_keep(event: &Event) {
     read_runtime_clone(event);
 }
 
-/// Lot 366: whether [`read_and_keep`] reads anything of `event`: an exec
-/// with its stdio, or its parent's, on an inet socket.
+/// Lot 366: whether [`read_and_keep`] reads anything of `event` — the
+/// union of its steps' own gates, each the very test its step starts with:
+/// an exec with its stdio, or its parent's, on an inet socket
+/// ([`reads_socket_exec`]); lot 369: a memfd exec sealed at the exec
+/// ([`reads_runtime_clone`]). Lot 366 gated the pump's hand-over on the
+/// first alone, so runc 1.1's sealed clone of itself was never compared
+/// again: R004 Critical at every container start on Debian 13 (the soak of
+/// rc5). A step gated here by a test of its own drifts from it no more.
 pub fn reads(event: &Event) -> bool {
+    reads_socket_exec(event) || reads_runtime_clone(event)
+}
+
+/// Lot 313's step ([`read_and_keep_judged`]): an exec with its stdio, or
+/// its parent's, on an inet socket.
+fn reads_socket_exec(event: &Event) -> bool {
     matches!(event, Event::ProcessSpawn { stdio, .. }
         if stdio.own.stdin_or_stdout_inet() || stdio.parent.stdin_or_stdout_inet())
+}
+
+/// Lot 347's step ([`read_runtime_clone_with`]): a memfd exec the LSM
+/// program described (`KNOWN`), sealed when the kernel executed it
+/// (`MEMFD_SEALED`, the review of #556, F1), of a process and a parent
+/// that are not the kernel's.
+fn reads_runtime_clone(event: &Event) -> bool {
+    use common::wire::exe::exe_flags::{KNOWN, MEMFD, MEMFD_SEALED};
+    matches!(event, Event::ProcessSpawn { pid, ppid, exe, .. }
+        if exe.has(KNOWN) && exe.has(MEMFD) && exe.has(MEMFD_SEALED) && *pid != 0 && *ppid != 0)
 }
 
 /// Lot 366: `event`'s reads were not waited for (a file system whose server
 /// does not answer held them): an exec with its stdio on an inet socket is
 /// kept unverified — R020 records it, as an image it could not open.
 pub fn not_read(event: &mut Event) {
-    if let Event::ProcessSpawn { stdio, exe, .. } = &*event {
+    // lot 369: a sealed memfd not compared keeps no clone — R004 judges it
+    // fileless, as before — and is counted ([`runtime_clone_counts`])
+    if reads_runtime_clone(event) {
+        RUNTIMES.not_read.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Event::ProcessSpawn { exe, .. } = &*event {
         let installed = exe.has(common::wire::exe::exe_flags::KNOWN)
             && program_identity::installed_kind((exe.dev, exe.ino)).is_some();
-        if !installed && (stdio.own.stdin_or_stdout_inet() || stdio.parent.stdin_or_stdout_inet()) {
+        if !installed && reads_socket_exec(event) {
             program_identity::keep_unverified(event);
         }
     }
@@ -572,21 +599,20 @@ fn open_operand(dir: &Path, program: &str, judge: &Judge) -> std::io::Result<std
 
 /// [`read_and_keep_with`], the file systems judged by `judge`.
 fn read_and_keep_judged(event: &Event, proc_root: &Path, bounds: &Bounds, judge: &Judge) {
+    if !reads_socket_exec(event) {
+        return;
+    }
     let Event::ProcessSpawn {
         pid,
         uid,
         filename,
         exe,
         argv,
-        stdio,
         ..
     } = event
     else {
         return;
     };
-    if !stdio.own.stdin_or_stdout_inet() && !stdio.parent.stdin_or_stdout_inet() {
-        return;
-    }
     let dir = proc_root.join(pid.to_string());
     let known = exe.has(common::wire::exe::exe_flags::KNOWN);
     let installed = if known {
@@ -686,6 +712,31 @@ const SEALED: libc::c_int = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_S
 pub struct RuntimeChecks {
     bounds: Bounds,
     refreshed: Mutex<Option<Instant>>,
+    /// Lot 369: the memfds kept as an installed runtime's clone, compared
+    /// whole ([`runtime_clone_counts`]).
+    kept: AtomicU64,
+    /// Lot 369: the sealed memfd execs whose reads the pump did not wait
+    /// for (no clone kept).
+    not_read: AtomicU64,
+}
+
+/// Lot 369: the runtime clones the exec pump judged since the agent's start
+/// (`nn-admin status`): sealed memfds compared whole with an installed
+/// runtime, those kept as its clone (R004's exemption), those not compared
+/// for the budget (kept unverified), and those whose reads it did not wait
+/// for (nothing kept). A container host where `kept` stays at zero while
+/// containers start has lost the exemption (lot 366 lost it on Debian 13).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeCloneCounts {
+    pub compared: u64,
+    pub kept: u64,
+    pub unverified: u64,
+    pub not_read: u64,
+}
+
+/// Lot 369: [`RuntimeCloneCounts`] since the agent's start.
+pub fn runtime_clone_counts() -> RuntimeCloneCounts {
+    RUNTIMES.counts()
 }
 
 impl RuntimeChecks {
@@ -695,6 +746,17 @@ impl RuntimeChecks {
         Self {
             bounds: Bounds::with_root_reserve(per_uid, global, root_reserve),
             refreshed: Mutex::new(None),
+            kept: AtomicU64::new(0),
+            not_read: AtomicU64::new(0),
+        }
+    }
+
+    fn counts(&self) -> RuntimeCloneCounts {
+        RuntimeCloneCounts {
+            compared: self.bounds.compared.load(Ordering::Relaxed),
+            kept: self.kept.load(Ordering::Relaxed),
+            unverified: self.bounds.skipped.load(Ordering::Relaxed),
+            not_read: self.not_read.load(Ordering::Relaxed),
         }
     }
 
@@ -802,7 +864,14 @@ pub fn read_runtime_clone(event: &Event) {
 /// [`read_runtime_clone`] with `/proc` at `proc_root`, the host's root at
 /// `root` and `checks` (tests).
 fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks: &RuntimeChecks) {
-    use common::wire::exe::exe_flags::{KNOWN, MEMFD, MEMFD_SEALED};
+    // the review of #556 (F1): sealed when the kernel executed it, by the
+    // LSM program's read of its seals — sealed only when the pump reads it,
+    // its bytes may have been rewritten after the exec (any holder of a
+    // writable descriptor: the parent of an OCI hook run from
+    // `/proc/<pid>/fd/N`)
+    if !reads_runtime_clone(event) {
+        return;
+    }
     let Event::ProcessSpawn {
         pid,
         ppid,
@@ -813,14 +882,6 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     else {
         return;
     };
-    // the review of #556 (F1): sealed when the kernel executed it, by the
-    // LSM program's read of its seals — sealed only when the pump reads it,
-    // its bytes may have been rewritten after the exec (any holder of a
-    // writable descriptor: the parent of an OCI hook run from
-    // `/proc/<pid>/fd/N`)
-    if !exe.has(KNOWN) || !exe.has(MEMFD) || !exe.has(MEMFD_SEALED) || *pid == 0 || *ppid == 0 {
-        return;
-    }
     checks.refresh(root, Instant::now());
     // first the parent, one `stat` of its image: a runtime's or a manager's
     // lot 366: from the kernel's cache (a parent run from a user's FUSE
@@ -902,6 +963,7 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
         .iter()
         .find(|i| same_over(&file, Path::new(&i.path), m.len(), Some(i.id), &whole))
     {
+        checks.kept.fetch_add(1, Ordering::Relaxed);
         program_identity::keep_runtime_clone(
             event,
             program_identity::RuntimeClone {
@@ -1290,6 +1352,87 @@ mod tests {
             None,
             "the old bytes"
         );
+    }
+
+    /// Lot 369 (the soak of rc5, Debian 13): runc 1.1's sealed clone of
+    /// itself (`runc init`'s `fexecve` of `runc_cloned:/proc/self/exe`, its
+    /// stdio no socket) is handed to the exec pump's runtime compare, and
+    /// kept as the installed runc's clone: whatever `read_and_keep` keeps
+    /// for an exec, `reads` hands it over. On 4f5f7aae the pump handed over
+    /// only the execs with their stdio on an inet socket (lot 366): no clone
+    /// was ever compared again, and R004 was Critical at every docker run,
+    /// build and exec and every Podman run (fails there). The counters say
+    /// so. Still nothing for an unsealed memfd, nor one the LSM program did
+    /// not describe: R004 judges those fileless.
+    #[test]
+    fn runc_1_1_s_sealed_clone_is_handed_to_the_runtime_compare() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        use std::os::fd::AsRawFd;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        let mut image: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 241) as u8).collect();
+        image[..4].copy_from_slice(b"r369");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let link = |pid: u32, to: &Path| {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            let _ = std::fs::remove_file(proc.join(pid.to_string()).join("exe"));
+            symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+        };
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        // `runc init` (the installed runc, run by `runc create`) re-executes
+        // itself from its sealed copy: no socket anywhere in its stdio
+        let e = memfd_exec(36_901, 36_900, 369, &clone);
+        if let Event::ProcessSpawn { stdio, .. } = &e {
+            assert!(!stdio.own.stdin_or_stdout_inet() && !stdio.parent.stdin_or_stdout_inet());
+        }
+        assert!(reads(&e), "the pump hands runc's sealed clone over");
+        link(36_900, &runc);
+        link(
+            36_901,
+            &PathBuf::from(format!("/proc/self/fd/{}", clone.as_raw_fd())),
+        );
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        read_runtime_clone_with(&e, &proc, &root, &checks);
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
+            Some((runc_id, false))
+        );
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                compared: 1,
+                kept: 1,
+                unverified: 0,
+                not_read: 0
+            }
+        );
+        // CONTROLS: not sealed at the exec (an OCI hook's memfd), no identity
+        // from the LSM program (tracepoint mode): not handed over
+        let mut unsealed = memfd_exec(36_902, 36_900, 369, &clone);
+        let mut tp = memfd_exec(36_903, 36_900, 369, &clone);
+        if let (Event::ProcessSpawn { exe: a, .. }, Event::ProcessSpawn { exe: b, .. }) =
+            (&mut unsealed, &mut tp)
+        {
+            a.flags &= !common::wire::exe::exe_flags::MEMFD_SEALED;
+            b.flags &= !common::wire::exe::exe_flags::KNOWN;
+        }
+        assert!(!reads(&unsealed) && !reads(&tp));
+        // its reads not waited for: nothing kept (R004 judges it fileless),
+        // counted
+        let before = runtime_clone_counts().not_read;
+        let mut late = memfd_exec(36_904, 36_900, 369, &clone);
+        not_read(&mut late);
+        assert_eq!(runtime_clone_of(&late), None);
+        assert_eq!(runtime_clone_counts().not_read, before + 1);
+        not_read(&mut unsealed);
+        assert_eq!(runtime_clone_counts().not_read, before + 1, "not a clone's");
+        // a socket program's exec is still handed over (lot 313)
+        let mut sock = nn_core::decision::rules::testutil::spawn("bash", "/tmp/bash");
+        if let Event::ProcessSpawn { stdio, .. } = &mut sock {
+            (stdio.own.read, stdio.own.inet_fds) = (true, 0b001);
+        }
+        assert!(reads(&sock));
     }
 
     /// The review of #556 (F1, named): the memfd runc's OCI hook is executed

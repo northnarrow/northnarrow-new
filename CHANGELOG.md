@@ -6,6 +6,47 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
+  each told by identity, the attack shape each rule exists for kept
+  (`UPGRADE_NOTES_WAVE4.md` §57).
+  - **R004: runc 1.1's sealed clone compared again.** Lot 366 handed the
+    exec pump's reads only socket programs' execs: no runtime clone was
+    compared, R004 Critical at every container start on Debian 12/13. The
+    hand-over is the union of the steps' own gates; `nn-admin status`
+    counts the clones (`runtime clones`, JSON `runtime_clones`;
+    `PROTOCOL_VERSION` 4). Tests
+    `runc_1_1_s_sealed_clone_is_handed_to_the_runtime_compare`,
+    `the_runtime_clones_are_appended_last`,
+    `the_runtime_clones_are_in_the_status`.
+  - **AppImage relaunches.** A FUSE placement by device is no hit after a
+    flagged change of the mounts: the table is read again at once, or the
+    file unplaced — never the old `/tmp/.mount_*` (a quick relaunch got
+    the device of the mount just gone: R001, CHAIN-002/005 Critical). Test
+    `a_fuse_device_handed_to_a_new_mount_is_placed_at_its_new_mount_point`.
+  - **NN-L-NET-013.** A socket sending to its own bound endpoint on
+    loopback (PostgreSQL ≤ 14's statistics) is no beacon; one record per
+    program, destination and hour, the folded flows counted. Tests
+    `net_013_a_socket_sending_to_itself_is_no_beacon`,
+    `net_013_records_one_beacon_per_program_destination_and_hour`.
+  - **R011.** The module tool's credentials read at the exec; a non-root
+    `modprobe` that cannot load a module (no uid 0, no `CAP_SYS_MODULE` in
+    PID 1's user namespace) is Low. Tests
+    `a_user_s_modprobe_that_cannot_load_a_module_is_low`,
+    `the_credentials_of_a_running_exec_are_read_tied_to_it`.
+  - **R001/R003: `go test`, `go run`.** Lot 346's identity of the packaged
+    `go`'s build output applies to the record: Low, never killed. Test
+    `go_test_and_go_run_built_by_the_packaged_go_are_recorded_low`.
+  - **Posture: a service's gone writer.** The own-data exemption tells a
+    writer gone before its crossing was judged by the cgroup the kernel
+    recorded at the write (pgbench's ENGAGED). Test
+    `a_service_writer_gone_before_its_crossing_is_judged_is_told_by_its_cgroup`.
+  - **Smaller.** NN-L-NET-006 Low for a packaged service daemon on
+    loopback (`net_006_a_packaged_service_daemon_on_loopback_is_low`); an
+    nsfs mount (`/run/docker/netns/<id>`) is a mount, no degradation
+    (`a_namespace_file_bound_by_docker_is_a_mount`); a FIM list path absent
+    at the start is watched once it appears (cron installed after the
+    agent: NN-L-FIM-007 for the next crontab;
+    `a_path_of_the_list_absent_at_the_start_is_watched_once_it_appears`).
 - Lot 367 (the pre-alpha self-protection round on five kernels, Phase
   3-bis): four behaviours and their texts (`UPGRADE_NOTES_WAVE4.md` §56).
   - **The agent's memory views refused at their open.** From kernel 6.16

@@ -92,6 +92,17 @@ Residual, named: root spending its own budget (512 MiB a second of
 compares), then executing a memfd of its own under the runtime, is recorded
 High, not killed — root, who needs no such route.
 
+`nn-admin status --key` counts what the exec pump did with these clones
+since the agent's start (lot 369), once one was seen: `runtime clones : N
+sealed memfds kept as an installed runtime's clone (R004 has no verdict on
+them), of M compared; U not compared (the budget), R not read in time
+(judged fileless)` — JSON `runtime_clones` (`compared`, `kept`,
+`unverified`, `not_read`). On a container host with runc 1.1 the kept count
+grows with every container start; containers that start while it stays at
+zero mean the exemption is lost and R004 judges every start (rc5's
+regression: the exec pump handed only the socket programs' execs to its
+reads, so no clone was compared, lot 369).
+
 What remains possible: the kernel reads the first bytes of the file (the
 binary's header) just before the LSM program reads the seals, so a writer
 racing that window chooses the header of a run whose every mapped byte is

@@ -82,6 +82,7 @@ const MARKERS: &[&str] = &[
     "H::on_host_path",
     "H::accessor_exe",
     "H::file_id",
+    "H::dir_ino",
     "TcpStream",
     "UnixStream",
     ".sync_all(",
@@ -301,7 +302,7 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        28,
+        30,
         "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses' — lot 360, the review of #568 \
          (F1): at `AsOf::Live` only, the `exe` link of a fork the kernel's fork record names, \
@@ -328,7 +329,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
          device and inode of the snapd package's binary at its path (one `fstat`, the host's \
          root: the package is on the host) — read only when a destructive FIM-009 verdict's \
          file is one of snapd's own units and its writer's nearest snapd, executed by root as \
-         PID 1's child, is the host's file at its path",
+         PID 1's child, is the host's file at its path; lot 369: `system_service_of_cgroup`, \
+         cgroupfs's `system.slice` listed and its units' directories' inode numbers read \
+         (kernfs: memory, no FUSE, at most 4096 entries) — only for a mass-write crossing of \
+         a service account's own data whose writer is gone when it is judged (its `/proc` \
+         cgroup unreadable)",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

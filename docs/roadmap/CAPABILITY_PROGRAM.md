@@ -11726,6 +11726,91 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 369 — the pre-alpha's Phase 5 early triage: the soak's false
+  positives on rc5 (C14, C16, C23; no level change).**
+  - What was open (the first hours of the soak, Ubuntu 22.04/24.04 and
+    Debian 13, alpha profile): R004 Critical at every container start on
+    Debian 13 (runc 1.1.15's sealed clone; lot 347's exemption lost in lot
+    366, which gated the exec pump's reads on socket programs only); an
+    AppImage relaunched within two seconds (or a second instance) R001 High
+    ×9 and CHAIN-002/005 Critical on all three; NN-L-NET-013 High ~190 an
+    hour (PostgreSQL 14's statistics collector to `[::1]`); R011 High for a
+    non-root `modprobe` (a session start on 22.04, rootless Podman on
+    24.04); R001 High on `go test`/`go run` (decision 283b's floor); the
+    posture ENGAGED at pgbench (a service account's own data); NET-006
+    Medium for packaged loopback daemons; a `mount_table_rows` degradation
+    at every container start (nsfs rows); and, from the triage's §6, no
+    NN-L-FIM-007 for a crontab after cron was installed after the agent.
+  - Done, by identity: the exec pump's hand-over is the union of its steps'
+    own gates (one predicate per step, shared); `nn-admin status` counts
+    the runtime clones (`runtime_clones`, PROTOCOL_VERSION 4). The AppImage
+    cause was the path placing, not the tie: the kernel hands the FUSE
+    mount's anonymous device to the relaunch's new mount, and the exec
+    sensor placed the programs under the old `/tmp/.mount_*` until its
+    throttled re-read — a FUSE placement by device is no hit after a
+    flagged change (re-read at once within the budget, or unplaced).
+    NN-L-NET-013: a flow to the sending socket's own bound endpoint on
+    loopback is no beacon; one record per program (kernel image),
+    destination and hour. R011: the tool's credentials read with its
+    environment (pidfd and start), no uid 0 and no `CAP_SYS_MODULE` in PID
+    1's user namespace → Low. R001/R003: lot 346's packaged-go identity on
+    the record → Low, never killed. Posture: a writer gone before its
+    crossing is judged is placed by the cgroup the kernel recorded at the
+    write (the cgroup v2 id, the unit's cgroup directory's inode). NET-006
+    Low for a root-owned-tree program in a system service's cgroup on
+    loopback; nsfs rows are mounts; FIM list paths absent at the start are
+    watched once they appear (once a second; the appearance itself not
+    reported). Not done: NET-019 for `pg_createcluster`'s probe.
+  - Lab (as measured; alpha profile; the lot's WIP commits):
+    **debian12** (6.1, runc 1.1.5, containerd 1.6.20, podman 4.3.1; the
+    same 1.1 clone as Debian 13's 1.1.15, Debian 13 being the soak's): docker
+    run, run -d + exec, build, Podman rootless and rootful — R004 0 (the
+    soak: Critical at each); control (the packaged runc's bytes from a
+    sealed memfd, run by a session's python) R004 Critical. Cron installed
+    after the agent's start, then a user's `crontab`: no record on the
+    first round's tree (the §6 false negative confirmed), NN-L-FIM-007 High
+    ×1 with the lot's. Bookworm's runc 1.1.5 still clones itself by a
+    bind mount, not a memfd (`runtime clones` stayed at 0: these rounds do
+    not exercise the regression); with runc 1.1.15 — Debian 13's version,
+    the upstream static release (sha256 checked) over bookworm's, trixie's
+    `.deb` needing glibc 2.38 — docker run ×2, run -d + exec, build, Podman
+    rootless and rootful: R004 0 and `runtime clones: 7 sealed memfds kept
+    … of 7 compared; 0 not compared, 0 not read`; the control still
+    Critical. PostgreSQL 16 (PGDG), 15 and (ubuntu2604) 18: `pg_createcluster
+    -p 5444`, `pgbench -i -s 10`, 60 s with 4 clients, `vacuumdb` — no
+    crossing of the mass-write arm at all, PG 16's run Alerted before and
+    after (the soak's crossing not reproduced here; the
+    fix follows its timings: a crossing 1 ms after `createdb`'s backend
+    ended, another 30 ms into pgbench's setup connection). A user's `modprobe
+    -n dummy` without a capability R011 Low (main: High); with an ambient
+    `CAP_SYS_MODULE` High; root's Low. A remote host (one address) every
+    5 s: NN-L-NET-013 High, one record for eight flows. NET-006: PostgreSQL's
+    loopback listeners Low; `exim4` on 127.0.0.1:25 (cron's Recommends)
+    stays Medium — its listener is a fork of the daemon, whose image the
+    lineage does not hold for that pid (not fixed).
+    **ubuntu2604** (7.0): the soak's three AppImage launches back to back,
+    five relaunches in a row, a second instance while the first runs (twice)
+    — 0 records each; the image copied to `/tmp` CHAIN-002 Critical ×3 and
+    R001 High ×7. **ubuntu2204** (5.15): the same AppImage cases 0 records,
+    the copy in `/tmp` the same Critical ×3 + High ×7; `go test` and `go
+    run` with the packaged go 1.18 — R001 Low ×1 each (a `/tmp` binary not
+    built by go, a work-directory layout run by a shell: High); PostgreSQL
+    14 installed — NET-006 Low ×2 (5432 on loopback), idle 30 minutes —
+    0 NET-013 (the soak: ~95 in 30 minutes); a local proxy port (127.0.0.1:
+    9050) every 5 s — NET-013 High, one record for seven flows; root's
+    `modprobe -n` R011 Low, a user's with an ambient `CAP_SYS_MODULE`
+    High. A fresh user's session start and rootless Podman gave no R011 at
+    all (the soak's 22.04 cause came with its packages: not reproduced).
+    Every guest uninstalled (`--purge`), the probe's packages purged, powered
+    off. A harness slip, said: a second round queued for the same guest
+    under the same lease started at once and its pin purge stopped round
+    D's agent during D's cleanup, after its last measured case.
+  - Mutation: 27 mutants of the new code, 26 caught by a named test (one
+    after its survivor's test, `the_go_build_record_needs_the_identity_and_a_linked_file`:
+    an unlinked build output was masked by R004's verdict on the same exec);
+    two argued equivalent (a `.scope` accepted by the cgroup walk is refused
+    by `system_service` after it; the credentials' start checked before the
+    read as well as after it, the latter deciding).
 - **Lot 367 — the pre-alpha's Phase 3-bis (self-protection on five
   kernels): the agent's memory views on 7.0, snapd's own units, the lock's
   and the watchdog's causes in `nn-admin status` (C23; no level change).**

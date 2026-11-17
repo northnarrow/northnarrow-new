@@ -3849,6 +3849,43 @@ fn kernel_state_held_back_json(out: &StatusOutcome) -> String {
     }
 }
 
+/// Lot 369: the container runtimes' sealed clones of themselves the exec
+/// pump judged — compared with an installed runtime, kept as its clone
+/// (R004's exemption), not compared for the budget, not read in time —
+/// `None` from an agent before the field, and when none was seen.
+fn runtime_clones_line(out: &StatusOutcome, tty: bool) -> Option<String> {
+    let c = out
+        .runtime_clones
+        .filter(|c| c.compared + c.unverified + c.not_read > 0)?;
+    let red = |n: u64| {
+        if n == 0 {
+            colorize("0", "32", tty)
+        } else {
+            colorize(&n.to_string(), "31", tty)
+        }
+    };
+    Some(format!(
+        "runtime clones    : {} sealed memfds kept as an installed runtime's clone (R004 has no \
+         verdict on them), of {} compared; {} not compared (the budget), {} not read in time \
+         (judged fileless)",
+        c.kept,
+        c.compared,
+        red(c.unverified),
+        red(c.not_read)
+    ))
+}
+
+/// [`runtime_clones_line`]'s counts as a JSON object (`null` when absent).
+fn runtime_clones_json(out: &StatusOutcome) -> String {
+    match out.runtime_clones {
+        Some(c) => format!(
+            "{{\"compared\":{},\"kept\":{},\"unverified\":{},\"not_read\":{}}}",
+            c.compared, c.kept, c.unverified, c.not_read
+        ),
+        None => "null".to_string(),
+    }
+}
+
 /// The content check's counters as a JSON object (`null` when absent).
 fn program_copies_json(out: &StatusOutcome) -> String {
     match (
@@ -3918,7 +3955,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{},\"runtime_clones\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3984,6 +4021,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             program_copies_json(out),
             // the review of #565 (F2)
             kernel_state_held_back_json(out),
+            // lot 369
+            runtime_clones_json(out),
         );
         return;
     }
@@ -4043,6 +4082,10 @@ fn print_status(out: &StatusOutcome, json: bool) {
         }
         // the review of #565 (F2): shown when the quota held some back
         if let Some(line) = kernel_state_held_back_line(out, tty) {
+            println!("{line}");
+        }
+        // lot 369: shown once a runtime's sealed clone was seen
+        if let Some(line) = runtime_clones_line(out, tty) {
             println!("{line}");
         }
         println!("{}", defense_line(out, tty));
@@ -6319,6 +6362,7 @@ mod flow_sock_line_tests {
             program_copy_compared_total: None,
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
+            runtime_clones: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -6328,6 +6372,31 @@ mod flow_sock_line_tests {
             records_today: None,
             telemetry_signed: true,
         }
+    }
+
+    /// Lot 369: the runtimes' sealed clones are in the status — a line once
+    /// one was seen (none from an older agent, none before any), and the
+    /// JSON object (`null` from an older agent).
+    #[test]
+    fn the_runtime_clones_are_in_the_status() {
+        let mut o = outcome(None, None, None);
+        assert!(super::runtime_clones_line(&o, false).is_none());
+        assert_eq!(super::runtime_clones_json(&o), "null");
+        o.runtime_clones = Some(nn_proto::admin_protocol::RuntimeClones::default());
+        assert!(super::runtime_clones_line(&o, false).is_none(), "none seen");
+        o.runtime_clones = Some(nn_proto::admin_protocol::RuntimeClones {
+            compared: 6,
+            kept: 6,
+            unverified: 0,
+            not_read: 1,
+        });
+        let l = super::runtime_clones_line(&o, false).unwrap();
+        assert!(l.contains("6 sealed memfds kept"), "{l}");
+        assert!(l.contains("1 not read in time"), "{l}");
+        assert_eq!(
+            super::runtime_clones_json(&o),
+            "{\"compared\":6,\"kept\":6,\"unverified\":0,\"not_read\":1}"
+        );
     }
 
     /// The review of #565 (F2): the kernel-state round's findings its quota

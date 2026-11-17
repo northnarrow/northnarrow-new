@@ -8,7 +8,7 @@ use crate::detection_payload::Sensor;
 pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {
         id: "R001_ExecFromTmp",
-        severities: &[Severity::High, Severity::Medium],
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
@@ -28,13 +28,20 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           home (lot 360: also an image whose file name is 31 bytes or more, \
                           by its whole path as its daemon runs it). An AppImage itself in \
                           `/tmp`, an extracted one, a writable FUSE mount or another \
-                          program's daemon stay judged.",
+                          program's daemon stay judged. Lot 369: the packaged `go`'s own build \
+                          output — `go test`'s test binary, `go run`'s program, in the layout of \
+                          its work directory (`go-build<digits>/b<digits>/<name>` or \
+                          `…/exe/<name>`), forked by the packaged `go` (its exec's image in a \
+                          root-only system tree), not unlinked — is recorded Low, never killed; \
+                          the same file run by a shell, by another parent or by a `go` in a \
+                          home is judged as above.",
         how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
                       && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
         tests: &[
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp",
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged",
+            "crates/nn-core/src/decision/tests.rs::go_test_and_go_run_built_by_the_packaged_go_are_recorded_low",
             "crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s",
             "agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp",
@@ -65,7 +72,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R003_ExecFromVarTmp",
-        severities: &[Severity::High, Severity::Medium],
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
@@ -74,7 +81,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at \
                           High below COMBAT; a system account's (a package scriptlet run as \
                           one) is killed; run as root in a package transaction or an \
-                          administrator's session it is R009's Low record.",
+                          administrator's session it is R009's Low record. Lot 369: the \
+                          packaged `go`'s build output in `/var/tmp` (`TMPDIR=/var/tmp`) as \
+                          R001's.",
         how_to_test: "As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && \
                       /var/tmp/nn-r003`.",
         tests: &[
@@ -333,7 +342,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    where R018 gives one) — Low when run by root with its environment read \
                    clean (lot 290; High before: a lab round left 369 such lines), Medium \
                    when run by root but exited before its environment could be read (lot \
-                   340: a module already loaded or built in), High otherwise. A process that \
+                   340: a module already loaded or built in), Low too when run by a process \
+                   that cannot load a module (lot 369: no uid 0 among its ids and no \
+                   `CAP_SYS_MODULE` in its permitted, effective or ambient set in PID 1's user \
+                   namespace, as the exec pump read its credentials from the running exec — \
+                   a session's `systemd --user`, rootless Podman), High otherwise. A process that \
                    had exited before its environment \
                    could be read is recorded, its environment not verified (its kill would \
                    reach no one): the environment's check is best effort for a short-lived \

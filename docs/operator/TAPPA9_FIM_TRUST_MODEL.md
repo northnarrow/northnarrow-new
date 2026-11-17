@@ -392,7 +392,8 @@ the trusted-installer window first, or expect the capability to be removed.
   every `modprobe.d` directory — `/etc`, `/run`, `/usr/local/lib`, `/lib`
   and `/usr/lib` — is in the watch list, and NN-L-FIM-026 records a write
   there (High outside a package transaction, Low inside one; a directory
-  absent at the agent's start is not watched); R011 records each child of
+  absent at the agent's start is watched once it appears — lot 369: looked
+  at once a second, a file put in it within that second not reported); R011 records each child of
   the module tool (Medium: the command a directive runs, `/bin/sh -c …`),
   but not the `install <module> /bin/true` (or `/bin/false`) idiom of the
   hardening guides; an `install` line in

@@ -4289,15 +4289,18 @@ mod tests {
     }
 
     /// The re-review of #468 (W1): a line not in the kernel's shape over a
-    /// protected path — an nsfs mounted over `agent.sig.key` (its root
-    /// `net:[…]` is not a path) — is a `mount_over_protected`, in a round
-    /// too; one elsewhere (an nsfs under `/run/netns`, as on a k8s node) is
-    /// nothing.
+    /// protected path — a root that is no path — is a
+    /// `mount_over_protected`, in a round too; one elsewhere is nothing.
+    /// Lot 369: the example was an nsfs bound over `agent.sig.key` (its
+    /// root `net:[…]`); an nsfs row is now a mount of the table (docker's
+    /// `/run/docker/netns/<id>`), so the malformed line here has a relative
+    /// root on ext4 — and the nsfs over `agent.sig.key` is reported as the
+    /// mount it is, its namespace named (below).
     #[test]
     fn a_malformed_line_over_a_protected_path_is_reported() {
         let base = "29 1 252:1 / / rw - ext4 /dev/vda1 rw\n";
         let over = format!(
-            "{base}600 29 0:4 net:[4026532] /etc/northnarrow/agent.sig.key rw - nsfs nsfs rw\n"
+            "{base}600 29 252:1 relative /etc/northnarrow/agent.sig.key rw - ext4 /dev/vda1 rw\n"
         );
         let f = mount_findings(&over, &[]);
         assert_eq!(f.len(), 1, "{f:?}");
@@ -4315,8 +4318,24 @@ mod tests {
             "{r:?}"
         );
         let elsewhere =
-            format!("{base}600 29 0:4 net:[4026532] /run/netns/cni-1 rw - nsfs nsfs rw\n");
+            format!("{base}600 29 252:1 relative /run/netns/cni-1 rw - ext4 /dev/vda1 rw\n");
         assert!(mount_findings(&elsewhere, &[]).is_empty());
+        // lot 369: an nsfs over a protected path is reported as a mount, an
+        // nsfs elsewhere (`/run/netns`, a k8s node's) is nothing
+        let nsfs = format!(
+            "{base}600 29 0:4 net:[4026532] /etc/northnarrow/agent.sig.key rw - nsfs nsfs rw\n"
+        );
+        let f = mount_findings(&nsfs, &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_over_protected");
+        assert!(
+            f[0].detail
+                .starts_with("/etc/northnarrow/agent.sig.key (nsfs"),
+            "{f:?}"
+        );
+        let nsfs_elsewhere =
+            format!("{base}600 29 0:4 net:[4026532] /run/netns/cni-1 rw - nsfs nsfs rw\n");
+        assert!(mount_findings(&nsfs_elsewhere, &[]).is_empty());
     }
 
     #[test]

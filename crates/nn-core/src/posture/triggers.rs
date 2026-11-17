@@ -1721,7 +1721,13 @@ fn confirmed_intrusion<H: DecisionHost>(
             cgroup_id,
             own_data,
         } => {
-            let mut own = own_data_exempt(auth, daemons, (*pid, *uid, *timestamp_ns), *own_data);
+            let mut own = own_data_exempt(
+                auth,
+                daemons,
+                (*pid, *uid, *timestamp_ns),
+                *own_data,
+                *cgroup_id,
+            );
             let shape = if *overwrites && *small_files {
                 Shape::SmallRewrites
             } else if *overwrites {
@@ -1767,7 +1773,13 @@ fn confirmed_intrusion<H: DecisionHost>(
             own_data,
             ..
         } => {
-            let own = own_data_exempt(auth, daemons, (*pid, *uid, *timestamp_ns), *own_data);
+            let own = own_data_exempt(
+                auth,
+                daemons,
+                (*pid, *uid, *timestamp_ns),
+                *own_data,
+                *cgroup_id,
+            );
             let Some(all_own) = replacements.record(
                 *pid,
                 pairing_cgroup(auth, *pid, *cgroup_id, *timestamp_ns, filename),
@@ -2097,19 +2109,40 @@ fn own_data_exempt<H: DecisionHost>(
     daemons: Option<&DaemonData>,
     (pid, uid, ts_ns): (u32, u32, u64),
     own: u8,
+    cgroup_id: u64,
 ) -> Option<&'static str> {
     match own {
         own_data::NONE => None,
-        // lot 346 (item 6): or by the packaged `initdb` making its cluster
-        own_data::SERVICE => (H::account_kind(uid) == AccountKind::System
-            && (auth.system_service(pid).is_some()
-                || auth.runs_postgres_initdb(pid, AsOf::judged(ts_ns))))
-        .then_some("a service account's own data, written by its service or its initdb"),
+        // lot 346 (item 6): or by the packaged `initdb` making its cluster;
+        // lot 369: or, the writer gone by now (a short-lived backend), by
+        // the service whose cgroup the kernel recorded at the write
+        own_data::SERVICE => {
+            const WHY: &str = "a service account's own data, written by its service or its initdb";
+            if H::account_kind(uid) != AccountKind::System {
+                return None;
+            }
+            if auth.system_service(pid).is_some()
+                || auth.runs_postgres_initdb(pid, AsOf::judged(ts_ns))
+            {
+                return Some(WHY);
+            }
+            let unit = auth.system_service_of_cgroup(cgroup_id)?;
+            tracing::info!(
+                pid,
+                unit = %nn_model::log_escape::Escaped(&unit),
+                "mass-write arm: the writer is gone; its service told by the cgroup the kernel \
+                 recorded at the write (lot 369)"
+            );
+            Some(WHY)
+        }
         own_data::CACHE => (H::account_kind(uid) == AccountKind::Human)
             .then_some("a person's own cache, written by that person"),
         code => {
             let units = daemons?.units_of(code)?;
-            let unit = auth.system_service(pid)?;
+            // lot 369: the writer gone by now: by its cgroup at the write
+            let unit = auth
+                .system_service(pid)
+                .or_else(|| auth.system_service_of_cgroup(cgroup_id))?;
             units
                 .contains(&unit)
                 .then_some("a listed daemon's own data directory, written by its unit")
@@ -6732,6 +6765,96 @@ mod tests {
             .det
             .detect(&gone, &[])
             .contains(&TriggerType::ConfirmedIntrusion));
+    }
+
+    /// Lot 369 (the soak of rc5: ConfirmedIntrusion → ENGAGED at pgbench's
+    /// start and after `createdb`, Ubuntu 24.04 and Debian 13): the writer
+    /// of a crossing — a short-lived PostgreSQL backend, pgbench's setup
+    /// connection, `createdb`'s — may be gone by the time the crossing is
+    /// judged, its `/proc` entry with it; the service it wrote from is then
+    /// the one whose cgroup the kernel recorded at the write (its cgroup v2
+    /// id, the inode of the unit's cgroup directory). Its own data written
+    /// by its service raises nothing; the same crossing from a session's
+    /// scope, from a cgroup a service made below itself, from a cgroup not
+    /// found, by a person's uid, or with a file outside its own data (the
+    /// ransomware shape) still counts. On main a gone writer was no one's
+    /// (fails there).
+    #[test]
+    fn a_service_writer_gone_before_its_crossing_is_judged_is_told_by_its_cgroup() {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::{testing::TestHost, PostureHost};
+        let procs = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        // the host's id of each unit's directory (the portable host's
+        // stand-in for its inode)
+        let dir = |rel: &str| {
+            let d = cg.path().join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            TestHost::dir_ino(&d).unwrap()
+        };
+        let service = dir("system.slice/system-postgresql.slice/postgresql@16-main.service");
+        let plain = dir("system.slice/postgresql.service");
+        let scope = dir("user.slice/user-1000.slice/session-3.scope");
+        let made = dir("system.slice/other.service/payload");
+        let containerd = dir("system.slice/containerd.service");
+        let other = dir("system.slice/other.service");
+        let auth = AuthSessionTracker::new(procs.path()).with_cgroup_root(cg.path());
+        assert_eq!(
+            auth.system_service_of_cgroup(service).as_deref(),
+            Some("postgresql@16-main.service")
+        );
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
+        let (data, refused) = DaemonData::build(
+            DaemonData::parse_text(crate::posture::daemon_data::BUILTIN_DAEMON_DATA_V1).0,
+        );
+        assert!(refused.is_empty());
+        det.set_daemon_data(Arc::new(data));
+        let pg = "/var/lib/postgresql/16/nnf05/base/16384/2833";
+        let raised = |pid: u32, uid: u32, own: u8, cgroup: u64| {
+            let mut e = own_burst(pid, uid, pg, own, 10 + u64::from(pid));
+            if let Event::MassWrite { cgroup_id, .. } = &mut e {
+                *cgroup_id = cgroup;
+            }
+            det.detect(&e, &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        };
+        // gone (no /proc entry), from the service's cgroup: its own data
+        assert!(!raised(7001, 113, own_data::SERVICE, service));
+        assert!(!raised(7002, 113, own_data::SERVICE, plain));
+        // still counted
+        for (pid, uid, own, cgroup, why) in [
+            (7003, 113, own_data::SERVICE, scope, "a session's scope"),
+            (
+                7004,
+                113,
+                own_data::SERVICE,
+                made,
+                "a cgroup a service made",
+            ),
+            (
+                7005,
+                113,
+                own_data::SERVICE,
+                999_999_999,
+                "a cgroup not found",
+            ),
+            (7006, 1000, own_data::SERVICE, service, "a person's uid"),
+            (
+                7007,
+                113,
+                own_data::NONE,
+                service,
+                "a file outside its own data",
+            ),
+        ] {
+            assert!(raised(pid, uid, own, cgroup), "{why}");
+        }
+        // the mini-hunt: a listed daemon's directory (containerd's), its
+        // writer gone — by its unit's cgroup, as the service account's
+        let code = unit_code(&det, "/var/lib/containerd/");
+        assert!(!raised(7008, 0, code, containerd), "containerd's own, gone");
+        assert!(raised(7009, 0, code, other), "another unit's cgroup");
     }
 
     /// Lot 283c, decision 1: the same burst from a login session — a
