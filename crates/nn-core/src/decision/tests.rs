@@ -1673,11 +1673,72 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
     assert_eq!(d.responses[0].rule_id, "R001_ExecFromTmp");
 }
 
+/// Lot 369: the go helpers of the tests below — an exec as `uid` of `path`
+/// with `argv` at `ts`, its image a root-only tree's (`rooted`) or the
+/// kernel's canonical path of a file elsewhere.
+fn go_exec(
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    path: &str,
+    argv: &[&str],
+    ts: u64,
+    rooted: bool,
+) -> Event {
+    use common::wire::exe::exe_flags;
+    let mut e = spawn_as(uid, "x", path);
+    if let Event::ProcessSpawn {
+        pid: pp,
+        ppid: parent,
+        timestamp_ns,
+        exe,
+        argv: a,
+        ..
+    } = &mut e
+    {
+        (*pp, *parent, *timestamp_ns) = (pid, ppid, ts);
+        *a = argv.iter().map(|s| s.to_string()).collect();
+        exe.path = path.into();
+        exe.flags |= exe_flags::KNOWN;
+        if rooted {
+            (exe.dev, exe.ino) = (2049, u64::from(pid));
+            exe.flags |= exe_flags::ROOT_DIR;
+        }
+    }
+    e
+}
+
+/// Lot 369: the packaged toolchain's linker, as `go` runs it.
+const GO_LINK: &str = "/usr/lib/go-1.22/pkg/tool/linux_amd64/link";
+
+/// Lot 369: `go` (`go_pid`, uid `uid`) runs its linker (`link_pid`) to
+/// write `out`, at `ts`.
+fn go_link(p: &Prod, link_pid: u32, go_pid: u32, uid: u32, out: &str, ts: u64) {
+    p.lineage.ingest_spawn_event(&go_exec(
+        link_pid,
+        go_pid,
+        uid,
+        GO_LINK,
+        &[
+            GO_LINK,
+            "-o",
+            out,
+            "-importcfg",
+            "/x/importcfg.link",
+            "-buildmode=exe",
+            "/x/_pkg_.a",
+        ],
+        ts,
+        true,
+    ));
+}
+
 /// Lot 369 (the soak of rc5: R001 High at every `go test` and `go run` on
-/// the three guests): the packaged `go`'s own build output — `go test`'s
-/// test binary, `go run`'s program, in the layout of its work directory in
-/// `/tmp` or `/var/tmp`, forked by the packaged `go` (a root-only system
-/// tree, its exec's image seen) — is R001's or R003's Low record, never a
+/// the three guests): what the packaged `go` itself built and then runs —
+/// `go test`'s test binary, `go run`'s program, in the layout of its work
+/// directory in `/tmp` or `/var/tmp`, written by the packaged toolchain's
+/// own linker that this very `go` ran (the review of #576, F1), run by that
+/// `go` for a person's account — is R001's or R003's Low record, never a
 /// kill, in every posture (lot 346 left it out of the posture's exec arm
 /// only; decision 283b recorded it High). The attack shapes stay judged:
 /// the same file run by a shell, by the test binary itself, by a `go` in a
@@ -1686,41 +1747,43 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
 /// before. Fails on main (High).
 #[test]
 fn go_test_and_go_run_built_by_the_packaged_go_are_recorded_low() {
-    use common::wire::exe::exe_flags;
     let p = prod("");
-    let exec = |pid: u32, ppid: u32, path: &str, ts: u64, rooted: bool| {
-        let mut e = spawn_as(1000, "x", path);
-        if let Event::ProcessSpawn {
-            pid: pp,
-            ppid: parent,
-            timestamp_ns,
-            exe,
-            ..
-        } = &mut e
-        {
-            (*pp, *parent, *timestamp_ns) = (pid, ppid, ts);
-            if rooted {
-                exe.path = path.into();
-                (exe.dev, exe.ino) = (2049, u64::from(pid));
-                exe.flags |= exe_flags::KNOWN | exe_flags::ROOT_DIR;
-            }
-        }
-        e
-    };
     p.lineage
-        .ingest_spawn_event(&exec(300, 1, "/usr/bin/bash", 1, true));
-    p.lineage
-        .ingest_spawn_event(&exec(8000, 300, "/usr/lib/go-1.22/bin/go", 2, true));
-    p.lineage
-        .ingest_spawn_event(&exec(8010, 300, "/home/u/sdk/go1.23.0/bin/go", 2, true));
+        .ingest_spawn_event(&go_exec(300, 1, 1000, "/usr/bin/bash", &["bash"], 1, true));
+    p.lineage.ingest_spawn_event(&go_exec(
+        8000,
+        300,
+        1000,
+        "/usr/lib/go-1.22/bin/go",
+        &["go", "test", "./..."],
+        2,
+        true,
+    ));
+    p.lineage.ingest_spawn_event(&go_exec(
+        8010,
+        300,
+        1000,
+        "/home/u/sdk/go1.23.0/bin/go",
+        &["go", "test"],
+        2,
+        true,
+    ));
+    let built = [
+        "/tmp/go-build2618259110/b053/calc.test",
+        "/tmp/go-build4098838642/b001/exe/nncorpus",
+        "/var/tmp/go-build77/b012/x.test",
+    ];
+    for (i, out) in (0u32..).zip(built) {
+        go_link(&p, 8100 + i, 8000, 1000, out, 3);
+        go_link(&p, 8200 + i, 8010, 1000, out, 3);
+    }
     let mut pid = 9000;
     let mut judged = |ppid: u32, image: &str, posture: PostureKind, deleted: bool| {
         pid += 1;
-        let mut e = exec(pid, ppid, image, 5, false);
+        let mut e = go_exec(pid, ppid, 1000, image, &[image], 5, false);
         if deleted {
             if let Event::ProcessSpawn { exe, .. } = &mut e {
-                exe.path = image.into();
-                exe.flags |= exe_flags::KNOWN | exe_flags::DELETED;
+                exe.flags |= common::wire::exe::exe_flags::DELETED;
             }
         }
         let d = p.decide_in(&e, posture).expect("a decision");
@@ -1732,11 +1795,7 @@ fn go_test_and_go_run_built_by_the_packaged_go_are_recorded_low() {
         PostureKind::Engaged,
         PostureKind::Combat,
     ] {
-        for image in [
-            "/tmp/go-build2618259110/b053/calc.test",
-            "/tmp/go-build4098838642/b001/exe/nncorpus",
-            "/var/tmp/go-build77/b012/x.test",
-        ] {
+        for image in built {
             assert_eq!(
                 judged(8000, image, posture, false),
                 (Severity::Low, ResponseAction::Log, 0),
@@ -1745,7 +1804,7 @@ fn go_test_and_go_run_built_by_the_packaged_go_are_recorded_low() {
         }
     }
     // the attack shapes: High (the kill held below COMBAT), as before
-    let built = "/tmp/go-build2618259110/b053/calc.test";
+    let built = built[0];
     for (ppid, image, deleted) in [
         (300, built, false),
         (9001, built, false),
@@ -1759,6 +1818,247 @@ fn go_test_and_go_run_built_by_the_packaged_go_are_recorded_low() {
             matches!(sev, Severity::High | Severity::Critical),
             "{ppid} {image} {deleted}: {sev:?} {action:?}"
         );
+    }
+}
+
+/// The review of #576 (F1, its probe): what the packaged `go` only
+/// launches from a `go-build`-shaped directory — a `-vettool` (`go vet
+/// -vettool=/tmp/go-build1/b1/x`), an `-exec` wrapper, a `go generate`
+/// command, a file another process dropped there — was R001's Low record
+/// on the head of #576 (the layout and the forker, not who wrote the file),
+/// in every posture: a web shell's payload as `www-data`, not killed in
+/// COMBAT (main: R001 Medium + KillProcessTree). It is judged as on main:
+/// the service account's killed in every posture, the person's High (the
+/// kill held below COMBAT) — as is a file the packaged linker was run to
+/// write by another process than the `go` that runs it (a shell running
+/// `link`, a second `go`, a `-toolexec` program in between), an argv of two
+/// outputs, a linker of a toolchain in a home or of another `GOROOT` than
+/// the `go`'s, a linker without its image, and a link noted after the
+/// exec. Fails on the head of #576 (Low).
+#[test]
+fn a_program_go_only_launches_from_a_go_build_dir_stays_judged() {
+    let p = prod("");
+    let go = "/usr/lib/go-1.22/bin/go";
+    // a web shell (www-data) runs the packaged go with a dropped vettool
+    p.lineage
+        .ingest_spawn_event(&go_exec(400, 1, 33, "/usr/bin/dash", &["sh"], 1, true));
+    let vettool = "/tmp/go-build1/b1/x";
+    p.lineage.ingest_spawn_event(&go_exec(
+        8100,
+        400,
+        33,
+        go,
+        &["go", "vet", "-vettool=/tmp/go-build1/b1/x", "."],
+        2,
+        true,
+    ));
+    for posture in [
+        PostureKind::Observing,
+        PostureKind::Engaged,
+        PostureKind::Combat,
+    ] {
+        let e = go_exec(9100, 8100, 33, vettool, &[vettool, "-V=full"], 5, false);
+        let d = p.decide_in(&e, posture).expect("a decision");
+        assert_eq!(d.verdict.rule_id, "R001_ExecFromTmp", "{posture}");
+        assert_eq!(
+            (
+                d.verdict.severity,
+                d.verdict.action.clone(),
+                d.responses.len()
+            ),
+            (Severity::Medium, ResponseAction::KillProcessTree, 1),
+            "{posture}: the service account's dropped vettool"
+        );
+    }
+    // a person's go: the same shapes are its High record, the kill held
+    p.lineage
+        .ingest_spawn_event(&go_exec(300, 1, 1000, "/usr/bin/bash", &["bash"], 1, true));
+    p.lineage.ingest_spawn_event(&go_exec(
+        8000,
+        300,
+        1000,
+        go,
+        &["go", "test", "-exec=/tmp/go-build7/b7/wrap", "."],
+        2,
+        true,
+    ));
+    p.lineage.ingest_spawn_event(&go_exec(
+        8020,
+        300,
+        1000,
+        go,
+        &["go", "tool", "link"],
+        2,
+        true,
+    ));
+    let toolexec = "/home/u/bin/wrap";
+    p.lineage
+        .ingest_spawn_event(&go_exec(8030, 8000, 1000, toolexec, &[toolexec], 3, false));
+    // a shell runs the packaged linker; a second go links; a -toolexec
+    // program runs the linker; two outputs; a toolchain's linker in a home
+    let shell_out = "/tmp/go-build3/b001/exe/a";
+    let other_out = "/tmp/go-build4/b001/exe/a";
+    let toolexec_out = "/tmp/go-build5/b001/exe/a";
+    let twice_out = "/tmp/go-build6/b001/exe/a";
+    let home_out = "/tmp/go-build8/b001/exe/a";
+    let late_out = "/tmp/go-build9/b001/exe/a";
+    go_link(&p, 8301, 300, 1000, shell_out, 3);
+    go_link(&p, 8302, 8020, 1000, other_out, 3);
+    go_link(&p, 8303, 8030, 1000, toolexec_out, 4);
+    p.lineage.ingest_spawn_event(&go_exec(
+        8304,
+        8000,
+        1000,
+        GO_LINK,
+        &[GO_LINK, "-o", twice_out, "-o", twice_out, "/x/_pkg_.a"],
+        3,
+        true,
+    ));
+    let home_link = "/home/u/sdk/go1.23.0/pkg/tool/linux_amd64/link";
+    p.lineage.ingest_spawn_event(&go_exec(
+        8305,
+        8000,
+        1000,
+        home_link,
+        &[home_link, "-o", home_out, "/x/_pkg_.a"],
+        3,
+        true,
+    ));
+    // another packaged toolchain's linker than the go's own; the go's own
+    // linker without its image (not a root-only tree's, as the kernel ran it)
+    let other_root_out = "/tmp/go-build10/b001/exe/a";
+    let unrooted_out = "/tmp/go-build11/b001/exe/a";
+    let link_121 = "/usr/lib/go-1.21/pkg/tool/linux_amd64/link";
+    p.lineage.ingest_spawn_event(&go_exec(
+        8307,
+        8000,
+        1000,
+        link_121,
+        &[link_121, "-o", other_root_out, "/x/_pkg_.a"],
+        3,
+        true,
+    ));
+    p.lineage.ingest_spawn_event(&go_exec(
+        8308,
+        8000,
+        1000,
+        GO_LINK,
+        &[GO_LINK, "-o", unrooted_out, "/x/_pkg_.a"],
+        3,
+        false,
+    ));
+    // a link noted only after the exec it would vouch for
+    go_link(&p, 8306, 8000, 1000, late_out, 7);
+    let mut pid = 9200;
+    for image in [
+        "/tmp/go-build7/b7/wrap",
+        "/tmp/go-build1/b1/x",
+        shell_out,
+        other_out,
+        toolexec_out,
+        twice_out,
+        home_out,
+        late_out,
+        other_root_out,
+        unrooted_out,
+    ] {
+        pid += 1;
+        let e = go_exec(pid, 8000, 1000, image, &[image], 6, false);
+        let d = p.decide_in(&e, PostureKind::Engaged).expect("a decision");
+        assert_eq!(d.verdict.rule_id, "R001_ExecFromTmp", "{image}");
+        assert_eq!(
+            (d.verdict.severity, d.verdict.action.clone()),
+            (Severity::High, ResponseAction::Log),
+            "{image}: the person's record, the kill held"
+        );
+        assert_eq!(
+            d.primary().held_action,
+            Some(ResponseAction::KillProcessTree),
+            "{image}"
+        );
+        let d = p.decide_in(&e, PostureKind::Combat).expect("a decision");
+        assert_eq!(
+            d.verdict.action,
+            ResponseAction::KillProcessTree,
+            "{image}: COMBAT"
+        );
+    }
+}
+
+/// The review of #576 (F1): the packaged `go`'s own build output is a
+/// person's code only for a person's account. A service account's `go run`
+/// from `/tmp` (`www-data`, `GOCACHE=/tmp/…`: the account has no home) or
+/// `/var/tmp`, linked and run by the packaged `go` as for a person, is
+/// R001's (R003's) kill in every posture, COMBAT included; root's is judged
+/// as before (High, the kill held below COMBAT, given back there). Fails on
+/// the head of #576 (Low for both).
+#[test]
+fn a_service_account_s_or_root_s_go_build_output_stays_judged() {
+    let p = prod("");
+    let go = "/usr/lib/go-1.22/bin/go";
+    for (uid, shell, go_pid, rule, out) in [
+        (
+            33,
+            400,
+            8100,
+            "R001_ExecFromTmp",
+            "/tmp/go-build1/b001/exe/implant",
+        ),
+        (
+            33,
+            400,
+            8100,
+            "R003_ExecFromVarTmp",
+            "/var/tmp/go-build2/b001/exe/implant",
+        ),
+        (
+            0,
+            410,
+            8110,
+            "R001_ExecFromTmp",
+            "/tmp/go-build3/b001/exe/implant",
+        ),
+    ] {
+        p.lineage
+            .ingest_spawn_event(&go_exec(shell, 1, uid, "/usr/bin/dash", &["sh"], 1, true));
+        p.lineage.ingest_spawn_event(&go_exec(
+            go_pid,
+            shell,
+            uid,
+            go,
+            &["go", "run", "/tmp/i.go"],
+            2,
+            true,
+        ));
+        go_link(&p, go_pid + 1, go_pid, uid, out, 3);
+        let e = go_exec(go_pid + 2, go_pid, uid, out, &[out], 5, false);
+        for posture in [
+            PostureKind::Observing,
+            PostureKind::Engaged,
+            PostureKind::Combat,
+        ] {
+            let d = p.decide_in(&e, posture).expect("a decision");
+            let m = d
+                .matches
+                .iter()
+                .find(|m| m.rule_id == rule)
+                .unwrap_or_else(|| panic!("{uid} {posture}: {:?}", ids(&d)));
+            assert_ne!(m.verdict.severity, Severity::Low, "{uid} {posture} {out}");
+            if uid == 0 && posture < PostureKind::Combat {
+                // root's: R009's record first, R001's kill held (lot 278)
+                assert_eq!(
+                    m.held_action,
+                    Some(ResponseAction::KillProcessTree),
+                    "root {posture}"
+                );
+            } else {
+                assert_eq!(
+                    (d.verdict.action.clone(), d.responses.len()),
+                    (ResponseAction::KillProcessTree, 1),
+                    "{uid} {posture} {out}"
+                );
+            }
+        }
     }
 }
 

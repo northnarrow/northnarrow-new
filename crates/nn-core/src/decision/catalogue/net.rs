@@ -307,10 +307,14 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "Outbound flows from one process to one destination at regular intervals: \
                    at least 4 of them, a mean interval of a second or more and a coefficient \
                    of variation of 0.15 or less, within an hour. Lot 369: one record per \
-                   program (the kernel's image), destination and hour, the next counting the \
-                   periodic flows folded since; a socket sending to its own bound endpoint on \
-                   loopback (PostgreSQL ≤ 14's statistics collector) reaches no other program \
-                   and is no beacon.",
+                   program (the kernel's image; an interpreter's image and the script it runs, \
+                   else its process), destination and hour, the next counting the periodic \
+                   flows folded since; a datagram sent to the sending socket's own bound \
+                   endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon \
+                   — the destination the send names (`sendto()`, connected socket or not), \
+                   the socket's peer only when it names none. Residual: another socket bound \
+                   to the same endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive it; that \
+                   relay's own flows are judged.",
         false_positives: "Pollers, health checks, metrics exporters and update checkers not in \
                           the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).",
         how_to_test: "From one process, connect to the same address every 5 seconds: \
@@ -322,6 +326,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/net.rs::net_013_a_socket_sending_to_itself_is_no_beacon",
             "crates/nn-core/src/decision/rules/net.rs::\
              net_013_records_one_beacon_per_program_destination_and_hour",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_013_an_interpreter_s_beacons_are_keyed_by_its_script",
         ],
         attack_note: "The timing is the signal: a C2 beacon over an application protocol \
                       (T1071) or a scheduled transfer (T1029).",

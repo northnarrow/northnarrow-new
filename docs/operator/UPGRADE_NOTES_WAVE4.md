@@ -4647,13 +4647,22 @@ its verdict.
   program, destination and hour (NN-L-NET-013).** PostgreSQL ≤ 14's
   statistics collector — one UDP socket bound to loopback and connected to
   its own address — was a High record every 20 seconds (Ubuntu 22.04: 872
-  in four hours). A flow whose destination is the sending socket's own
-  bound endpoint on loopback (the kernel's: its local address and port at
-  the send) reaches no other program and is no beacon. A loopback
-  destination of another socket (a local SOCKS or Tor proxy) and every
-  remote host keep firing — once per program (the kernel's image, else the
-  process), destination and hour, the next record counting the periodic
-  flows folded into the one before.
+  in four hours). A datagram sent to the sending socket's own bound
+  endpoint on loopback (its local address and port at the send) is no
+  beacon. The destination is the one the kernel sends to: the address the
+  send names (`sendto()`, `sendmsg()`), on a connected socket too — the UDP
+  flow sensor read a connected socket's peer before, so a socket connected
+  to itself that named a local relay in each send was recorded as sending
+  to itself — and the socket's peer only when the send names none
+  (`udp_sendmsg` reads an `AF_UNSPEC` name as an `AF_INET` one, as the
+  sensor now does). Residual, said: another socket bound to the same
+  endpoint (`SO_REUSEADDR`, `SO_REUSEPORT`) may receive such a datagram;
+  that relay's own flows are judged. A loopback destination of another
+  socket (a local SOCKS or Tor proxy, a relay) and every remote host keep
+  firing — once per program (the kernel's image; an interpreter's image
+  and the script it runs, an interpreter running no script file its
+  process; else the process), destination and hour, the next record
+  counting the periodic flows folded into the one before.
 - **A `modprobe` that cannot load a module is Low (R011).** The exec pump
   reads the module tool's credentials with its environment, tied to the
   exec the same way (`/proc/<pid>/status`: its four uids and its
@@ -4665,13 +4674,22 @@ its verdict.
   refuses it every load. Credentials not read (the process gone first), a
   uid 0, `CAP_SYS_MODULE` held (an ambient capability given by a unit), and
   every kill (`insmod`, a file, `-d`, `LD_*`, a copy) are judged as before.
-- **`go test` and `go run` are Low (R001, R003).** Lot 346's identity of
-  the packaged `go`'s own build output — a file in the layout of its work
-  directory, forked by the packaged `go` (its exec's image in a root-only
-  system tree), not unlinked — now applies to the record too: R001's (or
-  R003's, `TMPDIR=/var/tmp`) Low record, never a kill, in every posture
-  (decision 283b recorded it High). The same file run by a shell, by
-  another parent or by a `go` in a home stays judged.
+- **A person's `go test` and `go run` are Low (R001, R003).** What the
+  packaged `go` itself built and then runs is R001's (or R003's,
+  `TMPDIR=/var/tmp`) Low record, never a kill, in every posture (decision
+  283b recorded it High) — when every fact holds: the file is the output
+  the packaged toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`,
+  its image in a root-only system tree, as lot 346 identifies `go`) was run
+  to write by that very `go` process; it lies in the layout of its work
+  directory; that `go` runs it, by its path, not unlinked; and the account
+  is a person's (`UID_MIN` and up with a login shell). What `go` only
+  launches — a `-vettool`, an `-exec` wrapper, a `-toolexec` program, a
+  `go generate` command, a file another process dropped in a `go-build`
+  directory — is judged as before (a service account's killed in every
+  posture), as are root's and a service account's own build output (a web
+  shell's `go run` from `/tmp`), and the same file run by a shell, by
+  another parent or by a `go` in a home. The posture's exec arm keeps lot
+  346's exemption, unchanged.
 - **A service account's own data written by a writer already gone does
   not escalate.** The mass-write arm's own-data exemption needs the
   writer's system service; a short-lived PostgreSQL backend (`createdb`'s,
@@ -4704,4 +4722,8 @@ its verdict.
 - **Not changed:** NN-L-NET-019 for `pg_createcluster`'s port probe (a
   wildcard listener of a root-run packaged script: telling it from a
   backdoor needs more than its identity gives); every kill and every
-  protection above stands.
+  protection above stands, but one: R001's and R003's kill of a person's
+  own `go test` and `go run` build output, linked and run by the packaged
+  `go` (Low in every posture, COMBAT included; below COMBAT it was held
+  already). A `go test` binary that connects out still meets
+  NN-L-CHAIN-002/005 (Critical): the chains judge every staged exec.

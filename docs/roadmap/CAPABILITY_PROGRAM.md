@@ -11811,6 +11811,39 @@ number in parentheses is a lab PR.
     two argued equivalent (a `.scope` accepted by the cgroup walk is refused
     by `system_service` after it; the credentials' start checked before the
     read as well as after it, the latter deciding).
+  - Fix round 1 (the independent review of #576): F1 — the go Low was the
+    layout and the forker only, so a program `go` merely launches from a
+    `go-build`-shaped directory (`go vet -vettool=…`, `-exec`,
+    `-toolexec`, `go generate`, a dropped file) and a service account's own
+    `go run` were Low, unkilled in COMBAT. Now Low only when the packaged
+    toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`, by
+    identity) was run by that very `go` process to write the file, in its
+    work directory, `go` runs it by its path, and the account is a person's;
+    the posture's exec arm keeps lot 346's exemption. F2 — option (a): the
+    UDP flow sensor records the destination a send names (`msg_name`, on a
+    connected socket too; `AF_UNSPEC` read as `udp_sendmsg` reads it), so a
+    socket connected to itself that names a local relay is a beacon to the
+    relay again; NN-L-NET-013's self-send exemption kept, its residual said
+    (`SO_REUSEADDR`/`SO_REUSEPORT` sharers). F5 — an interpreter's beacons
+    keyed by its script. F4 (CHAIN-002/005 for a networked `go test`) and F6
+    (a FIM file path's own appearance) left for the backlog. Lab (as
+    measured; **ubuntu2204** 5.15, the alpha profile, the round's WIP
+    commits, two short rounds): the packaged go 1.18 as the lab user — `go
+    test` and `go run` R001 Low ×1 each; a dropped `-vettool` R001 High (the
+    kill held); as `www-data` — the review's probe (a dropped `-vettool` in
+    `/tmp/go-build1/b1/`) R001 Medium "would have KillProcessTree" (the
+    head of #576: Low), its `go run` from `/tmp` R001 Medium "would have
+    KillProcessTree"; a UDP socket bound and connected to itself sending to
+    a relay every 5 s (7 sends), by `sendto()` and by an `AF_UNSPEC` name —
+    the flows recorded to the relay's port, NN-L-NET-013 High ×1 each; the
+    same socket sending to itself — flows to itself, 0 NN-L-NET-013;
+    PostgreSQL 14 idle 10 minutes — 0 NN-L-NET-013. The verifier on 5.15:
+    `udp_sendmsg_outbound` 33,135 instructions processed,
+    `udpv6_sendmsg_outbound` 38,673, `udp_sendmsg` 25,505 (gate 900k).
+    Uninstalled, purged, powered off. Not run: debian13 and ubuntu2604 (the
+    soak holds debian13; one guest for this round). Mutation: 17 mutants,
+    16 caught by a named test, one argued equivalent (the work-directory
+    layout checked when the link is noted: the lookup checks it again).
 - **Lot 367 — the pre-alpha's Phase 3-bis (self-protection on five
   kernels): the agent's memory views on 7.0, snapd's own units, the lock's
   and the watchdog's causes in `nn-admin status` (C23; no level change).**

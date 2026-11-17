@@ -433,11 +433,39 @@ pub struct BeaconWindow {
 
 /// Lot 369: who a beacon record is for — the image the kernel executed
 /// (device, inode), as the lineage holds it; else the process (pid and its
-/// start), when the lineage holds no image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// start), when the lineage holds no image. The review of #576 (F5): an
+/// interpreter's image is many programs — the script it runs keys it too;
+/// an interpreter running no script file (`-c`, a REPL, standard input,
+/// options not read) is its process.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BeaconIdentity {
     Image(u64, u64),
+    Script(u64, u64, Box<str>),
     Process(u32, u64),
+}
+
+impl BeaconIdentity {
+    /// The identity of `pid` (started at `start_ns`) as `allowlist`'s
+    /// lineage holds it as of `as_of`.
+    pub fn of<H: PostureHost>(
+        allowlist: &CommAllowlist<H>,
+        pid: u32,
+        start_ns: u64,
+        as_of: crate::posture::lineage::AsOf,
+    ) -> Self {
+        let process = BeaconIdentity::Process(pid, start_ns);
+        let Some((dev, ino)) = allowlist.exec_image(pid, as_of) else {
+            return process;
+        };
+        match allowlist.exec_identity(pid, as_of) {
+            Some(id) if id.interprets() => match id.script() {
+                Some(script) => BeaconIdentity::Script(dev, ino, script.into()),
+                None => process,
+            },
+            Some(_) => BeaconIdentity::Image(dev, ino),
+            None => process,
+        }
+    }
 }
 
 /// Lot 369: the beacons recorded at once ([`BeaconWindow::report`]); past
@@ -575,7 +603,7 @@ impl BeaconWindow {
                     .reported
                     .iter()
                     .min_by_key(|(_, (since, _))| *since)
-                    .map(|(k, _)| *k)
+                    .map(|(k, _)| k.clone())
                 else {
                     break;
                 };
@@ -2280,10 +2308,7 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
         // lot 369: one record per program, destination and window, the
         // periodic flows it took since counted in the next
         let as_of = crate::posture::lineage::AsOf::of_event(event);
-        let id = match self.allowlist.exec_image(nf.pid, as_of) {
-            Some((dev, ino)) => BeaconIdentity::Image(dev, ino),
-            None => BeaconIdentity::Process(nf.pid, nf.proc_start_ns),
-        };
+        let id = BeaconIdentity::of(&self.allowlist, nf.pid, nf.proc_start_ns, as_of);
         let folded = self.window.lock().report(id, nf.dst_addr, nf.start_ns)?;
         let mut reasoning = "Periodic low-jitter outbound flows to a single destination \
              from one process — C2-beacon timing pattern (T1071/T1029); \
@@ -5404,6 +5429,13 @@ mod tests {
             fired((lo4, 40_000), (lo4, 9050), 5) > 0,
             "a local proxy's port"
         );
+        // the review of #576 (F2): a socket connected to itself that
+        // `sendto()`s a local relay — the sensor records the name the
+        // kernel sends to, not the socket's peer
+        assert!(
+            fired((lo4, 42_919), (lo4, 5335), 20) > 0,
+            "a relay named by a socket connected to itself"
+        );
         let unspec: IpAddr = "0.0.0.0".parse().unwrap();
         assert!(
             fired((unspec, 9050), (lo4, 9050), 5) > 0,
@@ -5478,6 +5510,65 @@ mod tests {
             Some(0),
             "forgotten: again"
         );
+    }
+
+    /// The review of #576 (F5): an interpreter's image is many programs.
+    /// Its beacons are keyed by the script it runs as well: two scripts of
+    /// one `python3` beaconing to one destination are two records (on the
+    /// head of #576, one: the second folded — fails there); the same script
+    /// in a second process folds as one program; an interpreter running no
+    /// script file (`-c`) is its own process; a binary stays one program.
+    #[test]
+    fn net_013_an_interpreter_s_beacons_are_keyed_by_its_script() {
+        use common::wire::exe::exe_flags::ROOT_DIR;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        let exec = |pid: u32, path: &str, argv: &[&str]| {
+            let mut e = crate::decision::rules::testutil::spawn_exe("x", path, path, ROOT_DIR);
+            if let Event::ProcessSpawn {
+                pid: p,
+                argv: a,
+                exe,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *timestamp_ns) = (pid, 1);
+                *a = argv.iter().map(|s| s.to_string()).collect();
+                // one image per program file
+                exe.ino = if path.ends_with("python3.12") { 77 } else { 78 };
+                exe.dev = 2049;
+            }
+            lineage.ingest_spawn_event(&e);
+        };
+        let py = "/usr/bin/python3.12";
+        exec(800, py, &["python3", "/home/u/a.py"]);
+        exec(801, py, &["python3", "/home/u/b.py"]);
+        exec(802, py, &["python3", "/home/u/a.py"]);
+        exec(803, py, &["python3", "-c", "import socket"]);
+        exec(804, py, &["python3", "-c", "import socket"]);
+        exec(805, "/usr/sbin/beacond", &["beacond", "-x"]);
+        exec(806, "/usr/sbin/beacond", &["beacond", "-y"]);
+        let rule = NnLNet013Beacon::new(
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::new(al().as_ref().clone().with_identity(lineage.clone())),
+        );
+        let dst = v4(203, 0, 113, 7);
+        let records = |pid: u32| {
+            (0..6u64)
+                .filter(|i| {
+                    rule.evaluate(&flow_pid(pid, dst, 443, "x", 1 + i * 20 * SEC))
+                        .is_some()
+                })
+                .count()
+        };
+        assert_eq!(records(800), 1, "a.py");
+        assert_eq!(records(801), 1, "b.py: another program of the same image");
+        assert_eq!(records(802), 0, "a.py again: the same program, folded");
+        assert_eq!(records(803), 1, "-c: its process");
+        assert_eq!(records(804), 1, "-c: another process");
+        assert_eq!(records(805), 1, "a binary");
+        assert_eq!(records(806), 0, "the binary again: one program");
     }
 
     #[test]

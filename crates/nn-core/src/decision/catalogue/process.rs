@@ -28,13 +28,18 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           home (lot 360: also an image whose file name is 31 bytes or more, \
                           by its whole path as its daemon runs it). An AppImage itself in \
                           `/tmp`, an extracted one, a writable FUSE mount or another \
-                          program's daemon stay judged. Lot 369: the packaged `go`'s own build \
-                          output — `go test`'s test binary, `go run`'s program, in the layout of \
-                          its work directory (`go-build<digits>/b<digits>/<name>` or \
-                          `…/exe/<name>`), forked by the packaged `go` (its exec's image in a \
-                          root-only system tree), not unlinked — is recorded Low, never killed; \
-                          the same file run by a shell, by another parent or by a `go` in a \
-                          home is judged as above.",
+                          program's daemon stay judged. Lot 369: what the packaged `go` itself \
+                          built and then runs, for a person's account — `go test`'s test binary, \
+                          `go run`'s program: the file the packaged toolchain's own linker \
+                          (`<GOROOT>/pkg/tool/<os>_<arch>/link`) was run to write by that very \
+                          `go`, in the layout of its work directory \
+                          (`go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), run by it \
+                          from its path, not unlinked — is recorded Low, never killed. What `go` \
+                          only launches (a `-vettool`, an `-exec` wrapper, a `-toolexec` \
+                          program, a `go generate` command, a file dropped in a `go-build` \
+                          directory), root's and a service account's build output, and the same \
+                          file run by a shell, by another parent or by a `go` in a home are \
+                          judged as above.",
         how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
                       && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
@@ -42,6 +47,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp",
             "crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::a_user_image_s_program_is_not_staged",
             "crates/nn-core/src/decision/tests.rs::go_test_and_go_run_built_by_the_packaged_go_are_recorded_low",
+            "crates/nn-core/src/decision/tests.rs::a_program_go_only_launches_from_a_go_build_dir_stays_judged",
+            "crates/nn-core/src/decision/tests.rs::a_service_account_s_or_root_s_go_build_output_stays_judged",
             "crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s",
             "agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp",
@@ -82,8 +89,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           High below COMBAT; a system account's (a package scriptlet run as \
                           one) is killed; run as root in a package transaction or an \
                           administrator's session it is R009's Low record. Lot 369: the \
-                          packaged `go`'s build output in `/var/tmp` (`TMPDIR=/var/tmp`) as \
-                          R001's.",
+                          packaged `go`'s own build output in `/var/tmp` (`TMPDIR=/var/tmp`) as \
+                          R001's: a person's, linked and run by that `go`.",
         how_to_test: "As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && \
                       /var/tmp/nn-r003`.",
         tests: &[

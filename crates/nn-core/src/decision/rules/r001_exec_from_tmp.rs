@@ -141,18 +141,20 @@ mod tests {
         }
     }
 
-    /// Lot 369: R001's own record of an exec lot 346's identity vouches
-    /// for (the packaged `go`'s build output, run by it) is Low, not
-    /// killed — but never for a file unlinked or a memfd when the kernel
-    /// ran it (a second factor: R001 judges it as ever), and never without
-    /// the identity.
+    /// Lot 369: R001's own record of an exec the go identity vouches for
+    /// (the packaged `go`'s build output, linked and run by it, for a
+    /// person) is Low, not killed — but never for a file unlinked or a memfd
+    /// when the kernel ran it, nor (the review of #576, F1) for a file the
+    /// kernel did not run by its path (no `KNOWN` canonical path: the
+    /// caller's string alone), and never without the identity. The
+    /// predicate is asked with the exec's own pid, uid and path.
     #[test]
     fn the_go_build_record_needs_the_identity_and_a_linked_file() {
         use crate::decision::rules::testutil::spawn_exe;
-        use common::wire::exe::exe_flags::{DELETED, MEMFD};
+        use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
         let built = "/tmp/go-build1/b001/calc.test";
         let go = R001ExecFromTmp::default().with_go_builds(super::super::GoBuilds::of_fn(
-            |_, _, image| image.contains("go-build"),
+            |pid, uid, _, image| (pid, uid) == (1234, 1000) && image.contains("go-build"),
         ));
         let v = go
             .evaluate(&spawn_exe("calc.test", built, built, 0))
@@ -164,6 +166,19 @@ mod tests {
                 .unwrap();
             assert_eq!(v.action, ResponseAction::KillProcessTree, "{flag:#x}");
             assert_eq!(v.severity, Severity::Medium);
+        }
+        // the caller's string alone, or a canonical path not yet placed
+        let mut unknown = spawn_exe("calc.test", built, built, 0);
+        if let Event::ProcessSpawn { exe, .. } = &mut unknown {
+            exe.flags &= !KNOWN;
+        }
+        let mut unplaced = spawn_exe("calc.test", built, "b001/calc.test", 0);
+        if let Event::ProcessSpawn { exe, .. } = &mut unplaced {
+            exe.root = (9, 9);
+        }
+        for e in [unknown, unplaced] {
+            let v = go.evaluate(&e).unwrap();
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{e:?}");
         }
         let v = R001ExecFromTmp::default()
             .evaluate(&spawn_exe("calc.test", built, built, 0))

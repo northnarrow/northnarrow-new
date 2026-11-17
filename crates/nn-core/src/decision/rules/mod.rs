@@ -95,50 +95,64 @@ pub fn is_staged_exec(exe: &nn_model::ExeIdentity, filename: &str) -> bool {
     staging_judged_path(exe, filename).is_some_and(is_staging_path)
 }
 
-/// Lot 369: lot 346's identity of the packaged `go`'s own build output, as
-/// the staging rules R001 and R003 apply it to the record (decision 283b
-/// held a person's exec from `/tmp` at High below COMBAT; the posture's
-/// exec arm already left it out): `go test`'s test binary and `go run`'s
-/// program, a file in the layout of `go`'s work directory
-/// (`<TMPDIR>/go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), forked
-/// by a process that ran the packaged `go` (a root-only system tree, its
-/// exec's image seen, run as itself) before the fork, the one hop above
-/// ([`crate::posture::lineage::AuthSessionTracker::runs_go_build_output`]),
-/// and not unlinked or a memfd when the kernel ran it. What `go` builds is
-/// the user's own code, as `go build && ./prog` from a home, which no
-/// staging rule judges. The same file run from a shell, by another parent
-/// or by the test binary itself, a `go` in a home, a layout that does not
-/// hold: judged as before. Without a lineage (tests, the boot-time rule
-/// set): never.
+/// Lot 369: what the packaged `go` itself built and then runs, as the
+/// staging rules R001 and R003 record it (decision 283b held a person's exec
+/// from `/tmp` at High below COMBAT): `go test`'s test binary and `go run`'s
+/// program. The review of #576 (F1): every fact of the identity, not the
+/// layout and the forker alone —
+/// - the file is the output the packaged toolchain's own linker
+///   (`<GOROOT>/pkg/tool/<os>_<arch>/link`, as lot 346 identifies `go`: a
+///   root-only system tree, its exec's image seen, run as itself) was run
+///   to write, by the very `go` process that runs it now
+///   ([`crate::posture::lineage::AuthSessionTracker::runs_go_linked_output`]);
+/// - it lies in that `go`'s work directory's layout
+///   (`<TMPDIR>/go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), and
+///   the kernel ran it by its path (`KNOWN`), not unlinked nor a memfd;
+/// - the account is a person's ([`crate::decision::host::AccountKind::Human`]:
+///   `UID_MIN` and up with a login shell) — what `go` builds is then the
+///   user's own code, as `go build && ./prog` from a home, which no staging
+///   rule judges. Root and a service account (`www-data`'s web shell with
+///   `go run`), whose `/tmp` is the staging path R001 and R003 exist for:
+///   judged as before.
+///
+/// What `go` merely launches — a `-vettool`, an `-exec` wrapper, a
+/// `-toolexec` program, a `go generate` command, a file another process
+/// dropped in a `go-build` directory — and the same file run from a shell,
+/// by another parent or by a `go` in a home: judged as before. Without a
+/// lineage (tests, the boot-time rule set): never.
 #[derive(Clone, Default)]
 pub struct GoBuilds(Option<GoBuildCheck>);
 
-/// Lot 369: [`GoBuilds`]'s predicate: `pid`'s exec of `image` as of the
-/// time given is the packaged `go`'s own build output.
-type GoBuildCheck = Arc<dyn Fn(u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync>;
+/// Lot 369: [`GoBuilds`]'s predicate: `pid`'s exec of `image` as uid `uid`,
+/// as of the time given, is the packaged `go`'s own build output, run by
+/// that `go`, for a person's account.
+type GoBuildCheck =
+    Arc<dyn Fn(u32, u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync>;
 
 impl GoBuilds {
-    /// The predicate, on `lineage`.
+    /// The predicate, on `lineage` and the host's accounts.
     pub fn of<H: DecisionHost>(lineage: crate::posture::lineage::AuthSessionTracker<H>) -> Self {
-        GoBuilds(Some(Arc::new(move |pid, as_of, image| {
-            lineage.runs_go_build_output(pid, as_of, image)
+        GoBuilds(Some(Arc::new(move |pid, uid, as_of, image| {
+            H::account_kind(uid) == crate::decision::host::AccountKind::Human
+                && lineage.runs_go_linked_output(pid, as_of, image)
         })))
     }
 
     /// A predicate given as is (tests).
     #[cfg(any(test, feature = "test-util"))]
     pub fn of_fn(
-        f: impl Fn(u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync + 'static,
+        f: impl Fn(u32, u32, crate::posture::lineage::AsOf, &str) -> bool + Send + Sync + 'static,
     ) -> Self {
         GoBuilds(Some(Arc::new(f)))
     }
 
-    /// `event`, an exec of `image`, is the packaged `go`'s own build
-    /// output, run by it.
+    /// `event`, an exec of `image` the kernel ran by its path, is the
+    /// packaged `go`'s own build output, run by it, for a person.
     pub fn runs(&self, event: &Event, image: &str) -> bool {
-        use common::wire::exe::exe_flags::{DELETED, MEMFD};
+        use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD};
         let Event::ProcessSpawn {
             pid,
+            uid,
             exe,
             timestamp_ns,
             ..
@@ -146,12 +160,13 @@ impl GoBuilds {
         else {
             return false;
         };
-        if exe.has(DELETED) || exe.has(MEMFD) {
+        if !exe.has(KNOWN) || exe.has(DELETED) || exe.has(MEMFD) || exe.path_or("") != image {
             return false;
         }
         self.0.as_ref().is_some_and(|f| {
             f(
                 *pid,
+                *uid,
                 crate::posture::lineage::AsOf::judged(*timestamp_ns),
                 image,
             )
@@ -180,8 +195,9 @@ pub(crate) fn go_build_record(rule: &dyn Rule, event: &Event, dir: &str) -> Verd
         Severity::Low,
         &format!(
             "Process executed from {dir} — the packaged go's own build output in its work \
-             directory (go test's test binary, go run's program), forked by that go: the user's \
-             code as go build and ./prog from a home — recorded Low, not killed (lot 369)"
+             directory (go test's test binary, go run's program): written by that go's own \
+             linker, run by that go, for a person's account — the user's code as go build and \
+             ./prog from a home — recorded Low, not killed (lot 369)"
         ),
     )
 }

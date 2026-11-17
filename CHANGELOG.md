@@ -23,19 +23,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     file unplaced — never the old `/tmp/.mount_*` (a quick relaunch got
     the device of the mount just gone: R001, CHAIN-002/005 Critical). Test
     `a_fuse_device_handed_to_a_new_mount_is_placed_at_its_new_mount_point`.
-  - **NN-L-NET-013.** A socket sending to its own bound endpoint on
-    loopback (PostgreSQL ≤ 14's statistics) is no beacon; one record per
-    program, destination and hour, the folded flows counted. Tests
+  - **NN-L-NET-013.** A datagram sent to the sending socket's own bound
+    endpoint on loopback (PostgreSQL ≤ 14's statistics) is no beacon; one
+    record per program (an interpreter's: per script), destination and
+    hour, the folded flows counted. The UDP flow sensor records the
+    destination a send names (`sendto()`), on a connected socket too, and
+    an `AF_UNSPEC` name as `udp_sendmsg` reads it: a socket connected to
+    itself that names a local relay is no longer recorded as sending to
+    itself (the review of #576). Tests
     `net_013_a_socket_sending_to_itself_is_no_beacon`,
-    `net_013_records_one_beacon_per_program_destination_and_hour`.
+    `net_013_records_one_beacon_per_program_destination_and_hour`,
+    `net_013_an_interpreter_s_beacons_are_keyed_by_its_script`,
+    `net_udp_a_connected_socket_s_named_send_is_recorded_to_the_name`
+    (privileged).
   - **R011.** The module tool's credentials read at the exec; a non-root
     `modprobe` that cannot load a module (no uid 0, no `CAP_SYS_MODULE` in
     PID 1's user namespace) is Low. Tests
     `a_user_s_modprobe_that_cannot_load_a_module_is_low`,
     `the_credentials_of_a_running_exec_are_read_tied_to_it`.
-  - **R001/R003: `go test`, `go run`.** Lot 346's identity of the packaged
-    `go`'s build output applies to the record: Low, never killed. Test
-    `go_test_and_go_run_built_by_the_packaged_go_are_recorded_low`.
+  - **R001/R003: a person's `go test`, `go run`.** What the packaged `go`
+    built and then runs — the output its own linker was run to write by
+    that `go`, run by it, for a person's account — is Low, never killed.
+    What `go` only launches (`-vettool`, `-exec`, `-toolexec`, `go
+    generate`, a dropped file) and root's or a service account's build
+    output stay judged (the review of #576). Tests
+    `go_test_and_go_run_built_by_the_packaged_go_are_recorded_low`,
+    `a_program_go_only_launches_from_a_go_build_dir_stays_judged`,
+    `a_service_account_s_or_root_s_go_build_output_stays_judged`,
+    `the_packaged_go_s_linker_and_its_one_output_are_told`.
   - **Posture: a service's gone writer.** The own-data exemption tells a
     writer gone before its crossing was judged by the cgroup the kernel
     recorded at the write (pgbench's ENGAGED). Test

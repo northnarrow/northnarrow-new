@@ -95,6 +95,12 @@ const UDP6_MAPPED_PORT: u16 = 35998;
 /// the same helper connects to during the burst.
 const UDP_BURST_PORT: u16 = 35996;
 const TCP_DURING_BURST_PORT: u16 = 35995;
+/// Lot 369 (the review of #576, F2): the port a UDP socket is bound and
+/// connected to (itself), the relay it names in a `sendto()`, and the port
+/// it names with an `AF_UNSPEC` address.
+const UDP_SELF_PORT: u16 = 35992;
+const UDP_RELAY_PORT: u16 = 35991;
+const UDP_UNSPEC_PORT: u16 = 35990;
 /// Lot 275: the ports of the inbound, TLS ClientHello and "no DNS, no
 /// connect" tests.
 const INBOUND_PORT: u16 = 35994;
@@ -993,6 +999,69 @@ u.close()
         "the aggregated rows must carry most of the ~10 MB sent; got {bytes} bytes in {} rows",
         rows.len()
     );
+}
+
+/// Lot 369 (the review of #576, F2): the kernel sends a datagram to the
+/// address the caller names (`msg_name`), on a connected socket too, and
+/// `udp_sendmsg` reads an `AF_UNSPEC` name as an `AF_INET` one. The flow
+/// sensor read a connected socket's peer whatever the name: a socket bound
+/// and connected to its own loopback endpoint that `sendto()`s a local relay
+/// was recorded as sending to itself — the shape NN-L-NET-013 leaves to no
+/// beacon (PostgreSQL ≤ 14's statistics collector). Now each send is
+/// recorded to where it went: the plain `send()` to itself, the named one to
+/// the relay, the `AF_UNSPEC` one to its port. Fails on main (no row to the
+/// relay or to the `AF_UNSPEC` port).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn net_udp_a_connected_socket_s_named_send_is_recorded_to_the_name() {
+    let _eni = EniIptablesGuard::install();
+    let fx = NetFixture::setup();
+
+    let helper = format!(
+        r#"
+import ctypes, socket, struct
+r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+r.bind(("127.0.0.1", {relay}))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", {own}))
+s.connect(("127.0.0.1", {own}))
+s.send(b"nn-self " * 4)
+s.sendto(b"nn-relay " * 4, ("127.0.0.1", {relay}))
+libc = ctypes.CDLL(None, use_errno=True)
+sa = struct.pack("=HH4s8x", 0, socket.htons({unspec}), socket.inet_aton("127.0.0.1"))
+data = b"nn-unspec " * 4
+if libc.sendto(s.fileno(), data, len(data), 0, sa, len(sa)) != len(data):
+    raise SystemExit("AF_UNSPEC sendto: errno %d" % ctypes.get_errno())
+s.close()
+r.close()
+"#,
+        own = UDP_SELF_PORT,
+        relay = UDP_RELAY_PORT,
+        unspec = UDP_UNSPEC_PORT,
+    );
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(&helper)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn python3 helper for the named-send test");
+    assert!(
+        status.success(),
+        "python3 helper exited non-zero: {status:?}"
+    );
+
+    let to = |port: u16| {
+        move |r: &serde_json::Value| {
+            r["proto"].as_u64() == Some(17)
+                && r["src_port"].as_u64() == Some(UDP_SELF_PORT as u64)
+                && r["dst_port"].as_u64() == Some(port as u64)
+                && r["dst_addr"].as_str() == Some("127.0.0.1")
+        }
+    };
+    fx.wait_netflow_matching(1, to(UDP_SELF_PORT));
+    fx.wait_netflow_matching(1, to(UDP_RELAY_PORT));
+    fx.wait_netflow_matching(1, to(UDP_UNSPEC_PORT));
 }
 
 // ── Lot 275 (C07): inbound connections, TLS ClientHellos, NN-L-NET-028 ──

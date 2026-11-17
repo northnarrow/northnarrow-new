@@ -16,17 +16,21 @@
 //!
 //! ## Destination resolution (review `net-udp-blind-1`)
 //!
-//! * **Connected** sockets (`connect()` + `send()`): destination from
-//!   `sk->__sk_common` (`skc_daddr` / `skc_dport`).
-//! * **Unconnected** `sendto()` (`skc_dport == 0`): the destination
-//!   lives in `msghdr->msg_name` (already copied to kernel memory by
-//!   `__sys_sendto` / `copy_msghdr_from_user`); resolved with the same
-//!   [`crate::dns_query::dest_from_msg_name`] walk the DNS sensor
-//!   uses. Before this fix such sends were skipped, so QUIC-like
-//!   beacons and raw-UDP exfil through an unconnected socket emitted
-//!   no network event at all. The local source may still be the
-//!   wildcard (`0.0.0.0:0`) when the socket is autobound later in
+//! * **A name given** (`sendto()`, `sendmsg()` with `msg_name`): the
+//!   destination lives in `msghdr->msg_name` (already copied to kernel
+//!   memory by `__sys_sendto` / `copy_msghdr_from_user`); resolved with
+//!   the same [`crate::dns_query::dest_from_msg_name`] walk the DNS
+//!   sensor uses. Before review `net-udp-blind-1` such sends on an
+//!   unconnected socket were skipped, so QUIC-like beacons and raw-UDP
+//!   exfil emitted no network event at all. The local source may still
+//!   be the wildcard (`0.0.0.0:0`) when the socket is autobound later in
 //!   `udp_sendmsg` — the row still carries pid/comm/uid + destination.
+//!   Lot 369 (the review of #576, F2): on a connected socket too — the
+//!   kernel sends to the name, not to the peer (`udp_sendmsg` reads an
+//!   `AF_UNSPEC` name as an `AF_INET` one); a socket connected to itself
+//!   that `sendto()`s a local relay was recorded as sending to itself.
+//! * **Connected** sockets, no name (`connect()` + `send()`): destination
+//!   from `sk->__sk_common` (`skc_daddr` / `skc_dport`).
 //!
 //! ## Aggregation (review 73)
 //!
@@ -122,8 +126,9 @@ struct Dst {
     family: u16,
     port_host: u16,
     addr: [u8; ADDR_LEN],
-    /// `true` when the destination came from `msg_name` (unconnected
-    /// send).
+    /// `true` for a send on an unconnected socket (its destination from
+    /// `msg_name`). Lot 369: a connected socket's send to a name is not
+    /// one.
     unconnected: bool,
 }
 
@@ -220,8 +225,26 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext, v6: bool) -> Result<(), i64> {
         };
     let dport_host = u16::from_be(dport_be);
 
-    let dst = if dport_host != 0 {
-        // Connected socket: destination lives in the sock.
+    // Lot 369 (the review of #576, F2): the kernel sends to `msg_name`
+    // whenever the caller names one, connected socket or not
+    // (`udp_sendmsg`: an `AF_INET` or `AF_UNSPEC` name; `udpv6_sendmsg`: an
+    // `AF_INET6` one) — a socket connected to itself that `sendto()`s a
+    // local relay reaches the relay, not itself. The socket's peer is the
+    // destination only when no name is given.
+    let named = if msg_ptr.is_null() {
+        None
+    } else {
+        dest_from_msg_name(msg_ptr, !v6)?
+    };
+    let dst = if let Some(d) = named {
+        Dst {
+            family: d.family as u16,
+            port_host: u16::from_be(d.port_be),
+            addr: d.addr,
+            unconnected: dport_host == 0,
+        }
+    } else if dport_host != 0 {
+        // Connected socket, no name: destination lives in the sock.
         let mut addr = [0u8; ADDR_LEN];
         if sk_family == AF_INET {
             let daddr: u32 = match unsafe {
@@ -251,21 +274,14 @@ fn try_udp_sendmsg_outbound(ctx: &ProbeContext, v6: bool) -> Result<(), i64> {
             unconnected: false,
         }
     } else {
-        // Unconnected sendto(): destination lives in msg_name
-        // (net-udp-blind-1). No msg_name either → nothing to attribute.
-        if msg_ptr.is_null() {
-            return Ok(());
-        }
-        let Some(d) = dest_from_msg_name(msg_ptr)? else {
-            return Ok(());
-        };
-        Dst {
-            family: d.family as u16,
-            port_host: u16::from_be(d.port_be),
-            addr: d.addr,
-            unconnected: true,
-        }
+        // Unconnected and no usable name: nothing to attribute.
+        return Ok(());
     };
+    // Lot 369 (the review of #576, F2): `udpv6_sendmsg` hands an `AF_INET`
+    // name to `udp_sendmsg`, where [`udp_sendmsg_outbound`] records it.
+    if v6 && dst.family == AF_INET {
+        return Ok(());
+    }
 
     // Filter DNS to dst port 53 — the existing dns_query kprobe
     // owns those events (connected AND unconnected shapes).
