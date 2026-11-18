@@ -125,11 +125,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       itself. The exec pump reads the program's dynamic section from the
       file the loader maps (unchanged since the process started,
       `nn_linux::sensors::elf_audit`): naming one, the program is judged as
-      run; Low only when read naming none (no `LD_AUDIT`, no `--audit`);
-      not read in time, Medium, never killed, never "runs no code".
+      run; not read in time, Medium, never killed, never "runs no code".
+      Round 3 (R2-1): a staged program glibc lists is never Low, even when
+      read naming none (the code that ran can make the read false, four
+      ways); Medium, never killed. The ELF reader (R2-2) takes only a
+      program-header size equal to the class's, with every buffer capped at
+      7 KiB, and has a fuzz target (`elf_audit`).
       `--verify` and musl's `ldd` stay Low; musl's loader under
       `LD_TRACE_LOADED_OBJECTS` (which it ignores) is judged as run. Tests
-      `a_listed_program_is_low_only_when_read_naming_no_auditing_library`,
+      `a_staged_program_glibc_lists_is_never_low_whatever_the_pump_read`,
       `a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps`,
       `a_program_naming_a_library_for_auditing_is_told_from_one_naming_none`,
       `the_dynamic_table_is_read_where_the_loader_maps_it`,

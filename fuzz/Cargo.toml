@@ -64,6 +64,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "elf_audit"
+path = "fuzz_targets/elf_audit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tracefs_format"
 path = "fuzz_targets/tracefs_format.rs"
 test = false

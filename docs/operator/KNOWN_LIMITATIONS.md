@@ -498,13 +498,16 @@ not cause as an incident.
   always run nothing: glibc's `--list`, `LD_TRACE_LOADED_OBJECTS` and `ldd`
   still load and run the libraries the program names for auditing
   (`DT_AUDIT`, `DT_DEPAUDIT`) — the program's own code when it names
-  itself. A staged program listed so is recorded Low only when the agent
-  read the file the loader maps (unchanged since the process started)
-  naming none, with no `LD_AUDIT` in the environment and no `--audit`
-  given; one naming one is judged as run (the kill); one the agent could
-  not read in time — `ldd` often exits first — is recorded Medium, never
-  killed, and its record does not say that nothing ran. `--verify` and
-  musl's `ldd` run nothing (Low); musl's loader ignores
+  itself. A staged program (in `/tmp`, a memfd, a
+  FUSE file and the like) listed so is never recorded Low (fix round 3,
+  R2-1): the file the agent reads is not always the file the loader maps —
+  code that has already run can make them differ four ways (a directory
+  swap onto the auditor, a write through a shared mapping that moves no
+  ctime on tmpfs or a dirty page, a relative link climbing out of the
+  directory, a segment layout whose pages overlap) — so one the agent read
+  naming an auditor is judged as run (the kill), and every other is
+  recorded Medium, never killed, and its record does not say that nothing
+  ran. `--verify` and musl's `ldd` run nothing (Low); musl's loader ignores
   `LD_TRACE_LOADED_OBJECTS` and runs the program (judged as run). A program
   rewritten in place in the instant between the agent's read and the
   loader's is judged by what the agent read. A library `--audit` names
@@ -512,7 +515,9 @@ not cause as an incident.
   `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
   `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`;
   `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`;
-  `a_listed_program_is_low_only_when_read_naming_no_auditing_library`;
+  `a_staged_program_glibc_lists_is_never_low_whatever_the_pump_read`;
+  `a_header_with_a_wrong_program_header_size_or_count_is_not_known`;
+  `no_buffer_of_the_reader_is_larger_than_its_fixed_bound`;
   `a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps`;
   `a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it`;
   lot 370.

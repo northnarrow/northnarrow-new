@@ -106,11 +106,10 @@ pub enum LoaderUse {
     Runs,
     /// It runs none of the file's code, and the agent knows why (the words):
     /// `--verify` (checked, nothing loaded); musl's loader listing it
-    /// (`--list`, or run as `ldd`); glibc's list or trace mode for a program
-    /// the exec pump read naming no library for auditing, in an environment
-    /// with no `LD_AUDIT` ([`exe_flags::LOADER_NO_AUDIT`]).
-    ///
-    /// [`exe_flags::LOADER_NO_AUDIT`]: common::wire::exe::exe_flags::LOADER_NO_AUDIT
+    /// (`--list`, or run as `ldd`). Round 3 of #578 (R2-1): never glibc's
+    /// list or trace mode for a staged file — the code that has run can
+    /// make the pump read another file than the one the loader mapped, so
+    /// that is [`LoaderUse::MayRun`].
     Lists(&'static str),
     /// The re-check of #578 (R1-1): it only lists or checks the file as far
     /// as its arguments and environment say, and the agent cannot tell that
@@ -153,9 +152,9 @@ impl LoaderUse {
 ///   nothing; its list and trace modes still load and run the libraries the
 ///   program names for auditing (`DT_AUDIT`, `DT_DEPAUDIT`: verified on
 ///   2.39, the program's own constructor when it names itself) — so the
-///   program is listed only when the exec pump read it naming none
-///   ([`exe_flags::LOADER_NO_AUDIT`]) and no `--audit` is given, run when it
-///   names one ([`exe_flags::LOADER_AUDITS`]), and may run otherwise;
+///   program is run when the exec pump read it naming one
+///   ([`exe_flags::LOADER_AUDITS`]) and may run otherwise — never listed
+///   (round 3, R2-1: what the pump read can be made false);
 /// - musl's: `--list` and `ldd` list; it reads no `LD_TRACE_LOADED_OBJECTS`
 ///   and runs the program then;
 /// - a loader that is not the system's (a copy, a name): may run.
@@ -163,7 +162,6 @@ impl LoaderUse {
 /// An auditing library `--audit` names runs in every mode.
 ///
 /// [`exe_flags::LOADER_LISTS`]: common::wire::exe::exe_flags::LOADER_LISTS
-/// [`exe_flags::LOADER_NO_AUDIT`]: common::wire::exe::exe_flags::LOADER_NO_AUDIT
 /// [`exe_flags::LOADER_AUDITS`]: common::wire::exe::exe_flags::LOADER_AUDITS
 pub fn loader_code(event: &Event, listing: bool) -> Vec<(&str, LoaderUse)> {
     let Event::ProcessSpawn { argv, .. } = event else {
@@ -189,7 +187,7 @@ fn program_use(
     code: &crate::posture::script_args::LoaderCode<'_>,
     listing: bool,
 ) -> LoaderUse {
-    use common::wire::exe::exe_flags::{LOADER_AUDITS, LOADER_LISTS, LOADER_NO_AUDIT};
+    use common::wire::exe::exe_flags::{LOADER_AUDITS, LOADER_LISTS};
     use program_identity::SystemLoader;
     let Event::ProcessSpawn { exe, .. } = event else {
         return LoaderUse::Runs;
@@ -217,13 +215,10 @@ fn program_use(
             "glibc's list or trace mode with an auditing library given: it runs beside the \
              program",
         ),
-        Some(SystemLoader::Glibc) if exe.has(LOADER_NO_AUDIT) => LoaderUse::Lists(
-            "glibc's list or trace mode, the program naming no library for auditing and the \
-             environment no LD_AUDIT, as the agent read them",
-        ),
         Some(SystemLoader::Glibc) => LoaderUse::MayRun(
-            "glibc's list or trace mode, the program not read: a library it names for auditing \
-             runs even then",
+            "glibc's list or trace mode for a staged program: a library it names for auditing \
+             runs even then, and the file the agent read can have changed or been swapped \
+             after the loader read it",
         ),
     }
 }
@@ -1313,13 +1308,14 @@ mod tests {
         // the review of #578 (P3): a staged program the loader only lists
         // or checks — recorded Low, never killed (it was not recorded). The
         // re-check (R1-1): glibc's --list runs the libraries the program
-        // names for auditing — Low once the pump read it naming none
+        // names for auditing — and round 3 (R2-1): the pump's read of a
+        // staged file can be made false, so Medium even when it read none
         one_read(
             &[ld, "--list", "/tmp/x"],
             common::wire::exe::exe_flags::LOADER_NO_AUDIT,
             "R001_ExecFromTmp",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         one(
             &[ld, "--verify", "/tmp/x"],
@@ -1535,9 +1531,11 @@ mod tests {
     /// library runs in every mode.
     ///
     /// The re-check of #578 (R1-1): glibc's list and trace modes run the
-    /// libraries the program names for auditing — Low only for a program the
-    /// pump read naming none (`LOADER_NO_AUDIT`, the inputs below; the next
-    /// test has the rest).
+    /// libraries the program names for auditing, and (round 3, R2-1) what the
+    /// pump read of a staged file can be made false by the code that ran — so
+    /// glibc's list or trace mode is Medium for a staged operand, never Low
+    /// (Low stays for musl's loader and `--verify`; the next test has the
+    /// rest).
     #[test]
     fn a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged() {
         use common::wire::exe::exe_flags::{LOADER_LISTS, LOADER_NO_AUDIT};
@@ -1567,42 +1565,42 @@ mod tests {
             false,
             "R001_ExecFromTmp",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         only(
             &traced(57_822, &[ld, "/dev/shm/x"]),
             false,
             "R002_ExecFromDevShm",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         only(
             &traced(57_823, &[ld, "/var/tmp/x"]),
             false,
             "R003_ExecFromVarTmp",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         only(
             &traced(57_824, &[ld, "/proc/self/fd/3"]),
             false,
             "R004_ExecFromProcSelfFd",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         only(
             &traced(57_825, &[ld, "./x"]),
             false,
             "R001_ExecFromTmp",
             Log,
-            Severity::Low,
+            Severity::Medium,
         );
         // the system's ldd its parent (the lineage's identity)
         let mut by_ldd = loader_exec(57_826, &[ld, "/tmp/x"]);
         if let nn_model::Event::ProcessSpawn { exe, .. } = &mut by_ldd {
             exe.flags |= LOADER_NO_AUDIT;
         }
-        only(&by_ldd, true, "R001_ExecFromTmp", Log, Severity::Low);
+        only(&by_ldd, true, "R001_ExecFromTmp", Log, Severity::Medium);
         // musl's loader as ldd
         let mut musl = loader_exec(57_827, &["ldd", "/tmp/x"]);
         if let nn_model::Event::ProcessSpawn { exe, filename, .. } = &mut musl {
@@ -1706,13 +1704,18 @@ mod tests {
     /// - recorded Medium, never killed, never said to run nothing, when it
     ///   was not read, when an auditing library is given beside it, or when
     ///   the loader is not the system's;
-    /// - Low (the previous test) only when read naming none.
+    /// - Round 3 (R2-1): the same Medium when it was read naming none
+    ///   (`LOADER_NO_AUDIT`), because the four ways the pump's read is made
+    ///   false by the code that ran (a directory swap onto the auditor, a
+    ///   write through a shared mapping, a relative link climbing out of the
+    ///   directory, a page-overlapping segment layout) cannot be told from
+    ///   an honest read: a staged operand is always "may run".
     ///
     /// musl reads no `LD_TRACE_LOADED_OBJECTS`: under it, it runs the
     /// program (judged as run); its `ldd` stays Low. On 6321c7b7 every list
     /// mode was Low, "runs none of its code".
     #[test]
-    fn a_listed_program_is_low_only_when_read_naming_no_auditing_library() {
+    fn a_staged_program_glibc_lists_is_never_low_whatever_the_pump_read() {
         use common::wire::exe::exe_flags::{LOADER_AUDITS, LOADER_LISTS, LOADER_NO_AUDIT};
         use nn_model::{ResponseAction::*, Severity};
         let ld = "/lib64/ld-linux-x86-64.so.2";
@@ -1842,6 +1845,56 @@ mod tests {
             Severity::Medium,
             false,
         );
+        // R2-1: read naming none is no longer Low — the staged operand, each
+        // spelling the four ways of the probe reach (a name in a directory,
+        // a relative name, `/proc`, `/dev/shm`), in each list mode
+        for (key, argv, flags, listing, rule) in [
+            (
+                57_870,
+                &[ld, "/tmp/x"][..],
+                LOADER_LISTS | LOADER_NO_AUDIT,
+                false,
+                r1,
+            ),
+            (
+                57_871,
+                &[ld, "--list", "/tmp/x"],
+                LOADER_NO_AUDIT,
+                false,
+                r1,
+            ),
+            (57_872, &[ld, "/tmp/x"], LOADER_NO_AUDIT, true, r1),
+            (
+                57_873,
+                &[ld, "./x"],
+                LOADER_LISTS | LOADER_NO_AUDIT,
+                false,
+                r1,
+            ),
+            (
+                57_874,
+                &[ld, "/dev/shm/x"],
+                LOADER_LISTS | LOADER_NO_AUDIT,
+                false,
+                r2,
+            ),
+            (
+                57_875,
+                &[ld, "/proc/self/fd/3"],
+                LOADER_LISTS | LOADER_NO_AUDIT,
+                false,
+                r4,
+            ),
+        ] {
+            only(
+                &with(key, argv, flags),
+                listing,
+                rule,
+                Log,
+                Severity::Medium,
+                false,
+            );
+        }
         // an auditing library given beside it: the program may run under it
         let got: Vec<_> = staging_verdicts(
             &with(
@@ -2012,7 +2065,7 @@ mod tests {
                 Severity::Critical
             )]
         );
-        // listed, the pump's read naming no auditing library: Low there too
+        // listed, the pump's read naming no auditing library: Medium (R2-1)
         let mut e = loader_exec(57_876, &[ld, "--list", "/usr/tmp/x"]);
         if let nn_model::Event::ProcessSpawn { exe, .. } = &mut e {
             exe.flags |= common::wire::exe::exe_flags::LOADER_NO_AUDIT;
@@ -2032,7 +2085,7 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            [("R003_ExecFromVarTmp".to_string(), Log, Severity::Low)]
+            [("R003_ExecFromVarTmp".to_string(), Log, Severity::Medium)]
         );
     }
 

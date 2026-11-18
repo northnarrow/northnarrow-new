@@ -11765,13 +11765,20 @@ number in parentheses is a lab PR.
     libraries the program names for auditing — the pump reads the program's
     dynamic section from the file the loader maps (`elf_audit`; unchanged
     since the process started): naming one, judged as run; Low only when
-    read naming none; not read, Medium, never "runs no code" (R1-1; musl's
+    read naming none (round 3, R2-1: no longer Low for a staged program: Medium); not read, Medium, never "runs no code" (R1-1; musl's
     loader under `LD_TRACE_LOADED_OBJECTS` judged as run). An absolute
     operand is also placed through symbolic links (`/usr/tmp`, R1-2). The
     mapping waits are per account, root's its own (R1-3). The privileged
     suites' fixtures follow F10-4 (the guard tests' restore agent as PID 1's
     child; the watchdog role's first claim established), the dirs made
     first; test messages no longer print verdict texts (CodeQL).
+  - Fix round 3 (re-check 2 of #578; no lab, none asked): a staged
+    program glibc lists is Medium, never Low, never killed unless the pump
+    read it naming an auditor (R2-1: four ways the read can be made false
+    by code that already ran); Low stays for `--verify` and musl. The ELF
+    reader takes only the class's own `e_phentsize`, caps its buffers at
+    7 KiB, has a cargo-fuzz target `elf_audit` and malformed-header tests
+    (R2-2). Not measured: a lab round.
   - Lab of fix round 2 (Ubuntu 22.04 / 5.15, the round's tree checked by
     hash on the guest): the watchdog's privileged suite on the guest with
     no `/etc/northnarrow`, 11 of 11 (its own-start test among them); then,

@@ -34,9 +34,10 @@
 //!   chmod of it since — a library rewriting the program it audits — is
 //!   not read): one named is [`exe_flags::LOADER_AUDITS`]; none, with the
 //!   environment read and holding no `LD_AUDIT`, is
-//!   [`exe_flags::LOADER_NO_AUDIT`]. Not read: neither — the rules then
-//!   record a listed program as one that may run, never as one that runs
-//!   nothing.
+//!   [`exe_flags::LOADER_NO_AUDIT`]. Not read: neither. Round 3 (R2-1): the
+//!   rules only ever take the upgrade from this read — for a staged file
+//!   the read can be made false by the code that ran, so the rest is
+//!   recorded as one that may run, never as one that runs nothing.
 //! - **The re-check (R1-2), a name through a symbolic link.** Any other
 //!   name the loader was given — absolute, or relative to the process's
 //!   directory — is walked the same way with its symbolic links followed

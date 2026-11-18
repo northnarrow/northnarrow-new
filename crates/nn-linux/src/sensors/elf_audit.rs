@@ -30,13 +30,15 @@ const PT_DYNAMIC: u32 = 2;
 /// `e_phnum`'s escape (the count in section 0): not followed.
 const PN_XNUM: u16 = 0xffff;
 
-/// The most program headers read (a program has a dozen).
-const MAX_PHDRS: usize = 1024;
+/// The most program headers read (a program has a dozen): the table is at
+/// most `128 * 56` bytes (round 3, R2-2).
+pub const MAX_PHDRS: usize = 128;
 /// The most dynamic entries read before a `DT_NULL` (a program has a few
 /// dozen).
 pub const MAX_ENTRIES: usize = 4096;
-/// The most bytes one read takes.
-const CHUNK: u64 = 64 * 1024;
+/// The most bytes one read of the dynamic section takes (round 3, R2-2: no
+/// buffer of this reader is larger than this or the program-header table).
+pub const CHUNK: u64 = 4 * 1024;
 
 /// What the dynamic section says (`Some`): it names a library for auditing
 /// (`true`) or none (`false`, a program with no dynamic section too); `None`
@@ -77,8 +79,10 @@ pub fn names_an_auditor(
             e.u16(&ident[0x2c..]),
         )
     };
-    let min_ent: u16 = if wide { 56 } else { 32 };
-    if phnum == PN_XNUM || usize::from(phnum) > MAX_PHDRS || (phnum > 0 && phentsize < min_ent) {
+    // round 3 (R2-2): glibc refuses any other size, so the table is at most
+    // MAX_PHDRS * 56 bytes
+    let ent_size: u16 = if wide { 56 } else { 32 };
+    if phnum == PN_XNUM || usize::from(phnum) > MAX_PHDRS || (phnum > 0 && phentsize != ent_size) {
         return None;
     }
     let mut table = vec![0u8; usize::from(phentsize) * usize::from(phnum)];
@@ -504,5 +508,76 @@ mod tests {
             Err(io::Error::from_raw_os_error(libc::EIO))
         };
         assert_eq!(names_an_auditor(&mut failing), None, "EIO");
+    }
+
+    /// Fix round 3 of #578 (R2-2, named): the header's escapes. Glibc
+    /// refuses an `e_phentsize` that is not the class's program header's
+    /// size, so the reader does too — and asks for no table larger than
+    /// [`MAX_PHDRS`] headers.
+    #[test]
+    fn a_header_with_a_wrong_program_header_size_or_count_is_not_known() {
+        let good = program(&[(DT_STRTAB, 1), (DT_AUDIT, 9), (0, 0)]);
+        assert_eq!(read(&good), Some(true), "control");
+        for (name, at, val) in [
+            ("phentsize too small", 0x36usize, 32u16),
+            ("phentsize one too large", 0x36, 57),
+            ("phentsize 0xffff", 0x36, 0xffff),
+            ("phentsize zero", 0x36, 0),
+            ("phnum is PN_XNUM", 0x38, 0xffff),
+            ("phnum past the cap", 0x38, MAX_PHDRS as u16 + 1),
+            ("phnum 1024", 0x38, 1024),
+        ] {
+            let mut img = good.clone();
+            img[at..at + 2].copy_from_slice(&val.to_le_bytes());
+            assert_eq!(read(&img), None, "{name}");
+        }
+        // 32-bit: 56 is the 64-bit size
+        let mut img = build(1, false, &[(1, 0, 0, 0x400, 0x400)], &[]);
+        img[0x2a..0x2c].copy_from_slice(&56u16.to_le_bytes());
+        assert_eq!(read(&img), None, "32-bit with the 64-bit size");
+    }
+
+    /// Fix round 3 of #578 (R2-2, named): no read of the reader is larger
+    /// than one program-header table or one chunk, whatever the header
+    /// says.
+    #[test]
+    fn no_buffer_of_the_reader_is_larger_than_its_fixed_bound() {
+        let good = program(&[(DT_STRTAB, 1), (DT_DEBUG, 0), (0, 0)]);
+        let bound = (MAX_PHDRS * 56).max(CHUNK as usize);
+        for (phentsize, phnum) in [
+            (0xffffu16, 1024u16),
+            (56, 128),
+            (56, 1024),
+            (0xffff, 0xffff),
+            (56, 0),
+        ] {
+            let mut img = good.clone();
+            img[0x36..0x38].copy_from_slice(&phentsize.to_le_bytes());
+            img[0x38..0x3a].copy_from_slice(&phnum.to_le_bytes());
+            let mut most = 0usize;
+            let mut at = |_: u64, buf: &mut [u8]| -> io::Result<usize> {
+                most = most.max(buf.len());
+                buf.fill(0);
+                Ok(buf.len())
+            };
+            let _ = names_an_auditor(&mut at);
+            assert!(most <= bound, "{phentsize}x{phnum}: {most}");
+        }
+        // an endless table of entries: read in chunks
+        let endless: Vec<(i64, u64)> = (0..MAX_ENTRIES as u64 + 8).map(|i| (DT_DEBUG, i)).collect();
+        let img = program(&endless);
+        let mut most = 0usize;
+        let mut at = |off: u64, buf: &mut [u8]| -> io::Result<usize> {
+            most = most.max(buf.len());
+            let off = off as usize;
+            if off >= img.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(img.len() - off);
+            buf[..n].copy_from_slice(&img[off..off + n]);
+            Ok(n)
+        };
+        assert_eq!(names_an_auditor(&mut at), None);
+        assert!(most <= bound, "{most}");
     }
 }

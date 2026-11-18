@@ -20,6 +20,39 @@ pub fn parse_btf_and_resolve(data: &[u8]) -> bool {
     crate::anti_tamper::btf_revalidate::fuzz_parse_and_resolve(data)
 }
 
+/// The exec pump's ELF reader (`names_an_auditor`, fix round 3 of #578,
+/// R2-2) over `data` as the file: its answer, and the most bytes any one
+/// read of it asked for.
+#[doc(hidden)]
+pub fn elf_audit_read(data: &[u8]) -> (Option<bool>, usize) {
+    let mut most = 0usize;
+    let mut at = |off: u64, buf: &mut [u8]| -> std::io::Result<usize> {
+        most = most.max(buf.len());
+        let off = usize::try_from(off).unwrap_or(usize::MAX);
+        if off >= data.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(data.len() - off);
+        buf[..n].copy_from_slice(&data[off..off + n]);
+        Ok(n)
+    };
+    let found = nn_linux::sensors::elf_audit::names_an_auditor(&mut at);
+    (found, most)
+}
+
+/// The most bytes one read of [`elf_audit_read`] may ask for: the program
+/// headers it keeps, or one chunk of the dynamic section.
+#[doc(hidden)]
+pub const ELF_AUDIT_READ_BOUND: usize = {
+    let table = nn_linux::sensors::elf_audit::MAX_PHDRS * 56;
+    let chunk = nn_linux::sensors::elf_audit::CHUNK as usize;
+    if table > chunk {
+        table
+    } else {
+        chunk
+    }
+};
+
 /// Chain-log terminator line parser (JSON line → entry hash).
 #[doc(hidden)]
 pub fn chainlog_terminator_entry_hash(line: &str) -> Option<String> {
@@ -815,6 +848,11 @@ mod tests {
                     .is_some(),
                 "{name}"
             );
+        }
+        for (name, bytes) in inputs("seeds", "elf_audit") {
+            let (found, most) = elf_audit_read(&bytes);
+            assert!(found.is_some(), "{name}");
+            assert!(most <= ELF_AUDIT_READ_BOUND, "{name}");
         }
         for (name, bytes) in inputs("seeds", "role_list") {
             assert!(

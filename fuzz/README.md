@@ -20,6 +20,7 @@ audit WDG-R04 to WDG-R08, WDG-014):
 | `tls_client_hello` | on every accepted hello, JA3's input has five fields with one value per non-GREASE cipher and extension, JA3 is 32 hex digits, JA4 is a 10-character prefix and two 12-hex hashes; a record-wrapped hello parses as its handshake |
 | `dns_records` | parsed answers fit in the packet; `decode_dns_qname` is printable ASCII, ends with `…` only at a compression pointer, and reads back as the wire labels byte for byte (distinct names never decode alike, NN-AUD-185); `qname_wire_end` ends just past a root label |
 | `btf_parse` | an accepted blob carries the BTF magic and its whole header |
+| `elf_audit` | the pump's ELF reader never asks for more than one program-header table (at most 128 entries of exactly the class's size) or one 4 KiB chunk of the dynamic section in a read; an auditor is named only by an ELF file (fix round 3 of #578, R2-2) |
 | `tracefs_format` | an offset comes from a `field:` line that names the field and writes it |
 | `role_list` | a parsed list is non-empty, without duplicates, the roles of its keywords; a keyword is the one-role list of itself |
 | `chainlog_line` | a terminator hash comes only from a JSON object carrying `rotate`, and is its `entry_hash` |

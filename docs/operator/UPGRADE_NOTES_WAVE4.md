@@ -4768,12 +4768,11 @@ left too little trace.
     is never killed for it (`ldd /tmp/x` was R001's kill); an `--audit`
     library stays judged. Its re-check (R1-1): glibc's list and trace modes
     still run the libraries the program names for auditing (`DT_AUDIT`,
-    `DT_DEPAUDIT`; its own constructor when it names itself), so the
-    record is Low ("in that mode the loader runs no code of it") only when
-    the exec pump read the file the loader maps, unchanged since the
-    process started, naming none (no `LD_AUDIT`, no `--audit`); naming
-    one, it is judged as run (the kill); not read in time (a fast `ldd`),
-    Medium, never killed and never said to run nothing. `--verify` and
+    `DT_DEPAUDIT`; its own constructor when it names itself), so a
+    staged program glibc lists is never recorded Low (round 3, R2-1: what
+    the pump reads can differ from what the loader maps once code has run):
+    naming an auditor as the pump read it, it is judged as run (the kill);
+    otherwise Medium, never killed and never said to run nothing. `--verify` and
     musl's `ldd` stay Low; musl's loader under `LD_TRACE_LOADED_OBJECTS`
     runs the program and is judged as run. The re-check (R1-2): any other
     absolute operand is also judged where the pump finds the file the
