@@ -1780,13 +1780,15 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
                     error!(error = %e, fseq, "chainlog: manifest ForeignArchive append failed (continuing)");
                 }
             }
-            for (eseq, ehash) in evicted {
+            for (eseq, ehash, age) in evicted {
                 if let Err(e) = self.manifest_append(ManifestEvent::Evicted {
                     seq: eseq,
                     terminator_hash: ehash,
                 }) {
                     error!(error = %e, eseq, "chainlog: manifest Evicted append failed (continuing)");
                 }
+                // lot 370 (02-3.1): an archive the retention dropped young
+                K::Host::archive_evicted(&active, eseq, age);
             }
             Ok(())
         })
@@ -2505,6 +2507,11 @@ fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Lot 370 (02-3.1): an archive the retention removed — its sequence, its
+/// terminator's hash, and how long it was kept since its seal (unread:
+/// `None`).
+type EvictedArchive = (u64, String, Option<std::time::Duration>);
+
 /// Drop oldest archives beyond `max_archives`, returning the
 /// `(seq, terminator_hash)` of each evicted file (hash read from the
 /// archive's terminator line before unlink, for the manifest record).
@@ -2527,7 +2534,7 @@ fn evict_excess_archives<H: ChainHost>(
     active: &Path,
     max_archives: usize,
     protection: &dyn ProtectionManager,
-) -> (Vec<(u64, String)>, Option<EvictFailure>) {
+) -> (Vec<EvictedArchive>, Option<EvictFailure>) {
     let seqs = match list_archive_seqs_in::<H>(active) {
         Ok(s) => s,
         Err(e) => return (Vec::new(), Some((None, e))),
@@ -2549,6 +2556,12 @@ fn evict_excess_archives<H: ChainHost>(
             continue;
         }
         let hash = read_terminator_hash::<H>(&path).unwrap_or_default();
+        // lot 370 (02-3.1): how long it was kept since its seal (its last
+        // write), for the host to tell an eviction a flood forced
+        let age = H::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
         if let Err(e) = protection.release(&path) {
             warn!(
                 error = %format!("{e:#}"),
@@ -2560,7 +2573,7 @@ fn evict_excess_archives<H: ChainHost>(
             let e = anyhow!(e).context(format!("evicting archive {}", path.display()));
             return (evicted, Some((Some(seq), e)));
         }
-        evicted.push((seq, hash));
+        evicted.push((seq, hash, age));
     }
     (evicted, None)
 }
@@ -7432,7 +7445,7 @@ mod tests {
         for _ in 0..3 {
             let (e, failed) = evict_excess_archives::<StdHost>(&active, 1, &NoProtection);
             assert!(failed.is_none(), "{failed:?}");
-            evicted.extend(e.into_iter().map(|(s, _)| s));
+            evicted.extend(e.into_iter().map(|(s, _, _)| s));
         }
         let files = (2..=5u64)
             .filter(|s| archive_path(&active, *s).is_file())

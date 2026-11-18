@@ -944,9 +944,13 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     let cost = 2 * m.len() * candidates.len() as u64;
     if !checks.bounds.take(*uid, cost, Instant::now()) {
         checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
+        // lot 370 (F10-6): the budget spent is a signed event of its own —
+        // the uid that spent it said (one line per uid, signed when new)
+        crate::boot::degradation::report("runtime_copy_compare", &budget_spent_line(*uid));
         // the review of #556 (F2): every fact but the bytes holds — kept
-        // unverified, any program of that length (R004: root's recorded,
-        // never killed; any other uid's killed — the re-check, N1)
+        // unverified, any program of that length (lot 370, F10-6: R004
+        // judges it fileless whoever's budget was spent — root's no longer
+        // lowered to a record)
         program_identity::keep_runtime_clone(
             event,
             program_identity::RuntimeClone {
@@ -973,6 +977,16 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
             },
         );
     }
+}
+
+/// Lot 370 (F10-6): the signed line of a runtime copy not compared, uid
+/// `uid`'s share of the compare budget spent.
+pub fn budget_spent_line(uid: u32) -> String {
+    format!(
+        "uid {uid}: its share of the compare budget for a container runtime's sealed copy of \
+         itself was spent — a sealed memfd of a runtime's length was not compared, and R004 \
+         judges it fileless code"
+    )
 }
 
 /// Lot 347: the installed runtime or manager whose identity `id` is, when
@@ -1553,6 +1567,10 @@ mod tests {
             "kept not compared, never as runc's compared image"
         );
         assert_eq!(checks.bounds.skipped.load(Ordering::Relaxed), 1);
+        // lot 370 (F10-6): the budget spent is signed, naming the uid
+        assert!(crate::boot::degradation::entries()
+            .iter()
+            .any(|d| d.source == "runtime_copy_compare" && d.detail == budget_spent_line(1000)));
     }
 
     /// The review of #556 (F2, named; its probe): seventeen 30 MiB compares

@@ -1234,6 +1234,50 @@ pub fn loader_program(argv: &[String]) -> Option<(&str, usize)> {
     None
 }
 
+/// Lot 370 (05-3.3): the files the dynamic loader runs or loads for `argv`
+/// — its program ([`loader_program`]) first, then each library a
+/// `--preload` or `--audit` names (a list split on `:` and spaces) — or none
+/// when it runs nothing: no program, or `--list` / `--verify` (it lists or
+/// checks the program, it does not run it).
+pub fn loader_code(argv: &[String]) -> Vec<&str> {
+    let Some((program, at)) = loader_program(argv) else {
+        return Vec::new();
+    };
+    let mut out = vec![program];
+    let mut i = 1;
+    while i < at {
+        let Some(name) = argv[i].strip_prefix("--").filter(|n| !n.is_empty()) else {
+            break;
+        };
+        let (name, value) = name
+            .split_once('=')
+            .map_or((name, None), |(n, v)| (n, Some(v)));
+        if matches!(name, "list" | "verify") {
+            return Vec::new();
+        }
+        match LOADER.long(name).map(|l| l.1) {
+            Some(Long::Loads) => {
+                let v = match value {
+                    Some(v) => Some(v),
+                    None => {
+                        i += 1;
+                        argv.get(i).map(String::as_str)
+                    }
+                };
+                out.extend(
+                    v.into_iter()
+                        .flat_map(|v| v.split([':', ' ']))
+                        .filter(|p| !p.is_empty()),
+                );
+            }
+            Some(Long::Arg) if value.is_none() => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// busybox's shells.
 pub(crate) const BUSYBOX_SHELLS: &[&str] = &["sh", "ash", "hush", "bash"];
 

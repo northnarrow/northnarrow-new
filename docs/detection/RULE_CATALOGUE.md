@@ -29,7 +29,7 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`R015_EncodingToolingServiceUid`](#r015_encodingtoolingserviceuid) | Encoding tooling exec by service account | Medium | Log | T1027, T1140, T1132 |
 | [`R016_DebuggerServiceUid`](#r016_debuggerserviceuid) | Debugger/tracer exec by service account | Medium | Log | T1055.008 |
 | [`R017_ShellFromNonstandardPath`](#r017_shellfromnonstandardpath) | Shell binary from non-standard path | High | KillProcessTree, Log | T1059.004 |
-| [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium | KillProcessTree, Log | T1547.006, T1014 |
+| [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium, Low | KillProcessTree, Log | T1547.006, T1014 |
 | [`R020_ShellWithSocketStdio`](#r020_shellwithsocketstdio) | Shell or interpreter with stdin/stdout on a network socket | Critical, High | Log | T1059.004, T1095 |
 | [`NN-L-EXECQ-001_FirstSightQuarantine`](#nn-l-execq-001_firstsightquarantine) | Exec quarantine at first sight | Critical, High, Medium, Low | Quarantine, KillProcess, Log | T1204.002, T1059.004, T1059.006, T1059.007, T1059 |
 | [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium, Low | Log | T1620, T1070.004, T1204.002, T1564.001 |
@@ -413,13 +413,13 @@ Kernel module load — category `rootkit`.
 
 | | |
 |---|---|
-| Severity | Critical, High, Medium |
+| Severity | Critical, High, Medium, Low |
 | Response | KillProcessTree, Log |
 | ATT&CK | T1547.006 Boot or Logon Autostart Execution: Kernel Modules and Extensions (Persistence); T1014 Rootkit (Stealth) |
 | Sensor — data | kernel module load (kernel_read_file, kernel_load_data) — DC0031 Kernel Module Load |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** A kernel module load (`finit_module`, `init_module`) at the LSM hooks, judged IN THE KERNEL by the file (lot 285): a file of the running kernel's tree that a verified package installed or DKMS built, unchanged since boot or written since inside a package transaction, or named by a signed `module-allow`, loads; any other file and every `init_module` buffer are refused outside a signed trusted-installer window in the deny mode (the default), let through in the record mode (`alert R018`). A DKMS or akmods build in `updates/dkms/` or `extra/` whose content is the registered build (DKMS's copy, the package's digest), written since boot outside a recognised package transaction (dnf's and yum's scripts recognised by the file their exec named), is let through and recorded High under every policy but `enforce R018`, which refuses it; a file of those directories nothing vouches for is refused. Who loads is not asked. Killed: a file outside `/lib/modules` or deeper than any module directory, refused or not. Recorded: any other untrusted file or buffer, an unattested DKMS or akmods build (High), a load a window or an opt-out let through (Medium); a load the kernel did not judge (the agent's first seconds) by the path and the package database — a path with a component the sensor read only in part (31 bytes, marked …) is unverifiable, High (lot 292).
+**Observes.** A kernel module load (`finit_module`, `init_module`) at the LSM hooks, judged IN THE KERNEL by the file (lot 285): a file of the running kernel's tree that a verified package installed or DKMS built, unchanged since boot or written since inside a package transaction, or named by a signed `module-allow`, loads; any other file and every `init_module` buffer are refused outside a signed trusted-installer window in the deny mode (the default), let through in the record mode (`alert R018`). A DKMS or akmods build in `updates/dkms/` or `extra/` whose content is the registered build (DKMS's copy, the package's digest), written since boot outside a recognised package transaction (dnf's and yum's scripts recognised by the file their exec named), is let through and recorded High under every policy but `enforce R018`, which refuses it; a file of those directories nothing vouches for is refused. Who loads is not asked. Killed: a file outside `/lib/modules` or deeper than any module directory, refused or not. Recorded: any other untrusted file or buffer, an unattested DKMS or akmods build (High), a load a window or an opt-out let through (Medium); a load the kernel trusted, with why — a package's file or DKMS's build, unchanged since boot or written this boot by a package transaction (Low, lot 370); a load the kernel did not judge (the agent's first seconds) by the path and the package database — a path with a component the sensor read only in part (31 bytes, marked …) is unverifiable, High (lot 292).
 
 **Known false positives.** None measured on the benign corpus (lot 285: udev's and the services' loads, docker's, k3s', a DKMS build under apt). A module built by hand outside the DKMS and akmods directories (`make modules_install`), a vendor's installer outside the package manager and a module of the tree written after boot before the agent started are refused until a signed `module-allow <module>` (or the next boot); a registered DKMS or akmods build written outside a package transaction (a root shell's `dkms install`, `akmods` at boot) is let through, recorded High; an administrator who loads a module from a build directory (`insmod ~/driver.ko`) is refused and killed.
 
@@ -1060,7 +1060,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
-**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369: looked at once a second), its own appearance not reported, and /etc is not watched as a directory.
+**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file (most hosts) its first creation is an event with its writer (lot 370): /etc is watched for that file's creation alone, any other file created there is no event; one found with no record of its creation is an event at the next look, its writer unknown.
 
 ### NN-L-FIM-023_SystemdTimerCreated
 
@@ -1142,7 +1142,7 @@ Kernel module configuration written — category `fim_persistence`.
 
 **Observes.** Lot 285: a file of kmod's configuration directories (/etc, /run, /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, renamed in, linked or removed: an `install` or `remove` directive runs a command as root whenever the module is asked for. High outside a package transaction (the writer's lineage at the write), Low inside one; never a kill (the write is done).
 
-**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: within a second; a file put in it within that second is not reported).
+**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369; a file already in it when it appears is watched, not reported).
 
 **How to test.** `echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, then remove it; expect High, Log.
 
@@ -2021,7 +2021,7 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0021 OS API Execution |
 | Validation | unit+lab |
 
-**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling.
+**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling. Lot 370: a successor of the agent or the watchdog that took its role after the holder exited this boot (the OOM killer, a crash) is recorded High; a first start's handle stays Low.
 
 **Known false positives.** A detach by tooling not in the list (a container runtime or CNI not listed). A handle to the agent's own objects is never exempt: an administrator's `bpftool map dump` of them is recorded too.
 

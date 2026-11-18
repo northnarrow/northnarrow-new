@@ -45,8 +45,23 @@ pub(crate) fn init(cli: &Cli, undumpable: std::io::Result<()>) {
              the agent's memory, keys included, to disk"
         );
     }
-    // External audit DEP-005 (NN-AUD-381): on a host where the unit's
-    // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
-    // before anything grows (the self-integrity check expects it there).
-    northnarrow_agent::self_integrity::relax_oom_score_adj();
+    // Lot 370 (F10-4): never a candidate of the OOM killer — the unit's
+    // OOMScoreAdjust=-999, written again whoever started the agent (the
+    // self-integrity check expects it). It replaces external audit
+    // DEP-005's raise to 0 where the memory cap cannot bind: the OOM
+    // killer's SIGKILL, which no hook refuses, made the agent's role vacant
+    // at a moment root could choose.
+    match antitamper_bpf::pin_oom_score_adj() {
+        Ok(None) => {}
+        Ok(Some(from)) => tracing::info!(
+            from,
+            to = antitamper_bpf::PINNED_OOM_SCORE_ADJ,
+            "oom_score_adj pinned: the host OOM killer's last pick (its memory cap still ends a leak)"
+        ),
+        Err(e) => error!(
+            error = %e,
+            "oom_score_adj NOT pinned: the OOM killer can take the agent (the self-integrity \
+             check reports the value)"
+        ),
+    }
 }

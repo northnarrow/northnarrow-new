@@ -35,9 +35,13 @@
 //! above the agent's paths is reported like one on the paths themselves
 //! ([`mount_round`]).
 //!
-//! Lab PR 184 (external audit DEP-005): where the unit's memory cap is at
-//! or above the host's memory, the agent raises its own `oom_score_adj` to
-//! 0 at boot ([`relax_oom_score_adj`]), and the limits round expects 0 there.
+//! Lab PR 184 (external audit DEP-005) raised the agent's `oom_score_adj`
+//! to 0 at boot where the unit's memory cap could not bind. Lot 370
+//! (F10-4): the agent and the watchdog hold -999 on every host — the host
+//! OOM killer's last pick, still killable by their own cgroup's limit
+//! (`antitamper_bpf::pin_oom_score_adj`) — and the limits round expects the
+//! units' value: the OOM killer's SIGKILL, which no hook refuses, made the
+//! agent's role vacant at a moment root could choose.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -351,6 +355,85 @@ pub fn weakening_env(vars: &[(String, String)]) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Lot 370 (F10-5): the weakening variables of `own` (this process's
+/// environment, [`lossy_vars`]) that came from the service manager's
+/// environment — `systemctl set-environment`, no key: `manager` its
+/// `show-environment` lines, `NAME=value` — and that the unit does not set
+/// (`unit`: its `Environment=` assignments, a protected unit file's or
+/// drop-in's, which only a signed window changes). Each is ignored at the
+/// start ([`ignore_manager_weakening`]).
+pub fn from_the_manager(
+    own: &[(String, String)],
+    manager: &[String],
+    unit: &[String],
+) -> Vec<String> {
+    weakening_env(own)
+        .into_iter()
+        .map(|f| f.detail)
+        .filter(|assignment| {
+            manager.iter().any(|m| m.trim() == assignment)
+                && !unit.iter().any(|u| u.trim() == assignment)
+        })
+        .filter_map(|assignment| assignment.split_once('=').map(|(n, _)| n.to_string()))
+        .collect()
+}
+
+/// Lot 370 (F10-5): at the agent's start, before anything reads its
+/// environment (one thread): every weakening variable that came from the
+/// service manager's environment and not from the agent's unit
+/// ([`from_the_manager`]) is removed from the process, and the removal is
+/// a signed degradation (`weakening_env_ignored`). It was honoured on the
+/// next start — after an OOM kill, a watchdog's respawn — with only the
+/// `weakening_env` finding. Asked only when such a variable is set (no
+/// command otherwise); the manager not asked (no `systemctl`, a timeout):
+/// nothing removed, the finding as before. Returns the names removed.
+pub fn ignore_manager_weakening(unit_name: &str) -> Vec<String> {
+    let own = lossy_vars(std::env::vars_os());
+    if weakening_env(&own).is_empty() {
+        return Vec::new();
+    }
+    let run = |args: &[&str]| -> Option<Vec<String>> {
+        let bin = crate::trusted_bin::resolve("systemctl").ok()?;
+        let mut cmd = bin.command();
+        cmd.args(args);
+        let out = crate::bounded_cmd::run_bounded(
+            cmd,
+            None,
+            std::time::Duration::from_secs(2),
+            "systemctl (the manager's environment)",
+        )
+        .ok()?;
+        out.status.success().then(|| {
+            String::from_utf8_lossy(&out.stdout)
+                .split(['\n', ' '])
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    let (Some(manager), Some(unit)) = (
+        run(&["show-environment"]),
+        run(&["show", "-p", "Environment", "--value", unit_name]),
+    ) else {
+        return Vec::new();
+    };
+    let names = from_the_manager(&own, &manager, &unit);
+    for name in &names {
+        // SAFETY (edition 2021: safe): the start's one thread, before the
+        // command line is parsed or any thread exists.
+        std::env::remove_var(name);
+        crate::boot::degradation::report(
+            "weakening_env_ignored",
+            &format!(
+                "{name}: set in the service manager's environment (`systemctl set-environment`, \
+                 no key), not by the agent's unit — ignored; a weakening the operator wants \
+                 belongs in the unit's Environment= (a signed window)"
+            ),
+        );
+    }
+    names
 }
 
 /// Lab PR 224: the agent flags that set what a [`WEAKENING_ENV`] variable
@@ -1845,113 +1928,12 @@ fn systemd_bytes(v: &str) -> Option<String> {
         .map(|b| b.to_string())
 }
 
-/// `MemTotal` of `/proc/meminfo` (reported in kB), in bytes.
-fn parse_mem_total(meminfo: &str) -> Option<u64> {
-    meminfo.lines().find_map(|l| {
-        let kb: u64 = l
-            .strip_prefix("MemTotal:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
-        Some(kb.saturating_mul(1024))
-    })
-}
-
-fn mem_total_bytes() -> Option<u64> {
-    parse_mem_total(&antitamper_bpf::kernel_roots::read_to_string("/proc/meminfo").ok()?)
-}
-
 /// The agent's own cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
 fn own_cgroup() -> Option<String> {
     crate::state_read::read_state("/proc/self/cgroup")
         .ok()?
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-}
-
-/// External audit DEP-005 (NN-AUD-381): does the agent's memory cap bind
-/// on this host? `memory_max` as the cgroup file shows it (bytes, or
-/// `max`). The unit's `MemoryMax=` is an absolute size (11G, sized for the
-/// LLM advisor removed in Wave 4, lab PR 214, and not re-sized yet); at or
-/// above the host's memory (`MemTotal`) the cgroup's own OOM killer can
-/// never fire before the host's does.
-pub fn memory_cap_binds(memory_max: &str, mem_total_bytes: u64) -> bool {
-    memory_max
-        .trim()
-        .parse::<u64>()
-        .is_ok_and(|cap| cap < mem_total_bytes)
-}
-
-/// The `oom_score_adj` the agent runs with where its cap does not bind:
-/// the unit's value raised to 0, never lowered.
-fn relaxed_oom_adj(unit_adj: i32) -> i32 {
-    unit_adj.max(0)
-}
-
-/// External audit DEP-005: the `oom_score_adj` to write at boot, if any.
-/// Only in the unit's own cgroup, where the unit set both values; with any
-/// input unreadable, nothing (the unit's value stands, and so does the
-/// check's expectation).
-fn boot_oom_adj(
-    cgroup: Option<&str>,
-    memory_max: Option<&str>,
-    mem_total: Option<u64>,
-    current: Option<i32>,
-) -> Option<i32> {
-    if cgroup? != AGENT_UNIT_CGROUP || memory_cap_binds(memory_max?, mem_total?) {
-        return None;
-    }
-    let current = current?;
-    let relaxed = relaxed_oom_adj(current);
-    (relaxed != current).then_some(relaxed)
-}
-
-/// External audit DEP-005 (NN-AUD-381), at the agent's start: where the
-/// unit's memory cap cannot bind, `OOMScoreAdjust=-500` would make the
-/// agent — leaking past what the host has — the last process the host's
-/// OOM killer picks, after sshd and the workload. There the agent raises
-/// its own `oom_score_adj` to 0 (raising needs no capability): an ordinary
-/// candidate, which the watchdog (-900) respawns. The self-integrity check
-/// expects that value on such a host ([`expected_limits`]). Not done with
-/// a percentage in the unit: [`systemd_bytes`] cannot compare `N%` with
-/// the cgroup file (the expectation would be dropped), and 70 % of a large
-/// host is far above 11G.
-pub fn relax_oom_score_adj() {
-    let cgroup = own_cgroup();
-    let memory_max = cgroup.as_deref().and_then(|cg| {
-        read_trim(
-            &PathBuf::from("/sys/fs/cgroup")
-                .join(cg.trim_start_matches('/'))
-                .join("memory.max"),
-        )
-    });
-    let mem_total = mem_total_bytes();
-    let path = Path::new("/proc/self/oom_score_adj");
-    let current = read_trim(path).and_then(|v| v.parse::<i32>().ok());
-    let Some(to) = boot_oom_adj(cgroup.as_deref(), memory_max.as_deref(), mem_total, current)
-    else {
-        return;
-    };
-    let memory_max = memory_max.unwrap_or_default();
-    let mem_total = mem_total.unwrap_or_default();
-    match antitamper_bpf::kernel_roots::write(path, to.to_string()) {
-        Ok(()) => warn!(
-            memory_max,
-            mem_total,
-            from = current.unwrap_or_default(),
-            to,
-            "memory cap at or above the host's memory: the agent's cgroup limit cannot bind, \
-             oom_score_adj raised so a leak is an ordinary OOM candidate (external audit DEP-005)"
-        ),
-        Err(e) => warn!(
-            memory_max,
-            mem_total,
-            error = %e,
-            "memory cap at or above the host's memory, and oom_score_adj could not be raised: \
-             the self-integrity check will report the value (external audit DEP-005)"
-        ),
-    }
 }
 
 /// One limit the units set, as [`limits`] names it.
@@ -1966,11 +1948,10 @@ struct ExpectedLimit {
 
 /// External audit NN-AUD-113: the limits the shipped units set. A
 /// directive the parser does not understand is left out (never a guess);
-/// a test keeps every one the units set understood. External audit DEP-005:
-/// where the agent's memory cap does not bind (`cap_binds` false, from
-/// [`memory_cap_binds`]) the agent raised its `oom_score_adj` at boot
-/// ([`relax_oom_score_adj`]), and that value is the expected one.
-fn expected_limits(cap_binds: bool) -> Vec<ExpectedLimit> {
+/// a test keeps every one the units set understood. Lot 370 (F10-4): the
+/// agent's `oom_score_adj` is the unit's on every host (DEP-005's raise to
+/// 0 where the memory cap cannot bind is gone).
+fn expected_limits() -> Vec<ExpectedLimit> {
     let mut out = Vec::new();
     let mut push = |name: &str, value: Option<String>, required: bool| {
         if let Some(value) = value {
@@ -1986,7 +1967,6 @@ fn expected_limits(cap_binds: bool) -> Vec<ExpectedLimit> {
         "agent oom_score_adj",
         unit_directive(AGENT_UNIT, "OOMScoreAdjust")
             .and_then(|v| v.parse::<i32>().ok())
-            .map(|v| if cap_binds { v } else { relaxed_oom_adj(v) })
             .map(|v| v.to_string()),
         true,
     );
@@ -2700,18 +2680,7 @@ impl Checker {
                 Path::new("/sys/fs/cgroup").join(AGENT_UNIT_CGROUP.trim_start_matches('/')),
             );
             if in_unit || unit_exists {
-                // External audit DEP-005: the same test the boot took
-                // (`relax_oom_score_adj`); unreadable is "binds", as there.
-                let cap_binds = match (
-                    now.iter()
-                        .find(|(n, _)| n == "agent memory.max")
-                        .map(|(_, v)| v.as_str()),
-                    mem_total_bytes(),
-                ) {
-                    (Some(max), Some(total)) => memory_cap_binds(max, total),
-                    _ => true,
-                };
-                expected_limits(cap_binds)
+                expected_limits()
             } else {
                 Vec::new()
             }
@@ -3044,6 +3013,9 @@ mod tests {
     /// High, and a degradation of the agent's status — naming what failed.
     #[test]
     fn a_stuck_recovery_and_a_restart_loop_are_signed() {
+        // lot 370: the registry is read here — no test resets it meanwhile
+        // (they reset it holding this lock; this read flaked in the gates)
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         use nn_proto::watchdog_hold as wh;
         let dir = tempfile::tempdir().unwrap();
         let holds = dir.path().join("watchdog.hold");
@@ -3111,6 +3083,9 @@ mod tests {
     /// degradation of the agent's status — not only the watchdog's log line.
     #[test]
     fn a_watchdog_pin_handle_failure_is_a_signed_degradation() {
+        // lot 370: the registry is read here — no test resets it meanwhile
+        // (they reset it holding this lock; this read flaked in the gates)
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         use nn_proto::watchdog_hold as wh;
         let dir = tempfile::tempdir().unwrap();
         let holds = dir.path().join("holds");
@@ -3436,6 +3411,47 @@ mod tests {
         for (_, env) in WEAKENING_FLAGS {
             assert!(WEAKENING_ENV.iter().any(|(n, _)| n == env), "{env}");
         }
+    }
+
+    /// Lot 370 (F10-5): a weakening variable the service manager's
+    /// environment gave (`systemctl set-environment`, no key) and the unit
+    /// does not set is the one ignored; the unit's own (a signed window) and
+    /// a non-weakening value are not. On main every such variable was
+    /// honoured at the next start (an OOM kill's respawn), recorded only.
+    #[test]
+    fn a_weakening_variable_from_the_service_manager_is_ignored() {
+        let own = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = own(&[
+            ("NN_BPF_DEFENSE_OBSERVE", "1"),
+            ("NN_OVERLAY_ALLOW_UNSIGNED", "1"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let manager = lines(&[
+            "LANG=C.UTF-8",
+            "NN_BPF_DEFENSE_OBSERVE=1",
+            "NN_OVERLAY_ALLOW_UNSIGNED=1",
+        ]);
+        // both from the manager, the unit sets neither
+        assert_eq!(
+            from_the_manager(&env, &manager, &lines(&["PATH=/usr/bin"])),
+            vec!["NN_BPF_DEFENSE_OBSERVE", "NN_OVERLAY_ALLOW_UNSIGNED"]
+        );
+        // the unit's own: kept (and reported as before)
+        assert_eq!(
+            from_the_manager(&env, &manager, &lines(&["NN_OVERLAY_ALLOW_UNSIGNED=1"])),
+            vec!["NN_BPF_DEFENSE_OBSERVE"]
+        );
+        // not in the manager's environment (a manual start's): not this
+        assert!(from_the_manager(&env, &lines(&["LANG=C"]), &[]).is_empty());
+        // a value that does not weaken: nothing
+        let off = own(&[("NN_BPF_DEFENSE_OBSERVE", "0")]);
+        assert!(from_the_manager(&off, &lines(&["NN_BPF_DEFENSE_OBSERVE=0"]), &[]).is_empty());
     }
 
     #[test]
@@ -4867,13 +4883,13 @@ mod tests {
     fn limit_appearing_or_vanishing_after_baseline_is_reported() {
         let mut w = LimitWatch::default();
         let boot = lim(&[
-            ("agent oom_score_adj", "-500"),
+            ("agent oom_score_adj", "-999"),
             ("agent cgroup", "/user.slice/x.scope"),
             ("agent memory.max", "max"),
         ]);
         assert!(w.observe(&boot, &[]).is_empty());
         let moved = lim(&[
-            ("agent oom_score_adj", "-500"),
+            ("agent oom_score_adj", "-999"),
             ("agent cgroup", "/"),
             ("agent pids.max", "512"),
         ]);
@@ -4913,7 +4929,7 @@ mod tests {
 
     #[test]
     fn expected_limits_match_the_shipped_units() {
-        let e: Vec<(String, String, bool)> = expected_limits(true)
+        let e: Vec<(String, String, bool)> = expected_limits()
             .into_iter()
             .map(|e| (e.name, e.value, e.required))
             .collect();
@@ -4922,7 +4938,8 @@ mod tests {
             e,
             vec![
                 want("agent cgroup", AGENT_UNIT_CGROUP, true),
-                want("agent oom_score_adj", "-500", true),
+                // lot 370 (F10-4): -999, the units' and every host's
+                want("agent oom_score_adj", "-999", true),
                 want("agent memory.high", "9663676416", true),
                 want("agent memory.max", "11811160064", true),
                 want("agent pids.max", "512", true),
@@ -4930,7 +4947,7 @@ mod tests {
                 want(LIMIT_NNP, "1", true),
                 want(LIMIT_SECCOMP, "2", true),
                 want(LIMIT_CORE, "0", true),
-                want("watchdog oom_score_adj", "-900", false),
+                want("watchdog oom_score_adj", "-999", false),
             ]
         );
         assert_eq!(systemd_bytes("64M").as_deref(), Some("67108864"));
@@ -4946,7 +4963,7 @@ mod tests {
     fn boot_limits_differing_from_the_unit_are_reported() {
         let mut w = LimitWatch::default();
         let boot = lim(&[
-            ("agent oom_score_adj", "-500"),
+            ("agent oom_score_adj", "-999"),
             ("agent cgroup", AGENT_UNIT_CGROUP),
             ("agent memory.max", "104857600"),
             ("agent memory.high", "9663676416"),
@@ -4957,7 +4974,7 @@ mod tests {
             (LIMIT_SECCOMP, "2"),
             (LIMIT_CORE, "0"),
         ]);
-        let f = w.observe(&boot, &expected_limits(true));
+        let f = w.observe(&boot, &expected_limits());
         let got: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
         assert_eq!(
             got,
@@ -4977,7 +4994,7 @@ mod tests {
             .filter(|(n, _)| n != "agent cpu.max")
             .cloned()
             .collect();
-        assert!(w.observe(&no_cpu, &expected_limits(true)).is_empty());
+        assert!(w.observe(&no_cpu, &expected_limits()).is_empty());
     }
 
     /// External audit NN-AUD-113: the watchdog registers after the agent;
@@ -4987,7 +5004,7 @@ mod tests {
     #[test]
     fn watchdog_oom_is_baselined_late_against_expected() {
         let base = [
-            ("agent oom_score_adj", "-500"),
+            ("agent oom_score_adj", "-999"),
             ("agent cgroup", AGENT_UNIT_CGROUP),
         ];
         let mut w = LimitWatch::default();
@@ -5004,16 +5021,16 @@ mod tests {
             v.extend(lim(extra));
             v
         };
-        assert!(w.observe(&full(&[]), &expected_limits(true)).is_empty());
+        assert!(w.observe(&full(&[]), &expected_limits()).is_empty());
         let f = w.observe(&full(&[("watchdog oom_score_adj", "1000")]), &[]);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].kind, "limit_unexpected");
         assert_eq!(
             f[0].detail,
-            "watchdog oom_score_adj: expected -900 (unit), found 1000"
+            "watchdog oom_score_adj: expected -999 (unit), found 1000"
         );
         assert!(w
-            .observe(&full(&[("watchdog oom_score_adj", "-900")]), &[])
+            .observe(&full(&[("watchdog oom_score_adj", "-999")]), &[])
             .is_empty());
         assert!(
             w.observe(&full(&[]), &[]).is_empty(),
@@ -5024,79 +5041,32 @@ mod tests {
         let mut w = LimitWatch::default();
         assert!(w.observe(&lim(&base), &[]).is_empty());
         let mut v = lim(&base);
-        v.extend(lim(&[("watchdog oom_score_adj", "-900")]));
+        v.extend(lim(&[("watchdog oom_score_adj", "-999")]));
         assert!(w.observe(&v, &[]).is_empty());
         v[2].1 = "1000".to_string();
         let f = w.observe(&v, &[]);
         assert_eq!(f[0].kind, "limit_changed");
     }
 
-    const GIB: u64 = 1 << 30;
-
-    /// External audit DEP-005 (NN-AUD-381): the unit's 11G cap on a host
-    /// with no more memory than that cannot bind; there the agent raises
-    /// its own -500 to 0 at boot, and only there.
+    /// Lot 370 (F10-4): the agent and the watchdog are the host OOM
+    /// killer's last pick on any host — both units set -999 (not -1000:
+    /// their own memory cgroup must still end a leak), the agent keeps its
+    /// memory cap, and the check expects -999 whatever the cap: the value
+    /// DEP-005 raised to 0 on a host the cap cannot bind (a 4 or 8 GiB
+    /// guest), and -1000, are drift. On main the agent ran at 0 on such a
+    /// host and -500 elsewhere, and the watchdog at -900: root that made
+    /// every other process exempt chose when the OOM killer emptied the
+    /// agent's role.
     #[test]
-    fn oom_adj_relaxed_when_memory_max_exceeds_memtotal() {
-        let cap = systemd_bytes(unit_directive(AGENT_UNIT, "MemoryMax").unwrap()).unwrap();
-        let unit = Some(AGENT_UNIT_CGROUP);
-        let at =
-            |total: u64, current: i32| boot_oom_adj(unit, Some(&cap), Some(total), Some(current));
-        // a 4 GiB and an 8 GiB guest (MemTotal a little under the RAM)
-        assert_eq!(at(3_900_000 * 1024, -500), Some(0));
-        assert_eq!(at(8_000_000 * 1024, -500), Some(0));
-        // exactly the cap: it cannot fire before the host's OOM killer
-        assert_eq!(at(11 * GIB, -500), Some(0));
-        // 16 GiB (the reference host has 15.24 GiB): the cap binds
-        assert_eq!(at(15_980_000 * 1024, -500), None);
-        assert_eq!(at(12 * GIB, -500), None);
-        // never lowered; already at or above 0: nothing to write
-        assert_eq!(at(4 * GIB, 0), None);
-        assert_eq!(at(4 * GIB, 300), None);
-        // no cap at all
-        assert_eq!(
-            boot_oom_adj(unit, Some("max"), Some(64 * GIB), Some(-500)),
-            Some(0)
-        );
-        // outside the unit's cgroup, or anything unreadable: unchanged
-        let small = Some(4 * GIB);
-        assert_eq!(
-            boot_oom_adj(Some("/user.slice/x.scope"), Some(&cap), small, Some(-500)),
-            None
-        );
-        assert_eq!(boot_oom_adj(None, Some(&cap), small, Some(-500)), None);
-        assert_eq!(boot_oom_adj(unit, None, small, Some(-500)), None);
-        assert_eq!(boot_oom_adj(unit, Some(&cap), None, Some(-500)), None);
-        assert_eq!(boot_oom_adj(unit, Some(&cap), small, None), None);
-        assert!(memory_cap_binds("11811160064", 12 * GIB));
-        assert!(!memory_cap_binds("11811160064", 11 * GIB));
-        assert!(!memory_cap_binds("max", u64::MAX));
-        let meminfo = "MemTotal:        8025360 kB\nMemFree:  12 kB\nMemAvailable: 9 kB\n";
-        assert_eq!(parse_mem_total(meminfo), Some(8_025_360 * 1024));
-        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
-    }
-
-    /// External audit DEP-005: the check expects what the boot did — 0 on
-    /// a host the cap does not bind, the unit's -500 elsewhere — so neither
-    /// install gives a finding, and each value on the other host does.
-    #[test]
-    fn expected_limits_follow_the_relaxed_adj() {
-        let adj = |binds: bool| {
-            expected_limits(binds)
-                .into_iter()
-                .find(|e| e.name == "agent oom_score_adj")
-                .map(|e| (e.value, e.required))
-        };
-        assert_eq!(adj(true), Some(("-500".to_string(), true)));
-        assert_eq!(adj(false), Some(("0".to_string(), true)));
-        let rest = |binds: bool| {
-            expected_limits(binds)
-                .into_iter()
-                .filter(|e| e.name != "agent oom_score_adj")
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(rest(true), rest(false), "only the agent's adj follows");
-
+    fn the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick() {
+        assert_eq!(antitamper_bpf::PINNED_OOM_SCORE_ADJ, -999);
+        for unit in [AGENT_UNIT, WATCHDOG_UNIT] {
+            assert_eq!(unit_directive(unit, "OOMScoreAdjust"), Some("-999"));
+            // the cap a leak meets: kept
+            assert!(unit_directive(unit, "MemoryMax")
+                .and_then(systemd_bytes)
+                .is_some());
+        }
         let host = |oom: &str| {
             lim(&[
                 ("agent oom_score_adj", oom),
@@ -5109,18 +5079,16 @@ mod tests {
                 (LIMIT_CORE, "0"),
             ])
         };
-        for (binds, ok, other) in [(false, "0", "-500"), (true, "-500", "0")] {
+        let mut w = LimitWatch::default();
+        assert!(w.observe(&host("-999"), &expected_limits()).is_empty());
+        // -1000 too: it would exempt the agent from its own cgroup's OOM
+        for relaxed in ["0", "-500", "-1000"] {
             let mut w = LimitWatch::default();
-            assert!(
-                w.observe(&host(ok), &expected_limits(binds)).is_empty(),
-                "binds={binds}: {ok} is the expected value"
-            );
-            let mut w = LimitWatch::default();
-            let f = w.observe(&host(other), &expected_limits(binds));
+            let f = w.observe(&host(relaxed), &expected_limits());
             assert_eq!(f.len(), 1, "{f:?}");
             assert_eq!(
                 f[0].detail,
-                format!("agent oom_score_adj: expected {ok} (unit), found {other}")
+                format!("agent oom_score_adj: expected -999 (unit), found {relaxed}")
             );
         }
     }
@@ -5144,7 +5112,7 @@ mod tests {
             let adj = unit_directive(unit, "OOMScoreAdjust").expect("OOMScoreAdjust");
             assert!(adj.parse::<i32>().is_ok(), "OOMScoreAdjust={adj}");
         }
-        let names: Vec<String> = expected_limits(true).into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = expected_limits().into_iter().map(|e| e.name).collect();
         for want in [
             "agent oom_score_adj",
             "agent memory.high",
@@ -5164,7 +5132,7 @@ mod tests {
     /// shows it.
     #[test]
     fn the_unit_s_confinement_is_expected_and_read() {
-        let want: Vec<(String, String)> = expected_limits(true)
+        let want: Vec<(String, String)> = expected_limits()
             .into_iter()
             .filter(|e| [LIMIT_NNP, LIMIT_SECCOMP, LIMIT_CORE].contains(&e.name.as_str()))
             .map(|e| {
@@ -5214,7 +5182,7 @@ mod tests {
     fn a_process_without_the_unit_s_confinement_is_drift() {
         let host = |nnp: &str, sec: &str, core: &str| {
             lim(&[
-                ("agent oom_score_adj", "-500"),
+                ("agent oom_score_adj", "-999"),
                 ("agent cgroup", AGENT_UNIT_CGROUP),
                 ("agent memory.max", "11811160064"),
                 ("agent memory.high", "9663676416"),
@@ -5226,10 +5194,10 @@ mod tests {
         };
         let mut w = LimitWatch::default();
         assert!(w
-            .observe(&host("1", "2", "0"), &expected_limits(true))
+            .observe(&host("1", "2", "0"), &expected_limits())
             .is_empty());
         let mut w = LimitWatch::default();
-        let f = w.observe(&host("0", "0", "unlimited"), &expected_limits(true));
+        let f = w.observe(&host("0", "0", "unlimited"), &expected_limits());
         let got: Vec<&str> = f.iter().map(|x| x.detail.as_str()).collect();
         assert_eq!(
             got,

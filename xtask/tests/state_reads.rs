@@ -644,10 +644,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(path)",
         OWN,
     ),
+    // lot 370 (F10-2): the package managers' lock holders, sampled every
+    // poll — an unread sample adds no transaction (nothing is vouched for:
+    // fail closed), the next poll samples again
     (
-        "crates/nn-linux/src/self_integrity.rs",
-        "read_to_string(\"/proc/meminfo\")",
+        "agent/src/module_trust/txn.rs",
+        "read_state(\"/proc/locks\")",
         KNOB,
+    ),
+    (
+        "agent/src/module_trust/txn.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",

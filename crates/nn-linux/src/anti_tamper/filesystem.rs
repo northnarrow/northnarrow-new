@@ -589,6 +589,15 @@ pub(crate) const MODULE_LOAD_PROGRAMS: &[(&str, &str)] = &[
 /// ([`crate::module_writes::attach`]).
 pub(crate) const MODULE_WRITE_PROGRAM: (&str, &str) = ("module_write_observe", "file_open");
 
+/// Lot 370 (the lab): the package managers' locks (`module_lock_observe`
+/// on `file_lock`, observe only), which the write history reads at a
+/// write: a transaction's only while its package manager holds its lock.
+/// Attached before the history's observer, pinned in the root like the
+/// load hooks (`file_lock` is no other program's hook). A failed attach is
+/// an observe failure (signed): the agent then samples the locks, and a
+/// transaction shorter than its poll vouches for nothing.
+pub(crate) const MODULE_LOCK_PROGRAM: (&str, &str) = ("module_lock_observe", "file_lock");
+
 /// Attach outcome of the FS deny + observe hook sets (audit
 /// `ebpf-lsm-1`): the caller aggregates it with task_kill/ptrace into one
 /// machine-readable health line and decides fail-closed vs degraded.
@@ -639,6 +648,9 @@ pub(crate) fn hooks_lost_to_bootstrap_failure(
     for (program, _) in MODULE_LOAD_PROGRAMS {
         health.observe_failures.push((program, lost.clone()));
     }
+    health
+        .observe_failures
+        .push((MODULE_LOCK_PROGRAM.0, lost.clone()));
     health
         .observe_failures
         .push((MODULE_WRITE_PROGRAM.0, lost.clone()));
@@ -924,6 +936,21 @@ pub(crate) fn attach(
                 program, hook, error = %e,
                 "anti-tamper FS: module-load LSM hook attach FAILED (BUG-034, lot 285)"
             );
+            health.observe_failures.push((program, format!("{e:#}")));
+        }
+    }
+    // Lot 370 (the lab): the package managers' locks, before the history's
+    // observer reads them
+    let (program, hook) = MODULE_LOCK_PROGRAM;
+    match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+        Ok(()) => crate::module_writes::set_locks_observed(true),
+        Err(e) => {
+            warn!(
+                program, hook, error = %e,
+                "anti-tamper FS: the package locks' observer attach FAILED (lot 370) — the module \
+                 judge samples the locks: a transaction shorter than its poll vouches for nothing"
+            );
+            crate::module_writes::set_locks_observed(false);
             health.observe_failures.push((program, format!("{e:#}")));
         }
     }
@@ -2626,6 +2653,7 @@ mod tests {
             .iter()
             .chain(OPTIONAL_LSM_PROGRAMS)
             .chain(MODULE_LOAD_PROGRAMS)
+            .chain([&MODULE_LOCK_PROGRAM])
             .map(|(_, hook)| *hook)
             .chain([
                 crate::anti_tamper::bpf_defense::GUARD_HOOK,
@@ -2829,7 +2857,7 @@ mod tests {
         assert_eq!(h.deny_failures.len(), LSM_PROGRAMS.len() + 1);
         assert_eq!(h.optional_present, 1);
         // lot 285: and the module files' write history
-        assert_eq!(h.observe_failures.len(), MODULE_LOAD_PROGRAMS.len() + 1);
+        assert_eq!(h.observe_failures.len(), MODULE_LOAD_PROGRAMS.len() + 2);
         assert_eq!(h.observe_failures.last().unwrap().0, MODULE_WRITE_PROGRAM.0);
         assert_eq!(
             h.infra_failures,

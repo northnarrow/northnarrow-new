@@ -693,8 +693,9 @@ pub fn image_kind(event: &Event) -> Option<ProgramKind> {
 }
 
 /// The exec runs the dynamic loader (by identity or name): its operand's
-/// index in its argv.
-fn loader_operand_at(event: &Event) -> Option<usize> {
+/// index in its argv. Lot 370 (05-3.3): the staging rules read it too
+/// ([`super::loader_code`]).
+pub(crate) fn loader_operand_at(event: &Event) -> Option<usize> {
     let Event::ProcessSpawn {
         filename,
         exe,

@@ -860,6 +860,7 @@ impl FloodKind {
     pub fn of(event: &Event) -> Option<(FloodKind, u32)> {
         use common::wire::{
             BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+            BPF_CMD_VACATED_ROLE_GET_FD,
         };
         match event {
             Event::FsProtectDenial { uid, .. } => Some((FloodKind::Denial, *uid)),
@@ -871,6 +872,7 @@ impl FloodKind {
                     BPF_CMD_FOREIGN_GET_FD
                         | BPF_CMD_FOREIGN_MAP_WRITE
                         | BPF_CMD_FRESH_INSTANCE_GET_FD
+                        | BPF_CMD_VACATED_ROLE_GET_FD
                 ) =>
             {
                 Some((FloodKind::BpfOwn, *uid))

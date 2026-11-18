@@ -97,15 +97,13 @@
 //! `shmem_inode_info`'s offsets stay Critical. A clone whose every fact
 //! holds but whose bytes were not compared — its uid's share of the
 //! compare budget spent this second (the review of #556, F2: each uid but
-//! root has its own share, root a reserve no user can spend) — is recorded
-//! High, never killed, only for uid 0 (the initial user namespace's root):
-//! any other uid spends its own share (the re-check of #556, N1: three
-//! decoy hooks, then a sealed payload of runc's length) and its uncompared
-//! memfd stays the Critical kill. Either verdict says "not compared
-//! (budget)" — a memfd of the runtime's length, any program's — never a
-//! copy of the runtime. Residual: root spending its own budget, then
-//! executing its own memfd under the runtime, is recorded, not killed —
-//! root, who needs no such route. Residual: the kernel reads the file's first bytes
+//! root has its own share, root a reserve no user can spend) — is the
+//! Critical kill, whoever spent the budget (lot 370, F10-6: root's was
+//! recorded High, never killed — root chose when the compare skipped), and
+//! the budget spent is a signed record of its own (the pump's
+//! `runtime_copy_compare` degradation, naming the uid). The verdict says
+//! "not compared (budget)" — a memfd of the runtime's length, any
+//! program's — never a copy of the runtime. Residual: the kernel reads the file's first bytes
 //! (the binary's header, `bprm->buf`) just before the LSM hook reads the
 //! seals; a writer racing that window chooses the header of a run whose
 //! every mapped byte is the sealed runtime's (no code of its own: the
@@ -442,34 +440,27 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
 
     /// The re-check of #556 (N1): the verdict on a memfd exec whose every
     /// identity fact holds but whose bytes the pump did not compare (the
-    /// budget's share of `uid` spent this second). Only uid 0 — the initial
-    /// user namespace's root, a budget no user can spend — is recorded High
-    /// without a kill; any other uid chooses to spend its own share (decoy
-    /// hooks), so its uncompared memfd stays the Critical kill. Neither text
-    /// calls it a copy of the runtime: nobody compared its bytes.
+    /// budget's share of `uid` spent this second): the Critical kill, any
+    /// uid's (lot 370, F10-6: uid 0's was recorded High without a kill —
+    /// root chose when to spend its reserve). The text calls it no copy of
+    /// the runtime: nobody compared its bytes.
     fn not_compared(&self, event: &Event, uid: u32) -> Verdict {
-        if uid == 0 {
-            build_verdict(
-                self,
-                event,
-                ResponseAction::Log,
-                Severity::High,
-                "memfd exec under an installed container runtime and its manager, sealed at \
-                 the exec, of an installed runtime's length — not compared (budget): root's \
-                 compare budget spent this second, its bytes may be any program's (lot 347); \
-                 recorded, not killed",
-            )
-        } else {
-            build_verdict(
-                self,
-                event,
-                ResponseAction::KillProcessTree,
-                Severity::Critical,
+        // Lot 370 (F10-6): root's spent budget no longer lowers the verdict
+        // (it was High, recorded, no kill: root chose when the compare
+        // skipped); the budget spent is a signed event of its own (the
+        // pump's `runtime_copy_compare` degradation).
+        build_verdict(
+            self,
+            event,
+            ResponseAction::KillProcessTree,
+            Severity::Critical,
+            &format!(
                 "memfd-style exec detected — fileless execution, highly suspicious; under an \
                  installed container runtime, of an installed runtime's length, not compared \
-                 (budget): its uid's share of the compare budget spent this second (lot 347)",
-            )
-        }
+                 (budget): uid {uid}'s share of the compare budget spent this second (lot 347; \
+                 lot 370: whoever spent it)"
+            ),
+        )
     }
 
     /// Lot 347 (module docs): `event`, a memfd exec, is an installed OCI
@@ -589,6 +580,24 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             return None;
         };
         use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD, PROC_EXE};
+        // Lot 370 (05-3.3): fileless code the dynamic loader runs — its
+        // operand (or a preload) a descriptor's link or a memfd's name: the
+        // image the kernel executed is the loader, in `/lib`
+        if let Some(p) = crate::decision::rules::loader_code(event)
+            .into_iter()
+            .find(|p| Self::is_proc_fd_path(p))
+        {
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                &format!(
+                    "memfd-style exec through the dynamic loader ({p}) — fileless execution, \
+                     highly suspicious"
+                ),
+            ));
+        }
         // R14a: the core starting its own worker from its boot descriptor
         if self
             .own
@@ -1978,14 +1987,15 @@ mod lot310 {
         assert!(kills(judged(unsealed_at_exec(35_604), true)));
     }
 
-    /// The review of #556 (F2, named): root's memfd whose every identity
-    /// fact holds but whose bytes the pump did not compare (root's budget
-    /// spent this second) is recorded High, never killed — the alpha's
-    /// Docker starts past a flood. One whose facts fail stays the Critical
-    /// kill (fails on the lot's first head: every uncompared clone was
-    /// killed). Any other uid's: the next test (N1).
+    /// The review of #556 (F2): root's memfd whose every identity fact
+    /// holds but whose bytes the pump did not compare (root's budget spent
+    /// this second) was recorded High, never killed. Lot 370 (F10-6, named):
+    /// the verdict is not lowered — the Critical kill, as any uid's (root
+    /// chose when its reserve was spent; the spending is signed by the
+    /// pump). One whose facts fail stays the Critical kill too. Any other
+    /// uid's: the next test (N1).
     #[test]
-    fn an_uncompared_runtime_copy_is_recorded_never_killed() {
+    fn an_uncompared_runtime_copy_is_not_lowered_for_root() {
         use crate::decision::rules::program_identity::{
             keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
         };
@@ -2028,10 +2038,11 @@ mod lot310 {
         let under_shim = memfd_exec(35_612, 35_611, 35_611, 400);
         assert!(lineage.ingest_spawn_event(&under_shim));
         keep_runtime_clone(&under_shim, unverified.clone());
-        let v = r.evaluate(&under_shim).expect("recorded");
+        let v = r.evaluate(&under_shim).expect("judged");
+        // lot 370 (F10-6): it read (Log, High)
         assert_eq!(
             (v.action.clone(), v.severity),
-            (ResponseAction::Log, Severity::High),
+            (ResponseAction::KillProcessTree, Severity::Critical),
             "{}",
             v.reasoning
         );
@@ -2122,12 +2133,12 @@ mod lot310 {
         // a subordinate uid (a rootless container's root, mapped): the same
         let sub = judged(&as_uid(35_634, 100_000), true);
         assert!(kills(sub), "a mapped root is no uid 0");
-        // CONTROL: root's past its own budget — recorded, not killed (the
-        // named residual)
-        let v = judged(&as_uid(35_635, 0), true).expect("recorded");
+        // lot 370 (F10-6): root's past its own budget — the same kill (it
+        // was recorded, not killed: the residual closed)
+        let v = judged(&as_uid(35_635, 0), true).expect("judged");
         assert_eq!(
             (v.action.clone(), v.severity),
-            (ResponseAction::Log, Severity::High)
+            (ResponseAction::KillProcessTree, Severity::Critical)
         );
     }
 

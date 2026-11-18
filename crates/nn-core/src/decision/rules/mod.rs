@@ -95,6 +95,44 @@ pub fn is_staged_exec(exe: &nn_model::ExeIdentity, filename: &str) -> bool {
     staging_judged_path(exe, filename).is_some_and(is_staging_path)
 }
 
+/// Lot 370 (05-3.3): the files the dynamic loader runs or loads for an exec
+/// of it — its program operand, and the libraries `--preload` and `--audit`
+/// name — as the caller wrote them; none for an exec that is not the
+/// loader's (by identity or name, as lot 313 reads it), or one in which it
+/// runs nothing (`--list`, `--verify`, `--help`, …). The staging rules
+/// judged only the image the kernel executed — the loader, in `/lib` — so
+/// `ld-linux-x86-64.so.2 /tmp/x` ran a staged program unjudged, and
+/// `ld.so /proc/self/fd/3` fileless code.
+pub fn loader_code(event: &Event) -> Vec<&str> {
+    let Event::ProcessSpawn { argv, .. } = event else {
+        return Vec::new();
+    };
+    if program_identity::loader_operand_at(event).is_none() {
+        return Vec::new();
+    }
+    // the one reader of the loader's options (`posture::script_args`)
+    crate::posture::script_args::loader_code(argv)
+}
+
+/// Lot 370 (05-3.3): where a file [`loader_code`] names lies, for the
+/// staging rules: `Some(path)` folded when it is absolute and holds no
+/// `..`; `None` when the text cannot place it — relative (the caller's
+/// directory is not in the event) or climbing.
+pub fn placed(path: &str) -> Option<String> {
+    path.starts_with('/')
+        .then(|| crate::posture::proc_link::lexical_form(path))
+        .flatten()
+}
+
+/// Lot 370 (05-3.3): a file the loader runs for this exec under `prefix`
+/// (a staging directory), folded.
+pub fn loader_staged(event: &Event, prefix: &str) -> Option<String> {
+    loader_code(event)
+        .into_iter()
+        .filter_map(placed)
+        .find(|p| p.starts_with(prefix))
+}
+
 /// Lot 369: what the packaged `go` itself built and then runs, as the
 /// staging rules R001 and R003 record it (decision 283b held a person's exec
 /// from `/tmp` at High below COMBAT): `go test`'s test binary and `go run`'s
@@ -719,6 +757,13 @@ pub(crate) fn build_verdict(
 pub mod testutil {
     use nn_model::Event;
 
+    /// Lot 370 (05-3.3): an exec of the dynamic loader, `argv` its own (its
+    /// `argv[0]` the loader), as the LSM hook reports it.
+    pub fn via_loader(argv: &[&str]) -> Event {
+        let loader = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2";
+        kernel_exe(spawn_full("ld-linux-x86-64", loader, 1000, argv, "bash"))
+    }
+
     /// Build a `ProcessSpawn` event with sensible defaults plus the
     /// fields callers actually care about.
     pub fn spawn(comm: &str, filename: &str) -> Event {
@@ -831,6 +876,162 @@ pub mod testutil {
 #[cfg(test)]
 mod tests {
     use super::is_service_uid;
+
+    /// Lot 370 (05-3.3): a program run as the dynamic loader's operand is
+    /// judged as if the kernel had executed it — `/tmp` (R001), `/dev/shm`
+    /// (R002), `/var/tmp` (R003), a descriptor's link or a memfd (R004), a
+    /// library `--preload` loads too — and one the text cannot place (a
+    /// relative name) is recorded without a response. On main the rules
+    /// judged only the image the kernel executed, the loader in `/lib`:
+    /// every one of these was silent. Controls: `ld.so --list` of anything,
+    /// a system binary run through the loader, and the loader's `--help`.
+    #[test]
+    fn a_program_run_through_the_dynamic_loader_is_judged_as_if_executed() {
+        use super::testutil::via_loader;
+        use super::*;
+        type H = crate::posture::host::testing::TestHost;
+        let ld = "/lib64/ld-linux-x86-64.so.2";
+        let r001 = R001ExecFromTmp::default();
+        let r003 = R003ExecFromVarTmp::default();
+        let r004 = R004ExecFromProcSelfFd::<H>::default();
+        let judge = |argv: &[&str]| -> Vec<(String, ResponseAction, Severity, String)> {
+            let e = via_loader(argv);
+            let rules: [&dyn Rule; 4] = [&r001, &R002ExecFromDevShm, &r003, &r004];
+            rules
+                .iter()
+                .filter_map(|r| r.evaluate(&e))
+                .map(|v| (v.rule_id, v.action, v.severity, v.reasoning))
+                .collect()
+        };
+        let one = |argv: &[&str], rule: &str, action, sev| {
+            let got = judge(argv);
+            assert_eq!(got.len(), 1, "{argv:?}: {got:?}");
+            assert_eq!(
+                (got[0].0.as_str(), got[0].1.clone(), got[0].2),
+                (rule, action, sev),
+                "{argv:?}"
+            );
+            assert!(got[0].3.contains("dynamic loader"), "{}", got[0].3);
+        };
+        use ResponseAction::{KillProcessTree as Kill, Log};
+        one(&[ld, "/tmp/x"], "R001_ExecFromTmp", Kill, Severity::Medium);
+        one(
+            &[ld, "/tmp//./x", "-q"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "--library-path", "/usr/lib", "/tmp/x"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "--preload", "/tmp/hook.so", "/usr/bin/true"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "--audit=/usr/lib/a.so:/tmp/audit.so", "/usr/bin/true"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "--", "/tmp/x"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "/dev/shm/x"],
+            "R002_ExecFromDevShm",
+            Kill,
+            Severity::High,
+        );
+        one(
+            &[ld, "/var/tmp/x"],
+            "R003_ExecFromVarTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "/proc/self/fd/3"],
+            "R004_ExecFromProcSelfFd",
+            Kill,
+            Severity::Critical,
+        );
+        one(
+            &[ld, "/dev/fd/4"],
+            "R004_ExecFromProcSelfFd",
+            Kill,
+            Severity::Critical,
+        );
+        one(
+            &[ld, "/proc/4242/fd/7", "arg"],
+            "R004_ExecFromProcSelfFd",
+            Kill,
+            Severity::Critical,
+        );
+        // the mini-hunt: musl's loader, a preload into /dev/shm, --argv0
+        one(
+            &["/lib/ld-musl-x86_64.so.1", "/tmp/x"],
+            "R001_ExecFromTmp",
+            Kill,
+            Severity::Medium,
+        );
+        one(
+            &[ld, "--preload=/dev/shm/h.so", "/usr/bin/true"],
+            "R002_ExecFromDevShm",
+            Kill,
+            Severity::High,
+        );
+        one(
+            &[ld, "--argv0", "sshd", "/var/tmp/x"],
+            "R003_ExecFromVarTmp",
+            Kill,
+            Severity::Medium,
+        );
+        // a name the text cannot place: recorded, no response
+        one(&[ld, "./x"], "R001_ExecFromTmp", Log, Severity::Medium);
+        one(
+            &[ld, "/usr/../tmp/x"],
+            "R001_ExecFromTmp",
+            Log,
+            Severity::Medium,
+        );
+        // controls
+        for quiet in [
+            &[ld, "--list", "/tmp/x"][..],
+            &[ld, "--verify", "/tmp/x"],
+            &[ld, "--list", "/usr/bin/ls"],
+            &[ld, "/usr/bin/true"],
+            &[ld, "--help"],
+            &[ld],
+        ] {
+            assert!(judge(quiet).is_empty(), "{quiet:?}: {:?}", judge(quiet));
+        }
+        // a staged copy of the loader is killed as staged, whatever it runs
+        let mut staged_loader = via_loader(&["/tmp/ld-linux-x86-64.so.2", "./x"]);
+        if let Event::ProcessSpawn { exe, filename, .. } = &mut staged_loader {
+            exe.path = "/tmp/ld-linux-x86-64.so.2".to_string();
+            *filename = exe.path.clone();
+        }
+        let v = r001.evaluate(&staged_loader).expect("staged");
+        assert_eq!(v.action, Kill);
+        // not the loader: its argv is its own
+        let e = super::testutil::kernel_exe(super::testutil::spawn_full(
+            "cat",
+            "/usr/bin/cat",
+            1000,
+            &["cat", "/tmp/x"],
+            "bash",
+        ));
+        assert!(super::loader_code(&e).is_empty());
+        assert!(r001.evaluate(&e).is_none());
+    }
 
     /// External audit PROC-012: the service-uid class at each boundary.
     #[test]

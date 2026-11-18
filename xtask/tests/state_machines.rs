@@ -44,6 +44,12 @@ const HELPERS: &str = "crates/nn-core/src/decision/bounded.rs";
 /// Tables of last-seen times outside the helpers, with what bounds each.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "agent/src/module_trust/txn.rs",
+        1,
+        "lot 370 (F10-2): the package transactions seen holding their lock — at most SEEN_MAX, \
+         each forgotten KEEP after it was last seen (all of them when the cap is reached)",
+    ),
+    (
         "crates/nn-core/src/net/resolved.rs",
         1,
         "coverage_last: keyed by `CoverageCause`, an enum — one entry per variant",

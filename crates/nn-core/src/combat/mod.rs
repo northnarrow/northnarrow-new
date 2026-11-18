@@ -96,11 +96,12 @@ pub mod reconcile;
 mod tests;
 
 pub use actuator::{
-    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, OffenderOutcome, SoftBlock,
+    CombatActuator, Containment, IsolateOutcome, NeutralizeOutcome, NeutralizeReport,
+    OffenderOutcome, SoftBlock,
 };
 pub use evidence::{
-    ActionOutcome, Addition, AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition,
-    Unrecorded,
+    ActionOutcome, Addition, AuditEvidence, EvidenceCounts, LadderEvidence, OutcomeResult,
+    StageTransition, Unrecorded,
 };
 pub use host::{Capture, CombatHost};
 pub use offender::{OffenderId, ProcFacts, Via};
@@ -1086,8 +1087,7 @@ impl<H: CombatHost> Inner<H> {
                 target: "combat.audit",
                 stage = %o.stage,
                 action = o.action,
-                success = o.success,
-                summary = %nn_model::log_escape::Escaped(&o.summary),
+                result = %nn_model::log_escape::Escaped(&o.result_text()),
                 why = %why,
                 "COMBAT action outcome NOT in the signed audit log — the ladder proceeds"
             );
@@ -1107,12 +1107,19 @@ impl<H: CombatHost> Inner<H> {
         outcome: IsolateOutcome,
     ) {
         let max = self.cfg.isolate_attempts.max(1);
-        let (next, success, summary, detail) = match &outcome {
+        let (next, result, summary, detail) = match &outcome {
             IsolateOutcome::NotApplied(why) => (
                 Isolation::NotApplied,
-                false,
+                OutcomeResult::Failure,
                 format!("not applied: {why}"),
                 serde_json::json!({ "applied": false, "why": why }),
+            ),
+            // Lot 370 (F10-1): the gate decided it and applied nothing.
+            IsolateOutcome::WouldHave(why) => (
+                Isolation::NotApplied,
+                OutcomeResult::WouldHave,
+                format!("would have isolated the host; not applied: {why}"),
+                serde_json::json!({ "applied": false, "would_have": true, "why": why }),
             ),
             IsolateOutcome::Applied(report) => {
                 let summary = report.summary("isolated (read back)");
@@ -1144,7 +1151,12 @@ impl<H: CombatHost> Inner<H> {
                 // unavailable one (no ip6tables, no v6 ruleset) is not
                 // retried, but it is a hole, and the row says so.
                 let both = report.v4 == FamilyOutcome::Done && report.v6 == FamilyOutcome::Done;
-                (next, both, summary, detail)
+                let result = if both {
+                    OutcomeResult::Success
+                } else {
+                    OutcomeResult::Failure
+                };
+                (next, result, summary, detail)
             }
         };
         let engaged = matches!(&outcome, IsolateOutcome::Applied(r) if r.engaged());
@@ -1164,8 +1176,15 @@ impl<H: CombatHost> Inner<H> {
         detail["attempt"] = serde_json::Value::from(attempt);
         detail["max_attempts"] = serde_json::Value::from(max);
         let summary = format!("attempt {attempt} of {max}: {summary}");
-        if success {
+        if result == OutcomeResult::Success {
             info!(target: "combat.ladder", outcome = %summary, "COMBAT: ISOLATE verified");
+        } else if result == OutcomeResult::WouldHave {
+            warn!(
+                target: "combat.ladder",
+                outcome = %summary,
+                "COMBAT: detect-only — would have ISOLATED the host; nothing applied, the host \
+                 stays on the network"
+            );
         } else if matches!(next_kind, Isolation::Done) {
             warn!(
                 target: "combat.ladder",
@@ -1185,7 +1204,7 @@ impl<H: CombatHost> Inner<H> {
             stage: CombatStage::Isolate,
             action: "isolate",
             trigger,
-            success,
+            result,
             summary,
             detail,
         });
@@ -1644,13 +1663,26 @@ impl<H: CombatHost> Inner<H> {
                              spared; threat to be contained at the network level (ISOLATE)"
                         );
                     }
-                    warn!(
-                        target: "combat.ladder",
-                        offenders = ?actionable_pids,
-                        spared = ?spared.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-                        reason = %reason,
-                        "COMBAT: NEUTRALIZE — kill + quarantine offending process(es), no isolation"
-                    );
+                    // Lot 370 (F10-1): under the gate the decision is
+                    // logged as one — nothing will be killed.
+                    if self.actuator.is_dry_run() {
+                        warn!(
+                            target: "combat.ladder",
+                            offenders = ?actionable_pids,
+                            spared = ?spared.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                            reason = %reason,
+                            "COMBAT: NEUTRALIZE decided — detect-only: would kill + quarantine the \
+                             offending process(es); nothing will be killed or quarantined"
+                        );
+                    } else {
+                        warn!(
+                            target: "combat.ladder",
+                            offenders = ?actionable_pids,
+                            spared = ?spared.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                            reason = %reason,
+                            "COMBAT: NEUTRALIZE — kill + quarantine offending process(es), no isolation"
+                        );
+                    }
                     // Evidence FIRST — captured/emitted before the
                     // neutralization (and before any later isolation). The
                     // record carries the FULL attributed set plus a note of
@@ -1698,7 +1730,8 @@ impl<H: CombatHost> Inner<H> {
                     self.record_outcome(neutralize_outcome(trigger, &report, &spared));
                     let outcome = report.outcome();
                     // Lab PR 222: the copy-on-first-write guard hears the
-                    // offenders a NEUTRALIZE contained.
+                    // offenders a NEUTRALIZE contained (lot 370, F10-1: not
+                    // a would-have — nothing was killed).
                     if matches!(outcome, NeutralizeOutcome::Contained) {
                         if let Some(hook) = &self.neutralize_hook {
                             hook(&actionable);
@@ -1714,6 +1747,17 @@ impl<H: CombatHost> Inner<H> {
                             );
                             return;
                         }
+                        // Lot 370 (F10-1): decided as a containment would
+                        // be (no ISOLATE for it), said as what it is.
+                        NeutralizeOutcome::WouldHaveContained if spared.is_empty() => {
+                            warn!(
+                                target: "combat.ladder",
+                                offenders = ?actionable_pids,
+                                "COMBAT: detect-only — would have NEUTRALIZED the threat; nothing \
+                                 was killed or quarantined, the offending process(es) still run"
+                            );
+                            return;
+                        }
                         NeutralizeOutcome::Contained => {
                             // Killable offenders contained, but a spared
                             // host-critical offender remains implicated and
@@ -1723,6 +1767,23 @@ impl<H: CombatHost> Inner<H> {
                                 spared = ?spared.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
                                 "COMBAT: actionable offenders contained but host-critical offender(s) \
                                  spared — escalating to ISOLATE (cannot contain them at process level)"
+                            );
+                            reason = format!(
+                                "host-critical offender(s) spared, cannot contain at process level: {}",
+                                fmt_protected(&spared)
+                            );
+                            target = CombatStage::Isolate;
+                            // loop → ISOLATE (fresh critical section)
+                        }
+                        NeutralizeOutcome::WouldHaveContained => {
+                            // Lot 370 (F10-1): the same escalation, said as
+                            // a would-have (ISOLATE signs its own).
+                            warn!(
+                                target: "combat.ladder",
+                                spared = ?spared.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                                "COMBAT: detect-only — the actionable offenders would have been \
+                                 contained (nothing was killed), host-critical offender(s) spared — \
+                                 escalating to ISOLATE"
                             );
                             reason = format!(
                                 "host-critical offender(s) spared, cannot contain at process level: {}",
@@ -1810,17 +1871,37 @@ fn fmt_protected(spared: &[(u32, ProtectedReason)]) -> String {
 /// entry per offender handed to the actuator, and the host-critical ones
 /// spared (never killed). `success` only when every offender is contained
 /// and none was spared.
+///
+/// Lot 370 (F10-1): an offender the gate held (would have been killed) is
+/// not contained: a NEUTRALIZE that killed nothing read `success`, "N
+/// contained". One with every offender held, none uncontained and none
+/// spared is a would-have — "would have contained N" —; any other with a
+/// held kill is not a success either.
 fn neutralize_outcome(
     trigger: Option<TriggerType>,
     report: &NeutralizeReport,
     spared: &[(u32, ProtectedReason)],
 ) -> ActionOutcome {
-    let contained = report.offenders.iter().filter(|o| o.contained).count();
-    let not = report.offenders.len() - contained;
-    let mut summary = format!(
-        "{} offender(s) handled: {contained} contained, {not} NOT contained",
-        report.offenders.len()
-    );
+    let contained = report.offenders.iter().filter(|o| o.contained()).count();
+    let would = report.offenders.iter().filter(|o| o.would_have()).count();
+    let not = report.offenders.len() - contained - would;
+    let mut summary = if would > 0 && contained == 0 && not == 0 {
+        format!(
+            "detect-only: would have contained {would} offender(s) (killed and quarantined); \
+             none contained — nothing was killed or quarantined"
+        )
+    } else if would > 0 {
+        format!(
+            "{} offender(s) handled: {contained} contained, {would} would have been (detect-only: \
+             not killed), {not} NOT contained",
+            report.offenders.len()
+        )
+    } else {
+        format!(
+            "{} offender(s) handled: {contained} contained, {not} NOT contained",
+            report.offenders.len()
+        )
+    };
     if let NeutralizeOutcome::Uncontainable { reason } = report.outcome() {
         // Lot 312 (external bug hunt 1.4, BUG-120): an empty report with
         // offenders spared is the all-host-critical NEUTRALIZE (nothing
@@ -1839,12 +1920,16 @@ fn neutralize_outcome(
         .offenders
         .iter()
         .map(|o| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "pid": o.pid,
-                "contained": o.contained,
+                "contained": o.contained(),
                 "kill": o.kill,
                 "quarantine": o.quarantine,
-            })
+            });
+            if o.would_have() {
+                row["would_have"] = serde_json::Value::Bool(true);
+            }
+            row
         })
         .collect();
     let spared_rows: Vec<serde_json::Value> = spared
@@ -1855,7 +1940,13 @@ fn neutralize_outcome(
         stage: CombatStage::Neutralize,
         action: "kill+quarantine",
         trigger,
-        success: !report.offenders.is_empty() && not == 0 && spared.is_empty(),
+        result: if report.offenders.is_empty() || not > 0 || !spared.is_empty() {
+            OutcomeResult::Failure
+        } else if would > 0 {
+            OutcomeResult::WouldHave
+        } else {
+            OutcomeResult::Success
+        },
         summary,
         detail: serde_json::json!({ "offenders": offenders, "spared": spared_rows }),
     }
@@ -1893,7 +1984,7 @@ mod bug120 {
             &NeutralizeReport::default(),
             &[(4242, ProtectedReason::SshService)],
         );
-        assert!(!o.success);
+        assert!(!o.success());
         assert!(
             o.summary.contains("ssh-service(sshd) (pid 4242)"),
             "{}",
@@ -1911,7 +2002,7 @@ mod bug120 {
     #[test]
     fn bug120_guard_nothing_attributed_is_still_said() {
         let o = neutralize_outcome(None, &NeutralizeReport::default(), &[]);
-        assert!(!o.success);
+        assert!(!o.success());
         assert!(
             o.summary.contains("no offending process attributed"),
             "{}",

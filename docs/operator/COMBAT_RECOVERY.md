@@ -287,6 +287,11 @@ payload ships in the same release as the agent.
   stops the kill of the others — and signs one `combat_outcome` row (`stage`
   NEUTRALIZE) with each offender's kill and quarantine outcome and the
   host-critical ones spared.
+- **Under the `alpha` profile (and `--detect-only`)** nothing is killed,
+  quarantined or isolated: the `combat_outcome` rows read `result`
+  `would_have: …` ("would have contained N offender(s) …; none contained"),
+  each offender `contained: false`, `would_have: true` — never `success`
+  (lot 370).
 
 ### 3.4 Why the ladder engaged, and against whom (lab PR 245)
 

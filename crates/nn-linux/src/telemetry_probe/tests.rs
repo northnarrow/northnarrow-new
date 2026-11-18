@@ -787,12 +787,14 @@ fn a_step_that_cannot_run_is_not_exercised_and_a_deny_let_through_is_missed() {
 #[test]
 fn the_module_load_check_reads_each_of_its_programs_where_it_is_linked() {
     use crate::anti_tamper::bpf_defense::LINK_PIN_PREFIX;
-    use crate::anti_tamper::filesystem::{MODULE_LOAD_PROGRAMS, MODULE_WRITE_PROGRAM};
+    use crate::anti_tamper::filesystem::{
+        MODULE_LOAD_PROGRAMS, MODULE_LOCK_PROGRAM, MODULE_WRITE_PROGRAM,
+    };
     let root = Path::new("/sys/fs/bpf/northnarrow");
     let mut attached: Vec<&str> = MODULE_LOAD_PROGRAMS
         .iter()
         .map(|(p, _)| *p)
-        .chain([MODULE_WRITE_PROGRAM.0])
+        .chain([MODULE_WRITE_PROGRAM.0, MODULE_LOCK_PROGRAM.0])
         .collect();
     let mut named = Sensor::ModuleLoad.programs().to_vec();
     attached.sort_unstable();
@@ -801,8 +803,9 @@ fn the_module_load_check_reads_each_of_its_programs_where_it_is_linked() {
         named, attached,
         "the module_load attach check and the module-load programs the agent attaches differ"
     );
-    // the two load hooks: `link_<hook>` in the root, which the check walks
-    for (program, hook) in MODULE_LOAD_PROGRAMS {
+    // the two load hooks and (lot 370) the locks' observer: `link_<hook>`
+    // in the root, which the check walks
+    for (program, hook) in MODULE_LOAD_PROGRAMS.iter().chain([&MODULE_LOCK_PROGRAM]) {
         let link = antitamper_bpf::lsm_pin_paths(root, hook).1;
         assert_eq!(link.parent(), Some(root), "{program}");
         let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("");

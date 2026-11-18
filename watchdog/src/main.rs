@@ -93,6 +93,22 @@ async fn main() -> ExitCode {
     if cli.record_unit_failure {
         return record_unit_failure(&cli);
     }
+    // Lot 370 (F10-4): no candidate of the OOM killer (the unit's
+    // OOMScoreAdjust=-999, written again whoever started it): the process
+    // that brings the agent back is the last thing to go.
+    match antitamper_bpf::pin_oom_score_adj() {
+        Ok(None) => {}
+        Ok(Some(from)) => info!(
+            target: "watchdog",
+            from,
+            "oom_score_adj pinned: the host OOM killer's last pick"
+        ),
+        Err(e) => warn!(
+            target: "watchdog",
+            error = %e,
+            "oom_score_adj NOT pinned: the OOM killer can take the watchdog"
+        ),
+    }
     info!(
         target: "watchdog",
         agent_pidfile = %cli.agent_pidfile.display(),

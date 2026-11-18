@@ -564,7 +564,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R018_KernelModuleLoad",
-        severities: &[Severity::Critical, Severity::High, Severity::Medium],
+        severities: &[
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ],
         actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::ModuleLoad],
         data_components: &["DC0031"],
@@ -583,7 +588,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    refused. Who loads is not asked. Killed: a file outside `/lib/modules` or \
                    deeper than any module directory, refused or not. Recorded: any other \
                    untrusted file or buffer, an unattested DKMS or akmods build (High), a load \
-                   a window or an opt-out let through (Medium); a load the kernel did not judge \
+                   a window or an opt-out let through (Medium); a load the kernel trusted, \
+                   with why — a package's file or DKMS's build, unchanged since boot or written \
+                   this boot by a package transaction (Low, lot 370); a load the kernel did not judge \
                    (the agent's first seconds) by the path and the package database — a path \
                    with a component the sensor read only in part (31 bytes, marked …) is \
                    unverifiable, High (lot 292).",

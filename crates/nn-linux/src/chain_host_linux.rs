@@ -142,6 +142,34 @@ impl ChainHost for LinuxHost {
         }
     }
 
+    /// Lot 370 (02-3.1): an archive removed by the retention younger than
+    /// [`MIN_ARCHIVE_AGE`] since its seal is a degradation of the agent
+    /// ([`EARLY_EVICTION_DEGRADATION`], one line per log, named by its
+    /// file): in `nn-admin status` and the trust level, signed in the audit
+    /// chain — the retention is by size alone, and a flood of records (a
+    /// user's included) drops the older ones from the host as fast as it
+    /// fills it. The line leaves when the log's next removal is of an
+    /// archive kept longer. The agent's own logs only (its state
+    /// directory, [`EVIDENCE_DIR`]): a chain a tool or a test keeps
+    /// elsewhere is not the agent's history.
+    fn archive_evicted(active: &Path, seq: u64, age: Option<std::time::Duration>) {
+        if !active.starts_with(EVIDENCE_DIR) {
+            return;
+        }
+        let name = active.file_name().map_or_else(
+            || active.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let prefix = format!("{name}: ");
+        let line = early_eviction_line(&name, seq, age);
+        crate::boot::degradation::withdraw_where(EARLY_EVICTION_DEGRADATION, |d| {
+            d.starts_with(&prefix) && Some(d) != line.as_deref()
+        });
+        if let Some(line) = &line {
+            crate::boot::degradation::report(EARLY_EVICTION_DEGRADATION, line);
+        }
+    }
+
     /// Lot 353 (the review of #563, F1): a signed log whose appends fail is
     /// a degradation of the agent ([`SIGNING_DEGRADATION`], one line per
     /// log, named by its file — in `nn-admin status`, the trust level, and
@@ -283,6 +311,37 @@ pub const SIGNING_DEGRADATION: &str = "signed_log";
 /// stalled ([`LinuxHost::retention_stalled`]).
 pub const RETENTION_DEGRADATION: &str = "chain_retention";
 
+/// Lot 370 (02-3.1): the degradation's source of a rotating chain whose
+/// retention removed an archive younger than [`MIN_ARCHIVE_AGE`]
+/// ([`LinuxHost::archive_evicted`]).
+pub const EARLY_EVICTION_DEGRADATION: &str = "chain_early_eviction";
+
+/// Lot 370 (02-3.1): where the agent keeps its evidence logs.
+pub const EVIDENCE_DIR: &str = "/var/lib/northnarrow";
+
+/// Lot 370 (02-3.1): the age under which an archive's removal by the
+/// retention is said — a day of records filled the whole budget.
+pub const MIN_ARCHIVE_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Lot 370 (02-3.1): the degradation line of archive `seq` of log `name`
+/// removed `age` after its seal — `None` when it was kept at least
+/// [`MIN_ARCHIVE_AGE`] (an unread age is not said).
+pub fn early_eviction_line(
+    name: &str,
+    seq: u64,
+    age: Option<std::time::Duration>,
+) -> Option<String> {
+    let age = age.filter(|a| *a < MIN_ARCHIVE_AGE)?;
+    Some(format!(
+        "{name}: archive {seq} removed by the retention {} min after its seal (under {} h): \
+         records arrive faster than the size budget keeps them — a flood, a user's included, \
+         pushes the oldest from the host; each removal is signed in the manifest, and only an \
+         export keeps their content",
+        age.as_secs() / 60,
+        MIN_ARCHIVE_AGE.as_secs() / 3600
+    ))
+}
+
 /// What is Linux about the chains, on the agent's host: modes, symlinks,
 /// FIFOs. R04a (lab PR 241): from the tests of `chainlog`, `audit`,
 /// `chain_anchor` and `chain_tail`, which run on a portable host since
@@ -318,6 +377,50 @@ mod tests {
             client_comm: "nn-admin".to_string(),
             client_exe: None,
         }
+    }
+
+    /// Lot 370 (02-3.1): a removal by the retention of an archive kept less
+    /// than a day is said (a signed degradation, in the status), one kept
+    /// longer is not, and the line leaves at the log's next older removal.
+    /// On main every removal was the manifest's `Evicted` row alone,
+    /// however young: a flood could empty the host's history with nothing
+    /// in the status.
+    #[test]
+    fn an_archive_evicted_young_is_said() {
+        use std::time::Duration;
+        let line = early_eviction_line("detections.jsonl", 7, Some(Duration::from_secs(600)))
+            .expect("young");
+        assert!(line.starts_with("detections.jsonl: archive 7 removed by the retention 10 min"));
+        assert!(line.contains("only an export keeps"), "{line}");
+        assert!(early_eviction_line("d", 7, Some(MIN_ARCHIVE_AGE)).is_none());
+        assert!(early_eviction_line("d", 7, Some(MIN_ARCHIVE_AGE * 3)).is_none());
+        assert!(early_eviction_line("d", 7, None).is_none());
+        // the agent's own log (nothing is written: the host only reports);
+        // no reset of the shared registry (other tests read it in parallel):
+        // this log's line alone is read, and withdrawn below; the lock keeps
+        // the tests that reset it out meanwhile
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        let a = Path::new(EVIDENCE_DIR).join("detections.jsonl");
+        let early = || {
+            crate::boot::degradation::entries()
+                .into_iter()
+                .filter(|d| d.source == EARLY_EVICTION_DEGRADATION)
+                .map(|d| d.detail)
+                .collect::<Vec<_>>()
+        };
+        LinuxHost::archive_evicted(&a, 3, Some(Duration::from_secs(60)));
+        let lines = early();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("detections.jsonl: archive 3 removed"));
+        LinuxHost::archive_evicted(&a, 4, Some(Duration::from_secs(48 * 3600)));
+        assert!(early().is_empty(), "{:?}", early());
+        // a chain elsewhere (a tool's, a test's) is not the agent's history
+        LinuxHost::archive_evicted(
+            Path::new("/tmp/x/detections.jsonl"),
+            5,
+            Some(Duration::ZERO),
+        );
+        assert!(early().is_empty());
     }
 
     /// Lot 353 (the review of #563, F1, its probe in a user namespace): a

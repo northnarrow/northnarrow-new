@@ -3128,6 +3128,11 @@ fn summary_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
 
 /// External audit CMB-018 (lab PR 193): whether the agent enforces, and
 /// what set detect-only. The signed `agent_boot` entry records the same.
+/// Lot 370 (F10-1): what `status` adds to the COMBAT stage under the
+/// no-enforcement gate — the stage was decided, its actions not carried out.
+const COMBAT_STAGE_DETECT_ONLY: &str =
+    " — detect-only: decided, not carried out (nothing killed, quarantined or isolated)";
+
 fn response_mode_line(out: &StatusOutcome, tty: bool) -> String {
     match (out.detect_only, &out.detect_only_source) {
         (Some(true), source) => format!(
@@ -4045,13 +4050,19 @@ fn print_status(out: &StatusOutcome, json: bool) {
         }
         _ => println!("network isolation : {iso}"),
     }
-    // External audit CMB-016: where the COMBAT ladder stands.
+    // External audit CMB-016: where the COMBAT ladder stands. Lot 370
+    // (F10-1): under the gate, that its actions were not carried out.
     match (&out.combat_stage, out.combat_locked) {
         (Some(st), locked) => println!(
-            "combat stage      : {}{}",
+            "combat stage      : {}{}{}",
             colorize(st, "31", tty),
             if locked == Some(true) {
                 " (locked: `nn-admin unlock` to release)"
+            } else {
+                ""
+            },
+            if out.detect_only == Some(true) {
+                COMBAT_STAGE_DETECT_ONLY
             } else {
                 ""
             }

@@ -30,6 +30,43 @@ impl R001ExecFromTmp {
     }
 }
 
+impl R001ExecFromTmp {
+    /// Lot 370 (05-3.3): an exec of the dynamic loader whose program (or a
+    /// library it preloads) is in `/tmp/` — or one it runs by a name the
+    /// text cannot place.
+    fn through_the_loader(&self, event: &Event) -> Option<Verdict> {
+        let code = crate::decision::rules::loader_code(event);
+        if let Some(p) = crate::decision::rules::loader_staged(event, "/tmp/") {
+            if !TMP_WHITELIST.contains(&p.as_str()) {
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::KillProcessTree,
+                    Severity::Medium,
+                    &format!(
+                        "Process executed from /tmp/ through the dynamic loader ({p}) — common \
+                         malware staging location"
+                    ),
+                ));
+            }
+        }
+        let unplaced = code
+            .iter()
+            .find(|p| crate::decision::rules::placed(p).is_none())?;
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            Severity::Medium,
+            &format!(
+                "A program run through the dynamic loader by a name the agent cannot place \
+                 ({unplaced}: relative to a directory the event does not carry, or climbing) — \
+                 a staged program is run this way; recorded, not killed"
+            ),
+        ))
+    }
+}
+
 impl Rule for R001ExecFromTmp {
     fn id(&self) -> &'static str {
         "R001_ExecFromTmp"
@@ -52,13 +89,16 @@ impl Rule for R001ExecFromTmp {
         // Review 61: the file the kernel executed, not the caller's string.
         // Lot 355: a file of a user's program image (an AppImage's) is the
         // image's, not staged in its mount point's directory.
-        let filename = crate::decision::rules::staging_judged_path(exe, filename)?;
-        if !filename.starts_with("/tmp/") {
-            return None;
-        }
-        if TMP_WHITELIST.contains(&filename) {
-            return None;
-        }
+        let staged = crate::decision::rules::staging_judged_path(exe, filename)
+            .filter(|f| f.starts_with("/tmp/") && !TMP_WHITELIST.contains(f));
+        let Some(filename) = staged else {
+            // Lot 370 (05-3.3): a program the dynamic loader runs (its
+            // operand, a `--preload`) is judged as if the kernel had executed
+            // it; one the text cannot place (a relative name: the caller's
+            // directory is not known) is recorded, not killed. After the
+            // image: a staged loader is killed as one.
+            return self.through_the_loader(event);
+        };
         // lot 369: `go test`'s binary and `go run`'s program, by identity
         if self.go.runs(event, filename) {
             return Some(super::go_build_record(self, event, "/tmp/"));

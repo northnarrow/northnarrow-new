@@ -6,6 +6,78 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 370 (the pre-alpha's final review, Phase 10, and a cross-model
+  check): what the records say is what happened, and the moments a root
+  could choose are recorded (`UPGRADE_NOTES_WAVE4.md` §58).
+  - **A would-have is its own outcome.** Under the no-enforcement gate
+    (the `alpha` profile, `--detect-only`) COMBAT's NEUTRALIZE kills and
+    quarantines nothing; its signed `combat_outcome` read `success`, "N
+    contained", and the journal "threat NEUTRALIZED and verified
+    contained". It is now `would_have: detect-only: would have contained
+    N …`, each offender `contained: false`, `would_have: true`; ISOLATE's
+    is `would_have` too; the copy-on-first-write guard is not told of a
+    containment; the journal and `nn-admin status` (the COMBAT stage line)
+    say detect-only; a rule response's journal line reads `NOT EXECUTED
+    (detect-only: would have)`. A ratchet keeps a would-have out of every
+    "done" pattern. Tests `detect_only_neutralize_signs_a_would_have_not_a_success`,
+    `detect_only_isolate_signs_a_would_have`,
+    `no_combat_outcome_is_a_success_with_a_held_action`,
+    `detect_only_neutralize_contains_nothing_and_says_would_have`,
+    `a_would_have_outcome_is_signed_as_one`,
+    `xtask/tests/would_have_outcomes.rs`.
+  - **A file of the FIM watch list created after the start is an event.**
+    `/etc/ld.so.preload` (NN-L-FIM-022) and root's `authorized_keys`
+    (NN-L-FIM-004), absent on most hosts, were watched from their creation
+    on, the creation itself unreported. The nearest directory there is
+    watched for that path's creation alone: the record names the writer
+    and is judged as a change; a file found with no record is an event at
+    the next look, its writer unknown. An ordinary file created in `/etc`
+    is no event. Tests
+    `ld_so_preload_created_after_the_start_is_fim_022_with_its_writer`,
+    `root_authorized_keys_created_after_the_start_is_fim_004`.
+  - **The module judge trusts a live package transaction only.** A module
+    file written since boot is trusted when its write came from a package
+    manager's lineage whose package manager was not stopped, traced or
+    frozen at the write, the writer free of injected code, and that
+    package manager held its lock at the write (dpkg's, apt's front end,
+    rpm's) — read in the kernel at the write: a new observer
+    (`module_lock_observe`, on `file_lock`) keeps the package managers'
+    write locks (`MODULE_PKG_LOCKERS`, pinned with the history), so a
+    `dpkg -i` shorter than any poll is still a transaction. Without that
+    observer (a signed observe failure) the agent samples the locks. Every
+    trusted load is recorded by R018, Low, with why. Two new kernel offsets
+    (`task_struct.__state`, `start_boottime`, the thread-group leader's);
+    the pinned write history names the transaction and pins a third map (a
+    new layout: an earlier agent's history is not adopted); its observer
+    steps in plain values (5.15's verifier refused the earlier form's read
+    of an unwritten stack slot). Tests
+    `a_module_write_is_a_transactions_only_while_it_holds_its_lock`,
+    `a_short_transactions_module_file_is_trusted_by_its_lock_at_the_write`,
+    `a_package_lock_is_held_from_its_write_lock_to_its_release`,
+    `the_write_history_names_its_one_live_transaction`,
+    `the_ebpf_history_step_is_the_option_step_in_plain_values`,
+    `verifier_headroom::the_module_write_history_steps_in_plain_values`,
+    `a_trusted_load_is_recorded_low_with_why`.
+  - **The agent's role is no longer vacated on demand in silence.** The
+    agent and the watchdog run with `OOMScoreAdjust=-999` — the host OOM
+    killer's last pick, still ended by their own memory cap — written again
+    by each at its start (the self-integrity check expects it on every host;
+    external audit DEP-005's raise to 0 is gone). A role whose holder exited
+    this boot is taken only by a successor started for it (by PID 1 or the
+    other role's holder, no code injected), and the taking is NN-L-BPF-002
+    High. Tests `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
+    `a_role_taken_after_its_holder_exited_is_high`.
+  - **Smaller ones.** A program run as the dynamic loader's operand (or
+    preloaded by it) is judged by R001–R004 as if executed; a weakening
+    variable from the service manager's environment, not the unit, is
+    ignored at the start and signed; R004's verdict on a runtime copy not
+    compared is not lowered for root, and the budget spent is signed; an
+    archive the retention removes younger than a day is a signed
+    degradation. Tests
+    `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`,
+    `a_weakening_variable_from_the_service_manager_is_ignored`,
+    `an_uncompared_runtime_copy_is_not_lowered_for_root`,
+    `an_archive_evicted_young_is_said`.
 - Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
   each told by identity, the attack shape each rule exists for kept
   (`UPGRADE_NOTES_WAVE4.md` §57).

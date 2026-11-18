@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 use aya::maps::{Map, MapData};
 use aya::programs::links::FdLink;
 use aya::{Btf, Ebpf, EbpfLoader};
-use common::module_judge::{MODULE_PKG_SCRIPTS_MAX, MODULE_WRITES_MAX};
+use common::module_judge::{MODULE_PKG_LOCKERS_MAX, MODULE_PKG_SCRIPTS_MAX, MODULE_WRITES_MAX};
 use tracing::{info, warn};
 
 use crate::cgroup_join::Seen;
@@ -51,8 +51,11 @@ use crate::cgroup_join::Seen;
 pub const WRITES_MAP: &str = "MODULE_WRITES";
 /// The package managers' `#!` scripts' processes (pinned there).
 pub const SCRIPTS_MAP: &str = "MODULE_PKG_SCRIPTS";
+/// Lot 370 (the lab): the package managers holding their lock (pinned
+/// there: a transaction running across an agent restart keeps its lock).
+pub const LOCKERS_MAP: &str = "MODULE_PKG_LOCKERS";
 /// The maps pinned in [`pin_dir`].
-pub const PINNED_MAPS: [&str; 2] = [WRITES_MAP, SCRIPTS_MAP];
+pub const PINNED_MAPS: [&str; 3] = [WRITES_MAP, SCRIPTS_MAP, LOCKERS_MAP];
 /// The observer (`agent-ebpf/src/module_load.rs`) and its hook.
 pub const PROGRAM: &str = "module_write_observe";
 pub const HOOK: &str = "file_open";
@@ -87,8 +90,23 @@ pub fn is_kept_program(name: &str) -> bool {
 fn layout(name: &str) -> Option<(aya::maps::MapType, u32, u32, u32)> {
     use aya::maps::MapType;
     match name {
-        WRITES_MAP => Some((MapType::LruHash, 16, 4, MODULE_WRITES_MAX)),
+        // lot 370 (F10-2): the value names the transaction too
+        // (`common::module_judge::ModuleWrite`, 16 bytes; a 4-byte history
+        // of an earlier agent is another layout: a new history)
+        WRITES_MAP => Some((
+            MapType::LruHash,
+            16,
+            std::mem::size_of::<common::module_judge::ModuleWrite>() as u32,
+            MODULE_WRITES_MAX,
+        )),
         SCRIPTS_MAP => Some((MapType::LruHash, 4, 8, MODULE_PKG_SCRIPTS_MAX)),
+        // lot 370 (the lab): `common::module_judge::PkgLocker`
+        LOCKERS_MAP => Some((
+            MapType::LruHash,
+            4,
+            std::mem::size_of::<common::module_judge::PkgLocker>() as u32,
+            MODULE_PKG_LOCKERS_MAX,
+        )),
         _ => None,
     }
 }
@@ -217,6 +235,23 @@ static LOAD_OUTCOME: OnceLock<Result<(), String>> = OnceLock::new();
 /// since lot 285) and not registered as the agent's own by the BPF guard
 /// (a foreign handle on it not refused, its loss not noticed).
 static LINK: OnceLock<FdLink> = OnceLock::new();
+
+/// Lot 370 (the lab): whether the package locks' observer
+/// (`module_lock_observe`, `anti_tamper::filesystem::MODULE_LOCK_PROGRAM`)
+/// attached this start.
+static LOCKS_OBSERVED: OnceLock<bool> = OnceLock::new();
+
+/// Lot 370: the attach of the package locks' observer, once.
+pub fn set_locks_observed(attached: bool) {
+    let _ = LOCKS_OBSERVED.set(attached);
+}
+
+/// Lot 370: `Some(false)` when the package locks' observer did not attach
+/// this start (the kernel cannot tell a transaction's lock: the agent
+/// samples it); `None` before the attach.
+pub fn locks_observed() -> Option<bool> {
+    LOCKS_OBSERVED.get().copied()
+}
 
 /// The history as this start has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,7 +485,9 @@ pub fn attach(
         }
     };
     match state {
-        Some(st) if st.maps.len() == PINNED_MAPS.len() => {
+        // lot 370 (the lab): a history written without the locks' observer
+        // names package managers without their lock: no start adopts it
+        Some(st) if st.maps.len() == PINNED_MAPS.len() && locks_observed() != Some(false) => {
             let path = Path::new(STATE_PATH);
             if let Some(parent) = path.parent() {
                 use std::os::unix::fs::DirBuilderExt;
@@ -506,14 +543,19 @@ mod tests {
         State {
             boot: "b1".to_string(),
             since: (1_762_400_000, 5),
-            maps: vec![(WRITES_MAP.to_string(), 11), (SCRIPTS_MAP.to_string(), 12)],
+            maps: vec![
+                (WRITES_MAP.to_string(), 11),
+                (SCRIPTS_MAP.to_string(), 12),
+                (LOCKERS_MAP.to_string(), 13),
+            ],
         }
     }
 
     fn pinned(name: &str) -> Result<Seen, String> {
         match name {
-            WRITES_MAP => Ok(seen(11, MapType::LruHash, 16, 4, MODULE_WRITES_MAX)),
+            WRITES_MAP => Ok(seen(11, MapType::LruHash, 16, 16, MODULE_WRITES_MAX)),
             SCRIPTS_MAP => Ok(seen(12, MapType::LruHash, 4, 8, MODULE_PKG_SCRIPTS_MAX)),
+            LOCKERS_MAP => Ok(seen(13, MapType::LruHash, 4, 16, MODULE_PKG_LOCKERS_MAX)),
             _ => Err("absent".to_string()),
         }
     }

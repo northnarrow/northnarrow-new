@@ -32,6 +32,19 @@ impl Rule for R002ExecFromDevShm {
         let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
+        // Lot 370 (05-3.3): a program the dynamic loader runs from it
+        if let Some(p) = crate::decision::rules::loader_staged(event, "/dev/shm/") {
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::High,
+                &format!(
+                    "Process executed from /dev/shm/ through the dynamic loader ({p}) — fileless \
+                     malware indicator"
+                ),
+            ));
+        }
         // Review 61: the file the kernel executed, not the caller's string.
         // Lot 355: a file of a user's program image (an AppImage's) is the
         // image's, not staged in its mount point's directory.

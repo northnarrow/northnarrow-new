@@ -139,6 +139,13 @@ pub enum WatchClass {
     /// A path of the watch list — at boot, re-baselined, or back after a
     /// rename — or one of the agent's control-surface baits.
     Configured,
+    /// Lot 370 (F10-3): the nearest directory there of a path of the list
+    /// absent at the start (`/etc` for `/etc/ld.so.preload`), watched only
+    /// for that path's creation: the record of it names its writer. Every
+    /// other record of the directory — an ordinary file created in `/etc`,
+    /// a listing — is dropped unread: no event, no drift row, nothing
+    /// enrolled.
+    AwaitParent,
 }
 
 impl WatchClass {
@@ -148,7 +155,9 @@ impl WatchClass {
     fn rank(self) -> u8 {
         match self {
             Self::RuntimeChild => 0,
-            Self::ChainHop => 1,
+            // lot 370: never taken over by a runtime child (a directory
+            // created in a watched one), never taking over a path
+            Self::ChainHop | Self::AwaitParent => 1,
             Self::Decoy | Self::Configured => 2,
         }
     }
@@ -916,6 +925,17 @@ struct DrainQueues {
     chain_awaiting: Vec<String>,
     /// Lot 369: see [`await_appearance`].
     appearing: Vec<String>,
+    /// Lot 370 (F10-3): files of the list found at the last look without a
+    /// record of their creation — reported at the next look if still none
+    /// came (the record may wait in the ring behind the look).
+    appear_seen: Vec<(String, InodeKey)>,
+    /// Lot 370: paths of the list whose creation a record reported (judged
+    /// with its writer) before the file was there to watch: watched at the
+    /// next look, without a second event.
+    appear_reported: Vec<String>,
+    /// Lot 370: the directories watched for the creation of the paths
+    /// awaited ([`WatchClass::AwaitParent`]).
+    appear_parents: Vec<(InodeKey, String)>,
 }
 
 impl std::fmt::Debug for DrainQueues {
@@ -925,6 +945,7 @@ impl std::fmt::Debug for DrainQueues {
             .field("awaiting_return", &self.awaiting_return.len())
             .field("chain_awaiting", &self.chain_awaiting.len())
             .field("appearing", &self.appearing.len())
+            .field("appear_parents", &self.appear_parents.len())
             .finish_non_exhaustive()
     }
 }
@@ -940,6 +961,9 @@ impl DrainQueues {
             awaiting_return: Vec::new(),
             chain_awaiting: Vec::new(),
             appearing: Vec::new(),
+            appear_seen: Vec::new(),
+            appear_reported: Vec::new(),
+            appear_parents: Vec::new(),
         }
     }
 }
@@ -1426,11 +1450,20 @@ fn repaired_chains(
 /// told the drain the path had come into being. Such paths are looked at
 /// with the renamed-away ones, once a second ([`AWAITING_RETURN_EVERY`]),
 /// and watched as a path of the list once there — a directory then reports
-/// every file put in it, as at the start. Residual, said: what appears at
-/// the path itself is watched from then on, not reported (a package makes
-/// most such paths: its writer is not known to the look), nor is a file put
-/// in a directory of the list within that second of the directory's own
-/// creation.
+/// every file put in it, as at the start.
+///
+/// Lot 370 (F10-3): a FILE of the list that appears is an event, judged as
+/// a modification of it would be — `/etc/ld.so.preload` (NN-L-FIM-022) and
+/// `/root/.ssh/authorized_keys` (NN-L-FIM-004) are absent on most hosts, and
+/// their first creation is the act those rules exist for; it was watched
+/// from then on, not reported. The nearest directory there of each awaited
+/// path is watched for that path's creation alone
+/// ([`WatchClass::AwaitParent`]): the kernel's record of it names the
+/// writer, and a package manager's write is judged as such. A file the look
+/// finds with no record of its creation (made in a directory created within
+/// the second before, or linked in) is reported at the next look, its
+/// writer unknown. Residual, said: a file already in a directory of the
+/// list when that directory appears is watched, not reported.
 const APPEARING_MAX: usize = 512;
 
 /// Lot 369: watch `path` (of the watch list) once it exists.
@@ -1443,25 +1476,174 @@ pub fn await_appearance(path_map: &InodePathMap, path: &str) {
     });
 }
 
+/// Lot 370 (F10-3): `child` (a creation a record reported) is a path of
+/// the list awaited — no longer awaited: the record is its event.
+fn take_awaited(path_map: &InodePathMap, child: &str) -> bool {
+    queues(path_map, |q| {
+        let Some(at) = q.appearing.iter().position(|p| p == child) else {
+            return false;
+        };
+        q.appearing.swap_remove(at);
+        q.appear_seen.retain(|(p, _)| p != child);
+        true
+    })
+}
+
+/// Lot 370: a path of the list whose creation a record reported, not there
+/// yet to watch (the hook runs before the file is made).
+fn note_reported(path_map: &InodePathMap, path: &str) {
+    queues(path_map, |q| {
+        if !q.appear_reported.iter().any(|p| p == path) && q.appear_reported.len() < APPEARING_MAX {
+            q.appear_reported.push(path.to_string());
+        }
+    });
+}
+
+/// The most components the look climbs from an awaited path to the
+/// directory there.
+const APPEAR_PARENT_DEPTH: usize = 16;
+
+/// Lot 370: the nearest directory there above `path` (absent), by its own
+/// name — a symlinked one is not a directory here.
+fn nearest_parent(path: &str) -> Option<(InodeKey, String)> {
+    let mut dir = Path::new(path).parent();
+    for _ in 0..APPEAR_PARENT_DEPTH {
+        let d = dir?;
+        let named = fs_path(&d.to_string_lossy()).into_owned();
+        if let Ok(m) = antitamper_bpf::kernel_roots::symlink_metadata(&named) {
+            if !m.is_dir() {
+                return None;
+            }
+            let key = key_for_path(&named).ok()?;
+            return Some((key, d.to_string_lossy().into_owned()));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// What a look at the awaited paths found ([`appeared_paths`]).
+#[derive(Debug, Default)]
+struct Appeared {
+    /// Paths there now, watched.
+    watched: usize,
+    /// Lot 370: files of the list that appeared with no record of their
+    /// creation — each checked as a creation, its writer unknown.
+    created: Vec<InodeKey>,
+}
+
 /// Lot 369: the paths of the watch list there since the last look, watched
-/// now (as a path of the list: its links and target too); how many.
+/// now (as a path of the list: its links and target too). Lot 370 (F10-3):
+/// a file reported by no record since the look before is a creation; the
+/// directories watched for the creations follow the paths still awaited.
 fn appeared_paths(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
-) -> usize {
-    let todo = queues(path_map, |q| std::mem::take(&mut q.appearing));
-    let mut n = 0;
-    for path in todo {
+) -> Appeared {
+    let (todo, seen, reported) = queues(path_map, |q| {
+        (
+            std::mem::take(&mut q.appearing),
+            std::mem::take(&mut q.appear_seen),
+            std::mem::take(&mut q.appear_reported),
+        )
+    });
+    let mut out = Appeared::default();
+    // a creation a record reported: watched, no second event
+    for path in reported {
         if key_for_path(&fs_path(&path)).is_ok()
             && enroll_path(&path, WatchClass::Configured, path_map, watched_paths)
         {
-            n += 1;
-            info!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a path of the watch list absent at the start is there now: watched");
+            out.watched += 1;
+        } else {
+            note_reported(path_map, &path);
+        }
+    }
+    let mut parents: Vec<(InodeKey, String)> = Vec::new();
+    for path in todo {
+        let file = fs_path(&path).into_owned();
+        let key = match key_for_path(&file) {
+            Ok(key) => key,
+            Err(_) => {
+                await_appearance(path_map, &path);
+                if let Some(p) = nearest_parent(&path) {
+                    if !parents.iter().any(|(k, _)| *k == p.0) {
+                        parents.push(p);
+                    }
+                }
+                continue;
+            }
+        };
+        let is_dir =
+            antitamper_bpf::kernel_roots::symlink_metadata(&file).is_ok_and(|m| m.is_dir());
+        // a file: one look for its creation's record, which may wait in
+        // the ring behind this look
+        if !is_dir && !seen.iter().any(|(p, k)| *p == path && *k == key) {
+            queues(path_map, |q| {
+                if q.appear_seen.len() < APPEARING_MAX {
+                    q.appear_seen.push((path.clone(), key));
+                }
+            });
+            await_appearance(path_map, &path);
+            if let Some(p) = nearest_parent(&path) {
+                if !parents.iter().any(|(k, _)| *k == p.0) {
+                    parents.push(p);
+                }
+            }
+            continue;
+        }
+        if enroll_path(&path, WatchClass::Configured, path_map, watched_paths) {
+            out.watched += 1;
+            if is_dir {
+                info!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a path of the watch list absent at the start is there now: watched");
+            } else {
+                warn!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a file of the watch list absent at the start was created with no record of it: checked as a creation, its writer unknown");
+                out.created.push(key);
+            }
         } else {
             await_appearance(path_map, &path);
         }
     }
-    n
+    watch_parents(path_map, watched_paths, parents);
+    out
+}
+
+/// Lot 370: watch `wanted` as the directories of the awaited paths, and
+/// stop watching those no longer wanted (as long as nothing else took
+/// their inode). A directory the kernel map cannot take is not one.
+fn watch_parents(
+    path_map: &InodePathMap,
+    watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
+    wanted: Vec<(InodeKey, String)>,
+) {
+    let current = queues(path_map, |q| std::mem::take(&mut q.appear_parents));
+    for (key, path) in &current {
+        if !wanted.iter().any(|(k, _)| k == key)
+            && path_map.class_of(key) == Some(WatchClass::AwaitParent)
+        {
+            path_map.remove(key);
+            if let Some(w) = watched_paths {
+                w.lock().unenroll(*key);
+            }
+            debug!(target: "fim.drain", path = %nn_model::log_escape::Escaped(path), "no path of the list awaited under it: no longer watched");
+        }
+    }
+    let mut kept = Vec::new();
+    for (key, path) in wanted {
+        let held = path_map.class_of(&key);
+        if held.is_some_and(|c| c != WatchClass::AwaitParent) {
+            // already watched as more: its records are read as that
+            kept.push((key, path));
+            continue;
+        }
+        if held.is_none()
+            && !watch_inode(key, &path, WatchClass::AwaitParent, path_map, watched_paths)
+        {
+            path_map.remove(&key);
+            continue;
+        }
+        kept.push((key, path));
+    }
+    queues(path_map, |q| q.appear_parents = kept);
 }
 
 /// `true` while a renamed-away path waits for its file, or a symlinked one
@@ -1929,28 +2111,47 @@ pub fn process_record(
     // watched inode itself (`FIM_RENAME_DEST_LEAF`).
     let moved_in_leaf = raw.child_name[0] != 0
         && (op != FimOp::Renamed || raw.op_flags & FIM_RENAME_DEST_LEAF == 0);
-    let (path, op, child_truncated) =
-        if matches!(op, FimOp::Created | FimOp::Renamed) && moved_in_leaf {
-            match reconstruct_child_path(&path, raw) {
-                Some(child) => {
-                    let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
-                    // Read before the enrollment below names the inode by
-                    // this path.
-                    ident = child_ident(&child, op == FimOp::Renamed, path_map);
-                    child_read = true;
-                    if !enroll_path(&child, WatchClass::RuntimeChild, path_map, watched_paths) {
-                        queues(path_map, |q| q.enroll.push(child.clone(), Instant::now()));
-                    }
-                    // A rename INTO a watched dir is a drop → present as Created
-                    // (single userland normalization point; the dir-class rules
-                    // keep their Created|Modified op-sets unchanged).
-                    (child, FimOp::Created, truncated)
+    // Lot 370 (F10-3): a directory watched for the creation of a path of
+    // the list (absent at the start) — that creation alone is read; every
+    // other record of it is dropped: no event, no drift row, nothing
+    // enrolled (an ordinary file created in `/etc`).
+    let awaiting_only = class == WatchClass::AwaitParent;
+    let (path, op, child_truncated) = if matches!(op, FimOp::Created | FimOp::Renamed)
+        && moved_in_leaf
+    {
+        match reconstruct_child_path(&path, raw) {
+            Some(child) => {
+                // lot 370: the creation of a path of the list, judged
+                // with its writer as a modification of it would be
+                let awaited = take_awaited(path_map, &child);
+                if awaiting_only && !awaited {
+                    return Ok(false);
                 }
-                None => (path, op, false),
+                let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
+                // Read before the enrollment below names the inode by
+                // this path.
+                ident = child_ident(&child, op == FimOp::Renamed, path_map);
+                child_read = true;
+                if awaited {
+                    if !enroll_path(&child, WatchClass::Configured, path_map, watched_paths) {
+                        note_reported(path_map, &child);
+                    }
+                } else if !enroll_path(&child, WatchClass::RuntimeChild, path_map, watched_paths) {
+                    queues(path_map, |q| q.enroll.push(child.clone(), Instant::now()));
+                }
+                // A rename INTO a watched dir is a drop → present as Created
+                // (single userland normalization point; the dir-class rules
+                // keep their Created|Modified op-sets unchanged).
+                (child, FimOp::Created, truncated)
             }
-        } else {
-            (path, op, false)
-        };
+            None if awaiting_only => return Ok(false),
+            None => (path, op, false),
+        }
+    } else if awaiting_only {
+        return Ok(false);
+    } else {
+        (path, op, false)
+    };
     // External audit NN-AUD-122 (FIMP-010): a link or the target behind a
     // watched symlink unlinked, renamed away or replaced — what the watched
     // path reaches may have changed. Its chain is resolved again once the
@@ -2862,6 +3063,12 @@ pub async fn drain_loop(
     // the first sweep a period after boot
     let _ = returns_pacer.due(Instant::now());
     let _ = gc_pacer.due(Instant::now());
+    // Lot 370 (F10-3): the directories of the paths absent at the start
+    // watched for their creation from now, not from the first look.
+    // (A first look reports no file: one found is waited on a look.)
+    if awaiting_returns(&inode_map) {
+        off_the_runtime(|| appeared_paths(inode_map.as_ref(), watched_paths.as_deref()));
+    }
     // One event through the pipeline: the baseline looked up by the watched
     // path, the hash and the rules' input built off the runtime's threads,
     // the drift log locked for its append only (external audit FIMP-003).
@@ -2909,9 +3116,11 @@ pub async fn drain_loop(
         // NN-AUD-122: so is a symlinked path whose target is back.
         if awaiting_returns(&inode_map) && returns_pacer.due(now) {
             let back = off_the_runtime(|| {
-                // lot 369: the paths of the list absent at the start, there now
-                appeared_paths(inode_map.as_ref(), watched_paths.as_deref());
-                let mut back = returned_paths(inode_map.as_ref(), watched_paths.as_deref());
+                // lot 369: the paths of the list absent at the start, there
+                // now; lot 370 (F10-3): a file of them that appeared with no
+                // record of its creation is checked as one
+                let mut back = appeared_paths(inode_map.as_ref(), watched_paths.as_deref()).created;
+                back.extend(returned_paths(inode_map.as_ref(), watched_paths.as_deref()));
                 back.extend(repaired_chains(
                     inode_map.as_ref(),
                     watched_paths.as_deref(),
@@ -5182,11 +5391,11 @@ mod tests {
         await_appearance(&path_map, &spool_s);
         await_appearance(&path_map, &spool_s);
         assert!(awaiting_returns(&path_map), "looked at once a second");
-        assert_eq!(appeared_paths(&path_map, None), 0, "not there yet");
+        assert_eq!(appeared_paths(&path_map, None).watched, 0, "not there yet");
         assert!(path_map.keys_for_path(&spool_s).is_empty());
         // `apt install cron` makes the spool
         std::fs::create_dir_all(&spool).unwrap();
-        assert_eq!(appeared_paths(&path_map, None), 1);
+        assert_eq!(appeared_paths(&path_map, None).watched, 1);
         assert!(!awaiting_returns(&path_map), "watched: no longer awaited");
         let key = key_for_path(&spool).unwrap();
         assert_eq!(path_map.lookup(&key), Some(spool_s.clone()));
@@ -5223,6 +5432,207 @@ mod tests {
             await_appearance(&m, &format!("/nonexistent-k369/{i}"));
         }
         assert_eq!(queues(&m, |q| q.appearing.len()), APPEARING_MAX);
+    }
+
+    /// Lot 370 (F10-3): the drain's record of `raw` (one event at most).
+    fn drift_event(
+        raw: &FimDriftRaw,
+        path_map: &InodePathMap,
+        db: &mut FimDriftDb,
+    ) -> Option<FimEvent> {
+        let mut out = Vec::new();
+        process_drift(
+            raw,
+            path_map,
+            None,
+            db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(out.len() <= 1, "{out:?}");
+        out.pop().map(|e| match e {
+            Event::Fim(fe) => fe,
+            other => panic!("{other:?}"),
+        })
+    }
+
+    /// A create record of the directory `parent` for its child `leaf`, by
+    /// `pid`.
+    fn create_in(parent: InodeKey, leaf: &[u8], pid: u32) -> FimDriftRaw {
+        let mut raw = fake_raw(parent.dev, parent.ino, FimOp::Created as u8);
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+        raw.modifier_pid = pid;
+        raw
+    }
+
+    /// Lot 370 (F10-3): `/etc/ld.so.preload`, absent at the start (most
+    /// hosts), is created — NN-L-FIM-022's event, with its writer, judged
+    /// as a modification would be; the file is watched from then on. On
+    /// main the path was watched at the next look and nothing was reported:
+    /// the act the rule exists for went unseen. The control: an ordinary new
+    /// file in `/etc` is no event, no drift row, and is not watched.
+    #[test]
+    fn ld_so_preload_created_after_the_start_is_fim_022_with_its_writer() {
+        use crate::decision::Rule;
+        let dir = TempDir::new().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        let preload = etc.join("ld.so.preload");
+        let preload_s = preload.to_string_lossy().into_owned();
+        let path_map = InodePathMap::new();
+        let mut db = drift_db_in(&dir);
+        await_appearance(&path_map, &preload_s);
+        // the look: absent — its directory watched for its creation
+        let looked = appeared_paths(&path_map, None);
+        assert_eq!((looked.watched, looked.created.len()), (0, 0));
+        let etc_key = key_for_path(&etc).unwrap();
+        assert_eq!(path_map.class_of(&etc_key), Some(WatchClass::AwaitParent));
+        // control: another file created in /etc is no event, and not watched
+        std::fs::write(etc.join("hostname.new"), b"h\n").unwrap();
+        assert!(drift_event(
+            &create_in(etc_key, b"hostname.new", 4100),
+            &path_map,
+            &mut db
+        )
+        .is_none());
+        let other = key_for_path(&etc.join("hostname.new")).unwrap();
+        assert_eq!(
+            path_map.lookup(&other),
+            None,
+            "an ordinary file is not watched"
+        );
+        // nor is a listing of /etc, a rename or an unlink in it
+        for op in [
+            FimOp::Opened,
+            FimOp::Deleted,
+            FimOp::Renamed,
+            FimOp::Modified,
+        ] {
+            let raw = fake_raw(etc_key.dev, etc_key.ino, op as u8);
+            assert!(drift_event(&raw, &path_map, &mut db).is_none(), "{op:?}");
+        }
+        // the creation: the hook runs before the file is made
+        let raw = create_in(etc_key, b"ld.so.preload", 4242);
+        std::fs::write(&preload, b"/tmp/.x/libhook.so\n").unwrap();
+        let mut fe = drift_event(&raw, &path_map, &mut db).expect("the creation is an event");
+        assert_eq!(fe.op, FimOp::Created);
+        assert_eq!(fe.path, preload_s);
+        assert_eq!(fe.modifier_pid, 4242, "the writer named");
+        fe.path = "/etc/ld.so.preload".to_string();
+        let v = crate::fim::rules::NnLFim022LdSoPreloadModified
+            .evaluate(&Event::Fim(fe))
+            .expect("NN-L-FIM-022");
+        assert_eq!(v.severity, nn_model::Severity::Critical);
+        // watched as a path of the list, no longer awaited; the directory
+        // no longer watched after the next look; no second event
+        let key = key_for_path(&preload).unwrap();
+        assert_eq!(path_map.class_of(&key), Some(WatchClass::Configured));
+        assert!(!awaiting_returns(&path_map));
+        let looked = appeared_paths(&path_map, None);
+        assert!(looked.created.is_empty(), "reported once");
+        assert_eq!(path_map.class_of(&etc_key), None);
+    }
+
+    /// Lot 370 (F10-3): root's `authorized_keys` on a host with no
+    /// `/root/.ssh` — the directory made (no record: a `mkdir`), then the
+    /// key file: the look moves the watch into the new directory, and the
+    /// creation is NN-L-FIM-004's with its writer. Made within the second
+    /// of the directory (no record), the next look but one reports it, its
+    /// writer unknown — never watched in silence (main).
+    #[test]
+    fn root_authorized_keys_created_after_the_start_is_fim_004() {
+        use crate::decision::Rule;
+        let judge = |mut fe: FimEvent| {
+            fe.path = "/root/.ssh/authorized_keys".to_string();
+            crate::fim::rules::NnLFim004AuthorizedKeysModified.evaluate(&Event::Fim(fe))
+        };
+        for recorded in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let ssh = root.join(".ssh");
+            let keys = ssh.join("authorized_keys");
+            let keys_s = keys.to_string_lossy().into_owned();
+            let path_map = InodePathMap::new();
+            let mut db = drift_db_in(&dir);
+            await_appearance(&path_map, &keys_s);
+            appeared_paths(&path_map, None);
+            let root_key = key_for_path(&root).unwrap();
+            assert_eq!(path_map.class_of(&root_key), Some(WatchClass::AwaitParent));
+            std::fs::create_dir(&ssh).unwrap();
+            if recorded {
+                appeared_paths(&path_map, None);
+                let ssh_key = key_for_path(&ssh).unwrap();
+                assert_eq!(path_map.class_of(&ssh_key), Some(WatchClass::AwaitParent));
+                assert_eq!(path_map.class_of(&root_key), None, "moved down");
+                let raw = create_in(ssh_key, b"authorized_keys", 5151);
+                std::fs::write(&keys, b"ssh-ed25519 AAAA intruder\n").unwrap();
+                let fe = drift_event(&raw, &path_map, &mut db).expect("an event");
+                assert_eq!((fe.op, fe.modifier_pid), (FimOp::Created, 5151));
+                assert!(judge(fe).is_some(), "NN-L-FIM-004");
+                assert!(appeared_paths(&path_map, None).created.is_empty());
+            } else {
+                std::fs::write(&keys, b"ssh-ed25519 AAAA intruder\n").unwrap();
+                // found: one look waits for a record of it
+                assert!(appeared_paths(&path_map, None).created.is_empty());
+                let created = appeared_paths(&path_map, None).created;
+                let key = key_for_path(&keys).unwrap();
+                assert_eq!(created, vec![key]);
+                let fe = drift_event(&returned_raw(key), &path_map, &mut db).expect("an event");
+                assert_eq!(
+                    (fe.op, fe.modifier_pid),
+                    (FimOp::Created, 0),
+                    "writer unknown"
+                );
+                assert!(judge(fe).is_some(), "NN-L-FIM-004");
+                assert!(!awaiting_returns(&path_map));
+            }
+            assert_eq!(
+                path_map.class_of(&key_for_path(&keys).unwrap()),
+                Some(WatchClass::Configured)
+            );
+        }
+    }
+
+    /// Lot 370 (F10-3, the mini-hunt): a file of the list renamed into place
+    /// (`mv x /etc/ld.so.preload`: the rename's record on the watched
+    /// directory, with the new name) is its creation, with its writer; one
+    /// linked into place (`ln`: the directory's record has no name) is found
+    /// by the look, an event at the next one, its writer unknown.
+    #[test]
+    fn a_watched_file_renamed_or_linked_into_place_is_its_creation() {
+        let dir = TempDir::new().unwrap();
+        let etc = dir.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        let path_map = InodePathMap::new();
+        let mut db = drift_db_in(&dir);
+        let preload = etc.join("ld.so.preload");
+        await_appearance(&path_map, &preload.to_string_lossy());
+        appeared_paths(&path_map, None);
+        let etc_key = key_for_path(&etc).unwrap();
+        let mut raw = create_in(etc_key, b"ld.so.preload", 6161);
+        raw.op = FimOp::Renamed as u8;
+        std::fs::write(etc.join("staged"), b"/x.so\n").unwrap();
+        std::fs::rename(etc.join("staged"), &preload).unwrap();
+        let fe = drift_event(&raw, &path_map, &mut db).expect("renamed into place");
+        assert_eq!((fe.op, fe.modifier_pid), (FimOp::Created, 6161));
+        // linked: no record names it — the look does
+        let keys = etc.join("authorized_keys2");
+        await_appearance(&path_map, &keys.to_string_lossy());
+        appeared_paths(&path_map, None);
+        std::fs::write(dir.path().join("k"), b"key\n").unwrap();
+        std::fs::hard_link(dir.path().join("k"), &keys).unwrap();
+        let linked = fake_raw(etc_key.dev, etc_key.ino, FimOp::Linked as u8);
+        assert!(drift_event(&linked, &path_map, &mut db).is_none());
+        assert!(appeared_paths(&path_map, None).created.is_empty());
+        assert_eq!(
+            appeared_paths(&path_map, None).created,
+            vec![key_for_path(&keys).unwrap()]
+        );
     }
 
     /// External audit FIMP-004: re-enrolling a path watches the inode it

@@ -636,6 +636,12 @@ const STATICS: &[Kept] = &[
         "lot 285: from when the one eBPF object's write history covers every write, set by its attach and read by the module-load judge's controller thread",
     ),
     kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "LOCKS_OBSERVED",
+        Kernel,
+        "lot 370: whether the one eBPF object's package-locks observer attached, set by its attach and read by the module-load judge's controller thread (which then tells the kernel and samples the locks itself)",
+    ),
+    kept(
         "agent/src/module_trust/mod.rs",
         "DESIRED",
         Kernel,

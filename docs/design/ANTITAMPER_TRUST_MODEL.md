@@ -383,8 +383,13 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   protected pid (the agent also records the watchdog it verifies), and
   `role_exit` — a raw tracepoint on `sched_process_exit` whose link is
   pinned (`link_role_exit`), so it outlives the agent that attached it —
-  empties the slot when that process's main thread exits. A second
-  instance started beside the live one, preloaded or not, gets nothing.
+  empties the slot when that process's main thread exits (lot 370: marked
+  vacated, not never held). A second instance started beside the live one,
+  preloaded or not, gets nothing. Lot 370 (F10-4): a role vacated this boot
+  is taken only by a successor started for it — a child of PID 1 (its
+  unit's restart) or of the other role's live holder (the watchdog's
+  respawn), with no code injected — and its handle is recorded High
+  (`BPF_CMD_VACATED_ROLE_GET_FD`); a first claim of the boot stays Low.
 - **Scope:** write handles on the agent's maps only (never a link handle), for a process that has only just started. `ptrace_access_check` refuses access to
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
@@ -400,7 +405,15 @@ the agent's are reported High as before.
 
 ### Residual
 
-While a role is vacant (at boot before the watchdog registers, or after it ends) a root process already running can be taken for that role. It needs root present at that moment; the same gap exists wherever a defender restarts. Lot 344, the review of #554:
+While a role is vacant (at boot before the watchdog registers, or after it ends) a root process already running can be taken for that role. It needs root present at that moment; the same gap exists wherever a defender restarts. Lot 370 (F10-4): the agent and the watchdog run with
+`oom_score_adj` -999, the host OOM killer's last pick (its SIGKILL, which
+no hook refuses, made the gap a moment root could choose; their own
+memory cgroup can still end a leak, so the ranking alone closes nothing);
+after a holder's exit the
+successor must be started for the role, and a successor that PID 1 starts
+is not told from the unit's own restart: it is recorded High, not
+refused. The same holds for a program that makes itself the role's binary
+by device and inode (`PR_SET_MM_EXE_FILE`). Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
 its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),

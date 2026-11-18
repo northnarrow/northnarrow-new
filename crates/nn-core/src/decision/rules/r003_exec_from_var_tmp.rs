@@ -41,6 +41,19 @@ impl Rule for R003ExecFromVarTmp {
         let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
+        // Lot 370 (05-3.3): a program the dynamic loader runs from it
+        if let Some(p) = crate::decision::rules::loader_staged(event, "/var/tmp/") {
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Medium,
+                &format!(
+                    "Process executed from /var/tmp/ through the dynamic loader ({p}) — \
+                     persistent staging location"
+                ),
+            ));
+        }
         // Review 61: the file the kernel executed, not the caller's string.
         // Lot 355: a file of a user's program image (an AppImage's) is the
         // image's, not staged in its mount point's directory.

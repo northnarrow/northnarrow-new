@@ -1921,8 +1921,9 @@ mod tests {
             );
             assert_eq!(
                 fs.observe_failures.len(),
-                3,
-                "the module-load hooks and the module files' write history (lot 285)"
+                4,
+                "the module-load hooks, the module files' write history (lot 285) and the \
+                 package locks' observer (lot 370)"
             );
             let mut deny = DenyHealth::default();
             for (p, w) in fs.deny_failures {

@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{Array, HashMap, MapData};
 use aya::Ebpf;
-use common::module_judge::{conf_slot, ModuleTrust};
+use common::module_judge::{conf_slot, ModuleTrust, ModuleWrite};
 use common::wire::InodeKey;
 
 /// `InodeKey` for aya (its own `Pod` marker; the orphan rule forbids
@@ -22,12 +22,21 @@ pub struct AyaTrust(pub ModuleTrust);
 // SAFETY: `#[repr(C)]`, two i64 then two u32, no padding.
 unsafe impl aya::Pod for AyaTrust {}
 
+/// Lot 370 (F10-2): the write history's value for aya.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AyaWrite(pub ModuleWrite);
+// SAFETY: `#[repr(C)]`, two u32 then one u64, no padding.
+unsafe impl aya::Pod for AyaWrite {}
+
 /// What the controller holds.
 pub struct Kernel {
     conf: Array<MapData, u64>,
     trust: HashMap<MapData, AyaKey, AyaTrust>,
     pkg_images: HashMap<MapData, AyaKey, u32>,
-    writes: HashMap<MapData, AyaKey, u32>,
+    /// Lot 370 (the lab): the package managers' lock files, by inode.
+    pkg_locks: HashMap<MapData, AyaKey, u32>,
+    writes: HashMap<MapData, AyaKey, AyaWrite>,
     gen: Array<MapData, u64>,
 }
 
@@ -48,6 +57,7 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
         conf: Array::try_from(take("MODULE_CONF")?).context("MODULE_CONF")?,
         trust: HashMap::try_from(take("MODULE_TRUST")?).context("MODULE_TRUST")?,
         pkg_images: HashMap::try_from(take("MODULE_PKG_IMAGES")?).context("MODULE_PKG_IMAGES")?,
+        pkg_locks: HashMap::try_from(take("MODULE_PKG_LOCKS")?).context("MODULE_PKG_LOCKS")?,
         writes: HashMap::try_from(take("MODULE_WRITES")?).context("MODULE_WRITES")?,
         gen: Array::try_from(take("MODULE_WRITE_GEN")?).context("MODULE_WRITE_GEN")?,
     })
@@ -93,9 +103,32 @@ impl Kernel {
         }
     }
 
-    /// The kernel's write history of `key`.
-    pub fn history(&self, key: InodeKey) -> Option<u32> {
-        self.writes.get(&AyaKey(key), 0).ok()
+    /// Lot 370 (the lab): replace the package managers' lock files with
+    /// `locks` (each with its bit).
+    pub fn set_pkg_locks(&mut self, locks: &[(InodeKey, u32)]) {
+        let old: Vec<AyaKey> = self.pkg_locks.keys().filter_map(|k| k.ok()).collect();
+        for k in old {
+            if !locks.iter().any(|(l, _)| *l == k.0) {
+                let _ = self.pkg_locks.remove(&k);
+            }
+        }
+        for (k, bit) in locks {
+            let _ = self.pkg_locks.insert(AyaKey(*k), *bit, 0);
+        }
+    }
+
+    /// Lot 370 (the lab): the package locks' observer is not attached —
+    /// the history names a lineage's package manager without its lock.
+    pub fn set_locks_unobserved(&mut self) -> Result<()> {
+        self.conf
+            .set(conf_slot::LOCKS_UNOBSERVED, 1, 0)
+            .context("MODULE_CONF locks")
+    }
+
+    /// The kernel's write history of `key` (lot 370: with the transaction
+    /// that wrote it).
+    pub fn history(&self, key: InodeKey) -> Option<ModuleWrite> {
+        self.writes.get(&AyaKey(key), 0).ok().map(|w| w.0)
     }
 
     /// The write history's generation (bumped at each write recorded).

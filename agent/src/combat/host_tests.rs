@@ -16,7 +16,7 @@ use nn_model::Event;
 use super::actuator::{
     CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
 };
-use super::evidence::{ActionOutcome, LadderEvidence, StageTransition, Unrecorded};
+use super::evidence::{ActionOutcome, LadderEvidence, OutcomeResult, StageTransition, Unrecorded};
 use super::offender::ProcFacts;
 use super::ProcRef;
 use super::{AuditEvidence, CombatLadder, CombatStage, LadderConfig, NoProtectedProcs};
@@ -198,7 +198,11 @@ impl LadderEvidence for MockEvidence {
         self.rec.push(format!(
             "outcome:{}:{}",
             o.stage.as_str(),
-            if o.success { "success" } else { "failure" }
+            match o.result {
+                OutcomeResult::Success => "success",
+                OutcomeResult::WouldHave => "would_have",
+                OutcomeResult::Failure => "failure",
+            }
         ));
         Ok(())
     }
@@ -730,7 +734,26 @@ fn detect_only_rows_name_the_trigger_and_offender_and_nothing_acts() {
         .find(|e| e.op == "combat_outcome")
         .expect("NEUTRALIZE's outcome");
     assert_eq!(outcome.extra["trigger"], "AntiTamperDenial");
+    // Lot 370 (F10-1): a NEUTRALIZE that killed nothing is a would-have —
+    // signed `success`, "1 contained", and the offender `contained`, on main.
+    assert!(
+        outcome
+            .result
+            .starts_with("would_have: detect-only: would have contained 1"),
+        "{}",
+        outcome.result
+    );
+    assert!(
+        outcome.extra["summary"]
+            .as_str()
+            .unwrap()
+            .contains("none contained"),
+        "{}",
+        outcome.extra["summary"]
+    );
     let o = &outcome.extra["detail"]["offenders"][0];
+    assert_eq!(o["contained"], false, "{o}");
+    assert_eq!(o["would_have"], true, "{o}");
     assert!(
         o["kill"].as_str().unwrap().starts_with("WouldExecute"),
         "{o}"

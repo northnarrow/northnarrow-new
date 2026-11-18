@@ -170,6 +170,16 @@ how.
   elsewhere ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md)). *Workaround:*
   forward the agent's journal off the host, or turn on the export.
   *Evidence:* `forged_tail_then_cut_while_down_is_not_found_at_boot`.
+- **A flood of records can push older ones off the host.** Each log keeps
+  a fixed number of archives of a fixed size, whatever their age. Records
+  arriving faster than that budget — a flood, an unprivileged user's
+  included — remove the oldest archives from the host. Each removal is
+  signed in the log's manifest, and an archive removed less than a day
+  after it was sealed is a signed degradation in `nn-admin status`
+  (`chain_early_eviction`), but its records are gone from the host.
+  *For you:* turn on the export to keep a copy off the host
+  ([EXPORT.md](EXPORT.md)). *Evidence:* `an_archive_evicted_young_is_said`;
+  lot 370.
 - **`nn-admin chain verify` with no chains says OK.** On a state directory
   that holds no chain (a purged host, a wrong `--state-dir`), it prints
   `OK` with 0 rows for each chain and exits 0. *For you:* read the row
@@ -225,6 +235,27 @@ not cause as an incident.
   *For you:* use the opt-out on a test VM only. *Evidence:*
   `an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent` (what it
   still cannot load); lot 345.
+- **A module installed by a package transaction is trusted.** A module
+  file written in the running kernel's tree since boot is trusted when the
+  package database or DKMS's registry vouches for its content and the
+  write came from a live package transaction: the package manager's
+  process held its lock, was not stopped, and the writer descends from it
+  with no code injected. Root that runs the package manager on a package
+  of its own is such a transaction. Every load the kernel trusted is
+  recorded, Low, with why it was trusted. The lock is read in the kernel
+  at the write, however short the transaction. A transaction that took its
+  lock while the agent's lock observer was not attached — before the
+  agent's first start of the boot, or in the moment of an upgrade between
+  the old agent's purge and the new one's start — holds no lock the kernel
+  knows: its module files are judged as written outside one (DKMS's build
+  let through and recorded High, a package's file elsewhere refused) until
+  the next transaction rewrites them or the next boot. If that observer
+  cannot attach (a signed observe failure), the agent samples the locks
+  instead, and a transaction that begins and ends between two of its
+  samples is not seen. *Evidence:*
+  `a_short_transactions_module_file_is_trusted_by_its_lock_at_the_write`;
+  `a_module_write_is_a_transactions_only_while_it_holds_its_lock`;
+  `a_trusted_load_is_recorded_low_with_why`; lot 370.
 - **Unsigned kernel modules on a host without lockdown.** The module-load
   judge refuses modules the agent does not trust, but the kernel itself is
   the host's to protect: without kernel lockdown and module signing, root
@@ -351,8 +382,26 @@ not cause as an incident.
 - **Kills nothing can refuse.** The kernel's OOM killer, a crash or a power
   loss end the agent without asking. The watchdog brings it back, and the
   next start records how the previous run ended (`previous_run` with
-  `"ended":"abrupt"` in its signed `agent_boot` entry). *Evidence:*
-  `previous_run_none_abrupt_clean`; internal check Phase 3 §7.2.
+  `"ended":"abrupt"` in its signed `agent_boot` entry). The agent and the
+  watchdog run with `oom_score_adj` -999: the host's OOM killer picks them
+  last, and their own memory cap still ends a leak with a kill and a
+  restart. On a host with less memory than the agent's cap (11 GiB) the cap
+  cannot bind, and a leak weighs on the host first.
+  The successor that takes the role of an agent or watchdog that ended is
+  recorded High (NN-L-BPF-002), and only a process started for the role
+  (by PID 1 or by the other role's holder, with no code injected) gets the
+  agent's maps in that moment; one PID 1 starts is not told from the
+  unit's own restart, and is recorded High, not refused. *Evidence:* `previous_run_none_abrupt_clean`;
+  `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`;
+  `a_role_taken_after_its_holder_exited_is_high`; internal check Phase 3
+  §7.2.
+- **Weakening variables from the service manager's environment are
+  ignored, not refused.** A variable that weakens the agent, set in the
+  service manager's environment rather than in the agent's unit, is
+  removed at the agent's start and signed as a degradation
+  (`weakening_env_ignored`). One set in the unit (or a drop-in) is honoured
+  and signed as `weakening_env`, as before. *Evidence:*
+  `a_weakening_variable_from_the_service_manager_is_ignored`; lot 370.
 - **The agent's CPU time.** Heavy CPU load from root processes can slow the
   agent: its unit has no raised CPU weight yet. A stall of more than 15 s is
   a signed `agent_stalled` record. A confinement of the agent to fewer CPUs
@@ -404,6 +453,21 @@ not cause as an incident.
 
 ## Detection coverage
 
+- **A program run through the dynamic loader by a relative name.** The
+  staging rules judge a program the dynamic loader runs (its operand, a
+  library it preloads) as if the kernel had executed it. One named relative
+  to the caller's working directory, which the record does not carry, is
+  recorded (R001, Medium) without a response. `ldd` on a file runs the
+  loader on it and is recorded the same way. *Evidence:*
+  `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
+  lot 370.
+- **A file of the FIM watch list absent at the start.** Its creation is an
+  event with its writer, judged as a change of the file would be. One whose
+  creation no record names (its directory itself new) is an event shortly
+  after, its writer unknown. A file already in a directory of the list when
+  that directory appears is watched, not reported.
+  *Evidence:* `ld_so_preload_created_after_the_start_is_fim_022_with_its_writer`;
+  `root_authorized_keys_created_after_the_start_is_fim_004`; lot 370.
 - **No adversarial campaign yet.** The rules have unit, end-to-end and lab
   tests; on the release candidate each rule was reproduced once, as its
   "How to test" says, on 5 kernels. No independent or adversarial campaign

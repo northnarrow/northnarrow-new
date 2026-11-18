@@ -703,7 +703,11 @@ mod tests {
     /// even with every enforcement asked for on the command line: the
     /// executor (kill, tree kill, quarantine, egress block, throttle),
     /// the exec quarantine's holds, the exec policy's denies, the kernel
-    /// connect deny, the exploit guard, the module-load judge's refusals.
+    /// connect deny, the exploit guard. The module-load judge does not stand
+    /// down: it is the host's integrity and the agent's self-protection, and
+    /// it refuses an untrusted module under `alpha` too (the review of #550,
+    /// F2; lot 370, F10-7: this text said it stood down, which the test's
+    /// last assertion contradicts).
     #[test]
     fn no_response_executes_under_alpha() {
         use nn_model::ResponseAction;

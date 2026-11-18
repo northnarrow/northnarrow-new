@@ -22,7 +22,7 @@
 //!
 //! | Kernel verdict | Condition | Severity | Action |
 //! |---|---|---|---|
-//! | trusted | — | — | none |
+//! | trusted | why the kernel trusted it (lot 370): a verified package's file or DKMS's build, unchanged since boot or written this boot by a package transaction | Low | Log |
 //! | window | a signed trusted-installer window let an untrusted load through | Medium | Log |
 //! | opt-out | a signed per-module opt-out let it through | Medium | Log |
 //! | dkms-unattested | a DKMS or akmods build its registry vouches for, written since boot outside a recognised package transaction: let through unless the policy enforces R018 | High | Log |
@@ -79,6 +79,36 @@ fn owner(f: &nn_model::ModuleFileFacts) -> &'static str {
         "owned by root"
     } else {
         "not owned by root"
+    }
+}
+
+/// Lot 370 (F10-2): why the kernel trusted the file, from its trust map
+/// entry's flags (`common::module_judge::trust_flag`).
+fn trusted_because(file: Option<&nn_model::ModuleFileFacts>) -> &'static str {
+    use common::module_judge::trust_flag::{DKMS, PACKAGE, PKG_WRITTEN};
+    let flags = file.map_or(0, |f| f.trust_flags);
+    match (
+        flags & PACKAGE != 0,
+        flags & DKMS != 0,
+        flags & PKG_WRITTEN != 0,
+    ) {
+        (true, _, false) => {
+            "a verified package's file (its content the digest the package \
+                             database recorded), unchanged since boot"
+        }
+        (true, _, true) => {
+            "a verified package's file, written this boot by a package \
+                            transaction the kernel saw write it"
+        }
+        (false, true, false) => {
+            "DKMS's registered build (the content DKMS's registry holds), \
+                                 unchanged since boot"
+        }
+        (false, true, true) => {
+            "DKMS's registered build, written this boot by a package \
+                                transaction the kernel saw write it"
+        }
+        (false, false, _) => "its trust map entry (no reason read)",
     }
 }
 
@@ -140,8 +170,20 @@ impl<H: DecisionHost> Rule for R018KernelModuleLoad<H> {
         };
         let shown = path.as_deref().unwrap_or("(no file: init_module)");
         match verdict {
-            // (1) The kernel vouches for the file: nothing to record.
-            ModuleLoadVerdict::Trusted => return None,
+            // (1) The kernel vouches for the file. Lot 370 (F10-2): recorded
+            // Low with why — a trusted load left no record, so one the
+            // judge trusted on a write it took for a transaction's was
+            // silent.
+            ModuleLoadVerdict::Trusted => {
+                return log(
+                    Severity::Low,
+                    format!(
+                        "Kernel module {shown} loaded by '{loader_comm}' (parent \
+                         '{parent_comm}'): trusted by the kernel — {} (T1547.006). Recorded.",
+                        trusted_because(file.as_ref())
+                    ),
+                );
+            }
             // (2) Let through by a signed decision: recorded.
             ModuleLoadVerdict::Window | ModuleLoadVerdict::OptOut => {
                 return log(
@@ -682,7 +724,9 @@ mod tests {
             kv::TRUSTED,
             trust_flag::PACKAGE,
         );
-        assert!(rule().evaluate(&ev(&trusted)).is_none());
+        // lot 370 (F10-2): recorded Low, never a response
+        let v = rule().evaluate(&ev(&trusted)).expect("recorded");
+        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
     }
 
     /// Named test (lot 285): R018's loader allowlist by `comm` is gone — a
@@ -711,13 +755,16 @@ mod tests {
                     "{loader}"
                 );
             }
-            assert!(rule()
+            // lot 370 (F10-2): a trusted file is recorded Low whoever
+            // loads it — never more
+            let v = rule()
                 .evaluate(&ev(&judged(
                     raw(MODULE_LOAD_FINIT, loader, parent, 0, TREE),
                     kv::TRUSTED,
                     trust_flag::PACKAGE,
                 )))
-                .is_none());
+                .expect("recorded");
+            assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
         }
         // the rule set builds R018 with nothing to allowlist
         let rules = crate::decision::rules::module_load_rules::<H>();
@@ -798,7 +845,14 @@ mod tests {
             "{}",
             v.reasoning
         );
-        assert!(at(kv::TRUSTED, trust_flag::DKMS).is_none());
+        // lot 370 (F10-2): trusted — recorded Low, with why
+        let v = at(kv::TRUSTED, trust_flag::DKMS).unwrap();
+        assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+        assert!(
+            v.reasoning.contains("DKMS's registered build"),
+            "{}",
+            v.reasoning
+        );
         let v = r
             .evaluate(&ev(&judged(
                 raw(
@@ -961,6 +1015,50 @@ mod tests {
             .expect("standard path, provenance unknown, not judged: recorded");
         assert_eq!(v.severity, Severity::Medium);
         assert_eq!(v.action, ResponseAction::Log); // alert, NOT kill
+    }
+
+    /// Lot 370 (F10-2): every load the kernel trusted is recorded Low,
+    /// with why — a package's file or DKMS's build, unchanged since boot or
+    /// written this boot by a package transaction. On main a trusted load
+    /// left no R018 record: one trusted on a write the judge took for a
+    /// transaction's was silent.
+    #[test]
+    fn a_trusted_load_is_recorded_low_with_why() {
+        let r = rule();
+        for (flags, why) in [
+            (trust_flag::PACKAGE, "a verified package's file"),
+            (
+                trust_flag::PACKAGE | trust_flag::PKG_WRITTEN,
+                "written this boot by a package transaction",
+            ),
+            (trust_flag::DKMS, "DKMS's registered build (the content"),
+            (
+                trust_flag::DKMS | trust_flag::PKG_WRITTEN,
+                "DKMS's registered build, written this boot",
+            ),
+        ] {
+            let v = r
+                .evaluate(&ev(&judged(
+                    raw(MODULE_LOAD_FINIT, "modprobe", "dpkg", 0, TREE),
+                    kv::TRUSTED,
+                    flags,
+                )))
+                .unwrap_or_else(|| panic!("flags {flags}: recorded"));
+            assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+            assert!(
+                v.reasoning.contains("trusted by the kernel"),
+                "{}",
+                v.reasoning
+            );
+            assert!(v.reasoning.contains(why), "{flags}: {}", v.reasoning);
+            if flags & trust_flag::PKG_WRITTEN == 0 {
+                assert!(
+                    v.reasoning.contains("unchanged since boot"),
+                    "{}",
+                    v.reasoning
+                );
+            }
+        }
     }
 
     #[test]

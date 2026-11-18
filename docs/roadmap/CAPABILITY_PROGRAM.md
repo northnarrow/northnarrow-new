@@ -11700,6 +11700,35 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 370 — the pre-alpha's Phase 10 (final review) findings and two of
+  a cross-model check (C17, C18; no level change).**
+  - What was open: under `alpha` COMBAT's NEUTRALIZE signed
+    `combat_outcome` `success`, "N contained", for a kill that never ran
+    (F10-1, P1); a file of the FIM watch list absent at the start
+    (`/etc/ld.so.preload`, root's `authorized_keys`) appeared with no event
+    (F10-3); the module judge trusted any root write under a package
+    manager's lineage, a stopped one included, and a trusted load left no
+    R018 record (F10-2); the OOM killer could empty the agent's role on
+    demand, the successor's handle recorded Low (F10-4); weakening variables
+    from the service manager's environment were honoured (F10-5); R004's
+    root budget lowered Critical to High (F10-6); a program run as the
+    dynamic loader's operand escaped R001–R004 (05-3.3); a flood could push
+    archives out of the retention unseen (02-3.1).
+  - Done: a would-have is its own outcome (`would_have`) in the signed
+    rows, the journal and the status, with a ratchet; the nearest directory
+    of an absent list path is watched for its creation alone (writer named;
+    a creation seen only by the look is an event, writer unknown); the
+    write history names the package transaction, which must be live (not
+    stopped, traced or frozen at the write; holding its lock at the write,
+    read in the kernel by `module_lock_observe` on `file_lock`; writer
+    untainted), and every trusted load is Low; `OOMScoreAdjust=-999` for
+    both units (the host OOM killer's last pick; their memory caps kept)
+    and pinned at each start, a vacated role taken only by a
+    successor started for it, recorded High; the manager's weakening
+    variables ignored and signed; R004 not lowered, its budget signed; the
+    loader's operand judged as executed; a young eviction signed.
+  - Lab: not yet measured (the soak holds the guests until 19/11).
+
 - **Lot 369 — the pre-alpha's Phase 5 early triage: the soak's false
   positives on rc5 (C14, C16, C23; no level change).**
   - What was open (the first hours of the soak, Ubuntu 22.04/24.04 and

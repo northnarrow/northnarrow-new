@@ -297,6 +297,18 @@ pub const fn clean(how: Option<u8>, lost: bool) -> bool {
         }
 }
 
+/// Lot 370 (F10-2): a thread group into which no code was injected (nor
+/// into one it was forked from after it): no taint bit, its tgid not among
+/// the lost ones. A placement is no taint — a shell a desktop's user
+/// manager put in its scope is untainted, not clean.
+pub const fn untainted(how: Option<u8>, lost: bool) -> bool {
+    !lost
+        && match how {
+            None => true,
+            Some(h) => h & HOW_TAINT == 0,
+        }
+}
+
 /// Lot 281: the `how` a fork gives the child of a process marked `parent`:
 /// [`HOW_INHERITED`] if the parent does not run where it started, and the
 /// taint passed on.
@@ -851,5 +863,19 @@ mod tests {
         // a mark with no bit of either kind (none is written so) is clean
         assert!(clean(Some(0), false));
         assert!(!clean(Some(0), true));
+    }
+
+    /// Lot 370 (F10-2): untainted — a placement is not a taint, an injected
+    /// or inherited taint is, and a lost group is never untainted.
+    #[test]
+    fn untainted_is_the_taint_alone() {
+        assert!(untainted(None, false));
+        assert!(untainted(Some(HOW_MOVED), false));
+        assert!(untainted(Some(HOW_INHERITED), false));
+        assert!(!untainted(Some(HOW_MOVED | HOW_INJECTED), false));
+        assert!(!untainted(Some(HOW_TAINT_INHERITED), false));
+        assert!(!untainted(None, true));
+        // clean is stricter: a placement is not clean
+        assert!(!clean(Some(HOW_MOVED), false));
     }
 }

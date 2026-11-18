@@ -120,6 +120,11 @@ pub fn main() -> Result<()> {
     {
         std::process::exit(nn_linux::anti_tamper::pin_lock::step_main());
     }
+    // Lot 370 (F10-5): a weakening variable the service manager's
+    // environment gave (`systemctl set-environment`, no key), not the
+    // unit, is ignored before anything reads it — the command line's
+    // `env =` arguments included (one thread here).
+    let _ = nn_linux::self_integrity::ignore_manager_weakening("northnarrow-agent.service");
     let cli = Cli::parse();
     if cli.build_features {
         let features = northnarrow_agent::build_info::build_features();
