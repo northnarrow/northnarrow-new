@@ -71,7 +71,7 @@ clap = { version = "4", features = ["derive", "env"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 # eBPF userland
-aya = "0.14"
+aya = "0.16"
 
 # Wave 4 restructure, R00 (lab PR 239): the lint levels the members share.
 # The Kani proofs live behind cfg(kani) (Tappa 10.8) and move with their
