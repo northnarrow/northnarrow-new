@@ -16,7 +16,7 @@ publish = false
 # the detection budget moved here; they judge `nn_model::Event`s and lock
 # with parking_lot, the agent's version.
 nn-model = { workspace = true }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # R08b (lab PR 251): the engine names the parts of a detection record it
 # reads (`detection_payload`: a rule's sensors, ATT&CK tags, the actor).
 nn-evidence = { workspace = true }
