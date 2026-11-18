@@ -43,7 +43,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           program, a `go generate` command, a file dropped in a `go-build` \
                           directory), root's and a service account's build output, and the same \
                           file run by a shell, by another parent or by a `go` in a home are \
-                          judged as above.",
+                          judged as above. Lot 372: Go 1.21 and later pass the linker a long \
+                          `-X=runtime.godebugDefault=…`, so the sensor cuts its argv; a cut \
+                          argv names the output only in the `go` command's own shape (`link -o \
+                          <target> -importcfg …`, no other output option among the arguments \
+                          kept).",
         how_to_test: "As a system account: `sudo -u www-data sh -c 'cp /bin/true /tmp/nn-r001 \
                       && /tmp/nn-r001'` (killed); as the lab user, the same is recorded at High. \
                       Run as root it is R009's verdict.",
@@ -53,6 +57,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/tests.rs::go_test_and_go_run_built_by_the_packaged_go_are_recorded_low",
             "crates/nn-core/src/decision/tests.rs::a_program_go_only_launches_from_a_go_build_dir_stays_judged",
             "crates/nn-core/src/decision/tests.rs::a_service_account_s_or_root_s_go_build_output_stays_judged",
+            "crates/nn-core/src/decision/tests.rs::go_test_and_go_run_with_a_cut_link_argv_are_recorded_low",
+            "crates/nn-core/src/decision/tests.rs::a_cut_link_argv_outside_go_s_own_shape_stays_judged",
             "crates/nn-linux/src/sensors/app_image.rs::an_appimage_program_is_its_image_s",
             "agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp",

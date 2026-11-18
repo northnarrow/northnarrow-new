@@ -2481,7 +2481,26 @@ pub fn encrypts(exe: &Path, argv: &[String]) -> bool {
 /// `-o <path>` or `-o=<path>` (`--o` too: Go's flag syntax); `None`
 /// for none, or for more than one (the last would win: `-ldflags` passed
 /// after `go`'s own `-o`).
-pub fn go_link_output(argv: &[String]) -> Option<&str> {
+///
+/// Lot 372 (the rc7 soak on Ubuntu 26.04: `go test` and `go run` at R001
+/// High): `cut`, the sensor kept only the argv's first bytes (external
+/// audit EBPF-021: `wire::ARGV_LEN - 1`, the last argument kept may itself
+/// be cut). Since Go 1.21 `go` passes its linker
+/// `-X=runtime.godebugDefault=…`, every GODEBUG changed since the main
+/// module's `go` line — 524 bytes for a `go 1.18` module on Go 1.26, 339 on
+/// Go 1.24 — so a link's argv passes the buffer and lot 369 noted no link.
+/// A cut argv is read only in the `go` command's own shape (`cmd/go`'s `ld`
+/// since Go 1.10: `link -o <target> -importcfg <file> …`): `-o` the first
+/// argument, its target whole (`-importcfg` follows it), and no other
+/// output option among the arguments kept, nor a last one that may be one
+/// cut short ([`go_link_output_cut`]); the target's own layout is the
+/// caller's check. The cut hides `go`'s own later flags
+/// and the user's `-ldflags` after them: a second `-o` there is the user's
+/// own build flag, as a module of their own is their own code.
+pub fn go_link_output(argv: &[String], cut: bool) -> Option<&str> {
+    if cut {
+        return go_link_output_cut(argv);
+    }
     let mut out = None;
     let mut n = 0;
     let mut args = argv.iter().skip(1);
@@ -2498,6 +2517,24 @@ pub fn go_link_output(argv: &[String]) -> Option<&str> {
         }
     }
     out.filter(|_| n == 1)
+}
+
+/// Lot 372: [`go_link_output`] of an argv the sensor cut — the target of
+/// `link -o <target> -importcfg …`, the `go` command's own shape; `None`
+/// for any other shape, for another output option among the arguments
+/// kept (`-o`, `-o=`, `--o`, `--o=`), or for a last argument kept that a
+/// cut may have made of one (`-`, `--`).
+fn go_link_output_cut(argv: &[String]) -> Option<&str> {
+    let [_, o, out, importcfg, rest @ ..] = argv else {
+        return None;
+    };
+    let output_option =
+        |a: &str| matches!(a, "-o" | "--o") || a.starts_with("-o=") || a.starts_with("--o=");
+    let shape = o == "-o" && importcfg == "-importcfg";
+    let last_cut_short = rest
+        .last()
+        .is_some_and(|a| matches!(a.as_str(), "-" | "--"));
+    (shape && !last_cut_short && !rest.iter().any(|a| output_option(a))).then_some(out.as_str())
 }
 
 /// The first argument that is not an option, at `at`: the script; after a

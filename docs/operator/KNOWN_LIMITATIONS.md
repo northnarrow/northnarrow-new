@@ -666,9 +666,26 @@ lists the known false positives of each rule.
   (`NN-L-AT-001`). *Evidence:* lots 340 and 344; internal check Phase 2b
   §4.2.
 - **Container runtimes**: see "Containers" below.
-- **Builds and tests that run from `/tmp`.** `go test`, `go run`, or a
-  build that runs what it unpacked in `/tmp`, are `R001_ExecFromTmp` High.
-  *Evidence:* lot 346.
+- **Builds and tests that run from `/tmp`.** A build that runs what it
+  unpacked in `/tmp` is `R001_ExecFromTmp` High (a person's; the kill held
+  below COMBAT). A person's `go test` and `go run` with the packaged `go`
+  (`/usr/lib/go-<version>`, `/usr/lib/go`, `/usr/local/go`, the snap) are
+  recorded Low (lot 369; lot 372 for Go 1.21 and later, whose link command
+  the sensor reads cut). Still High, by design:
+  - a `go` outside those trees — one a `GOTOOLCHAIN` switch downloads into
+    the module cache (`~/go/pkg/mod/golang.org/toolchain@…`), one unpacked
+    in a home — and its build output: the agent knows the packaged
+    toolchain only;
+  - a link whose arguments pass 30 KiB (`go` then hands the linker a
+    response file, `@file`, whose `-o` the agent does not read);
+  - `go run` with `GOCACHE` under `/tmp` or `/var/tmp`: from Go 1.24 a
+    program already in the build cache runs from the cache itself, not
+    from the work directory, and is judged as any exec from there (with
+    the default `GOCACHE`, in the home, it is no staging exec at all).
+  A person's own `-ldflags` naming a second `-o` past the bytes the sensor
+  keeps, or a build cache the user poisons with their own code, is the
+  user running their own code — Low by design, as a module of their own.
+  *Evidence:* lots 346, 369 and 372.
 - **npm installed with nvm or in a home directory.** It is not exempt:
   `npm ci` there can raise the posture to ENGAGED. *Evidence:* lot 346.
 - **Desktop sessions.** Services started by a user's systemd manager are

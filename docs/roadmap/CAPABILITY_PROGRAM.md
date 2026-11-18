@@ -11700,6 +11700,26 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 372 — the rc7 soak on Ubuntu 26.04: `go test` and `go run` on Go
+  1.21 and later (C14, C16; no level change).**
+  - What was open: on Ubuntu 26.04 (Go 1.26) a person's `go test` test
+    binary and `go run` program were R001 High (a would-have kill in
+    ENGAGED), Low on Ubuntu 22.04 (Go 1.18) as lot 369 meant. The brief's
+    hypothesis, Go 1.24's executable cache, did not hold: `cmd/go` runs a
+    cached `go run` program from `GOCACHE` itself and caches no test
+    binary; the soak's paths were link outputs. The cause: Go 1.21 and
+    later pass the linker `-X=runtime.godebugDefault=…` (524 bytes for the
+    corpus's `go 1.18` module on Go 1.26), the link's argv passes the
+    sensor's 511 bytes, and lot 369 read the output of a whole argv only.
+  - Done, by identity: a cut link argv names its output only in the `go`
+    command's own shape (`link -o <target> -importcfg …`, no other output
+    option among the arguments kept, no last one a cut may have made of
+    one); every other fact of lot 369 unchanged. Tests
+    `go_test_and_go_run_with_a_cut_link_argv_are_recorded_low` (fails on
+    main), `a_cut_link_argv_outside_go_s_own_shape_stays_judged`,
+    `a_cut_link_argv_names_its_output_only_in_the_go_command_s_shape`;
+    mutation 13/13 caught.
+  - Lab: pending.
 - **Lot 370 — the pre-alpha's Phase 10 (final review) findings and two of
   a cross-model check (C17, C18; no level change).**
   - What was open: under `alpha` COMBAT's NEUTRALIZE signed

@@ -1421,16 +1421,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             (image, fork_parent, exec_file, exe.has(USER_IMAGE)),
         );
         // lot 369 (the review of #576, F1): the packaged go's linker, and
-        // the file it was run to write
-        if !*argv_truncated {
-            self.note_go_link(
-                *pid,
-                *timestamp_ns,
-                Path::new(path),
-                argv,
-                image.is_some() && inline,
-            );
-        }
+        // the file it was run to write; lot 372: also from an argv the
+        // sensor cut, in the go command's own shape only
+        self.note_go_link(
+            *pid,
+            *timestamp_ns,
+            Path::new(path),
+            (argv, *argv_truncated),
+            image.is_some() && inline,
+        );
         let _ = filename;
         true
     }
@@ -1440,7 +1439,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `<GOROOT>/pkg/tool/<os>_<arch>/link` of a `GOROOT` whose `bin/go` is
     /// the packaged `go`), its image in a root-only system tree,
     /// run as itself, with exactly one output
-    /// ([`crate::posture::script_args::go_link_output`], argv whole)
+    /// ([`crate::posture::script_args::go_link_output`]: of the argv whole,
+    /// or — lot 372, `cut`: Go 1.21 and later pass a long
+    /// `-X=runtime.godebugDefault=…` — of a cut one in the `go` command's
+    /// own shape, `link -o <target> -importcfg …`)
     /// in a work directory's layout ([`in_go_work_dir`]); and the process
     /// that forked it, the one hop above, ran that `GOROOT`'s `go` (its
     /// exec seen with its image, run as itself) before the fork. Then that
@@ -1448,14 +1450,21 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// ([`Self::runs_go_linked_output`]). A link run by a `-toolexec`
     /// program, by a shell or by another toolchain's `go`, two outputs, an
     /// output elsewhere: nothing noted.
-    fn note_go_link(&self, pid: u32, ts: u64, exe: &Path, argv: &[String], rooted_inline: bool) {
+    fn note_go_link(
+        &self,
+        pid: u32,
+        ts: u64,
+        exe: &Path,
+        (argv, cut): (&[String], bool),
+        rooted_inline: bool,
+    ) {
         let Some(goroot) = go_linker_root(exe) else {
             return;
         };
         if pid <= 1 || !rooted_inline {
             return;
         }
-        let Some(out) = go_link_output(argv).filter(|o| in_go_work_dir(o)) else {
+        let Some(out) = go_link_output(argv, cut).filter(|o| in_go_work_dir(o)) else {
             return;
         };
         let go = Path::new(goroot).join("bin/go");
@@ -5286,7 +5295,7 @@ mod tests {
             &["link", "--o", out],
             &["link", "--o=/tmp/go-build1/b001/exe/a"],
         ] {
-            assert_eq!(go_link_output(&a(v)), Some(out), "{v:?}");
+            assert_eq!(go_link_output(&a(v), false), Some(out), "{v:?}");
         }
         for v in [
             &["link", "/m.a"][..],
@@ -5296,7 +5305,7 @@ mod tests {
             &["link", "-o", out, "-o"],
             &["-o", out],
         ] {
-            assert_eq!(go_link_output(&a(v)), None, "{v:?}");
+            assert_eq!(go_link_output(&a(v), false), None, "{v:?}");
         }
         // bounded: the oldest link is forgotten first
         let proc = TempDir::new().unwrap();
@@ -5358,6 +5367,74 @@ mod tests {
         assert!(
             !t.runs_go_linked_output(2002, AsOf::judged(5 * S), &output(1)),
             "another go process"
+        );
+    }
+
+    /// Lot 372 (the rc7 soak on Ubuntu 26.04): an argv the sensor cut (Go
+    /// 1.21 and later pass the linker a long `-X=runtime.godebugDefault=…`)
+    /// names the link's output only in the `go` command's own shape —
+    /// `link -o <target> -importcfg …`, no other output option among the
+    /// arguments kept, no last one a cut may have made of one. Any other
+    /// shape of a cut argv names none; a whole argv is read as before.
+    #[test]
+    fn a_cut_link_argv_names_its_output_only_in_the_go_command_s_shape() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let out = "/tmp/go-build1/b078/calc.test";
+        let cfg = "/tmp/go-build1/b078/importcfg.link";
+        for v in [
+            &["link", "-o", out, "-importcfg"][..],
+            &["link", "-o", out, "-importcfg", cfg],
+            &[
+                "link",
+                "-o",
+                out,
+                "-importcfg",
+                cfg,
+                "-X=runtime.godebugDefault=asy",
+            ],
+            &[
+                "link",
+                "-o",
+                out,
+                "-importcfg",
+                cfg,
+                "-buildmode=exe",
+                "-bui",
+            ],
+        ] {
+            assert_eq!(go_link_output(&a(v), true), Some(out), "{v:?}");
+        }
+        for v in [
+            &["link", "-o", out][..],
+            &["link", "-o", "/tmp/go-build1/b078/ca"],
+            &["link", "-importcfg", cfg, "-o", out],
+            &[
+                "link",
+                "-o=/tmp/go-build1/b078/calc.test",
+                "-importcfg",
+                cfg,
+            ],
+            &["link", "--o", out, "-importcfg", cfg],
+            &["link", "-o", out, "-buildmode=exe", "-importcfg", cfg],
+            &["link", "-o", out, "-importcfg", cfg, "-o", "/elsewhere"],
+            &["link", "-o", out, "-importcfg", cfg, "-o"],
+            &["link", "-o", out, "-importcfg", cfg, "-o=/elsewhere", "-s"],
+            &["link", "-o", out, "-importcfg", cfg, "--o", "/elsewhere"],
+            &["link", "-o", out, "-importcfg", cfg, "--o=/elsewhere"],
+            &["link", "-o", out, "-importcfg", cfg, "-"],
+            &["link", "-o", out, "-importcfg", cfg, "--"],
+            &["-o", out, "-importcfg"],
+            &["link", "-o"],
+        ] {
+            assert_eq!(go_link_output(&a(v), true), None, "{v:?}");
+        }
+        // a whole argv is read as before: one output anywhere
+        let whole = a(&["link", "-importcfg", cfg, "-o", out, "/m.a"]);
+        assert_eq!(go_link_output(&whole, false), Some(out));
+        assert_eq!(
+            go_link_output(&whole, true),
+            None,
+            "not the go command's shape"
         );
     }
 
