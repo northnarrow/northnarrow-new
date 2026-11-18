@@ -414,6 +414,15 @@ pub enum Launch {
     /// sets, so the agent's effective set lacks them (a unit's
     /// `CapabilityBoundingSet=` without them).
     SudoWithout(&'static [&'static str]),
+    /// Lot 370 (F10-4; the re-check of #578): as a transient service of
+    /// PID 1 (`systemd-run`, through the real sudo) — the agent a child of
+    /// PID 1, as its unit's restart starts it: the one start that may take
+    /// the role a previous agent vacated this boot while the BPF guard
+    /// enforces (one started from a shell gets no handle on the pins then,
+    /// by design). Its standard streams are the command's (`--pipe`), its
+    /// standard input none; `systemd-run` waits for it (`--wait`) and is the
+    /// child the test holds — the agent's pid is in its pid file.
+    Unit,
 }
 
 /// The agent of this build: `CARGO_BIN_EXE_northnarrow-agent` in the
@@ -581,6 +590,28 @@ impl InstalledAgent {
                 for (k, v) in env {
                     c.env(k, v);
                 }
+                c
+            }
+            Launch::Unit => {
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let mut c = Command::new(SUDO);
+                c.args([
+                    "systemd-run",
+                    "--quiet",
+                    "--wait",
+                    "--pipe",
+                    "--collect",
+                    "--service-type=exec",
+                ])
+                .arg(format!("--unit=nn-e2e-agent-{}-{ns}", std::process::id()));
+                for (k, v) in env {
+                    c.arg(format!("--setenv={k}={v}"));
+                }
+                c.arg("--").arg(&self.path);
+                c.stdin(std::process::Stdio::null());
                 c
             }
             Launch::SudoWithout(caps) => {

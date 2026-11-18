@@ -21,7 +21,8 @@ and hands the same value to every response path and deny switch it arms:
 | Path | `enforcing` | `alpha` |
 |---|---|---|
 | Response executor: kill, tree kill, quarantine, per-process egress block, throttle, file-capability strip | carried out | `WouldExecute`; the record reads `would have: <action>` |
-| COMBAT network isolation (and its egress release) | applied | not applied, recorded |
+| COMBAT NEUTRALIZE (tree kill and quarantine of the offenders) | carried out; `combat_outcome` `success` when every offender is contained | nothing killed or quarantined; `combat_outcome` reads `would_have: detect-only: would have contained N …`, each offender `contained: false`, `would_have: true` (lot 370) |
+| COMBAT network isolation (and its egress release) | applied | not applied; `combat_outcome` `would_have` |
 | Exec quarantine (`--exec-quarantine enforce`): holds before the first instruction, kills, vaults | enforced | observe mode: nothing held, "would refuse" recorded |
 | Exec quarantine: a kill an earlier enforcing run owed (a process left stopped) | killed | resumed; the boot's record lists it as `would_have_killed` |
 | Exec policy (`--exec-policy enforce`): exec / preload / mmap denies | denied | audit mode: recorded, not denied |
@@ -51,7 +52,7 @@ coordinator's corrected decision of 13/11/2026 puts them back.)
 | A write to its units' cgroup files (`cgroup.kill`, `cgroup.freeze`, limits) | they kill or freeze it |
 | A BPF operation on the agent's **own** programs, maps and links: a handle on one by id or through its pin (`bpftool map/prog/link … id`, `BPF_OBJ_GET`), a map update or delete, a link detach or replacement | they detach its hooks or rewrite its configuration |
 | A foreign BPF load of the nine refused types — tracing (`kprobe`, `tracepoint`, `perf_event`, `raw_tracepoint`, `tracing`: `bpftrace`, BCC and libbpf tools, another EDR), `raw_tracepoint_writable`, `struct_ops`, `ext`, `lsm` — outside the signed per-loader opt-out (§1.2) | `bpf_send_signal` kills the agent and its watchdog with a signal the `task_kill` hook never sees (the kernel checks no permission for it), at every restart; `bpf_probe_write_user` rewrites its memory; a foreign LSM program refuses its operations |
-| An untrusted kernel module (the module-load judge, R018: `init_module`, `finit_module`) — outside the signed policy's `module-allow` lines or a mode other than `enforce` for R018 | a module can do anything to the agent |
+| An untrusted kernel module (the module-load judge, R018: `init_module`, `finit_module`) — outside the signed policy's `module-allow` lines or a mode other than `enforce` for R018. A module file written since boot is trusted only when a live package transaction wrote it (its package manager holding its lock, not stopped; lot 370); every trusted load is recorded, Low, with why | a module can do anything to the agent |
 | A kexec image (`kexec -l`) | a kernel booted without the agent's hooks |
 | The sysctl guard (`kernel.ftrace_enabled`, `kernel.sched_rt_*`, overcommit, `pid_max`, `threads-max`, `max_map_count`) — its write deny, its `cgroup/sysctl` judge, and the integrity round's and a window's close's put-back of a harmful value; a `cgroup/sysctl` program attached to the root cgroup | `kernel.ftrace_enabled=0` silences the BPF trampolines — every deny hook of the agent among them, on 6.0 to 7.2 — and then a plain `kill -9` reaches it; the other values abort or starve it; a root `cgroup/sysctl` program runs after the guard and rewrites what it judged |
 | The kprobes switch (`/sys/kernel/debug/kprobes/enabled`) and the lockdown file (`/sys/kernel/security/lockdown`) | `0` disarms every kprobe of the agent; lockdown takes the kernel-memory helpers from its programs |

@@ -518,8 +518,25 @@ pub fn quit_agent(child: &mut Child) {
 /// it as a tamper attempt by this test process, which an enforcing agent
 /// answers (COMBAT, then the runner is killed).
 pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String> {
+    try_quit_agent_with(child, &[], timeout)
+}
+
+/// [`try_quit_agent`], `also` evicted and signalled with the tree — lot 370
+/// (the re-check of #578): an agent started as a transient service
+/// (`Launch::Unit`) is PID 1's child, outside the tree of the
+/// `systemd-run` the test holds; its pid (from its pid file) is given here.
+pub fn try_quit_agent_with(
+    child: &mut Child,
+    also: &[u32],
+    timeout: Duration,
+) -> Result<(), String> {
     let root = child.id();
     let mut known = process_tree(root);
+    for p in also {
+        if !known.contains(p) {
+            known.push(*p);
+        }
+    }
     let deadline = Instant::now() + timeout;
     let mut eviction: Result<(), String>;
     let mut refused: Option<(u32, std::io::Error)>;

@@ -4655,7 +4655,8 @@ its verdict.
   NN-L-FIM-007 (Debian 13). Such paths are looked at with the renamed-away ones, and watched as paths of the list once there (an
   operator's re-baseline queues the paths it finds absent too). Residual,
   said: the path's own appearance is not reported (a package makes most
-  such paths, and the look does not know its writer), nor may a file made together with it be.
+  such paths, and the look does not know its writer), nor may a file made together with it be (lot 370: a file of the list
+  itself is now reported when created, §58).
 - **Not changed:** NN-L-NET-019 for `pg_createcluster`'s port probe (a
   wildcard listener of a root-run packaged script: telling it from a
   backdoor needs more than its identity gives); every kill and every
@@ -4664,3 +4665,136 @@ its verdict.
   `go` (Low in every posture, COMBAT included; below COMBAT it was held
   already). A `go test` binary that connects out still meets
   NN-L-CHAIN-002/005 (Critical): the chains judge every staged exec.
+
+## 58. Would-have outcomes, watched files created later, live package transactions, the agent's role (lot 370)
+
+The pre-alpha's final review (Phase 10) and a cross-model check found
+records that said more than happened, and moments a root could choose that
+left too little trace.
+
+- **A would-have is its own outcome.** Under the `alpha` profile (and
+  `--detect-only`) COMBAT's NEUTRALIZE kills and quarantines nothing. Its
+  signed `combat_outcome` row read `result: success` ("N offender(s)
+  handled: N contained") and the journal "threat NEUTRALIZED and verified
+  contained". The row now reads `would_have: detect-only: would have
+  contained N offender(s) …`; each offender is `contained: false` with
+  `would_have: true`; ISOLATE under the gate is a `would_have` row, not a
+  `failure`. The copy-on-first-write guard is no longer told the offenders
+  were contained. The journal says "would have NEUTRALIZED … nothing was
+  killed or quarantined", `nn-admin status` adds "detect-only: decided,
+  not carried out" to the COMBAT stage, and a rule response's journal line
+  reads `NOT EXECUTED (detect-only: would have)` instead of `EXECUTED`. A
+  reader keyed on `result == "success"` sees no change for an enforcing
+  install; one that counted every `combat_outcome` as an action now has a
+  third result to read.
+- **A file of the FIM watch list absent at the start is reported when it
+  is created.** `/etc/ld.so.preload` (NN-L-FIM-022) and root's
+  `authorized_keys` (NN-L-FIM-004), absent on most hosts, were watched once
+  created, the creation itself unreported (§57). The nearest directory
+  there of each such path is now watched for that path's creation alone:
+  the record names its writer and is judged as a change of the file (a
+  package manager's write as a package manager's). A file found with no
+  record of its creation (made in a directory created within the second
+  before) is an event at the next look, its writer unknown. Any other file
+  created in that directory (`/etc`, `/root`) is no event and is not
+  watched. Expect a FIM record when a package or an administrator creates
+  a file of the list for the first time.
+- **The module-load judge trusts a live package transaction only.** A
+  module file written in the running kernel's tree since boot was trusted
+  when any root process descending from a package manager wrote it — a
+  stopped `apt`, a pager `dpkg -l` started — and the load left no R018
+  record. The write is now a transaction's only when, at the write, the
+  package manager was not stopped or traced (nor frozen by the system's
+  freezer; one a cgroup's freezer holds is in an ordinary wait and still
+  vouches) and the writer had no code injected, and when that package
+  manager held its lock (dpkg's,
+  apt's front end, rpm's) at the write — read in the kernel by a new
+  observer (`module_lock_observe` on `file_lock`, pinned in the pin root
+  like the module-load hooks; the locks it keeps are pinned with the
+  history), so a `dpkg -i` shorter than any poll is a transaction too; if
+  that observer cannot attach (a signed observe failure) the agent samples
+  the locks instead; otherwise it is judged as a write outside a
+  transaction (DKMS's build: let through, R018 High; a package's file
+  elsewhere: refused). Every load the kernel trusts is recorded by R018,
+  Low, with why it was trusted — expect one Low record per module load
+  after the agent's start. The kernel reads two more `task_struct` fields
+  (`__state`, `start_boottime`): without either, no write is a
+  transaction's and the judge records instead of refusing (a signed
+  degradation). The pinned write history has a new layout (its value, and
+  a third map): the first start
+  of this release does not adopt an earlier agent's history (modules
+  changed since boot before it are let through and recorded High, as
+  after any reset). Root can keep such a transaction open, or start one
+  around writes of its own: those modules are trusted and recorded Low,
+  with why.
+- **The host's OOM killer picks the agent and the watchdog last.** Both
+  units set `OOMScoreAdjust=-999` (they were -500 and -900), and each
+  process writes it again at its start; the self-integrity check expects
+  -999 on every host (the raise to 0 where the memory cap cannot bind,
+  external audit DEP-005, is gone). Not -1000, which would also exempt them
+  from their own memory cgroup's OOM: a leak past the agent's `MemoryMax`
+  (kept, 11G) ends in its cgroup's OOM kill and a restart by the watchdog;
+  on a host with less memory than the cap, the cap cannot bind, and a
+  leaking agent outlives every other process (the workload and `sshd`
+  included), which the OOM killer picks first. A drop-in that sets a
+  higher value is judged harmful. A role (the agent's, the watchdog's)
+  whose holder exited this boot is taken only by a successor started for
+  it — by PID 1 or by the other role's holder, with no code injected — and
+  the taking is recorded NN-L-BPF-002: High outside a signed
+  trusted-installer window, Low inside one (an upgrade's restart); a first
+  start of the boot stays Low. The review of #578 (N2): the agent's own
+  successor's record was never delivered — its handles on the pins are
+  taken by its object's load, judged by the previous agent's pinned hook,
+  whose ring nobody reads once that agent is gone (no NN-L-BPF-002 of any
+  kind after a restart). The successor now records it at its start from
+  the same kernel facts (the role its holder left, the window open or
+  not): expect one NN-L-BPF-002 High under the agent's new pid after an
+  OOM kill or a crash, one Low after an upgrade's restart. The watchdog's
+  successor is recorded by the live agent's hook, as before.
+- **Smaller ones.**
+  - A program run as the dynamic loader's operand, or a library it
+    preloads (`--preload`, `--audit`), is judged by R001–R004 as if the
+    kernel had executed it (`/tmp`, `/dev/shm`, `/var/tmp`, a descriptor's
+    link or a memfd); one named relative to the caller's directory is
+    recorded (R001, Medium) without a response. The review of #578 (N1):
+    one named through a link of `/proc` (the process's root, its working
+    directory, a descriptor) is placed by the file the loader maps — the
+    exec pump opens the link in the process's own view and finds the file
+    among those the process maps — and judged as a direct exec of it; not
+    placed, a descriptor's link is R004's and any other such name R001's
+    record. The review of #578 (P3): a loader that only lists or checks
+    its program (`--list`, `--verify`, `LD_TRACE_LOADED_OBJECTS` in its
+    environment, musl's loader as `ldd`, glibc's `ldd` script its parent)
+    is never killed for it (`ldd /tmp/x` was R001's kill); an `--audit`
+    library stays judged. Its re-check (R1-1): glibc's list and trace modes
+    still run the libraries the program names for auditing (`DT_AUDIT`,
+    `DT_DEPAUDIT`; its own constructor when it names itself), so a
+    staged program glibc lists is never recorded Low (round 3, R2-1: what
+    the pump reads can differ from what the loader maps once code has run):
+    naming an auditor as the pump read it, it is judged as run (the kill);
+    otherwise Medium, never killed and never said to run nothing. `--verify` and
+    musl's `ldd` stay Low; musl's loader under `LD_TRACE_LOADED_OBJECTS`
+    runs the program and is judged as run. The re-check (R1-2): any other
+    absolute operand is also judged where the pump finds the file the
+    loader maps, through symbolic links (`/usr/tmp` → `/var/tmp`).
+    The pump's waits for the mapping (R1-3) are root's own 50 ms a
+    second and 25 ms for each other account, 50 ms for all of them
+    together (one budget for the host before).
+  - A variable that weakens the agent, set in the service manager's
+    environment rather than in the agent's unit, is removed at the agent's
+    start and signed (`weakening_env_ignored`) — when the agent can ask the
+    service manager (`systemctl`, 2 s); when it cannot, it is honoured and
+    signed `weakening_env`, as before.
+  - R004's verdict on root's container runtime's sealed copy not compared
+    (the compare budget spent, every other fact holding) stays High,
+    recorded, never killed (the review of #578, N3: the lot's first head
+    made it the Critical kill, and a host starting more than ~17
+    containers a second would have had them killed under `enforcing`);
+    the first of each episode of a spent budget names the uid whose share
+    ran out and the second's biggest spender, and the budget spent is
+    signed (`runtime_copy_compare`, naming the uid). Another uid's stays
+    the Critical kill.
+  - An archive of a signed log removed by the retention less than a day
+    after its seal is a signed degradation (`chain_early_eviction`): a
+    flood of records, a user's included, can push the oldest from the host;
+    the export keeps a copy.

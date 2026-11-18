@@ -636,6 +636,12 @@ const STATICS: &[Kept] = &[
         "lot 285: from when the one eBPF object's write history covers every write, set by its attach and read by the module-load judge's controller thread",
     ),
     kept(
+        "crates/nn-linux/src/module_writes.rs",
+        "LOCKS_OBSERVED",
+        Kernel,
+        "lot 370: whether the one eBPF object's package-locks observer attached, set by its attach and read by the module-load judge's controller thread (which then tells the kernel and samples the locks itself)",
+    ),
+    kept(
         "agent/src/module_trust/mod.rs",
         "DESIRED",
         Kernel,
@@ -724,6 +730,16 @@ const STATICS: &[Kept] = &[
          host's packaged systemd-update-utmp in its unit's own cgroup, read while the writer \
          ran, which NN-L-FIM-019 judges the write on (one host; keyed by write, bounded, the \
          oldest out first)",
+    ),
+    kept(
+        "crates/nn-linux/src/sensors/loader_files.rs",
+        "MAP_WAITS",
+        HostFact,
+        "the review of #578 (N1, re-check R1-3): the waits the exec pump's reads of a \
+         dynamic loader's mappings may spend in the current second — root's own, each other \
+         account's share, all of them together (one host, one exec pump): a flood of loaders \
+         that never map their program slows the pump by that much at most, and no uid spends \
+         root's waits or another account's",
     ),
     kept(
         "crates/nn-linux/src/program_images.rs",

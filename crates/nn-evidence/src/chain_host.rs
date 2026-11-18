@@ -187,6 +187,15 @@ pub trait ChainHost: 'static {
     /// in `nn-admin status`, signed in the audit chain). Default: nothing.
     fn retention_stalled(_active: &Path, _why: Option<&str>) {}
 
+    /// Lot 370 (02-3.1): the retention of the rotating log whose active file
+    /// is `active` removed archive `seq`, kept `age` since its seal (`None`:
+    /// unread). The retention is by size alone: a flood of records — a
+    /// user's included — drops the oldest archives as fast as it fills
+    /// them; each removal is signed in the manifest, its content gone from
+    /// the host. The host makes a young removal seen (the agent: a signed
+    /// degradation while removals stay young). Default: nothing.
+    fn archive_evicted(_active: &Path, _seq: u64, _age: Option<std::time::Duration>) {}
+
     /// Lot 353 (the review of #563, F1): the appends of the signed log
     /// `path` fail (`Some(why)`: the row is not on the disk) or succeed
     /// again (`None`) — told by its writer at each change. A signing chain

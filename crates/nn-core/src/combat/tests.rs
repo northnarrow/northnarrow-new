@@ -23,9 +23,9 @@ use nn_model::posture_types::TriggerType;
 use nn_model::Event;
 
 use super::actuator::{
-    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
+    CombatActuator, Containment, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
 };
-use super::evidence::{ActionOutcome, LadderEvidence, StageTransition, Unrecorded};
+use super::evidence::{ActionOutcome, LadderEvidence, OutcomeResult, StageTransition, Unrecorded};
 use super::host::{Capture, CombatHost};
 use super::offender::ProcFacts;
 use super::{CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason};
@@ -237,7 +237,11 @@ impl LadderEvidence for MockEvidence {
         self.rec.push(format!(
             "outcome:{}:{}",
             o.stage.as_str(),
-            if o.success { "success" } else { "failure" }
+            match o.result {
+                OutcomeResult::Success => "success",
+                OutcomeResult::WouldHave => "would_have",
+                OutcomeResult::Failure => "failure",
+            }
         ));
         Ok(())
     }
@@ -1534,7 +1538,7 @@ impl CombatActuator<TestHost> for FirstUncontained {
             .push(format!("neutralize:{:?}", pids_of(offenders)));
         let mut report =
             NeutralizeReport::uniform(&pids_of(offenders), &NeutralizeOutcome::Contained);
-        report.offenders[0].contained = false;
+        report.offenders[0].containment = Containment::NotContained;
         report.offenders[0].kill = "kill outcome PermissionDenied { errno: 1 }".to_string();
         report
     }
@@ -1574,7 +1578,7 @@ fn neutralize_signs_an_outcome_for_every_offender() {
         .iter()
         .find(|o| o.stage == CombatStage::Neutralize)
         .expect("a signed NEUTRALIZE outcome");
-    assert!(!n.success);
+    assert!(!n.success());
     assert_eq!(n.action, "kill+quarantine");
     let rows = n.detail["offenders"].as_array().unwrap();
     assert_eq!(rows.len(), 3, "{:?}", n.detail);
@@ -1592,7 +1596,7 @@ fn neutralize_signs_an_outcome_for_every_offender() {
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
     assert!(outcomes
         .iter()
-        .any(|o| o.stage == CombatStage::Isolate && o.success));
+        .any(|o| o.stage == CombatStage::Isolate && o.success()));
 }
 
 /// A ladder whose isolations report `plan` in order (then success).
@@ -1661,7 +1665,7 @@ fn a_failed_isolate_is_not_done_and_is_retried() {
         let o = ev.0.lock();
         let last = o.last().unwrap();
         assert_eq!(last.stage, CombatStage::Isolate);
-        assert!(!last.success);
+        assert!(!last.success());
         assert!(last.summary.contains("attempt 1 of 3"), "{}", last.summary);
         assert!(last.summary.contains("IPv4: FAILED"), "{}", last.summary);
         assert_eq!(last.detail["retry_in_secs"], 5);
@@ -1678,7 +1682,7 @@ fn a_failed_isolate_is_not_done_and_is_retried() {
     l.tick(t1 + Duration::from_secs(15));
     assert_eq!(isolates(&rec), 3);
     let last = ev.0.lock().last().unwrap().clone();
-    assert!(last.success, "{}", last.summary);
+    assert!(last.success(), "{}", last.summary);
     assert!(last.summary.contains("attempt 3 of 3"), "{}", last.summary);
     for s in [30, 60, 120] {
         l.tick(t1 + Duration::from_secs(s));
@@ -1710,7 +1714,7 @@ fn isolate_retries_are_bounded() {
         .filter(|x| x.stage == CombatStage::Isolate)
         .collect();
     assert_eq!(isolate.len(), 3);
-    assert!(isolate.iter().all(|x| !x.success));
+    assert!(isolate.iter().all(|x| !x.success()));
     assert!(
         isolate[2].detail["retry_in_secs"].is_null(),
         "no further retry"
@@ -1737,7 +1741,7 @@ fn an_unavailable_family_is_a_hole_not_a_success() {
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
     let o = ev.0.lock();
     let last = o.last().unwrap();
-    assert!(!last.success, "an IPv6 hole is not a success");
+    assert!(!last.success(), "an IPv6 hole is not a success");
     assert!(
         last.summary.contains("IPv6: unavailable"),
         "{}",
@@ -1764,7 +1768,7 @@ fn an_isolation_not_applied_is_recorded_and_not_retried() {
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
     let o = ev.0.lock();
     let last = o.last().unwrap();
-    assert!(!last.success);
+    assert!(!last.success());
     assert!(last.summary.contains("not applied"), "{}", last.summary);
 }
 
@@ -1867,4 +1871,137 @@ fn a_ladder_whose_worker_is_missing_runs_nothing_on_the_caller() {
     // the tick (a runtime thread in the agent) starts it; the queued steps run
     l.tick(t0);
     wait_for(&rec, "neutralize:[100, 101]");
+}
+
+/// Lot 370 (F10-1): under the gate (the `alpha` profile, detect-only)
+/// NEUTRALIZE kills and quarantines nothing. Its signed outcome is a
+/// would-have — "would have contained 2", no offender `contained` — never
+/// `success`; the copy-on-first-write guard is not told of a containment;
+/// the ladder decides as a containment would (no ISOLATE). On main the row
+/// read `success`, "2 contained", and the hook ran.
+#[test]
+fn detect_only_neutralize_signs_a_would_have_not_a_success() {
+    let rec = Recorder::new();
+    let ev = OutcomeEvidence::default();
+    let heard: Arc<Mutex<Vec<Vec<u32>>>> = Arc::default();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::WouldHaveContained,
+            failing_blocks: Vec::new(),
+            partial_blocks: Vec::new(),
+            isolate_plan: Default::default(),
+        }),
+        Box::new(ev.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    )
+    .with_neutralize_hook({
+        let heard = Arc::clone(&heard);
+        Box::new(move |refs| heard.lock().push(pids_of(refs)))
+    });
+    let t0 = Instant::now();
+    l.engage(&entry(Some(900), Some(TriggerType::ConfirmedIntrusion)), t0);
+    l.engage(&entry(Some(901), None), t0);
+    l.tick(t0 + Duration::from_secs(31));
+    let outcomes = ev.0.lock().clone();
+    assert_eq!(outcomes.len(), 1, "NEUTRALIZE only: {outcomes:?}");
+    let n = &outcomes[0];
+    assert_eq!(n.stage, CombatStage::Neutralize);
+    assert_eq!(n.result, OutcomeResult::WouldHave, "{}", n.summary);
+    assert!(!n.success());
+    assert!(
+        n.result_text()
+            .starts_with("would_have: detect-only: would have contained 2"),
+        "{}",
+        n.result_text()
+    );
+    assert!(n.summary.contains("none contained"), "{}", n.summary);
+    for row in n.detail["offenders"].as_array().unwrap() {
+        assert_eq!(row["contained"], false, "{row}");
+        assert_eq!(row["would_have"], true, "{row}");
+    }
+    assert!(heard.lock().is_empty(), "the hook heard {:?}", heard.lock());
+    assert_eq!(isolates(&rec), 0, "{:?}", rec.log());
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+}
+
+/// Lot 370 (F10-1): ISOLATE under the gate is decided and not applied — a
+/// would-have row, not retried (it read `failure: not applied`).
+#[test]
+fn detect_only_isolate_signs_a_would_have() {
+    let (l, rec, ev) = ladder_with_isolate_plan(vec![IsolateOutcome::WouldHave(
+        "detect-only: iptables NOT applied (no enforcement)".to_string(),
+    )]);
+    let t0 = Instant::now();
+    l.engage(&entry(Some(1234), None), t0);
+    let t1 = t0 + Duration::from_secs(31);
+    l.tick(t1);
+    for s in [5, 15, 60] {
+        l.tick(t1 + Duration::from_secs(s));
+    }
+    assert_eq!(isolates(&rec), 1);
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let o = ev.0.lock();
+    let last = o.last().unwrap();
+    assert_eq!(last.stage, CombatStage::Isolate);
+    assert_eq!(last.result, OutcomeResult::WouldHave, "{}", last.summary);
+    assert!(
+        last.summary.contains("would have isolated the host"),
+        "{}",
+        last.summary
+    );
+    assert_eq!(last.detail["applied"], false);
+}
+
+/// Lot 370 (F10-1), the ratchet's behaviour half: a COMBAT outcome is
+/// `success` only when every offender's action was carried out — never
+/// with an offender the gate held, whatever else the report holds.
+#[test]
+fn no_combat_outcome_is_a_success_with_a_held_action() {
+    use super::actuator::OffenderOutcome;
+    let row = |pid, containment| OffenderOutcome {
+        pid,
+        containment,
+        kill: String::new(),
+        quarantine: String::new(),
+    };
+    let reports = [
+        vec![row(1, Containment::WouldHave)],
+        vec![
+            row(1, Containment::WouldHave),
+            row(2, Containment::WouldHave),
+        ],
+        vec![
+            row(1, Containment::Contained),
+            row(2, Containment::WouldHave),
+        ],
+        vec![
+            row(1, Containment::WouldHave),
+            row(2, Containment::NotContained),
+        ],
+    ];
+    for offenders in reports {
+        let report = NeutralizeReport { offenders };
+        for spared in [vec![], vec![(7u32, super::ProtectedReason::SshService)]] {
+            let o = super::neutralize_outcome(None, &report, &spared);
+            assert!(!o.success(), "{report:?} spared {spared:?}: {}", o.summary);
+            assert_ne!(o.result_text(), "success");
+            assert!(
+                o.detail["offenders"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r["would_have"] != true || r["contained"] == false),
+                "{}",
+                o.detail
+            );
+        }
+        assert_ne!(report.outcome(), NeutralizeOutcome::Contained, "{report:?}");
+    }
+    // control: every offender contained, none spared — the only success
+    let ok = NeutralizeReport {
+        offenders: vec![row(1, Containment::Contained)],
+    };
+    assert!(super::neutralize_outcome(None, &ok, &[]).success());
 }

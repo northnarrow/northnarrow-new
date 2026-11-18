@@ -138,8 +138,10 @@ MemoryMax=64M
 CPUQuota=10%
 TasksMax=8
 # OOMScoreAdjust — 64 MiB at most, and the process that brings the agent
-# back: the last thing the OOM killer should pick.
-OOMScoreAdjust=-900
+# back: the host OOM killer's last pick (lot 370, F10-4: -999, written again
+# by the watchdog at its start; it was -900). Not -1000: its own MemoryMax
+# above must still be able to end a leak.
+OOMScoreAdjust=-999
 
 # Hardening — same shape as the agent's unit. The watchdog is a
 # smaller target but the same posture (no new privileges, no

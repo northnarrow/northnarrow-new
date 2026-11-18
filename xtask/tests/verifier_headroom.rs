@@ -23,6 +23,14 @@
 //!    a branch per read multiplied the walk's states past the million on
 //!    5.15 (this lot's first object), and its frame stays small — it ends
 //!    the sensor's deepest call chain, whose stack is held to 512 bytes.
+//! 4. Lot 370 (the lab on 5.15): the module files' write history steps in
+//!    plain values. An `Option` built in the program (the transaction of
+//!    the write, the inode's history) leaves its payload's stack slots
+//!    unwritten on the `None` path, and the compiler read them before the
+//!    test: 5.15's verifier refused the observer ("invalid read from
+//!    stack"; 7.0's accepted it), and 5.15 had no write history. The
+//!    write's transaction is the package manager holding its lock at the
+//!    write, read in the kernel (`MODULE_PKG_LOCKERS`).
 
 mod support;
 
@@ -212,4 +220,51 @@ fn the_share_key_walk_reads_without_a_branch() {
     );
     assert!(flat(&ts)
         .contains("#[no_mangle] #[inline(never)] pub extern \"C\" fn nn_share_key() -> u64 {"));
+}
+
+/// 4. The write history's step in the eBPF program: plain values, no
+///    `Option` of the transaction or of the inode's history; the transaction
+///    one whose package manager holds its lock at the write.
+#[test]
+fn the_module_write_history_steps_in_plain_values() {
+    let ml = code("agent-ebpf/src/module_load.rs");
+    let write = flat(body(&ml, "try_write_open"));
+    in_order(
+        &write,
+        &[
+            "Txn::NONE",
+            "txn_of(hop)",
+            "conf(conf_slot::LOCKS_UNOBSERVED) == 0",
+            "MODULE_PKG_LOCKERS.get(&txn.tgid)",
+            "None => (false, PkgLocker::default())",
+            "holds_lock(entry, had, txn.start)",
+            "txn = Txn::NONE",
+            "MODULE_WRITES.get(&key)",
+            "None => (false, ModuleWrite::default())",
+            "history_step_raw(prev, had,",
+        ],
+    );
+    assert!(!write.contains("history_step("), "{write}");
+    assert!(!write.contains(".copied()"), "{write}");
+    let ml_flat = flat(&ml);
+    assert!(
+        ml_flat.contains("unsafe fn txn_of(hop: *const u8) -> Txn {"),
+        "the transaction a plain value"
+    );
+    assert!(!ml_flat.contains("-> Option<Txn>"));
+    let lock = flat(body(&ml, "try_lock"));
+    in_order(
+        &lock,
+        &[
+            "MODULE_PKG_LOCKS.get(&key)",
+            "leader_start(",
+            "None => (false, PkgLocker::default())",
+            "locker_step(prev, had, start, kind as u32, bit)",
+            "MODULE_PKG_LOCKERS.insert(",
+        ],
+    );
+    // the agent calls the `Option` form only in tests: the eBPF calls the plain
+    let judge = code("common/src/module_judge.rs");
+    let hs = flat(body(&judge, "history_step"));
+    assert!(hs.contains("history_step_raw("), "{hs}");
 }

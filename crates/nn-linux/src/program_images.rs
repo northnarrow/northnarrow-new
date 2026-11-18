@@ -229,6 +229,21 @@ impl Bounds {
     }
 }
 
+impl Bounds {
+    /// The review of #578 (N3): the uid that read the most in the second
+    /// running at `now`, and how many bytes — who spent the budget.
+    fn top_spender(&self, now: Instant) -> Option<(u32, u64)> {
+        let second = Duration::from_secs(1);
+        self.spent
+            .lock()
+            .uids
+            .iter()
+            .filter(|(_, (t, n, _))| *n > 0 && now.duration_since(*t) < second)
+            .max_by_key(|(uid, (_, n, _))| (*n, std::cmp::Reverse(**uid)))
+            .map(|(uid, (_, n, _))| (*uid, *n))
+    }
+}
+
 /// The content check's bounds: one exec pump, one host.
 static BOUNDS: LazyLock<Bounds> =
     LazyLock::new(|| Bounds::new(BUDGET_PER_SECOND, GLOBAL_BUDGET_PER_SECOND));
@@ -718,7 +733,16 @@ pub struct RuntimeChecks {
     /// Lot 369: the sealed memfd execs whose reads the pump did not wait
     /// for (no clone kept).
     not_read: AtomicU64,
+    /// The review of #578 (N3): each uid's last skip for the budget — an
+    /// episode of its spent budget opens at a skip with none in the
+    /// [`EPISODE_QUIET`] before ([`RuntimeChecks::opens_episode`]).
+    episodes: Mutex<HashMap<u32, Instant>>,
 }
+
+/// The review of #578 (N3): a skip for the budget with none of the same
+/// uid in this long before opens an episode — its record names who spent
+/// the budget, once.
+const EPISODE_QUIET: Duration = Duration::from_secs(60);
 
 /// Lot 369: the runtime clones the exec pump judged since the agent's start
 /// (`nn-admin status`): sealed memfds compared whole with an installed
@@ -748,7 +772,30 @@ impl RuntimeChecks {
             refreshed: Mutex::new(None),
             kept: AtomicU64::new(0),
             not_read: AtomicU64::new(0),
+            episodes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The review of #578 (N3): `uid`'s skip at `now` opens an episode of
+    /// its spent budget — none of its skips in the [`EPISODE_QUIET`] before
+    /// (each skip is remembered, so a steady flood stays one episode). At
+    /// most [`UIDS_CAP`] uids kept, the quiet ones first out.
+    fn opens_episode(&self, uid: u32, now: Instant) -> bool {
+        let mut e = self.episodes.lock();
+        let opens = e
+            .get(&uid)
+            .is_none_or(|last| now.duration_since(*last) >= EPISODE_QUIET);
+        if e.len() >= UIDS_CAP && !e.contains_key(&uid) {
+            e.retain(|_, last| now.duration_since(*last) < EPISODE_QUIET);
+            while e.len() >= UIDS_CAP {
+                let Some(oldest) = e.iter().min_by_key(|(_, t)| **t).map(|(u, _)| *u) else {
+                    break;
+                };
+                e.remove(&oldest);
+            }
+        }
+        e.insert(uid, now);
+        opens
     }
 
     fn counts(&self) -> RuntimeCloneCounts {
@@ -942,17 +989,32 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
         return;
     }
     let cost = 2 * m.len() * candidates.len() as u64;
-    if !checks.bounds.take(*uid, cost, Instant::now()) {
+    let now = Instant::now();
+    if !checks.bounds.take(*uid, cost, now) {
         checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
+        // lot 370 (F10-6): the budget spent is a signed event of its own —
+        // the uid that spent it said (one line per uid, signed when new)
+        crate::boot::degradation::report("runtime_copy_compare", &budget_spent_line(*uid));
+        // the review of #578 (N3): the first skip of an episode names who
+        // spent the budget — the uid whose share ran out and the second's
+        // biggest spender — in R004's record, once per episode
+        let episode = checks
+            .opens_episode(*uid, now)
+            .then(|| program_identity::BudgetEpisode {
+                uid: *uid,
+                top: checks.bounds.top_spender(now),
+            });
         // the review of #556 (F2): every fact but the bytes holds — kept
-        // unverified, any program of that length (R004: root's recorded,
-        // never killed; any other uid's killed — the re-check, N1)
+        // unverified, any program of that length (R004: root's recorded
+        // High, never killed; any other uid's the Critical kill — the
+        // review of #578, N3, reverting lot 370's F10-6)
         program_identity::keep_runtime_clone(
             event,
             program_identity::RuntimeClone {
                 image: candidates[0].id,
                 seen,
                 unverified: true,
+                episode,
             },
         );
         return;
@@ -970,9 +1032,21 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
                 image: found.id,
                 seen,
                 unverified: false,
+                episode: None,
             },
         );
     }
+}
+
+/// Lot 370 (F10-6): the signed line of a runtime copy not compared, uid
+/// `uid`'s share of the compare budget spent.
+pub fn budget_spent_line(uid: u32) -> String {
+    format!(
+        "uid {uid}: its share of the compare budget for a container runtime's sealed copy of \
+         itself was spent — a sealed memfd of a runtime's length was not compared: R004 records \
+         root's High (never killed) and kills any other uid's, the first of each episode naming \
+         who spent the budget"
+    )
 }
 
 /// Lot 347: the installed runtime or manager whose identity `id` is, when
@@ -1553,6 +1627,67 @@ mod tests {
             "kept not compared, never as runc's compared image"
         );
         assert_eq!(checks.bounds.skipped.load(Ordering::Relaxed), 1);
+        // lot 370 (F10-6): the budget spent is signed, naming the uid
+        assert!(crate::boot::degradation::entries()
+            .iter()
+            .any(|d| d.source == "runtime_copy_compare" && d.detail == budget_spent_line(1000)));
+        // the review of #578 (N3): the episode's first skip names who spent
+        // the budget — the user itself, its decoys' share
+        assert_eq!(
+            runtime_clone_of(&e).and_then(|c| c.episode),
+            Some(program_identity::BudgetEpisode {
+                uid: 1000,
+                top: Some((1000, RUNTIME_BUDGET_PER_UID)),
+            })
+        );
+        // the next skip of the same episode names nothing
+        let hook2 = memfd(&payload, SEALED | libc::F_SEAL_SEAL);
+        link(
+            35_702,
+            &PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&hook2)
+            )),
+        );
+        let mut e2 = memfd_exec(35_702, 35_700, 557, &hook2);
+        if let Event::ProcessSpawn { uid, .. } = &mut e2 {
+            *uid = 1000;
+        }
+        read_runtime_clone_with(&e2, &proc, &root, &checks);
+        assert_eq!(
+            runtime_clone_of(&e2).map(|c| (c.unverified, c.episode)),
+            Some((true, None))
+        );
+    }
+
+    /// The review of #578 (N3, named): a skip for the budget opens an
+    /// episode only after a quiet minute of that uid's — a steady flood is
+    /// one episode, one record naming who spent the budget — each uid its
+    /// own; the biggest spender is the uid that read the most this second.
+    #[test]
+    fn a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender() {
+        let checks = RuntimeChecks::new(
+            RUNTIME_BUDGET_PER_UID,
+            RUNTIME_BUDGET_PER_SECOND,
+            RUNTIME_ROOT_RESERVE,
+        );
+        let t0 = Instant::now();
+        assert!(checks.opens_episode(0, t0));
+        assert!(!checks.opens_episode(0, t0 + Duration::from_secs(30)));
+        // remembered at each skip: 59 s after the last one, still the same
+        assert!(!checks.opens_episode(0, t0 + Duration::from_secs(89)));
+        assert!(checks.opens_episode(0, t0 + Duration::from_secs(149)));
+        assert!(checks.opens_episode(1000, t0 + Duration::from_secs(149)));
+        // who read the most this second
+        assert!(checks.bounds.take(1000, 40 << 20, t0));
+        assert!(checks.bounds.take(0, 100 << 20, t0));
+        assert!(checks.bounds.take(1001, 10 << 20, t0));
+        assert_eq!(checks.bounds.top_spender(t0), Some((0, 100 << 20)));
+        assert_eq!(
+            checks.bounds.top_spender(t0 + Duration::from_secs(2)),
+            None,
+            "a second past: nobody spends"
+        );
     }
 
     /// The review of #556 (F2, named; its probe): seventeen 30 MiB compares

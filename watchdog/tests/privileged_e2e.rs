@@ -199,6 +199,21 @@ impl E2eFixture {
     fn setup() -> Self {
         // Start from a clean bpffs slate.
         purge_bpffs_root();
+        // Lot 370 (the re-check of #578): the agent registers
+        // /etc/northnarrow (and the state directory's detections/) only if
+        // it exists at its start, and the next start is refused when the
+        // directories it protects are not the previous agent's ("not the
+        // ones the previous agent protected"): on a guest without them, a
+        // respawned agent that made them refused every later test's agent.
+        // Made first, as the agent suites' fixtures make them.
+        let _ = Command::new("sudo")
+            .args([
+                "mkdir",
+                "-p",
+                "/etc/northnarrow",
+                "/var/lib/northnarrow/detections",
+            ])
+            .status();
         Self {
             tempdir: tempfile::tempdir().expect("create tempdir"),
             agent_install: Some(InstalledAgent::install()),
@@ -633,6 +648,58 @@ fn dump_protected_pids() -> Vec<u32> {
         }
     }
     pids
+}
+
+/// The bytes of `value` in a `bpftool … -j` record (`"value":["0x00",…]`).
+fn json_bytes(body: &str, field: &str) -> Option<Vec<u8>> {
+    let tag = format!("\"{field}\":[");
+    let at = body.find(&tag)? + tag.len();
+    let end = body[at..].find(']')?;
+    Some(
+        body[at..at + end]
+            .split(',')
+            .filter_map(|s| {
+                let t = s.trim().trim_matches('"');
+                u8::from_str_radix(t.strip_prefix("0x").unwrap_or(t), 16).ok()
+            })
+            .collect(),
+    )
+}
+
+/// The watchdog's slot (0) of the pinned `ROLE_TGIDS`: `None` when the map
+/// is not pinned (a boot's first claim).
+fn watchdog_role_slot() -> Option<u32> {
+    let out = Command::new("sudo")
+        .args(["bpftool", "map", "lookup", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/ROLE_TGIDS"))
+        .args(["key", "0", "0", "0", "0", "-j"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = json_bytes(&String::from_utf8_lossy(&out.stdout), "value")?;
+    (v.len() == 4).then(|| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+/// Lot 370 (F10-4; the re-check of #578): the watchdog's role as at a
+/// boot — its slot of the pinned `ROLE_TGIDS` never held (0) — so the
+/// watchdog a test starts is the role's first claim. The suite's earlier
+/// tests leave the slot vacated (`ROLE_VACATED`: their watchdogs exited, and
+/// the fixture's purge of the pins is refused while the hooks guard them);
+/// a watchdog started from the test's shell into a vacated role is not one
+/// started for it (its parent is neither PID 1 nor the live agent), and its
+/// handles are then a foreign process's: NN-L-BPF-002 High, by design. In
+/// observe mode root writes the map (the write is recorded as the foreign
+/// write it is). The slot read back.
+fn establish_first_claim_of_the_watchdog_role() -> Option<u32> {
+    let _ = Command::new("sudo")
+        .args(["bpftool", "map", "update", "pinned"])
+        .arg(format!("{BPFFS_ROOT}/ROLE_TGIDS"))
+        .args(["key", "0", "0", "0", "0", "value", "0", "0", "0", "0"])
+        .stderr(Stdio::null())
+        .status();
+    watchdog_role_slot()
 }
 
 // ── Test 1: W3 layer-2 evict ────────────────────────────────────────
@@ -1341,9 +1408,23 @@ fn heads(records: &[&String]) -> Vec<String> {
 /// `northnarrow-watchdog` as the watchdog, not this one (`--watchdog-exe`):
 /// two High records at every run; and the control looked for the verdict's
 /// reasoning, which the signed record does not carry.
+///
+/// Lot 370 (F10-4; the re-check of #578's KVM suites): a role its holder
+/// left this boot is vacated, and the suite's earlier tests leave the
+/// watchdog's so — a watchdog this test started was then a foreign handle
+/// (two High records, as F10-4 means). The test establishes what it is
+/// about, the role's first claim ([`establish_first_claim_of_the_watchdog_role`]);
+/// the vacated role's successor has its own test
+/// (`a_role_its_holder_left_outside_a_window_is_recorded_high`).
 #[test]
 fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
     let mut fx = E2eFixture::setup();
+    // before any agent of this test runs: no agent records the write
+    let slot = establish_first_claim_of_the_watchdog_role();
+    assert!(
+        matches!(slot, None | Some(0)),
+        "the watchdog's role could not be made a first claim (slot {slot:?})"
+    );
     let _agent_pid = fx.spawn_agent();
     fx.spawn_watchdog();
     let wd_pid: u32 = fs::read_to_string(fx.watchdog_pidfile())
@@ -1385,4 +1466,61 @@ fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
         "the watchdog's start was not seen: no Low record of its own (pid {wd_pid}): {:?}",
         heads(&start)
     );
+}
+
+/// The review of #578 (N2, named): the agent ends as the OOM killer ends
+/// it — a kill nothing refused, outside any trusted-installer window (here
+/// its pid evicted from `PROTECTED_PIDS`, then SIGKILL: the kernel's
+/// `sched_process_exit` vacates its role either way) — and the watchdog's
+/// respawn takes the role. That successor is recorded NN-L-BPF-002 High,
+/// under its own pid. On 382be007 nothing reached the detections: the
+/// start's handles on the pins were judged by the previous agent's pinned
+/// `bpf` hook, which wrote its record into that agent's ring — read by
+/// nobody once that agent was gone (lab r2 of lot 370: no NN-L-BPF-002 of
+/// any kind after the restart).
+#[test]
+fn a_role_its_holder_left_outside_a_window_is_recorded_high() {
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let wd_pid: u32 = fs::read_to_string(fx.watchdog_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("watchdog pidfile");
+    // the watchdog registered: the respawn is its own
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !dump_protected_pids().contains(&wd_pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        dump_protected_pids().contains(&wd_pid),
+        "the watchdog never registered itself in PROTECTED_PIDS"
+    );
+    fx.unprotect_and_sigkill_agent(pid0);
+    let pid1 = new_agent_pid(&fx, pid0, Duration::from_secs(30))
+        .expect("the watchdog never respawned the agent");
+    let rule = "NN-L-BPF-002_BpfForeignHandleOrDetach";
+    let high = "\"severity\":\"High\"";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let found = records_of(&fx.state().detections(), rule, pid1);
+        if found.iter().any(|l| l.contains(high)) {
+            // the successor's own record, under its name
+            assert!(
+                found
+                    .iter()
+                    .any(|l| l.contains(high) && l.contains("\"comm\":\"northnarrow-age\"")),
+                "the successor's High record does not name it: {:?}",
+                heads(&found.iter().collect::<Vec<_>>())
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no NN-L-BPF-002 High for the successor (pid {pid1}) of the agent the kernel killed \
+             outside a window (pid {pid0}): {:?}",
+            heads(&found.iter().collect::<Vec<_>>())
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }

@@ -57,6 +57,13 @@ pub mod conf_slot {
     /// `stat()` reports it: the root the write history walks up to.
     pub const TREE_DEV: u32 = 1;
     pub const TREE_INO: u32 = 2;
+    /// Lot 370 (the lab): non-zero when the package locks' observer
+    /// (`module_lock_observe`) is not attached — the write history then
+    /// names a lineage's package manager without its lock, which the agent
+    /// samples. 0 (the default, before the agent writes it): a write is a
+    /// transaction's only when its package manager holds its lock
+    /// ([`super::holds_lock`]).
+    pub const LOCKS_UNOBSERVED: u32 = 3;
     pub const SLOTS: u32 = 4;
 }
 
@@ -221,6 +228,14 @@ pub const MODULE_WRITES_MAX: u32 = 8_192;
 /// recently used evicted: a write of one evicted is no transaction's).
 pub const MODULE_PKG_SCRIPTS_MAX: u32 = 1_024;
 
+/// Lot 370 (the lab): the package managers' lock files the kernel watches
+/// (`MODULE_PKG_LOCKS`, the agent's list: dpkg's, apt's front end, rpm's).
+pub const MODULE_PKG_LOCKS_MAX: u32 = 8;
+
+/// Lot 370 (the lab): the thread groups holding a package manager's lock
+/// (`MODULE_PKG_LOCKERS`, an LRU map: a transaction long gone is evicted).
+pub const MODULE_PKG_LOCKERS_MAX: u32 = 1_024;
+
 /// `inode.i_ctime`'s nanoseconds as the kernel reads them back: from 6.13
 /// the field's high bit tells whether the time was queried
 /// (`I_CTIME_QUERIED`, multigrain timestamps); a nanosecond count is below
@@ -341,17 +356,28 @@ pub const fn verdict_name(v: u8) -> &'static str {
 /// transaction taints it, for the inode's life.
 #[inline(always)]
 pub const fn write_step(prev: Option<u32>, created: bool, pkg: bool) -> u32 {
+    match prev {
+        Some(p) => step_flags(p, true, created, pkg),
+        None => step_flags(0, false, created, pkg),
+    }
+}
+
+/// [`write_step`] in plain values: `had` the inode has a history, `prev`
+/// its flags then.
+#[inline(always)]
+const fn step_flags(prev: u32, had: bool, created: bool, pkg: bool) -> u32 {
     if created {
-        return if pkg {
+        if pkg {
             write_flag::PKG
         } else {
             write_flag::TAINT
-        };
-    }
-    match prev {
-        None => write_flag::TAINT,
-        Some(p) if pkg => p,
-        Some(p) => p | write_flag::TAINT,
+        }
+    } else if !had {
+        write_flag::TAINT
+    } else if pkg {
+        prev
+    } else {
+        prev | write_flag::TAINT
     }
 }
 
@@ -360,6 +386,183 @@ pub const fn write_step(prev: Option<u32>, created: bool, pkg: bool) -> u32 {
 #[inline(always)]
 pub const fn written_by_package(history: Option<u32>) -> bool {
     matches!(history, Some(write_flag::PKG))
+}
+
+/// Lot 370 (F10-2): one inode's write history, `MODULE_WRITES`' value —
+/// its [`write_flag`] bits and the package transaction that wrote it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct ModuleWrite {
+    /// [`write_flag`] bits.
+    pub flags: u32,
+    /// The transaction's package manager (its thread group, the lineage's
+    /// nearest package manager at the write): 0 none, [`TXN_MIXED`] more
+    /// than one wrote the file.
+    pub txn_tgid: u32,
+    /// Its start, `task_struct.start_boottime` (nanoseconds: what
+    /// `/proc/<pid>/stat` shows in ticks).
+    pub txn_start: u64,
+}
+
+/// [`ModuleWrite::txn_tgid`] of a file two transactions wrote: none vouches.
+pub const TXN_MIXED: u32 = u32::MAX;
+
+/// Lot 370 (F10-2): a package transaction as the kernel saw it at a write —
+/// its package manager's thread group and start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Txn {
+    pub tgid: u32,
+    pub start: u64,
+}
+
+impl Txn {
+    /// No transaction (no package manager's thread group is 0).
+    pub const NONE: Txn = Txn { tgid: 0, start: 0 };
+}
+
+/// Lot 370 (F10-2): [`write_step`] with the transaction that wrote: a
+/// creation inside one names it; a write by another (or by one where none
+/// was named) leaves [`TXN_MIXED`]; a write outside one taints the flags.
+/// [`history_step_raw`] is the form the eBPF program calls.
+#[inline(always)]
+pub fn history_step(prev: Option<ModuleWrite>, created: bool, txn: Option<Txn>) -> ModuleWrite {
+    history_step_raw(
+        prev.unwrap_or_default(),
+        prev.is_some(),
+        created,
+        txn.unwrap_or(Txn::NONE),
+    )
+}
+
+/// Lot 370 (the lab on 5.15): [`history_step`] in plain values, the form
+/// the eBPF program calls — `had` the inode has a history (`prev` it),
+/// `txn` [`Txn::NONE`] outside a transaction. An `Option` built in the
+/// program leaves its payload's stack slots unwritten on the `None` path,
+/// and the compiler may read them before the test: 5.15's verifier refuses
+/// that read ("invalid read from stack"; 7.0's accepts it), and the write
+/// history's observer did not load on 5.15.
+// the arms kept apart, one per case of `history_step`'s reference match
+#[allow(clippy::if_same_then_else)]
+#[inline(always)]
+pub fn history_step_raw(prev: ModuleWrite, had: bool, created: bool, txn: Txn) -> ModuleWrite {
+    let pkg = txn.tgid != 0;
+    let flags = step_flags(prev.flags, had, created, pkg);
+    let (txn_tgid, txn_start) = if pkg && created {
+        (txn.tgid, txn.start)
+    } else if had && pkg && prev.txn_tgid == txn.tgid && prev.txn_start == txn.start {
+        (txn.tgid, txn.start)
+    } else if had && pkg {
+        (TXN_MIXED, 0)
+    } else if had {
+        (prev.txn_tgid, prev.txn_start)
+    } else {
+        (0, 0)
+    };
+    ModuleWrite {
+        flags,
+        txn_tgid,
+        txn_start,
+    }
+}
+
+/// Lot 370 (F10-2): the one transaction that wrote the file, when the
+/// history says a package transaction wrote it and nothing else did
+/// ([`written_by_package`]).
+#[inline(always)]
+pub fn package_transaction(history: Option<ModuleWrite>) -> Option<Txn> {
+    match history {
+        Some(h)
+            if written_by_package(Some(h.flags)) && h.txn_tgid != 0 && h.txn_tgid != TXN_MIXED =>
+        {
+            Some(Txn {
+                tgid: h.txn_tgid,
+                start: h.txn_start,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Lot 370 (the lab): a thread group that asked for a package manager's
+/// lock, `MODULE_PKG_LOCKERS`' value — its leader's start
+/// (`task_struct.start_boottime`) and the lock files it holds a write lock
+/// on (their bits, `MODULE_PKG_LOCKS`' values).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct PkgLocker {
+    pub start: u64,
+    pub locks: u32,
+    pub _pad: u32,
+}
+
+/// The lock types the `file_lock` hook is called with (`F_RDLCK`,
+/// `F_WRLCK`, `F_UNLCK`: fcntl's and flock's, the same on every arch the
+/// agent runs on).
+pub mod lock_kind {
+    pub const RDLCK: u32 = 0;
+    pub const WRLCK: u32 = 1;
+    pub const UNLCK: u32 = 2;
+}
+
+/// Lot 370 (the lab): the locker entry after a lock request `kind` on the
+/// lock file `bit` by the thread group started at `start` (`had` it has an
+/// entry, `prev`): a write lock holds the file; a release, or a shared lock
+/// (rpm's queries take one), holds it no more. An entry of another start
+/// (a reused pid) holds nothing. The kernel steps it at the request, before
+/// the lock is granted — a package manager refused its lock exits, or waits
+/// without starting anything.
+#[inline(always)]
+pub fn locker_step(prev: PkgLocker, had: bool, start: u64, kind: u32, bit: u32) -> PkgLocker {
+    let held = if had && prev.start == start {
+        prev.locks
+    } else {
+        0
+    };
+    let locks = if kind == lock_kind::WRLCK {
+        held | bit
+    } else if kind == lock_kind::UNLCK || kind == lock_kind::RDLCK {
+        held & !bit
+    } else {
+        held
+    };
+    PkgLocker {
+        start,
+        locks,
+        _pad: 0,
+    }
+}
+
+/// Lot 370 (the lab): at a write, the package manager started at `start`
+/// holds a package manager's lock — its entry (`had`, `entry`) is of that
+/// start and holds a lock file. Read in the kernel at the write: a
+/// transaction shorter than any poll is still one.
+#[inline(always)]
+pub fn holds_lock(entry: PkgLocker, had: bool, start: u64) -> bool {
+    had && start != 0 && entry.start == start && entry.locks != 0
+}
+
+/// Lot 370 (F10-2): `task_struct.__state` bits (include/linux/sched.h).
+pub mod task_state {
+    /// `__TASK_STOPPED` (`SIGSTOP`, a job-control stop).
+    pub const STOPPED: u32 = 0x0004;
+    /// `__TASK_TRACED` (stopped under a tracer).
+    pub const TRACED: u32 = 0x0008;
+    /// `TASK_FROZEN` (6.1+: the system's freezer — suspend, the cgroup-v1
+    /// freezer; the bit is unused before). The review of #578 (N4): the
+    /// cgroup-v2 freezer leaves a task in an ordinary interruptible wait
+    /// (`TASK_INTERRUPTIBLE | TASK_FREEZABLE`): not told, it vouches.
+    pub const FROZEN: u32 = 0x8000;
+}
+
+/// Lot 370 (F10-2): a package manager in this state may vouch for a write
+/// of its lineage — not stopped, traced or frozen by the system's freezer
+/// (a held transaction is no transaction; one a cgroup-v2 freezer holds
+/// waits as any other and still vouches).
+#[inline(always)]
+pub const fn state_may_vouch(state: u32) -> bool {
+    state & (task_state::STOPPED | task_state::TRACED | task_state::FROZEN) == 0
 }
 
 /// The length of the name window [`module_file_name`] reads: the last
@@ -677,6 +880,212 @@ mod tests {
         assert_eq!(write_step(None, false, true), TAINT);
         assert!(!written_by_package(None));
         assert!(!written_by_package(Some(TAINT)));
+    }
+
+    /// Lot 370 (F10-2): the history names the transaction that wrote the
+    /// file — one transaction's creation and writes keep it; another's
+    /// write, or one by none named, leave none to vouch; a write outside a
+    /// transaction taints, as before. A stopped, traced or frozen package
+    /// manager vouches for nothing.
+    #[test]
+    fn the_write_history_names_its_one_live_transaction() {
+        use write_flag::{PKG, TAINT};
+        let a = Txn {
+            tgid: 700,
+            start: 5_000,
+        };
+        let b = Txn {
+            tgid: 701,
+            start: 6_000,
+        };
+        let h = history_step(None, true, Some(a));
+        assert_eq!((h.flags, h.txn_tgid, h.txn_start), (PKG, 700, 5_000));
+        assert_eq!(package_transaction(Some(h)), Some(a));
+        let h = history_step(Some(h), false, Some(a));
+        assert_eq!(package_transaction(Some(h)), Some(a));
+        // another transaction's write: none vouches
+        let mixed = history_step(Some(h), false, Some(b));
+        assert_eq!((mixed.flags, mixed.txn_tgid), (PKG, TXN_MIXED));
+        assert_eq!(package_transaction(Some(mixed)), None);
+        // the same pid, another start: another transaction
+        let reused = history_step(
+            Some(h),
+            false,
+            Some(Txn {
+                tgid: 700,
+                start: 9,
+            }),
+        );
+        assert_eq!(package_transaction(Some(reused)), None);
+        // outside one: tainted
+        let t = history_step(Some(h), false, None);
+        assert_eq!(t.flags, PKG | TAINT);
+        assert_eq!(package_transaction(Some(t)), None);
+        // created outside, written inside: no transaction
+        let t = history_step(None, true, None);
+        assert_eq!(
+            package_transaction(Some(history_step(Some(t), false, Some(a)))),
+            None
+        );
+        assert_eq!(package_transaction(None), None);
+        // created again: afresh
+        let again = history_step(Some(mixed), true, Some(b));
+        assert_eq!(package_transaction(Some(again)), Some(b));
+        // the state
+        assert!(state_may_vouch(0)); // running
+        assert!(state_may_vouch(0x0001)); // interruptible sleep (waits for its child)
+        assert!(state_may_vouch(0x0002)); // uninterruptible sleep
+        for held in [0x0104, 0x0004, 0x0108, 0x0008, 0x8000, 0x8001] {
+            assert!(!state_may_vouch(held), "{held:#x}");
+        }
+    }
+
+    /// Lot 370 (the lab on 5.15): the eBPF program's plain-value step is
+    /// the history's step — every history (none, a transaction's, another's,
+    /// mixed, tainted) by every write (created or not, by none, the same
+    /// transaction, another, the same pid restarted). The program called the
+    /// `Option` form, whose `None` payload 5.15's verifier refused to read:
+    /// no write history there.
+    #[test]
+    fn the_ebpf_history_step_is_the_option_step_in_plain_values() {
+        use write_flag::{PKG, TAINT};
+        let a = Txn {
+            tgid: 700,
+            start: 5_000,
+        };
+        let b = Txn {
+            tgid: 701,
+            start: 6_000,
+        };
+        let a_again = Txn {
+            tgid: 700,
+            start: 9,
+        };
+        let w = |flags, t: Txn| ModuleWrite {
+            flags,
+            txn_tgid: t.tgid,
+            txn_start: t.start,
+        };
+        let prevs = [
+            None,
+            Some(w(PKG, a)),
+            Some(w(PKG, b)),
+            Some(w(PKG, Txn::NONE)),
+            Some(w(PKG | TAINT, a)),
+            Some(w(TAINT, Txn::NONE)),
+            Some(ModuleWrite {
+                flags: PKG,
+                txn_tgid: TXN_MIXED,
+                txn_start: 0,
+            }),
+        ];
+        // the step as lot 370 first wrote it, on `Option`s: the reference
+        let reference = |prev: Option<ModuleWrite>, created: bool, txn: Option<Txn>| {
+            let flags = match (created, txn.is_some(), prev) {
+                (true, true, _) => PKG,
+                (true, false, _) | (false, _, None) => TAINT,
+                (false, true, Some(p)) => p.flags,
+                (false, false, Some(p)) => p.flags | TAINT,
+            };
+            let (txn_tgid, txn_start) = match (prev, txn) {
+                (_, Some(t)) if created => (t.tgid, t.start),
+                (Some(p), Some(t)) if p.txn_tgid == t.tgid && p.txn_start == t.start => {
+                    (t.tgid, t.start)
+                }
+                (Some(_), Some(_)) => (TXN_MIXED, 0),
+                (Some(p), None) => (p.txn_tgid, p.txn_start),
+                (None, _) => (0, 0),
+            };
+            ModuleWrite {
+                flags,
+                txn_tgid,
+                txn_start,
+            }
+        };
+        let mut n = 0;
+        for prev in prevs {
+            for txn in [None, Some(a), Some(b), Some(a_again)] {
+                for created in [false, true] {
+                    let raw = history_step_raw(
+                        prev.unwrap_or_default(),
+                        prev.is_some(),
+                        created,
+                        txn.unwrap_or(Txn::NONE),
+                    );
+                    let want = reference(prev, created, txn);
+                    assert_eq!(raw, want, "{prev:?} {txn:?} {created}");
+                    assert_eq!(history_step(prev, created, txn), want);
+                    // the flags are write_step's
+                    assert_eq!(
+                        raw.flags,
+                        write_step(prev.map(|p| p.flags), created, txn.is_some())
+                    );
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, 56);
+        // and the cases spelled out: a creation inside a names it, outside
+        // nothing; no history and a write: tainted, none named
+        assert_eq!(
+            history_step_raw(ModuleWrite::default(), false, true, a),
+            w(PKG, a)
+        );
+        assert_eq!(
+            history_step_raw(ModuleWrite::default(), false, false, a),
+            w(TAINT, Txn::NONE)
+        );
+        assert_eq!(
+            history_step_raw(w(PKG, a), true, false, b),
+            ModuleWrite {
+                flags: PKG,
+                txn_tgid: TXN_MIXED,
+                txn_start: 0
+            }
+        );
+    }
+
+    /// Lot 370 (the lab): a package manager holds its lock from its write
+    /// lock to its release — dpkg's two files, apt's front end released
+    /// around each dpkg it runs while it keeps the other; a shared lock
+    /// (rpm's queries) holds nothing; a reused pid (another start) inherits
+    /// nothing. On the lab a `dpkg -i` shorter than the agent's poll was
+    /// never seen holding its lock: its module file, trusted by a longer
+    /// one, was refused.
+    #[test]
+    fn a_package_lock_is_held_from_its_write_lock_to_its_release() {
+        use lock_kind::{RDLCK, UNLCK, WRLCK};
+        let (front, lock) = (1u32, 2u32);
+        let start = 8_812_000_000;
+        let none = PkgLocker::default();
+        // dpkg -i: the front end's lock, then the database's
+        let e = locker_step(none, false, start, WRLCK, front);
+        assert!(holds_lock(e, true, start));
+        let e = locker_step(e, true, start, WRLCK, lock);
+        assert_eq!(e.locks, front | lock);
+        // apt releases the database's around a dpkg run, keeps its front end
+        let e = locker_step(e, true, start, UNLCK, lock);
+        assert!(holds_lock(e, true, start));
+        let e = locker_step(e, true, start, UNLCK, front);
+        assert!(!holds_lock(e, true, start), "both released");
+        // a shared lock holds nothing, a downgrade releases
+        let r = locker_step(none, false, start, RDLCK, lock);
+        assert!(!holds_lock(r, true, start));
+        let w = locker_step(none, false, start, WRLCK, lock);
+        assert!(!holds_lock(
+            locker_step(w, true, start, RDLCK, lock),
+            true,
+            start
+        ));
+        // another start: nothing inherited, and not this start's lock
+        let reused = locker_step(w, true, start + 1, UNLCK, front);
+        assert_eq!(reused.locks, 0);
+        assert!(!holds_lock(w, true, start + 1));
+        // no entry, or an unread start: no lock
+        assert!(!holds_lock(w, false, start));
+        assert!(!holds_lock(PkgLocker { start: 0, ..w }, true, 0));
+        // an unknown request changes nothing
+        assert_eq!(locker_step(w, true, start, 7, lock), w);
     }
 
     /// Named test (lot 285, the coordinator's matrix): a DKMS or akmods

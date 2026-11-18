@@ -28,11 +28,17 @@ use crate::anti_tamper::network_isolate::IsolationReport;
 /// uses to decide whether STAGE 3 (isolation) is necessary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NeutralizeOutcome {
-    /// Every offender was killed (or had already exited, or — in
-    /// detect-only — *would* have been killed) and the binary
+    /// Every offender was killed (or had already exited) and the binary
     /// quarantined. The threat is contained at the process level; the
     /// host stays on the network.
     Contained,
+    /// Lot 370 (F10-1): the no-enforcement gate (the `alpha` profile,
+    /// `--detect-only`) — every offender *would* have been killed and its
+    /// binary quarantined, and nothing was: the processes still run. Never
+    /// [`Self::Contained`]: the ladder signs it as a would-have, says so,
+    /// and tells no one the offenders were contained (it counted as
+    /// contained, and the signed outcome read `success`, "N contained").
+    WouldHaveContained,
     /// At least one offender could not be neutralized — kernel/LSM
     /// protected (`EPERM`), below the kill floor, still alive after
     /// SIGKILL + verify (respawning / unkillable), or no offender could
@@ -40,13 +46,27 @@ pub enum NeutralizeOutcome {
     Uncontainable { reason: String },
 }
 
+/// Lot 370 (F10-1): what NEUTRALIZE's kill did to one offender's tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+    /// The process and its tree are gone: killed, or already exited.
+    Contained,
+    /// The no-enforcement gate: the kill was approved and not carried out
+    /// — the process runs. Not contained, and not a failure to contain.
+    WouldHave,
+    /// Not contained: refused (below the protection floor), denied by the
+    /// kernel, still alive after the kill, a descendant left running.
+    NotContained,
+}
+
 /// Lab PR 217 (capability C17): what NEUTRALIZE did to one offender.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffenderOutcome {
     pub pid: u32,
-    /// The process and its tree are contained: killed, already gone, or —
-    /// detect-only — would have been.
-    pub contained: bool,
+    /// Lot 370 (F10-1): contained (killed, already gone), would have been
+    /// (the no-enforcement gate: nothing was done), or not contained. A
+    /// would-have counted as contained.
+    pub containment: Containment,
     /// The kill's outcome, or why the offender is not contained.
     pub kill: String,
     /// What became of its binary: quarantined, nothing to quarantine, or
@@ -63,9 +83,25 @@ pub struct NeutralizeReport {
     pub offenders: Vec<OffenderOutcome>,
 }
 
+impl OffenderOutcome {
+    /// The offender is contained — killed, or already gone. Never a
+    /// would-have (lot 370, F10-1).
+    pub fn contained(&self) -> bool {
+        self.containment == Containment::Contained
+    }
+
+    /// The no-enforcement gate held the kill: nothing was done to it.
+    pub fn would_have(&self) -> bool {
+        self.containment == Containment::WouldHave
+    }
+}
+
 impl NeutralizeReport {
     /// What the ladder decides on: contained only when every offender is
-    /// (and there was one); otherwise why, for each one that is not.
+    /// (and there was one); otherwise why, for each one that is not. Lot
+    /// 370 (F10-1): when none is uncontained and the gate held a kill, a
+    /// would-have — never contained, though the ladder decides on it as it
+    /// would on a containment (no ISOLATE for it).
     pub fn outcome(&self) -> NeutralizeOutcome {
         if self.offenders.is_empty() {
             // No process attributed — we cannot contain a threat at the
@@ -78,10 +114,12 @@ impl NeutralizeReport {
         let not: Vec<String> = self
             .offenders
             .iter()
-            .filter(|o| !o.contained)
+            .filter(|o| o.containment == Containment::NotContained)
             .map(|o| format!("pid {}: {}", o.pid, o.kill))
             .collect();
-        if not.is_empty() {
+        if not.is_empty() && self.offenders.iter().any(OffenderOutcome::would_have) {
+            NeutralizeOutcome::WouldHaveContained
+        } else if not.is_empty() {
             NeutralizeOutcome::Contained
         } else {
             NeutralizeOutcome::Uncontainable {
@@ -92,18 +130,25 @@ impl NeutralizeReport {
 
     /// Every offender with the same verdict (test actuators).
     pub fn uniform(pids: &[u32], outcome: &NeutralizeOutcome) -> Self {
-        let (contained, kill) = match outcome {
-            NeutralizeOutcome::Contained => (true, "killed".to_string()),
-            NeutralizeOutcome::Uncontainable { reason } => (false, reason.clone()),
+        let (containment, kill, quarantine) = match outcome {
+            NeutralizeOutcome::Contained => (Containment::Contained, "killed", "quarantined"),
+            NeutralizeOutcome::WouldHaveContained => (
+                Containment::WouldHave,
+                "would have: KillProcessTree",
+                "detect-only: would be quarantined",
+            ),
+            NeutralizeOutcome::Uncontainable { reason } => {
+                (Containment::NotContained, reason.as_str(), "quarantined")
+            }
         };
         Self {
             offenders: pids
                 .iter()
                 .map(|&pid| OffenderOutcome {
                     pid,
-                    contained,
-                    kill: kill.clone(),
-                    quarantine: "quarantined".to_string(),
+                    containment,
+                    kill: kill.to_string(),
+                    quarantine: quarantine.to_string(),
                 })
                 .collect(),
         }
@@ -117,9 +162,13 @@ impl NeutralizeReport {
 pub enum IsolateOutcome {
     /// The isolator ran; per IP family, what the tables hold after it.
     Applied(IsolationReport),
-    /// Nothing was applied, and nothing will be: detect-only, or no
-    /// isolator in this build.
+    /// Nothing was applied, and nothing will be: no isolator in this
+    /// build.
     NotApplied(String),
+    /// Lot 370 (F10-1): the no-enforcement gate (the `alpha` profile,
+    /// `--detect-only`): the isolation was decided and not applied — the
+    /// host stays on the network. Signed as a would-have, not a failure.
+    WouldHave(String),
 }
 
 /// Outcome of a STAGE-1 soft egress block. External audit CMB-014: it

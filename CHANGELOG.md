@@ -6,6 +6,154 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 370 (the pre-alpha's final review, Phase 10, and a cross-model
+  check): what the records say is what happened, and the moments a root
+  could choose are recorded (`UPGRADE_NOTES_WAVE4.md` §58).
+  - **A would-have is its own outcome.** Under the no-enforcement gate
+    (the `alpha` profile, `--detect-only`) COMBAT's NEUTRALIZE kills and
+    quarantines nothing; its signed `combat_outcome` read `success`, "N
+    contained", and the journal "threat NEUTRALIZED and verified
+    contained". It is now `would_have: detect-only: would have contained
+    N …`, each offender `contained: false`, `would_have: true`; ISOLATE's
+    is `would_have` too; the copy-on-first-write guard is not told of a
+    containment; the journal and `nn-admin status` (the COMBAT stage line)
+    say detect-only; a rule response's journal line reads `NOT EXECUTED
+    (detect-only: would have)`. A ratchet keeps a would-have out of every
+    "done" pattern. Tests `detect_only_neutralize_signs_a_would_have_not_a_success`,
+    `detect_only_isolate_signs_a_would_have`,
+    `no_combat_outcome_is_a_success_with_a_held_action`,
+    `detect_only_neutralize_contains_nothing_and_says_would_have`,
+    `a_would_have_outcome_is_signed_as_one`,
+    `xtask/tests/would_have_outcomes.rs`.
+  - **A file of the FIM watch list created after the start is an event.**
+    `/etc/ld.so.preload` (NN-L-FIM-022) and root's `authorized_keys`
+    (NN-L-FIM-004), absent on most hosts, were watched from their creation
+    on, the creation itself unreported. The nearest directory there is
+    watched for that path's creation alone: the record names the writer
+    and is judged as a change; a file found with no record is an event at
+    the next look, its writer unknown. An ordinary file created in `/etc`
+    is no event. Tests
+    `ld_so_preload_created_after_the_start_is_fim_022_with_its_writer`,
+    `root_authorized_keys_created_after_the_start_is_fim_004`.
+  - **The module judge trusts a live package transaction only.** A module
+    file written since boot is trusted when its write came from a package
+    manager's lineage whose package manager was not stopped or traced at
+    the write (nor frozen by the system's freezer), the writer free of
+    injected code, and that
+    package manager held its lock at the write (dpkg's, apt's front end,
+    rpm's) — read in the kernel at the write: a new observer
+    (`module_lock_observe`, on `file_lock`) keeps the package managers'
+    write locks (`MODULE_PKG_LOCKERS`, pinned with the history), so a
+    `dpkg -i` shorter than any poll is still a transaction. Without that
+    observer (a signed observe failure) the agent samples the locks. Every
+    trusted load is recorded by R018, Low, with why. Two new kernel offsets
+    (`task_struct.__state`, `start_boottime`, the thread-group leader's);
+    the pinned write history names the transaction and pins a third map (a
+    new layout: an earlier agent's history is not adopted); its observer
+    steps in plain values (5.15's verifier refused the earlier form's read
+    of an unwritten stack slot). Tests
+    `a_module_write_is_a_transactions_only_while_it_holds_its_lock`,
+    `a_short_transactions_module_file_is_trusted_by_its_lock_at_the_write`,
+    `a_package_lock_is_held_from_its_write_lock_to_its_release`,
+    `the_write_history_names_its_one_live_transaction`,
+    `the_ebpf_history_step_is_the_option_step_in_plain_values`,
+    `verifier_headroom::the_module_write_history_steps_in_plain_values`,
+    `a_trusted_load_is_recorded_low_with_why`.
+  - **The agent's role is no longer vacated on demand in silence.** The
+    agent and the watchdog run with `OOMScoreAdjust=-999` — the host OOM
+    killer's last pick, still ended by their own memory cap — written again
+    by each at its start (the self-integrity check expects it on every host;
+    external audit DEP-005's raise to 0 is gone). A role whose holder exited
+    this boot is taken only by a successor started for it (by PID 1 or the
+    other role's holder, no code injected), and the taking is NN-L-BPF-002
+    High outside a signed trusted-installer window, Low inside one. Tests
+    `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
+    `a_role_taken_after_its_holder_exited_is_high`.
+  - **Smaller ones.** A program run as the dynamic loader's operand (or
+    preloaded by it) is judged by R001–R004 as if executed; a weakening
+    variable from the service manager's environment, not the unit, is
+    ignored at the start and signed (honoured, as before, when the manager
+    cannot be asked); the compare budget spent on runtime copies is signed;
+    an archive the retention removes younger than a day is a signed
+    degradation. Tests
+    `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`,
+    `a_weakening_variable_from_the_service_manager_is_ignored`,
+    `an_archive_evicted_young_is_said`.
+  - **The review of #578 (fix round 1).**
+    - A loader operand named through a link of `/proc` (the process's root
+      or working directory, a descriptor) is placed by the file the loader
+      maps — the exec pump opens the link in the
+      process's own view and finds the file among the process's executable
+      mappings (`nn_linux::sensors::loader_files`) — and judged as a direct
+      exec of it; not placed, a view's link is R001's record and a
+      descriptor's R004's kill (the first were silent). Tests
+      `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`,
+      `a_file_through_a_link_of_proc_is_placed_in_the_process_s_view`,
+      `the_pump_places_a_loader_s_files_the_process_maps`.
+    - A loader that only lists or checks its program (`--list`, `--verify`,
+      `LD_TRACE_LOADED_OBJECTS`, musl's loader as `ldd`, glibc's `ldd`
+      script its parent) is recorded Low, never killed; an `--audit`
+      library stays judged. Tests
+      `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`,
+      `the_system_s_ldd_is_a_shell_running_its_script_from_a_system_tree`,
+      `the_loader_s_trace_mode_is_read_from_its_environment`.
+    - R004: root's runtime copy not compared (the budget spent, every other
+      fact holding) is recorded High again, never killed (the first head
+      killed it: a container burst); the first of each episode names the
+      uid whose share ran out and the second's biggest spender. Tests
+      `an_uncompared_runtime_copy_is_recorded_never_killed`,
+      `the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget`,
+      `a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender`.
+    - The agent's own successor to a role its holder left is recorded: the
+      previous agent's hook wrote its record into a ring nobody read. The
+      successor records it at its start from the kernel's facts, High
+      outside a window, Low inside. Tests
+      `a_role_left_by_its_holder_is_high_outside_a_window_and_low_inside`,
+      `a_role_its_holder_left_outside_a_window_is_recorded_high`
+      (privileged).
+    - The would-have ratchet also forbids a would-have falling unnamed into
+      a `_ =>` arm that is done, and a negated `matches!` of the failures
+      only; the contain row says `would_have` for a held move.
+    - KNOWN_LIMITATIONS: files written in a package manager's lineage are
+      Low; a leaking agent outlives the workload where its cap cannot bind;
+      the weakening variables are honoured when the manager cannot be
+      asked; a root can keep a package transaction open for its modules.
+  - Its re-check (fix round 2):
+    - A program glibc's loader only lists (`--list`, `LD_TRACE_LOADED_OBJECTS`,
+      `ldd`) still has the libraries it names for auditing (`DT_AUDIT`,
+      `DT_DEPAUDIT`) loaded and run — its own constructor when it names
+      itself. The exec pump reads the program's dynamic section from the
+      file the loader maps (unchanged since the process started,
+      `nn_linux::sensors::elf_audit`): naming one, the program is judged as
+      run; not read in time, Medium, never killed, never "runs no code".
+      Round 3 (R2-1): a staged program glibc lists is never Low, even when
+      read naming none (the code that ran can make the read false, four
+      ways); Medium, never killed. The ELF reader (R2-2) takes only a
+      program-header size equal to the class's, with every buffer capped at
+      7 KiB, and has a fuzz target (`elf_audit`).
+      `--verify` and musl's `ldd` stay Low; musl's loader under
+      `LD_TRACE_LOADED_OBJECTS` (which it ignores) is judged as run. Tests
+      `a_staged_program_glibc_lists_is_never_low_whatever_the_pump_read`,
+      `a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps`,
+      `a_program_naming_a_library_for_auditing_is_told_from_one_naming_none`,
+      `the_dynamic_table_is_read_where_the_loader_maps_it`,
+      `a_dynamic_section_the_reader_cannot_follow_is_not_known`.
+    - A loader operand that reaches a staging directory through a symbolic
+      link (`/usr/tmp` → `../var/tmp` on the RHEL family) is also judged
+      where the pump finds the file the loader maps. Tests
+      `a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it`,
+      `a_loader_operand_through_a_symbolic_link_is_judged_where_the_pump_found_it`.
+    - The pump's waits for a loader's mapping are root's own and each
+      account's share, not one budget for the host. Test
+      `the_loaders_waits_are_root_s_own_and_each_account_s_share`.
+    - The privileged suites: the guard tests' restore agent starts as a
+      transient service (PID 1's child, the one start that may take a
+      vacated role while the guard enforces); the watchdog suite makes
+      `/etc/northnarrow` first and establishes the watchdog role's first
+      claim for `the_watchdog_s_own_start_is_not_a_foreign_bpf_handle`.
+    - Test assertion messages name what they expect instead of printing a
+      verdict's text (CodeQL `rust/cleartext-logging`).
+    - KNOWN_LIMITATIONS: the successor's record is its own.
 - Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
   each told by identity, the attack shape each rule exists for kept
   (`UPGRADE_NOTES_WAVE4.md` §57).

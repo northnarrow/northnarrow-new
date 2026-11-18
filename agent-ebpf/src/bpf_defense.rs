@@ -96,6 +96,7 @@ use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     bpf_held_dev, BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+    BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED,
     BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
@@ -105,7 +106,8 @@ use crate::btf_offsets::{
     BPF_PROG_INSNSI_OFFSET, BPF_PROG_LEN_OFFSET, BPF_PROG_TYPE_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
     FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
     INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
-    TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_START_TIME_OFFSET,
+    TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
+    TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 use northnarrow_common::wire::{InodeKey, PIN_NAME_HASH_PRIME, PIN_NAME_HASH_SEED};
 
@@ -269,7 +271,8 @@ pub const ROLE_AGENT: u8 = 2;
 
 /// External audit EBPF-002: the tgid of the live watchdog (slot 0) and
 /// agent (slot 1), written by each once it is a protected pid, zeroed by
-/// [`role_exit`] when that process exits. Pinned by name: the guard of an
+/// [`role_exit`] when that process exits — lot 370 (F10-4): set to
+/// [`ROLE_VACATED`] then, so the next claim is told from a first one. Pinned by name: the guard of an
 /// agent that died is still attached (pinned link) when its successor
 /// loads, and reads this to know the role is vacant.
 #[map]
@@ -918,6 +921,13 @@ pub(crate) fn caller_role() -> u8 {
 /// there before they register): its `start_time` is the process's, while
 /// a thread created later is always "fresh" and would keep the window
 /// open for as long as the process cares to spawn threads.
+///
+/// Lot 370 (F10-4): a role whose holder exited this boot
+/// ([`ROLE_VACATED`]: the OOM killer, a crash) is taken only by a
+/// successor started for it — a child of PID 1 (its unit's restart) or of
+/// the live holder of the other role (the watchdog's respawn) — with no
+/// code injected (lot 281's taint); a preloaded instance started from a
+/// shell gets nothing. A first claim this boot is as before.
 #[inline(always)]
 fn fresh_instance_may_load() -> bool {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -928,13 +938,12 @@ fn fresh_instance_may_load() -> bool {
     if role != ROLE_AGENT && role != ROLE_WATCHDOG {
         return false;
     }
-    let vacant = match ROLE_TGIDS.get((role - 1) as u32) {
-        Some(t) => *t == 0,
-        None => false,
+    let slot = (role - 1) as u32;
+    let vacated = match ROLE_TGIDS.get(slot) {
+        Some(t) if *t == 0 => false,
+        Some(t) if *t == ROLE_VACATED => true,
+        _ => return false,
     };
-    if !vacant {
-        return false;
-    }
     let task = unsafe { bpf_get_current_task() } as *const u8;
     if task.is_null() {
         return false;
@@ -945,7 +954,52 @@ fn fresh_instance_may_load() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    unsafe { bpf_ktime_get_ns() }.saturating_sub(start) < FRESH_INSTANCE_NS
+    if unsafe { bpf_ktime_get_ns() }.saturating_sub(start) >= FRESH_INSTANCE_NS {
+        return false;
+    }
+    !vacated || unsafe { started_for_the_role(task, slot) }
+}
+
+/// Lot 370 (F10-4): `task` (claiming role slot `slot`, vacated) is a child
+/// of PID 1 or of the live holder of the other role, and no code was
+/// injected into it.
+#[inline(always)]
+unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
+    let parent = match bpf_probe_read_kernel::<*const u8>(
+        task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
+    ) {
+        Ok(p) if !p.is_null() => p,
+        _ => return false,
+    };
+    let ptgid = match bpf_probe_read_kernel::<u32>(
+        parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
+    ) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let by_family = match ROLE_TGIDS.get(1 - (slot & 1)) {
+        Some(t) => *t != 0 && *t != ROLE_VACATED && *t == ptgid,
+        None => false,
+    };
+    (ptgid == 1 || by_family) && crate::cgroup_join::caller_untainted()
+}
+
+/// Lot 370 (F10-4): the record of a fresh instance's handle — a first
+/// claim of the role this boot (Low), or one after its holder exited
+/// (High: the OOM killer, a crash, the vacancy an attacker induces). The
+/// review of #578 (N2): inside a signed trusted-installer window the
+/// restart is the installer's (`systemctl restart` during an upgrade) —
+/// the family's own start, Low.
+#[inline(always)]
+fn fresh_instance_cmd() -> u32 {
+    let role = caller_role();
+    let vacated = (role == ROLE_AGENT || role == ROLE_WATCHDOG)
+        && matches!(ROLE_TGIDS.get((role - 1) as u32), Some(t) if *t == ROLE_VACATED);
+    if vacated && !crate::inode_protect::override_active() {
+        BPF_CMD_VACATED_ROLE_GET_FD
+    } else {
+        BPF_CMD_FRESH_INSTANCE_GET_FD
+    }
 }
 
 /// `sched_process_exit` (raw tracepoint): when the group leader of the
@@ -966,7 +1020,8 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
     while slot < 2 {
         if let Some(t) = ROLE_TGIDS.get_ptr_mut(slot) {
             if unsafe { *t } == tgid {
-                unsafe { *t = 0 };
+                // lot 370 (F10-4): vacated, not never held
+                unsafe { *t = ROLE_VACATED };
                 // the review of #567 (F2): its mount namespace is no longer
                 // judged as PID 1's
                 crate::mount_guard::vacate(slot);
@@ -1719,7 +1774,7 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     let fresh_instance =
         (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();
     let report_cmd = if fresh_instance {
-        BPF_CMD_FRESH_INSTANCE_GET_FD
+        fresh_instance_cmd()
     } else if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
     } else {

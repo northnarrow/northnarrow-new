@@ -1587,6 +1587,16 @@ impl GuardFixture {
 
     /// Start the installed agent; `enforce` forces the guard's deny mode.
     fn spawn(&self, name: &'static str, enforce: bool) -> Result<GuardRun, String> {
+        self.spawn_as(name, enforce, Launch::Sudo)
+    }
+
+    /// [`Self::spawn`], started by `launch`.
+    fn spawn_as(
+        &self,
+        name: &'static str,
+        enforce: bool,
+        launch: Launch,
+    ) -> Result<GuardRun, String> {
         let d = self.dir.path();
         let log = d.join(format!("{name}.log"));
         let out = std::fs::File::create(&log).map_err(|e| format!("create {name}.log: {e}"))?;
@@ -1609,7 +1619,7 @@ impl GuardFixture {
         }
         let child = self
             .agent
-            .command(&state, Launch::Sudo, &env)
+            .command(&state, launch, &env)
             .arg("--combat-rules")
             .arg(d.join("combat-rules.v4"))
             .arg("--detect-only")
@@ -1663,8 +1673,16 @@ impl GuardFixture {
     /// A run of the same binary without the variable: the guard re-armed
     /// in observe mode. Stopped signed, else by the fixtures' eviction
     /// (which observe mode allows).
+    ///
+    /// Lot 370 (F10-4; the re-check of #578): the enforce-mode agent's exit
+    /// vacated its role, and while the guard enforces only a successor
+    /// started for the role takes a handle on the pins — PID 1's child, as
+    /// the unit's restart. Started from the test's shell it was refused
+    /// (`BPF_OBJ_GET`: EPERM, exit 78), the guard stayed in enforce mode and
+    /// every later agent of the suite was refused: 18 tests on #578's KVM
+    /// suites. It starts as a transient service ([`Launch::Unit`]).
     fn restore_observe(&self) -> Result<(), String> {
-        let mut run = self.spawn("restore", false)?;
+        let mut run = self.spawn_as("restore", false, Launch::Unit)?;
         let ready = wait_ready(&mut run).and_then(|_| {
             let reg = wait_for_log_line(&run.log, &["own objects registered"], GUARD_LOG_TIMEOUT)
                 .ok_or("no BPF self-defence registration line")?;
@@ -1680,7 +1698,13 @@ impl GuardFixture {
             GUARD_STOP_TIMEOUT,
         )
         .or_else(|e| {
-            common::try_quit_agent(&mut run.child, common::QUIT_TIMEOUT)
+            // the agent is PID 1's child: its pid from its pid file
+            let agent: Vec<u32> = std::fs::read_to_string(&run.pid_file)
+                .ok()
+                .and_then(|b| b.trim().parse().ok())
+                .into_iter()
+                .collect();
+            common::try_quit_agent_with(&mut run.child, &agent, common::QUIT_TIMEOUT)
                 .map_err(|q| format!("{e}; then {q}"))
         });
         match (ready, stopped) {

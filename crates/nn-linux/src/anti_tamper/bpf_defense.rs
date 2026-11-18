@@ -887,6 +887,73 @@ fn claim_agent_role(guard: &BpfGuard, ebpf: &mut Ebpf, pin_root: Option<&Path>) 
     Ok(())
 }
 
+/// The review of #578 (N2): what the agent's own start records of the
+/// role it takes — `slot`, its role's entry in `ROLE_TGIDS` before it
+/// claims it, and whether a signed trusted-installer window was open then:
+/// the role vacated by its holder's exit this boot ([`ROLE_VACATED`]: the
+/// OOM killer, a crash, a kill nothing refused) is NN-L-BPF-002 High
+/// outside a window, the family's own start (Low) inside one (the
+/// installer's restart); a first claim this boot (0) records nothing here.
+/// The `bpf` hook's own choice ([`fresh_instance_cmd`] in the eBPF object).
+///
+/// [`ROLE_VACATED`]: common::wire::ROLE_VACATED
+/// [`fresh_instance_cmd`]: ../../../agent-ebpf/src/bpf_defense.rs
+pub fn succession_cmd(slot: u32, window: bool) -> Option<u32> {
+    use common::wire::{BPF_CMD_FRESH_INSTANCE_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED};
+    (slot == ROLE_VACATED).then_some(if window {
+        BPF_CMD_FRESH_INSTANCE_GET_FD
+    } else {
+        BPF_CMD_VACATED_ROLE_GET_FD
+    })
+}
+
+/// The review of #578 (N2): the record of the agent's own succession to
+/// its role ([`succession_cmd`]), read from `ebpf` right after its load —
+/// the pinned `ROLE_TGIDS`, `FS_GRANT` and `AGENT_SESSION` the load reused,
+/// before the start claims the role, rolls its session or zeroes the
+/// window. The start's handles on the agent's pins were taken by that load,
+/// before it was a protected pid: the previous agent's `bpf` hook, still
+/// attached through its pinned link, judged them and wrote its record into
+/// that agent's ring — which nobody reads any more (a ring is never pinned:
+/// a reused one desyncs its new reader). The successor records it from the
+/// same kernel facts the hook read; `now_ns` is `CLOCK_MONOTONIC`, the
+/// hook's clock. `None`: no succession, or a map the object lacks.
+pub fn succession_record(ebpf: &Ebpf, now_ns: u64) -> Option<nn_model::Event> {
+    let u32_at = |name: &str, slot: u32| -> Option<u32> {
+        let a: Array<&MapData, u32> = Array::try_from(ebpf.map(name)?).ok()?;
+        a.get(&slot, 0).ok()
+    };
+    let slot = u32_at(
+        antitamper_bpf::ROLE_TGIDS_MAP_NAME,
+        antitamper_bpf::ROLE_SLOT_AGENT,
+    )?;
+    let session = u32_at(super::AGENT_SESSION_MAP_NAME, 0).unwrap_or(0);
+    let window = ebpf
+        .map(super::FS_GRANT_MAP_NAME)
+        .and_then(|m| Array::<&MapData, super::AyaFsGrant>::try_from(m).ok())
+        .and_then(|a| a.get(&0, 0).ok())
+        .is_some_and(|g| g.0.active(now_ns, session));
+    let cmd = succession_cmd(slot, window)?;
+    let arg = ebpf
+        .map(antitamper_bpf::ROLE_TGIDS_MAP_NAME)
+        .and_then(|m| map_data(m).info().ok())
+        .map_or(0, |i| i.id());
+    // the record's name only: unread, the record carries none (its pid is
+    // the agent's)
+    let comm = crate::state_read::read_state("/proc/self/comm")
+        .map(|c| c.trim_end().to_string())
+        .unwrap_or_default();
+    Some(nn_model::Event::BpfSyscall {
+        pid: std::process::id(),
+        // SAFETY: geteuid has no failure mode.
+        uid: unsafe { libc::geteuid() },
+        comm,
+        cmd,
+        arg,
+        timestamp_ns: now_ns,
+    })
+}
+
 impl BpfGuard {
     /// External audit ATP-013: record the ids of every map of `ebpf` — call
     /// right after the load, before any `take_map`.
@@ -2035,6 +2102,56 @@ pub(crate) fn map_data(m: &Map) -> &MapData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review of #578 (N2, named): the agent's start records the role it
+    /// takes from the kernel's facts — a role its holder left this boot
+    /// (the OOM killer, a crash: `ROLE_VACATED`) is NN-L-BPF-002 High
+    /// outside a signed window and the family's own start (Low) inside one;
+    /// a first claim this boot, or a slot naming a process, records nothing
+    /// here. On 382be007 the only record of it was the previous agent's
+    /// guard's, written to a ring nobody read: none reached the detections
+    /// (the privileged `a_role_its_holder_left_outside_a_window_is_recorded_high`).
+    #[test]
+    fn a_role_left_by_its_holder_is_high_outside_a_window_and_low_inside() {
+        use common::wire::{
+            BPF_CMD_FRESH_INSTANCE_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED,
+        };
+        assert_eq!(
+            succession_cmd(ROLE_VACATED, false),
+            Some(BPF_CMD_VACATED_ROLE_GET_FD)
+        );
+        assert_eq!(
+            succession_cmd(ROLE_VACATED, true),
+            Some(BPF_CMD_FRESH_INSTANCE_GET_FD)
+        );
+        assert_eq!(succession_cmd(0, false), None);
+        assert_eq!(succession_cmd(0, true), None);
+        assert_eq!(succession_cmd(4242, false), None);
+        // the rule's verdicts for them: High, and the start's Low
+        let rule = nn_core::decision::rules::bpf::NnLBpf002BpfForeignHandleOrDetach::<
+            crate::chain_host_linux::LinuxHost,
+        >::new(std::sync::Arc::new(
+            nn_core::config::comm_allowlist::CommAllowlist::from_iter_owned(Vec::new()),
+        ));
+        let ev = |cmd: u32| nn_model::Event::BpfSyscall {
+            pid: 4242,
+            uid: 0,
+            comm: "northnarrow-age".into(),
+            cmd,
+            arg: 7,
+            timestamp_ns: 1,
+        };
+        use nn_core::decision::Rule;
+        let sev = |cmd| rule.evaluate(&ev(cmd)).map(|v| v.severity);
+        assert_eq!(
+            sev(succession_cmd(ROLE_VACATED, false).unwrap()),
+            Some(nn_model::Severity::High)
+        );
+        assert_eq!(
+            sev(succession_cmd(ROLE_VACATED, true).unwrap()),
+            Some(nn_model::Severity::Low)
+        );
+    }
 
     /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
     /// of the agent's programs is its own; anything else named `link_*` is

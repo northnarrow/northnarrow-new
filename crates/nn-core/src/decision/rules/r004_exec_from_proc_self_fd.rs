@@ -98,14 +98,19 @@
 //! holds but whose bytes were not compared — its uid's share of the
 //! compare budget spent this second (the review of #556, F2: each uid but
 //! root has its own share, root a reserve no user can spend) — is recorded
-//! High, never killed, only for uid 0 (the initial user namespace's root):
-//! any other uid spends its own share (the re-check of #556, N1: three
-//! decoy hooks, then a sealed payload of runc's length) and its uncompared
-//! memfd stays the Critical kill. Either verdict says "not compared
-//! (budget)" — a memfd of the runtime's length, any program's — never a
-//! copy of the runtime. Residual: root spending its own budget, then
-//! executing its own memfd under the runtime, is recorded, not killed —
-//! root, who needs no such route. Residual: the kernel reads the file's first bytes
+//! High, never killed, for uid 0 (the initial user namespace's root: a
+//! busy container host's starts past the budget — the review of #578, N3,
+//! reverting lot 370's F10-6 kill); any other uid spends its own share
+//! (the re-check of #556, N1: decoys, then a sealed payload of runc's
+//! length) and its uncompared memfd stays the Critical kill. The first
+//! such clone of an episode (no skip for that uid in the minute before)
+//! says so in its record, naming the uid whose share ran out and the
+//! second's biggest spender — the budget spent on purpose is seen — and
+//! the pump signs the spending (`runtime_copy_compare`). Either verdict
+//! says "not compared (budget)" — a memfd of the runtime's length, any
+//! program's — never a copy of the runtime. Residual: root spending its
+//! own budget, then executing its own memfd under the runtime, is recorded
+//! High, not killed — root, who needs no such route. Residual: the kernel reads the file's first bytes
 //! (the binary's header, `bprm->buf`) just before the LSM hook reads the
 //! seals; a writer racing that window chooses the header of a run whose
 //! every mapped byte is the sealed runtime's (no code of its own: the
@@ -140,8 +145,31 @@ enum RuntimeCopy {
     /// budget spent this second) — a memfd of the runtime's length, any
     /// program's: root's recorded, never killed; any other uid's the
     /// Critical kill (the re-check of #556, N1: a user spends its own
-    /// share; [`R004ExecFromProcSelfFd::not_compared`]).
-    NotCompared,
+    /// share; [`R004ExecFromProcSelfFd::not_compared`]) — with the episode
+    /// it opened, if it is the first (the review of #578, N3).
+    NotCompared(Option<program_identity::BudgetEpisode>),
+}
+
+/// The review of #578 (N3): the sentence an uncompared runtime copy's
+/// record adds when it opened an episode of a spent compare budget — the
+/// uid whose share ran out, and the second's biggest spender — and nothing
+/// for the later ones of the episode.
+fn episode_text(episode: Option<program_identity::BudgetEpisode>) -> String {
+    let Some(e) = episode else {
+        return String::new();
+    };
+    let top = match e.top {
+        Some((top, bytes)) => format!(
+            "; the second's biggest spender: uid {top}, {} MiB",
+            bytes >> 20
+        ),
+        None => String::new(),
+    };
+    format!(
+        " — the compare budget's spending opened an episode (signed once per episode): uid \
+         {}'s share ran out{top}",
+        e.uid
+    )
 }
 
 /// R14a (plan §3.5): how the agent starts its own workers — the one
@@ -358,6 +386,8 @@ pub struct R004ExecFromProcSelfFd<H: PostureHost> {
     own: Option<OwnWorkerLaunch>,
     /// Lot 310: systemd's executor, by its identities (empty: none known).
     executor: ExecutorImages,
+    /// The review of #578 (P3): the system's `ldd` running the loader.
+    listing: super::LoaderListing,
 }
 
 impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
@@ -366,7 +396,45 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
             lineage: Some(lineage),
             own: None,
             executor: ExecutorImages::default(),
+            listing: super::LoaderListing::default(),
         }
+    }
+
+    /// This rule with the lineage's identity of `ldd` (the review of #578).
+    pub fn with_loader_listing(mut self, listing: super::LoaderListing) -> Self {
+        self.listing = listing;
+        self
+    }
+
+    /// Lot 370 (05-3.3): fileless code the dynamic loader runs for `event`
+    /// — its operand (or a preload) a memfd or an unlinked file by the
+    /// kernel's identity of the file it maps (the pump's placement: the
+    /// review of #578, N1 — a linked file reached through a descriptor is
+    /// judged as a direct exec of it: by the staging rules, on its path), or
+    /// a descriptor's link (or a memfd's name) the pump could not place —
+    /// with what the loader does with it (one it runs first, then one it may
+    /// run). The re-check of #578 (R1-2): a name not through a link of
+    /// `/proc` the pump found unlinked is fileless too.
+    fn loader_fileless(&self, event: &Event) -> Option<(String, super::LoaderUse)> {
+        use super::{LoaderUse, Placement};
+        let mut found: Option<(String, LoaderUse)> = None;
+        for (text, use_) in super::loader_code(event, self.listing.lists(event)) {
+            let fileless = match super::placed(event, text) {
+                Some(Placement::Fileless(p)) => Some(format!("{text}: {p}")),
+                Some(Placement::File(_)) => None,
+                None => Self::is_proc_fd_path(text).then(|| text.to_string()),
+            }
+            .or_else(|| match super::pump_placement(event, text) {
+                Some(Placement::Fileless(p)) => Some(format!("{text}: {p}")),
+                _ => None,
+            });
+            if let Some(f) = fileless {
+                if found.as_ref().is_none_or(|(_, u)| u.rank() < use_.rank()) {
+                    found = Some((f, use_));
+                }
+            }
+        }
+        found
     }
 
     /// R14a: this rule knowing the agent's worker launch.
@@ -444,20 +512,31 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// identity fact holds but whose bytes the pump did not compare (the
     /// budget's share of `uid` spent this second). Only uid 0 — the initial
     /// user namespace's root, a budget no user can spend — is recorded High
-    /// without a kill; any other uid chooses to spend its own share (decoy
+    /// without a kill (the review of #578, N3: lot 370's F10-6 made it the
+    /// Critical kill, and a busy container host's starts past the budget
+    /// were killed); any other uid chooses to spend its own share (decoy
     /// hooks), so its uncompared memfd stays the Critical kill. Neither text
-    /// calls it a copy of the runtime: nobody compared its bytes.
-    fn not_compared(&self, event: &Event, uid: u32) -> Verdict {
+    /// calls it a copy of the runtime: nobody compared its bytes. The first
+    /// of an episode names who spent the budget ([`episode_text`]).
+    fn not_compared(
+        &self,
+        event: &Event,
+        uid: u32,
+        episode: Option<program_identity::BudgetEpisode>,
+    ) -> Verdict {
+        let episode = episode_text(episode);
         if uid == 0 {
             build_verdict(
                 self,
                 event,
                 ResponseAction::Log,
                 Severity::High,
-                "memfd exec under an installed container runtime and its manager, sealed at \
-                 the exec, of an installed runtime's length — not compared (budget): root's \
-                 compare budget spent this second, its bytes may be any program's (lot 347); \
-                 recorded, not killed",
+                &format!(
+                    "memfd exec under an installed container runtime and its manager, sealed at \
+                     the exec, of an installed runtime's length — not compared (budget): root's \
+                     compare budget spent this second, its bytes may be any program's (lot 347); \
+                     recorded, not killed{episode}"
+                ),
             )
         } else {
             build_verdict(
@@ -465,9 +544,12 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 event,
                 ResponseAction::KillProcessTree,
                 Severity::Critical,
-                "memfd-style exec detected — fileless execution, highly suspicious; under an \
-                 installed container runtime, of an installed runtime's length, not compared \
-                 (budget): its uid's share of the compare budget spent this second (lot 347)",
+                &format!(
+                    "memfd-style exec detected — fileless execution, highly suspicious; under an \
+                     installed container runtime, of an installed runtime's length, not compared \
+                     (budget): uid {uid}'s share of the compare budget spent this second (lot \
+                     347){episode}"
+                ),
             )
         }
     }
@@ -502,7 +584,7 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         // the pump's compare: the sealed memfd is this installed runtime
         let clone = program_identity::runtime_clone_of(event)?;
         let copy = if clone.unverified {
-            RuntimeCopy::NotCompared
+            RuntimeCopy::NotCompared(clone.episode)
         } else {
             RuntimeCopy::Compared
         };
@@ -589,6 +671,51 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             return None;
         };
         use common::wire::exe::exe_flags::{DELETED, KNOWN, MEMFD, PROC_EXE};
+        // Lot 370 (05-3.3): fileless code the dynamic loader runs — its
+        // operand (or a preload) a memfd or an unlinked file, or a
+        // descriptor's link not placed: the image the kernel executed is the
+        // loader, in `/lib`. The review of #578 (P3): one it only lists, Low;
+        // its re-check (R1-1): one it may run while it lists, Medium — never
+        // killed, never said to run nothing
+        if let Some((p, use_)) = self.loader_fileless(event) {
+            use crate::decision::rules::LoaderUse;
+            let listed = match use_ {
+                LoaderUse::Runs => None,
+                LoaderUse::Lists(why) => Some((
+                    Severity::Low,
+                    format!(
+                        "fileless code only listed or checked by the dynamic loader ({p}: {why}) \
+                         — in that mode the loader runs no code of it; recorded Low, not killed"
+                    ),
+                )),
+                LoaderUse::MayRun(why) => Some((
+                    Severity::Medium,
+                    format!(
+                        "fileless code given to the dynamic loader to list or check ({p}: {why}) \
+                         — it may still run code; recorded, not killed"
+                    ),
+                )),
+            };
+            if let Some((severity, text)) = listed {
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    severity,
+                    &text,
+                ));
+            }
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Critical,
+                &format!(
+                    "memfd-style exec through the dynamic loader ({p}) — fileless execution, \
+                     highly suspicious"
+                ),
+            ));
+        }
         // R14a: the core starting its own worker from its boot descriptor
         if self
             .own
@@ -617,8 +744,8 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             let fileless = if exe.has(MEMFD) {
                 match self.runtime_self_clone(event, as_of) {
                     Some(RuntimeCopy::Compared) => false,
-                    Some(RuntimeCopy::NotCompared) => {
-                        return Some(self.not_compared(event, *uid));
+                    Some(RuntimeCopy::NotCompared(episode)) => {
+                        return Some(self.not_compared(event, *uid, episode));
                     }
                     None => true,
                 }
@@ -1743,6 +1870,7 @@ mod lot310 {
             image,
             seen: Vec::new(),
             unverified: false,
+            ..Default::default()
         };
         let (runc, shim, bash, crun) = (
             (0x0fd0_0347, 347_001),
@@ -1855,6 +1983,7 @@ mod lot310 {
             image: runc,
             seen: vec![(34_741, runc), (at, forker_image)],
             unverified: false,
+            ..Default::default()
         };
         let podman = |e: Event, clone: RuntimeClone| {
             assert!(lineage.ingest_spawn_event(&e));
@@ -1880,6 +2009,7 @@ mod lot310 {
             image: runc,
             seen: vec![(34_747, runc), (34_746, conmon)],
             unverified: false,
+            ..Default::default()
         };
         assert!(kills(podman(
             memfd_exec(34_748, 34_747, 34_747, 410),
@@ -1901,6 +2031,7 @@ mod lot310 {
             image: runc,
             seen: vec![(34_751, runc), (at, conmon)],
             unverified: false,
+            ..Default::default()
         };
         assert!(podman(memfd_exec(34_752, 34_751, 0, 400), under(34_750)).is_none());
         assert!(podman(memfd_exec(34_753, 34_751, 34_751, 400), under(34_750)).is_none());
@@ -1961,6 +2092,7 @@ mod lot310 {
                     image: runc,
                     seen: Vec::new(),
                     unverified,
+                    ..Default::default()
                 },
             );
             r.evaluate(&e)
@@ -1978,12 +2110,14 @@ mod lot310 {
         assert!(kills(judged(unsealed_at_exec(35_604), true)));
     }
 
-    /// The review of #556 (F2, named): root's memfd whose every identity
-    /// fact holds but whose bytes the pump did not compare (root's budget
-    /// spent this second) is recorded High, never killed — the alpha's
-    /// Docker starts past a flood. One whose facts fail stays the Critical
-    /// kill (fails on the lot's first head: every uncompared clone was
-    /// killed). Any other uid's: the next test (N1).
+    /// The review of #556 (F2): root's memfd whose every identity fact
+    /// holds but whose bytes the pump did not compare (root's budget spent
+    /// this second) is recorded High, never killed — a busy container
+    /// host's starts past the budget. The review of #578 (N3, named): lot
+    /// 370's F10-6 made it the Critical kill (more than ~17 container
+    /// starts a second killed runc under `enforcing`, a Critical record
+    /// under `alpha`); it fails on 382be007. One whose facts fail stays the
+    /// Critical kill. Any other uid's: the next test (N1).
     #[test]
     fn an_uncompared_runtime_copy_is_recorded_never_killed() {
         use crate::decision::rules::program_identity::{
@@ -2024,6 +2158,7 @@ mod lot310 {
             image: runc,
             seen: Vec::new(),
             unverified: true,
+            ..Default::default()
         };
         let under_shim = memfd_exec(35_612, 35_611, 35_611, 400);
         assert!(lineage.ingest_spawn_event(&under_shim));
@@ -2032,16 +2167,22 @@ mod lot310 {
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::Log, Severity::High),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
+        );
+        // not the first of an episode: no episode sentence
+        assert!(
+            !v.reasoning.contains("episode"),
+            "the record does not say \'episode\'"
         );
         // the re-check of #556 (N1): the text vouches for no bytes
         assert!(
             v.reasoning.contains("not compared (budget)"),
-            "{}",
-            v.reasoning
+            "the record says 'not compared (budget)'"
         );
-        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("copy"),
+            "the record does not say \'copy\'"
+        );
         // CONTROL: the runtime run by a session's shell — the kill
         let under_shell = memfd_exec(35_622, 35_621, 35_621, 400);
         assert!(lineage.ingest_spawn_event(&under_shell));
@@ -2098,6 +2239,7 @@ mod lot310 {
                     image: runc,
                     seen: Vec::new(),
                     unverified,
+                    ..Default::default()
                 },
             );
             r.evaluate(e)
@@ -2110,24 +2252,107 @@ mod lot310 {
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::KillProcessTree, Severity::Critical),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
         );
         assert!(
             v.reasoning.contains("not compared (budget)"),
-            "{}",
-            v.reasoning
+            "the record says 'not compared (budget)'"
         );
-        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("copy"),
+            "the record does not say \'copy\'"
+        );
         // a subordinate uid (a rootless container's root, mapped): the same
         let sub = judged(&as_uid(35_634, 100_000), true);
         assert!(kills(sub), "a mapped root is no uid 0");
         // CONTROL: root's past its own budget — recorded, not killed (the
-        // named residual)
+        // named residual; the review of #578, N3)
         let v = judged(&as_uid(35_635, 0), true).expect("recorded");
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::Log, Severity::High)
+        );
+    }
+
+    /// The review of #578 (N3, named): the first uncompared runtime copy of
+    /// an episode of a spent compare budget says so in its record — the uid
+    /// whose share ran out and the second's biggest spender — root's
+    /// recorded High (never killed), any other uid's the Critical kill; the
+    /// later ones of the episode carry no such sentence (the previous
+    /// test). Fails on 382be007 (no episode in the record, root's killed).
+    #[test]
+    fn the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, BudgetEpisode, InstalledImage, RuntimeClone,
+        };
+        let (runc, shim) = ((0x0fd0_0578, 578_031), (0x0fd0_0578, 578_032));
+        for (id, path, kind) in [
+            (runc, "/usr/sbin/runc", ProgramKind::ContainerRuntime),
+            (
+                shim,
+                "/usr/bin/containerd-shim-runc-v2",
+                ProgramKind::RuntimeManager,
+            ),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<H>::new(tmp.path());
+        for e in [
+            lineage_exec(35_640, 1, 1, shim, 100),
+            lineage_exec(35_641, 35_640, 35_640, runc, 200),
+        ] {
+            assert!(lineage.ingest_spawn_event(&e));
+        }
+        let r = R004::new(lineage.clone());
+        let judged = |pid: u32, uid: u32, top: Option<(u32, u64)>| {
+            let mut e = memfd_exec(pid, 35_641, 35_641, 400);
+            if let Event::ProcessSpawn { uid: u, gid, .. } = &mut e {
+                (*u, *gid) = (uid, uid);
+            }
+            assert!(lineage.ingest_spawn_event(&e));
+            keep_runtime_clone(
+                &e,
+                RuntimeClone {
+                    image: runc,
+                    seen: Vec::new(),
+                    unverified: true,
+                    episode: Some(BudgetEpisode { uid, top }),
+                },
+            );
+            r.evaluate(&e).expect("judged")
+        };
+        let v = judged(35_642, 0, Some((1000, 300 << 20)));
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::High),
+            "the verdict's action and severity"
+        );
+        for want in [
+            "opened an episode",
+            "uid 0's share ran out",
+            "biggest spender: uid 1000, 300 MiB",
+        ] {
+            assert!(v.reasoning.contains(want), "the record says {want}");
+        }
+        let v = judged(35_643, 1000, None);
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::KillProcessTree, Severity::Critical),
+            "the verdict's action and severity"
+        );
+        assert!(
+            v.reasoning.contains("uid 1000's share ran out"),
+            "the record says 'uid 1000's share ran out'"
+        );
+        assert!(
+            !v.reasoning.contains("biggest spender"),
+            "the record does not say \'biggest spender\'"
         );
     }
 

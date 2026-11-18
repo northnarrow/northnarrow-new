@@ -26,7 +26,8 @@ use tracing::{info, warn};
 use nn_model::ResponseAction;
 
 pub use nn_core::combat::actuator::{
-    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, OffenderOutcome, SoftBlock,
+    CombatActuator, Containment, IsolateOutcome, NeutralizeOutcome, NeutralizeReport,
+    OffenderOutcome, SoftBlock,
 };
 
 use super::offender::ProcFacts;
@@ -81,18 +82,26 @@ impl SystemActuator {
     }
 
     /// Map a kill outcome to "did we contain this offender?". `Killed` /
-    /// `AlreadyGone` are containment; `WouldExecute` is detect-only (we
-    /// *would* have, and isolation is suppressed too, so don't pretend
-    /// uncontainable). Everything else (Refused = below the protection
-    /// floor, PermissionDenied = kernel/LSM protected, Failed =
-    /// `ETIMEDOUT` still-alive / other) is uncontainable.
+    /// `AlreadyGone` are containment. `WouldExecute` is the gate's (the
+    /// `alpha` profile, detect-only): the kill was approved and not carried
+    /// out — the process runs — so it is a would-have, never containment
+    /// (lot 370, F10-1: it counted as contained, and NEUTRALIZE signed
+    /// `success`, "N contained", for a kill that never happened); the ladder
+    /// still does not take it for uncontainable. Everything else (Refused =
+    /// below the protection floor, PermissionDenied = kernel/LSM protected,
+    /// Failed = `ETIMEDOUT` still-alive / other) is uncontainable.
+    pub fn containment(outcome: &ExecutionOutcome) -> Containment {
+        match outcome {
+            ExecutionOutcome::Killed { .. } | ExecutionOutcome::AlreadyGone { .. } => {
+                Containment::Contained
+            }
+            ExecutionOutcome::WouldExecute { .. } => Containment::WouldHave,
+            _ => Containment::NotContained,
+        }
+    }
+
     fn contained(outcome: &ExecutionOutcome) -> bool {
-        matches!(
-            outcome,
-            ExecutionOutcome::Killed { .. }
-                | ExecutionOutcome::AlreadyGone { .. }
-                | ExecutionOutcome::WouldExecute { .. }
-        )
+        Self::containment(outcome) == Containment::Contained
     }
 
     /// External audit CMB-002: why the descendants of a kill tree (its
@@ -139,20 +148,35 @@ impl SystemActuator {
     /// guard, or beyond a walk cut short — is a threat the process level
     /// did not contain. (Lab PR 243: a function of its own, so the golden
     /// replay's host reports through the same words.)
-    pub fn kill_outcome(report: &ExecutionReport) -> (bool, String) {
-        if !Self::contained(&report.primary) {
-            (false, format!("kill outcome {:?}", report.primary))
-        } else if let Some(reason) = Self::tree_not_contained(&report.additional) {
-            (false, reason)
-        } else {
-            (
-                true,
+    ///
+    /// Lot 370 (F10-1): a kill the gate held is a would-have: its text names
+    /// the outcome first (`WouldExecute { pid }`), then what would have run
+    /// and that nothing did.
+    pub fn kill_outcome(report: &ExecutionReport) -> (Containment, String) {
+        match Self::containment(&report.primary) {
+            Containment::WouldHave => (
+                Containment::WouldHave,
                 format!(
-                    "{:?} ({} descendant(s) handled)",
+                    "{:?}: {} — detect-only, not carried out: the process was left running",
                     report.primary,
-                    report.additional.len()
+                    nn_core::response::profile::would_have(&format!("{:?}", report.action))
                 ),
-            )
+            ),
+            Containment::NotContained => (
+                Containment::NotContained,
+                format!("kill outcome {:?}", report.primary),
+            ),
+            Containment::Contained => match Self::tree_not_contained(&report.additional) {
+                Some(reason) => (Containment::NotContained, reason),
+                None => (
+                    Containment::Contained,
+                    format!(
+                        "{:?} ({} descendant(s) handled)",
+                        report.primary,
+                        report.additional.len()
+                    ),
+                ),
+            },
         }
     }
 
@@ -402,26 +426,32 @@ impl CombatActuator<LinuxHost> for SystemActuator {
                 .executor
                 .execute_on(ResponseAction::KillProcessTree, r, &intent);
             Self::finish(intent, &report);
-            let (contained, kill) = Self::kill_outcome(&report);
-            if contained {
-                info!(
+            let (containment, kill) = Self::kill_outcome(&report);
+            match containment {
+                Containment::Contained => info!(
                     target: "combat.actuator",
                     pid,
                     outcome = ?report.primary,
                     children = report.additional.len(),
                     "NEUTRALIZE: killed offending process tree"
-                );
-            } else {
-                warn!(
+                ),
+                // Lot 370 (F10-1): not "killed".
+                Containment::WouldHave => warn!(
+                    target: "combat.actuator",
+                    pid,
+                    "NEUTRALIZE: detect-only — would have killed the offending process tree; \
+                     not killed, it still runs"
+                ),
+                Containment::NotContained => warn!(
                     target: "combat.actuator",
                     pid,
                     why = %kill,
                     "NEUTRALIZE: offender NOT contained — the other offenders are still handled"
-                );
+                ),
             }
             outcomes.push(OffenderOutcome {
                 pid,
-                contained,
+                containment,
                 kill,
                 quarantine: String::new(),
             });
@@ -464,7 +494,8 @@ impl CombatActuator<LinuxHost> for SystemActuator {
                 "DETECT-ONLY: STAGE 3 reached — would engage full network isolation; \
                  iptables NOT applied (no enforcement)"
             );
-            return IsolateOutcome::NotApplied(DETECT_ONLY_ISOLATE.to_string());
+            // Lot 370 (F10-1): a would-have, signed as one.
+            return IsolateOutcome::WouldHave(DETECT_ONLY_ISOLATE.to_string());
         }
         match &self.isolator {
             Some(iso) => {
@@ -590,14 +621,18 @@ mod tests {
     #[test]
     fn tree_containment_counts_every_descendant() {
         use ExecutionOutcome as O;
+        // Lot 370 (F10-1): a descendant the gate did not kill was in this
+        // contained set; it is not contained (below).
         assert_eq!(
-            SystemActuator::tree_not_contained(&[
-                O::Killed { pid: 8 },
-                O::AlreadyGone { pid: 9 },
-                O::WouldExecute { pid: 10 }
-            ]),
+            SystemActuator::tree_not_contained(&[O::Killed { pid: 8 }, O::AlreadyGone { pid: 9 }]),
             None
         );
+        let r = SystemActuator::tree_not_contained(&[
+            O::Killed { pid: 8 },
+            O::WouldExecute { pid: 10 },
+        ])
+        .unwrap();
+        assert!(r.contains("not killed") && r.contains("pid: 10"), "{r}");
         let r = SystemActuator::tree_not_contained(&[
             O::Killed { pid: 8 },
             O::PermissionDenied { pid: 9, errno: 1 },
@@ -665,6 +700,76 @@ mod tests {
             }
             other => panic!("a surviving descendant must not count as contained: {other:?}"),
         }
+    }
+
+    /// Lot 370 (F10-1): under the gate (the `alpha` profile, detect-only)
+    /// NEUTRALIZE kills nothing: the offender runs, and the report says it
+    /// would have been contained — never that it is. On main it read
+    /// `contained` and the outcome `Contained` while the process still ran,
+    /// and the ladder signed `success`, "1 contained". ISOLATE is a
+    /// would-have too.
+    #[test]
+    fn detect_only_neutralize_contains_nothing_and_says_would_have() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: true,
+            ..ExecutorConfig::for_test(&tmp.path().join("state"))
+        };
+        let journal = ActionJournal::memory();
+        let actuator = SystemActuator::new(Executor::with_config(cfg), None, true, journal.clone());
+        let report = actuator.neutralize(&[Arc::new(ProcRef::open(child.id()))]);
+        let alive = child.try_wait().unwrap().is_none();
+        let isolate = actuator.isolate();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "the offender was killed under detect-only");
+        let o = &report.offenders[0];
+        assert_eq!(o.containment, Containment::WouldHave, "{report:?}");
+        assert!(
+            !o.contained(),
+            "a held kill is not a containment: {report:?}"
+        );
+        assert!(o.kill.starts_with("WouldExecute"), "{}", o.kill);
+        assert!(o.kill.contains("would have: KillProcessTree"), "{}", o.kill);
+        assert!(o.kill.contains("left running"), "{}", o.kill);
+        assert_eq!(o.quarantine, "detect-only: would be quarantined");
+        assert_eq!(report.outcome(), NeutralizeOutcome::WouldHaveContained);
+        assert_eq!(
+            isolate,
+            IsolateOutcome::WouldHave(DETECT_ONLY_ISOLATE.to_string())
+        );
+        // the mini-hunt: a descendant the gate held is no containment in the
+        // action chain's count either, and the journal line says not executed
+        let tree = ExecutionReport {
+            action: ResponseAction::KillProcessTree,
+            primary: ExecutionOutcome::Killed { pid: 1 },
+            additional: vec![ExecutionOutcome::WouldExecute { pid: 2 }],
+            elapsed: std::time::Duration::ZERO,
+        };
+        let (result, text, _) = crate::response::journal_outcome(&tree);
+        assert_eq!(result, ActionResult::Partial, "{text}");
+        assert!(text.contains("1 not contained"), "{text}");
+        let held = ExecutionReport {
+            primary: ExecutionOutcome::WouldExecute { pid: 1 },
+            additional: Vec::new(),
+            ..tree.clone()
+        };
+        assert_eq!(
+            crate::response::executed_line(&held),
+            "NOT EXECUTED (detect-only: would have)"
+        );
+        assert_eq!(crate::response::executed_line(&tree), "EXECUTED");
+        // the actions chain: each one approved, none done
+        assert!(journal
+            .rows()
+            .iter()
+            .filter_map(|r| r.outcome.as_ref())
+            .all(|out| out.result == ActionResult::WouldExecute));
     }
 
     /// Lot 317 (BUG-124's family): the stand-down releases the soft egress
@@ -753,14 +858,14 @@ mod tests {
             "the second offender must be killed: {report:?}"
         );
         assert_eq!(report.offenders.len(), 2, "{report:?}");
-        assert!(!report.offenders[0].contained, "{report:?}");
+        assert!(!report.offenders[0].contained(), "{report:?}");
         assert!(
             report.offenders[0]
                 .kill
                 .contains(&format!("{spared} (test-guard)")),
             "{report:?}"
         );
-        assert!(report.offenders[1].contained, "{report:?}");
+        assert!(report.offenders[1].contained(), "{report:?}");
         assert_eq!(report.offenders[1].pid, second.id());
         match report.outcome() {
             NeutralizeOutcome::Uncontainable { reason } => {

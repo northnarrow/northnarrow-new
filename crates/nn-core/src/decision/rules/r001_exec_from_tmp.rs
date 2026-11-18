@@ -20,6 +20,8 @@ const TMP_WHITELIST: &[&str] = &[];
 pub struct R001ExecFromTmp {
     /// Lot 369: the packaged `go`'s own build output, recorded Low.
     go: super::GoBuilds,
+    /// The review of #578 (P3): the system's `ldd` running the loader.
+    listing: super::LoaderListing,
 }
 
 impl R001ExecFromTmp {
@@ -27,6 +29,89 @@ impl R001ExecFromTmp {
     pub fn with_go_builds(mut self, go: super::GoBuilds) -> Self {
         self.go = go;
         self
+    }
+
+    /// This rule with the lineage's identity of `ldd` (the review of #578).
+    pub fn with_loader_listing(mut self, listing: super::LoaderListing) -> Self {
+        self.listing = listing;
+        self
+    }
+}
+
+impl R001ExecFromTmp {
+    /// Lot 370 (05-3.3): an exec of the dynamic loader whose program (or a
+    /// library it preloads) is in `/tmp/` — or one it runs by a name the
+    /// text cannot place. The review of #578: one it only lists or checks
+    /// (`--list`, `--verify`, `ldd`) is recorded, never killed — Low when the
+    /// agent knows the loader runs none of its code, Medium when it cannot
+    /// tell (P3; the re-check, R1-1: glibc's list modes run the libraries
+    /// the program names for auditing); a name through a link of `/proc` is
+    /// placed by the kernel's identity of the file the loader maps, else not
+    /// placed (N1) — a descriptor's link R004 judges; any other name is also
+    /// judged where the pump found the file it names (R1-2: a symbolic link
+    /// on the way, `/usr/tmp` → `/var/tmp`).
+    fn through_the_loader(&self, event: &Event) -> Option<Verdict> {
+        use crate::decision::rules::LoaderUse;
+        let listing = self.listing.lists(event);
+        let code = crate::decision::rules::loader_code(event, listing);
+        let staged = crate::decision::rules::loader_staged(event, "/tmp/", listing)
+            .filter(|(p, _)| !TMP_WHITELIST.contains(&p.as_str()));
+        if let Some((p, LoaderUse::Runs)) = &staged {
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::KillProcessTree,
+                Severity::Medium,
+                &format!(
+                    "Process executed from /tmp/ through the dynamic loader ({p}) — common \
+                     malware staging location"
+                ),
+            ));
+        }
+        // a descriptor's link (or a memfd's name) is R004's, placed or not
+        let unplaced = code
+            .iter()
+            .filter(|(p, _)| {
+                !crate::posture::proc_link::reopens_a_descriptor(p)
+                    && !p.starts_with("/memfd:")
+                    && crate::decision::rules::placed(event, p).is_none()
+            })
+            // the first of the highest rank
+            .fold(None, |best: Option<&(&str, LoaderUse)>, c| match best {
+                Some(b) if b.1.rank() >= c.1.rank() => Some(b),
+                _ => Some(c),
+            });
+        // the re-check of #578 (R1-1): a staged program only listed is
+        // recorded as such — unless a file the agent cannot place may run
+        // more (`--audit=./x --list /tmp/x`: the auditor may be the program)
+        if let Some((p, use_)) = staged {
+            if unplaced.is_none_or(|u| u.1.rank() <= use_.rank()) {
+                return crate::decision::rules::loader_listed_record(
+                    self, event, "/tmp/", &p, use_,
+                );
+            }
+        }
+        let (unplaced, use_) = unplaced?;
+        let (severity, how) = match use_ {
+            LoaderUse::Runs => (Severity::Medium, "run"),
+            LoaderUse::MayRun(_) => (
+                Severity::Medium,
+                "listed or checked (it may still run code)",
+            ),
+            LoaderUse::Lists(_) => (Severity::Low, "listed (not run)"),
+        };
+        Some(build_verdict(
+            self,
+            event,
+            ResponseAction::Log,
+            severity,
+            &format!(
+                "A program {how} through the dynamic loader by a name the agent cannot place \
+                 ({unplaced}: relative to a directory the event does not carry, climbing, or \
+                 through a link of /proc the agent could not follow to a file the process maps) \
+                 — a staged program is run this way; recorded, not killed"
+            ),
+        ))
     }
 }
 
@@ -52,13 +137,16 @@ impl Rule for R001ExecFromTmp {
         // Review 61: the file the kernel executed, not the caller's string.
         // Lot 355: a file of a user's program image (an AppImage's) is the
         // image's, not staged in its mount point's directory.
-        let filename = crate::decision::rules::staging_judged_path(exe, filename)?;
-        if !filename.starts_with("/tmp/") {
-            return None;
-        }
-        if TMP_WHITELIST.contains(&filename) {
-            return None;
-        }
+        let staged = crate::decision::rules::staging_judged_path(exe, filename)
+            .filter(|f| f.starts_with("/tmp/") && !TMP_WHITELIST.contains(f));
+        let Some(filename) = staged else {
+            // Lot 370 (05-3.3): a program the dynamic loader runs (its
+            // operand, a `--preload`) is judged as if the kernel had executed
+            // it; one the text cannot place (a relative name: the caller's
+            // directory is not known) is recorded, not killed. After the
+            // image: a staged loader is killed as one.
+            return self.through_the_loader(event);
+        };
         // lot 369: `go test`'s binary and `go run`'s program, by identity
         if self.go.runs(event, filename) {
             return Some(super::go_build_record(self, event, "/tmp/"));
@@ -131,7 +219,7 @@ mod tests {
         use crate::decision::rules::{R002ExecFromDevShm, R003ExecFromVarTmp};
         use common::wire::exe::exe_flags::USER_IMAGE;
         let (r1, r3) = (R001ExecFromTmp::default(), R003ExecFromVarTmp::default());
-        let rules: [&dyn Rule; 3] = [&r1, &R002ExecFromDevShm, &r3];
+        let rules: [&dyn Rule; 3] = [&r1, &R002ExecFromDevShm::default(), &r3];
         for (rule, dir) in rules.iter().zip(["/tmp", "/dev/shm", "/var/tmp"]) {
             let app = format!("{dir}/.mount_k355ab/AppRun");
             let marked = spawn_exe("AppRun", &app, &app, USER_IMAGE);

@@ -248,7 +248,11 @@ fn an_action_outcome_is_signed_with_its_result() {
         stage: CombatStage::Isolate,
         action: "isolate",
         trigger: None,
-        success,
+        result: if success {
+            nn_core::combat::OutcomeResult::Success
+        } else {
+            nn_core::combat::OutcomeResult::Failure
+        },
         summary: if success {
             "attempt 1 of 3: IPv4: isolated; IPv6: isolated".to_string()
         } else {
@@ -278,6 +282,30 @@ fn an_action_outcome_is_signed_with_its_result() {
     assert_eq!(outcomes[0].extra["detail"]["attempt"], 1);
     assert_eq!(outcomes[1].result, "success");
     assert_eq!(outcomes[1].key_fp, "agent-self");
+}
+
+/// Lot 370 (F10-1): an action the gate held is signed as a would-have —
+/// `would_have: <summary>`, in the same chain — never `success`.
+#[test]
+fn a_would_have_outcome_is_signed_as_one() {
+    let lab = Lab::new();
+    let ev = AuditEvidence::new(Some(Arc::clone(&lab.log)));
+    ev.record_outcome(&ActionOutcome {
+        stage: CombatStage::Neutralize,
+        action: "kill+quarantine",
+        trigger: None,
+        result: nn_core::combat::OutcomeResult::WouldHave,
+        summary: "detect-only: would have contained 1 offender(s)".to_string(),
+        detail: serde_json::json!({}),
+    })
+    .unwrap();
+    let all = rows(&lab.path);
+    crate::audit::verify_chain(&all, &lab.pubkey).expect("the chain verifies");
+    let o = all.iter().find(|e| e.op == "combat_outcome").unwrap();
+    assert_eq!(
+        o.result,
+        "would_have: detect-only: would have contained 1 offender(s)"
+    );
 }
 
 /// Without an audit log every transition is unrecorded — and said so.

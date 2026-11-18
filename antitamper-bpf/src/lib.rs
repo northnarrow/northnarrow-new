@@ -157,6 +157,33 @@ pub fn claim_role(bpffs_root: &Path, slot: u32, tgid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Lot 370 (F10-4): the `oom_score_adj` the agent and the watchdog hold —
+/// the host OOM killer's last pick (its SIGKILL no hook can refuse: a root
+/// that exhausts the memory with every other process exempt chose the
+/// moment the agent's role fell vacant). Not -1000, which also exempts a
+/// process from its own memory cgroup's OOM: a leak past the unit's
+/// `MemoryMax` must end in a kill and a restart, not hang or press on the
+/// host. The units set it (`OOMScoreAdjust=-999`); each process writes it
+/// again at its start ([`pin_oom_score_adj`]), whoever started it.
+pub const PINNED_OOM_SCORE_ADJ: i32 = -999;
+
+/// Lot 370 (F10-4): write [`PINNED_OOM_SCORE_ADJ`] to the calling
+/// process's `oom_score_adj` unless it holds it already (lowering it takes
+/// `CAP_SYS_RESOURCE`). `Ok(None)`: it held it; `Ok(Some(previous))`:
+/// written.
+pub fn pin_oom_score_adj() -> std::io::Result<Option<i32>> {
+    let path = Path::new("/proc/self/oom_score_adj");
+    let now = kernel_roots::read_to_string(path)?;
+    let now = now.trim().parse::<i32>().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path:?}: {e}"))
+    })?;
+    if now == PINNED_OOM_SCORE_ADJ {
+        return Ok(None);
+    }
+    kernel_roots::write(path, PINNED_OOM_SCORE_ADJ.to_string())?;
+    Ok(Some(now))
+}
+
 /// BUG-011 (PHASE 15.1): name of the pinned `PROTECTED_OBSERVERS`
 /// map (mirrors the `#[map]` declaration in
 /// `agent-ebpf/src/ptrace_check.rs`). The agent's

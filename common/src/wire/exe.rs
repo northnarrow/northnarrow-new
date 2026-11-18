@@ -91,6 +91,28 @@ pub mod exe_flags {
     /// judge such an exec as the image's, not by its mount point under
     /// `/tmp`.
     pub const USER_IMAGE: u32 = 1 << 22;
+    /// The review of #578 (P3): an exec of the dynamic loader whose
+    /// environment, read whole while the exec's process still ran (its
+    /// start the exec's, its memory there after the read), holds
+    /// `LD_TRACE_LOADED_OBJECTS` (any value, as glibc's loader reads it:
+    /// `ldd`'s): the loader lists its program and libraries, runs none of
+    /// their code. Not read: not set, and the program is judged as run.
+    pub const LOADER_LISTS: u32 = 1 << 23;
+    /// The review of #578 (re-check 1, R1-1): an exec of the dynamic loader
+    /// whose program the exec pump read — the file the loader maps (by the
+    /// kernel's identity), its status unchanged since before the exec — and
+    /// found naming no library for auditing (no `DT_AUDIT`, no
+    /// `DT_DEPAUDIT` in its dynamic section), with its environment read
+    /// whole while the process ran and holding no `LD_AUDIT`: glibc's
+    /// loader, when it only lists the program, runs none of its code. Not
+    /// read: neither this nor [`LOADER_AUDITS`], and nothing is claimed.
+    pub const LOADER_NO_AUDIT: u32 = 1 << 24;
+    /// The review of #578 (re-check 1, R1-1): an exec of the dynamic loader
+    /// whose program, read as for [`LOADER_NO_AUDIT`], names a library for
+    /// auditing (`DT_AUDIT` or `DT_DEPAUDIT`): glibc's loader loads it and
+    /// runs its code (its constructors, `la_version`) in its list and trace
+    /// modes too — the program's own code when it names itself.
+    pub const LOADER_AUDITS: u32 = 1 << 25;
 }
 
 /// Lot 310: a device number as `stat(2)` reports it, in the kernel's

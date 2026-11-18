@@ -881,10 +881,10 @@ impl CombatActuator<LinuxHost> for HostActuator {
         let mut outcomes: Vec<OffenderOutcome> = offenders
             .iter()
             .map(|r| {
-                let (contained, kill) = SystemActuator::kill_outcome(&self.kill_tree(r));
+                let (containment, kill) = SystemActuator::kill_outcome(&self.kill_tree(r));
                 OffenderOutcome {
                     pid: r.pid(),
-                    contained,
+                    containment,
                     kill,
                     quarantine: String::new(),
                 }
@@ -937,7 +937,7 @@ impl CombatActuator<LinuxHost> for HostActuator {
         if self.detect_only {
             self.host
                 .note(json!({"ladder": "isolate", "answer": DETECT_ONLY_ISOLATE}));
-            return IsolateOutcome::NotApplied(DETECT_ONLY_ISOLATE.to_string());
+            return IsolateOutcome::WouldHave(DETECT_ONLY_ISOLATE.to_string());
         }
         let report = self
             .host

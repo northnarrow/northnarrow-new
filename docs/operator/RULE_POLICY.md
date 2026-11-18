@@ -786,7 +786,16 @@ the same content in DKMS's registry
 (`/var/lib/dkms/<package>/<version>/<release>/<arch>/module/`) gets a High
 record, not a refusal, unless the policy enforces R018 — as root who runs
 the package manager on a package of its own making gets a trusted file
-(the package database is root's). And the residuals of
+(the package database is root's). Lot 370: a write is a package
+transaction's only when, at the write, its package manager was not
+stopped or traced (nor frozen by the system's freezer; a cgroup's freezer
+leaves it in an ordinary wait), the writer had no code injected, and that
+package manager held its lock (dpkg's, apt's front end, rpm's — read in
+the kernel at the write, however short the transaction); a root process
+that merely descends from a package manager (a pager it started) writes
+outside one; a root process can keep a transaction open, or start one,
+around writes of its own, and such a module is trusted. Every load the
+kernel trusts is recorded by R018, Low, with why it was trusted. And the residuals of
 the judge itself: the trust map is the agent's (not pinned), so a restarted
 agent judges nothing until it has filled it again; the change time and
 size are what tie a file to its verification, so root who sets the clock

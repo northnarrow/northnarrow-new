@@ -61,6 +61,12 @@
 //! when the action achieved its purpose. It shares the stage transitions'
 //! retry queue and order.
 //!
+//! Lot 370 (F10-1): under the no-enforcement gate (the `alpha` profile,
+//! `--detect-only`) an action that was decided and not carried out is its
+//! own result, `would_have: <summary>` ([`OutcomeResult::WouldHave`]) —
+//! never `success`. A NEUTRALIZE that killed and quarantined nothing was
+//! signed `success`, "N contained".
+//!
 //! ## R08c (lab PR 252): in nn-core
 //!
 //! Moved from the agent with the ladder. [`AuditEvidence`] writes into an
@@ -133,6 +139,21 @@ pub struct Addition {
     pub by: Arc<CombatCause>,
 }
 
+/// Lot 370 (F10-1): what a COMBAT action's signed outcome says it achieved
+/// — the entry's `result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeResult {
+    /// The action achieved its purpose: every offender contained, every
+    /// family isolated. `success`.
+    Success,
+    /// The no-enforcement gate: the action was decided and not carried
+    /// out — nothing on the host changed. `would_have: <summary>`; never a
+    /// success, and not a failure of the action.
+    WouldHave,
+    /// The action did not achieve its purpose. `failure: <summary>`.
+    Failure,
+}
+
 /// Lab PR 217 (capability C17): what a COMBAT enforcement action did — the
 /// payload of a signed `combat_outcome` entry, written after the action.
 #[derive(Debug, Clone)]
@@ -143,13 +164,30 @@ pub struct ActionOutcome {
     pub action: &'static str,
     /// The posture trigger that drove COMBAT (context).
     pub trigger: Option<TriggerType>,
-    /// The action achieved its purpose: every offender contained, every
-    /// family isolated.
-    pub success: bool,
+    /// Lot 370 (F10-1): achieved, would have been (the gate: nothing
+    /// done), or not — a bool, which counted a would-have as a success.
+    pub result: OutcomeResult,
     /// One line: what happened.
     pub summary: String,
     /// Per offender / per family detail, for the entry's `extra`.
     pub detail: serde_json::Value,
+}
+
+impl ActionOutcome {
+    /// The action achieved its purpose (never a would-have).
+    pub fn success(&self) -> bool {
+        self.result == OutcomeResult::Success
+    }
+
+    /// The entry's `result`: `success`, `would_have: <summary>`,
+    /// `failure: <summary>`.
+    pub fn result_text(&self) -> String {
+        match self.result {
+            OutcomeResult::Success => "success".to_string(),
+            OutcomeResult::WouldHave => format!("would_have: {}", self.summary),
+            OutcomeResult::Failure => format!("failure: {}", self.summary),
+        }
+    }
 }
 
 /// External audit CMB-027: why a stage transition is not in the signed
@@ -372,7 +410,8 @@ fn draft(r: &Record, deferred: Option<&str>, lost: u64, pid: u32) -> AuditEntryD
             ("combat_stage", extra, "success".to_string())
         }
         // Lab PR 217: `result` says whether the action achieved its
-        // purpose — a failed kill or isolation is a `failure` row.
+        // purpose — a failed kill or isolation is a `failure` row. Lot 370
+        // (F10-1): one the gate held is a `would_have` row.
         Record::Outcome(o) => (
             "combat_outcome",
             serde_json::json!({
@@ -382,11 +421,7 @@ fn draft(r: &Record, deferred: Option<&str>, lost: u64, pid: u32) -> AuditEntryD
                 "summary": o.summary,
                 "detail": o.detail,
             }),
-            if o.success {
-                "success".to_string()
-            } else {
-                format!("failure: {}", o.summary)
-            },
+            o.result_text(),
         ),
     };
     if let Some(at) = deferred {
@@ -464,8 +499,7 @@ impl<K: ChainSigner + Send + 'static> LadderEvidence for AuditEvidence<K> {
             target: "combat.audit",
             stage = %o.stage,
             action = o.action,
-            success = o.success,
-            summary = %nn_model::log_escape::Escaped(&o.summary),
+            result = %nn_model::log_escape::Escaped(&o.result_text()),
             "COMBAT action outcome (signed audit entry)"
         );
         self.append(Record::Outcome(o.clone()))

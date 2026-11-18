@@ -28,6 +28,7 @@ use common::bpf_cmd::{
 };
 use common::wire::{
     bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+    BPF_CMD_VACATED_ROLE_GET_FD,
 };
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
@@ -213,6 +214,27 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
                 &reasoning,
             ));
         }
+        // Lot 370 (F10-4): the role was vacated this boot — its holder
+        // exited (the OOM killer, a crash) — and a successor started for it
+        // (a unit's restart, the watchdog's respawn) took it: High, not the
+        // start's Low. The moment is one an attacker can choose.
+        if *cmd == BPF_CMD_VACATED_ROLE_GET_FD {
+            let reasoning = format!(
+                "`{comm}` (pid {pid}) took the agent's or the watchdog's role after its holder \
+                 exited this boot — the OOM killer, a crash, or a vacancy induced on purpose — \
+                 and a handle to one of NorthNarrow's own BPF objects (id {arg}) before it was a \
+                 protected pid. The kernel let it through only as a successor started for the \
+                 role (by PID 1 or the other role's holder, no code injected into it); the \
+                 previous holder's exit is the anomaly: see the agent's `previous_run`."
+            );
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::High,
+                &reasoning,
+            ));
+        }
         let own_object = matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE);
         let detach = matches!(*cmd, BPF_PROG_DETACH | BPF_LINK_DETACH);
         if !own_object && !detach {
@@ -359,6 +381,32 @@ mod tests {
         assert_eq!(f.severity, Severity::High);
         assert!(r1
             .evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
+            .is_none());
+    }
+
+    /// Lot 370 (F10-4): a role taken after its holder exited this boot is
+    /// recorded High — on main every claim of a vacant role was the
+    /// start's Low, so a vacancy the OOM killer made on demand was taken
+    /// with only a Low record.
+    #[test]
+    fn a_role_taken_after_its_holder_exited_is_high() {
+        let (r1, r2) = rules();
+        let v = r2
+            .evaluate(&ev("northnarrow-age", BPF_CMD_VACATED_ROLE_GET_FD, 9))
+            .expect("recorded");
+        assert_eq!(v.rule_id, BPF002_ID);
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::Log)
+        );
+        assert!(
+            v.reasoning.contains("after its holder exited"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("(id 9)"), "{}", v.reasoning);
+        assert!(r1
+            .evaluate(&ev("northnarrow-age", BPF_CMD_VACATED_ROLE_GET_FD, 9))
             .is_none());
     }
 

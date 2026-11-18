@@ -525,7 +525,8 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
             "if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {",
             "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
             "let fresh_instance =\n        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
-            "let report_cmd = if fresh_instance {\n        BPF_CMD_FRESH_INSTANCE_GET_FD\n    } else if foreign_handle {\n        BPF_CMD_FOREIGN_GET_FD",
+            // lot 370 (F10-4): the start's record, or a vacated role's
+            "let report_cmd = if fresh_instance {\n        fresh_instance_cmd()\n    } else if foreign_handle {\n        BPF_CMD_FOREIGN_GET_FD",
             "if should_report(pid, dedup) {\n        emit_syscall(report_cmd, arg);",
         ],
     )
@@ -540,14 +541,40 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
         &h[from..to]
     );
     // the exemption is the deny path's: the binary by device and inode,
-    // the role vacant, the main thread, the first minute
+    // the role vacant, the main thread, the first minute — lot 370
+    // (F10-4): a role vacated this boot only to a successor started for it
     in_order(
         body(&c, "fresh_instance_may_load"),
         &[
             "if (pid_tgid >> 32) as u32 != pid_tgid as u32 {\n        return false;\n    }",
             "let role = caller_role();",
-            "Some(t) => *t == 0,",
-            "< FRESH_INSTANCE_NS",
+            "Some(t) if *t == 0 => false,",
+            "Some(t) if *t == ROLE_VACATED => true,",
+            "_ => return false,",
+            ">= FRESH_INSTANCE_NS {\n        return false;\n    }",
+            "!vacated || unsafe { started_for_the_role(task, slot) }",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "started_for_the_role"),
+        &[
+            "Some(t) => *t != 0 && *t != ROLE_VACATED && *t == ptgid,",
+            "(ptgid == 1 || by_family) && crate::cgroup_join::caller_untainted()",
+        ],
+    )
+    .unwrap();
+    // the exit vacates, it does not zero
+    assert!(body(&c, "role_exit").contains("unsafe { *t = ROLE_VACATED };"));
+    assert!(!body(&c, "role_exit").contains("*t = 0"));
+    // the review of #578 (N2): a vacated role's successor is High outside a
+    // signed window, the family's own start (Low) inside one
+    in_order(
+        body(&c, "fresh_instance_cmd"),
+        &[
+            "Some(t) if *t == ROLE_VACATED);",
+            "if vacated && !crate::inode_protect::override_active() {\n        BPF_CMD_VACATED_ROLE_GET_FD",
+            "} else {\n        BPF_CMD_FRESH_INSTANCE_GET_FD",
         ],
     )
     .unwrap();

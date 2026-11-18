@@ -58,10 +58,11 @@ use aya_ebpf::{
 };
 
 use northnarrow_common::module_judge::{
-    conf_slot, finit_verdict, init_verdict, mode, module_file_name, read_id, reads_module_file,
-    refuses, write_step, FileFacts,
-    ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_PKG_SCRIPTS_MAX, MODULE_TRUST_MAX,
-    MODULE_WRITES_MAX, NAME_TAIL, WALK_HOPS,
+    conf_slot, finit_verdict, history_step_raw, holds_lock, init_verdict, locker_step, mode,
+    module_file_name, read_id, reads_module_file, refuses, state_may_vouch, FileFacts,
+    ModuleTrust, ModuleWrite, PkgLocker, Txn, MODULE_PKG_IMAGES_MAX, MODULE_PKG_LOCKERS_MAX,
+    MODULE_PKG_LOCKS_MAX, MODULE_PKG_SCRIPTS_MAX, MODULE_TRUST_MAX, MODULE_WRITES_MAX,
+    NAME_TAIL, WALK_HOPS,
 };
 use northnarrow_common::wire::{
     InodeKey, ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT, MODULE_PATH_TOO_DEEP,
@@ -73,7 +74,8 @@ use crate::btf_offsets::{
     FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_CTIME_NSEC_OFFSET, INODE_I_CTIME_SEC_OFFSET,
     INODE_I_MODE_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET, MM_STRUCT_EXE_FILE_OFFSET,
     PATH_DENTRY_OFFSET, PF_KTHREAD, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, TASK_STRUCT_COMM_OFFSET,
-    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
+    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_MM_OFFSET,
+    TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_BOOTTIME_OFFSET, TASK_STRUCT_STATE_OFFSET,
     TASK_STRUCT_TGID_OFFSET,
 };
 
@@ -141,10 +143,31 @@ pub static MODULE_PKG_SCRIPTS: LruHashMap<u32, u64> =
 /// Lot 285: the write history of the module files in the running kernel's
 /// tree and of the inodes in [`MODULE_TRUST`] (`module_judge::write_flag`).
 /// An inode evicted has no history: the agent does not vouch for its
-/// writes (fail closed).
+/// writes (fail closed). Lot 370 (F10-2): with the package transaction
+/// that wrote it (`module_judge::ModuleWrite`), which the agent must find
+/// holding its package manager's lock.
 #[map]
-pub static MODULE_WRITES: LruHashMap<InodeKey, u32> =
+pub static MODULE_WRITES: LruHashMap<InodeKey, ModuleWrite> =
     LruHashMap::with_max_entries(MODULE_WRITES_MAX, 0);
+
+/// Lot 370 (the lab): the package managers' lock files (dpkg's, apt's front
+/// end, rpm's: `agent/src/module_trust/txn.rs`), by inode, each with its
+/// bit — set by the agent.
+#[map]
+pub static MODULE_PKG_LOCKS: HashMap<InodeKey, u32> =
+    HashMap::with_max_entries(MODULE_PKG_LOCKS_MAX, 0);
+
+/// Lot 370 (the lab): the thread groups that asked for a write lock on a
+/// lock file of [`MODULE_PKG_LOCKS`] and have not released it
+/// (`module_judge::PkgLocker`), kept by [`module_lock_observe`]. A write is
+/// a live transaction's only when its package manager holds one here, read
+/// at the write ([`try_write_open`]) — the agent's sampling of the locks
+/// after the write missed a `dpkg -i` shorter than its poll. Pinned with
+/// the history (`nn_linux::module_writes`): a transaction running across
+/// an agent restart keeps its lock.
+#[map]
+pub static MODULE_PKG_LOCKERS: LruHashMap<u32, PkgLocker> =
+    LruHashMap::with_max_entries(MODULE_PKG_LOCKERS_MAX, 0);
 
 /// Lot 285: bumped at every write the history records, which the agent
 /// polls to look at the tree again at once.
@@ -523,9 +546,34 @@ unsafe fn try_write_open(ctx: &LsmContext) {
             return;
         }
     }
-    let pkg = nn_module_pkg_lineage(bpf_get_current_task()) != 0;
-    let prev = MODULE_WRITES.get(&key).copied();
-    let next = write_step(prev, fmode & FMODE_CREATED != 0, pkg);
+    // Lot 370 (F10-2): the transaction the write belongs to — the nearest
+    // package manager of the lineage, not held, the writer's marks free of
+    // injected code — named by its thread group and start. In plain values
+    // on every path (`module_judge::history_step_raw`): an `Option`'s
+    // unwritten payload was a stack read 5.15's verifier refused
+    let hop = nn_module_pkg_lineage(bpf_get_current_task()) as *const u8;
+    let mut txn = if hop.is_null() || !crate::cgroup_join::caller_untainted() {
+        Txn::NONE
+    } else {
+        txn_of(hop)
+    };
+    // lot 370 (the lab): and holding its lock at this write
+    // ([`MODULE_PKG_LOCKERS`]), unless the agent says the locks' observer
+    // is not attached (it samples the locks then)
+    if txn.tgid != 0 && conf(conf_slot::LOCKS_UNOBSERVED) == 0 {
+        let (had, entry) = match MODULE_PKG_LOCKERS.get(&txn.tgid) {
+            Some(v) => (true, *v),
+            None => (false, PkgLocker::default()),
+        };
+        if !holds_lock(entry, had, txn.start) {
+            txn = Txn::NONE;
+        }
+    }
+    let (had, prev) = match MODULE_WRITES.get(&key) {
+        Some(v) => (true, *v),
+        None => (false, ModuleWrite::default()),
+    };
+    let next = history_step_raw(prev, had, fmode & FMODE_CREATED != 0, txn);
     let _ = MODULE_WRITES.insert(&key, &next, 0);
     if let Some(g) = MODULE_WRITE_GEN.get_ptr_mut(0) {
         *g = (*g).wrapping_add(1);
@@ -585,54 +633,151 @@ unsafe fn under_tree(leaf: *const u8) -> bool {
     false
 }
 
-/// Lot 285: 1 when the current task runs as root and it, or an ancestor
-/// within [`WALK_HOPS`], runs a package manager's image
-/// ([`MODULE_PKG_IMAGES`]), or a package manager's `#!` script
-/// ([`MODULE_PKG_SCRIPTS`]): a write inside a package transaction, read in
-/// the kernel at the write — no exit can race it. A global function.
+/// Lot 285: the current task runs as root and it, or an ancestor within
+/// [`WALK_HOPS`], runs a package manager's image ([`MODULE_PKG_IMAGES`]),
+/// or a package manager's `#!` script ([`MODULE_PKG_SCRIPTS`]): a write
+/// inside a package transaction, read in the kernel at the write — no exit
+/// can race it. A global function. Lot 370 (F10-2): it returns that package
+/// manager's task (0: none), and none when it is stopped, traced or frozen
+/// by the system's freezer (`module_judge::state_may_vouch`; a cgroup-v2
+/// freezer's task waits as any other, and vouches; its state unreadable: none) — a held
+/// package manager vouched for its lineage's writes.
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_module_pkg_lineage(task: u64) -> u64 {
-    unsafe { u64::from(pkg_lineage(task as *const u8)) }
+    unsafe { pkg_lineage(task as *const u8) as u64 }
 }
 
 #[inline(always)]
-unsafe fn pkg_lineage(task: *const u8) -> bool {
+unsafe fn pkg_lineage(task: *const u8) -> *const u8 {
     if bpf_get_current_uid_gid() as u32 != 0 {
-        return false;
+        return core::ptr::null();
     }
     let mut t = task;
     for _ in 0..WALK_HOPS {
         if t.is_null() {
-            return false;
+            return core::ptr::null();
         }
         let mm = peek_u64(t.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
         if !mm.is_null() {
+            let mut found = false;
             let exe = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
             if !exe.is_null() {
                 let inode = peek_u64(exe.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
                 if !inode.is_null() {
                     let k = crate::open_sensor::key_of(inode);
-                    if MODULE_PKG_IMAGES.get(&k).is_some() {
-                        return true;
-                    }
+                    found = MODULE_PKG_IMAGES.get(&k).is_some();
                 }
             }
             // a package manager's `#!` script, its image the interpreter's
-            let tgid = peek_u32(t.add(off!(TASK_STRUCT_TGID_OFFSET)));
-            if let Some(m) = MODULE_PKG_SCRIPTS.get(&tgid) {
-                if *m == mm as u64 {
-                    return true;
+            if !found {
+                let tgid = peek_u32(t.add(off!(TASK_STRUCT_TGID_OFFSET)));
+                if let Some(m) = MODULE_PKG_SCRIPTS.get(&tgid) {
+                    found = *m == mm as u64;
                 }
+            }
+            if found {
+                return if not_held(t) { t } else { core::ptr::null() };
             }
         }
         let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
         if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
-            return false;
+            return core::ptr::null();
         }
         t = up;
     }
-    false
+    core::ptr::null()
+}
+
+/// Lot 370 (F10-2): `task` is neither stopped, traced nor frozen by the
+/// system's freezer (`TASK_FROZEN`; the review of #578: the cgroup-v2
+/// freezer leaves it in an ordinary wait, not told); its state unreadable
+/// (no offset): held, fail closed.
+#[inline(always)]
+unsafe fn not_held(task: *const u8) -> bool {
+    let Some(o) = off_opt!(TASK_STRUCT_STATE_OFFSET) else {
+        return false;
+    };
+    match bpf_probe_read_kernel(task.add(o & 0xffff) as *const u32) {
+        Ok(state) => state_may_vouch(state),
+        Err(_) => false,
+    }
+}
+
+/// Lot 370 (F10-2): the transaction of package manager `hop` — its thread
+/// group and its leader's `start_boottime` (what `/proc/<tgid>/stat`
+/// shows, and what [`module_lock_observe`] records); [`Txn::NONE`] when
+/// that is unreadable (a plain value, never an `Option`:
+/// `module_judge::history_step_raw`).
+#[inline(always)]
+unsafe fn txn_of(hop: *const u8) -> Txn {
+    let start = leader_start(hop);
+    let tgid = peek_u32(hop.add(off!(TASK_STRUCT_TGID_OFFSET)));
+    if tgid > 1 && start != 0 {
+        Txn { tgid, start }
+    } else {
+        Txn::NONE
+    }
+}
+
+/// Lot 370: the `start_boottime` of `task`'s thread-group leader; 0 when
+/// unreadable.
+#[inline(always)]
+unsafe fn leader_start(task: *const u8) -> u64 {
+    let Some(o) = off_opt!(TASK_STRUCT_START_BOOTTIME_OFFSET) else {
+        return 0;
+    };
+    let leader = peek_u64(task.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET))) as *const u8;
+    if leader.is_null() {
+        return 0;
+    }
+    match bpf_probe_read_kernel(leader.add(o & 0xffff) as *const u64) {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
+
+/// Lot 370 (the lab): the package managers' locks. Observe only (always
+/// 0). A root thread group's request for a lock on a lock file of
+/// [`MODULE_PKG_LOCKS`] (`fcntl`'s and `flock`'s, at the request) steps
+/// its entry in [`MODULE_PKG_LOCKERS`] (`module_judge::locker_step`): a
+/// write lock holds the file, a release or a shared lock does not.
+#[lsm(hook = "file_lock")]
+pub fn module_lock_observe(ctx: LsmContext) -> i32 {
+    unsafe { try_lock(&ctx) };
+    0
+}
+
+#[inline(always)]
+unsafe fn try_lock(ctx: &LsmContext) {
+    if bpf_get_current_uid_gid() as u32 != 0 {
+        return;
+    }
+    let file: *const u8 = ctx.arg(0);
+    if file.is_null() {
+        return;
+    }
+    let kind: u64 = ctx.arg(1);
+    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+    if inode.is_null() {
+        return;
+    }
+    let key = crate::open_sensor::key_of(inode);
+    let bit = match MODULE_PKG_LOCKS.get(&key) {
+        Some(b) => *b,
+        None => return,
+    };
+    let start = leader_start(bpf_get_current_task() as *const u8);
+    if start == 0 {
+        return;
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let (had, prev) = match MODULE_PKG_LOCKERS.get(&tgid) {
+        Some(v) => (true, *v),
+        None => (false, PkgLocker::default()),
+    };
+    let next = locker_step(prev, had, start, kind as u32, bit);
+    let _ = MODULE_PKG_LOCKERS.insert(&tgid, &next, 0);
 }
 
 /// Lot 285 (the coordinator's matrix): after a successful exec

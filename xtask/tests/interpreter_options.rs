@@ -339,9 +339,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
-        13,
+        15,
         "the agent's own command-line flags its unit file must carry (`--net-scan-hosts`, …): \
-         compared with the unit's text, no interpreter's",
+         compared with the unit's text, no interpreter's; lot 370 (F10-5): `systemctl show -p \
+         Environment --value`, the agent's own question to systemd",
     ),
     (
         "crates/nn-linux/src/host_hardening.rs",

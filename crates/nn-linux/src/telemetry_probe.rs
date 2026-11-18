@@ -293,6 +293,7 @@ impl Sensor {
                 "module_read_file_observe",
                 "module_load_data_observe",
                 "module_write_observe",
+                "module_lock_observe",
             ],
             Sensor::ExploitGuard => &["epg_"],
             Sensor::DnsAnswer => &["dns_answer_"],

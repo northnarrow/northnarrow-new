@@ -348,10 +348,13 @@ pub fn describe_response(report: &ExecutionReport) -> String {
 fn partial_outcome(additional: &[ExecutionOutcome]) -> Option<String> {
     let not_killed = additional
         .iter()
+        // Lot 370 (F10-1): a descendant the gate did not kill is not killed.
         .filter(|o| {
             matches!(
                 o,
-                ExecutionOutcome::Failed { .. } | ExecutionOutcome::PermissionDenied { .. }
+                ExecutionOutcome::Failed { .. }
+                    | ExecutionOutcome::PermissionDenied { .. }
+                    | ExecutionOutcome::WouldExecute { .. }
             )
         })
         .count();

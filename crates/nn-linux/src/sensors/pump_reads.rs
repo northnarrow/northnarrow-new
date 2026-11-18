@@ -1045,6 +1045,14 @@ fn account_in(uid: u32, account_of: impl Fn(u32) -> Option<u32>) -> Option<u32> 
     account_of(uid).filter(|a| *a != OVERFLOW_SHARE)
 }
 
+/// The re-check of #578 (R1-3): the account `uid`'s waits count against —
+/// itself below the users' subordinate ranges, a subordinate id's owner,
+/// or one account for every id no known user is given — as the reader's
+/// shares count it.
+pub(crate) fn account_of(uid: u32) -> u32 {
+    subuid_account(uid).unwrap_or(UNATTRIBUTED)
+}
+
 /// The account of every id of [`Pool::Unattributed`] (no uid: the
 /// kernel's "no id", as the shares' overflow row).
 const UNATTRIBUTED: u32 = common::wire::execq::OVERFLOW_SHARE;

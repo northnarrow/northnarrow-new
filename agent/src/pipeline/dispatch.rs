@@ -323,7 +323,8 @@ fn answer(d: &Arc<Decided>, slot: usize, report: ExecutionReport, f: &Followups)
                 primary = ?report.primary,
                 additional_count = report.additional.len(),
                 elapsed_us = report.elapsed.as_micros() as u64,
-                "EXECUTED"
+                "{}",
+                northnarrow_agent::response::executed_line(report)
             );
         }
     }

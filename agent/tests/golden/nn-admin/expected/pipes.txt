@@ -506,7 +506,7 @@ exit: 0
 | ─────────────────────────────────────────────────────────
 | posture           : Engaged
 | network isolation : ENGAGED (IPv4 isolated, IPv6 clear)
-| combat stage      : investigate
+| combat stage      : investigate — detect-only: decided, not carried out (nothing killed, quarantined or isolated)
 | response mode     : DETECT-ONLY (config file) — no response action and no COMBAT isolation touch the system
 | combat evidence   : 1 stage transition(s) not written to the signed audit log when they happened — 2 queued for a late write, 0 dropped (never written); see the agent ERRORs
 | trust level       : L2 (enforcing and verified, degraded) — BTF offsets drifted: 5

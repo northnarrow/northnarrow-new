@@ -22,6 +22,9 @@ pub mod connect_deny;
 pub mod contract;
 pub mod dns_sensor;
 pub mod ebpf_object;
+/// The re-check of #578 (R1-1): whether a program names a library for
+/// auditing, read as glibc's loader reads its dynamic section.
+pub mod elf_audit;
 /// Lab PR 219: the exploit post-condition guard (loader, mode, counters).
 pub mod epg;
 pub mod exe_identity;
@@ -31,6 +34,9 @@ pub mod exec_facts;
 pub mod flow_sock;
 /// Lot 279: the exec pump's reading of a module tool's exec (R011).
 pub mod kmod_exec;
+/// The review of #578: what the exec pump reads of an exec of the dynamic
+/// loader (its files through a link of `/proc`, its trace mode).
+pub mod loader_files;
 pub mod multiplexer;
 /// Lot 275 (C07): the inbound, DNS response and TLS ClientHello sensors'
 /// attach, and the pumps of the last two.

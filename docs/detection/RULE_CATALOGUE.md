@@ -13,9 +13,9 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | Rule | Name | Severity | Response | ATT&CK |
 |---|---|---|---|---|
 | [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
-| [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High | KillProcessTree | T1059, T1027.011 |
+| [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High, Low | KillProcessTree, Log | T1059, T1027.011 |
 | [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
-| [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical | KillProcessTree | T1620 |
+| [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical, High, Low | KillProcessTree, Log | T1620 |
 | [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High, Low | Log | T1095 |
 | [`R006_ReverseShellTooling`](#r006_reverseshelltooling) | Reverse shell tooling | Critical, High | KillProcessTree, Log | T1095, T1059.004 |
 | [`R007_CryptoMiner`](#r007_cryptominer) | Crypto miner | Critical, High | KillProcessTree, Log | T1496.001 |
@@ -29,7 +29,7 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | [`R015_EncodingToolingServiceUid`](#r015_encodingtoolingserviceuid) | Encoding tooling exec by service account | Medium | Log | T1027, T1140, T1132 |
 | [`R016_DebuggerServiceUid`](#r016_debuggerserviceuid) | Debugger/tracer exec by service account | Medium | Log | T1055.008 |
 | [`R017_ShellFromNonstandardPath`](#r017_shellfromnonstandardpath) | Shell binary from non-standard path | High | KillProcessTree, Log | T1059.004 |
-| [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium | KillProcessTree, Log | T1547.006, T1014 |
+| [`R018_KernelModuleLoad`](#r018_kernelmoduleload) | Kernel module load | Critical, High, Medium, Low | KillProcessTree, Log | T1547.006, T1014 |
 | [`R020_ShellWithSocketStdio`](#r020_shellwithsocketstdio) | Shell or interpreter with stdin/stdout on a network socket | Critical, High | Log | T1059.004, T1095 |
 | [`NN-L-EXECQ-001_FirstSightQuarantine`](#nn-l-execq-001_firstsightquarantine) | Exec quarantine at first sight | Critical, High, Medium, Low | Quarantine, KillProcess, Log | T1204.002, T1059.004, T1059.006, T1059.007, T1059 |
 | [`NN-L-EXECPOL-001_StagingExecDenied`](#nn-l-execpol-001_stagingexecdenied) | Exec from a staging location refused by the exec policy | High, Medium, Low | Log | T1620, T1070.004, T1204.002, T1564.001 |
@@ -49,7 +49,7 @@ Exec from /tmp/ — category `execution`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit+e2e+lab |
 
-**Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it).
+**Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it). Lot 370: a program the dynamic loader runs (its operand, a preload) as if executed — one named through a link of `/proc` placed by the file the loader maps (the review of #578), one the text cannot place recorded Medium without a response, one the loader only lists or checks (`--list`, `--verify`, `ldd`) recorded Low.
 
 **Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot 355: an AppImage's own programs, served read-only at its runtime's `/tmp/.mount_*` (the exec pump ties the mount to the image file the user ran, `USER_IMAGE`), are the image's: no record, as from the home (lot 360: also an image whose file name is 31 bytes or more, by its whole path as its daemon runs it). An AppImage itself in `/tmp`, an extracted one, a writable FUSE mount or another program's daemon stay judged. Lot 369: what the packaged `go` itself built and then runs, for a person's account — `go test`'s test binary, `go run`'s program: the file the packaged toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`) was run to write by that very `go`, in the layout of its work directory (`go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), run by it from its path, not unlinked — is recorded Low, never killed. What `go` only launches (a `-vettool`, an `-exec` wrapper, a `-toolexec` program, a `go generate` command, a file dropped in a `go-build` directory), root's and a service account's build output, and the same file run by a shell, by another parent or by a `go` in a home are judged as above.
 
@@ -65,13 +65,13 @@ Exec from /dev/shm/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | High |
-| Response | KillProcessTree |
+| Severity | High, Low |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution); T1027.011 Obfuscated Files or Information: Fileless Storage (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit |
 
-**Observes.** The exec of a file under `/dev/shm/`, the memory-backed shared directory, judged on the file the kernel executed.
+**Observes.** The exec of a file under `/dev/shm/`, the memory-backed shared directory, judged on the file the kernel executed; a program the dynamic loader runs from it as R001's (lot 370), one it only lists recorded Low.
 
 **Known false positives.** Rare: few programs execute from `/dev/shm`. Nothing exempts one that does.
 
@@ -93,7 +93,7 @@ Exec from /var/tmp/ — category `execution`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit |
 
-**Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed.
+**Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed; a program the dynamic loader runs from it as R001's (lot 370), one it only lists recorded Low.
 
 **Known false positives.** As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at High below COMBAT; a system account's (a package scriptlet run as one) is killed; run as root in a package transaction or an administrator's session it is R009's Low record. Lot 369: the packaged `go`'s own build output in `/var/tmp` (`TMPDIR=/var/tmp`) as R001's: a person's, linked and run by that `go`.
 
@@ -109,13 +109,13 @@ Exec from /proc/<pid>/fd/* (memfd) — category `execution`.
 
 | | |
 |---|---|
-| Severity | Critical |
-| Response | KillProcessTree |
+| Severity | Critical, High, Low |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1620 Reflective Code Loading (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | e2e (V2 Critical sub-gate) |
 
-**Observes.** A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file opened then deleted), whatever path reached it (lot 310: `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`, a relative path, a symlink, `/proc/<pid>/exe` alike), judged on the executed file's identity: the exec sensor's in LSM mode; in tracepoint mode the exec pump's read of `/proc/<pid>/exe` while the process lives, else its path, read by the posture's one reader of a `/proc` link (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`.
+**Observes.** A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file opened then deleted), whatever path reached it (lot 310: `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`, a relative path, a symlink, `/proc/<pid>/exe` alike), judged on the executed file's identity: the exec sensor's in LSM mode; in tracepoint mode the exec pump's read of `/proc/<pid>/exe` while the process lives, else its path, read by the posture's one reader of a `/proc` link (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`. Lot 370: fileless code the dynamic loader runs — its operand a memfd or an unlinked file by the file it maps, or a descriptor's link not placed (the review of #578); one it only lists recorded Low. Root's container runtime copy past the compare budget, every other fact holding, is recorded High, not killed.
 
 **Known false positives.** systemd-executor's launch of every unit (systemd 254 and later) is a linked file, not fileless; after a systemd upgrade PID 1 launches from the old, unlinked executor until its re-exec, exempt by that file's identity: a copy the host's PID 1 holds by that identity alone (an inode no user can reach); the packaged file at its install path or a copy a genuine user manager holds (its image the packaged manager's, in PID 1's mount namespace) for the first exec of a process PID 1 or such a manager forked (the kernel's record at sched_process_fork, never the parent at exec time) — re-read every 10 s and replaced, never by its name or `argv[0]`. A process re-executing the very image its parent runs (`/proc/self/exe` after an upgrade unlinked it: Chromium's children, Docker's `reexec`) is not fileless when that image was executed from a directory only root can write, in PID 1's mount namespace (parents running at the agent's start included); a user's dropped binary that unlinks and re-executes itself is killed. Another program that re-executes itself from a memfd (older runc versions do, to protect their binary), or that execs a file at the instant an upgrade unlinks it, is killed: nothing else is exempt.
 
@@ -413,13 +413,13 @@ Kernel module load — category `rootkit`.
 
 | | |
 |---|---|
-| Severity | Critical, High, Medium |
+| Severity | Critical, High, Medium, Low |
 | Response | KillProcessTree, Log |
 | ATT&CK | T1547.006 Boot or Logon Autostart Execution: Kernel Modules and Extensions (Persistence); T1014 Rootkit (Stealth) |
 | Sensor — data | kernel module load (kernel_read_file, kernel_load_data) — DC0031 Kernel Module Load |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** A kernel module load (`finit_module`, `init_module`) at the LSM hooks, judged IN THE KERNEL by the file (lot 285): a file of the running kernel's tree that a verified package installed or DKMS built, unchanged since boot or written since inside a package transaction, or named by a signed `module-allow`, loads; any other file and every `init_module` buffer are refused outside a signed trusted-installer window in the deny mode (the default), let through in the record mode (`alert R018`). A DKMS or akmods build in `updates/dkms/` or `extra/` whose content is the registered build (DKMS's copy, the package's digest), written since boot outside a recognised package transaction (dnf's and yum's scripts recognised by the file their exec named), is let through and recorded High under every policy but `enforce R018`, which refuses it; a file of those directories nothing vouches for is refused. Who loads is not asked. Killed: a file outside `/lib/modules` or deeper than any module directory, refused or not. Recorded: any other untrusted file or buffer, an unattested DKMS or akmods build (High), a load a window or an opt-out let through (Medium); a load the kernel did not judge (the agent's first seconds) by the path and the package database — a path with a component the sensor read only in part (31 bytes, marked …) is unverifiable, High (lot 292).
+**Observes.** A kernel module load (`finit_module`, `init_module`) at the LSM hooks, judged IN THE KERNEL by the file (lot 285): a file of the running kernel's tree that a verified package installed or DKMS built, unchanged since boot or written since inside a package transaction, or named by a signed `module-allow`, loads; any other file and every `init_module` buffer are refused outside a signed trusted-installer window in the deny mode (the default), let through in the record mode (`alert R018`). A DKMS or akmods build in `updates/dkms/` or `extra/` whose content is the registered build (DKMS's copy, the package's digest), written since boot outside a recognised package transaction (dnf's and yum's scripts recognised by the file their exec named), is let through and recorded High under every policy but `enforce R018`, which refuses it; a file of those directories nothing vouches for is refused. Who loads is not asked. Killed: a file outside `/lib/modules` or deeper than any module directory, refused or not. Recorded: any other untrusted file or buffer, an unattested DKMS or akmods build (High), a load a window or an opt-out let through (Medium); a load the kernel trusted, with why — a package's file or DKMS's build, unchanged since boot or written this boot by a package transaction (Low, lot 370); a load the kernel did not judge (the agent's first seconds) by the path and the package database — a path with a component the sensor read only in part (31 bytes, marked …) is unverifiable, High (lot 292).
 
 **Known false positives.** None measured on the benign corpus (lot 285: udev's and the services' loads, docker's, k3s', a DKMS build under apt). A module built by hand outside the DKMS and akmods directories (`make modules_install`), a vendor's installer outside the package manager and a module of the tree written after boot before the agent started are refused until a signed `module-allow <module>` (or the next boot); a registered DKMS or akmods build written outside a package transaction (a root shell's `dkms install`, `akmods` at boot) is let through, recorded High; an administrator who loads a module from a build directory (`insmod ~/driver.ko`) is refused and killed.
 
@@ -1060,7 +1060,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
-**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: a path absent at the agent's start is watched once it appears (lot 369: looked at once a second), its own appearance not reported, and /etc is not watched as a directory.
+**ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file (most hosts) its first creation is an event with its writer (lot 370): /etc is watched for that file's creation alone, any other file created there is no event; one found with no record of its creation is an event at the next look, its writer unknown.
 
 ### NN-L-FIM-023_SystemdTimerCreated
 
@@ -1142,7 +1142,7 @@ Kernel module configuration written — category `fim_persistence`.
 
 **Observes.** Lot 285: a file of kmod's configuration directories (/etc, /run, /usr/local/lib, /lib and /usr/lib modprobe.d, /etc/modprobe.conf) created, changed, renamed in, linked or removed: an `install` or `remove` directive runs a command as root whenever the module is asked for. High outside a package transaction (the writer's lineage at the write), Low inside one; never a kill (the write is done).
 
-**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369: within a second; a file put in it within that second is not reported).
+**Known false positives.** An administrator's own blacklist or options file is recorded at High; a package's at Low. A directory absent at the agent's start is watched once it appears (lot 369; a file already in it when it appears is watched, not reported).
 
 **How to test.** `echo 'install dummy /bin/true' | sudo tee /etc/modprobe.d/nn-test.conf`, then remove it; expect High, Log.
 
@@ -2021,7 +2021,7 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0021 OS API Execution |
 | Validation | unit+lab |
 
-**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling.
+**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling. Lot 370: a successor of the agent or the watchdog that took its role after the holder exited this boot (the OOM killer, a crash) is recorded High outside a signed trusted-installer window, Low inside one; a first start's handle stays Low. The agent's own successor records it at its start (the review of #578).
 
 **Known false positives.** A detach by tooling not in the list (a container runtime or CNI not listed). A handle to the agent's own objects is never exempt: an administrator's `bpftool map dump` of them is recorded too.
 

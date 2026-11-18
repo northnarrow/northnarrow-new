@@ -690,6 +690,182 @@ mod tests {
         );
     }
 
+    /// Lot 370 (F10-2): without the locks' observer (the agent samples the
+    /// locks), a module file written since boot by a package
+    /// manager's lineage is trusted only when that transaction was live —
+    /// its package manager seen holding its lock, running. The same write
+    /// by a lineage whose package manager held no lock (a pager `apt
+    /// changelog` started, a shell from it) or was stopped is judged as a
+    /// write outside a transaction: DKMS's build let through and recorded
+    /// High (not trusted), a package's file elsewhere in the tree refused.
+    /// On main the lineage alone made it trusted, and the load left no
+    /// record.
+    #[test]
+    fn a_module_write_is_a_transactions_only_while_it_holds_its_lock() {
+        use super::super::{judged_history, txn::Txns};
+        use common::module_judge::{history_step, Txn};
+        let fx = fixture();
+        let dkms = fx.tree.join("updates/dkms/vboxdrv.ko.zst");
+        put(&dkms, b"vbox");
+        register(&fx, "virtualbox", "vboxdrv.ko.zst", b"vbox");
+        let pkg = fx.tree.join("kernel/net/extra.ko.zst");
+        put(&pkg, b"extra");
+        let opt = BTreeSet::new();
+        let since = inputs(&fx, before_files(), &opt);
+        let tick = 10_000_000;
+        let dpkg = Txn {
+            tgid: 4242,
+            start: 8_812 * tick,
+        };
+        let written = history_step(None, true, Some(dpkg));
+        let locks = "1: POSIX  ADVISORY  WRITE 4242 fd:01:131074 0 EOF\n";
+        let stat = |state: char| {
+            format!("4242 (dpkg) {state} 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 8812 1 1")
+        };
+        let now = std::time::Instant::now();
+        let packaged = |f: &TreeFile| {
+            if f.path == pkg {
+                trust_flag::PACKAGE
+            } else {
+                0
+            }
+        };
+        let mut vouch = |f: &TreeFile| packaged(f).max(vouched_by(f, &since, |_| false));
+        // live: dpkg seen holding its lock, running
+        let mut live = Txns::default();
+        live.sample_with(locks, &[131_074], |_| Some(stat('S')), now);
+        let (h, ok) = judged_history(written, false, false, &live, tick);
+        assert!(ok);
+        assert_eq!(
+            classify(&file(&dkms), &since, Some(h), &mut vouch),
+            Ok(trust_flag::DKMS | trust_flag::PKG_WRITTEN)
+        );
+        assert_eq!(
+            classify(&file(&pkg), &since, Some(h), &mut vouch),
+            Ok(trust_flag::PACKAGE | trust_flag::PKG_WRITTEN)
+        );
+        // held (stopped) when seen, or never seen holding the lock
+        let mut held = Txns::default();
+        held.sample_with(locks, &[131_074], |_| Some(stat('T')), now);
+        for txns in [&held, &Txns::default()] {
+            let (h, ok) = judged_history(written, false, false, txns, tick);
+            assert!(!ok);
+            assert_eq!(
+                classify(&file(&dkms), &since, Some(h), &mut vouch),
+                Ok(trust_flag::UNATTESTED),
+                "DKMS's build: let through, recorded High"
+            );
+            assert_eq!(
+                classify(&file(&pkg), &since, Some(h), &mut vouch),
+                Err(CHANGED_SINCE_BOOT),
+                "a package's file elsewhere: refused"
+            );
+        }
+        // found live once: still the transaction's after it ended
+        let (h, ok) = judged_history(written, true, false, &Txns::default(), tick);
+        assert!(ok);
+        assert_eq!(
+            classify(&file(&dkms), &since, Some(h), &mut vouch),
+            Ok(trust_flag::DKMS | trust_flag::PKG_WRITTEN)
+        );
+        // two transactions wrote it: none vouches, live or not
+        let mixed = history_step(Some(written), false, Some(Txn { tgid: 4243, ..dpkg }));
+        assert!(!judged_history(mixed, false, false, &live, tick).1);
+    }
+
+    /// Lot 370 (the lab, ubuntu2604): a module file a short `dpkg -i`
+    /// wrote — its lock taken, the file written, the lock released and dpkg
+    /// gone before the agent's first poll — is trusted, recorded Low: the
+    /// kernel found dpkg holding its lock at the write
+    /// (`module_lock_observe`, `try_write_open`), so no sample is needed.
+    /// On the lab one such install in four was refused: the agent's poll
+    /// never saw dpkg holding its lock. A lineage's package manager holding
+    /// no lock (a pager `apt changelog` started), or held at the write
+    /// (stopped: the kernel's lineage names none), is a write outside a
+    /// transaction there: a package's file refused, DKMS's build let
+    /// through and recorded High. And a history the kernel named by
+    /// lineage only (no observer) still needs the sample.
+    #[test]
+    fn a_short_transactions_module_file_is_trusted_by_its_lock_at_the_write() {
+        use super::super::{judged_history, txn::Txns};
+        use common::module_judge::{
+            history_step_raw, holds_lock, lock_kind, locker_step, ModuleWrite, PkgLocker, Txn,
+        };
+        let fx = fixture();
+        let dkms = fx.tree.join("updates/dkms/vboxdrv.ko.zst");
+        put(&dkms, b"vbox");
+        register(&fx, "virtualbox", "vboxdrv.ko.zst", b"vbox");
+        let pkg = fx.tree.join("kernel/net/extra.ko.zst");
+        put(&pkg, b"extra");
+        let opt = BTreeSet::new();
+        let since = inputs(&fx, before_files(), &opt);
+        let tick = 10_000_000;
+        let start = 8_812 * tick + 4_000;
+        let mut vouch = |f: &TreeFile| {
+            let p = if f.path == pkg {
+                trust_flag::PACKAGE
+            } else {
+                0
+            };
+            p.max(vouched_by(f, &since, |_| false))
+        };
+        // the kernel's steps: the lock taken, then the write
+        let dpkg = Txn { tgid: 4242, start };
+        let at_write = |locker: Option<PkgLocker>, txn: Txn| {
+            let named = match locker {
+                Some(e) if holds_lock(e, true, txn.start) => txn,
+                _ => Txn::NONE,
+            };
+            history_step_raw(ModuleWrite::default(), false, true, named)
+        };
+        let locked = locker_step(PkgLocker::default(), false, start, lock_kind::WRLCK, 2);
+        let written = at_write(Some(locked), dpkg);
+        // dpkg released its lock and exited: no sample ever saw it
+        let (h, ok) = judged_history(written, false, true, &Txns::default(), tick);
+        assert!(ok, "the kernel saw the lock at the write");
+        assert_eq!(
+            classify(&file(&pkg), &since, Some(h), &mut vouch),
+            Ok(trust_flag::PACKAGE | trust_flag::PKG_WRITTEN)
+        );
+        assert_eq!(
+            classify(&file(&dkms), &since, Some(h), &mut vouch),
+            Ok(trust_flag::DKMS | trust_flag::PKG_WRITTEN)
+        );
+        // a package manager holding no lock, its lock released, or held at
+        // the write (the lineage names none): outside a transaction
+        let released = locker_step(locked, true, start, lock_kind::UNLCK, 2);
+        for unlocked in [
+            at_write(None, dpkg),
+            at_write(Some(released), dpkg),
+            at_write(Some(locked), Txn::NONE),
+            // another start under the same pid (a reused pid)
+            at_write(
+                Some(locked),
+                Txn {
+                    start: start + tick,
+                    ..dpkg
+                },
+            ),
+        ] {
+            let (h, ok) = judged_history(unlocked, false, true, &Txns::default(), tick);
+            assert!(!ok);
+            assert_eq!(
+                classify(&file(&pkg), &since, Some(h), &mut vouch),
+                Err(CHANGED_SINCE_BOOT),
+                "a package's file: refused"
+            );
+            assert_eq!(
+                classify(&file(&dkms), &since, Some(h), &mut vouch),
+                Ok(trust_flag::UNATTESTED),
+                "DKMS's build: let through, recorded High"
+            );
+        }
+        // no observer: the kernel named the lineage's package manager
+        // without its lock — the agent's sample decides
+        let lineage = history_step_raw(ModuleWrite::default(), false, true, dpkg);
+        assert!(!judged_history(lineage, false, false, &Txns::default(), tick).1);
+    }
+
     /// Named test (lot 285): a DKMS module built and installed inside a
     /// package transaction since boot — the kernel's history says a package
     /// manager's lineage created it, DKMS registered it for this kernel —

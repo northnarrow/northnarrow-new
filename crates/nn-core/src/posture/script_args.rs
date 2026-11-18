@@ -1234,6 +1234,80 @@ pub fn loader_program(argv: &[String]) -> Option<(&str, usize)> {
     None
 }
 
+/// Lot 370 (05-3.3): the files the dynamic loader runs or loads for an
+/// `argv` ([`loader_code`]), as the caller wrote them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoaderCode<'a> {
+    /// Its program ([`loader_program`]) first, then each library a
+    /// `--preload` names: run — unless `lists`.
+    pub runs: Vec<&'a str>,
+    /// Each library an `--audit` names: the loader runs an auditing
+    /// library's code at its start (`la_version`), even when it only lists
+    /// (the review of #578).
+    pub audits: Vec<&'a str>,
+    /// The review of #578 (P3): `--list` or `--verify` — the loader lists
+    /// or checks the program, maps its preloads, runs none of them.
+    pub lists: bool,
+    /// The review of #578 (re-check 1, R1-1): of `--list` and `--verify`,
+    /// the last given is `--verify` (glibc's loader keeps the last mode
+    /// option): it checks the program and exits before it loads any library
+    /// for auditing — it runs nothing. `--list` loads the program's own
+    /// auditing libraries (`DT_AUDIT`, `DT_DEPAUDIT`) and runs them.
+    pub verifies: bool,
+}
+
+/// Lot 370 (05-3.3): the files the dynamic loader runs or loads for `argv`
+/// — its program ([`loader_program`]), each library a `--preload` or
+/// `--audit` names (a list split on `:` and spaces) — and (the review of
+/// #578, P3) whether it only lists or checks the program (`--list`,
+/// `--verify`). Empty when it runs nothing: no program.
+pub fn loader_code(argv: &[String]) -> LoaderCode<'_> {
+    let Some((program, at)) = loader_program(argv) else {
+        return LoaderCode::default();
+    };
+    let mut out = LoaderCode {
+        runs: vec![program],
+        ..LoaderCode::default()
+    };
+    let mut i = 1;
+    while i < at {
+        let Some(name) = argv[i].strip_prefix("--").filter(|n| !n.is_empty()) else {
+            break;
+        };
+        let (name, value) = name
+            .split_once('=')
+            .map_or((name, None), |(n, v)| (n, Some(v)));
+        if matches!(name, "list" | "verify") {
+            out.lists = true;
+            out.verifies = name == "verify";
+        }
+        match LOADER.long(name).map(|l| l.1) {
+            Some(Long::Loads) => {
+                let v = match value {
+                    Some(v) => Some(v),
+                    None => {
+                        i += 1;
+                        argv.get(i).map(String::as_str)
+                    }
+                };
+                let libs = v
+                    .into_iter()
+                    .flat_map(|v| v.split([':', ' ']))
+                    .filter(|p| !p.is_empty());
+                if name == "audit" {
+                    out.audits.extend(libs);
+                } else {
+                    out.runs.extend(libs);
+                }
+            }
+            Some(Long::Arg) if value.is_none() => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 /// busybox's shells.
 pub(crate) const BUSYBOX_SHELLS: &[&str] = &["sh", "ash", "hush", "bash"];
 

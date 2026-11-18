@@ -1850,6 +1850,14 @@ pub const BPF_CMD_FOREIGN_GET_FD: u32 = 0xFFFF_0002;
 /// "the watchdog by device and inode" (`prctl(PR_SET_MM,
 /// PR_SET_MM_EXE_FILE)`) while the role was vacant takes the same path.
 pub const BPF_CMD_FRESH_INSTANCE_GET_FD: u32 = 0xFFFF_0003;
+/// Lot 370 (F10-4): [`BPF_CMD_FRESH_INSTANCE_GET_FD`] for a role whose
+/// holder exited this boot ([`ROLE_VACATED`]): the successor's handle,
+/// recorded High — the OOM killer or a crash took the agent or the
+/// watchdog, and the vacancy is the moment a preloaded instance would take.
+pub const BPF_CMD_VACATED_ROLE_GET_FD: u32 = 0xFFFF_0004;
+/// Lot 370 (F10-4): `ROLE_TGIDS`' value for a role whose holder exited this
+/// boot (0: never held). No thread group has this number.
+pub const ROLE_VACATED: u32 = u32::MAX;
 
 /// Kernel→userland record of the `bpf()` syscall observer (40 bytes).
 #[repr(C)]
@@ -1893,6 +1901,7 @@ pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
         BPF_CMD_FOREIGN_MAP_WRITE => "foreign_map_write",
         BPF_CMD_FOREIGN_GET_FD => "foreign_get_fd",
         BPF_CMD_FRESH_INSTANCE_GET_FD => "fresh_instance_get_fd",
+        BPF_CMD_VACATED_ROLE_GET_FD => "vacated_role_get_fd",
         _ => "other",
     }
 }
@@ -2739,6 +2748,10 @@ mod tests {
         assert_eq!(
             bpf_cmd_name(BPF_CMD_FRESH_INSTANCE_GET_FD),
             "fresh_instance_get_fd"
+        );
+        assert_eq!(
+            bpf_cmd_name(BPF_CMD_VACATED_ROLE_GET_FD),
+            "vacated_role_get_fd"
         );
     }
 

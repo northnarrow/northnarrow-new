@@ -23,6 +23,7 @@
 
 pub mod kernel;
 pub mod scan;
+pub mod txn;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -158,6 +159,10 @@ pub fn offsets_resolved() -> bool {
         slot::INODE_I_CTIME_SEC_OFFSET,
         slot::INODE_I_CTIME_NSEC_OFFSET,
         slot::INODE_I_UID_OFFSET,
+        // lot 370 (F10-2): without them no write is a transaction's — the
+        // record mode rather than refusing every package's new module
+        slot::TASK_STRUCT_STATE_OFFSET,
+        slot::TASK_STRUCT_START_BOOTTIME_OFFSET,
     ]
     .iter()
     .all(|s| {
@@ -165,6 +170,31 @@ pub fn offsets_resolved() -> bool {
             .iter()
             .any(|(k, v)| k == s && *v != BTF_OFFSETS_ABSENT)
     })
+}
+
+/// Lot 370 (F10-2): the write history the judge classifies a file changed
+/// since boot by — `h`'s flags when the one transaction it names was live,
+/// or the file's change was found its before (`attested`); else a write
+/// outside a transaction (tainted). And whether it was. Live: the kernel
+/// found its package manager holding its lock at the write
+/// (`kernel_locks`, the locks' observer attached: the history names no
+/// other), or, without that observer, the agent saw it holding its lock,
+/// running (`txns`).
+pub fn judged_history(
+    h: common::module_judge::ModuleWrite,
+    attested: bool,
+    kernel_locks: bool,
+    txns: &txn::Txns,
+    tick_ns: u64,
+) -> (u32, bool) {
+    let live = attested
+        || common::module_judge::package_transaction(Some(h))
+            .is_some_and(|t| kernel_locks || txns.live(t, tick_ns));
+    if live {
+        (h.flags, true)
+    } else {
+        (h.flags | common::module_judge::write_flag::TAINT, false)
+    }
 }
 
 /// What a look classifies the tree's files with: the policy's part
@@ -216,6 +246,19 @@ struct Controller {
     rpm: Option<(Option<SystemTime>, RpmIndex)>,
     last: Option<LastLook>,
     armed: Option<u64>,
+    /// Lot 370 (F10-2): the package transactions seen holding their lock
+    /// (sampled only without the locks' observer).
+    txns: txn::Txns,
+    /// Lot 370 (the lab): the package managers' lock files in the kernel.
+    pkg_locks: Vec<(InodeKey, u32)>,
+    /// Lot 370 (the lab): the kernel tells a transaction's lock (the locks'
+    /// observer attached, or not yet known: the kernel then requires it);
+    /// false once the agent found it not attached and said so to the kernel.
+    kernel_locks: bool,
+    /// Lot 370: the files whose write a live transaction was found to have
+    /// made, by their change stamp (`ctime`, size) — kept once the
+    /// transaction has ended.
+    attested: HashMap<InodeKey, (i64, u32, i64)>,
 }
 
 /// The running kernel's release.
@@ -275,6 +318,17 @@ impl Controller {
         }
     }
 
+    /// Lot 370 (the lab): the package managers' lock files in the kernel
+    /// (`txn::LOCK_FILES`, each its bit), as found: dpkg creates its own
+    /// when missing.
+    fn refresh_pkg_locks(&mut self) {
+        let locks = txn::lock_keys();
+        if locks != self.pkg_locks {
+            self.kernel.set_pkg_locks(&locks);
+            self.pkg_locks = locks;
+        }
+    }
+
     /// What vouches for `f` ([`scan::vouched_by`]): a verified package
     /// (its content hashed, the package database's digest compared), DKMS's
     /// registry (the same content), nothing. Cached by the file's identity
@@ -309,6 +363,19 @@ impl Controller {
 
     /// One poll: look at the tree when something changed or it is time.
     fn round(&mut self) {
+        // lot 370 (the lab): the lock files the kernel watches; without the
+        // locks' observer, the transactions alive, every poll — before the
+        // look a write calls for
+        self.refresh_pkg_locks();
+        if self.kernel_locks && nn_linux::module_writes::locks_observed() == Some(false) {
+            match self.kernel.set_locks_unobserved() {
+                Ok(()) => self.kernel_locks = false,
+                Err(e) => warn!(error = %e, "module-load judge: the locks' mode NOT written"),
+            }
+        }
+        if !self.kernel_locks {
+            self.txns.sample();
+        }
         let want = desired();
         let gen = self.kernel.write_gen();
         let stamp = db_stamp();
@@ -358,10 +425,29 @@ impl Controller {
         let mut next: HashMap<InodeKey, ModuleTrust> = HashMap::with_capacity(files.len());
         let mut refused: Vec<(PathBuf, &'static str)> = Vec::new();
         let mut counts = [0usize; 5];
+        let tick = txn::tick_ns();
+        let mut attested: HashMap<InodeKey, (i64, u32, i64)> = HashMap::new();
         for f in &files {
+            // lot 370 (F10-2): a package transaction's write only when that
+            // transaction was seen holding its lock (or the file's change was
+            // found its before); else outside one
             let history = (f.facts.ctime_sec >= boot_sec)
                 .then(|| self.kernel.history(f.key))
-                .flatten();
+                .flatten()
+                .map(|h| {
+                    let stamp = (f.facts.ctime_sec, f.facts.ctime_nsec, f.facts.size);
+                    let (flags, live) = judged_history(
+                        h,
+                        self.attested.get(&f.key) == Some(&stamp),
+                        self.kernel_locks,
+                        &self.txns,
+                        tick,
+                    );
+                    if live {
+                        attested.insert(f.key, stamp);
+                    }
+                    flags
+                });
             let mut vouch = |f: &scan::TreeFile| self.vouch(f, &inputs);
             match scan::classify(f, &inputs, history, &mut vouch) {
                 Ok(flags) => {
@@ -406,6 +492,7 @@ impl Controller {
         }
         let keep: HashSet<InodeKey> = next.keys().copied().collect();
         self.cache.retain(&keep);
+        self.attested = attested;
         let changed = self.mirror != next;
         self.mirror = next;
         // the mode, once the map is filled
@@ -484,7 +571,8 @@ pub fn start(kernel: Option<kernel::Kernel>) -> Result<std::thread::JoinHandle<(
     if !deny_ok {
         crate::boot::degradation::report(
             "module_load",
-            "the kernel's inode offsets (owner, change time) are not resolved: the module-load \
+            "the kernel's inode offsets (owner, change time) or task offsets (state, start) are \
+             not resolved: the module-load \
              judge trusts no file, its deny mode is not armed (the record mode instead)",
         );
     }
@@ -500,6 +588,10 @@ pub fn start(kernel: Option<kernel::Kernel>) -> Result<std::thread::JoinHandle<(
         rpm: None,
         last: None,
         armed: None,
+        txns: txn::Txns::default(),
+        pkg_locks: Vec::new(),
+        kernel_locks: true,
+        attested: HashMap::new(),
     };
     set_state("starting".to_string());
     std::thread::Builder::new()

@@ -644,10 +644,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(path)",
         OWN,
     ),
+    // lot 370 (F10-2): the package managers' lock holders, sampled every
+    // poll — an unread sample adds no transaction (nothing is vouched for:
+    // fail closed), the next poll samples again
     (
-        "crates/nn-linux/src/self_integrity.rs",
-        "read_to_string(\"/proc/meminfo\")",
+        "agent/src/module_trust/txn.rs",
+        "read_state(\"/proc/locks\")",
         KNOB,
+    ),
+    (
+        "agent/src/module_trust/txn.rs",
+        "read_state(format!(\"/proc/{pid}/stat\"))",
+        PROC,
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
@@ -692,6 +700,19 @@ const KNOWN: &[(&str, &str, &str)] = &[
     (
         "crates/nn-linux/src/sensors/exec_facts.rs",
         "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    // the review of #578: the loader's process still the exec's (else
+    // nothing placed: its names judged by their text), and the agent's own
+    // name in its succession record
+    (
+        "crates/nn-linux/src/sensors/loader_files.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_state(\"/proc/self/comm\")",
         PROC,
     ),
     (

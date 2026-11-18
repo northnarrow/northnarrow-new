@@ -272,6 +272,23 @@ pub(crate) fn marks_clean(tgid: u32) -> bool {
     northnarrow_common::cgroup_join::clean(how, is_lost(tgid))
 }
 
+/// Lot 370 (F10-2): no code was injected into thread group `tgid`, or into
+/// a process it was forked from after it (lot 281's taint), and its marks
+/// are known (not lost: fail closed). A placement — a desktop's shell in
+/// its scope — is not a taint.
+#[inline(always)]
+pub(crate) fn untainted(tgid: u32) -> bool {
+    // SAFETY: a lookup of the marks' map, the value copied out at once.
+    let how = unsafe { CGROUP_JOINED.get(&tgid) }.map(|rec| unpack(rec[1]).0);
+    northnarrow_common::cgroup_join::untainted(how, is_lost(tgid))
+}
+
+/// [`untainted`] of the calling thread group.
+#[inline(always)]
+pub(crate) fn caller_untainted() -> bool {
+    untainted((bpf_get_current_pid_tgid() >> 32) as u32)
+}
+
 /// [`marks_clean`] of the calling thread group.
 #[inline(always)]
 pub(crate) fn caller_marks_clean() -> bool {

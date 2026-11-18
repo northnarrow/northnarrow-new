@@ -11700,6 +11700,103 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 370 — the pre-alpha's Phase 10 (final review) findings and two of
+  a cross-model check (C17, C18; no level change).**
+  - What was open: under `alpha` COMBAT's NEUTRALIZE signed
+    `combat_outcome` `success`, "N contained", for a kill that never ran
+    (F10-1, P1); a file of the FIM watch list absent at the start
+    (`/etc/ld.so.preload`, root's `authorized_keys`) appeared with no event
+    (F10-3); the module judge trusted any root write under a package
+    manager's lineage, a stopped one included, and a trusted load left no
+    R018 record (F10-2); the OOM killer could empty the agent's role on
+    demand, the successor's handle recorded Low (F10-4); weakening variables
+    from the service manager's environment were honoured (F10-5); R004's
+    root budget lowered Critical to High (F10-6); a program run as the
+    dynamic loader's operand escaped R001–R004 (05-3.3); a flood could push
+    archives out of the retention unseen (02-3.1).
+  - Done: a would-have is its own outcome (`would_have`) in the signed
+    rows, the journal and the status, with a ratchet; the nearest directory
+    of an absent list path is watched for its creation alone (writer named;
+    a creation seen only by the look is an event, writer unknown); the
+    write history names the package transaction, which must be live (not
+    stopped or traced at the write, nor frozen by the system's freezer;
+    holding its lock at the write,
+    read in the kernel by `module_lock_observe` on `file_lock`; writer
+    untainted), and every trusted load is Low; `OOMScoreAdjust=-999` for
+    both units (the host OOM killer's last pick; their memory caps kept)
+    and pinned at each start, a vacated role taken only by a
+    successor started for it, recorded High; the manager's weakening
+    variables ignored and signed; the compare budget spent signed; the
+    loader's operand judged as executed; a young eviction signed.
+  - Fix round 1 (the review of #578): a loader operand through a link of
+    `/proc` placed by the file the loader maps (the exec pump's
+    `loader_files`: the link opened in the process's view, the file found
+    among its executable mappings) and judged as a direct exec, else
+    recorded (N1); a loader that only lists or checks recorded Low (P3);
+    root's uncompared runtime copy recorded High again, never killed, the
+    first of an episode naming who spent the budget (N3); the agent's own
+    successor to a vacated role recorded at its start from the kernel's
+    facts, High outside a signed window, Low inside — the previous agent's
+    hook wrote it to a ring nobody read (N2); the would-have ratchet's
+    wildcard and negated `matches!` rules; the KNOWN_LIMITATIONS lines the
+    review listed.
+  - Lab (the lot's rounds r1–r2, Ubuntu 22.04 / 5.15 and 26.04 / 7.0, on
+    the first head): a short `dpkg -i` of a module 3/3 trusted Low, a held
+    `dpkg` refused High, the module-load programs within the verifier's
+    budget on both (highest 55% of 900k); the vacated-role case (an abrupt
+    kill inside a window) left no NN-L-BPF-002 record of any kind, the
+    defect fix round 1 closes.
+  - Lab of fix round 1 (Ubuntu 22.04 / 5.15, the operator's install under
+    `alpha`): a `/tmp` program run through the loader by four names through
+    links of `/proc` (the process's root, its working directory, a
+    descriptor) placed as `/tmp/…` and judged R001 (High, a person's, held
+    below COMBAT) — on the round's first build, without the re-read of
+    the mappings, none was placed (R001 Medium, no response: the pump read
+    before the loader mapped its program); `ldd` of it two R001 Low (its
+    `--verify` and its trace run), `ld.so --list` R001 Low, the same program
+    run through the loader R001 High; the agent SIGKILLed inside a signed
+    window, restarted by its unit: NN-L-BPF-002 Low under the new pid; the
+    privileged `a_role_its_holder_left_outside_a_window_is_recorded_high`
+    (no window, the watchdog's respawn) passed from a clean start, High
+    under the new pid; `bpf_syscall_observe` within the 5.15 verifier's
+    budget (51,220 processed). Not measured: a kernel OOM kill of the agent
+    itself (the probe's attempt killed one of its workers, at +1000).
+  - Fix round 2 (re-check 1 of #578): glibc's list and trace modes run the
+    libraries the program names for auditing — the pump reads the program's
+    dynamic section from the file the loader maps (`elf_audit`; unchanged
+    since the process started): naming one, judged as run; Low only when
+    read naming none (round 3, R2-1: no longer Low for a staged program: Medium); not read, Medium, never "runs no code" (R1-1; musl's
+    loader under `LD_TRACE_LOADED_OBJECTS` judged as run). An absolute
+    operand is also placed through symbolic links (`/usr/tmp`, R1-2). The
+    mapping waits are per account, root's its own (R1-3). The privileged
+    suites' fixtures follow F10-4 (the guard tests' restore agent as PID 1's
+    child; the watchdog role's first claim established), the dirs made
+    first; test messages no longer print verdict texts (CodeQL).
+  - Fix round 3 (re-check 2 of #578; no lab, none asked): a staged
+    program glibc lists is Medium, never Low, never killed unless the pump
+    read it naming an auditor (R2-1: four ways the read can be made false
+    by code that already ran); Low stays for `--verify` and musl. The ELF
+    reader takes only the class's own `e_phentsize`, caps its buffers at
+    7 KiB, has a cargo-fuzz target `elf_audit` and malformed-header tests
+    (R2-2). Not measured: a lab round.
+  - Lab of fix round 2 (Ubuntu 22.04 / 5.15, the round's tree checked by
+    hash on the guest): the watchdog's privileged suite on the guest with
+    no `/etc/northnarrow`, 11 of 11 (its own-start test among them); then,
+    as the KVM CI job runs it (`nn-lab.sh install`, `test-ignored`), the
+    five runs exit 0, 174 passed and none failed (the watchdog suite 11/11,
+    the agent's `privileged_e2e` 19/19). The operator's install under
+    `alpha`, glibc 2.35, the review's probe shapes built on the guest:
+    `ld.so --list` of a program with `DT_AUDIT` (another library, or
+    itself) and `LD_TRACE_LOADED_OBJECTS` with `DT_DEPAUDIT` — the
+    auditing library's constructor ran, R001 High (judged as run; a
+    person's, below COMBAT); `ldd` of the self-auditing one R001 High and
+    Low (its `--verify` run); `--list` and `ldd` of a program naming none
+    R001 Medium for the listing (the process gone before the pump confirmed
+    the mapping: not read) and Low for `--verify`, never a kill;
+    `--verify` of an auditing program Low, nothing ran; `LD_AUDIT` in the
+    environment R001 Medium; `ld.so /usr/tmp/x` with `/usr/tmp ->
+    ../var/tmp` R003 High (placed as `/var/tmp/x`).
+
 - **Lot 369 — the pre-alpha's Phase 5 early triage: the soak's false
   positives on rc5 (C14, C16, C23; no level change).**
   - What was open (the first hours of the soak, Ubuntu 22.04/24.04 and

@@ -257,12 +257,12 @@ pub fn journal_outcome(
         let left = report
             .additional
             .iter()
+            // Lot 370 (F10-1): a descendant the gate did not kill is not
+            // contained (it counted as one).
             .filter(|o| {
                 !matches!(
                     o,
-                    ExecutionOutcome::Killed { .. }
-                        | ExecutionOutcome::AlreadyGone { .. }
-                        | ExecutionOutcome::WouldExecute { .. }
+                    ExecutionOutcome::Killed { .. } | ExecutionOutcome::AlreadyGone { .. }
                 )
             })
             .count();
@@ -276,6 +276,18 @@ pub fn journal_outcome(
         }
     }
     (result, text, reason)
+}
+
+/// Lot 370 (F10-1): the journal line of a response's report — `EXECUTED`,
+/// or, for one the no-enforcement gate held (the `alpha` profile,
+/// detect-only), `NOT EXECUTED (detect-only: would have)`: the line read
+/// `EXECUTED` for an action that never ran.
+pub fn executed_line(report: &ExecutionReport) -> &'static str {
+    if matches!(report.primary, ExecutionOutcome::WouldExecute { .. }) {
+        "NOT EXECUTED (detect-only: would have)"
+    } else {
+        "EXECUTED"
+    }
 }
 
 /// Lot 312 (review F2): what a [`ExecutionOutcome::BlockedNewOnly`] row says.

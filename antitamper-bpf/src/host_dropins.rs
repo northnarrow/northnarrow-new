@@ -543,7 +543,8 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
     if matches!(reach, Reach::Slices | Reach::OurSlice) {
         return None;
     }
-    let our_oom = if reach == Reach::Watchdog { -900 } else { -500 };
+    // lot 370 (F10-4): both units hold -999
+    let our_oom = crate::PINNED_OOM_SCORE_ADJ;
     match key {
         // any value but `infinity` (a number, a size, a time span) is finite
         "LimitCPU" | "LimitAS" | "LimitDATA" | "LimitRSS" | "LimitFSIZE" => v
@@ -595,7 +596,7 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
             .parse::<i32>()
             .ok()
             .filter(|n| *n > our_oom)
-            .map(|n| format!("OOM score {n}, ours is -500 (the agent) and -900 (the watchdog)")),
+            .map(|n| format!("OOM score {n}, ours is -999 (the agent and the watchdog)")),
         "Restart" if reach != Reach::Agent => matches!(v, "no" | "on-success")
             .then(|| format!("Restart {v}: the watchdog's is always")),
         "Slice" => {
@@ -1071,7 +1072,9 @@ mod tests {
             "IOWeight=500",
             "Nice=-5",
             "KillMode=control-group",
-            "OOMScoreAdjust=-900",
+            // lot 370: ours, -999 (it read -900, the watchdog's, harmless
+            // then; a raise of either is harmful now)
+            "OOMScoreAdjust=-999",
             "Environment=http_proxy=http://p:3128",
             "ConditionPathExists=/",
             "MemorySwapMax=0",
@@ -1115,6 +1118,9 @@ mod tests {
         assert!(svc("KillMode=none").contains("control-group"));
         assert!(svc("SendSIGKILL=yes").contains("SendSIGKILL"));
         assert!(svc("OOMScoreAdjust=1000").contains("OOM score"));
+        // lot 370 (F10-4): the old values raise ours
+        assert!(svc("OOMScoreAdjust=-900").contains("ours is -999"));
+        assert!(svc("OOMScoreAdjust=-500").contains("OOM score"));
         assert!(svc("OOMPolicy=kill").contains("kill"));
         assert!(svc("Restart=no").contains("watchdog"));
         assert!(svc("Slice=other.slice").contains("slice"));
