@@ -99,12 +99,38 @@ pub fn is_staged_exec(exe: &nn_model::ExeIdentity, filename: &str) -> bool {
 /// was given for an exec ([`loader_code`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoaderUse {
-    /// It runs the file's code: the program, a preload — or an auditing
-    /// library, in every mode.
+    /// It runs the file's code: the program, a preload, an auditing
+    /// library — and (the re-check of #578, R1-1) a program glibc's loader
+    /// only lists that names a library for auditing, as the exec pump read
+    /// it: that library runs, the program's own code when it names itself.
     Runs,
-    /// It only lists or checks it — `--list`, `--verify`, `ldd`'s trace
-    /// mode — and runs none of its code.
-    Lists,
+    /// It runs none of the file's code, and the agent knows why (the words):
+    /// `--verify` (checked, nothing loaded); musl's loader listing it
+    /// (`--list`, or run as `ldd`); glibc's list or trace mode for a program
+    /// the exec pump read naming no library for auditing, in an environment
+    /// with no `LD_AUDIT` ([`exe_flags::LOADER_NO_AUDIT`]).
+    ///
+    /// [`exe_flags::LOADER_NO_AUDIT`]: common::wire::exe::exe_flags::LOADER_NO_AUDIT
+    Lists(&'static str),
+    /// The re-check of #578 (R1-1): it only lists or checks the file as far
+    /// as its arguments and environment say, and the agent cannot tell that
+    /// it runs none of its code (the words): glibc's list or trace mode for
+    /// a program the pump could not read — a library it names for auditing
+    /// would run — or a loader that is not the system's. Recorded, never
+    /// killed, never said to run nothing.
+    MayRun(&'static str),
+}
+
+impl LoaderUse {
+    /// The order a rule judges a loader's files in: one it runs first, then
+    /// one it may run, then one it only lists.
+    pub fn rank(self) -> u8 {
+        match self {
+            LoaderUse::Runs => 2,
+            LoaderUse::MayRun(_) => 1,
+            LoaderUse::Lists(_) => 0,
+        }
+    }
 }
 
 /// Lot 370 (05-3.3): the files the dynamic loader runs or loads for an exec
@@ -116,16 +142,31 @@ pub enum LoaderUse {
 /// executed — the loader, in `/lib` — so `ld-linux-x86-64.so.2 /tmp/x` ran a
 /// staged program unjudged, and `ld.so /proc/self/fd/3` fileless code.
 ///
-/// The review of #578 (P3): the loader runs no code of its program or
-/// preloads when it only lists or checks them — `--list`, `--verify`;
+/// The review of #578 (P3) and its re-check (R1-1): the program and its
+/// preloads are only listed or checked — `--list`, `--verify`;
 /// `LD_TRACE_LOADED_OBJECTS` in its environment as the exec pump read it
 /// ([`exe_flags::LOADER_LISTS`]); musl's loader run as `ldd`; or `listing`:
-/// the exec's parent runs the system's `ldd` script ([`LoaderListing`]).
-/// An auditing library runs in every mode.
+/// the exec's parent runs the system's `ldd` script ([`LoaderListing`]) —
+/// and what that means is told by whose loader it is
+/// ([`program_identity::system_loader`]):
+/// - glibc's: `--verify` (the last of `--list` and `--verify`) loads
+///   nothing; its list and trace modes still load and run the libraries the
+///   program names for auditing (`DT_AUDIT`, `DT_DEPAUDIT`: verified on
+///   2.39, the program's own constructor when it names itself) — so the
+///   program is listed only when the exec pump read it naming none
+///   ([`exe_flags::LOADER_NO_AUDIT`]) and no `--audit` is given, run when it
+///   names one ([`exe_flags::LOADER_AUDITS`]), and may run otherwise;
+/// - musl's: `--list` and `ldd` list; it reads no `LD_TRACE_LOADED_OBJECTS`
+///   and runs the program then;
+/// - a loader that is not the system's (a copy, a name): may run.
+///
+/// An auditing library `--audit` names runs in every mode.
 ///
 /// [`exe_flags::LOADER_LISTS`]: common::wire::exe::exe_flags::LOADER_LISTS
+/// [`exe_flags::LOADER_NO_AUDIT`]: common::wire::exe::exe_flags::LOADER_NO_AUDIT
+/// [`exe_flags::LOADER_AUDITS`]: common::wire::exe::exe_flags::LOADER_AUDITS
 pub fn loader_code(event: &Event, listing: bool) -> Vec<(&str, LoaderUse)> {
-    let Event::ProcessSpawn { argv, exe, .. } = event else {
+    let Event::ProcessSpawn { argv, .. } = event else {
         return Vec::new();
     };
     if program_identity::loader_operand_at(event).is_none() {
@@ -133,20 +174,58 @@ pub fn loader_code(event: &Event, listing: bool) -> Vec<(&str, LoaderUse)> {
     }
     // the one reader of the loader's options (`posture::script_args`)
     let code = crate::posture::script_args::loader_code(argv);
-    let lists = code.lists
-        || listing
-        || exe.has(common::wire::exe::exe_flags::LOADER_LISTS)
-        || program_identity::musl_ldd(event);
-    let program = if lists {
-        LoaderUse::Lists
-    } else {
-        LoaderUse::Runs
-    };
+    let program = program_use(event, &code, listing);
     code.runs
         .into_iter()
         .map(|p| (p, program))
         .chain(code.audits.into_iter().map(|p| (p, LoaderUse::Runs)))
         .collect()
+}
+
+/// The re-check of #578 (R1-1): what the loader of `event` does with its
+/// program and preloads ([`loader_code`]).
+fn program_use(
+    event: &Event,
+    code: &crate::posture::script_args::LoaderCode<'_>,
+    listing: bool,
+) -> LoaderUse {
+    use common::wire::exe::exe_flags::{LOADER_AUDITS, LOADER_LISTS, LOADER_NO_AUDIT};
+    use program_identity::SystemLoader;
+    let Event::ProcessSpawn { exe, .. } = event else {
+        return LoaderUse::Runs;
+    };
+    // `ldd`'s trace mode: the environment's, or the system's script running it
+    let traced = listing || exe.has(LOADER_LISTS);
+    let musl_ldd = program_identity::musl_ldd(event);
+    if !code.lists && !traced && !musl_ldd {
+        return LoaderUse::Runs;
+    }
+    match program_identity::system_loader(event) {
+        None => LoaderUse::MayRun("a loader that is not the system's: what it runs is not known"),
+        Some(SystemLoader::Musl) if code.lists || musl_ldd => {
+            LoaderUse::Lists("musl's loader lists it (--list or as ldd)")
+        }
+        // musl reads no LD_TRACE_LOADED_OBJECTS: it runs the program
+        Some(SystemLoader::Musl) => LoaderUse::Runs,
+        Some(SystemLoader::Glibc) if code.verifies => {
+            LoaderUse::Lists("--verify: the loader checks it and exits before loading any library")
+        }
+        Some(SystemLoader::Glibc) if exe.has(LOADER_AUDITS) => LoaderUse::Runs,
+        // an auditing library is code in the loader's process: whatever it
+        // is, the program is not said to run nothing beside it
+        Some(SystemLoader::Glibc) if !code.audits.is_empty() => LoaderUse::MayRun(
+            "glibc's list or trace mode with an auditing library given: it runs beside the \
+             program",
+        ),
+        Some(SystemLoader::Glibc) if exe.has(LOADER_NO_AUDIT) => LoaderUse::Lists(
+            "glibc's list or trace mode, the program naming no library for auditing and the \
+             environment no LD_AUDIT, as the agent read them",
+        ),
+        Some(SystemLoader::Glibc) => LoaderUse::MayRun(
+            "glibc's list or trace mode, the program not read: a library it names for auditing \
+             runs even then",
+        ),
+    }
 }
 
 /// The review of #578 (P3): glibc's `ldd`, a shell script, runs the loader
@@ -253,35 +332,93 @@ pub fn through_proc_link(path: &str) -> bool {
 /// exec pump to open it in the process's own view.
 pub use crate::posture::proc_link::{view_link, Hop, ViewLink, Who};
 
+/// The re-check of #578 (R1-2): where the exec pump found a file the loader
+/// was given by a name NOT through a link of `/proc` — an absolute or a
+/// relative one, walked in the process's view as the kernel walks it, its
+/// symbolic links followed (`/usr/tmp` is `../var/tmp` on the RHEL family),
+/// and found among the files the process maps: the kernel's identity of the
+/// file the loader maps. It only adds to [`placed`]: the text's own reading
+/// is judged beside it, and a name the text cannot place stays recorded.
+pub fn pump_placement(event: &Event, path: &str) -> Option<Placement> {
+    if through_proc_link(path) {
+        return None;
+    }
+    program_identity::loader_file(event, path).map(|f| {
+        if f.memfd || f.deleted {
+            Placement::Fileless(f.path)
+        } else {
+            Placement::File(f.path)
+        }
+    })
+}
+
+/// Every place a file [`loader_code`] names is known to lie in: its
+/// [`placed`] reading, and the pump's [`pump_placement`] when it is another.
+pub fn placements(event: &Event, path: &str) -> Vec<Placement> {
+    let mut out: Vec<Placement> = placed(event, path).into_iter().collect();
+    if let Some(p) = pump_placement(event, path) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Lot 370 (05-3.3): a file the loader runs or lists for this exec under
-/// `prefix` (a staging directory), placed ([`placed`]), and what the loader
-/// does with it — one it runs first.
+/// `prefix` (a staging directory), placed ([`placements`]), and what the
+/// loader does with it — one it runs first, then one it may run.
 pub fn loader_staged(event: &Event, prefix: &str, listing: bool) -> Option<(String, LoaderUse)> {
     let mut found: Option<(String, LoaderUse)> = None;
     for (text, use_) in loader_code(event, listing) {
-        if let Some(Placement::File(p)) = placed(event, text) {
-            if p.starts_with(prefix) && found.as_ref().is_none_or(|f| f.1 == LoaderUse::Lists) {
-                found = Some((p, use_));
+        for place in placements(event, text) {
+            if let Placement::File(p) = place {
+                if p.starts_with(prefix) && found.as_ref().is_none_or(|f| f.1.rank() < use_.rank())
+                {
+                    found = Some((p, use_));
+                }
             }
         }
     }
     found
 }
 
-/// The review of #578 (P3): the record of a staged file the loader only
-/// lists or checks (`--list`, `--verify`, `ldd`) — Low, never a kill, from
-/// the staging rule whose directory it lies in.
-pub(crate) fn loader_listed_record(rule: &dyn Rule, event: &Event, dir: &str, p: &str) -> Verdict {
-    build_verdict(
+/// The review of #578 (P3) and its re-check (R1-1): the record of a staged
+/// file the loader only lists or checks — never a kill — from the staging
+/// rule whose directory it lies in: Low when the agent knows the loader
+/// runs none of its code ([`LoaderUse::Lists`], saying why), Medium when it
+/// cannot tell ([`LoaderUse::MayRun`], saying why). `None` for a file it
+/// runs: the rule's own verdict.
+pub(crate) fn loader_listed_record(
+    rule: &dyn Rule,
+    event: &Event,
+    dir: &str,
+    p: &str,
+    use_: LoaderUse,
+) -> Option<Verdict> {
+    let (severity, text) = match use_ {
+        LoaderUse::Runs => return None,
+        LoaderUse::Lists(why) => (
+            Severity::Low,
+            format!(
+                "A program in {dir} only listed or checked by the dynamic loader ({p}: {why}) — \
+                 in that mode the loader runs no code of it; recorded Low, not killed"
+            ),
+        ),
+        LoaderUse::MayRun(why) => (
+            Severity::Medium,
+            format!(
+                "A program in {dir} given to the dynamic loader to list or check ({p}: {why}) — \
+                 it may still run code; recorded, not killed"
+            ),
+        ),
+    };
+    Some(build_verdict(
         rule,
         event,
         ResponseAction::Log,
-        Severity::Low,
-        &format!(
-            "A program in {dir} listed or checked by the dynamic loader ({p}: --list, --verify \
-             or ldd's trace mode) — the loader runs none of its code; recorded Low, not killed"
-        ),
-    )
+        severity,
+        &text,
+    ))
 }
 
 /// Lot 369: what the packaged `go` itself built and then runs, as the
@@ -1057,17 +1194,24 @@ mod tests {
         let r001 = R001ExecFromTmp::default();
         let r003 = R003ExecFromVarTmp::default();
         let r004 = R004ExecFromProcSelfFd::<H>::default();
-        let judge = |argv: &[&str]| -> Vec<(String, ResponseAction, Severity, String)> {
-            let e = via_loader(argv);
-            let rules: [&dyn Rule; 4] = [&r001, &R002ExecFromDevShm::default(), &r003, &r004];
-            rules
-                .iter()
-                .filter_map(|r| r.evaluate(&e))
-                .map(|v| (v.rule_id, v.action, v.severity, v.reasoning))
-                .collect()
-        };
-        let one = |argv: &[&str], rule: &str, action, sev| {
-            let got = judge(argv);
+        // `flags`: what the exec pump read of the exec (the re-check of
+        // #578: the program's auditing libraries)
+        let judge_read =
+            |argv: &[&str], flags: u32| -> Vec<(String, ResponseAction, Severity, String)> {
+                let mut e = via_loader(argv);
+                if let Event::ProcessSpawn { exe, .. } = &mut e {
+                    exe.flags |= flags;
+                }
+                let rules: [&dyn Rule; 4] = [&r001, &R002ExecFromDevShm::default(), &r003, &r004];
+                rules
+                    .iter()
+                    .filter_map(|r| r.evaluate(&e))
+                    .map(|v| (v.rule_id, v.action, v.severity, v.reasoning))
+                    .collect()
+            };
+        let judge = |argv: &[&str]| judge_read(argv, 0);
+        let one_read = |argv: &[&str], flags: u32, rule: &str, action, sev| {
+            let got = judge_read(argv, flags);
             assert_eq!(got.len(), 1, "{argv:?}: {got:?}");
             assert_eq!(
                 (got[0].0.as_str(), got[0].1.clone(), got[0].2),
@@ -1076,6 +1220,7 @@ mod tests {
             );
             assert!(got[0].3.contains("dynamic loader"), "{}", got[0].3);
         };
+        let one = |argv: &[&str], rule: &str, action, sev| one_read(argv, 0, rule, action, sev);
         use ResponseAction::{KillProcessTree as Kill, Log};
         one(&[ld, "/tmp/x"], "R001_ExecFromTmp", Kill, Severity::Medium);
         one(
@@ -1166,9 +1311,12 @@ mod tests {
             Severity::Medium,
         );
         // the review of #578 (P3): a staged program the loader only lists
-        // or checks — recorded Low, never killed (it was not recorded)
-        one(
+        // or checks — recorded Low, never killed (it was not recorded). The
+        // re-check (R1-1): glibc's --list runs the libraries the program
+        // names for auditing — Low once the pump read it naming none
+        one_read(
             &[ld, "--list", "/tmp/x"],
+            common::wire::exe::exe_flags::LOADER_NO_AUDIT,
             "R001_ExecFromTmp",
             Log,
             Severity::Low,
@@ -1385,9 +1533,14 @@ mod tests {
     /// recorded Low, never killed (`ldd /tmp/x` was R001's kill on
     /// 382be007). A loader that runs it stays judged, and an auditing
     /// library runs in every mode.
+    ///
+    /// The re-check of #578 (R1-1): glibc's list and trace modes run the
+    /// libraries the program names for auditing — Low only for a program the
+    /// pump read naming none (`LOADER_NO_AUDIT`, the inputs below; the next
+    /// test has the rest).
     #[test]
     fn a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged() {
-        use common::wire::exe::exe_flags::LOADER_LISTS;
+        use common::wire::exe::exe_flags::{LOADER_LISTS, LOADER_NO_AUDIT};
         use nn_model::{ResponseAction::*, Severity};
         let ld = "/lib64/ld-linux-x86-64.so.2";
         let only = |e: &nn_model::Event, listing: bool, rule: &str, action, sev| {
@@ -1399,10 +1552,12 @@ mod tests {
                 "{got:?}"
             );
         };
+        // the pump read the trace mode, and the program naming no library
+        // for auditing (R1-1)
         let traced = |key: u32, argv: &[&str]| {
             let mut e = loader_exec(key, argv);
             if let nn_model::Event::ProcessSpawn { exe, .. } = &mut e {
-                exe.flags |= LOADER_LISTS;
+                exe.flags |= LOADER_LISTS | LOADER_NO_AUDIT;
             }
             e
         };
@@ -1443,13 +1598,11 @@ mod tests {
             Severity::Low,
         );
         // the system's ldd its parent (the lineage's identity)
-        only(
-            &loader_exec(57_826, &[ld, "/tmp/x"]),
-            true,
-            "R001_ExecFromTmp",
-            Log,
-            Severity::Low,
-        );
+        let mut by_ldd = loader_exec(57_826, &[ld, "/tmp/x"]);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut by_ldd {
+            exe.flags |= LOADER_NO_AUDIT;
+        }
+        only(&by_ldd, true, "R001_ExecFromTmp", Log, Severity::Low);
         // musl's loader as ldd
         let mut musl = loader_exec(57_827, &["ldd", "/tmp/x"]);
         if let nn_model::Event::ProcessSpawn { exe, filename, .. } = &mut musl {
@@ -1488,9 +1641,11 @@ mod tests {
             KillProcessTree,
             Severity::Medium,
         );
-        // … and the program it lists is recorded Low beside it
+        // … and the program it checks is recorded Low beside it (R1-1:
+        // `--verify`, the one mode that loads no auditing library; listed,
+        // the next test)
         let got: Vec<_> = staging_verdicts(
-            &traced(57_831, &[ld, "--audit=/dev/shm/a.so", "/tmp/x"]),
+            &traced(57_831, &[ld, "--audit=/dev/shm/a.so", "--verify", "/tmp/x"]),
             false,
         )
         .into_iter()
@@ -1539,6 +1694,346 @@ mod tests {
         assert!(staging_verdicts(&named, false)
             .iter()
             .all(|v| v.1 == KillProcessTree));
+    }
+
+    /// The re-check of #578 (R1-1, named; its probe on glibc 2.39): glibc's
+    /// list and trace modes (`--list`, `LD_TRACE_LOADED_OBJECTS`, `ldd`)
+    /// still load and run the libraries the program names for auditing
+    /// (`DT_AUDIT`, `DT_DEPAUDIT`) — its own constructor when it names
+    /// itself — so a staged program is:
+    /// - judged as run (the kill) when the pump read it naming one
+    ///   (`LOADER_AUDITS`), in every list mode but `--verify`;
+    /// - recorded Medium, never killed, never said to run nothing, when it
+    ///   was not read, when an auditing library is given beside it, or when
+    ///   the loader is not the system's;
+    /// - Low (the previous test) only when read naming none.
+    ///
+    /// musl reads no `LD_TRACE_LOADED_OBJECTS`: under it, it runs the
+    /// program (judged as run); its `ldd` stays Low. On 6321c7b7 every list
+    /// mode was Low, "runs none of its code".
+    #[test]
+    fn a_listed_program_is_low_only_when_read_naming_no_auditing_library() {
+        use common::wire::exe::exe_flags::{LOADER_AUDITS, LOADER_LISTS, LOADER_NO_AUDIT};
+        use nn_model::{ResponseAction::*, Severity};
+        let ld = "/lib64/ld-linux-x86-64.so.2";
+        let with = |key: u32, argv: &[&str], flags: u32| {
+            let mut e = loader_exec(key, argv);
+            if let nn_model::Event::ProcessSpawn { exe, .. } = &mut e {
+                exe.flags |= flags;
+            }
+            e
+        };
+        // the one verdict, its rule, action and severity — and whether its
+        // text says the loader runs no code of the file
+        let only =
+            |e: &nn_model::Event, listing: bool, rule: &str, action, sev, says_none: bool| {
+                let got = staging_verdicts(e, listing);
+                let shape: Vec<_> = got
+                    .iter()
+                    .map(|v| (v.0.clone(), v.1.clone(), v.2))
+                    .collect();
+                assert_eq!(
+                    shape,
+                    [(rule.to_string(), action, sev)],
+                    "one verdict, as expected"
+                );
+                assert_eq!(
+                    got[0].3.contains("runs no code"),
+                    says_none,
+                    "the record says the loader runs no code only when that is known"
+                );
+            };
+        let (r1, r2, r3, r4) = (
+            "R001_ExecFromTmp",
+            "R002_ExecFromDevShm",
+            "R003_ExecFromVarTmp",
+            "R004_ExecFromProcSelfFd",
+        );
+        // read naming one: judged as run, in each list mode
+        for (key, argv, flags, listing) in [
+            (
+                57_841,
+                &[ld, "/tmp/x"][..],
+                LOADER_LISTS | LOADER_AUDITS,
+                false,
+            ),
+            (57_842, &[ld, "--list", "/tmp/x"], LOADER_AUDITS, false),
+            (57_843, &[ld, "/tmp/x"], LOADER_AUDITS, true),
+        ] {
+            only(
+                &with(key, argv, flags),
+                listing,
+                r1,
+                KillProcessTree,
+                Severity::Medium,
+                false,
+            );
+        }
+        let traced_audits = LOADER_LISTS | LOADER_AUDITS;
+        only(
+            &with(57_844, &[ld, "/dev/shm/x"], traced_audits),
+            false,
+            r2,
+            KillProcessTree,
+            Severity::High,
+            false,
+        );
+        only(
+            &with(57_845, &[ld, "/var/tmp/x"], traced_audits),
+            false,
+            r3,
+            KillProcessTree,
+            Severity::Medium,
+            false,
+        );
+        only(
+            &with(57_846, &[ld, "/proc/self/fd/3"], traced_audits),
+            false,
+            r4,
+            KillProcessTree,
+            Severity::Critical,
+            false,
+        );
+        // not read (the process gone, the budget spent, the file changed):
+        // recorded Medium, not killed, never "runs no code"
+        for (key, argv, flags, listing) in [
+            (57_847, &[ld, "/tmp/x"][..], LOADER_LISTS, false),
+            (57_848, &[ld, "--list", "/tmp/x"], 0, false),
+            (57_849, &[ld, "/tmp/x"], 0, true),
+        ] {
+            only(
+                &with(key, argv, flags),
+                listing,
+                r1,
+                Log,
+                Severity::Medium,
+                false,
+            );
+        }
+        only(
+            &with(57_850, &[ld, "/dev/shm/x"], LOADER_LISTS),
+            false,
+            r2,
+            Log,
+            Severity::Medium,
+            false,
+        );
+        only(
+            &with(57_851, &[ld, "/var/tmp/x"], LOADER_LISTS),
+            false,
+            r3,
+            Log,
+            Severity::Medium,
+            false,
+        );
+        only(
+            &with(57_852, &[ld, "/proc/self/fd/3"], LOADER_LISTS),
+            false,
+            r4,
+            Log,
+            Severity::Medium,
+            false,
+        );
+        only(
+            &with(57_853, &[ld, "./x"], LOADER_LISTS),
+            false,
+            r1,
+            Log,
+            Severity::Medium,
+            false,
+        );
+        // an auditing library given beside it: the program may run under it
+        let got: Vec<_> = staging_verdicts(
+            &with(
+                57_854,
+                &[ld, "--audit=/dev/shm/a.so", "--list", "/tmp/x"],
+                LOADER_NO_AUDIT,
+            ),
+            false,
+        )
+        .into_iter()
+        .map(|v| (v.0, v.1, v.2))
+        .collect();
+        assert_eq!(
+            got,
+            [
+                (r1.to_string(), Log, Severity::Medium),
+                (r2.to_string(), KillProcessTree, Severity::High)
+            ]
+        );
+        // … one the agent cannot place (it may be the program itself): its
+        // record, which names it, before the listed program's
+        let e = with(
+            57_855,
+            &[ld, "--audit=./x", "--list", "/tmp/x"],
+            LOADER_NO_AUDIT,
+        );
+        only(&e, false, r1, Log, Severity::Medium, false);
+        assert!(
+            staging_verdicts(&e, false)[0].3.contains("(./x:"),
+            "the record names the auditing library the agent cannot place"
+        );
+        // --verify loads no auditing library: Low, whatever the program names
+        only(
+            &with(57_856, &[ld, "--verify", "/tmp/x"], LOADER_AUDITS),
+            false,
+            r1,
+            Log,
+            Severity::Low,
+            true,
+        );
+        // … the last of --list and --verify is the mode
+        only(
+            &with(57_857, &[ld, "--verify", "--list", "/tmp/x"], LOADER_AUDITS),
+            false,
+            r1,
+            KillProcessTree,
+            Severity::Medium,
+            false,
+        );
+        // a loader that is not the system's (a copy in a home): may run
+        let mut copy = with(57_858, &[ld, "--list", "/tmp/x"], LOADER_NO_AUDIT);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut copy {
+            exe.path = "/home/u/ld-linux-x86-64.so.2".into();
+        }
+        only(&copy, false, r1, Log, Severity::Medium, false);
+        // … or one known by a name only (no kernel identity of its file)
+        let mut by_name = with(57_861, &[ld, "--list", "/tmp/x"], LOADER_NO_AUDIT);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut by_name {
+            exe.flags &= !common::wire::exe::exe_flags::KNOWN;
+        }
+        only(&by_name, false, r1, Log, Severity::Medium, false);
+        // musl reads no LD_TRACE_LOADED_OBJECTS: it runs the program
+        let musl = "/lib/ld-musl-x86_64.so.1";
+        let mut env_traced = with(
+            57_859,
+            &[musl, "/dev/shm/x"],
+            LOADER_LISTS | LOADER_NO_AUDIT,
+        );
+        if let nn_model::Event::ProcessSpawn { exe, filename, .. } = &mut env_traced {
+            exe.path = musl.into();
+            *filename = musl.into();
+        }
+        only(
+            &env_traced,
+            false,
+            r2,
+            KillProcessTree,
+            Severity::High,
+            false,
+        );
+        // … its own list mode stays Low, nothing read
+        let mut listed = with(57_860, &[musl, "--list", "/dev/shm/x"], 0);
+        if let nn_model::Event::ProcessSpawn { exe, filename, .. } = &mut listed {
+            exe.path = musl.into();
+            *filename = musl.into();
+        }
+        only(&listed, false, r2, Log, Severity::Low, true);
+    }
+
+    /// The re-check of #578 (R1-2, named): a loader operand whose text
+    /// reaches a staging directory through a symbolic link — the RHEL
+    /// family's `/usr/tmp -> ../var/tmp` — is judged where the exec pump
+    /// found the file the loader maps (R003 for `/var/tmp`), as a direct
+    /// exec of it is. The pump's placement only adds: the text's own
+    /// reading stays judged beside it (`/tmp/x` placed elsewhere is still
+    /// R001's), and a name it did not place is as before. On 6321c7b7
+    /// `ld.so /usr/tmp/x` was silent.
+    #[test]
+    fn a_loader_operand_through_a_symbolic_link_is_judged_where_the_pump_found_it() {
+        use super::program_identity::{keep_loader_files, LoaderFile};
+        use nn_model::{ResponseAction::*, Severity};
+        let ld = "/lib64/ld-linux-x86-64.so.2";
+        let placed_at = |key: u32, text: &str, path: &str| {
+            let e = loader_exec(key, &[ld, text]);
+            keep_loader_files(
+                &e,
+                vec![LoaderFile {
+                    text: text.into(),
+                    path: path.into(),
+                    memfd: false,
+                    deleted: false,
+                }],
+            );
+            staging_verdicts(&e, false)
+                .into_iter()
+                .map(|v| (v.0, v.1, v.2))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            placed_at(57_871, "/usr/tmp/x", "/var/tmp/x"),
+            [(
+                "R003_ExecFromVarTmp".to_string(),
+                KillProcessTree,
+                Severity::Medium
+            )]
+        );
+        assert_eq!(
+            placed_at(57_872, "/opt/app/shm/x", "/dev/shm/x"),
+            [(
+                "R002_ExecFromDevShm".to_string(),
+                KillProcessTree,
+                Severity::High
+            )]
+        );
+        // the text's own reading stays judged
+        assert_eq!(
+            placed_at(57_873, "/tmp/x", "/usr/bin/true"),
+            [(
+                "R001_ExecFromTmp".to_string(),
+                KillProcessTree,
+                Severity::Medium
+            )]
+        );
+        // a system file through a link: nothing, as its direct exec
+        assert!(placed_at(57_874, "/usr/tmp/x", "/usr/bin/true").is_empty());
+        // not placed by the pump: as before (the residual, said)
+        assert!(staging_verdicts(&loader_exec(57_875, &[ld, "/usr/tmp/x"]), false).is_empty());
+        // found unlinked (a file removed once the loader mapped it): R004's
+        let e = loader_exec(57_877, &[ld, "/opt/app/x"]);
+        keep_loader_files(
+            &e,
+            vec![LoaderFile {
+                text: "/opt/app/x".into(),
+                path: "/opt/app/x".into(),
+                memfd: false,
+                deleted: true,
+            }],
+        );
+        let got: Vec<_> = staging_verdicts(&e, false)
+            .into_iter()
+            .map(|v| (v.0, v.1, v.2))
+            .collect();
+        assert_eq!(
+            got,
+            [(
+                "R004_ExecFromProcSelfFd".to_string(),
+                KillProcessTree,
+                Severity::Critical
+            )]
+        );
+        // listed, the pump's read naming no auditing library: Low there too
+        let mut e = loader_exec(57_876, &[ld, "--list", "/usr/tmp/x"]);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.flags |= common::wire::exe::exe_flags::LOADER_NO_AUDIT;
+        }
+        keep_loader_files(
+            &e,
+            vec![LoaderFile {
+                text: "/usr/tmp/x".into(),
+                path: "/var/tmp/x".into(),
+                memfd: false,
+                deleted: false,
+            }],
+        );
+        let got: Vec<_> = staging_verdicts(&e, false)
+            .into_iter()
+            .map(|v| (v.0, v.1, v.2))
+            .collect();
+        assert_eq!(
+            got,
+            [("R003_ExecFromVarTmp".to_string(), Log, Severity::Low)]
+        );
     }
 
     /// The review of #578 (P3, named): the system's `ldd` is a shell in a

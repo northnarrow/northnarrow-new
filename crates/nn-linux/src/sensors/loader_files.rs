@@ -24,22 +24,48 @@
 //!   the exec's process still ran (its start the exec's, its memory there
 //!   after the read): `LD_TRACE_LOADED_OBJECTS` set — `ldd`'s trace mode —
 //!   is [`exe_flags::LOADER_LISTS`]. Not read: not set.
+//! - **The re-check (R1-1), what listing still runs.** glibc's loader loads
+//!   and runs the libraries its program names for auditing (`DT_AUDIT`,
+//!   `DT_DEPAUDIT`) in its list and trace modes too — the program's own
+//!   constructor when it names itself. The program's dynamic section is
+//!   read ([`super::elf_audit`]) from the file the loader maps (placed as
+//!   below, found among the process's executable mappings), its status
+//!   unchanged since the exec's process started (a write, a rename or a
+//!   chmod of it since — a library rewriting the program it audits — is
+//!   not read): one named is [`exe_flags::LOADER_AUDITS`]; none, with the
+//!   environment read and holding no `LD_AUDIT`, is
+//!   [`exe_flags::LOADER_NO_AUDIT`]. Not read: neither — the rules then
+//!   record a listed program as one that may run, never as one that runs
+//!   nothing.
+//! - **The re-check (R1-2), a name through a symbolic link.** Any other
+//!   name the loader was given — absolute, or relative to the process's
+//!   directory — is walked the same way with its symbolic links followed
+//!   as the kernel follows them (`/usr/tmp` is `../var/tmp` on the RHEL
+//!   family), and kept by the kernel's name of the file the process maps:
+//!   the rules judge it there beside the text's own reading.
 //!
 //! The loader maps its program a moment after the exec: a read that finds
-//! it not mapped yet is made again, every 500 µs up to 5 ms, within 50 ms
-//! of such waits a second for the whole host (past them: read once, not
-//! placed, recorded).
+//! it not mapped yet is made again, every 500 µs up to 5 ms, within a
+//! budget of such waits a second ([`MapWaits`]): root's own 50 ms, which no
+//! other uid spends, and 25 ms for each other account (a subordinate id
+//! counted as its owner, as the reader's shares count it), 50 ms for all of
+//! them together. Past them: read once, not placed, recorded.
 //!
 //! Residual, said: a process may change its own view (its directory, a
 //! descriptor), what it maps and its environment in the moment before the
 //! pump reads it; the file is then placed, and the trace mode read, by what
 //! the read finds; a file the loader reaches through a symbolic link of the
-//! process's view is not placed.
+//! process's view under a link of `/proc` is not placed. A program
+//! rewritten in place in the instant after the pump's last look at its
+//! status and before the loader reads its dynamic section is judged by
+//! what the pump read.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use antitamper_bpf::kernel_roots;
@@ -62,34 +88,91 @@ const ROOT_HOPS: u8 = 8;
 const MAP_WAIT: Duration = Duration::from_micros(500);
 const MAP_TRIES: u32 = 10;
 
-/// The waits all loaders' reads may spend in a second, together: a flood of
-/// loaders that never map their program slows the exec pump by this at
-/// most; past it they are read once (not placed: recorded).
+/// Root's waits a second ([`MapWaits`]), and all other accounts' together:
+/// a flood of loaders that never map their program slows the exec pump by
+/// at most these; past them they are read once (not placed: recorded).
 const MAP_WAITS_PER_SECOND: Duration = Duration::from_millis(50);
+/// The re-check of #578 (R1-3): one account's waits a second (not root's).
+const MAP_WAITS_PER_ACCOUNT: Duration = Duration::from_millis(25);
+/// The most accounts whose second is tracked at once; past it, an account
+/// not tracked gets no wait (read once).
+const MAP_WAIT_ACCOUNTS: usize = 4096;
 
-/// The second's waits spent ([`MAP_WAITS_PER_SECOND`]).
-static MAP_WAITS: WaitBudget = WaitBudget::new();
+/// The waits all loaders' reads spend ([`MapWaits`]).
+static MAP_WAITS: LazyLock<MapWaits> = LazyLock::new(MapWaits::new);
 
 /// A budget of waits a second.
-struct WaitBudget(Mutex<Option<(Instant, Duration)>>);
+struct WaitBudget {
+    limit: Duration,
+    spent: Mutex<Option<(Instant, Duration)>>,
+}
 
 impl WaitBudget {
-    const fn new() -> Self {
-        WaitBudget(Mutex::new(None))
+    const fn new(limit: Duration) -> Self {
+        WaitBudget {
+            limit,
+            spent: Mutex::new(None),
+        }
     }
 
     /// `wait` taken from the second running at `now`, if it is left.
     fn take(&self, wait: Duration, now: Instant) -> bool {
-        let mut s = self.0.lock();
+        let mut s = self.spent.lock();
         let (start, spent) = match *s {
             Some((t, n)) if now.duration_since(t) < Duration::from_secs(1) => (t, n),
             _ => (now, Duration::ZERO),
         };
-        if spent + wait > MAP_WAITS_PER_SECOND {
+        if spent + wait > self.limit {
             *s = Some((start, spent));
             return false;
         }
         *s = Some((start, spent + wait));
+        true
+    }
+}
+
+/// The re-check of #578 (R1-3): the loaders' waits a second, per account as
+/// the reader's shares are — root's own [`MAP_WAITS_PER_SECOND`], which no
+/// other uid spends; every other account [`MAP_WAITS_PER_ACCOUNT`] of its
+/// own, and all of them together [`MAP_WAITS_PER_SECOND`]. One host-wide
+/// budget let any user spend root's waits, and every other user's.
+struct MapWaits {
+    root: WaitBudget,
+    others: WaitBudget,
+    each: Mutex<HashMap<u32, (Instant, Duration)>>,
+}
+
+impl MapWaits {
+    fn new() -> Self {
+        MapWaits {
+            root: WaitBudget::new(MAP_WAITS_PER_SECOND),
+            others: WaitBudget::new(MAP_WAITS_PER_SECOND),
+            each: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `wait` taken for `account` (its uid's, [`super::pump_reads::account_of`];
+    /// 0 is root) from the second running at `now`, if it is left.
+    fn take(&self, account: u32, wait: Duration, now: Instant) -> bool {
+        if account == 0 {
+            return self.root.take(wait, now);
+        }
+        let second = Duration::from_secs(1);
+        let mut each = self.each.lock();
+        if each.len() >= MAP_WAIT_ACCOUNTS && !each.contains_key(&account) {
+            each.retain(|_, (t, _)| now.duration_since(*t) < second);
+            if each.len() >= MAP_WAIT_ACCOUNTS {
+                return false;
+            }
+        }
+        let (start, spent) = match each.get(&account) {
+            Some((t, n)) if now.duration_since(*t) < second => (*t, *n),
+            _ => (now, Duration::ZERO),
+        };
+        if spent + wait > MAP_WAITS_PER_ACCOUNT || !self.others.take(wait, now) {
+            return false;
+        }
+        each.insert(account, (start, spent + wait));
         true
     }
 }
@@ -121,48 +204,73 @@ fn read_judged(
         return;
     }
     let Event::ProcessSpawn {
-        pid, start_ns, exe, ..
+        pid,
+        uid,
+        start_ns,
+        exe,
+        ..
     } = &*event
     else {
         return;
     };
     let (pid, start_ns) = (*pid, *start_ns);
+    let account = super::pump_reads::account_of(*uid);
     let known = exe.has(exe_flags::KNOWN).then_some((exe.dev, exe.ino));
     let dir = proc_root.join(pid.to_string());
-    // P3: ldd's trace mode, from the environment read whole
-    if super::exec_facts::environ_has(&dir, start_ns, "LD_TRACE_LOADED_OBJECTS") == Some(true) {
+    // P3: ldd's trace mode; R1-1: an auditing library named by the
+    // environment — from the environment read whole
+    let env =
+        super::exec_facts::environ_names(&dir, start_ns, &["LD_TRACE_LOADED_OBJECTS", "LD_AUDIT"]);
+    if env.as_ref().is_some_and(|set| set[0]) {
         if let Event::ProcessSpawn { exe, .. } = event {
             exe.flags |= exe_flags::LOADER_LISTS;
         }
     }
-    // N1: the files given through a link of /proc
+    let env_audits = env.map(|set| set[1]);
+    // N1, R1-2: every file the loader was given, its program first
     let texts: Vec<String> = rules::loader_code(event, false)
         .into_iter()
-        .map(|(t, _)| t)
-        .filter(|t| rules::through_proc_link(t))
-        .map(str::to_string)
+        .map(|(t, _)| t.to_string())
         .collect();
-    if texts.is_empty() || !host_view(&dir) {
+    let Some(program) = texts.first().cloned() else {
+        return;
+    };
+    if !host_view(&dir) {
         return;
     }
-    let placed: Vec<(String, Placed)> = texts
-        .into_iter()
-        .filter_map(|text| place(proc_root, pid, &text, judge).ok().map(|p| (text, p)))
-        .collect();
-    if placed.is_empty() {
+    // (a relative name is opened for the program's dynamic section only:
+    // never placed)
+    let mut opened: Vec<(String, Placed, File)> = Vec::new();
+    for text in texts {
+        let relative = !text.starts_with('/');
+        if (relative && text != program) || opened.iter().any(|(t, _, _)| *t == text) {
+            continue;
+        }
+        if let Ok((f, p)) = open_placed(proc_root, pid, &text, judge, relative) {
+            opened.push((text, p, f));
+        }
+    }
+    if opened.is_empty() {
         return;
     }
     // the loader maps its program a moment after the exec: a read before
-    // that finds it not mapped yet — read again, a few times, within a
-    // budget the whole host shares (past it: not placed, recorded)
-    let wanted: Vec<(u64, u64)> = placed.iter().map(|(_, p)| (p.dev, p.ino)).collect();
-    let Some(mapped) = read_until_mapped(|| executable_mappings(&dir), &wanted, &MAP_WAITS) else {
+    // that finds it not mapped yet — read again, a few times, within the
+    // account's budget (past it: not placed, recorded)
+    let wanted: Vec<(u64, u64)> = opened.iter().map(|(_, p, _)| (p.dev, p.ino)).collect();
+    let Some(mapped) = read_until_mapped(|| executable_mappings(&dir), &wanted, &mut || {
+        MAP_WAITS.take(account, MAP_WAIT, Instant::now())
+    }) else {
         return;
     };
-    let files: Vec<program_identity::LoaderFile> = placed
+    // R1-1: the program's auditing libraries, from the file the loader maps
+    let audits = opened
+        .iter()
+        .find(|(t, p, _)| *t == program && mapped.contains(&(p.dev, p.ino)))
+        .and_then(|(_, _, f)| names_an_auditor_since(f, start_ns));
+    let files: Vec<program_identity::LoaderFile> = opened
         .into_iter()
-        .filter(|(_, p)| mapped.contains(&(p.dev, p.ino)))
-        .map(|(text, p)| program_identity::LoaderFile {
+        .filter(|(t, p, _)| t.starts_with('/') && mapped.contains(&(p.dev, p.ino)))
+        .map(|(text, p, _)| program_identity::LoaderFile {
             text,
             path: p.path,
             memfd: p.memfd,
@@ -174,24 +282,91 @@ fn read_judged(
         return;
     }
     program_identity::keep_loader_files(event, files);
+    if let Event::ProcessSpawn { exe, .. } = event {
+        match (audits, env_audits) {
+            (Some(true), _) => exe.flags |= exe_flags::LOADER_AUDITS,
+            (Some(false), Some(false)) => exe.flags |= exe_flags::LOADER_NO_AUDIT,
+            _ => {}
+        }
+    }
+}
+
+/// The re-check of #578 (R1-1): whether the program `f` (`O_PATH`, the file
+/// the loader maps) names a library for auditing ([`super::elf_audit`]),
+/// read from it opened again for reading — `None` when it cannot be read,
+/// or when its status changed since the exec's process started
+/// (`start_ns`, CLOCK_MONOTONIC), looked at after the read: a library that
+/// rewrites the program it audits before the pump reads it.
+fn names_an_auditor_since(f: &File, start_ns: u64) -> Option<bool> {
+    use std::os::unix::fs::FileExt;
+    if start_ns == 0 {
+        return None;
+    }
+    let r = kernel_roots::reopen_fd(f, libc::O_RDONLY | libc::O_CLOEXEC).ok()?;
+    let found = super::elf_audit::names_an_auditor(&mut |off, buf| r.read_at(buf, off))?;
+    let ctime = status_changed_ns(&r)?;
+    (!changed_after(ctime, monotonic_offset_ns()?, start_ns)).then_some(found)
+}
+
+/// How long before a process's start a status change still counts as
+/// after it: the coarse clock the kernel stamps it with (a tick, 10 ms at
+/// most) and the clocks' reads.
+const CHANGE_SLACK_NS: i128 = 20_000_000;
+
+/// The re-check of #578 (R1-1): a status change at `ctime_ns`
+/// (CLOCK_REALTIME) is at or after `start_ns` (CLOCK_MONOTONIC), the
+/// realtime clock being `offset_ns` ahead of the monotonic one — less
+/// [`CHANGE_SLACK_NS`]: one in that slack counts as after.
+fn changed_after(ctime_ns: i128, offset_ns: i128, start_ns: u64) -> bool {
+    ctime_ns - offset_ns + CHANGE_SLACK_NS >= i128::from(start_ns)
+}
+
+/// The file's status change time (CLOCK_REALTIME, ns), from the kernel's
+/// cache (`AT_STATX_DONT_SYNC`: no file system is asked).
+fn status_changed_ns(f: &File) -> Option<i128> {
+    // SAFETY: `statx` is plain old data, valid when zeroed.
+    let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: the fd is live, the empty path NUL-terminated, `sx` writable.
+    let rc = unsafe {
+        libc::statx(
+            f.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_CTIME,
+            &mut sx,
+        )
+    };
+    (rc == 0 && sx.stx_mask & libc::STATX_CTIME != 0)
+        .then(|| i128::from(sx.stx_ctime.tv_sec) * 1_000_000_000 + i128::from(sx.stx_ctime.tv_nsec))
+}
+
+/// How far CLOCK_REALTIME is ahead of CLOCK_MONOTONIC now (ns).
+fn monotonic_offset_ns() -> Option<i128> {
+    let read = |clock| {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is writable; the clocks always exist.
+        (unsafe { libc::clock_gettime(clock, &mut ts) } == 0)
+            .then(|| i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec))
+    };
+    Some(read(libc::CLOCK_REALTIME)? - read(libc::CLOCK_MONOTONIC)?)
 }
 
 /// The process's executable mappings (`read`) once every `wanted` file is
 /// among them — read again every [`MAP_WAIT`], at most [`MAP_TRIES`] times
-/// more, each wait taken from `budget` — or the last read; `None` when a
-/// read fails (the process gone).
+/// more, each wait taken by `take_wait` (the account's budget) — or the
+/// last read; `None` when a read fails (the process gone).
 fn read_until_mapped(
     mut read: impl FnMut() -> Option<HashSet<(u64, u64)>>,
     wanted: &[(u64, u64)],
-    budget: &WaitBudget,
+    take_wait: &mut dyn FnMut() -> bool,
 ) -> Option<HashSet<(u64, u64)>> {
     let mut tries = 0;
     loop {
         let mapped = read()?;
-        if wanted.iter().all(|w| mapped.contains(w))
-            || tries >= MAP_TRIES
-            || !budget.take(MAP_WAIT, Instant::now())
-        {
+        if wanted.iter().all(|w| mapped.contains(w)) || tries >= MAP_TRIES || !take_wait() {
             return Some(mapped);
         }
         tries += 1;
@@ -233,8 +408,41 @@ struct Placed {
 /// `/proc`, in that process's view): the link opened — the kernel follows
 /// it — and the rest walked from where it leads, one name at a time, no
 /// symbolic link followed, each file system judged; a regular file only.
+/// The re-check of #578 (R1-2): any other absolute name is walked from the
+/// process's root the same way, its symbolic links followed as the kernel
+/// follows them (an absolute target from the root: the process has PID 1's,
+/// [`host_view`]). (The pump's step opens it: [`open_placed`].)
+#[cfg(test)]
 fn place(proc_root: &Path, pid: u32, text: &str, judge: &Judge) -> io::Result<Placed> {
-    let (link, rest) = base(proc_root, pid, text, 0)?;
+    open_placed(proc_root, pid, text, judge, false).map(|(_, p)| p)
+}
+
+/// [`place`], and the file (`O_PATH`) — with `relative`, a relative name
+/// too, from the process's directory (the program whose dynamic section
+/// the pump reads, R1-1: `ldd x` runs the loader on `./x`).
+fn open_placed(
+    proc_root: &Path,
+    pid: u32,
+    text: &str,
+    judge: &Judge,
+    relative: bool,
+) -> io::Result<(File, Placed)> {
+    let (link, rest) = base(proc_root, pid, text, 0, relative)?;
+    let follow = !rules::through_proc_link(text);
+    // a walk that follows links reads their text in the agent's view: one
+    // into `/proc` (`/proc/self`, `/dev/fd`) would name the agent's own
+    // process — never crossed
+    let procfs = if follow {
+        Some(
+            kernel_roots::cached(&kernel_roots::open(
+                proc_root,
+                libc::O_PATH | libc::O_DIRECTORY,
+            )?)?
+            .dev,
+        )
+    } else {
+        None
+    };
     let judge = judge.of_process(&proc_root.join(pid.to_string()));
     let (f, c) = kernel_roots::link_target(&link)?;
     // a memfd is the kernel's own memory, on a mount no table shows: no
@@ -253,7 +461,9 @@ fn place(proc_root: &Path, pid: u32, text: &str, judge: &Judge) -> io::Result<Pl
         if !c.is_dir() {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
-        let w = kernel_roots::walk_judged(&f, &link, &rest, false, &mut |c| judge.trusts(c))?;
+        let w = kernel_roots::walk_judged(&f, &link, &rest, follow, &mut |c| {
+            Some(c.dev) != procfs && judge.trusts(c)
+        })?;
         (w.file, w.cached)
     };
     if !c.is_file() {
@@ -266,20 +476,22 @@ fn place(proc_root: &Path, pid: u32, text: &str, judge: &Judge) -> io::Result<Pl
         Some(p) if deleted => p,
         _ => &named,
     };
-    Ok(Placed {
+    let placed = Placed {
         dev: c.dev,
         ino: c.ino,
         memfd: path.starts_with("/memfd:"),
         path: path.to_string(),
         deleted,
-    })
+    };
+    Ok((file, placed))
 }
 
 /// `text`'s segments, `.` and empty ones dropped; `None` with a `..` (the
-/// kernel climbs from wherever a link led) or a relative name (the loader's
-/// directory is a link of its own: not a name the pump places).
-fn folded(text: &str) -> Option<Vec<&str>> {
-    if !text.starts_with('/') {
+/// kernel climbs from wherever a link led) or, unless `relative`, a
+/// relative name (the loader's directory is a link of its own: not a name
+/// the pump places).
+fn folded(text: &str, relative: bool) -> Option<Vec<&str>> {
+    if !relative && !text.starts_with('/') {
         return None;
     }
     let mut segs = Vec::new();
@@ -297,14 +509,22 @@ fn folded(text: &str) -> Option<Vec<&str>> {
 /// read from where it leads ([`rules::view_link`], the one reading of such
 /// a name): `self` and `thread-self` are the exec's process; a `root/`
 /// whose process has PID 1's root is read again from there
-/// (`/proc/self/root/proc/self/fd/3`); any other name from the process's
-/// root.
-fn base(proc_root: &Path, pid: u32, text: &str, hops: u8) -> io::Result<(PathBuf, PathBuf)> {
+/// (`/proc/self/root/proc/self/fd/3`); any other absolute name from the
+/// process's root, and (`relative`) a relative one from its directory.
+fn base(
+    proc_root: &Path,
+    pid: u32,
+    text: &str,
+    hops: u8,
+    relative: bool,
+) -> io::Result<(PathBuf, PathBuf)> {
     use rules::{Hop, Who};
     let own = proc_root.join(pid.to_string());
     let Some(v) = rules::view_link(text) else {
-        let segs = folded(text).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-        return Ok((own.join("root"), segs.iter().collect()));
+        let segs =
+            folded(text, relative).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let from = if text.starts_with('/') { "root" } else { "cwd" };
+        return Ok((own.join(from), segs.iter().collect()));
     };
     let dir = match v.who {
         Who::Own => own,
@@ -323,7 +543,7 @@ fn base(proc_root: &Path, pid: u32, text: &str, hops: u8) -> io::Result<(PathBuf
                 && rules::view_link(&again).is_some()
                 && super::exec_facts::same_root(proc_root, &dir)
             {
-                return base(proc_root, pid, &again, hops + 1);
+                return base(proc_root, pid, &again, hops + 1, false);
             }
             (dir.join("root"), rest)
         }
@@ -578,11 +798,11 @@ mod tests {
     }
 
     /// The review of #578 (N1): the loader's mappings read again while its
-    /// program is not mapped yet, within a budget of waits a second shared
-    /// by the whole host — 50 ms of them, then none until the next second.
+    /// program is not mapped yet, within a budget of waits a second — 50 ms
+    /// of them, then none until the next second.
     #[test]
     fn the_waits_for_a_loader_s_mapping_are_bounded_a_second() {
-        let b = WaitBudget::new();
+        let b = WaitBudget::new(MAP_WAITS_PER_SECOND);
         let t0 = Instant::now();
         let mut n = 0;
         while b.take(MAP_WAIT, t0) {
@@ -612,9 +832,10 @@ mod tests {
                 })
             }
         };
-        let b = WaitBudget::new();
+        let b = WaitBudget::new(MAP_WAITS_PER_SECOND);
+        let mut take = || b.take(MAP_WAIT, Instant::now());
         assert_eq!(
-            read_until_mapped(mapped_at(3), &[id], &b),
+            read_until_mapped(mapped_at(3), &[id], &mut take),
             Some(HashSet::from([id])),
             "mapped at the fourth read"
         );
@@ -625,13 +846,13 @@ mod tests {
                 Some(HashSet::new())
             },
             &[id],
-            &b,
+            &mut take,
         );
         assert_eq!(never, Some(HashSet::new()));
         assert_eq!(reads, MAP_TRIES as usize + 1);
-        assert_eq!(read_until_mapped(|| None, &[id], &b), None);
+        assert_eq!(read_until_mapped(|| None, &[id], &mut take), None);
         // the budget spent: one read
-        let spent = WaitBudget::new();
+        let spent = WaitBudget::new(MAP_WAITS_PER_SECOND);
         while spent.take(MAP_WAIT, Instant::now()) {}
         let mut reads = 0;
         read_until_mapped(
@@ -640,7 +861,7 @@ mod tests {
                 Some(HashSet::new())
             },
             &[id],
-            &spent,
+            &mut || spent.take(MAP_WAIT, Instant::now()),
         );
         assert_eq!(reads, 1);
     }
@@ -723,5 +944,413 @@ mod tests {
             unreachable!()
         };
         assert!(!exe.has(exe_flags::LOADER_LISTS));
+    }
+
+    /// The helper the next tests start as a child of their own: with
+    /// `NN_K370_MAP` set (files joined by `:`), it maps each file readable
+    /// and executable — as the loader maps its program — then waits for its
+    /// standard input to close. A no-op without the variable.
+    #[test]
+    #[ignore = "a helper of the loader tests (NN_K370_MAP)"]
+    fn map_and_wait_helper() {
+        use std::io::Read;
+        let Some(files) = std::env::var_os("NN_K370_MAP") else {
+            return;
+        };
+        let mut kept = Vec::new();
+        for f in std::env::split_paths(&files) {
+            let file = std::fs::File::open(&f).expect("open a file to map");
+            let len = file.metadata().unwrap().len() as usize;
+            // SAFETY: a fresh private read-only mapping of an open file.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(at, libc::MAP_FAILED, "mapped executable");
+            kept.push(file);
+        }
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+        drop(kept);
+    }
+
+    /// A child of this test binary mapping `files` executable
+    /// ([`map_and_wait_helper`]), `env` added to its environment; its
+    /// process's start (CLOCK_MONOTONIC) and image identity, once every file
+    /// is among its mappings.
+    fn mapper(files: &[&Path], env: &[(&str, &str)]) -> (Child, u64, (u64, u64)) {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "sensors::loader_files::tests::map_and_wait_helper",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("NN_K370_MAP", std::env::join_paths(files).unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn the mapping helper");
+        let dir = Path::new("/proc").join(child.id().to_string());
+        let wanted: Vec<_> = files.iter().map(|f| id_of(f)).collect();
+        for _ in 0..250 {
+            if executable_mappings(&dir).is_some_and(|m| wanted.iter().all(|w| m.contains(w))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            executable_mappings(&dir).is_some_and(|m| wanted.iter().all(|w| m.contains(w))),
+            "the helper maps its files"
+        );
+        let stat = crate::state_read::read_state(dir.join("stat")).unwrap();
+        let ticks = crate::response::proc_ref::stat_start_ticks(&stat).unwrap();
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let image = std::fs::canonicalize(dir.join("exe")).unwrap();
+        (child, ticks * (1_000_000_000 / hz), id_of(&image))
+    }
+
+    /// `argv` run through the loader by the process `pid` (started at
+    /// `start_ns`, running the image `image`), exec `key`, read by the pump.
+    fn pumped(argv: &[&str], pid: u32, start_ns: u64, image: (u64, u64), key: u64) -> Event {
+        let mut e = rules::testutil::via_loader(argv);
+        if let Event::ProcessSpawn {
+            pid: p,
+            start_ns: s,
+            timestamp_ns,
+            exe,
+            ..
+        } = &mut e
+        {
+            (*p, *s, *timestamp_ns) = (pid, start_ns, key);
+            (exe.dev, exe.ino) = image;
+        }
+        read_judged(Path::new("/proc"), &mut e, &judge(), &|_| true);
+        e
+    }
+
+    /// The pump's reading of the program's auditing libraries: `Some(true)`
+    /// one named, `Some(false)` none, `None` not read.
+    fn audit_read(e: &Event) -> Option<bool> {
+        let Event::ProcessSpawn { exe, .. } = e else {
+            unreachable!()
+        };
+        match (
+            exe.has(exe_flags::LOADER_AUDITS),
+            exe.has(exe_flags::LOADER_NO_AUDIT),
+        ) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+            (true, true) => panic!("both flags"),
+        }
+    }
+
+    /// A program image naming `audit` (a path, in its string table) under
+    /// `tag` (`DT_AUDIT`, `DT_DEPAUDIT`), or no auditing library.
+    fn program_naming(audit: Option<(i64, &str)>) -> Vec<u8> {
+        use super::super::elf_audit::image::{build, dynamic};
+        const DT_STRTAB: i64 = 5;
+        const DT_STRSZ: i64 = 10;
+        let mut strings = vec![0u8];
+        let at = strings.len() as u64;
+        if let Some((_, name)) = audit {
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let mut entries = vec![(DT_STRTAB, 0x300), (DT_STRSZ, strings.len() as u64)];
+        if let Some((tag, _)) = audit {
+            entries.push((tag, at));
+        }
+        entries.push((0, 0));
+        let d = dynamic(2, false, &entries);
+        let size = 0x400 + d.len() as u64;
+        build(
+            2,
+            false,
+            &[
+                (1, 0, 0, size, size),
+                (2, 0x400, 0x400, d.len() as u64, d.len() as u64),
+            ],
+            &[(0x300, strings), (0x400, d)],
+        )
+    }
+
+    /// The re-check of #578 (R1-1, named; its probe: glibc 2.39 runs a
+    /// listed program's auditing library, its own constructor when it names
+    /// itself): the pump reads the program's dynamic section from the file
+    /// the loader maps — a program naming itself for auditing, one naming
+    /// another library (`DT_AUDIT`, `DT_DEPAUDIT`): `LOADER_AUDITS`; one
+    /// naming none: `LOADER_NO_AUDIT`; one it cannot read (not ELF), or
+    /// changed since its process started (a library rewriting the program
+    /// it audits), or listed in an environment with `LD_AUDIT`: neither.
+    /// On 6321c7b7 nothing was read: every listed program was Low.
+    #[test]
+    fn a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps() {
+        use std::os::unix::fs::FileExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        let path = |n: &str| dir.join(n);
+        let self_audit = path("self.so");
+        std::fs::write(
+            &self_audit,
+            program_naming(Some((
+                super::super::elf_audit::DT_AUDIT,
+                &self_audit.to_string_lossy(),
+            ))),
+        )
+        .unwrap();
+        let foreign = path("xa");
+        std::fs::write(
+            &foreign,
+            program_naming(Some((super::super::elf_audit::DT_AUDIT, "/tmp/k370/a.so"))),
+        )
+        .unwrap();
+        let dep = path("xd");
+        std::fs::write(
+            &dep,
+            program_naming(Some((
+                super::super::elf_audit::DT_DEPAUDIT,
+                "/tmp/k370/a.so",
+            ))),
+        )
+        .unwrap();
+        let none = path("x");
+        std::fs::write(&none, program_naming(None)).unwrap();
+        let unreadable = path("script");
+        std::fs::write(&unreadable, b"#!/bin/sh\necho not an ELF program\n").unwrap();
+        let changed = path("changed");
+        std::fs::write(&changed, program_naming(None)).unwrap();
+        let unmapped = path("unmapped");
+        std::fs::write(
+            &unmapped,
+            program_naming(Some((super::super::elf_audit::DT_AUDIT, "/x.so"))),
+        )
+        .unwrap();
+        // the files older than the process by more than the clock's slack
+        std::thread::sleep(Duration::from_millis(60));
+        let all = [&self_audit, &foreign, &dep, &none, &unreadable, &changed];
+        let all: Vec<&Path> = all.iter().map(|p| p.as_path()).collect();
+        let (mut child, start_ns, image) = mapper(&all, &[]);
+        let pid = child.id();
+        // written since the process started: an auditing library rewriting
+        // the program it audits, before the pump reads it
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&changed)
+            .unwrap()
+            .write_all_at(b"\x7fELF", 0)
+            .unwrap();
+        let ld = "/lib64/ld-linux-x86-64.so.2";
+        let read = |key: u64, file: &Path| {
+            audit_read(&pumped(
+                &[ld, "--list", &file.to_string_lossy()],
+                pid,
+                start_ns,
+                image,
+                key,
+            ))
+        };
+        assert_eq!(
+            read(578_101, &self_audit),
+            Some(true),
+            "a program naming itself"
+        );
+        assert_eq!(
+            read(578_102, &foreign),
+            Some(true),
+            "a foreign auditing library"
+        );
+        assert_eq!(read(578_103, &dep), Some(true), "DT_DEPAUDIT");
+        assert_eq!(read(578_104, &none), Some(false), "none");
+        assert_eq!(read(578_105, &unreadable), None, "not ELF: not read");
+        // a file the process does not map (older than it): not the loader's,
+        // not read
+        assert_eq!(read(578_109, &unmapped), None, "not mapped: not read");
+        assert_eq!(
+            read(578_106, &changed),
+            None,
+            "changed since the exec: not read"
+        );
+        // relative to the process's directory (`ldd x` runs the loader on
+        // `./x`): read, never placed
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut in_dir = Command::new(std::env::current_exe().unwrap());
+        in_dir
+            .args([
+                "--exact",
+                "sensors::loader_files::tests::map_and_wait_helper",
+                "--ignored",
+            ])
+            .env("NN_K370_MAP", &none)
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (mut child, start_ns, image) = {
+            let c = in_dir.spawn().unwrap();
+            let dir = Path::new("/proc").join(c.id().to_string());
+            for _ in 0..250 {
+                if executable_mappings(&dir).is_some_and(|m| m.contains(&id_of(&none))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let stat = crate::state_read::read_state(dir.join("stat")).unwrap();
+            let ticks = crate::response::proc_ref::stat_start_ticks(&stat).unwrap();
+            // SAFETY: sysconf has no preconditions.
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+            let image = id_of(&std::fs::canonicalize(dir.join("exe")).unwrap());
+            (c, ticks * (1_000_000_000 / hz), image)
+        };
+        let e = pumped(&[ld, "--list", "./x"], child.id(), start_ns, image, 578_107);
+        assert_eq!(
+            audit_read(&e),
+            Some(false),
+            "./x read in the process's directory"
+        );
+        assert_eq!(
+            program_identity::loader_file(&e, "./x"),
+            None,
+            "a relative name is not placed"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        // an environment naming an auditing library: never "none"
+        let (mut child, start_ns, image) =
+            mapper(&[&none], &[("LD_AUDIT", "/nonexistent/k370-audit.so")]);
+        let e = pumped(
+            &[ld, "--list", &none.to_string_lossy()],
+            child.id(),
+            start_ns,
+            image,
+            578_108,
+        );
+        assert_eq!(audit_read(&e), None, "LD_AUDIT in the environment");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The re-check of #578 (R1-1): a status change is "since the process
+    /// started" with the coarse clock's slack — the clocks' offset applied.
+    #[test]
+    fn a_status_change_counts_from_the_process_s_start_with_a_slack() {
+        let s = 1_000_000_000_000u64;
+        let off = 5_000_000_000_000i128;
+        let at = |mono: i128| mono + off;
+        assert!(changed_after(at(i128::from(s)), off, s), "at the start");
+        assert!(changed_after(at(i128::from(s) + 1), off, s), "after");
+        assert!(
+            changed_after(at(i128::from(s) - 19_000_000), off, s),
+            "inside the slack"
+        );
+        assert!(
+            !changed_after(at(i128::from(s) - 21_000_000), off, s),
+            "before it"
+        );
+    }
+
+    /// The re-check of #578 (R1-2, named): a loader operand that reaches a
+    /// staging directory through a symbolic link of its text — the RHEL
+    /// family's `/usr/tmp -> ../var/tmp` — is placed where the kernel finds
+    /// the file the process maps (`…/var/tmp/x`), not by the text. A link
+    /// into `/proc` (`/proc/self/…` would name the agent's own process) is
+    /// never followed. On 6321c7b7 such a name was not placed (judged by
+    /// its text, and silent).
+    #[test]
+    fn a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        std::fs::create_dir_all(dir.join("var/tmp")).unwrap();
+        std::fs::create_dir_all(dir.join("usr")).unwrap();
+        std::os::unix::fs::symlink("../var/tmp", dir.join("usr/tmp")).unwrap();
+        let x = dir.join("var/tmp/x");
+        std::fs::write(&x, program_naming(None)).unwrap();
+        std::os::unix::fs::symlink("/proc/self/exe", dir.join("into-proc")).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let (mut child, start_ns, image) = mapper(&[&x], &[]);
+        let ld = "/lib64/ld-linux-x86-64.so.2";
+        let through = format!("{}/usr/tmp/x", dir.display());
+        let e = pumped(&[ld, &through], child.id(), start_ns, image, 578_111);
+        let placed = program_identity::loader_file(&e, &through).expect("placed");
+        assert_eq!(
+            placed.path,
+            x.to_string_lossy(),
+            "the kernel's name of the file"
+        );
+        assert!(!placed.memfd && !placed.deleted);
+        let into = format!("{}/into-proc", dir.display());
+        let e = pumped(&[ld, &into], child.id(), start_ns, image, 578_112);
+        assert_eq!(
+            program_identity::loader_file(&e, &into),
+            None,
+            "no link into /proc"
+        );
+        assert_eq!(
+            place(Path::new("/proc"), child.id(), &into, &judge()).ok(),
+            None,
+            "not even opened"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The re-check of #578 (R1-3, named): the loaders' waits a second are
+    /// root's own — no other uid spends them — and each other account's
+    /// share (25 ms), all of them together 50 ms; a second later, again.
+    /// On 6321c7b7 one budget for the host: any uid spent root's.
+    #[test]
+    fn the_loaders_waits_are_root_s_own_and_each_account_s_share() {
+        let w = MapWaits::new();
+        let t0 = Instant::now();
+        let spend = |account: u32| {
+            let mut n = 0;
+            while w.take(account, MAP_WAIT, t0) {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(spend(1000), 50, "an account's 25 ms");
+        assert_eq!(spend(1000), 0, "spent");
+        assert_eq!(spend(1001), 50, "another account's own");
+        assert_eq!(spend(1002), 0, "the accounts' 50 ms together");
+        assert_eq!(spend(0), 100, "root's 50 ms, its own");
+        assert!(
+            w.take(1002, MAP_WAIT, t0 + Duration::from_secs(1)),
+            "a second later"
+        );
+        assert!(
+            w.take(1000, MAP_WAIT, t0 + Duration::from_secs(1)),
+            "a spent account's share again a second later"
+        );
+        // the accounts tracked at once are bounded: past them, a new one
+        // waits not, until their second is over
+        let w = MapWaits::new();
+        for a in 1..=MAP_WAIT_ACCOUNTS as u32 {
+            w.each.lock().insert(a, (t0, Duration::ZERO));
+        }
+        assert!(
+            !w.take(1_000_000, MAP_WAIT, t0),
+            "no room for a new account"
+        );
+        assert!(w.take(1, MAP_WAIT, t0), "a tracked one still waits");
+        assert!(
+            w.take(1_000_000, MAP_WAIT, t0 + Duration::from_secs(1)),
+            "room again once their second is over"
+        );
+        assert!(
+            super::super::pump_reads::account_of(1000) == 1000,
+            "a uid below the subordinate ranges counts as its own account"
+        );
     }
 }

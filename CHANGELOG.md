@@ -118,6 +118,38 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       Low; a leaking agent outlives the workload where its cap cannot bind;
       the weakening variables are honoured when the manager cannot be
       asked; a root can keep a package transaction open for its modules.
+  - Its re-check (fix round 2):
+    - A program glibc's loader only lists (`--list`, `LD_TRACE_LOADED_OBJECTS`,
+      `ldd`) still has the libraries it names for auditing (`DT_AUDIT`,
+      `DT_DEPAUDIT`) loaded and run — its own constructor when it names
+      itself. The exec pump reads the program's dynamic section from the
+      file the loader maps (unchanged since the process started,
+      `nn_linux::sensors::elf_audit`): naming one, the program is judged as
+      run; Low only when read naming none (no `LD_AUDIT`, no `--audit`);
+      not read in time, Medium, never killed, never "runs no code".
+      `--verify` and musl's `ldd` stay Low; musl's loader under
+      `LD_TRACE_LOADED_OBJECTS` (which it ignores) is judged as run. Tests
+      `a_listed_program_is_low_only_when_read_naming_no_auditing_library`,
+      `a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps`,
+      `a_program_naming_a_library_for_auditing_is_told_from_one_naming_none`,
+      `the_dynamic_table_is_read_where_the_loader_maps_it`,
+      `a_dynamic_section_the_reader_cannot_follow_is_not_known`.
+    - A loader operand that reaches a staging directory through a symbolic
+      link (`/usr/tmp` → `../var/tmp` on the RHEL family) is also judged
+      where the pump finds the file the loader maps. Tests
+      `a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it`,
+      `a_loader_operand_through_a_symbolic_link_is_judged_where_the_pump_found_it`.
+    - The pump's waits for a loader's mapping are root's own and each
+      account's share, not one budget for the host. Test
+      `the_loaders_waits_are_root_s_own_and_each_account_s_share`.
+    - The privileged suites: the guard tests' restore agent starts as a
+      transient service (PID 1's child, the one start that may take a
+      vacated role while the guard enforces); the watchdog suite makes
+      `/etc/northnarrow` first and establishes the watchdog role's first
+      claim for `the_watchdog_s_own_start_is_not_a_foreign_bpf_handle`.
+    - Test assertion messages name what they expect instead of printing a
+      verdict's text (CodeQL `rust/cleartext-logging`).
+    - KNOWN_LIMITATIONS: the successor's record is its own.
 - Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
   each told by identity, the attack shape each rule exists for kept
   (`UPGRADE_NOTES_WAVE4.md` §57).

@@ -173,15 +173,47 @@ pub(crate) fn base_of(path: &str) -> &str {
 /// — the loader by the kernel's file (the LSM hook's, or the pump's
 /// `/proc/<pid>/exe`), musl's by that file's name in a root-owned tree.
 pub fn musl_ldd(event: &Event) -> bool {
-    use common::wire::exe::exe_flags::{KNOWN, PROC_EXE};
-    let Event::ProcessSpawn { argv, exe, .. } = event else {
+    let Event::ProcessSpawn { argv, .. } = event else {
         return false;
     };
-    let image = exe.path_or("");
-    exe.flags & (KNOWN | PROC_EXE) != 0
-        && crate::posture::lineage::in_system_tree(image)
-        && base_of(image).starts_with("ld-musl-")
+    system_loader(event) == Some(SystemLoader::Musl)
         && argv.first().is_some_and(|a| base_of(a) == "ldd")
+}
+
+/// The review of #578 (re-check 1, R1-1): the C library whose dynamic
+/// loader an exec of the loader runs ([`system_loader`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemLoader {
+    /// glibc's: `--list` and `LD_TRACE_LOADED_OBJECTS` list the program —
+    /// and still load and run the libraries it names for auditing.
+    Glibc,
+    /// musl's: `--list`, or run as `ldd`, lists the program; it reads no
+    /// `LD_TRACE_LOADED_OBJECTS` (it runs the program then) and has no
+    /// auditing interface.
+    Musl,
+}
+
+/// The review of #578 (re-check 1, R1-1): whose loader the kernel executed
+/// for `event` — its file (the LSM hook's, or the pump's
+/// `/proc/<pid>/exe`) in a root-owned system tree: musl's by that file's
+/// name (`ld-musl-*`), glibc's any other. `None` for a file known by the
+/// caller's name only, or one outside the system's trees (a copy): what
+/// such a loader does with its options is not known.
+pub fn system_loader(event: &Event) -> Option<SystemLoader> {
+    use common::wire::exe::exe_flags::{KNOWN, PROC_EXE};
+    let Event::ProcessSpawn { exe, .. } = event else {
+        return None;
+    };
+    let image = exe.path_or("");
+    (exe.flags & (KNOWN | PROC_EXE) != 0 && crate::posture::lineage::in_system_tree(image)).then(
+        || {
+            if base_of(image).starts_with("ld-musl-") {
+                SystemLoader::Musl
+            } else {
+                SystemLoader::Glibc
+            }
+        },
+    )
 }
 
 /// The review of #578 (P3): `id` is a shell running the system's `ldd`

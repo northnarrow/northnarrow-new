@@ -1248,6 +1248,12 @@ pub struct LoaderCode<'a> {
     /// The review of #578 (P3): `--list` or `--verify` — the loader lists
     /// or checks the program, maps its preloads, runs none of them.
     pub lists: bool,
+    /// The review of #578 (re-check 1, R1-1): of `--list` and `--verify`,
+    /// the last given is `--verify` (glibc's loader keeps the last mode
+    /// option): it checks the program and exits before it loads any library
+    /// for auditing — it runs nothing. `--list` loads the program's own
+    /// auditing libraries (`DT_AUDIT`, `DT_DEPAUDIT`) and runs them.
+    pub verifies: bool,
 }
 
 /// Lot 370 (05-3.3): the files the dynamic loader runs or loads for `argv`
@@ -1273,6 +1279,7 @@ pub fn loader_code(argv: &[String]) -> LoaderCode<'_> {
             .map_or((name, None), |(n, v)| (n, Some(v)));
         if matches!(name, "list" | "verify") {
             out.lists = true;
+            out.verifies = name == "verify";
         }
         match LOADER.long(name).map(|l| l.1) {
             Some(Long::Loads) => {

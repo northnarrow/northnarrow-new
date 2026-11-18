@@ -22,6 +22,9 @@ pub mod connect_deny;
 pub mod contract;
 pub mod dns_sensor;
 pub mod ebpf_object;
+/// The re-check of #578 (R1-1): whether a program names a library for
+/// auditing, read as glibc's loader reads its dynamic section.
+pub mod elf_audit;
 /// Lab PR 219: the exploit post-condition guard (loader, mode, counters).
 pub mod epg;
 pub mod exe_identity;

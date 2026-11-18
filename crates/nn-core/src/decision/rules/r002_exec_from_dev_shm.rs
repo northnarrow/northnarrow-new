@@ -49,13 +49,10 @@ impl Rule for R002ExecFromDevShm {
         let listing = self.listing.lists(event);
         if let Some((p, use_)) = crate::decision::rules::loader_staged(event, "/dev/shm/", listing)
         {
-            if use_ == crate::decision::rules::LoaderUse::Lists {
-                return Some(crate::decision::rules::loader_listed_record(
-                    self,
-                    event,
-                    "/dev/shm/",
-                    &p,
-                ));
+            if let Some(v) =
+                crate::decision::rules::loader_listed_record(self, event, "/dev/shm/", &p, use_)
+            {
+                return Some(v);
             }
             return Some(build_verdict(
                 self,

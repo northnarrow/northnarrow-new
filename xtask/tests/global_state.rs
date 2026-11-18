@@ -735,10 +735,11 @@ const STATICS: &[Kept] = &[
         "crates/nn-linux/src/sensors/loader_files.rs",
         "MAP_WAITS",
         HostFact,
-        "the review of #578 (N1): the waits the exec pump's reads of a dynamic loader's \
-         mappings may spend in the current second, for the whole host (one host, one exec \
-         pump): a flood of loaders that never map their program slows the pump by that much \
-         at most",
+        "the review of #578 (N1, re-check R1-3): the waits the exec pump's reads of a \
+         dynamic loader's mappings may spend in the current second — root's own, each other \
+         account's share, all of them together (one host, one exec pump): a flood of loaders \
+         that never map their program slows the pump by that much at most, and no uid spends \
+         root's waits or another account's",
     ),
     kept(
         "crates/nn-linux/src/program_images.rs",

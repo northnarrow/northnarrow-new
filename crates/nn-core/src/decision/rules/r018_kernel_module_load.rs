@@ -452,7 +452,10 @@ mod tests {
             (v.action, v.severity),
             (ResponseAction::Log, Severity::High)
         );
-        assert!(v.reasoning.contains("read only in part"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("read only in part"),
+            "the record says 'read only in part'"
+        );
         let packaged = [
             "/",
             "lib",
@@ -801,24 +804,24 @@ mod tests {
         );
         assert!(
             v.reasoning.contains("REFUSED by the kernel"),
-            "{}",
-            v.reasoning
+            "the record says 'REFUSED by the kernel'"
         );
         assert!(
             v.reasoning.contains("no package or DKMS vouches"),
-            "{}",
-            v.reasoning
+            "the record says 'no package or DKMS vouches'"
         );
         let v = at(kv::RECORDED, trust_flag::PACKAGE).unwrap();
         assert_eq!(
             (v.action, v.severity),
             (ResponseAction::Log, Severity::High)
         );
-        assert!(v.reasoning.contains("the record mode"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("the record mode"),
+            "the record says 'the record mode'"
+        );
         assert!(
             v.reasoning.contains("changed since the agent vouched"),
-            "{}",
-            v.reasoning
+            "the record says 'changed since the agent vouched'"
         );
         assert!(v.reasoning.contains("(owned by root, mode 100644)"));
         // another account's file: said so, the account not named
@@ -832,8 +835,7 @@ mod tests {
         assert!(
             v.reasoning.contains("(not owned by root, mode 100644)")
                 && !v.reasoning.contains("1000"),
-            "{}",
-            v.reasoning
+            "the record says the owner is not root and the mode, without the uid"
         );
         let v = at(kv::WINDOW, 0).unwrap();
         assert_eq!(
@@ -842,16 +844,14 @@ mod tests {
         );
         assert!(
             v.reasoning.contains("trusted-installer window"),
-            "{}",
-            v.reasoning
+            "the record says 'trusted-installer window'"
         );
         // lot 370 (F10-2): trusted — recorded Low, with why
         let v = at(kv::TRUSTED, trust_flag::DKMS).unwrap();
         assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
         assert!(
             v.reasoning.contains("DKMS's registered build"),
-            "{}",
-            v.reasoning
+            "the record says 'DKMS's registered build'"
         );
         let v = r
             .evaluate(&ev(&judged(
@@ -872,8 +872,7 @@ mod tests {
         );
         assert!(
             v.reasoning.contains("REFUSED by the kernel"),
-            "{}",
-            v.reasoning
+            "the record says 'REFUSED by the kernel'"
         );
         let v = r
             .evaluate(&ev(&judged(
@@ -886,7 +885,10 @@ mod tests {
             (v.action, v.severity),
             (ResponseAction::Log, Severity::High)
         );
-        assert!(v.reasoning.contains("from memory"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("from memory"),
+            "the record says 'from memory'"
+        );
     }
 
     /// Named test (lot 285, the rule's half): a load a signed per-module
@@ -904,7 +906,7 @@ mod tests {
             (v.action, v.severity),
             (ResponseAction::Log, Severity::Medium)
         );
-        assert!(v.reasoning.contains("opt-out"), "{}", v.reasoning);
+        assert!(v.reasoning.contains("opt-out"), "the record says 'opt-out'");
     }
 
     /// Named test (lot 285, the coordinator's matrix, the rule's half): a
@@ -943,8 +945,7 @@ mod tests {
                 && v.reasoning
                     .contains("outside a recognised package transaction")
                 && v.reasoning.contains("let through by the default policy"),
-            "{}",
-            v.reasoning
+            "the record names the registry, the package transaction and the default policy"
         );
     }
 
@@ -997,8 +998,7 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log); // alert, NOT kill
         assert!(
             v.reasoning.contains("init_module(2)") && v.reasoning.contains("no file to trust"),
-            "{}",
-            v.reasoning
+            "the record says 'init_module(2)', 'no file to trust'"
         );
     }
 
@@ -1047,15 +1047,13 @@ mod tests {
             assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
             assert!(
                 v.reasoning.contains("trusted by the kernel"),
-                "{}",
-                v.reasoning
+                "the record says 'trusted by the kernel'"
             );
-            assert!(v.reasoning.contains(why), "{flags}: {}", v.reasoning);
+            assert!(v.reasoning.contains(why), "{flags}: the record says {why}");
             if flags & trust_flag::PKG_WRITTEN == 0 {
                 assert!(
                     v.reasoning.contains("unchanged since boot"),
-                    "{}",
-                    v.reasoning
+                    "the record says 'unchanged since boot'"
                 );
             }
         }

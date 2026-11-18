@@ -227,6 +227,13 @@ fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
 /// the exec's process `dir`, read whole while it ran; `None` when it cannot
 /// be told.
 pub(super) fn environ_has(dir: &Path, start_ns: u64, name: &str) -> Option<bool> {
+    environ_names(dir, start_ns, &[name]).map(|set| set[0])
+}
+
+/// [`environ_has`] for each of `names`, from one read of the environment
+/// (the re-check of #578: the loader's `LD_TRACE_LOADED_OBJECTS` and
+/// `LD_AUDIT`): which are set; `None` when it cannot be told.
+pub(super) fn environ_names(dir: &Path, start_ns: u64, names: &[&str]) -> Option<Vec<bool>> {
     use crate::response::proc_ref::{started_at, stat_start_ticks};
     use std::io::Read;
     if start_ns == 0 {
@@ -246,10 +253,13 @@ pub(super) fn environ_has(dir: &Path, start_ns: u64, name: &str) -> Option<bool>
     {
         return None;
     }
-    Some(env.split(|b| *b == 0).any(|var| {
-        var.strip_prefix(name.as_bytes())
-            .is_some_and(|r| r.starts_with(b"="))
-    }))
+    let set = |name: &str| {
+        env.split(|b| *b == 0).any(|var| {
+            var.strip_prefix(name.as_bytes())
+                .is_some_and(|r| r.starts_with(b"="))
+        })
+    };
+    Some(names.iter().map(|n| set(n)).collect())
 }
 
 /// The path an image was executed by, from its `exe` link's text: the

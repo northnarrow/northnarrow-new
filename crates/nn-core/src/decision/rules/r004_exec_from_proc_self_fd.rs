@@ -412,7 +412,9 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// review of #578, N1 — a linked file reached through a descriptor is
     /// judged as a direct exec of it: by the staging rules, on its path), or
     /// a descriptor's link (or a memfd's name) the pump could not place —
-    /// with what the loader does with it (one it runs first).
+    /// with what the loader does with it (one it runs first, then one it may
+    /// run). The re-check of #578 (R1-2): a name not through a link of
+    /// `/proc` the pump found unlinked is fileless too.
     fn loader_fileless(&self, event: &Event) -> Option<(String, super::LoaderUse)> {
         use super::{LoaderUse, Placement};
         let mut found: Option<(String, LoaderUse)> = None;
@@ -421,9 +423,13 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 Some(Placement::Fileless(p)) => Some(format!("{text}: {p}")),
                 Some(Placement::File(_)) => None,
                 None => Self::is_proc_fd_path(text).then(|| text.to_string()),
-            };
+            }
+            .or_else(|| match super::pump_placement(event, text) {
+                Some(Placement::Fileless(p)) => Some(format!("{text}: {p}")),
+                _ => None,
+            });
             if let Some(f) = fileless {
-                if found.as_ref().is_none_or(|(_, u)| *u == LoaderUse::Lists) {
+                if found.as_ref().is_none_or(|(_, u)| u.rank() < use_.rank()) {
                     found = Some((f, use_));
                 }
             }
@@ -668,19 +674,35 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
         // Lot 370 (05-3.3): fileless code the dynamic loader runs — its
         // operand (or a preload) a memfd or an unlinked file, or a
         // descriptor's link not placed: the image the kernel executed is the
-        // loader, in `/lib`. The review of #578 (P3): one it only lists, Low
+        // loader, in `/lib`. The review of #578 (P3): one it only lists, Low;
+        // its re-check (R1-1): one it may run while it lists, Medium — never
+        // killed, never said to run nothing
         if let Some((p, use_)) = self.loader_fileless(event) {
-            if use_ == crate::decision::rules::LoaderUse::Lists {
+            use crate::decision::rules::LoaderUse;
+            let listed = match use_ {
+                LoaderUse::Runs => None,
+                LoaderUse::Lists(why) => Some((
+                    Severity::Low,
+                    format!(
+                        "fileless code only listed or checked by the dynamic loader ({p}: {why}) \
+                         — in that mode the loader runs no code of it; recorded Low, not killed"
+                    ),
+                )),
+                LoaderUse::MayRun(why) => Some((
+                    Severity::Medium,
+                    format!(
+                        "fileless code given to the dynamic loader to list or check ({p}: {why}) \
+                         — it may still run code; recorded, not killed"
+                    ),
+                )),
+            };
+            if let Some((severity, text)) = listed {
                 return Some(build_verdict(
                     self,
                     event,
                     ResponseAction::Log,
-                    Severity::Low,
-                    &format!(
-                        "fileless code listed or checked by the dynamic loader ({p}: --list, \
-                         --verify or ldd's trace mode) — the loader runs none of its code; \
-                         recorded Low, not killed"
-                    ),
+                    severity,
+                    &text,
                 ));
             }
             return Some(build_verdict(
@@ -2145,18 +2167,22 @@ mod lot310 {
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::Log, Severity::High),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
         );
         // not the first of an episode: no episode sentence
-        assert!(!v.reasoning.contains("episode"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("episode"),
+            "the record does not say \'episode\'"
+        );
         // the re-check of #556 (N1): the text vouches for no bytes
         assert!(
             v.reasoning.contains("not compared (budget)"),
-            "{}",
-            v.reasoning
+            "the record says 'not compared (budget)'"
         );
-        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("copy"),
+            "the record does not say \'copy\'"
+        );
         // CONTROL: the runtime run by a session's shell — the kill
         let under_shell = memfd_exec(35_622, 35_621, 35_621, 400);
         assert!(lineage.ingest_spawn_event(&under_shell));
@@ -2226,15 +2252,16 @@ mod lot310 {
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::KillProcessTree, Severity::Critical),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
         );
         assert!(
             v.reasoning.contains("not compared (budget)"),
-            "{}",
-            v.reasoning
+            "the record says 'not compared (budget)'"
         );
-        assert!(!v.reasoning.contains("copy"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("copy"),
+            "the record does not say \'copy\'"
+        );
         // a subordinate uid (a rootless container's root, mapped): the same
         let sub = judged(&as_uid(35_634, 100_000), true);
         assert!(kills(sub), "a mapped root is no uid 0");
@@ -2304,29 +2331,29 @@ mod lot310 {
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::Log, Severity::High),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
         );
         for want in [
             "opened an episode",
             "uid 0's share ran out",
             "biggest spender: uid 1000, 300 MiB",
         ] {
-            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+            assert!(v.reasoning.contains(want), "the record says {want}");
         }
         let v = judged(35_643, 1000, None);
         assert_eq!(
             (v.action.clone(), v.severity),
             (ResponseAction::KillProcessTree, Severity::Critical),
-            "{}",
-            v.reasoning
+            "the verdict's action and severity"
         );
         assert!(
             v.reasoning.contains("uid 1000's share ran out"),
-            "{}",
-            v.reasoning
+            "the record says 'uid 1000's share ran out'"
         );
-        assert!(!v.reasoning.contains("biggest spender"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("biggest spender"),
+            "the record does not say \'biggest spender\'"
+        );
     }
 
     /// The executor's identities: at most [`ExecutorImages::CAP`], the

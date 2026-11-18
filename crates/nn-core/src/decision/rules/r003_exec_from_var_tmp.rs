@@ -54,13 +54,10 @@ impl Rule for R003ExecFromVarTmp {
         let listing = self.listing.lists(event);
         if let Some((p, use_)) = crate::decision::rules::loader_staged(event, "/var/tmp/", listing)
         {
-            if use_ == crate::decision::rules::LoaderUse::Lists {
-                return Some(crate::decision::rules::loader_listed_record(
-                    self,
-                    event,
-                    "/var/tmp/",
-                    &p,
-                ));
+            if let Some(v) =
+                crate::decision::rules::loader_listed_record(self, event, "/var/tmp/", &p, use_)
+            {
+                return Some(v);
             }
             return Some(build_verdict(
                 self,

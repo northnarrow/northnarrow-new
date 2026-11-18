@@ -11761,6 +11761,34 @@ number in parentheses is a lab PR.
     under the new pid; `bpf_syscall_observe` within the 5.15 verifier's
     budget (51,220 processed). Not measured: a kernel OOM kill of the agent
     itself (the probe's attempt killed one of its workers, at +1000).
+  - Fix round 2 (re-check 1 of #578): glibc's list and trace modes run the
+    libraries the program names for auditing — the pump reads the program's
+    dynamic section from the file the loader maps (`elf_audit`; unchanged
+    since the process started): naming one, judged as run; Low only when
+    read naming none; not read, Medium, never "runs no code" (R1-1; musl's
+    loader under `LD_TRACE_LOADED_OBJECTS` judged as run). An absolute
+    operand is also placed through symbolic links (`/usr/tmp`, R1-2). The
+    mapping waits are per account, root's its own (R1-3). The privileged
+    suites' fixtures follow F10-4 (the guard tests' restore agent as PID 1's
+    child; the watchdog role's first claim established), the dirs made
+    first; test messages no longer print verdict texts (CodeQL).
+  - Lab of fix round 2 (Ubuntu 22.04 / 5.15, the round's tree checked by
+    hash on the guest): the watchdog's privileged suite on the guest with
+    no `/etc/northnarrow`, 11 of 11 (its own-start test among them); then,
+    as the KVM CI job runs it (`nn-lab.sh install`, `test-ignored`), the
+    five runs exit 0, 174 passed and none failed (the watchdog suite 11/11,
+    the agent's `privileged_e2e` 19/19). The operator's install under
+    `alpha`, glibc 2.35, the review's probe shapes built on the guest:
+    `ld.so --list` of a program with `DT_AUDIT` (another library, or
+    itself) and `LD_TRACE_LOADED_OBJECTS` with `DT_DEPAUDIT` — the
+    auditing library's constructor ran, R001 High (judged as run; a
+    person's, below COMBAT); `ldd` of the self-auditing one R001 High and
+    Low (its `--verify` run); `--list` and `ldd` of a program naming none
+    R001 Medium for the listing (the process gone before the pump confirmed
+    the mapping: not read) and Low for `--verify`, never a kill;
+    `--verify` of an auditing program Low, nothing ran; `LD_AUDIT` in the
+    environment R001 Medium; `ld.so /usr/tmp/x` with `/usr/tmp ->
+    ../var/tmp` R003 High (placed as `/var/tmp/x`).
 
 - **Lot 369 — the pre-alpha's Phase 5 early triage: the soak's false
   positives on rc5 (C14, C16, C23; no level change).**

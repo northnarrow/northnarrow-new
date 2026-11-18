@@ -4765,9 +4765,22 @@ left too little trace.
     record. The review of #578 (P3): a loader that only lists or checks
     its program (`--list`, `--verify`, `LD_TRACE_LOADED_OBJECTS` in its
     environment, musl's loader as `ldd`, glibc's `ldd` script its parent)
-    runs none of its code — a staged program it lists is recorded Low,
-    never killed (`ldd /tmp/x` was R001's kill); an `--audit` library
-    stays judged.
+    is never killed for it (`ldd /tmp/x` was R001's kill); an `--audit`
+    library stays judged. Its re-check (R1-1): glibc's list and trace modes
+    still run the libraries the program names for auditing (`DT_AUDIT`,
+    `DT_DEPAUDIT`; its own constructor when it names itself), so the
+    record is Low ("in that mode the loader runs no code of it") only when
+    the exec pump read the file the loader maps, unchanged since the
+    process started, naming none (no `LD_AUDIT`, no `--audit`); naming
+    one, it is judged as run (the kill); not read in time (a fast `ldd`),
+    Medium, never killed and never said to run nothing. `--verify` and
+    musl's `ldd` stay Low; musl's loader under `LD_TRACE_LOADED_OBJECTS`
+    runs the program and is judged as run. The re-check (R1-2): any other
+    absolute operand is also judged where the pump finds the file the
+    loader maps, through symbolic links (`/usr/tmp` → `/var/tmp`).
+    The pump's waits for the mapping (R1-3) are root's own 50 ms a
+    second and 25 ms for each other account, 50 ms for all of them
+    together (one budget for the host before).
   - A variable that weakens the agent, set in the service manager's
     environment rather than in the agent's unit, is removed at the agent's
     start and signed (`weakening_env_ignored`) — when the agent can ask the

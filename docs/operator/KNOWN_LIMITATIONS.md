@@ -401,7 +401,11 @@ not cause as an incident.
   watchdog's successor is recorded by the live agent's kernel hook; the
   agent's own successor records it at its start, from the kernel's facts
   (the role left by its holder, the window), since the hook of the agent
-  that ended writes to a ring nobody reads any more. Only a process started
+  that ended writes to a ring nobody reads any more. That record is the
+  successor's own: a successor root starts with code in its environment (a
+  unit drop-in, `systemd-run --setenv=LD_PRELOAD=…`) writes it or not, and
+  a root-started instance that takes the vacated role first leaves the
+  genuine successor refused. Only a process started
   for the role (by PID 1 or by the other role's holder, with no code
   injected) gets the agent's maps in that moment; one PID 1 starts is not
   told from the unit's own restart, and is recorded, not refused.
@@ -483,14 +487,34 @@ not cause as an incident.
   descriptor's link is judged as fileless code (R004) and any other such
   name is recorded (R001, Medium) without a response, as is one named
   relative to the caller's working directory, which the record does not
-  carry. A process that changes its own directory, descriptors or mappings
-  in that moment is judged by what the agent reads. A loader that only
-  lists or checks its program (`--list`, `--verify`, `ldd`) runs none of
-  its code: a staged program it lists is recorded Low, never killed; a
-  library `--audit` names still runs and is judged. *Evidence:*
+  carry. Any other absolute name is also judged where the agent finds the
+  file the loader maps, its symbolic links followed as the kernel follows
+  them (`/usr/tmp` is `../var/tmp` on the RHEL family): when the process is
+  gone before that read, or the agent's budget of waits for the mapping is
+  spent, such a name is judged by its text alone (`/usr/tmp/x` then draws
+  no record). A process that changes its own directory, descriptors or
+  mappings in that moment is judged by what the agent reads, or as the file
+  it then names. A loader that only lists or checks its program does not
+  always run nothing: glibc's `--list`, `LD_TRACE_LOADED_OBJECTS` and `ldd`
+  still load and run the libraries the program names for auditing
+  (`DT_AUDIT`, `DT_DEPAUDIT`) — the program's own code when it names
+  itself. A staged program listed so is recorded Low only when the agent
+  read the file the loader maps (unchanged since the process started)
+  naming none, with no `LD_AUDIT` in the environment and no `--audit`
+  given; one naming one is judged as run (the kill); one the agent could
+  not read in time — `ldd` often exits first — is recorded Medium, never
+  killed, and its record does not say that nothing ran. `--verify` and
+  musl's `ldd` run nothing (Low); musl's loader ignores
+  `LD_TRACE_LOADED_OBJECTS` and runs the program (judged as run). A program
+  rewritten in place in the instant between the agent's read and the
+  loader's is judged by what the agent read. A library `--audit` names
+  runs in every mode and is judged. *Evidence:*
   `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
   `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`;
   `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`;
+  `a_listed_program_is_low_only_when_read_naming_no_auditing_library`;
+  `a_listed_program_s_auditing_libraries_are_read_from_the_file_it_maps`;
+  `a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it`;
   lot 370.
 - **A file of the FIM watch list absent at the start.** Its creation is an
   event with its writer, judged as a change of the file would be. One whose
