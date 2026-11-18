@@ -12,12 +12,20 @@ use crate::decision::{rules::build_verdict, Rule};
 pub struct R003ExecFromVarTmp {
     /// Lot 369: the packaged `go`'s own build output, recorded Low.
     go: super::GoBuilds,
+    /// The review of #578 (P3): the system's `ldd` running the loader.
+    listing: super::LoaderListing,
 }
 
 impl R003ExecFromVarTmp {
     /// This rule with lot 346's identity of `go`'s build output (lot 369).
     pub fn with_go_builds(mut self, go: super::GoBuilds) -> Self {
         self.go = go;
+        self
+    }
+
+    /// This rule with the lineage's identity of `ldd` (the review of #578).
+    pub fn with_loader_listing(mut self, listing: super::LoaderListing) -> Self {
+        self.listing = listing;
         self
     }
 }
@@ -41,8 +49,19 @@ impl Rule for R003ExecFromVarTmp {
         let Event::ProcessSpawn { filename, exe, .. } = event else {
             return None;
         };
-        // Lot 370 (05-3.3): a program the dynamic loader runs from it
-        if let Some(p) = crate::decision::rules::loader_staged(event, "/var/tmp/") {
+        // Lot 370 (05-3.3): a program the dynamic loader runs from it (the
+        // review of #578: one it only lists, Low)
+        let listing = self.listing.lists(event);
+        if let Some((p, use_)) = crate::decision::rules::loader_staged(event, "/var/tmp/", listing)
+        {
+            if use_ == crate::decision::rules::LoaderUse::Lists {
+                return Some(crate::decision::rules::loader_listed_record(
+                    self,
+                    event,
+                    "/var/tmp/",
+                    &p,
+                ));
+            }
             return Some(build_verdict(
                 self,
                 event,

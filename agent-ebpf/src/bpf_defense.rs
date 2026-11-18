@@ -986,13 +986,16 @@ unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
 
 /// Lot 370 (F10-4): the record of a fresh instance's handle — a first
 /// claim of the role this boot (Low), or one after its holder exited
-/// (High: the OOM killer, a crash, the vacancy an attacker induces).
+/// (High: the OOM killer, a crash, the vacancy an attacker induces). The
+/// review of #578 (N2): inside a signed trusted-installer window the
+/// restart is the installer's (`systemctl restart` during an upgrade) —
+/// the family's own start, Low.
 #[inline(always)]
 fn fresh_instance_cmd() -> u32 {
     let role = caller_role();
     let vacated = (role == ROLE_AGENT || role == ROLE_WATCHDOG)
         && matches!(ROLE_TGIDS.get((role - 1) as u32), Some(t) if *t == ROLE_VACATED);
-    if vacated {
+    if vacated && !crate::inode_protect::override_active() {
         BPF_CMD_VACATED_ROLE_GET_FD
     } else {
         BPF_CMD_FRESH_INSTANCE_GET_FD

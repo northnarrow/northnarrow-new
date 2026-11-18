@@ -23,6 +23,12 @@
 //! 2. a match arm on a would-have variant never yields a done value:
 //!    `…::Success`, `"success"`, `Containment::Contained`,
 //!    `NeutralizeOutcome::Contained`, `SoftBlock::Blocked`.
+//! 3. (the review of #578, N6) a `match` over a type with a would-have
+//!    variant that never names it does not yield a done value from its
+//!    `_ =>` arm — the would-have would fall into it unnamed;
+//! 4. (the same) a negated `matches!` over such a type's variants that are
+//!    none of them done names its would-have — `!matches!(o, Failed { .. } |
+//!    Refused { .. })` is true for `WouldExecute`.
 //!
 //! Each rule is shown failing on main's shapes. Lexical, so not a proof: the
 //! behaviour tests of the lot (nn-core's `no_combat_outcome_is_a_success_
@@ -63,6 +69,195 @@ const DONE_VALUES: &[&str] = &[
     "NeutralizeOutcome::Contained",
     "SoftBlock::Blocked",
 ];
+
+/// The review of #578 (N6): the types with a would-have variant, and that
+/// variant (rules 3 and 4).
+const WOULD_HAVE_OF: &[(&str, &str)] = &[
+    ("ExecutionOutcome", "WouldExecute"),
+    ("ActionResult", "WouldExecute"),
+    ("NeutralizeOutcome", "WouldHaveContained"),
+    ("Containment", "WouldHave"),
+    ("OutcomeResult", "WouldHave"),
+    ("IsolateOutcome", "WouldHave"),
+];
+
+/// The would-have variants of the types `text` names a variant of
+/// (`Type::Variant`).
+fn would_haves_named_in(text: &str) -> Vec<&'static str> {
+    WOULD_HAVE_OF
+        .iter()
+        .filter(|(t, _)| {
+            text.match_indices(&format!("{t}::")).any(|(i, _)| {
+                i == 0 || !path_char(text.as_bytes()[i - 1]) || text.as_bytes()[i - 1] == b':'
+            })
+        })
+        .map(|(_, w)| *w)
+        .collect()
+}
+
+/// `text` names the variant `w` (a path's last segment).
+fn names_variant(text: &str, w: &str) -> bool {
+    text.match_indices(w).any(|(i, _)| {
+        let b = text.as_bytes();
+        let after = i + w.len();
+        (i == 0 || !path_char(b[i - 1]) || b[i - 1] == b':')
+            && (after >= b.len() || !path_char(b[after]))
+    })
+}
+
+/// The arms of a match body (its braces' inside, whitespace removed):
+/// each one's pattern (with its guard) and its body.
+fn arms(b: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let mut depth = 0i32;
+        let mut k = i;
+        let mut arrow = None;
+        while k + 1 < b.len() {
+            match b[k] {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                b'=' if depth == 0 && b[k + 1] == b'>' => {
+                    arrow = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let Some(a) = arrow else {
+            break;
+        };
+        let start = a + 2;
+        let end = if start < b.len() && b[start] == b'{' {
+            close_of(b, start)
+        } else {
+            let mut depth = 0i32;
+            let mut k = start;
+            while k < b.len() {
+                match b[k] {
+                    b'{' | b'(' | b'[' => depth += 1,
+                    b'}' | b')' | b']' => depth -= 1,
+                    b',' if depth == 0 => break,
+                    _ => {}
+                }
+                k += 1;
+            }
+            k
+        };
+        out.push((
+            String::from_utf8_lossy(&b[i..a]).into_owned(),
+            String::from_utf8_lossy(&b[start..end.min(b.len())]).into_owned(),
+        ));
+        i = end;
+        if i < b.len() && b[i] == b',' {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The review of #578 (N6): rules 3 and 4 over `code` (comments blanked,
+/// whitespace kept: a `match` is found by its keyword).
+fn wildcard_violations(code: &str) -> Vec<(&'static str, String, String)> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    // 3: a match naming a would-have type's variants but not its would-have,
+    // whose `_` arm yields a done value
+    for (at, _) in code.match_indices("match") {
+        let before_ok = at == 0 || !path_char(bytes[at - 1]);
+        let after = at + "match".len();
+        let after_ok = after < bytes.len() && bytes[after].is_ascii_whitespace();
+        if !before_ok || !after_ok {
+            continue;
+        }
+        // the body: the first `{` outside brackets after the scrutinee
+        let mut depth = 0i32;
+        let mut k = after;
+        let open = loop {
+            if k >= bytes.len() {
+                break None;
+            }
+            match bytes[k] {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b'{' if depth == 0 => break Some(k),
+                b';' if depth == 0 => break None,
+                _ => {}
+            }
+            k += 1;
+        };
+        let Some(open) = open else {
+            continue;
+        };
+        let close = close_of(bytes, open);
+        let inside: Vec<u8> = bytes[open + 1..close.saturating_sub(1).max(open + 1)]
+            .iter()
+            .copied()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let arms = arms(&inside);
+        let patterns: String = arms.iter().map(|(p, _)| p.as_str()).collect();
+        for w in would_haves_named_in(&patterns) {
+            if names_variant(&patterns, w) {
+                continue;
+            }
+            for (p, body) in &arms {
+                if (p == "_" || p.starts_with("_if"))
+                    && DONE_VALUES.iter().any(|v| body.contains(v))
+                {
+                    out.push((
+                        "3: a would-have falls unnamed into a wildcard arm that is done",
+                        w.to_string(),
+                        body.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    // 4: a negated `matches!` over a would-have type's variants that does
+    // not name its would-have
+    let compact: Vec<u8> = code.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    let text = String::from_utf8_lossy(&compact).into_owned();
+    for (at, _) in text.match_indices("!matches!(") {
+        let open = at + "!matches!".len();
+        let close = close_of(&compact, open);
+        let inner = &text[open + 1..close.saturating_sub(1).max(open + 1)];
+        // the pattern: past the scrutinee's top-level comma
+        let mut depth = 0i32;
+        let comma = inner.bytes().position(|c| {
+            match c {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {}
+            }
+            c == b',' && depth == 0
+        });
+        let Some(comma) = comma else {
+            continue;
+        };
+        let pattern = &inner[comma + 1..];
+        for w in would_haves_named_in(pattern) {
+            // negating done outcomes leaves the would-have not done: fine
+            let done = PAIRS
+                .iter()
+                .find(|(x, _)| *x == w)
+                .map_or(&[][..], |(_, d)| *d);
+            if done.iter().any(|d| names_variant(pattern, d)) {
+                continue;
+            }
+            if !names_variant(pattern, w) {
+                out.push((
+                    "4: a negated matches! is true for an unnamed would-have",
+                    w.to_string(),
+                    pattern.to_string(),
+                ));
+            }
+        }
+    }
+    out
+}
 
 fn path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b':'
@@ -267,7 +462,10 @@ fn no_would_have_counts_as_done() {
     );
     let mut bad = Vec::new();
     for (rel, text) in &code {
-        for (rule, would, with) in violations(text) {
+        for (rule, would, with) in violations(text)
+            .into_iter()
+            .chain(wildcard_violations(text))
+        {
             bad.push(format!("{rel}: rule {rule}: {would} with {with}"));
         }
     }
@@ -310,6 +508,46 @@ fn each_rule_fails_on_the_shape_it_forbids() {
             v.iter().any(|(r, _, _)| r.starts_with(rule)),
             "rule {rule} misses `{code}`: {v:?}"
         );
+    }
+    // the review of #578 (N6, named; its probe): a would-have folded into
+    // "done" through a wildcard arm, or a negated `matches!` — the lexical
+    // rules 1 and 2 passed both
+    let wildcard: &[(&str, &str)] = &[
+        (
+            "pub fn p(o: &ExecutionOutcome) -> Containment {\n    match o {\n        ExecutionOutcome::Failed { .. }\n        | ExecutionOutcome::PermissionDenied { .. }\n        | ExecutionOutcome::Refused { .. } => Containment::NotContained,\n        _ => Containment::Contained,\n    }\n}",
+            "3",
+        ),
+        (
+            "let r = match outcome { OutcomeResult::Failure => \"failure\", _ => \"success\" };",
+            "3",
+        ),
+        (
+            "let done = !matches!(o, ExecutionOutcome::Failed { .. } | ExecutionOutcome::Refused { .. });",
+            "4",
+        ),
+    ];
+    for (code, rule) in wildcard {
+        assert!(
+            violations(code).is_empty(),
+            "rules 1 and 2 were lexical: {code}"
+        );
+        let v = wildcard_violations(code);
+        assert!(
+            v.iter().any(|(r, _, _)| r.starts_with(rule)),
+            "rule {rule} misses `{code}`: {v:?}"
+        );
+    }
+    for ok in [
+        "match o { ExecutionOutcome::Failed { .. } => Containment::NotContained, ExecutionOutcome::WouldExecute { .. } => Containment::WouldHave, _ => Containment::Contained }",
+        "match o { ExecutionOutcome::Failed { .. } => Containment::NotContained, _ => Containment::NotContained }",
+        "match kind { Kind::A => \"a\", _ => \"success\" }",
+        "let failed = matches!(o, ExecutionOutcome::Failed { .. } | ExecutionOutcome::Refused { .. });",
+        "let done = !matches!(o, ExecutionOutcome::Failed { .. } | ExecutionOutcome::WouldExecute { .. });",
+        "let x = !matches!(k, Kind::A | Kind::B);",
+        // the descendants not contained: a would-have among them
+        "let left = !matches!(o, ExecutionOutcome::Killed { .. } | ExecutionOutcome::AlreadyGone { .. });",
+    ] {
+        assert_eq!(wildcard_violations(ok), Vec::new(), "{ok}");
     }
     // what stays allowed: a would-have with the outcomes that are not done,
     // its own arm, a constructor

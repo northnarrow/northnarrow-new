@@ -587,8 +587,8 @@ pub const MOUNT_MNT_CHILD_OFFSET: usize = 112;
 
 /// Lot 370 (F10-2): `struct task_struct.__state` (`unsigned int`; `state`
 /// before 5.14) — the module judge's write history reads the package
-/// manager's state at the write: a stopped, traced or frozen one vouches
-/// for nothing. Byte 24 on 6.8 (after the 24-byte `thread_info`). Optional:
+/// manager's state at the write: a stopped, traced or frozen one (the
+/// system's freezer) vouches for nothing. Byte 24 on 6.8 (after the 24-byte `thread_info`). Optional:
 /// without it no write is a package transaction's (fail closed).
 pub const TASK_STRUCT_STATE_OFFSET: usize = 24;
 /// Lot 370 (F10-2): `struct task_struct.start_boottime` (`u64`, BOOTTIME

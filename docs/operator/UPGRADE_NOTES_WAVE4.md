@@ -4704,8 +4704,10 @@ left too little trace.
   when any root process descending from a package manager wrote it — a
   stopped `apt`, a pager `dpkg -l` started — and the load left no R018
   record. The write is now a transaction's only when, at the write, the
-  package manager was not stopped, traced or frozen and the writer had no
-  code injected, and when that package manager held its lock (dpkg's,
+  package manager was not stopped or traced (nor frozen by the system's
+  freezer; one a cgroup's freezer holds is in an ordinary wait and still
+  vouches) and the writer had no code injected, and when that package
+  manager held its lock (dpkg's,
   apt's front end, rpm's) at the write — read in the kernel by a new
   observer (`module_lock_observe` on `file_lock`, pinned in the pin root
   like the module-load hooks; the locks it keeps are pinned with the
@@ -4722,7 +4724,9 @@ left too little trace.
   a third map): the first start
   of this release does not adopt an earlier agent's history (modules
   changed since boot before it are let through and recorded High, as
-  after any reset).
+  after any reset). Root can keep such a transaction open, or start one
+  around writes of its own: those modules are trusted and recorded Low,
+  with why.
 - **The host's OOM killer picks the agent and the watchdog last.** Both
   units set `OOMScoreAdjust=-999` (they were -500 and -900), and each
   process writes it again at its start; the self-integrity check expects
@@ -4730,27 +4734,54 @@ left too little trace.
   external audit DEP-005, is gone). Not -1000, which would also exempt them
   from their own memory cgroup's OOM: a leak past the agent's `MemoryMax`
   (kept, 11G) ends in its cgroup's OOM kill and a restart by the watchdog;
-  on a host with less memory than the cap, the cap cannot bind and a leak
-  weighs on the host first. A drop-in that sets a higher value is judged
-  harmful. A role
-  (the agent's, the watchdog's) whose holder exited this boot is taken only
-  by a successor started for it — by PID 1 or by the other role's holder,
-  with no code injected — and the taking is recorded NN-L-BPF-002 High; a
-  first start of the boot stays Low.
+  on a host with less memory than the cap, the cap cannot bind, and a
+  leaking agent outlives every other process (the workload and `sshd`
+  included), which the OOM killer picks first. A drop-in that sets a
+  higher value is judged harmful. A role (the agent's, the watchdog's)
+  whose holder exited this boot is taken only by a successor started for
+  it — by PID 1 or by the other role's holder, with no code injected — and
+  the taking is recorded NN-L-BPF-002: High outside a signed
+  trusted-installer window, Low inside one (an upgrade's restart); a first
+  start of the boot stays Low. The review of #578 (N2): the agent's own
+  successor's record was never delivered — its handles on the pins are
+  taken by its object's load, judged by the previous agent's pinned hook,
+  whose ring nobody reads once that agent is gone (no NN-L-BPF-002 of any
+  kind after a restart). The successor now records it at its start from
+  the same kernel facts (the role its holder left, the window open or
+  not): expect one NN-L-BPF-002 High under the agent's new pid after an
+  OOM kill or a crash, one Low after an upgrade's restart. The watchdog's
+  successor is recorded by the live agent's hook, as before.
 - **Smaller ones.**
   - A program run as the dynamic loader's operand, or a library it
     preloads (`--preload`, `--audit`), is judged by R001–R004 as if the
     kernel had executed it (`/tmp`, `/dev/shm`, `/var/tmp`, a descriptor's
     link or a memfd); one named relative to the caller's directory is
-    recorded (R001, Medium) without a response. `ld.so --list` and
-    `--verify` run nothing and stay quiet.
+    recorded (R001, Medium) without a response. The review of #578 (N1):
+    one named through a link of `/proc` (the process's root, its working
+    directory, a descriptor) is placed by the file the loader maps — the
+    exec pump opens the link in the process's own view and finds the file
+    among those the process maps — and judged as a direct exec of it; not
+    placed, a descriptor's link is R004's and any other such name R001's
+    record. The review of #578 (P3): a loader that only lists or checks
+    its program (`--list`, `--verify`, `LD_TRACE_LOADED_OBJECTS` in its
+    environment, musl's loader as `ldd`, glibc's `ldd` script its parent)
+    runs none of its code — a staged program it lists is recorded Low,
+    never killed (`ldd /tmp/x` was R001's kill); an `--audit` library
+    stays judged.
   - A variable that weakens the agent, set in the service manager's
     environment rather than in the agent's unit, is removed at the agent's
-    start and signed (`weakening_env_ignored`).
-  - R004's verdict on a container runtime's sealed copy not compared (the
-    compare budget spent) is the Critical kill for root too (it was High,
-    recorded); the budget spent is signed (`runtime_copy_compare`, naming
-    the uid).
+    start and signed (`weakening_env_ignored`) — when the agent can ask the
+    service manager (`systemctl`, 2 s); when it cannot, it is honoured and
+    signed `weakening_env`, as before.
+  - R004's verdict on root's container runtime's sealed copy not compared
+    (the compare budget spent, every other fact holding) stays High,
+    recorded, never killed (the review of #578, N3: the lot's first head
+    made it the Critical kill, and a host starting more than ~17
+    containers a second would have had them killed under `enforcing`);
+    the first of each episode of a spent budget names the uid whose share
+    ran out and the second's biggest spender, and the budget spent is
+    signed (`runtime_copy_compare`, naming the uid). Another uid's stays
+    the Critical kill.
   - An archive of a signed log removed by the retention less than a day
     after its seal is a signed degradation (`chain_early_eviction`): a
     flood of records, a user's included, can push the oldest from the host;

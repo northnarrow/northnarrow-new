@@ -91,6 +91,13 @@ pub mod exe_flags {
     /// judge such an exec as the image's, not by its mount point under
     /// `/tmp`.
     pub const USER_IMAGE: u32 = 1 << 22;
+    /// The review of #578 (P3): an exec of the dynamic loader whose
+    /// environment, read whole while the exec's process still ran (its
+    /// start the exec's, its memory there after the read), holds
+    /// `LD_TRACE_LOADED_OBJECTS` (any value, as glibc's loader reads it:
+    /// `ldd`'s): the loader lists its program and libraries, runs none of
+    /// their code. Not read: not set, and the program is judged as run.
+    pub const LOADER_LISTS: u32 = 1 << 23;
 }
 
 /// Lot 310: a device number as `stat(2)` reports it, in the kernel's

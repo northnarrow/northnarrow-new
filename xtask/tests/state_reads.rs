@@ -702,6 +702,19 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(dir.join(\"stat\"))",
         PROC,
     ),
+    // the review of #578: the loader's process still the exec's (else
+    // nothing placed: its names judged by their text), and the agent's own
+    // name in its succession record
+    (
+        "crates/nn-linux/src/sensors/loader_files.rs",
+        "read_state(dir.join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
+        "read_state(\"/proc/self/comm\")",
+        PROC,
+    ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
         "read_state(dir.join(\"stat\"))",

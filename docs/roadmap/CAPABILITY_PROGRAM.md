@@ -11719,15 +11719,48 @@ number in parentheses is a lab PR.
     of an absent list path is watched for its creation alone (writer named;
     a creation seen only by the look is an event, writer unknown); the
     write history names the package transaction, which must be live (not
-    stopped, traced or frozen at the write; holding its lock at the write,
+    stopped or traced at the write, nor frozen by the system's freezer;
+    holding its lock at the write,
     read in the kernel by `module_lock_observe` on `file_lock`; writer
     untainted), and every trusted load is Low; `OOMScoreAdjust=-999` for
     both units (the host OOM killer's last pick; their memory caps kept)
     and pinned at each start, a vacated role taken only by a
     successor started for it, recorded High; the manager's weakening
-    variables ignored and signed; R004 not lowered, its budget signed; the
+    variables ignored and signed; the compare budget spent signed; the
     loader's operand judged as executed; a young eviction signed.
-  - Lab: not yet measured (the soak holds the guests until 19/11).
+  - Fix round 1 (the review of #578): a loader operand through a link of
+    `/proc` placed by the file the loader maps (the exec pump's
+    `loader_files`: the link opened in the process's view, the file found
+    among its executable mappings) and judged as a direct exec, else
+    recorded (N1); a loader that only lists or checks recorded Low (P3);
+    root's uncompared runtime copy recorded High again, never killed, the
+    first of an episode naming who spent the budget (N3); the agent's own
+    successor to a vacated role recorded at its start from the kernel's
+    facts, High outside a signed window, Low inside — the previous agent's
+    hook wrote it to a ring nobody read (N2); the would-have ratchet's
+    wildcard and negated `matches!` rules; the KNOWN_LIMITATIONS lines the
+    review listed.
+  - Lab (the lot's rounds r1–r2, Ubuntu 22.04 / 5.15 and 26.04 / 7.0, on
+    the first head): a short `dpkg -i` of a module 3/3 trusted Low, a held
+    `dpkg` refused High, the module-load programs within the verifier's
+    budget on both (highest 55% of 900k); the vacated-role case (an abrupt
+    kill inside a window) left no NN-L-BPF-002 record of any kind, the
+    defect fix round 1 closes.
+  - Lab of fix round 1 (Ubuntu 22.04 / 5.15, the operator's install under
+    `alpha`): a `/tmp` program run through the loader by four names through
+    links of `/proc` (the process's root, its working directory, a
+    descriptor) placed as `/tmp/…` and judged R001 (High, a person's, held
+    below COMBAT) — on the round's first build, without the re-read of
+    the mappings, none was placed (R001 Medium, no response: the pump read
+    before the loader mapped its program); `ldd` of it two R001 Low (its
+    `--verify` and its trace run), `ld.so --list` R001 Low, the same program
+    run through the loader R001 High; the agent SIGKILLed inside a signed
+    window, restarted by its unit: NN-L-BPF-002 Low under the new pid; the
+    privileged `a_role_its_holder_left_outside_a_window_is_recorded_high`
+    (no window, the watchdog's respawn) passed from a clean start, High
+    under the new pid; `bpf_syscall_observe` within the 5.15 verifier's
+    budget (51,220 processed). Not measured: a kernel OOM kill of the agent
+    itself (the probe's attempt killed one of its workers, at +1000).
 
 - **Lot 369 — the pre-alpha's Phase 5 early triage: the soak's false
   positives on rc5 (C14, C16, C23; no level change).**

@@ -549,13 +549,17 @@ pub mod task_state {
     pub const STOPPED: u32 = 0x0004;
     /// `__TASK_TRACED` (stopped under a tracer).
     pub const TRACED: u32 = 0x0008;
-    /// `TASK_FROZEN` (6.1+: the cgroup freezer; the bit is unused before).
+    /// `TASK_FROZEN` (6.1+: the system's freezer — suspend, the cgroup-v1
+    /// freezer; the bit is unused before). The review of #578 (N4): the
+    /// cgroup-v2 freezer leaves a task in an ordinary interruptible wait
+    /// (`TASK_INTERRUPTIBLE | TASK_FREEZABLE`): not told, it vouches.
     pub const FROZEN: u32 = 0x8000;
 }
 
 /// Lot 370 (F10-2): a package manager in this state may vouch for a write
-/// of its lineage — not stopped, traced or frozen (a held transaction is
-/// no transaction).
+/// of its lineage — not stopped, traced or frozen by the system's freezer
+/// (a held transaction is no transaction; one a cgroup-v2 freezer holds
+/// waits as any other and still vouches).
 #[inline(always)]
 pub const fn state_may_vouch(state: u32) -> bool {
     state & (task_state::STOPPED | task_state::TRACED | task_state::FROZEN) == 0

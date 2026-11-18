@@ -389,7 +389,15 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   is taken only by a successor started for it — a child of PID 1 (its
   unit's restart) or of the other role's live holder (the watchdog's
   respawn), with no code injected — and its handle is recorded High
-  (`BPF_CMD_VACATED_ROLE_GET_FD`); a first claim of the boot stays Low.
+  (`BPF_CMD_VACATED_ROLE_GET_FD`) outside a signed trusted-installer
+  window, Low inside one (the installer's restart); a first claim of the
+  boot stays Low. The review of #578 (N2): the agent's successor takes its
+  handles during its object's load, before it is a protected pid, and the
+  hook that judges them is the previous agent's (pinned), whose ring
+  (never pinned) nobody reads once that agent is gone — so the successor
+  records its succession at its start, from the same kernel facts read
+  before it claims the role (`ROLE_TGIDS`, the previous session's window).
+  The watchdog's successor is recorded by the live agent's hook.
 - **Scope:** write handles on the agent's maps only (never a link handle), for a process that has only just started. `ptrace_access_check` refuses access to
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
@@ -411,8 +419,9 @@ no hook refuses, made the gap a moment root could choose; their own
 memory cgroup can still end a leak, so the ranking alone closes nothing);
 after a holder's exit the
 successor must be started for the role, and a successor that PID 1 starts
-is not told from the unit's own restart: it is recorded High, not
-refused. The same holds for a program that makes itself the role's binary
+is not told from the unit's own restart: it is recorded (High outside a
+signed window), not refused. A successor that is not the genuine agent
+reads the agent's own ring: its record rests on it. The same holds for a program that makes itself the role's binary
 by device and inode (`PR_SET_MM_EXE_FILE`). Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves

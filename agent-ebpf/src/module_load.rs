@@ -639,7 +639,8 @@ unsafe fn under_tree(leaf: *const u8) -> bool {
 /// inside a package transaction, read in the kernel at the write — no exit
 /// can race it. A global function. Lot 370 (F10-2): it returns that package
 /// manager's task (0: none), and none when it is stopped, traced or frozen
-/// (`module_judge::state_may_vouch`; its state unreadable: none) — a held
+/// by the system's freezer (`module_judge::state_may_vouch`; a cgroup-v2
+/// freezer's task waits as any other, and vouches; its state unreadable: none) — a held
 /// package manager vouched for its lineage's writes.
 #[no_mangle]
 #[inline(never)]
@@ -688,8 +689,10 @@ unsafe fn pkg_lineage(task: *const u8) -> *const u8 {
     core::ptr::null()
 }
 
-/// Lot 370 (F10-2): `task` is neither stopped, traced nor frozen; its
-/// state unreadable (no offset): held, fail closed.
+/// Lot 370 (F10-2): `task` is neither stopped, traced nor frozen by the
+/// system's freezer (`TASK_FROZEN`; the review of #578: the cgroup-v2
+/// freezer leaves it in an ordinary wait, not told); its state unreadable
+/// (no offset): held, fail closed.
 #[inline(always)]
 unsafe fn not_held(task: *const u8) -> bool {
     let Some(o) = off_opt!(TASK_STRUCT_STATE_OFFSET) else {

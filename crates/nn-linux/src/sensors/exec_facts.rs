@@ -219,6 +219,14 @@ pub fn not_read(event: &mut Event) {
 /// reused before its process is reaped, so the exec's process with its
 /// memory then is the one whose environment was read, whole.
 fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
+    environ_has(dir, start_ns, "POSIXLY_CORRECT")
+}
+
+/// [`posixly_correct`] for any variable `name` (the review of #578: the
+/// dynamic loader's `LD_TRACE_LOADED_OBJECTS`): set in the environment of
+/// the exec's process `dir`, read whole while it ran; `None` when it cannot
+/// be told.
+pub(super) fn environ_has(dir: &Path, start_ns: u64, name: &str) -> Option<bool> {
     use crate::response::proc_ref::{started_at, stat_start_ticks};
     use std::io::Read;
     if start_ns == 0 {
@@ -238,10 +246,10 @@ fn posixly_correct(dir: &Path, start_ns: u64) -> Option<bool> {
     {
         return None;
     }
-    Some(
-        env.split(|b| *b == 0)
-            .any(|var| var.starts_with(b"POSIXLY_CORRECT=")),
-    )
+    Some(env.split(|b| *b == 0).any(|var| {
+        var.strip_prefix(name.as_bytes())
+            .is_some_and(|r| r.starts_with(b"="))
+    }))
 }
 
 /// The path an image was executed by, from its `exe` link's text: the

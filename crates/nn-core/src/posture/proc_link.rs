@@ -130,6 +130,102 @@ pub(crate) fn reopens_a_descriptor(path: &str) -> bool {
     proc_link(path) == Some(ProcLink::Descriptor)
 }
 
+/// The review of #578 (N1): whose view a link of `/proc` opens — the
+/// process that reads the name (`self`, `thread-self`), or a process by its
+/// pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Who<'a> {
+    Own,
+    OwnThread,
+    Pid(&'a str),
+}
+
+/// The review of #578 (N1): the link a name of a process's view goes
+/// through ([`ViewLink`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hop<'a> {
+    Root,
+    Cwd,
+    Exe,
+    Fd(&'a str),
+    MapFiles(&'a str),
+}
+
+/// The review of #578 (N1): the first link of a process's view an absolute
+/// name goes through — `/proc/<who>[/task/<tid>]/{root,cwd,exe}`,
+/// `fd/<n>`, `map_files/<range>`, and `/dev/fd/<n>`, `/dev/std{in,out,err}`
+/// (the reader's own descriptors) — and the rest of the name, read from
+/// where it leads. What [`proc_link`] tells the kind of, with the parts the
+/// exec pump opens in the process's own view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewLink<'a> {
+    pub who: Who<'a>,
+    pub task: Option<&'a str>,
+    pub hop: Hop<'a>,
+    pub rest: Vec<&'a str>,
+}
+
+/// [`ViewLink`] of `path` — absolute, `.` and empty segments dropped;
+/// `None` with any `..` (the kernel climbs from wherever a link led) or
+/// when it starts with no such link.
+pub fn view_link(path: &str) -> Option<ViewLink<'_>> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for s in path.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => return None,
+            s => segs.push(s),
+        }
+    }
+    view_link_of(&segs)
+}
+
+fn view_link_of<'a>(segs: &[&'a str]) -> Option<ViewLink<'a>> {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let own_fd = |n: &'a str, rest: &[&'a str]| ViewLink {
+        who: Who::Own,
+        task: None,
+        hop: Hop::Fd(n),
+        rest: rest.to_vec(),
+    };
+    match segs {
+        ["dev", "fd", n, rest @ ..] if digits(n) => Some(own_fd(n, rest)),
+        ["dev", "stdin"] => Some(own_fd("0", &[])),
+        ["dev", "stdout"] => Some(own_fd("1", &[])),
+        ["dev", "stderr"] => Some(own_fd("2", &[])),
+        ["proc", who, tail @ ..] => {
+            let who = match *who {
+                "self" => Who::Own,
+                "thread-self" => Who::OwnThread,
+                n if digits(n) => Who::Pid(n),
+                _ => return None,
+            };
+            let (task, tail) = match tail {
+                ["task", t, rest @ ..] if digits(t) && who != Who::OwnThread => (Some(*t), rest),
+                _ => (None, tail),
+            };
+            let (hop, rest): (Hop<'a>, &[&'a str]) = match tail {
+                ["root", rest @ ..] => (Hop::Root, rest),
+                ["cwd", rest @ ..] => (Hop::Cwd, rest),
+                ["exe"] => (Hop::Exe, &[]),
+                ["fd", n, rest @ ..] if digits(n) => (Hop::Fd(n), rest),
+                ["map_files", m] => (Hop::MapFiles(m), &[]),
+                _ => return None,
+            };
+            Some(ViewLink {
+                who,
+                task,
+                hop,
+                rest: rest.to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +294,58 @@ mod tests {
             "/dev/null",
         ] {
             assert!(!reopens_a_descriptor(p), "{p}");
+        }
+    }
+
+    /// The review of #578 (N1, named): the parts of a name through a link of
+    /// a process's view, as the exec pump opens it — whose view, the link,
+    /// the rest; none with a `..`, a relative name, or no link.
+    #[test]
+    fn a_view_link_s_parts_are_read_once() {
+        let v = |p| view_link(p).map(|v| (v.who, v.task, v.hop, v.rest.join("/")));
+        assert_eq!(
+            v("/proc/self/root/tmp/x"),
+            Some((Who::Own, None, Hop::Root, "tmp/x".into()))
+        );
+        assert_eq!(
+            v("/proc/thread-self/cwd/./x"),
+            Some((Who::OwnThread, None, Hop::Cwd, "x".into()))
+        );
+        assert_eq!(
+            v("/proc/42/task/43/root//var/tmp/x"),
+            Some((Who::Pid("42"), Some("43"), Hop::Root, "var/tmp/x".into()))
+        );
+        assert_eq!(
+            v("/proc/self/fd/3"),
+            Some((Who::Own, None, Hop::Fd("3"), String::new()))
+        );
+        assert_eq!(
+            v("/dev/fd/4/sub"),
+            Some((Who::Own, None, Hop::Fd("4"), "sub".into()))
+        );
+        assert_eq!(
+            v("/dev/stdin"),
+            Some((Who::Own, None, Hop::Fd("0"), String::new()))
+        );
+        assert_eq!(
+            v("/proc/7/exe"),
+            Some((Who::Pid("7"), None, Hop::Exe, String::new()))
+        );
+        assert_eq!(
+            v("/proc/7/map_files/1-2"),
+            Some((Who::Pid("7"), None, Hop::MapFiles("1-2"), String::new()))
+        );
+        for p in [
+            "/proc/self/cwd/../x",
+            "proc/self/cwd/x",
+            "/proc/self/environ",
+            "/proc/self/exe/x",
+            "/proc/sys/vm/x",
+            "/tmp/x",
+            "/dev/null",
+            "/proc/self/fd/x",
+        ] {
+            assert_eq!(v(p), None, "{p}");
         }
     }
 

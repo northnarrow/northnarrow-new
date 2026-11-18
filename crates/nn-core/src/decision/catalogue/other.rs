@@ -397,7 +397,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    a write handle on an agent map (observe mode), or a program or link detach \
                    by a process outside the known BPF tooling. Lot 370: a successor of the agent \
                    or the watchdog that took its role after the holder exited this boot (the \
-                   OOM killer, a crash) is recorded High; a first start's handle stays Low.",
+                   OOM killer, a crash) is recorded High outside a signed trusted-installer \
+                   window, Low inside one; a first start's handle stays Low. The agent's own \
+                   successor records it at its start (the review of #578).",
         false_positives: "A detach by tooling not in the list (a container runtime or CNI not \
                           listed). A handle to the agent's own objects is never exempt: an \
                           administrator's `bpftool map dump` of them is recorded too.",

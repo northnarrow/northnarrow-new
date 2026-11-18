@@ -1386,3 +1386,60 @@ fn the_watchdog_s_own_start_is_not_a_foreign_bpf_handle() {
         heads(&start)
     );
 }
+
+/// The review of #578 (N2, named): the agent ends as the OOM killer ends
+/// it — a kill nothing refused, outside any trusted-installer window (here
+/// its pid evicted from `PROTECTED_PIDS`, then SIGKILL: the kernel's
+/// `sched_process_exit` vacates its role either way) — and the watchdog's
+/// respawn takes the role. That successor is recorded NN-L-BPF-002 High,
+/// under its own pid. On 382be007 nothing reached the detections: the
+/// start's handles on the pins were judged by the previous agent's pinned
+/// `bpf` hook, which wrote its record into that agent's ring — read by
+/// nobody once that agent was gone (lab r2 of lot 370: no NN-L-BPF-002 of
+/// any kind after the restart).
+#[test]
+fn a_role_its_holder_left_outside_a_window_is_recorded_high() {
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let wd_pid: u32 = fs::read_to_string(fx.watchdog_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("watchdog pidfile");
+    // the watchdog registered: the respawn is its own
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !dump_protected_pids().contains(&wd_pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        dump_protected_pids().contains(&wd_pid),
+        "the watchdog never registered itself in PROTECTED_PIDS"
+    );
+    fx.unprotect_and_sigkill_agent(pid0);
+    let pid1 = new_agent_pid(&fx, pid0, Duration::from_secs(30))
+        .expect("the watchdog never respawned the agent");
+    let rule = "NN-L-BPF-002_BpfForeignHandleOrDetach";
+    let high = "\"severity\":\"High\"";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let found = records_of(&fx.state().detections(), rule, pid1);
+        if found.iter().any(|l| l.contains(high)) {
+            // the successor's own record, under its name
+            assert!(
+                found
+                    .iter()
+                    .any(|l| l.contains(high) && l.contains("\"comm\":\"northnarrow-age\"")),
+                "the successor's High record does not name it: {:?}",
+                heads(&found.iter().collect::<Vec<_>>())
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no NN-L-BPF-002 High for the successor (pid {pid1}) of the agent the kernel killed \
+             outside a window (pid {pid0}): {:?}",
+            heads(&found.iter().collect::<Vec<_>>())
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

@@ -13,7 +13,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "The exec of a file under `/tmp/`, judged on the file the kernel executed \
-                   (a relative path, a symlink or `..` resolves to it).",
+                   (a relative path, a symlink or `..` resolves to it). Lot 370: a program the \
+                   dynamic loader runs (its operand, a preload) as if executed — one named \
+                   through a link of `/proc` placed by the file the loader maps (the review of \
+                   #578), one the text cannot place recorded Medium without a response, one the \
+                   loader only lists or checks (`--list`, `--verify`, `ldd`) recorded Low.",
         false_positives: "Lot 283b: a person's exec (an account from `UID_MIN` up with a \
                           login shell) — `go test`'s binaries, `go run`, an AppImage, a build \
                           that runs what it unpacked in `/tmp` — is recorded at High below \
@@ -60,12 +64,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R002_ExecFromDevShm",
-        severities: &[Severity::High],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "The exec of a file under `/dev/shm/`, the memory-backed shared directory, \
-                   judged on the file the kernel executed.",
+                   judged on the file the kernel executed; a program the dynamic loader runs \
+                   from it as R001's (lot 370), one it only lists recorded Low.",
         false_positives: "Rare: few programs execute from `/dev/shm`. Nothing exempts one that \
                           does.",
         how_to_test: "As an unprivileged user: `cp /bin/true /dev/shm/nn-r002 && \
@@ -84,7 +89,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "The exec of a file under `/var/tmp/`, the temporary directory that survives \
-                   a reboot, judged on the file the kernel executed.",
+                   a reboot, judged on the file the kernel executed; a program the dynamic \
+                   loader runs from it as R001's (lot 370), one it only lists recorded Low.",
         false_positives: "As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at \
                           High below COMBAT; a system account's (a package scriptlet run as \
                           one) is killed; run as root in a package transaction or an \
@@ -101,8 +107,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R004_ExecFromProcSelfFd",
-        severities: &[Severity::Critical],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::Critical, Severity::High, Severity::Low],
+        actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::Exec],
         data_components: &["DC0032"],
         observes: "A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file \
@@ -113,7 +119,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    exec pump's read of `/proc/<pid>/exe` while the process lives, else its \
                    path, read by the posture's one reader of a `/proc` link \
                    (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, \
-                   `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`.",
+                   `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`. Lot 370: fileless \
+                   code the dynamic loader runs — its operand a memfd or an unlinked file by \
+                   the file it maps, or a descriptor's link not placed (the review of #578); \
+                   one it only lists recorded Low. Root's container runtime copy past the \
+                   compare budget, every other fact holding, is recorded High, not killed.",
         false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is a \
                           linked file, not fileless; after a systemd upgrade PID 1 launches \
                           from the old, unlinked executor until its re-exec, exempt by that \

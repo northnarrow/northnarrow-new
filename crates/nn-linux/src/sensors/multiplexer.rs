@@ -346,6 +346,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let mut ebpf = loader
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
+        // The review of #578 (N2): the agent's own succession to its role,
+        // read before anything below claims it, rolls the session or zeroes
+        // the window — the previous agent's guard judged this load's handles
+        // on the pins, and its record went to a ring nobody reads any more.
+        let succession = crate::anti_tamper::bpf_defense::succession_record(
+            &ebpf,
+            crate::telemetry_probe::monotonic_ns(),
+        );
         // Lot 285: the history's maps checked or pinned, and frozen, before
         // the module-load judge's controller takes them.
         let _ = crate::module_writes::after_load(&mut ebpf, pin_root);
@@ -627,6 +635,20 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         let bpf_syscall_rb = take_ringbuf(&mut ebpf, "BPF_SYSCALL_EVENTS")?;
 
         let (tx, rx) = crate::sensors::bus::channel();
+        // the review of #578 (N2): the succession's record, the first event
+        // on the bus — NN-L-BPF-002 High for a role its holder left this
+        // boot outside a signed window, Low inside one
+        if let Some(e) = succession {
+            warn!(
+                event = ?e,
+                "anti-tamper: this start takes the agent's role after its holder exited this \
+                 boot — recorded (NN-L-BPF-002)"
+            );
+            let tx = tx.for_source("role_succession");
+            tokio::spawn(async move {
+                let _ = tx.send(e).await;
+            });
+        }
         let bus_losses = BusLosses::default();
         let lineage_for_bus = net.as_ref().map(|w| w.lineage.clone());
         let flow_tracker_for_tcp = net.as_ref().map(|w| ConnectWiring {
@@ -1590,6 +1612,9 @@ fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<E
         e,
         move |mut e| {
             crate::sensors::exec_facts::read_under(std::path::Path::new("/proc"), &mut e);
+            // the review of #578: an exec of the dynamic loader — its files
+            // through a link of /proc placed, its trace mode read
+            crate::sensors::loader_files::read_under(std::path::Path::new("/proc"), &mut e);
             if tie.is_some_and(|t| crate::sensors::app_image::read_tie(&t)) {
                 crate::sensors::app_image::mark(&mut e);
             }

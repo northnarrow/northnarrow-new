@@ -873,10 +873,13 @@ pub const SOURCES: [SourceContract; 16] = [
 /// The sources that do not travel the bus as a source of their own and are
 /// not in [`SOURCES`]: the bus's loss recorder and the file-open sensor's
 /// rule refresher are tasks the run loop watches like pumps, the test's
-/// senders are tests'.
-pub const NOT_SOURCES: [&str; 2] = [
+/// senders are tests'; the review of #578 (N2): `role_succession` is the
+/// agent's start's one record of its own succession to its role (a
+/// `BpfSyscall`, the `bpf_syscall` source's kind), sent once, no sensor.
+pub const NOT_SOURCES: [&str; 3] = [
     "open_sensor_rules",
     crate::sensors::multiplexer::BUS_LOSSES_LABEL,
+    "role_succession",
 ];
 
 /// The source of the bus named `label`.

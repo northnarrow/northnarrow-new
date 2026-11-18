@@ -168,6 +168,32 @@ pub(crate) fn base_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The review of #578 (P3): musl's dynamic loader run as `ldd` (its
+/// `argv[0]`'s name), which lists its operand's libraries and runs nothing
+/// — the loader by the kernel's file (the LSM hook's, or the pump's
+/// `/proc/<pid>/exe`), musl's by that file's name in a root-owned tree.
+pub fn musl_ldd(event: &Event) -> bool {
+    use common::wire::exe::exe_flags::{KNOWN, PROC_EXE};
+    let Event::ProcessSpawn { argv, exe, .. } = event else {
+        return false;
+    };
+    let image = exe.path_or("");
+    exe.flags & (KNOWN | PROC_EXE) != 0
+        && crate::posture::lineage::in_system_tree(image)
+        && base_of(image).starts_with("ld-musl-")
+        && argv.first().is_some_and(|a| base_of(a) == "ldd")
+}
+
+/// The review of #578 (P3): `id` is a shell running the system's `ldd`
+/// script — both in a root-owned system tree, the script named by an
+/// absolute path, nothing loaded into the shell by its environment
+/// ([`crate::posture::lineage::ExecIdentity::is_installed_program`]).
+pub fn runs_the_ldd_script(id: &crate::posture::lineage::ExecIdentity) -> bool {
+    id.is_installed_program()
+        && ProgramKind::of_name(&id.exe.to_string_lossy()) == Some(ProgramKind::Shell)
+        && id.script().is_some_and(|s| base_of(s) == "ldd")
+}
+
 /// A word of a command line names a shell (`/bin/sh`, `bash`): by name —
 /// a command line holds names, no executed file.
 pub fn names_a_shell(word: &str) -> bool {
@@ -439,6 +465,30 @@ struct Known {
     /// sealed, an installed OCI runtime's image — that image's identity.
     clones: HashMap<ExecKey, RuntimeClone>,
     clone_order: VecDeque<ExecKey>,
+    /// The review of #578 (N1): the files the dynamic loader was given
+    /// through a link of `/proc`, as the pump placed them ([`LoaderFile`]).
+    loader_files: HashMap<ExecKey, Vec<LoaderFile>>,
+    loader_order: VecDeque<ExecKey>,
+}
+
+/// The review of #578 (N1): a file the dynamic loader was given through a
+/// link of `/proc` — `/proc/self/root/…`, `/proc/<pid>/cwd/…`,
+/// `/proc/self/fd/N`, `/dev/fd/N` and their kin — placed by the exec pump
+/// by the kernel's identity of the file: the link opened in the process's
+/// own view (the kernel follows it), the file it reaches found among the
+/// files the process maps (the loader mapped it). The staging rules judge
+/// it as a direct exec of that file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoaderFile {
+    /// The caller's text, as the loader was given it.
+    pub text: String,
+    /// The file's path in the host's view, as the kernel names it (a
+    /// memfd's `/memfd:` name), without the ` (deleted)` of an unlinked one.
+    pub path: String,
+    /// A `memfd_create` file.
+    pub memfd: bool,
+    /// Unlinked (`i_nlink == 0`), or an `O_TMPFILE`.
+    pub deleted: bool,
 }
 
 /// The installed programs the agent recorded, and the copies the exec pump
@@ -481,6 +531,19 @@ impl Known {
         while self.clone_order.len() > cap {
             if let Some(old) = self.clone_order.pop_front() {
                 self.clones.remove(&old);
+            }
+        }
+    }
+
+    /// The review of #578 (N1): `files` kept for the exec `key`, at most
+    /// `cap` execs (the oldest out).
+    fn keep_loader_files(&mut self, key: ExecKey, files: Vec<LoaderFile>, cap: usize) {
+        if self.loader_files.insert(key, files).is_none() {
+            self.loader_order.push_back(key);
+        }
+        while self.loader_order.len() > cap {
+            if let Some(old) = self.loader_order.pop_front() {
+                self.loader_files.remove(&old);
             }
         }
     }
@@ -622,6 +685,21 @@ pub struct RuntimeClone {
     /// never killing it, and kills any other uid's (the re-check of #556,
     /// N1: a user spends its own share with decoys).
     pub unverified: bool,
+    /// The review of #578 (N3): with `unverified`, this skip opened an
+    /// episode of its uid's spent budget (none for that uid in the minute
+    /// before) — R004's record of it says so, once per episode, naming who
+    /// spent the budget.
+    pub episode: Option<BudgetEpisode>,
+}
+
+/// The review of #578 (N3): the first runtime copy left uncompared in an
+/// episode of a spent compare budget — the uid whose share ran out, and the
+/// uid that read the most in that second (and how many bytes), which may be
+/// another: a flood spent on purpose is named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BudgetEpisode {
+    pub uid: u32,
+    pub top: Option<(u32, u64)>,
 }
 
 impl RuntimeClone {
@@ -644,6 +722,31 @@ pub fn keep_runtime_clone(event: &Event, clone: RuntimeClone) {
     if let Some(key) = exec_key(event) {
         KNOWN.write().keep_clone(key, clone, COPIES_CAP);
     }
+}
+
+/// The review of #578 (N1): the exec pump's placement of the files
+/// `event`'s dynamic loader was given through a link of `/proc`
+/// ([`LoaderFile`]); those it could not place are not kept.
+pub fn keep_loader_files(event: &Event, files: Vec<LoaderFile>) {
+    if files.is_empty() {
+        return;
+    }
+    if let Some(key) = exec_key(event) {
+        KNOWN.write().keep_loader_files(key, files, COPIES_CAP);
+    }
+}
+
+/// The review of #578 (N1): the pump's placement of `text`, a file
+/// `event`'s dynamic loader was given ([`keep_loader_files`]).
+pub fn loader_file(event: &Event, text: &str) -> Option<LoaderFile> {
+    let key = exec_key(event)?;
+    KNOWN
+        .read()
+        .loader_files
+        .get(&key)?
+        .iter()
+        .find(|f| f.text == text)
+        .cloned()
 }
 
 /// Lot 347: what the exec pump found of `event`'s memfd
@@ -695,7 +798,7 @@ pub fn image_kind(event: &Event) -> Option<ProgramKind> {
 /// The exec runs the dynamic loader (by identity or name): its operand's
 /// index in its argv. Lot 370 (05-3.3): the staging rules read it too
 /// ([`super::loader_code`]).
-pub(crate) fn loader_operand_at(event: &Event) -> Option<usize> {
+pub fn loader_operand_at(event: &Event) -> Option<usize> {
     let Event::ProcessSpawn {
         filename,
         exe,

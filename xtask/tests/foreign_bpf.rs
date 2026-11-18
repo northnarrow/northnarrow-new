@@ -567,6 +567,17 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
     // the exit vacates, it does not zero
     assert!(body(&c, "role_exit").contains("unsafe { *t = ROLE_VACATED };"));
     assert!(!body(&c, "role_exit").contains("*t = 0"));
+    // the review of #578 (N2): a vacated role's successor is High outside a
+    // signed window, the family's own start (Low) inside one
+    in_order(
+        body(&c, "fresh_instance_cmd"),
+        &[
+            "Some(t) if *t == ROLE_VACATED);",
+            "if vacated && !crate::inode_protect::override_active() {\n        BPF_CMD_VACATED_ROLE_GET_FD",
+            "} else {\n        BPF_CMD_FRESH_INSTANCE_GET_FD",
+        ],
+    )
+    .unwrap();
 }
 
 /// Lot 344 (#554's KVM suites): the `bpf` hook's watchdog role is the

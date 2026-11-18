@@ -44,6 +44,13 @@ const HELPERS: &str = "crates/nn-core/src/decision/bounded.rs";
 /// Tables of last-seen times outside the helpers, with what bounds each.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "crates/nn-linux/src/program_images.rs",
+        1,
+        "the review of #578 (N3): each uid's last skip of a runtime copy's compare for the \
+         budget (an episode opens after a quiet minute) — at most UIDS_CAP uids, the quiet ones \
+         out first, then the oldest",
+    ),
+    (
         "agent/src/module_trust/txn.rs",
         1,
         "lot 370 (F10-2): the package transactions seen holding their lock — at most SEEN_MAX, \

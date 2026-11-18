@@ -13,9 +13,9 @@ MITRE ATT&CK® Enterprise 20.0: the ids, tactics and names are MITRE's, from the
 | Rule | Name | Severity | Response | ATT&CK |
 |---|---|---|---|---|
 | [`R001_ExecFromTmp`](#r001_execfromtmp) | Exec from /tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
-| [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High | KillProcessTree | T1059, T1027.011 |
+| [`R002_ExecFromDevShm`](#r002_execfromdevshm) | Exec from /dev/shm/ | High, Low | KillProcessTree, Log | T1059, T1027.011 |
 | [`R003_ExecFromVarTmp`](#r003_execfromvartmp) | Exec from /var/tmp/ | High, Medium, Low | KillProcessTree, Log | T1059 |
-| [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical | KillProcessTree | T1620 |
+| [`R004_ExecFromProcSelfFd`](#r004_execfromprocselffd) | Exec from /proc/<pid>/fd/* (memfd) | Critical, High, Low | KillProcessTree, Log | T1620 |
 | [`R005_NetcatExec`](#r005_netcatexec) | Netcat family launched | High, Low | Log | T1095 |
 | [`R006_ReverseShellTooling`](#r006_reverseshelltooling) | Reverse shell tooling | Critical, High | KillProcessTree, Log | T1095, T1059.004 |
 | [`R007_CryptoMiner`](#r007_cryptominer) | Crypto miner | Critical, High | KillProcessTree, Log | T1496.001 |
@@ -49,7 +49,7 @@ Exec from /tmp/ — category `execution`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit+e2e+lab |
 
-**Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it).
+**Observes.** The exec of a file under `/tmp/`, judged on the file the kernel executed (a relative path, a symlink or `..` resolves to it). Lot 370: a program the dynamic loader runs (its operand, a preload) as if executed — one named through a link of `/proc` placed by the file the loader maps (the review of #578), one the text cannot place recorded Medium without a response, one the loader only lists or checks (`--list`, `--verify`, `ldd`) recorded Low.
 
 **Known false positives.** Lot 283b: a person's exec (an account from `UID_MIN` up with a login shell) — `go test`'s binaries, `go run`, an AppImage, a build that runs what it unpacked in `/tmp` — is recorded at High below COMBAT, killed in COMBAT or under a signed `enforce`. A system account's exec (below `UID_MIN`, or a `nologin` shell: `www-data`, `postgres`, `nobody`) is killed in every posture: the whitelist is empty and the process allowlist does not apply. A root exec is R009's (R009 runs first; R001's kill of it waits for COMBAT). Lot 355: an AppImage's own programs, served read-only at its runtime's `/tmp/.mount_*` (the exec pump ties the mount to the image file the user ran, `USER_IMAGE`), are the image's: no record, as from the home (lot 360: also an image whose file name is 31 bytes or more, by its whole path as its daemon runs it). An AppImage itself in `/tmp`, an extracted one, a writable FUSE mount or another program's daemon stay judged. Lot 369: what the packaged `go` itself built and then runs, for a person's account — `go test`'s test binary, `go run`'s program: the file the packaged toolchain's own linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`) was run to write by that very `go`, in the layout of its work directory (`go-build<digits>/b<digits>/<name>` or `…/exe/<name>`), run by it from its path, not unlinked — is recorded Low, never killed. What `go` only launches (a `-vettool`, an `-exec` wrapper, a `-toolexec` program, a `go generate` command, a file dropped in a `go-build` directory), root's and a service account's build output, and the same file run by a shell, by another parent or by a `go` in a home are judged as above.
 
@@ -65,13 +65,13 @@ Exec from /dev/shm/ — category `execution`.
 
 | | |
 |---|---|
-| Severity | High |
-| Response | KillProcessTree |
+| Severity | High, Low |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1059 Command and Scripting Interpreter (Execution); T1027.011 Obfuscated Files or Information: Fileless Storage (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit |
 
-**Observes.** The exec of a file under `/dev/shm/`, the memory-backed shared directory, judged on the file the kernel executed.
+**Observes.** The exec of a file under `/dev/shm/`, the memory-backed shared directory, judged on the file the kernel executed; a program the dynamic loader runs from it as R001's (lot 370), one it only lists recorded Low.
 
 **Known false positives.** Rare: few programs execute from `/dev/shm`. Nothing exempts one that does.
 
@@ -93,7 +93,7 @@ Exec from /var/tmp/ — category `execution`.
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | unit |
 
-**Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed.
+**Observes.** The exec of a file under `/var/tmp/`, the temporary directory that survives a reboot, judged on the file the kernel executed; a program the dynamic loader runs from it as R001's (lot 370), one it only lists recorded Low.
 
 **Known false positives.** As R001 (lot 283b): a person's exec from `/var/tmp` is recorded at High below COMBAT; a system account's (a package scriptlet run as one) is killed; run as root in a package transaction or an administrator's session it is R009's Low record. Lot 369: the packaged `go`'s own build output in `/var/tmp` (`TMPDIR=/var/tmp`) as R001's: a person's, linked and run by that `go`.
 
@@ -109,13 +109,13 @@ Exec from /proc/<pid>/fd/* (memfd) — category `execution`.
 
 | | |
 |---|---|
-| Severity | Critical |
-| Response | KillProcessTree |
+| Severity | Critical, High, Low |
+| Response | KillProcessTree, Log |
 | ATT&CK | T1620 Reflective Code Loading (Stealth) |
 | Sensor — data | exec (sched_process_exec, bprm_check_security) — DC0032 Process Creation |
 | Validation | e2e (V2 Critical sub-gate) |
 
-**Observes.** A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file opened then deleted), whatever path reached it (lot 310: `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`, a relative path, a symlink, `/proc/<pid>/exe` alike), judged on the executed file's identity: the exec sensor's in LSM mode; in tracepoint mode the exec pump's read of `/proc/<pid>/exe` while the process lives, else its path, read by the posture's one reader of a `/proc` link (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`.
+**Observes.** A fileless exec: a memfd or an unlinked file (an `O_TMPFILE`, a file opened then deleted), whatever path reached it (lot 310: `/proc/thread-self/fd/N`, `/proc/<pid>/task/<tid>/fd/N`, `/dev/stdin`, a relative path, a symlink, `/proc/<pid>/exe` alike), judged on the executed file's identity: the exec sensor's in LSM mode; in tracepoint mode the exec pump's read of `/proc/<pid>/exe` while the process lives, else its path, read by the posture's one reader of a `/proc` link (`/proc/<pid>[/task/<tid>]/fd/N`, `map_files/`, `/dev/fd/N`, `/dev/std*`, `/proc/<pid>/root/…` chains, `..` folded) or `/memfd:`. Lot 370: fileless code the dynamic loader runs — its operand a memfd or an unlinked file by the file it maps, or a descriptor's link not placed (the review of #578); one it only lists recorded Low. Root's container runtime copy past the compare budget, every other fact holding, is recorded High, not killed.
 
 **Known false positives.** systemd-executor's launch of every unit (systemd 254 and later) is a linked file, not fileless; after a systemd upgrade PID 1 launches from the old, unlinked executor until its re-exec, exempt by that file's identity: a copy the host's PID 1 holds by that identity alone (an inode no user can reach); the packaged file at its install path or a copy a genuine user manager holds (its image the packaged manager's, in PID 1's mount namespace) for the first exec of a process PID 1 or such a manager forked (the kernel's record at sched_process_fork, never the parent at exec time) — re-read every 10 s and replaced, never by its name or `argv[0]`. A process re-executing the very image its parent runs (`/proc/self/exe` after an upgrade unlinked it: Chromium's children, Docker's `reexec`) is not fileless when that image was executed from a directory only root can write, in PID 1's mount namespace (parents running at the agent's start included); a user's dropped binary that unlinks and re-executes itself is killed. Another program that re-executes itself from a memfd (older runc versions do, to protect their binary), or that execs a file at the instant an upgrade unlinks it, is killed: nothing else is exempt.
 
@@ -2021,7 +2021,7 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0021 OS API Execution |
 | Validation | unit+lab |
 
-**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling. Lot 370: a successor of the agent or the watchdog that took its role after the holder exited this boot (the OOM killer, a crash) is recorded High; a first start's handle stays Low.
+**Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling. Lot 370: a successor of the agent or the watchdog that took its role after the holder exited this boot (the OOM killer, a crash) is recorded High outside a signed trusted-installer window, Low inside one; a first start's handle stays Low. The agent's own successor records it at its start (the review of #578).
 
 **Known false positives.** A detach by tooling not in the list (a container runtime or CNI not listed). A handle to the agent's own objects is never exempt: an administrator's `bpftool map dump` of them is recorded too.
 

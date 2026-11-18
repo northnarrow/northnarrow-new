@@ -125,6 +125,9 @@ impl Executor {
                 extra["why"] = serde_json::json!(super::blocked_new_only(*sockets));
                 "partial"
             }
+            // the review of #578 (N6): never "success" for a move the gate
+            // held (the callers record only one carried out)
+            ExecutionOutcome::WouldExecute { .. } => "would_have",
             _ => "success",
         };
         self.audit_entry("response_contain", extra, result);

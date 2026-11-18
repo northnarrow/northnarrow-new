@@ -37,8 +37,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `root_authorized_keys_created_after_the_start_is_fim_004`.
   - **The module judge trusts a live package transaction only.** A module
     file written since boot is trusted when its write came from a package
-    manager's lineage whose package manager was not stopped, traced or
-    frozen at the write, the writer free of injected code, and that
+    manager's lineage whose package manager was not stopped or traced at
+    the write (nor frozen by the system's freezer), the writer free of
+    injected code, and that
     package manager held its lock at the write (dpkg's, apt's front end,
     rpm's) — read in the kernel at the write: a new observer
     (`module_lock_observe`, on `file_lock`) keeps the package managers'
@@ -65,19 +66,58 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     external audit DEP-005's raise to 0 is gone). A role whose holder exited
     this boot is taken only by a successor started for it (by PID 1 or the
     other role's holder, no code injected), and the taking is NN-L-BPF-002
-    High. Tests `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
+    High outside a signed trusted-installer window, Low inside one. Tests
+    `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
     `a_role_taken_after_its_holder_exited_is_high`.
   - **Smaller ones.** A program run as the dynamic loader's operand (or
     preloaded by it) is judged by R001–R004 as if executed; a weakening
     variable from the service manager's environment, not the unit, is
-    ignored at the start and signed; R004's verdict on a runtime copy not
-    compared is not lowered for root, and the budget spent is signed; an
-    archive the retention removes younger than a day is a signed
+    ignored at the start and signed (honoured, as before, when the manager
+    cannot be asked); the compare budget spent on runtime copies is signed;
+    an archive the retention removes younger than a day is a signed
     degradation. Tests
     `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`,
     `a_weakening_variable_from_the_service_manager_is_ignored`,
-    `an_uncompared_runtime_copy_is_not_lowered_for_root`,
     `an_archive_evicted_young_is_said`.
+  - **The review of #578 (fix round 1).**
+    - A loader operand named through a link of `/proc` (the process's root
+      or working directory, a descriptor) is placed by the file the loader
+      maps — the exec pump opens the link in the
+      process's own view and finds the file among the process's executable
+      mappings (`nn_linux::sensors::loader_files`) — and judged as a direct
+      exec of it; not placed, a view's link is R001's record and a
+      descriptor's R004's kill (the first were silent). Tests
+      `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`,
+      `a_file_through_a_link_of_proc_is_placed_in_the_process_s_view`,
+      `the_pump_places_a_loader_s_files_the_process_maps`.
+    - A loader that only lists or checks its program (`--list`, `--verify`,
+      `LD_TRACE_LOADED_OBJECTS`, musl's loader as `ldd`, glibc's `ldd`
+      script its parent) is recorded Low, never killed; an `--audit`
+      library stays judged. Tests
+      `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`,
+      `the_system_s_ldd_is_a_shell_running_its_script_from_a_system_tree`,
+      `the_loader_s_trace_mode_is_read_from_its_environment`.
+    - R004: root's runtime copy not compared (the budget spent, every other
+      fact holding) is recorded High again, never killed (the first head
+      killed it: a container burst); the first of each episode names the
+      uid whose share ran out and the second's biggest spender. Tests
+      `an_uncompared_runtime_copy_is_recorded_never_killed`,
+      `the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget`,
+      `a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender`.
+    - The agent's own successor to a role its holder left is recorded: the
+      previous agent's hook wrote its record into a ring nobody read. The
+      successor records it at its start from the kernel's facts, High
+      outside a window, Low inside. Tests
+      `a_role_left_by_its_holder_is_high_outside_a_window_and_low_inside`,
+      `a_role_its_holder_left_outside_a_window_is_recorded_high`
+      (privileged).
+    - The would-have ratchet also forbids a would-have falling unnamed into
+      a `_ =>` arm that is done, and a negated `matches!` of the failures
+      only; the contain row says `would_have` for a held move.
+    - KNOWN_LIMITATIONS: files written in a package manager's lineage are
+      Low; a leaking agent outlives the workload where its cap cannot bind;
+      the weakening variables are honoured when the manager cannot be
+      asked; a root can keep a package transaction open for its modules.
 - Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
   each told by identity, the attack shape each rule exists for kept
   (`UPGRADE_NOTES_WAVE4.md` §57).

@@ -198,7 +198,7 @@ fn rules_share_consistent_metadata() {
     // Sanity: each rule has a non-empty id, name, and category.
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(R001ExecFromTmp::default()),
-        Box::new(R002ExecFromDevShm),
+        Box::new(R002ExecFromDevShm::default()),
         Box::new(R003ExecFromVarTmp::default()),
         Box::new(R004ExecFromProcSelfFd::default()),
         Box::new(R005NetcatExec::default()),
@@ -243,7 +243,7 @@ fn ordering_is_deterministic() {
 #[test]
 fn rule_ids_are_pinned() {
     assert_eq!(R001ExecFromTmp::default().id(), "R001_ExecFromTmp");
-    assert_eq!(R002ExecFromDevShm.id(), "R002_ExecFromDevShm");
+    assert_eq!(R002ExecFromDevShm::default().id(), "R002_ExecFromDevShm");
     assert_eq!(R003ExecFromVarTmp::default().id(), "R003_ExecFromVarTmp");
     assert_eq!(
         R004ExecFromProcSelfFd::default().id(),

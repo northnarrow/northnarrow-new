@@ -239,10 +239,14 @@ not cause as an incident.
   file written in the running kernel's tree since boot is trusted when the
   package database or DKMS's registry vouches for its content and the
   write came from a live package transaction: the package manager's
-  process held its lock, was not stopped, and the writer descends from it
-  with no code injected. Root that runs the package manager on a package
-  of its own is such a transaction. Every load the kernel trusted is
-  recorded, Low, with why it was trusted. The lock is read in the kernel
+  process held its lock, was not stopped or traced, and the writer
+  descends from it with no code injected. Root that runs the package
+  manager on a package of its own is such a transaction, and a root
+  process can keep a package transaction open, or start one, around writes
+  of its own (the package manager waiting at a prompt, or frozen by a
+  cgroup's freezer, still vouches): such a module is trusted and recorded
+  Low. Every load the kernel trusted is recorded, Low, with why it was
+  trusted. The lock is read in the kernel
   at the write, however short the transaction. A transaction that took its
   lock while the agent's lock observer was not attached — before the
   agent's first start of the boot, or in the moment of an upgrade between
@@ -386,22 +390,38 @@ not cause as an incident.
   watchdog run with `oom_score_adj` -999: the host's OOM killer picks them
   last, and their own memory cap still ends a leak with a kill and a
   restart. On a host with less memory than the agent's cap (11 GiB) the cap
-  cannot bind, and a leak weighs on the host first.
-  The successor that takes the role of an agent or watchdog that ended is
-  recorded High (NN-L-BPF-002), and only a process started for the role
-  (by PID 1 or by the other role's holder, with no code injected) gets the
-  agent's maps in that moment; one PID 1 starts is not told from the
-  unit's own restart, and is recorded High, not refused. *Evidence:* `previous_run_none_abrupt_clean`;
+  cannot bind: a leaking agent outlives every other process, the
+  workload and `sshd` included, which the OOM killer picks first. Root can
+  still make the agent the OOM killer's pick (every other process at
+  -1000): what holds then is the record of its successor below.
+  The successor that takes the role of an agent or watchdog that ended
+  this boot is recorded by NN-L-BPF-002: High when no signed
+  trusted-installer window was open (the OOM killer, a crash, a kill
+  nothing refused), Low inside one (the installer's restart). The
+  watchdog's successor is recorded by the live agent's kernel hook; the
+  agent's own successor records it at its start, from the kernel's facts
+  (the role left by its holder, the window), since the hook of the agent
+  that ended writes to a ring nobody reads any more. Only a process started
+  for the role (by PID 1 or by the other role's holder, with no code
+  injected) gets the agent's maps in that moment; one PID 1 starts is not
+  told from the unit's own restart, and is recorded, not refused.
+  *Evidence:* `previous_run_none_abrupt_clean`;
   `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`;
-  `a_role_taken_after_its_holder_exited_is_high`; internal check Phase 3
-  §7.2.
+  `a_role_taken_after_its_holder_exited_is_high`;
+  `a_role_left_by_its_holder_is_high_outside_a_window_and_low_inside`;
+  `a_role_its_holder_left_outside_a_window_is_recorded_high`; internal
+  check Phase 3 §7.2.
 - **Weakening variables from the service manager's environment are
   ignored, not refused.** A variable that weakens the agent, set in the
   service manager's environment rather than in the agent's unit, is
   removed at the agent's start and signed as a degradation
-  (`weakening_env_ignored`). One set in the unit (or a drop-in) is honoured
-  and signed as `weakening_env`, as before. *Evidence:*
-  `a_weakening_variable_from_the_service_manager_is_ignored`; lot 370.
+  (`weakening_env_ignored`). The agent tells the two apart by asking the
+  service manager (`systemctl`, for at most 2 s each); when it cannot ask
+  (no `systemctl` it trusts, no answer in time) nothing is removed, and
+  the variable is honoured and signed as `weakening_env`. One set in the
+  unit (or a drop-in) is honoured and signed as `weakening_env`, as before.
+  *Evidence:* `a_weakening_variable_from_the_service_manager_is_ignored`;
+  lot 370.
 - **The agent's CPU time.** Heavy CPU load from root processes can slow the
   agent: its unit has no raised CPU weight yet. A stall of more than 15 s is
   a signed `agent_stalled` record. A confinement of the agent to fewer CPUs
@@ -453,13 +473,24 @@ not cause as an incident.
 
 ## Detection coverage
 
-- **A program run through the dynamic loader by a relative name.** The
-  staging rules judge a program the dynamic loader runs (its operand, a
-  library it preloads) as if the kernel had executed it. One named relative
-  to the caller's working directory, which the record does not carry, is
-  recorded (R001, Medium) without a response. `ldd` on a file runs the
-  loader on it and is recorded the same way. *Evidence:*
+- **A program run through the dynamic loader.** The staging rules judge a
+  program the dynamic loader runs (its operand, a library it preloads) as
+  if the kernel had executed it. One named through a link of `/proc` (the
+  process's root, its working directory, a descriptor) is placed by the
+  file the loader maps, as the agent reads the process just after the
+  exec; when it cannot be placed that way — the process gone or in another
+  view, the file not mapped yet, a symbolic link on the way — a
+  descriptor's link is judged as fileless code (R004) and any other such
+  name is recorded (R001, Medium) without a response, as is one named
+  relative to the caller's working directory, which the record does not
+  carry. A process that changes its own directory, descriptors or mappings
+  in that moment is judged by what the agent reads. A loader that only
+  lists or checks its program (`--list`, `--verify`, `ldd`) runs none of
+  its code: a staged program it lists is recorded Low, never killed; a
+  library `--audit` names still runs and is judged. *Evidence:*
   `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
+  `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`;
+  `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`;
   lot 370.
 - **A file of the FIM watch list absent at the start.** Its creation is an
   event with its writer, judged as a change of the file would be. One whose
@@ -468,6 +499,18 @@ not cause as an incident.
   that directory appears is watched, not reported.
   *Evidence:* `ld_so_preload_created_after_the_start_is_fim_022_with_its_writer`;
   `root_authorized_keys_created_after_the_start_is_fim_004`; lot 370.
+- **Files written in a package manager's lineage are recorded Low.** A
+  write of a watched file by a process descending from a package manager
+  root ran (dpkg, rpm, dnf, apt's lineage), while that package manager
+  runs or just after, is recorded Low, not killed — killing a transaction
+  would leave a half-installed package — and so is an account tool's change
+  to the users database inside one. Unlike a kernel module's, such a write
+  needs no lock held and is not checked for a stopped package manager: a
+  root process that keeps one waiting has its lineage's writes recorded
+  Low. `/etc/ld.so.preload`, root's `authorized_keys`, the bait files and
+  the credential files keep their severity. *Evidence:*
+  `package_manager_writes_are_logged_not_killed`;
+  `account_tools_in_a_package_transaction_are_recorded_low`.
 - **No adversarial campaign yet.** The rules have unit, end-to-end and lab
   tests; on the release candidate each rule was reproduced once, as its
   "How to test" says, on 5 kernels. No independent or adversarial campaign
@@ -701,6 +744,19 @@ kernel.
   mode. Under `alpha` that is a record with `would have: KillProcessTree`,
   and nothing is killed ([UPGRADE_NOTES_WAVE4.md](UPGRADE_NOTES_WAVE4.md)
   §41). *Evidence:* lot 347.
+- **Many container starts in one second.** The agent compares each copy
+  byte for byte within a budget (about seventeen runc 1.1 starts a second
+  for root). Past it, root's copy whose every other fact holds is recorded
+  High (`R004_ExecFromProcSelfFd`, "not compared (budget)"), never killed:
+  its bytes were not compared, and they may be any program's of that
+  length. The first one of each episode (no such skip for that uid in the
+  minute before) names the uid whose share ran out and the second's
+  biggest spender, and the spending is signed (`runtime_copy_compare`).
+  Another uid's copy past its own share stays the Critical kill.
+  *Evidence:* `an_uncompared_runtime_copy_is_recorded_never_killed`;
+  `the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget`;
+  `a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender`;
+  lot 370.
 - **k3s.** Its runc runs from a non-standard path: a
   `R013_NamespaceEscapeTooling` High record. Its installer writes
   `k3s.service`: an `NN-L-FIM-009_SystemdUnitDropped` High record. An
