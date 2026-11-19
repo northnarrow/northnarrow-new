@@ -12,7 +12,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **A cut link argv names its output in `go`'s own shape.** Since Go 1.21
     `go` passes its linker `-X=runtime.godebugDefault=…`, every GODEBUG
     changed since the main module's `go` line (524 bytes for a `go 1.18`
-    module on Go 1.26, 339 on Go 1.24), so the link's argv passes the
+    module on Go 1.26, 350 on Go 1.24), so the link's argv passes the
     sensor's 511 bytes and came cut; lot 369 read the output of a whole
     argv only, noted no link, and the test binary and the program were
     R001 High (a would-have kill in ENGAGED). A cut argv now names the

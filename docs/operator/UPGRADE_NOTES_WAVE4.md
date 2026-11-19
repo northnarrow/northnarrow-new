@@ -4810,7 +4810,7 @@ Low, as §57 meant.
 - **The cause.** Since Go 1.21, `go` passes its linker
   `-X=runtime.godebugDefault=…`: every GODEBUG setting changed since the
   main module's `go` line. For a `go 1.18` module that is 524 bytes on Go
-  1.26 and 339 on Go 1.24, so the link command passes the 511 bytes of
+  1.26 and 350 on Go 1.24, so the link command passes the 511 bytes of
   arguments the exec sensor keeps and arrives cut (`argv_truncated`). §57's
   identity read the linker's output only from a whole argument list, so it
   noted no link and the output was judged as any exec from `/tmp`. A
@@ -4818,8 +4818,8 @@ Low, as §57 meant.
   passes no such list and was not affected.
 - **What changes.** A cut link command names its output only in the `go`
   command's own shape — `link -o <target> -importcfg …`: `-o` the first
-  argument, its target whole, no other output option among the arguments
-  kept, and no last argument a cut may have made of one. Every other fact
+  argument, its target whole, no other output option and no response file
+  (`@…`) among the arguments kept, and no last argument a cut may have made of one. Every other fact
   of §57 is unchanged: the packaged toolchain's own linker, run by the very
   `go` process that then runs the file, in its work directory's layout, by
   its path, not unlinked, for a person's account.
@@ -4829,7 +4829,7 @@ Low, as §57 meant.
   and test binaries are not cached. A `GOCACHE` under `/tmp` or
   `/var/tmp` makes such a run an exec from there, judged as before.
 - **Still judged.** A second `-o` among the arguments kept, the target cut,
-  `-o` not first, a link run by a shell or by a `-toolexec` program, a `go`
+  `-o` not first, a link run by a shell or forked by a `-toolexec` program (one that `exec`s the real linker in place leaves `go` as its parent and is noted), a `go`
   a `GOTOOLCHAIN` switch downloaded into the module cache (its linker is not
   in a root-only system tree), a file dropped in a `go-build` directory,
   `-exec` wrappers, and root's and a service account's build output. What

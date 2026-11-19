@@ -5370,6 +5370,41 @@ mod tests {
         );
     }
 
+    /// Lot 372 (review F1): the linker expands a response file (`@file`)
+    /// among its arguments, and the file may hold another `-o`; `go` never
+    /// mixes one with its own shape, so an argv with an `@…` argument,
+    /// whole or cut, names no output.
+    #[test]
+    fn a_link_argv_with_a_response_file_names_no_output() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (out, cfg) = (
+            "/tmp/go-build1/b078/calc.test",
+            "/tmp/go-build1/b078/importcfg.link",
+        );
+        for cut in [true, false] {
+            for v in [
+                &["link", "-o", out, "-importcfg", cfg, "@/tmp/rsp"][..],
+                &[
+                    "link",
+                    "-o",
+                    out,
+                    "-importcfg",
+                    cfg,
+                    "-s",
+                    "@/tmp/rsp",
+                    "-w",
+                ],
+                &["@/tmp/rsp", "-o", out, "-importcfg", cfg],
+            ] {
+                assert_eq!(go_link_output(&a(v), cut), None, "{cut} {v:?}");
+            }
+        }
+        assert_eq!(
+            go_link_output(&a(&["link", "-o", out, "-importcfg", cfg, "-s"]), true),
+            Some(out)
+        );
+    }
+
     /// Lot 372 (the rc7 soak on Ubuntu 26.04): an argv the sensor cut (Go
     /// 1.21 and later pass the linker a long `-X=runtime.godebugDefault=…`)
     /// names the link's output only in the `go` command's own shape —
@@ -5425,9 +5460,25 @@ mod tests {
             &["link", "-o", out, "-importcfg", cfg, "--"],
             &["-o", out, "-importcfg"],
             &["link", "-o"],
+            // a response file kept: the linker expands it, whatever it holds
+            &["link", "-o", out, "-importcfg", cfg, "@/tmp/rsp"],
+            &[
+                "link",
+                "-o",
+                out,
+                "-importcfg",
+                cfg,
+                "-s",
+                "@/tmp/rsp",
+                "-w",
+            ],
+            &["@/tmp/rsp", "-o", out, "-importcfg", cfg],
         ] {
             assert_eq!(go_link_output(&a(v), true), None, "{v:?}");
         }
+        // a response file is refused in a whole argv too
+        let rsp = a(&["link", "-o", out, "-importcfg", cfg, "@/tmp/rsp", "/m.a"]);
+        assert_eq!(go_link_output(&rsp, false), None);
         // a whole argv is read as before: one output anywhere
         let whole = a(&["link", "-importcfg", cfg, "-o", out, "/m.a"]);
         assert_eq!(go_link_output(&whole, false), Some(out));

@@ -682,6 +682,10 @@ lists the known false positives of each rule.
     program already in the build cache runs from the cache itself, not
     from the work directory, and is judged as any exec from there (with
     the default `GOCACHE`, in the home, it is no staging exec at all).
+  - a CI runner account created with a login shell and a regular uid (the
+    default of GitLab's runner, for one) counts as a person: a malicious
+    module's `go test` binary run by it is recorded Low like a developer's.
+    A service account with no login shell, and root, stay judged.
   A person's own `-ldflags` naming a second `-o` past the bytes the sensor
   keeps, or a build cache the user poisons with their own code, is the
   user running their own code — Low by design, as a module of their own.

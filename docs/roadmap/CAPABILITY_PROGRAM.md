@@ -11719,7 +11719,20 @@ number in parentheses is a lab PR.
     main), `a_cut_link_argv_outside_go_s_own_shape_stays_judged`,
     `a_cut_link_argv_names_its_output_only_in_the_go_command_s_shape`;
     mutation 13/13 caught.
-  - Lab: pending.
+  - Lab (as measured): ubuntu2604 (Go 1.26, `go 1.18` module; alpha
+    profile, observe-only), the commit of the PR's first head. `go test`,
+    `go run` (cache miss) and `go run` on the toolchain's own `go` line:
+    R001 Low, one record each; the second `go run` (cache hit, run from
+    `GOCACHE`): no R001. Controls: a copy of `/usr/bin/true` in `/tmp` and
+    a file dropped in a `go-build` directory: R001 High. Two controls
+    ended with an error of the probe, not of the product: the `-exec`
+    wrapper was a copy of coreutils' `env`, a multicall binary that
+    refuses an unknown name on 26.04 (so it never ran the test binary:
+    one R001 High, for the wrapper), and the service account could not
+    read the files the probe copied from a home directory (so `go run`
+    found no module). Fixed in the probe (util-linux `setsid` as the
+    wrapper; files installed by root); their rerun waits for a free guest
+    slot and is not claimed here.
 - **Lot 370 — the pre-alpha's Phase 10 (final review) findings and two of
   a cross-model check (C17, C18; no level change).**
   - What was open: under `alpha` COMBAT's NEUTRALIZE signed

@@ -2487,7 +2487,7 @@ pub fn encrypts(exe: &Path, argv: &[String]) -> bool {
 /// audit EBPF-021: `wire::ARGV_LEN - 1`, the last argument kept may itself
 /// be cut). Since Go 1.21 `go` passes its linker
 /// `-X=runtime.godebugDefault=…`, every GODEBUG changed since the main
-/// module's `go` line — 524 bytes for a `go 1.18` module on Go 1.26, 339 on
+/// module's `go` line — 524 bytes for a `go 1.18` module on Go 1.26, 350 on
 /// Go 1.24 — so a link's argv passes the buffer and lot 369 noted no link.
 /// A cut argv is read only in the `go` command's own shape (`cmd/go`'s `ld`
 /// since Go 1.10: `link -o <target> -importcfg <file> …`): `-o` the first
@@ -2498,6 +2498,13 @@ pub fn encrypts(exe: &Path, argv: &[String]) -> bool {
 /// and the user's `-ldflags` after them: a second `-o` there is the user's
 /// own build flag, as a module of their own is their own code.
 pub fn go_link_output(argv: &[String], cut: bool) -> Option<&str> {
+    // The linker expands a response file (`@file`) among its arguments
+    // (`objabi.Flagparse`), and the file may hold another `-o`: `go` never
+    // mixes one with its own shape (a long command line is `link @file`
+    // alone, which names no output here), so any `@…` argument is refused.
+    if argv.iter().any(|a| a.starts_with('@')) {
+        return None;
+    }
     if cut {
         return go_link_output_cut(argv);
     }
