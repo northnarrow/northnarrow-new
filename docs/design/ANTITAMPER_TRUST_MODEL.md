@@ -385,7 +385,7 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   pinned (`link_role_exit`), so it outlives the agent that attached it —
   empties the slot when that process's main thread exits (lot 370: marked
   vacated, not never held). A second instance started beside the live one gets nothing. Lot 370 (F10-4): a role vacated this boot
-  is taken only by a successor started for it — a child of PID 1 (its unit's restart) or of the other role's live holder (the watchdog's respawn) — and its handle is recorded High
+  is taken only by a successor started for it — since lot 374 its own unit's restart: a child of PID 1 running in that unit's own cgroup under `northnarrow.slice`, with clean lot 277/281 marks (`nn_in_role_unit`, `caller_marks_clean`; before, a child of PID 1 or of the other role's live holder) — and its handle is recorded High
   (`BPF_CMD_VACATED_ROLE_GET_FD`) outside a signed trusted-installer
   window, Low inside one (the installer's restart); a first claim of the
   boot stays Low. The review of #578 (N2): the agent's successor takes its
@@ -394,7 +394,11 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   (never pinned) nobody reads once that agent is gone — so the successor
   records its succession at its start, from the same kernel facts read
   before it claims the role (`ROLE_TGIDS`, the previous session's window).
-  The watchdog's successor is recorded by the live agent's hook.
+  The watchdog's successor is recorded by the live agent's hook. Lot 374:
+  the surviving role signs the vacancy and the successor itself — the
+  watchdog in a witness chain of its own (an in-memory key the agent
+  certifies; `EVIDENCE_CHAINS.md`), the agent for the watchdog — and the
+  units unset the loader's variables, a start refusing one it finds.
 - **Scope:** write handles on the agent's maps only (never a link handle), for a process that has only just started. `ptrace_access_check` refuses access to
   a process running either binary before it registers, so a fresh successor
   cannot be injected into.
@@ -414,10 +418,10 @@ While a role is vacant (at boot before the watchdog registers, or after it ends)
 `oom_score_adj` -999, the host OOM killer's last pick (its SIGKILL, which
 no hook refuses, made the gap a moment root could choose; their own memory cap still ends a leak with a kill and a restart);
 after a holder's exit the
-successor must be started for the role, and a successor that PID 1 starts
-is not told from the unit's own restart: it is recorded (High outside a
-signed window), not refused. A successor that is not the genuine agent
-reads the agent's own ring: its record rests on it. The same holds for a program that takes on the role's binary identity. Lot 344, the review of #554:
+successor must be its unit's own restart (lot 374), and the vacancy and the
+successor are signed by the surviving role, so their record no longer rests
+on the successor; while both roles are gone, the next agent start signs the
+gap it finds. The same holds for a program that takes on the role's binary identity. Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
 its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),
