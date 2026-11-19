@@ -391,30 +391,62 @@ not cause as an incident.
   last, and their own memory cap still ends a leak with a kill and a
   restart. On a host with less memory than the agent's cap (11 GiB) the cap
   cannot bind: a leaking agent outlives every other process, the
-  workload and `sshd` included, which the OOM killer picks first. Root can
-  still make the agent the OOM killer's pick (every other process at
-  -1000): what holds then is the record of its successor below.
-  The successor that takes the role of an agent or watchdog that ended
-  this boot is recorded by NN-L-BPF-002: High when no signed
-  trusted-installer window was open (the OOM killer, a crash, a kill
-  nothing refused), Low inside one (the installer's restart). The
-  watchdog's successor is recorded by the live agent's kernel hook; the
-  agent's own successor records it at its start, from the kernel's facts
-  (the role left by its holder, the window), since the hook of the agent
-  that ended writes to a ring nobody reads any more. That record is the
-  successor's own: a successor root starts with code in its environment (a
-  unit drop-in, `systemd-run --setenv=LD_PRELOAD=…`) writes it or not, and
-  a root-started instance that takes the vacated role first leaves the
-  genuine successor refused. Only a process started
-  for the role (by PID 1 or by the other role's holder, with no code
-  injected) gets the agent's maps in that moment; one PID 1 starts is not
-  told from the unit's own restart, and is recorded, not refused.
+  workload and `sshd` included, which the OOM killer picks first. A kill
+  nothing can refuse can still end the agent or the watchdog, and its role
+  stays vacated until a successor takes it. What is recorded then, and by
+  whom (lot 374):
+  - The agent's vacancy and its successor are signed by the watchdog, the
+    surviving role, in a witness chain of its own: the vacancy with its
+    cause as systemd records it (the OOM killer, a signal, an exit status;
+    "not known" when systemd has not recorded it within 3 s), then the
+    process that took the role — its parent, its cgroup, and whether its
+    environment or its executable mappings hold anything the release does
+    not start with. The watchdog's key lives in its memory for its life;
+    the agent certifies its public half from the watchdog's own descriptor
+    table and imports every row it can verify into its signed audit chain
+    (`witness_row`). A row changed or removed, or signed by a key the agent
+    never certified, is recorded as such (`witness_chain_broken`,
+    `witness_row_uncertified`).
+  - The watchdog's vacancy and its successor are signed by the live agent
+    (`watchdog_gone`, then `watchdog_succession` or
+    `watchdog_successor_refused`).
+  - When both roles were vacated, the next agent start signs the gap it
+    finds (`roles_vacated_gap`).
+  - The taking itself is NN-L-BPF-002: High when no signed
+    trusted-installer window was open, Low inside one (the installer's
+    restart).
+  Only the restart systemd makes of the role's own unit takes a vacated
+  role: a child of PID 1 in that unit's own cgroup, with clean lot 277/281
+  marks, in or out of a window. A process started anywhere else, a
+  transient unit included, gets neither the agent's maps nor the other
+  role's registration, and is recorded. The units unset the dynamic
+  loader's and the C library's variables, whatever the service manager's
+  environment holds, and a start that finds one, or an executable mapping
+  of a library the release does not link, refuses itself before it takes
+  its role, signed (`start_self_check`, `watchdog_start_refused`). What
+  remains: while the watchdog is gone too, or runs without its witness
+  (`witness_unavailable`, High), the agent's vacancy is recorded by its
+  successor's own start (`previous_run`, the succession record) and by the
+  gap the next start finds; on a host without systemd (the watchdog's
+  `exec` respawn backend) a vacated role is not taken again until the next
+  boot; the agent judges a process that takes the watchdog's role at its
+  next round (every 30 s), while the kernel's guard refuses one outside
+  the unit at once.
   *Evidence:* `previous_run_none_abrupt_clean`;
   `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`;
   `a_role_taken_after_its_holder_exited_is_high`;
   `a_role_left_by_its_holder_is_high_outside_a_window_and_low_inside`;
-  `a_role_its_holder_left_outside_a_window_is_recorded_high`; internal
-  check Phase 3 §7.2.
+  `a_role_its_holder_left_outside_a_window_is_recorded_high`;
+  `the_witness_signs_the_vacancy_and_the_successor_in_one_chain`;
+  `witness_rows_are_imported_once_after_their_key_is_certified`;
+  `the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`;
+  `a_watchdog_successor_is_registered_only_as_its_unit_s_clean_restart`;
+  `only_the_unit_s_restart_with_nothing_foreign_is_given_the_role`;
+  `only_pid_1_in_the_unit_s_own_cgroup_is_its_restart`;
+  `both_roles_vacated_is_the_gap_and_nothing_else_is`;
+  `every_unit_unsets_every_loader_variable`;
+  `a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it`;
+  `a_preloaded_library_anywhere_is_foreign`; internal check Phase 3 §7.2.
 - **Weakening variables from the service manager's environment are
   ignored, not refused.** A variable that weakens the agent, set in the
   service manager's environment rather than in the agent's unit, is

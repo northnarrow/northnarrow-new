@@ -3301,6 +3301,10 @@ mod tests {
             (wh::REASON_SIGNED_RECORDS_FAILED, "signed_records_failed"),
             // lot 359 (the re-check 3 of #567, P3 e)
             (wh::REASON_PIN_HANDLE_FAILED, PIN_HANDLE_FAILED),
+            // lot 374: a watchdog start that refused itself, a watchdog
+            // without its witness — signed by the agent, the surviving role
+            (wh::REASON_START_SELF_CHECK, WATCHDOG_START_REFUSED),
+            (wh::REASON_WITNESS_UNAVAILABLE, WITNESS_UNAVAILABLE),
         ];
         let body = reasons
             .iter()
@@ -3322,6 +3326,16 @@ mod tests {
             f[4].detail.contains("tried to start the agent again"),
             "{}",
             f[4].detail
+        );
+        // lot 374: both High
+        for kind in [WATCHDOG_START_REFUSED, WITNESS_UNAVAILABLE] {
+            assert!(high_kind(kind), "{kind}");
+        }
+        let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();
+        assert!(
+            refused.detail.contains("refused itself before it took its role"),
+            "{}",
+            refused.detail
         );
     }
 

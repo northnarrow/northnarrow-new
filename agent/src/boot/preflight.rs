@@ -599,3 +599,47 @@ mod absent_field_effect_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::self_check_refusal;
+    use antitamper_bpf::start_check::{Findings, Foreign};
+
+    /// Lot 374: a start's own check refuses the start when it found
+    /// anything — a loader variable, a mapping not expected, or what it
+    /// could not read — naming it, never a value; nothing found, no refusal.
+    #[test]
+    fn a_start_that_finds_anything_of_its_own_refuses_itself() {
+        assert_eq!(self_check_refusal(&Findings::default()), None);
+        for (found, name) in [
+            (
+                Findings {
+                    loader_vars: vec!["LD_PRELOAD".into()],
+                    ..Findings::default()
+                },
+                "LD_PRELOAD",
+            ),
+            (
+                Findings {
+                    foreign: vec![Foreign {
+                        path: "/tmp/x.so".into(),
+                        why: "not in a system library directory",
+                    }],
+                    ..Findings::default()
+                },
+                "/tmp/x.so",
+            ),
+            (
+                Findings {
+                    unreadable: vec!["maps: denied".into()],
+                    ..Findings::default()
+                },
+                "maps: denied",
+            ),
+        ] {
+            let why = self_check_refusal(&found).expect("refused");
+            assert!(why.starts_with("the start's own check: "), "{why}");
+            assert!(why.contains(name), "{why}");
+        }
+    }
+}

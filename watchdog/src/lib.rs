@@ -3604,6 +3604,34 @@ pub fn event_loop_stalled_record(
 
 #[cfg(test)]
 mod tests {
+    /// Lot 374: a watchdog start that refused itself leaves a record for
+    /// the live agent to sign: its reason, the names it found (never a
+    /// value), and the agent it would have watched.
+    #[test]
+    fn a_start_that_refused_itself_is_recorded_for_the_agent_to_sign() {
+        use antitamper_bpf::start_check::{Findings, Foreign};
+        let found = Findings {
+            loader_vars: vec!["LD_PRELOAD".into()],
+            foreign: vec![Foreign {
+                path: "/tmp/x.so".into(),
+                why: "not in a system library directory",
+            }],
+            unreadable: vec![],
+        };
+        let r = start_refused_record(&found, 42, 1_800_000_000);
+        assert_eq!(r.reason, nn_proto::watchdog_hold::REASON_START_SELF_CHECK);
+        assert_eq!((r.agent_pid, r.at), (42, 1_800_000_000));
+        assert!(
+            r.detail.contains("refused its start before it took the watchdog's role")
+                && r.detail.contains("LD_PRELOAD")
+                && r.detail.contains("/tmp/x.so"),
+            "{}",
+            r.detail
+        );
+        assert_eq!(ExitReason::StartSelfCheck.code(), 16);
+        assert_eq!(ExitReason::StartSelfCheck.name(), "start_self_check");
+    }
+
     use super::*;
     use clap::Parser;
     use tempfile::TempDir;

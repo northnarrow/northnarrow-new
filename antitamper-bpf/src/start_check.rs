@@ -165,12 +165,16 @@ pub struct FileFacts {
     pub mode: u32,
 }
 
+/// How [`foreign_mappings`] names executable memory no file backs.
+pub const ANONYMOUS_CODE: &str = "[anonymous executable memory]";
+
 /// The executable file mappings of a `/proc/<pid>/maps` text that are
 /// neither the binary (`exe`: its path as `/proc/<pid>/exe` names it and
 /// its inode) nor an expected library: under [`LIB_DIRS`], its name in
 /// [`EXPECTED_LIBS`] (or a name-service module, [`Libs::Running`]), the file
 /// at that path ([`FileFacts`] by `facts`) the one mapped (its inode), root's
-/// and writable by nobody else. Anonymous and pseudo mappings (`[vdso]`,
+/// and writable by nobody else — and executable anonymous memory
+/// ([`ANONYMOUS_CODE`], lot 374). The kernel's pseudo mappings (`[vdso]`,
 /// `[stack]`, `anon_inode:…`) and the ones that cannot execute are not
 /// code of a file. One entry per path.
 pub fn foreign_mappings(
@@ -191,7 +195,24 @@ pub fn foreign_mappings(
         };
         let path = f.next().unwrap_or("").trim_start();
         let ino: u64 = ino.parse().unwrap_or(0);
-        if !perms.contains('x') || ino == 0 || !path.starts_with('/') {
+        if !perms.contains('x') {
+            continue;
+        }
+        // Executable memory no file backs: code copied there, then its
+        // file unmapped, would leave no path to judge. Neither a start nor
+        // our daemons make any (the kernel's own pages are named: `[vdso]`);
+        // a name a process gives its own (`[anon:…]`, `[anon_shmem:…]`,
+        // `PR_SET_VMA_ANON_NAME`) is still anonymous memory.
+        if ino == 0 && (path.is_empty() || path.starts_with("[anon")) {
+            if !out.iter().any(|o| o.path == ANONYMOUS_CODE) {
+                out.push(Foreign {
+                    path: ANONYMOUS_CODE.to_string(),
+                    why: "executable memory no file backs",
+                });
+            }
+            continue;
+        }
+        if ino == 0 || !path.starts_with('/') {
             continue;
         }
         if out.iter().any(|o| o.path == path) {
@@ -471,6 +492,22 @@ mod tests {
             assert_eq!(found.len(), 1, "{path}: {found:?}");
             assert_eq!(found[0].path, path);
         }
+    }
+
+    /// Lot 374: code copied into anonymous memory (its file unmapped
+    /// after) is foreign; the kernel's named pages are not.
+    #[test]
+    fn executable_memory_no_file_backs_is_foreign() {
+        let maps = genuine() + &line("r-xp", 0, "") + &line("rwxp", 0, "");
+        let f = foreign_mappings(&maps, EXE, Libs::Start, sys);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].path, ANONYMOUS_CODE);
+        let f = foreign_mappings(&maps, EXE, Libs::Running, sys);
+        assert_eq!(f.len(), 1, "{f:?}");
+        let named = genuine() + &line("r-xp", 0, "[anon:x]");
+        assert_eq!(foreign_mappings(&named, EXE, Libs::Start, sys)[0].path, ANONYMOUS_CODE);
+        let named = genuine() + &line("r-xp", 0, "[vsyscall]") + &line("rw-p", 0, "");
+        assert!(foreign_mappings(&named, EXE, Libs::Start, sys).is_empty());
     }
 
     #[test]
