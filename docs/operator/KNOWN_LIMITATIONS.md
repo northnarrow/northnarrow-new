@@ -755,6 +755,13 @@ lists the known false positives of each rule.
   `update`, `pin` or `detach`, or any other program's handle on the agent's
   objects; any other program beaconing to UDP 123.
 
+  Expect on the RPM family: `NN-L-FIM-025` High (Log, kept, not stripped)
+  at each install or upgrade of a package that ships a root-equivalent file
+  capability (`shadow-utils`' `newuidmap` with `cap_setuid`, `newgidmap`
+  with `cap_setgid`): a package transaction cannot vouch for such a grant.
+  A capability number the text spells with a leading `0` (octal), in hex or
+  with a sign is read as libcap reads it or not at all, and is then High.
+
   Residuals:
   - **A package's own files.** What says a file is a package's is a line of
     its dpkg `.list`, which the package's own maintainer script, run as root,
@@ -771,7 +778,11 @@ lists the known false positives of each rule.
     before an exec of it, through an inherited descriptor, is another
     writer's and stays High; but the binary run with a preloaded library
     (`LD_PRELOAD`) or with code injected by `ptrace` can rewrite a record in
-    place before its append, and `NN-L-FIM-019` does not see it.
+    place before its append, and `NN-L-FIM-019` does not see it. A process
+    can also take the same executable identity with
+    `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` (it needs `CAP_SYS_RESOURCE`, and
+    the call is itself observable): its writes then carry the packaged
+    image's device and inode, and the same residual applies.
   - **bpftool's environment.** The proof of a bpftool listing does not read
     the taker's environment: a packaged bpftool run by root with a preloaded
     library and a listing command line has its refused handles recorded Low

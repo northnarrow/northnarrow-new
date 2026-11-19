@@ -91,7 +91,21 @@ fn cap_name_mask(name: &str) -> Option<u64> {
     if lower == "all" {
         return Some(ALL_CAPS);
     }
-    if !lower.is_empty() && lower.bytes().all(|b| b.is_ascii_digit()) {
+    // The review of #580 (re-check 1, N1): libcap reads a number with
+    // `strtoul(.., 0)` — a leading `0` is octal (`023` is 19,
+    // `cap_sys_ptrace`), `0x` hex, a sign accepted. Only a plain decimal
+    // (no leading zero, digits only) is read; every other numeric form is
+    // ambiguous and stays unread, so High.
+    if lower
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_digit() || b == b'+' || b == b'-')
+    {
+        let plain =
+            lower == "0" || (!lower.starts_with('0') && lower.bytes().all(|b| b.is_ascii_digit()));
+        if !plain {
+            return None;
+        }
         let bit: u32 = lower.parse().ok()?;
         return (bit < 64).then(|| 1u64 << bit);
     }
@@ -151,6 +165,18 @@ mod tests {
             "cap_net_raw+ex",
             "cap_net_raw,+ep",
             "64+ep",
+            "023+ep",
+            "0023+ep",
+            "010+ep",
+            "036+ep",
+            "0x13+ep",
+            "0X7+ep",
+            "+7+ep",
+            "-7+ep",
+            "00+ep",
+            "99999999999+ep",
+            "18446744073709551616+ep",
+            "cap_net_raw,023+ep",
             "cap_net_raw+ep cap_bogus=p",
         ] {
             assert_eq!(caps_text_mask(unread), None, "{unread:?}");

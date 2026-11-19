@@ -4923,7 +4923,9 @@ still fires.
   - Residual: the packaged binary itself, run by root with a preloaded
     library (`LD_PRELOAD`) or with code injected by `ptrace`, can rewrite a
     record in place before its append; `NN-L-FIM-019` does not see that
-    (`KNOWN_LIMITATIONS.md`).
+    (`KNOWN_LIMITATIONS.md`). So can a process that took the same
+    executable identity with `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` (it
+    needs `CAP_SYS_RESOURCE`, and the call is itself observable).
   - A removed cgroup is found gone on a host whose hierarchy is deeper than
     five levels (a user manager's units, containers): the walk reads every
     level, and a directory it cannot read leaves the record High.

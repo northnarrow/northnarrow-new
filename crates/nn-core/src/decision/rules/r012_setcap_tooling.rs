@@ -845,6 +845,29 @@ mod tests {
         IdTestHost::set_file_id(&twin, None);
     }
 
+    /// The review of #580 (re-check 1, N1, named): libcap reads a capability
+    /// NUMBER with `strtoul(.., 0)`, so `023` is octal 19 (`cap_sys_ptrace`),
+    /// not decimal 23 (`cap_sys_nice`). A number that is not a plain decimal
+    /// is not read: High.
+    #[test]
+    fn a_postinst_setcap_with_an_octal_or_ambiguous_number_is_high() {
+        let f = PkgHost::new();
+        let helper = f.helper.clone();
+        for caps in [
+            "023+ep",
+            "0023+ep",
+            "010+ep",
+            "036+ep",
+            "0x13+ep",
+            "+23+ep",
+            "99+ep",
+            "18446744073709551616+ep",
+        ] {
+            let v = f.postinst(&[caps, &helper]);
+            assert_eq!(v.severity, Severity::High, "{caps}: {}", v.reasoning);
+        }
+    }
+
     /// Lot 373 (named, the lab of lot 373: `iputils-ping`'s postinst runs
     /// `setcap cap_net_raw+ep /bin/ping`, its `.list` names `/usr/bin/ping` —
     /// High on the PR's head): on a merged `/usr` the file a `.list` line

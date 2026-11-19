@@ -160,6 +160,9 @@ pub struct NnLBpf002BpfForeignHandleOrDetach<H: PostureHost> {
     /// Lot 373: the listing processes recorded lately (pid, the record's
     /// time), so that one listing is one record ([`LISTING_DEDUP_NS`]).
     listings: parking_lot::Mutex<std::collections::VecDeque<(u32, u64)>>,
+    /// The review of #580 (re-check 1, N2): the kernel's lot 277/281 marks
+    /// of the listing process (production: `DecisionHost::actor_facts`).
+    facts: Arc<dyn crate::decision::rule_policy::ActorFacts>,
 }
 
 /// Lot 373: how long one process's proven bpftool listing stays one record
@@ -176,7 +179,23 @@ impl<H: PostureHost> NnLBpf002BpfForeignHandleOrDetach<H> {
         Self {
             allowlist,
             listings: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            facts: Arc::new(crate::decision::rule_policy::NoActorFacts),
         }
+    }
+
+    /// The marks the listing's Low reads.
+    pub fn with_facts(mut self, facts: Arc<dyn crate::decision::rule_policy::ActorFacts>) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// The review of #580 (re-check 1, N2): the listing process carries
+    /// clean marks — started where it runs, never moved into another
+    /// cgroup, no code-injection access (ptrace, `pidfd_getfd`, a write
+    /// handle on its memory) given to another. Not known: not clean.
+    fn listing_is_clean(&self, pid: u32) -> bool {
+        self.facts.started_in_cgroup(pid) == Some(true)
+            && self.facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
     }
 
     /// Lot 373: `pid`'s proven listing at `at_ns` is the first of that
@@ -275,6 +294,14 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
         // listing — root's, its image by device and inode, its command line
         // read whole (`BPF_CMD_LISTING_GET_FD`): one Low record per listing
         // process, no posture.
+        // N2: a listing whose process does not carry clean marks is no
+        // listing: the handle is judged as any foreign one (High below)
+        let dirty_listing = *cmd == BPF_CMD_LISTING_GET_FD && !self.listing_is_clean(*pid);
+        let cmd = &if dirty_listing {
+            BPF_CMD_FOREIGN_GET_FD
+        } else {
+            *cmd
+        };
         if *cmd == BPF_CMD_LISTING_GET_FD {
             let timestamp_ns = match event {
                 Event::BpfSyscall { timestamp_ns, .. } => *timestamp_ns,
@@ -344,10 +371,15 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
 }
 
 /// The two BPF rules, sharing the process comm allowlist.
-pub fn bpf_rules<H: PostureHost>(allowlist: Arc<CommAllowlist<H>>) -> Vec<Box<dyn Rule>> {
+pub fn bpf_rules<H: crate::decision::host::DecisionHost>(
+    allowlist: Arc<CommAllowlist<H>>,
+) -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(NnLBpf001BpfProgramLoaded::new(Arc::clone(&allowlist))),
-        Box::new(NnLBpf002BpfForeignHandleOrDetach::new(allowlist)),
+        Box::new(
+            NnLBpf002BpfForeignHandleOrDetach::new(allowlist)
+                .with_facts(H::actor_facts(std::path::Path::new(H::PROC_ROOT))),
+        ),
     ]
 }
 
@@ -382,6 +414,10 @@ mod tests {
     #[test]
     fn a_proven_bpftool_listing_is_one_low_record() {
         let (_, r) = rules();
+        let r = r.with_facts(Arc::new(MarkFacts {
+            started: Some(true),
+            injected: Some(Injected::No),
+        }));
         let at = |pid: u32, cmd: u32, ts: u64| Event::BpfSyscall {
             pid,
             uid: 0,
@@ -446,6 +482,89 @@ mod tests {
             listing(2_000 + LISTINGS_MAX as u32 - 1, 81 * S).is_none(),
             "still remembered"
         );
+    }
+
+    use crate::decision::rule_policy::Injected;
+
+    /// The lot 277/281 marks of every process, as a test sets them.
+    struct MarkFacts {
+        started: Option<bool>,
+        injected: Option<Injected>,
+    }
+
+    impl crate::decision::rule_policy::ActorFacts for MarkFacts {
+        fn uid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+        fn cgroup(&self, _pid: u32) -> Option<String> {
+            None
+        }
+        fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
+            None
+        }
+        fn started_in_cgroup(&self, _pid: u32) -> Option<bool> {
+            self.started
+        }
+        fn injected(&self, _pid: u32) -> Option<Injected> {
+            self.injected
+        }
+        fn unread(
+            &self,
+            _pid: u32,
+            _fact: crate::decision::rule_policy::ExemptionFact,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// The review of #580 (re-check 1, N2, named): a packaged bpftool
+    /// listing is Low only when its process carries clean lot 277/281
+    /// marks. Code-injection access given to it (ptrace, `pidfd_getfd`),
+    /// a move into another cgroup, or marks not known: High, and no
+    /// listing dedup is consumed.
+    #[test]
+    fn a_bpftool_listing_with_dirty_marks_is_no_low() {
+        let (_, r) = rules();
+        let listing = Event::BpfSyscall {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd: BPF_CMD_LISTING_GET_FD,
+            arg: 48,
+            timestamp_ns: 10,
+        };
+        let mut r = r;
+        for (started, injected, why) in [
+            (
+                Some(true),
+                Some(Injected::Yes {
+                    by: 77,
+                    inherited: false,
+                }),
+                "ptrace or pidfd_getfd",
+            ),
+            (
+                Some(true),
+                Some(Injected::Yes {
+                    by: 1,
+                    inherited: true,
+                }),
+                "inherited",
+            ),
+            (Some(false), Some(Injected::No), "moved into another cgroup"),
+            (Some(true), None, "injection not known"),
+            (None, Some(Injected::No), "start not known"),
+        ] {
+            r = r.with_facts(Arc::new(MarkFacts { started, injected }));
+            let v = r.evaluate(&listing).expect(why);
+            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+        }
+        assert!(r.listings.lock().is_empty(), "no dirty listing was deduped");
+        r = r.with_facts(Arc::new(MarkFacts {
+            started: Some(true),
+            injected: Some(Injected::No),
+        }));
+        assert_eq!(r.evaluate(&listing).unwrap().severity, Severity::Low);
     }
 
     fn rules() -> (NnLBpf001BpfProgramLoaded, NnLBpf002BpfForeignHandleOrDetach) {

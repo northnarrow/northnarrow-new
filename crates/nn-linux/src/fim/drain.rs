@@ -2963,8 +2963,10 @@ const UTMP_UNIT_GONE: &str = "a unit of the packaged systemd-update-utmp, its cg
 /// it removes before the read, or in the unit's (the writer has exited, so
 /// lot 277's mark of where it started is not read) — has its writes kept
 /// when the file grew by whole records; with a library preloaded into it
-/// (`LD_PRELOAD`) or code injected by `ptrace`, those writes can rewrite a
-/// record in place before the append, and NN-L-FIM-019 does not see it.
+/// (`LD_PRELOAD`), code injected by `ptrace`, or the image's identity taken
+/// with `prctl(PR_SET_MM_EXE_FILE)` (`CAP_SYS_RESOURCE`, observable), those
+/// writes can rewrite a record in place before the append, and NN-L-FIM-019
+/// does not see it.
 fn kernel_login_unit_writer(
     fe: &FimEvent,
     raw: &FimDriftRaw,
