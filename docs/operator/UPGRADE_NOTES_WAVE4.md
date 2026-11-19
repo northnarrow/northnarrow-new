@@ -4736,7 +4736,7 @@ left too little trace.
   leaking agent outlives every other process (the workload and `sshd`
   included), which the OOM killer picks first. A drop-in that sets a
   higher value is judged harmful. A role (the agent's, the watchdog's)
-  whose holder exited this boot is taken by a successor started for it (by PID 1 or by the other role's holder), and the taking is recorded NN-L-BPF-002: High outside a signed
+  whose holder exited this boot is taken by a successor started for it (by PID 1 or by the other role's holder; since lot 374, §61, only by its own unit's restart, witnessed by the surviving role), and the taking is recorded NN-L-BPF-002: High outside a signed
   trusted-installer window, Low inside one (an upgrade's restart); a first
   start of the boot stays Low. The review of #578 (N2): the agent's own
   successor's record was never delivered — its handles on the pins are
@@ -4975,3 +4975,87 @@ still fires.
     on the RPM family, `newuidmap`'s `cap_setuid` at each `shadow-utils`
     install or upgrade.
 
+## 61. The vacated role's successor is witnessed, bound to its unit and free of injected code (lot 374)
+
+A kill nothing can refuse (the OOM killer, a crash) ends the agent or the
+watchdog and leaves its role vacated until a successor takes it. Until
+this version the successor's record was the successor's own: written at
+its start, by the process that took the role. Now the role that survives
+signs it, the successor must be its unit's own restart, and a start that
+was given code before its `main` refuses itself.
+
+- **The watchdog's witness chain.** The watchdog makes an Ed25519 key at
+  its start and keeps it in its memory for its life; its public half is in
+  a sealed memory file of the watchdog's. It signs, in
+  `/var/lib/northnarrow/witness/witness.chain`:
+  - `role_vacated`: the agent exited — its pid, the cause as systemd
+    recorded it for that process (the OOM killer, a signal, an exit
+    status; "not known" past 3 s) and what the shutdown marker said;
+    `role_released` instead for a shutdown the admin quorum signed;
+  - `role_succeeded` (its unit's clean restart) or `role_successor_refused`
+    (anything else): the process that took the role — its pid, parent and
+    cgroup, and the loader variables and executable mappings not expected
+    that it shows (names only);
+  - `role_found_vacant`: a watchdog start that found the agent's role
+    already vacated; `witness_opened`: each watchdog life's first row.
+  The agent certifies the key from the watchdog's own descriptor table and
+  imports every row it can verify into its audit log every 30 s: a vacancy
+  or a successor that is not its unit's clean restart as `witness_row`
+  (`integrity_drift`, High); the key's certification, a life's first row, a
+  release and a clean restart as notes (op `witness`:
+  `witness_key_certified`, `witness_note`). A row changed or removed, a
+  chain cut, or a row signed by a key it never certified is High
+  (`witness_chain_broken`, `witness_row_uncertified`). A watchdog that
+  cannot open its witness records it, and the agent signs
+  `witness_unavailable` (High). See `EVIDENCE_CHAINS.md`.
+- **The watchdog's successor**, judged by the agent at its next round: its
+  unit's restart with clean marks and nothing foreign is registered and
+  signed as a note (`watchdog_succession`; the death itself is
+  `watchdog_gone`, as before); anything else is not registered
+  (`watchdog_successor_refused`, High). An agent start that
+  finds both roles vacated signs the gap (`roles_vacated_gap`).
+- **Bound to its unit.** The kernel gives a vacated role's rights (its
+  handles on the agent's maps) only to a child of PID 1 running in that
+  role's own unit cgroup under `northnarrow.slice`, with clean lot 277/281
+  marks — in or out of a trusted-installer window. A child of the other
+  role, a transient unit or a shell gets nothing. The watchdog gives its
+  defensive re-registration of a new agent, and the agent its registration
+  of a new watchdog, only to the same process. The kernel reads the cgroup
+  through three new BTF offsets (`task_struct.cgroups`,
+  `css_set.dfl_cgrp`, `cgroup.kn`; optional: without one, no vacated role
+  is taken again this boot).
+- **Nothing given before `main`.** The agent, watchdog and watchdog-failed
+  units unset the dynamic loader's and the C library's variables
+  (`UnsetEnvironment=`: `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`,
+  `GLIBC_TUNABLES`, `GCONV_PATH`, `LOCPATH`, the `MALLOC_` tunables and the
+  rest of glibc's list), applied last whatever the service manager's
+  environment or a drop-in sets; the transient unit the agent starts for
+  the pin lock does too. A drop-in that clears the list
+  (`UnsetEnvironment=` empty) is `unit_dropin_harmful`. Each start checks
+  its own environment and executable mappings before it takes its role:
+  a loader variable, a library the release does not link (the release
+  gate's list: glibc's libraries, its loader, `libgcc_s`) or executable
+  memory no file backs refuses it. The agent signs `start_self_check` in
+  its refusal chain and exits 78; the watchdog exits 16 and leaves a
+  record the agent signs (`watchdog_start_refused`, High).
+- **What remains.** While the watchdog is gone too, or runs without its
+  witness, the agent's vacancy is recorded by its successor's start
+  (`previous_run`, the succession record) and by the gap the next start
+  finds. On a host without systemd (the watchdog's `exec` backend) a
+  vacated role is not taken again until the next boot. The agent judges a
+  process that takes the watchdog's role at its next round (30 s); the
+  kernel's guard refuses one outside the unit at once.
+- **Upgrade.** No configuration. The units change (`UnsetEnvironment=`;
+  the watchdog's `ReadWritePaths=` adds `-/var/lib/northnarrow/witness`):
+  `install.sh --upgrade` installs them. The agent makes the witness
+  directory at its start, before the watchdog's. The kernel object and the
+  agent are one build (three BTF offset slots added).
+  - Expect one `witness_key_certified` and one `witness_note` (the first
+    row) per watchdog start, under the new audit op `witness`.
+  - Expect a `witness_row` (High) for each agent exit the watchdog sees
+    that is not a signed shutdown, then a `witness_note` for its unit's
+    restart; a `watchdog_succession` note after each watchdog restart.
+  - A unit drop-in or a manager environment that set a loader variable for
+    the agent or the watchdog no longer reaches them; one that a test
+    harness relied on (a `LD_LIBRARY_PATH` for a build's own libraries)
+    now refuses the start.

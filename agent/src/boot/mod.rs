@@ -179,6 +179,13 @@ pub fn main() -> Result<()> {
         }
     }
 
+    // Lot 374: the daemon's start checks itself first, before it maps
+    // anything of its own and before it takes its role: its environment
+    // (a loader variable) and its executable mappings (a file that is
+    // neither this binary nor a library the release links). What it finds
+    // refuses the start in the preflight, signed like every refused start.
+    let self_check = antitamper_bpf::start_check::check_self();
+
     // Lab PR 216 (static review C-43 / G-06): from here on the process is
     // the daemon, and it will hold its signing key — no core dump, no
     // `/proc/<agent>/mem` for a reader without CAP_SYS_PTRACE. Before the
@@ -217,7 +224,7 @@ pub fn main() -> Result<()> {
         .worker_threads(antitamper_bpf::kernel_roots::available_parallelism())
         .build()
         .context("building the tokio runtime")?;
-    let result = runtime.block_on(run(cli, undumpable, image, &stop));
+    let result = runtime.block_on(run(cli, undumpable, image, &stop, self_check));
     // Lot 288 (#125): the runtime's drop waits for every blocking task with
     // no bound — its shutdown gets what is left of the stop's budget.
     stop.stage("runtime");
@@ -237,6 +244,7 @@ async fn run(
     undumpable: std::io::Result<()>,
     image: std::io::Result<nn_linux::worker::SelfImage>,
     stop: &crate::stop_deadline::StopDeadline,
+    self_check: antitamper_bpf::start_check::Findings,
 ) -> Result<()> {
     // Wave 4 restructure, R11a (lab PR 261): the start in typed phases,
     // called in the order their code always ran. Each takes what the phases
@@ -271,7 +279,7 @@ async fn run(
         chain_targets,
         boot_chains,
         rollback_floor,
-    } = preflight::check(&cli)?;
+    } = preflight::check(&cli, &self_check)?;
     let state_ready = state::bootstrap(&cli, &heads_file, refused.is_some(), &signing_key);
     let identity::Identity {
         identity,

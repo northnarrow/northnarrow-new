@@ -137,6 +137,47 @@ the heads of the audit and actions chains. It is verified with the others
 (`sudo nn-admin chain verify --log heartbeat`) and read from another host
 by `nn-admin heartbeat watch` — `HEARTBEAT.md`.
 
+### The watchdog's witness chain (lot 374)
+
+`/var/lib/northnarrow/witness/witness.chain` is the watchdog's own record
+of the agent's role, so that the agent's vacancy and the process that took
+it are never recorded only by that process. One JSON row per line: `v`,
+`seq` (from 0), `prev` (the SHA-256, hex, of the line before it; empty for
+the first), `at`, the watchdog's `tgid`, its `key`, `kind`, `detail`,
+`sig`. The key is an Ed25519 key the watchdog makes at its start and keeps
+in its memory for its life; its public half is published in a sealed
+memory file of the watchdog's, never on disk.
+
+| Kind | Written when |
+|---|---|
+| `witness_opened` | a watchdog life's first row: its key, and the row it continues, or why the previous chain was set aside |
+| `role_vacated` | the agent exited: its pid, the cause as systemd recorded it for that process (the OOM killer, a signal, an exit status; "not known" past 3 s), what the shutdown marker said |
+| `role_released` | the agent stopped by a shutdown the admin quorum signed: no successor follows |
+| `role_succeeded` | the agent's unit's clean restart took the role: its pid, parent and cgroup, nothing foreign in its environment and executable mappings |
+| `role_successor_refused` | a process that is not that took the role (not given the watchdog's re-registration): its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
+| `role_found_vacant` | a watchdog start found the agent's role already vacated |
+
+- Every 30 s the agent certifies the verified watchdog's key, read from
+  the watchdog's own descriptor table — one `witness_key_certified` entry
+  per key, op `witness` — and imports the rows after the last one it
+  imported into the audit log: `role_vacated`, `role_found_vacant` and
+  `role_successor_refused` as `witness_row` (`integrity_drift`, High); the
+  others as `witness_note` (op `witness`); a row whose key it never
+  certified as `witness_row_uncertified` (High).
+  Its position is `witness.imported`, beside the chain. A row changed or
+  removed, a line that is not a row, or a chain that no longer holds the
+  last row imported is `witness_chain_broken` (High).
+- A chain that does not verify at a watchdog's start is kept as
+  `witness.chain.1` and a new one is opened; past 512 KiB too, its first row
+  naming the old one's last.
+- A watchdog that cannot open its witness records it, and the agent signs
+  `witness_unavailable` (High).
+- Each row is also an INFO line of the watchdog's journal (`witness row
+  signed`): `journalctl --namespace=northnarrow -u northnarrow-watchdog`.
+  To check a row by hand: `sig` is the Ed25519 signature, by `key`, of the
+  row's JSON with `sig` empty (the fields in the order above), and `key` is
+  the one a `witness_key_certified` entry of the audit log names.
+
 ## Exit codes of the verifiers
 
 Stable (scripts may rely on them; external audit MAIN-014, EVD-017, lab

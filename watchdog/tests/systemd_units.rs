@@ -337,6 +337,70 @@ fn both_units_set_a_path_without_usr_local() {
     }
 }
 
+/// Lot 374: every unit of ours unsets the loader's and the C library's
+/// variables — all of `start_check::LOADER_ENV`, nothing reset or cleared
+/// (an empty `UnsetEnvironment=` empties the list) — and sets none of them.
+#[test]
+fn every_unit_unsets_every_loader_variable() {
+    use antitamper_bpf::start_check::LOADER_ENV;
+    for name in [
+        "northnarrow-agent.service",
+        "northnarrow-watchdog.service",
+        "northnarrow-watchdog-failed.service",
+    ] {
+        let d = directives(&unit(name));
+        let lines: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "UnsetEnvironment")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert!(
+            lines.iter().all(|v| !v.is_empty()),
+            "{name}: an empty UnsetEnvironment= resets the list"
+        );
+        let mut unset: Vec<&str> = lines.iter().flat_map(|v| v.split_whitespace()).collect();
+        assert!(
+            unset.iter().all(|v| !v.contains('=')),
+            "{name}: a NAME=value entry unsets only that value: {unset:?}"
+        );
+        unset.sort_unstable();
+        unset.dedup();
+        let mut want: Vec<&str> = LOADER_ENV.to_vec();
+        want.sort_unstable();
+        assert_eq!(unset, want, "{name}: UnsetEnvironment= is not LOADER_ENV");
+        for (k, v) in &d {
+            if k == "Environment" || k == "PassEnvironment" {
+                for a in v.split_whitespace() {
+                    let var = a.trim_matches('"').split('=').next().unwrap_or("");
+                    assert!(!LOADER_ENV.contains(&var), "{name}: {k}={a}");
+                }
+            }
+        }
+    }
+}
+
+/// Lot 374: the watchdog writes its witness chain in the directory the
+/// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
+/// and nothing else of the agent's state; under `ProtectSystem=strict`
+/// a chain anywhere else would be read-only to it.
+#[test]
+fn the_watchdog_writes_its_witness_chain_and_nothing_else_of_the_state() {
+    let d = directives(&unit("northnarrow-watchdog.service"));
+    let rw: Vec<String> = d
+        .iter()
+        .filter(|(k, _)| k == "ReadWritePaths")
+        .flat_map(|(_, v)| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        rw,
+        [
+            "/run/northnarrow".to_string(),
+            format!("-{}", nn_proto::witness::WITNESS_DIR)
+        ]
+    );
+    assert_eq!(value(&d, "ProtectSystem"), Some("strict"));
+}
+
 // ── Lab PR 216 (capability C23): fail-visible supervision ──────────────
 
 const WATCHDOG: &str = "northnarrow-watchdog.service";

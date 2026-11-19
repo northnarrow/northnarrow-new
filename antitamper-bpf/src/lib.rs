@@ -94,6 +94,11 @@ pub mod kernel_roots;
 /// `nr_cpus` read it by path on every fresh thread).
 #[cfg(target_os = "linux")]
 pub mod per_cpu;
+/// Lot 374: a start's check of its own environment and mappings before it
+/// takes its role, and the same facts of the process that takes the other
+/// role, read by the surviving one.
+#[cfg(target_os = "linux")]
+pub mod start_check;
 /// systemd over its private socket, served by PID 1: what it reports the
 /// host and our units as, and its reload (external audit EBPF-001; lot
 /// 273c; lot 273d: here, so that the watchdog reads our units' properties
@@ -121,6 +126,8 @@ use aya::{
     Btf, Ebpf,
 };
 pub use common::wire::pid_role;
+/// Lot 374: `ROLE_TGIDS`' value for a role whose holder exited this boot.
+pub use common::wire::ROLE_VACATED;
 use tracing::{error, info, warn};
 
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
@@ -155,6 +162,24 @@ pub fn claim_role(bpffs_root: &Path, slot: u32, tgid: u32) -> Result<()> {
     arr.set(slot, tgid, 0)
         .with_context(|| format!("setting {ROLE_TGIDS_MAP_NAME}[{slot}] = {tgid}"))?;
     Ok(())
+}
+
+/// Lot 374: slot `slot` of the pinned `ROLE_TGIDS` (0: never held this
+/// boot, `common::wire::ROLE_VACATED`: its holder exited, else the
+/// holder's tgid). A read handle: the caller must be a protected pid while
+/// the guard enforces.
+pub fn role_slot(bpffs_root: &Path, slot: u32) -> Result<u32> {
+    let pin_path = bpffs_root.join(ROLE_TGIDS_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).with_context(|| {
+        format!(
+            "opening pinned {ROLE_TGIDS_MAP_NAME} at {}",
+            pin_path.display()
+        )
+    })?;
+    let arr: AyaArray<MapData, u32> = AyaArray::try_from(AyaMap::Array(map_data))
+        .with_context(|| format!("{ROLE_TGIDS_MAP_NAME} is not an Array<u32>"))?;
+    arr.get(&slot, 0)
+        .with_context(|| format!("reading {ROLE_TGIDS_MAP_NAME}[{slot}]"))
 }
 
 /// Lot 370 (F10-4): the `oom_score_adj` the agent and the watchdog hold —

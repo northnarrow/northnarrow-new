@@ -11700,6 +11700,27 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 374 — the vacated role's successor is witnessed, bound to its unit
+  and free of injected code (C23; no level change).**
+  - What was open (the pre-alpha re-check on rc9, R9-1): a role vacated by
+    a kill nothing can refuse was taken by a successor whose own start
+    wrote the only signed record of it; the successor's right asked for
+    PID 1 or the other role as its parent and no injection, not its unit;
+    and the units passed the service manager's loader variables on.
+  - Done:
+    - The watchdog's witness chain: its own in-memory key, certified by
+      the agent from the watchdog's descriptor table; the vacancy with
+      systemd's cause and the successor's identity and findings, imported
+      into the audit log; the agent signs the watchdog's successor; a
+      start signs both roles found vacated.
+    - The kernel's successor right bound to the role's unit cgroup (three
+      new optional BTF offsets) and clean lot 277/281 marks; the same rule
+      in the watchdog's and the agent's registrations of the other role.
+    - `UnsetEnvironment=` of the loader's and libc's variables in the three
+      units and the pin lock's transient unit; a start's own check of its
+      environment and executable mappings, refused and signed.
+    - Ratchets `xtask/tests/start_check.rs`, the units test.
+  - Lab (as measured): not run yet.
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

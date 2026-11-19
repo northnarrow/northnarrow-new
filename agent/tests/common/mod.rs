@@ -522,9 +522,8 @@ pub fn try_quit_agent(child: &mut Child, timeout: Duration) -> Result<(), String
 }
 
 /// [`try_quit_agent`], `also` evicted and signalled with the tree — lot 370
-/// (the re-check of #578): an agent started as a transient service
-/// (`Launch::Unit`) is PID 1's child, outside the tree of the
-/// `systemd-run` the test holds; its pid (from its pid file) is given here.
+/// (the re-check of #578): an agent outside the tree of the process the
+/// test holds (a transient service, PID 1's child) is given here by its pid.
 pub fn try_quit_agent_with(
     child: &mut Child,
     also: &[u32],

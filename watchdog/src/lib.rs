@@ -24,6 +24,9 @@
 //! 5. Wait for SIGTERM/SIGINT and exit — restart loop + layer-2
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
+/// Lot 374: the watchdog as the agent's witness (its own signed chain).
+pub mod witness;
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -131,6 +134,11 @@ pub struct Cli {
     #[arg(long = "shutdown-marker", value_name = "PATH", default_value = nn_proto::shutdown_marker::MARKER_PATH)]
     pub shutdown_marker: PathBuf,
 
+    /// Lot 374: the directory of the watchdog's witness chain (the agent
+    /// makes it in its state directory; [`witness`]).
+    #[arg(long = "witness-dir", value_name = "DIR", default_value = nn_proto::witness::WITNESS_DIR)]
+    pub witness_dir: PathBuf,
+
     /// The admin keys a shutdown must be signed by (external audit
     /// WDG-001: the watchdog verifies the quorum the agent verified).
     #[arg(long = "admin-pub", value_name = "PATH", default_value = DEFAULT_ADMIN_PUB)]
@@ -173,6 +181,7 @@ pub struct Cli {
 /// | 13 | the respawn backend could not be set up |
 /// | 14 | `READY=1` could not be sent to systemd |
 /// | 15 | the signal handlers could not be installed |
+/// | 16 | lot 374: the start refused itself (a loader variable, a mapped file not expected) |
 /// | 20 | the wait on the agent's pidfd failed |
 /// | 30 | `--record-unit-failure`: the record could not be written |
 ///
@@ -191,13 +200,14 @@ pub enum ExitReason {
     Backend,
     Notify,
     Signals,
+    StartSelfCheck,
     PidfdWait,
     RecordFailed,
 }
 
 impl ExitReason {
     /// Every reason, in the order of the table above.
-    pub const ALL: [ExitReason; 11] = [
+    pub const ALL: [ExitReason; 12] = [
         ExitReason::Stopped,
         ExitReason::Unclassified,
         ExitReason::Usage,
@@ -207,6 +217,7 @@ impl ExitReason {
         ExitReason::Backend,
         ExitReason::Notify,
         ExitReason::Signals,
+        ExitReason::StartSelfCheck,
         ExitReason::PidfdWait,
         ExitReason::RecordFailed,
     ];
@@ -223,6 +234,7 @@ impl ExitReason {
             ExitReason::Backend => 13,
             ExitReason::Notify => 14,
             ExitReason::Signals => 15,
+            ExitReason::StartSelfCheck => 16,
             ExitReason::PidfdWait => 20,
             ExitReason::RecordFailed => 30,
         }
@@ -240,6 +252,7 @@ impl ExitReason {
             ExitReason::Backend => "respawn_backend_failed",
             ExitReason::Notify => "sd_notify_failed",
             ExitReason::Signals => "signal_handlers_failed",
+            ExitReason::StartSelfCheck => "start_self_check",
             ExitReason::PidfdWait => "pidfd_wait_failed",
             ExitReason::RecordFailed => "record_failed",
         }
@@ -310,6 +323,27 @@ pub fn exit_record(failure: &Failure, at: u64) -> nn_proto::watchdog_hold::HoldR
             failure.reason.code(),
             failure.reason.name(),
             bounded(&format!("{:#}", failure.error), 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 374: the record of a start that refused itself
+/// ([`antitamper_bpf::start_check::check_self`]) — what it found, names
+/// only — for the live agent, the surviving role, to sign High.
+pub fn start_refused_record(
+    found: &antitamper_bpf::start_check::Findings,
+    agent_pid: u32,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_START_SELF_CHECK.to_string(),
+        detail: format!(
+            "pid {} refused its start before it took the watchdog's role: {}",
+            std::process::id(),
+            bounded(&found.describe(), 600)
         ),
         unit_state: None,
     }
@@ -3570,6 +3604,35 @@ pub fn event_loop_stalled_record(
 
 #[cfg(test)]
 mod tests {
+    /// Lot 374: a watchdog start that refused itself leaves a record for
+    /// the live agent to sign: its reason, the names it found (never a
+    /// value), and the agent it would have watched.
+    #[test]
+    fn a_start_that_refused_itself_is_recorded_for_the_agent_to_sign() {
+        use antitamper_bpf::start_check::{Findings, Foreign};
+        let found = Findings {
+            loader_vars: vec!["LD_PRELOAD".into()],
+            foreign: vec![Foreign {
+                path: "/tmp/x.so".into(),
+                why: "not in a system library directory",
+            }],
+            unreadable: vec![],
+        };
+        let r = start_refused_record(&found, 42, 1_800_000_000);
+        assert_eq!(r.reason, nn_proto::watchdog_hold::REASON_START_SELF_CHECK);
+        assert_eq!((r.agent_pid, r.at), (42, 1_800_000_000));
+        assert!(
+            r.detail
+                .contains("refused its start before it took the watchdog's role")
+                && r.detail.contains("LD_PRELOAD")
+                && r.detail.contains("/tmp/x.so"),
+            "{}",
+            r.detail
+        );
+        assert_eq!(ExitReason::StartSelfCheck.code(), 16);
+        assert_eq!(ExitReason::StartSelfCheck.name(), "start_self_check");
+    }
+
     use super::*;
     use clap::Parser;
     use tempfile::TempDir;
