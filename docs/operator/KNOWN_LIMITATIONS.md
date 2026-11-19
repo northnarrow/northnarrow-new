@@ -243,9 +243,7 @@ not cause as an incident.
   descends from it with no code injected. Root that runs the package
   manager on a package of its own is such a transaction, and a root
   process can keep a package transaction open, or start one, around writes
-  of its own (the package manager waiting at a prompt, or frozen by a
-  cgroup's freezer, still vouches): such a module is trusted and recorded
-  Low. Every load the kernel trusted is recorded, Low, with why it was
+  of its own): a module written by root inside a package transaction it controls is trusted, and recorded Low. Every load the kernel trusted is recorded, Low, with why it was
   trusted. The lock is read in the kernel
   at the write, however short the transaction. A transaction that took its
   lock while the agent's lock observer was not attached — before the
@@ -453,8 +451,7 @@ not cause as an incident.
   service manager's environment rather than in the agent's unit, is
   removed at the agent's start and signed as a degradation
   (`weakening_env_ignored`). The agent tells the two apart by asking the
-  service manager (`systemctl`, for at most 2 s each); when it cannot ask
-  (no `systemctl` it trusts, no answer in time) nothing is removed, and
+  service manager; when it cannot ask nothing is removed, and
   the variable is honoured and signed as `weakening_env`. One set in the
   unit (or a drop-in) is honoured and signed as `weakening_env`, as before.
   *Evidence:* `a_weakening_variable_from_the_service_manager_is_ignored`;
@@ -522,28 +519,18 @@ not cause as an incident.
   relative to the caller's working directory, which the record does not
   carry. Any other absolute name is also judged where the agent finds the
   file the loader maps, its symbolic links followed as the kernel follows
-  them (`/usr/tmp` is `../var/tmp` on the RHEL family): when the process is
-  gone before that read, or the agent's budget of waits for the mapping is
-  spent, such a name is judged by its text alone (`/usr/tmp/x` then draws
-  no record). A process that changes its own directory, descriptors or
-  mappings in that moment is judged by what the agent reads, or as the file
-  it then names. A loader that only lists or checks its program does not
+  them (`/usr/tmp` is `../var/tmp` on the RHEL family). A name the agent cannot place where the loader maps it is judged by its text; a staging directory reached only through a symbolic link may then draw no record (a residual, named). The agent judges the process as it reads it just after the exec. A loader that only lists or checks its program does not
   always run nothing: glibc's `--list`, `LD_TRACE_LOADED_OBJECTS` and `ldd`
   still load and run the libraries the program names for auditing
   (`DT_AUDIT`, `DT_DEPAUDIT`) — the program's own code when it names
   itself. A staged program (in `/tmp`, a memfd, a
   FUSE file and the like) listed so is never recorded Low (fix round 3,
-  R2-1): the file the agent reads is not always the file the loader maps —
-  code that has already run can make them differ four ways (a directory
-  swap onto the auditor, a write through a shared mapping that moves no
-  ctime on tmpfs or a dirty page, a relative link climbing out of the
-  directory, a segment layout whose pages overlap) — so one the agent read
+  R2-1): the file the agent reads is not always the file the loader maps
+  once code has run, so one the agent read
   naming an auditor is judged as run (the kill), and every other is
   recorded Medium, never killed, and its record does not say that nothing
   ran. `--verify` and musl's `ldd` run nothing (Low); musl's loader ignores
-  `LD_TRACE_LOADED_OBJECTS` and runs the program (judged as run). A program
-  rewritten in place in the instant between the agent's read and the
-  loader's is judged by what the agent read. A library `--audit` names
+  `LD_TRACE_LOADED_OBJECTS` and runs the program (judged as run). A library `--audit` names
   runs in every mode and is judged. *Evidence:*
   `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
   `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`;
@@ -566,10 +553,7 @@ not cause as an incident.
   root ran (dpkg, rpm, dnf, apt's lineage), while that package manager
   runs or just after, is recorded Low, not killed — killing a transaction
   would leave a half-installed package — and so is an account tool's change
-  to the users database inside one. Unlike a kernel module's, such a write
-  needs no lock held and is not checked for a stopped package manager: a
-  root process that keeps one waiting has its lineage's writes recorded
-  Low. `/etc/ld.so.preload`, root's `authorized_keys`, the bait files and
+  to the users database inside one. Unlike a kernel module's, such a write is not checked for a live transaction: a root process in a package manager's lineage has its writes of watched files recorded Low. `/etc/ld.so.preload`, root's `authorized_keys`, the bait files and
   the credential files keep their severity. *Evidence:*
   `package_manager_writes_are_logged_not_killed`;
   `account_tools_in_a_package_transaction_are_recorded_low`.
@@ -715,13 +699,9 @@ lists the known false positives of each rule.
     program already in the build cache runs from the cache itself, not
     from the work directory, and is judged as any exec from there (with
     the default `GOCACHE`, in the home, it is no staging exec at all).
-  - a CI runner account created with a login shell and a regular uid (the
-    default of GitLab's runner, for one) counts as a person: a malicious
-    module's `go test` binary run by it is recorded Low like a developer's.
+  - a CI runner account with a login shell and a regular uid counts as a person: its `go test` and `go run` are recorded Low, like a developer's.
     A service account with no login shell, and root, stay judged.
-  A person's own `-ldflags` naming a second `-o` past the bytes the sensor
-  keeps, or a build cache the user poisons with their own code, is the
-  user running their own code — Low by design, as a module of their own.
+  What a person's own build flags or build cache make `go` produce is the user running their own code — Low by design, as a module of their own.
   *Evidence:* lots 346, 369 and 372.
 - **npm installed with nvm or in a home directory.** It is not exempt:
   `npm ci` there can raise the posture to ENGAGED. *Evidence:* lot 346.
@@ -786,8 +766,7 @@ lists the known false positives of each rule.
   root (`cap_setuid`, `cap_sys_admin`, `cap_dac_override`, …), `=ep` — on
   `R012` and on `NN-L-FIM-025` (kept, not stripped); a bpftool `map dump`,
   `update`, `pin` or `detach`, or any other program's handle on the agent's
-  objects; any other program beaconing to UDP 123.
-
+  objects; any other program beaconing to UDP 123. chronyd and ntpd keep a netflow allowlist entry by identity: their flows are not judged as beacons, whatever the port (a residual, named). 
   Expect on the RPM family: `NN-L-FIM-025` High (Log, kept, not stripped)
   at each install or upgrade of a package that ships a root-equivalent file
   capability (`shadow-utils`' `newuidmap` with `cap_setuid`, `newgidmap`
@@ -805,25 +784,11 @@ lists the known false positives of each rule.
     (`gst-ptp-helper`'s, `dumpcap`'s): a malicious package's helper with it
     lets whoever runs it change the network's configuration, the host
     firewall included.
-  - **The packaged `systemd-update-utmp` itself.** Root that runs it (in a
-    cgroup it removes before the read, or in the unit's) has its writes to a
-    login record kept when the file grew by whole records. A rewrite made
+  - **The packaged `systemd-update-utmp` itself.** Root that runs the packaged binary has its appends of whole records kept. A rewrite made
     before an exec of it, through an inherited descriptor, is another
-    writer's and stays High; but the binary run with a preloaded library
-    (`LD_PRELOAD`) or with code injected by `ptrace` can rewrite a record in
-    place before its append, and `NN-L-FIM-019` does not see it. A process
-    can also take the same executable identity with
-    `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` (it needs `CAP_SYS_RESOURCE`, and
-    the call is itself observable): its writes then carry the packaged
-    image's device and inode, and the same residual applies.
+    writer's and stays High; but a rewrite in place made under the packaged binary's own identity, by code root placed in it, is not recorded by `NN-L-FIM-019` (a residual, named); the same holds for a process that takes on that identity.
   - **bpftool's environment.** The proof of a bpftool listing does not read
-    the taker's environment: a packaged bpftool run by root with a preloaded
-    library and a listing command line has its refused handles recorded Low
-    (`NN-L-AT-001`), and in observe mode its handles by id one Low record
-    (`NN-L-BPF-002`, whose record does not say whether a map, a program or a
-    link was asked for; a map's read-write handle included, as bpftool
-    takes one for a program's metadata). In enforce mode the refusal
-    stands, and every other operation (a detach, a dump's or an update's
+    the taker's environment: a listing by root that is proven the packaged bpftool's has its refused handles recorded Low (`NN-L-AT-001`), and in observe mode its handles by id one Low record (`NN-L-BPF-002`, which does not say which object was asked for); the proof does not cover everything such a process can do with them. In enforce mode the refusal stands, and every other operation (a detach, a dump's or an update's
     handle) keeps its own High record.
   - A bait created with no kernel record of its writer that holds the bait's
     own content is High, not Critical (no writer to act on).
@@ -901,12 +866,7 @@ kernel.
   and nothing is killed ([UPGRADE_NOTES_WAVE4.md](UPGRADE_NOTES_WAVE4.md)
   §41). *Evidence:* lot 347.
 - **Many container starts in one second.** The agent compares each copy
-  byte for byte within a budget (about seventeen runc 1.1 starts a second
-  for root). Past it, root's copy whose every other fact holds is recorded
-  High (`R004_ExecFromProcSelfFd`, "not compared (budget)"), never killed:
-  its bytes were not compared, and they may be any program's of that
-  length. The first one of each episode (no such skip for that uid in the
-  minute before) names the uid whose share ran out and the second's
+  byte for byte with a budget per user, and a share kept for root's container starts; normal starts stay well inside it. Past it, root's copy whose every other fact holds is recorded High (`R004_ExecFromProcSelfFd`, "not compared (budget)"), never killed: its bytes were not compared. The first one of each episode names the uid whose share ran out and the second's
   biggest spender, and the spending is signed (`runtime_copy_compare`).
   Another uid's copy past its own share stays the Critical kill.
   *Evidence:* `an_uncompared_runtime_copy_is_recorded_never_killed`;

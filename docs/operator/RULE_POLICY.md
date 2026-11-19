@@ -788,8 +788,7 @@ record, not a refusal, unless the policy enforces R018 — as root who runs
 the package manager on a package of its own making gets a trusted file
 (the package database is root's). Lot 370: a write is a package
 transaction's only when, at the write, its package manager was not
-stopped or traced (nor frozen by the system's freezer; a cgroup's freezer
-leaves it in an ordinary wait), the writer had no code injected, and that
+stopped or traced, the writer had no code injected, and that
 package manager held its lock (dpkg's, apt's front end, rpm's — read in
 the kernel at the write, however short the transaction); a root process
 that merely descends from a package manager (a pager it started) writes

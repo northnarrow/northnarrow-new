@@ -4704,9 +4704,7 @@ left too little trace.
   when any root process descending from a package manager wrote it — a
   stopped `apt`, a pager `dpkg -l` started — and the load left no R018
   record. The write is now a transaction's only when, at the write, the
-  package manager was not stopped or traced (nor frozen by the system's
-  freezer; one a cgroup's freezer holds is in an ordinary wait and still
-  vouches) and the writer had no code injected, and when that package
+  package manager was not stopped or traced and the writer had no code injected, and when that package
   manager held its lock (dpkg's,
   apt's front end, rpm's) at the write — read in the kernel by a new
   observer (`module_lock_observe` on `file_lock`, pinned in the pin root
@@ -4738,9 +4736,7 @@ left too little trace.
   leaking agent outlives every other process (the workload and `sshd`
   included), which the OOM killer picks first. A drop-in that sets a
   higher value is judged harmful. A role (the agent's, the watchdog's)
-  whose holder exited this boot is taken only by a successor started for
-  it — by PID 1 or by the other role's holder, with no code injected — and
-  the taking is recorded NN-L-BPF-002: High outside a signed
+  whose holder exited this boot is taken by a successor started for it (by PID 1 or by the other role's holder; since lot 374, §61, only by its own unit's restart, witnessed by the surviving role), and the taking is recorded NN-L-BPF-002: High outside a signed
   trusted-installer window, Low inside one (an upgrade's restart); a first
   start of the boot stays Low. The review of #578 (N2): the agent's own
   successor's record was never delivered — its handles on the pins are
@@ -4777,19 +4773,16 @@ left too little trace.
     runs the program and is judged as run. The re-check (R1-2): any other
     absolute operand is also judged where the pump finds the file the
     loader maps, through symbolic links (`/usr/tmp` → `/var/tmp`).
-    The pump's waits for the mapping (R1-3) are root's own 50 ms a
-    second and 25 ms for each other account, 50 ms for all of them
-    together (one budget for the host before).
+    The pump's waits for the mapping are per account, root's its own (one budget for the host before).
   - A variable that weakens the agent, set in the service manager's
     environment rather than in the agent's unit, is removed at the agent's
     start and signed (`weakening_env_ignored`) — when the agent can ask the
-    service manager (`systemctl`, 2 s); when it cannot, it is honoured and
+    service manager; when it cannot, it is honoured and
     signed `weakening_env`, as before.
   - R004's verdict on root's container runtime's sealed copy not compared
     (the compare budget spent, every other fact holding) stays High,
     recorded, never killed (the review of #578, N3: the lot's first head
-    made it the Critical kill, and a host starting more than ~17
-    containers a second would have had them killed under `enforcing`);
+    made it the Critical kill, and a burst of container starts would have had them killed under `enforcing`);
     the first of each episode of a spent budget names the uid whose share
     ran out and the second's biggest spender, and the budget spent is
     signed (`runtime_copy_compare`, naming the uid). Another uid's stays
@@ -4810,8 +4803,7 @@ Low, as §57 meant.
 - **The cause.** Since Go 1.21, `go` passes its linker
   `-X=runtime.godebugDefault=…`: every GODEBUG setting changed since the
   main module's `go` line. For a `go 1.18` module that is 524 bytes on Go
-  1.26 and 350 on Go 1.24, so the link command passes the 511 bytes of
-  arguments the exec sensor keeps and arrives cut (`argv_truncated`). §57's
+  1.26 and 350 on Go 1.24, so the link command is longer than the part the exec sensor keeps and arrives cut (`argv_truncated`). §57's
   identity read the linker's output only from a whole argument list, so it
   noted no link and the output was judged as any exec from `/tmp`. A
   module whose `go` line is the toolchain's own, or Go 1.20 and earlier,
@@ -4829,13 +4821,10 @@ Low, as §57 meant.
   and test binaries are not cached. A `GOCACHE` under `/tmp` or
   `/var/tmp` makes such a run an exec from there, judged as before.
 - **Still judged.** A second `-o` among the arguments kept, the target cut,
-  `-o` not first, a link run by a shell or forked by a `-toolexec` program (one that `exec`s the real linker in place leaves `go` as its parent and is noted), a `go`
+  `-o` not first, a link run by a shell or forked by a `-toolexec` program, a `go`
   a `GOTOOLCHAIN` switch downloaded into the module cache (its linker is not
   in a root-only system tree), a file dropped in a `go-build` directory,
-  `-exec` wrappers, and root's and a service account's build output. What
-  the cut hides is `go`'s own later flags and the user's `-ldflags`: a
-  second `-o` there is the user's own build flag, Low by design as the
-  user's own code (`KNOWN_LIMITATIONS.md`).
+  `-exec` wrappers, and root's and a service account's build output. What the cut hides is the user's own build flags: what they produce is the user's own code, Low by design (`KNOWN_LIMITATIONS.md`).
 - **Upgrade.** No configuration. Expect fewer R001/R003 High records from
   developers' `go test` and `go run` on Debian 13 and Ubuntu 26.04 (Go 1.24
   and later), and wherever a module's `go` line is far older than the
@@ -4896,7 +4885,7 @@ still fires.
     the program's metadata (`NN-L-BPF-002`, High ×100 for one `bpftool prog
     show` in the lot's lab, at every boot). The same proof, at the bus's
     barrier, now marks such a handle by id a listing: one `NN-L-BPF-002`
-    Low record per bpftool process (a minute), no posture. A handle or a
+    Low record per bpftool process, no posture. A handle or a
     write handle not proven (ctypes, a copy, a dump, an update) and a
     detach stay High.
 - **`NN-L-FIM-005` (rsyslogd) and `NN-L-FIM-019` (`systemd-update-utmp`) at
@@ -4920,12 +4909,7 @@ still fires.
     same process before it executed the packaged binary (through a
     descriptor the binary inherits), a truncation, and `sudo logrotate -f`
     (by design, lot 340).
-  - Residual: the packaged binary itself, run by root with a preloaded
-    library (`LD_PRELOAD`) or with code injected by `ptrace`, can rewrite a
-    record in place before its append; `NN-L-FIM-019` does not see that
-    (`KNOWN_LIMITATIONS.md`). So can a process that took the same
-    executable identity with `prctl(PR_SET_MM, PR_SET_MM_EXE_FILE)` (it
-    needs `CAP_SYS_RESOURCE`, and the call is itself observable).
+  - Residual: a rewrite in place under the packaged binary's identity, by code root placed in it, is not seen by `NN-L-FIM-019` (`KNOWN_LIMITATIONS.md`).
   - A removed cgroup is found gone on a host whose hierarchy is deeper than
     five levels (a user manager's units, containers): the walk reads every
     level, and a directory it cannot read leaves the record High.
@@ -4969,13 +4953,7 @@ still fires.
   `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
   `openntpd.service`), started there and never injected (the kernel's lot
   277 and 281 marks).
-  - Still a beacon: python or any other program to UDP 123, the daemon to
-    another port or over TCP, the daemon's image run as another user, from
-    a session (`setpriv --reuid=systemd-timesync …`), moved into the unit's
-    cgroup, traced or injected, or with a mark not known.
-  - The netflow comm allowlist's `chronyd` and `ntpd` entries are as before
-    (by exec identity, any port).
-- **`R011` High, intermittent, on Debian 12.** This was a race. A
+  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named). - **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
   the exec's own `/proc` entry, which was gone, so lot 348's exemption fell

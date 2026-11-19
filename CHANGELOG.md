@@ -135,8 +135,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **A cut link argv names its output in `go`'s own shape.** Since Go 1.21
     `go` passes its linker `-X=runtime.godebugDefault=…`, every GODEBUG
     changed since the main module's `go` line (524 bytes for a `go 1.18`
-    module on Go 1.26, 350 on Go 1.24), so the link's argv passes the
-    sensor's 511 bytes and came cut; lot 369 read the output of a whole
+    module on Go 1.26, 350 on Go 1.24), so the link's argv is longer than the sensor keeps and came cut; lot 369 read the output of a whole
     argv only, noted no link, and the test binary and the program were
     R001 High (a would-have kill in ENGAGED). A cut argv now names the
     output only in the `go` command's own shape (`link -o <target>
@@ -179,7 +178,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **The module judge trusts a live package transaction only.** A module
     file written since boot is trusted when its write came from a package
     manager's lineage whose package manager was not stopped or traced at
-    the write (nor frozen by the system's freezer), the writer free of
+    the write, the writer free of
     injected code, and that
     package manager held its lock at the write (dpkg's, apt's front end,
     rpm's) — read in the kernel at the write: a new observer
@@ -200,7 +199,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `the_ebpf_history_step_is_the_option_step_in_plain_values`,
     `verifier_headroom::the_module_write_history_steps_in_plain_values`,
     `a_trusted_load_is_recorded_low_with_why`.
-  - **The agent's role is no longer vacated on demand in silence.** The
+  - **The agent's role vacated this boot is recorded (since lot 374 by the
+    surviving role; see `KNOWN_LIMITATIONS.md`).** The
     agent and the watchdog run with `OOMScoreAdjust=-999` — the host OOM
     killer's last pick, still ended by their own memory cap — written again
     by each at its start (the self-integrity check expects it on every host;
