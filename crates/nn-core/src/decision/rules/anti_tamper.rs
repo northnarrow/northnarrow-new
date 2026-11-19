@@ -305,6 +305,32 @@ impl Rule for NnLAt001AntiTamperDenial {
                     &reasoning,
                 ));
             }
+            // Lot 373: the packaged bpftool, run by root, listing or
+            // showing objects (proven at the bus): refused all the same, Low.
+            FsProtectOperation::BpfHandle
+                if common::bpf_prog_class::bpf_listing_kind(*target_dev).is_some() =>
+            {
+                let object = match common::bpf_prog_class::bpf_listing_kind(*target_dev) {
+                    Some(1) => format!("map id {target_ino}"),
+                    _ => format!("program id {target_ino}"),
+                };
+                let reasoning = format!(
+                    "A handle on the agent's own BPF {object}, refused: `{comm}` (pid {pid}) is \
+                     the packaged bpftool run by root (its device and inode, read by the agent \
+                     at the record) listing or showing objects (`prog show`, `map list`, \
+                     `cgroup tree`), which takes a handle by id on each only to read its \
+                     information. The refusal stands (the agent's objects are not listed); \
+                     recorded Low, and raises no posture (lot 373). A dump, an update, a pin, a \
+                     detach or any other program's handle stays High."
+                );
+                return Some(build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Low,
+                    &reasoning,
+                ));
+            }
             // Lot 290: foreign BPF.
             FsProtectOperation::BpfHandle => {
                 let object = match *target_dev {
@@ -2366,6 +2392,35 @@ mod tests {
             "{}",
             h.reasoning
         );
+        // lot 373: the packaged bpftool's listing, proven (the mark): Low,
+        // still refused; a mark on a kind it never carries keeps High
+        use common::bpf_prog_class::BPF_LISTING_BIT;
+        for (kind, object) in [(1, "map id 31"), (2, "program id 31")] {
+            let l = v(ev(
+                FsProtectOperation::BpfHandle,
+                "bpftool",
+                kind | BPF_LISTING_BIT,
+                31,
+            ));
+            assert_eq!(
+                (l.severity, l.action.clone()),
+                (Severity::Low, ResponseAction::Log),
+                "{}",
+                l.reasoning
+            );
+            assert!(
+                l.reasoning.contains(object) && l.reasoning.contains("refusal stands"),
+                "{}",
+                l.reasoning
+            );
+        }
+        let h = v(ev(
+            FsProtectOperation::BpfHandle,
+            "bpftool",
+            BPF_LISTING_BIT,
+            0,
+        ));
+        assert_eq!(h.severity, Severity::High);
         let t = v(ev(FsProtectOperation::BpfProgType, "bpftrace", 0, 2));
         assert_eq!(t.severity, Severity::High);
         assert!(

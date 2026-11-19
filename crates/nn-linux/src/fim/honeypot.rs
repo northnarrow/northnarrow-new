@@ -88,6 +88,23 @@ pub struct HoneypotIntegrityReport {
     /// FIFO, a directory. Each was removed and re-created, so it is also
     /// in `recreated` (or `failed`).
     pub replaced: Vec<String>,
+    /// Lot 373 (the rc7 soak's NN-L-FIM-024 at every boot): what the sweep
+    /// wrote for each path in `recreated` — the file it made and the bytes
+    /// it put in it — handed to the FIM drain before the file is watched
+    /// (`FimWatch::watch_own_creation`): the agent's own creation of its
+    /// own runtime files is no creation by an unknown writer.
+    pub written: Vec<BaitWrite>,
+}
+
+/// Lot 373: one bait the sweep created — its path, the file it made (its
+/// device in `stat(2)`'s form and its inode, read from the descriptor it
+/// wrote through) and the SHA-256 (hex) of the bytes it wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaitWrite {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+    pub sha256: String,
 }
 
 impl HoneypotIntegrityReport {
@@ -128,6 +145,7 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
     let mut recreated = Vec::new();
     let mut failed = Vec::new();
     let mut replaced = Vec::new();
+    let mut written = Vec::new();
     for (path, content) in items {
         total += 1;
         let p = Path::new(path);
@@ -160,7 +178,10 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
             }
         }
         match create_bait(p, content) {
-            Ok(()) => recreated.push(path.to_string()),
+            Ok(write) => {
+                recreated.push(path.to_string());
+                written.push(write);
+            }
             Err(_) => failed.push(path.to_string()),
         }
     }
@@ -170,6 +191,7 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
         recreated,
         failed,
         replaced,
+        written,
     }
 }
 
@@ -177,7 +199,7 @@ fn restore_paths<'a>(items: impl Iterator<Item = (&'a str, &'a str)>) -> Honeypo
 /// appeared since the check — with `template` ([`render_bait`] at the time
 /// of the write, which is also its mtime) and [`BAIT_MODE`]. A missing
 /// parent is created at [`BAIT_DIR_MODE`]; an existing one keeps its mode.
-fn create_bait(path: &Path, template: &str) -> io::Result<()> {
+fn create_bait(path: &Path, template: &str) -> io::Result<BaitWrite> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty()
             && antitamper_bpf::kernel_roots::symlink_metadata(parent).is_err()
@@ -195,11 +217,23 @@ fn create_bait(path: &Path, template: &str) -> io::Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
     let at = write_time();
-    f.write_all(render_bait(template, at).as_bytes())?;
+    let bytes = render_bait(template, at);
+    f.write_all(bytes.as_bytes())?;
     // External audit FIMR-016: the date the file gives is its mtime.
     f.set_modified(at)?;
     // The umask may have narrowed the mode at creation.
-    f.set_permissions(fs::Permissions::from_mode(BAIT_MODE))
+    f.set_permissions(fs::Permissions::from_mode(BAIT_MODE))?;
+    // lot 373: the file this descriptor made, and what was written to it
+    let made = f.metadata()?;
+    Ok(BaitWrite {
+        path: path.to_string_lossy().into_owned(),
+        dev: std::os::unix::fs::MetadataExt::dev(&made),
+        ino: std::os::unix::fs::MetadataExt::ino(&made),
+        sha256: {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(bytes.as_bytes()))
+        },
+    })
 }
 
 /// External audit FIMR-008: the file in the state directory holding the
@@ -407,6 +441,7 @@ mod tests {
             recreated: recreated.iter().map(|s| s.to_string()).collect(),
             failed: Vec::new(),
             replaced: Vec::new(),
+            written: Vec::new(),
         };
         let volatile = rep(&[
             "/run/northnarrow/pause.flag",
@@ -418,6 +453,30 @@ mod tests {
             "same boot: deleted"
         );
         assert!(!rep(&["/etc/northnarrow/kill_switch.conf"]).only_volatile_after_reboot(true));
+    }
+
+    /// Lot 373: the sweep reports what it wrote — the file it made (its
+    /// device and inode) and the hash of its bytes — for each re-created
+    /// bait, so the drain can tell the agent's own creation from another.
+    #[test]
+    fn the_sweep_reports_the_file_it_made_and_its_bytes() {
+        use sha2::Digest;
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pp = dir.path().join("run/northnarrow/pause.flag");
+        let ps = pp.to_str().unwrap();
+        let rep =
+            restore_paths([(ps, bait_content("/run/northnarrow/pause.flag").unwrap())].into_iter());
+        assert_eq!(rep.written.len(), 1);
+        let w = &rep.written[0];
+        let m = fs::metadata(&pp).unwrap();
+        assert_eq!((w.path.as_str(), w.dev, w.ino), (ps, m.dev(), m.ino()));
+        let bytes = fs::read(&pp).unwrap();
+        assert_eq!(w.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+        // a bait present is not written
+        let again =
+            restore_paths([(ps, bait_content("/run/northnarrow/pause.flag").unwrap())].into_iter());
+        assert!(again.written.is_empty());
     }
 
     #[test]

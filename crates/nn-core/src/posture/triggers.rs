@@ -843,8 +843,13 @@ impl<H: DecisionHost> TriggerDetector<H> {
             // Lot 340: nor a known system program's feature probe, its
             // loader proven (the user manager's, networkd's): refused and
             // signed Low — every boot of Ubuntu 26.04 raised ENGAGED with it.
-            let known_probe = *operation == nn_model::FsProtectOperation::BpfProgType
-                && common::bpf_prog_class::known_probe_of(*target_dev, *target_ino).is_some();
+            let known_probe = (*operation == nn_model::FsProtectOperation::BpfProgType
+                && common::bpf_prog_class::known_probe_of(*target_dev, *target_ino).is_some())
+                // lot 373: nor the packaged bpftool's listing, proven: refused
+                // and signed Low (the bench's `bpftool prog show` raised
+                // ENGAGED at every boot)
+                || (*operation == nn_model::FsProtectOperation::BpfHandle
+                    && common::bpf_prog_class::bpf_listing_kind(*target_dev).is_some());
             // Lot 280a: nor a write the signed per-sysctl opt-out let
             // through (`SysctlOptOut`): recorded, the operator's tuning.
             // Lot 280b: nor what the kernel-state round found (a new
@@ -968,7 +973,9 @@ impl<H: DecisionHost> TriggerDetector<H> {
         // write and so no denial reaches the posture either, it is not
         // raised; the rule still kills and records.
         if let Event::Fim(fe) = event {
-            if crate::fim::rules::is_bait_tamper(fe)
+            // lot 373: not a bait created with no record of its writer
+            // that holds its own content (High, "writer unknown")
+            if crate::fim::rules::is_decisive_bait_tamper(fe)
                 && fe.modifier_pid != std::process::id()
                 && !self.installer_window.is_open()
             {
@@ -5024,6 +5031,38 @@ mod tests {
             (0, PROG_TYPE_TRACEPOINT),
         ] {
             let hits = det.detect(&refused(4242, dev, ty), &[]);
+            assert!(
+                hits.contains(&TriggerType::DefenseImpairment),
+                "{dev:#x}: {hits:?}"
+            );
+        }
+    }
+
+    /// Named test (lot 373, the rc7 soak): the bench's `sudo bpftool prog
+    /// show` raised DefenseImpairment (ENGAGED) at every boot. A refused
+    /// handle the agent proved the packaged bpftool's listing raises
+    /// nothing; the kernel's own record of the same refusal (any other
+    /// taker: python's ctypes, a copy, a dump) still raises it, and so does
+    /// a handle under the pin directories (kind 0, never marked).
+    #[test]
+    fn a_proven_bpftool_listing_raises_no_posture() {
+        use common::bpf_prog_class::BPF_LISTING_BIT;
+        let refused = |dev: u64, ino: u64| Event::FsProtectDenial {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: nn_model::FsProtectOperation::BpfHandle,
+            timestamp_ns: 10,
+        };
+        let det = detector_with_empty_proc();
+        for kind in [1, 2] {
+            let hits = det.detect(&refused(kind | BPF_LISTING_BIT, 48), &[]);
+            assert!(hits.is_empty(), "{hits:?}");
+        }
+        for dev in [1, 2, 0, BPF_LISTING_BIT, 3 | BPF_LISTING_BIT] {
+            let hits = det.detect(&refused(dev, 48), &[]);
             assert!(
                 hits.contains(&TriggerType::DefenseImpairment),
                 "{dev:#x}: {hits:?}"

@@ -453,8 +453,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           controller's own scheduling check of the agent, when a \
                           `cgroup.subtree_control` write enables it above the agent's unit \
                           (systemd, runc and containerd-shim at a container start), is no \
-                          longer refused or recorded — the writing thread's check only. The \
+                          longer refused or recorded — the writing thread's check only. Lot \
+                          373: the packaged bpftool run by root listing or showing programs or \
+                          maps (`prog show`, `map list`, `cgroup tree`) takes a handle by id on \
+                          each of the agent's — refused, recorded Low, no posture. The \
                           kernel refused the action either way; the record is Log only.",
+
         how_to_test: "`kill -9` the agent from a root shell (anti-tamper.sh case C01) or read \
                       /proc/<agent>/mem (case C03): the record names the refused operation \
                       (deny=signal, deny=ptrace).",

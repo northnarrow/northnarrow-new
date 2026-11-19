@@ -185,6 +185,8 @@ pub mod fim {
     pub mod rules;
     /// Lot 347: a login record's packaged writer, as the drain read it.
     pub mod unit_writers;
+    /// Lot 373: a creation no kernel record reported, judged on its content.
+    pub mod unknown_writer;
 }
 
 // The COMBAT ladder (R08c, lab PR 252; was the agent's `combat`): the

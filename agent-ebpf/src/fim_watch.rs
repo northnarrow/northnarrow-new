@@ -213,6 +213,15 @@ pub struct DirtyMeta {
     pub fork_parent_start: u64,
     /// The writer's start ([`crate::fork_parent::current_start`]).
     pub start: u64,
+    /// Lot 373: the writer's executable at its write (`mm->exe_file`: the
+    /// device in the kernel's form, the inode; 0 for none read) and its
+    /// cgroup v2 id — carried in the record at close
+    /// ([`FimDriftRaw::writer_exe_dev`] and kin): the writer of a host's
+    /// shutdown (rsyslogd's last flush, `systemd-update-utmp`'s record) has
+    /// exited by the time its record is judged.
+    pub exe_dev: u64,
+    pub exe_ino: u64,
+    pub cgroup: u64,
 }
 
 /// `O_APPEND` in `file->f_flags` (uapi, every architecture the agent runs
@@ -510,6 +519,10 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
         (*raw_ptr).fork_start = meta.fork_start;
         (*raw_ptr).fork_pppid = meta.fork_pppid;
         (*raw_ptr).fork_parent_start = meta.fork_parent_start;
+        // lot 373: the writer's image and cgroup at its write
+        (*raw_ptr).writer_exe_dev = meta.exe_dev;
+        (*raw_ptr).writer_exe_ino = meta.exe_ino;
+        (*raw_ptr).writer_cgroup = meta.cgroup;
     }
     entry.submit(0);
 }
@@ -1009,10 +1022,19 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
                 fork_start: 0,
                 fork_parent_start: 0,
                 start,
+                exe_dev: 0,
+                exe_ino: 0,
+                cgroup: 0,
             };
             if let Ok(comm) = bpf_get_current_comm() {
                 meta.comm = comm;
             }
+            // lot 373: the writer's image and cgroup, at its write
+            if let Some(exe) = crate::bpf_defense::caller_exe_key() {
+                meta.exe_dev = exe.dev;
+                meta.exe_ino = exe.ino;
+            }
+            meta.cgroup = aya_ebpf::helpers::generated::bpf_get_current_cgroup_id();
             // lot 344: the writer's fork records, at its write
             let (own, forker) = crate::fork_parent::unexecuted_forks();
             if let Some(f) = own {

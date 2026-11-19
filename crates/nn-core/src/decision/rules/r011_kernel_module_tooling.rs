@@ -232,7 +232,12 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
     /// [`ExecFacts::initramfs_builder`]: kmod_exec_facts::ExecFacts::initramfs_builder
     /// [`ExecFacts::package_manager`]: kmod_exec_facts::ExecFacts::package_manager
     /// [`AuthSessionTracker::is_host_file_in_root_dir`]: crate::posture::lineage::AuthSessionTracker::is_host_file_in_root_dir
-    fn package_initramfs_build(&self, event: &Event) -> Option<String> {
+    ///
+    /// Lot 373: `Err(Some(why))` for an exec of that shape whose transaction
+    /// was not read — which fact the exec pump did not find, said in R011's
+    /// record (the rc7 soak's High on Debian 12 said only the argv's cut);
+    /// `Err(None)` for any other exec.
+    fn package_initramfs_build(&self, event: &Event) -> Result<String, Option<&'static str>> {
         use common::wire::exe::exe_flags::KNOWN;
         use kmod_exec_facts::Environment;
         let Event::ProcessSpawn {
@@ -243,15 +248,15 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
             ..
         } = event
         else {
-            return None;
+            return Err(None);
         };
         if *uid != 0 || !exe.has(KNOWN) {
-            return None;
+            return Err(None);
         }
-        let image = program_identity::kernel_image(event)?;
-        let facts = kmod_exec_facts::of(event)?;
+        let image = program_identity::kernel_image(event).ok_or(None)?;
+        let facts = kmod_exec_facts::of(event).ok_or(None)?;
         if matches!(facts.environment, Environment::Refused(_)) {
-            return None;
+            return Err(None);
         }
         let what = match (&facts.program, facts.interpreter.as_deref()) {
             // the system's modprobe (its device and inode, the pump's)
@@ -270,8 +275,8 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
                     && !kmod_invocation::in_tool_place(image)
                     && self
                         .lineage
-                        .as_ref()?
-                        .is_host_file_in_root_dir(image, (exe.dev, exe.ino)) =>
+                        .as_ref()
+                        .is_some_and(|l| l.is_host_file_in_root_dir(image, (exe.dev, exe.ino))) =>
             {
                 format!(
                     "{image}, a script of a system tree run by {interpreter} (the host's file at \
@@ -280,11 +285,15 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
                      on its own"
                 )
             }
-            _ => return None,
+            _ => return Err(None),
         };
-        let builder = facts.initramfs_builder?;
-        let pm = facts.package_manager?;
-        Some(format!(
+        let builder = facts.initramfs_builder.ok_or(Some(
+            "no packaged initramfs builder run by root was read in its lineage at the exec",
+        ))?;
+        let pm = facts.package_manager.ok_or(Some(
+            "no package manager run by root was read in its lineage at the exec",
+        ))?;
+        Ok(format!(
             "{what}; run by the initramfs build of the packaged {builder} in a package \
              transaction ({pm}, run by root, both read in its lineage at the exec)"
         ))
@@ -616,7 +625,9 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             ));
         }
         // lot 348: an initramfs hook of a dpkg trigger's build, by identity
-        if let Some(what) = self.package_initramfs_build(event) {
+        // — lot 373: the fact missing said when it does not hold
+        let build = self.package_initramfs_build(event);
+        if let Ok(what) = &build {
             let mut reasoning = format!(
                 "Kernel-module tooling ({comm}) exec — {what}: what a dpkg trigger's initramfs \
                  build runs, nothing loaded — recorded Low (lot 348) (T1547.006)"
@@ -672,7 +683,13 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
                 super::tool_kill(exe.path_or(filename)),
                 format!(
                     "Kernel-module tooling (insmod/modprobe/kmod) exec — kernel rootkit / \
-                     persistence indicator (T1547.006); posture → ENGAGED — killed: {why}"
+                     persistence indicator (T1547.006); posture → ENGAGED — killed: {why}{}",
+                    match build {
+                        Err(Some(missing)) => format!(
+                            " (not exempt as a package transaction's initramfs build: {missing})"
+                        ),
+                        _ => String::new(),
+                    }
                 ),
             ),
         };
@@ -1559,6 +1576,76 @@ mod tests {
             ))
             .expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// Lot 373 (the rc7 soak, Debian 12): a dpkg trigger's `modprobe
+    /// --show-depends`, its argv cut past the dry run, under the packaged
+    /// builder — Low when the exec pump read the package manager in its
+    /// lineage; when it read none, the High record says which fact was
+    /// missing (the soak's said only "its argv was cut").
+    #[test]
+    fn a_missing_transaction_fact_is_named_in_r011_s_record() {
+        let b = Some(UPDATE_INITRAMFS);
+        let cut = || {
+            let mut e = exec("/usr/sbin/modprobe", "/usr/bin/kmod", SHOW_DEPENDS);
+            if let Event::ProcessSpawn { argv_truncated, .. } = &mut e {
+                *argv_truncated = true;
+            }
+            e
+        };
+        let exited = |pm: Option<&str>| ExecFacts {
+            environment: Environment::Exited("no process with its pid".into()),
+            package_manager: pm.map(str::to_string),
+            ..built(b, Ok(()), None)
+        };
+        let v = rule()
+            .evaluate(&read_as(cut(), exited(Some("/usr/bin/dpkg"))))
+            .expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::Low),
+            "{}",
+            v.reasoning
+        );
+        let v = rule()
+            .evaluate(&read_as(cut(), exited(None)))
+            .expect("fires");
+        assert_eq!(v.severity, Severity::High, "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains(
+                "not exempt as a package transaction's initramfs build: no package manager run \
+                 by root was read in its lineage at the exec"
+            ),
+            "{}",
+            v.reasoning
+        );
+        let v = rule()
+            .evaluate(&read_as(
+                cut(),
+                ExecFacts {
+                    initramfs_builder: None,
+                    ..exited(Some("/usr/bin/dpkg"))
+                },
+            ))
+            .expect("fires");
+        assert!(
+            v.reasoning
+                .contains("no packaged initramfs builder run by root"),
+            "{}",
+            v.reasoning
+        );
+        // a tool asked to load a module is no build's dry run: nothing named
+        let v = rule()
+            .evaluate(&read_as(
+                modprobe(&["--set-version=6.8.0-1", "ext4"]),
+                exited(None),
+            ))
+            .expect("fires");
+        assert!(
+            !v.reasoning.contains("not exempt as a package"),
+            "{}",
+            v.reasoning
+        );
     }
 
     /// Lot 348 (the alpha: `apt install podman` on Debian 13): the hook

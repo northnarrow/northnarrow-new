@@ -11700,6 +11700,48 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
+  files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
+  racy R011 (C06, C14, C18; no level change).**
+  - What was open:
+    - `NN-L-FIM-024` Critical at every boot (7 of 7 boots), with COMBAT
+      locked and "would isolate the host". Lot 370's look judged the
+      agent's own re-creation of the `/run` baits as a creation by an
+      unknown writer.
+    - `NN-L-AT-001` High from `sudo bpftool prog show`.
+    - `NN-L-FIM-005` (rsyslogd) and `NN-L-FIM-019` (`systemd-update-utmp`)
+      at shutdown: the writer had exited before lot 347's `/proc` read.
+      rc6 had them too.
+    - `R012` High from `libgstreamer1.0-0`'s postinst.
+    - `NN-L-NET-013` from systemd-timesyncd.
+    - `R011` High on Debian 12: the pump walked to the package manager from
+      the exec's own `/proc` entry, already gone.
+  - Done, each by identity:
+    - **The agent's own creations.** The boot sweep hands the drain the
+      inode and the content hash of each file it re-created, before
+      watching it. A creation no record reported is never Critical or
+      COMBAT on the unknown writer alone: a bait holding its own content
+      is High, "writer unknown".
+    - **bpftool listings.** A refused handle proven the packaged bpftool's
+      read-only listing (image by device and inode, root, the argv
+      compared whole) is `NN-L-AT-001` Low with no posture.
+    - **Shutdown writes.** The FIM record of a write seen at close carries
+      the writer's image and cgroup id from its write (eBPF: `DirtyMeta`,
+      `FimDriftRaw` grows from 176 to 200 bytes). rsyslogd is named by that
+      identity. `systemd-update-utmp`'s record is kept on the kernel's
+      facts: image, root, `FIM_WRITE_ONE_WRITER`, its cgroup the unit's or
+      gone.
+    - **Package setcap.** `R012` is Low for a maintainer script's `setcap`
+      on its own package's files in the live transaction.
+    - **NTP.** The packaged NTP clients polling UDP 123 as their service
+      account are no beacon.
+    - **R011.** The pump walks from the exec's parent when the exec is
+      gone, and the High names the missing fact.
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §60 and the CHANGELOG.
+  - Mutation: 45 mutants of the lot's new code, 45 caught by a named test
+    (no survivor, no compile error).
+  - Lab (as measured): none yet — the guests were held by the rc7 soaks;
+    the round (ubuntu2604, debian12) is added here once measured.
 - **Lot 372 — the rc7 soak on Ubuntu 26.04: `go test` and `go run` on Go
   1.21 and later (C14, C16; no level change).**
   - What was open: on Ubuntu 26.04 (Go 1.26) a person's `go test` test

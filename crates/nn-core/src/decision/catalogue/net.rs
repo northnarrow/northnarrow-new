@@ -316,7 +316,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    sender's own loopback endpoint is no beacon; whatever forwards it is judged \
                    by its own flows.",
         false_positives: "Pollers, health checks, metrics exporters and update checkers not in \
-                          the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are).",
+                          the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are). \
+                          Lot 373: the system's NTP client (systemd-timesyncd, chronyd, ntpd: \
+                          the packaged image by its device and inode, as its service account) \
+                          to UDP 123 is no beacon; any other program to UDP 123, or the daemon \
+                          to another port, is judged.",
+
         how_to_test: "From one process, connect to the same address every 5 seconds: \
                       `python3 -c 'import socket, time; \
                       [(socket.create_connection((\"<peer>\", 80)).close(), time.sleep(5)) \
@@ -324,6 +329,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow",
             "crates/nn-core/src/decision/rules/net.rs::net_013_a_socket_sending_to_itself_is_no_beacon",
+            "crates/nn-core/src/decision/rules/net.rs::the_system_s_ntp_client_polling_udp_123_is_no_beacon",
             "crates/nn-core/src/decision/rules/net.rs::\
              net_013_records_one_beacon_per_program_destination_and_hour",
             "crates/nn-core/src/decision/rules/net.rs::\

@@ -100,7 +100,7 @@ const LOG_ROOT_PREFIXES: &[&str] = &["/var/log/", "/var/audit/"];
 /// canonical target; an exact-path match (never `comm`) keeps the
 /// exemption tight. A truncation (file shrank) by this same daemon is
 /// NOT exempted — it still fires (log-tamper indicator). Sorted.
-const RSYSLOGD_EXES: &[&str] = &["/sbin/rsyslogd", "/usr/sbin/rsyslogd"];
+pub const RSYSLOGD_EXES: &[&str] = &["/sbin/rsyslogd", "/usr/sbin/rsyslogd"];
 
 /// NN-L-FIM-006: operator-installed binary roots. Modifications
 /// here are Medium (often legit package upgrades), but worth
@@ -211,6 +211,17 @@ fn fim_verdict(
     } else {
         (action, reasoning.to_string())
     };
+    // Lot 373: a creation no kernel record reported says so — its writer is
+    // not known, and no pid or name stands in for one.
+    let reasoning =
+        if super::unknown_writer::writer_unknown(fe) && !reasoning.contains("writer unknown") {
+            format!(
+            "{reasoning} [writer unknown: no kernel record of this creation — the file was found \
+             at a look]"
+        )
+        } else {
+            reasoning
+        };
     Verdict {
         rule_id: rule.id().to_string(),
         rule_name: rule.name().to_string(),
@@ -2287,6 +2298,16 @@ pub fn is_bait_tamper(fe: &FimEvent) -> bool {
     ) && HONEYPOT_PATHS.contains(&fe.path.as_str())
 }
 
+/// Lot 373: a bait tamper that is decisive tamper evidence — any but a
+/// bait created with no kernel record of its writer that holds the bait's
+/// own content ([`super::unknown_writer::benign_bait`]): NN-L-FIM-024
+/// records that one High, and the posture's `ControlSurfaceTamper` raises
+/// no COMBAT on it (the agent's own boot sweep re-creating the `/run` pair
+/// was one, at every boot of rc7).
+pub fn is_decisive_bait_tamper(fe: &FimEvent) -> bool {
+    is_bait_tamper(fe) && !super::unknown_writer::benign_bait(fe)
+}
+
 /// NN-L-FIM-024: tamper of an anti-tamper bait file. ANY mutation —
 /// create, modify, delete, rename — is an adversary probing for an
 /// agent off-switch. Critical → KillProcessTree, and (lab PR 162) the
@@ -2344,14 +2365,38 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
         if fe.modifier_pid == self.own_pid {
             return None;
         }
+        // Lot 373 (the rc7 soak): a bait created with no kernel record of
+        // its writer, holding the bait's own content — no hostile content,
+        // no writer to act on: never Critical or COMBAT on the unknown
+        // writer alone. Any other content (or one not read) is Critical.
+        if super::unknown_writer::benign_bait(fe) {
+            return Some(fim_verdict(
+                self,
+                fe,
+                ResponseAction::Log,
+                Severity::High,
+                "NorthNarrow control-surface file created with no kernel record of its \
+                 writer (writer unknown: found at a look); it holds the file as the agent and \
+                 the install write it, no hostile content — recorded High, nothing to act on \
+                 (lot 373)",
+            ));
+        }
+        let reasoning = if super::unknown_writer::writer_unknown(fe) {
+            "NorthNarrow control-surface file created with no kernel record of its writer \
+             (writer unknown: found at a look), holding content the agent and the install \
+             never write — an attempt on an agent off-switch (T1562.001); kill tree + \
+             posture → COMBAT"
+        } else {
+            "NorthNarrow control-surface file tampered — adversary \
+             probing for an agent off-switch (T1562.001); kill tree + \
+             posture → COMBAT"
+        };
         Some(fim_verdict(
             self,
             fe,
             ResponseAction::KillProcessTree,
             Severity::Critical,
-            "NorthNarrow control-surface file tampered — adversary \
-             probing for an agent off-switch (T1562.001); kill tree + \
-             posture → COMBAT",
+            reasoning,
         ))
     }
 }
@@ -5647,6 +5692,92 @@ mod tests {
                 .is_none(),
             "FIM-024 must NOT fire when modifier_pid == own_pid"
         );
+    }
+
+    /// Lot 373 (named, the rc7 soak: the agent's own re-creation of the
+    /// `/run` pair judged "created with no record, writer unknown",
+    /// Critical, COMBAT, "would isolate the host" at every boot): a bait
+    /// created with no kernel record of its writer is never Critical on the
+    /// unknown writer alone — holding the bait's own content it is High,
+    /// Log, "writer unknown", and raises no COMBAT; holding anything else
+    /// (or a content not read) it stays Critical and says the writer is
+    /// unknown. A creation the kernel recorded (a root shell's `touch`)
+    /// stays Critical, as does every other mutation.
+    #[test]
+    fn fim024_an_unknown_writer_s_own_bait_is_high_never_combat() {
+        use crate::posture::triggers::TriggerDetector;
+        use nn_model::posture_types::TriggerType;
+        let rule = NnLFim024AntiTamperHoneypotModified::new(TEST_AGENT_PID);
+        let created = |pid: u32, ts: u64| {
+            let Event::Fim(mut fe) = fim_event(FimOp::Created, "/run/northnarrow/pause.flag")
+            else {
+                unreachable!()
+            };
+            (fe.modifier_pid, fe.timestamp_ns) = (pid, ts);
+            if pid == 0 {
+                fe.modifier_comm.clear();
+            }
+            fe
+        };
+        let det = TriggerDetector::<H>::with_exempt_and_auth(
+            crate::posture::exempt::ExemptPids::default(),
+            AuthSessionTracker::new("/nonexistent-proc-373"),
+        );
+        // the agent's own content, found at a look: High, nothing to act on
+        let own = created(0, 373_001);
+        super::super::unknown_writer::keep(&own, true);
+        let v = rule.evaluate(&Event::Fim(own.clone())).expect("recorded");
+        assert_eq!(
+            (v.severity, v.action.clone()),
+            (Severity::High, ResponseAction::Log),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("writer unknown") && v.reasoning.contains("no hostile content"),
+            "{}",
+            v.reasoning
+        );
+        assert!(!is_decisive_bait_tamper(&own));
+        assert!(!det
+            .detect(&Event::Fim(own), &[])
+            .contains(&TriggerType::ControlSurfaceTamper));
+        // a hostile content, or one not read: Critical, the writer said unknown
+        for (fe, why) in [
+            (created(0, 373_002), "hostile"),
+            (created(0, 373_003), "not read"),
+        ] {
+            if why == "hostile" {
+                super::super::unknown_writer::keep(&fe, false);
+            }
+            let v = rule.evaluate(&Event::Fim(fe.clone())).expect("fires");
+            assert_eq!(
+                (v.severity, v.action.clone()),
+                (Severity::Critical, ResponseAction::KillProcessTree),
+                "{why}"
+            );
+            assert!(
+                v.reasoning.contains("writer unknown"),
+                "{why}: {}",
+                v.reasoning
+            );
+            assert!(
+                det.detect(&Event::Fim(fe), &[])
+                    .contains(&TriggerType::ControlSurfaceTamper),
+                "{why}"
+            );
+        }
+        // the attack shape: another process creates the runtime file (the
+        // kernel's record names it) — Critical, COMBAT, even with the
+        // bait's own content
+        let by_shell = created(4242, 373_004);
+        super::super::unknown_writer::keep(&by_shell, true);
+        let v = rule.evaluate(&Event::Fim(by_shell.clone())).expect("fires");
+        assert_eq!(v.severity, Severity::Critical);
+        assert!(!v.reasoning.contains("writer unknown"), "{}", v.reasoning);
+        assert!(det
+            .detect(&Event::Fim(by_shell), &[])
+            .contains(&TriggerType::ControlSurfaceTamper));
     }
 
     #[test]

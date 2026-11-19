@@ -4841,3 +4841,105 @@ Low, as §57 meant.
   and later), and wherever a module's `go` line is far older than the
   toolchain (Go 1.22's list for a `go 1.18` module is 89 bytes, so Ubuntu
   24.04's link usually fits); nothing else changes.
+
+## 60. The rc7 soak's false positives: the agent's own runtime files, a read-only BPF listing, shutdown writes, package setcap, NTP, a racy R011 (lot 373)
+
+The rc7 soaks on Ubuntu 26.04, Ubuntu 24.04, Debian 13 and Debian 12 met
+six false positives of the host's own routine. Each is now judged by
+identity — the kernel's facts about the process, its lineage and its
+binary — never by a path or a name alone; each attack shape it resembles
+still fires.
+
+- **`NN-L-FIM-024` Critical at every boot** (P1, a regression of lot 370's
+  F10-3). After every boot the agent's own sweep re-creates the tmpfs pair
+  `/run/northnarrow/pause.flag` and `unload.signal`. The agent is a
+  protected pid, so the kernel records none of its writes, and lot 370's
+  look at the watch-list paths absent at the start judged the files
+  "created with no record, writer unknown" (pid 0): Critical, COMBAT locked,
+  "would have ISOLATED the host".
+  - Now the sweep hands the FIM drain each file it made — its inode and the
+    SHA-256 of what it wrote — before the inode is watched. At its next look
+    the drain watches the path with no event while it still holds that inode
+    with that content.
+  - Another inode at the path, other content, or a path with no such note is
+    judged as before. A write after the watch is a kernel record that names
+    its writer. A root shell's `touch` of a bait stays Critical.
+  - The census of the files the agent, its watchdog and its units create on
+    watched paths at start or stop found only the baits.
+- **A creation no kernel record reported** (a file found at a look, its
+  writer unknown) is never Critical or COMBAT on the unknown writer alone.
+  The record says "writer unknown".
+  - A bait that holds the bait's own content (its template, its
+    `last_modified=` line a stamp) is `NN-L-FIM-024` High, Log, with no
+    COMBAT.
+  - Any other content (`paused=true`), or content that could not be read,
+    stays Critical.
+  - The rules whose finding is the content itself (`/etc/ld.so.preload`, a
+    module, a PAM module, a setuid file) keep their weight.
+- **`NN-L-AT-001` from `sudo bpftool prog show`.** bpftool lists programs by
+  id (`BPF_PROG_GET_NEXT_ID`) and takes a handle by id on each one, only to
+  read its information (`BPF_OBJ_GET_INFO_BY_FD`). The guard refuses the
+  handle on the agent's own objects, and that refusal stays.
+  - A refusal whose taker is the packaged bpftool, run by root, with a
+    listing command line is now recorded Low and raises no posture. The
+    agent proves this from the taker's exec as of the refusal: the device
+    and inode of `/usr/sbin/bpftool`, or of `/usr/lib/linux-tools-*/bpftool`
+    on Ubuntu, in a root-only directory; root; and the argv, compared whole.
+    Listing command lines are `prog|map [show|list [id N]]` and `cgroup
+    tree`, with `-j`/`-p`.
+  - A dump, an update, a pin, a detach, a copy of bpftool, python's ctypes,
+    a non-root run and a handle under the pin directories stay High and
+    still raise ENGAGED.
+- **`NN-L-FIM-005` (rsyslogd) and `NN-L-FIM-019` (`systemd-update-utmp`) at
+  shutdown.** Lot 347's fix was not lost. It read the writer's `/proc` and
+  cgroup while the writer runs, and at a shutdown the writer has often
+  exited before the drain reads the record (rc6 had the same records).
+  - The FIM record of a write seen at close now carries the writer's
+    executable at its write (`mm->exe_file`: device and inode) and its
+    cgroup v2 id.
+  - `NN-L-FIM-005`'s rsyslogd append names the packaged daemon by that
+    identity once `/proc` and the lineage name none.
+  - `NN-L-FIM-019` keeps lot 347's unit when all of these hold: the packaged
+    `systemd-update-utmp` image; root; the file's only writer since its
+    last record (the kernel's `FIM_WRITE_ONE_WRITER`); and the writer's
+    cgroup is the unit's or no cgroup any more (a oneshot's `ExecStop=`
+    cgroup is removed as its process exits). An append of whole records is
+    still required.
+  - Still High: a copy of the binary, the binary in a session's scope or in
+    another unit still there, another writer folded in, a truncation, and
+    `sudo logrotate -f` (by design, lot 340).
+- **`R012` High from a package's postinst.** A package transaction now
+  records Low (lot 373) when all of these hold: root runs the system's
+  `setcap` (`/usr/sbin/setcap`, by device and inode); its parent is dpkg's
+  maintainer script of a package (`/var/lib/dpkg/info/<package>.postinst`
+  and its kin, in a root-only directory); that parent runs in a live
+  package transaction run by root; and every file the command line names
+  is listed in that package's `.list`, in a root-only directory of a
+  system tree.
+  - Still High: a `setcap` from a session (`sudo` included), the
+    maintainer script run by hand, a file of no package or of another
+    package, a writable directory, a copy of the tool, a non-root run, and
+    a command line cut.
+  - `NN-L-FIM-025` still records the grant itself.
+- **`NN-L-NET-013` from systemd-timesyncd.** The system's NTP client
+  talking NTP is no beacon. That means UDP to port 123, from the packaged
+  image of systemd-timesyncd, chronyd or ntpd (the lineage's records, else
+  `/proc/<pid>/exe` of the process that started at the flow's start), run
+  as that client's service account from `/etc/passwd`.
+  - Still a beacon: python or any other program to UDP 123, the daemon to
+    another port or over TCP, and the daemon's image run as another user.
+- **`R011` High, intermittent, on Debian 12.** This was a race. A
+  `modprobe --show-depends` of a dpkg trigger's initramfs build exits
+  within milliseconds. The exec pump looked for the package manager from
+  the exec's own `/proc` entry, which was gone, so lot 348's exemption fell
+  and the cut argv was High. Its twin a millisecond later was Low.
+  - The walk now starts at the exec's parent (by its start) when the exec's
+    own process is gone, as the builder's walk already did.
+  - The High record now says which fact of the exemption was missing.
+- **Upgrade.** No configuration. The FIM ring's record grows from 176 to
+  200 bytes (the kernel object and the agent are one build).
+  - Expect no `NN-L-FIM-024` and no COMBAT at boot.
+  - Expect `NN-L-AT-001` Low for an administrator's bpftool listings.
+  - Expect fewer High records at shutdown, in package upgrades with
+    capability-bearing helpers, and from timesyncd.
+

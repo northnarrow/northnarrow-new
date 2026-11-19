@@ -120,7 +120,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
             whether it shrank. wtmp, btmp and lastlog are left to NN-L-FIM-018 and -019.",
         false_positives: "Logrotate and any other writer of a watched log fire it, which is why it \
             only records. rsyslogd's own append (its exe, the syslog uid, the file grown) is \
-            exempt; its truncation is not.",
+            exempt; its truncation is not. Lot 373: a writer gone by the judgement (rsyslogd's \
+            last flush at the host's shutdown) is named by the image the kernel recorded at its \
+            write (the packaged daemon's device and inode).",
+
         how_to_test: "`echo nn-test | sudo tee -a /var/log/syslog` (/var/log/messages on the RHEL \
             family), a writer other than rsyslogd; expect High, Log.",
         tests: &[
@@ -451,7 +454,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "The login machinery (login, sshd, sshd-session, systemd-logind, \
             systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt \
             by kernel-resolved exe. Another program that writes login records through the utmp API \
-            (a terminal multiplexer's helper) is killed.",
+            (a terminal multiplexer's helper) is killed. Lot 373: the packaged \
+            systemd-update-utmp's shutdown record, its process gone by the judgement, is told by \
+            what the kernel recorded at the write (its image, root, the file's only writer, its \
+            unit's cgroup or a cgroup removed since) and an append of whole records.",
+
         how_to_test: "`printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab \
             guest: it appends a byte); expect High, KillProcess aimed at dd.",
         tests: &[
@@ -552,14 +559,19 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-FIM-024_AntiTamperHoneypotModified",
-        severities: &[Severity::Critical],
-        actions: &[ResponseAction::KillProcessTree],
+        severities: &[Severity::Critical, Severity::High],
+        actions: &[ResponseAction::KillProcessTree, ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0039", "DC0061", "DC0040", "DC0059"],
         observes: "Any change (create, write, delete, rename, chmod or chown) of one of the ten \
             control-surface bait files under /etc/northnarrow, /var/lib/northnarrow and \
             /run/northnarrow, whose names offer a way to disable the agent; the agent never reads \
-            them. Its own writes are not judged.",
+            them. Its own writes are not judged — lot 373: its boot sweep's re-creation of the \
+            /run pair after every reboot is handed to the FIM drain (the inode and the hash of \
+            what it wrote) before it is watched. A creation no kernel record reported (found \
+            at a look, its writer unknown) holding the bait's own content is High, Log, and \
+            raises no COMBAT; any other content stays Critical.",
+
         false_positives: "None expected: no operator workflow writes them. A \
             configuration-management run that resets /etc/northnarrow wholesale (rsync --delete) \
             fires it.",
@@ -568,6 +580,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim024_fires_on_every_honeypot_path",
             "crates/nn-core/src/fim/rules.rs::fim024_fires_on_create_delete_rename_too",
+            "crates/nn-core/src/fim/rules.rs::fim024_an_unknown_writer_s_own_bait_is_high_never_combat",
+            "crates/nn-linux/src/fim/drain.rs::the_agent_s_own_runtime_bait_is_no_creation_by_an_unknown_writer",
             "agent/tests/honeypot_tamper_e2e.rs::delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer",
         ],
         attack_note: "T1685 (Disable or Modify Tools), which replaced T1562.001 in ATT&CK v19; the \

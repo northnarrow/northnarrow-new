@@ -729,6 +729,31 @@ lists the known false positives of each rule.
   the agent outside a window is refused and recorded `NN-L-AT-001` High.
   Use a window ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md)
   §3.7). *Evidence:* `deploy/lab/adversarial/anti-tamper.sh` (C01).
+- **The host's own boot, shutdown and package routine** (lot 373, the
+  rc7 soak). Recorded Low or not at all now, each by identity:
+  - the agent re-creating its `/run/northnarrow` control-surface files at
+    every boot (no `NN-L-FIM-024`);
+  - `sudo bpftool prog show` (or `map list`, `cgroup tree`) with the
+    packaged bpftool: still refused, `NN-L-AT-001` Low, no posture;
+  - rsyslogd's last flush and `systemd-update-utmp`'s record at shutdown,
+    judged by what the kernel recorded at the write;
+  - a package's postinst running `setcap` on its own files in its
+    transaction (`R012` Low);
+  - systemd-timesyncd, chronyd or ntpd polling UDP 123 as their service
+    account (no `NN-L-NET-013`).
+
+  Still recorded High: `sudo logrotate -f` by hand (by design, lot 340); a
+  `setcap` from a session or on a file of no package; a bpftool `map dump`,
+  `update`, `pin` or `detach`, or any other program's handle on the agent's
+  objects; any other program beaconing to UDP 123. Residuals: root running
+  the packaged `systemd-update-utmp` in a cgroup it removes before the read
+  appends a boot or shutdown record unrecorded (the binary writes nothing
+  else and erases nothing); a bait created with no kernel record of its
+  writer that holds the bait's own content is High, not Critical (no
+  writer to act on). *Evidence:* lot 373;
+  `the_agent_s_own_runtime_bait_is_no_creation_by_an_unknown_writer`,
+  `a_root_listing_by_the_packaged_bpftool_is_told_from_a_handle_grab`,
+  `a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

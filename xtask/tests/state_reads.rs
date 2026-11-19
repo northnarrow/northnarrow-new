@@ -146,6 +146,24 @@ const SHELLS: &str = "lot 313: /etc/shells, one of R020's two lists of installed
 /// answer that a protection then publishes. The readers that keep the last
 /// good state (`LastGood`, a `Condition` in the error's arm) are not sites.
 const KNOWN: &[(&str, &str, &str)] = &[
+    // lot 373: the exec's and its parent's start before the package
+    // manager's walk; a package's dpkg list and an account's uid under the
+    // host's root (R012, NN-L-NET-013), each failing toward no exemption
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(p.to_string()).join(\"stat\"))",
+        PROC,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(self.inner.host_root.join(\"etc/passwd\"))",
+        ACCT,
+    ),
+    (
+        "crates/nn-core/src/posture/lineage.rs",
+        "read_state(list)",
+        PKG,
+    ),
     (
         "agent/src/admin/transport.rs",
         "read_state(format!(\"/proc/{pid}/comm\"))",

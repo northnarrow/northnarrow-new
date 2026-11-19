@@ -1450,6 +1450,49 @@ pub(crate) fn mark_known_probe_on_host(e: &mut Event, lineage: &AuthSessionTrack
     });
 }
 
+/// Lot 373 (the rc7 soak: the bench's `sudo bpftool prog show`, NN-L-AT-001
+/// High and ENGAGED at every boot): a refused handle by id on one of the
+/// agent's maps or programs (`bpf_handle`, kind 1 or 2) whose taker the
+/// agent proves the packaged `bpftool` run by root to list or show objects
+/// ([`crate::known_system_prog::bpftool_listing`]) is marked in its
+/// `target_dev` (`common::bpf_prog_class::BPF_LISTING_BIT`) before the
+/// posture or the rule reads it: NN-L-AT-001 signs it Low and the posture
+/// raises nothing. Still refused. The proof is the taker's exec as of the
+/// refusal, from the lineage, past the bus's barrier — as
+/// [`mark_known_probe_on_host`]'s.
+pub(crate) fn mark_bpf_listing_on_host(e: &mut Event, lineage: &AuthSessionTracker) {
+    mark_bpf_listing(e, &|pid, kind_id, at| {
+        crate::known_system_prog::bpftool_listing_on_host(lineage, pid, kind_id, at)
+    });
+}
+
+/// [`mark_bpf_listing_on_host`]'s decision, the proof read by `prove`.
+fn mark_bpf_listing(e: &mut Event, prove: &dyn Fn(u32, (u64, u64), u64) -> Result<String, String>) {
+    if let Event::FsProtectDenial {
+        pid,
+        operation: nn_model::FsProtectOperation::BpfHandle,
+        target_dev,
+        target_ino,
+        timestamp_ns,
+        ..
+    } = e
+    {
+        if !matches!(*target_dev, 1 | 2) {
+            return;
+        }
+        match prove(*pid, (*target_dev, *target_ino), *timestamp_ns) {
+            Ok(_) => *target_dev |= common::bpf_prog_class::BPF_LISTING_BIT,
+            Err(why) => tracing::debug!(
+                pid = *pid,
+                kind = *target_dev,
+                id = *target_ino,
+                why,
+                "bpf_handle: no listing by the packaged bpftool"
+            ),
+        }
+    }
+}
+
 /// [`mark_known_probe_on_host`]'s decision, the proof read by `prove`.
 fn mark_known_probe(e: &mut Event, prove: &dyn Fn(u32, u32, u64) -> Result<usize, String>) {
     if let Event::FsProtectDenial {
@@ -2678,6 +2721,52 @@ mod tests {
             let before = format!("{e:?}");
             let mut e = e;
             mark_known_probe(&mut e, prove);
+            assert_eq!(format!("{e:?}"), before);
+        }
+    }
+
+    /// Lot 373 (named): a refused handle by id on one of the agent's maps
+    /// or programs is marked a bpftool listing only when proven, with the
+    /// kind kept; a handle not proven, one under the pin directories (kind
+    /// 0), another operation pass unchanged.
+    #[test]
+    fn a_refused_handle_is_marked_a_bpftool_listing_only_when_proven() {
+        use common::bpf_prog_class::{bpf_listing_kind, BPF_LISTING_BIT};
+        let denial = |op, dev, ino| Event::FsProtectDenial {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 5,
+        };
+        type Prove = dyn Fn(u32, (u64, u64), u64) -> Result<String, String>;
+        let proven =
+            |_: u32, _: (u64, u64), _: u64| -> Result<String, String> { Ok("bpftool".into()) };
+        let not = |_: u32, _: (u64, u64), _: u64| -> Result<String, String> { Err("no".into()) };
+        let handle = nn_model::FsProtectOperation::BpfHandle;
+        for kind in [1, 2] {
+            let mut marked = denial(handle, kind, 48);
+            mark_bpf_listing(&mut marked, &proven);
+            assert!(
+                matches!(marked, Event::FsProtectDenial { target_dev, .. }
+                    if target_dev == kind | BPF_LISTING_BIT && bpf_listing_kind(target_dev) == Some(kind)),
+                "{marked:?}"
+            );
+        }
+        for (e, prove) in [
+            (denial(handle, 2, 48), &not as &Prove),
+            (denial(handle, 0, 0), &proven),
+            (
+                denial(nn_model::FsProtectOperation::BpfLink, 2, 48),
+                &proven,
+            ),
+            (denial(nn_model::FsProtectOperation::BpfMap, 1, 31), &proven),
+        ] {
+            let before = format!("{e:?}");
+            let mut e = e;
+            mark_bpf_listing(&mut e, prove);
             assert_eq!(format!("{e:?}"), before);
         }
     }

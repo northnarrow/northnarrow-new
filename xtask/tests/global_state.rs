@@ -723,6 +723,15 @@ const STATICS: &[Kept] = &[
          oldest out first)",
     ),
     kept(
+        "crates/nn-core/src/fim/unknown_writer.rs",
+        "FACTS",
+        HostFact,
+        "lot 373: what the FIM drain read of a bait created with no kernel record of its \
+         writer (its content the bait's own or not), which NN-L-FIM-024 and the posture's \
+         ControlSurfaceTamper judge the creation on (one host; keyed by creation, bounded, \
+         the oldest out first)",
+    ),
+    kept(
         "crates/nn-core/src/fim/unit_writers.rs",
         "KEPT",
         HostFact,

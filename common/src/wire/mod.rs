@@ -2230,6 +2230,17 @@ pub struct FimDriftRaw {
     /// start is the one the chains tag its credential read or canary trip
     /// with (`FimEvent::modifier_start`).
     pub modifier_start: u64,
+    /// Lot 373 (the rc7 soak: rsyslogd's last flush and
+    /// `systemd-update-utmp`'s shutdown record, High at the host's
+    /// shutdown): for a `Modified` seen at close, the writer's executable at
+    /// its last write — the device (the kernel's form, as [`InodeKey`]'s)
+    /// and inode of its `mm->exe_file` — and its cgroup v2 id
+    /// (`bpf_get_current_cgroup_id`); 0 otherwise (or unread). The writer
+    /// has often exited when the record is judged: its `/proc` entry and
+    /// its unit's cgroup are gone, its exec may not be in the lineage yet.
+    pub writer_exe_dev: u64,
+    pub writer_exe_ino: u64,
+    pub writer_cgroup: u64,
 }
 
 /// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
@@ -2283,6 +2294,9 @@ impl FimDriftRaw {
             fork_start: 0,
             fork_parent_start: 0,
             modifier_start: 0,
+            writer_exe_dev: 0,
+            writer_exe_ino: 0,
+            writer_cgroup: 0,
         }
     }
 }
@@ -2643,16 +2657,21 @@ mod tests {
     fn fim_drift_raw_layout_is_stable() {
         // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 (= 72, polish #3)
         // + 64 + 1 + 7 (= 144, BUG-022 child-name tail)
-        // + 4 + 4 + 8 + 8 (= 168, lot 344: the writer's fork records), 8-aligned.
-        assert_eq!(size_of::<FimDriftRaw>(), 176);
+        // + 4 + 4 + 8 + 8 (= 168, lot 344: the writer's fork records), 8-aligned
+        // + 8 (= 176, modifier_start) + 8 + 8 + 8 (= 200, lot 373: the
+        // writer's image and cgroup at its write).
+        assert_eq!(size_of::<FimDriftRaw>(), 200);
         assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_ppid), 144);
         assert_eq!(core::mem::offset_of!(FimDriftRaw, fork_parent_start), 160);
         assert_eq!(core::mem::offset_of!(FimDriftRaw, modifier_start), 168);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, writer_exe_dev), 176);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, writer_exe_ino), 184);
+        assert_eq!(core::mem::offset_of!(FimDriftRaw, writer_cgroup), 192);
         assert_eq!(align_of::<FimDriftRaw>(), 8);
         // lot 352: the link record, the drift record then the walk
-        assert_eq!(size_of::<FimLinkRaw>(), 176 + 16 + 8 + 512);
-        assert_eq!(core::mem::offset_of!(FimLinkRaw, root_dev), 176);
-        assert_eq!(core::mem::offset_of!(FimLinkRaw, path), 200);
+        assert_eq!(size_of::<FimLinkRaw>(), 200 + 16 + 8 + 512);
+        assert_eq!(core::mem::offset_of!(FimLinkRaw, root_dev), 200);
+        assert_eq!(core::mem::offset_of!(FimLinkRaw, path), 224);
         assert_eq!(align_of::<FimLinkRaw>(), 8);
         // FsProtectDenialRaw stays at the original 56-byte
         // shape; the FIM drift record is now a SUPERSET (first
@@ -2691,6 +2710,9 @@ mod tests {
             fork_start: 11,
             fork_parent_start: 5,
             modifier_start: 13,
+            writer_exe_dev: 0x800001,
+            writer_exe_ino: 373,
+            writer_cgroup: 4242,
         };
         let bytes: &[u8] = bytemuck::bytes_of(&original);
         assert_eq!(bytes.len(), size_of::<FimDriftRaw>());
@@ -2704,6 +2726,14 @@ mod tests {
         assert_eq!(restored.dest_dev, original.dest_dev);
         assert_eq!(restored.dest_ino, original.dest_ino);
         assert_eq!(restored.modifier_start, 13);
+        assert_eq!(
+            (
+                restored.writer_exe_dev,
+                restored.writer_exe_ino,
+                restored.writer_cgroup
+            ),
+            (0x800001, 373, 4242)
+        );
         assert_eq!(
             (
                 restored.fork_ppid,
