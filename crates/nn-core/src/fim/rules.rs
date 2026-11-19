@@ -2404,7 +2404,7 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
 // ── NN-L-FIM-025 — file capability granted (review 86) ────────────
 
 /// Capability names by bit (linux/capability.h).
-const CAP_NAMES: [&str; 41] = [
+pub(crate) const CAP_NAMES: [&str; 41] = [
     "cap_chown",
     "cap_dac_override",
     "cap_dac_read_search",
@@ -2464,7 +2464,7 @@ const ROOT_EQUIVALENT_CAPS: u64 = (1 << 0)
     | (1 << 31)
     | (1 << 39);
 
-fn capability_names(permitted: u64) -> String {
+pub(crate) fn capability_names(permitted: u64) -> String {
     (0..64)
         .filter(|bit| permitted & (1u64 << bit) != 0)
         .map(|bit| {
@@ -2708,14 +2708,39 @@ impl<H: PostureAgent> Rule for NnLFim026ModprobeConfigWritten<H> {
 /// killed. The posture machine already applies the same boundary to
 /// these binaries. NN-L-FIM-022 (`/etc/ld.so.preload`), the bait and the
 /// credential rules are deliberately not wrapped.
+///
+/// Lot 373 (the review of #580, F1): a wrapped rule may name what the
+/// transaction does not lower ([`Self::with_floor`]): such a write is
+/// recorded High, kept, never Low.
 pub struct PackageManaged<H: PostureHost> {
     inner: Box<dyn Rule>,
     lineage: AuthSessionTracker<H>,
+    floor: Option<PackageFloor>,
 }
+
+/// Lot 373 (the review of #580, F1): what in a write a package transaction
+/// does not lower — `Some(what)` for the record.
+pub type PackageFloor = fn(&FimEvent) -> Option<String>;
 
 impl<H: PostureHost> PackageManaged<H> {
     pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker<H>) -> Self {
-        Self { inner, lineage }
+        Self {
+            inner,
+            lineage,
+            floor: None,
+        }
+    }
+
+    /// Lot 373 (the review of #580, F1): a write `floor` names, made in a
+    /// package transaction, is recorded High and kept (`Log`: killing the
+    /// transaction or undoing its write would leave a half-installed
+    /// package), not lowered to Low — NN-L-FIM-025's grant of a capability
+    /// beyond the narrow set ([`super::file_caps::grant_beyond_package`]):
+    /// the package's own root maintainer script decides what the transaction
+    /// vouches for.
+    pub fn with_floor(mut self, floor: PackageFloor) -> Self {
+        self.floor = Some(floor);
+        self
     }
 }
 
@@ -2745,6 +2770,19 @@ impl<H: PostureHost> Rule for PackageManaged<H> {
             crate::posture::lineage::AsOf::judged(fe.timestamp_ns),
         ) {
             return Some(verdict);
+        }
+        if let Some(what) = self.floor.and_then(|floor| floor(fe)) {
+            return Some(Verdict {
+                action: ResponseAction::Log,
+                severity: Severity::High,
+                reasoning: format!(
+                    "{} [written by the package manager (dpkg/rpm/dnf lineage): recorded, kept \
+                     — but {what} is not lowered by a package transaction, whose own root \
+                     maintainer script decides what it vouches for (lot 373)]",
+                    verdict.reasoning
+                ),
+                ..verdict
+            });
         }
         Some(Verdict {
             action: ResponseAction::Log,
@@ -3626,10 +3664,22 @@ pub fn fim_rules_with_lineage<H: DecisionHost>(
         ),
         fim019,
         admin(Box::new(NnLFim023SystemdTimerCreated)),
-        // Review 86 — a file capability grant, undone.
-        admin(Box::new(NnLFim025FileCapabilityGranted::<H>::new(
-            installer_override,
-        ))),
+        // Review 86 — a file capability grant, undone; lot 373 (the review
+        // of #580, F1): one beyond the narrow set stays High in a package
+        // transaction.
+        Box::new(InteractiveAdmin::new(
+            Box::new(
+                PackageManaged::new(
+                    Box::new(NnLFim025FileCapabilityGranted::<H>::new(installer_override)),
+                    lineage.clone(),
+                )
+                .with_floor(|fe| {
+                    super::file_caps::grant_beyond_package(fe)
+                        .map(|names| format!("a grant of {names}"))
+                }),
+            ),
+            lineage.clone(),
+        )),
         // Lot 285 — kmod's configuration, recorded.
         Box::new(NnLFim026ModprobeConfigWritten::<H>::new(lineage.clone())),
         // Medium last.
@@ -5729,14 +5779,10 @@ mod tests {
         let v = rule.evaluate(&Event::Fim(own.clone())).expect("recorded");
         assert_eq!(
             (v.severity, v.action.clone()),
-            (Severity::High, ResponseAction::Log),
-            "{}",
-            v.reasoning
+            (Severity::High, ResponseAction::Log)
         );
         assert!(
-            v.reasoning.contains("writer unknown") && v.reasoning.contains("no hostile content"),
-            "{}",
-            v.reasoning
+            v.reasoning.contains("writer unknown") && v.reasoning.contains("no hostile content")
         );
         assert!(!is_decisive_bait_tamper(&own));
         assert!(!det
@@ -5756,11 +5802,7 @@ mod tests {
                 (Severity::Critical, ResponseAction::KillProcessTree),
                 "{why}"
             );
-            assert!(
-                v.reasoning.contains("writer unknown"),
-                "{why}: {}",
-                v.reasoning
-            );
+            assert!(v.reasoning.contains("writer unknown"), "{why}");
             assert!(
                 det.detect(&Event::Fim(fe), &[])
                     .contains(&TriggerType::ControlSurfaceTamper),
@@ -5774,7 +5816,7 @@ mod tests {
         super::super::unknown_writer::keep(&by_shell, true);
         let v = rule.evaluate(&Event::Fim(by_shell.clone())).expect("fires");
         assert_eq!(v.severity, Severity::Critical);
-        assert!(!v.reasoning.contains("writer unknown"), "{}", v.reasoning);
+        assert!(!v.reasoning.contains("writer unknown"));
         assert!(det
             .detect(&Event::Fim(by_shell), &[])
             .contains(&TriggerType::ControlSurfaceTamper));
@@ -8820,8 +8862,10 @@ mod tests {
         let (_tmp, lineage) = admin_fixture();
         let rules = rules_by_id(&lineage);
         let r = &rules["NN-L-FIM-025_FileCapabilityGranted"];
+        // lot 373 (the review of #580, F1): a narrow grant (ping's
+        // cap_net_raw) — a root-equivalent one stays High, the next test
         let v = r
-            .evaluate(&cap_set("/usr/bin/newuidmap", 200, 1 << 7, false))
+            .evaluate(&cap_set("/usr/bin/ping", 200, 1 << 13, false))
             .unwrap();
         assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
         let v = r
@@ -8836,6 +8880,77 @@ mod tests {
         // a root shell with no sudo: stripped.
         let v = r.evaluate(&cap_set("/opt/x", 600, 1 << 7, false)).unwrap();
         assert_eq!(v.action, ResponseAction::StripFileCapability);
+    }
+
+    /// Lot 373 (named, the review of #580, F1: a package's root maintainer
+    /// script may append any path to its own `.list` and grant it
+    /// `cap_setuid`, or ship a helper of its own with it — Low on the PR's
+    /// head): in a package transaction, a grant of a capability equivalent
+    /// to root or of every capability is recorded High and kept (not
+    /// stripped from the package's file), never Low; the narrow ones
+    /// (`cap_net_raw`, `cap_net_admin`, …) stay Low. Outside the
+    /// transaction, as before (stripped, Critical for a root-equivalent
+    /// one).
+    #[test]
+    fn fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high() {
+        let (_tmp, lineage) = admin_fixture();
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-025_FileCapabilityGranted"];
+        for (bit, name) in [
+            (7, "cap_setuid"),
+            (6, "cap_setgid"),
+            (21, "cap_sys_admin"),
+            (16, "cap_sys_module"),
+            (19, "cap_sys_ptrace"),
+            (1, "cap_dac_override"),
+            (2, "cap_dac_read_search"),
+            (0, "cap_chown"),
+            (3, "cap_fowner"),
+            (39, "cap_bpf"),
+            (17, "cap_sys_rawio"),
+            (31, "cap_setfcap"),
+        ] {
+            for path in ["/usr/bin/python3.12", "/usr/lib/evil/helper"] {
+                let v = r
+                    .evaluate(&cap_set(path, 200, (1 << bit) | (1 << 13), false))
+                    .unwrap();
+                assert_eq!(
+                    (v.action.clone(), v.severity),
+                    (ResponseAction::Log, Severity::High),
+                    "{name} on {path}"
+                );
+                assert!(v.reasoning.contains(name) && v.reasoning.contains("not lowered"));
+            }
+        }
+        let v = r
+            .evaluate(&cap_set("/usr/bin/python3.12", 200, u64::MAX, false))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+        // the narrow ones: Low, as before
+        // (the soak's gst-ptp-helper: cap_sys_nice,cap_net_bind_service,
+        // cap_net_admin)
+        for bits in [
+            1u64 << 13,
+            (1 << 10) | (1 << 23),
+            1 << 14,
+            (1 << 23) | (1 << 10) | (1 << 12),
+        ] {
+            let v = r
+                .evaluate(&cap_set("/usr/lib/x/helper", 200, bits, false))
+                .unwrap();
+            assert_eq!((v.action, v.severity), (ResponseAction::Log, Severity::Low));
+        }
+        // outside the transaction: stripped, as before
+        let v = r
+            .evaluate(&cap_set("/usr/bin/python3.12", 600, 1 << 7, false))
+            .unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::StripFileCapability, Severity::Critical)
+        );
     }
 
     // ── external audit NN-AUD-284 — the package transaction proper ──

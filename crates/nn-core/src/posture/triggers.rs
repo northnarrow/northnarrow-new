@@ -5068,6 +5068,18 @@ mod tests {
                 "{dev:#x}: {hits:?}"
             );
         }
+        // the lab of lot 373: in observe mode the handles are let through
+        // and marked a listing (NN-L-BPF-002 Low): no trigger either
+        let listed = Event::BpfSyscall {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd: common::wire::BPF_CMD_LISTING_GET_FD,
+            arg: 48,
+            timestamp_ns: 10,
+        };
+        let hits = det.detect(&listed, &[]);
+        assert!(hits.is_empty(), "{hits:?}");
     }
 
     // ── lot 340 — npm and the Go toolchain in their own directories ──

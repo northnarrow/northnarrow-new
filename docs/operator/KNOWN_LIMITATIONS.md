@@ -734,26 +734,63 @@ lists the known false positives of each rule.
   - the agent re-creating its `/run/northnarrow` control-surface files at
     every boot (no `NN-L-FIM-024`);
   - `sudo bpftool prog show` (or `map list`, `cgroup tree`) with the
-    packaged bpftool: still refused, `NN-L-AT-001` Low, no posture;
+    packaged bpftool: still refused, `NN-L-AT-001` Low, no posture; in
+    observe mode, where the kernel lets the handles through, one
+    `NN-L-BPF-002` Low record per bpftool process, no posture;
   - rsyslogd's last flush and `systemd-update-utmp`'s record at shutdown,
     judged by what the kernel recorded at the write;
-  - a package's postinst running `setcap` on its own files in its
-    transaction (`R012` Low);
+  - a package's postinst running `setcap` with a narrow capability
+    (`cap_net_raw`, `cap_net_admin`, `cap_net_bind_service`, `cap_sys_nice`,
+    …: `ping`'s, `gst-ptp-helper`'s) on its own files in its transaction
+    (`R012` Low);
   - systemd-timesyncd, chronyd or ntpd polling UDP 123 as their service
-    account (no `NN-L-NET-013`).
+    account, in their unit's cgroup, started there and never injected (no
+    `NN-L-NET-013`).
 
   Still recorded High: `sudo logrotate -f` by hand (by design, lot 340); a
-  `setcap` from a session or on a file of no package; a bpftool `map dump`,
+  `setcap` from a session or on a file of no package; any grant in a
+  package transaction beyond the narrow set — a capability equivalent to
+  root (`cap_setuid`, `cap_sys_admin`, `cap_dac_override`, …), `=ep` — on
+  `R012` and on `NN-L-FIM-025` (kept, not stripped); a bpftool `map dump`,
   `update`, `pin` or `detach`, or any other program's handle on the agent's
-  objects; any other program beaconing to UDP 123. Residuals: root running
-  the packaged `systemd-update-utmp` in a cgroup it removes before the read
-  appends a boot or shutdown record unrecorded (the binary writes nothing
-  else and erases nothing); a bait created with no kernel record of its
-  writer that holds the bait's own content is High, not Critical (no
-  writer to act on). *Evidence:* lot 373;
+  objects; any other program beaconing to UDP 123.
+
+  Residuals:
+  - **A package's own files.** What says a file is a package's is a line of
+    its dpkg `.list`, which the package's own maintainer script, run as root,
+    can append to; a malicious package can also ship a helper of its own. A
+    narrow capability on such a file is Low: the trust boundary every package
+    transaction already is (root installs what it likes through the real
+    package manager). The narrow set includes `cap_net_admin`
+    (`gst-ptp-helper`'s, `dumpcap`'s): a malicious package's helper with it
+    lets whoever runs it change the network's configuration, the host
+    firewall included.
+  - **The packaged `systemd-update-utmp` itself.** Root that runs it (in a
+    cgroup it removes before the read, or in the unit's) has its writes to a
+    login record kept when the file grew by whole records. A rewrite made
+    before an exec of it, through an inherited descriptor, is another
+    writer's and stays High; but the binary run with a preloaded library
+    (`LD_PRELOAD`) or with code injected by `ptrace` can rewrite a record in
+    place before its append, and `NN-L-FIM-019` does not see it.
+  - **bpftool's environment.** The proof of a bpftool listing does not read
+    the taker's environment: a packaged bpftool run by root with a preloaded
+    library and a listing command line has its refused handles recorded Low
+    (`NN-L-AT-001`), and in observe mode its handles by id one Low record
+    (`NN-L-BPF-002`, whose record does not say whether a map, a program or a
+    link was asked for; a map's read-write handle included, as bpftool
+    takes one for a program's metadata). In enforce mode the refusal
+    stands, and every other operation (a detach, a dump's or an update's
+    handle) keeps its own High record.
+  - A bait created with no kernel record of its writer that holds the bait's
+    own content is High, not Critical (no writer to act on).
+
+  *Evidence:* lot 373;
   `the_agent_s_own_runtime_bait_is_no_creation_by_an_unknown_writer`,
   `a_root_listing_by_the_packaged_bpftool_is_told_from_a_handle_grab`,
-  `a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts`.
+  `a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts`,
+  `an_exec_between_two_writes_is_another_writer`,
+  `a_postinst_setcap_of_a_root_equivalent_capability_stays_high`,
+  `fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

@@ -4890,6 +4890,15 @@ still fires.
   - A dump, an update, a pin, a detach, a copy of bpftool, python's ctypes,
     a non-root run and a handle under the pin directories stay High and
     still raise ENGAGED.
+  - In observe mode (the alpha profile) the kernel lets the handles through
+    and reports each as a foreign handle — a program's, and each of its
+    maps', which bpftool opens by id read-write (libbpf's default) to print
+    the program's metadata (`NN-L-BPF-002`, High ×100 for one `bpftool prog
+    show` in the lot's lab, at every boot). The same proof, at the bus's
+    barrier, now marks such a handle by id a listing: one `NN-L-BPF-002`
+    Low record per bpftool process (a minute), no posture. A handle or a
+    write handle not proven (ctypes, a copy, a dump, an update) and a
+    detach stay High.
 - **`NN-L-FIM-005` (rsyslogd) and `NN-L-FIM-019` (`systemd-update-utmp`) at
   shutdown.** Lot 347's fix was not lost. It read the writer's `/proc` and
   cgroup while the writer runs, and at a shutdown the writer has often
@@ -4901,33 +4910,69 @@ still fires.
     identity once `/proc` and the lineage name none.
   - `NN-L-FIM-019` keeps lot 347's unit when all of these hold: the packaged
     `systemd-update-utmp` image; root; the file's only writer since its
-    last record (the kernel's `FIM_WRITE_ONE_WRITER`); and the writer's
+    last record (the kernel's `FIM_WRITE_ONE_WRITER`: one process — its pid
+    and start — running one image at every write); and the writer's
     cgroup is the unit's or no cgroup any more (a oneshot's `ExecStop=`
     cgroup is removed as its process exits). An append of whole records is
     still required.
   - Still High: a copy of the binary, the binary in a session's scope or in
-    another unit still there, another writer folded in, a truncation, and
-    `sudo logrotate -f` (by design, lot 340).
+    another unit still there, a write by another process, a write by the
+    same process before it executed the packaged binary (through a
+    descriptor the binary inherits), a truncation, and `sudo logrotate -f`
+    (by design, lot 340).
+  - Residual: the packaged binary itself, run by root with a preloaded
+    library (`LD_PRELOAD`) or with code injected by `ptrace`, can rewrite a
+    record in place before its append; `NN-L-FIM-019` does not see that
+    (`KNOWN_LIMITATIONS.md`).
+  - A removed cgroup is found gone on a host whose hierarchy is deeper than
+    five levels (a user manager's units, containers): the walk reads every
+    level, and a directory it cannot read leaves the record High.
 - **`R012` High from a package's postinst.** A package transaction now
   records Low (lot 373) when all of these hold: root runs the system's
   `setcap` (`/usr/sbin/setcap`, by device and inode); its parent is dpkg's
   maintainer script of a package (`/var/lib/dpkg/info/<package>.postinst`
   and its kin, in a root-only directory); that parent runs in a live
-  package transaction run by root; and every file the command line names
-  is listed in that package's `.list`, in a root-only directory of a
-  system tree.
+  package transaction run by root; every file the command line names is
+  listed in that package's `.list` (or is the file a line names under
+  another spelling of a merged `/usr`, by device and inode: `iputils-ping`
+  grants `/bin/ping`, its list names `/usr/bin/ping`), in a root-only
+  directory of a system tree, and is no interpreter or shell; and every
+  capability it grants is a narrow one (`cap_net_raw`, `cap_net_admin`,
+  `cap_net_bind_service`, `cap_net_broadcast`, `cap_ipc_lock`,
+  `cap_sys_nice`, `cap_sys_resource`, `cap_wake_alarm`,
+  `cap_block_suspend`): `libgstreamer1.0-0`'s
+  `cap_sys_nice,cap_net_bind_service,cap_net_admin` on `gst-ptp-helper` is
+  Low.
   - Still High: a `setcap` from a session (`sudo` included), the
     maintainer script run by hand, a file of no package or of another
-    package, a writable directory, a copy of the tool, a non-root run, and
-    a command line cut.
-  - `NN-L-FIM-025` still records the grant itself.
+    package, a writable directory, a copy of the tool, a non-root run, a
+    command line cut, and — the review of #580 — any grant beyond the
+    narrow set, inside the transaction too: the `.list` is the package's
+    own maintainer script's to append to, so it vouches for nothing
+    equivalent to root (`cap_setuid`, `cap_setgid`, `cap_sys_admin`,
+    `cap_sys_module`, `cap_sys_ptrace`, `cap_dac_override`,
+    `cap_dac_read_search`, `cap_chown`, `cap_fowner`, `cap_bpf`,
+    `cap_sys_rawio`, `cap_setfcap`), nor for `=ep` or `all`. The High record
+    names the fact that was missing.
+  - `NN-L-FIM-025` records the grant itself: Low in the transaction for a
+    narrow capability; High for any other, kept (not stripped from the
+    package's file) — it was Low for every grant in a transaction since
+    review 86.
 - **`NN-L-NET-013` from systemd-timesyncd.** The system's NTP client
   talking NTP is no beacon. That means UDP to port 123, from the packaged
   image of systemd-timesyncd, chronyd or ntpd (the lineage's records, else
   `/proc/<pid>/exe` of the process that started at the flow's start), run
-  as that client's service account from `/etc/passwd`.
+  as that client's service account from `/etc/passwd`, in one of that
+  client's units' cgroups (`systemd-timesyncd.service`, `chrony.service`,
+  `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
+  `openntpd.service`), started there and never injected (the kernel's lot
+  277 and 281 marks).
   - Still a beacon: python or any other program to UDP 123, the daemon to
-    another port or over TCP, and the daemon's image run as another user.
+    another port or over TCP, the daemon's image run as another user, from
+    a session (`setpriv --reuid=systemd-timesync …`), moved into the unit's
+    cgroup, traced or injected, or with a mark not known.
+  - The netflow comm allowlist's `chronyd` and `ntpd` entries are as before
+    (by exec identity, any port).
 - **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
@@ -4940,6 +4985,13 @@ still fires.
   200 bytes (the kernel object and the agent are one build).
   - Expect no `NN-L-FIM-024` and no COMBAT at boot.
   - Expect `NN-L-AT-001` Low for an administrator's bpftool listings.
-  - Expect fewer High records at shutdown, in package upgrades with
-    capability-bearing helpers, and from timesyncd.
+  - Expect fewer High records at shutdown, in package upgrades whose
+    helpers get a narrow capability (`ping`, `mtr-packet`,
+    `gst-ptp-helper`, `dumpcap`), and from timesyncd.
+  - Expect `NN-L-BPF-002` Low (one per bpftool process) for an
+    administrator's bpftool listings in observe mode.
+  - Expect `R012` High and `NN-L-FIM-025` High (Log, the capability kept)
+    when a package transaction grants a capability beyond the narrow set:
+    on the RPM family, `newuidmap`'s `cap_setuid` at each `shadow-utils`
+    install or upgrade.
 

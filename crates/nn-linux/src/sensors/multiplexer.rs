@@ -1467,7 +1467,46 @@ pub(crate) fn mark_bpf_listing_on_host(e: &mut Event, lineage: &AuthSessionTrack
 }
 
 /// [`mark_bpf_listing_on_host`]'s decision, the proof read by `prove`.
+///
+/// The lab of lot 373 (observe mode: the kernel lets the handles through and
+/// reports `BPF_CMD_FOREIGN_GET_FD` for each program, and
+/// `BPF_CMD_FOREIGN_MAP_WRITE` for each of its maps — bpftool opens a
+/// program's maps by id, read-write as libbpf does by default, to print its
+/// metadata — NN-L-BPF-002 High ×100 for each `bpftool prog show`): such a
+/// report, its id given (`arg`), whose taker the agent proves the packaged
+/// bpftool's listing of programs or of maps (the record does not say which
+/// kind: either listing's command line) is marked `BPF_CMD_LISTING_GET_FD` —
+/// NN-L-BPF-002 signs one Low record per listing process. A report not
+/// proven, one with no id (a pin), a detach, any other report pass
+/// unchanged.
 fn mark_bpf_listing(e: &mut Event, prove: &dyn Fn(u32, (u64, u64), u64) -> Result<String, String>) {
+    if let Event::BpfSyscall {
+        pid,
+        cmd,
+        arg,
+        timestamp_ns,
+        ..
+    } = e
+    {
+        if !matches!(
+            *cmd,
+            common::wire::BPF_CMD_FOREIGN_GET_FD | common::wire::BPF_CMD_FOREIGN_MAP_WRITE
+        ) || *arg == 0
+        {
+            return;
+        }
+        let proofs = [2u64, 1].map(|kind| prove(*pid, (kind, u64::from(*arg)), *timestamp_ns));
+        match proofs.iter().find(|p| p.is_ok()) {
+            Some(_) => *cmd = common::wire::BPF_CMD_LISTING_GET_FD,
+            None => tracing::debug!(
+                pid = *pid,
+                id = *arg,
+                why = ?proofs.iter().filter_map(|p| p.as_ref().err()).collect::<Vec<_>>(),
+                "bpf foreign handle: no listing by the packaged bpftool"
+            ),
+        }
+        return;
+    }
     if let Event::FsProtectDenial {
         pid,
         operation: nn_model::FsProtectOperation::BpfHandle,
@@ -2763,6 +2802,64 @@ mod tests {
                 &proven,
             ),
             (denial(nn_model::FsProtectOperation::BpfMap, 1, 31), &proven),
+        ] {
+            let before = format!("{e:?}");
+            let mut e = e;
+            mark_bpf_listing(&mut e, prove);
+            assert_eq!(format!("{e:?}"), before);
+        }
+    }
+
+    /// Lot 373 (named, the lab of lot 373: `sudo bpftool prog show`, `-j prog
+    /// list`, `map show`, `cgroup tree` in observe mode — NN-L-BPF-002 High
+    /// ×100 at every boot): a foreign handle the kernel let through is marked
+    /// a bpftool listing only when proven (either kind's listing) — a
+    /// program's map opened read-write for its metadata too; a handle not
+    /// proven, one with no id (a pin), a detach pass unchanged.
+    #[test]
+    fn a_foreign_handle_is_marked_a_bpftool_listing_only_when_proven() {
+        use common::wire::{
+            BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_LISTING_GET_FD,
+        };
+        let call = |cmd, arg| Event::BpfSyscall {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd,
+            arg,
+            timestamp_ns: 5,
+        };
+        type Prove = dyn Fn(u32, (u64, u64), u64) -> Result<String, String>;
+        let seen = std::cell::RefCell::new(Vec::new());
+        let maps_only = |pid: u32, kind_id: (u64, u64), at: u64| -> Result<String, String> {
+            seen.borrow_mut().push((pid, kind_id, at));
+            if kind_id.0 == 1 {
+                Ok("bpftool".into())
+            } else {
+                Err("no prog listing".into())
+            }
+        };
+        let not = |_: u32, _: (u64, u64), _: u64| -> Result<String, String> { Err("no".into()) };
+        let mut e = call(BPF_CMD_FOREIGN_GET_FD, 48);
+        mark_bpf_listing(&mut e, &maps_only);
+        assert!(
+            matches!(e, Event::BpfSyscall { cmd, arg: 48, .. } if cmd == BPF_CMD_LISTING_GET_FD),
+            "{e:?}"
+        );
+        assert_eq!(*seen.borrow(), vec![(1613, (2, 48), 5), (1613, (1, 48), 5)]);
+        let proven = |_: u32, _: (u64, u64), _: u64| -> Result<String, String> { Ok("b".into()) };
+        let mut e = call(BPF_CMD_FOREIGN_MAP_WRITE, 130);
+        mark_bpf_listing(&mut e, &proven);
+        assert!(
+            matches!(e, Event::BpfSyscall { cmd, arg: 130, .. } if cmd == BPF_CMD_LISTING_GET_FD),
+            "a program's map for its metadata: {e:?}"
+        );
+        for (e, prove) in [
+            (call(BPF_CMD_FOREIGN_GET_FD, 48), &not as &Prove),
+            (call(BPF_CMD_FOREIGN_MAP_WRITE, 130), &not),
+            (call(BPF_CMD_FOREIGN_GET_FD, 0), &proven),
+            (call(common::bpf_cmd::BPF_PROG_DETACH, 48), &proven),
+            (call(common::bpf_cmd::BPF_LINK_DETACH, 48), &proven),
         ] {
             let before = format!("{e:?}");
             let mut e = e;

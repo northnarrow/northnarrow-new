@@ -1855,6 +1855,13 @@ pub const BPF_CMD_FRESH_INSTANCE_GET_FD: u32 = 0xFFFF_0003;
 /// recorded High — the OOM killer or a crash took the agent or the
 /// watchdog, and the vacancy is the moment a preloaded instance would take.
 pub const BPF_CMD_VACATED_ROLE_GET_FD: u32 = 0xFFFF_0004;
+/// Lot 373 (the lab of lot 373: `sudo bpftool prog show` in observe mode,
+/// NN-L-BPF-002 High ×100 at every boot): a [`BPF_CMD_FOREIGN_GET_FD`] that
+/// the agent proved, at the bus's barrier, the packaged bpftool's
+/// read-only listing (`nn_linux::sensors::multiplexer::mark_bpf_listing_on_host`).
+/// Userland only: the kernel never emits it, and a raw record that carries
+/// it is read as [`BPF_CMD_FOREIGN_GET_FD`] (`nn_model`'s decoding).
+pub const BPF_CMD_LISTING_GET_FD: u32 = 0xFFFF_0005;
 /// Lot 370 (F10-4): `ROLE_TGIDS`' value for a role whose holder exited this
 /// boot (0: never held). No thread group has this number.
 pub const ROLE_VACATED: u32 = u32::MAX;
@@ -1902,6 +1909,7 @@ pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
         BPF_CMD_FOREIGN_GET_FD => "foreign_get_fd",
         BPF_CMD_FRESH_INSTANCE_GET_FD => "fresh_instance_get_fd",
         BPF_CMD_VACATED_ROLE_GET_FD => "vacated_role_get_fd",
+        BPF_CMD_LISTING_GET_FD => "listing_get_fd",
         _ => "other",
     }
 }
@@ -2254,10 +2262,35 @@ pub const FIM_WRITE_APPEND_ONLY: u8 = 0x04;
 /// [`FimDriftRaw::op_flags`] bit (lot 344) of a `Modified` seen at close:
 /// every write to the inode since its last record the marker saw was by the
 /// record's process (one process: its pid and its start — the marker is
-/// last-writer-wins). Not exact (the review of #554, F3): the marker's
+/// last-writer-wins) running one image (lot 373, the review of #580, F3: its
+/// `mm->exe_file`'s device and inode, read at each write — a write before an
+/// exec is another writer's; an image not read clears it). Not exact (the review of #554, F3): the marker's
 /// update is not atomic, so a write racing another can be lost from it; a
 /// record read smaller is exempt only with [`FIM_WRITE_TRUNCATED_BY_ANOTHER`].
 pub const FIM_WRITE_ONE_WRITER: u8 = 0x08;
+
+/// Lot 373 (the review of #580, F3): a writer of a watched inode as the FIM
+/// marker keeps it at each write — its pid, its start, and its image's
+/// device (the kernel's form) and inode (`mm->exe_file`; 0: not read).
+pub type FimWriter = (u32, u64, u64, u64);
+
+/// Lot 373 (the review of #580, F3): [`FIM_WRITE_ONE_WRITER`] may stay set
+/// at a write by `now`, the marker holding `prev`'s write (`None`: none
+/// pending) — `now`'s image is known, and `prev`, when there is one, is the
+/// same process (pid and start) running the same image. An exec keeps the
+/// pid and the start: a rewrite made before it, through a descriptor the
+/// new image inherits, is not the new image's write. Shared by the eBPF
+/// marker and its tests.
+#[inline(always)]
+pub fn fim_one_writer_keeps(prev: Option<FimWriter>, now: FimWriter) -> bool {
+    if now.3 == 0 {
+        return false;
+    }
+    match prev {
+        None => true,
+        Some(p) => p.0 == now.0 && p.1 == now.1 && p.2 == now.2 && p.3 == now.3,
+    }
+}
 
 /// [`FimDriftRaw::op_flags`] bit (the review of #554, F1) of a `Modified`
 /// seen at close: while the record's writes were pending, ANOTHER process
@@ -2312,7 +2345,7 @@ impl FimDriftRaw {
 /// named only the source (`/usr/bin/passwd`): the link's directory is
 /// rarely watched (`/var/tmp`), so NN-L-FIM-002 never saw where the link
 /// went. Sent on the FIM ring beside the drift records, told apart by its
-/// size. 712 bytes, 8-aligned.
+/// size. 736 bytes, 8-aligned (lot 373: the drift record grew by 24).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -2645,14 +2678,50 @@ mod tests {
     // ── Tappa 9 C1 — FIM wire types ────────────────────────────────
 
     /// C1 (+ polish #3) test #1: [`FimDriftRaw`] layout matches
-    /// the kernel↔userland ABI exactly. **176 bytes**, 8-aligned (lot 344; the
-    /// review of #554 appended `modifier_start`).
+    /// the kernel↔userland ABI exactly. **200 bytes**, 8-aligned (lot 344; the
+    /// review of #554 appended `modifier_start`; lot 373 the writer's image
+    /// and cgroup).
     /// Polish #3 grew this from 56 → 72 bytes by appending
     /// `dest_dev` + `dest_ino` (each `u64`); BUG-022 grew it
     /// 72 → 144 by appending the `child_name` tail so
     /// `fim_create_observe` / `fim_rename_observe` can communicate
     /// the dropped child's leaf to userland. Wire-byte stability
     /// matters — any change here is a coordinated kernel+user upgrade.
+    /// Lot 373 (named, the review of #580, F3: the marker's one writer was
+    /// its pid and start, which an exec keeps — python's in-place rewrite of
+    /// `/var/log/wtmp` through a descriptor it then handed to the packaged
+    /// `systemd-update-utmp` it executed was folded into that binary's
+    /// append): one writer is one process running one image; an image not
+    /// read is never the same.
+    #[test]
+    fn an_exec_between_two_writes_is_another_writer() {
+        const PY: FimWriter = (4_242, 9_000, 0x0080_0001, 1_234);
+        const UTMP: FimWriter = (4_242, 9_000, 0x0080_0001, 5_678);
+        assert!(fim_one_writer_keeps(None, UTMP), "the first write");
+        assert!(fim_one_writer_keeps(Some(UTMP), UTMP), "the same image");
+        assert!(!fim_one_writer_keeps(Some(PY), UTMP), "an exec between");
+        assert!(
+            !fim_one_writer_keeps(Some((4_242, 9_000, 0x0080_0002, 5_678)), UTMP),
+            "the same inode on another device"
+        );
+        assert!(
+            !fim_one_writer_keeps(Some((4_243, 9_000, 0x0080_0001, 5_678)), UTMP),
+            "another pid"
+        );
+        assert!(
+            !fim_one_writer_keeps(Some((4_242, 9_001, 0x0080_0001, 5_678)), UTMP),
+            "a pid reused"
+        );
+        assert!(
+            !fim_one_writer_keeps(None, (4_242, 9_000, 0, 0)),
+            "no image read"
+        );
+        assert!(
+            !fim_one_writer_keeps(Some((4_242, 9_000, 0, 0)), (4_242, 9_000, 0, 0)),
+            "two writes with no image read"
+        );
+    }
+
     #[test]
     fn fim_drift_raw_layout_is_stable() {
         // 8 + 8 + 8 + 4 + 4 + 16 + 1 + 7 + 8 + 8 (= 72, polish #3)
@@ -2775,6 +2844,7 @@ mod tests {
         assert_eq!(bpf_cmd_name(30), "link_get_fd_by_id");
         assert_eq!(bpf_cmd_name(31), "other");
         assert_eq!(bpf_cmd_name(BPF_CMD_FOREIGN_GET_FD), "foreign_get_fd");
+        assert_eq!(bpf_cmd_name(BPF_CMD_LISTING_GET_FD), "listing_get_fd");
         assert_eq!(
             bpf_cmd_name(BPF_CMD_FRESH_INSTANCE_GET_FD),
             "fresh_instance_get_fd"

@@ -291,11 +291,11 @@ Capability-set tooling exec — category `privilege_escalation`.
 
 **Observes.** The exec of `setcap`, which grants file capabilities; a capability spec in argv is named in the reasoning. A copy run from a staging directory is killed with its tree.
 
-**Known false positives.** A provisioning tool that sets capabilities is killed unless `setcap` is allowlisted in `process-comm-allowlist`; under a trusted actor (a package manager) the system's `setcap` is recorded. A capability set by any other route is NN-L-FIM-025's. Lot 373: a package's maintainer script granting capabilities to files of that same package (its dpkg list, root-only directories), in the live package transaction, by the system's `setcap` run by root, is Low.
+**Known false positives.** A provisioning tool that sets capabilities is killed unless `setcap` is allowlisted in `process-comm-allowlist`; under a trusted actor (a package manager) the system's `setcap` is recorded. A capability set by any other route is NN-L-FIM-025's. Lot 373: a package's maintainer script granting a narrow capability (cap_net_raw, cap_net_admin, cap_net_bind_service, cap_sys_nice, …) to a file of that same package that is no interpreter (its dpkg list, root-only directories), in the live package transaction, by the system's `setcap` run by root, is Low; a grant beyond that set (cap_setuid, a capability equivalent to root, =ep) stays High there too (the review of #580).
 
 **How to test.** `setcap` with no argument (the exec alone fires it).
 
-**Tests.** `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::fires_on_setcap`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::r012_staged_copy_kills_the_process_tree`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::a_postinst_setcap_on_its_own_package_s_file_is_low`
+**Tests.** `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::fires_on_setcap`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::r012_staged_copy_kills_the_process_tree`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::a_postinst_setcap_on_its_own_package_s_file_is_low`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::a_postinst_setcap_of_a_root_equivalent_capability_stays_high`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::a_postinst_setcap_through_a_merged_usr_is_the_package_s_file`
 
 **ATT&CK note.** File capabilities have no sub-technique of their own (T1548.001 is setuid and setgid): the parent technique.
 
@@ -988,7 +988,7 @@ wtmp/btmp tampered by non-login process — category `fim_defense_evasion`.
 
 **Observes.** A rewrite of /var/log/wtmp or /var/log/btmp by a process outside the login machinery.
 
-**Known false positives.** The login machinery (login, sshd, sshd-session, systemd-logind, systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt by kernel-resolved exe. Another program that writes login records through the utmp API (a terminal multiplexer's helper) is killed. Lot 373: the packaged systemd-update-utmp's shutdown record, its process gone by the judgement, is told by what the kernel recorded at the write (its image, root, the file's only writer, its unit's cgroup or a cgroup removed since) and an append of whole records.
+**Known false positives.** The login machinery (login, sshd, sshd-session, systemd-logind, systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt by kernel-resolved exe. Another program that writes login records through the utmp API (a terminal multiplexer's helper) is killed. Lot 373: the packaged systemd-update-utmp's shutdown record, its process gone by the judgement, is told by what the kernel recorded at the write (its image, root, the file's only writer — one process running one image at every write — its unit's cgroup or a cgroup removed since) and an append of whole records.
 
 **How to test.** `printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab guest: it appends a byte); expect High, KillProcess aimed at dd.
 
@@ -1120,11 +1120,11 @@ File capability granted — category `fim_privilege_escalation`.
 
 **Observes.** A file capability (security.capability) stored on any file, by any route (setcap, setxattr, cp --preserve=xattr, tar --xattrs), seen by the file-open sensor's inode_post_setxattr hook. Critical for a root-equivalent capability (setuid, setgid, dac_override, dac_read_search, fowner, chown, sys_admin, sys_ptrace, sys_module, sys_rawio, setfcap, bpf), else High; the response removes it.
 
-**Known false positives.** Packages install files with capabilities (ping, newuidmap, dumpcap): recorded at Low and kept. A grant in an interactive sudo or su session, or while the trusted-installer window is open, is recorded and kept; a namespaced capability (a rootless container build) is recorded at Medium.
+**Known false positives.** Packages install files with capabilities (ping, mtr-packet, dumpcap, gst-ptp-helper, gnome-keyring): a narrow one (cap_net_raw, cap_net_admin, cap_net_bind_service, cap_net_broadcast, cap_ipc_lock, cap_sys_nice, cap_sys_resource, cap_wake_alarm, cap_block_suspend) written in a package transaction is recorded at Low and kept. Lot 373 (the review of #580): any other in a transaction (newuidmap's cap_setuid, a capability equivalent to root, =ep) is recorded at High and kept — the package's own root maintainer script decides what the transaction vouches for. A grant in an interactive sudo or su session, or while the trusted-installer window is open, is recorded and kept; a namespaced capability (a rootless container build) is recorded at Medium.
 
 **How to test.** `cp /usr/bin/python3 /tmp/nn-py && sudo systemd-run --wait setcap cap_setuid+ep /tmp/nn-py`; `getcap /tmp/nn-py` then prints nothing; expect Critical, StripFileCapability.
 
-**Tests.** `crates/nn-core/src/fim/rules.rs::fim025_strips_a_granted_capability`, `crates/nn-core/src/fim/rules.rs::fim025_keeps_a_grant_inside_the_trusted_installer_window`, `crates/nn-core/src/fim/rules.rs::fim025_package_manager_and_interactive_admin_keep_the_capability`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim025_strips_a_granted_capability`, `crates/nn-core/src/fim/rules.rs::fim025_keeps_a_grant_inside_the_trusted_installer_window`, `crates/nn-core/src/fim/rules.rs::fim025_package_manager_and_interactive_admin_keep_the_capability`, `crates/nn-core/src/fim/rules.rs::fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high`
 
 **ATT&CK note.** T1548: ATT&CK has no sub-technique for Linux file capabilities (T1548.001 is the set-id bits).
 
@@ -1471,7 +1471,7 @@ Periodic outbound beacon (low jitter) — category `net_high`.
 
 **Observes.** Outbound flows from one process to one destination at regular intervals: at least 4 of them, a mean interval of a second or more and a coefficient of variation of 0.15 or less, within an hour. Lot 369: one record per program (the kernel's image; an interpreter's image and the script it runs, else its process), destination and hour, the next counting the periodic flows folded since; a datagram sent to the sending socket's own bound endpoint on loopback (PostgreSQL ≤ 14's statistics collector) is no beacon — the destination the send names (`sendto()`, connected socket or not), the socket's peer only when it names none. Residual: a datagram to the sender's own loopback endpoint is no beacon; whatever forwards it is judged by its own flows.
 
-**Known false positives.** Pollers, health checks, metrics exporters and update checkers not in the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are). Lot 373: the system's NTP client (systemd-timesyncd, chronyd, ntpd: the packaged image by its device and inode, as its service account) to UDP 123 is no beacon; any other program to UDP 123, or the daemon to another port, is judged.
+**Known false positives.** Pollers, health checks, metrics exporters and update checkers not in the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are). Lot 373: the system's NTP client (systemd-timesyncd, chronyd, ntpd: the packaged image by its device and inode, as its service account, in its unit's cgroup, started there and never injected — the kernel's lot 277/281 marks) to UDP 123 is no beacon; any other program to UDP 123, the daemon to another port, from a session or injected, is judged.
 
 **How to test.** From one process, connect to the same address every 5 seconds: `python3 -c 'import socket, time; [(socket.create_connection(("<peer>", 80)).close(), time.sleep(5)) for _ in range(6)]'`.
 
@@ -1672,7 +1672,7 @@ Connect to a public address the process's lineage did not resolve — category `
 | [`NN-L-IOU-001_IoUringRingCreated`](#nn-l-iou-001_iouringringcreated) | io_uring ring created by an unlisted process | Low | Log | T1106 |
 | [`NN-L-IOU-002_IoUringFileAndNetwork`](#nn-l-iou-002_iouringfileandnetwork) | io_uring file and network I/O from the same unlisted process | High | Log | T1106 |
 | [`NN-L-BPF-001_BpfProgramLoaded`](#nn-l-bpf-001_bpfprogramloaded) | BPF program loaded or attached by an unlisted process | Medium | Log | T1014 |
-| [`NN-L-BPF-002_BpfForeignHandleOrDetach`](#nn-l-bpf-002_bpfforeignhandleordetach) | Handle to the agent's BPF objects, or a program/link detach, by an unlisted process | High | Log | T1685 |
+| [`NN-L-BPF-002_BpfForeignHandleOrDetach`](#nn-l-bpf-002_bpfforeignhandleordetach) | Handle to the agent's BPF objects, or a program/link detach, by an unlisted process | High, Low | Log | T1685 |
 | [`NN-L-AT-001_AntiTamperDenial`](#nn-l-at-001_antitamperdenial) | Attempt on the agent refused by an anti-tamper hook | High, Low | Log | T1685, T1055.008, T1055.009, T1552.004 |
 | [`NN-L-EPG-001_CredentialPostcondition`](#nn-l-epg-001_credentialpostcondition) | Credentials gained without a legitimate kernel transition | Critical, High | KillProcess, Log | T1068 |
 | [`NN-L-EPG-002_NamespaceRootPostcondition`](#nn-l-epg-002_namespacerootpostcondition) | Namespaces or root left without a legitimate kernel transition | Critical | KillProcess, Log | T1611 |
@@ -2015,7 +2015,7 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 
 | | |
 |---|---|
-| Severity | High |
+| Severity | High, Low |
 | Response | Log |
 | ATT&CK | T1685 Disable or Modify Tools (Defense Impairment) |
 | Sensor — data | anti-tamper (LSM denials, bpf() syscalls) — DC0021 OS API Execution |
@@ -2023,11 +2023,11 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 
 **Observes.** A handle taken by id to one of the agent's own BPF maps, programs or links, a write handle on an agent map (observe mode), or a program or link detach by a process outside the known BPF tooling. Lot 370: a successor of the agent or the watchdog that took its role after the holder exited this boot (the OOM killer, a crash) is recorded High outside a signed trusted-installer window, Low inside one; a first start's handle stays Low. The agent's own successor records it at its start (the review of #578).
 
-**Known false positives.** A detach by tooling not in the list (a container runtime or CNI not listed). A handle to the agent's own objects is never exempt: an administrator's `bpftool map dump` of them is recorded too.
+**Known false positives.** A detach by tooling not in the list (a container runtime or CNI not listed). A handle to the agent's own objects is never exempt: an administrator's `bpftool map dump` of them is recorded too. Lot 373: the packaged bpftool run by root listing or showing programs or maps (`prog show`, `map list`, `cgroup tree`), which in observe mode gets a handle by id on each of the agent's, is one Low record per process, no posture.
 
 **How to test.** `bpftool map update pinned <pins>/PROTECTED_PIDS key 1 0 0 0 value 1` (anti-tamper.sh case C08) or `bpftool link show pinned` (C09): observe mode records this rule, enforce mode denies the handle (NN-L-AT-001).
 
-**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::own_object_handle_is_high_even_for_known_tooling`, `deploy/lab/adversarial/anti-tamper.sh::case C08`
+**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::own_object_handle_is_high_even_for_known_tooling`, `crates/nn-core/src/decision/rules/bpf.rs::a_proven_bpftool_listing_is_one_low_record`, `crates/nn-linux/src/sensors/multiplexer.rs::a_foreign_handle_is_marked_a_bpftool_listing_only_when_proven`, `deploy/lab/adversarial/anti-tamper.sh::case C08`
 
 ### NN-L-AT-001_AntiTamperDenial
 

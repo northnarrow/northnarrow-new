@@ -28,7 +28,7 @@ use common::bpf_cmd::{
 };
 use common::wire::{
     bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_CMD_VACATED_ROLE_GET_FD,
+    BPF_CMD_LISTING_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD,
 };
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
@@ -157,11 +157,44 @@ pub const BPF002_ID: &str = "NN-L-BPF-002_BpfForeignHandleOrDetach";
 
 pub struct NnLBpf002BpfForeignHandleOrDetach<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
+    /// Lot 373: the listing processes recorded lately (pid, the record's
+    /// time), so that one listing is one record ([`LISTING_DEDUP_NS`]).
+    listings: parking_lot::Mutex<std::collections::VecDeque<(u32, u64)>>,
 }
+
+/// Lot 373: how long one process's proven bpftool listing stays one record
+/// (bpftool takes a handle on each object it prints: a hundred a run).
+pub const LISTING_DEDUP_NS: u64 = 60 * 1_000_000_000;
+
+/// Lot 373: the listing processes [`NnLBpf002BpfForeignHandleOrDetach`]
+/// remembers at most (the oldest forgotten first: a forgotten one records
+/// again).
+const LISTINGS_MAX: usize = 64;
 
 impl<H: PostureHost> NnLBpf002BpfForeignHandleOrDetach<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            listings: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Lot 373: `pid`'s proven listing at `at_ns` is the first of that
+    /// process within [`LISTING_DEDUP_NS`] — the one to record.
+    fn first_listing(&self, pid: u32, at_ns: u64) -> bool {
+        let mut seen = self.listings.lock();
+        if seen
+            .iter()
+            .any(|&(p, t)| p == pid && at_ns.saturating_sub(t) < LISTING_DEDUP_NS)
+        {
+            return false;
+        }
+        seen.retain(|&(p, _)| p != pid);
+        if seen.len() >= LISTINGS_MAX {
+            seen.pop_front();
+        }
+        seen.push_back((pid, at_ns));
+        true
     }
 }
 
@@ -235,6 +268,39 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
                 &reasoning,
             ));
         }
+        // Lot 373 (the lab of lot 373: `sudo bpftool prog show` in observe
+        // mode, High ×100 at every boot): a handle by id — a program's, or a
+        // map's opened read-write for the program's metadata — the agent
+        // proved, at the bus's barrier, the packaged bpftool's read-only
+        // listing — root's, its image by device and inode, its command line
+        // read whole (`BPF_CMD_LISTING_GET_FD`): one Low record per listing
+        // process, no posture.
+        if *cmd == BPF_CMD_LISTING_GET_FD {
+            let timestamp_ns = match event {
+                Event::BpfSyscall { timestamp_ns, .. } => *timestamp_ns,
+                _ => 0,
+            };
+            if !self.first_listing(*pid, timestamp_ns) {
+                return None;
+            }
+            let reasoning = format!(
+                "`{comm}` (pid {pid}) took a handle by id on one of NorthNarrow's own BPF objects \
+                 (id {arg}) and the others it lists: the packaged bpftool run by root (its device \
+                 and inode, read by the agent at the record) listing or showing objects (`prog \
+                 show`, `map list`, `cgroup tree`), which takes a handle on each — a program's \
+                 maps read-write, as libbpf opens them, for its metadata — only to read its \
+                 information. Recorded Low, once for the process, and raises no posture (lot \
+                 373). A dump, an update, a pin, a detach or any other program's handle stays \
+                 High."
+            );
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Low,
+                &reasoning,
+            ));
+        }
         let own_object = matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE);
         let detach = matches!(*cmd, BPF_PROG_DETACH | BPF_LINK_DETACH);
         if !own_object && !detach {
@@ -303,6 +369,83 @@ mod tests {
             arg,
             timestamp_ns: 1,
         }
+    }
+
+    /// Lot 373 (named, the lab of lot 373: `sudo bpftool prog show`, `-j prog
+    /// list`, `map show`, `cgroup tree` in observe mode — NN-L-BPF-002 High
+    /// ×100 at every boot on Ubuntu 26.04 and Debian 12): a handle the agent
+    /// proved the packaged bpftool's listing is one Low record per process
+    /// within a minute; another process's listing is its own record. The
+    /// attack shapes stay High: a handle or a write handle not proven
+    /// (python's ctypes, a copy, a dump, an update), a detach — by bpftool
+    /// too.
+    #[test]
+    fn a_proven_bpftool_listing_is_one_low_record() {
+        let (_, r) = rules();
+        let at = |pid: u32, cmd: u32, ts: u64| Event::BpfSyscall {
+            pid,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd,
+            arg: 48,
+            timestamp_ns: ts,
+        };
+        const S: u64 = 1_000_000_000;
+        let v = r
+            .evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, 10 * S))
+            .expect("the first handle of the listing");
+        assert_eq!(
+            (v.severity, v.action.clone()),
+            (Severity::Low, ResponseAction::Log),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("lot 373") && v.reasoning.contains("no posture"),
+            "{}",
+            v.reasoning
+        );
+        for ts in [10 * S, 11 * S, 69 * S] {
+            assert!(
+                r.evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, ts)).is_none(),
+                "the same listing at {ts}"
+            );
+        }
+        assert!(
+            r.evaluate(&at(1614, BPF_CMD_LISTING_GET_FD, 12 * S))
+                .is_some(),
+            "another listing process"
+        );
+        assert!(
+            r.evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, 71 * S))
+                .is_some(),
+            "a minute later"
+        );
+        for (cmd, why) in [
+            (BPF_CMD_FOREIGN_GET_FD, "a handle not proven a listing"),
+            (
+                BPF_CMD_FOREIGN_MAP_WRITE,
+                "a write handle not proven a listing",
+            ),
+            (BPF_PROG_DETACH, "a detach"),
+            (BPF_LINK_DETACH, "a link detach"),
+        ] {
+            let v = r.evaluate(&at(1613, cmd, 72 * S)).expect(why);
+            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+        }
+        // the dedup is bounded, and forgets the oldest past its bound: that
+        // one records again within its minute
+        let listing = |pid: u32, ts: u64| r.evaluate(&at(pid, BPF_CMD_LISTING_GET_FD, ts));
+        assert!(listing(1_999, 80 * S).is_some());
+        for pid in 2_000..2_000 + LISTINGS_MAX as u32 {
+            assert!(listing(pid, 80 * S).is_some());
+        }
+        assert_eq!(r.listings.lock().len(), LISTINGS_MAX);
+        assert!(listing(1_999, 81 * S).is_some(), "forgotten");
+        assert!(
+            listing(2_000 + LISTINGS_MAX as u32 - 1, 81 * S).is_none(),
+            "still remembered"
+        );
     }
 
     fn rules() -> (NnLBpf001BpfProgramLoaded, NnLBpf002BpfForeignHandleOrDetach) {

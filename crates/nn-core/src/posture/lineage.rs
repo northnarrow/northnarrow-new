@@ -2954,11 +2954,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if self.exec_uid(pid, as_of) != Some(0) {
             return None;
         }
-        let id = match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => ExecIdentity {
-                exe: e.exe,
-                runs: e.runs,
-            },
+        let (id, image) = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => (
+                ExecIdentity {
+                    exe: e.exe,
+                    runs: e.runs,
+                },
+                e.exec_file,
+            ),
             CachedAt::LaterOnly | CachedAt::Absent => return None,
         };
         let exe = id.exe.to_string_lossy();
@@ -2967,12 +2970,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         } else {
             id.script()?.to_string()
         };
-        let (package, kind) = script.strip_prefix(INFO)?.rsplit_once('.')?;
-        if !KINDS.contains(&kind) || !is_package_name(package) {
+        let name = script.strip_prefix(INFO)?;
+        if !H::dir_is_root_only(self.inner.host_root.join(INFO.trim_matches('/'))) {
             return None;
         }
-        H::dir_is_root_only(self.inner.host_root.join(INFO.trim_matches('/')))
-            .then(|| package.to_string())
+        // the review of #580's lab: a name of 31 bytes may have been cut by
+        // the kernel's read (external audit EBPF-021: `libgstreamer1.0-0:
+        // amd64.postinst` is 32) — the file the kernel executed names it
+        let name = match name.strip_suffix(common::wire::exe::EXE_NAME_CUT_MARK) {
+            Some(cut) => self.info_file_named_by(INFO, cut, image?)?,
+            None => name.to_string(),
+        };
+        let (package, kind) = name.rsplit_once('.')?;
+        (KINDS.contains(&kind) && is_package_name(package)).then(|| package.to_string())
+    }
+
+    /// The review of #580's lab: the one file of dpkg's `info` directory
+    /// (`info`, under the host's root) whose name begins with `cut` (a name
+    /// the kernel's read may have cut) and that is the executed file `image`
+    /// (its device, in the kernel's form, and inode) — `None` when none or
+    /// more than one is.
+    fn info_file_named_by(&self, info: &str, cut: &str, image: (u64, u64)) -> Option<String> {
+        if cut.is_empty() || cut.contains('/') {
+            return None;
+        }
+        let names = H::read_dir(self.inner.host_root.join(info.trim_matches('/'))).ok()?;
+        let mut found = names
+            .into_iter()
+            .filter_map(|n| n.into_string().ok())
+            .filter(|n| n.starts_with(cut) && !n.contains('/'))
+            .filter(|n| self.is_host_file(&format!("{info}{n}"), image));
+        let one = found.next()?;
+        found.next().is_none().then_some(one)
     }
 
     /// Lot 373: `path` is a file the package `package` installed — a line of
@@ -2980,6 +3009,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// unpacked), in a root-owned system tree ([`in_system_tree`]), in a
     /// directory root's and writable by no one else, as the host's root
     /// holds them: no user can have put another file at that path.
+    ///
+    /// The lab of lot 373 (`iputils-ping`'s postinst grants `/bin/ping`, its
+    /// `.list` names `/usr/bin/ping`): a path no line spells is the file a
+    /// line of the same name names when both are one file under the host's
+    /// root (by device and inode: another spelling of a merged `/usr`).
+    ///
+    /// The review of #580 (F1): the `.list` is the package's own maintainer
+    /// script's to append to — it tells where a package put its files, not
+    /// that a file is harmless; R012 lowers only a narrow capability on it.
     pub fn is_package_file(&self, package: &str, path: &str) -> bool {
         if !is_package_name(package)
             || !in_system_tree(path)
@@ -2994,7 +3032,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let Ok(text) = H::read_state(list) else {
             return false;
         };
-        text.lines().any(|l| l == path)
+        let host = |p: &str| self.inner.host_root.join(p.trim_start_matches('/'));
+        let name = std::path::Path::new(path).file_name();
+        let listed = text.lines().any(|l| l == path) || {
+            let file = H::file_id(host(path));
+            file.is_some()
+                && text.lines().any(|l| {
+                    l.starts_with('/')
+                        && in_system_tree(l)
+                        && !l.split('/').any(|c| c == ".." || c == ".")
+                        && std::path::Path::new(l).file_name() == name
+                        && H::file_id(host(l)) == file
+                })
+        };
+        listed
             && std::path::Path::new(path).parent().is_some_and(|dir| {
                 H::dir_is_root_only(
                     self.inner

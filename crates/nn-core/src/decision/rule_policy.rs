@@ -985,6 +985,33 @@ pub trait ActorFacts: Send + Sync {
     fn unread(&self, pid: u32, fact: ExemptionFact) -> Option<String>;
 }
 
+/// Lot 373 (the review of #580, F2): no fact of any process can be read —
+/// what a rule holds before production gives it the process table's
+/// (`DecisionHost::actor_facts`): no exemption judged by a fact applies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoActorFacts;
+
+impl ActorFacts for NoActorFacts {
+    fn uid(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+    fn cgroup(&self, _pid: u32) -> Option<String> {
+        None
+    }
+    fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
+        None
+    }
+    fn started_in_cgroup(&self, _pid: u32) -> Option<bool> {
+        None
+    }
+    fn injected(&self, _pid: u32) -> Option<Injected> {
+        None
+    }
+    fn unread(&self, _pid: u32, _fact: ExemptionFact) -> Option<String> {
+        None
+    }
+}
+
 /// Lot 353 (re-check 4 of #563): whether an exemption of the policy covers
 /// a process code was first injected into ([`covering`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

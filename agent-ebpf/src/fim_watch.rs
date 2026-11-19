@@ -84,7 +84,7 @@ use northnarrow_common::wire::{
     FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
     FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_DEST_LEAF,
     FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
-    FIM_WRITE_TRUNCATED_BY_ANOTHER, TASK_COMM_LEN,
+    FIM_WRITE_TRUNCATED_BY_ANOTHER, TASK_COMM_LEN, fim_one_writer_keeps,
 };
 
 use crate::btf_offsets::{
@@ -1004,12 +1004,20 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
             // the review of #554 (F1): one writer is one process — a pid
             // reused is another
             let start = crate::fork_parent::current_start();
+            // lot 373: the writer's image at its write (the review of #580,
+            // F3: and one writer is one image — an exec keeps the pid and the
+            // start, so a rewrite before it, through a descriptor the new
+            // image inherits, is another writer's; an image not read is
+            // never the same)
+            let (exe_dev, exe_ino) = crate::bpf_defense::caller_exe_key().map_or((0, 0), |e| (e.dev, e.ino));
+            let mut prev_writer = None;
             if let Some(prev) = FIM_DIRTY_INODES.get(&key) {
                 // another's truncation while pending stays said
                 flags = (flags & prev.flags) | (prev.flags & u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER));
-                if prev.pid != pid || prev.start != start {
-                    flags &= !u32::from(FIM_WRITE_ONE_WRITER);
-                }
+                prev_writer = Some((prev.pid, prev.start, prev.exe_dev, prev.exe_ino));
+            }
+            if !fim_one_writer_keeps(prev_writer, (pid, start, exe_dev, exe_ino)) {
+                flags &= !u32::from(FIM_WRITE_ONE_WRITER);
             }
             let mut meta = DirtyMeta {
                 pid,
@@ -1022,18 +1030,14 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
                 fork_start: 0,
                 fork_parent_start: 0,
                 start,
-                exe_dev: 0,
-                exe_ino: 0,
+                exe_dev,
+                exe_ino,
                 cgroup: 0,
             };
             if let Ok(comm) = bpf_get_current_comm() {
                 meta.comm = comm;
             }
-            // lot 373: the writer's image and cgroup, at its write
-            if let Some(exe) = crate::bpf_defense::caller_exe_key() {
-                meta.exe_dev = exe.dev;
-                meta.exe_ino = exe.ino;
-            }
+            // lot 373: the writer's cgroup, at its write
             meta.cgroup = aya_ebpf::helpers::generated::bpf_get_current_cgroup_id();
             // lot 344: the writer's fork records, at its write
             let (own, forker) = crate::fork_parent::unexecuted_forks();

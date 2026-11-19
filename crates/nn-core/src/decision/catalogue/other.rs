@@ -389,7 +389,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-BPF-002_BpfForeignHandleOrDetach",
-        severities: &[Severity::High],
+        severities: &[Severity::High, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::AntiTamper],
         data_components: &["DC0021"],
@@ -402,12 +402,19 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    successor records it at its start (the review of #578).",
         false_positives: "A detach by tooling not in the list (a container runtime or CNI not \
                           listed). A handle to the agent's own objects is never exempt: an \
-                          administrator's `bpftool map dump` of them is recorded too.",
+                          administrator's `bpftool map dump` of them is recorded too. Lot 373: \
+                          the packaged bpftool run by root listing or showing programs or maps \
+                          (`prog show`, `map list`, `cgroup tree`), which in observe mode gets a \
+                          handle by id on each of the agent's, is one Low record per process, \
+                          no posture.",
         how_to_test: "`bpftool map update pinned <pins>/PROTECTED_PIDS key 1 0 0 0 value 1` \
                       (anti-tamper.sh case C08) or `bpftool link show pinned` (C09): observe \
                       mode records this rule, enforce mode denies the handle (NN-L-AT-001).",
         tests: &[
             "crates/nn-core/src/decision/rules/bpf.rs::own_object_handle_is_high_even_for_known_tooling",
+            "crates/nn-core/src/decision/rules/bpf.rs::a_proven_bpftool_listing_is_one_low_record",
+            "crates/nn-linux/src/sensors/multiplexer.rs::\
+             a_foreign_handle_is_marked_a_bpftool_listing_only_when_proven",
             "deploy/lab/adversarial/anti-tamper.sh::case C08",
         ],
         attack_note: "",

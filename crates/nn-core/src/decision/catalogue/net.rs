@@ -318,9 +318,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "Pollers, health checks, metrics exporters and update checkers not in \
                           the netflow comm allowlist (`chronyd`, `ntpd`, `node_exporter` are). \
                           Lot 373: the system's NTP client (systemd-timesyncd, chronyd, ntpd: \
-                          the packaged image by its device and inode, as its service account) \
-                          to UDP 123 is no beacon; any other program to UDP 123, or the daemon \
-                          to another port, is judged.",
+                          the packaged image by its device and inode, as its service account, \
+                          in its unit's cgroup, started there and never injected — the kernel's \
+                          lot 277/281 marks) to UDP 123 is no beacon; any other program to UDP \
+                          123, the daemon to another port, from a session or injected, is \
+                          judged.",
 
         how_to_test: "From one process, connect to the same address every 5 seconds: \
                       `python3 -c 'import socket, time; \

@@ -2855,15 +2855,26 @@ enum CgroupNow {
 
 /// Lot 373: the most directories [`cgroup_now`] looks at.
 const CGROUP_WALK_MAX: usize = 4096;
-/// Lot 373: the deepest [`cgroup_now`] goes below the root
-/// (`/user.slice/user-0.slice/session-3.scope`, a unit in a slice of a
-/// slice of `system.slice`).
-const CGROUP_WALK_DEPTH: usize = 5;
+/// Lot 373: the deepest [`cgroup_now`] goes below the root. The review of
+/// #580 (F4): a user manager's units are at depth 5
+/// (`/user.slice/user-1000.slice/user@1000.service/app.slice/<unit>`), a
+/// container's below them — the walk reads every level there is (the
+/// directory cap bounds it); this only bounds a hierarchy deeper than any
+/// systemd lays out, which is then not read.
+const CGROUP_WALK_DEPTH: usize = 32;
+
+/// The review of #580 (F4): a look at a cgroup directory failed for another
+/// reason than its removal (`ENOENT`, `ENOTDIR`: removed since it was listed,
+/// with every cgroup below it) — what it holds is not known.
+fn walk_failed(e: &std::io::Error) -> bool {
+    !matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+}
 
 /// Lot 373: the cgroup v2 directory whose inode number (its cgroup id) is
 /// `id`, under the hierarchy at `root` (`/sys/fs/cgroup`, or its `unified`
 /// mount on a hybrid host) — found, or surely gone (the whole hierarchy
-/// walked, within its caps), or not read.
+/// walked, within its caps, every directory read: the review of #580, F4),
+/// or not read.
 fn cgroup_now(root: &Path, id: u64) -> CgroupNow {
     use std::os::unix::fs::MetadataExt;
     if id == 0 {
@@ -2886,13 +2897,17 @@ fn cgroup_now(root: &Path, id: u64) -> CgroupNow {
     for _ in 0..CGROUP_WALK_DEPTH {
         let mut next = Vec::new();
         for (dir, cg) in level {
-            let Ok(names) = antitamper_bpf::kernel_roots::read_dir(&dir) else {
-                continue;
+            let names = match antitamper_bpf::kernel_roots::read_dir(&dir) {
+                Ok(names) => names,
+                Err(e) if walk_failed(&e) => return CgroupNow::Unread,
+                Err(_) => continue,
             };
             for name in names {
                 let path = dir.join(&name);
-                let Ok(m) = antitamper_bpf::kernel_roots::symlink_metadata(&path) else {
-                    continue;
+                let m = match antitamper_bpf::kernel_roots::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) if walk_failed(&e) => return CgroupNow::Unread,
+                    Err(_) => continue,
                 };
                 if !m.is_dir() {
                     continue;
@@ -2933,8 +2948,10 @@ const UTMP_UNIT_GONE: &str = "a unit of the packaged systemd-update-utmp, its cg
 /// - the writer's image at its write is the host's packaged
 ///   `systemd-update-utmp` ([`is_packaged_image`]: its device and inode);
 /// - it wrote as root, and was the file's only writer since its last
-///   record (the kernel's `FIM_WRITE_ONE_WRITER`: a rewrite by another
-///   process folded into the packaged binary's append clears it);
+///   record (the kernel's `FIM_WRITE_ONE_WRITER`: one process — its pid and
+///   start — running one image at every write; a rewrite by another
+///   process, or by the same process before it executed the packaged
+///   binary, clears it — the review of #580, F3);
 /// - its cgroup at the write (`writer_cgroup`) is now one of the unit's
 ///   (`/system.slice/systemd-update-utmp.service`), or no cgroup any more:
 ///   a oneshot's cgroup is removed as its `ExecStop=` process exits, at
@@ -2942,9 +2959,12 @@ const UTMP_UNIT_GONE: &str = "a unit of the packaged systemd-update-utmp, its cg
 ///   unit's — a session's scope (`sudo systemd-update-utmp`), another
 ///   service — keeps the High kill, as does a cgroup not read.
 ///
-/// Residual, said: root that runs the packaged binary in a cgroup it
-/// removes before the read appends a boot, shutdown or runlevel record —
-/// the binary writes nothing else, and erases nothing.
+/// Residual, said: root that runs the packaged binary itself — in a cgroup
+/// it removes before the read, or in the unit's (the writer has exited, so
+/// lot 277's mark of where it started is not read) — has its writes kept
+/// when the file grew by whole records; with a library preloaded into it
+/// (`LD_PRELOAD`) or code injected by `ptrace`, those writes can rewrite a
+/// record in place before the append, and NN-L-FIM-019 does not see it.
 fn kernel_login_unit_writer(
     fe: &FimEvent,
     raw: &FimDriftRaw,
@@ -5949,12 +5969,8 @@ mod tests {
             } else {
                 nn_model::Severity::Critical
             };
-            assert_eq!(v.severity, want, "{case}: {}", v.reasoning);
-            assert!(
-                v.reasoning.contains("writer unknown"),
-                "{case}: {}",
-                v.reasoning
-            );
+            assert_eq!(v.severity, want, "{case}");
+            assert!(v.reasoning.contains("writer unknown"), "{case}");
         }
     }
 
@@ -8189,6 +8205,51 @@ mod tests {
             let (kept, verdict) = judge(image, cgroup, uid, flags);
             assert_eq!(kept, None, "{why}");
             assert_eq!(verdict, Some(nn_model::Severity::High), "{why}");
+        }
+    }
+
+    /// Lot 373 (named, the review of #580, F4: the walk stopped at depth 5
+    /// and said "not read" whenever a directory existed there — a user
+    /// manager's unit, `/user.slice/user-1000.slice/user@1000.service/
+    /// app.slice/<unit>`, on any desktop — so a removed oneshot's cgroup was
+    /// never found gone and its shutdown record stayed High): every level is
+    /// read; a cgroup below a user manager's units is found; the id of a
+    /// removed one is gone; a directory that cannot be read leaves it not
+    /// read (fails closed).
+    #[test]
+    fn a_removed_cgroup_is_found_gone_below_a_user_manager_s_units() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let t = TempDir::new().unwrap();
+        let cg = t.path().join("cgroup");
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.controllers"), b"cpu memory pids\n").unwrap();
+        let mkcg = |rel: &str| {
+            let d = cg.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::metadata(&d).unwrap().ino()
+        };
+        let user = "user.slice/user-1000.slice/user@1000.service/app.slice";
+        mkcg(&format!("{user}/app-gnome-terminal.scope"));
+        let deep = mkcg(&format!(
+            "{user}/podman-1.scope/container/libpod-payload/init.scope/inner"
+        ));
+        let removed = mkcg("system.slice/systemd-update-utmp.service");
+        std::fs::remove_dir(cg.join("system.slice/systemd-update-utmp.service")).unwrap();
+        assert_eq!(cgroup_now(&cg, removed), CgroupNow::Gone, "removed");
+        assert_eq!(
+            cgroup_now(&cg, deep),
+            CgroupNow::At(format!(
+                "/{user}/podman-1.scope/container/libpod-payload/init.scope/inner"
+            )),
+            "found at depth 9"
+        );
+        // a directory not read: not gone (root reads every mode)
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = cg.join("system.slice");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let seen = cgroup_now(&cg, removed);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(seen, CgroupNow::Unread, "a directory not read");
         }
     }
 

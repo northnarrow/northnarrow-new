@@ -456,8 +456,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
             by kernel-resolved exe. Another program that writes login records through the utmp API \
             (a terminal multiplexer's helper) is killed. Lot 373: the packaged \
             systemd-update-utmp's shutdown record, its process gone by the judgement, is told by \
-            what the kernel recorded at the write (its image, root, the file's only writer, its \
-            unit's cgroup or a cgroup removed since) and an append of whole records.",
+            what the kernel recorded at the write (its image, root, the file's only writer — one \
+            process running one image at every write — its unit's cgroup or a cgroup removed \
+            since) and an append of whole records.",
 
         how_to_test: "`printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab \
             guest: it appends a byte); expect High, KillProcess aimed at dd.",
@@ -598,10 +599,16 @@ pub(super) const DOCS: &[RuleDoc] = &[
             inode_post_setxattr hook. Critical for a root-equivalent capability (setuid, setgid, \
             dac_override, dac_read_search, fowner, chown, sys_admin, sys_ptrace, sys_module, \
             sys_rawio, setfcap, bpf), else High; the response removes it.",
-        false_positives: "Packages install files with capabilities (ping, newuidmap, dumpcap): \
-            recorded at Low and kept. A grant in an interactive sudo or su session, or while the \
-            trusted-installer window is open, is recorded and kept; a namespaced capability (a \
-            rootless container build) is recorded at Medium.",
+        false_positives: "Packages install files with capabilities (ping, mtr-packet, dumpcap, \
+            gst-ptp-helper, gnome-keyring): a narrow one (cap_net_raw, cap_net_admin, \
+            cap_net_bind_service, cap_net_broadcast, cap_ipc_lock, cap_sys_nice, cap_sys_resource, \
+            cap_wake_alarm, cap_block_suspend) written in a package transaction is recorded at Low \
+            and kept. Lot 373 (the review of #580): any other in a transaction (newuidmap's \
+            cap_setuid, a capability equivalent to root, =ep) is recorded at High and kept — the \
+            package's own root maintainer script decides what the transaction vouches for. A grant in an \
+            interactive sudo or su session, or while the trusted-installer window is open, is \
+            recorded and kept; a namespaced capability (a rootless container build) is recorded \
+            at Medium.",
         how_to_test: "`cp /usr/bin/python3 /tmp/nn-py && sudo systemd-run --wait setcap \
             cap_setuid+ep /tmp/nn-py`; `getcap /tmp/nn-py` then prints nothing; expect Critical, \
             StripFileCapability.",
@@ -609,6 +616,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/fim/rules.rs::fim025_strips_a_granted_capability",
             "crates/nn-core/src/fim/rules.rs::fim025_keeps_a_grant_inside_the_trusted_installer_window",
             "crates/nn-core/src/fim/rules.rs::fim025_package_manager_and_interactive_admin_keep_the_capability",
+            "crates/nn-core/src/fim/rules.rs::fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high",
         ],
         attack_note: "T1548: ATT&CK has no sub-technique for Linux file capabilities (T1548.001 is \
             the set-id bits).",

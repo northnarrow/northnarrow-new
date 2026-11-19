@@ -26,19 +26,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     dump, update, pin or detach, ctypes or a copy stays High. Tests
     `a_root_listing_by_the_packaged_bpftool_is_told_from_a_handle_grab`,
     `a_refused_handle_is_marked_a_bpftool_listing_only_when_proven`,
-    `a_proven_bpftool_listing_raises_no_posture`.
+    `a_proven_bpftool_listing_raises_no_posture`. In observe mode, where
+    the kernel lets the handles through, the same proof makes them one
+    `NN-L-BPF-002` Low record per bpftool process (it was High ×100 at
+    every boot in the lot's lab). Tests
+    `a_proven_bpftool_listing_is_one_low_record`,
+    `a_foreign_handle_is_marked_a_bpftool_listing_only_when_proven`,
+    `a_raw_record_cannot_claim_a_bpftool_listing`.
   - **Shutdown writes.** The FIM record of a write seen at close carries
     the writer's image (device, inode) and cgroup id from its write.
     rsyslogd's last flush (`NN-L-FIM-005`) and `systemd-update-utmp`'s
     record (`NN-L-FIM-019`) are judged on them once the writer has exited.
     Tests `a_gone_writer_s_image_is_named_by_the_kernel_s_identity`,
     `a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts`.
-  - **Package setcap.** A maintainer script's `setcap` on its own
-    package's files, in the live transaction, is `R012` Low. Test
-    `a_postinst_setcap_on_its_own_package_s_file_is_low`.
+  - **Package setcap.** A maintainer script's `setcap` of a narrow
+    capability (`cap_net_raw`, `cap_net_admin`, `cap_net_bind_service`,
+    `cap_sys_nice`, …) on its own package's files, in the live transaction,
+    is `R012` Low; a merged `/usr`'s other spelling (`/bin/ping`) is
+    matched by inode. Any grant beyond the narrow set (a capability
+    equivalent to root, `=ep`) stays High there, and `NN-L-FIM-025`
+    records it High (kept) instead of Low: the `.list` is the package's own
+    root script's to append to (the review of #580). Tests `a_postinst_setcap_on_its_own_package_s_file_is_low`,
+    `a_postinst_setcap_of_a_root_equivalent_capability_stays_high`,
+    `a_postinst_setcap_through_a_merged_usr_is_the_package_s_file`,
+    `fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high`,
+    `root_equivalent_capabilities_are_never_lowered_by_a_package`.
   - **NTP.** systemd-timesyncd, chronyd and ntpd polling UDP 123 as their
-    service accounts, by image identity, are no `NN-L-NET-013` beacon.
-    Test `the_system_s_ntp_client_polling_udp_123_is_no_beacon`.
+    service accounts, by image identity, in their unit's cgroup, started
+    there and never injected, are no `NN-L-NET-013` beacon. Test
+    `the_system_s_ntp_client_polling_udp_123_is_no_beacon`.
+  - **One writer is one image** (the review of #580). The FIM marker's
+    "one writer" also compares the writer's image at each write, so a
+    rewrite made before an exec of the packaged `systemd-update-utmp`
+    is not folded into its append; the cgroup walk reads every level (a
+    user manager's units) and a directory it cannot read keeps the High.
+    Tests `an_exec_between_two_writes_is_another_writer`,
+    `a_removed_cgroup_is_found_gone_below_a_user_manager_s_units`.
   - **A racy R011.** A module tool gone before the exec pump read it finds
     its package manager from its parent, and the High says which fact was
     missing. Tests
