@@ -422,6 +422,12 @@ pub enum Launch {
     /// by design). Its standard streams are the command's (`--pipe`), its
     /// standard input none; `systemd-run` waits for it (`--wait`) and is the
     /// child the test holds — the agent's pid is in its pid file.
+    ///
+    /// Lot 374: the unit is named as the agent's own
+    /// (`northnarrow-agent.service`, in `northnarrow.slice`): a vacated role
+    /// goes only to a child of PID 1 in its unit's own cgroup. A guest
+    /// where the agent is installed has that unit already: the fixture is
+    /// for a guest without it (the CI's).
     Unit,
 }
 
@@ -587,16 +593,17 @@ impl InstalledAgent {
             }
             Launch::Direct => {
                 let mut c = Command::new(&self.path);
+                // lot 374: not the test's loader variables (cargo's
+                // LD_LIBRARY_PATH): the agent's start refuses them
+                for v in antitamper_bpf::start_check::LOADER_ENV {
+                    c.env_remove(v);
+                }
                 for (k, v) in env {
                     c.env(k, v);
                 }
                 c
             }
             Launch::Unit => {
-                let ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
                 let mut c = Command::new(SUDO);
                 c.args([
                     "systemd-run",
@@ -605,8 +612,11 @@ impl InstalledAgent {
                     "--pipe",
                     "--collect",
                     "--service-type=exec",
-                ])
-                .arg(format!("--unit=nn-e2e-agent-{}-{ns}", std::process::id()));
+                    // lot 374: the agent's own unit and slice (the cgroup a
+                    // vacated role's successor must start in)
+                    "--unit=northnarrow-agent.service",
+                    "--slice=northnarrow.slice",
+                ]);
                 for (k, v) in env {
                     c.arg(format!("--setenv={k}={v}"));
                 }

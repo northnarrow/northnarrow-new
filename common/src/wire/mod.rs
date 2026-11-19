@@ -1866,6 +1866,39 @@ pub const BPF_CMD_LISTING_GET_FD: u32 = 0xFFFF_0005;
 /// boot (0: never held). No thread group has this number.
 pub const ROLE_VACATED: u32 = u32::MAX;
 
+/// Lot 374: the slice both our units run in (their `Slice=`).
+pub const OUR_SLICE: &str = "northnarrow.slice";
+/// Lot 374: the agent's unit.
+pub const AGENT_UNIT: &str = "northnarrow-agent.service";
+/// Lot 374: the watchdog's unit.
+pub const WATCHDOG_UNIT: &str = "northnarrow-watchdog.service";
+
+/// Lot 374: a cgroup's kernfs name as the eBPF programs compare it — its
+/// first 31 bytes in four little-endian words, zero past its end (the NUL
+/// the kernel's string read writes included). A name of 32 bytes or more
+/// never equals one of ours (all shorter).
+pub const fn kn_name_words(name: &str) -> [u64; 4] {
+    let b = name.as_bytes();
+    let mut w = [0u64; 4];
+    let mut i = 0;
+    while i < b.len() && i < 31 {
+        w[i / 8] |= (b[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    w
+}
+
+/// Lot 374: the unit whose own cgroup a successor of role slot `slot`
+/// (`ROLE_TGIDS`: 0 the watchdog, 1 the agent) must run in to take the
+/// role its holder vacated, as [`kn_name_words`].
+pub const fn role_unit_words(slot: u32) -> [u64; 4] {
+    if slot == 0 {
+        kn_name_words(WATCHDOG_UNIT)
+    } else {
+        kn_name_words(AGENT_UNIT)
+    }
+}
+
 /// Kernel→userland record of the `bpf()` syscall observer (40 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]

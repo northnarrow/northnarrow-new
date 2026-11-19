@@ -556,11 +556,46 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
         ],
     )
     .unwrap();
+    // lot 374: started for it is the restart of the role's unit — PID 1's
+    // child (no longer the other role's), in the unit's own cgroup, with
+    // clean lot 277/281 marks (not only untainted)
+    let sftr = body(&c, "started_for_the_role");
     in_order(
-        body(&c, "started_for_the_role"),
+        sftr,
         &[
-            "Some(t) => *t != 0 && *t != ROLE_VACATED && *t == ptgid,",
-            "(ptgid == 1 || by_family) && crate::cgroup_join::caller_untainted()",
+            "ptgid == 1\n        && nn_in_role_unit(task as u64, u64::from(slot)) == 1\n        && crate::cgroup_join::caller_marks_clean()",
+        ],
+    )
+    .unwrap();
+    for gone in ["by_family", "caller_untainted", "ROLE_TGIDS", "override_active"] {
+        assert!(!sftr.contains(gone), "started_for_the_role: {gone}");
+    }
+    in_order(
+        body(&c, "in_role_unit"),
+        &[
+            "off_opt!(TASK_STRUCT_CGROUPS_OFFSET)",
+            "off_opt!(CSS_SET_DFL_CGRP_OFFSET)",
+            "off_opt!(CGROUP_KN_OFFSET)",
+            "else {\n        return false;\n    };",
+            "let Some(cset) = read_ptr(task, o_cgroups) else {",
+            "let Some(cgrp) = read_ptr(cset, o_dfl) else {",
+            "let Some(kn) = read_ptr(cgrp, o_kn) else {",
+            "role_unit_words(0)",
+            "role_unit_words(1)",
+            "if !kn_named(kn, o_name, &unit) {\n        return false;\n    }",
+            "let Some(slice) = read_ptr(kn, o_parent) else {",
+            "kn_name_words(OUR_SLICE)",
+            "if !kn_named(slice, o_name, &SLICE) {\n        return false;\n    }",
+            "let Some(root) = read_ptr(slice, o_parent) else {",
+            "Ok(p) if p.is_null()",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "kn_named"),
+        &[
+            "32,",
+            "n > 1 && w[0] == want[0] && w[1] == want[1] && w[2] == want[2] && w[3] == want[3]",
         ],
     )
     .unwrap();

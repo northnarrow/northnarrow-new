@@ -59,6 +59,24 @@ LogNamespace=northnarrow
 # watchdog runs `systemctl` by absolute path and the agent by --agent-bin;
 # on the `exec` backend the agent it starts inherits this environment.
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Lot 374: the dynamic loader's and the C library's variables are unset,
+# whatever the service manager's own environment (`systemctl
+# set-environment`) or a drop-in gives: systemd applies UnsetEnvironment=
+# last. No start of this unit runs with code or a library path given to it
+# before its `main` (the list is antitamper-bpf's `start_check::LOADER_ENV`;
+# a start that finds one all the same refuses itself, signed).
+UnsetEnvironment=LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH LD_ASSUME_KERNEL
+UnsetEnvironment=LD_BIND_NOT LD_BIND_NOW LD_DEBUG LD_DEBUG_OUTPUT
+UnsetEnvironment=LD_DYNAMIC_WEAK LD_HWCAP_MASK LD_ORIGIN_PATH
+UnsetEnvironment=LD_POINTER_GUARD LD_PREFER_MAP_32BIT_EXEC LD_PROFILE
+UnsetEnvironment=LD_PROFILE_OUTPUT LD_SHOW_AUXV LD_TRACE_LOADED_OBJECTS
+UnsetEnvironment=LD_TRACE_PRELINKING LD_USE_LOAD_BIAS LD_VERBOSE LD_WARN
+UnsetEnvironment=GCONV_PATH GETCONF_DIR GLIBC_TUNABLES HOSTALIASES
+UnsetEnvironment=LOCALDOMAIN LOCPATH MALLOC_ARENA_MAX MALLOC_ARENA_TEST
+UnsetEnvironment=MALLOC_CHECK_ MALLOC_MMAP_MAX_ MALLOC_MMAP_THRESHOLD_
+UnsetEnvironment=MALLOC_PERTURB_ MALLOC_TOP_PAD_ MALLOC_TRACE
+UnsetEnvironment=MALLOC_TRIM_THRESHOLD_ NIS_PATH NLSPATH RESOLV_HOST_CONF
+UnsetEnvironment=RES_OPTIONS TZDIR
 ExecStart=/usr/local/bin/northnarrow-watchdog \
     --agent-bin /usr/local/bin/northnarrow-agent \
     --agent-pidfile /run/northnarrow/agent.pid \

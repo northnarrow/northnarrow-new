@@ -93,6 +93,16 @@ async fn main() -> ExitCode {
     if cli.record_unit_failure {
         return record_unit_failure(&cli);
     }
+    // Lot 374: first, before it takes its role (its PROTECTED_PIDS entry,
+    // its ROLE_TGIDS slot) — its environment and the files it has mapped
+    // executable. A loader variable, or a mapping that is neither this
+    // binary nor a library the release links, refuses the start: recorded
+    // for the live agent (the surviving role) to sign High, and an exit
+    // status of its own.
+    let self_check = antitamper_bpf::start_check::check_self();
+    if !self_check.clean() {
+        return refuse_start(&cli, &self_check);
+    }
     // Lot 370 (F10-4): no candidate of the OOM killer (the unit's
     // OOMScoreAdjust=-999, written again whoever started it): the process
     // that brings the agent back is the last thing to go.
@@ -154,6 +164,28 @@ async fn main() -> ExitCode {
             ExitCode::from(failure.reason.code())
         }
     }
+}
+
+/// Lot 374: a start that refused itself ([`check_self`]): an ERROR, the
+/// record the live agent signs (`watchdog_start_refused`), and
+/// [`ExitReason::StartSelfCheck`] — nothing registered, no pidfile written.
+///
+/// [`check_self`]: antitamper_bpf::start_check::check_self
+fn refuse_start(cli: &Cli, found: &antitamper_bpf::start_check::Findings) -> ExitCode {
+    error!(
+        target: "watchdog.tamper",
+        detail = %found.describe(),
+        "watchdog start REFUSED before it took its role — the agent signs the record"
+    );
+    let agent_pid = read_pid_from_file(&cli.agent_pidfile).unwrap_or(0);
+    let path = hold_record_path(&cli.shutdown_marker);
+    if let Err(e) = record_hold(
+        &path,
+        &northnarrow_watchdog::start_refused_record(found, agent_pid, unix_now()),
+    ) {
+        error!(target: "watchdog.tamper", error = %e, path = %path.display(), "could not record the refused start");
+    }
+    ExitCode::from(ExitReason::StartSelfCheck.code())
 }
 
 /// Lab PR 216: `--record-unit-failure`, the mode

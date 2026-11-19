@@ -483,6 +483,37 @@ fn an_unwritable_audit_log_is_refused_before_the_load_and_signed_beside_the_pid_
     );
 }
 
+/// Lot 374: a start with a loader variable in its environment (one that
+/// changes nothing else: `LD_BIND_NOW`) refuses itself before the load and
+/// signs `start_self_check` in the audit log, naming the variable — never
+/// its value.
+#[test]
+#[ignore = "root and bpftool: nn-lab.sh test-ignored"]
+fn a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it() {
+    preconditions("start an agent with a loader variable in its environment");
+    let dir = tempfile::tempdir().unwrap();
+    let state = AgentState::new(dir.path());
+    let installed = InstalledAgent::install();
+    let rules = combat_rules(dir.path());
+    let manifest = manifest_of_another_copy(dir.path());
+    let before = kernel();
+    let log = dir.path().join("agent.log");
+    let mut cmd = installed.command(&state, Launch::Sudo, &[("LD_BIND_NOW", "nn-lot-374")]);
+    cmd.args([
+        "--install-manifest".as_ref(),
+        manifest.as_os_str(),
+        "--combat-rules".as_ref(),
+        rules.as_os_str(),
+    ]);
+    let status = command_until_exit(cmd, &log);
+    let text = assert_refused_before_the_load(status, &log, &state, &before, "start_self_check");
+    assert!(text.contains("loader variables LD_BIND_NOW"), "{}", tail(&log));
+    let row = signed_refusal(&state.audit_log(), &state, "start_self_check");
+    let detail = row["extra"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("LD_BIND_NOW"), "{row}");
+    assert!(!detail.contains("nn-lot-374"), "the value is not recorded: {row}");
+}
+
 /// A broken audit chain (a line before the end that is not a row): found
 /// when the log is opened, now before the load (it was after the attach),
 /// and signed in the fallback chain — the chain cannot take it.

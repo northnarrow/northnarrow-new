@@ -637,6 +637,11 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
             let var = a.trim_matches('"').split('=').next().unwrap_or("");
             dangerous_env(var).then(|| format!("{var} set in our units' environment"))
         }),
+        // Lot 374: an empty assignment clears our units' list of the
+        // loader's variables they unset (`start_check::LOADER_ENV`).
+        "UnsetEnvironment" if v.is_empty() => Some(
+            "UnsetEnvironment= cleared: the loader's variables would reach our units again".into(),
+        ),
         "EnvironmentFile" => {
             let p = v.trim_start_matches('-');
             // lot 311 (F4): read as bytes — a byte that is not UTF-8 (a
@@ -1134,6 +1139,9 @@ mod tests {
             svc("Environment=\"A=1\" NN_ANTI_TAMPER_ALLOW_DEGRADED=1").contains("NN_ANTI_TAMPER")
         );
         assert!(svc("Environment=LD_PRELOAD=/usr/lib/libjemalloc.so").contains("LD_PRELOAD"));
+        // lot 374: clearing the units' list of loader variables to unset
+        assert!(svc("UnsetEnvironment=").contains("UnsetEnvironment= cleared"));
+        assert!(h(Reach::Agent, "UnsetEnvironment=TZ").is_none(), "one more unset is no harm");
         assert!(svc("ConditionPathExists=/nonexistent-nn-lab").contains("fails"));
         // a slice drop-in, judged against the slice's floors
         let sl = |kv| h(Reach::OurSlice, kv).unwrap_or_else(|| panic!("{kv} not harmful"));

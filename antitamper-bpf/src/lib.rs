@@ -94,6 +94,11 @@ pub mod kernel_roots;
 /// `nr_cpus` read it by path on every fresh thread).
 #[cfg(target_os = "linux")]
 pub mod per_cpu;
+/// Lot 374: a start's check of its own environment and mappings before it
+/// takes its role, and the same facts of the process that takes the other
+/// role, read by the surviving one.
+#[cfg(target_os = "linux")]
+pub mod start_check;
 /// systemd over its private socket, served by PID 1: what it reports the
 /// host and our units as, and its reload (external audit EBPF-001; lot
 /// 273c; lot 273d: here, so that the watchdog reads our units' properties

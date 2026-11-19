@@ -173,6 +173,7 @@ pub struct Cli {
 /// | 13 | the respawn backend could not be set up |
 /// | 14 | `READY=1` could not be sent to systemd |
 /// | 15 | the signal handlers could not be installed |
+/// | 16 | lot 374: the start refused itself (a loader variable, a mapped file not expected) |
 /// | 20 | the wait on the agent's pidfd failed |
 /// | 30 | `--record-unit-failure`: the record could not be written |
 ///
@@ -191,13 +192,14 @@ pub enum ExitReason {
     Backend,
     Notify,
     Signals,
+    StartSelfCheck,
     PidfdWait,
     RecordFailed,
 }
 
 impl ExitReason {
     /// Every reason, in the order of the table above.
-    pub const ALL: [ExitReason; 11] = [
+    pub const ALL: [ExitReason; 12] = [
         ExitReason::Stopped,
         ExitReason::Unclassified,
         ExitReason::Usage,
@@ -207,6 +209,7 @@ impl ExitReason {
         ExitReason::Backend,
         ExitReason::Notify,
         ExitReason::Signals,
+        ExitReason::StartSelfCheck,
         ExitReason::PidfdWait,
         ExitReason::RecordFailed,
     ];
@@ -223,6 +226,7 @@ impl ExitReason {
             ExitReason::Backend => 13,
             ExitReason::Notify => 14,
             ExitReason::Signals => 15,
+            ExitReason::StartSelfCheck => 16,
             ExitReason::PidfdWait => 20,
             ExitReason::RecordFailed => 30,
         }
@@ -240,6 +244,7 @@ impl ExitReason {
             ExitReason::Backend => "respawn_backend_failed",
             ExitReason::Notify => "sd_notify_failed",
             ExitReason::Signals => "signal_handlers_failed",
+            ExitReason::StartSelfCheck => "start_self_check",
             ExitReason::PidfdWait => "pidfd_wait_failed",
             ExitReason::RecordFailed => "record_failed",
         }
@@ -310,6 +315,27 @@ pub fn exit_record(failure: &Failure, at: u64) -> nn_proto::watchdog_hold::HoldR
             failure.reason.code(),
             failure.reason.name(),
             bounded(&format!("{:#}", failure.error), 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// Lot 374: the record of a start that refused itself
+/// ([`antitamper_bpf::start_check::check_self`]) — what it found, names
+/// only — for the live agent, the surviving role, to sign High.
+pub fn start_refused_record(
+    found: &antitamper_bpf::start_check::Findings,
+    agent_pid: u32,
+    at: u64,
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: nn_proto::watchdog_hold::REASON_START_SELF_CHECK.to_string(),
+        detail: format!(
+            "pid {} refused its start before it took the watchdog's role: {}",
+            std::process::id(),
+            bounded(&found.describe(), 600)
         ),
         unit_state: None,
     }
