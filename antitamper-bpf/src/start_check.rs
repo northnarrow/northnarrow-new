@@ -424,6 +424,13 @@ pub fn start_ticks(pid: u32) -> Option<u64> {
         .and_then(|s| stat_start_ticks(&s))
 }
 
+/// [`stat_start_ticks`] of this process, read now.
+pub fn own_start_ticks() -> Option<u64> {
+    crate::kernel_roots::read_text("/proc/self/stat")
+        .ok()
+        .and_then(|s| stat_start_ticks(&s))
+}
+
 /// [`Identity`] of process `pid`, read now.
 pub fn identity(pid: u32) -> Identity {
     let ppid = crate::kernel_roots::read_text(format!("/proc/{pid}/stat"))
@@ -451,6 +458,9 @@ mod tests {
             "/usr/lib/x86_64-linux-gnu/libevil.so" => 15,
             "/usr/lib/x86_64-linux-gnu/libz.so.1" => 16,
             "/lib64/libc.so.6" => 17,
+            "/opt/lib/libc.so.6" => 18,
+            "/usr/lib/x86_64-linux-gnu/../../../tmp/libc.so.6" => 19,
+            "/usr/lib/./x86_64-linux-gnu/libc.so.6" => 20,
             _ => return None,
         };
         Some(FileFacts {
@@ -502,6 +512,24 @@ mod tests {
             let found = foreign_mappings(&maps, EXE, Libs::Start, sys);
             assert_eq!(found.len(), 1, "{path}: {found:?}");
             assert_eq!(found[0].path, path);
+        }
+    }
+
+    /// Lot 374: a library of an expected name — readable, root's, the same
+    /// file at its path — is still foreign outside the system library
+    /// directories, or through a `..` or `.` component (the kernel's own
+    /// paths never hold one).
+    #[test]
+    fn an_expected_library_outside_the_system_directories_is_foreign() {
+        for (path, ino) in [
+            ("/opt/lib/libc.so.6", 18),
+            ("/usr/lib/x86_64-linux-gnu/../../../tmp/libc.so.6", 19),
+            ("/usr/lib/./x86_64-linux-gnu/libc.so.6", 20),
+        ] {
+            let maps = genuine() + &line("r-xp", ino, path);
+            let f = foreign_mappings(&maps, EXE, Libs::Start, sys);
+            assert_eq!(f.len(), 1, "{path}: {f:?}");
+            assert_eq!(f[0].why, "not in a system library directory", "{path}");
         }
     }
 

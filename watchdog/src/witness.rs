@@ -108,7 +108,8 @@ impl Witness {
     /// written there: the caller records that for the agent to sign.
     pub fn open(dir: &Path, tgid: u32) -> Result<Witness> {
         let key = WitnessKey::from_seed(seed()?);
-        let start = antitamper_bpf::start_check::start_ticks(tgid).unwrap_or(0);
+        // this process's own start (`tgid` is this process)
+        let start = antitamper_bpf::start_check::own_start_ticks().unwrap_or(0);
         let published = match publish(&key_record(tgid, start, &key.public_hex())) {
             Ok(fd) => Some(fd),
             Err(e) => {

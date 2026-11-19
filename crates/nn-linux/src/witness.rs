@@ -77,14 +77,14 @@ pub const ROLES_VACATED_GAP: &str = "roles_vacated_gap";
 /// ([`KEY_MEMFD_NAME`]) in its own descriptor table, sealed against any
 /// write, naming `pid` and its start. `Err` says why there is none.
 pub fn published_key(pid: u32) -> Result<String, String> {
-    let dir = format!("/proc/{pid}/fd");
+    let fds = format!("/proc/{pid}/fd");
     let names =
-        antitamper_bpf::kernel_roots::read_dir_max(&dir, 256).map_err(|e| format!("{dir}: {e}"))?;
+        antitamper_bpf::kernel_roots::read_dir_max(&fds, 256).map_err(|e| format!("{fds}: {e}"))?;
     let want = format!("/memfd:{KEY_MEMFD_NAME}");
     let start = antitamper_bpf::start_check::start_ticks(pid)
         .ok_or_else(|| format!("the start of {pid} cannot be read"))?;
     for n in names {
-        let entry = format!("{dir}/{}", n.to_string_lossy());
+        let entry = format!("{fds}/{}", n.to_string_lossy());
         let Ok(link) = antitamper_bpf::kernel_roots::read_link(&entry) else {
             continue;
         };
@@ -147,12 +147,9 @@ impl WitnessReader {
         };
         let path = self.dir.join(IMPORTED_FILE);
         let body = serde_json::to_vec(imp).unwrap_or_default();
-        let r = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, &body).and_then(|()| f.sync_all()));
-        if let Err(e) = r {
+        // in place (the inode the deny hooks protect); lost at a crash, the
+        // position only makes rows imported again, never skipped
+        if let Err(e) = antitamper_bpf::kernel_roots::write(&path, &body) {
             tracing::warn!(path = %path.display(), error = %e, "witness: import position not kept");
         }
     }
@@ -494,6 +491,30 @@ mod tests {
         }
         std::fs::write(dir.join(CHAIN_FILE), lines.join("\n") + "\n").unwrap();
         lines
+    }
+
+    /// Lot 374: a line that breaks the chain after the last row imported
+    /// is said on its own (the position still found: nothing is imported
+    /// again).
+    #[test]
+    fn a_break_after_the_imported_rows_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        let k = WitnessKey::from_seed([5; 32]);
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED]);
+        let mut r = WitnessReader::new(dir.path());
+        r.position().certify(&k.public_hex());
+        let (f, last) = r.pending();
+        assert_eq!(f.len(), 2, "{f:?}");
+        r.commit(last);
+        let mut text = std::fs::read_to_string(dir.path().join(CHAIN_FILE)).unwrap();
+        text.push_str("not a row\n");
+        std::fs::write(dir.path().join(CHAIN_FILE), text).unwrap();
+        let (f, last) = r.pending();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, WITNESS_BROKEN);
+        assert!(f[0].detail.contains("line 3"), "{}", f[0].detail);
+        assert!(last.is_none());
     }
 
     #[test]

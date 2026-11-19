@@ -392,6 +392,40 @@ mod tests {
         ));
     }
 
+    /// Lot 374: a row numbered right but linked to another chain's line
+    /// (two chains of one key spliced), and a row linked right but numbered
+    /// wrong, each break the chain.
+    #[test]
+    fn a_spliced_or_misnumbered_row_breaks_the_chain() {
+        let k = key(1);
+        let a = chain(&k, 3);
+        // another chain of the same key, its rows other from row 1 on
+        let mut b = Vec::new();
+        let mut prev = String::new();
+        for i in 0..3u64 {
+            let mut r = row(i, &prev, KIND_VACATED);
+            if i >= 1 {
+                r.detail = format!("other {i}");
+            }
+            let l = serde_json::to_string(&k.sign(r)).unwrap();
+            prev = line_hash(&l);
+            b.push(l);
+        }
+        let spliced = [a[0].clone(), a[1].clone(), b[2].clone()].join("\n");
+        let j = judge_chain(&spliced);
+        assert!(
+            matches!(j.last(), Some(Judged::Broken { line: 3, .. })),
+            "{j:?}"
+        );
+        let prev0 = line_hash(&a[0]);
+        let skipped = serde_json::to_string(&k.sign(row(5, &prev0, KIND_VACATED))).unwrap();
+        let j = judge_chain(&[a[0].clone(), skipped].join("\n"));
+        assert!(
+            matches!(j.last(), Some(Judged::Broken { line: 2, .. })),
+            "{j:?}"
+        );
+    }
+
     #[test]
     fn the_import_takes_the_rows_after_its_position_and_trusts_only_certified_keys() {
         let k = key(1);
