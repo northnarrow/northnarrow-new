@@ -384,11 +384,8 @@ runs: root could start `nn-admin`, or a second agent or watchdog, with
   `role_exit` — a raw tracepoint on `sched_process_exit` whose link is
   pinned (`link_role_exit`), so it outlives the agent that attached it —
   empties the slot when that process's main thread exits (lot 370: marked
-  vacated, not never held). A second instance started beside the live one,
-  preloaded or not, gets nothing. Lot 370 (F10-4): a role vacated this boot
-  is taken only by a successor started for it — a child of PID 1 (its
-  unit's restart) or of the other role's live holder (the watchdog's
-  respawn), with no code injected — and its handle is recorded High
+  vacated, not never held). A second instance started beside the live one gets nothing. Lot 370 (F10-4): a role vacated this boot
+  is taken only by a successor started for it — a child of PID 1 (its unit's restart) or of the other role's live holder (the watchdog's respawn) — and its handle is recorded High
   (`BPF_CMD_VACATED_ROLE_GET_FD`) outside a signed trusted-installer
   window, Low inside one (the installer's restart); a first claim of the
   boot stays Low. The review of #578 (N2): the agent's successor takes its
@@ -415,14 +412,12 @@ the agent's are reported High as before.
 
 While a role is vacant (at boot before the watchdog registers, or after it ends) a root process already running can be taken for that role. It needs root present at that moment; the same gap exists wherever a defender restarts. Lot 370 (F10-4): the agent and the watchdog run with
 `oom_score_adj` -999, the host OOM killer's last pick (its SIGKILL, which
-no hook refuses, made the gap a moment root could choose; their own
-memory cgroup can still end a leak, so the ranking alone closes nothing);
+no hook refuses, made the gap a moment root could choose; their own memory cap still ends a leak with a kill and a restart);
 after a holder's exit the
 successor must be started for the role, and a successor that PID 1 starts
 is not told from the unit's own restart: it is recorded (High outside a
 signed window), not refused. A successor that is not the genuine agent
-reads the agent's own ring: its record rests on it. The same holds for a program that makes itself the role's binary
-by device and inode (`PR_SET_MM_EXE_FILE`). Lot 344, the review of #554:
+reads the agent's own ring: its record rests on it. The same holds for a program that takes on the role's binary identity. Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
 its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),

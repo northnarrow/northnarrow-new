@@ -73,8 +73,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **A cut link argv names its output in `go`'s own shape.** Since Go 1.21
     `go` passes its linker `-X=runtime.godebugDefault=…`, every GODEBUG
     changed since the main module's `go` line (524 bytes for a `go 1.18`
-    module on Go 1.26, 350 on Go 1.24), so the link's argv passes the
-    sensor's 511 bytes and came cut; lot 369 read the output of a whole
+    module on Go 1.26, 350 on Go 1.24), so the link's argv is longer than the sensor keeps and came cut; lot 369 read the output of a whole
     argv only, noted no link, and the test binary and the program were
     R001 High (a would-have kill in ENGAGED). A cut argv now names the
     output only in the `go` command's own shape (`link -o <target>
@@ -117,7 +116,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **The module judge trusts a live package transaction only.** A module
     file written since boot is trusted when its write came from a package
     manager's lineage whose package manager was not stopped or traced at
-    the write (nor frozen by the system's freezer), the writer free of
+    the write, the writer free of
     injected code, and that
     package manager held its lock at the write (dpkg's, apt's front end,
     rpm's) — read in the kernel at the write: a new observer
@@ -138,13 +137,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `the_ebpf_history_step_is_the_option_step_in_plain_values`,
     `verifier_headroom::the_module_write_history_steps_in_plain_values`,
     `a_trusted_load_is_recorded_low_with_why`.
-  - **The agent's role is no longer vacated on demand in silence.** The
+  - **The agent's role vacated this boot is recorded by its successor (see `KNOWN_LIMITATIONS.md`).** The
     agent and the watchdog run with `OOMScoreAdjust=-999` — the host OOM
     killer's last pick, still ended by their own memory cap — written again
     by each at its start (the self-integrity check expects it on every host;
-    external audit DEP-005's raise to 0 is gone). A role whose holder exited
-    this boot is taken only by a successor started for it (by PID 1 or the
-    other role's holder, no code injected), and the taking is NN-L-BPF-002
+    external audit DEP-005's raise to 0 is gone). A role whose holder exited this boot is taken by a successor started for it, and the taking is NN-L-BPF-002
     High outside a signed trusted-installer window, Low inside one. Tests
     `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
     `a_role_taken_after_its_holder_exited_is_high`.
@@ -225,9 +222,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     - The pump's waits for a loader's mapping are root's own and each
       account's share, not one budget for the host. Test
       `the_loaders_waits_are_root_s_own_and_each_account_s_share`.
-    - The privileged suites: the guard tests' restore agent starts as a
-      transient service (PID 1's child, the one start that may take a
-      vacated role while the guard enforces); the watchdog suite makes
+    - The privileged suites: the guard tests' restore agent starts as the unit's own restart would; the watchdog suite makes
       `/etc/northnarrow` first and establishes the watchdog role's first
       claim for `the_watchdog_s_own_start_is_not_a_foreign_bpf_handle`.
     - Test assertion messages name what they expect instead of printing a
