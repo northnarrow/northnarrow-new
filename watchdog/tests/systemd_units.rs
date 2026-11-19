@@ -379,6 +379,28 @@ fn every_unit_unsets_every_loader_variable() {
     }
 }
 
+/// Lot 374: the watchdog writes its witness chain in the directory the
+/// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
+/// and nothing else of the agent's state; under `ProtectSystem=strict`
+/// a chain anywhere else would be read-only to it.
+#[test]
+fn the_watchdog_writes_its_witness_chain_and_nothing_else_of_the_state() {
+    let d = directives(&unit("northnarrow-watchdog.service"));
+    let rw: Vec<String> = d
+        .iter()
+        .filter(|(k, _)| k == "ReadWritePaths")
+        .flat_map(|(_, v)| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        rw,
+        [
+            "/run/northnarrow".to_string(),
+            format!("-{}", nn_proto::witness::WITNESS_DIR)
+        ]
+    );
+    assert_eq!(value(&d, "ProtectSystem"), Some("strict"));
+}
+
 // ── Lab PR 216 (capability C23): fail-visible supervision ──────────────
 
 const WATCHDOG: &str = "northnarrow-watchdog.service";

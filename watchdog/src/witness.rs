@@ -225,8 +225,7 @@ impl Witness {
 /// and `ExecMainStatus=` (`None` when it says nothing yet).
 pub fn cause_from_show(show: &str) -> Option<String> {
     let get = |k: &str| {
-        show.split_whitespace()
-            .chain(show.lines())
+        show.lines()
             .find_map(|l| l.trim().strip_prefix(k).and_then(|v| v.strip_prefix('=')))
     };
     let result = get("Result")?;
@@ -248,34 +247,71 @@ pub fn cause_from_show(show: &str) -> Option<String> {
 /// agent's exit (the watchdog's pidfd can see it first).
 pub const EXIT_CAUSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Why the agent's unit `unit` ended, as systemd recorded it
-/// ([`cause_from_show`]), asked until its main process is no longer
-/// running or [`EXIT_CAUSE_WAIT`] passed. Blocking: call off the runtime.
-pub fn unit_exit_cause(unit: &str) -> Option<String> {
+/// What `systemctl show` says of the agent `pid`'s exit: `Some` once its
+/// unit recorded that process's exit (`ExecMainPID=` is `pid`,
+/// `ExecMainCode=` set) and left the active states — the cause
+/// ([`cause_from_show`]) — or once its unit has started another process
+/// since (then the cause is not known); `None` while neither holds yet.
+pub fn exit_from_show(show: &str, pid: u32) -> Option<String> {
+    let get = |k: &str| {
+        show.lines()
+            .find_map(|l| l.trim().strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+    };
+    let main: u32 = get("ExecMainPID").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if main != 0 && main != pid {
+        return Some(format!(
+            "not known (systemd started another process of the unit since, pid {main})"
+        ));
+    }
+    let code = get("ExecMainCode").unwrap_or("0");
+    let settled = matches!(get("ActiveState"), Some("failed" | "inactive"));
+    if main != pid || code == "0" || !settled {
+        return None;
+    }
+    cause_from_show(show)
+}
+
+/// Why the agent `pid` of unit `unit` ended, as systemd recorded it
+/// ([`exit_from_show`]), asked until it did or [`EXIT_CAUSE_WAIT`]
+/// passed. Blocking: call off the runtime.
+pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
     let systemctl = crate::find_systemctl()?;
     let deadline = std::time::Instant::now() + EXIT_CAUSE_WAIT;
     loop {
         let out = std::process::Command::new(&systemctl)
             .arg("show")
-            .arg("--property=ActiveState,MainPID,Result,ExecMainCode,ExecMainStatus")
+            .arg("--property=ActiveState,ExecMainPID,Result,ExecMainCode,ExecMainStatus")
             .arg(unit)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let running = text.lines().any(|l| l.trim() == "ActiveState=active")
-            && !text.lines().any(|l| l.trim() == "MainPID=0");
-        if !running {
-            if let Some(c) = cause_from_show(&text) {
-                return Some(c);
-            }
+        if let Some(c) = exit_from_show(&text, pid) {
+            return Some(c);
         }
         if std::time::Instant::now() >= deadline {
-            return cause_from_show(&text).map(|c| format!("{c}, as systemd still reported it"));
+            return Some(format!(
+                "not known (systemd had not recorded the exit of pid {pid} within {} s)",
+                EXIT_CAUSE_WAIT.as_secs()
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// The vacancy row's detail: the agent `pid` gone, `cause` (the wait's or
+/// systemd's), and what its shutdown marker said — an authorised stop is
+/// one too, and says so.
+pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -> String {
+    let marker = match verdict {
+        crate::ShutdownVerdict::Absent => "no shutdown marker",
+        crate::ShutdownVerdict::Authorised => "a shutdown the admin quorum signed: no successor follows",
+        crate::ShutdownVerdict::Refused(_) => {
+            "a shutdown marker refused (not signed by the admin quorum for this agent)"
+        }
+    };
+    format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}")
 }
 
 /// Why the agent exited, from the wait on the exec backend's child
@@ -320,18 +356,175 @@ mod tests {
     use super::*;
     use antitamper_bpf::start_check::{Findings, Foreign, Identity};
 
+    fn show(state: &str, main: u32, result: &str, code: u8, status: i32) -> String {
+        format!(
+            "ActiveState={state}\nExecMainPID={main}\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\n"
+        )
+    }
+
     #[test]
     fn the_cause_names_the_oom_killer_a_signal_or_an_exit() {
-        let oom = "ActiveState=failed Result=oom-kill ExecMainCode=2 ExecMainStatus=9";
-        let c = cause_from_show(oom).unwrap();
+        let c = cause_from_show(&show("failed", 7, "oom-kill", 2, 9)).unwrap();
         assert!(c.starts_with("the OOM killer") && c.contains("signal 9"), "{c}");
-        let sig = "ActiveState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=11\n";
-        assert_eq!(cause_from_show(sig).unwrap(), "signal 11 (systemd Result=signal)");
-        let ex = "Result=exit-code ExecMainCode=1 ExecMainStatus=78";
-        assert_eq!(cause_from_show(ex).unwrap(), "exit status 78 (systemd Result=exit-code)");
-        assert_eq!(cause_from_show("ActiveState=active"), None);
+        assert_eq!(
+            cause_from_show(&show("failed", 7, "signal", 2, 11)).unwrap(),
+            "signal 11 (systemd Result=signal)"
+        );
+        assert_eq!(
+            cause_from_show(&show("failed", 7, "exit-code", 1, 78)).unwrap(),
+            "exit status 78 (systemd Result=exit-code)"
+        );
+        assert_eq!(cause_from_show("ActiveState=active\n"), None);
         assert_eq!(cause_from_wait(libc::CLD_KILLED, 9), "signal 9");
         assert_eq!(cause_from_wait(libc::CLD_EXITED, 0), "exit status 0");
+        assert_eq!(cause_from_wait(libc::CLD_DUMPED, 6), "signal 6, core dumped");
+    }
+
+    /// Lot 374: systemd's record is the dead agent's only once it names
+    /// that process and the unit left the active states; a record of
+    /// another process is never given as its cause.
+    #[test]
+    fn the_exit_is_read_only_from_systemd_s_record_of_that_process() {
+        // not recorded yet: the unit still active, or the exit not seen
+        assert_eq!(exit_from_show(&show("active", 7, "success", 0, 0), 7), None);
+        assert_eq!(exit_from_show(&show("deactivating", 7, "signal", 2, 9), 7), None);
+        assert_eq!(exit_from_show(&show("failed", 7, "success", 0, 0), 7), None);
+        assert_eq!(exit_from_show(&show("failed", 0, "success", 0, 0), 7), None);
+        // recorded
+        let c = exit_from_show(&show("failed", 7, "oom-kill", 2, 9), 7).unwrap();
+        assert!(c.starts_with("the OOM killer"), "{c}");
+        let c = exit_from_show(&show("inactive", 7, "success", 1, 0), 7).unwrap();
+        assert_eq!(c, "exit status 0 (systemd Result=success)");
+        // another process of the unit since: its status is not the cause
+        let c = exit_from_show(&show("active", 8, "success", 0, 0), 7).unwrap();
+        assert!(c.starts_with("not known") && c.contains("pid 8"), "{c}");
+        let c = exit_from_show(&show("failed", 8, "signal", 2, 9), 7).unwrap();
+        assert!(!c.contains("signal 9"), "{c}");
+    }
+
+    #[test]
+    fn the_vacancy_names_the_agent_its_cause_and_the_marker() {
+        let d = vacancy_detail(41, "signal 9 (systemd Result=signal)", &crate::ShutdownVerdict::Absent);
+        assert_eq!(
+            d,
+            "the agent (pid 41) exited, its role vacated: signal 9 (systemd Result=signal); no shutdown marker"
+        );
+        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Authorised);
+        assert!(d.ends_with("a shutdown the admin quorum signed: no successor follows"), "{d}");
+        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Refused("x".into()));
+        assert!(d.contains("a shutdown marker refused"), "{d}");
+    }
+
+    fn chain_text(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join(CHAIN_FILE)).unwrap()
+    }
+
+    /// Lot 374 (the witness record when the agent dies): the watchdog's
+    /// own rows — the vacancy, then its successor — signed by its key and
+    /// linked, so the agent imports them as the watchdog's, whatever the
+    /// successor writes or leaves out.
+    #[test]
+    fn the_witness_signs_the_vacancy_and_the_successor_in_one_chain() {
+        use nn_proto::witness::{to_import, Imported, KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "the agent (pid 10) exited, its role vacated: signal 9")
+            .unwrap();
+        w.record(KIND_SUCCEEDED, "the agent's role, vacated by pid 10, taken by pid 11")
+            .unwrap();
+        let text = chain_text(dir.path());
+        let mut imp = Imported::default();
+        imp.certify(&w.key_hex());
+        let t = to_import(&text, &imp);
+        assert!(t.broken.is_none() && !t.position_lost, "{t:?}");
+        let kinds: Vec<&str> = t.rows.iter().map(|(r, _, _)| r.kind.as_str()).collect();
+        assert_eq!(kinds, [KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
+        assert!(t.rows.iter().all(|(r, _, ok)| *ok && r.tgid == me && r.key == w.key_hex()));
+        assert!(t.rows[1].0.detail.contains("signal 9"));
+        // another key's rows are the claim of a key no agent certified
+        let other = Imported::default();
+        assert!(to_import(&text, &other).rows.iter().all(|(_, _, ok)| !ok));
+    }
+
+    /// Lot 374: a watchdog's next life continues the chain with a key of
+    /// its own (never the last one's: it was never on disk).
+    #[test]
+    fn a_new_life_continues_the_chain_with_a_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let first = Witness::open(dir.path(), me).unwrap().key_hex();
+        let mut second = Witness::open(dir.path(), me).unwrap();
+        second.record(nn_proto::witness::KIND_VACATED, "d").unwrap();
+        assert_ne!(first, second.key_hex());
+        let j = judge_chain(&chain_text(dir.path()));
+        assert_eq!(j.len(), 3, "{j:?}");
+        let Judged::Valid { row, .. } = &j[1] else {
+            panic!("{j:?}")
+        };
+        assert_eq!((row.seq, row.kind.as_str()), (1, KIND_OPENED));
+        assert!(row.detail.contains("continues row 0"), "{}", row.detail);
+        assert!(j.iter().all(|x| matches!(x, Judged::Valid { .. })));
+    }
+
+    /// Lot 374: a chain changed under the watchdog is not continued (its
+    /// next row would vouch for it): kept aside, said in the new chain's
+    /// first row.
+    #[test]
+    fn a_broken_chain_is_kept_aside_and_a_new_one_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(nn_proto::witness::KIND_VACATED, "row 1").unwrap();
+        let text = chain_text(dir.path()).replace("row 1", "row X");
+        std::fs::write(dir.path().join(CHAIN_FILE), &text).unwrap();
+        Witness::open(dir.path(), me).unwrap();
+        let aside = dir.path().join(format!("{CHAIN_FILE}.1"));
+        assert_eq!(std::fs::read_to_string(aside).unwrap(), text);
+        let j = judge_chain(&chain_text(dir.path()));
+        assert_eq!(j.len(), 1, "{j:?}");
+        let Judged::Valid { row, .. } = &j[0] else {
+            panic!("{j:?}")
+        };
+        assert_eq!(row.seq, 0);
+        assert!(row.detail.contains("the previous chain is broken (line 2"), "{}", row.detail);
+        // a chain that is not a file is not written over
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(CHAIN_FILE)).unwrap();
+        assert!(Witness::open(dir.path(), me).is_err());
+    }
+
+    /// Lot 374: the key's public half is published in a sealed memory file
+    /// of this process's, naming this process and its start — what the
+    /// agent reads from the watchdog's descriptor table.
+    #[test]
+    fn the_key_is_published_in_a_sealed_memory_file_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let w = Witness::open(dir.path(), me).unwrap();
+        let want = format!("/memfd:{KEY_MEMFD_NAME}");
+        let mut found = 0;
+        for e in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let p = e.unwrap().path();
+            let Ok(link) = std::fs::read_link(&p) else { continue };
+            if !link.to_string_lossy().starts_with(&want) {
+                continue;
+            }
+            let f = std::fs::File::open(&p).unwrap();
+            let seals = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GET_SEALS) };
+            let need = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+            if seals & need != need {
+                continue; // another test's witness, not sealed yet
+            }
+            let body = std::fs::read_to_string(&p).unwrap();
+            let (tgid, start, key) = nn_proto::witness::parse_key_record(&body).unwrap();
+            if key == w.key_hex() {
+                assert_eq!(tgid, me);
+                assert_eq!(Some(start), antitamper_bpf::start_check::start_ticks(me));
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1);
     }
 
     #[test]

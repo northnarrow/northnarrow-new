@@ -180,7 +180,12 @@ ProtectHome=true
 # connect() to /run/dbus/system_bus_socket; a read-only /run does not
 # block unix-socket connects (EROFS applies to regular files/dirs only).
 # If a host proves otherwise, add /run/dbus here (design §3.2 / §5.1).
-ReadWritePaths=/run/northnarrow
+# Lot 374: the watchdog's witness chain (its own signed record of the
+# agent's vacancies and successors) is in the agent's state directory,
+# which the agent makes at its start and its deny hooks keep from every
+# process outside the two; `-`: a host where it is not made yet starts the
+# watchdog all the same, and the watchdog records that it has no witness.
+ReadWritePaths=/run/northnarrow -/var/lib/northnarrow/witness
 # CAP_BPF        — open the pinned maps by path (BPF_OBJ_GET and the
 #                  info of the fd), claim the watchdog's role slot,
 #                  insert into and delete from PROTECTED_PIDS: all

@@ -248,10 +248,13 @@ MemoryHigh=9G
 MemoryMax=11G
 TasksMax=512
 # OOMScoreAdjust — lot 370 (F10-4): -999, the host OOM killer's last pick.
-# Its SIGKILL is one no hook can refuse: root that exempts every other
-# process and exhausts the memory chose when the agent's role fell vacant
-# (the successor of a vacated role is checked and signed High, whatever
-# the OOM ranking). Not -1000: that would make the agent unkillable by its
+# Its SIGKILL is one no hook can refuse, so the agent's role can fall
+# vacant. Lot 374: the watchdog then signs the vacancy (its cause as
+# systemd records it) and the process that takes the role, in its own
+# witness chain, which the agent imports. Only this unit's own restart
+# takes the role, and a start that finds a loader variable or a library
+# the release does not link refuses itself. Not -1000: that would make the
+# agent unkillable by its
 # own cgroup's OOM too, so a leak would hang its allocations or weigh on
 # the host; with -999 a leak past MemoryMax ends in the cgroup's OOM kill
 # and a restart (the watchdog). The agent writes it again at its start,

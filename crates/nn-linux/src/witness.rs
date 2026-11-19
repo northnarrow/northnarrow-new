@@ -340,6 +340,65 @@ mod tests {
         }
     }
 
+    /// A memory file named as the watchdog's key file, holding `body`,
+    /// sealed or not, in this process's descriptor table.
+    fn key_file(body: &str, sealed: bool) -> std::os::fd::OwnedFd {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = std::ffi::CString::new(KEY_MEMFD_NAME).unwrap();
+        // SAFETY: a NUL-terminated name.
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(fd >= 0);
+        // SAFETY: a new descriptor this test owns.
+        let mut f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        f.write_all(body.as_bytes()).unwrap();
+        if sealed {
+            let s = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+            // SAFETY: fcntl on a descriptor we hold.
+            assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, s) }, 0);
+        }
+        f.into()
+    }
+
+    /// Lot 374: the watchdog's key is taken only from a sealed memory file
+    /// in the watchdog's own descriptor table that names that process and
+    /// its start — never from a file another process could write — and
+    /// certified once.
+    #[test]
+    fn the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file() {
+        let me = std::process::id();
+        let start = antitamper_bpf::start_check::start_ticks(me).unwrap();
+        let key = WitnessKey::from_seed([6; 32]).public_hex();
+        let err = published_key(me).unwrap_err();
+        assert!(err.contains("published no witness key"), "{err}");
+        let record = nn_proto::witness::key_record(me, start, &key);
+        for (body, sealed, why) in [
+            (record.clone(), false, "not sealed"),
+            (nn_proto::witness::key_record(me + 1, start, &key), true, "names pid"),
+            (nn_proto::witness::key_record(me, start + 1, &key), true, "names pid"),
+            ("nothing\n".to_string(), true, "holds no key record"),
+        ] {
+            let fd = key_file(&body, sealed);
+            let err = published_key(me).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+            drop(fd);
+        }
+        let fd = key_file(&record, true);
+        assert_eq!(published_key(me), Ok(key.clone()));
+        // certified once, kept for the next reader
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        let mut r = WitnessReader::new(dir.path());
+        let f = r.certify(me).expect("certified");
+        assert_eq!(f.kind, WITNESS_KEY);
+        assert!(f.detail.contains(&key), "{}", f.detail);
+        assert!(r.certify(me).is_none(), "once");
+        assert!(WitnessReader::new(dir.path()).position().certified(&key));
+        drop(fd);
+    }
+
     fn write_chain(dir: &Path, k: &WitnessKey, kinds: &[&str]) -> Vec<String> {
         let mut prev = String::new();
         let mut lines = Vec::new();

@@ -528,15 +528,6 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         "waitid on the agent pidfd failed"
                     ),
                 }
-                // Lot 374: the vacancy, signed by the surviving role, with
-                // its cause as the wait or systemd reports it.
-                if let Some(w) = witness.as_mut() {
-                    let cause = exit_cause(&backend, &reaped).await;
-                    w.record_or_log(
-                        nn_proto::witness::KIND_VACATED,
-                        &format!("the agent (pid {agent_pid}) exited, its role vacated: {cause}"),
-                    );
-                }
                 match evict_dead_agent(&cli.bpffs_root, agent_pid) {
                     Ok(report) => info!(
                         target: "watchdog.layer2_evict",
@@ -574,7 +565,23 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     agent_started,
                 };
                 // lot 357 (re-check 3 of #563, R3-2): bounded, off this thread
-                match check_shutdown_marker_bounded(&check) {
+                let verdict = check_shutdown_marker_bounded(&check);
+                // Lot 374: the vacancy, signed by the surviving role, with
+                // its cause as the wait or systemd records it and what the
+                // shutdown marker said — after the evict, which the wait on
+                // systemd's record never delays.
+                if let Some(w) = witness.as_mut() {
+                    let cause = exit_cause(&backend, &reaped, agent_pid).await;
+                    w.record_or_log(
+                        nn_proto::witness::KIND_VACATED,
+                        &northnarrow_watchdog::witness::vacancy_detail(
+                            agent_pid,
+                            &cause,
+                            &verdict,
+                        ),
+                    );
+                }
+                match verdict {
                     ShutdownVerdict::Authorised => {
                         info!(
                             target: "watchdog.shutdown_marker",
@@ -1079,9 +1086,13 @@ fn judge_successor(old: u32, new: u32) -> (bool, String) {
     northnarrow_watchdog::witness::successor_detail(old, new, &id, &found)
 }
 
-/// Lot 374: why the agent exited — the wait's status for the exec
+/// Lot 374: why the agent `pid` exited — the wait's status for the exec
 /// backend's child, systemd's record of the unit otherwise.
-async fn exit_cause(backend: &RespawnBackend, reaped: &std::io::Result<Reaped>) -> String {
+async fn exit_cause(
+    backend: &RespawnBackend,
+    reaped: &std::io::Result<Reaped>,
+    pid: u32,
+) -> String {
     use northnarrow_watchdog::witness::{cause_from_wait, unit_exit_cause};
     if let Ok(Reaped::Collected { si_code, code, .. }) = reaped {
         return cause_from_wait(*si_code, *code);
@@ -1089,7 +1100,7 @@ async fn exit_cause(backend: &RespawnBackend, reaped: &std::io::Result<Reaped>) 
     match backend {
         RespawnBackend::SystemdUnit { unit } => {
             let unit = unit.clone();
-            tokio::task::spawn_blocking(move || unit_exit_cause(&unit))
+            tokio::task::spawn_blocking(move || unit_exit_cause(&unit, pid))
                 .await
                 .ok()
                 .flatten()

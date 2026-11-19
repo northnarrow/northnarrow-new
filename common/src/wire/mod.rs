@@ -2485,6 +2485,33 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    /// Lot 374: a cgroup's name as the eBPF programs compare it — the
+    /// bytes of the kernel's string read (at most 31 and a NUL) in
+    /// little-endian words; slot 0 the watchdog's unit, slot 1 the agent's.
+    #[test]
+    fn a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it() {
+        use super::{kn_name_words, role_unit_words, AGENT_UNIT, OUR_SLICE, WATCHDOG_UNIT};
+        let words = |w: [u64; 4]| {
+            let mut b = [0u8; 32];
+            for (i, x) in w.iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        let b = words(kn_name_words(OUR_SLICE));
+        assert_eq!(&b[..OUR_SLICE.len()], OUR_SLICE.as_bytes());
+        assert!(b[OUR_SLICE.len()..].iter().all(|x| *x == 0));
+        assert_eq!(role_unit_words(0), kn_name_words("northnarrow-watchdog.service"));
+        assert_eq!(role_unit_words(1), kn_name_words("northnarrow-agent.service"));
+        assert_ne!(role_unit_words(0), role_unit_words(1));
+        // a name that only starts with ours is not ours: ours end before 31
+        // bytes, where the kernel's read of a longer one does not
+        for n in [OUR_SLICE, AGENT_UNIT, WATCHDOG_UNIT] {
+            assert!(n.len() < 31, "{n}");
+            assert_ne!(kn_name_words(&alloc::format!("{n}x")), kn_name_words(n));
+        }
+        assert_ne!(kn_name_words("northnarrow-agent.servic"), role_unit_words(1));
+    }
     /// Named test (the review of #555, F5): the exec sensor's argv read —
     /// a block of exactly `ARGV_LEN` bytes is read as `ARGV_LEN - 1` and
     /// marked cut. On 61e15d9a the mark was set only past `ARGV_LEN`, and
