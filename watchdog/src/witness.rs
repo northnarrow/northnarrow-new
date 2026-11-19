@@ -67,18 +67,23 @@ fn publish(record: &str) -> Result<OwnedFd> {
     use std::io::Write;
     let name = std::ffi::CString::new(KEY_MEMFD_NAME).expect("no NUL");
     // SAFETY: a NUL-terminated name; the flags are memfd_create's.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if fd < 0 {
         return Err(anyhow!("memfd_create: {}", std::io::Error::last_os_error()));
     }
     // SAFETY: a new descriptor this call alone owns.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut f = std::fs::File::from(owned);
-    f.write_all(record.as_bytes()).context("writing the key record")?;
+    f.write_all(record.as_bytes())
+        .context("writing the key record")?;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     // SAFETY: fcntl on a descriptor we hold.
     if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(anyhow!("sealing the key record: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "sealing the key record: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(OwnedFd::from(f))
 }
@@ -129,15 +134,18 @@ impl Witness {
                 match end {
                     Ok((seq, prev)) if m.len() < ROTATE_BYTES => {
                         if seq > 0 {
-                            notes.push(format!("continues row {} ({})", seq - 1, prev.get(..16).unwrap_or("")));
+                            notes.push(format!(
+                                "continues row {} ({})",
+                                seq - 1,
+                                prev.get(..16).unwrap_or("")
+                            ));
                         }
                         (seq, prev)
                     }
                     other => {
                         let aside = dir.join(format!("{CHAIN_FILE}.1"));
-                        std::fs::rename(&path, &aside).with_context(|| {
-                            format!("moving {} aside", path.display())
-                        })?;
+                        std::fs::rename(&path, &aside)
+                            .with_context(|| format!("moving {} aside", path.display()))?;
                         match other {
                             Ok((seq, prev)) => notes.push(format!(
                                 "the previous chain, full, ends at row {} ({}), kept as {}",
@@ -306,7 +314,9 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
 pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -> String {
     let marker = match verdict {
         crate::ShutdownVerdict::Absent => "no shutdown marker",
-        crate::ShutdownVerdict::Authorised => "a shutdown the admin quorum signed: no successor follows",
+        crate::ShutdownVerdict::Authorised => {
+            "a shutdown the admin quorum signed: no successor follows"
+        }
         crate::ShutdownVerdict::Refused(_) => {
             "a shutdown marker refused (not signed by the admin quorum for this agent)"
         }
@@ -365,7 +375,10 @@ mod tests {
     #[test]
     fn the_cause_names_the_oom_killer_a_signal_or_an_exit() {
         let c = cause_from_show(&show("failed", 7, "oom-kill", 2, 9)).unwrap();
-        assert!(c.starts_with("the OOM killer") && c.contains("signal 9"), "{c}");
+        assert!(
+            c.starts_with("the OOM killer") && c.contains("signal 9"),
+            "{c}"
+        );
         assert_eq!(
             cause_from_show(&show("failed", 7, "signal", 2, 11)).unwrap(),
             "signal 11 (systemd Result=signal)"
@@ -377,7 +390,10 @@ mod tests {
         assert_eq!(cause_from_show("ActiveState=active\n"), None);
         assert_eq!(cause_from_wait(libc::CLD_KILLED, 9), "signal 9");
         assert_eq!(cause_from_wait(libc::CLD_EXITED, 0), "exit status 0");
-        assert_eq!(cause_from_wait(libc::CLD_DUMPED, 6), "signal 6, core dumped");
+        assert_eq!(
+            cause_from_wait(libc::CLD_DUMPED, 6),
+            "signal 6, core dumped"
+        );
     }
 
     /// Lot 374: systemd's record is the dead agent's only once it names
@@ -387,7 +403,10 @@ mod tests {
     fn the_exit_is_read_only_from_systemd_s_record_of_that_process() {
         // not recorded yet: the unit still active, or the exit not seen
         assert_eq!(exit_from_show(&show("active", 7, "success", 0, 0), 7), None);
-        assert_eq!(exit_from_show(&show("deactivating", 7, "signal", 2, 9), 7), None);
+        assert_eq!(
+            exit_from_show(&show("deactivating", 7, "signal", 2, 9), 7),
+            None
+        );
         assert_eq!(exit_from_show(&show("failed", 7, "success", 0, 0), 7), None);
         assert_eq!(exit_from_show(&show("failed", 0, "success", 0, 0), 7), None);
         // recorded
@@ -404,14 +423,25 @@ mod tests {
 
     #[test]
     fn the_vacancy_names_the_agent_its_cause_and_the_marker() {
-        let d = vacancy_detail(41, "signal 9 (systemd Result=signal)", &crate::ShutdownVerdict::Absent);
+        let d = vacancy_detail(
+            41,
+            "signal 9 (systemd Result=signal)",
+            &crate::ShutdownVerdict::Absent,
+        );
         assert_eq!(
             d,
             "the agent (pid 41) exited, its role vacated: signal 9 (systemd Result=signal); no shutdown marker"
         );
         let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Authorised);
-        assert!(d.ends_with("a shutdown the admin quorum signed: no successor follows"), "{d}");
-        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Refused("x".into()));
+        assert!(
+            d.ends_with("a shutdown the admin quorum signed: no successor follows"),
+            "{d}"
+        );
+        let d = vacancy_detail(
+            41,
+            "exit status 0",
+            &crate::ShutdownVerdict::Refused("x".into()),
+        );
         assert!(d.contains("a shutdown marker refused"), "{d}");
     }
 
@@ -429,10 +459,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let me = std::process::id();
         let mut w = Witness::open(dir.path(), me).unwrap();
-        w.record(KIND_VACATED, "the agent (pid 10) exited, its role vacated: signal 9")
-            .unwrap();
-        w.record(KIND_SUCCEEDED, "the agent's role, vacated by pid 10, taken by pid 11")
-            .unwrap();
+        w.record(
+            KIND_VACATED,
+            "the agent (pid 10) exited, its role vacated: signal 9",
+        )
+        .unwrap();
+        w.record(
+            KIND_SUCCEEDED,
+            "the agent's role, vacated by pid 10, taken by pid 11",
+        )
+        .unwrap();
         let text = chain_text(dir.path());
         let mut imp = Imported::default();
         imp.certify(&w.key_hex());
@@ -440,7 +476,10 @@ mod tests {
         assert!(t.broken.is_none() && !t.position_lost, "{t:?}");
         let kinds: Vec<&str> = t.rows.iter().map(|(r, _, _)| r.kind.as_str()).collect();
         assert_eq!(kinds, [KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
-        assert!(t.rows.iter().all(|(r, _, ok)| *ok && r.tgid == me && r.key == w.key_hex()));
+        assert!(t
+            .rows
+            .iter()
+            .all(|(r, _, ok)| *ok && r.tgid == me && r.key == w.key_hex()));
         assert!(t.rows[1].0.detail.contains("signal 9"));
         // another key's rows are the claim of a key no agent certified
         let other = Imported::default();
@@ -487,7 +526,11 @@ mod tests {
             panic!("{j:?}")
         };
         assert_eq!(row.seq, 0);
-        assert!(row.detail.contains("the previous chain is broken (line 2"), "{}", row.detail);
+        assert!(
+            row.detail.contains("the previous chain is broken (line 2"),
+            "{}",
+            row.detail
+        );
         // a chain that is not a file is not written over
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(CHAIN_FILE)).unwrap();
@@ -506,13 +549,17 @@ mod tests {
         let mut found = 0;
         for e in std::fs::read_dir("/proc/self/fd").unwrap() {
             let p = e.unwrap().path();
-            let Ok(link) = std::fs::read_link(&p) else { continue };
+            let Ok(link) = std::fs::read_link(&p) else {
+                continue;
+            };
             if !link.to_string_lossy().starts_with(&want) {
                 continue;
             }
             let f = std::fs::File::open(&p).unwrap();
-            let seals = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GET_SEALS) };
-            let need = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+            let seals =
+                unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GET_SEALS) };
+            let need =
+                libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
             if seals & need != need {
                 continue; // another test's witness, not sealed yet
             }
@@ -551,12 +598,18 @@ mod tests {
             unreadable: vec![],
         };
         let (ok, d) = successor_detail(10, 11, &unit, &preloaded);
-        assert!(!ok && d.contains("something foreign") && d.contains("/tmp/x.so"), "{d}");
+        assert!(
+            !ok && d.contains("something foreign") && d.contains("/tmp/x.so"),
+            "{d}"
+        );
         let unread = Findings {
             unreadable: vec!["maps: denied".into()],
             ..Findings::default()
         };
-        assert!(!successor_detail(10, 11, &unit, &unread).0, "unread is never clean");
+        assert!(
+            !successor_detail(10, 11, &unit, &unread).0,
+            "unread is never clean"
+        );
     }
 
     #[test]
@@ -583,6 +636,8 @@ mod tests {
         }
         assert_eq!(chain_end(&text), Ok((3, prev)));
         assert_eq!(chain_end(""), Ok((0, String::new())));
-        assert!(chain_end(&format!("{text}garbage\n")).unwrap_err().contains("line 4"));
+        assert!(chain_end(&format!("{text}garbage\n"))
+            .unwrap_err()
+            .contains("line 4"));
     }
 }

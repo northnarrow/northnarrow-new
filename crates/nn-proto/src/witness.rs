@@ -349,12 +349,18 @@ mod tests {
         let mut changed = lines.clone();
         changed[1] = changed[1].replace("detail 1", "detail X");
         let j = judge_chain(&changed.join("\n"));
-        assert!(matches!(j.last(), Some(Judged::Broken { line: 2, .. })), "{j:?}");
+        assert!(
+            matches!(j.last(), Some(Judged::Broken { line: 2, .. })),
+            "{j:?}"
+        );
         // a row removed
         let mut removed = lines.clone();
         removed.remove(1);
         let j = judge_chain(&removed.join("\n"));
-        assert!(matches!(j.last(), Some(Judged::Broken { line: 2, .. })), "{j:?}");
+        assert!(
+            matches!(j.last(), Some(Judged::Broken { line: 2, .. })),
+            "{j:?}"
+        );
         // a row signed by another key in its place: valid signature, but a
         // key the agent never certified (see the import test)
         let other = key(2);
@@ -365,10 +371,17 @@ mod tests {
         // a signature of another row's
         let mut swapped: Row = serde_json::from_str(&lines[1]).unwrap();
         swapped.sig = serde_json::from_str::<Row>(&lines[2]).unwrap().sig;
-        let j = judge_chain(&[lines[0].clone(), serde_json::to_string(&swapped).unwrap()].join("\n"));
-        assert!(matches!(j.last(), Some(Judged::Broken { line: 2, .. })), "{j:?}");
+        let j =
+            judge_chain(&[lines[0].clone(), serde_json::to_string(&swapped).unwrap()].join("\n"));
+        assert!(
+            matches!(j.last(), Some(Judged::Broken { line: 2, .. })),
+            "{j:?}"
+        );
         // not JSON
-        assert!(matches!(judge_chain("x").last(), Some(Judged::Broken { line: 1, .. })));
+        assert!(matches!(
+            judge_chain("x").last(),
+            Some(Judged::Broken { line: 1, .. })
+        ));
     }
 
     #[test]
@@ -404,7 +417,10 @@ mod tests {
         let rec = key_record(42, 1234, &k.public_hex());
         assert_eq!(parse_key_record(&rec), Some((42, 1234, k.public_hex())));
         assert_eq!(parse_key_record("nn-witness-key-v1 42 1234 zz"), None);
-        assert_eq!(parse_key_record(&format!("other 42 1234 {}", k.public_hex())), None);
+        assert_eq!(
+            parse_key_record(&format!("other 42 1234 {}", k.public_hex())),
+            None
+        );
         assert_eq!(parse_key_record(&format!("{} extra", rec.trim_end())), None);
     }
 

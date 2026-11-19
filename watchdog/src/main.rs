@@ -574,11 +574,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     let cause = exit_cause(&backend, &reaped, agent_pid).await;
                     w.record_or_log(
                         nn_proto::witness::KIND_VACATED,
-                        &northnarrow_watchdog::witness::vacancy_detail(
-                            agent_pid,
-                            &cause,
-                            &verdict,
-                        ),
+                        &northnarrow_watchdog::witness::vacancy_detail(agent_pid, &cause, &verdict),
                     );
                 }
                 match verdict {

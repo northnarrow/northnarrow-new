@@ -507,11 +507,18 @@ fn a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it() 
     ]);
     let status = command_until_exit(cmd, &log);
     let text = assert_refused_before_the_load(status, &log, &state, &before, "start_self_check");
-    assert!(text.contains("loader variables LD_BIND_NOW"), "{}", tail(&log));
+    assert!(
+        text.contains("loader variables LD_BIND_NOW"),
+        "{}",
+        tail(&log)
+    );
     let row = signed_refusal(&state.audit_log(), &state, "start_self_check");
     let detail = row["extra"]["detail"].as_str().unwrap_or_default();
     assert!(detail.contains("LD_BIND_NOW"), "{row}");
-    assert!(!detail.contains("nn-lot-374"), "the value is not recorded: {row}");
+    assert!(
+        !detail.contains("nn-lot-374"),
+        "the value is not recorded: {row}"
+    );
 }
 
 /// A broken audit chain (a line before the end that is not a row): found

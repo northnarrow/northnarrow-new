@@ -242,7 +242,9 @@ fn library_refused(
     if path.ends_with(" (deleted)") {
         return Some("a file deleted since it was mapped");
     }
-    if !LIB_DIRS.iter().any(|d| path.starts_with(d)) || path.contains("/../") || path.contains("/./")
+    if !LIB_DIRS.iter().any(|d| path.starts_with(d))
+        || path.contains("/../")
+        || path.contains("/./")
     {
         return Some("not in a system library directory");
     }
@@ -251,7 +253,9 @@ fn library_refused(
         && name
             .strip_prefix("libnss_")
             .and_then(|r| r.strip_suffix(".so.2"))
-            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            .is_some_and(|s| {
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            });
     if !EXPECTED_LIBS.contains(&name) && !nss {
         return Some("not a library the release links");
     }
@@ -305,7 +309,10 @@ impl Findings {
                 .take(8)
                 .map(|f| format!("{} ({})", f.path, f.why))
                 .collect();
-            parts.push(format!("executable mappings not expected: {}", libs.join("; ")));
+            parts.push(format!(
+                "executable mappings not expected: {}",
+                libs.join("; ")
+            ));
         }
         if !self.unreadable.is_empty() {
             parts.push(format!("not read: {}", self.unreadable.join("; ")));
@@ -380,14 +387,16 @@ impl Identity {
     /// unit's own cgroup under [`OUR_SLICE`] at the hierarchy's root —
     /// the restart systemd makes of the unit, and nothing else.
     pub fn in_unit(&self, unit: &str) -> bool {
-        self.ppid == Some(1) && self.cgroup.as_deref() == Some(format!("/{OUR_SLICE}/{unit}").as_str())
+        self.ppid == Some(1)
+            && self.cgroup.as_deref() == Some(format!("/{OUR_SLICE}/{unit}").as_str())
     }
 
     /// One line for a record.
     pub fn describe(&self) -> String {
         format!(
             "parent {}, cgroup {}",
-            self.ppid.map_or_else(|| "unread".to_string(), |p| p.to_string()),
+            self.ppid
+                .map_or_else(|| "unread".to_string(), |p| p.to_string()),
             self.cgroup.as_deref().unwrap_or("unread")
         )
     }
@@ -452,7 +461,9 @@ mod tests {
     }
 
     fn line(perms: &str, ino: u64, path: &str) -> String {
-        format!("7f0000000000-7f0000001000 {perms} 00000000 fd:01 {ino}                      {path}\n")
+        format!(
+            "7f0000000000-7f0000001000 {perms} 00000000 fd:01 {ino}                      {path}\n"
+        )
     }
 
     fn genuine() -> String {
@@ -505,7 +516,10 @@ mod tests {
         let f = foreign_mappings(&maps, EXE, Libs::Running, sys);
         assert_eq!(f.len(), 1, "{f:?}");
         let named = genuine() + &line("r-xp", 0, "[anon:x]");
-        assert_eq!(foreign_mappings(&named, EXE, Libs::Start, sys)[0].path, ANONYMOUS_CODE);
+        assert_eq!(
+            foreign_mappings(&named, EXE, Libs::Start, sys)[0].path,
+            ANONYMOUS_CODE
+        );
         let named = genuine() + &line("r-xp", 0, "[vsyscall]") + &line("rw-p", 0, "");
         assert!(foreign_mappings(&named, EXE, Libs::Start, sys).is_empty());
     }
@@ -525,13 +539,23 @@ mod tests {
         // a user's file
         let user = |p: &str| sys(p).map(|f| FileFacts { uid: 1000, ..f });
         let f = foreign_mappings(&genuine(), EXE, Libs::Start, user);
-        assert!(f.iter().all(|x| x.why == "not root's, or writable by another user"));
+        assert!(f
+            .iter()
+            .all(|x| x.why == "not root's, or writable by another user"));
         assert_eq!(f.len(), 4);
         // group-writable
-        let gw = |p: &str| sys(p).map(|f| FileFacts { mode: 0o100664, ..f });
+        let gw = |p: &str| {
+            sys(p).map(|f| FileFacts {
+                mode: 0o100664,
+                ..f
+            })
+        };
         assert_eq!(foreign_mappings(&genuine(), EXE, Libs::Start, gw).len(), 4);
         // unreadable
-        assert_eq!(foreign_mappings(&genuine(), EXE, Libs::Start, |_| None).len(), 4);
+        assert_eq!(
+            foreign_mappings(&genuine(), EXE, Libs::Start, |_| None).len(),
+            4
+        );
         // deleted
         let maps = genuine() + &line("r-xp", 10, "/usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)");
         let f = foreign_mappings(&maps, EXE, Libs::Start, sys);
@@ -561,7 +585,10 @@ mod tests {
         for v in LOADER_ENV {
             assert_eq!(loader_vars([*v, "PATH", "LANG"]), vec![v.to_string()]);
             let block = format!("PATH=/usr/bin\0{v}=/tmp/x.so\0LANG=C\0");
-            assert_eq!(loader_vars_in_environ(block.as_bytes()), vec![v.to_string()]);
+            assert_eq!(
+                loader_vars_in_environ(block.as_bytes()),
+                vec![v.to_string()]
+            );
         }
         // a value or a longer name is not the variable
         assert!(loader_vars(["LD_PRELOADX", "XLD_PRELOAD", "PATH"]).is_empty());
@@ -598,7 +625,11 @@ mod tests {
             };
             assert!(!id.in_unit(AGENT_UNIT), "{id:?}");
         }
-        assert!(!Identity { ppid: Some(1), cgroup: None }.in_unit(AGENT_UNIT));
+        assert!(!Identity {
+            ppid: Some(1),
+            cgroup: None
+        }
+        .in_unit(AGENT_UNIT));
     }
 
     #[test]

@@ -1141,7 +1141,10 @@ mod tests {
         assert!(svc("Environment=LD_PRELOAD=/usr/lib/libjemalloc.so").contains("LD_PRELOAD"));
         // lot 374: clearing the units' list of loader variables to unset
         assert!(svc("UnsetEnvironment=").contains("UnsetEnvironment= cleared"));
-        assert!(h(Reach::Agent, "UnsetEnvironment=TZ").is_none(), "one more unset is no harm");
+        assert!(
+            h(Reach::Agent, "UnsetEnvironment=TZ").is_none(),
+            "one more unset is no harm"
+        );
         assert!(svc("ConditionPathExists=/nonexistent-nn-lab").contains("fails"));
         // a slice drop-in, judged against the slice's floors
         let sl = |kv| h(Reach::OurSlice, kv).unwrap_or_else(|| panic!("{kv} not harmful"));

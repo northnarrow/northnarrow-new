@@ -3622,7 +3622,8 @@ mod tests {
         assert_eq!(r.reason, nn_proto::watchdog_hold::REASON_START_SELF_CHECK);
         assert_eq!((r.agent_pid, r.at), (42, 1_800_000_000));
         assert!(
-            r.detail.contains("refused its start before it took the watchdog's role")
+            r.detail
+                .contains("refused its start before it took the watchdog's role")
                 && r.detail.contains("LD_PRELOAD")
                 && r.detail.contains("/tmp/x.so"),
             "{}",

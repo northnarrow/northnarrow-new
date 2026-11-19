@@ -3333,7 +3333,9 @@ mod tests {
         }
         let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();
         assert!(
-            refused.detail.contains("refused itself before it took its role"),
+            refused
+                .detail
+                .contains("refused itself before it took its role"),
             "{}",
             refused.detail
         );

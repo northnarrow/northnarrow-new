@@ -18,7 +18,9 @@ use support::{product_code, repo_root};
 
 /// The string literals between `start` and the next `end` in `text`.
 fn literals_between(text: &str, start: &str, end: &str) -> Vec<String> {
-    let at = text.find(start).unwrap_or_else(|| panic!("{start} not found"));
+    let at = text
+        .find(start)
+        .unwrap_or_else(|| panic!("{start} not found"));
     let body = &text[at + start.len()..];
     let body = &body[..body.find(end).unwrap_or_else(|| panic!("{end} not found"))];
     body.split('"')
@@ -66,7 +68,9 @@ fn every_transient_unit_the_product_starts_unsets_the_loader_variables() {
         let runs = code.matches("\"systemd-run\"").count();
         let unsets = code.matches("start_check::systemd_run_unset()").count();
         if unsets < runs {
-            bad.push(format!("{rel}: {runs} systemd-run, {unsets} systemd_run_unset()"));
+            bad.push(format!(
+                "{rel}: {runs} systemd-run, {unsets} systemd_run_unset()"
+            ));
         }
     }
     assert!(
@@ -87,7 +91,9 @@ fn both_daemons_check_themselves_before_they_take_their_role() {
     let root = repo_root();
     let code = product_code(&root);
     let wd = &code["watchdog/src/main.rs"];
-    let check = wd.find("start_check::check_self()").expect("the watchdog's check");
+    let check = wd
+        .find("start_check::check_self()")
+        .expect("the watchdog's check");
     let refuse = wd[check..]
         .find("return refuse_start(")
         .map(|i| i + check)
@@ -99,9 +105,14 @@ fn both_daemons_check_themselves_before_they_take_their_role() {
         "the watchdog checks itself first"
     );
     let main = &code["agent/src/boot/mod.rs"];
-    let check = main.find("start_check::check_self()").expect("the agent's check");
+    let check = main
+        .find("start_check::check_self()")
+        .expect("the agent's check");
     let runtime = main.find("tokio::runtime::Builder").unwrap_or(usize::MAX);
-    assert!(check < runtime, "the agent checks itself before its runtime starts");
+    assert!(
+        check < runtime,
+        "the agent checks itself before its runtime starts"
+    );
     let pre = &code["agent/src/boot/preflight.rs"];
     let refusal = pre
         .find("self_check_refusal(self_check)")

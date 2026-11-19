@@ -127,6 +127,13 @@ pub const STATE_FLAGS: &[StateFlag] = &[
         what: "the FIM drift chain, its archives and manifest",
     },
     StateFlag {
+        flag: "--witness-dir",
+        file: "witness",
+        shared: false,
+        what: "lot 374: the watchdog's witness chain and the agent's import position (a \
+               directory the agent makes; the watchdog's --witness-dir)",
+    },
+    StateFlag {
         flag: "--canary-registry-file",
         file: "canaries.jsonl",
         shared: false,
@@ -328,6 +335,10 @@ impl AgentState {
     pub fn actions(&self) -> PathBuf {
         self.path("--actions-file")
     }
+    /// Lot 374: the watchdog's witness directory.
+    pub fn witness_dir(&self) -> PathBuf {
+        self.path("--witness-dir")
+    }
     pub fn heartbeat(&self) -> PathBuf {
         self.path("--heartbeat-file")
     }
@@ -394,6 +405,8 @@ impl AgentState {
             ("--shutdown-marker", self.shutdown_marker()),
             ("--admin-pub", self.admin_pub()),
             ("--agent-id-file", self.agent_id_file()),
+            // lot 374: its witness chain, where this agent imports it
+            ("--witness-dir", self.witness_dir()),
         ]
         .into_iter()
         .flat_map(|(flag, path)| [OsString::from(flag), path.into_os_string()])

@@ -2501,8 +2501,14 @@ mod tests {
         let b = words(kn_name_words(OUR_SLICE));
         assert_eq!(&b[..OUR_SLICE.len()], OUR_SLICE.as_bytes());
         assert!(b[OUR_SLICE.len()..].iter().all(|x| *x == 0));
-        assert_eq!(role_unit_words(0), kn_name_words("northnarrow-watchdog.service"));
-        assert_eq!(role_unit_words(1), kn_name_words("northnarrow-agent.service"));
+        assert_eq!(
+            role_unit_words(0),
+            kn_name_words("northnarrow-watchdog.service")
+        );
+        assert_eq!(
+            role_unit_words(1),
+            kn_name_words("northnarrow-agent.service")
+        );
         assert_ne!(role_unit_words(0), role_unit_words(1));
         // a name that only starts with ours is not ours: ours end before 31
         // bytes, where the kernel's read of a longer one does not
@@ -2510,7 +2516,10 @@ mod tests {
             assert!(n.len() < 31, "{n}");
             assert_ne!(kn_name_words(&alloc::format!("{n}x")), kn_name_words(n));
         }
-        assert_ne!(kn_name_words("northnarrow-agent.servic"), role_unit_words(1));
+        assert_ne!(
+            kn_name_words("northnarrow-agent.servic"),
+            role_unit_words(1)
+        );
     }
     /// Named test (the review of #555, F5): the exec sensor's argv read —
     /// a block of exactly `ARGV_LEN` bytes is read as `ARGV_LEN - 1` and

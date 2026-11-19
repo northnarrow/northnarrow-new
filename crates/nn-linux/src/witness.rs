@@ -55,8 +55,8 @@ pub const ROLES_VACATED_GAP: &str = "roles_vacated_gap";
 /// write, naming `pid` and its start. `Err` says why there is none.
 pub fn published_key(pid: u32) -> Result<String, String> {
     let dir = format!("/proc/{pid}/fd");
-    let names = antitamper_bpf::kernel_roots::read_dir_max(&dir, 256)
-        .map_err(|e| format!("{dir}: {e}"))?;
+    let names =
+        antitamper_bpf::kernel_roots::read_dir_max(&dir, 256).map_err(|e| format!("{dir}: {e}"))?;
     let want = format!("/memfd:{KEY_MEMFD_NAME}");
     let start = antitamper_bpf::start_check::start_ticks(pid)
         .ok_or_else(|| format!("the start of {pid} cannot be read"))?;
@@ -74,7 +74,9 @@ pub fn published_key(pid: u32) -> Result<String, String> {
         // SAFETY: fcntl on a descriptor we hold.
         let seals = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&f), libc::F_GET_SEALS) };
         if seals < 0 || seals & need != need {
-            return Err(format!("the watchdog's key file is not sealed (seals {seals:#x})"));
+            return Err(format!(
+                "the watchdog's key file is not sealed (seals {seals:#x})"
+            ));
         }
         let body = antitamper_bpf::kernel_roots::read_file_bounded(&f, 256)
             .map_err(|e| format!("{entry}: {e}"))?;
@@ -201,7 +203,9 @@ impl WitnessReader {
         if let Some(why) = t.broken {
             out.push(Finding {
                 kind: WITNESS_BROKEN,
-                detail: format!("the witness chain is broken at {why}: what follows is not imported"),
+                detail: format!(
+                    "the witness chain is broken at {why}: what follows is not imported"
+                ),
             });
         }
         (out, last)
@@ -283,7 +287,9 @@ pub fn roles_gap(agent: u32, watchdog: u32) -> Option<Finding> {
 mod tests {
     use super::*;
     use antitamper_bpf::start_check::{Findings, Identity};
-    use nn_proto::witness::{line_hash, Row, WitnessKey, KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION};
+    use nn_proto::witness::{
+        line_hash, Row, WitnessKey, KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION,
+    };
 
     fn unit() -> Identity {
         Identity {
@@ -355,9 +361,13 @@ mod tests {
         let mut f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
         f.write_all(body.as_bytes()).unwrap();
         if sealed {
-            let s = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+            let s =
+                libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
             // SAFETY: fcntl on a descriptor we hold.
-            assert_eq!(unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, s) }, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, s) },
+                0
+            );
         }
         f.into()
     }
@@ -376,8 +386,16 @@ mod tests {
         let record = nn_proto::witness::key_record(me, start, &key);
         for (body, sealed, why) in [
             (record.clone(), false, "not sealed"),
-            (nn_proto::witness::key_record(me + 1, start, &key), true, "names pid"),
-            (nn_proto::witness::key_record(me, start + 1, &key), true, "names pid"),
+            (
+                nn_proto::witness::key_record(me + 1, start, &key),
+                true,
+                "names pid",
+            ),
+            (
+                nn_proto::witness::key_record(me, start + 1, &key),
+                true,
+                "names pid",
+            ),
             ("nothing\n".to_string(), true, "holds no key record"),
         ] {
             let fd = key_file(&body, sealed);

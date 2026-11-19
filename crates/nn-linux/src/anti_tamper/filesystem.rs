@@ -1831,7 +1831,10 @@ pub fn bootstrap_witness_dir(dir: &Path) -> Result<()> {
             .create(dir)
             .with_context(|| format!("creating the witness directory {}", dir.display()))?;
     }
-    for name in [nn_proto::witness::CHAIN_FILE, nn_proto::witness::IMPORTED_FILE] {
+    for name in [
+        nn_proto::witness::CHAIN_FILE,
+        nn_proto::witness::IMPORTED_FILE,
+    ] {
         let path = dir.join(name);
         let _ = std::fs::OpenOptions::new()
             .create(true)

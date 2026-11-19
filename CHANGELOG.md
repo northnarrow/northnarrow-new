@@ -6,6 +6,57 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 374 (the pre-alpha's re-check on rc9, R9-1): **the vacated role's
+  successor is witnessed, bound to its unit and free of injected code**
+  (`UPGRADE_NOTES_WAVE4.md` §61).
+  - **The surviving role signs.** The watchdog holds a signing key of its
+    own for its life, in its memory, and signs a witness chain in the
+    agent's state directory: the agent's vacancy with its cause as systemd
+    records it (the OOM killer, a signal, an exit status), then the process
+    that took the role — its parent, its cgroup, and what its environment
+    and executable mappings show. The agent certifies the key's public half
+    from the watchdog's own descriptor table and imports every row it can
+    verify into its signed audit chain; a changed, removed or uncertified
+    row is recorded as such. The agent signs the watchdog's successor the
+    same way, and a start that finds both roles vacated signs the gap.
+    Before, the successor's record was written by the successor alone.
+    Tests `the_witness_signs_the_vacancy_and_the_successor_in_one_chain`,
+    `witness_rows_are_imported_once_after_their_key_is_certified`,
+    `the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`,
+    `a_watchdog_successor_is_registered_only_as_its_unit_s_clean_restart`,
+    `both_roles_vacated_is_the_gap_and_nothing_else_is`,
+    `the_exit_is_read_only_from_systemd_s_record_of_that_process`.
+  - **Bound to its unit.** A vacated role is taken only by the restart
+    systemd makes of the role's own unit: a child of PID 1 in that unit's
+    own cgroup (`northnarrow.slice`), with clean lot 277/281 marks, in or
+    out of a trusted-installer window. A child of the other role or a
+    transient unit no longer qualifies; the kernel reads the cgroup through
+    three new BTF offsets. The watchdog and the agent apply the same rule
+    before they register the other role's new process. Tests
+    `only_pid_1_in_the_unit_s_own_cgroup_is_its_restart`,
+    `only_the_unit_s_restart_with_nothing_foreign_is_given_the_role`,
+    `a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it`.
+  - **Nothing given before `main`.** The agent, watchdog and
+    watchdog-failed units, and the transient unit the agent starts for the
+    pin lock, unset the dynamic loader's and the C library's variables
+    (`UnsetEnvironment=`, applied last whatever the service manager's
+    environment holds); a drop-in that clears the list is harmful. Each
+    start checks its own environment and executable mappings before it
+    takes its role: a loader variable, a library the release does not link
+    or executable memory no file backs refuses it — the agent's signed in
+    its refusal chain (`start_self_check`), the watchdog's for the agent to
+    sign (`watchdog_start_refused`, exit status 16). Tests
+    `every_unit_unsets_every_loader_variable`,
+    `a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it`,
+    `a_start_that_finds_anything_of_its_own_refuses_itself`,
+    `a_start_that_refused_itself_is_recorded_for_the_agent_to_sign`,
+    `a_preloaded_library_anywhere_is_foreign`,
+    `executable_memory_no_file_backs_is_foreign`, and the ratchets
+    `start_check::a_start_maps_only_the_libraries_the_release_gate_allows`,
+    `every_transient_unit_the_product_starts_unsets_the_loader_variables`,
+    `both_daemons_check_themselves_before_they_take_their_role`.
+  - KNOWN_LIMITATIONS: the vacated-role item says what is recorded, by
+    whom, and what remains.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep
@@ -143,9 +194,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     killer's last pick, still ended by their own memory cap — written again
     by each at its start (the self-integrity check expects it on every host;
     external audit DEP-005's raise to 0 is gone). A role whose holder exited
-    this boot is taken only by a successor started for it (by PID 1 or the
-    other role's holder, no code injected), and the taking is NN-L-BPF-002
-    High outside a signed trusted-installer window, Low inside one. Tests
+    this boot is taken only by a successor started for it (since lot 374:
+    its own unit's restart, witnessed by the surviving role), and the
+    taking is NN-L-BPF-002 High outside a signed trusted-installer window,
+    Low inside one. Tests
     `the_agent_and_the_watchdog_are_the_oom_killer_s_last_pick`,
     `a_role_taken_after_its_holder_exited_is_high`.
   - **Smaller ones.** A program run as the dynamic loader's operand (or
@@ -226,13 +278,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       account's share, not one budget for the host. Test
       `the_loaders_waits_are_root_s_own_and_each_account_s_share`.
     - The privileged suites: the guard tests' restore agent starts as a
-      transient service (PID 1's child, the one start that may take a
-      vacated role while the guard enforces); the watchdog suite makes
+      service, PID 1's child (since lot 374, under the agent's own unit
+      name and slice); the watchdog suite makes
       `/etc/northnarrow` first and establishes the watchdog role's first
       claim for `the_watchdog_s_own_start_is_not_a_foreign_bpf_handle`.
     - Test assertion messages name what they expect instead of printing a
       verdict's text (CodeQL `rust/cleartext-logging`).
-    - KNOWN_LIMITATIONS: the successor's record is its own.
+    - KNOWN_LIMITATIONS: the successor's record (lot 374: witnessed by the
+      surviving role).
 - Lot 369 (the pre-alpha soak on rc5, its first hours' false positives):
   each told by identity, the attack shape each rule exists for kept
   (`UPGRADE_NOTES_WAVE4.md` §57).

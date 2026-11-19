@@ -567,7 +567,12 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
         ],
     )
     .unwrap();
-    for gone in ["by_family", "caller_untainted", "ROLE_TGIDS", "override_active"] {
+    for gone in [
+        "by_family",
+        "caller_untainted",
+        "ROLE_TGIDS",
+        "override_active",
+    ] {
         assert!(!sftr.contains(gone), "started_for_the_role: {gone}");
     }
     in_order(
