@@ -11806,8 +11806,7 @@ number in parentheses is a lab PR.
     cached `go run` program from `GOCACHE` itself and caches no test
     binary; the soak's paths were link outputs. The cause: Go 1.21 and
     later pass the linker `-X=runtime.godebugDefault=…` (524 bytes for the
-    corpus's `go 1.18` module on Go 1.26), the link's argv passes the
-    sensor's 511 bytes, and lot 369 read the output of a whole argv only.
+    corpus's `go 1.18` module on Go 1.26), the link's argv is longer than the sensor keeps, and lot 369 read the output of a whole argv only.
   - Done, by identity: a cut link argv names its output only in the `go`
     command's own shape (`link -o <target> -importcfg …`, no other output
     option among the arguments kept, no last one a cut may have made of
@@ -11849,14 +11848,13 @@ number in parentheses is a lab PR.
     of an absent list path is watched for its creation alone (writer named;
     a creation seen only by the look is an event, writer unknown); the
     write history names the package transaction, which must be live (not
-    stopped or traced at the write, nor frozen by the system's freezer;
+    stopped or traced at the write;
     holding its lock at the write,
     read in the kernel by `module_lock_observe` on `file_lock`; writer
     untainted), and every trusted load is Low; `OOMScoreAdjust=-999` for
     both units (the host OOM killer's last pick; their memory caps kept)
     and pinned at each start, a vacated role taken only by a
-    successor started for it, recorded High; the manager's weakening
-    variables ignored and signed; the compare budget spent signed; the
+    successor started for it, recorded High (the agent's successor records it itself, see the residual); the manager's weakening variables ignored and signed when the manager can be asked (honoured and signed otherwise); the compare budget spent signed; the
     loader's operand judged as executed; a young eviction signed.
   - Fix round 1 (the review of #578): a loader operand through a link of
     `/proc` placed by the file the loader maps (the exec pump's
@@ -11890,7 +11888,7 @@ number in parentheses is a lab PR.
     (no window, the watchdog's respawn) passed from a clean start, High
     under the new pid; `bpf_syscall_observe` within the 5.15 verifier's
     budget (51,220 processed). Not measured: a kernel OOM kill of the agent
-    itself (the probe's attempt killed one of its workers, at +1000).
+    itself.
   - Fix round 2 (re-check 1 of #578): glibc's list and trace modes run the
     libraries the program names for auditing — the pump reads the program's
     dynamic section from the file the loader maps (`elf_audit`; unchanged
