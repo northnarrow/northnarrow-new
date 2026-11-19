@@ -177,8 +177,10 @@ fn facts_in(
     // the review of #556 (F4): kept only when what it names only root can
     // change
     let library_path = library_path.filter(|v| root_only_library_path(v, root));
-    // lot 283b: and the lineage, while it is alive
-    let package_manager = package_manager(proc, *pid);
+    // lot 283b: and the lineage, while it is alive — lot 373: from the
+    // exec's parent when the exec's own process is gone
+    let package_manager =
+        package_manager_of_exec(proc, (*pid, *start_ns), (*ppid, *parent_start_ns));
     // lot 287: and the initramfs build, from its parent up
     let initramfs_builder = initramfs_builder(proc, *ppid, *parent_start_ns, builders);
     Some(ExecFacts {
@@ -504,6 +506,43 @@ pub fn package_manager(proc: &Path, pid: u32) -> Option<String> {
         p = ppid(&dir)?;
     }
     None
+}
+
+/// Lot 373 (the rc7 soak, Debian 12: one `modprobe --show-depends` of a
+/// dpkg trigger's initramfs build High, its twin a millisecond later Low;
+/// the same exec Low in rc6): [`package_manager`] of an exec — walked from
+/// its own process while `/proc/<pid>` is still the exec's (its start
+/// `start_ns`), else from its parent `ppid` while that is still the
+/// parent that started at `parent_start_ns`, as [`initramfs_builder`]
+/// walks. A module tool asked to load nothing exits within milliseconds,
+/// the likelier before the pump reads it as a build's hundred execs slow
+/// the pump: the walk from its own pid found no entry and named no package
+/// manager, and lot 348's exemption fell. `None` when neither is the
+/// exec's (both gone, or their pids another's).
+fn package_manager_of_exec(
+    proc: &Path,
+    (pid, start_ns): (u32, u64),
+    (ppid, parent_start_ns): (u32, u64),
+) -> Option<String> {
+    let started = |p: u32, at: u64| {
+        crate::state_read::read_state(proc.join(p.to_string()).join("stat"))
+            .ok()
+            .as_deref()
+            .and_then(stat_start_ticks)
+            .is_some_and(|t| started_at(t, at))
+    };
+    if start_ns == 0 || started(pid, start_ns) {
+        if let Some(pm) = package_manager(proc, pid) {
+            return Some(pm);
+        }
+        if start_ns == 0 {
+            return None;
+        }
+    }
+    if parent_start_ns == 0 || !started(ppid, parent_start_ns) {
+        return None;
+    }
+    package_manager(proc, ppid)
 }
 
 /// The most parents [`package_manager`] walks up (the lineage's own cap).
@@ -945,6 +984,85 @@ mod tests {
         }
         let f = facts_in(Path::new("/"), proc, &[], &e).expect("a module tool's exec");
         assert_eq!(f.package_manager.as_deref(), Some("/usr/bin/dpkg"));
+    }
+
+    /// Lot 373 (the rc7 soak, Debian 12): a module tool of a dpkg trigger's
+    /// initramfs build that exited before the pump read it — its own
+    /// `/proc` entry gone — still has the package transaction it ran in,
+    /// read from its parent up (the parent the exec named, by its start);
+    /// a parent that is not the exec's (another start), or no parent, names
+    /// none. On main the walk began at the exec's own pid and found nothing.
+    #[test]
+    fn a_tool_gone_before_the_read_finds_its_package_manager_from_its_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proc = tmp.path();
+        let t = tick();
+        let at = |ticks: u64| ticks * t;
+        // dpkg (20) → trigger (30) → mkinitramfs (50), modprobe (81) gone
+        proc_entry(proc, 10, 1, 100, 0, Path::new("/usr/bin/apt-get"));
+        proc_entry(proc, 20, 10, 110, 0, Path::new("/usr/bin/dpkg"));
+        proc_entry(proc, 30, 20, 120, 0, Path::new("/usr/bin/dash"));
+        proc_entry(proc, 50, 30, 130, 0, Path::new("/usr/bin/dash"));
+        let exec = |pid: u32, start: u64, ppid: u32, parent_start: u64| {
+            let mut e = nn_core::decision::rules::testutil::spawn_exe(
+                "modprobe",
+                "/sbin/modprobe",
+                "/usr/bin/kmod",
+                0,
+            );
+            if let Event::ProcessSpawn {
+                pid: p,
+                ppid: pp,
+                start_ns,
+                parent_start_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *pp, *start_ns, *parent_start_ns) = (pid, ppid, start, parent_start);
+            }
+            e
+        };
+        // a host root of its own: no file of the host is read
+        let host = tempfile::TempDir::new().unwrap();
+        let pm = |e: &Event| {
+            facts_in(host.path(), proc, &[], e)
+                .expect("a tool")
+                .package_manager
+        };
+        // gone: read from the parent the exec named
+        assert_eq!(
+            pm(&exec(81, at(140), 50, at(130))).as_deref(),
+            Some("/usr/bin/dpkg")
+        );
+        // the parent's pid now another process's (another start): none
+        assert_eq!(pm(&exec(81, at(140), 50, at(100))), None);
+        // no parent start known: none
+        assert_eq!(pm(&exec(81, at(140), 50, 0)), None);
+        // still running: read from its own entry, as before
+        proc_entry(proc, 82, 50, 141, 0, Path::new("/usr/bin/kmod"));
+        assert_eq!(
+            pm(&exec(82, at(141), 50, at(130))).as_deref(),
+            Some("/usr/bin/dpkg")
+        );
+        // its pid now another process's, under no package manager: read
+        // from the exec's parent, not from that process
+        proc_entry(proc, 300, 1, 90, 0, Path::new("/usr/bin/bash"));
+        proc_entry(proc, 83, 300, 150, 0, Path::new("/usr/bin/sleep"));
+        assert_eq!(
+            pm(&exec(83, at(142), 50, at(130))).as_deref(),
+            Some("/usr/bin/dpkg")
+        );
+        // an administrator's own modprobe (no package manager above it)
+        // gone before the read finds none from its parent either
+        proc_entry(proc, 400, 1, 95, 0, Path::new("/usr/bin/bash"));
+        assert_eq!(pm(&exec(401, at(160), 400, at(95))), None);
+        // ... nor from a later process its pid names now, under dpkg
+        proc_entry(proc, 402, 50, 170, 0, Path::new("/usr/bin/kmod"));
+        assert_eq!(
+            pm(&exec(402, at(160), 400, at(95))),
+            None,
+            "not the exec's process"
+        );
     }
 
     /// Lot 287: one clock tick in ns (`/proc`'s starts are counted in them).

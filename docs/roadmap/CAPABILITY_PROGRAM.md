@@ -11700,6 +11700,103 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
+  files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
+  racy R011 (C06, C14, C18; no level change).**
+  - What was open:
+    - `NN-L-FIM-024` Critical at every boot (7 of 7 boots), with COMBAT
+      locked and "would isolate the host". Lot 370's look judged the
+      agent's own re-creation of the `/run` baits as a creation by an
+      unknown writer.
+    - `NN-L-AT-001` High from `sudo bpftool prog show`.
+    - `NN-L-FIM-005` (rsyslogd) and `NN-L-FIM-019` (`systemd-update-utmp`)
+      at shutdown: the writer had exited before lot 347's `/proc` read.
+      rc6 had them too.
+    - `R012` High from `libgstreamer1.0-0`'s postinst.
+    - `NN-L-NET-013` from systemd-timesyncd.
+    - `R011` High on Debian 12: the pump walked to the package manager from
+      the exec's own `/proc` entry, already gone.
+  - Done, each by identity:
+    - **The agent's own creations.** The boot sweep hands the drain the
+      inode and the content hash of each file it re-created, before
+      watching it. A creation no record reported is never Critical or
+      COMBAT on the unknown writer alone: a bait holding its own content
+      is High, "writer unknown".
+    - **bpftool listings.** A refused handle proven the packaged bpftool's
+      read-only listing (image by device and inode, root, the argv
+      compared whole) is `NN-L-AT-001` Low with no posture. Fix round 1:
+      in observe mode, where the kernel lets the handles through (a
+      program's maps read-write, for its metadata, included), the same
+      proof makes them one `NN-L-BPF-002` Low per bpftool process.
+    - **Shutdown writes.** The FIM record of a write seen at close carries
+      the writer's image and cgroup id from its write (eBPF: `DirtyMeta`,
+      `FimDriftRaw` grows from 176 to 200 bytes). rsyslogd is named by that
+      identity. `systemd-update-utmp`'s record is kept on the kernel's
+      facts: image, root, `FIM_WRITE_ONE_WRITER` (fix round 1: one process
+      running one image at every write — the review of #580, F3), its
+      cgroup the unit's or gone (the walk reads every level: F4).
+    - **Package setcap.** `R012` is Low for a maintainer script's `setcap`
+      of a narrow capability (`cap_net_raw`, `cap_net_admin`,
+      `cap_net_bind_service`, `cap_sys_nice`, …) on its own package's
+      files in the live transaction (a merged `/usr`'s other spelling and a
+      script name the kernel's read cut are matched by identity). Fix round
+      1 (the review of #580, F1): a capability equivalent to root, `=ep` or
+      `all` stays High there, and `NN-L-FIM-025` records it High, kept —
+      the `.list` is the package's own root script's to append to.
+    - **NTP.** The packaged NTP clients polling UDP 123 as their service
+      account, in their unit's cgroup, started there and never injected
+      (lot 277/281 marks: fix round 1, F2), are no beacon.
+    - **R011.** The pump walks from the exec's parent when the exec is
+      gone, and the High names the missing fact.
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §60 and the CHANGELOG.
+  - Mutation: 45 mutants of the lot's new code, 45 caught by a named test
+    (no survivor, no compile error). Fix round 1: 45 more (the narrow set,
+    the capability text, the floor, the one-writer image, the cgroup
+    walk, the NTP unit and marks, the listing mark and its dedup, the cut
+    name), 45 caught — one survivor (the dedup's bound) caught after its
+    test was strengthened.
+  - Lab (as measured), alpha profile, each guest under its lease:
+    - Round a, the PR's head `98743207` — ubuntu2604 (7.0.0-43) on a clean
+      tree; debian12 (6.1.0-55) on a tree with fix round 1's first edits
+      uncommitted, so its R012 and FIM-025 cases are not the head's:
+      - `NN-L-FIM-024`: 0 after the install, two reboots and a cold boot on
+        each guest (8 boots); the journal says the agent's own creations
+        watched and the runtime pair re-created at each boot.
+        `NN-L-FIM-005`/`-019` at each shutdown: 0.
+      - `R011`: 0 High, 86 Low over four `fuse3` reinstalls.
+      - `NN-L-NET-013`: systemd-timesyncd polling every 16 s for 240 s on
+        debian12: 0 (ubuntu2604 runs chrony: not run).
+      - Still open there, fixed in round 1: `bpftool prog show`, `-j prog
+        list`, `map show`, `cgroup tree` gave no `NN-L-AT-001` but
+        `NN-L-BPF-002` High (×100 for `prog show`, at every boot);
+        ubuntu2604's `R012` was High for both postinsts (iputils' `/bin/ping`
+        against its `.list`'s `/usr/bin/ping`; gstreamer's 32-byte script
+        name cut by the kernel's read).
+      - The attack shapes fired: a foreign creation of `unload.signal` and a
+        hostile `pause.flag` Critical (COMBAT); python's ctypes taking our
+        map and program handles `NN-L-BPF-002` High; a `/tmp` binary to UDP
+        123 `NN-L-CHAIN-002` Critical ×8 and R001; `setcap` on a `/tmp` copy
+        `R012` and `NN-L-FIM-025` High; `dd` onto btmp `NN-L-FIM-019` High;
+        `tee` onto syslog `NN-L-FIM-005` High.
+    - Fix round 1 — ubuntu2604 at `977890c4`, debian12 at `cbca9fe5` (full)
+      and `10a38a9a`:
+      - `libgstreamer1.0-0`'s postinst (`cap_sys_nice,cap_net_bind_service,
+        cap_net_admin` on `gst-ptp-helper`): `R012` Low and `NN-L-FIM-025`
+        Low on both guests; `iputils-ping`'s: Low and Low on both.
+      - The review's shapes in one local package's postinst (`dpkg -i`):
+        `cap_net_raw` on its own helper `R012` Low, `NN-L-FIM-025` Low;
+        `cap_setuid` on its own helper and on a path appended to its own
+        `.list`: `R012` High ("beyond the narrow set (cap_setuid)") and
+        `NN-L-FIM-025` High, kept; `cap_net_raw` on a python copy it lists:
+        `R012` High (an interpreter). `setcap` on a `/tmp` copy: High.
+      - The four bpftool listings: one `NN-L-BPF-002` Low each, on both
+        guests; ctypes on our maps High ×100, on our programs High; a copy of
+        bpftool listing High ×9 and R009 High.
+      - debian12: timesyncd for 240 s, `NN-L-NET-013` 0 (its cgroup
+        `/system.slice/systemd-timesyncd.service`); with a user manager's
+        unit at depth 5 (linger), `systemd-update-utmp` stopped and started:
+        no `NN-L-FIM-019`; a reboot: `NN-L-FIM-024`, `-005`, `-019` 0, the
+        shutdown record in wtmp.
 - **Lot 372 — the rc7 soak on Ubuntu 26.04: `go test` and `go run` on Go
   1.21 and later (C14, C16; no level change).**
   - What was open: on Ubuntu 26.04 (Go 1.26) a person's `go test` test

@@ -1761,11 +1761,17 @@ pub struct ModuleFileFacts {
 
 impl From<&crate::wire::BpfSyscallRaw> for Event {
     fn from(raw: &crate::wire::BpfSyscallRaw) -> Self {
+        // lot 373: a listing is the agent's own proof, never the record's
+        let cmd = if raw.cmd == crate::wire::BPF_CMD_LISTING_GET_FD {
+            crate::wire::BPF_CMD_FOREIGN_GET_FD
+        } else {
+            raw.cmd
+        };
         Event::BpfSyscall {
             pid: raw.pid,
             uid: raw.uid,
             comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
-            cmd: raw.cmd,
+            cmd,
             arg: raw.arg,
             timestamp_ns: raw.timestamp_ns,
         }
@@ -2034,6 +2040,32 @@ pub struct Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 373 (named): a raw `bpf()` record that carries the userland's
+    /// listing mark is read as the foreign handle the kernel reports — the
+    /// listing is the agent's own proof, never the record's.
+    #[test]
+    fn a_raw_record_cannot_claim_a_bpftool_listing() {
+        use crate::wire::{BPF_CMD_FOREIGN_GET_FD, BPF_CMD_LISTING_GET_FD};
+        let raw = |cmd| crate::wire::BpfSyscallRaw {
+            timestamp_ns: 1,
+            pid: 2,
+            uid: 0,
+            comm: [0; crate::wire::TASK_COMM_LEN],
+            cmd,
+            arg: 48,
+        };
+        for (sent, read) in [
+            (BPF_CMD_LISTING_GET_FD, BPF_CMD_FOREIGN_GET_FD),
+            (BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_GET_FD),
+            (13, 13),
+        ] {
+            assert!(
+                matches!(Event::from(&raw(sent)), Event::BpfSyscall { cmd, arg: 48, .. } if cmd == read),
+                "{sent:#x}"
+            );
+        }
+    }
 
     /// External audit EBPF-015: the six denial codes of the new-entry and
     /// extended-attribute hooks decode to their own operation (not

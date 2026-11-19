@@ -302,8 +302,16 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        30,
-        "the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
+        35,
+        "lot 373: a package's dpkg list (`is_package_file`: R012's maintainer-script setcap \
+         on the package's own files, read only for a setcap a maintainer script of a live \
+         transaction runs, of a narrow capability — and, for a path no line spells, the \
+         device and inode of it and of a listed file of its name: a merged /usr's other \
+         spelling, the review of #580; and dpkg's info directory listed when the kernel's \
+         read cut a maintainer script's name, for the one file there that is the executed \
+         file) and an account's uid (`account_uid`: NN-L-NET-013's NTP client, \
+         read only once a beacon is seen), each under the host's root; \
+         the lineage's /proc reads for the lookups outside a judgement (`AsOf::Now`, \
          `AsOf::Live`: the pumps', the admin's, the responses' — lot 360, the review of #568 \
          (F1): at `AsOf::Live` only, the `exe` link of a fork the kernel's fork record names, \
          or of its forker, each at the start the record gives (read before and after), to \

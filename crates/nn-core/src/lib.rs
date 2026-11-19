@@ -178,6 +178,9 @@ pub mod fim {
     /// The drift's provisional severity, its classifier and the per-tier
     /// token bucket (R08b, lab PR 251; cut from the agent's `fim::drain`).
     pub mod drift;
+    /// Lot 373 (the review of #580, F1): the file capabilities a package
+    /// transaction may lower (R012, NN-L-FIM-025).
+    pub mod file_caps;
     /// The shipped `fim-paths.v1` and the operator's `fim-paths.local`.
     pub mod paths_config;
     // The FIM, credential-read and file-capability rules (Tappa 9; R08b,
@@ -185,6 +188,8 @@ pub mod fim {
     pub mod rules;
     /// Lot 347: a login record's packaged writer, as the drain read it.
     pub mod unit_writers;
+    /// Lot 373: a creation no kernel record reported, judged on its content.
+    pub mod unknown_writer;
 }
 
 // The COMBAT ladder (R08c, lab PR 252; was the agent's `combat`): the

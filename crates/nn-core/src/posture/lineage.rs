@@ -708,6 +708,17 @@ fn names(entry: &str, base: &str) -> bool {
 /// `TASK_COMM_LEN` less its NUL.
 const COMM_LEN_MAX: usize = 15;
 
+/// Lot 373: a Debian package's name as dpkg's `info` directory spells it
+/// (`libgstreamer1.0-0:amd64`): letters, digits, `+ - . :`, no path.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b':'))
+}
+
 /// Review 85: `path` lies in a root-owned system tree, which a process
 /// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
 /// memfd, and not a binary deleted or replaced while it runs. Lot 313
@@ -2859,6 +2870,48 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .is_some_and(|image| self.is_host_file(path, image))
     }
 
+    /// Lot 373 (the rc7 soak: systemd-timesyncd's NTP polls a beacon on
+    /// Debian 12): `pid`, the process that started at `start_ns` (the
+    /// kernel's `CLOCK_MONOTONIC` start a flow carries; 0: not known), runs
+    /// the host's file at `path` — by the records ([`Self::ran_host_file`]),
+    /// else, for a process older than the agent in a mount namespace of its
+    /// own (a unit's `ProtectSystem=`, where the start's scan kept no
+    /// image), by [`Self::runs_host_file`] (`/proc/<pid>/exe` opened as a
+    /// file) while `/proc` shows that start before and after. A process
+    /// whose start is not known is judged by the records only.
+    pub fn runs_host_file_started(&self, pid: u32, start_ns: u64, as_of: AsOf, path: &str) -> bool {
+        if pid <= 1 {
+            return false;
+        }
+        if self.ran_host_file(pid, as_of, path) {
+            return true;
+        }
+        let started = || {
+            self.proc_start_ticks(pid)
+                .is_some_and(|t| self.ticks_show_start(t, start_ns))
+        };
+        start_ns != 0 && started() && self.runs_host_file(pid, path) && started()
+    }
+
+    /// Lot 373: the directory `dir` under the host's root is root's and
+    /// writable by no one else ([`PostureHost::dir_is_root_only`]).
+    pub fn is_root_only_host_dir(&self, dir: &str) -> bool {
+        H::dir_is_root_only(self.inner.host_root.join(dir.trim_start_matches('/')))
+    }
+
+    /// Lot 373: the uid of the local account `name`, from the host's
+    /// `/etc/passwd` (a system account a package created; no name-service
+    /// call on the decision path). `None` when no line names it.
+    pub fn account_uid(&self, name: &str) -> Option<u32> {
+        let passwd = H::read_state(self.inner.host_root.join("etc/passwd")).ok()?;
+        passwd.lines().find_map(|l| {
+            let mut f = l.split(':');
+            (f.next() == Some(name))
+                .then(|| f.nth(1).and_then(|u| u.parse().ok()))
+                .flatten()
+        })
+    }
+
     /// Lot 348: `image` (an executed file's device and inode as the LSM
     /// program gave them, the device in the kernel's form) is the file at
     /// `path` under the host's root — PID 1's mount namespace, the agent's
@@ -2879,6 +2932,120 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// (the lab of lot 348: initramfs-tools' hook `kmod`).
     pub fn is_host_file_in_root_dir(&self, path: &str, image: (u64, u64)) -> bool {
         self.is_host_file(path, image)
+            && std::path::Path::new(path).parent().is_some_and(|dir| {
+                H::dir_is_root_only(
+                    self.inner
+                        .host_root
+                        .join(dir.to_string_lossy().trim_start_matches('/')),
+                )
+            })
+    }
+
+    /// Lot 373 (the rc7 soak: `setcap` run by `libgstreamer1.0-0`'s
+    /// postinst, R012 High): the package whose maintainer script `pid` ran
+    /// as of `as_of` — its exec, seen (the spawn cache), run by root, was
+    /// of dpkg's `/var/lib/dpkg/info/<package>.<preinst|postinst|prerm|
+    /// postrm>` (the script itself, as the LSM hook names a `#!` exec, or
+    /// the script a shell ran), in that directory as the host's root holds
+    /// it, root's and writable by no one else. `None` otherwise.
+    pub fn maintainer_script_package(&self, pid: u32, as_of: AsOf) -> Option<String> {
+        const INFO: &str = "/var/lib/dpkg/info/";
+        const KINDS: &[&str] = &["preinst", "postinst", "prerm", "postrm"];
+        if self.exec_uid(pid, as_of) != Some(0) {
+            return None;
+        }
+        let (id, image) = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => (
+                ExecIdentity {
+                    exe: e.exe,
+                    runs: e.runs,
+                },
+                e.exec_file,
+            ),
+            CachedAt::LaterOnly | CachedAt::Absent => return None,
+        };
+        let exe = id.exe.to_string_lossy();
+        let script = if exe.starts_with(INFO) {
+            exe.into_owned()
+        } else {
+            id.script()?.to_string()
+        };
+        let name = script.strip_prefix(INFO)?;
+        if !H::dir_is_root_only(self.inner.host_root.join(INFO.trim_matches('/'))) {
+            return None;
+        }
+        // the review of #580's lab: a name of 31 bytes may have been cut by
+        // the kernel's read (external audit EBPF-021: `libgstreamer1.0-0:
+        // amd64.postinst` is 32) — the file the kernel executed names it
+        let name = match name.strip_suffix(common::wire::exe::EXE_NAME_CUT_MARK) {
+            Some(cut) => self.info_file_named_by(INFO, cut, image?)?,
+            None => name.to_string(),
+        };
+        let (package, kind) = name.rsplit_once('.')?;
+        (KINDS.contains(&kind) && is_package_name(package)).then(|| package.to_string())
+    }
+
+    /// The review of #580's lab: the one file of dpkg's `info` directory
+    /// (`info`, under the host's root) whose name begins with `cut` (a name
+    /// the kernel's read may have cut) and that is the executed file `image`
+    /// (its device, in the kernel's form, and inode) — `None` when none or
+    /// more than one is.
+    fn info_file_named_by(&self, info: &str, cut: &str, image: (u64, u64)) -> Option<String> {
+        if cut.is_empty() || cut.contains('/') {
+            return None;
+        }
+        let names = H::read_dir(self.inner.host_root.join(info.trim_matches('/'))).ok()?;
+        let mut found = names
+            .into_iter()
+            .filter_map(|n| n.into_string().ok())
+            .filter(|n| n.starts_with(cut) && !n.contains('/'))
+            .filter(|n| self.is_host_file(&format!("{info}{n}"), image));
+        let one = found.next()?;
+        found.next().is_none().then_some(one)
+    }
+
+    /// Lot 373: `path` is a file the package `package` installed — a line of
+    /// its `/var/lib/dpkg/info/<package>.list` (dpkg's record of the files it
+    /// unpacked), in a root-owned system tree ([`in_system_tree`]), in a
+    /// directory root's and writable by no one else, as the host's root
+    /// holds them: no user can have put another file at that path.
+    ///
+    /// The lab of lot 373 (`iputils-ping`'s postinst grants `/bin/ping`, its
+    /// `.list` names `/usr/bin/ping`): a path no line spells is the file a
+    /// line of the same name names when both are one file under the host's
+    /// root (by device and inode: another spelling of a merged `/usr`).
+    ///
+    /// The review of #580 (F1): the `.list` is the package's own maintainer
+    /// script's to append to — it tells where a package put its files, not
+    /// that a file is harmless; R012 lowers only a narrow capability on it.
+    pub fn is_package_file(&self, package: &str, path: &str) -> bool {
+        if !is_package_name(package)
+            || !in_system_tree(path)
+            || path.split('/').any(|c| c == ".." || c == ".")
+        {
+            return false;
+        }
+        let list = self
+            .inner
+            .host_root
+            .join(format!("var/lib/dpkg/info/{package}.list"));
+        let Ok(text) = H::read_state(list) else {
+            return false;
+        };
+        let host = |p: &str| self.inner.host_root.join(p.trim_start_matches('/'));
+        let name = std::path::Path::new(path).file_name();
+        let listed = text.lines().any(|l| l == path) || {
+            let file = H::file_id(host(path));
+            file.is_some()
+                && text.lines().any(|l| {
+                    l.starts_with('/')
+                        && in_system_tree(l)
+                        && !l.split('/').any(|c| c == ".." || c == ".")
+                        && std::path::Path::new(l).file_name() == name
+                        && H::file_id(host(l)) == file
+                })
+        };
+        listed
             && std::path::Path::new(path).parent().is_some_and(|dir| {
                 H::dir_is_root_only(
                     self.inner

@@ -440,7 +440,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "R012_SetcapTooling",
-        severities: &[Severity::High],
+        severities: &[Severity::High, Severity::Low],
         actions: &[
             ResponseAction::KillProcessTree,
             ResponseAction::KillProcess,
@@ -454,12 +454,26 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "A provisioning tool that sets capabilities is killed unless `setcap` \
                           is allowlisted in `process-comm-allowlist`; under a trusted actor (a \
                           package manager) the system's `setcap` is recorded. A capability set \
-                          by any other route is NN-L-FIM-025's.",
+                          by any other route is NN-L-FIM-025's. Lot 373: a package's \
+                          maintainer script granting a narrow capability (cap_net_raw, \
+                          cap_net_admin, cap_net_bind_service, cap_sys_nice, …) to a file of \
+                          that same package that is no interpreter (its dpkg list, root-only \
+                          directories), in the live package transaction, by the system's \
+                          `setcap` run by root, is Low; a grant beyond that set (cap_setuid, a \
+                          capability equivalent to root, =ep) stays High there too (the review \
+                          of #580).",
+
         how_to_test: "`setcap` with no argument (the exec alone fires it).",
         tests: &[
             "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::fires_on_setcap",
             "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::\
              r012_staged_copy_kills_the_process_tree",
+            "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::\
+             a_postinst_setcap_on_its_own_package_s_file_is_low",
+            "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::\
+             a_postinst_setcap_of_a_root_equivalent_capability_stays_high",
+            "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::\
+             a_postinst_setcap_through_a_merged_usr_is_the_package_s_file",
         ],
         attack_note: "File capabilities have no sub-technique of their own (T1548.001 is \
                       setuid and setgid): the parent technique.",

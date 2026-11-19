@@ -28,7 +28,7 @@ use common::bpf_cmd::{
 };
 use common::wire::{
     bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_CMD_VACATED_ROLE_GET_FD,
+    BPF_CMD_LISTING_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD,
 };
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
@@ -157,11 +157,63 @@ pub const BPF002_ID: &str = "NN-L-BPF-002_BpfForeignHandleOrDetach";
 
 pub struct NnLBpf002BpfForeignHandleOrDetach<H: PostureHost> {
     allowlist: Arc<CommAllowlist<H>>,
+    /// Lot 373: the listing processes recorded lately (pid, the record's
+    /// time), so that one listing is one record ([`LISTING_DEDUP_NS`]).
+    listings: parking_lot::Mutex<std::collections::VecDeque<(u32, u64)>>,
+    /// The review of #580 (re-check 1, N2): the kernel's lot 277/281 marks
+    /// of the listing process (production: `DecisionHost::actor_facts`).
+    facts: Arc<dyn crate::decision::rule_policy::ActorFacts>,
 }
+
+/// Lot 373: how long one process's proven bpftool listing stays one record
+/// (bpftool takes a handle on each object it prints: a hundred a run).
+pub const LISTING_DEDUP_NS: u64 = 60 * 1_000_000_000;
+
+/// Lot 373: the listing processes [`NnLBpf002BpfForeignHandleOrDetach`]
+/// remembers at most (the oldest forgotten first: a forgotten one records
+/// again).
+const LISTINGS_MAX: usize = 64;
 
 impl<H: PostureHost> NnLBpf002BpfForeignHandleOrDetach<H> {
     pub fn new(allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            listings: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            facts: Arc::new(crate::decision::rule_policy::NoActorFacts),
+        }
+    }
+
+    /// The marks the listing's Low reads.
+    pub fn with_facts(mut self, facts: Arc<dyn crate::decision::rule_policy::ActorFacts>) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// The review of #580 (re-check 1, N2): the listing process carries
+    /// clean marks — started where it runs, never moved into another
+    /// cgroup, no code-injection access (ptrace, `pidfd_getfd`, a write
+    /// handle on its memory) given to another. Not known: not clean.
+    fn listing_is_clean(&self, pid: u32) -> bool {
+        self.facts.started_in_cgroup(pid) == Some(true)
+            && self.facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
+    }
+
+    /// Lot 373: `pid`'s proven listing at `at_ns` is the first of that
+    /// process within [`LISTING_DEDUP_NS`] — the one to record.
+    fn first_listing(&self, pid: u32, at_ns: u64) -> bool {
+        let mut seen = self.listings.lock();
+        if seen
+            .iter()
+            .any(|&(p, t)| p == pid && at_ns.saturating_sub(t) < LISTING_DEDUP_NS)
+        {
+            return false;
+        }
+        seen.retain(|&(p, _)| p != pid);
+        if seen.len() >= LISTINGS_MAX {
+            seen.pop_front();
+        }
+        seen.push_back((pid, at_ns));
+        true
     }
 }
 
@@ -235,6 +287,47 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
                 &reasoning,
             ));
         }
+        // Lot 373 (the lab of lot 373: `sudo bpftool prog show` in observe
+        // mode, High ×100 at every boot): a handle by id — a program's, or a
+        // map's opened read-write for the program's metadata — the agent
+        // proved, at the bus's barrier, the packaged bpftool's read-only
+        // listing — root's, its image by device and inode, its command line
+        // read whole (`BPF_CMD_LISTING_GET_FD`): one Low record per listing
+        // process, no posture.
+        // N2: a listing whose process does not carry clean marks is no
+        // listing: the handle is judged as any foreign one (High below)
+        let dirty_listing = *cmd == BPF_CMD_LISTING_GET_FD && !self.listing_is_clean(*pid);
+        let cmd = &if dirty_listing {
+            BPF_CMD_FOREIGN_GET_FD
+        } else {
+            *cmd
+        };
+        if *cmd == BPF_CMD_LISTING_GET_FD {
+            let timestamp_ns = match event {
+                Event::BpfSyscall { timestamp_ns, .. } => *timestamp_ns,
+                _ => 0,
+            };
+            if !self.first_listing(*pid, timestamp_ns) {
+                return None;
+            }
+            let reasoning = format!(
+                "`{comm}` (pid {pid}) took a handle by id on one of NorthNarrow's own BPF objects \
+                 (id {arg}) and the others it lists: the packaged bpftool run by root (its device \
+                 and inode, read by the agent at the record) listing or showing objects (`prog \
+                 show`, `map list`, `cgroup tree`), which takes a handle on each — a program's \
+                 maps read-write, as libbpf opens them, for its metadata — only to read its \
+                 information. Recorded Low, once for the process, and raises no posture (lot \
+                 373). A dump, an update, a pin, a detach or any other program's handle stays \
+                 High."
+            );
+            return Some(build_verdict(
+                self,
+                event,
+                ResponseAction::Log,
+                Severity::Low,
+                &reasoning,
+            ));
+        }
         let own_object = matches!(*cmd, BPF_CMD_FOREIGN_GET_FD | BPF_CMD_FOREIGN_MAP_WRITE);
         let detach = matches!(*cmd, BPF_PROG_DETACH | BPF_LINK_DETACH);
         if !own_object && !detach {
@@ -278,10 +371,15 @@ impl<H: PostureHost> Rule for NnLBpf002BpfForeignHandleOrDetach<H> {
 }
 
 /// The two BPF rules, sharing the process comm allowlist.
-pub fn bpf_rules<H: PostureHost>(allowlist: Arc<CommAllowlist<H>>) -> Vec<Box<dyn Rule>> {
+pub fn bpf_rules<H: crate::decision::host::DecisionHost>(
+    allowlist: Arc<CommAllowlist<H>>,
+) -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(NnLBpf001BpfProgramLoaded::new(Arc::clone(&allowlist))),
-        Box::new(NnLBpf002BpfForeignHandleOrDetach::new(allowlist)),
+        Box::new(
+            NnLBpf002BpfForeignHandleOrDetach::new(allowlist)
+                .with_facts(H::actor_facts(std::path::Path::new(H::PROC_ROOT))),
+        ),
     ]
 }
 
@@ -303,6 +401,170 @@ mod tests {
             arg,
             timestamp_ns: 1,
         }
+    }
+
+    /// Lot 373 (named, the lab of lot 373: `sudo bpftool prog show`, `-j prog
+    /// list`, `map show`, `cgroup tree` in observe mode — NN-L-BPF-002 High
+    /// ×100 at every boot on Ubuntu 26.04 and Debian 12): a handle the agent
+    /// proved the packaged bpftool's listing is one Low record per process
+    /// within a minute; another process's listing is its own record. The
+    /// attack shapes stay High: a handle or a write handle not proven
+    /// (python's ctypes, a copy, a dump, an update), a detach — by bpftool
+    /// too.
+    #[test]
+    fn a_proven_bpftool_listing_is_one_low_record() {
+        let (_, r) = rules();
+        let r = r.with_facts(Arc::new(MarkFacts {
+            started: Some(true),
+            injected: Some(Injected::No),
+        }));
+        let at = |pid: u32, cmd: u32, ts: u64| Event::BpfSyscall {
+            pid,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd,
+            arg: 48,
+            timestamp_ns: ts,
+        };
+        const S: u64 = 1_000_000_000;
+        let v = r
+            .evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, 10 * S))
+            .expect("the first handle of the listing");
+        assert_eq!(
+            (v.severity, v.action.clone()),
+            (Severity::Low, ResponseAction::Log),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("lot 373") && v.reasoning.contains("no posture"),
+            "{}",
+            v.reasoning
+        );
+        for ts in [10 * S, 11 * S, 69 * S] {
+            assert!(
+                r.evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, ts)).is_none(),
+                "the same listing at {ts}"
+            );
+        }
+        assert!(
+            r.evaluate(&at(1614, BPF_CMD_LISTING_GET_FD, 12 * S))
+                .is_some(),
+            "another listing process"
+        );
+        assert!(
+            r.evaluate(&at(1613, BPF_CMD_LISTING_GET_FD, 71 * S))
+                .is_some(),
+            "a minute later"
+        );
+        for (cmd, why) in [
+            (BPF_CMD_FOREIGN_GET_FD, "a handle not proven a listing"),
+            (
+                BPF_CMD_FOREIGN_MAP_WRITE,
+                "a write handle not proven a listing",
+            ),
+            (BPF_PROG_DETACH, "a detach"),
+            (BPF_LINK_DETACH, "a link detach"),
+        ] {
+            let v = r.evaluate(&at(1613, cmd, 72 * S)).expect(why);
+            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+        }
+        // the dedup is bounded, and forgets the oldest past its bound: that
+        // one records again within its minute
+        let listing = |pid: u32, ts: u64| r.evaluate(&at(pid, BPF_CMD_LISTING_GET_FD, ts));
+        assert!(listing(1_999, 80 * S).is_some());
+        for pid in 2_000..2_000 + LISTINGS_MAX as u32 {
+            assert!(listing(pid, 80 * S).is_some());
+        }
+        assert_eq!(r.listings.lock().len(), LISTINGS_MAX);
+        assert!(listing(1_999, 81 * S).is_some(), "forgotten");
+        assert!(
+            listing(2_000 + LISTINGS_MAX as u32 - 1, 81 * S).is_none(),
+            "still remembered"
+        );
+    }
+
+    use crate::decision::rule_policy::Injected;
+
+    /// The lot 277/281 marks of every process, as a test sets them.
+    struct MarkFacts {
+        started: Option<bool>,
+        injected: Option<Injected>,
+    }
+
+    impl crate::decision::rule_policy::ActorFacts for MarkFacts {
+        fn uid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+        fn cgroup(&self, _pid: u32) -> Option<String> {
+            None
+        }
+        fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
+            None
+        }
+        fn started_in_cgroup(&self, _pid: u32) -> Option<bool> {
+            self.started
+        }
+        fn injected(&self, _pid: u32) -> Option<Injected> {
+            self.injected
+        }
+        fn unread(
+            &self,
+            _pid: u32,
+            _fact: crate::decision::rule_policy::ExemptionFact,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// The review of #580 (re-check 1, N2, named): a packaged bpftool
+    /// listing is Low only when its process carries clean lot 277/281
+    /// marks. Code-injection access given to it (ptrace, `pidfd_getfd`),
+    /// a move into another cgroup, or marks not known: High, and no
+    /// listing dedup is consumed.
+    #[test]
+    fn a_bpftool_listing_with_dirty_marks_is_no_low() {
+        let (_, r) = rules();
+        let listing = Event::BpfSyscall {
+            pid: 1613,
+            uid: 0,
+            comm: "bpftool".into(),
+            cmd: BPF_CMD_LISTING_GET_FD,
+            arg: 48,
+            timestamp_ns: 10,
+        };
+        let mut r = r;
+        for (started, injected, why) in [
+            (
+                Some(true),
+                Some(Injected::Yes {
+                    by: 77,
+                    inherited: false,
+                }),
+                "ptrace or pidfd_getfd",
+            ),
+            (
+                Some(true),
+                Some(Injected::Yes {
+                    by: 1,
+                    inherited: true,
+                }),
+                "inherited",
+            ),
+            (Some(false), Some(Injected::No), "moved into another cgroup"),
+            (Some(true), None, "injection not known"),
+            (None, Some(Injected::No), "start not known"),
+        ] {
+            r = r.with_facts(Arc::new(MarkFacts { started, injected }));
+            let v = r.evaluate(&listing).expect(why);
+            assert_eq!(v.severity, Severity::High, "{why}: {}", v.reasoning);
+        }
+        assert!(r.listings.lock().is_empty(), "no dirty listing was deduped");
+        r = r.with_facts(Arc::new(MarkFacts {
+            started: Some(true),
+            injected: Some(Injected::No),
+        }));
+        assert_eq!(r.evaluate(&listing).unwrap().severity, Severity::Low);
     }
 
     fn rules() -> (NnLBpf001BpfProgramLoaded, NnLBpf002BpfForeignHandleOrDetach) {

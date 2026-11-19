@@ -936,6 +936,10 @@ struct DrainQueues {
     /// Lot 370: the directories watched for the creation of the paths
     /// awaited ([`WatchClass::AwaitParent`]).
     appear_parents: Vec<(InodeKey, String)>,
+    /// Lot 373: the agent's own creations of files of the list awaited —
+    /// the path, the inode it made and the SHA-256 (hex) of what it wrote
+    /// ([`note_own_creation`]).
+    own_created: Vec<(String, InodeKey, String)>,
 }
 
 impl std::fmt::Debug for DrainQueues {
@@ -964,6 +968,7 @@ impl DrainQueues {
             appear_seen: Vec::new(),
             appear_reported: Vec::new(),
             appear_parents: Vec::new(),
+            own_created: Vec::new(),
         }
     }
 }
@@ -1489,6 +1494,91 @@ fn take_awaited(path_map: &InodePathMap, child: &str) -> bool {
     })
 }
 
+/// Lot 373 (the rc7 soak's NN-L-FIM-024 at every boot): the agent itself
+/// created `path` of the list — the inode `key`, with the bytes whose
+/// SHA-256 is `sha256` (hex) — as its boot sweep re-creates the
+/// control-surface files of the tmpfs `/run/northnarrow` after every
+/// reboot. The agent is a protected pid: the kernel reports none of its
+/// writes, and the look at the awaited paths judged the file a creation by
+/// an unknown writer (a Critical, COMBAT locked, "would isolate the host").
+/// Told to the drain BEFORE the inode is watched: at its next look the path
+/// is watched with no event only while it still holds that inode with that
+/// content. Another inode there, another content, or a path with no such
+/// note is judged as before; a write after the watch is a kernel record
+/// with its writer.
+pub fn note_own_creation(path_map: &InodePathMap, path: &str, key: InodeKey, sha256: &str) {
+    queues(path_map, |q| {
+        q.own_created.retain(|(p, _, _)| p != path);
+        if q.own_created.len() < APPEARING_MAX {
+            q.own_created
+                .push((path.to_string(), key, sha256.to_string()));
+        }
+    });
+}
+
+/// Lot 373: the agent's own creation noted for `path` ([`note_own_creation`])
+/// taken out — its content's hash when it made the inode `key` (another
+/// inode is not its creation).
+fn take_own_creation(path_map: &InodePathMap, path: &str, key: InodeKey) -> Option<String> {
+    queues(path_map, |q| {
+        let at = q.own_created.iter().position(|(p, _, _)| p == path)?;
+        let (_, made, sha) = q.own_created.swap_remove(at);
+        (made == key).then_some(sha)
+    })
+}
+
+/// Lot 373: the SHA-256 (hex) of the regular file at `path` now, read as a
+/// drift's re-hash reads it.
+fn content_sha256(path: &str) -> Option<String> {
+    compute_baseline(&fs_path(path))
+        .ok()?
+        .into_iter()
+        .find(|d| !d.is_symlink)
+        .map(|d| d.sha256)
+}
+
+/// Lot 373: a creation no kernel record reported (`writer_unknown`) of a
+/// bait: whether the file the event names (its inode) holds the bait of its
+/// path as the agent and the install write it — read through a descriptor
+/// that follows no link, the inode checked to be the event's, the bytes
+/// hashed to the event's content. `false` when anything differs or cannot
+/// be read: NN-L-FIM-024 judges it Critical.
+fn holds_own_bait(fe: &FimEvent) -> bool {
+    holds_own_bait_at(fe, &fe.path)
+}
+
+/// [`holds_own_bait`] of `fe`'s file, its content judged as the bait of
+/// `bait` (the event's own path; another in tests, whose files are not at
+/// the baits' paths).
+fn holds_own_bait_at(fe: &FimEvent, bait: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(want) = fe.file_key else {
+        return false;
+    };
+    let Ok(f) = antitamper_bpf::kernel_roots::open(
+        fs_path(&fe.path),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+    ) else {
+        return false;
+    };
+    let Ok(m) = f.metadata() else {
+        return false;
+    };
+    let dev = crate::anti_tamper::filesystem::stat_dev_to_kernel_dev(m.dev());
+    if !m.is_file() || (dev, m.ino()) != (want.dev, want.ino) {
+        return false;
+    }
+    let Ok(bytes) = antitamper_bpf::kernel_roots::read_file_bounded(&f, BAIT_READ_MAX) else {
+        return false;
+    };
+    let hashed: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+    fe.new_sha256 == Some(hashed) && nn_core::fim::baits::is_bait_rendering(bait, &bytes)
+}
+
+/// Lot 373: the most of a bait [`holds_own_bait`] reads (a bait is under
+/// 1 KiB; a larger file is not one).
+const BAIT_READ_MAX: u64 = 64 * 1024;
+
 /// Lot 370: a path of the list whose creation a record reported, not there
 /// yet to watch (the hook runs before the file is made).
 fn note_reported(path_map: &InodePathMap, path: &str) {
@@ -1575,6 +1665,24 @@ fn appeared_paths(
         };
         let is_dir =
             antitamper_bpf::kernel_roots::symlink_metadata(&file).is_ok_and(|m| m.is_dir());
+        // lot 373: the agent's own creation (its boot sweep's re-created
+        // `/run` pair), still that inode with what it wrote: watched, no
+        // event
+        if !is_dir {
+            if let Some(sha) = take_own_creation(path_map, &path, key) {
+                if content_sha256(&path).as_deref() == Some(sha.as_str()) {
+                    if enroll_path(&path, WatchClass::Configured, path_map, watched_paths) {
+                        out.watched += 1;
+                        info!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a file of the watch list the agent itself created is there with what it wrote: watched, not a creation by an unknown writer");
+                    } else {
+                        note_own_creation(path_map, &path, key, &sha);
+                        await_appearance(path_map, &path);
+                    }
+                    continue;
+                }
+                warn!(target: "fim.drain", path = %nn_model::log_escape::Escaped(&path), "a file of the watch list the agent created holds something else now: checked as a creation, its writer unknown");
+            }
+        }
         // a file: one look for its creation's record, which may wait in
         // the ring behind this look
         if !is_dir && !seen.iter().any(|(p, k)| *p == path && *k == key) {
@@ -2556,8 +2664,17 @@ pub fn process_record(
             unchanged_since_read,
             modifier_start: process_start(raw),
         };
-        // lot 347: a login record's packaged writer, read while it runs
+        // lot 347: a login record's packaged writer, read while it runs —
+        // lot 373: else as the kernel recorded it at the write
         read_login_unit_writer(&fe, raw.modifier_start, Path::new("/proc"), Path::new("/"));
+        kernel_login_unit_writer(&fe, raw, Path::new("/"), Path::new("/sys/fs/cgroup"));
+        // lot 373: a bait created with no record of its writer, judged on
+        // its content
+        if nn_core::fim::unknown_writer::writer_unknown(&fe)
+            && nn_core::fim::baits::bait_content(&fe.path).is_some()
+        {
+            nn_core::fim::unknown_writer::keep(&fe, holds_own_bait(&fe));
+        }
         out.push(Event::Fim(fe));
     }
     Ok(true)
@@ -2642,7 +2759,9 @@ fn process_start(raw: &FimDriftRaw) -> u64 {
 fn writer_exe_of(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) -> Option<String> {
     let pid = raw.modifier_pid;
     if raw.modifier_start == 0 {
-        return resolve_pid_exe(pid).or_else(|| writer_exe(raw, lineage));
+        return resolve_pid_exe(pid)
+            .or_else(|| writer_exe(raw, lineage))
+            .or_else(|| image_named_by_identity(raw, Path::new("/")).map(str::to_string));
     }
     let same = || {
         crate::response::proc_ref::proc_start_ticks(pid)
@@ -2654,6 +2773,245 @@ fn writer_exe_of(raw: &FimDriftRaw, lineage: Option<&AuthSessionTracker>) -> Opt
         }
     }
     writer_exe(raw, lineage)
+        .or_else(|| image_named_by_identity(raw, Path::new("/")).map(str::to_string))
+}
+
+/// Lot 373: the packaged images a FIM rule's exemption names its writer by
+/// — the rsyslog daemon (NN-L-FIM-005's FP-1) and `systemd-update-utmp`
+/// (NN-L-FIM-019's login machinery).
+fn named_writer_images() -> impl Iterator<Item = &'static str> {
+    nn_core::fim::rules::RSYSLOGD_EXES
+        .iter()
+        .chain(nn_core::fim::unit_writers::UTMP_IMAGES)
+        .copied()
+}
+
+/// Lot 373 (the rc7 soak: rsyslogd's last flush at the host's shutdown,
+/// NN-L-FIM-005 High — its `/proc` gone, its exec older than the agent):
+/// the writer's image as the kernel recorded it AT ITS WRITE (the record's
+/// `writer_exe_dev`, `writer_exe_ino`: `mm->exe_file`) named, when it is
+/// one of [`named_writer_images`] — the host's file at that path under
+/// `host_root`, a regular file root's and writable by no one else, in a
+/// directory root's and writable by no one else ([`is_packaged_image`]).
+/// Read only once `/proc` and the lineage named none (the writer gone). A
+/// copy, another file at the path since, another mount namespace's file:
+/// `None`.
+fn image_named_by_identity(raw: &FimDriftRaw, host_root: &Path) -> Option<&'static str> {
+    image_named_among(raw, host_root, named_writer_images(), 0)
+}
+
+/// [`image_named_by_identity`] among `images`, their files `owner`'s (root:
+/// 0; a test's own uid).
+fn image_named_among(
+    raw: &FimDriftRaw,
+    host_root: &Path,
+    mut images: impl Iterator<Item = &'static str>,
+    owner: u32,
+) -> Option<&'static str> {
+    if raw.writer_exe_ino == 0 {
+        return None;
+    }
+    images.find(|p| {
+        is_packaged_image(
+            host_root,
+            p,
+            (raw.writer_exe_dev, raw.writer_exe_ino),
+            owner,
+        )
+    })
+}
+
+/// Lot 373: `path` under `host_root` is the file whose kernel identity is
+/// `image` (the device in the kernel's form, the inode) — a regular file
+/// owned by `owner` (root) and writable by no one else, in a directory
+/// owned by `owner` and writable by no one else.
+fn is_packaged_image(host_root: &Path, path: &str, image: (u64, u64), owner: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = host_root.join(path.trim_start_matches('/'));
+    let root_only = |m: &std::fs::Metadata| m.uid() == owner && m.permissions().mode() & 0o022 == 0;
+    let Ok(m) = antitamper_bpf::kernel_roots::metadata(&file) else {
+        return false;
+    };
+    let dir_ok = file.parent().is_some_and(|d| {
+        antitamper_bpf::kernel_roots::metadata(d).is_ok_and(|d| d.is_dir() && root_only(&d))
+    });
+    m.is_file()
+        && root_only(&m)
+        && dir_ok
+        && (crate::fim::attach::stat_dev_to_kernel_dev(m.dev()), m.ino()) == image
+}
+
+/// Lot 373: where the cgroup v2 id a write recorded is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CgroupNow {
+    /// The cgroup's path from the hierarchy's root (`/system.slice/x.service`).
+    At(String),
+    /// No directory of the hierarchy has that id (removed: the kernel never
+    /// gives an id twice in a boot).
+    Gone,
+    /// Not read (no id, the hierarchy unreadable, the walk past its cap).
+    Unread,
+}
+
+/// Lot 373: the most directories [`cgroup_now`] looks at.
+const CGROUP_WALK_MAX: usize = 4096;
+/// Lot 373: the deepest [`cgroup_now`] goes below the root. The review of
+/// #580 (F4): a user manager's units are at depth 5
+/// (`/user.slice/user-1000.slice/user@1000.service/app.slice/<unit>`), a
+/// container's below them — the walk reads every level there is (the
+/// directory cap bounds it); this only bounds a hierarchy deeper than any
+/// systemd lays out, which is then not read.
+const CGROUP_WALK_DEPTH: usize = 32;
+
+/// The review of #580 (F4): a look at a cgroup directory failed for another
+/// reason than its removal (`ENOENT`, `ENOTDIR`: removed since it was listed,
+/// with every cgroup below it) — what it holds is not known.
+fn walk_failed(e: &std::io::Error) -> bool {
+    !matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+}
+
+/// Lot 373: the cgroup v2 directory whose inode number (its cgroup id) is
+/// `id`, under the hierarchy at `root` (`/sys/fs/cgroup`, or its `unified`
+/// mount on a hybrid host) — found, or surely gone (the whole hierarchy
+/// walked, within its caps, every directory read: the review of #580, F4),
+/// or not read.
+fn cgroup_now(root: &Path, id: u64) -> CgroupNow {
+    use std::os::unix::fs::MetadataExt;
+    if id == 0 {
+        return CgroupNow::Unread;
+    }
+    let root =
+        if antitamper_bpf::kernel_roots::exists(root.join("cgroup.controllers")).unwrap_or(false) {
+            root.to_path_buf()
+        } else {
+            root.join("unified")
+        };
+    let Ok(top) = antitamper_bpf::kernel_roots::symlink_metadata(&root) else {
+        return CgroupNow::Unread;
+    };
+    if top.ino() == id {
+        return CgroupNow::At("/".to_string());
+    }
+    let mut looked = 0usize;
+    let mut level = vec![(root, String::new())];
+    for _ in 0..CGROUP_WALK_DEPTH {
+        let mut next = Vec::new();
+        for (dir, cg) in level {
+            let names = match antitamper_bpf::kernel_roots::read_dir(&dir) {
+                Ok(names) => names,
+                Err(e) if walk_failed(&e) => return CgroupNow::Unread,
+                Err(_) => continue,
+            };
+            for name in names {
+                let path = dir.join(&name);
+                let m = match antitamper_bpf::kernel_roots::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) if walk_failed(&e) => return CgroupNow::Unread,
+                    Err(_) => continue,
+                };
+                if !m.is_dir() {
+                    continue;
+                }
+                looked += 1;
+                if looked > CGROUP_WALK_MAX {
+                    return CgroupNow::Unread;
+                }
+                let cgroup = format!("{cg}/{}", name.to_string_lossy());
+                if m.ino() == id {
+                    return CgroupNow::At(cgroup);
+                }
+                next.push((path, cgroup));
+            }
+        }
+        if next.is_empty() {
+            return CgroupNow::Gone;
+        }
+        level = next;
+    }
+    CgroupNow::Unread
+}
+
+/// Lot 373: what NN-L-FIM-019 is told of a login record's writer whose
+/// unit's cgroup was removed before the drain read it (`unit_writers::keep`).
+const UTMP_UNIT_GONE: &str = "a unit of the packaged systemd-update-utmp, its cgroup removed when \
+                              its process exited";
+
+/// Lot 373 (the rc7 soak: `systemd-update-utmp`'s shutdown record on
+/// Debian 12, NN-L-FIM-019 High with a `would have: KillProcess` — lot 347's
+/// read of the writer's `/proc` came after it exited, as it does whenever
+/// the drain is slower than a process of a few milliseconds): a login
+/// record's write judged on what the KERNEL recorded at the write, when
+/// [`read_login_unit_writer`] found no writer to read. The unit's name is
+/// kept for NN-L-FIM-019 (which still asks for an append of whole records)
+/// when every fact holds:
+///
+/// - the writer's image at its write is the host's packaged
+///   `systemd-update-utmp` ([`is_packaged_image`]: its device and inode);
+/// - it wrote as root, and was the file's only writer since its last
+///   record (the kernel's `FIM_WRITE_ONE_WRITER`: one process — its pid and
+///   start — running one image at every write; a rewrite by another
+///   process, or by the same process before it executed the packaged
+///   binary, clears it — the review of #580, F3);
+/// - its cgroup at the write (`writer_cgroup`) is now one of the unit's
+///   (`/system.slice/systemd-update-utmp.service`), or no cgroup any more:
+///   a oneshot's cgroup is removed as its `ExecStop=` process exits, at
+///   the shutdown this record is. A cgroup still there that is not the
+///   unit's — a session's scope (`sudo systemd-update-utmp`), another
+///   service — keeps the High kill, as does a cgroup not read.
+///
+/// Residual, said: root that runs the packaged binary itself — in a cgroup
+/// it removes before the read, or in the unit's (the writer has exited, so
+/// lot 277's mark of where it started is not read) — has its writes kept
+/// when the file grew by whole records; with a library preloaded into it
+/// (`LD_PRELOAD`), code injected by `ptrace`, or the image's identity taken
+/// with `prctl(PR_SET_MM_EXE_FILE)` (`CAP_SYS_RESOURCE`, observable), those
+/// writes can rewrite a record in place before the append, and NN-L-FIM-019
+/// does not see it.
+fn kernel_login_unit_writer(
+    fe: &FimEvent,
+    raw: &FimDriftRaw,
+    host_root: &Path,
+    cgroup_root: &Path,
+) {
+    kernel_login_unit_writer_owned(fe, raw, (host_root, 0), cgroup_root);
+}
+
+/// [`kernel_login_unit_writer`], the packaged files `owner`'s (root: 0; a
+/// test's own uid).
+fn kernel_login_unit_writer_owned(
+    fe: &FimEvent,
+    raw: &FimDriftRaw,
+    (host_root, owner): (&Path, u32),
+    cgroup_root: &Path,
+) {
+    use nn_core::fim::unit_writers as uw;
+    if fe.op != FimOp::Modified
+        || !uw::LOGIN_RECORDS.contains(&fe.path.as_str())
+        || uw::unit_of(fe).is_some()
+        || raw.modifier_uid != 0
+        || raw.op_flags & FIM_WRITE_ONE_WRITER == 0
+        || raw.writer_exe_ino == 0
+    {
+        return;
+    }
+    let image = (raw.writer_exe_dev, raw.writer_exe_ino);
+    if !uw::UTMP_IMAGES
+        .iter()
+        .any(|p| is_packaged_image(host_root, p, image, owner))
+    {
+        return;
+    }
+    let unit = match cgroup_now(cgroup_root, raw.writer_cgroup) {
+        CgroupNow::At(cgroup) => {
+            match uw::unit_writer(nn_core::posture::daemon_data::system_service(&cgroup), true) {
+                Some(unit) => unit,
+                None => return,
+            }
+        }
+        CgroupNow::Gone => UTMP_UNIT_GONE,
+        CgroupNow::Unread => return,
+    };
+    uw::keep(fe, unit);
 }
 
 /// Lot 344: the image of a writer gone before its record was judged
@@ -3446,6 +3804,9 @@ mod tests {
             fork_start: 0,
             fork_parent_start: 0,
             modifier_start: 0,
+            writer_exe_dev: 0,
+            writer_exe_ino: 0,
+            writer_cgroup: 0,
         }
     }
 
@@ -5537,6 +5898,165 @@ mod tests {
         assert_eq!(path_map.class_of(&etc_key), None);
     }
 
+    /// Lot 373 (named, the rc7 soak's NN-L-FIM-024 Critical at every boot):
+    /// a bait of the tmpfs `/run/northnarrow` the agent's boot sweep
+    /// re-creates — told to the drain before it is watched — is watched with
+    /// no event while it holds that inode with what the agent wrote (on main
+    /// the look reported it "created with no record, writer unknown"). The
+    /// same path holding another inode, or other content, is still a
+    /// creation at the next look; with the bait's own content NN-L-FIM-024
+    /// records that one High ("writer unknown"), with any other Critical.
+    #[test]
+    fn the_agent_s_own_runtime_bait_is_no_creation_by_an_unknown_writer() {
+        use crate::decision::Rule;
+        use crate::fim::honeypot::{bait_content, render_bait};
+        let rule = crate::fim::rules::NnLFim024AntiTamperHoneypotModified::new(1);
+        let template = bait_content("/run/northnarrow/pause.flag").unwrap();
+        let own = render_bait(
+            template,
+            std::time::UNIX_EPOCH + Duration::from_secs(1_795_000_000),
+        );
+        let sha = |b: &str| hex::encode(Sha256::digest(b.as_bytes()));
+        // (what the agent noted, what the path holds at the look)
+        for case in ["own", "other inode", "other content"] {
+            let dir = TempDir::new().unwrap();
+            let run = dir.path().join("run/northnarrow");
+            std::fs::create_dir_all(&run).unwrap();
+            let bait = run.join("pause.flag");
+            let bait_s = bait.to_string_lossy().into_owned();
+            let path_map = InodePathMap::new();
+            let mut db = drift_db_in(&dir);
+            await_appearance(&path_map, &bait_s);
+            appeared_paths(&path_map, None);
+            // the sweep: created, noted, then watched
+            std::fs::write(&bait, &own).unwrap();
+            let made = key_for_path(&bait).unwrap();
+            note_own_creation(&path_map, &bait_s, made, &sha(&own));
+            match case {
+                "own" => {}
+                "other inode" => {
+                    // the agent's inode kept (renamed aside), so the new
+                    // file cannot be given its number again
+                    std::fs::rename(&bait, run.join("held")).unwrap();
+                    std::fs::write(&bait, &own).unwrap();
+                }
+                _ => std::fs::write(&bait, own.replace("paused=false", "paused=true")).unwrap(),
+            }
+            let now = key_for_path(&bait).unwrap();
+            let first = appeared_paths(&path_map, None);
+            if case == "own" {
+                assert!(first.created.is_empty(), "{case}");
+                assert_eq!(first.watched, 1, "{case}");
+                assert_eq!(path_map.class_of(&made), Some(WatchClass::Configured));
+                assert!(appeared_paths(&path_map, None).created.is_empty());
+                assert!(!awaiting_returns(&path_map), "no longer awaited");
+                continue;
+            }
+            // one look waits for a record, the next reports it
+            assert!(first.created.is_empty(), "{case}");
+            let created = appeared_paths(&path_map, None).created;
+            assert_eq!(created, vec![now], "{case}");
+            let mut fe = drift_event(&returned_raw(now), &path_map, &mut db).expect("an event");
+            // the rule reads the drain's path, the bait's
+            let kept_path = fe.path.clone();
+            assert_eq!((fe.op, fe.modifier_pid), (FimOp::Created, 0), "{case}");
+            fe.path = "/run/northnarrow/pause.flag".to_string();
+            nn_core::fim::unknown_writer::keep(&fe, {
+                let bytes = std::fs::read(&kept_path).unwrap();
+                nn_core::fim::baits::is_bait_rendering(&fe.path, &bytes)
+            });
+            let v = rule.evaluate(&Event::Fim(fe)).expect("NN-L-FIM-024");
+            let want = if case == "other inode" {
+                nn_model::Severity::High
+            } else {
+                nn_model::Severity::Critical
+            };
+            assert_eq!(v.severity, want, "{case}");
+            assert!(v.reasoning.contains("writer unknown"), "{case}");
+        }
+    }
+
+    /// Lot 373: a creation no record reported of a bait is read for its
+    /// content through its inode — the bait's own bytes (hashed to the
+    /// event's content) are told; another content, another inode at the
+    /// path, a content the event's hash does not match are not.
+    #[test]
+    fn an_unknown_writer_s_bait_is_read_for_its_own_content() {
+        use crate::fim::honeypot::{bait_content, render_bait};
+        const BAIT: &str = "/run/northnarrow/pause.flag";
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("pause.flag");
+        let own = render_bait(
+            bait_content(BAIT).unwrap(),
+            std::time::UNIX_EPOCH + Duration::from_secs(1_795_000_000),
+        );
+        std::fs::write(&file, &own).unwrap();
+        let key = key_for_path(&file).unwrap();
+        let hash = |b: &[u8]| -> [u8; 32] { Sha256::digest(b).into() };
+        let event = |key: InodeKey, sha: [u8; 32]| FimEvent {
+            timestamp_ns: 1,
+            path: file.to_string_lossy().into_owned(),
+            op: FimOp::Created,
+            new_sha256: Some(sha),
+            baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: 0,
+            modifier_uid: 0,
+            modifier_comm: String::new(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
+            capability: None,
+            attrs: None,
+            file_key: Some(key),
+            is_dir: false,
+            moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
+            unchanged_since_read: false,
+            modifier_start: 0,
+        };
+        let own_sha = hash(own.as_bytes());
+        assert!(
+            holds_own_bait_at(&event(key, own_sha), BAIT),
+            "the bait's own bytes"
+        );
+        assert!(
+            !holds_own_bait_at(&event(key, hash(b"other")), BAIT),
+            "the hash differs"
+        );
+        let other = InodeKey {
+            dev: key.dev,
+            ino: key.ino + 1,
+        };
+        assert!(
+            !holds_own_bait_at(&event(other, own_sha), BAIT),
+            "another inode"
+        );
+        assert!(
+            !holds_own_bait_at(&event(key, own_sha), "/run/northnarrow/unload.signal"),
+            "another bait's content"
+        );
+        let hostile = own.replace("paused=false", "paused=true");
+        std::fs::write(&file, &hostile).unwrap();
+        assert!(
+            !holds_own_bait_at(&event(key, hash(hostile.as_bytes())), BAIT),
+            "a hostile content"
+        );
+        // through a link: not read
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let mut via = event(key, hash(hostile.as_bytes()));
+        via.path = link.to_string_lossy().into_owned();
+        std::fs::write(&file, &own).unwrap();
+        via.new_sha256 = Some(own_sha);
+        assert!(!holds_own_bait_at(&via, BAIT), "a link");
+    }
+
     /// Lot 370 (F10-3): root's `authorized_keys` on a host with no
     /// `/root/.ssh` — the directory made (no record: a `mkdir`), then the
     /// key file: the look moves the watch into the new directory, and the
@@ -7569,6 +8089,237 @@ mod tests {
             None,
             "gone"
         );
+    }
+
+    /// Lot 373 (named, the rc7 soak: Debian 12's shutdown record of
+    /// `systemd-update-utmp`, NN-L-FIM-019 High with a `would have:
+    /// KillProcess` — the writer had exited before lot 347's `/proc` read):
+    /// a login record's write is judged on what the KERNEL recorded at the
+    /// write — the writer's image, its cgroup, root, the file's only writer
+    /// — with no `/proc` entry left to read. Kept: the packaged binary in
+    /// the unit's cgroup, or in a cgroup removed since (the oneshot's
+    /// `ExecStop=` at the shutdown). Not kept (High as before): a copy, the
+    /// binary in a session's scope or another unit still there, not root,
+    /// another writer folded in, no identity recorded, a cgroup not read.
+    #[test]
+    fn a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts() {
+        use crate::decision::Rule;
+        use nn_core::fim::unit_writers::{unit_of, UTMP_RECORD_LEN};
+        use std::os::unix::fs::MetadataExt;
+        let t = TempDir::new().unwrap();
+        let (root, cg) = (t.path().join("root"), t.path().join("cgroup"));
+        let put = |path: &str, body: &[u8]| {
+            let f = root.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+            f
+        };
+        let utmp = put("/usr/lib/systemd/systemd-update-utmp", b"utmp image, 373");
+        let copy = put("/tmp/systemd-update-utmp", b"utmp image, 373");
+        // the fixture's files are this test's own (the host's are root's)
+        let owner = std::fs::metadata(&utmp).unwrap().uid();
+        let id_of = |f: &Path| {
+            let m = std::fs::metadata(f).unwrap();
+            (crate::fim::attach::stat_dev_to_kernel_dev(m.dev()), m.ino())
+        };
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.controllers"), b"cpu memory pids\n").unwrap();
+        let mkcg = |rel: &str| {
+            let d = cg.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::metadata(&d).unwrap().ino()
+        };
+        let unit_cg = mkcg("system.slice/systemd-update-utmp.service");
+        let session = mkcg("user.slice/user-0.slice/session-3.scope");
+        let cron = mkcg("system.slice/cron.service");
+        let removed = mkcg("system.slice/gone.service");
+        std::fs::remove_dir(cg.join("system.slice/gone.service")).unwrap();
+        let mut n = 0u64;
+        let mut judge = |image: (u64, u64), cgroup: u64, uid: u32, flags: u8| {
+            n += 1;
+            let mut raw = fake_raw(1, 2, FimOp::Modified as u8);
+            (raw.modifier_pid, raw.modifier_uid, raw.op_flags) = (37_300, uid, flags);
+            (raw.writer_exe_dev, raw.writer_exe_ino, raw.writer_cgroup) =
+                (image.0, image.1, cgroup);
+            let fe = FimEvent {
+                timestamp_ns: 373_000 + n,
+                path: "/var/log/wtmp".into(),
+                op: FimOp::Modified,
+                new_sha256: None,
+                baseline_sha256: None,
+                new_size: Some(3712 + UTMP_RECORD_LEN),
+                baseline_size: Some(3712),
+                modifier_exe: None,
+                modifier_pid: 37_300,
+                modifier_uid: uid,
+                modifier_comm: "systemd-update-".into(),
+                dest_path: None,
+                child_truncated: false,
+                wide_coverage: false,
+                owner_uid: None,
+                reader_dac_capable: false,
+                capability: None,
+                attrs: None,
+                file_key: None,
+                is_dir: false,
+                moved_in: false,
+                appends_only: true,
+                truncated_by_another: false,
+                unchanged_since_read: false,
+                modifier_start: 0,
+            };
+            kernel_login_unit_writer_owned(&fe, &raw, (&root, owner), &cg);
+            let rule = nn_core::fim::rules::NnLFim019WtmpBtmpTampered;
+            (
+                unit_of(&fe),
+                rule.evaluate(&Event::Fim(fe)).map(|v| v.severity),
+            )
+        };
+        let one = FIM_WRITE_ONE_WRITER | FIM_WRITE_APPEND_ONLY;
+        let (kept, verdict) = judge(id_of(&utmp), unit_cg, 0, one);
+        assert_eq!(
+            (kept, verdict),
+            (Some("systemd-update-utmp.service"), None),
+            "the unit's"
+        );
+        let (kept, verdict) = judge(id_of(&utmp), removed, 0, one);
+        assert_eq!(
+            (kept, verdict),
+            (Some(UTMP_UNIT_GONE), None),
+            "its cgroup gone"
+        );
+        // the attack shapes: High, as before
+        for (image, cgroup, uid, flags, why) in [
+            (id_of(&copy), unit_cg, 0, one, "a copy"),
+            (id_of(&utmp), session, 0, one, "a session's scope"),
+            (id_of(&utmp), cron, 0, one, "another unit"),
+            (id_of(&utmp), unit_cg, 1000, one, "not root"),
+            (
+                id_of(&utmp),
+                unit_cg,
+                0,
+                FIM_WRITE_APPEND_ONLY,
+                "another writer folded in",
+            ),
+            ((0, 0), unit_cg, 0, one, "no identity recorded"),
+            (id_of(&utmp), 0, 0, one, "no cgroup recorded"),
+        ] {
+            let (kept, verdict) = judge(image, cgroup, uid, flags);
+            assert_eq!(kept, None, "{why}");
+            assert_eq!(verdict, Some(nn_model::Severity::High), "{why}");
+        }
+    }
+
+    /// Lot 373 (named, the review of #580, F4: the walk stopped at depth 5
+    /// and said "not read" whenever a directory existed there — a user
+    /// manager's unit, `/user.slice/user-1000.slice/user@1000.service/
+    /// app.slice/<unit>`, on any desktop — so a removed oneshot's cgroup was
+    /// never found gone and its shutdown record stayed High): every level is
+    /// read; a cgroup below a user manager's units is found; the id of a
+    /// removed one is gone; a directory that cannot be read leaves it not
+    /// read (fails closed).
+    #[test]
+    fn a_removed_cgroup_is_found_gone_below_a_user_manager_s_units() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let t = TempDir::new().unwrap();
+        let cg = t.path().join("cgroup");
+        std::fs::create_dir_all(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.controllers"), b"cpu memory pids\n").unwrap();
+        let mkcg = |rel: &str| {
+            let d = cg.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::metadata(&d).unwrap().ino()
+        };
+        let user = "user.slice/user-1000.slice/user@1000.service/app.slice";
+        mkcg(&format!("{user}/app-gnome-terminal.scope"));
+        let deep = mkcg(&format!(
+            "{user}/podman-1.scope/container/libpod-payload/init.scope/inner"
+        ));
+        let removed = mkcg("system.slice/systemd-update-utmp.service");
+        std::fs::remove_dir(cg.join("system.slice/systemd-update-utmp.service")).unwrap();
+        assert_eq!(cgroup_now(&cg, removed), CgroupNow::Gone, "removed");
+        assert_eq!(
+            cgroup_now(&cg, deep),
+            CgroupNow::At(format!(
+                "/{user}/podman-1.scope/container/libpod-payload/init.scope/inner"
+            )),
+            "found at depth 9"
+        );
+        // a directory not read: not gone (root reads every mode)
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = cg.join("system.slice");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let seen = cgroup_now(&cg, removed);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(seen, CgroupNow::Unread, "a directory not read");
+        }
+    }
+
+    /// Lot 373 (named, the rc7 soak: rsyslogd's last flush at the host's
+    /// shutdown, NN-L-FIM-005 High — its `/proc` gone, its exec older than
+    /// the agent): the writer's image as the kernel recorded it at the
+    /// write names the packaged rsyslog daemon by its device and inode; a
+    /// copy, a file in a directory another user may write, no identity
+    /// recorded name nothing.
+    #[test]
+    fn a_gone_writer_s_image_is_named_by_the_kernel_s_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let t = TempDir::new().unwrap();
+        let root = t.path().join("root");
+        let put = |path: &str| {
+            let f = root.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, path.as_bytes()).unwrap();
+            for d in [f.parent().unwrap(), f.as_path()] {
+                let mut p = std::fs::metadata(d).unwrap().permissions();
+                p.set_mode(p.mode() & !0o022);
+                std::fs::set_permissions(d, p).unwrap();
+            }
+            let m = std::fs::metadata(&f).unwrap();
+            (
+                crate::fim::attach::stat_dev_to_kernel_dev(m.dev()),
+                m.ino(),
+                m.uid(),
+            )
+        };
+        let (dev, ino, owner) = put("/usr/sbin/rsyslogd");
+        let (cdev, cino, _) = put("/opt/rsyslogd");
+        let images = || ["/usr/sbin/rsyslogd", "/sbin/rsyslogd"].into_iter();
+        let mut raw = fake_raw(1, 2, FimOp::Modified as u8);
+        (raw.writer_exe_dev, raw.writer_exe_ino) = (dev, ino);
+        assert_eq!(
+            image_named_among(&raw, &root, images(), owner),
+            Some("/usr/sbin/rsyslogd")
+        );
+        (raw.writer_exe_dev, raw.writer_exe_ino) = (cdev, cino);
+        assert_eq!(
+            image_named_among(&raw, &root, images(), owner),
+            None,
+            "a copy"
+        );
+        (raw.writer_exe_dev, raw.writer_exe_ino) = (0, 0);
+        assert_eq!(
+            image_named_among(&raw, &root, images(), owner),
+            None,
+            "none recorded"
+        );
+        (raw.writer_exe_dev, raw.writer_exe_ino) = (dev, ino);
+        assert_eq!(
+            image_named_among(&raw, &root, images(), owner + 1),
+            None,
+            "another owner"
+        );
+        let dir = root.join("usr/sbin");
+        let mut p = std::fs::metadata(&dir).unwrap().permissions();
+        p.set_mode(p.mode() | 0o002);
+        std::fs::set_permissions(&dir, p).unwrap();
+        assert_eq!(
+            image_named_among(&raw, &root, images(), owner),
+            None,
+            "a writable directory"
+        );
+        // NN-L-FIM-005's FP-1 then reads the daemon's append as its own
+        assert!(nn_core::fim::rules::RSYSLOGD_EXES.contains(&"/usr/sbin/rsyslogd"));
     }
 
     /// `/proc/<pid>/stat` of a process started `ticks` clock ticks after

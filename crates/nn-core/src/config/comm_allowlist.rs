@@ -230,6 +230,13 @@ impl<H: PostureHost> CommAllowlist<H> {
         self
     }
 
+    /// Lot 373: the lineage the entries are judged with (production), for a
+    /// rule's own reading of what the kernel executed — `None` without one
+    /// (tests, the boot-time rule set).
+    pub fn lineage(&self) -> Option<&crate::posture::lineage::AuthSessionTracker<H>> {
+        self.identity.as_ref()
+    }
+
     /// Lot 314 (BUG-83): the start of process `pid` — `starttime` of its
     /// `stat`, in clock ticks since boot — as the identity source's process
     /// table shows it now: with the pid, what tells one process from the

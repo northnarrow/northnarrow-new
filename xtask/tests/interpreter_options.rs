@@ -243,6 +243,19 @@ const KNOWN: &[(&str, usize, &str)] = &[
          `--privileged`): no interpreter's",
     ),
     (
+        "crates/nn-core/src/decision/rules/r012_setcap_tooling.rs",
+        7,
+        "lot 373: setcap's own options (`-q`, `-v`, `-f`, `-n <rootid>`, `-r`) to find the \
+         files a command line names, any other option refused: no interpreter's",
+    ),
+    (
+        "crates/nn-linux/src/known_system_prog.rs",
+        14,
+        "lot 373: bpftool's exact read-only command lines (`-j`, `-p`, `--json`, `--pretty`, \
+         `prog show`, `cgroup tree`), compared whole by the lineage's digest: no \
+         interpreter's",
+    ),
+    (
         "crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs",
         1,
         "an exact argv, `sh -c /bin/true` (a modprobe.d directive's `install x /bin/true`): three \
@@ -299,8 +312,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        9,
-        "FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, once since lot 340: `names_npm_cli`): stricter \
+        10,
+        "lot 373: `/etc/passwd`'s uid field by position (`account_uid`), no command line; \
+         FP-2: npm's entrypoint as node's first argument exactly (`argv.get(1)`, once since lot 340: `names_npm_cli`): stricter \
          than the reader, which would take it after an option; a cgroup name's `-pod` and \
          `-conmon-` (no option) \
          — and `/proc` text fields read by position (`stat`, `mountinfo`, `cgroup`: \

@@ -876,25 +876,29 @@ pub(crate) fn start(
     // After the FIM observe programs are attached (above) and the agent
     // is in PROTECTED_PIDS, verify the NN-L-FIM-024 bait files exist and
     // recreate any missing one from its embedded template. The recreate
-    // is an agent write → PROTECTED_PIDS-exempt, so it cannot
-    // self-trigger NN-L-FIM-024. A missing bait at boot is itself a
-    // tamper signal (Medium); all-present logs at Info.
+    // is an agent write → PROTECTED_PIDS-exempt: no kernel record of it.
+    // Lot 373: and no creation by an unknown writer either — the drain is
+    // told of each before its inode is watched (below). A missing bait at
+    // boot is itself a tamper signal (Medium); all-present logs at Info.
     let report = northnarrow_agent::fim::honeypot::check_and_restore();
     // External audit FIMR-008: a bait re-created here was absent when the
     // watch set was built above, and nothing enrolled it afterwards — after
     // every reboot the tmpfs pair under /run went unwatched until the next
-    // agent restart. Watched now.
+    // agent restart. Watched now. Lot 373 (the rc7 soak: NN-L-FIM-024
+    // Critical at every boot, "writer unknown", COMBAT locked): the drain's
+    // look at the paths absent at the start (lot 370) judged the agent's own
+    // re-creation a creation by an unknown writer. Each is handed to the
+    // drain as the agent's own write — the inode the sweep made and the
+    // hash of what it wrote — before it is watched.
     if let Some(fim) = fim_admin_state.as_ref() {
-        for path in &report.recreated {
-            let watched = northnarrow_agent::fim::attach::key_for_path(std::path::Path::new(path))
-                .map(|key| {
-                    fim.watch.watch(
-                        key,
-                        path,
-                        northnarrow_agent::fim::drain::WatchClass::Configured,
-                    )
-                });
-            if !matches!(watched, Ok(true)) {
+        for write in &report.written {
+            let key = common::wire::InodeKey {
+                dev: northnarrow_agent::fim::attach::stat_dev_to_kernel_dev(write.dev),
+                ino: write.ino,
+            };
+            let path = &write.path;
+            let watched = fim.watch.watch_own_creation(key, path, &write.sha256);
+            if !watched {
                 warn!(
                     target: "fim.honeypot",
                     path = %path,

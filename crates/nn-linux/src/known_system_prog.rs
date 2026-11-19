@@ -408,6 +408,166 @@ pub fn known_probe_on_host(
     )
 }
 
+/// Lot 373: where the distributions install `bpftool` itself — Debian's
+/// `bpftool` package, Ubuntu 26.04's; Ubuntu's `linux-tools` puts it under
+/// `/usr/lib/linux-tools-<version>/` ([`is_bpftool_path`]), which its
+/// `/usr/sbin/bpftool` (a shell script) executes.
+pub const BPFTOOL_PATHS: &[&str] = &["/usr/sbin/bpftool", "/usr/bin/bpftool", "/sbin/bpftool"];
+
+/// Lot 373: `path` is where a package installs `bpftool` ([`BPFTOOL_PATHS`],
+/// or `/usr/lib/linux-tools-<version>/bpftool`, `/usr/lib/linux-tools/<version>/bpftool`).
+pub fn is_bpftool_path(path: &str) -> bool {
+    if BPFTOOL_PATHS.contains(&path) {
+        return true;
+    }
+    let Some(dir) = path.strip_suffix("/bpftool") else {
+        return false;
+    };
+    let version = dir
+        .strip_prefix("/usr/lib/linux-tools-")
+        .or_else(|| dir.strip_prefix("/usr/lib/linux-tools/"));
+    version.is_some_and(|v| {
+        !v.is_empty()
+            && v.len() <= 64
+            && !v.starts_with('.')
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+'))
+    })
+}
+
+/// Lot 373: the command lines of `bpftool` that only list or show objects
+/// — `[-j|-p|--json|--pretty…] prog|map [show|list [id <id>]]`, and `cgroup
+/// tree` for a program — of the kind `kind` (1 a map, 2 a program) whose
+/// handle by id `id` was refused. Every one takes a handle by id on each
+/// object it prints only to read its information (`BPF_OBJ_GET_INFO_BY_FD`);
+/// a dump, an update, a pin, a detach, a load is none of them.
+pub fn bpftool_listing_argvs(kind: u64, id: u64) -> Vec<Vec<String>> {
+    const OPTIONS: &[&[&str]] = &[
+        &[],
+        &["-j"],
+        &["-p"],
+        &["--json"],
+        &["--pretty"],
+        &["-j", "-p"],
+        &["-p", "-j"],
+        &["-jp"],
+        &["-pj"],
+        &["--json", "--pretty"],
+        &["--pretty", "--json"],
+    ];
+    let object = match kind {
+        1 => "map",
+        2 => "prog",
+        _ => return Vec::new(),
+    };
+    let id = id.to_string();
+    let mut verbs: Vec<Vec<&str>> = vec![
+        vec![object],
+        vec![object, "show"],
+        vec![object, "list"],
+        vec![object, "show", "id", &id],
+        vec![object, "list", "id", &id],
+    ];
+    if kind == 2 {
+        verbs.push(vec!["cgroup", "tree"]);
+    }
+    let mut out = Vec::new();
+    for opts in OPTIONS {
+        for verb in &verbs {
+            let mut argv = vec!["bpftool".to_string()];
+            argv.extend(opts.iter().map(|s| s.to_string()));
+            argv.extend(verb.iter().map(|s| s.to_string()));
+            out.push(argv);
+        }
+    }
+    out
+}
+
+/// Lot 373 (the rc7 soak: the bench's `sudo bpftool prog show` was NN-L-AT-001
+/// High at every boot, ENGAGED): a refused handle by id on one of the
+/// agent's maps or programs (`kind` 1 or 2, `id`) is the packaged
+/// `bpftool` listing or showing objects — `Ok(its path)` when every fact
+/// holds, each from the taker's exec as of the refusal:
+///
+/// * the file it executed (`exe`, `image`: the LSM program's device and
+///   inode) is the host's file at a [`is_bpftool_path`], as `packaged`
+///   reads it (a regular file owned by root and writable by no one else);
+///   a copy, a program of its own (python's ctypes), another mount
+///   namespace's file is not;
+/// * it executed it as root (`uid`);
+/// * its command line, read whole, is one of [`bpftool_listing_argvs`]
+///   (`argv_is`, the lineage's digest of it): a dump, an update, a pin, a
+///   detach is none.
+///
+/// Refused all the same; NN-L-AT-001 records it Low and the posture raises
+/// nothing. What this trusts: the packaged tool, and a listing being one
+/// (another refused operation of the same process is judged on its own).
+pub fn bpftool_listing(
+    exe: Option<&str>,
+    image: Option<(u64, u64)>,
+    uid: Option<u32>,
+    argv_is: &dyn Fn(&[&str]) -> bool,
+    packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
+    (kind, id): (u64, u64),
+) -> Result<String, String> {
+    let exe = exe.ok_or("no exec of it recorded as of the refusal")?;
+    if !is_bpftool_path(exe) {
+        return Err(format!("{exe} is not where a package installs bpftool"));
+    }
+    let image = image.ok_or("no image of its exec recorded")?;
+    let file = packaged(exe).map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino));
+    if file != Some(image) {
+        return Err(format!("it did not run the packaged {exe}"));
+    }
+    if uid != Some(0) {
+        return Err("not run by root".to_string());
+    }
+    let listed = bpftool_listing_argvs(kind, id).iter().any(|argv| {
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        argv_is(&argv)
+    });
+    if !listed {
+        return Err("its command line is no listing (show, list, cgroup tree)".to_string());
+    }
+    Ok(exe.to_string())
+}
+
+/// [`bpftool_listing`] on this host: the taker `pid`'s exec as `lineage`
+/// recorded it as of the refusal at `at_ns`, the packaged file under `/`
+/// in a directory root's and writable by no one else.
+pub fn bpftool_listing_on_host(
+    lineage: &AuthSessionTracker,
+    pid: u32,
+    kind_id: (u64, u64),
+    at_ns: u64,
+) -> Result<String, String> {
+    let as_of = AsOf::judged(at_ns);
+    let id = lineage.exec_identity(pid, as_of);
+    let exe = id
+        .as_ref()
+        .filter(|i| !i.interprets())
+        .map(|i| i.exe.to_string_lossy().into_owned());
+    bpftool_listing(
+        exe.as_deref(),
+        lineage.exec_file(pid, as_of),
+        lineage.exec_uid(pid, as_of),
+        &|argv| lineage.exec_argv_is(pid, as_of, argv),
+        &|path| {
+            let dir_ok = Path::new(path).parent().is_some_and(|d| {
+                antitamper_bpf::kernel_roots::metadata(d).is_ok_and(|m| {
+                    m.is_dir() && m.uid() == 0 && m.permissions().mode() & 0o022 == 0
+                })
+            });
+            if dir_ok {
+                packaged(Path::new("/"), path, 0)
+            } else {
+                None
+            }
+        },
+        kind_id,
+    )
+}
+
 /// The host's clock ticks a second.
 pub fn clk_tck() -> u64 {
     // SAFETY: sysconf has no preconditions.
@@ -480,6 +640,142 @@ impl Host<'_> {
 mod tests {
     use super::*;
     use common::bpf_prog_class::{PROG_TYPE_CGROUP_SYSCTL, PROG_TYPE_LSM};
+
+    /// Lot 373 (the rc7 soak's `sudo bpftool prog show`): the packaged
+    /// bpftool, run by root, listing or showing programs or maps, is a
+    /// listing; a copy, a program of its own, a non-root run, a dump or a
+    /// detach, an object of another kind is not — they keep High.
+    #[test]
+    fn a_root_listing_by_the_packaged_bpftool_is_told_from_a_handle_grab() {
+        const IMG: (u64, u64) = (common::wire::exe::kernel_dev(0x801), 373_001);
+        let tool = "/usr/lib/linux-tools-6.8.0-149/bpftool";
+        let packaged =
+            |p: &str| (p == tool || p == "/usr/sbin/bpftool").then_some((0x801, 373_001));
+        let argv_of = |want: &'static [&'static str]| move |argv: &[&str]| argv == want;
+        let prove = |exe: &str, uid: u32, argv: &'static [&'static str], kind_id: (u64, u64)| {
+            bpftool_listing(
+                Some(exe),
+                Some(IMG),
+                Some(uid),
+                &argv_of(argv),
+                &packaged,
+                kind_id,
+            )
+        };
+        for (argv, kind_id) in [
+            (&["bpftool", "prog", "show"][..], (2, 48)),
+            (&["bpftool", "prog"][..], (2, 48)),
+            (&["bpftool", "-j", "prog", "list"][..], (2, 48)),
+            (
+                &["bpftool", "--json", "--pretty", "map", "show"][..],
+                (1, 31),
+            ),
+            (&["bpftool", "prog", "show", "id", "48"][..], (2, 48)),
+            (&["bpftool", "cgroup", "tree"][..], (2, 48)),
+        ] {
+            assert_eq!(
+                prove(tool, 0, argv, kind_id).as_deref(),
+                Ok(tool),
+                "{argv:?}"
+            );
+        }
+        assert!(prove("/usr/sbin/bpftool", 0, &["bpftool", "prog", "show"], (2, 1)).is_ok());
+        // HIGH as before: what takes a usable handle, or is not the tool
+        for (exe, uid, argv, kind_id, why) in [
+            (
+                tool,
+                0,
+                &["bpftool", "map", "dump", "id", "31"][..],
+                (1, 31),
+                "a dump",
+            ),
+            (
+                tool,
+                0,
+                &["bpftool", "map", "update", "id", "31"][..],
+                (1, 31),
+                "an update",
+            ),
+            (
+                tool,
+                0,
+                &["bpftool", "prog", "pin", "id", "48", "/sys/fs/bpf/x"][..],
+                (2, 48),
+                "a pin",
+            ),
+            (
+                tool,
+                0,
+                &["bpftool", "prog", "show", "id", "49"][..],
+                (2, 48),
+                "another id",
+            ),
+            (
+                tool,
+                0,
+                &["bpftool", "map", "show"][..],
+                (2, 48),
+                "the kind refused is a program",
+            ),
+            (
+                tool,
+                0,
+                &["bpftool", "cgroup", "tree"][..],
+                (1, 31),
+                "a map by cgroup tree",
+            ),
+            (
+                tool,
+                1000,
+                &["bpftool", "prog", "show"][..],
+                (2, 48),
+                "not root",
+            ),
+            (
+                "/tmp/bpftool",
+                0,
+                &["bpftool", "prog", "show"][..],
+                (2, 48),
+                "a copy",
+            ),
+            (
+                "/usr/bin/python3.12",
+                0,
+                &["bpftool", "prog", "show"][..],
+                (2, 48),
+                "ctypes",
+            ),
+        ] {
+            assert!(prove(exe, uid, argv, kind_id).is_err(), "{why}");
+        }
+        // the file at the path is not the one it ran (replaced, a copy
+        // bind-mounted over it in its namespace)
+        let other = |_: &str| Some((0x801, 999));
+        assert!(bpftool_listing(
+            Some(tool),
+            Some(IMG),
+            Some(0),
+            &argv_of(&["bpftool", "prog", "show"]),
+            &other,
+            (2, 48)
+        )
+        .is_err());
+        assert!(bpftool_listing(
+            None,
+            Some(IMG),
+            Some(0),
+            &argv_of(&["bpftool", "prog", "show"]),
+            &packaged,
+            (2, 48)
+        )
+        .is_err());
+        assert!(is_bpftool_path(
+            "/usr/lib/linux-tools/6.8.0-149-generic/bpftool"
+        ));
+        assert!(!is_bpftool_path("/usr/lib/linux-tools-../bpftool"));
+        assert!(!is_bpftool_path("/usr/lib/linux-tools-6.8/x/bpftool"));
+        assert!(!is_bpftool_path("/home/u/bpftool"));
+    }
 
     const NETWORKD: &str = "/usr/lib/systemd/systemd-networkd";
     const SYSTEMD: &str = "/usr/lib/systemd/systemd";

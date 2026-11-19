@@ -1080,6 +1080,8 @@ fn teach(mut r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
             l.ingest_spawn_event(e);
         }
         crate::sensors::multiplexer::mark_known_probe_on_host(&mut r.envelope.event, l);
+        // lot 373: and a refused handle proven the packaged bpftool's listing
+        crate::sensors::multiplexer::mark_bpf_listing_on_host(&mut r.envelope.event, l);
     }
     r
 }

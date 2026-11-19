@@ -2248,11 +2248,26 @@ impl<H: PostureHost> Rule for NnLNet011PlaintextCredService<H> {
 pub struct NnLNet013Beacon<H: PostureHost> {
     window: Arc<Mutex<BeaconWindow>>,
     allowlist: Arc<CommAllowlist<H>>,
+    /// Lot 373 (the review of #580, F2): the NTP client's unit and the
+    /// kernel's lot 277/281 marks ([`system_ntp_client`]); none read before
+    /// production gives the process table's.
+    facts: Arc<dyn crate::decision::rule_policy::ActorFacts>,
 }
 
 impl<H: PostureHost> NnLNet013Beacon<H> {
     pub fn new(window: Arc<Mutex<BeaconWindow>>, allowlist: Arc<CommAllowlist<H>>) -> Self {
-        Self { window, allowlist }
+        Self {
+            window,
+            allowlist,
+            facts: Arc::new(crate::decision::rule_policy::NoActorFacts),
+        }
+    }
+
+    /// Lot 373 (the review of #580, F2): the exemption facts the NTP
+    /// client's identity reads (production: `DecisionHost::actor_facts`).
+    pub fn with_facts(mut self, facts: Arc<dyn crate::decision::rule_policy::ActorFacts>) -> Self {
+        self.facts = facts;
+        self
     }
 }
 
@@ -2291,6 +2306,17 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
         }
         let is_beacon = self.window.lock().observe(nf.pid, nf.dst_addr, nf.start_ns);
         if !is_beacon {
+            return None;
+        }
+        // lot 373: the system's NTP client polling its servers, by identity
+        if system_ntp_client(
+            &self.allowlist,
+            nf,
+            crate::posture::lineage::AsOf::of_event(event),
+            self.facts.as_ref(),
+        )
+        .is_some()
+        {
             return None;
         }
         // External audit NET-010 (NN-AUD-006): the allowlist is judged on
@@ -2333,6 +2359,101 @@ impl<H: PostureHost> Rule for NnLNet013Beacon<H> {
             &nf.comm,
         ))
     }
+}
+
+/// Lot 373 (the rc7 soak: `systemd-timesyncd` polling an NTP server on
+/// Debian 12, NN-L-NET-013 High): the system's NTP clients — each packaged
+/// image with the service accounts its unit runs it as (Debian's and
+/// Ubuntu's `systemd-timesync`, `_chrony` (Fedora's `chrony`), `ntp`,
+/// NTPsec's `ntpsec`, and OpenNTPD's privilege-separated `_ntp`) and, the
+/// review of #580 (F2), the units that run it (Debian's `chrony.service`,
+/// Fedora's `chronyd.service`; `ntp`, `ntpd`, `ntpsec`, `openntpd`).
+pub const NTP_CLIENTS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "/usr/lib/systemd/systemd-timesyncd",
+        &["systemd-timesync"],
+        &["systemd-timesyncd.service"],
+    ),
+    (
+        "/lib/systemd/systemd-timesyncd",
+        &["systemd-timesync"],
+        &["systemd-timesyncd.service"],
+    ),
+    (
+        "/usr/sbin/chronyd",
+        &["_chrony", "chrony"],
+        &["chrony.service", "chronyd.service"],
+    ),
+    (
+        "/usr/sbin/ntpd",
+        &["ntp", "ntpsec", "_ntp"],
+        &[
+            "ntp.service",
+            "ntpd.service",
+            "ntpsec.service",
+            "openntpd.service",
+        ],
+    ),
+];
+
+/// NTP's port (RFC 5905).
+pub const NTP_PORT: u16 = 123;
+
+/// Lot 373: `nf` is the system's NTP client talking NTP — a UDP flow to
+/// port 123, from a process that runs one of the [`NTP_CLIENTS`]' packaged
+/// images (the host's file at that path in a root-only directory, by its
+/// device and inode: the lineage's records, else `/proc/<pid>/exe` of the
+/// process that started at the flow's start —
+/// [`crate::posture::lineage::AuthSessionTracker::runs_host_file_started`]) as one
+/// of that client's service accounts (`/etc/passwd`), and — the review of
+/// #580 (F2) — in one of that client's units' cgroups
+/// (`/system.slice/<unit>`), started there (systemd spawned it, or it was
+/// forked from a process that was: the kernel's lot 277 mark) with no
+/// code-injection access to it ever given (lot 281's: no `ptrace`, no
+/// write handle on its memory). The image path, or `None`: another program
+/// to UDP 123 (a python client, a copy of the daemon), the daemon to
+/// another port or over TCP, the daemon run as another user, from a
+/// session (`setpriv --reuid=systemd-timesync …`), moved into the unit's
+/// cgroup, injected or traced, or a fact not read — judged as before.
+pub fn system_ntp_client<H: PostureHost>(
+    allowlist: &CommAllowlist<H>,
+    nf: &nn_model::telemetry::NetFlowEvent,
+    as_of: crate::posture::lineage::AsOf,
+    facts: &dyn crate::decision::rule_policy::ActorFacts,
+) -> Option<&'static str> {
+    if nf.proto != 17 || nf.dst_port != NTP_PORT {
+        return None;
+    }
+    let lineage = allowlist.lineage()?;
+    NTP_CLIENTS.iter().find_map(|(path, accounts, units)| {
+        let dir_root_only = std::path::Path::new(path)
+            .parent()
+            .is_some_and(|d| lineage.is_root_only_host_dir(&d.to_string_lossy()));
+        (dir_root_only
+            && accounts
+                .iter()
+                .any(|a| lineage.account_uid(a) == Some(nf.uid))
+            && lineage.runs_host_file_started(nf.pid, nf.proc_start_ns, as_of, path)
+            && in_a_unit_started_clean(facts, nf.pid, units))
+        .then_some(*path)
+    })
+}
+
+/// The review of #580 (F2): process `pid` runs in the cgroup of one of
+/// `units` (`/system.slice/<unit>`, by its components), started there and
+/// never moved into it, with no code-injection access to it given to
+/// another (the kernel's lot 277 and 281 marks). Not known: no.
+fn in_a_unit_started_clean(
+    facts: &dyn crate::decision::rule_policy::ActorFacts,
+    pid: u32,
+    units: &[&str],
+) -> bool {
+    facts.cgroup(pid).is_some_and(|cg| {
+        units
+            .iter()
+            .any(|u| crate::response::cgroup::cgroup_at(&cg, &format!("/system.slice/{u}")))
+    }) && facts.started_in_cgroup(pid) == Some(true)
+        && facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
 }
 
 /// Lot 369: the flow's destination is the sending socket's own bound
@@ -3148,10 +3269,12 @@ pub fn net_rules<H: DecisionHost>(
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,
         ))),
-        Box::new(NnLNet013Beacon::new(
-            beacon_window,
-            Arc::clone(&comm_allowlist),
-        )),
+        // lot 373 (the review of #580, F2): the NTP client's unit and the
+        // kernel's marks, read as the per-rule policy's exemptions read them
+        Box::new(
+            NnLNet013Beacon::new(beacon_window, Arc::clone(&comm_allowlist))
+                .with_facts(H::actor_facts(std::path::Path::new(H::PROC_ROOT))),
+        ),
         Box::new(
             NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))
                 .with_lineage(lineage.clone()),
@@ -5624,6 +5747,251 @@ mod tests {
             !fired,
             "per-(pid,dst) isolation must prevent a cross-PID false beacon"
         );
+    }
+
+    const TIMESYNCD_UNIT: &str = "/system.slice/systemd-timesyncd.service";
+
+    /// A pid's cgroup, lot 277 mark and lot 281 mark, as a test sets them.
+    type UnitFact = (&'static str, Option<bool>, Option<Injected>);
+
+    /// The review of #580 (F2): each pid's cgroup and lot 277/281 marks, as a
+    /// test sets them.
+    #[derive(Default)]
+    struct UnitFacts(parking_lot::Mutex<std::collections::HashMap<u32, UnitFact>>);
+
+    impl UnitFacts {
+        fn set(&self, pid: u32, cg: &'static str, started: Option<bool>, inj: Option<Injected>) {
+            self.0.lock().insert(pid, (cg, started, inj));
+        }
+        fn forget(&self, pid: u32) {
+            self.0.lock().remove(&pid);
+        }
+    }
+
+    impl crate::decision::rule_policy::ActorFacts for UnitFacts {
+        fn uid(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+        fn cgroup(&self, pid: u32) -> Option<String> {
+            self.0.lock().get(&pid).map(|f| f.0.to_string())
+        }
+        fn trusted_exe(&self, _pid: u32) -> Option<(String, [u8; 32])> {
+            None
+        }
+        fn started_in_cgroup(&self, pid: u32) -> Option<bool> {
+            self.0.lock().get(&pid).and_then(|f| f.1)
+        }
+        fn injected(&self, pid: u32) -> Option<Injected> {
+            self.0.lock().get(&pid).and_then(|f| f.2)
+        }
+        fn unread(
+            &self,
+            _pid: u32,
+            _fact: crate::decision::rule_policy::ExemptionFact,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    use crate::decision::rule_policy::Injected;
+
+    /// Lot 373 (named, the rc7 soak: Debian 12's systemd-timesyncd polling
+    /// an NTP server, NN-L-NET-013 High and ENGAGED on main): the system's
+    /// NTP client — its packaged image by device and inode, as its service
+    /// account — to UDP 123 is no beacon. The attack shapes still fire: a
+    /// program of its own (python) as the same account to UDP 123, the
+    /// daemon to another port or over TCP, the daemon's image run as
+    /// another user. The review of #580 (F2): and the daemon outside its
+    /// unit's cgroup (`setpriv --reuid=systemd-timesync …` from a session),
+    /// moved into it, injected or traced, or its marks not known.
+    #[test]
+    fn the_system_s_ntp_client_polling_udp_123_is_no_beacon() {
+        use crate::posture::host::testing::IdTestHost;
+        use crate::posture::lineage::AuthSessionTracker;
+        use common::wire::exe::exe_flags::KNOWN;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let host = tempfile::tempdir().unwrap();
+        let h = |rel: &str| host.path().join(rel);
+        std::fs::create_dir_all(h("etc")).unwrap();
+        std::fs::write(
+            h("etc/passwd"),
+            "root:x:0:0::/root:/bin/sh\nsystemd-timesync:x:997:997::/:/usr/sbin/nologin\n\
+             alice:x:1000:1000::/home/alice:/bin/bash\n",
+        )
+        .unwrap();
+        IdTestHost::set_dir_root_only(h("usr/lib/systemd"), true);
+        IdTestHost::set_file_id(
+            h("usr/lib/systemd/systemd-timesyncd"),
+            Some((STAT_DEV, 373_005)),
+        );
+        let procs = tempfile::tempdir().unwrap();
+        let lineage =
+            AuthSessionTracker::<IdTestHost>::new(procs.path()).with_host_root(host.path());
+        let exec = |pid: u32, exe: &str, ino: u64, uid: u32| {
+            let mut e = crate::decision::rules::testutil::spawn_exe("x", exe, exe, 0);
+            if let Event::ProcessSpawn {
+                pid: p,
+                uid: u,
+                exe: x,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *u, *timestamp_ns) = (pid, uid, 1);
+                (x.dev, x.ino, x.flags) = (KDEV, ino, KNOWN);
+            }
+            e
+        };
+        assert!(lineage.ingest_spawn_event(&exec(
+            600,
+            "/usr/lib/systemd/systemd-timesyncd",
+            373_005,
+            997
+        )));
+        assert!(lineage.ingest_spawn_event(&exec(700, "/usr/bin/python3.11", 373_006, 997)));
+        // the review of #580 (F2): each pid's cgroup and lot 277/281 marks
+        let facts = Arc::new(UnitFacts::default());
+        for pid in [600, 700, 800] {
+            facts.set(pid, TIMESYNCD_UNIT, Some(true), Some(Injected::No));
+        }
+        let rule = || {
+            super::NnLNet013Beacon::<IdTestHost>::new(
+                Arc::new(Mutex::new(BeaconWindow::new())),
+                Arc::new(
+                    crate::config::comm_allowlist::CommAllowlist::<IdTestHost>::default()
+                        .with_identity(lineage.clone()),
+                ),
+            )
+            .with_facts(facts.clone())
+        };
+        // TEST-NET-3 (RFC 5737)
+        let dst = v4(203, 0, 113, 76);
+        let flows = |pid: u32, port: u16, proto: u8, uid: u32| {
+            let r = rule();
+            (1..=8u64)
+                .filter(|i| {
+                    let mut e = flow_pid(pid, dst, port, "systemd-timesyn", i * 64 * SEC);
+                    if let Event::NetFlow(nf) = &mut e {
+                        (nf.proto, nf.uid) = (proto, uid);
+                    }
+                    r.evaluate(&e).is_some()
+                })
+                .count()
+        };
+        assert_eq!(flows(600, 123, 17, 997), 0, "timesyncd to UDP 123");
+        assert!(flows(600, 4460, 17, 997) > 0, "timesyncd to another port");
+        assert!(flows(600, 123, 6, 997) > 0, "TCP 123");
+        assert!(
+            flows(700, 123, 17, 997) > 0,
+            "python as the service account"
+        );
+        assert!(
+            flows(600, 123, 17, 1000) > 0,
+            "the daemon's image as another user"
+        );
+        // the review of #580 (F2): its unit, started there, never injected
+        for (cgroup, started, injected, why) in [
+            (
+                "/user.slice/user-0.slice/session-3.scope",
+                Some(true),
+                Some(Injected::No),
+                "from a session (setpriv)",
+            ),
+            (
+                "/system.slice/cron.service",
+                Some(true),
+                Some(Injected::No),
+                "another unit",
+            ),
+            (
+                "/system.slice/systemd-timesyncd.service/x",
+                Some(true),
+                Some(Injected::No),
+                "a cgroup below the unit's",
+            ),
+            (
+                TIMESYNCD_UNIT,
+                Some(false),
+                Some(Injected::No),
+                "moved into the unit",
+            ),
+            (
+                TIMESYNCD_UNIT,
+                None,
+                Some(Injected::No),
+                "where it started not known",
+            ),
+            (
+                TIMESYNCD_UNIT,
+                Some(true),
+                Some(Injected::Yes {
+                    by: 4_242,
+                    inherited: false,
+                }),
+                "injected (ptrace, process_vm_writev)",
+            ),
+            (TIMESYNCD_UNIT, Some(true), None, "injection not known"),
+        ] {
+            facts.set(600, cgroup, started, injected);
+            assert!(flows(600, 123, 17, 997) > 0, "{why}");
+        }
+        facts.forget(600);
+        assert!(flows(600, 123, 17, 997) > 0, "no cgroup read");
+        facts.set(600, TIMESYNCD_UNIT, Some(true), Some(Injected::No));
+        assert_eq!(flows(600, 123, 17, 997), 0, "clean again");
+        // and no facts at all (the rule before production gives them)
+        let bare = super::NnLNet013Beacon::<IdTestHost>::new(
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::new(
+                crate::config::comm_allowlist::CommAllowlist::<IdTestHost>::default()
+                    .with_identity(lineage.clone()),
+            ),
+        );
+        let fired = (1..=8u64)
+            .filter(|i| {
+                let mut e = flow_pid(600, dst, 123, "systemd-timesyn", i * 64 * SEC);
+                if let Event::NetFlow(nf) = &mut e {
+                    (nf.proto, nf.uid) = (17, 997);
+                }
+                bare.evaluate(&e).is_some()
+            })
+            .count();
+        assert!(fired > 0, "no facts read");
+        // a daemon older than the agent in a mount namespace of its own
+        // (the start's scan kept no image): its `/proc/<pid>/exe`, while
+        // `/proc` shows the flow's process (its start)
+        let tick = IdTestHost::clock_tick_ns();
+        let proc_entry = |pid: u32, ticks: u64| {
+            let d = procs.path().join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!("{pid} (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+            )
+            .unwrap();
+            IdTestHost::set_file_id(d.join("exe"), Some((STAT_DEV, 373_005)));
+        };
+        proc_entry(800, 50);
+        let seeded = |start_ns: u64| {
+            let r = rule();
+            (1..=8u64)
+                .filter(|i| {
+                    let mut e = flow_pid(800, dst, 123, "systemd-timesyn", i * 64 * SEC);
+                    if let Event::NetFlow(nf) = &mut e {
+                        (nf.proto, nf.uid, nf.proc_start_ns) = (17, 997, start_ns);
+                    }
+                    r.evaluate(&e).is_some()
+                })
+                .count()
+        };
+        assert_eq!(seeded(50 * tick), 0, "the daemon's own process");
+        assert!(seeded(90 * tick) > 0, "a later process at that pid");
+        assert!(seeded(0) > 0, "no start known: the records only");
+        IdTestHost::set_dir_root_only(h("usr/lib/systemd"), false);
+        assert!(flows(600, 123, 17, 997) > 0, "a directory a user can write");
+        IdTestHost::set_file_id(h("usr/lib/systemd/systemd-timesyncd"), None);
+        IdTestHost::set_file_id(procs.path().join("800/exe"), None);
     }
 
     #[test]

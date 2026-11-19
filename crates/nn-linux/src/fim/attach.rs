@@ -693,6 +693,18 @@ impl FimWatch {
         }
     }
 
+    /// Lot 373 (the rc7 soak's NN-L-FIM-024 at every boot): watch `path`
+    /// (of the list), which the agent itself just created as the inode
+    /// `key` holding the bytes whose SHA-256 is `sha256` (hex) — told to
+    /// the drain first ([`crate::fim::drain::note_own_creation`]), so the
+    /// look at the paths awaited takes it for the agent's own creation
+    /// while that inode holds that content, never for a creation by an
+    /// unknown writer.
+    pub fn watch_own_creation(&self, key: InodeKey, path: &str, sha256: &str) -> bool {
+        crate::fim::drain::note_own_creation(&self.path_map, path, key, sha256);
+        self.watch(key, path, WatchClass::Configured)
+    }
+
     /// Stop watching inode `key`.
     pub fn unwatch(&self, key: InodeKey) {
         self.path_map.remove(&key);

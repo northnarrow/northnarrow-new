@@ -852,6 +852,26 @@ pub const fn known_probe_of(target_dev: u64, prog_type: u64) -> Option<usize> {
     Some(entry)
 }
 
+/// Lot 373 (the rc7 soak: `sudo bpftool prog show` NN-L-AT-001 High at
+/// every boot of the bench): `target_dev` bit of a `bpf_handle` record (a
+/// handle by id on one of the agent's maps, kind 1, or programs, kind 2)
+/// whose taker the agent proved the packaged `bpftool`, run by root, listing
+/// or showing objects ([`bpf_listing_kind`]). Still refused; the kernel's
+/// record carries the kind alone there.
+pub const BPF_LISTING_BIT: u64 = 1 << 62;
+
+/// Lot 373: the kind (1 a map, 2 a program) of a `bpf_handle` record's
+/// `target_dev` marked [`BPF_LISTING_BIT`]; `None` for the kernel's own
+/// value, any other bit set, another kind.
+#[inline(always)]
+pub const fn bpf_listing_kind(target_dev: u64) -> Option<u64> {
+    let kind = target_dev & !BPF_LISTING_BIT;
+    if target_dev & BPF_LISTING_BIT == 0 || !(kind == 1 || kind == 2) {
+        return None;
+    }
+    Some(kind)
+}
+
 /// Length of a program's name in the kernel (`BPF_OBJ_NAME_LEN`).
 pub const OBJ_NAME_LEN: usize = 16;
 /// The bytes of a program's attach function's name an iterator record
