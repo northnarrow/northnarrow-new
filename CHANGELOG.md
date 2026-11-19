@@ -6,6 +6,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 372 (the rc7 soak on Ubuntu 26.04): a person's `go test` and `go run`
+  on Go 1.21 and later are R001's (R003's) Low record again, as lot 369
+  meant (`UPGRADE_NOTES_WAVE4.md` §59).
+  - **A cut link argv names its output in `go`'s own shape.** Since Go 1.21
+    `go` passes its linker `-X=runtime.godebugDefault=…`, every GODEBUG
+    changed since the main module's `go` line (524 bytes for a `go 1.18`
+    module on Go 1.26, 350 on Go 1.24), so the link's argv passes the
+    sensor's 511 bytes and came cut; lot 369 read the output of a whole
+    argv only, noted no link, and the test binary and the program were
+    R001 High (a would-have kill in ENGAGED). A cut argv now names the
+    output only in the `go` command's own shape (`link -o <target>
+    -importcfg …`, no other output option among the arguments kept, no
+    last one a cut may have made of one); every other fact of lot 369's
+    identity is unchanged. Not Go 1.24's executable cache: a cached `go
+    run` program runs from `GOCACHE` itself, and test binaries are not
+    cached. Tests `go_test_and_go_run_with_a_cut_link_argv_are_recorded_low`,
+    `a_cut_link_argv_outside_go_s_own_shape_stays_judged`,
+    `a_cut_link_argv_names_its_output_only_in_the_go_command_s_shape`.
 - Lot 370 (the pre-alpha's final review, Phase 10, and a cross-model
   check): what the records say is what happened, and the moments a root
   could choose are recorded (`UPGRADE_NOTES_WAVE4.md` §58).

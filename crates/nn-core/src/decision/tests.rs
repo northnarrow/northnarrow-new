@@ -2066,6 +2066,258 @@ fn a_service_account_s_or_root_s_go_build_output_stays_judged() {
     }
 }
 
+/// Lot 372: what Go 1.21 and later pass the linker for a `go 1.18` main
+/// module (`-X=runtime.godebugDefault=…`: every GODEBUG changed since) —
+/// Go 1.26's (Ubuntu 26.04) and Go 1.24's (Debian 13), as `cmd/go`
+/// computes them from `internal/godebugs`.
+const GODEBUG_GO126_GO118: &str = "asynctimerchan=1,containermaxprocs=0,cryptocustomrand=1,\
+    decoratemappings=0,gotestjsonbuildtext=1,gotypesalias=0,httpcookiemaxnum=0,\
+    httplaxcontentlength=1,httpmuxgo121=1,httpservecontentkeepheaders=1,multipathtcp=0,netedns0=0,\
+    panicnil=1,randseednop=0,rsa1024min=0,tls10server=1,tls3des=1,tlsmlkem=0,tlsrsakex=1,\
+    tlssecpmlkem=0,tlssha1=1,tlsunsafeekm=1,updatemaxprocs=0,urlmaxqueryparams=0,\
+    urlstrictcolons=0,winreadlinkvolume=0,winsymlink=0,x509keypairleaf=0,x509negativeserial=1,\
+    x509rsacrt=0,x509sha256skid=0,x509usepolicies=0";
+const GODEBUG_GO124_GO118: &str = "asynctimerchan=1,gotestjsonbuildtext=1,gotypesalias=0,\
+    httplaxcontentlength=1,httpmuxgo121=1,httpservecontentkeepheaders=1,multipathtcp=0,netedns0=0,\
+    panicnil=1,randseednop=0,rsa1024min=0,tls10server=1,tls3des=1,tlsmlkem=0,tlsrsakex=1,\
+    tlsunsafeekm=1,winreadlinkvolume=0,winsymlink=0,x509keypairleaf=0,x509negativeserial=1,\
+    x509rsacrt=0,x509usepolicies=0";
+
+/// Lot 372: the argv the sensor reads of `link` as `go` runs it for `out`
+/// (`cmd/go`'s `ld`: `-o`, `-importcfg`, the ldflags, the main package),
+/// `args` given after `-o <out>` instead when not empty: its first
+/// `ARGV_LEN - 1` bytes, cut as the kernel's blob is parsed.
+fn cut_link_argv(link: &str, out: &str, godebug: &str, args: &[&str]) -> Vec<String> {
+    let dir = out.trim_end_matches(|c| c != '/');
+    let dir = dir.strip_suffix("exe/").unwrap_or(dir);
+    let tail = if args.is_empty() {
+        vec![
+            "-importcfg".to_string(),
+            format!("{dir}importcfg.link"),
+            format!("-X=runtime.godebugDefault={godebug}"),
+            "-buildmode=exe".into(),
+            format!("-buildid={0}/{0}/{0}/{0}", "Zx3Qm0aT9bK2cR7wP1dE"),
+            "-extld=gcc".into(),
+            format!("{dir}_pkg_.a"),
+        ]
+    } else {
+        args.iter().map(|a| a.to_string()).collect()
+    };
+    let mut blob = [link, "-o", out].map(String::from).to_vec();
+    blob.extend(tail);
+    let mut blob = blob.join("\0").into_bytes();
+    blob.push(0);
+    let kept = common::wire::ARGV_LEN - 1;
+    assert!(
+        blob.len() > kept,
+        "the link's argv passes the sensor's buffer"
+    );
+    nn_model::parse_argv_blob(&blob[..kept], kept as u16)
+}
+
+/// Lot 372: `link` (`link_pid`) as `go_pid` runs it, uid `uid`, at `ts`,
+/// with the cut `argv` ([`cut_link_argv`]) the sensor reads (`rooted`: its
+/// image a root-only tree's).
+fn go_link_cut(p: &Prod, (link_pid, go_pid, uid): (u32, u32, u32), argv: &[String], ts: u64) {
+    let link = argv[0].as_str();
+    let mut e = go_exec(link_pid, go_pid, uid, link, &[], ts, true);
+    if let Event::ProcessSpawn {
+        argv: a,
+        argv_truncated,
+        ..
+    } = &mut e
+    {
+        *a = argv.to_vec();
+        *argv_truncated = true;
+    }
+    p.lineage.ingest_spawn_event(&e);
+}
+
+/// Lot 372 (the rc7 soak on Ubuntu 26.04: R001 High, a would-have kill in
+/// ENGAGED, at `go test`'s `…/b078/calc.test` and `go run`'s
+/// `…/b001/exe/nncorpus`; Low on Go 1.18 as lot 369 meant): since Go 1.21
+/// `go` passes its linker every GODEBUG changed since the main module's `go`
+/// line, so the link's argv passes the sensor's buffer and comes cut —
+/// lot 369 read the output of a whole argv only, so it noted no link. Not
+/// Go 1.24's executable cache: a `go run` whose program is cached runs it
+/// from `GOCACHE` itself, and no test binary is cached. The cut argv in the
+/// `go` command's own shape (`link -o <target> -importcfg …`) names the
+/// output; every other fact of lot 369's identity is unchanged: Low, never
+/// killed, in every posture, on Go 1.26 and 1.24. Fails on main (High).
+#[test]
+fn go_test_and_go_run_with_a_cut_link_argv_are_recorded_low() {
+    let p = prod("");
+    let go = "/usr/lib/go-1.26/bin/go";
+    let link = "/usr/lib/go-1.26/pkg/tool/linux_amd64/link";
+    p.lineage
+        .ingest_spawn_event(&go_exec(300, 1, 1000, "/usr/bin/bash", &["bash"], 1, true));
+    // the go command's own argv cut too (a long list of packages)
+    let mut go_test = go_exec(
+        8000,
+        300,
+        1000,
+        go,
+        &["go", "test", "-count=1", "./a"],
+        2,
+        true,
+    );
+    if let Event::ProcessSpawn { argv_truncated, .. } = &mut go_test {
+        *argv_truncated = true;
+    }
+    p.lineage.ingest_spawn_event(&go_test);
+    let built = [
+        (
+            "/tmp/go-build3497956760/b078/calc.test",
+            GODEBUG_GO126_GO118,
+        ),
+        (
+            "/tmp/go-build477568886/b001/exe/nncorpus",
+            GODEBUG_GO126_GO118,
+        ),
+        (
+            "/tmp/go-build1147089945/b072/calc.test",
+            GODEBUG_GO124_GO118,
+        ),
+        ("/var/tmp/go-build77/b001/exe/nncorpus", GODEBUG_GO124_GO118),
+    ];
+    for (i, (out, godebug)) in (0u32..).zip(built) {
+        let argv = cut_link_argv(link, out, godebug, &[]);
+        assert_eq!(
+            argv.get(2).map(String::as_str),
+            Some(out),
+            "the output kept whole"
+        );
+        go_link_cut(&p, (8100 + i, 8000, 1000), &argv, 3);
+    }
+    let mut pid = 9000;
+    for posture in [
+        PostureKind::Observing,
+        PostureKind::Alerted,
+        PostureKind::Engaged,
+        PostureKind::Combat,
+    ] {
+        for (image, _) in built {
+            pid += 1;
+            let e = go_exec(pid, 8000, 1000, image, &[image], 5, false);
+            let d = p.decide_in(&e, posture).expect("a decision");
+            assert_eq!(
+                (
+                    d.verdict.severity,
+                    d.verdict.action.clone(),
+                    d.responses.len()
+                ),
+                (Severity::Low, ResponseAction::Log, 0),
+                "{posture} {image}"
+            );
+        }
+    }
+}
+
+/// Lot 372: a cut link argv vouches for nothing outside the `go` command's
+/// own shape, and lot 369's other facts still decide — judged as before
+/// (the person's High, the kill held below COMBAT; the service account's
+/// kill): a second output option among the arguments kept, the output the
+/// last argument kept (it may be cut), `-o` not first, a cut link run by a
+/// shell or by a `go` a `GOTOOLCHAIN` switch downloaded into the module
+/// cache (its own linker there), a service account's `go run`, and a
+/// binary dropped in a `go-build` directory with no link at all.
+#[test]
+fn a_cut_link_argv_outside_go_s_own_shape_stays_judged() {
+    let p = prod("");
+    let go = "/usr/lib/go-1.26/bin/go";
+    let link = "/usr/lib/go-1.26/pkg/tool/linux_amd64/link";
+    let toolchain = "/home/u/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.0.linux-amd64";
+    let tc_go = format!("{toolchain}/bin/go");
+    let tc_link = format!("{toolchain}/pkg/tool/linux_amd64/link");
+    p.lineage
+        .ingest_spawn_event(&go_exec(300, 1, 1000, "/usr/bin/bash", &["bash"], 1, true));
+    p.lineage
+        .ingest_spawn_event(&go_exec(400, 1, 33, "/usr/bin/dash", &["sh"], 1, true));
+    for (pid, ppid, uid, exe) in [
+        (8000, 300, 1000, go),
+        (8010, 300, 1000, tc_go.as_str()),
+        (8020, 400, 33, go),
+    ] {
+        p.lineage
+            .ingest_spawn_event(&go_exec(pid, ppid, uid, exe, &["go", "run", "."], 2, true));
+    }
+    let long = format!("-X=runtime.godebugDefault={GODEBUG_GO126_GO118}");
+    let two = "/tmp/go-build1/b001/exe/a";
+    let last = format!("/tmp/go-build2/b001/exe/{}", "a".repeat(500));
+    let order = "/tmp/go-build3/b001/exe/a";
+    let shell = "/tmp/go-build4/b001/exe/a";
+    let switched = "/tmp/go-build5/b001/exe/a";
+    let service = "/tmp/go-build6/b001/exe/a";
+    let dropped = "/tmp/go-build7/b001/exe/a";
+    let cfg = ["-importcfg", "/tmp/go-build1/b001/importcfg.link"];
+    for (ids, argv) in [
+        (
+            (8101, 8000, 1000),
+            cut_link_argv(
+                link,
+                two,
+                "",
+                &[cfg[0], cfg[1], "-o", "/tmp/x", long.as_str()],
+            ),
+        ),
+        (
+            (8102, 8000, 1000),
+            cut_link_argv(link, &last, "", &[long.as_str()]),
+        ),
+        ((8103, 8000, 1000), {
+            let mut v = cut_link_argv(link, order, GODEBUG_GO126_GO118, &[]);
+            v.swap(1, 3);
+            v.swap(2, 4);
+            v
+        }),
+        (
+            (8104, 300, 1000),
+            cut_link_argv(link, shell, GODEBUG_GO126_GO118, &[]),
+        ),
+        (
+            (8105, 8010, 1000),
+            cut_link_argv(&tc_link, switched, GODEBUG_GO126_GO118, &[]),
+        ),
+        (
+            (8106, 8020, 33),
+            cut_link_argv(link, service, GODEBUG_GO126_GO118, &[]),
+        ),
+    ] {
+        go_link_cut(&p, ids, &argv, 3);
+    }
+    let mut pid = 9200;
+    for (go_pid, uid, image) in [
+        (8000, 1000, two),
+        (8000, 1000, last.as_str()),
+        (8000, 1000, order),
+        (8000, 1000, shell),
+        (8010, 1000, switched),
+        (8000, 1000, dropped),
+    ] {
+        pid += 1;
+        let e = go_exec(pid, go_pid, uid, image, &[image], 6, false);
+        let d = p.decide_in(&e, PostureKind::Engaged).expect("a decision");
+        assert_eq!(d.verdict.rule_id, "R001_ExecFromTmp", "{image}");
+        assert_eq!(
+            (d.verdict.severity, d.verdict.action.clone()),
+            (Severity::High, ResponseAction::Log),
+            "{image}: the person's record, the kill held"
+        );
+        assert_eq!(
+            d.primary().held_action,
+            Some(ResponseAction::KillProcessTree),
+            "{image}"
+        );
+    }
+    let e = go_exec(9300, 8020, 33, service, &[service], 6, false);
+    let d = p.decide_in(&e, PostureKind::Engaged).expect("a decision");
+    assert_eq!(
+        (d.verdict.rule_id.as_str(), d.verdict.action.clone()),
+        ("R001_ExecFromTmp", ResponseAction::KillProcessTree),
+        "the service account's go run: killed"
+    );
+}
+
 /// Lot 283b: a person's exec from /tmp (uid 1000: `go test`'s binary, an
 /// AppImage's AppRun) is R001's High record below COMBAT, its kill held and
 /// given back by COMBAT or a signed `enforce`; the same program run by a

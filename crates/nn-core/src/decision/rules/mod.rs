@@ -440,7 +440,10 @@ pub(crate) fn loader_listed_record(
 /// `-toolexec` program, a `go generate` command, a file another process
 /// dropped in a `go-build` directory — and the same file run from a shell,
 /// by another parent or by a `go` in a home: judged as before. Without a
-/// lineage (tests, the boot-time rule set): never.
+/// lineage (tests, the boot-time rule set): never. Lot 372: the linker's
+/// output also read from an argv the sensor cut (Go 1.21 and later pass a
+/// long `-X=runtime.godebugDefault=…`), in the `go` command's own shape
+/// only ([`crate::posture::script_args::go_link_output`]).
 #[derive(Clone, Default)]
 pub struct GoBuilds(Option<GoBuildCheck>);
 

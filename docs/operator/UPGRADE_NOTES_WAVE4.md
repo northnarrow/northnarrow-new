@@ -4798,3 +4798,46 @@ left too little trace.
     after its seal is a signed degradation (`chain_early_eviction`): a
     flood of records, a user's included, can push the oldest from the host;
     the export keeps a copy.
+
+## 59. `go test` and `go run` on Go 1.21 and later are Low again (lot 372)
+
+The rc7 soak on Ubuntu 26.04 (Go 1.26 from the distribution) recorded a
+person's `go test` test binary (`/tmp/go-build…/b078/calc.test`) and `go
+run` program (`…/b001/exe/nncorpus`) as `R001_ExecFromTmp` High, a
+would-have kill in ENGAGED; on Ubuntu 22.04 (Go 1.18) the same load was
+Low, as §57 meant.
+
+- **The cause.** Since Go 1.21, `go` passes its linker
+  `-X=runtime.godebugDefault=…`: every GODEBUG setting changed since the
+  main module's `go` line. For a `go 1.18` module that is 524 bytes on Go
+  1.26 and 350 on Go 1.24, so the link command passes the 511 bytes of
+  arguments the exec sensor keeps and arrives cut (`argv_truncated`). §57's
+  identity read the linker's output only from a whole argument list, so it
+  noted no link and the output was judged as any exec from `/tmp`. A
+  module whose `go` line is the toolchain's own, or Go 1.20 and earlier,
+  passes no such list and was not affected.
+- **What changes.** A cut link command names its output only in the `go`
+  command's own shape — `link -o <target> -importcfg …`: `-o` the first
+  argument, its target whole, no other output option and no response file
+  (`@…`) among the arguments kept, and no last argument a cut may have made of one. Every other fact
+  of §57 is unchanged: the packaged toolchain's own linker, run by the very
+  `go` process that then runs the file, in its work directory's layout, by
+  its path, not unlinked, for a person's account.
+- **What it is not.** Go 1.24's caching of `go run` programs puts nothing
+  in the work directory: a program already in the build cache runs from
+  `GOCACHE` itself (in the home by default, so no staging rule sees it),
+  and test binaries are not cached. A `GOCACHE` under `/tmp` or
+  `/var/tmp` makes such a run an exec from there, judged as before.
+- **Still judged.** A second `-o` among the arguments kept, the target cut,
+  `-o` not first, a link run by a shell or forked by a `-toolexec` program (one that `exec`s the real linker in place leaves `go` as its parent and is noted), a `go`
+  a `GOTOOLCHAIN` switch downloaded into the module cache (its linker is not
+  in a root-only system tree), a file dropped in a `go-build` directory,
+  `-exec` wrappers, and root's and a service account's build output. What
+  the cut hides is `go`'s own later flags and the user's `-ldflags`: a
+  second `-o` there is the user's own build flag, Low by design as the
+  user's own code (`KNOWN_LIMITATIONS.md`).
+- **Upgrade.** No configuration. Expect fewer R001/R003 High records from
+  developers' `go test` and `go run` on Debian 13 and Ubuntu 26.04 (Go 1.24
+  and later), and wherever a module's `go` line is far older than the
+  toolchain (Go 1.22's list for a `go 1.18` module is 89 bytes, so Ubuntu
+  24.04's link usually fits); nothing else changes.
