@@ -954,6 +954,19 @@ pub fn succession_record(ebpf: &Ebpf, now_ns: u64) -> Option<nn_model::Event> {
     })
 }
 
+/// Lot 374: both roles found vacated at the agent's start — the agent's and
+/// the watchdog's holders exited this boot and neither saw the other's
+/// exit: the gap's detail, read from `ebpf`'s reused `ROLE_TGIDS` before
+/// the start claims its role (`nn_linux::witness::roles_gap`). `None`
+/// otherwise, or with no pinned map.
+pub fn roles_gap(ebpf: &Ebpf) -> Option<String> {
+    let a: Array<&MapData, u32> =
+        Array::try_from(ebpf.map(antitamper_bpf::ROLE_TGIDS_MAP_NAME)?).ok()?;
+    let agent = a.get(&antitamper_bpf::ROLE_SLOT_AGENT, 0).ok()?;
+    let watchdog = a.get(&antitamper_bpf::ROLE_SLOT_WATCHDOG, 0).ok()?;
+    crate::witness::roles_gap(agent, watchdog).map(|f| f.detail)
+}
+
 impl BpfGuard {
     /// External audit ATP-013: record the ids of every map of `ebpf` — call
     /// right after the load, before any `take_map`.

@@ -350,14 +350,9 @@ pub struct Identity {
     pub cgroup: Option<String>,
 }
 
-/// The slice both our units run in (`Slice=`).
-pub const OUR_SLICE: &str = "northnarrow.slice";
-
-/// The agent's unit.
-pub const AGENT_UNIT: &str = "northnarrow-agent.service";
-
-/// The watchdog's unit.
-pub const WATCHDOG_UNIT: &str = "northnarrow-watchdog.service";
+/// Our slice and units' names (one source with the eBPF programs' check of
+/// the same cgroup, `common::wire`).
+pub use common::wire::{AGENT_UNIT, OUR_SLICE, WATCHDOG_UNIT};
 
 impl Identity {
     /// Started for the role of `unit` (one of ours): by PID 1, in that
@@ -382,6 +377,21 @@ impl Identity {
 pub fn stat_ppid(stat: &str) -> Option<u32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The start of a `/proc/<pid>/stat` text, in clock ticks since boot
+/// (field 22).
+pub fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// [`stat_start_ticks`] of process `pid`, read now: with its pid, what
+/// names one process (a pid is reused, never with the same start).
+pub fn start_ticks(pid: u32) -> Option<u64> {
+    crate::kernel_roots::read_text(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| stat_start_ticks(&s))
 }
 
 /// [`Identity`] of process `pid`, read now.
@@ -559,6 +569,9 @@ mod tests {
         assert_eq!(stat_ppid("42 (a) b) S 1 42 42 0"), Some(1));
         assert_eq!(stat_ppid("42 (northnarrow-age) S 977 42"), Some(977));
         assert_eq!(stat_ppid("42 (x"), None);
+        let stat = "42 (a b) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10";
+        assert_eq!(stat_start_ticks(stat), Some(98765));
+        assert_eq!(stat_start_ticks("42 (x) S 1"), None);
     }
 
     #[test]

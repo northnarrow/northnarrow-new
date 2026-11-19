@@ -298,6 +298,7 @@ pub(crate) fn machine(
             cli.resolved_watchdog_exe(),
             Arc::clone(&watchdog_audit),
             Arc::clone(&mount_refresh),
+            cli.witness_dir.clone(),
         );
     }
     // External audit EBPF-001: PID 1 may signal the agent at the very end

@@ -1050,8 +1050,21 @@ fn high_kind(kind: &str) -> bool {
             // lot 359 (the re-check 3 of #567, N4)
             | crate::anti_tamper::pin_lock::MISSING
             | crate::anti_tamper::pin_lock::CHANGED
+            // lot 374: the other role's vacancy, its successor, a refused start
+            | WATCHDOG_START_REFUSED
+            | WITNESS_UNAVAILABLE
+            | crate::witness::WATCHDOG_SUCCESSION
+            | crate::witness::WATCHDOG_SUCCESSOR_REFUSED
+            | crate::witness::WITNESS_ROW
+            | crate::witness::WITNESS_BROKEN
+            | crate::witness::ROLES_VACATED_GAP
     )
 }
+
+/// Lot 374: a start of the watchdog that refused itself (its hold record).
+pub const WATCHDOG_START_REFUSED: &str = "watchdog_start_refused";
+/// Lot 374: the watchdog's witness not opened (its hold record).
+pub const WITNESS_UNAVAILABLE: &str = "witness_unavailable";
 
 /// Fix round 3 of #567: a pin of the agent's gone while it holds the object
 /// (`antitamper_bpf::held`) — High.
@@ -1751,6 +1764,18 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                         wh::REASON_PIN_HANDLE_FAILED => (
                             PIN_HANDLE_FAILED,
                             "the watchdog's handle on the agent's pinned maps failed",
+                        ),
+                        // Lot 374: the watchdog's start refused itself
+                        // (a loader variable, a mapping not expected), and
+                        // its witness not opened — the surviving role signs
+                        wh::REASON_START_SELF_CHECK => (
+                            WATCHDOG_START_REFUSED,
+                            "a start of the watchdog refused itself before it took its role",
+                        ),
+                        wh::REASON_WITNESS_UNAVAILABLE => (
+                            WITNESS_UNAVAILABLE,
+                            "the watchdog could not open its witness: the agent's vacancies are \
+                             not signed by it",
                         ),
                         wh::REASON_HOLD_RETRY => (
                             "watchdog_hold",

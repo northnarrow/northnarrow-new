@@ -371,8 +371,11 @@ pub const STATE_PROTECTED_FILES: &[&str] = &[
 /// Tappa 9.0 detection chains — `detections.jsonl` and the triage
 /// `status_events.jsonl` — were deletable/truncatable by root with no
 /// denial (signed, so detectable after the fact, but not defended).
-pub const STATE_PROTECTED_SUBDIRS: &[(&str, &[&str])] =
-    &[("detections", &["detections.jsonl", "status_events.jsonl"])];
+pub const STATE_PROTECTED_SUBDIRS: &[(&str, &[&str])] = &[
+    ("detections", &["detections.jsonl", "status_events.jsonl"]),
+    // lot 374: the watchdog's witness chain and the agent's import position
+    ("witness", &["witness.chain", "witness.imported"]),
+];
 
 /// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
 /// K4 canary content templates the renderer reads at
@@ -1811,6 +1814,34 @@ pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
         path = %detections_log_path.display(),
         "anti-tamper FS: detections log bootstrapped (zero-byte placeholder for PROTECTED_INODES)"
     );
+    Ok(())
+}
+
+/// Lot 374: the watchdog's witness directory (`--witness-dir`) and its two
+/// files — the chain the watchdog appends to, the agent's import position
+/// — made pre-attach (0700, zero-byte 0600 files), so that the attach
+/// registers their inodes ([`STATE_PROTECTED_SUBDIRS`]): no process outside
+/// the family writes, renames or removes them. Idempotent: what is there
+/// (an existing chain) is left untouched.
+pub fn bootstrap_witness_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        DirBuilder::new()
+            .mode(STATE_DIR_MODE)
+            .recursive(true)
+            .create(dir)
+            .with_context(|| format!("creating the witness directory {}", dir.display()))?;
+    }
+    for name in [nn_proto::witness::CHAIN_FILE, nn_proto::witness::IMPORTED_FILE] {
+        let path = dir.join(name);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(crate::chainlog::STATE_LOG_FILE_MODE)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+    }
     Ok(())
 }
 

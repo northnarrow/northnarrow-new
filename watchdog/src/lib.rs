@@ -24,6 +24,9 @@
 //! 5. Wait for SIGTERM/SIGINT and exit — restart loop + layer-2
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
+/// Lot 374: the watchdog as the agent's witness (its own signed chain).
+pub mod witness;
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -130,6 +133,11 @@ pub struct Cli {
     /// quorum stops it ([`check_shutdown_marker`]).
     #[arg(long = "shutdown-marker", value_name = "PATH", default_value = nn_proto::shutdown_marker::MARKER_PATH)]
     pub shutdown_marker: PathBuf,
+
+    /// Lot 374: the directory of the watchdog's witness chain (the agent
+    /// makes it in its state directory; [`witness`]).
+    #[arg(long = "witness-dir", value_name = "DIR", default_value = nn_proto::witness::WITNESS_DIR)]
+    pub witness_dir: PathBuf,
 
     /// The admin keys a shutdown must be signed by (external audit
     /// WDG-001: the watchdog verifies the quorum the agent verified).

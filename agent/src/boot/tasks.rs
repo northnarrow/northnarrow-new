@@ -387,11 +387,21 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
     expected_exe: PathBuf,
     audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
     mount_refresh: MountGuardRefresh,
+    witness_dir: PathBuf,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         // Last verified PID we stored (`None` == exemption cleared).
         let mut last: Option<u32> = None;
+        // Lot 374: the watchdog's witness chain read and its key certified;
+        // a watchdog death this agent saw, until a successor is judged; the
+        // successor refused (its record signed once).
+        let mut witness = nn_linux::witness::WitnessReader::new(&witness_dir);
+        let mut succession_pending = false;
+        let mut successor_refused: Option<u32> = None;
+        // Lot 374: the watchdog registered after the last tick (0: none),
+        // for the witness round.
+        let verified_now = std::sync::atomic::AtomicU32::new(0);
         // A pid the pidfile named while the registered watchdog ran (logged once).
         let mut refused: Option<u32> = None;
         // Lot 273: the keys of the verified watchdog's unit cgroup in
@@ -422,6 +432,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 WatchdogResolution::Verified { pid, .. } => Some(*pid),
                 _ => None,
             };
+            verified_now.store(last.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
             if new_pid == last {
                 // External audit POS-009: the posture exemption follows the
                 // start of the process verified now (a restart that drew the
@@ -469,8 +480,57 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     let f = northnarrow_agent::self_integrity::watchdog_gone(prev, &resolution);
                     let log = audit.get().and_then(|l| l.as_ref());
                     northnarrow_agent::self_integrity::report_event(log, &f);
+                    succession_pending = true;
                 }
                 withdraw_watchdog_pid(bpffs_root, prev, &expected_exe);
+            }
+            // Lot 374: the process that takes the watchdog's role after a
+            // death this agent saw, or while its slot is vacated, gets the
+            // agent's registration only as its unit's restart with clean
+            // marks and nothing foreign — the vacated role's right, as the
+            // kernel's guard gives it; recorded either way (the agent, the
+            // surviving role, signs the watchdog's succession).
+            if let Some(p) = new_pid {
+                let vacated = bpffs_root
+                    .and_then(|r| {
+                        antitamper_bpf::role_slot(r, antitamper_bpf::ROLE_SLOT_WATCHDOG).ok()
+                    })
+                    .is_some_and(|s| s == antitamper_bpf::ROLE_VACATED);
+                if succession_pending || vacated {
+                    let v = nn_linux::witness::judge_watchdog_successor(
+                        p,
+                        &antitamper_bpf::start_check::identity(p),
+                        nn_linux::witness::marks_clean(p),
+                        &antitamper_bpf::start_check::inspect(p),
+                    );
+                    let log = audit.get().and_then(|l| l.as_ref());
+                    if !v.given {
+                        if successor_refused != Some(p) {
+                            warn!(watchdog_pid = p, detail = %v.detail, "the watchdog's successor is not its unit's clean restart — not registered");
+                            northnarrow_agent::self_integrity::report_event(
+                                log,
+                                &northnarrow_agent::self_integrity::Finding {
+                                    kind: nn_linux::witness::WATCHDOG_SUCCESSOR_REFUSED,
+                                    detail: v.detail,
+                                },
+                            );
+                            successor_refused = Some(p);
+                        }
+                        exempt.clear_watchdog();
+                        last = None;
+                        verified_now.store(0, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    northnarrow_agent::self_integrity::report_event(
+                        log,
+                        &northnarrow_agent::self_integrity::Finding {
+                            kind: nn_linux::witness::WATCHDOG_SUCCESSION,
+                            detail: v.detail,
+                        },
+                    );
+                    succession_pending = false;
+                    successor_refused = None;
+                }
             }
             if let Some(p) = new_pid {
                 if let Err(e) =
@@ -634,10 +694,31 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 }
             }
             last = new_pid;
+            verified_now.store(new_pid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        };
+        // Lot 374: the verified watchdog's witness key certified, then the
+        // witness rows imported into the signed audit chain — only while the
+        // audit log is open (a row is never passed over unsigned).
+        let mut witness_round = |verified: Option<u32>| {
+            let Some(log) = audit.get().and_then(|l| l.as_ref()) else {
+                return;
+            };
+            if let Some(p) = verified {
+                if let Some(f) = witness.certify(p) {
+                    northnarrow_agent::self_integrity::report_event(Some(log), &f);
+                }
+            }
+            let (found, position) = witness.pending();
+            for f in &found {
+                northnarrow_agent::self_integrity::report_event(Some(log), f);
+            }
+            witness.commit(position);
         };
         loop {
             tick.tick().await;
             nn_linux::runtime::off_the_runtime(&mut tick_once);
+            let v = verified_now.load(std::sync::atomic::Ordering::Relaxed);
+            nn_linux::runtime::off_the_runtime(|| witness_round((v != 0).then_some(v)));
         }
     });
 }
