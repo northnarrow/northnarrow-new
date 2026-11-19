@@ -3,7 +3,7 @@
 // No `//!` and no `#![…]` here: the watchdog's tests `include!` this file
 // (`watchdog/tests/privileged_e2e.rs`), which takes items only. The agent's
 // tests name it `common::agent_state`. Standard library only, for the same
-// reason.
+// reason (and lot 374's `antitamper_bpf::start_check`, which both link).
 //
 // An agent writes its evidence where its command line says, and at the
 // installed agent's paths for whatever the command line leaves out. The
@@ -427,21 +427,6 @@ pub enum Launch {
     /// sets, so the agent's effective set lacks them (a unit's
     /// `CapabilityBoundingSet=` without them).
     SudoWithout(&'static [&'static str]),
-    /// Lot 370 (F10-4; the re-check of #578): as a transient service of
-    /// PID 1 (`systemd-run`, through the real sudo) — the agent a child of
-    /// PID 1, as its unit's restart starts it: the one start that may take
-    /// the role a previous agent vacated this boot while the BPF guard
-    /// enforces (one started from a shell gets no handle on the pins then,
-    /// by design). Its standard streams are the command's (`--pipe`), its
-    /// standard input none; `systemd-run` waits for it (`--wait`) and is the
-    /// child the test holds — the agent's pid is in its pid file.
-    ///
-    /// Lot 374: the unit is named as the agent's own
-    /// (`northnarrow-agent.service`, in `northnarrow.slice`): a vacated role
-    /// goes only to a child of PID 1 in its unit's own cgroup. A guest
-    /// where the agent is installed has that unit already: the fixture is
-    /// for a guest without it (the CI's).
-    Unit,
 }
 
 /// The agent of this build: `CARGO_BIN_EXE_northnarrow-agent` in the
@@ -614,27 +599,6 @@ impl InstalledAgent {
                 for (k, v) in env {
                     c.env(k, v);
                 }
-                c
-            }
-            Launch::Unit => {
-                let mut c = Command::new(SUDO);
-                c.args([
-                    "systemd-run",
-                    "--quiet",
-                    "--wait",
-                    "--pipe",
-                    "--collect",
-                    "--service-type=exec",
-                    // lot 374: the agent's own unit and slice (the cgroup a
-                    // vacated role's successor must start in)
-                    "--unit=northnarrow-agent.service",
-                    "--slice=northnarrow.slice",
-                ]);
-                for (k, v) in env {
-                    c.arg(format!("--setenv={k}={v}"));
-                }
-                c.arg("--").arg(&self.path);
-                c.stdin(std::process::Stdio::null());
                 c
             }
             Launch::SudoWithout(caps) => {

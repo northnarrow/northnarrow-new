@@ -308,6 +308,25 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
     }
 }
 
+/// The vacancy row's kind: the role released by a shutdown the admin
+/// quorum signed, vacated otherwise.
+pub fn vacancy_kind(verdict: &crate::ShutdownVerdict) -> &'static str {
+    match verdict {
+        crate::ShutdownVerdict::Authorised => nn_proto::witness::KIND_RELEASED,
+        _ => nn_proto::witness::KIND_VACATED,
+    }
+}
+
+/// The successor row's kind: the agent's unit's clean restart, or not
+/// (`given`: [`successor_detail`]'s verdict).
+pub fn successor_kind(given: bool) -> &'static str {
+    if given {
+        nn_proto::witness::KIND_SUCCEEDED
+    } else {
+        nn_proto::witness::KIND_SUCCESSOR_REFUSED
+    }
+}
+
 /// The vacancy row's detail: the agent `pid` gone, `cause` (the wait's or
 /// systemd's), and what its shutdown marker said — an authorised stop is
 /// one too, and says so.
@@ -443,6 +462,21 @@ mod tests {
             &crate::ShutdownVerdict::Refused("x".into()),
         );
         assert!(d.contains("a shutdown marker refused"), "{d}");
+        // only a signed shutdown releases the role; a refused marker vacates it
+        use nn_proto::witness::{
+            KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_REFUSED, KIND_VACATED,
+        };
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Authorised),
+            KIND_RELEASED
+        );
+        assert_eq!(vacancy_kind(&crate::ShutdownVerdict::Absent), KIND_VACATED);
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into())),
+            KIND_VACATED
+        );
+        assert_eq!(successor_kind(true), KIND_SUCCEEDED);
+        assert_eq!(successor_kind(false), KIND_SUCCESSOR_REFUSED);
     }
 
     fn chain_text(dir: &Path) -> String {

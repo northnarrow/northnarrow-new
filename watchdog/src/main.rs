@@ -573,7 +573,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 if let Some(w) = witness.as_mut() {
                     let cause = exit_cause(&backend, &reaped, agent_pid).await;
                     w.record_or_log(
-                        nn_proto::witness::KIND_VACATED,
+                        northnarrow_watchdog::witness::vacancy_kind(&verdict),
                         &northnarrow_watchdog::witness::vacancy_detail(agent_pid, &cause, &verdict),
                     );
                 }
@@ -696,10 +696,13 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     }
                 };
                 match respawned {
-                    Ok((new_pid, new_fd, successor)) => {
+                    Ok((new_pid, new_fd, (given, successor))) => {
                         // Lot 374: the successor, signed by the witness
                         if let Some(w) = witness.as_mut() {
-                            w.record_or_log(nn_proto::witness::KIND_SUCCEEDED, &successor);
+                            w.record_or_log(
+                                northnarrow_watchdog::witness::successor_kind(given),
+                                &successor,
+                            );
                         }
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
@@ -1002,7 +1005,7 @@ async fn respawn_cycle(
     agent_bin: &std::path::Path,
     hold_path: &std::path::Path,
     old_pid: u32,
-) -> Result<(u32, OwnedFd, String)> {
+) -> Result<(u32, OwnedFd, (bool, String))> {
     info!(
         target: "watchdog.respawn",
         attempt,
@@ -1070,7 +1073,7 @@ async fn respawn_cycle(
         pin_handle_failed(hold_path, new_pid, "reinsert_new_agent_pid", &e);
     }
 
-    Ok((new_pid, new_fd, successor))
+    Ok((new_pid, new_fd, (given, successor)))
 }
 
 /// Lot 374: the successor `new` of the agent `old` — its identity and its
@@ -1260,7 +1263,10 @@ async fn hold(
             // clean restart.
             let (given, successor) = judge_successor(held.agent_pid, pid);
             if let Some(w) = witness.as_mut() {
-                w.record_or_log(nn_proto::witness::KIND_SUCCEEDED, &successor);
+                w.record_or_log(
+                    northnarrow_watchdog::witness::successor_kind(given),
+                    &successor,
+                );
             }
             if !given {
                 warn!(

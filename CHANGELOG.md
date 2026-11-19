@@ -55,6 +55,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `start_check::a_start_maps_only_the_libraries_the_release_gate_allows`,
     `every_transient_unit_the_product_starts_unsets_the_loader_variables`,
     `both_daemons_check_themselves_before_they_take_their_role`.
+  - The bookkeeping (a key certified, a watchdog life's first row, a
+    signed shutdown's release, a unit's clean restart) is signed under the
+    audit op `witness`, never as an `integrity_drift`; a vacancy and a
+    successor that is not its unit's clean restart are High. Test
+    `a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note`,
+    `the_witness_records_are_high_and_its_bookkeeping_is_not`.
+  - The privileged suites: the guard tests remove the enforce-mode agent's
+    pins inside a trusted-installer window opened before its signed stop
+    (a restore agent started by a test is not its unit's restart); the
+    agent and watchdog fixtures pass `--witness-dir`; new
+    `the_watchdog_signs_the_agent_s_vacancy_and_its_successor`.
   - KNOWN_LIMITATIONS: the vacated-role item says what is recorded, by
     whom, and what remains.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
@@ -278,8 +289,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       account's share, not one budget for the host. Test
       `the_loaders_waits_are_root_s_own_and_each_account_s_share`.
     - The privileged suites: the guard tests' restore agent starts as a
-      service, PID 1's child (since lot 374, under the agent's own unit
-      name and slice); the watchdog suite makes
+      service, PID 1's child (since lot 374 the guard tests remove the
+      enforce-mode agent's pins in a window instead); the watchdog suite makes
       `/etc/northnarrow` first and establishes the watchdog role's first
       claim for `the_watchdog_s_own_start_is_not_a_foreign_bpf_handle`.
     - Test assertion messages name what they expect instead of printing a

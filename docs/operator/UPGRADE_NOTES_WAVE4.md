@@ -5012,24 +5012,29 @@ was given code before its `main` refuses itself.
   `/var/lib/northnarrow/witness/witness.chain`:
   - `role_vacated`: the agent exited — its pid, the cause as systemd
     recorded it for that process (the OOM killer, a signal, an exit
-    status; "not known" past 3 s) and what the shutdown marker said (an
-    authorised stop says so);
-  - `role_succeeded`: the process that took the role — its pid, parent and
-    cgroup, whether it is its unit's restart, and the loader variables and
-    executable mappings not expected that it shows (names only);
+    status; "not known" past 3 s) and what the shutdown marker said;
+    `role_released` instead for a shutdown the admin quorum signed;
+  - `role_succeeded` (its unit's clean restart) or `role_successor_refused`
+    (anything else): the process that took the role — its pid, parent and
+    cgroup, and the loader variables and executable mappings not expected
+    that it shows (names only);
   - `role_found_vacant`: a watchdog start that found the agent's role
     already vacated; `witness_opened`: each watchdog life's first row.
-  The agent certifies the key from the watchdog's own descriptor table
-  (`witness_key_certified`) and imports every row it can verify into its
-  audit log every 30 s (`witness_row`, High). A row changed or removed, a
+  The agent certifies the key from the watchdog's own descriptor table and
+  imports every row it can verify into its audit log every 30 s: a vacancy
+  or a successor that is not its unit's clean restart as `witness_row`
+  (`integrity_drift`, High); the key's certification, a life's first row, a
+  release and a clean restart as notes (op `witness`:
+  `witness_key_certified`, `witness_note`). A row changed or removed, a
   chain cut, or a row signed by a key it never certified is High
   (`witness_chain_broken`, `witness_row_uncertified`). A watchdog that
   cannot open its witness records it, and the agent signs
   `witness_unavailable` (High). See `EVIDENCE_CHAINS.md`.
 - **The watchdog's successor**, judged by the agent at its next round: its
   unit's restart with clean marks and nothing foreign is registered and
-  signed (`watchdog_succession`, High: the watchdog died); anything else is
-  not registered (`watchdog_successor_refused`, High). An agent start that
+  signed as a note (`watchdog_succession`; the death itself is
+  `watchdog_gone`, as before); anything else is not registered
+  (`watchdog_successor_refused`, High). An agent start that
   finds both roles vacated signs the gap (`roles_vacated_gap`).
 - **Bound to its unit.** The kernel gives a vacated role's rights (its
   handles on the agent's maps) only to a child of PID 1 running in that
@@ -5067,11 +5072,11 @@ was given code before its `main` refuses itself.
   `install.sh --upgrade` installs them. The agent makes the witness
   directory at its start, before the watchdog's. The kernel object and the
   agent are one build (three BTF offset slots added).
-  - Expect one `witness_key_certified` per watchdog start and one
-    `witness_opened` row imported.
-  - Expect a `role_vacated` row (`witness_row`, High) at each agent exit
-    the watchdog sees — an authorised stop says so — and a
-    `role_succeeded` row after each restart it makes.
+  - Expect one `witness_key_certified` and one `witness_note` (the first
+    row) per watchdog start, under the new audit op `witness`.
+  - Expect a `witness_row` (High) for each agent exit the watchdog sees
+    that is not a signed shutdown, then a `witness_note` for its unit's
+    restart; a `watchdog_succession` note after each watchdog restart.
   - A unit drop-in or a manager environment that set a loader variable for
     the agent or the watchdog no longer reaches them; one that a test
     harness relied on (a `LD_LIBRARY_PATH` for a build's own libraries)

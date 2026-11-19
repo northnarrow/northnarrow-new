@@ -1053,9 +1053,9 @@ fn high_kind(kind: &str) -> bool {
             // lot 374: the other role's vacancy, its successor, a refused start
             | WATCHDOG_START_REFUSED
             | WITNESS_UNAVAILABLE
-            | crate::witness::WATCHDOG_SUCCESSION
             | crate::witness::WATCHDOG_SUCCESSOR_REFUSED
             | crate::witness::WITNESS_ROW
+            | crate::witness::WITNESS_UNCERTIFIED
             | crate::witness::WITNESS_BROKEN
             | crate::witness::ROLES_VACATED_GAP
     )
@@ -2806,6 +2806,25 @@ fn append_entry(
 /// admin socket's own watch, external audit WDG-007): an ERROR and one
 /// signed `integrity_drift`, as a round records one. The caller bounds
 /// how often.
+/// Lot 374: a finding of the witness's bookkeeping (`witness::is_note`)
+/// signed as a note — op [`crate::witness::WITNESS_OP`], an INFO line —
+/// never as a drift of the host.
+pub fn record_note(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    tracing::info!(kind = f.kind, detail = %f.detail, "witness: recorded");
+    let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail });
+    append_entry(audit_log, crate::witness::WITNESS_OP, extra, "recorded");
+}
+
+/// Lot 374: a finding signed as [`record_note`] when it is the witness's
+/// bookkeeping, else as [`report_event`].
+pub fn report_or_note(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    if crate::witness::is_note(f.kind) {
+        record_note(audit_log, f);
+    } else {
+        report_event(audit_log, f);
+    }
+}
+
 pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
     error!(
         kind = f.kind,
@@ -3339,6 +3358,28 @@ mod tests {
             "{}",
             refused.detail
         );
+    }
+
+    /// Lot 374: what the surviving role signs of the other's vacancy and
+    /// successor is High — a witness row, one of a key never certified, a
+    /// broken chain, the watchdog's refused successor — and its bookkeeping
+    /// (a key certified, a note, the watchdog's clean succession) is not.
+    #[test]
+    fn the_witness_records_are_high_and_its_bookkeeping_is_not() {
+        use crate::witness as w;
+        for kind in [
+            w::WITNESS_ROW,
+            w::WITNESS_UNCERTIFIED,
+            w::WITNESS_BROKEN,
+            w::WATCHDOG_SUCCESSOR_REFUSED,
+            WATCHDOG_START_REFUSED,
+            WITNESS_UNAVAILABLE,
+        ] {
+            assert!(high_kind(kind), "{kind}");
+        }
+        for kind in [w::WITNESS_KEY, w::WITNESS_NOTE, w::WATCHDOG_SUCCESSION] {
+            assert!(!high_kind(kind), "{kind}");
+        }
     }
 
     /// External audit WDG-007: a finding another task reports between two

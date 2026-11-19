@@ -404,7 +404,8 @@ not cause as an incident.
     not start with. The watchdog's key lives in its memory for its life;
     the agent certifies its public half from the watchdog's own descriptor
     table and imports every row it can verify into its signed audit chain
-    (`witness_row`). A row changed or removed, or signed by a key the agent
+    (`witness_row`, High, for a vacancy or a successor that is not its
+    unit's clean restart). A row changed or removed, or signed by a key the agent
     never certified, is recorded as such (`witness_chain_broken`,
     `witness_row_uncertified`).
   - The watchdog's vacancy and its successor are signed by the live agent

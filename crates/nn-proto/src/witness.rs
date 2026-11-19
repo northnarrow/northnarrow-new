@@ -48,8 +48,16 @@ pub const ROW_VERSION: u32 = 1;
 pub const KIND_OPENED: &str = "witness_opened";
 /// The agent's role fell vacant: its holder exited (the cause, when known).
 pub const KIND_VACATED: &str = "role_vacated";
-/// A process took the agent's vacated role: who it is and what it shows.
+/// The agent's role released by a shutdown the admin quorum signed (no
+/// successor follows).
+pub const KIND_RELEASED: &str = "role_released";
+/// The agent's unit's restart, nothing foreign in it, took the vacated
+/// role: who it is and what it shows.
 pub const KIND_SUCCEEDED: &str = "role_succeeded";
+/// A process that is not the agent's unit's clean restart took the vacated
+/// role (not given the watchdog's re-registration): who it is, where it was
+/// started and what it shows.
+pub const KIND_SUCCESSOR_REFUSED: &str = "role_successor_refused";
 /// The watchdog's start found the agent's role vacated and no agent: both
 /// roles were vacant.
 pub const KIND_FOUND_VACANT: &str = "role_found_vacant";
@@ -92,7 +100,7 @@ impl Row {
             self.kind,
             self.detail,
             self.seq,
-            &self.key.get(..16).unwrap_or(&self.key)
+            self.key.get(..16).unwrap_or(&self.key)
         )
     }
 }

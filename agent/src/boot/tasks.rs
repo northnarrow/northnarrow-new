@@ -521,7 +521,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         verified_now.store(0, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
-                    northnarrow_agent::self_integrity::report_event(
+                    northnarrow_agent::self_integrity::report_or_note(
                         log,
                         &northnarrow_agent::self_integrity::Finding {
                             kind: nn_linux::witness::WATCHDOG_SUCCESSION,
@@ -705,12 +705,12 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
             };
             if let Some(p) = verified {
                 if let Some(f) = witness.certify(p) {
-                    northnarrow_agent::self_integrity::report_event(Some(log), &f);
+                    northnarrow_agent::self_integrity::report_or_note(Some(log), &f);
                 }
             }
             let (found, position) = witness.pending();
             for f in &found {
-                northnarrow_agent::self_integrity::report_event(Some(log), f);
+                northnarrow_agent::self_integrity::report_or_note(Some(log), f);
             }
             witness.commit(position);
         };

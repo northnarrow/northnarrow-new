@@ -1670,59 +1670,74 @@ impl GuardFixture {
         }
     }
 
-    /// A run of the same binary without the variable: the guard re-armed
-    /// in observe mode. Stopped signed, else by the fixtures' eviction
-    /// (which observe mode allows).
-    ///
-    /// Lot 370 (F10-4; the re-check of #578): the enforce-mode agent's exit
-    /// vacated its role, and while the guard enforces only a successor
-    /// started for the role takes a handle on the pins — PID 1's child, as
-    /// the unit's restart. Started from the test's shell it was refused
-    /// (`BPF_OBJ_GET`: EPERM, exit 78), the guard stayed in enforce mode and
-    /// every later agent of the suite was refused: 18 tests on #578's KVM
-    /// suites. It starts as a transient service ([`Launch::Unit`]).
-    fn restore_observe(&self) -> Result<(), String> {
-        let mut run = self.spawn_as("restore", false, Launch::Unit)?;
-        let ready = wait_ready(&mut run).and_then(|_| {
-            let reg = wait_for_log_line(&run.log, &["own objects registered"], GUARD_LOG_TIMEOUT)
-                .ok_or("no BPF self-defence registration line")?;
-            if reg.contains("mode=\"observe\"") {
-                Ok(())
-            } else {
-                Err(format!("the guard re-armed in another mode: {reg}"))
-            }
-        });
-        let stopped = common::shutdown_signed(
-            &mut run.child,
-            &self.signed(&run.socket),
-            GUARD_STOP_TIMEOUT,
-        )
-        .or_else(|e| {
-            // the agent is PID 1's child: its pid from its pid file
-            let agent: Vec<u32> = std::fs::read_to_string(&run.pid_file)
-                .ok()
-                .and_then(|b| b.trim().parse().ok())
-                .into_iter()
-                .collect();
-            common::try_quit_agent_with(&mut run.child, &agent, common::QUIT_TIMEOUT)
-                .map_err(|q| format!("{e}; then {q}"))
-        });
-        match (ready, stopped) {
-            (Ok(()), Ok(())) => Ok(()),
-            (r, s) => Err(format!(
-                "{}{}\n{}",
-                r.err().unwrap_or_default(),
-                s.err().map(|e| format!(" (stop: {e})")).unwrap_or_default(),
-                log_tail(&run.log)
-            )),
+    /// Lot 374: the enforce run, for its signed stop, with a
+    /// trusted-installer window opened on it first ([`TEARDOWN_WINDOW`]):
+    /// the window outlives the agent, and in it the teardown removes the
+    /// pins its guard keeps ([`purge_pins_in_window`]).
+    fn take_for_stop(&mut self) -> Option<GuardRun> {
+        let run = self.enforce_run.take()?;
+        if let Err(e) = self.grant_window(run.name, TEARDOWN_WINDOW.as_secs() as u32) {
+            eprintln!(
+                "guard e2e: no teardown window on the {} agent: {e}",
+                run.name
+            );
         }
+        Some(run)
+    }
+}
+
+/// Lot 374: how long the teardown's window lasts (the signed stop, then the
+/// purge).
+#[cfg(feature = "debug-trigger")]
+const TEARDOWN_WINDOW: Duration = Duration::from_secs(90);
+
+/// Lot 374: the pins an enforce-mode agent's guard keeps after its stop,
+/// removed inside the window opened before it (as the lab's
+/// `lab_purge_pins` and `install.sh` purge them): the pin root (its lock
+/// unmounted first), the tracker's, the judges' and the module history's,
+/// then their LSM programs gone. The enforce run's exit vacated its role,
+/// and only its unit's restart takes a vacated role (lot 374: in the
+/// unit's own cgroup, which no agent a test starts runs in): before, a
+/// restore agent started as a transient service put the guard back in
+/// observe mode. After the purge the next fixture's agent is a first claim.
+#[cfg(feature = "debug-trigger")]
+fn purge_pins_in_window() -> Result<(), String> {
+    let script = r#"
+for i in 1 2 3 4; do
+    mountpoint -q /sys/fs/bpf/northnarrow 2>/dev/null || break
+    umount /sys/fs/bpf/northnarrow 2>/dev/null || umount -l /sys/fs/bpf/northnarrow 2>/dev/null || break
+done
+rm -rf /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null
+rm -f /run/northnarrow/cgroup-join-pins /run/northnarrow/module-writes-pins 2>/dev/null
+left=$(ls -d /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null)
+[ -z "$left" ] || { echo "pins left: $left"; exit 1; }
+for i in $(seq 1 20); do
+    [ "$(bpftool prog show 2>/dev/null | grep -c ' lsm ')" = 0 ] && exit 0
+    sleep 1
+done
+echo "LSM programs still loaded: $(bpftool prog show 2>/dev/null | grep -c ' lsm ')"
+exit 1
+"#;
+    let out = Command::new("sudo")
+        .args(["sh", "-c", script])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn the purge: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the pin purge failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
     }
 }
 
 #[cfg(feature = "debug-trigger")]
 impl Drop for GuardFixture {
     fn drop(&mut self) {
-        if let Some(mut run) = self.enforce_run.take() {
+        if let Some(mut run) = self.take_for_stop() {
             if let Err(e) = common::shutdown_signed(
                 &mut run.child,
                 &self.signed(&run.socket),
@@ -1736,11 +1751,12 @@ impl Drop for GuardFixture {
                 return;
             }
         }
-        if let Err(e) = self.restore_observe() {
+        if let Err(e) = purge_pins_in_window() {
             common::fail_teardown(&format!(
-                "guard e2e: the BPF guard could not be put back in observe mode ({e}). The next \
-                 fixtures' agents (other binaries) are refused their registration until the pin \
-                 root is purged or the host restarted (nn-lab.sh: lab_purge_pins restarts the guest)."
+                "guard e2e: the enforce-mode agent's pins could not be removed in the teardown's \
+                 window ({e}). The next fixtures' agents (other binaries) are refused their \
+                 registration until the pin root is purged or the host restarted (nn-lab.sh: \
+                 lab_purge_pins restarts the guest)."
             ));
         }
     }
@@ -1888,9 +1904,9 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         "the agent is gone after the refused teardown"
     );
 
-    // 6. The authorised stop: a 2-of-N signed shutdown. Drop then puts
-    //    the guard back in observe mode.
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    // 6. The authorised stop: a 2-of-N signed shutdown. Drop then removes
+    //    its pins in the window opened before it (lot 374).
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2131,8 +2147,8 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
         log_tail(&log)
     );
 
-    // The authorised stop, signed; Drop puts the guard back in observe mode.
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    // The authorised stop, signed; Drop removes the pins in its window.
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2287,7 +2303,7 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
         "a decisive record or the ring lost: {drops:#?}"
     );
 
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2537,7 +2553,7 @@ fn a_flood_of_minor_refusals_never_hides_a_held_load() {
         "a held load refused unsigned, or the ring lost: {drops:#?}"
     );
 
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2594,7 +2610,7 @@ fn assert_decisive_record_after_flood(
             .any(|l| l.contains("fs_protect") || l.contains(&decisive)),
         "a decisive record or the ring lost: {drops:#?}"
     );
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -3050,8 +3066,8 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // 3. The authorised stop. Drop then restores the guard's mode.
-    let mut run = fx.enforce_run.take().expect("the sigio run");
+    // 3. The authorised stop. Drop then removes the pins in its window.
+    let mut run = fx.take_for_stop().expect("the sigio run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {

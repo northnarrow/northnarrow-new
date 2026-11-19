@@ -7,7 +7,9 @@
 //!   ([`WITNESS_KEY`]) — once per key.
 //! * The watchdog's witness chain: each row the agent can verify — signed
 //!   by a key it certified, linked to the row before it — imported into its
-//!   own chain ([`WITNESS_ROW`]); a row of a key it never certified is
+//!   own chain ([`WITNESS_ROW`], High: the role vacated, taken by a process
+//!   that is not its unit's clean restart; [`WITNESS_NOTE`]: the
+//!   bookkeeping); a row of a key it never certified is
 //!   recorded as such ([`WITNESS_UNCERTIFIED`]), a broken chain too
 //!   ([`WITNESS_BROKEN`]). Where it stopped is kept in the witness directory
 //!   ([`nn_proto::witness::IMPORTED_FILE`]), which only the family writes.
@@ -22,8 +24,25 @@ use std::path::{Path, PathBuf};
 
 use nn_proto::witness::{
     parse_key_record, to_import, Imported, CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE,
-    KEY_MEMFD_NAME, KIND_OPENED,
+    KEY_MEMFD_NAME, KIND_OPENED, KIND_RELEASED, KIND_SUCCEEDED,
 };
+
+/// A finding of this module signed as a note ([`WITNESS_OP`]): the
+/// bookkeeping of the witness, never a drift of the host.
+pub fn is_note(kind: &str) -> bool {
+    matches!(kind, WITNESS_KEY | WITNESS_NOTE | WATCHDOG_SUCCESSION)
+}
+
+/// A verified row's finding: the watchdog's bookkeeping a note, its record
+/// of the role's vacancy or of a successor not its unit's clean restart a
+/// [`WITNESS_ROW`] (High).
+pub fn row_kind(row_kind: &str) -> &'static str {
+    if matches!(row_kind, KIND_OPENED | KIND_RELEASED | KIND_SUCCEEDED) {
+        WITNESS_NOTE
+    } else {
+        WITNESS_ROW
+    }
+}
 
 use crate::self_integrity::Finding;
 
@@ -33,15 +52,19 @@ pub const WITNESS_KEY: &str = "witness_key_certified";
 /// A row of the watchdog's witness chain, verified: the agent's role
 /// vacated, its successor, the role found vacated (High).
 pub const WITNESS_ROW: &str = "witness_row";
-/// A witness row of a watchdog life's start (informational).
-pub const WITNESS_OPENED: &str = "witness_opened";
+/// A witness row of the watchdog's bookkeeping, verified: a life's first
+/// row, the role released by a signed shutdown, the unit's clean restart
+/// taking it (signed as a note, [`WITNESS_OP`], not as a drift).
+pub const WITNESS_NOTE: &str = "witness_note";
+/// The audit op of the witness's notes and of a key's certification.
+pub const WITNESS_OP: &str = "witness";
 /// A witness row signed by a key the agent never certified (High: what it
 /// says is the watchdog's claim alone).
 pub const WITNESS_UNCERTIFIED: &str = "witness_row_uncertified";
 /// The witness chain broken: a row changed, removed or not one (High).
 pub const WITNESS_BROKEN: &str = "witness_chain_broken";
-/// The watchdog's vacated role taken by its unit's clean restart (High:
-/// the watchdog died).
+/// The watchdog's vacated role taken by its unit's clean restart (a note:
+/// its death is `watchdog_gone`).
 pub const WATCHDOG_SUCCESSION: &str = "watchdog_succession";
 /// A process that took the watchdog's vacated role refused the agent's
 /// registration: not its unit's restart, marks not clean, or something
@@ -189,10 +212,10 @@ impl WitnessReader {
         }
         let mut last = None;
         for (row, hash, certified) in &t.rows {
-            let kind = match (*certified, row.kind == KIND_OPENED) {
-                (false, _) => WITNESS_UNCERTIFIED,
-                (true, true) => WITNESS_OPENED,
-                (true, false) => WITNESS_ROW,
+            let kind = if *certified {
+                row_kind(&row.kind)
+            } else {
+                WITNESS_UNCERTIFIED
             };
             out.push(Finding {
                 kind,
@@ -337,6 +360,39 @@ mod tests {
         assert!(v.detail.contains("taken by pid 9") && v.detail.contains("marks clean"));
     }
 
+    /// Lot 374: the watchdog's record of a vacancy, or of a successor that
+    /// is not its unit's clean restart, is a row (High); its bookkeeping —
+    /// a life's first row, a signed shutdown's release, the unit's clean
+    /// restart — a note, as the key's certification and the watchdog's
+    /// clean succession.
+    #[test]
+    fn a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note() {
+        use nn_proto::witness::{KIND_FOUND_VACANT, KIND_SUCCESSOR_REFUSED};
+        for k in [
+            KIND_VACATED,
+            KIND_FOUND_VACANT,
+            KIND_SUCCESSOR_REFUSED,
+            "a kind of later",
+        ] {
+            assert_eq!(row_kind(k), WITNESS_ROW, "{k}");
+        }
+        for k in [KIND_OPENED, KIND_RELEASED, KIND_SUCCEEDED] {
+            assert_eq!(row_kind(k), WITNESS_NOTE, "{k}");
+        }
+        for k in [WITNESS_KEY, WITNESS_NOTE, WATCHDOG_SUCCESSION] {
+            assert!(is_note(k), "{k}");
+        }
+        for k in [
+            WITNESS_ROW,
+            WITNESS_UNCERTIFIED,
+            WITNESS_BROKEN,
+            WATCHDOG_SUCCESSOR_REFUSED,
+            ROLES_VACATED_GAP,
+        ] {
+            assert!(!is_note(k), "{k}");
+        }
+    }
+
     #[test]
     fn both_roles_vacated_is_the_gap_and_nothing_else_is() {
         use antitamper_bpf::ROLE_VACATED as V;
@@ -458,7 +514,7 @@ mod tests {
         let (f, last) = r.pending();
         assert_eq!(
             f.iter().map(|x| x.kind).collect::<Vec<_>>(),
-            vec![WITNESS_OPENED, WITNESS_ROW, WITNESS_ROW]
+            vec![WITNESS_NOTE, WITNESS_ROW, WITNESS_NOTE]
         );
         assert!(f[1].detail.contains("role_vacated"), "{}", f[1].detail);
         r.commit(last);
