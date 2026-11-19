@@ -321,8 +321,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           the packaged image by its device and inode, as its service account, \
                           in its unit's cgroup, started there and never injected — the kernel's \
                           lot 277/281 marks) to UDP 123 is no beacon; any other program to UDP \
-                          123, the daemon to another port, from a session or injected, is \
-                          judged.",
+                          123 is judged, as is systemd-timesyncd to another port, from a \
+                          session or injected; chronyd and ntpd keep a broader allowlist entry \
+                          (a residual, named).",
 
         how_to_test: "From one process, connect to the same address every 5 seconds: \
                       `python3 -c 'import socket, time; \
