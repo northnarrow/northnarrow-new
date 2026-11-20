@@ -11795,8 +11795,16 @@ number in parentheses is a lab PR.
       exec of the reader.
     - **F6.** The coalescing is keyed by the process (pid and start); the
       docs say "up to 8 sample paths".
-    - Mutation: @MUTATION@
-    - Lab (as measured): @LAB@
+    - Mutation: 30 mutants of the round's code, 29 caught by a named test; 1 equivalent by construction (the listener text's `in_transaction` guard: the result is `Ok` only inside a transaction where it is read), removed from the code.
+    - Lab (as measured):
+      - **r6 — ubuntu2404 (6.8.0-149), `b51bc5a6`** (the round's product code; the tests and one equivalent refactor came after). Alpha profile (observe-only), under its lease; left uninstalled and powered off, with no `.local` files, no pins and no probe files.
+        - `verifier-check`: 124 programs, every one within the 900,000 budget (highest `mount_guard_sb_umount` 285,254); `mount_guard_sb_mount` 235,430, `fim_file_open_sensor` 137,624, `fim_rename_observe` 218,580; only the two `dns_answer_*_ret6` variants refused (another variant loads). 5.15 is the PR CI's.
+        - The PostgreSQL install: `NN-L-NET-019` Low ×2 and `NN-L-NET-006` Low ×2 (its postinst found).
+        - An APT hook (`APT::Update::Post-Invoke`) starting the host's `socat` on the wildcard of 4444: `NN-L-NET-019` Medium, naming "no dpkg maintainer script runs it" (and `R006` High).
+        - `sudo logrotate -f /etc/logrotate.conf`: `NN-L-FIM-005` High ×3 and `NN-L-FIM-019` High ×1 on logrotate, each "rotated by hand … recorded, not killed"; `NN-L-FIM-019`'s response none (r4: a would-have KillProcess).
+        - The cold boot and the reboot: no `R004`; `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition.
+        - `cat /etc/login.defs`: ALERTED, named. A `/tmp` copy of `truncate` emptying `/var/log/auth.log`: `NN-L-FIM-005` High.
+        - A memfd executed through `/proc/self/fd/3` and `/dev/fd/3` (uid 1000) and as root: `R004` Critical ×1 each (would have KillProcessTree).
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**
