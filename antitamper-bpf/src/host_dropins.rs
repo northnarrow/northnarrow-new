@@ -642,6 +642,11 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         "UnsetEnvironment" if v.is_empty() => Some(
             "UnsetEnvironment= cleared: the loader's variables would reach our units again".into(),
         ),
+        // The review of #582 (F2 b): our units deny memory both writable
+        // and executable; turned off, a start can run code no file backs.
+        "MemoryDenyWriteExecute" if matches!(v, "" | "no" | "false" | "0" | "off") => Some(
+            "MemoryDenyWriteExecute= turned off: code no file backs could run in our units".into(),
+        ),
         "EnvironmentFile" => {
             let p = v.trim_start_matches('-');
             // lot 311 (F4): read as bytes — a byte that is not UTF-8 (a
@@ -1145,6 +1150,19 @@ mod tests {
             h(Reach::Agent, "UnsetEnvironment=TZ").is_none(),
             "one more unset is no harm"
         );
+        // the review of #582 (F2 b): the units' denial of writable and
+        // executable memory turned off, or reset
+        for kv in [
+            "MemoryDenyWriteExecute=no",
+            "MemoryDenyWriteExecute=false",
+            "MemoryDenyWriteExecute=",
+        ] {
+            assert!(
+                svc(kv).contains("MemoryDenyWriteExecute= turned off"),
+                "{kv}"
+            );
+        }
+        assert!(h(Reach::Agent, "MemoryDenyWriteExecute=yes").is_none());
         assert!(svc("ConditionPathExists=/nonexistent-nn-lab").contains("fails"));
         // a slice drop-in, judged against the slice's floors
         let sl = |kv| h(Reach::OurSlice, kv).unwrap_or_else(|| panic!("{kv} not harmful"));

@@ -170,13 +170,19 @@ pub const ANONYMOUS_CODE: &str = "[anonymous executable memory]";
 
 /// The executable file mappings of a `/proc/<pid>/maps` text that are
 /// neither the binary (`exe`: its path as `/proc/<pid>/exe` names it and
-/// its inode) nor an expected library: under [`LIB_DIRS`], its name in
-/// [`EXPECTED_LIBS`] (or a name-service module, [`Libs::Running`]), the file
-/// at that path ([`FileFacts`] by `facts`) the one mapped (its inode), root's
-/// and writable by nobody else — and executable anonymous memory
-/// ([`ANONYMOUS_CODE`], lot 374). The kernel's pseudo mappings (`[vdso]`,
-/// `[stack]`, `anon_inode:…`) and the ones that cannot execute are not
-/// code of a file. One entry per path.
+/// its inode) nor an expected library — and executable anonymous memory
+/// ([`ANONYMOUS_CODE`], lot 374). An expected library is judged by what it
+/// is, never by the name `maps` shows: the kernel names a mapping after the
+/// file the loader's path resolved to, and a distribution may install a
+/// library under a versioned name its expected name links to (RHEL's
+/// `libgcc_s.so.1` → `libgcc_s-<gcc>-<date>.so.1`). So the mapped file, under
+/// [`LIB_DIRS`], is one of [`EXPECTED_LIBS`] (or a name-service module,
+/// [`Libs::Running`]) when that expected name in the same directory
+/// resolves (symbolic links followed) to the mapped inode ([`alias_of`]);
+/// the file at the mapped path ([`FileFacts`] by `facts`) is the one mapped
+/// (its inode), root's and writable by nobody else. The kernel's pseudo
+/// mappings (`[vdso]`, `[stack]`, `anon_inode:…`) and the ones that cannot
+/// execute are not code of a file. One entry per path.
 pub fn foreign_mappings(
     maps: &str,
     exe: (&str, u64),
@@ -248,17 +254,6 @@ fn library_refused(
     {
         return Some("not in a system library directory");
     }
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let nss = libs == Libs::Running
-        && name
-            .strip_prefix("libnss_")
-            .and_then(|r| r.strip_suffix(".so.2"))
-            .is_some_and(|s| {
-                !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            });
-    if !EXPECTED_LIBS.contains(&name) && !nss {
-        return Some("not a library the release links");
-    }
     let Some(f) = facts(path) else {
         return Some("its file cannot be read");
     };
@@ -268,7 +263,40 @@ fn library_refused(
     if f.uid != 0 || f.mode & 0o022 != 0 {
         return Some("not root's, or writable by another user");
     }
+    // the review of #582 (F1): by identity, not by the name maps shows
+    if alias_of(path, ino, libs, facts).is_none() {
+        return Some("not a library the release links");
+    }
     None
+}
+
+/// `name` is a glibc name-service module's (`libnss_<service>.so.2`).
+fn is_nss_module(name: &str) -> bool {
+    name.strip_prefix("libnss_")
+        .and_then(|r| r.strip_suffix(".so.2"))
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+}
+
+/// The review of #582 (F1): the expected library the file mapped from
+/// `path` (inode `ino`) is — its own name when that is one of
+/// [`EXPECTED_LIBS`] (or a name-service module's, [`Libs::Running`]),
+/// else the expected name that, in the same directory, resolves (symbolic
+/// links followed, `facts`) to that inode: what the loader opened by that
+/// name. `None`: no expected name is that file.
+pub fn alias_of(
+    path: &str,
+    ino: u64,
+    libs: Libs,
+    facts: &impl Fn(&str) -> Option<FileFacts>,
+) -> Option<String> {
+    let (dir, name) = path.rsplit_once('/')?;
+    if EXPECTED_LIBS.contains(&name) || (libs == Libs::Running && is_nss_module(name)) {
+        return Some(name.to_string());
+    }
+    EXPECTED_LIBS
+        .iter()
+        .find(|n| facts(&format!("{dir}/{n}")).is_some_and(|f| f.ino == ino))
+        .map(|n| n.to_string())
 }
 
 /// [`FileFacts`] of the file at `path` (symbolic links followed, as the
@@ -550,6 +578,199 @@ mod tests {
         );
         let named = genuine() + &line("r-xp", 0, "[vsyscall]") + &line("rw-p", 0, "");
         assert!(foreign_mappings(&named, EXE, Libs::Start, sys).is_empty());
+    }
+
+    /// The facts of a host's library directory: `files` are `(path, inode)`
+    /// of the real files, `links` `(link, target path)` resolved as `stat`
+    /// follows them.
+    fn host(
+        files: &'static [(&'static str, u64)],
+        links: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<FileFacts> {
+        move |p: &str| {
+            let real = links.iter().find(|(l, _)| *l == p).map_or(p, |(_, t)| *t);
+            files
+                .iter()
+                .find(|(f, _)| *f == real)
+                .map(|(_, ino)| FileFacts {
+                    ino: *ino,
+                    uid: 0,
+                    mode: 0o100755,
+                })
+        }
+    }
+
+    fn maps_of(files: &[(&str, u64)]) -> String {
+        let mut m = String::new();
+        m += &line("r-xp", 4242, EXE.0);
+        for (p, ino) in files {
+            m += &line("r--p", *ino, p);
+            m += &line("r-xp", *ino, p);
+        }
+        m += &line("r-xp", 0, "[vdso]");
+        m
+    }
+
+    /// The review of #582 (F1): AlmaLinux / RHEL 9 installs libgcc_s under
+    /// a versioned name its expected name links to, and the kernel names the
+    /// mapping after the file: a genuine start there maps nothing foreign
+    /// (it was refused at every start, the agent's and the watchdog's).
+    #[test]
+    fn a_genuine_alma_start_maps_its_versioned_libgcc_s_by_identity() {
+        const FILES: &[(&str, u64)] = &[
+            ("/usr/lib64/libc.so.6", 10),
+            ("/usr/lib64/libm.so.6", 11),
+            ("/usr/lib64/libgcc_s-11-20231218.so.1", 12),
+            ("/usr/lib64/ld-linux-x86-64.so.2", 13),
+        ];
+        const LINKS: &[(&str, &str)] = &[
+            (
+                "/usr/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+            ),
+            // merged /usr: /lib64 is a link to usr/lib64
+            (
+                "/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+            ),
+        ];
+        let facts = host(FILES, LINKS);
+        for libs in [Libs::Start, Libs::Running] {
+            let f = foreign_mappings(&maps_of(FILES), EXE, libs, &facts);
+            assert!(
+                f.is_empty(),
+                "a genuine AlmaLinux 9 start is refused: {f:?}"
+            );
+        }
+        assert_eq!(
+            alias_of(
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+                12,
+                Libs::Start,
+                &facts
+            )
+            .as_deref(),
+            Some("libgcc_s.so.1")
+        );
+    }
+
+    /// The review of #582 (F1): the layouts of the supported distributions
+    /// — Debian 12/13 and Ubuntu 22.04/24.04/26.04 (multiarch, merged /usr
+    /// or not), Fedora/RHEL multilib (`/usr/lib64` for the 64-bit
+    /// libraries, `/usr/lib` the 32-bit ones), a glibc before 2.34 (every
+    /// library a versioned file its soname links to) — each a genuine start.
+    #[test]
+    fn every_supported_library_layout_is_a_genuine_start() {
+        const DEB: &[(&str, u64)] = &[
+            ("/usr/lib/x86_64-linux-gnu/libc.so.6", 10),
+            ("/usr/lib/x86_64-linux-gnu/libm.so.6", 11),
+            ("/usr/lib/x86_64-linux-gnu/libgcc_s.so.1", 12),
+            ("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", 13),
+        ];
+        const DEB_SPLIT: &[(&str, u64)] = &[
+            ("/lib/x86_64-linux-gnu/libc.so.6", 10),
+            ("/lib/x86_64-linux-gnu/libm.so.6", 11),
+            ("/lib/x86_64-linux-gnu/libgcc_s.so.1", 12),
+            ("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", 13),
+        ];
+        const FEDORA: &[(&str, u64)] = &[
+            ("/usr/lib64/libc.so.6", 10),
+            ("/usr/lib64/libm.so.6", 11),
+            ("/usr/lib64/libgcc_s-14-20250110.so.1", 12),
+            ("/usr/lib64/ld-linux-x86-64.so.2", 13),
+            // the 32-bit multilib copies, never mapped by a 64-bit start
+            ("/usr/lib/libc.so.6", 20),
+            ("/usr/lib/libgcc_s-14-20250110.so.1", 22),
+        ];
+        const OLD_GLIBC: &[(&str, u64)] = &[
+            ("/lib/x86_64-linux-gnu/libc-2.31.so", 10),
+            ("/lib/x86_64-linux-gnu/libm-2.31.so", 11),
+            ("/lib/x86_64-linux-gnu/libgcc_s.so.1", 12),
+            ("/lib/x86_64-linux-gnu/ld-2.31.so", 13),
+        ];
+        const FEDORA_LINKS: &[(&str, &str)] = &[
+            (
+                "/usr/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-14-20250110.so.1",
+            ),
+            (
+                "/usr/lib/libgcc_s.so.1",
+                "/usr/lib/libgcc_s-14-20250110.so.1",
+            ),
+        ];
+        const OLD_LINKS: &[(&str, &str)] = &[
+            (
+                "/lib/x86_64-linux-gnu/libc.so.6",
+                "/lib/x86_64-linux-gnu/libc-2.31.so",
+            ),
+            (
+                "/lib/x86_64-linux-gnu/libm.so.6",
+                "/lib/x86_64-linux-gnu/libm-2.31.so",
+            ),
+            (
+                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/lib/x86_64-linux-gnu/ld-2.31.so",
+            ),
+        ];
+        for (name, files, links) in [
+            ("debian/ubuntu merged /usr", DEB, &[][..]),
+            ("debian split /usr", DEB_SPLIT, &[][..]),
+            ("fedora/rhel multilib", FEDORA, FEDORA_LINKS),
+            ("glibc before 2.34", OLD_GLIBC, OLD_LINKS),
+        ] {
+            let mapped: Vec<(&str, u64)> =
+                files.iter().copied().filter(|(_, ino)| *ino < 20).collect();
+            let f = foreign_mappings(&maps_of(&mapped), EXE, Libs::Start, host(files, links));
+            assert!(f.is_empty(), "{name}: a genuine start is refused: {f:?}");
+        }
+    }
+
+    /// The review of #582 (F1): identity, not a looser name rule — a file
+    /// in a library directory that no expected name resolves to is still
+    /// foreign, whatever it is called (a versioned look-alike, another
+    /// library under the expected name's prefix, a copy of libc with its
+    /// own inode), and so is the 32-bit multilib copy's name in the 64-bit
+    /// directory when it is not the same file.
+    #[test]
+    fn a_file_no_expected_name_resolves_to_is_foreign() {
+        const FILES: &[(&str, u64)] = &[
+            ("/usr/lib64/libc.so.6", 10),
+            ("/usr/lib64/libgcc_s-11-20231218.so.1", 12),
+            ("/usr/lib64/libgcc_s-11-evil.so.1", 30),
+            ("/usr/lib64/libc-copy.so.6", 31),
+            ("/usr/lib64/libz.so.1", 32),
+            ("/usr/lib64/sub/libgcc_s-11-20231218.so.1", 33),
+        ];
+        const LINKS: &[(&str, &str)] = &[(
+            "/usr/lib64/libgcc_s.so.1",
+            "/usr/lib64/libgcc_s-11-20231218.so.1",
+        )];
+        let facts = host(FILES, LINKS);
+        for (path, ino) in [
+            ("/usr/lib64/libgcc_s-11-evil.so.1", 30),
+            ("/usr/lib64/libc-copy.so.6", 31),
+            ("/usr/lib64/libz.so.1", 32),
+            ("/usr/lib64/sub/libgcc_s-11-20231218.so.1", 33),
+        ] {
+            let maps = maps_of(&[("/usr/lib64/libc.so.6", 10)]) + &line("r-xp", ino, path);
+            let f = foreign_mappings(&maps, EXE, Libs::Running, &facts);
+            assert_eq!(f.len(), 1, "{path}: {f:?}");
+            assert_eq!(f[0].why, "not a library the release links", "{path}");
+            assert_eq!(alias_of(path, ino, Libs::Running, &facts), None, "{path}");
+        }
+        // the mapped file's own facts are still judged: a versioned file
+        // replaced since it was mapped, or a user's
+        let maps = maps_of(&[("/usr/lib64/libgcc_s-11-20231218.so.1", 99)]);
+        assert_eq!(
+            foreign_mappings(&maps, EXE, Libs::Start, &facts)[0].why,
+            "its path names another file now"
+        );
+        let user = |p: &str| facts(p).map(|f| FileFacts { uid: 1000, ..f });
+        let maps = maps_of(&[("/usr/lib64/libgcc_s-11-20231218.so.1", 12)]);
+        assert_eq!(
+            foreign_mappings(&maps, EXE, Libs::Start, user)[0].why,
+            "not root's, or writable by another user"
+        );
     }
 
     #[test]

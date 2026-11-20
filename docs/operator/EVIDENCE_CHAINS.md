@@ -150,20 +150,29 @@ memory file of the watchdog's, never on disk.
 
 | Kind | Written when |
 |---|---|
-| `witness_opened` | a watchdog life's first row: its key, and the row it continues, or why the previous chain was set aside |
-| `role_vacated` | the agent exited: its pid, the cause as systemd recorded it for that process (the OOM killer, a signal, an exit status; "not known" past 3 s), what the shutdown marker said |
+| `witness_opened` | a watchdog life's first row: its key, the row it continues or why the previous chain was set aside, and the host as that start read it (`/etc/ld.so.preload` by size and digest, the count of drop-in directives that change our units' code) |
+| `role_vacated` | the agent exited outside a signed window: its pid, the cause as systemd recorded it for that process (the OOM killer, a signal, an exit status; "not known" when systemd has not recorded it in time), what the shutdown marker said, what the host would give a successor |
 | `role_released` | the agent stopped by a shutdown the admin quorum signed: no successor follows |
-| `role_succeeded` | the agent's unit's clean restart took the role: its pid, parent and cgroup, nothing foreign in its environment and executable mappings |
-| `role_successor_refused` | a process that is not that took the role (not given the watchdog's re-registration): its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
+| `role_released_in_window` | the agent exited inside a signed trusted-installer window (the operator's restart or stop): as `role_vacated` |
+| `role_succeeded` | the agent's unit's clean restart took the role: its pid, parent and cgroup, nothing foreign in its environment and executable mappings; the host before its start |
+| `role_successor_foreign` | a process that is not that took the role: it holds the role the kernel gave it, and the watchdog does not re-register it; its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
+| `role_respawn_held` | the watchdog held a start of the agent: `/etc/ld.so.preload`, or a drop-in that changes our units' code, new or changed since its start (named; never a file's contents) |
+| `witness_chain_cut` | the first row of a new chain: the previous one no longer ended at the watchdog's last row (what it expected, what it found; set aside as `witness.chain.cut`) |
 | `role_found_vacant` | a watchdog start found the agent's role already vacated |
 
-- Every 30 s the agent certifies the verified watchdog's key, read from
-  the watchdog's own descriptor table — one `witness_key_certified` entry
-  per key, op `witness` — and imports the rows after the last one it
-  imported into the audit log: `role_vacated`, `role_found_vacant` and
-  `role_successor_refused` as `witness_row` (`integrity_drift`, High); the
+- At each of its rounds the agent certifies the verified watchdog's key,
+  read from the watchdog's own descriptor table — one
+  `witness_key_certified` entry per key, op `witness` — and imports the
+  rows after the last one it imported into the audit log: `role_vacated`,
+  `role_found_vacant`, `role_successor_foreign`, `role_respawn_held` and
+  `witness_chain_cut` as `witness_row` (`integrity_drift`, High); the
   others as `witness_note` (op `witness`); a row whose key it never
   certified as `witness_row_uncertified` (High).
+- Only the watchdog writes the chain: the kernel refuses the agent, a
+  worker and every other process a write, truncation, rename, link or
+  removal of it outside a trusted-installer window (`ROLE_WRITE_INODES`,
+  the watchdog's role). The watchdog checks that it still ends at its last
+  row before each row and at a regular interval.
   Its position is `witness.imported`, beside the chain. A row changed or
   removed, a line that is not a row, or a chain that no longer holds the
   last row imported is `witness_chain_broken` (High).

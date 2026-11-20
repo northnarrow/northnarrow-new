@@ -1251,3 +1251,55 @@ fn a_full_held_set_refuses_the_window_s_load_and_the_round_empties_it() {
     assert!(x.contains("pub const HELD_MAP: &str = \"PROG_CONTENT_HELD\";"));
     assert!(c.contains("pub static PROG_CONTENT_HELD: HashMap<u32, u64> ="));
 }
+
+/// The review of #582 (F2 c): the witness chain is the watchdog role's to
+/// change alone — in the deny hooks' shared verdict, the family's exemption
+/// holds for an inode of `ROLE_WRITE_INODES` only when the caller's binary
+/// is that role's; nothing lets an exempt caller through before that test.
+#[test]
+fn an_inode_of_one_role_is_changed_by_that_role_alone() {
+    let c = code("agent-ebpf/src/inode_protect.rs");
+    assert!(
+        c.contains("pub static ROLE_WRITE_INODES: HashMap<InodeKey, u8> = HashMap::pinned(8, 0);")
+    );
+    let v = body(&c, "protected_verdict");
+    in_order(
+        v,
+        &[
+            "let flags = match PROTECTED_INODES.get(&key) {",
+            "if override_active() {\n        return None;\n    }",
+            "if crate::task_kill::is_exempt_pid(caller_tgid) {",
+            "match ROLE_WRITE_INODES.get(&key) {",
+            "Some(role) if *role != crate::bpf_defense::caller_role() => {}",
+            "_ => return None,",
+        ],
+    )
+    .unwrap();
+    let exempt = v
+        .find("if crate::task_kill::is_exempt_pid(caller_tgid) {")
+        .unwrap();
+    let role = v.find("match ROLE_WRITE_INODES.get(&key) {").unwrap();
+    assert!(
+        !v[exempt..role].contains("return None"),
+        "an exempt caller let through before the role's test"
+    );
+}
+
+/// The review of #582 (F4, F6): the kernel's liveness watch marks each
+/// role's vacancy in a map no syscall writes (`BPF_F_RDONLY`), whether the
+/// exit was inside a signed window, right where it vacates the slot.
+#[test]
+fn the_kernel_marks_each_vacancy_where_no_process_writes() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    assert!(c.contains("pub static ROLE_MARKS: Array<u32> = Array::pinned(2, BPF_F_RDONLY);"));
+    in_order(
+        body(&c, "role_exit"),
+        &[
+            "if unsafe { *t } == tgid {",
+            "unsafe { *t = ROLE_VACATED };",
+            "if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {",
+            "unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };",
+        ],
+    )
+    .unwrap();
+}

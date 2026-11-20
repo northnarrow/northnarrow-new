@@ -97,6 +97,7 @@ use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     bpf_held_dev, BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
     BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED, kn_name_words, role_unit_words, OUR_SLICE,
+    role_exit_mark, BPF_F_RDONLY,
     BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
@@ -280,6 +281,16 @@ pub const ROLE_AGENT: u8 = 2;
 /// loads, and reads this to know the role is vacant.
 #[map]
 pub static ROLE_TGIDS: Array<u32> = Array::pinned(2, 0);
+
+/// The review of #582 (F4, F6): per slot of [`ROLE_TGIDS`], what
+/// [`role_exit`] recorded of its holders' exits this boot
+/// (`northnarrow_common::wire::role_exit_mark`: vacated, and whether the last
+/// exit was inside a signed trusted-installer window). No syscall writes it
+/// (`BPF_F_RDONLY`): a successor's claim of its slot, the family's handles
+/// included, leaves the "vacated this boot" the other role reads at its own
+/// start. Pinned by name, as [`ROLE_TGIDS`].
+#[map]
+pub static ROLE_MARKS: Array<u32> = Array::pinned(2, BPF_F_RDONLY);
 
 /// How long after its start a fresh agent or watchdog may take write
 /// handles before it is a protected pid (the agent registers itself in
@@ -1115,6 +1126,11 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
                 // the review of #567 (F2): its mount namespace is no longer
                 // judged as PID 1's
                 crate::mount_guard::vacate(slot);
+                // the review of #582 (F4, F6): vacated this boot, and
+                // whether inside a signed window — kept past the next claim
+                if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {
+                    unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };
+                }
             }
         }
         slot += 1;

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use nn_proto::witness::{
     judge_chain, key_record, line_hash, Judged, Row, WitnessKey, CHAIN_FILE, CHAIN_MAX_BYTES,
-    KEY_MEMFD_NAME, KIND_OPENED, ROW_VERSION,
+    KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_OPENED, ROW_VERSION,
 };
 use tracing::{error, info, warn};
 
@@ -36,6 +36,9 @@ pub struct Witness {
     seq: u64,
     prev: String,
     tgid: u32,
+    /// The review of #582 (F2 c): the pin root each chain this life opens
+    /// is registered under (the watchdog role's alone), once known.
+    bpffs_root: Option<PathBuf>,
     /// The sealed memory file with the key's public half, held for the
     /// watchdog's life (the agent reads it from this descriptor table).
     _published: Option<OwnedFd>,
@@ -107,6 +110,13 @@ impl Witness {
     /// broken or full) with a [`KIND_OPENED`] row. `Err` when no row can be
     /// written there: the caller records that for the agent to sign.
     pub fn open(dir: &Path, tgid: u32) -> Result<Witness> {
+        Self::open_noting(dir, tgid, "")
+    }
+
+    /// [`Witness::open`], `note` added to its first row (the review of #582,
+    /// F2 d: the host the watchdog's later judgements compare with, signed
+    /// before any vacancy it sees).
+    pub fn open_noting(dir: &Path, tgid: u32, note: &str) -> Result<Witness> {
         let key = WitnessKey::from_seed(seed()?);
         // this process's own start (`tgid` is this process)
         let start = antitamper_bpf::start_check::own_start_ticks().unwrap_or(0);
@@ -170,13 +180,18 @@ impl Witness {
             seq,
             prev,
             tgid,
+            bpffs_root: None,
             _published: published,
         };
-        let detail = if notes.is_empty() {
+        let mut detail = if notes.is_empty() {
             "a new chain".to_string()
         } else {
             notes.join("; ")
         };
+        if !note.is_empty() {
+            detail.push_str("; ");
+            detail.push_str(note);
+        }
         w.record(
             KIND_OPENED,
             &format!("watchdog {tgid} (start {start}) opened its witness: {detail}"),
@@ -189,8 +204,104 @@ impl Witness {
         self.key.public_hex()
     }
 
-    /// One signed row of `kind` with `detail`, appended and logged.
+    /// The review of #582 (F2 c): the chain this life writes registered as
+    /// the watchdog role's alone under `bpffs_root` (`ROLE_WRITE_INODES`:
+    /// the agent and every other caller refused its write), now and for
+    /// each chain opened after a cut. A failure is a WARN: the chain is then
+    /// the family's, as before.
+    pub fn protect_with(&mut self, bpffs_root: &Path) {
+        self.bpffs_root = Some(bpffs_root.to_path_buf());
+        self.protect();
+    }
+
+    fn protect(&self) {
+        let Some(root) = &self.bpffs_root else {
+            return;
+        };
+        match antitamper_bpf::protect_for_role(root, &self.path, antitamper_bpf::WATCHDOG_EXE_ROLE)
+        {
+            Ok(k) => {
+                info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone")
+            }
+            Err(e) => {
+                warn!(target: "watchdog.witness", error = format!("{e:#}"), "the witness chain is NOT registered as the watchdog role's alone")
+            }
+        }
+    }
+
+    /// The review of #582 (F2 c): what the chain's file shows of its end
+    /// when it no longer ends at this life's last row (`None`: it does).
+    fn cut_since_last_row(&self) -> Option<String> {
+        if self.seq == 0 {
+            return None;
+        }
+        let text = match antitamper_bpf::kernel_roots::read(&self.path, CHAIN_MAX_BYTES) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some("the file is gone".to_string())
+            }
+            Err(e) => return Some(format!("the file cannot be read: {e}")),
+        };
+        match chain_end(&text) {
+            Ok((seq, prev)) if seq == self.seq && prev == self.prev => None,
+            Ok((0, _)) => Some("the file holds no row".to_string()),
+            Ok((seq, prev)) => Some(format!(
+                "the file ends at row {} ({})",
+                seq - 1,
+                prev.get(..16).unwrap_or("")
+            )),
+            Err(why) => Some(format!("the file is broken ({why})")),
+        }
+    }
+
+    /// The review of #582 (F2 c): the chain checked against this life's last
+    /// row (the watchdog's memory, which nothing else writes); a chain cut,
+    /// changed or replaced since is set aside and a new chain begins with a
+    /// signed [`KIND_CHAIN_CUT`] row saying what was expected and found.
+    /// `true` when it was.
+    pub fn check_head(&mut self) -> bool {
+        let Some(found) = self.cut_since_last_row() else {
+            return false;
+        };
+        let expected = format!(
+            "row {} ({})",
+            self.seq - 1,
+            self.prev.get(..16).unwrap_or("")
+        );
+        let aside = self.path.with_file_name(format!("{CHAIN_FILE}.cut"));
+        let moved = match std::fs::rename(&self.path, &aside) {
+            Ok(()) => format!("set aside as {}", aside.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "nothing to set aside".to_string()
+            }
+            Err(e) => format!("not set aside ({e})"),
+        };
+        error!(
+            target: "watchdog.witness",
+            expected = %expected,
+            found = %found,
+            "the witness chain no longer ends at this watchdog's last row: a new chain begins"
+        );
+        self.seq = 0;
+        self.prev = String::new();
+        let detail = format!(
+            "the chain watchdog {} writes no longer ended at its last row, {expected}: {found}; \
+             {moved}; a new chain begins here",
+            self.tgid
+        );
+        let _ = self.append(KIND_CHAIN_CUT, &detail);
+        self.protect();
+        true
+    }
+
+    /// One signed row of `kind` with `detail`, appended and logged — the
+    /// chain checked first ([`Witness::check_head`]).
     pub fn record(&mut self, kind: &str, detail: &str) -> Result<()> {
+        self.check_head();
+        self.append(kind, detail)
+    }
+
+    fn append(&mut self, kind: &str, detail: &str) -> Result<()> {
         let row = self.key.sign(Row {
             v: ROW_VERSION,
             seq: self.seq,
@@ -310,11 +421,35 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
 }
 
 /// The vacancy row's kind: the role released by a shutdown the admin
-/// quorum signed, vacated otherwise.
-pub fn vacancy_kind(verdict: &crate::ShutdownVerdict) -> &'static str {
+/// quorum signed, or inside a signed trusted-installer window (the review of
+/// #582, F4: the operator's documented restart and stop — a note, as the
+/// successor's NN-L-BPF-002 is Low inside one), vacated otherwise.
+pub fn vacancy_kind(verdict: &crate::ShutdownVerdict, in_window: bool) -> &'static str {
     match verdict {
         crate::ShutdownVerdict::Authorised => nn_proto::witness::KIND_RELEASED,
+        _ if in_window => nn_proto::witness::KIND_RELEASED_IN_WINDOW,
         _ => nn_proto::witness::KIND_VACATED,
+    }
+}
+
+/// The review of #582 (F4, the mini-hunt): the row of the agent's role
+/// found vacated at this watchdog's start — `role_found_vacant` (High),
+/// or a note (`role_released_in_window`) when the kernel marked its
+/// holder's last exit inside a signed trusted-installer window (`marks`,
+/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's).
+pub fn found_vacant(marks: Option<u32>) -> (&'static str, &'static str) {
+    if marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
+        (
+            nn_proto::witness::KIND_RELEASED_IN_WINDOW,
+            "the agent's role was found vacated at this watchdog's start: its holder's last \
+             exit was inside a signed trusted-installer window (the operator's stop)",
+        )
+    } else {
+        (
+            nn_proto::witness::KIND_FOUND_VACANT,
+            "the agent's role was found vacated at this watchdog's start: its holder exited \
+             with no watchdog to see it",
+        )
     }
 }
 
@@ -324,14 +459,19 @@ pub fn successor_kind(given: bool) -> &'static str {
     if given {
         nn_proto::witness::KIND_SUCCEEDED
     } else {
-        nn_proto::witness::KIND_SUCCESSOR_REFUSED
+        nn_proto::witness::KIND_SUCCESSOR_FOREIGN
     }
 }
 
 /// The vacancy row's detail: the agent `pid` gone, `cause` (the wait's or
 /// systemd's), and what its shutdown marker said — an authorised stop is
 /// one too, and says so.
-pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -> String {
+pub fn vacancy_detail(
+    pid: u32,
+    cause: &str,
+    verdict: &crate::ShutdownVerdict,
+    in_window: bool,
+) -> String {
     let marker = match verdict {
         crate::ShutdownVerdict::Absent => "no shutdown marker",
         crate::ShutdownVerdict::Authorised => {
@@ -341,7 +481,12 @@ pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -
             "a shutdown marker refused (not signed by the admin quorum for this agent)"
         }
     };
-    format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}")
+    let window = if in_window {
+        "; inside a signed trusted-installer window (the operator's restart or stop)"
+    } else {
+        ""
+    };
+    format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}{window}")
 }
 
 /// Why the agent exited, from the wait on the exec backend's child
@@ -357,7 +502,9 @@ pub fn cause_from_wait(si_code: i32, code: i32) -> String {
 
 /// The successor's record: where it was started and what it shows, and
 /// whether it is the restart of the agent's unit with nothing foreign
-/// (the watchdog gives the role's rights only to that one).
+/// (the watchdog re-registers only that one). The review of #582 (F3): a
+/// successor that is not is observed, never refused here — it holds the
+/// role the kernel gave it, and the record says so.
 pub fn successor_detail(
     old: u32,
     new: u32,
@@ -371,10 +518,21 @@ pub fn successor_detail(
         (false, _) => "NOT its unit's restart (not PID 1's child in the agent's own cgroup)",
         (true, false) => "its unit's restart, with something foreign in it",
     };
+    let taken = if ok {
+        ""
+    } else {
+        " — it holds the role the kernel gave it; the watchdog does not re-register it"
+    };
+    // old 0: the vacancy is the kernel's mark, its holder not known here
+    let by = if old == 0 {
+        "earlier this boot".to_string()
+    } else {
+        format!("by pid {old}")
+    };
     (
         ok,
         format!(
-            "the agent's role, vacated by pid {old}, taken by pid {new}: {verdict}; {}; {}",
+            "the agent's role, vacated {by}, taken by pid {new}: {verdict}{taken}; {}; {}",
             id.describe(),
             found.describe()
         ),
@@ -447,12 +605,18 @@ mod tests {
             41,
             "signal 9 (systemd Result=signal)",
             &crate::ShutdownVerdict::Absent,
+            false,
         );
         assert_eq!(
             d,
             "the agent (pid 41) exited, its role vacated: signal 9 (systemd Result=signal); no shutdown marker"
         );
-        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Authorised);
+        let d = vacancy_detail(
+            41,
+            "exit status 0",
+            &crate::ShutdownVerdict::Authorised,
+            false,
+        );
         assert!(
             d.ends_with("a shutdown the admin quorum signed: no successor follows"),
             "{d}"
@@ -461,23 +625,73 @@ mod tests {
             41,
             "exit status 0",
             &crate::ShutdownVerdict::Refused("x".into()),
+            false,
         );
         assert!(d.contains("a shutdown marker refused"), "{d}");
         // only a signed shutdown releases the role; a refused marker vacates it
         use nn_proto::witness::{
-            KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_REFUSED, KIND_VACATED,
+            KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
         };
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Authorised),
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, false),
             KIND_RELEASED
         );
-        assert_eq!(vacancy_kind(&crate::ShutdownVerdict::Absent), KIND_VACATED);
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into())),
+            vacancy_kind(&crate::ShutdownVerdict::Absent, false),
+            KIND_VACATED
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), false),
             KIND_VACATED
         );
         assert_eq!(successor_kind(true), KIND_SUCCEEDED);
-        assert_eq!(successor_kind(false), KIND_SUCCESSOR_REFUSED);
+        assert_eq!(successor_kind(false), KIND_SUCCESSOR_FOREIGN);
+    }
+
+    /// The review of #582 (F4, the mini-hunt): a watchdog start that finds
+    /// the agent's role vacated by the operator's stop inside a signed
+    /// window (the maintenance stop, the watchdog started first) writes a
+    /// note; any other vacancy, or marks not read, stays `role_found_vacant`.
+    #[test]
+    fn a_role_found_vacated_by_a_window_s_stop_is_a_note() {
+        use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M};
+        use nn_proto::witness::{KIND_FOUND_VACANT, KIND_RELEASED_IN_WINDOW};
+        assert_eq!(found_vacant(Some(M | W)).0, KIND_RELEASED_IN_WINDOW);
+        for m in [Some(M), Some(0), None] {
+            assert_eq!(found_vacant(m).0, KIND_FOUND_VACANT, "{m:?}");
+        }
+    }
+
+    /// The review of #582 (F4 a): the guide's restart — a window granted,
+    /// the agent stopped, the watchdog starting it again — is the
+    /// operator's: its vacancy is `role_released_in_window` (a note), never
+    /// the High `role_vacated`; a signed shutdown stays `role_released`.
+    #[test]
+    fn a_vacancy_inside_a_signed_window_is_released_not_vacated() {
+        use nn_proto::witness::{KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_VACATED};
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            KIND_RELEASED_IN_WINDOW
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), true),
+            KIND_RELEASED_IN_WINDOW
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, true),
+            KIND_RELEASED
+        );
+        assert_ne!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            KIND_VACATED
+        );
+        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Absent, true);
+        assert!(
+            d.ends_with(
+                "inside a signed trusted-installer window (the operator's restart or stop)"
+            ),
+            "{d}"
+        );
     }
 
     fn chain_text(dir: &Path) -> String {
@@ -572,6 +786,68 @@ mod tests {
         assert!(Witness::open(dir.path(), me).is_err());
     }
 
+    /// The review of #582 (F2 c): a tail cut of rows not yet imported, made
+    /// while this watchdog lives, is detected — the chain no longer ends at
+    /// the last row in the watchdog's memory: set aside, and a new chain
+    /// begins with a signed `witness_chain_cut` row naming what it expected
+    /// and found (the agent imports it High), before the next row. A chain
+    /// left as written is never cut.
+    #[test]
+    fn a_tail_cut_while_the_watchdog_lives_is_detected_and_signed() {
+        use nn_proto::witness::{to_import, Imported, KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "the vacancy").unwrap();
+        w.record(KIND_SUCCEEDED, "the successor").unwrap();
+        assert!(!w.check_head(), "a chain as written is not cut");
+        let text = chain_text(dir.path());
+        // the successor's row and the vacancy's cut: a valid prefix is left
+        let prefix: String = text.lines().take(1).map(|l| format!("{l}\n")).collect();
+        std::fs::write(dir.path().join(CHAIN_FILE), &prefix).unwrap();
+        assert!(w.check_head(), "the cut is detected");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("{CHAIN_FILE}.cut"))).unwrap(),
+            prefix
+        );
+        w.record(KIND_SUCCEEDED, "after").unwrap();
+        let mut imp = Imported::default();
+        imp.certify(&w.key_hex());
+        let t = to_import(&chain_text(dir.path()), &imp);
+        assert!(t.broken.is_none(), "{t:?}");
+        let kinds: Vec<&str> = t.rows.iter().map(|(r, _, _)| r.kind.as_str()).collect();
+        assert_eq!(kinds, [KIND_CHAIN_CUT, KIND_SUCCEEDED]);
+        let cut = &t.rows[0].0.detail;
+        assert!(
+            cut.contains("no longer ended at its last row, row 2")
+                && cut.contains("the file ends at row 0"),
+            "{cut}"
+        );
+        // a row appended by another writer, or the file emptied or removed:
+        // the same, at the next row the watchdog signs
+        for damage in ["append", "empty", "remove"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = Witness::open(dir.path(), me).unwrap();
+            w.record(KIND_VACATED, "v").unwrap();
+            let p = dir.path().join(CHAIN_FILE);
+            match damage {
+                "append" => {
+                    let t = chain_text(dir.path()) + "{\"not\":\"a row\"}\n";
+                    std::fs::write(&p, t).unwrap();
+                }
+                "empty" => std::fs::write(&p, "").unwrap(),
+                _ => std::fs::remove_file(&p).unwrap(),
+            }
+            w.record(KIND_SUCCEEDED, "s").unwrap();
+            let j = judge_chain(&chain_text(dir.path()));
+            let Judged::Valid { row, .. } = &j[0] else {
+                panic!("{damage}: {j:?}")
+            };
+            assert_eq!(row.kind, KIND_CHAIN_CUT, "{damage}");
+            assert_eq!(j.len(), 2, "{damage}: {j:?}");
+        }
+    }
+
     /// Lot 374: the key's public half is published in a sealed memory file
     /// of this process's, naming this process and its start — what the
     /// agent reads from the watchdog's descriptor table.
@@ -645,6 +921,34 @@ mod tests {
             !successor_detail(10, 11, &unit, &unread).0,
             "unread is never clean"
         );
+    }
+
+    /// The review of #582 (F3): a successor that is not its unit's clean
+    /// restart is observed — it holds the role the kernel gave it — and its
+    /// record says that, never that it was refused; the row's kind is
+    /// `role_successor_foreign`.
+    #[test]
+    fn a_foreign_successor_is_recorded_as_holding_the_role_never_as_refused() {
+        let unit = Identity {
+            ppid: Some(1),
+            cgroup: Some("/northnarrow.slice/northnarrow-agent.service".into()),
+        };
+        let preloaded = Findings {
+            loader_vars: vec!["LD_PRELOAD".into()],
+            ..Findings::default()
+        };
+        let (ok, d) = successor_detail(10, 11, &unit, &preloaded);
+        assert!(!ok);
+        assert!(
+            d.contains("holds the role the kernel gave it")
+                && d.contains("does not re-register it"),
+            "{d}"
+        );
+        assert!(!d.to_lowercase().contains("refus"), "{d}");
+        assert_eq!(successor_kind(false), "role_successor_foreign");
+        assert_eq!(successor_kind(true), "role_succeeded");
+        let (ok, d) = successor_detail(10, 11, &unit, &Findings::default());
+        assert!(ok && !d.contains("holds the role"), "{d}");
     }
 
     #[test]

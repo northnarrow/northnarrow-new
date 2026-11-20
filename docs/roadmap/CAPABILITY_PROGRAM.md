@@ -11700,8 +11700,8 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
-- **Lot 374 — the vacated role's successor is witnessed, bound to its unit
-  and free of injected code (C23; no level change).**
+- **Lot 374 — the vacated role's successor is witnessed and bound to its
+  unit (C23; no level change).**
   - What was open (the pre-alpha re-check on rc9, R9-1): a role vacated by
     a kill nothing can refuse was taken by a successor whose own start
     wrote the only signed record of it; the successor's right asked for
@@ -11720,7 +11720,31 @@ number in parentheses is a lab PR.
       units and the pin lock's transient unit; a start's own check of its
       environment and executable mappings, refused and signed.
     - Ratchets `xtask/tests/start_check.rs`, the units test.
-  - Lab (as measured): not run yet.
+  - The review of #582, fix round 1:
+    - F1: a library judged by what it is (the expected name in its
+      directory resolving to the mapped file), not by the name the kernel
+      shows — a genuine start on AlmaLinux 9 was refused.
+    - F2 (the parts reachable without a new kernel mark): the units deny
+      writable and executable memory; the chain is the watchdog role's
+      alone (`ROLE_WRITE_INODES`), checked by the watchdog against its last
+      row (`witness_chain_cut`); before each start it makes, the watchdog
+      judges `/etc/ld.so.preload` and the code-changing drop-ins against its
+      own start's and holds on a change (`role_respawn_held`). The kernel's
+      mark on a successor's executable mappings stays for a post-alpha lot.
+    - F3: a successor that shows something foreign is recorded as holding
+      the role (`…_successor_foreign`), never as refused.
+    - F4: an exit inside a signed window is a note
+      (`role_released_in_window`); both roles released by the operator are
+      `roles_released`, a note.
+    - F5: the integrity round's agent cgroup is `northnarrow.slice`'s
+      (NN-AUD-113's limits and the pin lock's redo run again).
+    - F6: the kernel's "vacated this boot" mark per role (`ROLE_MARKS`, no
+      syscall writes it); each role's start judges the other's process.
+    - F7: the privileged `a_unit_restart_takes_the_vacated_role_under_enforce`
+      on the installed unit.
+    - F8: the public texts say what is recorded and what is not yet
+      guaranteed, as behaviour.
+  - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

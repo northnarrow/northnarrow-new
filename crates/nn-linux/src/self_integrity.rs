@@ -279,8 +279,13 @@ const WATCHDOG_UNIT: &str = include_str!(concat!(
     "/deploy/systemd/northnarrow-watchdog.service"
 ));
 
-/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
-const AGENT_UNIT_CGROUP: &str = "/system.slice/northnarrow-agent.service";
+/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`):
+/// its unit under our slice (`common::wire::{OUR_SLICE, AGENT_UNIT}`). The
+/// review of #582 (F5): it named `system.slice` since the units moved to
+/// `northnarrow.slice` (lot 273d), and NN-AUD-113's limits and the pin
+/// lock made again when the unit started without it (#569 F3) never ran;
+/// a test ties it to the shipped unit's `Slice=`.
+const AGENT_UNIT_CGROUP: &str = "/northnarrow.slice/northnarrow-agent.service";
 
 /// Limit names as [`limits`] reports them.
 const LIMIT_CGROUP: &str = "agent cgroup";
@@ -1053,7 +1058,9 @@ fn high_kind(kind: &str) -> bool {
             // lot 374: the other role's vacancy, its successor, a refused start
             | WATCHDOG_START_REFUSED
             | WITNESS_UNAVAILABLE
-            | crate::witness::WATCHDOG_SUCCESSOR_REFUSED
+            // the review of #582 (F2 d)
+            | WATCHDOG_RESPAWN_HELD
+            | crate::witness::WATCHDOG_SUCCESSOR_FOREIGN
             | crate::witness::WITNESS_ROW
             | crate::witness::WITNESS_UNCERTIFIED
             | crate::witness::WITNESS_BROKEN
@@ -1065,6 +1072,9 @@ fn high_kind(kind: &str) -> bool {
 pub const WATCHDOG_START_REFUSED: &str = "watchdog_start_refused";
 /// Lot 374: the watchdog's witness not opened (its hold record).
 pub const WITNESS_UNAVAILABLE: &str = "witness_unavailable";
+/// The review of #582 (F2 d): the watchdog held a start of the agent — the
+/// host changed during the vacancy (its hold record, High).
+pub const WATCHDOG_RESPAWN_HELD: &str = "watchdog_respawn_held";
 
 /// Fix round 3 of #567: a pin of the agent's gone while it holds the object
 /// (`antitamper_bpf::held`) — High.
@@ -1780,6 +1790,13 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                         wh::REASON_HOLD_RETRY => (
                             "watchdog_hold",
                             "the holding watchdog tried to start the agent again",
+                        ),
+                        // The review of #582 (F2 d): the host changed during
+                        // the vacancy — the start held, or a retry skipped
+                        wh::REASON_RESPAWN_HELD => (
+                            WATCHDOG_RESPAWN_HELD,
+                            "the watchdog held instead of starting the agent: the host changed \
+                             during the vacancy",
                         ),
                         wh::REASON_HOLD_ENDED => ("watchdog_hold", "the watchdog's hold ended"),
                         // Lot 273c: the agent's fresh cgroup, or the
@@ -3324,6 +3341,8 @@ mod tests {
             // without its witness — signed by the agent, the surviving role
             (wh::REASON_START_SELF_CHECK, WATCHDOG_START_REFUSED),
             (wh::REASON_WITNESS_UNAVAILABLE, WITNESS_UNAVAILABLE),
+            // the review of #582 (F2 d): a respawn held, the host changed
+            (wh::REASON_RESPAWN_HELD, WATCHDOG_RESPAWN_HELD),
         ];
         let body = reasons
             .iter()
@@ -3347,7 +3366,11 @@ mod tests {
             f[4].detail
         );
         // lot 374: both High
-        for kind in [WATCHDOG_START_REFUSED, WITNESS_UNAVAILABLE] {
+        for kind in [
+            WATCHDOG_START_REFUSED,
+            WITNESS_UNAVAILABLE,
+            WATCHDOG_RESPAWN_HELD,
+        ] {
             assert!(high_kind(kind), "{kind}");
         }
         let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();
@@ -3371,7 +3394,7 @@ mod tests {
             w::WITNESS_ROW,
             w::WITNESS_UNCERTIFIED,
             w::WITNESS_BROKEN,
-            w::WATCHDOG_SUCCESSOR_REFUSED,
+            w::WATCHDOG_SUCCESSOR_FOREIGN,
             WATCHDOG_START_REFUSED,
             WITNESS_UNAVAILABLE,
         ] {
@@ -5007,6 +5030,24 @@ mod tests {
         let f = w.observe(&seen("50000 100000"), &expected);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, "limit_unexpected");
+    }
+
+    /// The review of #582 (F5): the agent unit's cgroup is the shipped
+    /// unit's own — its `Slice=` and its name, as the eBPF programs and
+    /// `start_check` build it (`common::wire`). It named `system.slice`
+    /// after the units had moved, and both checks that read it were dead.
+    #[test]
+    fn the_agent_unit_cgroup_is_the_shipped_unit_s_slice_and_name() {
+        let slice = unit_directive(AGENT_UNIT, "Slice").expect("the agent unit sets Slice=");
+        assert_eq!(slice, common::wire::OUR_SLICE);
+        assert_eq!(
+            AGENT_UNIT_CGROUP,
+            format!("/{slice}/{}", common::wire::AGENT_UNIT)
+        );
+        assert_eq!(
+            unit_directive(WATCHDOG_UNIT, "Slice"),
+            Some(common::wire::OUR_SLICE)
+        );
     }
 
     #[test]

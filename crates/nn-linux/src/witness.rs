@@ -16,28 +16,35 @@
 //! * The watchdog's successor, when the watchdog's role was vacated: given
 //!   the agent's registration only when it is its unit's restart, with clean
 //!   lot 277/281 marks and nothing foreign in its environment or mappings
-//!   ([`judge_watchdog_successor`]); recorded either way
-//!   ([`WATCHDOG_SUCCESSION`], [`WATCHDOG_SUCCESSOR_REFUSED`]).
+//!   ([`judge_watchdog_successor`]); recorded either way — a successor that
+//!   is not is observed, never refused here (the kernel gave it the role)
+//!   ([`WATCHDOG_SUCCESSION`], [`WATCHDOG_SUCCESSOR_FOREIGN`]).
 //! * Both roles found vacated at the agent's start: [`ROLES_VACATED_GAP`].
 
 use std::path::{Path, PathBuf};
 
 use nn_proto::witness::{
     parse_key_record, to_import, Imported, CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE,
-    KEY_MEMFD_NAME, KIND_OPENED, KIND_RELEASED, KIND_SUCCEEDED,
+    KEY_MEMFD_NAME, KIND_OPENED, KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
 };
 
 /// A finding of this module signed as a note ([`WITNESS_OP`]): the
 /// bookkeeping of the witness, never a drift of the host.
 pub fn is_note(kind: &str) -> bool {
-    matches!(kind, WITNESS_KEY | WITNESS_NOTE | WATCHDOG_SUCCESSION)
+    matches!(
+        kind,
+        WITNESS_KEY | WITNESS_NOTE | WATCHDOG_SUCCESSION | ROLES_RELEASED
+    )
 }
 
 /// A verified row's finding: the watchdog's bookkeeping a note, its record
 /// of the role's vacancy or of a successor not its unit's clean restart a
 /// [`WITNESS_ROW`] (High).
 pub fn row_kind(row_kind: &str) -> &'static str {
-    if matches!(row_kind, KIND_OPENED | KIND_RELEASED | KIND_SUCCEEDED) {
+    if matches!(
+        row_kind,
+        KIND_OPENED | KIND_RELEASED | KIND_RELEASED_IN_WINDOW | KIND_SUCCEEDED
+    ) {
         WITNESS_NOTE
     } else {
         WITNESS_ROW
@@ -66,10 +73,12 @@ pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
 /// its death is `watchdog_gone`).
 pub const WATCHDOG_SUCCESSION: &str = "watchdog_succession";
-/// A process that took the watchdog's vacated role refused the agent's
-/// registration: not its unit's restart, marks not clean, or something
-/// foreign in it (High).
-pub const WATCHDOG_SUCCESSOR_REFUSED: &str = "watchdog_successor_refused";
+/// The review of #582 (F3): the process that took the watchdog's vacated
+/// role is not its unit's clean restart — not its unit's restart, marks not
+/// clean, or something foreign in it (High). Observed, not refused: the
+/// kernel gave it the role and it registers itself; the agent withholds its
+/// own registration of it and its posture exemption.
+pub const WATCHDOG_SUCCESSOR_FOREIGN: &str = "watchdog_successor_foreign";
 /// Both roles found vacated at the agent's start (High).
 pub const ROLES_VACATED_GAP: &str = "roles_vacated_gap";
 
@@ -231,6 +240,27 @@ impl WitnessReader {
         (out, last)
     }
 
+    /// The review of #582 (F4 b): the chain's last valid row is the agent's
+    /// role released by a shutdown the admin quorum signed
+    /// ([`KIND_RELEASED`]: the watchdog stands down after it), signed by a
+    /// key this agent's position certified — a later life of a watchdog
+    /// would have opened a row after it.
+    pub fn ends_with_signed_release(&mut self) -> bool {
+        let path = self.dir.join(CHAIN_FILE);
+        let Ok(b) = crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES) else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&b).into_owned();
+        let last = nn_proto::witness::judge_chain(&text)
+            .into_iter()
+            .rev()
+            .find_map(|j| match j {
+                nn_proto::witness::Judged::Valid { row, .. } => Some(row),
+                nn_proto::witness::Judged::Broken { .. } => None,
+            });
+        last.is_some_and(|row| row.kind == KIND_RELEASED && self.position().certified(&row.key))
+    }
+
     /// The position after the rows [`WitnessReader::pending`] gave, signed.
     pub fn commit(&mut self, last: Option<String>) {
         if let Some(h) = last {
@@ -265,10 +295,17 @@ pub fn judge_watchdog_successor(
         None => "marks not known",
     };
     let given = in_unit && marks_clean == Some(true) && found.clean();
+    // the review of #582 (F3): observed, not refused
+    let taken = if given {
+        ""
+    } else {
+        " — it holds the role the kernel gave it and registers itself; the agent does not \
+         register it nor exempt it"
+    };
     SuccessorVerdict {
         given,
         detail: format!(
-            "the watchdog's role, vacated, taken by pid {pid}: {}; {}; {marks}; {}",
+            "the watchdog's role, vacated, taken by pid {pid}: {}{taken}; {}; {marks}; {}",
             if in_unit {
                 "its unit's restart"
             } else {
@@ -290,16 +327,80 @@ pub fn marks_clean(pid: u32) -> Option<bool> {
     Some(started && injected == Injected::No)
 }
 
-/// Both roles vacated at the agent's start (`agent` and `watchdog`, the
-/// two `ROLE_TGIDS` slots it read before it claimed its own): the gap's
-/// finding.
-pub fn roles_gap(agent: u32, watchdog: u32) -> Option<Finding> {
-    use antitamper_bpf::ROLE_VACATED;
-    (agent == ROLE_VACATED && watchdog == ROLE_VACATED).then(|| Finding {
-        kind: ROLES_VACATED_GAP,
-        detail: "the agent's start found both roles vacated this boot: the agent and the \
-                 watchdog had exited, no role held the other's record of it until now"
-            .to_string(),
+/// What the agent's start read of both roles before it claimed its own:
+/// the two `ROLE_TGIDS` slots and (the review of #582, F4 b, F6) the
+/// kernel's marks of their holders' exits (`ROLE_MARKS`; `None` unread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolesAtStart {
+    pub agent: u32,
+    pub watchdog: u32,
+    pub agent_mark: Option<u32>,
+    pub watchdog_mark: Option<u32>,
+}
+
+impl RolesAtStart {
+    /// Both roles' holders had exited (neither held now).
+    pub fn both_vacated(&self) -> bool {
+        use antitamper_bpf::ROLE_VACATED;
+        self.agent == ROLE_VACATED && self.watchdog == ROLE_VACATED
+    }
+
+    /// Both last exits were inside a signed trusted-installer window (the
+    /// operator's maintenance stop), as the kernel marked them.
+    pub fn both_left_in_a_window(&self) -> bool {
+        let w = |m: Option<u32>| m.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0);
+        w(self.agent_mark) && w(self.watchdog_mark)
+    }
+}
+
+static ROLES_AT_START: std::sync::OnceLock<RolesAtStart> = std::sync::OnceLock::new();
+
+/// Kept once, by the start that read it (the eBPF load).
+pub fn note_roles_at_start(r: RolesAtStart) {
+    let _ = ROLES_AT_START.set(r);
+}
+
+/// What [`note_roles_at_start`] kept.
+pub fn roles_at_start() -> Option<RolesAtStart> {
+    ROLES_AT_START.get().copied()
+}
+
+/// Both roles released by the operator (a note): inside a signed window,
+/// or after a shutdown the admin quorum signed.
+pub const ROLES_RELEASED: &str = "roles_released";
+
+/// Both roles vacated at the agent's start: the gap's finding — High
+/// ([`ROLES_VACATED_GAP`]) unless the operator released both (the review of
+/// #582, F4 b): their last exits inside a signed trusted-installer window
+/// (the kernel's marks), or the watchdog's chain ending with the agent's
+/// role released by a signed shutdown, the watchdog standing down after it
+/// (`signed_stop`, [`WitnessReader::ends_with_signed_release`]) — then a
+/// note ([`ROLES_RELEASED`]). `None` when not both were vacated.
+pub fn roles_gap(r: &RolesAtStart, signed_stop: bool) -> Option<Finding> {
+    if !r.both_vacated() {
+        return None;
+    }
+    let why = if r.both_left_in_a_window() {
+        Some("both last exits inside a signed trusted-installer window (the operator's stop)")
+    } else if signed_stop {
+        Some(
+            "the watchdog's chain ends with the agent's role released by a shutdown the admin \
+             quorum signed, the watchdog standing down after it",
+        )
+    } else {
+        None
+    };
+    Some(match why {
+        Some(why) => Finding {
+            kind: ROLES_RELEASED,
+            detail: format!("the agent's start found both roles released this boot: {why}"),
+        },
+        None => Finding {
+            kind: ROLES_VACATED_GAP,
+            detail: "the agent's start found both roles vacated this boot: the agent and the \
+                     watchdog had exited, no role held the other's record of it until now"
+                .to_string(),
+        },
     })
 }
 
@@ -357,6 +458,31 @@ mod tests {
         assert!(v.detail.contains("taken by pid 9") && v.detail.contains("marks clean"));
     }
 
+    /// The review of #582 (F3): a watchdog successor that is not its unit's
+    /// clean restart is observed, not refused — it holds the role the kernel
+    /// gave it and registers itself — and the finding says so
+    /// (`watchdog_successor_foreign`).
+    #[test]
+    fn a_foreign_watchdog_successor_is_recorded_as_holding_the_role_never_as_refused() {
+        let v = judge_watchdog_successor(9, &unit(), Some(false), &Findings::default());
+        assert!(!v.given);
+        assert!(
+            v.detail
+                .contains("holds the role the kernel gave it and registers itself")
+                && v.detail.contains("the agent does not register it"),
+            "{}",
+            v.detail
+        );
+        assert!(!v.detail.to_lowercase().contains("refus"), "{}", v.detail);
+        assert_eq!(WATCHDOG_SUCCESSOR_FOREIGN, "watchdog_successor_foreign");
+        let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
+        assert!(
+            v.given && !v.detail.contains("holds the role"),
+            "{}",
+            v.detail
+        );
+    }
+
     /// Lot 374: the watchdog's record of a vacancy, or of a successor that
     /// is not its unit's clean restart, is a row (High); its bookkeeping —
     /// a life's first row, a signed shutdown's release, the unit's clean
@@ -364,16 +490,27 @@ mod tests {
     /// clean succession.
     #[test]
     fn a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note() {
-        use nn_proto::witness::{KIND_FOUND_VACANT, KIND_SUCCESSOR_REFUSED};
+        use nn_proto::witness::{
+            KIND_CHAIN_CUT, KIND_FOUND_VACANT, KIND_RESPAWN_HELD, KIND_SUCCESSOR_FOREIGN,
+        };
         for k in [
             KIND_VACATED,
             KIND_FOUND_VACANT,
-            KIND_SUCCESSOR_REFUSED,
+            KIND_SUCCESSOR_FOREIGN,
+            // the review of #582 (F2 c, d): a held respawn, a cut chain
+            KIND_RESPAWN_HELD,
+            KIND_CHAIN_CUT,
             "a kind of later",
         ] {
             assert_eq!(row_kind(k), WITNESS_ROW, "{k}");
         }
-        for k in [KIND_OPENED, KIND_RELEASED, KIND_SUCCEEDED] {
+        for k in [
+            KIND_OPENED,
+            KIND_RELEASED,
+            // the review of #582 (F4 a)
+            KIND_RELEASED_IN_WINDOW,
+            KIND_SUCCEEDED,
+        ] {
             assert_eq!(row_kind(k), WITNESS_NOTE, "{k}");
         }
         for k in [WITNESS_KEY, WITNESS_NOTE, WATCHDOG_SUCCESSION] {
@@ -383,20 +520,115 @@ mod tests {
             WITNESS_ROW,
             WITNESS_UNCERTIFIED,
             WITNESS_BROKEN,
-            WATCHDOG_SUCCESSOR_REFUSED,
+            WATCHDOG_SUCCESSOR_FOREIGN,
             ROLES_VACATED_GAP,
         ] {
             assert!(!is_note(k), "{k}");
         }
     }
 
+    fn at_start(agent: u32, watchdog: u32, marks: (Option<u32>, Option<u32>)) -> RolesAtStart {
+        RolesAtStart {
+            agent,
+            watchdog,
+            agent_mark: marks.0,
+            watchdog_mark: marks.1,
+        }
+    }
+
     #[test]
     fn both_roles_vacated_is_the_gap_and_nothing_else_is() {
         use antitamper_bpf::ROLE_VACATED as V;
-        assert_eq!(roles_gap(V, V).map(|f| f.kind), Some(ROLES_VACATED_GAP));
+        let out = Some(antitamper_bpf::ROLE_MARK_VACATED);
+        let gap = roles_gap(&at_start(V, V, (out, out)), false);
+        assert_eq!(gap.map(|f| f.kind), Some(ROLES_VACATED_GAP));
         for (a, w) in [(V, 0), (0, V), (V, 42), (42, V), (0, 0)] {
-            assert!(roles_gap(a, w).is_none(), "{a} {w}");
+            assert!(
+                roles_gap(&at_start(a, w, (out, out)), false).is_none(),
+                "{a} {w}"
+            );
+            assert!(
+                roles_gap(&at_start(a, w, (out, out)), true).is_none(),
+                "{a} {w}"
+            );
         }
+    }
+
+    /// The review of #582 (F4 b): both roles released by the operator — the
+    /// guide's maintenance stop inside a signed window (both last exits
+    /// marked so by the kernel), or a shutdown the admin quorum signed (the
+    /// watchdog's chain ends with the agent's role released) — is a note at
+    /// the next start in the same boot, never the High gap. One exit
+    /// outside a window, or a mark not read, is still the gap.
+    #[test]
+    fn both_roles_released_by_the_operator_is_a_note_not_the_gap() {
+        use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M, ROLE_VACATED as V};
+        let win = Some(M | W);
+        let f = roles_gap(&at_start(V, V, (win, win)), false).unwrap();
+        assert_eq!(f.kind, ROLES_RELEASED);
+        assert!(
+            f.detail.contains("signed trusted-installer window"),
+            "{}",
+            f.detail
+        );
+        assert!(is_note(f.kind));
+        let f = roles_gap(&at_start(V, V, (Some(M), Some(M))), true).unwrap();
+        assert_eq!(f.kind, ROLES_RELEASED);
+        assert!(f.detail.contains("admin quorum signed"), "{}", f.detail);
+        for marks in [(win, Some(M)), (Some(M), win), (win, None), (None, None)] {
+            let f = roles_gap(&at_start(V, V, marks), false).unwrap();
+            assert_eq!(f.kind, ROLES_VACATED_GAP, "{marks:?}");
+            assert!(!is_note(f.kind));
+        }
+    }
+
+    /// The review of #582 (F4 b): the chain "ends with a signed release" only
+    /// when its last valid row is `role_released` signed by a key the agent
+    /// certified — a later watchdog life's row after it, a key never
+    /// certified, or another kind is not.
+    #[test]
+    fn only_a_certified_release_as_the_chain_s_last_row_is_a_signed_stop() {
+        use nn_proto::witness::{KIND_OPENED, KIND_RELEASED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let k = WitnessKey::from_seed([3; 32]);
+        let write = |kinds: &[&str]| {
+            let mut text = String::new();
+            let mut prev = String::new();
+            for (i, kind) in kinds.iter().enumerate() {
+                let r = k.sign(Row {
+                    v: ROW_VERSION,
+                    seq: i as u64,
+                    prev: prev.clone(),
+                    at: 1,
+                    tgid: 7,
+                    key: String::new(),
+                    kind: kind.to_string(),
+                    detail: String::new(),
+                    sig: String::new(),
+                });
+                let line = serde_json::to_string(&r).unwrap();
+                prev = line_hash(&line);
+                text += &line;
+                text.push('\n');
+            }
+            std::fs::write(dir.path().join(CHAIN_FILE), text).unwrap();
+        };
+        let reader = |certified: bool| {
+            let mut r = WitnessReader::new(dir.path());
+            if certified {
+                r.position().certify(&k.public_hex());
+            }
+            r
+        };
+        write(&[KIND_OPENED, KIND_RELEASED]);
+        assert!(reader(true).ends_with_signed_release());
+        assert!(!reader(false).ends_with_signed_release());
+        write(&[KIND_OPENED, KIND_RELEASED, KIND_OPENED]);
+        assert!(!reader(true).ends_with_signed_release());
+        write(&[KIND_OPENED, KIND_VACATED]);
+        assert!(!reader(true).ends_with_signed_release());
+        std::fs::remove_file(dir.path().join(CHAIN_FILE)).unwrap();
+        assert!(!reader(true).ends_with_signed_release());
     }
 
     /// A memory file named as the watchdog's key file, holding `body`,
