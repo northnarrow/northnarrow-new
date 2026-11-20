@@ -11774,6 +11774,11 @@ number in parentheses is a lab PR.
     reads the role maps through a read-only descriptor; the witness test
     waits for the successor's row and matches the import's kinds whole (its
     watchdog is the test's, not its unit's restart: its rows uncertified).
+  - #582's KVM suites, fix round 5 (product): the agent's start signs its
+    verdict on the watchdog it finds — the watchdog refresh has the audit
+    log from its spawn; bound a few ms after its first round, a foreign
+    watchdog found at the start was only logged, never signed (both CI
+    guests). Ratchet `the_watchdog_refresh_signs_from_its_first_round`.
   - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a

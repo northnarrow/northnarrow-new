@@ -1410,6 +1410,11 @@ fn heads(records: &[&String]) -> Vec<String> {
 /// The certified import — a unit's watchdog, its key read from its sealed
 /// memory file — is the lab's `witness_open` case and nn-linux's
 /// `witness_rows_are_imported_once_after_their_key_is_certified`.
+///
+/// Fix round 5 of #582: the verdict was only logged on both CI guests — the
+/// agent's watchdog refresh judged the watchdog at its first round, a few
+/// ms before the start handed it the audit log. It has the log from its
+/// spawn now (the agent's `the_watchdog_refresh_signs_from_its_first_round`).
 #[test]
 fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     use nn_proto::witness::{
