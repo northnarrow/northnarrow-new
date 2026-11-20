@@ -1682,6 +1682,7 @@ fn kmod_tree_write(r: &OpenRecordRaw, path: &str, comm: &str) -> Option<FimEvent
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         // lot 352 (the re-check of #561, N1): a fork-only process's start
         modifier_start: r.fork_start,
     })
@@ -1727,6 +1728,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             timestamp_ns: r.timestamp_ns,
             path_from_user: false,
             kernel_class: r.reason,
+            exe_file: (r.exe_dev, r.exe_ino),
         });
     }
     if r.reason & open_reason::CRED != 0 {
@@ -1764,6 +1766,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             // lot 352: as above
             modifier_start: r.fork_start,
         }));
@@ -1794,6 +1797,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             // lot 352: as above
             modifier_start: r.fork_start,
         }));
@@ -3457,6 +3461,27 @@ mod tests {
         assert!(
             matches!(&events_of(&r, &mut mounts)[0], Event::Fim(fe) if fe.path == "mnt[0:5:5]/.aws/credentials")
         );
+    }
+
+    /// Lot 376 (named): the opener's executable the kernel read at the open
+    /// (`mm->exe_file`) travels with the `FileOpen` event — the posture tells
+    /// `sudo`'s own read of `/etc/sudoers` by it while its exec is not in
+    /// the lineage yet; a record without it says `(0, 0)`.
+    #[test]
+    fn the_opener_s_executable_travels_with_the_open() {
+        let mut mounts = MountTable {
+            loaded: Some(Instant::now()),
+            ..MountTable::default()
+        };
+        let dev = (0x2d << 20) | 7;
+        let mut r = record(open_reason::SENSITIVE, &["sudoers", "etc", "/"], (dev, 2));
+        let image = |r: &OpenRecordRaw, mounts: &mut MountTable| match &events_of(r, mounts)[0] {
+            Event::FileOpen { exe_file, .. } => *exe_file,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(image(&r, &mut mounts), (0, 0));
+        (r.exe_dev, r.exe_ino) = (0x80_0001, 4242);
+        assert_eq!(image(&r, &mut mounts), (0x80_0001, 4242));
     }
 
     /// External audit SNS-005: a record whose filesystem root no mount of

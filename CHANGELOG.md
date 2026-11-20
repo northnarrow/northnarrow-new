@@ -6,6 +6,69 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 376 (the rc9 soaks): three false positives and the Low noise judged
+  by identity (`UPGRADE_NOTES_WAVE4.md` §62).
+  - **A rotated log's first record.** logrotate's `create` put a new file
+    at the watched path, watched with no check and no size. Its first
+    record — rsyslogd's last flush at a cold boot's shutdown — was
+    measured against the old file's baseline: `NN-L-FIM-005` High by
+    rsyslogd. The new file's size is now read as it is watched. The
+    rotation is checked once as the renamer's change of the path
+    (logrotate by hand: High; under its timer: Low), as FIMR-004 checks a
+    file renamed over a watched one. Tests
+    `a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size`,
+    `the_file_found_at_a_renamed_away_path_is_checked_as_the_renamer_s`,
+    `a_rotation_seen_before_it_lands_is_checked_by_the_retry`.
+  - **The posture at every boot.** The `POSTURE TRANSITION` line names the
+    event: kind, pid, uid, comm, image, path or object (test
+    `the_event_that_raised_a_trigger_is_named`). It named `sudo`'s read of
+    `/etc/sudoers` at uid 1000, judged before its exec reached the lineage.
+    The file-open sensor's record now carries the opener's executable at
+    the open (`mm->exe_file`). The host's packaged authentication binary,
+    in a root-only directory, is the auth stack's own read. On Debian 13
+    the line named podman's quadlet user generator reading `/etc/passwd`
+    under the user's service manager, which sets no login uid there. A
+    packaged program the user's own manager (the host's systemd, as the
+    user, PID 1's child) started is now covered by BUG-018's `/etc/passwd`
+    carve-out. Tests
+    `sudo_s_own_read_before_its_exec_is_known_is_told_by_its_image`,
+    `the_opener_s_executable_travels_with_the_open`,
+    `a_user_manager_s_packaged_generator_reading_passwd_is_no_sensitive_access`.
+  - **`pg_createcluster`'s free-port probe.** A package transaction's own
+    program, run by root, binding the wildcard address is `NN-L-NET-019`
+    and `NN-L-NET-006` Low. A root listener's Medium record names the
+    missing fact. Test
+    `net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low`.
+  - **`NN-L-FIM-009` noise.** A package transaction's Low records are one
+    per package-manager process within 15 minutes, the rest counted as
+    coalesced (lot 352's mechanism, shared; the review of #583: keyed by
+    the process's pid and start). Tests
+    `fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window`,
+    `transaction_coalesced_keeps_what_is_not_a_transaction_s_low_record`,
+    `a_pid_reused_within_the_window_records_its_own_first`.
+  - **The review of #583.**
+    - A hand `logrotate -f` with root's configuration, by the packaged
+      logrotate as root, renaming `wtmp`/`btmp` away: `NN-L-FIM-019` High,
+      recorded, never a kill. The drain marks the check of a file renamed
+      away (`FimEvent::renamed_away`); a truncation in place, a rename over
+      the file, another configuration or writer keep the kill. Tests
+      `a_hand_rotation_by_the_packaged_logrotate_with_root_s_configuration_is_high_never_a_kill`,
+      `a_rename_away_check_carries_its_mark_and_nothing_else_does`,
+      `logrotate_with_root_s_configuration_only`.
+    - The package-transaction listener's Low needs a package's dpkg
+      maintainer script in the lineage: an APT hook's `socat` bind shell is
+      Medium. Test
+      `net_019_an_apt_hook_s_packaged_relay_listener_is_no_package_s_own`.
+    - The image at the open stands in only while the cache holds no exec of
+      the reader (a process can change its `mm->exe_file`). Test
+      `the_image_at_the_open_does_not_override_a_known_foreign_exec`.
+    - R004 at a 24.04 reboot: the exec record is attached after the exec
+      sensor (ratchet `exec_attach_order.rs`), and an exec with no identity
+      of `/proc/self/fd/N` that PID 1 forked, as root, is its executor when
+      PID 1's own descriptor `N` is one of the executor's identities. Tests
+      `pid_1_s_executor_launch_without_an_identity_is_told_by_pid_1_s_descriptor`,
+      `own_descriptor_reads_only_the_two_exact_spellings`,
+      `the_exec_record_is_attached_after_the_exec_sensor`.
 - Lot 374 (the pre-alpha's re-check on rc9, R9-1): **the vacated role's
   successor is witnessed and bound to its unit** (`UPGRADE_NOTES_WAVE4.md`
   §61).

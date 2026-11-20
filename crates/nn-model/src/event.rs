@@ -123,6 +123,13 @@ pub enum Event {
         /// unread component). 0 in tracepoint mode and on older records.
         #[serde(default)]
         kernel_class: u32,
+        /// Lot 376: the opener's executable at the open, as the LSM
+        /// file-open sensor read it (`mm->exe_file`: the device in the
+        /// kernel's form, the inode) — the image the process ran when it
+        /// opened, whether or not its exec has reached the lineage. `(0, 0)`
+        /// when not read: tracepoint mode, older records.
+        #[serde(default)]
+        exe_file: (u64, u64),
     },
     /// Tappa 10.9 step 1: one process crossed the mass-write threshold
     /// (`OPEN_MASS_WRITE_MIN` write-opens within the window), counted in
@@ -1482,6 +1489,7 @@ impl From<&FileOpenRaw> for Event {
             timestamp_ns: raw.timestamp_ns,
             path_from_user: true,
             kernel_class: 0,
+            exe_file: (0, 0),
         }
     }
 }

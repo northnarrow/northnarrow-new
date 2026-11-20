@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
+    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAMED_AWAY,
     FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
     FIM_WRITE_ONE_WRITER, FIM_WRITE_TRUNCATED_BY_ANOTHER,
 };
@@ -996,13 +996,15 @@ const RETRY_EVERY: Duration = Duration::from_millis(5);
 
 /// A watched inode renamed away: its path, why it was watched, since when,
 /// and — external audit FIMR-004 — the renamer's event when the rename put
-/// another file over it.
+/// another file over it; lot 376: the rename's own event (the file found at
+/// the path once it lands is checked as the renamer's: [`replacement_check`]).
 #[derive(Debug, Clone)]
 struct PendingRename {
     path: String,
     class: WatchClass,
     since: Instant,
     replaced: Option<FimDriftRaw>,
+    renamer: FimDriftRaw,
 }
 
 /// Lab PR 229: a setattr event whose re-read found the file as baselined —
@@ -1235,7 +1237,10 @@ fn replacement_raw(path: &str, mut raw: FimDriftRaw) -> Option<FimDriftRaw> {
     raw.target_dev = key.dev;
     raw.target_ino = key.ino;
     raw.op = FimOp::Modified as u8;
-    raw.op_flags = 0;
+    // the review of #583 (F1): only the drain's own mark of a rename away
+    // ([`replacement_check`]) is kept — the rename record's bits describe
+    // the rename, not this check
+    raw.op_flags &= FIM_RENAMED_AWAY;
     raw.dest_dev = 0;
     raw.dest_ino = 0;
     raw.child_name = [0u8; FIM_CHILD_NAME_LEN];
@@ -1266,9 +1271,10 @@ fn retry_pending_enrollments(
     examined += renames.len();
     let mut left = Vec::new();
     for (key, p) in renames {
-        if settle_rename(&key, &p.path, p.class, path_map, watched_paths) {
-            if let Some(raw) = &p.replaced {
-                queue_replacement(path_map, &p.path, raw);
+        let settled = settle_rename(&key, &p.path, p.class, path_map, watched_paths);
+        if settled != Settled::NotLanded {
+            if let Some(raw) = replacement_check(settled, p.class, p.replaced, &p.renamer) {
+                queue_replacement(path_map, &p.path, &raw);
             }
         } else if p.since.elapsed() < ENROLL_RETRY_FOR {
             left.push((key, p));
@@ -1342,23 +1348,34 @@ fn retries_waiting(path_map: &InodePathMap) -> bool {
     })
 }
 
+/// What [`settle_rename`] found at the watched path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The path still resolves to the renamed inode: the rename has not
+    /// landed yet, or was refused.
+    NotLanded,
+    /// Nothing is at the path (a return is awaited, but a runtime child's).
+    Gone,
+    /// Another file is at the path, watched in the renamed one's place.
+    Replaced,
+}
+
 /// External audit FIMP-005: a watched file renamed away keeps its inode,
 /// which went on resolving to the watched path — every later event on the
 /// moved file was reported under the watched name (`mv authorized_keys
 /// authorized_keys.bak`, then an edit of the copy, drew the
 /// authorized_keys rule's kill). Once the path no longer resolves to
 /// `key`, forget `key` and watch whatever now lives at the path, as
-/// `class`. `false` while the path still resolves to `key`: the rename has
-/// not landed yet, or was refused.
+/// `class`. [`Settled::NotLanded`] while the path still resolves to `key`.
 fn settle_rename(
     key: &InodeKey,
     path: &str,
     class: WatchClass,
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
-) -> bool {
+) -> Settled {
     if matches!(key_for_path(&fs_path(path)), Ok(k) if k == *key) {
-        return false;
+        return Settled::NotLanded;
     }
     forget_if_gone(key, path, path_map, watched_paths);
     // A replacement may already sit at the path (rename-over). If nothing
@@ -1366,10 +1383,63 @@ fn settle_rename(
     // not for a runtime child — a file put back in a watched directory is
     // enrolled by the directory's own event, and children renamed away
     // (`crontab`'s temporary file) filled the list for good.
-    if !enroll_path(path, class, path_map, watched_paths) && class != WatchClass::RuntimeChild {
+    // Lot 376: the size of the file there read BEFORE the kernel watches it,
+    // as at the start (lot 340, lot 350 F2-1): every write a record of it
+    // reports comes after — rsyslogd's appends to the log logrotate put
+    // there are measured against it, never against the old file's baseline.
+    let watched_size = antitamper_bpf::kernel_roots::symlink_metadata(fs_path(path))
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.ino(), m.len())
+        });
+    if enroll_path(path, class, path_map, watched_paths) {
+        if let Some((ino, size)) = watched_size {
+            if let Some(now) = key_for_path(&fs_path(path)).ok().filter(|k| k.ino == ino) {
+                path_map.note_size(&now, size);
+            }
+        }
+        return Settled::Replaced;
+    }
+    if class != WatchClass::RuntimeChild {
         await_return(path_map, path, class);
     }
-    true
+    Settled::Gone
+}
+
+/// The renamer's event to check the file at the path with, as a
+/// modification of the path by the renamer ([`queue_replacement`]), once a
+/// rename of the watched inode landed:
+/// - external audit FIMR-004: the rename put another file over it (the
+///   kernel flagged the replaced inode: `replaced`);
+/// - lot 376 (the rc9 soak: NN-L-FIM-005 High by rsyslogd at a host's
+///   shutdown): or another file stood at the path when it landed — renamed
+///   away and a new file put there (logrotate's `create`, an editor's
+///   backup rename, `mv` away then a new file written). That file was
+///   watched with no check and no size read, so its first record —
+///   rsyslogd's next close, often its last flush at the shutdown, hours
+///   later — was measured against the old file's baseline: the rotation's
+///   shrink judged late, on rsyslogd. It is the renamer's change of the
+///   path, judged when it lands (logrotate by hand: High; under its timer:
+///   Low), and its read is the new file's measure for the appends after it.
+///   Not for a runtime child: its directory's own event enrolls and judges
+///   the file put back.
+fn replacement_check(
+    settled: Settled,
+    class: WatchClass,
+    replaced: Option<FimDriftRaw>,
+    renamer: &FimDriftRaw,
+) -> Option<FimDriftRaw> {
+    replaced.or_else(|| {
+        (settled == Settled::Replaced && class != WatchClass::RuntimeChild).then(|| {
+            // the review of #583 (F1): renamed AWAY — the content kept under
+            // the new name — not over (`replaced`), not a write in place
+            let mut away = *renamer;
+            away.op_flags = FIM_RENAMED_AWAY;
+            away
+        })
+    })
 }
 
 /// Wait for a file to come back at `path`, watched as `class`.
@@ -2281,9 +2351,10 @@ pub fn process_record(
     // renamed over it — checked as a modification once the rename lands.
     if op == FimOp::Renamed && !moved_in_leaf {
         let replaced = (raw.op_flags & FIM_RENAME_REPLACED != 0).then_some(*raw);
-        if settle_rename(&key, &path, class, path_map, watched_paths) {
-            if let Some(r) = &replaced {
-                queue_replacement(path_map, &path, r);
+        let settled = settle_rename(&key, &path, class, path_map, watched_paths);
+        if settled != Settled::NotLanded {
+            if let Some(r) = replacement_check(settled, class, replaced, raw) {
+                queue_replacement(path_map, &path, &r);
             }
         } else {
             let pending = PendingRename {
@@ -2291,12 +2362,15 @@ pub fn process_record(
                 class,
                 since: Instant::now(),
                 replaced,
+                renamer: *raw,
             };
             queues(path_map, |q| {
                 q.rename.push_with(key, pending, |queued, new| {
                     if queued.replaced.is_none() {
                         queued.replaced = new.replaced;
                     }
+                    // lot 376: the latest rename of the inode
+                    queued.renamer = new.renamer;
                 })
             });
         }
@@ -2381,6 +2455,7 @@ pub fn process_record(
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 // lot 352 (the re-check of #561, N1): the reader's start
                 modifier_start: process_start(raw),
             }));
@@ -2434,6 +2509,9 @@ pub fn process_record(
     let unchanged_since_read = content
         .as_ref()
         .is_some_and(|c| path_map.read_unchanged(&size_key, c.size, &c.sha256));
+    // the review of #583 (F1): the drain's check of a file put at a watched
+    // path whose file was renamed away ([`replacement_check`])
+    let renamed_away = op == FimOp::Modified && raw.op_flags & FIM_RENAMED_AWAY != 0;
     if let Some(c) = &content {
         path_map.note_read(&size_key, c.size, &c.sha256);
     }
@@ -2662,6 +2740,7 @@ pub fn process_record(
             appends_only: appends_only(raw, op),
             truncated_by_another,
             unchanged_since_read,
+            renamed_away,
             modifier_start: process_start(raw),
         };
         // lot 347: a login record's packaged writer, read while it runs —
@@ -3181,9 +3260,19 @@ fn decode_record(
             (link.root_dev, link.root_ino),
             mounts,
         );
-        return Ok((link.drift, Some(path)));
+        return Ok((kernel_record(link.drift), Some(path)));
     }
-    Ok((*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?, None))
+    Ok((
+        kernel_record(*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?),
+        None,
+    ))
+}
+
+/// The review of #583 (F1): a record the kernel sent, without the bits only
+/// the drain sets ([`FIM_RENAMED_AWAY`]: its own check of a rename away).
+fn kernel_record(mut raw: FimDriftRaw) -> FimDriftRaw {
+    raw.op_flags &= !FIM_RENAMED_AWAY;
+    raw
 }
 
 /// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
@@ -3624,6 +3713,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         modifier_start: 0,
     })
 }
@@ -5127,6 +5217,247 @@ mod tests {
         assert_eq!(fx.path_map.take_truncation(&fx.key), Some(other));
     }
 
+    /// Lot 376: logrotate's `create` on the log of [`LogFixture`] — the log
+    /// renamed away by `renamer`, a new one written with `new` in its place
+    /// — and the drain's record of that rename. The new file's key.
+    fn rotate_by_create(fx: &mut LogFixture, renamer: u32, new: &[u8]) -> InodeKey {
+        std::fs::rename(&fx.log, fx.log.with_extension("log.1")).unwrap();
+        std::fs::write(&fx.log, new).unwrap();
+        let mut renamed = fake_raw(fx.key.dev, fx.key.ino, FimOp::Renamed as u8);
+        renamed.modifier_pid = renamer;
+        renamed.modifier_comm = *b"logrotate\0\0\0\0\0\0\0";
+        let fe = fx.drift(&renamed).expect("the rename's own event");
+        assert_eq!(fe.op, FimOp::Renamed);
+        key_for_path(&fx.log).unwrap()
+    }
+
+    /// Lot 376 (mini-hunt): the check of the file found at a path after its
+    /// watched inode was renamed away is the renamer's, for a path watched
+    /// in its own right — an editor's backup rename (`sshd_config` to
+    /// `sshd_config~`, a new file written) is checked as its change, as a
+    /// rename over it is (FIMR-004). Not for a runtime child of a watched
+    /// directory: the directory's own event enrolls and judges the file put
+    /// back (no second check). Nothing at the path: no check (a return is
+    /// awaited).
+    #[test]
+    fn the_file_found_at_a_renamed_away_path_is_checked_as_the_renamer_s() {
+        let dir = TempDir::new().unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            fresh_signing_key(&dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let renamed_away =
+            |name: &str, class: WatchClass, back: bool, drift_db: &mut FimDriftDb| {
+                let watched = dir.path().join(name);
+                std::fs::write(&watched, b"PermitRootLogin no\n").unwrap();
+                let key = key_for_path(&watched).unwrap();
+                let _ = path_map.insert_as(key, watched.to_string_lossy().to_string(), class);
+                std::fs::rename(&watched, dir.path().join(format!("{name}~"))).unwrap();
+                if back {
+                    std::fs::write(&watched, b"PermitRootLogin yes\n").unwrap();
+                }
+                let mut raw = fake_raw(key.dev, key.ino, FimOp::Renamed as u8);
+                raw.modifier_pid = 7_000;
+                let _ = process_drift(
+                    &raw,
+                    &path_map,
+                    None,
+                    drift_db,
+                    &DriftClassifier::new(),
+                    &DriftRateLimiter::new(),
+                    None,
+                    None,
+                    None,
+                );
+                // a file put at an empty path after the settle is a return
+                // awaited (its own check), not the renamer's
+                if !back {
+                    std::fs::write(&watched, b"later\n").unwrap();
+                }
+                replacement_raws(&path_map)
+                    .into_iter()
+                    .filter(|r| r.modifier_pid == 7_000)
+                    .count()
+            };
+        assert_eq!(
+            renamed_away("sshd_config", WatchClass::Configured, true, &mut drift_db),
+            1,
+            "the editor's new file: its change"
+        );
+        assert_eq!(
+            renamed_away("x.conf", WatchClass::RuntimeChild, true, &mut drift_db),
+            0,
+            "a runtime child: its directory's event"
+        );
+        assert_eq!(
+            renamed_away("sudoers", WatchClass::Configured, false, &mut drift_db),
+            0,
+            "nothing at the path"
+        );
+    }
+
+    /// Lot 376 (named, the rc9 soak: NN-L-FIM-005 High by rsyslogd at a cold
+    /// boot's shutdown — 2604 ×3, 2404 ×1). logrotate's `create` renames the
+    /// log away and puts a new file at its path; the drain watched the new
+    /// file with no check and no size, so its FIRST record — rsyslogd's
+    /// next close, its last flush at the shutdown hours later — was measured
+    /// against the old file's baseline: a "shrink" by rsyslogd, High. The
+    /// rotation's shrink, judged late and on the wrong writer.
+    ///
+    /// Now the new file's size is read as it is watched: rsyslogd's appends
+    /// to it (its shutdown flush) grew it — exempt by the daemon's identity,
+    /// whichever comes first; and the rotation itself is checked once, as
+    /// the renamer's modification of the path (logrotate by hand: High,
+    /// EXPECTED; under its timer: Low, [`nn_core::fim::rules::LogRotation`]).
+    /// The attack shapes stay High: a writer that is not rsyslogd shrinking
+    /// the new file, and a log moved away with a new file put in its place
+    /// by any other program.
+    #[test]
+    fn a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size() {
+        const BOTH: u8 = FIM_WRITE_APPEND_ONLY | FIM_WRITE_ONE_WRITER;
+        let (logrotate, rsyslogd) = (4_200, 600);
+        let flush = |key: InodeKey| {
+            let mut raw = fake_raw(key.dev, key.ino, FimOp::Modified as u8);
+            raw.modifier_pid = rsyslogd;
+            raw.op_flags = BOTH;
+            raw
+        };
+        let judged_as = |fe: &FimEvent, exe: &str| {
+            use nn_core::decision::Rule;
+            let mut fe = fe.clone();
+            fe.path = "/var/log/auth.log".into();
+            fe.modifier_exe = Some(exe.into());
+            fe.modifier_uid = 0;
+            nn_core::fim::rules::NnLFim005LogTruncated::new(Some(102)).evaluate(&Event::Fim(fe))
+        };
+        // rsyslogd's flush read before the rotation's check, and after it
+        for check_first in [false, true] {
+            let mut fx = LogFixture::new(4_000);
+            fx.baseline_now();
+            let new = rotate_by_create(&mut fx, logrotate, b"");
+            let mut checks: Vec<_> = replacement_raws(&fx.path_map)
+                .into_iter()
+                .filter(|r| r.modifier_pid == logrotate)
+                .collect();
+            assert_eq!(checks.len(), 1, "one check of the file put at the path");
+            assert_eq!(
+                (checks[0].target_dev, checks[0].target_ino),
+                (new.dev, new.ino)
+            );
+            assert_eq!(checks[0].op, FimOp::Modified as u8);
+            let check = checks.remove(0);
+            let judge_check = |fx: &mut LogFixture| {
+                let fe = fx.drift(&check).expect("the path's file changed");
+                assert_eq!((fe.op, fe.modifier_pid), (FimOp::Modified, logrotate));
+                let v = judged_as(&fe, "/usr/sbin/logrotate").expect("the rotation is judged");
+                assert_eq!(v.severity, nn_model::Severity::High);
+            };
+            if check_first {
+                judge_check(&mut fx);
+            }
+            fx.append(b"rsyslogd: exiting on signal 15\n");
+            let fe = fx
+                .drift(&flush(new))
+                .expect("rsyslogd's appends are a drift");
+            assert_eq!(fe.baseline_size, Some(0), "measured against the new file");
+            for uid in [0, 102] {
+                assert!(
+                    LogFixture::judged_as_rsyslogd(&fe, uid).is_none(),
+                    "rsyslogd's last flush to the rotated log is its append (check first: {check_first})"
+                );
+            }
+            if !check_first {
+                judge_check(&mut fx);
+            }
+            // the attack shape: another writer shrinks the new log — High
+            fx.truncate(3);
+            let mut cut = fake_raw(new.dev, new.ino, FimOp::Modified as u8);
+            cut.modifier_pid = 4_300;
+            cut.op_flags = FIM_SETATTR_SIZE;
+            let fe = fx.drift(&cut).expect("a truncation");
+            let v = LogFixture::judged_as_another(&fe).expect("a truncation by another writer");
+            assert_eq!(v.severity, nn_model::Severity::High);
+        }
+        // the attack shape: a log moved away by a program run from /tmp, a
+        // forged one put in its place — judged as that program's change of
+        // the log, High
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let mover = 4_400;
+        let new = rotate_by_create(&mut fx, mover, b"Nov 20 nothing to see\n");
+        let check = replacement_raws(&fx.path_map)
+            .into_iter()
+            .find(|r| r.modifier_pid == mover)
+            .expect("the forged file is checked");
+        assert_eq!((check.target_dev, check.target_ino), (new.dev, new.ino));
+        let fe = fx.drift(&check).expect("a drift");
+        let v = judged_as(&fe, "/tmp/.x/mv").expect("High");
+        assert_eq!(v.severity, nn_model::Severity::High);
+    }
+
+    /// The review of #583 (named, F1): the drain's check of a file put at a
+    /// path whose watched file was renamed AWAY (logrotate's `create`: the
+    /// old content kept as `wtmp.1`) carries the mark `renamed_away` — what
+    /// NN-L-FIM-019's rotation arm needs to tell a hand rotation from a
+    /// truncation ([`nn_core::fim::rules::LogRotation`]). Nothing else
+    /// carries it: a rename OVER the watched file (FIMR-004: its content
+    /// gone), a truncation in place, a write, and a kernel record that came
+    /// with the bit set (the drain's alone: cleared at the decode).
+    #[test]
+    fn a_rename_away_check_carries_its_mark_and_nothing_else_does() {
+        let logrotate = 4_200;
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let new = rotate_by_create(&mut fx, logrotate, b"");
+        let check = replacement_raws(&fx.path_map)
+            .into_iter()
+            .find(|r| r.modifier_pid == logrotate)
+            .expect("the rotation's check");
+        assert_eq!(check.op_flags, FIM_RENAMED_AWAY, "the mark alone");
+        let fe = fx.drift(&check).expect("the path's file changed");
+        assert!(fe.renamed_away, "a rename away");
+        assert_eq!((fe.op, fe.modifier_pid), (FimOp::Modified, logrotate));
+        // a truncation in place of the new file, by another writer: no mark
+        fx.append(b"a line\n");
+        fx.truncate(0);
+        let mut cut = fake_raw(new.dev, new.ino, FimOp::Modified as u8);
+        cut.modifier_pid = 4_300;
+        cut.op_flags = FIM_SETATTR_SIZE;
+        let fe = fx.drift(&cut).expect("a truncation");
+        assert!(!fe.renamed_away, "a truncation in place");
+        // a rename OVER the watched file (FIMR-004): no mark
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let prepared = fx.log.with_extension("new");
+        std::fs::write(&prepared, b"").unwrap();
+        std::fs::rename(&prepared, &fx.log).unwrap();
+        let mut over = fake_raw(fx.key.dev, fx.key.ino, FimOp::Renamed as u8);
+        over.op_flags = FIM_RENAME_REPLACED;
+        over.modifier_pid = 4_400;
+        let _ = fx.drift(&over);
+        let check = replacement_raws(&fx.path_map)
+            .into_iter()
+            .find(|r| r.modifier_pid == 4_400)
+            .expect("the rename over is checked");
+        assert_eq!(check.op_flags, 0, "no mark on a rename over");
+        let fe = fx.drift(&check).expect("the replaced content");
+        assert!(!fe.renamed_away, "a rename over");
+        // a kernel record with the drain's bit: cleared at the decode
+        let mut forged = fake_raw(fx.key.dev, fx.key.ino, FimOp::Modified as u8);
+        forged.op_flags = FIM_RENAMED_AWAY | FIM_WRITE_APPEND_ONLY;
+        let mut mounts = crate::sensors::open_sensor::MountTable::default();
+        let (decoded, _) = decode_record(bytemuck::bytes_of(&forged), &mut mounts).unwrap();
+        assert_eq!(
+            decoded.op_flags, FIM_WRITE_APPEND_ONLY,
+            "the kernel's bits only"
+        );
+    }
+
     /// The review of #554 (named, F1): a record seen at close carries its
     /// writer's start, and its pid may name another process by then — an
     /// `rsyslogd` started at the pid lent its image to a log's shrink. The
@@ -6018,6 +6349,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let own_sha = hash(own.as_bytes());
@@ -6317,6 +6649,57 @@ mod tests {
         std::fs::rename(&watched, dir.path().join("sshd_config.orig")).unwrap();
         retry_pending_enrollments(&path_map, None);
         assert_eq!(path_map.lookup(&key), None);
+    }
+
+    /// Lot 376 (mutation guard): a rotation whose rename record the drain
+    /// read before it landed is settled by the retry — and the file put at
+    /// the path then is checked as the renamer's change there too, with its
+    /// size read as it is watched.
+    #[test]
+    fn a_rotation_seen_before_it_lands_is_checked_by_the_retry() {
+        let dir = TempDir::new().unwrap();
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            fresh_signing_key(&dir),
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let path_map = InodePathMap::new();
+        let log = dir.path().join("syslog");
+        std::fs::write(&log, vec![b'x'; 4_000]).unwrap();
+        let key = key_for_path(&log).unwrap();
+        path_map.insert(key, log.to_string_lossy().to_string());
+        let mut raw = fake_raw(key.dev, key.ino, FimOp::Renamed as u8);
+        raw.modifier_pid = 4_200;
+        let _ = process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            None,
+        );
+        assert!(path_map.lookup(&key).is_some(), "not moved yet");
+        // logrotate's `create` lands
+        std::fs::rename(&log, dir.path().join("syslog.1")).unwrap();
+        std::fs::write(&log, b"").unwrap();
+        retry_pending_enrollments(&path_map, None);
+        let new = key_for_path(&log).unwrap();
+        let checks: Vec<_> = replacement_raws(&path_map)
+            .into_iter()
+            .filter(|r| r.modifier_pid == 4_200)
+            .collect();
+        assert_eq!(checks.len(), 1, "the renamer's check of the new file");
+        assert_eq!(
+            (checks[0].target_dev, checks[0].target_ino),
+            (new.dev, new.ino)
+        );
+        assert_eq!(path_map.last_size(&new), Some(0), "measured as watched");
     }
 
     /// External audit FIMP-006: a drift log that cannot be written must not
@@ -8033,6 +8416,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let read = |fe: &FimEvent| {
@@ -8166,6 +8550,7 @@ mod tests {
                 appends_only: true,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             kernel_login_unit_writer_owned(&fe, &raw, (&root, owner), &cg);
@@ -8386,6 +8771,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             read_login_unit_writer(&fe, 0, &proc, &root);
@@ -8470,6 +8856,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             read_login_unit_writer(&fe, writer_start, &proc, &root);

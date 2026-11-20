@@ -302,7 +302,8 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        35,
+        // lot 376 (the review of #583, F3): 35 → 36, `pid1_descriptor_file`
+        36,
         "lot 373: a package's dpkg list (`is_package_file`: R012's maintainer-script setcap \
          on the package's own files, read only for a setcap a maintainer script of a live \
          transaction runs, of a narrow capability — and, for a path no line spells, the \
@@ -341,7 +342,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
          cgroupfs's `system.slice` listed and its units' directories' inode numbers read \
          (kernfs: memory, no FUSE, at most 4096 entries) — only for a mass-write crossing of \
          a service account's own data whose writer is gone when it is judged (its `/proc` \
-         cgroup unreadable)",
+         cgroup unreadable); lot 376 (the review of #583, F3): `pid1_descriptor_file`, the \
+         device and inode of PID 1's descriptor N (`/proc/1/fd/N`, one open and `fstat` of \
+         procfs, beneath the anchored root) — read only for R004's exec with no identity whose \
+         path names its own descriptor N, run as root by a process PID 1 forked, never a \
+         process's image as its identity",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

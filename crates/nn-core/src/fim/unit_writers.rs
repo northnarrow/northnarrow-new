@@ -177,6 +177,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         keep(&fe(34_700), "systemd-update-utmp.service");

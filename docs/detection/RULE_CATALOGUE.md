@@ -692,11 +692,11 @@ Log file modified (truncation suspect) — category `fim_defense_evasion`.
 
 **Observes.** A rewrite of a watched file under /var/log or /var/audit (fim-paths.v1: auth.log, secure, syslog, messages, kern.log, audit/audit.log); the drift record says whether it shrank. wtmp, btmp and lastlog are left to NN-L-FIM-018 and -019.
 
-**Known false positives.** Logrotate and any other writer of a watched log fire it, which is why it only records. rsyslogd's own append (its exe, the syslog uid, the file grown) is exempt; its truncation is not. Lot 373: a writer gone by the judgement (rsyslogd's last flush at the host's shutdown) is named by the image the kernel recorded at its write (the packaged daemon's device and inode).
+**Known false positives.** Logrotate and any other writer of a watched log fire it, which is why it only records. rsyslogd's own append (its exe, the syslog uid, the file grown) is exempt; its truncation is not. Lot 373: a writer gone by the judgement (rsyslogd's last flush at the host's shutdown) is named by the image the kernel recorded at its write (the packaged daemon's device and inode). Lot 376: a log renamed away with a new file put at its path (logrotate's `create`) is checked once, when the rename lands, as the renamer's change of the path (logrotate by hand: High; under its timer: Low), and the new file's size is read as it is watched — rsyslogd's appends to it, its last flush at the shutdown included, are appends, not a shrink judged hours late.
 
 **How to test.** `echo nn-test | sudo tee -a /var/log/syslog` (/var/log/messages on the RHEL family), a writer other than rsyslogd; expect High, Log.
 
-**Tests.** `crates/nn-core/src/fim/rules.rs::fim005_fires_on_log_modification_but_logs_only`, `crates/nn-core/src/fim/rules.rs::fim005_rsyslogd_truncation_still_fires`, `crates/nn-core/src/fim/rules.rs::fim005_non_rsyslogd_writer_still_fires`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim005_fires_on_log_modification_but_logs_only`, `crates/nn-core/src/fim/rules.rs::fim005_rsyslogd_truncation_still_fires`, `crates/nn-core/src/fim/rules.rs::fim005_non_rsyslogd_writer_still_fires`, `crates/nn-linux/src/fim/drain.rs::a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size`
 
 **ATT&CK note.** T1685.006 (Clear Linux or Mac System Logs), which ATT&CK v19 made of T1070.002, now revoked. A write to the Linux audit log is also T1685.004; the rule does not tell it from another log.
 
@@ -780,11 +780,11 @@ Systemd unit file dropped or modified — category `fim_persistence`.
 
 **Observes.** A new or rewritten file under /etc/systemd/system, /lib/systemd/system or /usr/lib/systemd/system: a unit or a drop-in, a .timer included.
 
-**Known false positives.** Package transactions are recorded at Low; `sudo systemctl edit` and other writes in an interactive sudo or su session at High; the agent's own units, written while the operator's trusted-installer window is open, at Low. Lot 283b: any other writer (a vendor's install script: k3s' `k3s.service`) is recorded at High, the kill of the writer held (it came after the write) — a signed `enforce` gives it back; preventing the unit is the kernel's deny and the persistence that repairs itself (Wave 3).
+**Known false positives.** Package transactions are recorded at Low; `sudo systemctl edit` and other writes in an interactive sudo or su session at High; the agent's own units, written while the operator's trusted-installer window is open, at Low. Lot 283b: any other writer (a vendor's install script: k3s' `k3s.service`) is recorded at High, the kill of the writer held (it came after the write) — a signed `enforce` gives it back; preventing the unit is the kernel's deny and the persistence that repairs itself (Wave 3). Lot 376: a package transaction's Low records are one per package-manager process within 15 minutes, the others counted as coalesced (the next record's count, and up to 8 sample paths in the reporter's signed entry; every change keeps its own row in the drift log).
 
 **How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, then remove it; expect High, the KillProcess aimed at cp held (Log).
 
-**Tests.** `crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`, `crates/nn-core/src/fim/rules.rs::fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window`
 
 **ATT&CK note.** /etc/systemd/user is watched but not among the rule's directories: a user unit there draws no verdict. A .timer here draws one record whose primary is NN-L-FIM-023 (it acts on the writer), this rule among its matches.
 
@@ -988,7 +988,7 @@ wtmp/btmp tampered by non-login process — category `fim_defense_evasion`.
 
 **Observes.** A rewrite of /var/log/wtmp or /var/log/btmp by a process outside the login machinery.
 
-**Known false positives.** The login machinery (login, sshd, sshd-session, systemd-logind, systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt by kernel-resolved exe. Another program that writes login records through the utmp API (a terminal multiplexer's helper) is killed. Lot 373: the packaged systemd-update-utmp's shutdown record, its process gone by the judgement, is told by what the kernel recorded at the write (its image, root, the file's only writer — one process running one image at every write — its unit's cgroup or a cgroup removed since) and an append of whole records.
+**Known false positives.** The login machinery (login, sshd, sshd-session, systemd-logind, systemd-update-utmp, getty and agetty, display managers, su, sudo, lastlog) is exempt by kernel-resolved exe. Another program that writes login records through the utmp API (a terminal multiplexer's helper) is killed. Lot 373: the packaged systemd-update-utmp's shutdown record, its process gone by the judgement, is told by what the kernel recorded at the write (its image, root, the file's only writer — one process running one image at every write — its unit's cgroup or a cgroup removed since) and an append of whole records. Lot 340: the packaged logrotate's scheduled rotation (its timer's unit, cron's daily run) is recorded Low. Lot 376: a rotation by hand with root's configuration (`logrotate -f /etc/logrotate.conf`: the file renamed away, its content kept as wtmp.1, a new one created) by the packaged logrotate (its device and inode) as root is recorded High, never killed; a truncation in place, a rename over the file, another configuration or writer keep the kill.
 
 **How to test.** `printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab guest: it appends a byte); expect High, KillProcess aimed at dd.
 
@@ -1210,7 +1210,7 @@ Burst of renames to a new extension — category `impact_ransomware`.
 | [`NN-L-NET-013_Beacon`](#nn-l-net-013_beacon) | Periodic outbound beacon (low jitter) | High | Log | T1071, T1029 |
 | [`NN-L-NET-014_DnsTunnelEntropy`](#nn-l-net-014_dnstunnelentropy) | DNS qname high-entropy label (tunnelling) | High, Medium | KillProcess, Log | T1071.004 |
 | [`NN-L-NET-018_Rfc1918LateralPort`](#nn-l-net-018_rfc1918lateralport) | RFC1918 outbound on lateral-movement port | High | KillProcess, Log | T1021.002, T1021.001, T1021.006, T1021.005 |
-| [`NN-L-NET-019_WildcardListener`](#nn-l-net-019_wildcardlistener) | Wildcard-bind listener on uncommon port | Medium | Log | T1571 |
+| [`NN-L-NET-019_WildcardListener`](#nn-l-net-019_wildcardlistener) | Wildcard-bind listener on uncommon port | Medium, Low | Log | T1571 |
 | [`NN-L-NET-020_DnsQueryFlood`](#nn-l-net-020_dnsqueryflood) | DNS queries beyond the kernel's DNS budget | High | Log | T1071.004 |
 | [`NN-L-NET-021_SensorRecordFlood`](#nn-l-net-021_sensorrecordflood) | listen() or io_uring_setup() calls beyond the kernel's record budget | High | Log | T1685 |
 | [`NN-L-NET-026_ScanFanOut`](#nn-l-net-026_scanfanout) | Outbound connects to many hosts or ports (scan fan-out) | High | Log | T1046 |
@@ -1337,13 +1337,13 @@ New listener on uncommon port — category `net_medium`.
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0021 OS API Execution |
 | Validation | unit+e2e |
 
-**Observes.** A new TCP listener on a port outside 22, 53, 80, 443, 8080 and 8443 — or on one of them from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist. A wildcard bind is NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the kernel's image), in a system service's own cgroup, listening on loopback only (a packaged database or mail daemon) is recorded Low.
+**Observes.** A new TCP listener on a port outside 22, 53, 80, 443, 8080 and 8443 — or on one of them from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist. A wildcard bind is NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the kernel's image), in a system service's own cgroup, listening on loopback only (a packaged database or mail daemon) is recorded Low. Lot 376: so is a program a package's dpkg maintainer script runs as root in a package transaction (as NN-L-NET-019 says).
 
 **Known false positives.** Developer servers, test fixtures and user services that listen on high ports; the netflow comm allowlist (judged on the executed program, not on `comm`) answers the known daemons.
 
 **How to test.** Listen on loopback on an uncommon port from `python3`: `python3 -m http.server 18080 --bind 127.0.0.1`.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `crates/nn-core/src/decision/rules/net.rs::net_006_a_packaged_service_daemon_on_loopback_is_low`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `crates/nn-core/src/decision/rules/net.rs::net_006_a_packaged_service_daemon_on_loopback_is_low`, `crates/nn-core/src/decision/rules/net.rs::net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
 
 **ATT&CK note.** A bind shell or a backdoor listener has no ATT&CK technique of its own; mapped to T1571 as the code names it. The protocol served on the port is not seen.
 
@@ -1529,19 +1529,19 @@ Wildcard-bind listener on uncommon port — category `net_medium`.
 
 | | |
 |---|---|
-| Severity | Medium |
+| Severity | Medium, Low |
 | Response | Log |
 | ATT&CK | T1571 Non-Standard Port (Command and Control) |
 | Sensor — data | network (TCP connect, DNS, flows, listeners) — DC0021 OS API Execution |
 | Validation | unit+e2e |
 
-**Observes.** A new TCP listener bound to the wildcard address (`0.0.0.0` or `::`) on an uncommon port — or on a common one from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist: the port is reachable from other hosts.
+**Observes.** A new TCP listener bound to the wildcard address (`0.0.0.0` or `::`) on an uncommon port — or on a common one from a program not installed in a root-owned system tree — by a process outside the netflow comm allowlist: the port is reachable from other hosts. Lot 376: a package transaction's own program — the file the kernel executed is the host's file at its path in a root-only directory, installed in a root-owned system tree (an interpreter's script there too), executed by root and listening as root, inside a live package transaction run by root, run by a package's dpkg maintainer script (`pg_createcluster`'s free-port probe in PostgreSQL's postinst; not an APT or dpkg hook, not an rpm scriptlet) — is recorded Low, naming the package; a root listener's Medium record names the fact that was missing.
 
 **Known false positives.** Developer servers and user services that bind all addresses by default (`python3 -m http.server`, test fixtures); the allowlist answers the known daemons.
 
 **How to test.** Listen on all addresses on an uncommon port: `python3 -m http.server 18080`.
 
-**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_019_fires_on_wildcard_uncommon_port_non_allowlist`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_wildcard_listener_trips_net_019`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_019_fires_on_wildcard_uncommon_port_non_allowlist`, `crates/nn-core/src/decision/rules/net.rs::net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_wildcard_listener_trips_net_019`
 
 **ATT&CK note.** As NN-L-NET-006: a backdoor listener has no technique of its own; T1571 as the code names it.
 

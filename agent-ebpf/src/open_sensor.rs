@@ -1283,6 +1283,13 @@ unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32
         (*raw).fork_pppid = f.ppid;
         (*raw).fork_parent_start = f.start;
     }
+    // Lot 376: the opener's executable at the open — `sudo`'s read of
+    // `/etc/sudoers` is the auth stack's by its image, when its exec is not
+    // in the lineage yet
+    if let Some(e) = crate::bpf_defense::caller_exe_key() {
+        (*raw).exe_dev = e.dev;
+        (*raw).exe_ino = e.ino;
+    }
     let dst = (*raw).path.as_mut_ptr();
     let mut d = dentry;
     let mut n: usize = 0;

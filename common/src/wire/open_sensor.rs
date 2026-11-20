@@ -714,8 +714,8 @@ pub fn cgroup_step(w: &mut OpenCgWindow, add: u32, now: u64) -> u32 {
 }
 
 /// One interesting open. 8-aligned, no implicit padding:
-/// 8·8 + 4·9 + 16 + 2 + 1 + 1 + 512 = 632 (lot 340: 608 before the fork
-/// records).
+/// 8·8 + 4·9 + 16 + 2 + 1 + 1 + 512 + 8·2 = 648 (lot 340: 608 before the
+/// fork records; lot 376: 632 before the reader's executable).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -771,6 +771,13 @@ pub struct OpenRecordRaw {
     /// crossing's window; `NONE` for any other record.
     pub own: u8,
     pub path: [u8; OPEN_PATH_SLOTS * OPEN_PATH_SLOT_LEN],
+    /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`'s read of
+    /// `/etc/sudoers` at the invoking user's uid, judged before its exec
+    /// reached the lineage): the opener's executable at the open
+    /// (`mm->exe_file`: the device in the kernel's form, the inode; 0 when
+    /// not read — a kernel thread, a task past its `exit_mm`).
+    pub exe_dev: u64,
+    pub exe_ino: u64,
 }
 
 /// Lab PR 225: a leaf name as the rename counter reads it from a dentry:
@@ -1128,8 +1135,9 @@ mod tests {
     #[test]
     fn open_sensor_layouts() {
         // lot 340: + the fork records (fork_start, fork_parent_start,
-        // fork_ppid, fork_pppid)
-        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 632);
+        // fork_ppid, fork_pppid); lot 376: + the opener's executable
+        assert_eq!(core::mem::size_of::<OpenRecordRaw>(), 648);
+        assert_eq!(core::mem::offset_of!(OpenRecordRaw, exe_dev), 632);
         assert_eq!(core::mem::align_of::<OpenRecordRaw>(), 8);
         assert_eq!(core::mem::size_of::<ChildRuleKey>(), 48);
         assert_eq!(core::mem::size_of::<DirClass>(), 16);

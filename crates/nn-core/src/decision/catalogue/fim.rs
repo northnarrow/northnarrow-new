@@ -122,7 +122,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
             only records. rsyslogd's own append (its exe, the syslog uid, the file grown) is \
             exempt; its truncation is not. Lot 373: a writer gone by the judgement (rsyslogd's \
             last flush at the host's shutdown) is named by the image the kernel recorded at its \
-            write (the packaged daemon's device and inode).",
+            write (the packaged daemon's device and inode). Lot 376: a log renamed away with a new \
+            file put at its path (logrotate's `create`) is checked once, when the rename lands, as \
+            the renamer's change of the path (logrotate by hand: High; under its timer: Low), and \
+            the new file's size is read as it is watched — rsyslogd's appends to it, its last \
+            flush at the shutdown included, are appends, not a shrink judged hours late.",
 
         how_to_test: "`echo nn-test | sudo tee -a /var/log/syslog` (/var/log/messages on the RHEL \
             family), a writer other than rsyslogd; expect High, Log.",
@@ -130,6 +134,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/fim/rules.rs::fim005_fires_on_log_modification_but_logs_only",
             "crates/nn-core/src/fim/rules.rs::fim005_rsyslogd_truncation_still_fires",
             "crates/nn-core/src/fim/rules.rs::fim005_non_rsyslogd_writer_still_fires",
+            "crates/nn-linux/src/fim/drain.rs::\
+             a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size",
         ],
         attack_note: "T1685.006 (Clear Linux or Mac System Logs), which ATT&CK v19 made of \
             T1070.002, now revoked. A write to the Linux audit log is also T1685.004; the rule \
@@ -222,12 +228,17 @@ pub(super) const DOCS: &[RuleDoc] = &[
             other writer (a vendor's install script: k3s' `k3s.service`) is recorded at High, the \
             kill of the writer held (it came after the write) — a signed `enforce` gives it back; \
             preventing the unit is the kernel's deny and the persistence that repairs itself \
-            (Wave 3).",
+            (Wave 3). Lot 376: a package transaction's Low records are one per package-manager \
+            process within 15 minutes, the others counted as coalesced (the next record's count, \
+            and up to 8 sample paths in the reporter's signed entry; every change keeps its own \
+            row in the drift log).",
         how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, \
             then remove it; expect High, the KillProcess aimed at cp held (Log).",
         tests: &[
             "crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified",
             "crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window",
+            "crates/nn-core/src/fim/rules.rs::\
+             fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window",
         ],
         attack_note: "/etc/systemd/user is watched but not among the rule's directories: a user \
             unit there draws no verdict. A .timer here draws one record whose primary is \
@@ -458,7 +469,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
             systemd-update-utmp's shutdown record, its process gone by the judgement, is told by \
             what the kernel recorded at the write (its image, root, the file's only writer — one \
             process running one image at every write — its unit's cgroup or a cgroup removed \
-            since) and an append of whole records.",
+            since) and an append of whole records. Lot 340: the packaged logrotate's scheduled \
+            rotation (its timer's unit, cron's daily run) is recorded Low. Lot 376: a rotation \
+            by hand with root's configuration (`logrotate -f /etc/logrotate.conf`: the file \
+            renamed away, its content kept as wtmp.1, a new one created) by the packaged \
+            logrotate (its device and inode) as root is recorded High, never killed; a \
+            truncation in place, a rename over the file, another configuration or writer keep \
+            the kill.",
 
         how_to_test: "`printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab \
             guest: it appends a byte); expect High, KillProcess aimed at dd.",

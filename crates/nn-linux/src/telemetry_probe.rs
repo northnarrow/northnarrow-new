@@ -2577,6 +2577,7 @@ pub fn round_events_for_tests(
                 timestamp_ns: ts,
                 path_from_user: false,
                 kernel_class: 0,
+                exe_file: (0, 0),
             },
         ),
         (
@@ -2591,6 +2592,7 @@ pub fn round_events_for_tests(
                 timestamp_ns: ts,
                 path_from_user: false,
                 kernel_class: 0,
+                exe_file: (0, 0),
             },
         ),
         (
@@ -2739,6 +2741,7 @@ pub fn deny_events_for_tests(
         timestamp_ns: ts,
         path_from_user: false,
         kernel_class: 0,
+        exe_file: (0, 0),
     };
     v.push((
         None,

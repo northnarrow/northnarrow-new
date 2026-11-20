@@ -874,6 +874,61 @@ lists the known false positives of each rule.
   `an_exec_between_two_writes_is_another_writer`,
   `a_postinst_setcap_of_a_root_equivalent_capability_stays_high`,
   `fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high`.
+- **The host's rotations, boots and package installs** (lot 376, the rc9
+  soak). Judged by identity now:
+  - rsyslogd's appends to a log logrotate re-created, its last flush at the
+    shutdown included: the new file is measured from the size it had when
+    watched (no `NN-L-FIM-005`);
+  - the first `sudo` of a session after a boot: its read of
+    `/etc/sudoers` at the invoking user's uid is told by the image the
+    kernel recorded at the open (no ALERTED posture);
+  - a packaged program the user's own service manager starts (podman's
+    quadlet user generator on Debian 13, whose `systemd-user` PAM stack
+    sets no login uid) reading `/etc/passwd` for a name lookup;
+  - `pg_createcluster`'s free-port probe in PostgreSQL's postinst:
+    `NN-L-NET-019`/`-006` Low;
+  - a package transaction's unit writes: one `NN-L-FIM-009` Low record per
+    package-manager process within 15 minutes, the rest counted.
+
+  Still recorded High: `sudo logrotate -f` by hand, now on logrotate at the
+  rotation (`NN-L-FIM-005`; for `wtmp`/`btmp` also `NN-L-FIM-019`, with no
+  kill when the packaged logrotate runs as root with root's configuration
+  only and renames the file away — the review of #583); a truncation of a
+  log by any other writer, which keeps `NN-L-FIM-019`'s kill;
+  `cat /etc/login.defs` from a session (ALERTED).
+
+  Residuals:
+  - **A log moved away and re-created late.** A watched log renamed away
+    with nothing at its path when the drain settles the rename is watched
+    again when a file comes back, checked as a creation by an unknown
+    writer: `NN-L-FIM-005` judges modifications only, so the move itself
+    is the drift row's `Renamed` and the line in the journal, not a High.
+    A file put at the path at once is the renamer's change (High).
+  - **`NN-L-AT-001`'s boot burst.** The BPF cross-view's baseline of
+    systemd's programs (~30 Low records at each boot) is signed once per
+    program, a sole trace by design (lot 356); not coalesced.
+  - **A package's own maintainer script starting a generic relay.** The
+    `NN-L-NET-019`/`-006` Low for a package transaction's listener asks for
+    a dpkg maintainer script in the listener's lineage (an APT or dpkg
+    hook does not give it: Medium), and trusts that script: a malicious
+    package's postinst starting the host's `socat` or `nc` as a listener is
+    recorded Low, naming the package. rpm scriptlets give no such identity:
+    their listeners stay Medium.
+  - **A user's service manager launching a unit with no identity.** R004
+    tells an exec with no identity (the agent's start, a lost handoff) of
+    `/proc/self/fd/N` as systemd's executor only for PID 1's forks, by PID
+    1's own descriptor `N`; a user manager's launch in that window stays
+    Critical (a user may change its own manager's child before the exec).
+
+  *Evidence:* lot 376;
+  `a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size`,
+  `sudo_s_own_read_before_its_exec_is_known_is_told_by_its_image`,
+  `a_user_manager_s_packaged_generator_reading_passwd_is_no_sensitive_access`,
+  `net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low`,
+  `fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window`,
+  `a_hand_rotation_by_the_packaged_logrotate_with_root_s_configuration_is_high_never_a_kill`,
+  `net_019_an_apt_hook_s_packaged_relay_listener_is_no_package_s_own`,
+  `pid_1_s_executor_launch_without_an_identity_is_told_by_pid_1_s_descriptor`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

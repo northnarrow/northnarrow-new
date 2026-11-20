@@ -1941,6 +1941,7 @@ mod tests {
             timestamp_ns: 789,
             path_from_user: false,
             kernel_class: 0,
+            exe_file: (0, 0),
         }
     }
 
@@ -1982,6 +1983,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         });
         let r = DetectionRecord::from_rule(

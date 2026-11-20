@@ -2368,6 +2368,14 @@ pub const FIM_WRITE_TRUNCATED_BY_ANOTHER: u8 = 0x10;
 /// sent by `inode_setattr`: the setattr changes the size (`ATTR_SIZE`).
 pub const FIM_SETATTR_SIZE: u8 = 0x20;
 
+/// [`FimDriftRaw::op_flags`] bit (lot 376, the review of #583, F1) — USERLAND
+/// ONLY: the kernel never sets it, and the FIM drain clears it from every
+/// record it decodes. The drain's check of the file now at a watched path
+/// whose watched file was renamed away (its content kept under another
+/// name) and another file put there, by the renamer — not a rename over it
+/// ([`FIM_RENAME_REPLACED`]), not a write or truncation in place.
+pub const FIM_RENAMED_AWAY: u8 = 0x40;
+
 impl FimDriftRaw {
     pub const fn zeroed() -> Self {
         Self {

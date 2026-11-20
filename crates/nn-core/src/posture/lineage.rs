@@ -73,6 +73,11 @@ use super::host::PostureHost;
 pub use super::script_args::Runs;
 use super::script_args::{family_of, go_link_output, runs_of};
 
+/// Lot 376: the packaged service manager's binary, a user's manager
+/// (`systemd --user`, `user@<uid>.service`) included
+/// ([`AuthSessionTracker::is_user_manager_program`]).
+pub const SYSTEMD_MANAGER_EXES: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
+
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
 ///
@@ -482,6 +487,15 @@ struct Entry {
     /// every entry no exec of its own gave (a fork, an orphan, the start's
     /// scan) — its argv is not known.
     argv: Option<u64>,
+    /// Lot 376 (the review of #583, F1): the exec's argv is logrotate's run
+    /// with root's configuration only ([`rotates_with_root_config`](crate::posture::script_args::rotates_with_root_config): no
+    /// option but `-f`/`--force`/`-v`/`--verbose`, no file but
+    /// `/etc/logrotate.conf` and `/etc/logrotate.d/<name>`), precomputed at
+    /// ingest as [`Self::encrypts`] is (the argv is not kept). `false` for
+    /// an argv the sensor cut and every entry no exec of its own gave (a
+    /// fork, an orphan, the start's scan). Meaningful only with the exe's
+    /// gate ([`AuthSessionTracker::exec_rotates_with_root_config`]).
+    root_rotation: bool,
     /// Review 85: what an interpreter `exe` runs ([`runs_of`]): a script
     /// path or a `-m` module; [`Runs::Inline`] for a binary or an inline
     /// program; lot 292: [`Runs::Unknown`] for an argv its table could not
@@ -1287,7 +1301,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1318,7 +1332,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (start_ns, None),
@@ -1336,7 +1350,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1410,6 +1424,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         } else {
             self.argv_digest(argv)
         };
+        // the review of #583 (F1): logrotate run with root's configuration
+        let root_rotation =
+            !*argv_truncated && crate::posture::script_args::rotates_with_root_config(argv);
         let runs = with_pump_facts(
             runs_of(Path::new(path), argv),
             Path::new(path),
@@ -1424,7 +1441,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *pid,
             *ppid,
             path,
-            (js_pm, encrypts, digest),
+            (js_pm, encrypts, digest, root_rotation),
             runs,
             *timestamp_ns,
             (*start_ns, None),
@@ -1536,7 +1553,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (js_pm, encrypts, self.argv_digest(argv)),
+            (
+                js_pm,
+                encrypts,
+                self.argv_digest(argv),
+                crate::posture::script_args::rotates_with_root_config(argv),
+            ),
             runs,
             spawn_ns,
             (start_ns, None),
@@ -1670,6 +1692,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 // exec, an encryption it was asked for included (as `fork_entry`)
                 encrypts: parent.encrypts,
                 argv: None,
+                root_rotation: false,
                 runs: parent.runs,
                 start_ticks: None,
                 uid: k.uid,
@@ -1783,7 +1806,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 pid,
                 ppid,
                 &exe,
-                (None, false, None),
+                (None, false, None, false),
                 runs,
                 0,
                 (start_ns, Some(ticks)),
@@ -1840,7 +1863,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
-        (js_pm, encrypts, argv): (Option<JsPm>, bool, Option<u64>),
+        (js_pm, encrypts, argv, root_rotation): (Option<JsPm>, bool, Option<u64>, bool),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
@@ -1858,6 +1881,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             js_pm,
             encrypts,
             argv,
+            root_rotation,
             runs,
             start_ticks,
             uid,
@@ -2140,7 +2164,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     e.ppid,
                     &e.exe.to_string_lossy(),
-                    (e.js_pm, e.encrypts, e.argv),
+                    (e.js_pm, e.encrypts, e.argv, e.root_rotation),
                     e.runs,
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
@@ -2233,6 +2257,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             encrypts: first.encrypts,
             // the review of #552 (F1): its own argv is not known
             argv: None,
+            root_rotation: false,
             runs: first.runs.clone(),
             start_ticks: Some(ticks),
             uid,
@@ -2375,6 +2400,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             encrypts: parent.encrypts,
             // the review of #552 (F1): an exec's argv is its own process's
             argv: None,
+            root_rotation: false,
             runs: parent.runs,
             start_ticks: Some(ticks),
             uid,
@@ -2513,6 +2539,79 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     pub fn is_credential_reader(&self, pid: u32, as_of: AsOf) -> bool {
         self.lineage_match(pid, as_of, is_auth_binary, 1)
             .unwrap_or(false)
+    }
+
+    /// Lot 376 (the rc9 soak and its lab on Debian 13: ALERTED at a reboot
+    /// — podman's quadlet user generator, run by the user's service manager
+    /// as it starts, reading `/etc/passwd` for its name lookup; Debian's
+    /// `systemd-user` PAM stack sets no login uid, so BUG-018's carve-out
+    /// did not hold): `pid` runs a packaged program its user's own service
+    /// manager started.
+    /// - Its exec as of `as_of` (the spawn cache) is the host's file at its
+    ///   path in a root-only directory ([`Self::is_host_file_in_root_dir`]),
+    ///   executed as `uid`, not root.
+    /// - Its parent is that user's service manager: the host's packaged
+    ///   `systemd` ([`SYSTEMD_MANAGER_EXES`], by the file its exec ran),
+    ///   executed as `uid`, whose own parent is PID 1 (`user@<uid>.service`).
+    ///
+    /// A program of the user's (a home), a copy of systemd, a manager run by
+    /// hand from a shell, a child of the program (a shell a unit runs):
+    /// not.
+    pub fn is_user_manager_program(&self, pid: u32, uid: u32, as_of: AsOf) -> bool {
+        if uid == 0 || pid <= 1 {
+            return false;
+        }
+        let (Some(me), Some(file)) = (self.hop(pid, as_of), self.exec_file(pid, as_of)) else {
+            return false;
+        };
+        if !me.cached
+            || me.uid != Some(uid)
+            || !self.is_host_file_in_root_dir(&me.exe.to_string_lossy(), file)
+        {
+            return false;
+        }
+        let Some(manager) = self.hop(me.ppid, as_of).filter(|h| h.cached && h.pid > 1) else {
+            return false;
+        };
+        manager.uid == Some(uid)
+            && manager.ppid == 1
+            && SYSTEMD_MANAGER_EXES
+                .iter()
+                .any(|p| self.ran_host_file(manager.pid, as_of, p))
+    }
+
+    /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`, run from a
+    /// session right after the boot, reading `/etc/sudoers` at the invoking
+    /// user's uid, judged before its exec reached the cache): `image`, the
+    /// kernel's identity of `pid`'s executable AT an event (`mm->exe_file`,
+    /// the device in the kernel's form and the inode, as the LSM file-open
+    /// sensor reads it at the open), is the host's file of an
+    /// authentication binary ([`AUTH_BINARY_EXES`]) in a directory root's
+    /// and writable by no one else ([`Self::is_host_file_in_root_dir`]) —
+    /// the reader itself is the auth stack, as
+    /// [`Self::is_credential_reader`] says of an exec it has. A copy, a
+    /// renamed or replaced binary, a file elsewhere, `(0, 0)` (not read):
+    /// not. The reader's children are not (POS-002: a session's shell reads
+    /// as itself).
+    ///
+    /// The review of #583 (F4): only when the spawn cache holds no exec of
+    /// `pid` as of `as_of` — the race the image closes, an exec not read
+    /// yet. `mm->exe_file` is the process's to change (`prctl(PR_SET_MM,
+    /// PR_SET_MM_MAP)` with an `exe_fd`: CAP_SYS_ADMIN or
+    /// CAP_CHECKPOINT_RESTORE in its own user namespace): an exec the cache
+    /// holds (`/tmp/x`) is what the process runs, whatever image it names
+    /// at the open.
+    pub fn is_auth_binary_image(&self, pid: u32, as_of: AsOf, image: (u64, u64)) -> bool {
+        if matches!(
+            self.cached_live(pid, as_of.time()),
+            CachedAt::Current(_) | CachedAt::Past(_)
+        ) {
+            return false;
+        }
+        image.1 != 0
+            && AUTH_BINARY_EXES
+                .iter()
+                .any(|p| self.is_host_file_in_root_dir(p, image))
     }
 
     /// True iff `pid` or any ancestor's exe is a known system
@@ -2924,6 +3023,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             == Some(image)
     }
 
+    /// Lot 376 (the review of #583, F3): the file the host's PID 1 holds
+    /// open as its descriptor `n` — `/proc/1/fd/<n>` followed, its device in
+    /// the kernel's form (`MKDEV`, as the exec sensor reports a file) and
+    /// its inode. `None` when it cannot be read. A child of PID 1's
+    /// `posix_spawn` starts with a copy of that table (no `CLONE_FILES`).
+    pub fn pid1_descriptor_file(&self, n: u32) -> Option<(u64, u64)> {
+        H::file_id(
+            self.inner
+                .proc_root
+                .join("1")
+                .join("fd")
+                .join(n.to_string()),
+        )
+        .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
+    }
+
+    /// Lot 376 (the review of #583, F3): the spawn cache holds an exec of
+    /// the process `pid` that started at `start_ns` (an exec event's exact
+    /// start: never the start's scan's or a sweep's entry) from before
+    /// `before_ns` — the process executed something before.
+    pub fn executed_before(&self, pid: u32, start_ns: u64, before_ns: u64) -> bool {
+        if start_ns == 0 || before_ns == 0 {
+            return false;
+        }
+        match self.cached_at(pid, Some(before_ns - 1)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.start_ticks.is_none() && e.start_ns == start_ns && e.spawn_ns < before_ns
+            }
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
     /// Lot 348: [`Self::is_host_file`], and the file's directory under the
     /// host's root is root's and writable by no one else
     /// ([`PostureHost::dir_is_root_only`]) — what `ROOT_DIR` says of a
@@ -2983,6 +3114,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         };
         let (package, kind) = name.rsplit_once('.')?;
         (KINDS.contains(&kind) && is_package_name(package)).then(|| package.to_string())
+    }
+
+    /// The review of #583 (F2): the package whose dpkg maintainer script
+    /// ([`Self::maintainer_script_package`]) runs in `pid`'s lineage as of
+    /// `as_of` — `pid` itself or an ancestor, below the nearest package
+    /// manager proper ([`PACKAGE_MANAGER_EXES`], what the kernel executed)
+    /// above it: what a package's own program in its transaction descends
+    /// from. An APT hook (`APT::Update::Post-Invoke`, `DPkg::Post-Invoke`:
+    /// a shell `apt-get` itself runs, apt-daily's run included), dpkg's own
+    /// hooks (`--pre-invoke`), a script a maintainer script's package
+    /// manager runs above it, an rpm scriptlet (no such file): `None`. A hop
+    /// whose exec is not in the spawn cache vouches for nothing.
+    pub fn maintainer_script_in_lineage(&self, pid: u32, as_of: AsOf) -> Option<String> {
+        let below = std::cell::RefCell::new(Vec::new());
+        let Some(Some(_manager)) = self.lineage_walk(
+            pid,
+            as_of,
+            |hop| {
+                if is_package_manager_binary(&hop.exe) {
+                    return true;
+                }
+                below.borrow_mut().push(hop.pid);
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        ) else {
+            return None;
+        };
+        below
+            .into_inner()
+            .into_iter()
+            .find_map(|p| self.maintainer_script_package(p, as_of))
     }
 
     /// The review of #580's lab: the one file of dpkg's `info` directory
@@ -3784,6 +3947,25 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::Current(e) | CachedAt::Past(e) => e.argv.is_some() && e.argv == want,
             CachedAt::LaterOnly | CachedAt::Absent => false,
         }
+    }
+
+    /// Lot 376 (the review of #583, F1): `pid`'s exec, as of `as_of`, ran
+    /// logrotate with root's configuration only ([`Entry::root_rotation`]:
+    /// [`rotates_with_root_config`](crate::posture::script_args::rotates_with_root_config)), and that configuration lies in
+    /// directories root's and writable by no one else under the host's root
+    /// ([`PostureHost::dir_is_root_only`]: `/etc`, `/etc/logrotate.d`) —
+    /// what it trusts is root's own, whether or not the FIM watches it.
+    /// From the spawn cache only: `false` when it does not hold the exec.
+    /// The caller checks that the exec is the packaged logrotate.
+    pub fn exec_rotates_with_root_config(&self, pid: u32, as_of: AsOf) -> bool {
+        let rotation = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.root_rotation,
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        };
+        rotation
+            && crate::posture::script_args::LOGROTATE_ROOT_CONFIG_DIRS
+                .iter()
+                .all(|d| self.is_root_only_host_dir(d))
     }
 
     /// Lot 340 (the alpha's daily false positives): `pid` is the Go
@@ -8649,7 +8831,7 @@ mod tests {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (start_ns, None),
@@ -9347,7 +9529,7 @@ mod tests {
             270,
             100,
             "/usr/bin/bash",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -9361,7 +9543,7 @@ mod tests {
             280,
             100,
             "/home/alice/askpass",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -9380,7 +9562,7 @@ mod tests {
                 pid,
                 ppid,
                 exe,
-                (None, false, None),
+                (None, false, None, false),
                 Runs::Inline,
                 0,
                 (3, Some(0)),
@@ -9572,7 +9754,7 @@ mod tests {
             500,
             50,
             "/usr/bin/sudo",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -10635,6 +10817,7 @@ mod tests {
             js_pm: None,
             encrypts: false,
             argv: None,
+            root_rotation: false,
             runs: Runs::Inline,
             start_ticks,
             uid: 0,
