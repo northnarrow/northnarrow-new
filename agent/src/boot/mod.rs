@@ -1110,6 +1110,7 @@ mod tests {
     /// logged — never signed, and never again (signed once per pid).
     #[test]
     fn the_watchdog_refresh_signs_from_its_first_round() {
+        let source_of = |call: &str| PHASES.iter().find(|p| p.0 == call).unwrap().1;
         let main = start_in_order();
         let at = |needle: &str| {
             main.find(needle)
@@ -1128,6 +1129,15 @@ mod tests {
             call[..call.find(");").expect("the call's end")].contains("&audit_log,"),
             "posture::machine is handed the audit log"
         );
+        let machine = function(source_of("posture::machine("), "pub(crate) fn machine(");
+        assert!(
+            machine.contains("let watchdog_audit: WatchdogAudit = audit_log.clone();"),
+            "and gives it to the refresh"
+        );
+        let spawn = &machine[machine
+            .find("spawn_watchdog_exempt_refresh(")
+            .expect("the refresh spawned")..];
+        assert!(spawn[..spawn.find(");").expect("the spawn's end")].contains("watchdog_audit,"));
         let tasks = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/tasks.rs"));
         let refresh = function(tasks, "pub(crate) fn spawn_watchdog_exempt_refresh(");
         assert!(
@@ -1138,10 +1148,13 @@ mod tests {
             "pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;"
         ));
         for (name, src) in [
-            ("mod.rs", include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs"))),
+            (
+                "mod.rs",
+                include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            ),
             ("tasks.rs", tasks),
-            ("posture.rs", PHASES.iter().find(|p| p.0 == "posture::machine(").unwrap().1),
-            ("evidence.rs", PHASES.iter().find(|p| p.0 == "evidence::wire(").unwrap().1),
+            ("posture.rs", source_of("posture::machine(")),
+            ("evidence.rs", source_of("evidence::wire(")),
         ] {
             let late = ["OnceLock<", "WatchdogAudit>"].concat();
             assert!(!src.contains(&late), "{name}: the refresh's log bound late");
