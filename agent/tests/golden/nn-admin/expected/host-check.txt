@@ -2,7 +2,7 @@
 
 ### host-check.table
 $ nn-admin host-check
-exit: <0, or 2 with the host's warnings: checked>
+exit: <0, 2 with the host's warnings, 3 with a failure: checked>
 --- stdout
 | <status>  BPF LSM in the active LSM list   <value>
 | <status>  Kernel lockdown mode             <value>
@@ -17,13 +17,14 @@ exit: <0, or 2 with the host's warnings: checked>
 | <status>  release verified at install      <value>
 | <status>  cgroup v1 controllers not mountable <value>
 | <status>  Kernel fixes the sandbox relies on <value>
-| 13 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+| <status>  Library preload list             <value>
+| 14 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any><, then a line of the failures when there are any>
 --- stderr
 (empty)
 
 ### host-check.json
 $ nn-admin host-check --json
-exit: <0, or 2 with the host's warnings: checked>
+exit: <0, 2 with the host's warnings, 3 with a failure: checked>
 --- stdout
 | [
 |   {
@@ -116,6 +117,13 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "status": "<status>",
 |     "value": "<value>",
 |     "fix": "upgrade to a kernel whose stable branch carries the fix (docs/operator/KERNEL_COMPATIBILITY.md, \"Kernel fix level\"); on a distribution's kernel check its security tracker for each CVE named `unknown` — the agent's workers and anti-tamper rely on these fixes"
+|   },
+|   {
+|     "id": "preload",
+|     "name": "Library preload list",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "remove the entry that names a library (or the file) — the agent and its watchdog check what their start maps and refuse to start with a library the release does not link (exit 78 and 16) — or run the agent on a host without one"
 |   }
 | ]
 --- stderr

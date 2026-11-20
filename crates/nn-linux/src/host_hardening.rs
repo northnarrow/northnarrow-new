@@ -44,6 +44,9 @@ pub enum Status {
     Warn,
     /// Cannot be determined on this host (no EFI, file absent) — informational.
     Unknown,
+    /// Lot 377: the agent cannot run on this host as it is (its start
+    /// refuses itself) — the fix text says what to change first.
+    Fail,
 }
 
 /// One host hardening check.
@@ -81,7 +84,47 @@ pub fn run_in(root: &Path) -> Vec<Check> {
         install_provenance(root),
         cgroup_v1(root),
         kernel_fixes(root),
+        preload(root),
     ]
+}
+
+/// Lot 377: what to do about a preload list that loads a library.
+pub const PRELOAD_FIX: &str = "remove the entry that names a library (or the file) — the agent and its watchdog check what their start maps and refuse to start with a library the release does not link (exit 78 and 16) — or run the agent on a host without one";
+
+/// Lot 377: the dynamic loader's preload list (`/etc/ld.so.preload`) —
+/// one that makes every program load a library is a host the agent cannot
+/// run on (its start check, and the watchdog's, refuse it): `fail`, named;
+/// one absent, empty or naming no file that exists is `ok`, and said. Read
+/// as the loader reads it, by the rule the watchdog's respawn gate and
+/// `install.sh`'s preflight share (`antitamper_bpf::preload`).
+fn preload(root: &Path) -> Check {
+    use antitamper_bpf::preload::{judge_in, Verdict, PRELOAD_PATH};
+    let (status, value) = match judge_in(root, Path::new(PRELOAD_PATH)) {
+        Verdict::Absent => (Status::Ok, "absent".to_string()),
+        Verdict::Inert { names: 0 } => (Status::Ok, "present, loads nothing (empty)".to_string()),
+        Verdict::Inert { names } => (
+            Status::Ok,
+            format!("present, loads nothing ({names} name(s), no file any of them names exists)"),
+        ),
+        Verdict::Loads(files) => (
+            Status::Fail,
+            format!(
+                "loads {} into every program: the agent and its watchdog refuse to start",
+                files.join(", ")
+            ),
+        ),
+        Verdict::Unjudged(why) => (
+            Status::Fail,
+            format!("cannot be judged ({why}); every program reads it at its start"),
+        ),
+    };
+    Check {
+        id: "preload",
+        name: "Library preload list",
+        status,
+        value,
+        fix: PRELOAD_FIX,
+    }
 }
 
 /// Lot 277: a kernel fix the workers' sandbox or the anti-tamper relies
@@ -549,6 +592,12 @@ pub fn warn_count(checks: &[Check]) -> usize {
     checks.iter().filter(|c| c.status == Status::Warn).count()
 }
 
+/// Lot 377: number of `Fail` checks in `checks` (the agent cannot run on
+/// this host as it is).
+pub fn fail_count(checks: &[Check]) -> usize {
+    checks.iter().filter(|c| c.status == Status::Fail).count()
+}
+
 /// Human table, one line per check.
 pub fn render_table(checks: &[Check]) -> String {
     let mut out = String::new();
@@ -557,9 +606,10 @@ pub fn render_table(checks: &[Check]) -> String {
             Status::Ok => "OK  ",
             Status::Warn => "WARN",
             Status::Unknown => "n/a ",
+            Status::Fail => "FAIL",
         };
         out.push_str(&format!("{tag}  {:<32} {}\n", c.name, c.value));
-        if c.status == Status::Warn && !c.fix.is_empty() {
+        if matches!(c.status, Status::Warn | Status::Fail) && !c.fix.is_empty() {
             out.push_str(&format!("      fix: {}\n", c.fix));
         }
     }
@@ -573,6 +623,13 @@ pub fn render_table(checks: &[Check]) -> String {
             ""
         }
     ));
+    // Lot 377: a host the agent cannot run on, said apart from the hardening
+    let fails = fail_count(checks);
+    if fails > 0 {
+        out.push_str(&format!(
+            "{fails} failure(s) — the agent does not start on this host until each FAIL is fixed\n"
+        ));
+    }
     out
 }
 
@@ -962,14 +1019,16 @@ mod tests {
         );
         w(r, "proc/sys/kernel/osrelease", b"6.19.1\n");
         let checks = run_in(r);
-        assert_eq!(checks.len(), 13);
+        assert_eq!(checks.len(), 14);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
+        assert_eq!(fail_count(&checks), 0, "{:?}", checks);
         assert!(
             checks.iter().all(|c| c.status == Status::Ok),
             "{:?}",
             checks
         );
-        assert!(render_table(&checks).contains("13 check(s), 0 warning(s)"));
+        assert!(render_table(&checks).contains("14 check(s), 0 warning(s)"));
+        assert!(!render_table(&checks).contains("failure(s)"));
     }
 
     fn kernel(files: &[(&str, &str)]) -> Check {
@@ -1308,6 +1367,50 @@ mod tests {
 
     /// Lot 273b: the v1 controllers a root can mount, unless the kernel's
     /// command line refuses them — all, or by name.
+    /// Lot 377 (named): a preload list that makes every program load a
+    /// library is a host the agent cannot run on — `fail`, the file named,
+    /// the fix shown, a failures line under the table; an absent, empty or
+    /// inert list is `ok` and said; a list that cannot be read as one fails.
+    #[test]
+    fn host_check_fails_a_loadable_preload_list() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let check = |r: &Path| run_in(r).into_iter().find(|c| c.id == "preload").unwrap();
+        let c = check(r);
+        assert_eq!((c.status, c.value.as_str()), (Status::Ok, "absent"));
+        w(r, "etc/ld.so.preload", b"# nothing\n");
+        let c = check(r);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        assert!(c.value.contains("loads nothing (empty)"), "{}", c.value);
+        w(r, "etc/ld.so.preload", b"/opt/gone/libx.so\n");
+        let c = check(r);
+        assert_eq!(c.status, Status::Ok, "{}", c.value);
+        assert!(c.value.contains("1 name(s)"), "{}", c.value);
+        w(r, "usr/lib/x86_64-linux-gnu/libnnlog.so", b"");
+        w(r, "etc/ld.so.preload", b"/opt/gone/libx.so libnnlog.so\n");
+        let checks = run_in(r);
+        let c = checks.iter().find(|c| c.id == "preload").unwrap();
+        assert_eq!(c.status, Status::Fail, "{}", c.value);
+        assert!(
+            c.value.contains("/usr/lib/x86_64-linux-gnu/libnnlog.so"),
+            "{}",
+            c.value
+        );
+        assert_eq!(fail_count(&checks), 1);
+        let table = render_table(&checks);
+        assert!(table.contains("FAIL  Library preload list"), "{table}");
+        assert!(table.contains(PRELOAD_FIX), "{table}");
+        assert!(table.contains("1 failure(s)"), "{table}");
+        let json = serde_json::to_string(&checks).unwrap();
+        assert!(json.contains("\"status\":\"fail\""), "{json}");
+        // a list that is no file the loader reads as one
+        std::fs::remove_file(r.join("etc/ld.so.preload")).unwrap();
+        std::fs::create_dir(r.join("etc/ld.so.preload")).unwrap();
+        let c = check(r);
+        assert_eq!(c.status, Status::Fail, "{}", c.value);
+        assert!(c.value.contains("cannot be judged"), "{}", c.value);
+    }
+
     #[test]
     fn cgroup_v1_names_what_root_can_mount() {
         let d = tempfile::tempdir().unwrap();
@@ -1617,11 +1720,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let checks = run_in(d.path());
         // nothing readable: every check is Unknown except bpffs (no mount =
-        // Warn), nft (no binary = Warn) and admin_key (no key file = Ok)
+        // Warn), nft (no binary = Warn), admin_key (no key file = Ok) and
+        // preload (lot 377: no list = Ok, nothing preloaded)
         for c in &checks {
             if c.id == "bpffs" || c.id == "nft" {
                 assert_eq!(c.status, Status::Warn);
-            } else if c.id == "admin_key" {
+            } else if c.id == "admin_key" || c.id == "preload" {
                 assert_eq!(c.status, Status::Ok);
             } else {
                 assert_eq!(c.status, Status::Unknown, "{}", c.id);

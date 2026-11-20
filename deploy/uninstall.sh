@@ -275,6 +275,30 @@ own_progs_loaded() {
     done
     echo "${left[*]:-}"
 }
+# >>> lsm_progs_left (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# Lot 377: the LSM programs the wait without a list of the agent's own (an
+# agent older than the list, or a start refused before it loaded anything)
+# waits for — every one on the host but those PID 1 holds. systemd's
+# RestrictFileSystems= program (Debian 13) is loaded by PID 1 and held by it
+# for as long as it runs: no stop of NorthNarrow detaches it, and the wait
+# failed with the host half-uninstalled. PID 1's descriptors name what it
+# holds (`prog_id:` in the fdinfo of a program's or a link's descriptor), as
+# the agent's known-system judge reads them. One `bpftool prog show` header
+# line per program left.
+pid1_prog_ids() {
+    { cat "${PROC_ROOT:-/proc}"/1/fdinfo/* 2>/dev/null || true; } |
+        awk '$1 == "prog_id:" && $2 ~ /^[0-9]+$/ {print $2}' | sort -un | tr '\n' ' '
+}
+lsm_progs_left() {
+    local held
+    held=" $(pid1_prog_ids) "
+    { bpftool prog show 2>/dev/null || true; } | awk -v held="$held" '
+        $1 ~ /^[0-9]+:$/ && $2 == "lsm" {
+            id = substr($1, 1, length($1) - 1)
+            if (index(held, " " id " ") == 0) print
+        }'
+}
+# <<< lsm_progs_left
 # ── 0. stale pins (external audit DEP-020) ───────────────────────────
 # Both units inactive and the pin root of the last agent still there: one
 # nothing protects any more goes now (step 2 would remove it anyway); a
@@ -487,19 +511,21 @@ elif (( ! NN_HELD )) && ! nn_procs_running; then
     # products' are not waited for (external audit DEP-006).
     log "no $OWN_IDS_FILE, and nothing of NorthNarrow holds an LSM program (no pin root or unit process at the start, no NorthNarrow process): other products' are not waited for"
 else
-    # An agent older than the list (or none ever ran): every LSM program on
-    # the host, as before, naming what is left.
-    log "no $OWN_IDS_FILE — waiting for every LSM program on the host to detach"
+    # An agent older than the list (or none ever ran, or each start was
+    # refused before it loaded anything — the unit's pin-lock step made the
+    # pin root first): every LSM program on the host but those PID 1 holds
+    # (lsm_progs_left), as before, naming what is left.
+    log "no $OWN_IDS_FILE — waiting for every LSM program on the host to detach (but those PID 1 holds)"
     for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
-        n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+        n=$(lsm_progs_left | grep -c . || true)
         [[ "$n" == 0 ]] && break
         (( i == 0 )) && log "waiting for $n LSM program(s) to detach"
         sleep 1
     done
-    n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+    n=$(lsm_progs_left | grep -c . || true)
     if [[ "$n" != 0 ]]; then
         echo "uninstall.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s:" >&2
-        bpftool prog show 2>/dev/null | grep " lsm " | sed 's/^/uninstall.sh:   /' >&2
+        lsm_progs_left | sed 's/^/uninstall.sh:   /' >&2
         echo "uninstall.sh: if they are NorthNarrow's, a NorthNarrow process still holds them" >&2
         echo "uninstall.sh: (ps aux | grep northnarrow). Stop it and re-run." >&2
         (( PACKAGE )) || exit 1
@@ -606,6 +632,24 @@ for d in /sys/fs/cgroup/northnarrow-deny-selftest /sys/fs/cgroup/northnarrow-mov
     if [[ -d "$d" ]] && rmdir "$d" 2>/dev/null; then log "removed $d"; fi
 done
 systemctl daemon-reload
+# >>> late_pin_sweep (run by xtask/tests/install_scripts.rs)
+# Lot 377: a unit restarted between its stop (step 1) and the removal of its
+# file above — the watchdog's Restart=always after a refused start: `systemctl
+# kill` does not cancel a pending restart, and RefuseManualStop= refuses the
+# stop — pulls the agent's unit in, whose pin-lock step makes the pin root
+# again before the start's own check refuses it. No unit file is left to
+# start: a pin root there now, with no unit process, is removed.
+late_pin_sweep() {
+    pins_present || return 0
+    nn_unit_has_procs northnarrow-agent && return 0
+    nn_unit_has_procs northnarrow-watchdog && return 0
+    log "$BPFFS_ROOT is there after the units' removal: removing it"
+    remove_pins
+    pins_present && log "$BPFFS_ROOT could not be removed: it goes at the next reboot"
+    return 0
+}
+# <<< late_pin_sweep
+late_pin_sweep
 # >>> stop_slice (run by xtask/tests/install_scripts.rs)
 # Lot 350 (F2-5): the units' slice outlived its file until the next boot —
 # loaded, active, its cgroup there. Its file is gone at the reload above, and

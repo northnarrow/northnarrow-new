@@ -26,18 +26,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Mutex;
 
 use antitamper_bpf::host_dropins::{Harm, Kind};
 use antitamper_bpf::unit_props::LoadedView;
 
-/// The dynamic loader's preload list, read by every dynamically linked
-/// start.
-pub const PRELOAD_PATH: &str = "/etc/ld.so.preload";
-/// The most of it read (far above any real list).
-pub const PRELOAD_MAX: u64 = 64 << 10;
+// Lot 377: the list read and split by one rule with `nn-admin host-check`
+// and install.sh's preflight (moved to antitamper-bpf).
+pub use antitamper_bpf::preload::{
+    candidates, preload_names, PRELOAD_MAX, PRELOAD_PATH, SEARCH_DIRS,
+};
 
 /// The drop-in directives that change the code a start of our units runs
 /// or what protects it: its environment, its commands, its memory's
@@ -119,113 +119,10 @@ pub fn read_preload(path: &Path) -> Preload {
 
 /// [`read_preload`], and the bytes read (`None` when none were).
 pub fn read_preload_bytes(path: &Path) -> (Preload, Option<Vec<u8>>) {
-    let read = || -> std::io::Result<Vec<u8>> {
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
-            .open(path)?;
-        let t = f.metadata()?.file_type();
-        if !t.is_file() {
-            let what = if t.is_fifo() {
-                "a FIFO"
-            } else if t.is_socket() {
-                "a socket"
-            } else if t.is_char_device() || t.is_block_device() {
-                "a device"
-            } else {
-                "not a regular file"
-            };
-            return Err(std::io::Error::other(what));
-        }
-        let mut b = Vec::new();
-        f.take(PRELOAD_MAX + 1).read_to_end(&mut b)?;
-        if b.len() as u64 > PRELOAD_MAX {
-            return Err(std::io::Error::other(format!(
-                "larger than {PRELOAD_MAX} bytes"
-            )));
-        }
-        Ok(b)
-    };
-    match read() {
+    match antitamper_bpf::preload::read_list(path) {
         Ok(b) => (preload_of(Ok(b.clone())), Some(b)),
         Err(e) => (preload_of(Err(e)), None),
     }
-}
-
-/// The re-check of #582 (N3): the names a preload list holds, as the
-/// loader splits it (white space and `:`; `#` starts a comment to the end
-/// of its line).
-pub fn preload_names(text: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(text);
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("");
-        for n in line.split(|c: char| c.is_ascii_whitespace() || c == ':') {
-            if !n.is_empty() && !out.iter().any(|o| o == n) {
-                out.push(n.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// The directories the loader searches for a name without a `/` (the
-/// default paths of the supported layouts: Debian's multiarch, Fedora's
-/// `lib64`, merged `/usr` or not).
-pub const SEARCH_DIRS: &[&str] = &[
-    "/lib/x86_64-linux-gnu",
-    "/usr/lib/x86_64-linux-gnu",
-    "/lib64",
-    "/usr/lib64",
-    "/lib",
-    "/usr/lib",
-];
-
-/// The re-check of #582 (N3): every path the loader may load for preload
-/// entry `name` — the path itself, its `$LIB` and `$PLATFORM` expansions
-/// (each a supported layout's), or `name` in each of [`SEARCH_DIRS`].
-pub fn candidates(name: &str) -> Vec<String> {
-    let mut out = vec![name.to_string()];
-    for (token, values) in [
-        (
-            "$LIB",
-            &[
-                "lib",
-                "lib64",
-                "lib/x86_64-linux-gnu",
-                "usr/lib",
-                "usr/lib64",
-            ][..],
-        ),
-        (
-            "${LIB}",
-            &[
-                "lib",
-                "lib64",
-                "lib/x86_64-linux-gnu",
-                "usr/lib",
-                "usr/lib64",
-            ][..],
-        ),
-        ("$PLATFORM", &["x86_64", "haswell", "xeon_phi"][..]),
-        ("${PLATFORM}", &["x86_64", "haswell", "xeon_phi"][..]),
-    ] {
-        out = out
-            .into_iter()
-            .flat_map(|p| {
-                if p.contains(token) {
-                    values.iter().map(|v| p.replace(token, v)).collect()
-                } else {
-                    vec![p]
-                }
-            })
-            .collect();
-    }
-    if !name.contains('/') {
-        out = SEARCH_DIRS.iter().map(|d| format!("{d}/{name}")).collect();
-    }
-    out.dedup();
-    out
 }
 
 /// The most of a named library read for its digest.

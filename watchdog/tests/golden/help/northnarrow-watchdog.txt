@@ -1,0 +1,66 @@
+NorthNarrow watchdog: supervises the agent and restarts it.
+
+Usage: northnarrow-watchdog [OPTIONS]
+
+Options:
+      --agent-pidfile <PATH>
+          The agent's PID file (what the agent's `--pid-file` writes, once every protection hook is attached). The watchdog watches the process it names
+          
+          [default: /run/northnarrow/agent.pid]
+
+      --admin-socket <PATH>
+          The agent's admin socket. The watchdog pings the agent there to find an agent that is still alive but stuck, and recovers it
+          
+          [default: /run/northnarrow/admin.sock]
+
+      --pidfile <PATH>
+          Where the watchdog writes its own PID, atomically (the agent's `--watchdog-pidfile` reads it to protect the watchdog's process)
+          
+          [default: /run/northnarrow/watchdog.pid]
+
+      --bpffs-root <PATH>
+          The BPF filesystem directory where the agent pins its protection maps. The watchdog adds itself to the protected processes there, and removes a dead agent's entry before it restarts it
+          
+          [default: /sys/fs/bpf/northnarrow]
+
+      --agent-bin <PATH>
+          The agent binary. The process the agent's PID file names is treated as the agent only if it runs this file; the `exec` restart method starts it. Default: /usr/local/bin/northnarrow-agent
+
+      --respawn-backend <RESPAWN_BACKEND>
+          How the agent is brought back after a crash
+
+          Possible values:
+          - auto:    `systemd` when systemd runs the host (/run/systemd/system exists), else `exec`
+          - systemd: `systemctl start <unit>`: the agent returns under its own unit (its command line, cgroup, capabilities, sandbox and journal)
+          - exec:    Start the agent again with the command line of its first start (hosts without systemd)
+          
+          [default: auto]
+
+      --agent-unit <UNIT>
+          The agent's systemd unit, which the `systemd` restart method starts
+          
+          [default: northnarrow-agent.service]
+
+      --witness-dir <DIR>
+          The directory of the watchdog's witness chain (created at the start, protected with the state directory)
+          
+          [default: /var/lib/northnarrow/witness]
+
+      --admin-pub <PATH>
+          The administrators' public keys: a shutdown must be signed by them (the watchdog checks the signatures the agent checked) for the watchdog to let the agent stop
+          
+          [default: /etc/northnarrow/admin.pub]
+
+      --agent-id-file <PATH>
+          This install's agent id; a shutdown signed for another install is refused
+          
+          [default: /etc/northnarrow/agent_id]
+
+      --record-unit-failure
+          Record that systemd put the watchdog's unit in its failed state, and exit: what `northnarrow-watchdog-failed.service` (the watchdog unit's `OnFailure=` handler) runs. It appends one record beside the shutdown marker (`watchdog.hold`), which the agent signs at its next round
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

@@ -2346,9 +2346,11 @@ life).
 - A program that lives less than a round is not seen by the cross-view
   (the light part of it); one loaded while the agent was stopped is in the
   baseline, signed at the next start, not refused.
-- The `bpf` and `bpf_prog` hooks are not pinned: while no agent runs (a
-  restart's or an upgrade's gap, which only a window opens) nothing refuses
-  a load; the next start's baseline signs what it left.
+- (As of this lot; superseded by lot 302, which pins the `bpf` and
+  `bpf_prog` hooks: through a restart's or an upgrade's gap the previous
+  start's guard keeps refusing, outside a trusted-installer window.) The
+  `bpf` and `bpf_prog` hooks were not pinned: while no agent ran nothing
+  refused a load; the next start's baseline signed what it left.
 - A program pinned under another path through a bind mount of the bpffs is
   refused on its object (maps, programs); a link pin through it is matched
   by its final name only, behind the detach/update refusal.

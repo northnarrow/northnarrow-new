@@ -766,6 +766,13 @@ fn unit_sandbox_dirs(unit: &str) -> Vec<String> {
     out
 }
 
+/// Lot 377: [`unit_sandbox_dirs`] of the watchdog's shipped unit — what
+/// systemd binds onto itself in the watchdog's namespace, the mount guard's
+/// judge of that namespace and [`MountSource::Watchdog`] from one source.
+pub(crate) fn watchdog_unit_sandbox_dirs() -> Vec<String> {
+    unit_sandbox_dirs(WATCHDOG_UNIT)
+}
+
 fn covers_protected(mp: &str, extra_files: &[String]) -> bool {
     PROTECTED_MOUNT_PREFIXES.iter().any(|p| mp.starts_with(p))
         || extra_files.iter().any(|f| mp == f)

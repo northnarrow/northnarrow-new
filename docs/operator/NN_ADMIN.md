@@ -44,7 +44,7 @@ colour.
 |---|---|---|
 | `nn-admin status` | the posture, the network isolation, the last admin action, the COMBAT stage; with `--key` also the telemetry (lost events, the response mode: `OBSERVE-ONLY` under the `alpha` profile; the review of #565: the kernel-state round's findings past its quota, `kernel-state quota`, JSON `kernel_state_held_back`; lot 369: the container runtimes' sealed clones kept, compared, not compared and not read, `runtime clones`, JSON `runtime_clones`) | none, or `audit-read` / `telemetry-read` |
 | `nn-admin capabilities` | this boot's signed capability manifest: kernel, BTF, deny hooks and their self-test, each sensor's attach point, the degradations, the trust level | `audit-read` or `telemetry-read` |
-| `nn-admin host-check` | the host's hardening: lockdown, module signing, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, a single bpffs (the agent's own pin lock, recognised as such, is not counted), the install's verification level. Reads `/sys` and `/proc` only | none |
+| `nn-admin host-check` | the host's hardening: lockdown, module signing, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, a single bpffs (the agent's own pin lock, recognised as such, is not counted), the library preload list (`/etc/ld.so.preload`: a library every program would load fails the check, since the agent and the watchdog refuse to start with it), the install's verification level. Reads `/sys`, `/proc` and the preload list only | none |
 | `nn-admin verify-keys` | parse `admin.pub`, print each key's fingerprint and roles | none |
 
 ### Detections
@@ -129,8 +129,8 @@ which of them it uses.
 |---|---|
 | 0 | success |
 | 1 | a failure before or around the request: a file that cannot be read, a key that does not load, no capability manifest signed yet (`capabilities`), an overlay or policy present that would not load (`config overlay status`, `policy show`) |
-| 2 | a usage error (an unknown option, a missing value: the help is printed); `unlock` / `shutdown`: the agent rejected the signature; `host-check`: warnings found |
-| 3 | `unlock` / `shutdown`: the agent has no pending challenge for this request (retry) |
+| 2 | a usage error (an unknown option, a missing value: the help is printed); `unlock` / `shutdown`: the agent rejected the signature; `host-check`: warnings found, no check failed |
+| 3 | `unlock` / `shutdown`: the agent has no pending challenge for this request (retry); `host-check`: a check failed (`FAIL`, `fail` in `--json`): the agent cannot run on this host as it is |
 | 4 | rate-limited by the agent (the wait is printed; retry after it) |
 | 5 | the agent could not be reached or answered something else: no socket or nobody listening on it (the agent is not running), protocol, a skewed clock, another install's agent id, an operation this agent does not know (an `nn-admin` of another release) |
 | 6 | `shutdown`, `rotate-keys`: the quorum was not met (two distinct valid keys are needed) |
@@ -154,6 +154,7 @@ which of them it uses.
 | 2 | a usage error: an unknown or conflicting option, a profile switch asked of an installed agent |
 | 3 | an upgrade failed and was rolled back: the previous version runs again |
 | 4 | an upgrade failed and its rollback could not be completed: the message says how to finish it ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §2) |
+| 5 | refused, nothing changed: `/etc/ld.so.preload` names a library every program would load (the files are named), or the list cannot be read as a regular file; the agent and the watchdog would refuse to start with it ([`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §1) |
 | 129, 130, 143 | interrupted by a signal (HUP, INT, TERM) |
 
 ### `uninstall.sh`
@@ -168,11 +169,30 @@ which of them it uses.
 
 ### The agent
 
-The agent exits **78** when it refuses to start: a verification failed — a
-binary that is not the one the installer verified, a kernel layout it cannot
-read safely, a deny hook that did not attach. Its unit is left `failed`
-(the watchdog's restart limit bounds any respawn), the reason is in its journal
+| Exit | Meaning |
+|---|---|
+| 0 | stopped (a signal), or `--build-features` printed its list (`--btf-check` and `--own-dropins`: below) |
+| 1 | an error without a status of its own |
+| 2 | the command line was refused, or a lab-only option was asked of a release build |
+| 75 | a stop cut at its deadline (`EX_TEMPFAIL`); inside a signed trusted-installer window it is the operator's stop (`stop_deadline`) |
+| 78 | refused to start (`EX_CONFIG`): a verification failed — a binary that is not the one the installer verified, a kernel layout it cannot read safely, a deny hook that did not attach — or the start's own check found a loader variable in its environment or an executable mapping of a library the release does not link (`start_self_check`) |
+
+A refused start leaves its unit `failed` (the watchdog's restart limit
+bounds any respawn), the reason in its journal
 (`journalctl --namespace=northnarrow -u northnarrow-agent`) and, when the
-audit chain could be written, in a signed `agent_boot` row.
+audit chain could be written, a signed `agent_boot` row.
 [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §5.1 says how to
 recover.
+
+Two modes have codes of their own: `--btf-check <file>` exits 0 when the
+kernel is supported, 2 when the agent would refuse it, 3 when the file
+cannot be read or parsed; `--own-dropins check` exits 0 when no drop-in of
+its units would be set aside, 3 when one would, and `--own-dropins
+quarantine` 0, or 1 when one could not be moved.
+
+### The watchdog
+
+Every status of the watchdog, and what each means, is in the table of
+[`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md) §3.9: 0 for a
+stop it was told to make, 16 when its start refused itself, one status per
+failure otherwise.

@@ -4953,7 +4953,8 @@ still fires.
   `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
   `openntpd.service`), started there and never injected (the kernel's lot
   277 and 281 marks).
-  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named). - **`R011` High, intermittent, on Debian 12.** This was a race. A
+  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named).
+- **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
   the exec's own `/proc` entry, which was gone, so lot 348's exemption fell
@@ -5335,3 +5336,68 @@ it resembles still fires.
     `NN-L-FIM-019` High, recorded, with no kill and no would-have kill.
   - Expect one `NN-L-FIM-009` Low record per package-manager process in a
     transaction, and Low for a package's own free-port probe.
+
+## 63. rc10's findings: the witness directory's bind, a preload list refused before the install, plain daemon help (lot 377)
+
+The checks of the rc10 release candidate found a false High at every start
+of the watchdog on Debian 13, a host the agent cannot run on that the
+installer did not refuse, and operator texts written for developers.
+
+- **No `mount_not_canonical` High at the watchdog's start** (P2). Lot 374
+  made the witness directory writable for the watchdog
+  (`ReadWritePaths=-/var/lib/northnarrow/witness`), and systemd binds it
+  onto itself in the watchdog's namespace. The mount guard judges that
+  namespace at each start of the watchdog, and a mount below the agent's
+  own directories was never canonical there: an `INTEGRITY DRIFT` ERROR
+  and a signed High each time.
+  - A bind of exactly one of the directories the watchdog's shipped unit
+    names (`ReadWritePaths=`, `RuntimeDirectory=`), onto itself, is the
+    canonical layout of the watchdog's namespace now — the rule the
+    integrity round already applied there.
+  - Still named, High: a bind of another directory below the agent's,
+    one below the witness directory, a bind of another directory over it,
+    another file system or a memory file system at it, and the same bind
+    in any other namespace. A directory a drop-in adds to the unit is not
+    the shipped unit's: its bind is named too.
+- **A host whose `/etc/ld.so.preload` loads a library** (P2). Since lot 374
+  the agent and the watchdog refuse to start when they map a library the
+  release does not link (exit 78 and 16), so on such a host every start
+  refused itself — after `install.sh` had changed the host.
+  - `install.sh` (a fresh install, a reinstall, `--upgrade`) reads the list
+    as the dynamic loader does before it changes anything (and before an
+    upgrade stops the running units). A name of a file that exists (a path,
+    a bare name in a system library directory, `$LIB` or `$PLATFORM`
+    expanded) is refused: **exit 5**, the files named, nothing changed. A
+    list that is not a regular file or is larger than 64 KiB is refused
+    the same way. An empty list, one with comments only, or one whose
+    names match no file is noted, and the install goes on: each start's own
+    check still refuses a library that appears later.
+  - `nn-admin host-check` has a new row, **Library preload list**
+    (`preload`): OK when absent or when it loads nothing (said in its
+    value), and a new status, **FAIL**, when a library would load. A FAIL
+    makes `host-check` exit **3** (2 with warnings only, 0 otherwise); the
+    table ends with a line of the failures, and `--json` says `fail`.
+  - The packages' hooks do not run this check: on such a host the agent's
+    own start check refuses it, as before.
+  - A host left with the files installed and each start refused (the
+    installer before this lot) needs no window to be uninstalled: nothing
+    was loaded (the agent unit's pin-lock step, which runs before the
+    start's own check, leaves an empty pin root).
+  - That uninstall stopped with the whole host left on Debian 13 (exit 1,
+    the lab of this lot): with no list of the agent's programs, it waited
+    for every LSM program on the host, and PID 1's own (systemd's
+    `RestrictFileSystems=`) never detaches. The uninstall and the upgrade
+    no longer wait for the programs PID 1 holds (read from PID 1's
+    descriptors); another product's are waited for as before. A pin root
+    that a unit restart makes again during the uninstall (the watchdog's
+    `Restart=` after a refused start) is removed once the units are gone.
+- **The daemons' `--help`.** Every option they show says what it does;
+  internal references moved to the code. Hidden, still accepted: the
+  agent's `--install-manifest`, `--shutdown-marker-file`,
+  `--chain-heads-file`, `--fim-baseline-file`, `--detections-file`,
+  `--status-events-file`, `--canary-registry-file`, `--canary-access-file`,
+  `--netflow-listeners-file`, and the watchdog's `--shutdown-marker`.
+- **Upgrade.** No configuration. Expect no `mount_not_canonical` at the
+  watchdog's start, a 14th row in `nn-admin host-check`, and `host-check`
+  exit 3 on a host whose preload list loads a library. A script that read
+  `host-check`'s exit 2 as "something to fix" should read 3 the same way.

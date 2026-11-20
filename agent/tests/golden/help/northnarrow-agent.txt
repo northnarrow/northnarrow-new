@@ -1,0 +1,366 @@
+NorthNarrow XDR agent daemon (Linux).
+
+Usage: northnarrow-agent [OPTIONS]
+
+Options:
+      --detect-only
+          Detect-only (monitor) mode. Detection runs in full and the posture still moves (OBSERVING, ALERTED, COMBAT are logged), but nothing is enforced: every response (kill, block, quarantine, throttle, isolation) and the COMBAT network isolation are skipped and logged as "would execute". Use it to roll out safely, or to tune, before arming the automatic response. Also `NN_DETECT_ONLY=1` (the older `NORTHNARROW_DRY_RUN=1` is honoured too)
+
+      --btf-check <BTF_FILE>
+          Check this agent's compatibility with a kernel, and exit: resolve every kernel structure field and value the agent's kernel programs need against the given BTF file (`/sys/kernel/btf/vmlinux` of this or another kernel, or a BTF extracted from a distribution's kernel package) and print the report. Exit 0 when everything resolves, 2 when a field is missing (the agent would refuse to start on that kernel), 3 when the BTF cannot be read or parsed. Loads nothing into the kernel; needs no root
+
+      --own-dropins <check|quarantine>
+          Check the drop-ins of NorthNarrow's systemd units against this version's rules, whatever their age, and exit. `check` prints each one the agent would quarantine (`would move <path>: <why>`) and exits 3 when there is one, 0 when there is none. `quarantine` moves them to /var/lib/northnarrow/quarantine/dropins (`moved <path> -> <to>: <why>`) and exits 1 when one could not be moved. `install.sh --upgrade` runs `check` before it changes anything, and `quarantine` when given `--accept-dropin-quarantine`
+          
+          [possible values: check, quarantine]
+
+      --build-features
+          Print the test and debug build features this binary was built with (comma-separated), or `none`, and exit. A release build prints `none`; the range bootstrap and the release checks refuse a binary that prints anything else
+
+      --file-open-sensor <FILE_OPEN_SENSOR>
+          File-open sensor. `lsm` (default): the kernel classifies every open and sends only the ones a rule reads (and counts the opens for writing, for mass-write detection). `tracepoint`: the older sensor that sends every open to user space; a fallback (also `NN_FILE_OPEN_SENSOR=tracepoint` in a unit drop-in)
+          
+          [env: NN_FILE_OPEN_SENSOR]
+          [default: lsm]
+          [possible values: lsm, tracepoint]
+
+      --exec-sensor <EXEC_SENSOR>
+          Exec sensor. `lsm` (default): the kernel's exec check reads the file the kernel actually opened, and the exec rules match its canonical path. `tracepoint`: the older sensor, whose rules matched the path the caller passed; a fallback (also `NN_EXEC_SENSOR=tracepoint` in a unit drop-in)
+          
+          [env: NN_EXEC_SENSOR]
+          [default: lsm]
+          [possible values: lsm, tracepoint]
+
+      --dns-sensor <DNS_SENSOR>
+          DNS sensor. `skb` (default): reads each query from the packet the kernel built — the name actually sent, over IPv4 and IPv6. `sendmsg`: the older sensor, which read the caller's memory before the kernel copied it and saw IPv4 only; a fallback (also `NN_DNS_SENSOR=sendmsg` in a unit drop-in)
+          
+          [env: NN_DNS_SENSOR]
+          [default: skb]
+          [possible values: skb, sendmsg]
+
+      --exploit-guard <EXPLOIT_GUARD>
+          Exploit guard (experimental): catches a gain of credentials, namespaces or root that the kernel's own mechanisms did not make for the system call in progress (rules NN-L-EPG-001/002). `lite` (default): no system-call hooks — the mechanisms are judged on the call in progress, and a credential changed without one is caught at its first use (`capable`, exec, a root-only file open). `strict`: the comparison around every system call (opt-in: hundreds of nanoseconds per call of an unprivileged task; refused below Linux 6.1). `off`: not attached, reported as a degradation (also `NN_EXPLOIT_GUARD=off`, a variable that weakens the protection)
+          
+          [env: NN_EXPLOIT_GUARD]
+          [default: lite]
+          [possible values: off, lite, strict]
+
+      --exploit-guard-response <EXPLOIT_GUARD_RESPONSE>
+          What the exploit guard does on a finding. `detect` (default): a signed record; the task continues. `enforce`: the kernel kills the task (SIGKILL) before it returns to user mode (in `lite`, the use itself is also refused with EPERM), then the record. `--detect-only` keeps it at `detect`
+          
+          [env: NN_EXPLOIT_GUARD_RESPONSE]
+          [default: detect]
+          [possible values: detect, enforce]
+
+      --exploit-guard-tasks <EXPLOIT_GUARD_TASKS>
+          Exploit guard: how many tasks it tracks. `strict`: default `/proc/sys/kernel/pid_max` (every live task fits; not preallocated). `lite`: default `min(pid_max, threads-max)` capped at 65536 (preallocated, about 150 bytes a task; at most 1048576); when it is full the oldest entries are evicted and taken again, counted and reported (at most once every 600 s)
+          
+          [env: NN_EXPLOIT_GUARD_TASKS]
+
+      --combat-rules <PATH>
+          The IPv4 firewall ruleset (`iptables-restore` format) applied when the agent enters COMBAT, to isolate the host from the network
+          
+          [default: /etc/northnarrow/combat-rules.v4]
+
+      --combat-rules-v6 <PATH>
+          The IPv6 firewall ruleset (`ip6tables-restore` format) applied on COMBAT alongside the IPv4 one. If the file is missing, IPv6 is not isolated (a loud warning); the IPv4 isolation still applies
+          
+          [default: /etc/northnarrow/combat-rules.v6]
+
+      --combat-allow-cidrs <PATH>
+          Management networks that stay reachable during COMBAT: a list of CIDR blocks, one per line, so that a remote operator on a declared management network is not locked out. Read again each time COMBAT engages. Empty or missing (the shipped state): full isolation
+          
+          [default: /etc/northnarrow/combat-allow.cidrs]
+
+      --admin-pub <PATH>
+          The administrators' public keys, which the agent's admin socket checks every signed `nn-admin` request against. If the file is missing the admin socket is not started: the agent still runs, still enters COMBAT and isolates the network on an intrusion, but nothing can release COMBAT short of a reboot
+          
+          [default: /etc/northnarrow/admin.pub]
+
+      --watchdog-exe <PATH>
+          The installed watchdog binary: a process is trusted as the watchdog only if it runs this file (checked through `/proc/<pid>/exe`). Default: `northnarrow-watchdog` next to this agent's executable (`/usr/local/bin` for `install.sh`, `/usr/bin` for a package). It must not be the agent's own binary: the start is refused
+
+      --agent-id-file <PATH>
+          This install's agent id: 16 random bytes (32 hex characters), made at the first start. Every signed admin request names it, so a signature made for one install cannot be replayed on another. Keep it in /etc/northnarrow: another directory is not supported (a restart is refused)
+          
+          [default: /etc/northnarrow/agent_id]
+
+      --watchdog-pidfile <PATH>
+          The watchdog's PID file (what the watchdog's `--pidfile` writes). If it exists when the agent starts, the agent protects the watchdog as it protects itself: kill signals and ptrace against it are refused in the kernel. A missing file is fine: the agent starts without a watchdog
+          
+          [default: /run/northnarrow/watchdog.pid]
+
+      --admin-socket <PATH>
+          The Unix socket `nn-admin` connects to. A file left there by an unclean stop is removed at the start
+          
+          [default: /run/northnarrow/admin.sock]
+
+      --signing-key-file <PATH>
+          The agent's signing key, which signs its audit log and its evidence chains (made at the first start). Keep it in /etc/northnarrow: another directory is not supported (a restart is refused)
+          
+          [default: /etc/northnarrow/agent.sig.key]
+
+      --audit-log-file <PATH>
+          The agent's signed audit log. Keep it in /etc/northnarrow: another directory is not supported (a restart is refused)
+          
+          [default: /etc/northnarrow/audit.log]
+
+      --fim-paths-v1 <PATH>
+          The shipped list of paths the file-integrity monitor (FIM) watches: one absolute path per line, `#` comments. `install.sh` installs it; add or disable paths in the local overlay (`--fim-paths-local`)
+          
+          [default: /etc/northnarrow/fim-paths.v1]
+
+      --fim-paths-local <PATH>
+          The operator's overlay of the FIM paths: `+/abs/path` adds a path, `-/abs/path` disables a shipped one; stored with `nn-admin config overlay set fim-paths`. A missing file means no overlay
+          
+          [default: /etc/northnarrow/fim-paths.local]
+
+      --fim-drift-file <PATH>
+          The FIM drift log: the signed chain of the changes to watched files (`nn-admin fim report` reads it)
+          
+          [default: /var/lib/northnarrow/fim_drift.jsonl]
+
+      --witness-dir <DIR>
+          The directory of the watchdog's witness chain (created at the start, protected with the state directory)
+          
+          [default: /var/lib/northnarrow/witness]
+
+      --actions-file <PATH>
+          The actions log: the signed chain of every response's intent before it acts and its outcome after
+          
+          [default: /var/lib/northnarrow/detections/actions.jsonl]
+
+      --heartbeat-file <PATH>
+          The heartbeat log: a signed beat every `NN_HEARTBEAT_SECS` (30 s) that a verifier on another host reads (`nn-admin heartbeat export` and `watch`)
+          
+          [default: /var/lib/northnarrow/heartbeat.jsonl]
+
+      --canary-template-dir <PATH>
+          The directory of the canary templates (`<family>.tmpl`) that file and credential canaries are made from (network and process canaries need none)
+          
+          [default: /etc/northnarrow/canary-templates]
+
+      --netflow-file <PATH>
+          The network flow log: the signed chain of closed connections, one row per flow (`nn-admin net flows`, `net resolve` and `net fingerprint` read it and its rotated archives)
+          
+          [default: /var/lib/northnarrow/netflow.jsonl]
+
+      --netflow-blocklist-v1 <PATH>
+          The shipped IP/CIDR blocklist that rule NN-L-NET-001 checks connections against (read at the start); add your own entries in the local overlay (`--netflow-blocklist-local`)
+          
+          [default: /etc/northnarrow/netflow-blocklist.v1]
+
+      --netflow-blocklist-local <PATH>
+          The operator's overlay of the IP/CIDR blocklist: `+` adds an entry, `-` disables a shipped one; stored with `nn-admin config overlay set netflow-blocklist`. A missing file means no overlay
+          
+          [default: /etc/northnarrow/netflow-blocklist.local]
+
+      --netflow-ja3-blocklist-v1 <PATH>
+          The shipped blocklist of TLS client fingerprints (JA3) that rule NN-L-NET-003 checks (read at the start; ships empty)
+          
+          [default: /etc/northnarrow/netflow-ja3-blocklist.v1]
+
+      --netflow-ja3-blocklist-local <PATH>
+          The operator's overlay of the JA3 blocklist, stored with `nn-admin config overlay set netflow-ja3-blocklist`. A missing file means no overlay
+          
+          [default: /etc/northnarrow/netflow-ja3-blocklist.local]
+
+      --process-comm-allowlist-v1 <PATH>
+          The shipped list of process names (`comm`) that some process rules do not fire on (the file's header names them). `install.sh` installs it; the agent reads it with the local overlay at the start
+          
+          [default: /etc/northnarrow/process-comm-allowlist.v1]
+
+      --process-comm-allowlist-local <PATH>
+          The operator's overlay of the process-name allowlist: `+comm` exempts a name, `-comm` re-enables detection on a shipped one; stored with `nn-admin config overlay set process-comm-allowlist`. A missing file means no overlay
+          
+          [default: /etc/northnarrow/process-comm-allowlist.local]
+
+      --netflow-comm-allowlist-v1 <PATH>
+          The shipped list of trusted process names (`comm`) the network rules do not fire on. `install.sh` installs it; the agent reads it with the local overlay at the start
+          
+          [default: /etc/northnarrow/netflow-comm-allowlist.v1]
+
+      --netflow-comm-allowlist-local <PATH>
+          The operator's overlay of the network process-name allowlist: `+comm` adds a name, `-comm` re-enables detection on a shipped one; stored with `nn-admin config overlay set netflow-comm-allowlist`. A missing file means no overlay
+          
+          [default: /etc/northnarrow/netflow-comm-allowlist.local]
+
+      --net-connect-deny
+          Refuse in the kernel, with EPERM, every connection to an address of the IP/CIDR blocklist, before any packet leaves; each refusal is a signed NN-L-NET-001 record. Off by default: without it NN-L-NET-001 kills the process once the connection is made. Entries wider than /8 (IPv4) or /16 (IPv6), or covering loopback, are left out of the kernel's refusal (the rule still judges them). Ignored in detect-only mode, which never refuses a connection. Also `NN_NET_CONNECT_DENY=1` (or `true`, `yes`, `on`; `0`, `false`, `no`, `off` leave it off)
+          
+          [env: NN_NET_CONNECT_DENY]
+
+      --net-snapshot-interval-secs <SECS>
+          An open TCP connection is judged again every this many seconds (by the rules that need no byte count, with the process's current executable)
+          
+          [env: NN_NET_SNAPSHOT_INTERVAL_SECS]
+          [default: 60]
+
+      --net-snapshot-min-age-secs <SECS>
+          An open connection is first judged once it has been open this many seconds
+          
+          [env: NN_NET_SNAPSHOT_MIN_AGE_SECS]
+          [default: 60]
+
+      --net-snapshot-max <N>
+          At most this many open connections are judged per round (every 10 s); the others wait for the next round (`nn-admin net status` counts them)
+          
+          [env: NN_NET_SNAPSHOT_MAX]
+          [default: 512]
+
+      --net-scan-hosts <N>
+          Scan detection (rule NN-L-NET-026): record one process (or the children of one parent) that reaches this many distinct destination addresses within the scan window
+          
+          [env: NN_NET_SCAN_HOSTS]
+          [default: 64]
+
+      --net-scan-pairs <N>
+          Scan detection: also record one process (or the children of one parent) that reaches this many distinct (address, port) pairs within the scan window
+          
+          [env: NN_NET_SCAN_PAIRS]
+          [default: 256]
+
+      --net-scan-kill-hosts <N>
+          Scan detection: kill a process that reaches this many distinct addresses within the scan window (0: never). The kill is held, and only recorded, unless the rule policy (`nn-admin policy set`) says `enforce` for NN-L-NET-026
+          
+          [env: NN_NET_SCAN_KILL_HOSTS]
+          [default: 512]
+
+      --net-scan-window-secs <SECS>
+          Scan detection: the scan window, in seconds
+          
+          [env: NN_NET_SCAN_WINDOW_SECS]
+          [default: 60]
+
+      --net-brute-connects <N>
+          Brute-force detection (rule NN-L-NET-027): record one process (or the children of one parent) that makes this many connections to login services (SSH, Telnet, RDP, VNC) within the brute-force window, to one host or to many
+          
+          [env: NN_NET_BRUTE_CONNECTS]
+          [default: 20]
+
+      --net-brute-kill-connects <N>
+          Brute-force detection: kill a process that makes this many (0: never). The kill is held, and only recorded, unless the rule policy (`nn-admin policy set`) says `enforce` for NN-L-NET-027
+          
+          [env: NN_NET_BRUTE_KILL_CONNECTS]
+          [default: 100]
+
+      --net-brute-window-secs <SECS>
+          Brute-force detection: the brute-force window, in seconds
+          
+          [env: NN_NET_BRUTE_WINDOW_SECS]
+          [default: 300]
+
+      --net-fanout-exempt <PROGRAM>
+          A program whose processes and their descendants legitimately reach many hosts (the host's own monitoring), exempt from scan and brute-force detection beside the built-in list: the name of its executable, or of the script an interpreter runs, installed in a root-owned system directory. Repeatable, or a comma-separated list in `NN_NET_FANOUT_EXEMPT`
+          
+          [env: NN_NET_FANOUT_EXEMPT]
+
+      --pid-file <PATH>
+          The agent's PID file. It is written atomically once every protection hook is attached (when "decision engine ready" is logged), so its existence is the readiness signal for supervisors and test harnesses, and it is removed at a clean stop. A file left by a crashed run is overwritten, not trusted: check /proc/<pid> before trusting its contents. The shipped unit passes /run/northnarrow/agent.pid; the list of the agent's kernel program ids and the records of refused starts (boot-refusals/) are written beside it. Without this option none of them is written
+
+      --exec-quarantine <EXEC_QUARANTINE>
+          Exec quarantine at first sight (experimental). `off` (default). `observe`: a new executable run from a guarded location (/tmp, /var/tmp, /dev/shm, a home directory, a world-writable directory, a memfd, a deleted file) is scanned while it runs, and the record says what would have been done. `enforce`: the kernel holds it before its first instruction until the scanner and the rules have judged it. A detect-only agent only observes
+
+          Possible values:
+          - off:     No candidate, no stop (the default)
+          - observe: Candidates are scanned while they run; the record says what would have been done
+          - enforce: Candidates are held before their first instruction
+          
+          [env: NN_EXEC_QUARANTINE]
+          [default: off]
+
+      --exec-quarantine-budget-ms <MS>
+          How long a held process waits for its verdict, in milliseconds (100 to 10000), before `--exec-quarantine-on-expiry` applies
+          
+          [env: NN_EXEC_QUARANTINE_BUDGET_MS]
+          [default: 2000]
+
+      --exec-quarantine-on-expiry <EXEC_QUARANTINE_ON_EXPIRY>
+          What a held process gets when no verdict comes within the budget (or its file cannot be scanned). Signed either way
+
+          Possible values:
+          - resume: `SIGCONT`
+          - kill:   `SIGKILL` (and the file quarantined when the basis is a block-list hit or a suspicious verdict)
+          
+          [env: NN_EXEC_QUARANTINE_ON_EXPIRY]
+          [default: resume]
+
+      --exec-quarantine-on-suspicious <EXEC_QUARANTINE_ON_SUSPICIOUS>
+          What a held process gets when the scanner calls it suspicious (heuristics, not a blocklist hit)
+
+          Possible values:
+          - resume: `SIGCONT`
+          - kill:   `SIGKILL` (and the file quarantined when the basis is a block-list hit or a suspicious verdict)
+          
+          [env: NN_EXEC_QUARANTINE_ON_SUSPICIOUS]
+          [default: resume]
+
+      --exec-quarantine-scanner <PATH>
+          The exec quarantine's scanner binary. Default: `northnarrow-scan` next to the agent, else /usr/local/bin/northnarrow-scan
+
+      --exec-quarantine-scan-user <USER>
+          The account the scanner runs as (`install.sh` creates it)
+          
+          [default: northnarrow-scan]
+
+      --execq-hashes-local <PATH>
+          The exec quarantine's signed hash list (`block <sha256> [label]` / `allow <sha256> [label]`), stored with `nn-admin config overlay set execq-hashes`
+          
+          [default: /etc/northnarrow/execq-hashes.local]
+
+      --exec-policy <EXEC_POLICY>
+          Exec policy (experimental): rules applied to an exec before it runs. `off` (default). `audit`: every exec the policy denies (a memfd, a deleted file, /dev/shm for services and sessions in the server profile) is recorded as "would deny" and runs. `enforce`: it is refused with EACCES before the exec takes effect. Execs the policy quarantines are handed to `--exec-quarantine`. The loader variables (LD_PRELOAD, LD_AUDIT pointing into a staging location) and the executable mappings of staged files are judged by the same policy. A detect-only agent only audits
+
+          Possible values:
+          - off:     Nothing classified for the policy, nothing denied (the default)
+          - audit:   Every deny recorded as "would deny", the exec runs; quarantine cells still hand execs to the exec quarantine
+          - enforce: Deny cells refuse the exec
+          
+          [env: NN_EXEC_POLICY]
+          [default: off]
+
+      --exec-policy-profile <EXEC_POLICY_PROFILE>
+          The built-in exec policy the signed policy starts from: `server` (default) or `desktop` (a login session's own staging locations allowed: AppImage, build trees; memfd and deleted files recorded)
+
+          Possible values:
+          - server:  Servers: memfd, deleted files and `/dev/shm` refused outside an interactive admin session; the other staging locations handed to the exec quarantine
+          - desktop: Desktops and developer machines: services as on a server; a login session's own staging locations allowed (AppImage, `go test`, pip builds), memfd and deleted files recorded as "would deny"
+          
+          [env: NN_EXEC_POLICY_PROFILE]
+          [default: server]
+
+      --exec-policy-local <PATH>
+          The signed exec policy (`exec <class> <tier> <action>`…), stored with `nn-admin config overlay set exec-policy`
+          
+          [default: /etc/northnarrow/exec-policy.local]
+
+      --rule-policy-local <PATH>
+          The signed per-rule response policy (`enforce|alert|audit|off <rule>`, `exempt <rule> …`), stored with `nn-admin policy set`. Without it every rule keeps its built-in response
+          
+          [default: /etc/northnarrow/rule-policy.local]
+
+      --nodns-allow-local <PATH>
+          The signed allowlist of rule NN-L-NET-028 (a connection to a public address the process did not look up in DNS): the addresses and CIDR blocks it does not judge, one per line, stored with `nn-admin config overlay set nodns-allow`
+          
+          [default: /etc/northnarrow/nodns-allow.local]
+
+      --profile-local <PATH>
+          The signed response profile (`profile = alpha|enforcing`), stored with `nn-admin config overlay set profile`; it applies at the next start and wins over the install's profile. Without it: the install's profile (`install.sh` writes `alpha` on a fresh install), else `enforcing`
+          
+          [default: /etc/northnarrow/profile.local]
+
+      --exec-policy-no-env
+          Exec policy: do not read the new program's environment at exec (no LD_PRELOAD, LD_AUDIT, GLIBC_TUNABLES or history checks). Also `NN_EXEC_POLICY_NO_ENV=1` (1/0, true/false, yes/no, on/off)
+          
+          [env: NN_EXEC_POLICY_NO_ENV]
+
+      --exec-policy-no-map
+          Exec policy: do not judge executable file mappings (`mmap`). Also `NN_EXEC_POLICY_NO_MAP=1` (1/0, true/false, yes/no, on/off)
+          
+          [env: NN_EXEC_POLICY_NO_MAP]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
