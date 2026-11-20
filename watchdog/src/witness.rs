@@ -432,6 +432,27 @@ pub fn vacancy_kind(verdict: &crate::ShutdownVerdict, in_window: bool) -> &'stat
     }
 }
 
+/// The review of #582 (F4, the mini-hunt): the row of the agent's role
+/// found vacated at this watchdog's start — `role_found_vacant` (High),
+/// or a note (`role_released_in_window`) when the kernel marked its
+/// holder's last exit inside a signed trusted-installer window (`marks`,
+/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's).
+pub fn found_vacant(marks: Option<u32>) -> (&'static str, &'static str) {
+    if marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
+        (
+            nn_proto::witness::KIND_RELEASED_IN_WINDOW,
+            "the agent's role was found vacated at this watchdog's start: its holder's last \
+             exit was inside a signed trusted-installer window (the operator's stop)",
+        )
+    } else {
+        (
+            nn_proto::witness::KIND_FOUND_VACANT,
+            "the agent's role was found vacated at this watchdog's start: its holder exited \
+             with no watchdog to see it",
+        )
+    }
+}
+
 /// The successor row's kind: the agent's unit's clean restart, or not
 /// (`given`: [`successor_detail`]'s verdict).
 pub fn successor_kind(given: bool) -> &'static str {
@@ -625,6 +646,20 @@ mod tests {
         );
         assert_eq!(successor_kind(true), KIND_SUCCEEDED);
         assert_eq!(successor_kind(false), KIND_SUCCESSOR_FOREIGN);
+    }
+
+    /// The review of #582 (F4, the mini-hunt): a watchdog start that finds
+    /// the agent's role vacated by the operator's stop inside a signed
+    /// window (the maintenance stop, the watchdog started first) writes a
+    /// note; any other vacancy, or marks not read, stays `role_found_vacant`.
+    #[test]
+    fn a_role_found_vacated_by_a_window_s_stop_is_a_note() {
+        use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M};
+        use nn_proto::witness::{KIND_FOUND_VACANT, KIND_RELEASED_IN_WINDOW};
+        assert_eq!(found_vacant(Some(M | W)).0, KIND_RELEASED_IN_WINDOW);
+        for m in [Some(M), Some(0), None] {
+            assert_eq!(found_vacant(m).0, KIND_FOUND_VACANT, "{m:?}");
+        }
     }
 
     /// The review of #582 (F4 a): the guide's restart — a window granted,

@@ -1263,11 +1263,17 @@ fn open_witness(
                 antitamper_bpf::role_slot(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)
             {
                 if slot == antitamper_bpf::ROLE_VACATED {
-                    w.record_or_log(
-                        nn_proto::witness::KIND_FOUND_VACANT,
-                        "the agent's role was found vacated at this watchdog's start: its holder \
-                         exited with no watchdog to see it",
-                    );
+                    // The review of #582 (F4, the mini-hunt): its holder's
+                    // last exit inside a signed window (the kernel's mark) is
+                    // the operator's stop — a note, as the vacancy the
+                    // watchdog sees inside one
+                    let marks = antitamper_bpf::role_marks(
+                        &cli.bpffs_root,
+                        antitamper_bpf::ROLE_SLOT_AGENT,
+                    )
+                    .ok();
+                    let (kind, detail) = northnarrow_watchdog::witness::found_vacant(marks);
+                    w.record_or_log(kind, detail);
                 }
             }
             Some(w)
