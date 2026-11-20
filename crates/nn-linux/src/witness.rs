@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 use nn_proto::witness::{
     parse_key_record, to_import, Imported, CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE,
-    KEY_MEMFD_NAME, KIND_OPENED, KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
+    KEY_MEMFD_NAME, KIND_CHAIN_TORN, KIND_GATE_REFERENCE, KIND_OPENED, KIND_RELEASED,
+    KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
 };
 
 /// A finding of this module signed as a note ([`WITNESS_OP`]): the
@@ -43,7 +44,12 @@ pub fn is_note(kind: &str) -> bool {
 pub fn row_kind(row_kind: &str) -> &'static str {
     if matches!(
         row_kind,
-        KIND_OPENED | KIND_RELEASED | KIND_RELEASED_IN_WINDOW | KIND_SUCCEEDED
+        KIND_OPENED
+            | KIND_RELEASED
+            | KIND_RELEASED_IN_WINDOW
+            | KIND_SUCCEEDED
+            | KIND_GATE_REFERENCE
+            | KIND_CHAIN_TORN
     ) {
         WITNESS_NOTE
     } else {
@@ -73,6 +79,11 @@ pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
 /// its death is `watchdog_gone`).
 pub const WATCHDOG_SUCCESSION: &str = "watchdog_succession";
+/// The re-check of #582 (N4): the watchdog's vacated role taken by its
+/// unit's clean restart, but a library it maps was replaced on disk since
+/// and is not the agent's own copy — its identity not confirmed (High). The
+/// agent registers it: never withheld for that alone.
+pub const WATCHDOG_SUCCESSOR_UNCONFIRMED: &str = "watchdog_successor_unconfirmed";
 /// The review of #582 (F3): the process that took the watchdog's vacated
 /// role is not its unit's clean restart — not its unit's restart, marks not
 /// clean, or something foreign in it (High). Observed, not refused: the
@@ -206,8 +217,28 @@ impl WitnessReader {
                 )
             }
         };
-        let t = to_import(&text, self.position());
+        let mut t = to_import(&text, self.position());
         let mut out = Vec::new();
+        // The re-check of #582 (N6): the chain rotated (full, at a watchdog's
+        // open or within its life) — the import continues in the rotated
+        // chain (`witness.chain.1`) where it stopped, then the new chain
+        // from its first row: no row is lost, and a rotation is not a cut.
+        if t.position_lost {
+            if let Some(rest) = self.rotated_rest() {
+                let from_start = Imported {
+                    keys: self.position().keys.clone(),
+                    last: String::new(),
+                };
+                let mut whole = to_import(&text, &from_start);
+                if !whole.position_lost {
+                    let mut rows = rest.rows;
+                    rows.append(&mut whole.rows);
+                    whole.rows = rows;
+                    whole.broken = rest.broken.or(whole.broken);
+                    t = whole;
+                }
+            }
+        }
         if t.position_lost {
             out.push(Finding {
                 kind: WITNESS_BROKEN,
@@ -240,12 +271,35 @@ impl WitnessReader {
         (out, last)
     }
 
+    /// The re-check of #582 (N6): the rows of the rotated chain
+    /// (`witness.chain.1`) after the last one imported — `None` when that
+    /// chain does not hold it either.
+    fn rotated_rest(&mut self) -> Option<nn_proto::witness::ToImport> {
+        let path = self.dir.join(format!("{CHAIN_FILE}.1"));
+        let b = crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES).ok()?;
+        let t = to_import(&String::from_utf8_lossy(&b), self.position());
+        (!t.position_lost).then_some(t)
+    }
+
     /// The review of #582 (F4 b): the chain's last valid row is the agent's
     /// role released by a shutdown the admin quorum signed
     /// ([`KIND_RELEASED`]: the watchdog stands down after it), signed by a
     /// key this agent's position certified — a later life of a watchdog
     /// would have opened a row after it.
+    /// The re-check of #582 (N8): signed this boot — a release a previous
+    /// boot's chain ends with (its certified key kept) is not this boot's
+    /// stop.
     pub fn ends_with_signed_release(&mut self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let up = antitamper_bpf::start_check::boot_ns_now() / 1_000_000_000;
+        self.ends_with_signed_release_since(now.saturating_sub(up))
+    }
+
+    /// [`WitnessReader::ends_with_signed_release`], the row written at
+    /// `boot_at` (unix seconds) or after.
+    pub fn ends_with_signed_release_since(&mut self, boot_at: u64) -> bool {
         let path = self.dir.join(CHAIN_FILE);
         let Ok(b) = crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES) else {
             return false;
@@ -258,7 +312,9 @@ impl WitnessReader {
                 nn_proto::witness::Judged::Valid { row, .. } => Some(row),
                 nn_proto::witness::Judged::Broken { .. } => None,
             });
-        last.is_some_and(|row| row.kind == KIND_RELEASED && self.position().certified(&row.key))
+        last.is_some_and(|row| {
+            row.kind == KIND_RELEASED && row.at >= boot_at && self.position().certified(&row.key)
+        })
     }
 
     /// The position after the rows [`WitnessReader::pending`] gave, signed.
@@ -276,6 +332,25 @@ pub struct SuccessorVerdict {
     /// Its unit's restart, clean marks, nothing foreign: registered.
     pub given: bool,
     pub detail: String,
+    /// The re-check of #582 (N4): and no library of it replaced on disk
+    /// that is not the agent's own copy (`Findings::replaced`); a given
+    /// successor that is not confirmed is registered, and signed High
+    /// ([`WATCHDOG_SUCCESSOR_UNCONFIRMED`]).
+    pub confirmed: bool,
+}
+
+impl SuccessorVerdict {
+    /// The finding's kind: [`WATCHDOG_SUCCESSION`] (a note) for a given,
+    /// confirmed successor, [`WATCHDOG_SUCCESSOR_UNCONFIRMED`] for a given
+    /// one whose libraries' identity is not confirmed, and
+    /// [`WATCHDOG_SUCCESSOR_FOREIGN`] otherwise.
+    pub fn kind(&self) -> &'static str {
+        match (self.given, self.confirmed) {
+            (true, true) => WATCHDOG_SUCCESSION,
+            (true, false) => WATCHDOG_SUCCESSOR_UNCONFIRMED,
+            (false, _) => WATCHDOG_SUCCESSOR_FOREIGN,
+        }
+    }
 }
 
 /// The process `pid` that took the watchdog's vacated role: `id` where it
@@ -304,6 +379,7 @@ pub fn judge_watchdog_successor(
     };
     SuccessorVerdict {
         given,
+        confirmed: given && found.confirmed(),
         detail: format!(
             "the watchdog's role, vacated, taken by pid {pid}: {}{taken}; {}; {marks}; {}",
             if in_unit {
@@ -329,13 +405,16 @@ pub fn marks_clean(pid: u32) -> Option<bool> {
 
 /// What the agent's start read of both roles before it claimed its own:
 /// the two `ROLE_TGIDS` slots and (the review of #582, F4 b, F6) the
-/// kernel's marks of their holders' exits (`ROLE_MARKS`; `None` unread).
+/// kernel's marks of their holders' exits (`ROLE_MARKS`; `None` unread, or
+/// not frozen), and (the re-check, N4) when the agent's role was last left
+/// (`ROLE_EXITS`, `CLOCK_BOOTTIME` ns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RolesAtStart {
     pub agent: u32,
     pub watchdog: u32,
     pub agent_mark: Option<u32>,
     pub watchdog_mark: Option<u32>,
+    pub agent_exit_ns: Option<u64>,
 }
 
 impl RolesAtStart {
@@ -453,6 +532,7 @@ mod tests {
         ] {
             let v = judge_watchdog_successor(9, &id, marks, &found);
             assert!(!v.given, "{}", v.detail);
+            assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_FOREIGN);
         }
         let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
         assert!(v.detail.contains("taken by pid 9") && v.detail.contains("marks clean"));
@@ -492,6 +572,7 @@ mod tests {
     fn a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note() {
         use nn_proto::witness::{
             KIND_CHAIN_CUT, KIND_FOUND_VACANT, KIND_RESPAWN_HELD, KIND_SUCCESSOR_FOREIGN,
+            KIND_SUCCESSOR_UNCONFIRMED, KIND_UNMADE_START,
         };
         for k in [
             KIND_VACATED,
@@ -500,6 +581,9 @@ mod tests {
             // the review of #582 (F2 c, d): a held respawn, a cut chain
             KIND_RESPAWN_HELD,
             KIND_CHAIN_CUT,
+            // the re-check of #582 (N3, N4)
+            KIND_UNMADE_START,
+            KIND_SUCCESSOR_UNCONFIRMED,
             "a kind of later",
         ] {
             assert_eq!(row_kind(k), WITNESS_ROW, "{k}");
@@ -510,6 +594,10 @@ mod tests {
             // the review of #582 (F4 a)
             KIND_RELEASED_IN_WINDOW,
             KIND_SUCCEEDED,
+            // the re-check of #582 (N2, N6): the gate's reference moved
+            // inside a window, the watchdog's own torn append repaired
+            KIND_GATE_REFERENCE,
+            KIND_CHAIN_TORN,
         ] {
             assert_eq!(row_kind(k), WITNESS_NOTE, "{k}");
         }
@@ -533,6 +621,7 @@ mod tests {
             watchdog,
             agent_mark: marks.0,
             watchdog_mark: marks.1,
+            agent_exit_ns: None,
         }
     }
 
@@ -591,6 +680,11 @@ mod tests {
         use nn_proto::witness::{KIND_OPENED, KIND_RELEASED, KIND_VACATED};
         let dir = tempfile::tempdir().unwrap();
         let k = WitnessKey::from_seed([3; 32]);
+        // written now (the re-check of #582, N8: this boot's)
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let write = |kinds: &[&str]| {
             let mut text = String::new();
             let mut prev = String::new();
@@ -599,7 +693,7 @@ mod tests {
                     v: ROW_VERSION,
                     seq: i as u64,
                     prev: prev.clone(),
-                    at: 1,
+                    at,
                     tgid: 7,
                     key: String::new(),
                     kind: kind.to_string(),
@@ -623,6 +717,10 @@ mod tests {
         write(&[KIND_OPENED, KIND_RELEASED]);
         assert!(reader(true).ends_with_signed_release());
         assert!(!reader(false).ends_with_signed_release());
+        // the re-check of #582 (N8): a release written before this boot (a
+        // chain the watchdog did not continue this boot) is not this boot's
+        assert!(reader(true).ends_with_signed_release_since(at));
+        assert!(!reader(true).ends_with_signed_release_since(at + 1));
         write(&[KIND_OPENED, KIND_RELEASED, KIND_OPENED]);
         assert!(!reader(true).ends_with_signed_release());
         write(&[KIND_OPENED, KIND_VACATED]);
@@ -781,5 +879,72 @@ mod tests {
         let mut after = WitnessReader::new(dir.path());
         let (f, _) = after.pending();
         assert!(f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
+    }
+
+    /// The re-check of #582 (N6): the chain rotated (the watchdog moved it
+    /// to `witness.chain.1` when full, at its start or within its life):
+    /// the import goes on in the moved chain after the last row imported,
+    /// then the new chain from its first row — every row once, and a
+    /// rotation is not a broken chain. A chain cut (no rotated chain holds
+    /// the position) still is.
+    #[test]
+    fn an_import_continues_through_a_rotated_chain() {
+        use nn_proto::witness::{KIND_OPENED, KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let k = WitnessKey::from_seed([5; 32]);
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED]);
+        let mut r = WitnessReader::new(dir.path());
+        r.position().certify(&k.public_hex());
+        let (f, last) = r.pending();
+        assert_eq!(f.len(), 2);
+        r.commit(last);
+        // a row more, then rotated: the old chain moved aside whole
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
+        std::fs::rename(
+            dir.path().join(CHAIN_FILE),
+            dir.path().join(format!("{CHAIN_FILE}.1")),
+        )
+        .unwrap();
+        write_chain(dir.path(), &k, &[KIND_SUCCEEDED, KIND_VACATED]);
+        let (f, last) = r.pending();
+        assert!(!f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
+        assert_eq!(
+            f.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            vec![WITNESS_NOTE, WITNESS_NOTE, WITNESS_ROW],
+            "the moved chain's last row, then the new chain's two"
+        );
+        r.commit(last);
+        assert!(r.pending().0.is_empty());
+        // no rotated chain holds the position: broken, as before
+        let other = WitnessKey::from_seed([6; 32]);
+        write_chain(dir.path(), &other, &[KIND_OPENED]);
+        std::fs::remove_file(dir.path().join(format!("{CHAIN_FILE}.1"))).unwrap();
+        let (f, _) = r.pending();
+        assert!(f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
+    }
+
+    /// The re-check of #582 (N4): the watchdog's clean successor whose
+    /// library was replaced on disk since it mapped it, and is not the
+    /// agent's own copy, is registered (never withheld for that alone) and
+    /// signed High; a foreign one is still foreign.
+    #[test]
+    fn a_watchdog_successor_with_an_unconfirmed_library_is_registered_and_high() {
+        let replaced = Findings {
+            replaced: vec!["/usr/lib/x86_64-linux-gnu/libc.so.6".into()],
+            ..Findings::default()
+        };
+        let v = judge_watchdog_successor(9, &unit(), Some(true), &replaced);
+        assert!(v.given, "{}", v.detail);
+        assert!(!v.confirmed);
+        assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_UNCONFIRMED);
+        assert!(!is_note(v.kind()));
+        assert!(v.detail.contains("identity not confirmed"), "{}", v.detail);
+        let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
+        assert_eq!(
+            (v.given, v.confirmed, v.kind()),
+            (true, true, WATCHDOG_SUCCESSION)
+        );
+        let v = judge_watchdog_successor(9, &unit(), Some(false), &replaced);
+        assert_eq!((v.given, v.kind()), (false, WATCHDOG_SUCCESSOR_FOREIGN));
     }
 }

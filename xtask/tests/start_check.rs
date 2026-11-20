@@ -158,9 +158,18 @@ fn every_start_the_watchdog_makes_is_judged_first() {
         1,
         "its definition, and no other start"
     );
+    // the re-check of #582 (N2, N3): judged with the window's state, the
+    // judgement's end kept for the successor
     let gate = wd
-        .find("let host = judge_host().await;\n                if let Some(why) = &host.hold {")
+        .find("let (host, adopted, judged_in_window) = judge_host(&cli.bpffs_root).await;")
         .expect("the gate before the respawn");
+    let hold_at = wd[gate..]
+        .find("if let Some(why) = &host.hold {")
+        .map(|i| i + gate)
+        .expect("its verdict");
+    assert!(
+        wd[gate..hold_at].contains("let judged_at = antitamper_bpf::start_check::boot_ns_now();")
+    );
     let held = wd[gate..]
         .find("REASON_RESPAWN_HELD")
         .map(|i| i + gate)
@@ -170,10 +179,11 @@ fn every_start_the_watchdog_makes_is_judged_first() {
         gate < held && held < respawn,
         "judged and held before the respawn"
     );
+    assert!(wd[respawn..].contains("(!judged_in_window).then_some(judged_at),"));
     let retry = wd.find("fn hold_supervision(").expect("the hold's retries");
     let r = &wd[retry..];
     let judged = r
-        .find("let host = judge_host().await;")
+        .find("northnarrow_watchdog::respawn_gate::judge_now_keeping(in_window)")
         .expect("the retry judged");
     let skipped = r
         .find("if let Some(why) = host.hold {")
@@ -198,16 +208,84 @@ fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
         .find("judge_agent_at_start(&cli, &mut witness, agent_pid);")
         .expect("judged");
     assert!(found < judged);
+    // the re-check of #582 (N4, N5): judged once — only a process that took
+    // its role while this role was vacant (the kernel's exit time), what is
+    // not read judged and recorded
     let f = &wd[wd.find("fn judge_agent_at_start(").unwrap()..];
-    assert!(
-        f.contains("antitamper_bpf::role_marks(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)")
-    );
-    assert!(f.contains("Ok(m) if m & antitamper_bpf::ROLE_MARK_VACATED != 0 => {"));
+    let f = &f[..f.find("\n}\n").unwrap()];
+    for needle in [
+        "role_marks(root, ROLE_SLOT_AGENT)",
+        "role_exit_ns(root, ROLE_SLOT_WATCHDOG)",
+        "antitamper_bpf::succession_to_judge(",
+        "antitamper_bpf::start_check::start_boot_ns(pid)",
+        "pin_handle_failed(",
+    ] {
+        assert!(f.contains(needle), "{needle}");
+    }
     let tasks = &code["agent/src/boot/tasks.rs"];
     let t = tasks
-        .find("let mut succession_pending = bpffs_root")
+        .find("let at_start = nn_linux::witness::roles_at_start();")
         .expect("the agent's start");
     let rest = &tasks[t..];
-    assert!(rest.contains("antitamper_bpf::role_marks(r, antitamper_bpf::ROLE_SLOT_WATCHDOG)"));
-    assert!(rest[..300].contains("ROLE_MARK_VACATED != 0"));
+    let first = rest
+        .find("if std::mem::take(&mut first_found) {")
+        .expect("the watchdog found first");
+    let rest = &rest[first..];
+    for needle in [
+        "ROLE_MARKS_DEGRADATION",
+        "antitamper_bpf::succession_to_judge(",
+        "antitamper_bpf::start_check::start_boot_ns(p)",
+        "succession_pending = true;",
+    ] {
+        assert!(rest[..1500].contains(needle), "{needle}");
+    }
+    // the rule itself is antitamper_bpf's, one for both roles
+    let lib = &code["antitamper-bpf/src/lib.rs"];
+    assert_eq!(lib.matches("pub fn succession_to_judge(").count(), 1);
+}
+
+/// The re-check of #582 (N0, N2, N3, N8): where the new rules are wired —
+/// the agent's start reads `MemoryDenyWriteExecute` from systemd's copy;
+/// the gate's reference moves only inside a signed window; a successor
+/// that started before the gate's judgement is not given the role and is
+/// recorded as a start the watchdog did not make; a vacancy's window is the
+/// kernel's mark of the exit.
+#[test]
+fn the_re_check_s_rules_are_wired_where_they_hold() {
+    let root = repo_root();
+    let code = product_code(&root);
+    let boot = &code["agent/src/boot/mod.rs"];
+    let init = boot
+        .find("antitamper_bpf::kernel_roots::init()")
+        .expect("the kernel's views anchored");
+    let mdwe = boot
+        .find("nn_linux::host_dropins::note_units_mdwe();")
+        .expect("the units' MDWE read at the start");
+    let runtime = boot.find("tokio::runtime::Builder").expect("the runtime");
+    assert!(init < mdwe && mdwe < runtime);
+    let gate = &code["watchdog/src/respawn_gate.rs"];
+    let j = &gate[gate.find("pub fn judge_now(").unwrap()..];
+    assert!(j[..400].contains("let adopted = if in_window { adopt(&host) } else { None };"));
+    let k = &gate[gate.find("pub fn judge_now_keeping(").unwrap()..];
+    assert!(
+        !k[..300].contains("adopt("),
+        "the retry never moves the reference"
+    );
+    let wd = &code["watchdog/src/main.rs"];
+    let a = &wd[wd.find("async fn adopt_in_window(").unwrap()..];
+    let a = &a[..a.find("\n}\n").unwrap()];
+    let open = a
+        .find("window_open(&cli.bpffs_root)")
+        .expect("the window asked");
+    let back = a.find("return;").expect("outside one, nothing");
+    let adopt = a.find("adopt_now").expect("inside one, adopted");
+    assert!(open < back && back < adopt);
+    let c = &wd[wd.find("async fn respawn_cycle(").unwrap()..];
+    let c = &c[..c.find("\n}\n").unwrap()];
+    assert!(c.contains("antitamper_bpf::start_check::started_before("));
+    assert!(c.contains("let given = judged.given && !judged.unmade;"));
+    assert!(wd.contains("nn_proto::witness::KIND_UNMADE_START,"));
+    assert!(wd.contains("let in_window = exit_in_window(&cli.bpffs_root);"));
+    let e = &wd[wd.find("fn exit_in_window(").unwrap()..];
+    assert!(e[..400].contains("ROLE_SLOT_AGENT") && e[..400].contains("ROLE_MARK_IN_WINDOW"));
 }

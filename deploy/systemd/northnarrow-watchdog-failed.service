@@ -46,10 +46,11 @@ LimitCORE=0
 # owns the 0700 directory), no network, a read-only system.
 NoNewPrivileges=true
 # The review of #582 (F2 b): no memory both writable and executable, and
-# none made executable later — the binary's and its libraries' file
-# mappings are the only code a start of this unit runs, as its executable
-# mappings show for its whole life (the start's own check). Neither daemon makes any (no JIT; the eBPF
-# programs are the kernel's to compile).
+# none made executable later — what a start of this unit maps executable
+# is its binary's and its libraries' files, as its executable mappings
+# show (the start's own check). The re-check of #582 (N7): it does not
+# keep a file mapping's pages as the file holds them once mapped. Neither
+# daemon makes any (no JIT; the eBPF programs are the kernel's to compile).
 MemoryDenyWriteExecute=yes
 ProtectSystem=strict
 ProtectHome=true

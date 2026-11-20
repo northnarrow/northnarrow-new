@@ -153,21 +153,26 @@ memory file of the watchdog's, never on disk.
 | `witness_opened` | a watchdog life's first row: its key, the row it continues or why the previous chain was set aside, and the host as that start read it (`/etc/ld.so.preload` by size and digest, the count of drop-in directives that change our units' code) |
 | `role_vacated` | the agent exited outside a signed window: its pid, the cause as systemd recorded it for that process (the OOM killer, a signal, an exit status; "not known" when systemd has not recorded it in time), what the shutdown marker said, what the host would give a successor |
 | `role_released` | the agent stopped by a shutdown the admin quorum signed: no successor follows |
-| `role_released_in_window` | the agent exited inside a signed trusted-installer window (the operator's restart or stop): as `role_vacated` |
+| `role_released_in_window` | the agent stopped cleanly (exit status 0 or SIGTERM) inside a signed trusted-installer window, as the kernel marked its exit (the operator's restart or stop): as `role_vacated`; another exit inside a window is `role_vacated` |
 | `role_succeeded` | the agent's unit's clean restart took the role: its pid, parent and cgroup, nothing foreign in its environment and executable mappings; the host before its start |
 | `role_successor_foreign` | a process that is not that took the role: it holds the role the kernel gave it, and the watchdog does not re-register it; its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
-| `role_respawn_held` | the watchdog held a start of the agent: `/etc/ld.so.preload`, or a drop-in that changes our units' code, new or changed since its start (named; never a file's contents) |
-| `witness_chain_cut` | the first row of a new chain: the previous one no longer ended at the watchdog's last row (what it expected, what it found; set aside as `witness.chain.cut`) |
+| `role_successor_unconfirmed` | the agent's unit's clean restart took the role, but a library it maps was replaced on disk since it mapped it and is not the watchdog's own copy (its identity not confirmed; re-registered all the same) |
+| `role_taken_by_another_start` | the role taken by a start the watchdog did not make: the process had started before the watchdog judged the host, outside a signed window; what it shows, and the host as read after its start |
+| `role_respawn_held` | the watchdog held a start of the agent: `/etc/ld.so.preload` or a library it names, a drop-in that changes our units' code, or systemd's copy of the agent's unit, new or changed since its start (named; never a file's contents or a value) |
+| `respawn_gate_reference_moved` | the host as a signed trusted-installer window left it became the reference of the watchdog's later judgements (the same counts as `witness_opened`) |
+| `witness_chain_cut` | the first row of a new chain: the previous one no longer ended at the watchdog's last row (what it expected, what it found; set aside as `witness.chain.cut.<time>`) |
+| `witness_chain_torn` | an append of the watchdog's failed part-way (a full disk, an I/O error): its partial row removed, the chain ends at its last whole row again |
 | `role_found_vacant` | a watchdog start found the agent's role already vacated |
 
 - At each of its rounds the agent certifies the verified watchdog's key,
   read from the watchdog's own descriptor table — one
   `witness_key_certified` entry per key, op `witness` — and imports the
   rows after the last one it imported into the audit log: `role_vacated`,
-  `role_found_vacant`, `role_successor_foreign`, `role_respawn_held` and
-  `witness_chain_cut` as `witness_row` (`integrity_drift`, High); the
-  others as `witness_note` (op `witness`); a row whose key it never
-  certified as `witness_row_uncertified` (High).
+  `role_found_vacant`, `role_successor_foreign`,
+  `role_successor_unconfirmed`, `role_taken_by_another_start`,
+  `role_respawn_held` and `witness_chain_cut` as `witness_row`
+  (`integrity_drift`, High); the others as `witness_note` (op `witness`);
+  a row whose key it never certified as `witness_row_uncertified` (High).
 - Only the watchdog writes the chain: the kernel refuses the agent, a
   worker and every other process a write, truncation, rename, link or
   removal of it outside a trusted-installer window (`ROLE_WRITE_INODES`,
@@ -177,8 +182,9 @@ memory file of the watchdog's, never on disk.
   removed, a line that is not a row, or a chain that no longer holds the
   last row imported is `witness_chain_broken` (High).
 - A chain that does not verify at a watchdog's start is kept as
-  `witness.chain.1` and a new one is opened; past 512 KiB too, its first row
-  naming the old one's last.
+  `witness.chain.1` and a new one is opened; past 512 KiB too, at its
+  start or within its life, its first row naming the old one's last (the
+  agent's import continues in `witness.chain.1`).
 - A watchdog that cannot open its witness records it, and the agent signs
   `witness_unavailable` (High).
 - Each row is also an INFO line of the watchdog's journal (`witness row

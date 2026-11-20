@@ -3620,6 +3620,7 @@ mod tests {
                 why: "not in a system library directory",
             }],
             unreadable: vec![],
+            replaced: vec![],
         };
         let r = start_refused_record(&found, 42, 1_800_000_000);
         assert_eq!(r.reason, nn_proto::watchdog_hold::REASON_START_SELF_CHECK);

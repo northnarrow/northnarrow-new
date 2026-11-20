@@ -199,6 +199,9 @@ pub fn main() -> Result<()> {
     // lot 353 (the review of #563, F1): this process's failing signed
     // appends are degradations of its status
     nn_linux::chain_host_linux::tell_degradations();
+    // The re-check of #582 (N0): our units' MemoryDenyWriteExecute as
+    // systemd's copy holds it — off (any spelling) is a signed degradation
+    nn_linux::host_dropins::note_units_mdwe();
     northnarrow_agent::loop_progress::start();
     // R14a (plan §3.5): the binary this process runs, opened now, before
     // anything else: the workers start from this descriptor

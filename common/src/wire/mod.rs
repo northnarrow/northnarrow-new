@@ -1869,20 +1869,23 @@ pub const ROLE_VACATED: u32 = u32::MAX;
 /// The review of #582 (F4, F6): the pinned map of what the kernel's
 /// liveness watch (`role_exit`) recorded of each role's holders' exits this
 /// boot — one word per `ROLE_TGIDS` slot, [`ROLE_MARK_VACATED`] and
-/// [`ROLE_MARK_IN_WINDOW`]. Written by that program only: no process can
-/// write it (`BPF_F_RDONLY`, the family included), and a successor's claim
-/// of its slot leaves it as it is — the sticky "vacated this boot" the
-/// other role reads at its own start.
+/// [`ROLE_MARK_IN_WINDOW`]. A successor's claim of its slot leaves it as it
+/// is — the sticky "vacated this boot" the other role reads at its own
+/// start. The re-check of #582 (N1): the agent's load freezes it
+/// (`BPF_MAP_FREEZE`); from then on that program alone writes it, and a
+/// reader that finds it not frozen takes its words as not known.
 pub const ROLE_MARKS_MAP_NAME: &str = "ROLE_MARKS";
+/// The re-check of #582 (N4): the pinned map of when each role's holder
+/// last exited this boot (`CLOCK_BOOTTIME` ns, one `u64` per `ROLE_TGIDS`
+/// slot; 0: never), written by `role_exit` beside [`ROLE_MARKS_MAP_NAME`]
+/// and frozen with it.
+pub const ROLE_EXITS_MAP_NAME: &str = "ROLE_EXITS";
 /// [`ROLE_MARKS_MAP_NAME`]: the slot's holder exited at least once this
 /// boot (never cleared until the next boot).
 pub const ROLE_MARK_VACATED: u32 = 1;
 /// [`ROLE_MARKS_MAP_NAME`]: the slot's holder's last exit was inside a
 /// signed trusted-installer window (the operator's stop or restart).
 pub const ROLE_MARK_IN_WINDOW: u32 = 2;
-/// `BPF_F_RDONLY` (include/uapi/linux/bpf.h): a map no syscall writes.
-pub const BPF_F_RDONLY: u32 = 1 << 3;
-
 /// The review of #582 (F4, F6): the mark `role_exit` writes for a holder's
 /// exit — vacated, and inside a window or not.
 pub const fn role_exit_mark(in_window: bool) -> u32 {
@@ -2514,12 +2517,10 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
 mod tests {
     /// The review of #582 (F4, F6): the mark `role_exit` writes for a
     /// holder's exit — vacated always, inside a window or not; the two bits
-    /// apart, neither ever a slot's value; the map no syscall writes.
+    /// apart, neither ever a slot's value.
     #[test]
     fn an_exit_s_mark_says_vacated_and_whether_inside_a_window() {
-        use super::{
-            role_exit_mark, BPF_F_RDONLY, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED,
-        };
+        use super::{role_exit_mark, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED};
         assert_eq!(role_exit_mark(false), ROLE_MARK_VACATED);
         assert_eq!(
             role_exit_mark(true),
@@ -2527,7 +2528,6 @@ mod tests {
         );
         assert_eq!(ROLE_MARK_VACATED & ROLE_MARK_IN_WINDOW, 0);
         assert_ne!(role_exit_mark(true), ROLE_VACATED);
-        assert_eq!(BPF_F_RDONLY, 8, "include/uapi/linux/bpf.h");
     }
 
     /// Lot 374: a cgroup's name as the eBPF programs compare it — the

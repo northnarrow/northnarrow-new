@@ -130,7 +130,9 @@ pub use common::wire::pid_role;
 pub use common::wire::ROLE_VACATED;
 /// The review of #582 (F4, F6): what the kernel recorded of each role's
 /// holders' exits this boot.
-pub use common::wire::{ROLE_MARKS_MAP_NAME, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED};
+pub use common::wire::{
+    ROLE_EXITS_MAP_NAME, ROLE_MARKS_MAP_NAME, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED,
+};
 use tracing::{error, info, warn};
 
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
@@ -189,20 +191,109 @@ pub fn role_slot(bpffs_root: &Path, slot: u32) -> Result<u32> {
 /// `ROLE_MARKS` (`common::wire::ROLE_MARK_VACATED`: its holder exited at
 /// least once this boot; `ROLE_MARK_IN_WINDOW`: the last of those exits was
 /// inside a signed trusted-installer window). Written by the kernel's
-/// liveness watch only. A read handle: the caller must be a protected pid
-/// while the guard enforces.
+/// liveness watch only, once the agent's load froze it ([`frozen_pin`]: a
+/// map not frozen is an error, its words not known). A read handle: the
+/// caller must be a protected pid while the guard enforces.
 pub fn role_marks(bpffs_root: &Path, slot: u32) -> Result<u32> {
-    let pin_path = bpffs_root.join(ROLE_MARKS_MAP_NAME);
-    let map_data = MapData::from_pin(&pin_path).with_context(|| {
-        format!(
-            "opening pinned {ROLE_MARKS_MAP_NAME} at {}",
-            pin_path.display()
-        )
-    })?;
-    let arr: AyaArray<MapData, u32> = AyaArray::try_from(AyaMap::Array(map_data))
-        .with_context(|| format!("{ROLE_MARKS_MAP_NAME} is not an Array<u32>"))?;
+    let arr: AyaArray<MapData, u32> =
+        AyaArray::try_from(AyaMap::Array(frozen_pin(bpffs_root, ROLE_MARKS_MAP_NAME)?))
+            .with_context(|| format!("{ROLE_MARKS_MAP_NAME} is not an Array<u32>"))?;
     arr.get(&slot, 0)
         .with_context(|| format!("reading {ROLE_MARKS_MAP_NAME}[{slot}]"))
+}
+
+/// The re-check of #582 (N4): when slot `slot`'s holder last exited this
+/// boot (`CLOCK_BOOTTIME` ns; 0: never), from the pinned `ROLE_EXITS`, which
+/// the kernel's liveness watch writes beside `ROLE_MARKS` ([`frozen_pin`]
+/// as [`role_marks`]).
+pub fn role_exit_ns(bpffs_root: &Path, slot: u32) -> Result<u64> {
+    let arr: AyaArray<MapData, u64> =
+        AyaArray::try_from(AyaMap::Array(frozen_pin(bpffs_root, ROLE_EXITS_MAP_NAME)?))
+            .with_context(|| format!("{ROLE_EXITS_MAP_NAME} is not an Array<u64>"))?;
+    arr.get(&slot, 0)
+        .with_context(|| format!("reading {ROLE_EXITS_MAP_NAME}[{slot}]"))
+}
+
+/// The re-check of #582 (N1): the pinned map `name` under `bpffs_root`,
+/// opened only when the kernel says it is frozen (its descriptor's fdinfo,
+/// [`fdinfo_frozen`]): a map no syscall can write any more, whatever
+/// descriptor a process holds on it. One not frozen — a pin swapped for
+/// another, or a load that failed to freeze it — is an error: what it
+/// holds is not known.
+pub fn frozen_pin(bpffs_root: &Path, name: &str) -> Result<MapData> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let pin_path = bpffs_root.join(name);
+    let map_data = MapData::from_pin(&pin_path)
+        .with_context(|| format!("opening pinned {name} at {}", pin_path.display()))?;
+    let fd = map_data.fd().as_fd().as_raw_fd();
+    let info = kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .with_context(|| format!("{name}: its descriptor's fdinfo"))?;
+    require_frozen(&info, name)?;
+    Ok(map_data)
+}
+
+/// The re-check of #582 (N1): `Ok` only when the fdinfo of map `name`'s
+/// descriptor says it is frozen.
+pub fn require_frozen(fdinfo: &str, name: &str) -> Result<()> {
+    match fdinfo_frozen(fdinfo) {
+        Some(true) => Ok(()),
+        Some(false) => Err(anyhow!(
+            "{name} is not frozen: any family handle could have written it, its words are not known"
+        )),
+        None => Err(anyhow!("{name}: no frozen state in its fdinfo")),
+    }
+}
+
+/// The `frozen:` line of a map descriptor's fdinfo (`/proc/<pid>/fdinfo/<fd>`).
+pub fn fdinfo_frozen(fdinfo: &str) -> Option<bool> {
+    fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("frozen:"))
+        .and_then(|v| match v.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
+}
+
+/// The re-check of #582 (N4): how long before its own role's last exit a
+/// process of the other role may have started and not been judged by that
+/// holder — the agent's round over the watchdog every 30 s, the watchdog's
+/// respawn within its start's deadline — with margin. A start judges such
+/// a process again.
+pub const UNJUDGED_BEFORE_EXIT_NS: u64 = 45 * 1_000_000_000;
+
+/// The re-check of #582 (N4): why a role's start judges the process now in
+/// the other role as a successor nobody judged — `Some(reason)` — or `None`:
+/// a holder of this role was there when it took its role (it was judged
+/// then, or never needed to be), and a long-running process is not judged
+/// again. `other_mark` is the other role's `ROLE_MARKS` word, `own_mark` and
+/// `own_exit_ns` this role's mark and last exit (`ROLE_EXITS`), and
+/// `other_start_ns` the other process's start, all `CLOCK_BOOTTIME`. What is
+/// not known (`None`) is judged.
+pub fn succession_to_judge(
+    other_mark: Option<u32>,
+    own_mark: Option<u32>,
+    own_exit_ns: Option<u64>,
+    other_start_ns: Option<u64>,
+) -> Option<&'static str> {
+    let Some(other) = other_mark else {
+        return Some("the other role's marks not known");
+    };
+    if other & ROLE_MARK_VACATED == 0 {
+        return None;
+    }
+    let Some(own) = own_mark else {
+        return Some("this role's marks not known");
+    };
+    if own & ROLE_MARK_VACATED == 0 {
+        return Some("no holder of this role before this start");
+    }
+    let (Some(exit), Some(start)) = (own_exit_ns.filter(|e| *e != 0), other_start_ns) else {
+        return Some("this role's last exit, or the other process's start, not known");
+    };
+    (start.saturating_add(UNJUDGED_BEFORE_EXIT_NS) >= exit)
+        .then_some("it took its role while this role was vacant")
 }
 
 /// `FS_GRANT`'s slot as aya reads it (`common::wire::FsGrant`).
@@ -226,12 +317,28 @@ pub fn monotonic_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// The re-check of #582 (N2): the last signed trusted-installer window
+/// granted this boot (`FS_GRANT[0]` of this boot's session): its deadline
+/// (monotonic ns, a new grant's differs) and whether it is open now.
+/// `None`: none granted this boot.
+pub fn window_grant(bpffs_root: &Path) -> Result<Option<(u64, bool)>> {
+    let (grant, session) = read_grant(bpffs_root)?;
+    Ok((grant.nonce != 0 && grant.nonce == session)
+        .then(|| (grant.expires_ns, grant.active(monotonic_ns(), session))))
+}
+
 /// The review of #582 (F4): whether a signed trusted-installer window is
 /// open now — the kernel hooks' own test (`FS_GRANT[0]` against this
 /// boot's `AGENT_SESSION[0]`, `common::wire::FsGrant::active`), read from
 /// the pins under `bpffs_root`. A read handle: the caller must be a
 /// protected pid while the guard enforces.
 pub fn window_open(bpffs_root: &Path) -> Result<bool> {
+    let (grant, session) = read_grant(bpffs_root)?;
+    Ok(grant.active(monotonic_ns(), session))
+}
+
+/// `FS_GRANT[0]` and `AGENT_SESSION[0]` read from the pins.
+fn read_grant(bpffs_root: &Path) -> Result<(common::wire::FsGrant, u32)> {
     let open = |name: &str| -> Result<MapData> {
         let pin = bpffs_root.join(name);
         MapData::from_pin(&pin)
@@ -249,7 +356,7 @@ pub fn window_open(bpffs_root: &Path) -> Result<bool> {
     let grant = grant
         .get(&0, 0)
         .with_context(|| format!("reading {FS_GRANT_MAP_NAME}[0]"))?;
-    Ok(grant.0.active(monotonic_ns(), session))
+    Ok((grant.0, session))
 }
 
 /// The review of #582 (F2 c): name of the pinned `ROLE_WRITE_INODES` map
@@ -296,14 +403,24 @@ pub fn protect_for_role(
         AyaHashMap::try_from(AyaMap::HashMap(data))
             .with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))
     };
-    open(ROLE_WRITE_INODES_MAP_NAME)?
-        .insert(PodInodeKey(key), role, 0)
-        .with_context(|| {
-            format!(
-                "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
-                path.display()
-            )
-        })?;
+    let mut roles = open(ROLE_WRITE_INODES_MAP_NAME)?;
+    // the re-check of #582 (N6): the role's earlier chains (set aside by a
+    // cut or a rotation) leave the small pinned map, as at the agent's start
+    let stale: Vec<PodInodeKey> = roles
+        .iter()
+        .filter_map(|e| e.ok())
+        .filter(|(k, v)| *v == role && k.0 != key)
+        .map(|(k, _)| k)
+        .collect();
+    for k in stale {
+        let _ = roles.remove(&k);
+    }
+    roles.insert(PodInodeKey(key), role, 0).with_context(|| {
+        format!(
+            "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
+            path.display()
+        )
+    })?;
     open(cgroup_guard::PROTECTED_INODES_MAP_NAME)?
         .insert(
             PodInodeKey(key),
@@ -1149,6 +1266,74 @@ fn is_not_found_err(e: &aya::maps::MapError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The re-check of #582 (N4, N5): a role's start judges the process in
+    /// the other role only when it took its role while this role was
+    /// vacant — after (or just before) this role's last exit — or when this
+    /// role was never held this boot; a process a holder of this role saw
+    /// take its role is not judged again, however long it has run. What is
+    /// not known (a mark not read or not frozen, an exit time or a start
+    /// not read) is judged.
+    #[test]
+    fn a_successor_is_judged_once_by_the_next_start_of_the_other_role() {
+        const S: u64 = 1_000_000_000;
+        let v = Some(ROLE_MARK_VACATED);
+        let w = Some(ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW);
+        // the other role never vacated: its first holder, nothing to judge
+        assert_eq!(
+            succession_to_judge(Some(0), v, Some(100 * S), Some(5 * S)),
+            None
+        );
+        // it took its role after this role's last exit
+        assert!(succession_to_judge(v, v, Some(100 * S), Some(101 * S)).is_some());
+        assert!(succession_to_judge(w, w, Some(100 * S), Some(100 * S)).is_some());
+        // or within the round's period before it (a holder may not have
+        // judged it yet)
+        assert!(succession_to_judge(v, v, Some(100 * S), Some(60 * S)).is_some());
+        // a long-running process an earlier holder of this role saw start
+        assert_eq!(succession_to_judge(v, v, Some(100 * S), Some(50 * S)), None);
+        assert_eq!(
+            succession_to_judge(v, v, Some(3 * 86_400 * S), Some(10 * S)),
+            None,
+            "days later"
+        );
+        // this role never held before this start
+        assert!(succession_to_judge(v, Some(0), None, Some(10 * S)).is_some());
+        // not known: judged
+        for (o, m, e, st) in [
+            (None, v, Some(100 * S), Some(10 * S)),
+            (v, None, Some(100 * S), Some(10 * S)),
+            (v, v, None, Some(10 * S)),
+            (v, v, Some(0), Some(10 * S)),
+            (v, v, Some(100 * S), None),
+        ] {
+            assert!(
+                succession_to_judge(o, m, e, st).is_some(),
+                "{o:?} {m:?} {e:?} {st:?}"
+            );
+        }
+    }
+
+    /// The re-check of #582 (N1): a map descriptor's fdinfo says whether the
+    /// map is frozen; no such line is not known.
+    #[test]
+    fn a_map_is_read_as_frozen_only_when_its_fdinfo_says_so() {
+        let fdinfo = |f: &str| {
+            format!("pos:\t0\nflags:\t02000002\nmap_type:\t2\nmap_id:\t31\nfrozen:\t{f}\n")
+        };
+        assert_eq!(fdinfo_frozen(&fdinfo("1")), Some(true));
+        assert_eq!(fdinfo_frozen(&fdinfo("0")), Some(false));
+        assert_eq!(fdinfo_frozen("pos:\t0\nflags:\t02\n"), None);
+        assert!(require_frozen(&fdinfo("1"), "M").is_ok());
+        let e = require_frozen(&fdinfo("0"), "M").unwrap_err().to_string();
+        assert!(e.contains("not frozen"), "{e}");
+        assert!(require_frozen("pos:\t0\n", "M").is_err());
+        // a pin that is not there is an error, never a word
+        let dir = tempfile::tempdir().unwrap();
+        assert!(frozen_pin(dir.path(), ROLE_MARKS_MAP_NAME).is_err());
+        assert!(role_marks(dir.path(), ROLE_SLOT_AGENT).is_err());
+        assert!(role_exit_ns(dir.path(), ROLE_SLOT_AGENT).is_err());
+    }
 
     /// External audit ATP-007 (NN-AUD-260): a pin root that is a link is
     /// refused, naming the link, and its target is not touched; a real

@@ -16,12 +16,13 @@
 //! family. Each row is also a journal line.
 
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use nn_proto::witness::{
     judge_chain, key_record, line_hash, Judged, Row, WitnessKey, CHAIN_FILE, CHAIN_MAX_BYTES,
-    KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_OPENED, ROW_VERSION,
+    KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_CHAIN_TORN, KIND_OPENED, ROW_VERSION,
 };
 use tracing::{error, info, warn};
 
@@ -35,6 +36,18 @@ pub struct Witness {
     path: PathBuf,
     seq: u64,
     prev: String,
+    /// The re-check of #582 (N6): the chain's length after this life's last
+    /// whole row (where a torn append is cut back to).
+    len: u64,
+    /// The re-check of #582 (N6): the text of an append that failed, and
+    /// why — its partial row, if one was left, is this watchdog's own.
+    tried: Option<(String, String)>,
+    /// The re-check of #582 (N6): rows not written when they were due (a
+    /// chain cut's, with the disk full), written before the next one.
+    pending: Vec<(String, String)>,
+    /// The re-check of #582 (N5): why the chain this life writes is not
+    /// registered as the watchdog role's alone, said once in a row.
+    unprotected: Option<String>,
     tgid: u32,
     /// The review of #582 (F2 c): the pin root each chain this life opens
     /// is registered under (the watchdog role's alone), once known.
@@ -129,6 +142,7 @@ impl Witness {
         };
         let path = dir.join(CHAIN_FILE);
         let mut notes = Vec::new();
+        let mut len = 0u64;
         let (seq, prev) = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, String::new()),
             Err(e) => return Err(anyhow!("{}: {e}", path.display())),
@@ -151,6 +165,7 @@ impl Witness {
                                 prev.get(..16).unwrap_or("")
                             ));
                         }
+                        len = text.as_ref().map_or(m.len(), |t| t.len() as u64);
                         (seq, prev)
                     }
                     other => {
@@ -179,6 +194,10 @@ impl Witness {
             path,
             seq,
             prev,
+            len,
+            tried: None,
+            pending: Vec::new(),
+            unprotected: None,
             tgid,
             bpffs_root: None,
             _published: published,
@@ -207,24 +226,89 @@ impl Witness {
     /// The review of #582 (F2 c): the chain this life writes registered as
     /// the watchdog role's alone under `bpffs_root` (`ROLE_WRITE_INODES`:
     /// the agent and every other caller refused its write), now and for
-    /// each chain opened after a cut. A failure is a WARN: the chain is then
-    /// the family's, as before.
-    pub fn protect_with(&mut self, bpffs_root: &Path) {
+    /// each chain opened after a cut. The re-check of #582 (N5): a failure
+    /// is returned (the caller records it for the agent to sign) and said in
+    /// the next row this life writes — the chain is then the family's, as
+    /// before.
+    pub fn protect_with(&mut self, bpffs_root: &Path) -> std::result::Result<(), String> {
         self.bpffs_root = Some(bpffs_root.to_path_buf());
-        self.protect();
+        self.protect()
     }
 
-    fn protect(&self) {
+    fn protect(&mut self) -> std::result::Result<(), String> {
         let Some(root) = &self.bpffs_root else {
-            return;
+            return Ok(());
         };
         match antitamper_bpf::protect_for_role(root, &self.path, antitamper_bpf::WATCHDOG_EXE_ROLE)
         {
             Ok(k) => {
-                info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone")
+                info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone");
+                Ok(())
             }
             Err(e) => {
-                warn!(target: "watchdog.witness", error = format!("{e:#}"), "the witness chain is NOT registered as the watchdog role's alone")
+                let e = format!("{e:#}");
+                warn!(target: "watchdog.witness", error = %e, "the witness chain is NOT registered as the watchdog role's alone");
+                self.unprotected = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// The re-check of #582 (N6): what this watchdog's own failed append
+    /// left at the chain's end. The bytes past its last whole row are the
+    /// start of the text it tried to write: a partial row is cut back to
+    /// that row (`Torn`, said in a row); the whole row (a write that went
+    /// through, its sync failed) is taken as written (`Whole`). Anything
+    /// else past that row is not this watchdog's (a cut,
+    /// [`Witness::check_head`]).
+    fn repair_torn(&mut self) -> Tail {
+        let Some((text, why)) = self.tried.clone() else {
+            return Tail::Clean;
+        };
+        let Ok(b) = antitamper_bpf::kernel_roots::read(&self.path, CHAIN_MAX_BYTES + 4096) else {
+            return Tail::Foreign;
+        };
+        let Some(tail) = b.get(self.len as usize..) else {
+            return Tail::Foreign;
+        };
+        let tail = tail.strip_prefix(b"\n").unwrap_or(tail);
+        if tail.is_empty() {
+            self.tried = None;
+            return Tail::Clean;
+        }
+        if tail == text.as_bytes() {
+            self.prev = line_hash(text.trim_end_matches('\n'));
+            self.seq += 1;
+            self.len = b.len() as u64;
+            self.tried = None;
+            return Tail::Whole;
+        }
+        if !text.as_bytes().starts_with(tail) {
+            return Tail::Foreign;
+        }
+        let cut = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.path)
+            .and_then(|f| f.set_len(self.len));
+        match cut {
+            Ok(()) => {
+                let what = format!(
+                    "an append of watchdog {} failed part-way ({why}): its partial row ({} bytes) \
+                     removed, the chain ends at row {} ({}) again",
+                    self.tgid,
+                    b.len() as u64 - self.len,
+                    self.seq.saturating_sub(1),
+                    self.prev.get(..16).unwrap_or("")
+                );
+                warn!(target: "watchdog.witness", what = %what, "witness chain torn and repaired");
+                self.tried = None;
+                self.pending.push((KIND_CHAIN_TORN.to_string(), what));
+                Tail::Torn
+            }
+            Err(e) => {
+                warn!(target: "watchdog.witness", error = %e, "the torn witness row could not be removed yet");
+                Tail::Foreign
             }
         }
     }
@@ -260,6 +344,9 @@ impl Witness {
     /// signed [`KIND_CHAIN_CUT`] row saying what was expected and found.
     /// `true` when it was.
     pub fn check_head(&mut self) -> bool {
+        // the re-check of #582 (N6): this watchdog's own torn append, cut
+        // back and said so — torn, not cut
+        self.repair_torn();
         let Some(found) = self.cut_since_last_row() else {
             return false;
         };
@@ -268,7 +355,9 @@ impl Witness {
             self.seq - 1,
             self.prev.get(..16).unwrap_or("")
         );
-        let aside = self.path.with_file_name(format!("{CHAIN_FILE}.cut"));
+        // the re-check of #582 (N6): a name of its own for each cut, so a
+        // later cut never replaces an earlier one's evidence
+        let aside = aside_name(&self.path, &format!("cut.{}", crate::unix_now()));
         let moved = match std::fs::rename(&self.path, &aside) {
             Ok(()) => format!("set aside as {}", aside.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -284,21 +373,79 @@ impl Witness {
         );
         self.seq = 0;
         self.prev = String::new();
+        self.len = 0;
+        self.tried = None;
         let detail = format!(
             "the chain watchdog {} writes no longer ended at its last row, {expected}: {found}; \
              {moved}; a new chain begins here",
             self.tgid
         );
-        let _ = self.append(KIND_CHAIN_CUT, &detail);
-        self.protect();
+        // the re-check of #582 (N6): a cut row not written now (a full
+        // disk) is written before the next row, never lost
+        self.pending.insert(0, (KIND_CHAIN_CUT.to_string(), detail));
+        // not written now: kept, and written before the next row
+        let _ = self.flush_pending();
+        let _ = self.protect();
         true
     }
 
+    /// The rows due and not written yet, in order; stops at the first that
+    /// fails (kept for the next).
+    fn flush_pending(&mut self) -> Result<()> {
+        while let Some((kind, detail)) = self.pending.first().cloned() {
+            self.append(&kind, &detail)?;
+            self.pending.remove(0);
+        }
+        Ok(())
+    }
+
+    /// The re-check of #582 (N6): the chain moved aside within this life once
+    /// it passes [`ROTATE_BYTES`] (as `open` does), so it never grows past
+    /// what the agent and this watchdog read ([`CHAIN_MAX_BYTES`]): a new
+    /// chain begins with a [`KIND_OPENED`] row naming the old one's last
+    /// row, the old one kept as `witness.chain.1` (the agent continues its
+    /// import there).
+    fn rotate_if_full(&mut self) -> Result<()> {
+        if self.len < ROTATE_BYTES || self.seq == 0 {
+            return Ok(());
+        }
+        let aside = aside_name(&self.path, "1");
+        let _ = std::fs::remove_file(&aside);
+        std::fs::rename(&self.path, &aside)
+            .with_context(|| format!("moving {} aside", self.path.display()))?;
+        let detail = format!(
+            "watchdog {} rotated its witness within its life: the previous chain, full, ends at \
+             row {} ({}), kept as {}",
+            self.tgid,
+            self.seq - 1,
+            self.prev.get(..16).unwrap_or(""),
+            aside.display()
+        );
+        self.seq = 0;
+        self.prev = String::new();
+        self.len = 0;
+        self.tried = None;
+        self.append(KIND_OPENED, &detail)?;
+        let _ = self.protect();
+        Ok(())
+    }
+
     /// One signed row of `kind` with `detail`, appended and logged — the
-    /// chain checked first ([`Witness::check_head`]).
+    /// chain checked first ([`Witness::check_head`]), rotated when full,
+    /// the rows due before it written first.
     pub fn record(&mut self, kind: &str, detail: &str) -> Result<()> {
         self.check_head();
-        self.append(kind, detail)
+        self.rotate_if_full()?;
+        self.flush_pending()?;
+        match self.unprotected.take() {
+            Some(why) => self.append(
+                kind,
+                &format!(
+                    "{detail}; (this chain is not registered as the watchdog role's alone: {why})"
+                ),
+            ),
+            None => self.append(kind, detail),
+        }
     }
 
     fn append(&mut self, kind: &str, detail: &str) -> Result<()> {
@@ -314,11 +461,22 @@ impl Witness {
             sig: String::new(),
         });
         let line = serde_json::to_string(&row).context("serialising the witness row")?;
-        crate::append_line(&self.path, &format!("{line}\n"))
-            .with_context(|| format!("appending to {}", self.path.display()))?;
+        let text = format!("{line}\n");
+        if let Err(e) = crate::append_line(&self.path, &text) {
+            // the re-check of #582 (N6): what a partial write left is this
+            // watchdog's own — cut back now, or at the next check
+            self.tried = Some((text, e.to_string()));
+            if self.repair_torn() == Tail::Whole {
+                info!(target: "watchdog.witness", row = %line, "witness row signed (its sync failed, the row is whole)");
+                return Ok(());
+            }
+            return Err(e).with_context(|| format!("appending to {}", self.path.display()));
+        }
         info!(target: "watchdog.witness", row = %line, "witness row signed");
         self.prev = line_hash(&line);
         self.seq += 1;
+        self.len += text.len() as u64;
+        self.tried = None;
         Ok(())
     }
 
@@ -339,6 +497,34 @@ impl Witness {
             }
         }
     }
+}
+
+/// The re-check of #582 (N6): what the bytes past the last whole row of a
+/// life are ([`Witness::repair_torn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Nothing past it, or no failed append to judge.
+    Clean,
+    /// The row a failed append tried to write, whole: written.
+    Whole,
+    /// Its partial row, removed.
+    Torn,
+    /// Not this watchdog's own (or not removable yet).
+    Foreign,
+}
+
+/// The re-check of #582 (N6): `path` with `.{suffix}` added, and `.{n}`
+/// after it when that name is taken (a cut never replaces another's
+/// evidence; a rotation's `.1` is removed by its caller first).
+fn aside_name(path: &Path, suffix: &str) -> PathBuf {
+    let base = path.with_file_name(format!("{CHAIN_FILE}.{suffix}"));
+    if suffix == "1" || std::fs::symlink_metadata(&base).is_err() {
+        return base;
+    }
+    (2..1000)
+        .map(|n| path.with_file_name(format!("{CHAIN_FILE}.{suffix}.{n}")))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .unwrap_or(base)
 }
 
 /// Why the agent exited, from `systemctl show`'s `Result=`, `ExecMainCode=`
@@ -423,22 +609,56 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
 /// The vacancy row's kind: the role released by a shutdown the admin
 /// quorum signed, or inside a signed trusted-installer window (the review of
 /// #582, F4: the operator's documented restart and stop — a note, as the
-/// successor's NN-L-BPF-002 is Low inside one), vacated otherwise.
-pub fn vacancy_kind(verdict: &crate::ShutdownVerdict, in_window: bool) -> &'static str {
+/// successor's NN-L-BPF-002 is Low inside one), vacated otherwise. The
+/// re-check of #582 (N8): inside a window only a clean stop (`clean`,
+/// [`clean_stop`]) is the operator's — an OOM kill or a crash during an
+/// upgrade's window stays a vacancy (High).
+pub fn vacancy_kind(
+    verdict: &crate::ShutdownVerdict,
+    in_window: bool,
+    clean: bool,
+) -> &'static str {
     match verdict {
         crate::ShutdownVerdict::Authorised => nn_proto::witness::KIND_RELEASED,
-        _ if in_window => nn_proto::witness::KIND_RELEASED_IN_WINDOW,
+        _ if in_window && clean => nn_proto::witness::KIND_RELEASED_IN_WINDOW,
         _ => nn_proto::witness::KIND_VACATED,
     }
+}
+
+/// The re-check of #582 (N8): the exit `cause` ([`cause_from_show`],
+/// [`cause_from_wait`]) is a clean stop — exit status 0 (the agent's
+/// answer to `SIGTERM`) or the `SIGTERM` itself.
+pub fn clean_stop(cause: &str) -> bool {
+    ["exit status 0", "signal 15"]
+        .iter()
+        .any(|c| cause == *c || cause.starts_with(&format!("{c} ")))
+}
+
+/// The re-check of #582 (the mini-hunt of N8): systemd's record of unit
+/// `unit`'s last exit ([`cause_from_show`]); `None` when it has none (or
+/// systemd cannot be asked). Blocking.
+pub fn unit_last_exit(unit: &str) -> Option<String> {
+    let systemctl = crate::find_systemctl()?;
+    let out = std::process::Command::new(systemctl)
+        .arg("show")
+        .arg("--property=Result,ExecMainCode,ExecMainStatus")
+        .arg(unit)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    cause_from_show(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// The review of #582 (F4, the mini-hunt): the row of the agent's role
 /// found vacated at this watchdog's start — `role_found_vacant` (High),
 /// or a note (`role_released_in_window`) when the kernel marked its
 /// holder's last exit inside a signed trusted-installer window (`marks`,
-/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's).
-pub fn found_vacant(marks: Option<u32>) -> (&'static str, &'static str) {
-    if marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
+/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's) —
+/// and (the re-check of #582, the mini-hunt of N8) a clean stop (`clean`,
+/// [`clean_stop`] of systemd's record of the exit).
+pub fn found_vacant(marks: Option<u32>, clean: bool) -> (&'static str, &'static str) {
+    if clean && marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
         (
             nn_proto::witness::KIND_RELEASED_IN_WINDOW,
             "the agent's role was found vacated at this watchdog's start: its holder's last \
@@ -454,12 +674,15 @@ pub fn found_vacant(marks: Option<u32>) -> (&'static str, &'static str) {
 }
 
 /// The successor row's kind: the agent's unit's clean restart, or not
-/// (`given`: [`successor_detail`]'s verdict).
-pub fn successor_kind(given: bool) -> &'static str {
-    if given {
-        nn_proto::witness::KIND_SUCCEEDED
-    } else {
-        nn_proto::witness::KIND_SUCCESSOR_FOREIGN
+/// (`given`: [`successor_detail`]'s verdict) — and (the re-check of #582,
+/// N4) a given one whose libraries' identity is not all confirmed
+/// (`confirmed`: `Findings::confirmed`) is
+/// [`nn_proto::witness::KIND_SUCCESSOR_UNCONFIRMED`] (High, still given).
+pub fn successor_kind(given: bool, confirmed: bool) -> &'static str {
+    match (given, confirmed) {
+        (true, true) => nn_proto::witness::KIND_SUCCEEDED,
+        (true, false) => nn_proto::witness::KIND_SUCCESSOR_UNCONFIRMED,
+        (false, _) => nn_proto::witness::KIND_SUCCESSOR_FOREIGN,
     }
 }
 
@@ -472,6 +695,7 @@ pub fn vacancy_detail(
     verdict: &crate::ShutdownVerdict,
     in_window: bool,
 ) -> String {
+    let clean = clean_stop(cause);
     let marker = match verdict {
         crate::ShutdownVerdict::Absent => "no shutdown marker",
         crate::ShutdownVerdict::Authorised => {
@@ -481,10 +705,15 @@ pub fn vacancy_detail(
             "a shutdown marker refused (not signed by the admin quorum for this agent)"
         }
     };
-    let window = if in_window {
-        "; inside a signed trusted-installer window (the operator's restart or stop)"
-    } else {
-        ""
+    let window = match (in_window, clean) {
+        (true, true) => {
+            "; inside a signed trusted-installer window (the operator's restart or stop)"
+        }
+        (true, false) => {
+            "; inside a signed trusted-installer window, but not a clean stop (exit status 0 or \
+             SIGTERM): not taken as the operator's"
+        }
+        (false, _) => "",
     };
     format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}{window}")
 }
@@ -633,19 +862,19 @@ mod tests {
             KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
         };
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Authorised, false),
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, false, true),
             KIND_RELEASED
         );
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Absent, false),
+            vacancy_kind(&crate::ShutdownVerdict::Absent, false, true),
             KIND_VACATED
         );
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), false),
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), false, true),
             KIND_VACATED
         );
-        assert_eq!(successor_kind(true), KIND_SUCCEEDED);
-        assert_eq!(successor_kind(false), KIND_SUCCESSOR_FOREIGN);
+        assert_eq!(successor_kind(true, true), KIND_SUCCEEDED);
+        assert_eq!(successor_kind(false, true), KIND_SUCCESSOR_FOREIGN);
     }
 
     /// The review of #582 (F4, the mini-hunt): a watchdog start that finds
@@ -656,10 +885,13 @@ mod tests {
     fn a_role_found_vacated_by_a_window_s_stop_is_a_note() {
         use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M};
         use nn_proto::witness::{KIND_FOUND_VACANT, KIND_RELEASED_IN_WINDOW};
-        assert_eq!(found_vacant(Some(M | W)).0, KIND_RELEASED_IN_WINDOW);
+        assert_eq!(found_vacant(Some(M | W), true).0, KIND_RELEASED_IN_WINDOW);
         for m in [Some(M), Some(0), None] {
-            assert_eq!(found_vacant(m).0, KIND_FOUND_VACANT, "{m:?}");
+            assert_eq!(found_vacant(m, true).0, KIND_FOUND_VACANT, "{m:?}");
         }
+        // the re-check of #582 (the mini-hunt of N8): an OOM kill or a crash
+        // inside a window is not the operator's stop
+        assert_eq!(found_vacant(Some(M | W), false).0, KIND_FOUND_VACANT);
     }
 
     /// The review of #582 (F4 a): the guide's restart — a window granted,
@@ -670,19 +902,19 @@ mod tests {
     fn a_vacancy_inside_a_signed_window_is_released_not_vacated() {
         use nn_proto::witness::{KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_VACATED};
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true, true),
             KIND_RELEASED_IN_WINDOW
         );
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), true),
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), true, true),
             KIND_RELEASED_IN_WINDOW
         );
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Authorised, true),
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, true, true),
             KIND_RELEASED
         );
         assert_ne!(
-            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true, true),
             KIND_VACATED
         );
         let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Absent, true);
@@ -692,6 +924,77 @@ mod tests {
             ),
             "{d}"
         );
+    }
+
+    /// The re-check of #582 (N8): inside a window only a clean stop — exit
+    /// status 0 (the agent's answer to SIGTERM) or the SIGTERM itself — is
+    /// the operator's; an OOM kill, a crash or a SIGKILL during an upgrade's
+    /// window stays the High vacancy, and its row says it was inside one
+    /// without claiming the operator.
+    #[test]
+    fn inside_a_window_only_a_clean_stop_is_the_operator_s() {
+        use nn_proto::witness::{KIND_RELEASED_IN_WINDOW, KIND_VACATED};
+        for c in [
+            "exit status 0",
+            "exit status 0 (systemd Result=success)",
+            "signal 15",
+            "signal 15 (systemd Result=signal)",
+        ] {
+            assert!(clean_stop(c), "{c}");
+        }
+        for c in [
+            "the OOM killer (systemd Result=oom-kill; signal 9)",
+            "signal 9 (systemd Result=signal)",
+            "signal 11, core dumped (systemd Result=core-dump)",
+            "exit status 1 (systemd Result=exit-code)",
+            "exit status 01",
+            "signal 150",
+            "not known (systemd reported none)",
+        ] {
+            assert!(!clean_stop(c), "{c}");
+            assert_eq!(
+                vacancy_kind(&crate::ShutdownVerdict::Absent, true, clean_stop(c)),
+                KIND_VACATED,
+                "{c}"
+            );
+            let d = vacancy_detail(41, c, &crate::ShutdownVerdict::Absent, true);
+            assert!(
+                d.contains("not taken as the operator's") && !d.contains("(the operator's restart"),
+                "{d}"
+            );
+        }
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true, true),
+            KIND_RELEASED_IN_WINDOW
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, false, true),
+            KIND_VACATED
+        );
+    }
+
+    /// The re-check of #582 (N4): a given successor whose libraries'
+    /// identity is not all confirmed is its own High kind — never foreign
+    /// on that alone, and still given.
+    #[test]
+    fn a_successor_with_an_unconfirmed_library_is_given_and_high() {
+        use nn_proto::witness::{
+            KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_SUCCESSOR_UNCONFIRMED,
+        };
+        assert_eq!(successor_kind(true, true), KIND_SUCCEEDED);
+        assert_eq!(successor_kind(true, false), KIND_SUCCESSOR_UNCONFIRMED);
+        assert_eq!(successor_kind(false, false), KIND_SUCCESSOR_FOREIGN);
+        let unit = Identity {
+            ppid: Some(1),
+            cgroup: Some("/northnarrow.slice/northnarrow-agent.service".into()),
+        };
+        let found = Findings {
+            replaced: vec!["/usr/lib/x86_64-linux-gnu/libc.so.6".into()],
+            ..Findings::default()
+        };
+        let (given, d) = successor_detail(10, 11, &unit, &found);
+        assert!(given, "{d}");
+        assert!(d.contains("identity not confirmed"), "{d}");
     }
 
     fn chain_text(dir: &Path) -> String {
@@ -806,10 +1109,9 @@ mod tests {
         let prefix: String = text.lines().take(1).map(|l| format!("{l}\n")).collect();
         std::fs::write(dir.path().join(CHAIN_FILE), &prefix).unwrap();
         assert!(w.check_head(), "the cut is detected");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(format!("{CHAIN_FILE}.cut"))).unwrap(),
-            prefix
-        );
+        let aside = cut_files(dir.path());
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), prefix);
         w.record(KIND_SUCCEEDED, "after").unwrap();
         let mut imp = Imported::default();
         imp.certify(&w.key_hex());
@@ -853,6 +1155,153 @@ mod tests {
             assert_eq!(row.kind, KIND_CHAIN_CUT, "{damage}");
             assert_eq!(j.len(), 2, "{damage}: {j:?}");
         }
+    }
+
+    /// The chain files set aside by cuts (`witness.chain.cut.*`), sorted.
+    fn cut_files(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name().is_some_and(|n| {
+                    n.to_string_lossy()
+                        .starts_with(&format!("{CHAIN_FILE}.cut."))
+                })
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The re-check of #582 (N6): an append of this watchdog's that failed
+    /// part-way (a full disk, an I/O error) leaves the start of its own row
+    /// past the chain's last whole row: cut back to that row and said in a
+    /// `witness_chain_torn` row (a note) — never a `witness_chain_cut`. A
+    /// row written whole whose sync failed is taken as written. Anything
+    /// else past the last row is still a cut.
+    #[test]
+    fn a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn() {
+        use nn_proto::witness::{KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let p = dir.path().join(CHAIN_FILE);
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "the vacancy").unwrap();
+        let good = chain_text(dir.path());
+        // the row it tried, a third of it on disk
+        let tried =
+            "{\"v\":1,\"seq\":2,\"kind\":\"role_succeeded\",\"detail\":\"x\"}\n".to_string();
+        std::fs::write(&p, format!("{good}{}", &tried[..tried.len() / 3])).unwrap();
+        w.tried = Some((
+            tried.clone(),
+            "No space left on device (os error 28)".into(),
+        ));
+        assert!(!w.check_head(), "torn is not cut");
+        assert_eq!(chain_text(dir.path()), good, "the partial row removed");
+        w.record(KIND_SUCCEEDED, "the successor").unwrap();
+        let j = judge_chain(&chain_text(dir.path()));
+        let kinds: Vec<String> = j
+            .iter()
+            .map(|x| match x {
+                Judged::Valid { row, .. } => row.kind.clone(),
+                Judged::Broken { why, .. } => format!("broken: {why}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [KIND_OPENED, KIND_VACATED, KIND_CHAIN_TORN, KIND_SUCCEEDED]
+        );
+        let Judged::Valid { row, .. } = &j[2] else {
+            panic!("{j:?}")
+        };
+        assert!(
+            row.detail.contains("failed part-way (No space left"),
+            "{}",
+            row.detail
+        );
+        assert!(cut_files(dir.path()).is_empty());
+        // a whole row whose sync failed: written, the chain continues
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(CHAIN_FILE);
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        let row = w.key.sign(Row {
+            v: ROW_VERSION,
+            seq: w.seq,
+            prev: w.prev.clone(),
+            at: 1,
+            tgid: me,
+            key: String::new(),
+            kind: KIND_VACATED.to_string(),
+            detail: "whole".into(),
+            sig: String::new(),
+        });
+        let whole = format!("{}\n", serde_json::to_string(&row).unwrap());
+        std::fs::write(&p, format!("{}{whole}", chain_text(dir.path()))).unwrap();
+        w.tried = Some((whole, "EIO at sync".into()));
+        assert!(!w.check_head());
+        w.record(KIND_SUCCEEDED, "next").unwrap();
+        let j = judge_chain(&chain_text(dir.path()));
+        let kinds: Vec<&str> = j
+            .iter()
+            .map(|x| match x {
+                Judged::Valid { row, .. } => row.kind.as_str(),
+                Judged::Broken { .. } => "broken",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED],
+            "the whole row kept"
+        );
+        // what is past the last row and not the row it tried: a cut
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(CHAIN_FILE);
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "v").unwrap();
+        std::fs::write(&p, chain_text(dir.path()) + "{\"not\":").unwrap();
+        w.tried = Some(("{\"v\":1,\"seq\":2}\n".into(), "EIO".into()));
+        assert!(w.check_head(), "another's bytes are a cut");
+    }
+
+    /// The re-check of #582 (N6): the chain rotated within a life once it
+    /// passes `ROTATE_BYTES` (never grown past what is read: no false cut at
+    /// 1 MiB) — the old one kept as `witness.chain.1`, the new one opened
+    /// with a row naming the old one's last row; and a second cut never
+    /// replaces the first one's evidence.
+    #[test]
+    fn a_full_chain_rotates_within_a_life_and_cuts_keep_their_own_names() {
+        use nn_proto::witness::{KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "before").unwrap();
+        let before = chain_text(dir.path());
+        w.len = ROTATE_BYTES;
+        w.record(KIND_SUCCEEDED, "after").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("{CHAIN_FILE}.1"))).unwrap(),
+            before
+        );
+        let j = judge_chain(&chain_text(dir.path()));
+        assert_eq!(j.len(), 2, "{j:?}");
+        let Judged::Valid { row, .. } = &j[0] else {
+            panic!("{j:?}")
+        };
+        assert_eq!((row.seq, row.kind.as_str()), (0, KIND_OPENED));
+        assert!(
+            row.detail.contains("rotated its witness within its life")
+                && row.detail.contains("ends at row 1"),
+            "{}",
+            row.detail
+        );
+        assert!(!w.check_head(), "a rotation is not a cut");
+        // two cuts, two files
+        for _ in 0..2 {
+            std::fs::write(dir.path().join(CHAIN_FILE), "").unwrap();
+            assert!(w.check_head());
+            w.record(KIND_SUCCEEDED, "s").unwrap();
+        }
+        assert_eq!(cut_files(dir.path()).len(), 2);
     }
 
     /// Lot 374: the key's public half is published in a sealed memory file
@@ -914,6 +1363,7 @@ mod tests {
                 why: "not in a system library directory",
             }],
             unreadable: vec![],
+            replaced: vec![],
         };
         let (ok, d) = successor_detail(10, 11, &unit, &preloaded);
         assert!(
@@ -952,8 +1402,8 @@ mod tests {
             "{d}"
         );
         assert!(!d.to_lowercase().contains("refus"), "{d}");
-        assert_eq!(successor_kind(false), "role_successor_foreign");
-        assert_eq!(successor_kind(true), "role_succeeded");
+        assert_eq!(successor_kind(false, true), "role_successor_foreign");
+        assert_eq!(successor_kind(true, true), "role_succeeded");
         let (ok, d) = successor_detail(10, 11, &unit, &Findings::default());
         assert!(ok && !d.contains("holds the role"), "{d}");
     }
