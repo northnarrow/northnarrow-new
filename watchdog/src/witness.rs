@@ -1342,6 +1342,29 @@ mod tests {
         assert_eq!(found, 1);
     }
 
+    /// The re-check 3 of #582 (R2-1): the agent a watchdog's start finds is
+    /// judged at every start, its role not always vacated this boot — the
+    /// detail names the process, and a vacancy only when it saw one.
+    #[test]
+    fn an_agent_found_at_a_watchdog_start_is_not_said_vacated() {
+        let unit = Identity {
+            ppid: Some(1),
+            cgroup: Some("/northnarrow.slice/northnarrow-agent.service".into()),
+        };
+        let (ok, d) = successor_detail(0, 11, &unit, &Findings::default());
+        assert!(ok, "{d}");
+        assert!(
+            d.starts_with("the agent's role taken by pid 11: ") && !d.contains("vacated"),
+            "{d}"
+        );
+        let shell = Identity {
+            ppid: Some(4242),
+            cgroup: Some("/user.slice/session-1.scope".into()),
+        };
+        let (ok, d) = successor_detail(0, 11, &shell, &Findings::default());
+        assert!(!ok && !d.contains("vacated"), "{d}");
+    }
+
     #[test]
     fn only_the_unit_s_restart_with_nothing_foreign_is_given_the_role() {
         let unit = Identity {

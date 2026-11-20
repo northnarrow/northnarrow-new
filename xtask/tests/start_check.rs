@@ -233,6 +233,12 @@ fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
         !f[..judged].contains("return"),
         "a return before the judgement"
     );
+    assert_eq!(
+        f.matches("return").count(),
+        1,
+        "one return: a given verdict held"
+    );
+    assert!(f.contains("(antitamper_bpf::AtStart::Held, _) => return,"));
     let tasks = &code["agent/src/boot/tasks.rs"];
     let t = tasks
         .find("let at_start = nn_linux::witness::roles_at_start();")
@@ -277,6 +283,12 @@ fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
         rest[foreign..register].contains("last = None;")
             && rest[foreign..register].contains("return;")
     );
+    // a long-running watchdog given signs nothing (N4 kept)
+    let held = rest
+        .find("nn_linux::witness::SuccessorStep::Held(v) => {")
+        .expect("held");
+    assert!(foreign < held && held < register);
+    assert!(!rest[held..register].contains("report_"));
     // the rule itself is antitamper_bpf's, one for both roles
     let lib = &code["antitamper-bpf/src/lib.rs"];
     assert_eq!(lib.matches("pub fn succession_to_judge(").count(), 1);
