@@ -6282,14 +6282,15 @@ fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
     fs::create_dir_all(&stub).unwrap();
     let fdinfo = dir.join("proc/1/fdinfo");
     fs::create_dir_all(&fdinfo).unwrap();
-    // a link to 21 and a program descriptor of 120 (not 12) and of 30
+    // a link to 21 and program descriptors of 120 (not 12) and of 33 (the
+    // cgroup program 30 is not PID 1's: listed if the type were not read)
     fs::write(fdinfo.join("41"), pid_one_lsm_link(21)).unwrap();
     fs::write(
         fdinfo.join("42"),
         "pos:\t0\nflags:\t02000002\nprog_type:\t29\nprog_jited:\t1\nprog_tag:\t00\nprog_id:\t120\n",
     )
     .unwrap();
-    fs::write(fdinfo.join("43"), "prog_type:\t8\nprog_id:\t30\n").unwrap();
+    fs::write(fdinfo.join("43"), "prog_type:\t8\nprog_id:\t33\n").unwrap();
     let progs = dir.join("progs");
     fs::write(
         &progs,
@@ -6348,7 +6349,7 @@ fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
          31: lsm  name other_edr  tag 1111111111111111  gpl\n"
     );
     let (rc, out, _) = run("pid1_prog_ids");
-    assert_eq!((rc, out.as_str()), (0, "21 30 120 "));
+    assert_eq!((rc, out.as_str()), (0, "21 33 120 "));
     // install.sh's wait: two programs left, then only PID 1's
     let (rc, _, err) = run("wait_own_programs_unloaded ''");
     assert_eq!(rc, 1, "{err}");
