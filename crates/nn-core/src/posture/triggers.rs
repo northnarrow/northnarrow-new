@@ -3077,6 +3077,29 @@ mod tests {
             ),
             "a known /tmp/x exec with sudo's image at the open fires"
         );
+        // the process executes something else after the open: the exec it
+        // had at the open (the cache's past) still decides
+        let mut later = spawn_with_exe(3000, 1, "/usr/bin/true", 1);
+        if let Event::ProcessSpawn {
+            uid,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut later
+        {
+            *uid = 1000;
+            (*start_ns, *timestamp_ns) = (3000, 20_000);
+            (exe.path, exe.dev, exe.ino, exe.flags) = ("/usr/bin/true".into(), KDEV, 778, KNOWN);
+        }
+        assert!(auth.ingest_spawn_event(&later));
+        assert!(
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
+            "the exec at the open, from the cache's past, with sudo's image fires"
+        );
         // a service uid's credential read, the same shape
         let mut e = spawn_with_exe(3001, 1, "/tmp/x", 1);
         if let Event::ProcessSpawn {

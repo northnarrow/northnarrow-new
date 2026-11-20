@@ -2516,6 +2516,20 @@ mod lot376 {
         images.replace(vec![EXECUTOR]);
         images.replace_pid1_held(vec![EXECUTOR]);
         let lineage = Tracker::new(tmp.path());
+        // an earlier process at the pid (another start) executed: not this
+        // process's exec
+        let mut earlier = launch("/usr/bin/true", 1, 0, 1);
+        if let Event::ProcessSpawn {
+            timestamp_ns,
+            start_ns,
+            exe,
+            ..
+        } = &mut earlier
+        {
+            (*timestamp_ns, *start_ns) = (1_000_000_000, 900_000_000);
+            exe.path = "/usr/bin/true".into();
+        }
+        assert!(lineage.ingest_spawn_event(&earlier));
         let r = R004::new(lineage.clone()).with_launches(KnownLaunches {
             own_worker: None,
             executor: images.clone(),
@@ -2540,6 +2554,10 @@ mod lot376 {
             (
                 launch("/proc/self/fd/9", 1, 0, 4444),
                 "an orphan PID 1 adopted",
+            ),
+            (
+                launch("/proc/self/fd/9", 4444, 0, 1),
+                "another parent at the exec",
             ),
             (launch("/proc/self/fd/9", 1, 0, 0), "no fork record"),
             (

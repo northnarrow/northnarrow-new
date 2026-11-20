@@ -7857,6 +7857,18 @@ mod tests {
             ingest(627, 0, &[LOGROTATE, "-f"]);
             ingest(628, 0, &[LOGROTATE, "-fm", "/tmp/m", "/etc/logrotate.conf"]);
             ingest(629, 0, &[LOGROTATE, "-f", "--", "/etc/logrotate.conf"]);
+            // root's configuration, but the argv the sensor cut
+            start += S;
+            let cut = exec(
+                630,
+                521,
+                LOGROTATE,
+                &[LOGROTATE, "-f", "/etc/logrotate.conf"],
+                PACKAGED,
+                521,
+                start,
+            );
+            assert!(t.ingest_spawn_event(&exec_by(0, true, cut)));
             let [fim005, fim019] = log_rules(None, &t);
             let judged = |rule: &dyn Rule, path: &str, pid: u32, away: bool| {
                 let mut e = write(path, pid, "logrotate");
@@ -7905,6 +7917,7 @@ mod tests {
                 (627, "logrotate", "no file named"),
                 (628, "logrotate", "-m"),
                 (629, "logrotate", "--"),
+                (630, "logrotate", "an argv the sensor cut"),
                 (530, "lr", "a copy in /tmp"),
                 (531, "logrotate", "a replaced inode"),
                 (532, "logrotate", "no image"),
