@@ -138,8 +138,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       (any case; `n`, `No`, `FALSE`, an empty reset): a harmful drop-in in
       every spelling (N0). The agent's start reads both units'
       `MemoryDenyWriteExecute` from systemd's copy and signs a degradation
-      when it is off (`units_mdwe`). Test
-      `memory_deny_write_execute_off_is_judged_as_systemd_parses_it`.
+      when it is off (`units_mdwe`). The mini-hunt: a condition's booleans
+      (`ConditionFirstBoot=`, `ConditionVirtualization=`) and the agent's
+      own switches in a drop-in (`NN_NET_CONNECT_DENY=No` turns it off,
+      as the agent's parser reads it) are read the same way. Tests
+      `memory_deny_write_execute_off_is_judged_as_systemd_parses_it`,
+      `the_hosts_tuning_and_conditions_are_judged_on_their_merits`.
     - The kernel's record of the roles' exits is frozen by the agent's load
       (`BPF_MAP_FREEZE`; N1: `BPF_F_RDONLY` was the creating descriptor's
       flag, not the map's, so the family's handles could write it), and
@@ -185,8 +189,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       `a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn`,
       `a_full_chain_rotates_within_a_life_and_cuts_keep_their_own_names`.
     - Inside a window only a clean stop (exit status 0 or SIGTERM) is the
-      operator's, as the kernel marked the exit; a signed stop counts for
-      the gap only when signed this boot (N8). Tests
+      operator's, as the kernel marked the exit — at a vacancy the watchdog
+      sees and at one its start finds (systemd's record of the exit); a
+      signed stop counts for the gap only when signed this boot (N8). Tests
       `inside_a_window_only_a_clean_stop_is_the_operator_s`,
       `only_a_certified_release_as_the_chain_s_last_row_is_a_signed_stop`.
     - The units' and KNOWN_LIMITATIONS' claims on memory protection and on

@@ -634,13 +634,31 @@ pub fn clean_stop(cause: &str) -> bool {
         .any(|c| cause == *c || cause.starts_with(&format!("{c} ")))
 }
 
+/// The re-check of #582 (the mini-hunt of N8): systemd's record of unit
+/// `unit`'s last exit ([`cause_from_show`]); `None` when it has none (or
+/// systemd cannot be asked). Blocking.
+pub fn unit_last_exit(unit: &str) -> Option<String> {
+    let systemctl = crate::find_systemctl()?;
+    let out = std::process::Command::new(systemctl)
+        .arg("show")
+        .arg("--property=Result,ExecMainCode,ExecMainStatus")
+        .arg(unit)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    cause_from_show(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// The review of #582 (F4, the mini-hunt): the row of the agent's role
 /// found vacated at this watchdog's start — `role_found_vacant` (High),
 /// or a note (`role_released_in_window`) when the kernel marked its
 /// holder's last exit inside a signed trusted-installer window (`marks`,
-/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's).
-pub fn found_vacant(marks: Option<u32>) -> (&'static str, &'static str) {
-    if marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
+/// `ROLE_MARKS`' agent word; `None` unread: not known to be a window's) —
+/// and (the re-check of #582, the mini-hunt of N8) a clean stop (`clean`,
+/// [`clean_stop`] of systemd's record of the exit).
+pub fn found_vacant(marks: Option<u32>, clean: bool) -> (&'static str, &'static str) {
+    if clean && marks.is_some_and(|m| m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0) {
         (
             nn_proto::witness::KIND_RELEASED_IN_WINDOW,
             "the agent's role was found vacated at this watchdog's start: its holder's last \
@@ -867,10 +885,13 @@ mod tests {
     fn a_role_found_vacated_by_a_window_s_stop_is_a_note() {
         use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M};
         use nn_proto::witness::{KIND_FOUND_VACANT, KIND_RELEASED_IN_WINDOW};
-        assert_eq!(found_vacant(Some(M | W)).0, KIND_RELEASED_IN_WINDOW);
+        assert_eq!(found_vacant(Some(M | W), true).0, KIND_RELEASED_IN_WINDOW);
         for m in [Some(M), Some(0), None] {
-            assert_eq!(found_vacant(m).0, KIND_FOUND_VACANT, "{m:?}");
+            assert_eq!(found_vacant(m, true).0, KIND_FOUND_VACANT, "{m:?}");
         }
+        // the re-check of #582 (the mini-hunt of N8): an OOM kill or a crash
+        // inside a window is not the operator's stop
+        assert_eq!(found_vacant(Some(M | W), false).0, KIND_FOUND_VACANT);
     }
 
     /// The review of #582 (F4 a): the guide's restart — a window granted,

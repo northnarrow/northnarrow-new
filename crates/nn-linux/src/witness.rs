@@ -572,6 +572,7 @@ mod tests {
     fn a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note() {
         use nn_proto::witness::{
             KIND_CHAIN_CUT, KIND_FOUND_VACANT, KIND_RESPAWN_HELD, KIND_SUCCESSOR_FOREIGN,
+            KIND_SUCCESSOR_UNCONFIRMED, KIND_UNMADE_START,
         };
         for k in [
             KIND_VACATED,
@@ -580,6 +581,9 @@ mod tests {
             // the review of #582 (F2 c, d): a held respawn, a cut chain
             KIND_RESPAWN_HELD,
             KIND_CHAIN_CUT,
+            // the re-check of #582 (N3, N4)
+            KIND_UNMADE_START,
+            KIND_SUCCESSOR_UNCONFIRMED,
             "a kind of later",
         ] {
             assert_eq!(row_kind(k), WITNESS_ROW, "{k}");
@@ -590,6 +594,10 @@ mod tests {
             // the review of #582 (F4 a)
             KIND_RELEASED_IN_WINDOW,
             KIND_SUCCEEDED,
+            // the re-check of #582 (N2, N6): the gate's reference moved
+            // inside a window, the watchdog's own torn append repaired
+            KIND_GATE_REFERENCE,
+            KIND_CHAIN_TORN,
         ] {
             assert_eq!(row_kind(k), WITNESS_NOTE, "{k}");
         }

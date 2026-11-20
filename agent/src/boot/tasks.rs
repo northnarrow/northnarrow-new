@@ -509,7 +509,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     let (wm, am, ae) = at_start.map_or((None, None, None), |r| {
                         (r.watchdog_mark, r.agent_mark, r.agent_exit_ns)
                     });
-                    if wm.is_none() || am.is_none() {
+                    if bpffs_root.is_some() && (wm.is_none() || am.is_none()) {
                         nn_linux::boot::degradation::report(
                             nn_linux::sensors::multiplexer::ROLE_MARKS_DEGRADATION,
                             "the agent's start did not read the roles' exit marks: the watchdog \

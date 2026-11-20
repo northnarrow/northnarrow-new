@@ -449,12 +449,14 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
                 "proot",
                 "pouch",
             ];
-            match p {
-                "yes" | "true" | "1" => !virt.is_empty(),
-                "no" | "false" | "0" => virt.is_empty(),
-                "vm" => vm.contains(&virt),
-                "container" => container.contains(&virt),
-                name => virt == name,
+            // the re-check of #582 (the mini-hunt of N0): a boolean as
+            // systemd parses it, then a name
+            match (systemd_bool(p), p) {
+                (Some(true), _) => !virt.is_empty(),
+                (Some(false), _) => virt.is_empty(),
+                (None, "vm") => vm.contains(&virt),
+                (None, "container") => container.contains(&virt),
+                (None, name) => virt == name,
             }
         }
         "Host" => p == host.hostname || p == host.machine_id,
@@ -480,10 +482,11 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
         "Capability" => true,
         "FirstBoot" => {
             let first = Path::new("/run/systemd/first-boot").exists();
-            match p {
-                "yes" | "true" => first,
-                "no" | "false" => !first,
-                _ => return None,
+            // the re-check of #582 (the mini-hunt of N0)
+            match systemd_bool(p) {
+                Some(true) => first,
+                Some(false) => !first,
+                None => return None,
             }
         }
         "PathExists" => path.exists(),
@@ -976,6 +979,9 @@ mod tests {
             "ConditionVirtualization=kvm",
             "ConditionVirtualization=vm",
             "ConditionVirtualization=yes",
+            // the re-check of #582 (the mini-hunt of N0): systemd's spellings
+            "ConditionVirtualization=Y",
+            "ConditionVirtualization=TRUE",
             "ConditionHost=nn-lab",
             "ConditionKernelCommandLine=lsm",
             "ConditionArchitecture=x86-64",
@@ -998,8 +1004,34 @@ mod tests {
             "ConditionSecurity=selinux",
             "ConditionControlGroupController=io",
             "ConditionUser=nobody",
+            // the re-check of #582 (the mini-hunt of N0): a VM is not "no"
+            "ConditionVirtualization=No",
+            "ConditionVirtualization=n",
         ] {
             assert!(h(Reach::Services, kv).is_some(), "{kv}");
+        }
+        // ConditionFirstBoot, in systemd's spellings: a later boot fails
+        // "yes" (our units would not start) and holds "no"
+        if !Path::new("/run/systemd/first-boot").exists() {
+            for kv in [
+                "ConditionFirstBoot=yes",
+                "ConditionFirstBoot=Yes",
+                "ConditionFirstBoot=1",
+                "ConditionFirstBoot=on",
+            ] {
+                assert!(
+                    h(Reach::Services, kv).is_some_and(|w| w.contains("condition fails")),
+                    "{kv}"
+                );
+            }
+            for kv in [
+                "ConditionFirstBoot=no",
+                "ConditionFirstBoot=No",
+                "ConditionFirstBoot=0",
+                "ConditionFirstBoot=off",
+            ] {
+                assert_eq!(h(Reach::Services, kv), None, "{kv}");
+            }
         }
         // a small VM: 1 GiB, 1 CPU
         let small = HostLimits {

@@ -1442,7 +1442,12 @@ fn open_witness(
                         antitamper_bpf::ROLE_SLOT_AGENT,
                     )
                     .ok();
-                    let (kind, detail) = northnarrow_watchdog::witness::found_vacant(marks);
+                    // the re-check of #582 (the mini-hunt of N8): a clean
+                    // stop only, as systemd recorded the agent's last exit
+                    let clean = systemd_is_booted(std::path::Path::new(SYSTEMD_RUNTIME_DIR))
+                        && northnarrow_watchdog::witness::unit_last_exit(&cli.agent_unit)
+                            .is_some_and(|c| northnarrow_watchdog::witness::clean_stop(&c));
+                    let (kind, detail) = northnarrow_watchdog::witness::found_vacant(marks, clean);
                     w.record_or_log(kind, detail);
                 }
             }

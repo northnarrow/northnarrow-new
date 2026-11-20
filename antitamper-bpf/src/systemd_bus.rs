@@ -936,6 +936,12 @@ mod tests {
         put_strings(&mut body, &["a"]);
         body[4] += 1;
         assert!(parse_reply(&reply_body(4, &body), 4).is_err());
+        // a length short of its elements
+        let mut body = Vec::new();
+        put_signature(&mut body, "as");
+        put_strings(&mut body, &["abc", "de"]);
+        body[4] -= 1;
+        assert!(parse_reply(&reply_body(4, &body), 4).is_err());
         assert_eq!(single_type("a(sasb)x").unwrap(), ("a(sasb)", "x"));
         assert_eq!(single_type("aas").unwrap(), ("aas", ""));
     }

@@ -473,16 +473,24 @@ fn judge_loaded(
         }
         return (held, seen);
     };
-    if now.env != base.env {
+    let mut added: Vec<&str> = now
+        .env
+        .iter()
+        .filter(|e| !base.env.contains(e))
+        .map(|e| e.split('=').next().unwrap_or(""))
+        .collect();
+    added.dedup();
+    if !added.is_empty() {
         held.push(format!(
-            "the environment systemd's copy gives the agent changed since the watchdog's start \
-             (variables now: {})",
-            now.env_names().join(",")
+            "the environment systemd's copy gives the agent set or changed since the watchdog's \
+             start: {}",
+            added.join(",")
         ));
     }
-    if now.unset != base.unset {
+    if base.unset.iter().any(|u| !now.unset.contains(u)) {
         held.push(
-            "the variables systemd's copy unsets for the agent changed since the watchdog's start"
+            "a variable systemd's copy unset for the agent at the watchdog's start is no longer \
+             unset"
                 .into(),
         );
     }
@@ -944,7 +952,7 @@ mod tests {
                     unset: vec![],
                     ..view(&[a], &["RUST_LOG=info"], true)
                 },
-                "unsets",
+                "no longer unset",
             ),
             (
                 LoadedView {
@@ -961,6 +969,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("not held: {}", out.detail));
             assert!(held.contains(why), "{why}: {held}");
             assert!(!held.contains("debug"), "never a value");
+        }
+        // a variable removed, or one more unset: nothing taken, not held
+        for v in [
+            view(&[a], &[], true),
+            LoadedView {
+                unset: vec!["LD_PRELOAD".into(), "LD_AUDIT".into()],
+                ..view(&[a], &["RUST_LOG=info"], true)
+            },
+        ] {
+            let out = judge_with(&base, &with(v), false, |_| true);
+            assert_eq!(out.hold, None, "{}", out.detail);
         }
         // loaded, then deleted from disk: the copy still applies it
         let gone = judge_with(
