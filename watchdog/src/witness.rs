@@ -543,8 +543,14 @@ pub fn cause_from_show(show: &str) -> Option<String> {
         "3" => format!("signal {status}, core dumped"),
         _ => format!("exit code {code}, status {status}"),
     };
+    // re-check 7 of #582 (the mini-hunt of G2): systemd's `oom-kill` is the
+    // unit's — an OOM kill of any of its processes (a worker, the first
+    // pick) or systemd-oomd's — not a fact of the main process
     Some(match result {
-        "oom-kill" => format!("the OOM killer (systemd Result=oom-kill; {how})"),
+        "oom-kill" => format!(
+            "the OOM killer in its unit (systemd Result=oom-kill, of the agent or of another \
+             process of the unit, such as a worker; {how})"
+        ),
         r => format!("{how} (systemd Result={r})"),
     })
 }
@@ -572,19 +578,26 @@ pub fn units_oom_kills() -> Option<u64> {
         .and_then(|b| oom_kills_of(&b))
 }
 
-/// The lab round 5 of #582: the vacancy's `cause` with the kernel's OOM
-/// killer named. It applies when the agent died of SIGKILL and the slice's
-/// `oom_kill` count rose during its life: `before` read at its
-/// registration, `after` now. Under `OOMPolicy=continue` systemd records an
-/// OOM kill of the main process as `signal 9` (`Result=signal`). Outside a
-/// window that SIGKILL is the one the hooks cannot refuse. Otherwise
-/// `cause` is returned as it is.
-pub fn with_oom_killer(cause: &str, before: Option<u64>, after: Option<u64>) -> String {
-    let sigkill = cause == "signal 9" || cause.starts_with("signal 9 ");
+/// The lab round 5 of #582: the vacancy's `cause` with the units' slice's
+/// OOM kill count noted. It applies when the agent died of SIGKILL — the
+/// wait's `signal 9`, or systemd's `Result=signal` one (under
+/// `OOMPolicy=continue` systemd records an OOM kill of the main process
+/// so) — and the slice's `oom_kill` count rose during its life: `before`
+/// read at its registration, `after` now. Re-check 7 of #582 (G2): that
+/// count is the slice's, hierarchical — the workers (the OOM killer's
+/// first pick) and the watchdog's own children count in it — so it never
+/// says the agent was the OOM killer's victim: a `cgroup.kill` of the
+/// agent after a worker's OOM kill raises it too. The row says the cause
+/// is not known and notes the count. systemd's own SIGKILL
+/// (`Result=timeout`, `watchdog`) and every other cause are returned as
+/// they are.
+pub fn with_slice_oom_count(cause: &str, before: Option<u64>, after: Option<u64>) -> String {
+    let sigkill = cause == "signal 9" || cause == "signal 9 (systemd Result=signal)";
     match (before, after) {
         (Some(b), Some(a)) if sigkill && a > b => format!(
-            "{cause}, the kernel's OOM killer's (northnarrow.slice's oom_kill count rose from {b} \
-             to {a} during its life)"
+            "{cause}, cause not known: an OOM kill was counted in northnarrow.slice during its \
+             life (oom_kill from {b} to {a}), of the agent or of another process of the units, \
+             such as a worker"
         ),
         _ => cause.to_string(),
     }
@@ -668,12 +681,29 @@ pub fn vacancy_kind(
 
 /// The re-check of #582 (N8): the exit `cause` ([`cause_from_show`],
 /// [`cause_from_wait`]) is a clean stop — exit status 0 (the agent's
-/// answer to `SIGTERM`) or the `SIGTERM` itself.
+/// answer to `SIGTERM`) or the `SIGTERM` itself — or (re-check 7 of #582,
+/// G1) the stop cut at its deadline ([`stop_cut`]). It counts only inside
+/// a signed window ([`vacancy_kind`], [`found_vacant`]): outside one every
+/// exit is the vacancy.
 pub fn clean_stop(cause: &str) -> bool {
-    ["exit status 0", "signal 15"]
-        .iter()
-        .any(|c| cause == *c || cause.starts_with(&format!("{c} ")))
+    stop_cut(cause)
+        || ["exit status 0", "signal 15"]
+            .iter()
+            .any(|c| cause == *c || cause.starts_with(&format!("{c} ")))
 }
+
+/// Re-check 7 of #582 (G1): the exit `cause` is the agent's stop cut at
+/// its deadline — exit status 75, lot 288's `stop_deadline` (the agent
+/// signs it). It is the agent's own exit after its event loop ended, as
+/// exit status 0 is: on a loaded host the operator's stop or restart in a
+/// window can overrun its 2 s (the workers' stop alone waits up to 2 s).
+pub fn stop_cut(cause: &str) -> bool {
+    cause == STOP_CUT || cause.starts_with(&format!("{STOP_CUT} "))
+}
+
+/// Lot 288's exit of a stop cut at its deadline (sysexits' `EX_TEMPFAIL`),
+/// as [`cause_from_show`] and [`cause_from_wait`] write it.
+pub const STOP_CUT: &str = "exit status 75";
 
 /// The re-check of #582 (the mini-hunt of N8): systemd's record of unit
 /// `unit`'s last exit ([`cause_from_show`]); `None` when it has none (or
@@ -747,12 +777,17 @@ pub fn vacancy_detail(
         }
     };
     let window = match (in_window, clean) {
+        (true, true) if stop_cut(cause) => {
+            "; inside a signed trusted-installer window (the operator's restart or stop, cut at \
+             its deadline: the agent's stop_deadline)"
+        }
         (true, true) => {
             "; inside a signed trusted-installer window (the operator's restart or stop)"
         }
         (true, false) => {
-            "; inside a signed trusted-installer window, but not a clean stop (exit status 0 or \
-             SIGTERM): not taken as the operator's"
+            "; inside a signed trusted-installer window, but not a clean stop (exit status 0, \
+             SIGTERM, or exit status 75, the stop cut at its deadline): not taken as the \
+             operator's"
         }
         (false, _) => "",
     };
@@ -873,21 +908,23 @@ mod tests {
     /// The lab round 5 of #582: under `OOMPolicy=continue` systemd records
     /// the agent's OOM kill as its exit, `signal 9` (measured on systemd 249
     /// and 259: `Result=signal`, `ExecMainCode=2`, `ExecMainStatus=9`). The
-    /// vacancy names the kernel's OOM killer when the units' slice counted
-    /// an OOM kill during the agent's life; never for another cause, nor
-    /// without the count.
+    /// vacancy notes the units' slice's OOM kill count when it rose during
+    /// the agent's life; never for another cause, nor without the count.
+    /// Re-check 7 of #582 (G2): the note no longer names the OOM killer as
+    /// the agent's ([`with_slice_oom_count`]; the count is the slice's).
     #[test]
-    fn an_oom_kill_recorded_as_signal_9_is_named_the_oom_killer_s() {
+    fn an_oom_kill_recorded_as_signal_9_notes_the_slice_s_count() {
         let recorded = exit_from_show(&show("failed", 7, "signal", 2, 9), 7).unwrap();
         assert_eq!(recorded, "signal 9 (systemd Result=signal)");
-        let c = with_oom_killer(&recorded, Some(3), Some(4));
+        let c = with_slice_oom_count(&recorded, Some(3), Some(4));
         assert!(
-            c.starts_with("signal 9 (systemd Result=signal), the kernel's OOM killer's")
-                && c.contains("from 3 to 4"),
+            c.starts_with("signal 9 (systemd Result=signal), cause not known: an OOM kill was")
+                && c.contains("from 3 to 4")
+                && !c.contains("OOM killer"),
             "{c}"
         );
         // the exec backend's wait
-        assert!(with_oom_killer("signal 9", Some(0), Some(1)).contains("OOM killer"));
+        assert!(with_slice_oom_count("signal 9", Some(0), Some(1)).contains("cause not known"));
         // no kill counted during its life, or a count not read: as recorded
         for (b, a) in [
             (Some(4), Some(4)),
@@ -895,7 +932,11 @@ mod tests {
             (Some(3), None),
             (Some(5), Some(4)),
         ] {
-            assert_eq!(with_oom_killer(&recorded, b, a), recorded, "{b:?} {a:?}");
+            assert_eq!(
+                with_slice_oom_count(&recorded, b, a),
+                recorded,
+                "{b:?} {a:?}"
+            );
         }
         // another cause is never the OOM killer's, whatever the count
         for cause in [
@@ -905,7 +946,7 @@ mod tests {
             "exit status 9 (systemd Result=exit-code)",
             "not known (systemd had not recorded the exit of pid 7 within 3 s)",
         ] {
-            assert_eq!(with_oom_killer(cause, Some(0), Some(1)), cause);
+            assert_eq!(with_slice_oom_count(cause, Some(0), Some(1)), cause);
         }
         // the clean-stop rule is not changed by the naming
         assert!(!clean_stop(&c));
@@ -1060,6 +1101,111 @@ mod tests {
             vacancy_kind(&crate::ShutdownVerdict::Absent, false, true),
             KIND_VACATED
         );
+    }
+
+    /// Re-check 7 of #582 (G1): the operator's stop inside a signed window
+    /// whose stop is cut at its deadline (lot 288: exit status 75, the
+    /// agent signs `stop_deadline`) is the operator's stop — a note, whose
+    /// row names the cut. Outside a window nothing changes: still the High
+    /// vacancy, its row as before. Only exit status 75 itself.
+    #[test]
+    fn a_stop_cut_at_its_deadline_inside_a_window_is_the_operator_s() {
+        use antitamper_bpf::{ROLE_MARK_IN_WINDOW as W, ROLE_MARK_VACATED as M};
+        use nn_proto::witness::{
+            KIND_FOUND_VACANT, KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_VACATED,
+        };
+        let absent = crate::ShutdownVerdict::Absent;
+        for c in [
+            "exit status 75 (systemd Result=exit-code)",
+            "exit status 75",
+        ] {
+            assert!(clean_stop(c), "{c}");
+            assert_eq!(
+                vacancy_kind(&absent, true, clean_stop(c)),
+                KIND_RELEASED_IN_WINDOW,
+                "{c}"
+            );
+            let d = vacancy_detail(41, c, &absent, true);
+            assert!(
+                d.contains("the operator's restart or stop, cut at its deadline")
+                    && d.contains("stop_deadline")
+                    && !d.contains("not taken as the operator's"),
+                "{d}"
+            );
+            // outside a window: the High vacancy, its row as before
+            assert_eq!(vacancy_kind(&absent, false, clean_stop(c)), KIND_VACATED);
+            assert_eq!(
+                vacancy_detail(41, c, &absent, false),
+                format!("the agent (pid 41) exited, its role vacated: {c}; no shutdown marker")
+            );
+            assert_eq!(
+                vacancy_kind(&crate::ShutdownVerdict::Authorised, true, clean_stop(c)),
+                KIND_RELEASED
+            );
+            // found at the watchdog's start: the kernel's window mark decides
+            assert_eq!(
+                found_vacant(Some(M | W), clean_stop(c)).0,
+                KIND_RELEASED_IN_WINDOW
+            );
+            assert_eq!(found_vacant(Some(M), clean_stop(c)).0, KIND_FOUND_VACANT);
+        }
+        // the clean stops are still named as such, not as a cut
+        let d = vacancy_detail(41, "exit status 0", &absent, true);
+        assert!(!d.contains("cut at its deadline"), "{d}");
+        // no other status near it
+        for c in [
+            "exit status 7",
+            "exit status 750",
+            "exit status 075",
+            "exit status 76 (systemd Result=exit-code)",
+            "signal 75",
+            "exit code 75, status 0",
+        ] {
+            assert!(!clean_stop(c), "{c}");
+            assert_eq!(vacancy_kind(&absent, true, clean_stop(c)), KIND_VACATED);
+        }
+    }
+
+    /// Re-check 7 of #582 (G2): the slice's `oom_kill` count also counts
+    /// the workers (the OOM killer's first pick) and the watchdog's own
+    /// children, so a SIGKILL of the agent after a worker's OOM kill (a
+    /// `cgroup.kill`) is not the OOM killer's. The vacancy keeps the cause
+    /// as recorded, says its sender is not known and notes the count —
+    /// never naming the OOM killer as the agent's. Only the wait's
+    /// `signal 9` and systemd's `Result=signal` one: systemd's own SIGKILL
+    /// (`Result=timeout`, `watchdog`) is left as recorded.
+    #[test]
+    fn a_slice_oom_count_never_names_the_oom_killer_as_the_agent_s() {
+        let recorded = exit_from_show(&show("failed", 7, "signal", 2, 9), 7).unwrap();
+        for cause in [recorded.as_str(), "signal 9"] {
+            let c = with_slice_oom_count(cause, Some(3), Some(4));
+            assert!(
+                c.starts_with(&format!(
+                    "{cause}, cause not known: an OOM kill was counted"
+                )) && c.contains("northnarrow.slice")
+                    && c.contains("from 3 to 4")
+                    && c.contains("such as a worker"),
+                "{c}"
+            );
+            assert!(!c.contains("OOM killer"), "{c}");
+            assert!(!clean_stop(&c));
+        }
+        // the mini-hunt: systemd's `oom-kill` is the unit's, said so
+        let u = exit_from_show(&show("failed", 7, "oom-kill", 2, 9), 7).unwrap();
+        assert!(
+            u.contains("of the agent or of another process of the unit, such as a worker")
+                && u.ends_with("; signal 9)"),
+            "{u}"
+        );
+        assert_eq!(with_slice_oom_count(&u, Some(0), Some(1)), u);
+        for cause in [
+            "signal 9 (systemd Result=timeout)",
+            "signal 9 (systemd Result=watchdog)",
+            "signal 9 (systemd Result=core-dump)",
+            "signal 9, core dumped",
+        ] {
+            assert_eq!(with_slice_oom_count(cause, Some(0), Some(1)), cause);
+        }
     }
 
     /// The re-check of #582 (N4): a given successor whose libraries'

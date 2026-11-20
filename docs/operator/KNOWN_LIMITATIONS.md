@@ -395,8 +395,10 @@ not cause as an incident.
   whom (lot 374):
   - The agent's vacancy and its successor are signed by the watchdog, the
     surviving role, in a witness chain of its own: the vacancy with its
-    cause as systemd records it (the OOM killer, a signal, an exit status;
-    "not known" when systemd has not recorded it in time), then the
+    cause as systemd records it (an OOM kill in its unit, a signal, an
+    exit status; "not known" when systemd has not recorded it in time;
+    after a SIGKILL, the slice's OOM kill count when it rose, the cause
+    then not known: the count is the slice's, the workers' too), then the
     process that took the role — its parent, its cgroup, and whether its
     environment or its executable mappings hold anything the release does
     not start with. The watchdog's key lives in its memory for its life;
@@ -421,13 +423,16 @@ not cause as an incident.
     nothing is held, and the host as the operator leaves it there becomes
     the reference (`respawn_gate_reference_moved`, signed): a later start
     in the same watchdog life is judged against it. A change made outside
-    a window stays the reference's difference for that watchdog's life,
-    until an operator starts the agent or the host is as it was. A
+    a window stays the reference's difference until an operator starts the
+    agent, the host is as it was, or the next signed window opens: any
+    window, even one granted for something else, takes the host as it then
+    is as the reference (open). A
     successor that started before that judgement, outside a window, is
     recorded as the role taken by a start the watchdog did not make
     (`role_taken_by_another_start`, High), after that start.
   - A clean stop inside a signed trusted-installer window (the operator's
-    restart or stop) is a note (`role_released_in_window`), as is a
+    restart or stop, also when cut at its deadline: exit status 75,
+    `stop_deadline`) is a note (`role_released_in_window`), as is a
     shutdown the admin quorum signed (`role_released`); another exit inside
     a window stays `role_vacated`.
   - The watchdog's vacancy and its successor are signed by the live agent

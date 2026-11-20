@@ -916,8 +916,11 @@ respawns. Under systemd's default (`stop`), that kill made systemd stop the
 whole unit, a stop the task_kill hook refuses outside a window. The unit was
 left `failed` with the agent still running and no main PID, and every start
 failed with `Result=resources`. An OOM kill of the agent itself is recorded
-as its exit (`signal 9`). The watchdog's vacancy row names the OOM killer
-when `northnarrow.slice`'s `oom_kill` count rose during the agent's life. A
+as its exit (`signal 9`). When the agent died of SIGKILL and
+`northnarrow.slice`'s `oom_kill` count rose during its life, the watchdog's
+vacancy row notes the count and says the cause is not known: the count is
+the slice's, so it counts the workers too, and a SIGKILL after a worker's
+OOM kill (a write to `cgroup.kill`) is not the OOM killer's. A
 drop-in that sets `OOMPolicy=stop` or `kill` for every service is judged
 harmful (`unit_dropin_harmful`).
 

@@ -5062,9 +5062,10 @@ signs it, and the successor must be its unit's own restart.
   signs the gap (`roles_vacated_gap`, High) — or a note (`roles_released`)
   when the operator released both: both last exits inside a signed window
   (the guide's maintenance stop), or a shutdown the admin quorum signed
-  this boot. Inside a window only a clean stop (exit status 0 or SIGTERM)
-  is the operator's: an OOM kill or a crash during an upgrade's window
-  stays `role_vacated`.
+  this boot. Inside a window only a clean stop (exit status 0 or SIGTERM,
+  or that stop cut at its deadline: exit status 75, the agent signs
+  `stop_deadline`) is the operator's: an OOM kill or a crash during an
+  upgrade's window stays `role_vacated`.
 - **Bound to its unit.** The kernel gives a vacated role's rights (its
   handles on the agent's maps) only to a child of PID 1 running in that
   role's own unit cgroup under `northnarrow.slice`, with clean lot 277/281
@@ -5168,9 +5169,12 @@ signs it, and the successor must be its unit's own restart.
     start failed with `Result=resources` until the agent exited. The
     agent's own OOM kill is now recorded as its exit (`signal 9`,
     `Result=signal`; before, systemd failed the unit before it reaped the
-    agent and the vacancy's cause read "not known"). The watchdog names
-    the kernel's OOM killer when the slice's `oom_kill` count
-    (`northnarrow.slice/memory.events`) rose during the agent's life.
+    agent and the vacancy's cause read "not known"). When the agent died
+    of SIGKILL and the slice's `oom_kill` count
+    (`northnarrow.slice/memory.events`) rose during its life, the
+    watchdog notes the count and says the cause is not known: the count
+    also counts the workers, so it never names the OOM killer as the
+    agent's (re-check 7).
   - A host drop-in that sets `OOMPolicy=stop` (or `kill`) for every
     service, or for our units, is judged harmful (`unit_dropin_harmful`,
     the `host_dropins` degradation). Remove it before a window's
