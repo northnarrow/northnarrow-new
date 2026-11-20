@@ -467,7 +467,6 @@ async fn run(
         exempt,
         open_sensor_extras,
         posture,
-        watchdog_audit,
         stale_combat,
     } = posture::machine(
         &cli,
@@ -478,12 +477,12 @@ async fn run(
         &ransom_tracker,
         &defense_detector,
         &rule_policy,
+        &audit_log,
     );
     let evidence::Wired { telemetry_probe } = evidence::wire(
         &cli,
         &sensor,
         &audit_log,
-        &watchdog_audit,
         &overlay_gate,
         &executor,
         &chain_anchor,
@@ -1100,6 +1099,66 @@ mod tests {
         assert_eq!(sources.matches("BootSequence::begin()").count(), 1);
         assert!(function(PHASES[1].1, PHASES[1].2).contains("BootSequence::begin()?"));
         assert!(!sources.contains("BootSequence::for_tests"));
+    }
+
+    /// Lot 374, fix round 5 of #582 (its KVM suites): the watchdog refresh
+    /// has the signed audit log from its spawn (the posture phase, after the
+    /// attest phase opened it), never from a slot bound later. Its first
+    /// round, at the agent's start, judges the watchdog this start finds (the
+    /// re-check 3, R2-1); bound by `evidence::wire` a few ms after that
+    /// round, the verdict on a watchdog not its unit's restart was only
+    /// logged — never signed, and never again (signed once per pid).
+    #[test]
+    fn the_watchdog_refresh_signs_from_its_first_round() {
+        let source_of = |call: &str| PHASES.iter().find(|p| p.0 == call).unwrap().1;
+        let main = start_in_order();
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("the start: `{needle}` not found"))
+        };
+        assert!(
+            at("spawn_watchdog_exempt_refresh(") > at("boot.enter(BootPhase::Subsystems)"),
+            "the refresh spawned once the audit log is open"
+        );
+        let run = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "async fn run(",
+        );
+        let call = &run[run.find("posture::machine(").expect("posture::machine")..];
+        assert!(
+            call[..call.find(");").expect("the call's end")].contains("&audit_log,"),
+            "posture::machine is handed the audit log"
+        );
+        let machine = function(source_of("posture::machine("), "pub(crate) fn machine(");
+        assert!(
+            machine.contains("let watchdog_audit: WatchdogAudit = audit_log.clone();"),
+            "and gives it to the refresh"
+        );
+        let spawn = &machine[machine
+            .find("spawn_watchdog_exempt_refresh(")
+            .expect("the refresh spawned")..];
+        assert!(spawn[..spawn.find(");").expect("the spawn's end")].contains("watchdog_audit,"));
+        let tasks = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/tasks.rs"));
+        let refresh = function(tasks, "pub(crate) fn spawn_watchdog_exempt_refresh(");
+        assert!(
+            refresh.contains("    audit: WatchdogAudit,\n"),
+            "the refresh takes the log itself"
+        );
+        assert!(tasks.contains(
+            "pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;"
+        ));
+        for (name, src) in [
+            (
+                "mod.rs",
+                include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            ),
+            ("tasks.rs", tasks),
+            ("posture.rs", source_of("posture::machine(")),
+            ("evidence.rs", source_of("evidence::wire(")),
+        ] {
+            let late = ["OnceLock<", "WatchdogAudit>"].concat();
+            assert!(!src.contains(&late), "{name}: the refresh's log bound late");
+        }
     }
 
     /// The review of #468, R4 (the ratchet): the start decides its signing

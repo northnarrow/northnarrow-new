@@ -215,6 +215,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `watchdog_successor_foreign` to the agent, its key never certified, its
     rows `witness_row_uncertified`. Test
     `enforce_mode_tests_read_maps_read_only_and_match_whole_kinds`.
+  - **The agent's start signs its verdict on the watchdog it finds** (fix
+    round 5, from the same KVM suites): the watchdog refresh got the signed
+    audit log a few milliseconds after its first round, which at the
+    agent's start judges the watchdog it finds — a watchdog not its unit's
+    restart found there was only logged (`watchdog_successor_foreign`),
+    never signed, and not again (once per pid). The refresh now has the log
+    from its spawn, after the attest phase opened it. Test
+    `the_watchdog_refresh_signs_from_its_first_round`; the privileged
+    `the_watchdog_signs_the_agent_s_vacancy_and_its_successor` asserts the
+    signed verdict.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep

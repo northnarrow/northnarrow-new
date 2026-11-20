@@ -364,7 +364,13 @@ pub(crate) fn spawn_program_images_refresh() {
     });
 }
 
-/// The signed audit log, as the watchdog refresh gets it once it is open.
+/// The signed audit log the watchdog refresh signs to. Fix round 5 of #582
+/// (its KVM suites): handed to the task at its spawn — the audit log is open
+/// by then (the attest phase) — never bound later: the first round, at the
+/// agent's start, judges the watchdog it finds (the re-check 3, R2-1), and
+/// bound later (`evidence::wire`, a few ms after that round) its verdict on
+/// a watchdog not its unit's restart was only logged, never signed, and
+/// never again (signed once per pid).
 pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 
 /// The re-check of #567 (N1): one refresh of the mount guard's maps at a
@@ -385,7 +391,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
     exempt: ExemptPids,
     pidfile: PathBuf,
     expected_exe: PathBuf,
-    audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
+    audit: WatchdogAudit,
     mount_refresh: MountGuardRefresh,
     witness_dir: PathBuf,
 ) {
@@ -493,7 +499,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                 // Lab PR 216: a watchdog gone is signed, once per pid.
                 if !runs_watchdog_binary(prev, &expected_exe) {
                     let f = northnarrow_agent::self_integrity::watchdog_gone(prev, &resolution);
-                    let log = audit.get().and_then(|l| l.as_ref());
+                    let log = audit.as_ref();
                     northnarrow_agent::self_integrity::report_event(log, &f);
                     succession_pending = true;
                 }
@@ -553,7 +559,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         )
                     },
                 );
-                let log = audit.get().and_then(|l| l.as_ref());
+                let log = audit.as_ref();
                 match step {
                     nn_linux::witness::SuccessorStep::NotJudged => {}
                     nn_linux::witness::SuccessorStep::Foreign(v) => {
@@ -640,7 +646,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                                 "anti-tamper mount guard: the watchdog's mount namespace is \
                                  judged as PID 1's"
                             );
-                            let log = audit.get().and_then(|l| l.as_ref());
+                            let log = audit.as_ref();
                             for f in g.not_canonical {
                                 northnarrow_agent::self_integrity::report_event(
                                     log,
@@ -762,7 +768,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // witness rows imported into the signed audit chain — only while the
         // audit log is open (a row is never passed over unsigned).
         let mut witness_round = |verified: Option<u32>| {
-            let Some(log) = audit.get().and_then(|l| l.as_ref()) else {
+            let Some(log) = audit.as_ref() else {
                 return;
             };
             if !gap_judged {

@@ -20,7 +20,6 @@ use tracing::{error, info, warn};
 use super::cli::Cli;
 use super::posture::audit_combat_reconcile;
 use super::refusal::{self, Refusal};
-use super::tasks::WatchdogAudit;
 
 /// The signed audit log, once [`attest`] opened it (`None`: the boot
 /// runs unaudited, as the attest phase allowed).
@@ -411,7 +410,6 @@ pub(crate) fn wire(
     cli: &Cli,
     sensor: &SensorMultiplexer,
     audit_log: &AuditHandle,
-    watchdog_audit: &std::sync::OnceLock<WatchdogAudit>,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     executor: &Executor,
     chain_anchor: &AnchorHandle,
@@ -426,8 +424,8 @@ pub(crate) fn wire(
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     sensor.bpf_guard().spawn_link_self_check(audit_log.clone());
-    // Lab PR 216: and the watchdog refresh, to sign a watchdog that is gone.
-    let _ = watchdog_audit.set(audit_log.clone());
+    // Lab PR 216: the watchdog refresh has the log from its spawn
+    // (`posture::machine`, fix round 5 of #582), not from here.
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
     // root that are not the agent's links, one signed `integrity_drift` each.
     sensor.bpf_guard().attest_foreign_pins(audit_log.as_ref());
