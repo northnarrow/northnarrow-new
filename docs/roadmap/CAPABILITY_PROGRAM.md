@@ -11779,6 +11779,13 @@ number in parentheses is a lab PR.
     log from its spawn; bound a few ms after its first round, a foreign
     watchdog found at the start was only logged, never signed (both CI
     guests). Ratchet `the_watchdog_refresh_signs_from_its_first_round`.
+  - The lab r5, fix round 6 (product): `OOMPolicy=continue` in both units.
+    A worker's OOM kill (the kernel's first pick) made systemd stop the
+    agent's unit, a stop the hook refused, and the unit was left failed
+    with the agent running and no start possible. The agent's own OOM kill
+    is now recorded (`signal 9`), and the vacancy names the OOM killer from
+    the slice's `oom_kill` count. A drop-in that sets `OOMPolicy=stop` is
+    judged harmful.
   - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a

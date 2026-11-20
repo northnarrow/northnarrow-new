@@ -225,6 +225,22 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `the_watchdog_refresh_signs_from_its_first_round`; the privileged
     `the_watchdog_signs_the_agent_s_vacancy_and_its_successor` asserts the
     signed verdict.
+  - **A worker's OOM kill no longer strands the agent's unit** (fix round
+    6, from the lab on 5.15 and 7.0). Both units now set
+    `OOMPolicy=continue`. The kernel's OOM killer takes an agent worker
+    first (`oom_score_adj` 1000). Under systemd's default (`stop`) that kill
+    made systemd stop the whole unit. The task_kill hook refused the stop,
+    so the unit was left `failed` with the agent still running and no main
+    PID, and every later start failed (`resources`). systemd also failed
+    the unit before it reaped an OOM-killed agent, so the watchdog signed
+    the vacancy's cause as "not known". Now the agent's OOM kill is recorded
+    as its exit (`signal 9`). The watchdog names the kernel's OOM killer
+    from the `oom_kill` count of `northnarrow.slice`, read at the agent's
+    registration and at its exit. A drop-in that sets `OOMPolicy=stop` is
+    judged harmful, like `kill`. Tests
+    `an_oom_kill_of_one_process_leaves_both_units_running`,
+    `an_oom_kill_recorded_as_signal_9_is_named_the_oom_killer_s` and
+    `an_oom_policy_that_stops_or_kills_our_units_is_harmful`.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep
