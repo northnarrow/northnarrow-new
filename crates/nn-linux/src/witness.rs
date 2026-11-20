@@ -253,11 +253,11 @@ impl WitnessReader {
         let text = String::from_utf8_lossy(&b).into_owned();
         let last = nn_proto::witness::judge_chain(&text)
             .into_iter()
-            .filter_map(|j| match j {
+            .rev()
+            .find_map(|j| match j {
                 nn_proto::witness::Judged::Valid { row, .. } => Some(row),
                 nn_proto::witness::Judged::Broken { .. } => None,
-            })
-            .last();
+            });
         last.is_some_and(|row| row.kind == KIND_RELEASED && self.position().certified(&row.key))
     }
 
@@ -393,9 +393,7 @@ pub fn roles_gap(r: &RolesAtStart, signed_stop: bool) -> Option<Finding> {
     Some(match why {
         Some(why) => Finding {
             kind: ROLES_RELEASED,
-            detail: format!(
-                "the agent's start found both roles released this boot: {why}"
-            ),
+            detail: format!("the agent's start found both roles released this boot: {why}"),
         },
         None => Finding {
             kind: ROLES_VACATED_GAP,
@@ -469,7 +467,8 @@ mod tests {
         let v = judge_watchdog_successor(9, &unit(), Some(false), &Findings::default());
         assert!(!v.given);
         assert!(
-            v.detail.contains("holds the role the kernel gave it and registers itself")
+            v.detail
+                .contains("holds the role the kernel gave it and registers itself")
                 && v.detail.contains("the agent does not register it"),
             "{}",
             v.detail
@@ -477,7 +476,11 @@ mod tests {
         assert!(!v.detail.to_lowercase().contains("refus"), "{}", v.detail);
         assert_eq!(WATCHDOG_SUCCESSOR_FOREIGN, "watchdog_successor_foreign");
         let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
-        assert!(v.given && !v.detail.contains("holds the role"), "{}", v.detail);
+        assert!(
+            v.given && !v.detail.contains("holds the role"),
+            "{}",
+            v.detail
+        );
     }
 
     /// Lot 374: the watchdog's record of a vacancy, or of a successor that
@@ -540,8 +543,14 @@ mod tests {
         let gap = roles_gap(&at_start(V, V, (out, out)), false);
         assert_eq!(gap.map(|f| f.kind), Some(ROLES_VACATED_GAP));
         for (a, w) in [(V, 0), (0, V), (V, 42), (42, V), (0, 0)] {
-            assert!(roles_gap(&at_start(a, w, (out, out)), false).is_none(), "{a} {w}");
-            assert!(roles_gap(&at_start(a, w, (out, out)), true).is_none(), "{a} {w}");
+            assert!(
+                roles_gap(&at_start(a, w, (out, out)), false).is_none(),
+                "{a} {w}"
+            );
+            assert!(
+                roles_gap(&at_start(a, w, (out, out)), true).is_none(),
+                "{a} {w}"
+            );
         }
     }
 
@@ -557,7 +566,11 @@ mod tests {
         let win = Some(M | W);
         let f = roles_gap(&at_start(V, V, (win, win)), false).unwrap();
         assert_eq!(f.kind, ROLES_RELEASED);
-        assert!(f.detail.contains("signed trusted-installer window"), "{}", f.detail);
+        assert!(
+            f.detail.contains("signed trusted-installer window"),
+            "{}",
+            f.detail
+        );
         assert!(is_note(f.kind));
         let f = roles_gap(&at_start(V, V, (Some(M), Some(M))), true).unwrap();
         assert_eq!(f.kind, ROLES_RELEASED);

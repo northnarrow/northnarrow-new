@@ -240,7 +240,11 @@ pub fn judge(base: &Baseline, preload: &Preload, harms: &[Harm]) -> Verdict {
     } else {
         format!(
             "the host before the start: {}",
-            held.iter().chain(seen.iter()).cloned().collect::<Vec<_>>().join("; ")
+            held.iter()
+                .chain(seen.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         )
     };
     Verdict {
@@ -303,13 +307,20 @@ mod tests {
         let none = Baseline::of(Preload::Absent, &[]);
         let v = judge(&none, &names(b"/tmp/x.so\n"), &[]);
         let why = v.hold.expect("held");
-        assert!(why.contains("written or changed since the watchdog's start"), "{why}");
+        assert!(
+            why.contains("written or changed since the watchdog's start"),
+            "{why}"
+        );
         let base = Baseline::of(vendor.clone(), &[]);
         let v = judge(&base, &vendor, &[]);
         assert_eq!(v.hold, None, "{}", v.detail);
         assert!(v.detail.contains("recorded, not held"), "{}", v.detail);
         // the vendor's list changed during the vacancy
-        let v = judge(&base, &names(b"/opt/vendor/lib/libhook.so /tmp/x.so\n"), &[]);
+        let v = judge(
+            &base,
+            &names(b"/opt/vendor/lib/libhook.so /tmp/x.so\n"),
+            &[],
+        );
         assert!(v.hold.is_some(), "{}", v.detail);
         for p in [Preload::Absent, names(b" \n\t")] {
             let v = judge(&none, &p, &[]);
@@ -347,12 +358,20 @@ mod tests {
             "A=1",
             Kind::BreaksAgent,
         );
-        let unread = harm("/run/systemd/system/service.d/z.conf", "", "", Kind::Harmful);
+        let unread = harm(
+            "/run/systemd/system/service.d/z.conf",
+            "",
+            "",
+            Kind::Harmful,
+        );
         let base = Baseline::of(Preload::Absent, &[]);
         for h in [&env, &unread] {
             let v = judge(&base, &Preload::Absent, std::slice::from_ref(h));
             let why = v.hold.unwrap_or_else(|| panic!("{h:?} not held"));
-            assert!(why.contains("a drop-in new since the watchdog's start"), "{why}");
+            assert!(
+                why.contains("a drop-in new since the watchdog's start"),
+                "{why}"
+            );
         }
         for h in [&limit, &warn] {
             let v = judge(&base, &Preload::Absent, std::slice::from_ref(h));
@@ -362,12 +381,23 @@ mod tests {
         assert_eq!(base.harms.len(), 1);
         let v = judge(&base, &Preload::Absent, std::slice::from_ref(&env));
         assert_eq!(v.hold, None, "{}", v.detail);
-        assert!(v.detail.contains("as at the watchdog's start"), "{}", v.detail);
+        assert!(
+            v.detail.contains("as at the watchdog's start"),
+            "{}",
+            v.detail
+        );
         // the same file, another value: new
-        let other = harm(&env.path.display().to_string(), "UnsetEnvironment", "", Kind::Harmful);
-        assert!(judge(&base, &Preload::Absent, &[other.clone(), unread.clone()])
-            .hold
-            .is_some());
+        let other = harm(
+            &env.path.display().to_string(),
+            "UnsetEnvironment",
+            "",
+            Kind::Harmful,
+        );
+        assert!(
+            judge(&base, &Preload::Absent, &[other.clone(), unread.clone()])
+                .hold
+                .is_some()
+        );
         let changed = Harm {
             value: "x".into(),
             ..other

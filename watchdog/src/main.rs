@@ -711,9 +711,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     if let Some(w) = witness.as_mut() {
                         w.record_or_log(
                             nn_proto::witness::KIND_RESPAWN_HELD,
-                            &format!(
-                                "the start of the agent after pid {agent_pid} held: {why}"
-                            ),
+                            &format!("the start of the agent after pid {agent_pid} held: {why}"),
                         );
                     }
                     let held = Hold {

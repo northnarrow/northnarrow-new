@@ -589,11 +589,14 @@ mod tests {
     ) -> impl Fn(&str) -> Option<FileFacts> {
         move |p: &str| {
             let real = links.iter().find(|(l, _)| *l == p).map_or(p, |(_, t)| *t);
-            files.iter().find(|(f, _)| *f == real).map(|(_, ino)| FileFacts {
-                ino: *ino,
-                uid: 0,
-                mode: 0o100755,
-            })
+            files
+                .iter()
+                .find(|(f, _)| *f == real)
+                .map(|(_, ino)| FileFacts {
+                    ino: *ino,
+                    uid: 0,
+                    mode: 0o100755,
+                })
         }
     }
 
@@ -621,17 +624,32 @@ mod tests {
             ("/usr/lib64/ld-linux-x86-64.so.2", 13),
         ];
         const LINKS: &[(&str, &str)] = &[
-            ("/usr/lib64/libgcc_s.so.1", "/usr/lib64/libgcc_s-11-20231218.so.1"),
+            (
+                "/usr/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+            ),
             // merged /usr: /lib64 is a link to usr/lib64
-            ("/lib64/libgcc_s.so.1", "/usr/lib64/libgcc_s-11-20231218.so.1"),
+            (
+                "/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+            ),
         ];
         let facts = host(FILES, LINKS);
         for libs in [Libs::Start, Libs::Running] {
             let f = foreign_mappings(&maps_of(FILES), EXE, libs, &facts);
-            assert!(f.is_empty(), "a genuine AlmaLinux 9 start is refused: {f:?}");
+            assert!(
+                f.is_empty(),
+                "a genuine AlmaLinux 9 start is refused: {f:?}"
+            );
         }
         assert_eq!(
-            alias_of("/usr/lib64/libgcc_s-11-20231218.so.1", 12, Libs::Start, &facts).as_deref(),
+            alias_of(
+                "/usr/lib64/libgcc_s-11-20231218.so.1",
+                12,
+                Libs::Start,
+                &facts
+            )
+            .as_deref(),
             Some("libgcc_s.so.1")
         );
     }
@@ -671,12 +689,24 @@ mod tests {
             ("/lib/x86_64-linux-gnu/ld-2.31.so", 13),
         ];
         const FEDORA_LINKS: &[(&str, &str)] = &[
-            ("/usr/lib64/libgcc_s.so.1", "/usr/lib64/libgcc_s-14-20250110.so.1"),
-            ("/usr/lib/libgcc_s.so.1", "/usr/lib/libgcc_s-14-20250110.so.1"),
+            (
+                "/usr/lib64/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-14-20250110.so.1",
+            ),
+            (
+                "/usr/lib/libgcc_s.so.1",
+                "/usr/lib/libgcc_s-14-20250110.so.1",
+            ),
         ];
         const OLD_LINKS: &[(&str, &str)] = &[
-            ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc-2.31.so"),
-            ("/lib/x86_64-linux-gnu/libm.so.6", "/lib/x86_64-linux-gnu/libm-2.31.so"),
+            (
+                "/lib/x86_64-linux-gnu/libc.so.6",
+                "/lib/x86_64-linux-gnu/libc-2.31.so",
+            ),
+            (
+                "/lib/x86_64-linux-gnu/libm.so.6",
+                "/lib/x86_64-linux-gnu/libm-2.31.so",
+            ),
             (
                 "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
                 "/lib/x86_64-linux-gnu/ld-2.31.so",
@@ -711,8 +741,10 @@ mod tests {
             ("/usr/lib64/libz.so.1", 32),
             ("/usr/lib64/sub/libgcc_s-11-20231218.so.1", 33),
         ];
-        const LINKS: &[(&str, &str)] =
-            &[("/usr/lib64/libgcc_s.so.1", "/usr/lib64/libgcc_s-11-20231218.so.1")];
+        const LINKS: &[(&str, &str)] = &[(
+            "/usr/lib64/libgcc_s.so.1",
+            "/usr/lib64/libgcc_s-11-20231218.so.1",
+        )];
         let facts = host(FILES, LINKS);
         for (path, ino) in [
             ("/usr/lib64/libgcc_s-11-evil.so.1", 30),

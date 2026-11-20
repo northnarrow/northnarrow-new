@@ -1157,7 +1157,10 @@ mod tests {
             "MemoryDenyWriteExecute=false",
             "MemoryDenyWriteExecute=",
         ] {
-            assert!(svc(kv).contains("MemoryDenyWriteExecute= turned off"), "{kv}");
+            assert!(
+                svc(kv).contains("MemoryDenyWriteExecute= turned off"),
+                "{kv}"
+            );
         }
         assert!(h(Reach::Agent, "MemoryDenyWriteExecute=yes").is_none());
         assert!(svc("ConditionPathExists=/nonexistent-nn-lab").contains("fails"));

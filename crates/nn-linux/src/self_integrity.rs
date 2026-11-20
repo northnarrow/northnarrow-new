@@ -3366,7 +3366,11 @@ mod tests {
             f[4].detail
         );
         // lot 374: both High
-        for kind in [WATCHDOG_START_REFUSED, WITNESS_UNAVAILABLE, WATCHDOG_RESPAWN_HELD] {
+        for kind in [
+            WATCHDOG_START_REFUSED,
+            WITNESS_UNAVAILABLE,
+            WATCHDOG_RESPAWN_HELD,
+        ] {
             assert!(high_kind(kind), "{kind}");
         }
         let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();

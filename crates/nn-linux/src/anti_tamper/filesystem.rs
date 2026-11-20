@@ -2298,8 +2298,8 @@ fn register_role_inode(ebpf: &mut Ebpf, key: &InodeKey, role: u8) -> Result<()> 
     let map = ebpf
         .map_mut(name)
         .ok_or_else(|| anyhow!("map {name} missing from eBPF object"))?;
-    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> =
-        AyaHashMap::try_from(map).with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))?;
+    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
+        .with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))?;
     let stale: Vec<AyaInodeKey> = map
         .keys()
         .filter_map(|k| k.ok())

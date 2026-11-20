@@ -234,7 +234,8 @@ pub fn monotonic_ns() -> u64 {
 pub fn window_open(bpffs_root: &Path) -> Result<bool> {
     let open = |name: &str| -> Result<MapData> {
         let pin = bpffs_root.join(name);
-        MapData::from_pin(&pin).with_context(|| format!("opening pinned {name} at {}", pin.display()))
+        MapData::from_pin(&pin)
+            .with_context(|| format!("opening pinned {name} at {}", pin.display()))
     };
     let session: AyaArray<MapData, u32> =
         AyaArray::try_from(AyaMap::Array(open(AGENT_SESSION_MAP_NAME)?))
@@ -273,9 +274,14 @@ unsafe impl aya::Pod for PodInodeKey {}
 /// trusted-installer window) and in `ROLE_WRITE_INODES`, which takes the
 /// family's exemption from every caller but that role's binary. The
 /// watchdog's witness chain: the agent reads it, never writes it. Its key.
-pub fn protect_for_role(bpffs_root: &Path, path: &Path, role: u8) -> Result<common::wire::InodeKey> {
+pub fn protect_for_role(
+    bpffs_root: &Path,
+    path: &Path,
+    role: u8,
+) -> Result<common::wire::InodeKey> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         return Err(anyhow!("{} is not a regular file", path.display()));
     }
@@ -292,7 +298,12 @@ pub fn protect_for_role(bpffs_root: &Path, path: &Path, role: u8) -> Result<comm
     };
     open(ROLE_WRITE_INODES_MAP_NAME)?
         .insert(PodInodeKey(key), role, 0)
-        .with_context(|| format!("registering {} in {ROLE_WRITE_INODES_MAP_NAME}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
+                path.display()
+            )
+        })?;
     open(cgroup_guard::PROTECTED_INODES_MAP_NAME)?
         .insert(
             PodInodeKey(key),

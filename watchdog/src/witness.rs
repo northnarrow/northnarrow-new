@@ -218,9 +218,14 @@ impl Witness {
         let Some(root) = &self.bpffs_root else {
             return;
         };
-        match antitamper_bpf::protect_for_role(root, &self.path, antitamper_bpf::WATCHDOG_EXE_ROLE) {
-            Ok(k) => info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone"),
-            Err(e) => warn!(target: "watchdog.witness", error = format!("{e:#}"), "the witness chain is NOT registered as the watchdog role's alone"),
+        match antitamper_bpf::protect_for_role(root, &self.path, antitamper_bpf::WATCHDOG_EXE_ROLE)
+        {
+            Ok(k) => {
+                info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone")
+            }
+            Err(e) => {
+                warn!(target: "watchdog.witness", error = format!("{e:#}"), "the witness chain is NOT registered as the watchdog role's alone")
+            }
         }
     }
 
@@ -266,7 +271,9 @@ impl Witness {
         let aside = self.path.with_file_name(format!("{CHAIN_FILE}.cut"));
         let moved = match std::fs::rename(&self.path, &aside) {
             Ok(()) => format!("set aside as {}", aside.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "nothing to set aside".to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                "nothing to set aside".to_string()
+            }
             Err(e) => format!("not set aside ({e})"),
         };
         error!(
@@ -645,7 +652,9 @@ mod tests {
         );
         let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Absent, true);
         assert!(
-            d.ends_with("inside a signed trusted-installer window (the operator's restart or stop)"),
+            d.ends_with(
+                "inside a signed trusted-installer window (the operator's restart or stop)"
+            ),
             "{d}"
         );
     }
