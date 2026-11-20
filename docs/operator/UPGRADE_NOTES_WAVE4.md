@@ -5447,6 +5447,56 @@ shape it resembles still fires.
     happen (a write in place, a `commit_creds` for a call that never makes
     that change), against a re-taken snapshot included. Still High: the
     degraded evidence while the host runs.
+- **Its review's fixes.**
+  - **`(sd-pam)` on systemd before 255** (Ubuntu 22.04's 249, Debian 12's
+    252, alpha targets: no `systemd-executor`). PID 1's fork sets the unit
+    up in PID 1's own image: it opens the PAM session as root, forks
+    `(sd-pam)`, and only then executes the user's manager. Its read is no
+    sensitive access when every fact holds:
+    - the reader executed nothing of its own, and the kernel recorded its
+      fork, by a forker that had executed nothing by then;
+    - the forker's next exec (that process's: started no later than the
+      fork) is its first since PID 1 forked it, PID 1's child, the host's
+      packaged `systemd` (the file the kernel executed, in a root-only
+      directory) as the reader's uid: `user@<uid>.service`'s launch;
+    - the reader's image at the open is that packaged `systemd`.
+
+    A manager re-executed since (`daemon-reexec`) still is: the forker's
+    first exec decides. For a manager older than the agent, the start's
+    scan finds `(sd-pam)` running the packaged `systemd` where the host's
+    systemd ships no executor (where it ships one, only the executor).
+    Still ALERTED: a fork of the manager after its exec (a user's unit), a
+    forker whose first exec another process forked (a user's process
+    reparented to PID 1), not PID 1's child, its first exec as another uid
+    or of a copy, another image at the open, a forker started after the
+    fork.
+  - **Podman's quadlet user generator** (lot 376's case; the lab met it
+    again). systemd runs its generators from `(sd-exec-strv)`
+    (`(sd-executor)` before 254), a fork of the user's manager that never
+    executes, each in a fork of that one which executes the generator: the
+    generator is never the manager's direct child, which lot 376's
+    exemption required. The manager is now also the kernel's anchor of the
+    program's fork (the exec record's `fork_anchor`: the nearest process
+    up the forks that had executed — every fork between them executed
+    nothing, running the manager's image), started no later than the
+    program; the same checks of it. Still ALERTED: a program anchored at a
+    unit's shell (which executed), an exec that is not its process's first
+    since its fork, a later process at the anchor's pid, an anchor that is
+    no user's manager.
+  - **The runtime compare budget** (rootless loops). Lot 378's lab: 30
+    `podman run` in a row by one rootless user met the user's share of a
+    second eight times (runc 1.1's 10.7 MB copy, compared about four times
+    a second): eight R004 Critical "not compared (budget)". Each uid's share
+    but root's is now a token bucket: up to four seconds of it (256 MiB) at
+    once, paid back at its rate (64 MiB a second); the global budget's
+    second and root's reserve are unchanged. Past it a copy is still not
+    compared, the Critical kill for a uid but root: the burst only costs
+    more to exhaust, it trusts no identity in place of the compare (the
+    review showed that "High when the parent is the packaged runc" would
+    be a bypass: a user can run the installed conmon and runc, preload
+    their code into runc, and spend its own share on purpose).
 - **Upgrade.** No configuration. Expect an unchanged posture after a login
-  ends, no R004 at a rootless Podman run, and at a shutdown at most a
-  Medium `NN-L-EPG-001` for a task whose record the guard lost.
+  ends, on systemd 249 and 252 too, and after a quadlet generator's run;
+  no R004 at a rootless Podman run, a loop of a few dozen included; and at
+  a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
+  guard lost.

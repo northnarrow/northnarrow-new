@@ -129,8 +129,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    code the dynamic loader runs — its operand a memfd or an unlinked file by \
                    the file it maps, or a descriptor's link not placed (the review of #578); \
                    one it only lists recorded Low. Root's container runtime copy past the \
-                   compare budget, every other fact holding, is recorded High, not killed.",
-        false_positives: "systemd-executor's launch of every unit (systemd 254 and later) is a \
+                   compare budget, every other fact holding, is recorded High, not killed. \
+                   Each other uid's share of that budget may be spent four seconds at once \
+                   (a token bucket: a rootless user's container starts in a loop); past it \
+                   the copy is not compared and stays the Critical kill.",
+        false_positives: "systemd-executor's launch of every unit (systemd 255 and later) is a \
                           linked file, not fileless; after a systemd upgrade PID 1 launches \
                           from the old, unlinked executor until its re-exec, exempt by that \
                           file's identity: a copy the host's PID 1 holds by that identity \

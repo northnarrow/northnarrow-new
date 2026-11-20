@@ -936,7 +936,14 @@ lists the known false positives of each rule.
     `/etc/login.defs` and `/etc/passwd` as the user, told by the kernel's
     record of its fork and the lineage of PID 1's launch of
     `user@<uid>.service`, or, for a manager older than the agent, by the
-    start's scan and its cgroup (no ALERTED posture);
+    start's scan and its cgroup (no ALERTED posture). On every systemd the
+    alpha supports: 255 and later (`(sd-pam)` forked by the executor,
+    Debian 13, Ubuntu 24.04 and 26.04) and before 255 (Ubuntu 22.04's 249,
+    Debian 12's 252: no executor, `(sd-pam)` a fork of PID 1's own fork
+    made before it executed the manager, running the packaged systemd);
+  - podman's quadlet user generator as systemd runs it, under
+    `(sd-exec-strv)` (a fork of the user's manager that never executes),
+    told by the kernel's anchor of its fork;
   - the packaged setuid `fusermount3`/`fusermount` (and `newuidmap`/
     `newgidmap`) looking up its caller's name in `/etc/passwd` (an
     AppImage's runtime mounting its image);
@@ -957,12 +964,12 @@ lists the known false positives of each rule.
     agent (a login racing the agent's start at a boot, the agent restarted
     during a session) left no record of its launch: its `(sd-pam)` is told
     by the agent's start's scan (`(sd-pam)` running the packaged executor
-    as the user, its parent the packaged systemd as the user, PID 1's
-    child) and by its cgroup at the open, the manager's own
-    `user@<uid>.service/init.scope`. A process of the user's running the
-    packaged executor since before the agent's start, moved by the user
-    into that scope, reading `/etc/login.defs` or `/etc/passwd` is not
-    told from it. A manager the agent saw launched whose fork record the
+    as the user — before systemd 255, the packaged systemd —, its parent
+    the packaged systemd as the user, PID 1's child) and by its cgroup at
+    the open, the manager's own `user@<uid>.service/init.scope`. A process
+    of the user's running that packaged program since before the agent's
+    start, moved by the user into that scope, reading `/etc/login.defs` or
+    `/etc/passwd` is not told from it. A manager the agent saw launched whose fork record the
     kernel lost still raises ALERTED once at its stop.
   - **An exploit at a shutdown with a lost task record.** While systemd
     stops the host, a task the guard finds without its record and holding
@@ -974,6 +981,10 @@ lists the known false positives of each rule.
   `the_user_manager_s_sd_pam_closing_its_session_is_no_sensitive_access`,
   `the_user_manager_s_sd_pam_is_known_from_the_sweep_and_the_start_s_scan`,
   `the_sd_pam_of_a_manager_older_than_the_agent_is_told_by_its_cgroup`,
+  `the_sd_pam_of_systemd_before_255_is_known_by_its_fork_and_its_manager_s_first_exec`,
+  `the_sd_pam_of_systemd_before_255_closing_its_session_is_no_sensitive_access`,
+  `the_quadlet_generator_under_sd_exec_strv_is_its_manager_s_program`,
+  `the_quadlet_generator_under_sd_exec_strv_reading_passwd_is_no_sensitive_access`,
   `the_packaged_fuse_mount_helper_looking_up_its_caller_is_no_sensitive_access`,
   `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`,
   `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
@@ -1048,14 +1059,21 @@ kernel.
   biggest spender, and the spending is signed (`runtime_copy_compare`).
   Another uid's copy past its own share stays the Critical kill. Lot 378's
   lab measured it on Debian 13: 30 rootless Podman runs back to back (runc
-  10.7 MB, about two compares a second in a user's share) gave 8 such
-  Criticals, twice, all among each loop's first starts (the later ones
-  were compared). Rootless loops of container starts (a CI runner's) can
-  meet it.
+  10.7 MB, about three compares a second in a user's share) gave 8 such
+  Criticals, twice. Each user's share now holds a burst: four seconds of
+  it may be spent at once, paid back at its rate, so a loop of that length
+  is compared whole. Under a longer burst of container starts by one user
+  (with runc 1.1's copy, past about seventy starts in a row at the lab's
+  pace of about four a second; fewer on a faster host), some starts can
+  still be reported Critical as not compared. The burst trusts nothing: a
+  copy past it is not compared, and a foreign memfd is the Critical kill
+  either way.
   *Evidence:* `an_uncompared_runtime_copy_is_recorded_never_killed`;
   `the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget`;
   `a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender`;
-  lot 370.
+  `thirty_rootless_starts_in_a_row_are_all_compared_and_a_flood_still_runs_out`;
+  `a_foreign_memfd_under_a_flood_is_never_kept_as_runc_s_clone`;
+  lot 370; lot 378.
 - **k3s.** Its runc runs from a non-standard path: a
   `R013_NamespaceEscapeTooling` High record. Its installer writes
   `k3s.service`: an `NN-L-FIM-009_SystemdUnitDropped` High record. An
