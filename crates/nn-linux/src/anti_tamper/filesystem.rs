@@ -377,6 +377,16 @@ pub const STATE_PROTECTED_SUBDIRS: &[(&str, &[&str])] = &[
     ("witness", &["witness.chain", "witness.imported"]),
 ];
 
+/// The review of #582 (F2 c): the files of [`STATE_PROTECTED_SUBDIRS`] one
+/// role alone may change — `(sub-directory, file, role)`, the role as the
+/// eBPF object's `OWN_EXE_INODES` values it: the watchdog's witness chain,
+/// which the agent only reads (`ROLE_WRITE_INODES`).
+pub const STATE_ROLE_FILES: &[(&str, &str, u8)] = &[(
+    "witness",
+    nn_proto::witness::CHAIN_FILE,
+    antitamper_bpf::WATCHDOG_EXE_ROLE,
+)];
+
 /// Tappa 9.5 K7: subdirectory under [`CONFIG_DIR`] holding the
 /// K4 canary content templates the renderer reads at
 /// `canary deploy` time. The directory itself is created by
@@ -1353,6 +1363,19 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
                 dev: stat_dev_to_kernel_dev(meta.dev()),
                 ino: meta.ino(),
             };
+            // the review of #582 (F2 c): one role's alone, that role first
+            if let Some((_, _, role)) = STATE_ROLE_FILES
+                .iter()
+                .find(|(s, f, _)| s == sub && f == name)
+            {
+                register_role_inode(ebpf, &key, *role).with_context(|| {
+                    format!(
+                        "registering {} in {}",
+                        path.display(),
+                        antitamper_bpf::ROLE_WRITE_INODES_MAP_NAME
+                    )
+                })?;
+            }
             register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE).with_context(
                 || format!("registering {} in {PROTECTED_INODES_MAP}", path.display()),
             )?;
@@ -1836,14 +1859,20 @@ pub fn bootstrap_witness_dir(dir: &Path) -> Result<()> {
         nn_proto::witness::IMPORTED_FILE,
     ] {
         let path = dir.join(name);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
+        // the review of #582 (F2 c): made when missing, never opened for
+        // writing when there — the chain is the watchdog's alone to write
+        // (`STATE_ROLE_FILES`), and its deny refuses the agent's write-open
+        match std::fs::OpenOptions::new()
+            .create_new(true)
             .write(true)
             .custom_flags(libc::O_NOFOLLOW)
             .mode(crate::chainlog::STATE_LOG_FILE_MODE)
             .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
     }
     Ok(())
 }
@@ -2259,6 +2288,28 @@ pub(crate) fn register_agent_file(ebpf: &mut Ebpf, path: &Path) -> Result<()> {
 /// stale-key prune).
 pub(crate) fn register_cgroup_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     register_inode(ebpf, key, flags)
+}
+
+/// The review of #582 (F2 c): `key` one role's alone (`ROLE_WRITE_INODES`),
+/// the keys of earlier chains (a rotation, an earlier start) removed first:
+/// the map is pinned and small.
+fn register_role_inode(ebpf: &mut Ebpf, key: &InodeKey, role: u8) -> Result<()> {
+    let name = antitamper_bpf::ROLE_WRITE_INODES_MAP_NAME;
+    let map = ebpf
+        .map_mut(name)
+        .ok_or_else(|| anyhow!("map {name} missing from eBPF object"))?;
+    let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
+        .with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))?;
+    let stale: Vec<AyaInodeKey> = map
+        .keys()
+        .filter_map(|k| k.ok())
+        .filter(|k| k.0 != *key)
+        .collect();
+    for k in stale {
+        let _ = map.remove(&k);
+    }
+    map.insert(AyaInodeKey(*key), role, 0)?;
+    Ok(())
 }
 
 fn insert_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
@@ -3389,6 +3440,42 @@ mod tests {
             body, "existing entry line\n",
             "second bootstrap must NOT truncate"
         );
+    }
+
+    /// The review of #582 (F2 c): the witness chain is the watchdog role's
+    /// alone (one of the state's protected sub-directory files, registered
+    /// under the watchdog's role), the agent's import position the agent's;
+    /// and a start that finds both never opens the chain for writing (its
+    /// deny would refuse the agent): the bootstrap leaves an existing chain
+    /// untouched, its bytes and its inode.
+    #[test]
+    fn the_witness_chain_is_the_watchdog_role_s_alone_and_never_opened_for_writing() {
+        let witness = STATE_PROTECTED_SUBDIRS
+            .iter()
+            .find(|(s, _)| *s == "witness")
+            .expect("the witness sub-directory is protected");
+        assert!(witness.1.contains(&nn_proto::witness::CHAIN_FILE));
+        assert!(witness.1.contains(&nn_proto::witness::IMPORTED_FILE));
+        assert_eq!(
+            STATE_ROLE_FILES,
+            &[(
+                "witness",
+                nn_proto::witness::CHAIN_FILE,
+                antitamper_bpf::WATCHDOG_EXE_ROLE
+            )]
+        );
+        let dir = TempDir::new().unwrap();
+        let w = dir.path().join("witness");
+        bootstrap_witness_dir(&w).unwrap();
+        let chain = w.join(nn_proto::witness::CHAIN_FILE);
+        std::fs::write(&chain, "row\n").unwrap();
+        // read-only: an open for writing would fail, as the deny refuses it
+        std::fs::set_permissions(&chain, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let ino = std::fs::metadata(&chain).unwrap().ino();
+        // (as a user: root's write-open would pass the mode, not the deny)
+        bootstrap_witness_dir(&w).expect("an existing chain is left as it is");
+        assert_eq!(std::fs::read_to_string(&chain).unwrap(), "row\n");
+        assert_eq!(std::fs::metadata(&chain).unwrap().ino(), ino);
     }
 
     /// A14 test #4: `bootstrap_audit_log` creates the parent

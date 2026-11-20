@@ -7,8 +7,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ### Added
 - Lot 374 (the pre-alpha's re-check on rc9, R9-1): **the vacated role's
-  successor is witnessed, bound to its unit and free of injected code**
-  (`UPGRADE_NOTES_WAVE4.md` §61).
+  successor is witnessed and bound to its unit** (`UPGRADE_NOTES_WAVE4.md`
+  §61).
   - **The surviving role signs.** The watchdog holds a signing key of its
     own for its life, in its memory, and signs a witness chain in the
     agent's state directory: the agent's vacancy with its cause as systemd
@@ -16,16 +16,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     that took the role — its parent, its cgroup, and what its environment
     and executable mappings show. The agent certifies the key's public half
     from the watchdog's own descriptor table and imports every row it can
-    verify into its signed audit chain; a changed, removed or uncertified
-    row is recorded as such. The agent signs the watchdog's successor the
-    same way, and a start that finds both roles vacated signs the gap.
-    Before, the successor's record was written by the successor alone.
-    Tests `the_witness_signs_the_vacancy_and_the_successor_in_one_chain`,
+    verify into its signed audit chain; a changed or uncertified row is
+    recorded as such. The agent signs the watchdog's successor the same
+    way, and a start that finds both roles vacated signs the gap. Before,
+    the successor's record was written by the successor alone. Tests
+    `the_witness_signs_the_vacancy_and_the_successor_in_one_chain`,
     `witness_rows_are_imported_once_after_their_key_is_certified`,
     `the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`,
     `a_watchdog_successor_is_registered_only_as_its_unit_s_clean_restart`,
     `both_roles_vacated_is_the_gap_and_nothing_else_is`,
     `the_exit_is_read_only_from_systemd_s_record_of_that_process`.
+  - **The chain is the watchdog's alone** (the review of #582, F2 c). The
+    kernel refuses the agent, a worker and every other process a write,
+    truncation, rename, link or removal of the chain (outside a
+    trusted-installer window): the family's exemption there is the
+    watchdog's binary's only. The agent reads it and writes only its import
+    position. The watchdog checks, before each row and at a regular
+    interval, that the chain still ends at the last row it wrote; one cut,
+    changed or replaced since is set aside and the new chain begins with a
+    signed `witness_chain_cut` row (High). Tests
+    `a_tail_cut_while_the_watchdog_lives_is_detected_and_signed`,
+    `the_witness_chain_is_the_watchdog_role_s_alone_and_never_opened_for_writing`.
   - **Bound to its unit.** A vacated role is taken only by the restart
     systemd makes of the role's own unit: a child of PID 1 in that unit's
     own cgroup (`northnarrow.slice`), with clean lot 277/281 marks, in or
@@ -35,39 +46,90 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     before they register the other role's new process. Tests
     `only_pid_1_in_the_unit_s_own_cgroup_is_its_restart`,
     `only_the_unit_s_restart_with_nothing_foreign_is_given_the_role`,
-    `a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it`.
+    `a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it`;
+    the privileged `a_unit_restart_takes_the_vacated_role_under_enforce`
+    (the review of #582, F7: the installed unit's restart takes the
+    vacated role back while the guard enforces).
+  - **A successor that shows something foreign is recorded, not refused**
+    (the review of #582, F3): `role_successor_foreign` and
+    `watchdog_successor_foreign` (they were `…_refused`) say that it holds
+    the role the kernel gave it and that the other role does not register
+    it. Tests
+    `a_foreign_successor_is_recorded_as_holding_the_role_never_as_refused`,
+    `a_foreign_watchdog_successor_is_recorded_as_holding_the_role_never_as_refused`.
+  - **Each role judges the other's successor at its own start** (the
+    review of #582, F6): the kernel marks each role vacated once its holder
+    exits (a mark no process can write, which no claim clears), and the
+    watchdog's start and the agent's judge the other's process when that
+    role was vacated earlier in the boot.
+  - **The operator's own stops are notes** (the review of #582, F4): the
+    agent's vacancy inside a signed trusted-installer window (the guide's
+    restart) is `role_released_in_window`, a note, not `role_vacated`
+    (High); both roles released inside a window, or by a shutdown the admin
+    quorum signed, is `roles_released` at the next start, a note, not
+    `roles_vacated_gap`. Tests
+    `a_vacancy_inside_a_signed_window_is_released_not_vacated`,
+    `both_roles_released_by_the_operator_is_a_note_not_the_gap`,
+    `only_a_certified_release_as_the_chain_s_last_row_is_a_signed_stop`.
+  - **The host judged before each start the watchdog makes** (the review
+    of #582, F2 d): `/etc/ld.so.preload` and the drop-ins that change our
+    units' code (their environment, commands, memory protection, root),
+    against what the watchdog read at its start (signed in its first row).
+    One new or changed since holds the start (`role_respawn_held`,
+    `watchdog_respawn_held`, High) — a hold's retry too; one as it was then
+    (a vendor's own preload list) is recorded only. Tests
+    `a_preload_new_since_the_watchdog_s_start_holds_and_an_old_one_is_recorded`,
+    `a_code_drop_in_new_since_the_watchdog_s_start_holds`,
+    `the_preload_file_is_read_as_the_loader_reads_it_and_never_blocks`.
   - **Nothing given before `main`.** The agent, watchdog and
     watchdog-failed units, and the transient unit the agent starts for the
     pin lock, unset the dynamic loader's and the C library's variables
     (`UnsetEnvironment=`, applied last whatever the service manager's
-    environment holds); a drop-in that clears the list is harmful. Each
-    start checks its own environment and executable mappings before it
-    takes its role: a loader variable, a library the release does not link
-    or executable memory no file backs refuses it — the agent's signed in
-    its refusal chain (`start_self_check`), the watchdog's for the agent to
-    sign (`watchdog_start_refused`, exit status 16). Tests
+    environment holds), and deny memory both writable and executable
+    (`MemoryDenyWriteExecute=yes`, the review of #582, F2 b); a drop-in that
+    clears the list or turns the denial off is harmful. Each start checks
+    its own environment and executable mappings before it takes its role:
+    a loader variable, a library the release does not link or executable
+    memory no file backs refuses it — the agent's signed in its refusal
+    chain (`start_self_check`), the watchdog's for the agent to sign
+    (`watchdog_start_refused`, exit status 16). A library is judged by
+    what it is, not by the name the kernel shows (the review of #582, F1:
+    a distribution's versioned file its expected name links to, as RHEL's
+    `libgcc_s`, refused every start on AlmaLinux 9). This check runs inside
+    the starting process: it refuses a start given such code openly, not
+    one that hides it (`KNOWN_LIMITATIONS.md`). Tests
     `every_unit_unsets_every_loader_variable`,
+    `every_unit_denies_writable_and_executable_memory`,
     `a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it`,
     `a_start_that_finds_anything_of_its_own_refuses_itself`,
     `a_start_that_refused_itself_is_recorded_for_the_agent_to_sign`,
     `a_preloaded_library_anywhere_is_foreign`,
-    `executable_memory_no_file_backs_is_foreign`, and the ratchets
+    `executable_memory_no_file_backs_is_foreign`,
+    `a_genuine_alma_start_maps_its_versioned_libgcc_s_by_identity`,
+    `every_supported_library_layout_is_a_genuine_start`,
+    `a_file_no_expected_name_resolves_to_is_foreign`, and the ratchets
     `start_check::a_start_maps_only_the_libraries_the_release_gate_allows`,
     `every_transient_unit_the_product_starts_unsets_the_loader_variables`,
     `both_daemons_check_themselves_before_they_take_their_role`.
   - The bookkeeping (a key certified, a watchdog life's first row, a
-    signed shutdown's release, a unit's clean restart) is signed under the
-    audit op `witness`, never as an `integrity_drift`; a vacancy and a
-    successor that is not its unit's clean restart are High. Test
+    signed shutdown's or a window's release, a unit's clean restart) is
+    signed under the audit op `witness`, never as an `integrity_drift`; a
+    vacancy outside a window, a successor that is not its unit's clean
+    restart, a held start and a cut chain are High. Test
     `a_vacancy_or_a_foreign_successor_is_a_row_and_the_bookkeeping_a_note`,
     `the_witness_records_are_high_and_its_bookkeeping_is_not`.
+  - The agent unit's cgroup the integrity round compares with is
+    `northnarrow.slice`'s (the review of #582, F5: it still named
+    `system.slice`, so NN-AUD-113's limits check and the pin lock made
+    again when the unit started without it never ran). Test
+    `the_agent_unit_cgroup_is_the_shipped_unit_s_slice_and_name`.
   - The privileged suites: the guard tests remove the enforce-mode agent's
     pins inside a trusted-installer window opened before its signed stop
     (a restore agent started by a test is not its unit's restart); the
     agent and watchdog fixtures pass `--witness-dir`; new
     `the_watchdog_signs_the_agent_s_vacancy_and_its_successor`.
   - KNOWN_LIMITATIONS: the vacated-role item says what is recorded, by
-    whom, and what remains.
+    whom, and what is not yet guaranteed.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep

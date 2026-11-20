@@ -421,7 +421,9 @@ after a holder's exit the
 successor must be its unit's own restart (lot 374), and the vacancy and the
 successor are signed by the surviving role, so their record no longer rests
 on the successor; while both roles are gone, the next agent start signs the
-gap it finds. The same holds for a program that takes on the role's binary identity. Lot 344, the review of #554:
+gap it finds. A successor that hides code root gave it before its start is
+not reliably told from its unit's restart (`KNOWN_LIMITATIONS.md`): the
+surviving role's record of it stands, its own does not. The same holds for a program that takes on the role's binary identity. Lot 344, the review of #554:
 such a process's handles on the agent's maps, programs and pin directories
 are recorded NN-L-BPF-002 Low (not refused); a watchdog gone, which leaves
 its role vacant, is signed by the agent (lab PR 216). If the liveness watch cannot be attached (logged as an ERROR),

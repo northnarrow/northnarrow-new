@@ -954,17 +954,26 @@ pub fn succession_record(ebpf: &Ebpf, now_ns: u64) -> Option<nn_model::Event> {
     })
 }
 
-/// Lot 374: both roles found vacated at the agent's start — the agent's and
-/// the watchdog's holders exited this boot and neither saw the other's
-/// exit: the gap's detail, read from `ebpf`'s reused `ROLE_TGIDS` before
-/// the start claims its role (`nn_linux::witness::roles_gap`). `None`
-/// otherwise, or with no pinned map.
-pub fn roles_gap(ebpf: &Ebpf) -> Option<String> {
+/// Lot 374: what the agent's start read of both roles from `ebpf`'s reused
+/// `ROLE_TGIDS`, before it claims its own — and (the review of #582, F4 b)
+/// the kernel's marks of their last exits (`ROLE_MARKS`): both vacated is
+/// the gap `nn_linux::witness::roles_gap` judges once the witness chain and
+/// the audit log are there. `None` with no pinned map.
+pub fn roles_at_start(ebpf: &Ebpf) -> Option<crate::witness::RolesAtStart> {
     let a: Array<&MapData, u32> =
         Array::try_from(ebpf.map(antitamper_bpf::ROLE_TGIDS_MAP_NAME)?).ok()?;
     let agent = a.get(&antitamper_bpf::ROLE_SLOT_AGENT, 0).ok()?;
     let watchdog = a.get(&antitamper_bpf::ROLE_SLOT_WATCHDOG, 0).ok()?;
-    crate::witness::roles_gap(agent, watchdog).map(|f| f.detail)
+    let marks = ebpf
+        .map(antitamper_bpf::ROLE_MARKS_MAP_NAME)
+        .and_then(|m| Array::<&MapData, u32>::try_from(m).ok());
+    let mark = |slot: u32| marks.as_ref().and_then(|m| m.get(&slot, 0).ok());
+    Some(crate::witness::RolesAtStart {
+        agent,
+        watchdog,
+        agent_mark: mark(antitamper_bpf::ROLE_SLOT_AGENT),
+        watchdog_mark: mark(antitamper_bpf::ROLE_SLOT_WATCHDOG),
+    })
 }
 
 impl BpfGuard {
@@ -2474,6 +2483,9 @@ mod tests {
         assert_ne!(ROLE_WATCHDOG, ROLE_AGENT);
         assert_ne!(ROLE_WATCHDOG, 0, "0 is \"not one of ours\" in the guard");
         assert_ne!(ROLE_AGENT, 0, "0 is \"not one of ours\" in the guard");
+        // the review of #582 (F2 c): the role a file of the watchdog's alone
+        // is registered under is the one the guard gives its binary
+        assert_eq!(antitamper_bpf::WATCHDOG_EXE_ROLE, ROLE_WATCHDOG);
     }
 
     /// Lot 344 (#554's KVM suites): the hook's roles are the executables

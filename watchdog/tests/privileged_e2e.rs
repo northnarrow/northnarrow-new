@@ -1400,7 +1400,7 @@ fn heads(records: &[&String]) -> Vec<String> {
 #[test]
 fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     use nn_proto::witness::{
-        judge_chain, Judged, CHAIN_FILE, KIND_SUCCESSOR_REFUSED, KIND_VACATED,
+        judge_chain, Judged, CHAIN_FILE, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
     };
     let mut fx = E2eFixture::setup();
     let pid0 = fx.spawn_agent();
@@ -1445,14 +1445,14 @@ fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
         "signed by the watchdog"
     );
     find(KIND_VACATED, &format!("the agent (pid {pid0}) exited"));
-    let s1 = find(KIND_SUCCESSOR_REFUSED, &format!("taken by pid {pid1}"));
+    let s1 = find(KIND_SUCCESSOR_FOREIGN, &format!("taken by pid {pid1}"));
     assert!(
         s1.detail.contains("NOT its unit's restart"),
         "the watchdog's child is not its unit's restart"
     );
     let v1 = find(KIND_VACATED, &format!("the agent (pid {pid1}) exited"));
     assert!(v1.detail.contains("signal 9"), "the wait's cause");
-    find(KIND_SUCCESSOR_REFUSED, &format!("taken by pid {pid2}"));
+    find(KIND_SUCCESSOR_FOREIGN, &format!("taken by pid {pid2}"));
     // imported by the agent into its signed audit log
     let needle = format!("the agent (pid {pid1}) exited");
     let deadline = Instant::now() + Duration::from_secs(40);

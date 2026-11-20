@@ -136,6 +136,12 @@ pub const REASON_START_SELF_CHECK: &str = "start_self_check";
 /// signed by the watchdog until it can. The agent signs it High
 /// (`witness_unavailable`).
 pub const REASON_WITNESS_UNAVAILABLE: &str = "witness_unavailable";
+/// The review of #582 (F2 d): the watchdog held instead of starting the
+/// agent — the host changed during the vacancy since the watchdog's start
+/// (`/etc/ld.so.preload`, a drop-in that changes our units' code; the
+/// detail names it). Also a hold's retry it skipped for the same reason.
+/// The agent signs it High (`watchdog_respawn_held`).
+pub const REASON_RESPAWN_HELD: &str = "respawn_held_host_changed";
 /// Lot 353: how many stuck recoveries make a restart loop…
 pub const RESTART_LOOP_RECOVERIES: usize = 3;
 /// …within this many seconds.

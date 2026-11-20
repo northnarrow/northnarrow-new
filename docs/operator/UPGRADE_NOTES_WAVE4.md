@@ -4975,14 +4975,13 @@ still fires.
     on the RPM family, `newuidmap`'s `cap_setuid` at each `shadow-utils`
     install or upgrade.
 
-## 61. The vacated role's successor is witnessed, bound to its unit and free of injected code (lot 374)
+## 61. The vacated role's successor is witnessed and bound to its unit (lot 374)
 
 A kill nothing can refuse (the OOM killer, a crash) ends the agent or the
 watchdog and leaves its role vacated until a successor takes it. Until
 this version the successor's record was the successor's own: written at
 its start, by the process that took the role. Now the role that survives
-signs it, the successor must be its unit's own restart, and a start that
-was given code before its `main` refuses itself.
+signs it, and the successor must be its unit's own restart.
 
 - **The watchdog's witness chain.** The watchdog makes an Ed25519 key at
   its start and keeps it in its memory for its life; its public half is in
@@ -4990,72 +4989,130 @@ was given code before its `main` refuses itself.
   `/var/lib/northnarrow/witness/witness.chain`:
   - `role_vacated`: the agent exited — its pid, the cause as systemd
     recorded it for that process (the OOM killer, a signal, an exit
-    status; "not known" past 3 s) and what the shutdown marker said;
-    `role_released` instead for a shutdown the admin quorum signed;
-  - `role_succeeded` (its unit's clean restart) or `role_successor_refused`
-    (anything else): the process that took the role — its pid, parent and
-    cgroup, and the loader variables and executable mappings not expected
-    that it shows (names only);
+    status; "not known" when systemd has not recorded it in time), what
+    the shutdown marker said, and what the host would give a successor
+    (below); `role_released` instead for a shutdown the admin quorum
+    signed, `role_released_in_window` for an exit inside a signed
+    trusted-installer window (the operator's restart or stop);
+  - `role_succeeded` (its unit's clean restart) or `role_successor_foreign`
+    (anything else, which holds the role the kernel gave it; the watchdog
+    does not re-register it): the process that took the role — its pid,
+    parent and cgroup, and the loader variables and executable mappings
+    not expected that it shows (names only);
+  - `role_respawn_held`: a start of the agent the watchdog held (below);
+  - `witness_chain_cut`: the chain no longer ended at the watchdog's last
+    row (it is set aside, a new chain begins);
   - `role_found_vacant`: a watchdog start that found the agent's role
-    already vacated; `witness_opened`: each watchdog life's first row.
+    already vacated; `witness_opened`: each watchdog life's first row, with
+    the host as that start read it.
   The agent certifies the key from the watchdog's own descriptor table and
-  imports every row it can verify into its audit log every 30 s: a vacancy
-  or a successor that is not its unit's clean restart as `witness_row`
-  (`integrity_drift`, High); the key's certification, a life's first row, a
-  release and a clean restart as notes (op `witness`:
-  `witness_key_certified`, `witness_note`). A row changed or removed, a
-  chain cut, or a row signed by a key it never certified is High
-  (`witness_chain_broken`, `witness_row_uncertified`). A watchdog that
-  cannot open its witness records it, and the agent signs
+  imports every row it can verify into its audit log at each of its
+  rounds: a vacancy outside a window, a successor that is not its unit's
+  clean restart, a held start and a cut chain as `witness_row`
+  (`integrity_drift`, High); the key's certification, a life's first row,
+  a release and a clean restart as notes (op `witness`:
+  `witness_key_certified`, `witness_note`). A row changed, a chain that no
+  longer holds the last row imported, or a row signed by a key it never
+  certified is High (`witness_chain_broken`, `witness_row_uncertified`). A
+  watchdog that cannot open its witness records it, and the agent signs
   `witness_unavailable` (High). See `EVIDENCE_CHAINS.md`.
+- **The chain is the watchdog's alone.** The kernel refuses the agent, a
+  worker and every other process a write, truncation, rename, link or
+  removal of it outside a trusted-installer window; the agent reads it and
+  writes only its import position beside it. The watchdog checks that the
+  chain still ends at its last row before each row it signs and at a
+  regular interval.
 - **The watchdog's successor**, judged by the agent at its next round: its
   unit's restart with clean marks and nothing foreign is registered and
   signed as a note (`watchdog_succession`; the death itself is
-  `watchdog_gone`, as before); anything else is not registered
-  (`watchdog_successor_refused`, High). An agent start that
-  finds both roles vacated signs the gap (`roles_vacated_gap`).
+  `watchdog_gone`, as before); anything else holds the role the kernel gave
+  it and registers itself, and the agent neither registers nor exempts it
+  (`watchdog_successor_foreign`, High).
+- **Each role's start judges the other.** The kernel marks a role vacated
+  once its holder exits, a mark no process writes and no claim clears;
+  the watchdog's start and the agent's judge the other role's process when
+  that role was vacated earlier in the boot, as after a death they saw.
+- **Both roles vacated.** An agent start that finds both roles vacated
+  signs the gap (`roles_vacated_gap`, High) — or a note (`roles_released`)
+  when the operator released both: both last exits inside a signed window
+  (the guide's maintenance stop), or a shutdown the admin quorum signed.
 - **Bound to its unit.** The kernel gives a vacated role's rights (its
   handles on the agent's maps) only to a child of PID 1 running in that
   role's own unit cgroup under `northnarrow.slice`, with clean lot 277/281
   marks — in or out of a trusted-installer window. A child of the other
   role, a transient unit or a shell gets nothing. The watchdog gives its
   defensive re-registration of a new agent, and the agent its registration
-  of a new watchdog, only to the same process. The kernel reads the cgroup
-  through three new BTF offsets (`task_struct.cgroups`,
+  of a new watchdog, only to its unit's clean restart. The kernel reads the
+  cgroup through three new BTF offsets (`task_struct.cgroups`,
   `css_set.dfl_cgrp`, `cgroup.kn`; optional: without one, no vacated role
   is taken again this boot).
-- **Nothing given before `main`.** The agent, watchdog and watchdog-failed
-  units unset the dynamic loader's and the C library's variables
-  (`UnsetEnvironment=`: `LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`,
-  `GLIBC_TUNABLES`, `GCONV_PATH`, `LOCPATH`, the `MALLOC_` tunables and the
-  rest of glibc's list), applied last whatever the service manager's
-  environment or a drop-in sets; the transient unit the agent starts for
-  the pin lock does too. A drop-in that clears the list
-  (`UnsetEnvironment=` empty) is `unit_dropin_harmful`. Each start checks
-  its own environment and executable mappings before it takes its role:
-  a loader variable, a library the release does not link (the release
-  gate's list: glibc's libraries, its loader, `libgcc_s`) or executable
-  memory no file backs refuses it. The agent signs `start_self_check` in
-  its refusal chain and exits 78; the watchdog exits 16 and leaves a
-  record the agent signs (`watchdog_start_refused`, High).
-- **What remains.** While the watchdog is gone too, or runs without its
-  witness, the agent's vacancy is recorded by its successor's start
-  (`previous_run`, the succession record) and by the gap the next start
-  finds. On a host without systemd (the watchdog's `exec` backend) a
-  vacated role is not taken again until the next boot. The agent judges a
-  process that takes the watchdog's role at its next round (30 s); the
-  kernel's guard refuses one outside the unit at once.
-- **Upgrade.** No configuration. The units change (`UnsetEnvironment=`;
-  the watchdog's `ReadWritePaths=` adds `-/var/lib/northnarrow/witness`):
-  `install.sh --upgrade` installs them. The agent makes the witness
-  directory at its start, before the watchdog's. The kernel object and the
-  agent are one build (three BTF offset slots added).
+- **The host before each start the watchdog makes.** Before it starts the
+  agent again — after a vacancy, or as a hold's retry — the watchdog reads
+  `/etc/ld.so.preload` and the drop-ins that reach our units and change
+  their code (their environment, their commands, their memory's
+  protection, their root), and compares them with what it read at its own
+  start (signed in its first row). One that is new or changed since holds
+  the start (`role_respawn_held`; the agent signs `watchdog_respawn_held`,
+  High) until an operator starts the agent or the host is as it was; one
+  that was already there (another vendor's own preload list) is recorded,
+  not held.
+- **Nothing given before `main` openly.** The agent, watchdog and
+  watchdog-failed units unset the dynamic loader's and the C library's
+  variables (`UnsetEnvironment=`: `LD_PRELOAD`, `LD_AUDIT`,
+  `LD_LIBRARY_PATH`, `GLIBC_TUNABLES`, `GCONV_PATH`, `LOCPATH`, the
+  `MALLOC_` tunables and the rest of glibc's list), applied last whatever
+  the service manager's environment or a drop-in sets, and deny memory
+  both writable and executable (`MemoryDenyWriteExecute=yes`); the
+  transient unit the agent starts for the pin lock unsets the variables
+  too. A drop-in that clears the list or turns the denial off is
+  `unit_dropin_harmful`. Each start checks its own environment and
+  executable mappings before it takes its role: a loader variable, a
+  library the release does not link (the release gate's list: glibc's
+  libraries, its loader, `libgcc_s` — each judged by what it is, so a
+  distribution's versioned file its name links to is the library) or
+  executable memory no file backs refuses it. The agent signs
+  `start_self_check` in its refusal chain and exits 78; the watchdog exits
+  16 and leaves a record the agent signs (`watchdog_start_refused`, High).
+  The check runs inside the starting process: it refuses a start given
+  such code openly.
+- **What is not yet guaranteed.** A successor that runs code root gave it
+  before its start, and that hides it, is not reliably told from its
+  unit's clean restart; what it signs then, its import of the watchdog's
+  rows included, is not evidence — the watchdog's chain keeps its own
+  record of that succession. While the watchdog is gone too, or runs
+  without its witness, the agent's vacancy is recorded by its successor's
+  start (`previous_run`, the succession record) and by the gap the next
+  start finds, and a change to the chain made while no watchdog runs is
+  seen only for the rows the agent had already imported. On a host
+  without systemd (the watchdog's `exec` backend) a vacated role is not
+  taken again until the next boot. The agent judges a process that takes
+  the watchdog's role at its next round; the kernel's guard refuses one
+  outside the unit at once.
+- **Upgrade.** No configuration. The units change (`UnsetEnvironment=`,
+  `MemoryDenyWriteExecute=yes`; the watchdog's `ReadWritePaths=` adds
+  `-/var/lib/northnarrow/witness`): `install.sh --upgrade` installs them.
+  The agent makes the witness directory at its start, before the
+  watchdog's. The kernel object and the agent are one build (three BTF
+  offset slots added, two pinned maps added: `ROLE_MARKS`,
+  `ROLE_WRITE_INODES`).
   - Expect one `witness_key_certified` and one `witness_note` (the first
     row) per watchdog start, under the new audit op `witness`.
   - Expect a `witness_row` (High) for each agent exit the watchdog sees
-    that is not a signed shutdown, then a `witness_note` for its unit's
-    restart; a `watchdog_succession` note after each watchdog restart.
+    outside a signed window that is not a signed shutdown, then a
+    `witness_note` for its unit's restart; a `witness_note` for an exit
+    inside a window (the documented restart); a `watchdog_succession` note
+    after each watchdog restart.
   - A unit drop-in or a manager environment that set a loader variable for
     the agent or the watchdog no longer reaches them; one that a test
     harness relied on (a `LD_LIBRARY_PATH` for a build's own libraries)
     now refuses the start.
+  - A host with a preload list of its own (`/etc/ld.so.preload`, another
+    vendor's agent or a command logger): every start of the agent and of
+    the watchdog maps the libraries it names and refuses itself
+    (`start_self_check`, `watchdog_start_refused`). Check for one before
+    the upgrade; the host stays on the previous version while it is
+    needed.
+  - The integrity round compares the agent's limits with its unit's again
+    (NN-AUD-113: the cgroup it compared with named `system.slice` since the
+    units moved to `northnarrow.slice`) and makes the pin lock again when
+    the unit started without it.

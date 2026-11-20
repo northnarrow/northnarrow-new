@@ -24,6 +24,9 @@
 //! 5. Wait for SIGTERM/SIGINT and exit — restart loop + layer-2
 //!    PROTECTED_PIDS evict + STATUS ping land in W3/W4/W5.
 
+/// The review of #582 (F2 d): the host judged before each start of the
+/// agent the watchdog makes.
+pub mod respawn_gate;
 /// Lot 374: the watchdog as the agent's witness (its own signed chain).
 pub mod witness;
 
