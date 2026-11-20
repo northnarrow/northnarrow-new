@@ -2036,7 +2036,20 @@ fn a_unit_restart_takes_the_vacated_role_under_enforce() {
         "the guard does not enforce: {reg}"
     );
 
-    // 2. Its role vacated: stopped inside a signed window.
+    // 2. Its role vacated: stopped inside a signed window. Lot 377: the
+    // registration is logged at the anti-tamper's attach, before the FIM,
+    // the network and the admin socket start — the grant waits for the
+    // socket (it failed once on a slow runner: "connecting to
+    // /run/northnarrow/admin.sock: No such file or directory").
+    let until = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < until && !log.contains("admin socket listening") {
+        std::thread::sleep(Duration::from_secs(1));
+        log = agent_journal(first);
+    }
+    assert!(
+        log.contains("admin socket listening"),
+        "the first agent's admin socket did not come up:\n{log}"
+    );
     grant_installed_window(&unit, 15).unwrap_or_else(|e| panic!("{e}"));
     let granted = Instant::now();
     let o = systemctl(&["kill", "-s", "SIGTERM", AGENT_UNIT]);
@@ -2084,6 +2097,17 @@ fn a_unit_restart_takes_the_vacated_role_under_enforce() {
     // 4. Read in a window, through read-only descriptors (a write handle
     // stays refused there while the guard enforces): the successor holds the
     // agent's slot; the kernel's mark of the vacancy outlived the claim.
+    // (Lot 377: once the successor's admin socket is up, as in step 2.)
+    let until = Instant::now() + Duration::from_secs(90);
+    let mut log = log;
+    while Instant::now() < until && !log.contains("admin socket listening") {
+        std::thread::sleep(Duration::from_secs(1));
+        log = agent_journal(second);
+    }
+    assert!(
+        log.contains("admin socket listening"),
+        "the successor's admin socket did not come up:\n{log}"
+    );
     grant_installed_window(&unit, 120).unwrap_or_else(|e| panic!("{e}"));
     let roles = pinned_words("ROLE_TGIDS").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(

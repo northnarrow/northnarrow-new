@@ -6173,9 +6173,11 @@ fn install_refuses_a_loadable_preload_list_and_notes_an_inert_one() {
 
 /// Named (lot 377): the half-install a host with a loadable preload list
 /// was left with before install.sh refused it (files installed, units
-/// enabled, each start refused by the start's own check — before any BPF,
-/// so no pin root): uninstall.sh needs no window and no key — it starts
-/// nothing, opens no window, and disables both units.
+/// enabled, each start refused by the start's own check — before any BPF;
+/// the pin root the unit's pin-lock step made before it is empty, see
+/// `uninstall_of_a_half_install_does_not_wait_for_pid_ones_lsm_program`):
+/// uninstall.sh needs no window and no key — it starts nothing, opens no
+/// window, and disables both units.
 #[test]
 fn uninstall_of_a_half_install_whose_start_was_refused_needs_no_window() {
     let host = Host::new("uninstall-half-install", &[], false, true);
@@ -6194,5 +6196,209 @@ fn uninstall_of_a_half_install_whose_start_was_refused_needs_no_window() {
                 .any(|c| c.starts_with("systemctl disable") && c.contains(&format!("{u}.service"))),
             "{u} disabled: {r:#?}"
         );
+    }
+}
+
+/// PID 1's `restrict_filesystems` link as the Debian 13 guest has it
+/// (systemd's `RestrictFileSystems=`; the fdinfo of the link's descriptor,
+/// from `known_system_prog.rs`), its program id `prog`.
+fn pid_one_lsm_link(prog: u32) -> String {
+    format!(
+        "pos:\t0\nflags:\t02000002\nmnt_id:\t16\nino:\t1063\nlink_type:\ttracing\n\
+         link_id:\t2\nprog_tag:\te8932b6bae2b9745\nprog_id:\t{prog}\nattach_type:\t27\n\
+         target_obj_id:\t1\ntarget_btf_id:\t55789\n"
+    )
+}
+
+/// Named (lot 377, the lab of #584 on Debian 13): the half-install's
+/// uninstall exited 1 and left everything — binaries, units, state, the
+/// accounts, the key. Each refused start had run the agent unit's pin-lock
+/// step first (an empty pin root), and no start had loaded anything (no
+/// list of the agent's programs): the wait for every LSM program on the
+/// host never ended, because PID 1's own (systemd's `RestrictFileSystems=`
+/// program) never detaches. Programs PID 1 holds are not waited for now;
+/// another product's still are, as before (and fail the run, naming them).
+#[test]
+fn uninstall_of_a_half_install_does_not_wait_for_pid_ones_lsm_program() {
+    const THROUGH_LSM: &str = "# ── 3. immutable flags";
+    let setup = |case: &str, pid_one_holds: u32| {
+        // no hooks were ever armed: the pin root is not protected
+        let host = Host::new(case, &[], false, false);
+        fs::create_dir_all(host.dir.join("pins")).unwrap();
+        fs::remove_file(host.dir.join("own-ids")).unwrap();
+        for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+            fs::write(host.dir.join(format!("state.{u}")), "failed\n").unwrap();
+        }
+        fs::write(
+            host.dir.join("foreign-lsm"),
+            "21: lsm  name restrict_filesystems  tag e8932b6bae2b9745  gpl\n\
+             \tloaded_at 2026-11-20T20:41:00+0000  uid 0\n\
+             \txlated 560B  jited 305B  memlock 4096B  map_ids 5\n",
+        )
+        .unwrap();
+        let fdinfo = host.dir.join("proc/1/fdinfo");
+        fs::create_dir_all(&fdinfo).unwrap();
+        fs::write(fdinfo.join("0"), "pos:\t0\nflags:\t02000002\nmnt_id:\t25\nino:\t7\n").unwrap();
+        fs::write(fdinfo.join("41"), pid_one_lsm_link(pid_one_holds)).unwrap();
+        host
+    };
+    let extra = "PROC_ROOT=$T/proc";
+
+    let host = setup("half-install-pid-one-lsm", 21);
+    let r = host.uninstall_to(false, None, extra, THROUGH_LSM);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert!(r.stdout.contains("but those PID 1 holds"), "{r:#?}");
+    assert!(!r.stderr.contains("still loaded"), "{r:#?}");
+    assert!(!host.pins_left(), "the empty pin root goes: {r:#?}");
+    assert!(r.index(GRANT).is_none(), "{r:#?}");
+
+    // PID 1 holds another program: this one is another product's, waited for
+    let host = setup("half-install-other-lsm", 210);
+    let r = host.uninstall_to(false, None, extra, THROUGH_LSM);
+    assert_eq!(r.status, 1, "{r:#?}");
+    assert!(
+        r.stderr.contains("1 LSM program(s) still loaded")
+            && r.stderr.contains("21: lsm  name restrict_filesystems"),
+        "{r:#?}"
+    );
+}
+
+/// Lot 377: both scripts pick the LSM programs their wait without a list
+/// waits for the same way (`lsm_progs_left`): every LSM program's header
+/// but those a descriptor of PID 1 names (a program's or a link's
+/// `prog_id:`), by the whole id; no other program type; nothing without
+/// bpftool's answer. And install.sh's wait for an agent older than the list
+/// ends at once when only PID 1's is left.
+#[test]
+fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
+    let a = block("deploy/install.sh", "lsm_progs_left");
+    assert_eq!(a, block("deploy/uninstall.sh", "lsm_progs_left"));
+    let dir = case_dir("lsm-progs-left");
+    let stub = dir.join("stub");
+    fs::create_dir_all(&stub).unwrap();
+    let fdinfo = dir.join("proc/1/fdinfo");
+    fs::create_dir_all(&fdinfo).unwrap();
+    // a link to 21 and a program descriptor of 120 (not 12) and of 30
+    fs::write(fdinfo.join("41"), pid_one_lsm_link(21)).unwrap();
+    fs::write(
+        fdinfo.join("42"),
+        "pos:\t0\nflags:\t02000002\nprog_type:\t29\nprog_jited:\t1\nprog_tag:\t00\nprog_id:\t120\n",
+    )
+    .unwrap();
+    fs::write(fdinfo.join("43"), "prog_type:\t8\nprog_id:\t30\n").unwrap();
+    let progs = dir.join("progs");
+    fs::write(
+        &progs,
+        "12: lsm  name task_kill  tag 0123456789abcdef  gpl\n\
+         \tpids northnarrow-age(1234)\n\
+         21: lsm  name restrict_filesystems  tag e8932b6bae2b9745  gpl\n\
+         30: cgroup_skb  name sd_fw_egress  tag 6deef7357e7b4530  gpl\n\
+         31: lsm  name other_edr  tag 1111111111111111  gpl\n\
+         \tloaded_at 2026-11-20T20:41:00+0000  uid 0\n",
+    )
+    .unwrap();
+    write_exec(
+        &stub.join("bpftool"),
+        &format!(
+            "[ -e {d}/no-bpftool ] && exit 255; [ \"$1 $2\" = \"prog show\" ] && cat {p}; exit 0",
+            d = dir.display(),
+            p = progs.display()
+        ),
+    );
+    write_exec(&stub.join("sleep"), "exit 0");
+    let wait = section("deploy/install.sh", "wait_own_programs_unloaded() {", "\n}\n");
+    let run = |call: &str| {
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\nPROC_ROOT={proc}\nLSM_DRAIN_TIMEOUT=1\n\
+                 OWN_IDS_FILE={d}/none\nBPFFS_ROOT={d}/pins\n{a}\n{wait}\n}}\n{call}",
+                proc = dir.join("proc").display(),
+                d = dir.display()
+            ))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    stub.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let (rc, out, err) = run("lsm_progs_left");
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(
+        out,
+        "12: lsm  name task_kill  tag 0123456789abcdef  gpl\n\
+         31: lsm  name other_edr  tag 1111111111111111  gpl\n"
+    );
+    let (rc, out, _) = run("pid1_prog_ids");
+    assert_eq!((rc, out.as_str()), (0, "21 30 120 "));
+    // install.sh's wait: two programs left, then only PID 1's
+    let (rc, _, err) = run("wait_own_programs_unloaded ''");
+    assert_eq!(rc, 1, "{err}");
+    assert!(err.contains("2 LSM program(s) still loaded") && err.contains("31: lsm"), "{err}");
+    fs::write(
+        &progs,
+        "21: lsm  name restrict_filesystems  tag e8932b6bae2b9745  gpl\n",
+    )
+    .unwrap();
+    let (rc, out, err) = run("wait_own_programs_unloaded ''");
+    assert_eq!(rc, 0, "{out}{err}");
+    assert!(out.contains("but those PID 1 holds"), "{out}");
+    // no answer from bpftool, no PID 1 descriptors: nothing listed, no error
+    fs::write(dir.join("no-bpftool"), "").unwrap();
+    fs::remove_dir_all(&fdinfo).unwrap();
+    let (rc, out, err) = run("lsm_progs_left; pid1_prog_ids");
+    assert_eq!((rc, out.as_str()), (0, ""), "{err}");
+}
+
+/// Lot 377 (the mini-hunt of the half-install's uninstall): a unit restart
+/// between the stop and the removal of the unit files (the watchdog's
+/// `Restart=always` after a refused start; `systemctl kill` does not cancel
+/// a pending restart, `RefuseManualStop=` refuses the stop) makes the pin
+/// root again through the agent unit's pin-lock step. After the units'
+/// removal and the reload, a pin root with no unit process is removed; one
+/// a unit process may still hold stays; none, nothing is done.
+#[test]
+fn uninstall_removes_a_pin_root_made_again_after_the_units_are_gone() {
+    let text = read("deploy/uninstall.sh");
+    let call = text.rfind("\nlate_pin_sweep\n").expect("late_pin_sweep is run");
+    let units_removed = text
+        .find("rm -f \"$UNIT_DIR/$u.service\"")
+        .expect("the unit files are removed");
+    let reload = text[..call].rfind("\nsystemctl daemon-reload\n").unwrap();
+    assert!(units_removed < reload && reload < call);
+    let sweep = block("deploy/uninstall.sh", "late_pin_sweep");
+    for (case, procs, removed) in [
+        ("sweep-none", "", true),
+        ("sweep-agent-proc", "northnarrow-agent", false),
+        ("sweep-watchdog-proc", "northnarrow-watchdog", false),
+    ] {
+        let dir = case_dir(&format!("late-pin-{case}"));
+        fs::create_dir_all(dir.join("pins")).unwrap();
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\nT={d}\nBPFFS_ROOT=$T/pins\n\
+                 log() {{ echo \"LOG $*\"; }}\npins_present() {{ [[ -d $BPFFS_ROOT ]]; }}\n\
+                 remove_pins() {{ rm -rf \"$BPFFS_ROOT\"; }}\n\
+                 nn_unit_has_procs() {{ [[ \"$1\" == '{procs}' ]]; }}\n{sweep}\nlate_pin_sweep\n\
+                 late_pin_sweep\necho done",
+                d = dir.display()
+            ))
+            .output()
+            .unwrap();
+        let so = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && so.ends_with("done\n"), "{case}: {out:?}");
+        assert_eq!(!dir.join("pins").exists(), removed, "{case}: {so}");
+        assert_eq!(so.matches("removing it").count(), usize::from(removed), "{case}: {so}");
     }
 }

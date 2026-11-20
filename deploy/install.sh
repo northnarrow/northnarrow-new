@@ -2084,6 +2084,30 @@ own_progs_loaded() {
     done
     echo "${left[*]:-}"
 }
+# >>> lsm_progs_left (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# Lot 377: the LSM programs the wait without a list of the agent's own (an
+# agent older than the list, or a start refused before it loaded anything)
+# waits for — every one on the host but those PID 1 holds. systemd's
+# RestrictFileSystems= program (Debian 13) is loaded by PID 1 and held by it
+# for as long as it runs: no stop of NorthNarrow detaches it, and the wait
+# failed with the host half-uninstalled. PID 1's descriptors name what it
+# holds (`prog_id:` in the fdinfo of a program's or a link's descriptor), as
+# the agent's known-system judge reads them. One `bpftool prog show` header
+# line per program left.
+pid1_prog_ids() {
+    { cat "${PROC_ROOT:-/proc}"/1/fdinfo/* 2>/dev/null || true; } |
+        awk '$1 == "prog_id:" && $2 ~ /^[0-9]+$/ {print $2}' | sort -un | tr '\n' ' '
+}
+lsm_progs_left() {
+    local held
+    held=" $(pid1_prog_ids) "
+    { bpftool prog show 2>/dev/null || true; } | awk -v held="$held" '
+        $1 ~ /^[0-9]+:$/ && $2 == "lsm" {
+            id = substr($1, 1, length($1) - 1)
+            if (index(held, " " id " ") == 0) print
+        }'
+}
+# <<< lsm_progs_left
 # Wait until NorthNarrow's programs are gone: the ids in $1, or — for an
 # agent that predates the list — every LSM program on the host, as before,
 # naming what is left. Without bpftool: the units' processes and the pin root
@@ -2115,15 +2139,16 @@ wait_own_programs_unloaded() {
         echo "install.sh: (bpftool prog show id <id>) — another NorthNarrow process holds them; stop it and re-run" >&2
         return 1
     fi
-    echo "install.sh: no $OWN_IDS_FILE (an agent older than the list) — waiting for every LSM program on the host to detach"
+    # lot 377: but those PID 1 holds (lsm_progs_left)
+    echo "install.sh: no $OWN_IDS_FILE (an agent older than the list) — waiting for every LSM program on the host to detach (but those PID 1 holds)"
     for ((i = 0; i < LSM_DRAIN_TIMEOUT; i++)); do
-        n=$(bpftool prog show 2>/dev/null | grep -c " lsm " || true)
+        n=$(lsm_progs_left | grep -c . || true)
         [[ "$n" == 0 ]] && return 0
         (( i == 0 )) && echo "install.sh: waiting for $n LSM program(s) to detach"
         sleep 1
     done
     echo "install.sh: $n LSM program(s) still loaded after ${LSM_DRAIN_TIMEOUT}s:" >&2
-    bpftool prog show 2>/dev/null | grep " lsm " | sed 's/^/install.sh:   /' >&2
+    lsm_progs_left | sed 's/^/install.sh:   /' >&2
     echo "install.sh: if they are NorthNarrow's, another NorthNarrow process holds them: stop it and re-run" >&2
     return 1
 }
