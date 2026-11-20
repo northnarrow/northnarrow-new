@@ -122,7 +122,13 @@ impl Row {
 
 /// The hex SHA-256 of a chain line (without its newline).
 pub fn line_hash(line: &str) -> String {
-    hex::encode(Sha256::digest(line.as_bytes()))
+    bytes_hash(line.as_bytes())
+}
+
+/// The hex SHA-256 of `b` (the review of #582, F2 d: the digest a witness
+/// row records of a file, never its contents).
+pub fn bytes_hash(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
 }
 
 /// The watchdog's witness key, made from 32 random bytes at its start.

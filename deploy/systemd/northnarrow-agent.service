@@ -205,6 +205,13 @@ SystemCallFilter=~ptrace process_vm_writev kexec_load kexec_file_load init_modul
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 LockPersonality=yes
+# The review of #582 (F2 b): no memory both writable and executable, and
+# none made executable later — the binary's and its libraries' file
+# mappings are the only code a start of this unit runs, as its executable
+# mappings show for its whole life (the start's own check, the other
+# role's reading of it). Neither daemon makes any (no JIT; the eBPF
+# programs are the kernel's to compile).
+MemoryDenyWriteExecute=yes
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700
 # /run/northnarrow is SHARED with the watchdog (watchdog.pid, the A8

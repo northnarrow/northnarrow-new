@@ -379,6 +379,28 @@ fn every_unit_unsets_every_loader_variable() {
     }
 }
 
+/// The review of #582 (F2 b): every unit of ours that runs one of our
+/// binaries denies memory both writable and executable
+/// (`MemoryDenyWriteExecute=yes`), set once and never reset: code a start
+/// was given, or copied anywhere, is then a file mapping its executable
+/// mappings show.
+#[test]
+fn every_unit_denies_writable_and_executable_memory() {
+    for name in [
+        "northnarrow-agent.service",
+        "northnarrow-watchdog.service",
+        "northnarrow-watchdog-failed.service",
+    ] {
+        let d = directives(&unit(name));
+        let set: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "MemoryDenyWriteExecute")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(set, ["yes"], "{name}: MemoryDenyWriteExecute= {set:?}");
+    }
+}
+
 /// Lot 374: the watchdog writes its witness chain in the directory the
 /// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
 /// and nothing else of the agent's state; under `ProtectSystem=strict`

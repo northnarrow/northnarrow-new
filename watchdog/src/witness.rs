@@ -107,6 +107,13 @@ impl Witness {
     /// broken or full) with a [`KIND_OPENED`] row. `Err` when no row can be
     /// written there: the caller records that for the agent to sign.
     pub fn open(dir: &Path, tgid: u32) -> Result<Witness> {
+        Self::open_noting(dir, tgid, "")
+    }
+
+    /// [`Witness::open`], `note` added to its first row (the review of #582,
+    /// F2 d: the host the watchdog's later judgements compare with, signed
+    /// before any vacancy it sees).
+    pub fn open_noting(dir: &Path, tgid: u32, note: &str) -> Result<Witness> {
         let key = WitnessKey::from_seed(seed()?);
         // this process's own start (`tgid` is this process)
         let start = antitamper_bpf::start_check::own_start_ticks().unwrap_or(0);
@@ -172,11 +179,15 @@ impl Witness {
             tgid,
             _published: published,
         };
-        let detail = if notes.is_empty() {
+        let mut detail = if notes.is_empty() {
             "a new chain".to_string()
         } else {
             notes.join("; ")
         };
+        if !note.is_empty() {
+            detail.push_str("; ");
+            detail.push_str(note);
+        }
         w.record(
             KIND_OPENED,
             &format!("watchdog {tgid} (start {start}) opened its witness: {detail}"),
