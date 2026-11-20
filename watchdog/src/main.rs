@@ -417,10 +417,16 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     //   4. On ceiling breach, or a failed respawn: log, then hold —
     //      alive and protected, no respawn — until an operator starts
     //      the agent again (external audit WDG-004; see `hold`)
+    // The review of #582 (F2 c): the chain checked against this watchdog's
+    // last row every WITNESS_HEAD_EVERY (and before every row it appends).
+    let mut witness_tick = tokio::time::interval(WITNESS_HEAD_EVERY);
+    witness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    witness_tick.tick().await;
     'restart_loop: loop {
         let select_outcome = tokio::select! {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
             _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
+            _ = witness_tick.tick() => SelectOutcome::WitnessTick,
             result = wait_agent(&agent_pidfd, &cli.agent_pidfile) => SelectOutcome::AgentDied(result),
             // W5 stuck-recovery arm: the parallel ping task has
             // observed two consecutive STATUS-ping timeouts and
@@ -475,6 +481,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
             SelectOutcome::Signal(name) => {
                 info!(target: "watchdog", signal = name, "shutting down");
                 break 'restart_loop;
+            }
+            SelectOutcome::WitnessTick => {
+                if let Some(w) = witness.as_mut() {
+                    w.check_head();
+                }
+                continue 'restart_loop;
             }
             SelectOutcome::StaleStuck(pid) => {
                 info!(
@@ -936,6 +948,8 @@ enum SelectOutcome {
     StaleStuck(u32),
     /// Lab PR 216: stuck recovery could not confirm the agent's exit.
     RecoveryFailed(String),
+    /// The review of #582 (F2 c): the witness chain's head checked.
+    WitnessTick,
 }
 
 /// Lab PR 216 (static review C-44 / G-05): stuck recovery failed and the
@@ -1154,6 +1168,10 @@ fn judge_successor(old: u32, new: u32) -> (bool, String) {
     northnarrow_watchdog::witness::successor_detail(old, new, &id, &found)
 }
 
+/// The review of #582 (F2 c): how often the watchdog checks that its
+/// witness chain still ends at the last row it wrote.
+const WITNESS_HEAD_EVERY: Duration = Duration::from_secs(30);
+
 /// The review of #582 (F2 d): [`northnarrow_watchdog::respawn_gate::judge_now`]
 /// off the runtime's thread (it reads the drop-in directories and
 /// `/etc/ld.so.preload`). A judgement that could not run holds nothing and
@@ -1239,6 +1257,10 @@ fn open_witness(
     match northnarrow_watchdog::witness::Witness::open_noting(&cli.witness_dir, own_pid, note) {
         Ok(mut w) => {
             info!(target: "watchdog.witness", key = %w.key_hex(), dir = %cli.witness_dir.display(), "witness opened");
+            // The review of #582 (F2 c): the chain this life writes is the
+            // watchdog role's alone (the agent reads it), registered now
+            // and for each chain it opens after.
+            w.protect_with(&cli.bpffs_root);
             if let Ok(slot) =
                 antitamper_bpf::role_slot(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)
             {

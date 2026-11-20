@@ -2483,6 +2483,9 @@ mod tests {
         assert_ne!(ROLE_WATCHDOG, ROLE_AGENT);
         assert_ne!(ROLE_WATCHDOG, 0, "0 is \"not one of ours\" in the guard");
         assert_ne!(ROLE_AGENT, 0, "0 is \"not one of ours\" in the guard");
+        // the review of #582 (F2 c): the role a file of the watchdog's alone
+        // is registered under is the one the guard gives its binary
+        assert_eq!(antitamper_bpf::WATCHDOG_EXE_ROLE, ROLE_WATCHDOG);
     }
 
     /// Lot 344 (#554's KVM suites): the hook's roles are the executables

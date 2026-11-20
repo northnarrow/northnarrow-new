@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use nn_proto::witness::{
     judge_chain, key_record, line_hash, Judged, Row, WitnessKey, CHAIN_FILE, CHAIN_MAX_BYTES,
-    KEY_MEMFD_NAME, KIND_OPENED, ROW_VERSION,
+    KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_OPENED, ROW_VERSION,
 };
 use tracing::{error, info, warn};
 
@@ -36,6 +36,9 @@ pub struct Witness {
     seq: u64,
     prev: String,
     tgid: u32,
+    /// The review of #582 (F2 c): the pin root each chain this life opens
+    /// is registered under (the watchdog role's alone), once known.
+    bpffs_root: Option<PathBuf>,
     /// The sealed memory file with the key's public half, held for the
     /// watchdog's life (the agent reads it from this descriptor table).
     _published: Option<OwnedFd>,
@@ -177,6 +180,7 @@ impl Witness {
             seq,
             prev,
             tgid,
+            bpffs_root: None,
             _published: published,
         };
         let mut detail = if notes.is_empty() {
@@ -200,8 +204,97 @@ impl Witness {
         self.key.public_hex()
     }
 
-    /// One signed row of `kind` with `detail`, appended and logged.
+    /// The review of #582 (F2 c): the chain this life writes registered as
+    /// the watchdog role's alone under `bpffs_root` (`ROLE_WRITE_INODES`:
+    /// the agent and every other caller refused its write), now and for
+    /// each chain opened after a cut. A failure is a WARN: the chain is then
+    /// the family's, as before.
+    pub fn protect_with(&mut self, bpffs_root: &Path) {
+        self.bpffs_root = Some(bpffs_root.to_path_buf());
+        self.protect();
+    }
+
+    fn protect(&self) {
+        let Some(root) = &self.bpffs_root else {
+            return;
+        };
+        match antitamper_bpf::protect_for_role(root, &self.path, antitamper_bpf::WATCHDOG_EXE_ROLE) {
+            Ok(k) => info!(target: "watchdog.witness", dev = k.dev, ino = k.ino, "witness chain registered as the watchdog role's alone"),
+            Err(e) => warn!(target: "watchdog.witness", error = format!("{e:#}"), "the witness chain is NOT registered as the watchdog role's alone"),
+        }
+    }
+
+    /// The review of #582 (F2 c): what the chain's file shows of its end
+    /// when it no longer ends at this life's last row (`None`: it does).
+    fn cut_since_last_row(&self) -> Option<String> {
+        if self.seq == 0 {
+            return None;
+        }
+        let text = match antitamper_bpf::kernel_roots::read(&self.path, CHAIN_MAX_BYTES) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some("the file is gone".to_string())
+            }
+            Err(e) => return Some(format!("the file cannot be read: {e}")),
+        };
+        match chain_end(&text) {
+            Ok((seq, prev)) if seq == self.seq && prev == self.prev => None,
+            Ok((0, _)) => Some("the file holds no row".to_string()),
+            Ok((seq, prev)) => Some(format!(
+                "the file ends at row {} ({})",
+                seq - 1,
+                prev.get(..16).unwrap_or("")
+            )),
+            Err(why) => Some(format!("the file is broken ({why})")),
+        }
+    }
+
+    /// The review of #582 (F2 c): the chain checked against this life's last
+    /// row (the watchdog's memory, which nothing else writes); a chain cut,
+    /// changed or replaced since is set aside and a new chain begins with a
+    /// signed [`KIND_CHAIN_CUT`] row saying what was expected and found.
+    /// `true` when it was.
+    pub fn check_head(&mut self) -> bool {
+        let Some(found) = self.cut_since_last_row() else {
+            return false;
+        };
+        let expected = format!(
+            "row {} ({})",
+            self.seq - 1,
+            self.prev.get(..16).unwrap_or("")
+        );
+        let aside = self.path.with_file_name(format!("{CHAIN_FILE}.cut"));
+        let moved = match std::fs::rename(&self.path, &aside) {
+            Ok(()) => format!("set aside as {}", aside.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "nothing to set aside".to_string(),
+            Err(e) => format!("not set aside ({e})"),
+        };
+        error!(
+            target: "watchdog.witness",
+            expected = %expected,
+            found = %found,
+            "the witness chain no longer ends at this watchdog's last row: a new chain begins"
+        );
+        self.seq = 0;
+        self.prev = String::new();
+        let detail = format!(
+            "the chain watchdog {} writes no longer ended at its last row, {expected}: {found}; \
+             {moved}; a new chain begins here",
+            self.tgid
+        );
+        let _ = self.append(KIND_CHAIN_CUT, &detail);
+        self.protect();
+        true
+    }
+
+    /// One signed row of `kind` with `detail`, appended and logged — the
+    /// chain checked first ([`Witness::check_head`]).
     pub fn record(&mut self, kind: &str, detail: &str) -> Result<()> {
+        self.check_head();
+        self.append(kind, detail)
+    }
+
+    fn append(&mut self, kind: &str, detail: &str) -> Result<()> {
         let row = self.key.sign(Row {
             v: ROW_VERSION,
             seq: self.seq,
@@ -647,6 +740,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(CHAIN_FILE)).unwrap();
         assert!(Witness::open(dir.path(), me).is_err());
+    }
+
+    /// The review of #582 (F2 c): a tail cut of rows not yet imported, made
+    /// while this watchdog lives, is detected — the chain no longer ends at
+    /// the last row in the watchdog's memory: set aside, and a new chain
+    /// begins with a signed `witness_chain_cut` row naming what it expected
+    /// and found (the agent imports it High), before the next row. A chain
+    /// left as written is never cut.
+    #[test]
+    fn a_tail_cut_while_the_watchdog_lives_is_detected_and_signed() {
+        use nn_proto::witness::{to_import, Imported, KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let mut w = Witness::open(dir.path(), me).unwrap();
+        w.record(KIND_VACATED, "the vacancy").unwrap();
+        w.record(KIND_SUCCEEDED, "the successor").unwrap();
+        assert!(!w.check_head(), "a chain as written is not cut");
+        let text = chain_text(dir.path());
+        // the successor's row and the vacancy's cut: a valid prefix is left
+        let prefix: String = text.lines().take(1).map(|l| format!("{l}\n")).collect();
+        std::fs::write(dir.path().join(CHAIN_FILE), &prefix).unwrap();
+        assert!(w.check_head(), "the cut is detected");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("{CHAIN_FILE}.cut"))).unwrap(),
+            prefix
+        );
+        w.record(KIND_SUCCEEDED, "after").unwrap();
+        let mut imp = Imported::default();
+        imp.certify(&w.key_hex());
+        let t = to_import(&chain_text(dir.path()), &imp);
+        assert!(t.broken.is_none(), "{t:?}");
+        let kinds: Vec<&str> = t.rows.iter().map(|(r, _, _)| r.kind.as_str()).collect();
+        assert_eq!(kinds, [KIND_CHAIN_CUT, KIND_SUCCEEDED]);
+        let cut = &t.rows[0].0.detail;
+        assert!(
+            cut.contains("no longer ended at its last row, row 2")
+                && cut.contains("the file ends at row 0"),
+            "{cut}"
+        );
+        // a row appended by another writer, or the file emptied or removed:
+        // the same, at the next row the watchdog signs
+        for damage in ["append", "empty", "remove"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = Witness::open(dir.path(), me).unwrap();
+            w.record(KIND_VACATED, "v").unwrap();
+            let p = dir.path().join(CHAIN_FILE);
+            match damage {
+                "append" => {
+                    let t = chain_text(dir.path()) + "{\"not\":\"a row\"}\n";
+                    std::fs::write(&p, t).unwrap();
+                }
+                "empty" => std::fs::write(&p, "").unwrap(),
+                _ => std::fs::remove_file(&p).unwrap(),
+            }
+            w.record(KIND_SUCCEEDED, "s").unwrap();
+            let j = judge_chain(&chain_text(dir.path()));
+            let Judged::Valid { row, .. } = &j[0] else {
+                panic!("{damage}: {j:?}")
+            };
+            assert_eq!(row.kind, KIND_CHAIN_CUT, "{damage}");
+            assert_eq!(j.len(), 2, "{damage}: {j:?}");
+        }
     }
 
     /// Lot 374: the key's public half is published in a sealed memory file

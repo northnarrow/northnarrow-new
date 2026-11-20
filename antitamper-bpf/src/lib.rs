@@ -251,6 +251,64 @@ pub fn window_open(bpffs_root: &Path) -> Result<bool> {
     Ok(grant.0.active(monotonic_ns(), session))
 }
 
+/// The review of #582 (F2 c): name of the pinned `ROLE_WRITE_INODES` map
+/// (mirrors `agent-ebpf/src/inode_protect.rs`): the protected inodes one
+/// role alone may change, valued by that role.
+pub const ROLE_WRITE_INODES_MAP_NAME: &str = "ROLE_WRITE_INODES";
+/// The watchdog's role as the eBPF object's `OWN_EXE_INODES` values it
+/// (`ROLE_WATCHDOG`; the agent is 2).
+pub const WATCHDOG_EXE_ROLE: u8 = 1;
+
+/// An inode key as the eBPF maps store it.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct PodInodeKey(common::wire::InodeKey);
+// SAFETY: `InodeKey` is `#[repr(C)]`, two `u64`, no padding.
+unsafe impl aya::Pod for PodInodeKey {}
+
+/// The review of #582 (F2 c): the regular file at `path` (never a link's
+/// target) protected for role `role` alone — in the pinned
+/// `PROTECTED_INODES` like the agent's other chains (no write, truncation,
+/// rename, link or removal by a caller outside the family, outside a
+/// trusted-installer window) and in `ROLE_WRITE_INODES`, which takes the
+/// family's exemption from every caller but that role's binary. The
+/// watchdog's witness chain: the agent reads it, never writes it. Its key.
+pub fn protect_for_role(bpffs_root: &Path, path: &Path, role: u8) -> Result<common::wire::InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    let key = common::wire::InodeKey {
+        dev: cgroup_guard::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    };
+    let open = |name: &str| -> Result<AyaHashMap<MapData, PodInodeKey, u8>> {
+        let pin = bpffs_root.join(name);
+        let data = MapData::from_pin(&pin)
+            .with_context(|| format!("opening pinned {name} at {}", pin.display()))?;
+        AyaHashMap::try_from(AyaMap::HashMap(data))
+            .with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))
+    };
+    open(ROLE_WRITE_INODES_MAP_NAME)?
+        .insert(PodInodeKey(key), role, 0)
+        .with_context(|| format!("registering {} in {ROLE_WRITE_INODES_MAP_NAME}", path.display()))?;
+    open(cgroup_guard::PROTECTED_INODES_MAP_NAME)?
+        .insert(
+            PodInodeKey(key),
+            common::wire::FS_PROTECT_MUTATE | common::wire::FS_PROTECT_WRITE,
+            0,
+        )
+        .with_context(|| {
+            format!(
+                "registering {} in {}",
+                path.display(),
+                cgroup_guard::PROTECTED_INODES_MAP_NAME
+            )
+        })?;
+    Ok(key)
+}
+
 /// The pinned map of this boot's session nonce (mirrors the eBPF object's
 /// `AGENT_SESSION`).
 pub const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
