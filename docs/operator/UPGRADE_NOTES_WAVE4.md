@@ -5048,12 +5048,16 @@ signs it, and the successor must be its unit's own restart.
   once its holder exits, and when, in maps the agent's load freezes (no
   process's handle writes them after; one read not frozen is not known,
   and the start signs `role_marks`); no claim clears the mark. The
-  watchdog's start and the agent's judge the other role's process when it
-  took its role while their own role was vacant, as after a death they
-  saw — once: a process an earlier holder saw start is not judged again.
-  A library replaced on disk since a process mapped it (a package upgrade
-  leaves it "(deleted)") is judged by identity, never foreign on that
-  alone. Marks a start cannot read are judged, and recorded.
+  watchdog's start and the agent's judge the other role's process at
+  every start. One that is not its unit's clean restart is recorded, and
+  the agent does not register such a watchdog, whatever an earlier holder
+  concluded: a refusal does not lapse when the agent restarts. A clean
+  verdict is recorded when the process took its role while their own role
+  was vacant, as after a death they saw; a process an earlier holder saw
+  start is not recorded again. A library replaced on disk since a process
+  mapped it (a package upgrade leaves it "(deleted)") is judged by
+  identity, never foreign on that alone. Marks a start cannot read are
+  judged, and recorded.
 - **Both roles vacated.** An agent start that finds both roles vacated
   signs the gap (`roles_vacated_gap`, High) — or a note (`roles_released`)
   when the operator released both: both last exits inside a signed window

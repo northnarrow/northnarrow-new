@@ -61,10 +61,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     review of #582, F6): the kernel marks each role vacated once its holder
     exits, and when (a mark no claim clears, in maps the agent's load
     freezes), and the watchdog's start and the agent's judge the other's
-    process once: when it took its role while their own role was vacant
-    (the re-check, N4: a long-running process an earlier holder saw start
-    is never judged again days later). Test
-    `a_successor_is_judged_once_by_the_next_start_of_the_other_role`.
+    process at every start (the re-check 3, R2-1: an earlier holder's
+    refusal is never inherited as "judged once" — the agent's start does
+    not register a watchdog that is not its unit's clean restart, and a
+    watchdog it refused stays judged at every round, its slot vacated or
+    not). A clean verdict is signed only for a process that took its role
+    while their own role was vacant (the re-check, N4: a long-running
+    process an earlier holder saw start is no High days later). Tests
+    `a_succession_is_the_other_role_s_process_taken_while_this_role_was_vacant`,
+    `a_successor_refused_by_an_earlier_holder_is_judged_again_at_the_next_start`,
+    `a_watchdog_an_earlier_agent_refused_is_refused_again_at_the_next_agent_start`,
+    `a_watchdog_successor_no_agent_judged_is_judged_at_the_next_agent_start`,
+    `a_long_running_watchdog_given_at_an_agent_start_is_registered_with_nothing_signed`,
+    `a_watchdog_refused_while_its_slot_was_vacated_is_judged_again_once_it_holds_the_slot`,
+    `an_agent_found_at_a_watchdog_start_is_not_said_vacated`.
   - **The operator's own stops are notes** (the review of #582, F4): the
     agent's vacancy inside a signed trusted-installer window (the guide's
     restart) is `role_released_in_window`, a note, not `role_vacated`

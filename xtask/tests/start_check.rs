@@ -195,7 +195,9 @@ fn every_start_the_watchdog_makes_is_judged_first() {
 }
 
 /// The review of #582 (F6): each role's start judges the other role's
-/// process when the kernel marked that role vacated earlier this boot.
+/// process when the kernel marked that role vacated earlier this boot —
+/// and (the re-check 3, R2-1) at every start, the timing rule deciding only
+/// whether a given verdict is recorded.
 #[test]
 fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
     let root = repo_root();
@@ -219,16 +221,31 @@ fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
         "antitamper_bpf::succession_to_judge(",
         "antitamper_bpf::start_check::start_boot_ns(pid)",
         "pin_handle_failed(",
+        "antitamper_bpf::at_start(why.is_some(), judged.given)",
     ] {
         assert!(f.contains(needle), "{needle}");
     }
+    // the re-check 3 of #582 (R2-1): judged whatever the timing rule says —
+    // its "no succession" skips the record of a given verdict only
+    let judged = f.find("judge_successor(0, pid)").expect("judged");
+    assert!(judged < f.find("antitamper_bpf::at_start(").unwrap());
+    assert!(
+        !f[..judged].contains("return"),
+        "a return before the judgement"
+    );
+    assert_eq!(
+        f.matches("return").count(),
+        1,
+        "one return: a given verdict held"
+    );
+    assert!(f.contains("(antitamper_bpf::AtStart::Held, _) => return,"));
     let tasks = &code["agent/src/boot/tasks.rs"];
     let t = tasks
         .find("let at_start = nn_linux::witness::roles_at_start();")
         .expect("the agent's start");
     let rest = &tasks[t..];
     let first = rest
-        .find("if std::mem::take(&mut first_found) {")
+        .find("let found_first = std::mem::take(&mut first_found);")
         .expect("the watchdog found first");
     let rest = &rest[first..];
     for needle in [
@@ -239,9 +256,46 @@ fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
     ] {
         assert!(rest[..1500].contains(needle), "{needle}");
     }
+    // the re-check 3 (R2-1): the one judgement of the watchdog is
+    // `successor_step`'s, told the watchdog found first — never skipped by
+    // the timing rule — and a refusal returns before any registration
+    let step = rest
+        .find("nn_linux::witness::successor_step(")
+        .expect("successor_step");
+    assert!(rest[step..step + 200].contains("found_first,"));
+    assert_eq!(
+        tasks
+            .matches("nn_linux::witness::judge_watchdog_successor(")
+            .count(),
+        1
+    );
+    let judge = rest
+        .find("nn_linux::witness::judge_watchdog_successor(")
+        .unwrap();
+    let foreign = rest
+        .find("nn_linux::witness::SuccessorStep::Foreign(v) => {")
+        .expect("the refusal");
+    let register = rest
+        .find("anti_tamper::register_protected_pid(bpffs_root, p)")
+        .expect("the registration");
+    assert!(step < judge && judge < foreign && foreign < register);
+    assert!(
+        rest[foreign..register].contains("last = None;")
+            && rest[foreign..register].contains("return;")
+    );
+    // a long-running watchdog given signs nothing (N4 kept)
+    let held = rest
+        .find("nn_linux::witness::SuccessorStep::Held(v) => {")
+        .expect("held");
+    assert!(foreign < held && held < register);
+    assert!(!rest[held..register].contains("report_"));
     // the rule itself is antitamper_bpf's, one for both roles
     let lib = &code["antitamper-bpf/src/lib.rs"];
     assert_eq!(lib.matches("pub fn succession_to_judge(").count(), 1);
+    assert_eq!(lib.matches("pub fn at_start(").count(), 1);
+    let w = &code["crates/nn-linux/src/witness.rs"];
+    let s = &w[w.find("pub fn successor_step(").expect("successor_step")..];
+    assert!(s[..s.find("\n}\n").unwrap()].contains("antitamper_bpf::at_start("));
 }
 
 /// The re-check of #582 (N0, N2, N3, N8): where the new rules are wired —

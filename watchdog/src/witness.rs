@@ -752,16 +752,17 @@ pub fn successor_detail(
     } else {
         " — it holds the role the kernel gave it; the watchdog does not re-register it"
     };
-    // old 0: the vacancy is the kernel's mark, its holder not known here
-    let by = if old == 0 {
-        "earlier this boot".to_string()
+    // old 0: found at this watchdog's start (the vacancy, if any, is the
+    // kernel's mark, its holder not known here)
+    let role = if old == 0 {
+        "the agent's role".to_string()
     } else {
-        format!("by pid {old}")
+        format!("the agent's role, vacated by pid {old},")
     };
     (
         ok,
         format!(
-            "the agent's role, vacated {by}, taken by pid {new}: {verdict}{taken}; {}; {}",
+            "{role} taken by pid {new}: {verdict}{taken}; {}; {}",
             id.describe(),
             found.describe()
         ),
@@ -1339,6 +1340,29 @@ mod tests {
             }
         }
         assert_eq!(found, 1);
+    }
+
+    /// The re-check 3 of #582 (R2-1): the agent a watchdog's start finds is
+    /// judged at every start, its role not always vacated this boot — the
+    /// detail names the process, and a vacancy only when it saw one.
+    #[test]
+    fn an_agent_found_at_a_watchdog_start_is_not_said_vacated() {
+        let unit = Identity {
+            ppid: Some(1),
+            cgroup: Some("/northnarrow.slice/northnarrow-agent.service".into()),
+        };
+        let (ok, d) = successor_detail(0, 11, &unit, &Findings::default());
+        assert!(ok, "{d}");
+        assert!(
+            d.starts_with("the agent's role taken by pid 11: ") && !d.contains("vacated"),
+            "{d}"
+        );
+        let shell = Identity {
+            ppid: Some(4242),
+            cgroup: Some("/user.slice/session-1.scope".into()),
+        };
+        let (ok, d) = successor_detail(0, 11, &shell, &Findings::default());
+        assert!(!ok && !d.contains("vacated"), "{d}");
     }
 
     #[test]
