@@ -5610,7 +5610,8 @@ mod tests {
         let lineage = crate::posture::lineage::AuthSessionTracker::<IdTestHost>::new(tmp.path());
         let running = |pid: u32| std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
         let hook = ["/bin/sh", "-c", "socat TCP-LISTEN:4444,fork EXEC:/bin/sh &"].map(String::from);
-        let postinst = ["/bin/sh", "/var/lib/dpkg/info/socat.postinst", "configure"].map(String::from);
+        let postinst =
+            ["/bin/sh", "/var/lib/dpkg/info/socat.postinst", "configure"].map(String::from);
         let fake = ["/bin/sh", "/tmp/x/socat.postinst", "configure"].map(String::from);
         // root's apt-get (800, running: apt-daily's `apt-get update`) → the
         // hook's shell (801)
@@ -5633,7 +5634,8 @@ mod tests {
         IdTestHost::set_dir_root_only("/usr/bin", true);
         IdTestHost::set_dir_root_only("/var/lib/dpkg/info", true);
         let relay = |pid: u32, ppid: u32| {
-            let mut e = crate::decision::rules::testutil::spawn_exe("socat", socat, socat, ROOT_DIR);
+            let mut e =
+                crate::decision::rules::testutil::spawn_exe("socat", socat, socat, ROOT_DIR);
             if let Event::ProcessSpawn {
                 pid: p,
                 ppid: pp,
@@ -5680,7 +5682,10 @@ mod tests {
         for (pid, what) in [
             (802, "an APT hook's socat bind shell"),
             (822, "a nested apt-get's hook under a postinst"),
-            (831, "a script named like a postinst outside dpkg's directory"),
+            (
+                831,
+                "a script named like a postinst outside dpkg's directory",
+            ),
         ] {
             for r in [&n19 as &dyn Rule, &n06] {
                 let v = r.evaluate(&bind(pid)).expect("judged");
@@ -5696,7 +5701,11 @@ mod tests {
         for r in [&n19 as &dyn Rule, &n06] {
             let v = r.evaluate(&bind(813)).expect("judged");
             assert_eq!(v.severity, Severity::Low, "{}", v.reasoning);
-            assert!(v.reasoning.contains("socat's dpkg maintainer script"), "{}", v.reasoning);
+            assert!(
+                v.reasoning.contains("socat's dpkg maintainer script"),
+                "{}",
+                v.reasoning
+            );
         }
         // dpkg's directory writable by others: no maintainer script known
         IdTestHost::set_dir_root_only("/var/lib/dpkg/info", false);

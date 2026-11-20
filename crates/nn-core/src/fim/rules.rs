@@ -3533,8 +3533,9 @@ impl<H: PostureHost> LogRotation<H> {
             return None;
         }
         let exe = id.exe.to_string_lossy().into_owned();
-        (self.lineage.ran_host_file(pid, as_of, &exe) && self.lineage.exec_uid(pid, as_of) == Some(0))
-            .then_some(exe)
+        (self.lineage.ran_host_file(pid, as_of, &exe)
+            && self.lineage.exec_uid(pid, as_of) == Some(0))
+        .then_some(exe)
     }
 
     /// How the packaged logrotate `pid` was started by the system's
@@ -7839,7 +7840,11 @@ mod tests {
                 ],
             );
             ingest(622, 0, &[LOGROTATE, "-f", "/etc/logrotate.d/../../tmp/x"]);
-            ingest(623, 0, &[LOGROTATE, "-f", "-s", "/tmp/st", "/etc/logrotate.conf"]);
+            ingest(
+                623,
+                0,
+                &[LOGROTATE, "-f", "-s", "/tmp/st", "/etc/logrotate.conf"],
+            );
             ingest(624, 1000, &[LOGROTATE, "-f", "/etc/logrotate.conf"]);
             ingest(625, 0, &[LOGROTATE, "-d", "-f", "/etc/logrotate.conf"]);
             ingest(626, 0, &[LOGROTATE, "-f", "/tmp/evil.conf"]);
@@ -7876,7 +7881,11 @@ mod tests {
                     } else {
                         ResponseAction::Log
                     };
-                    assert_eq!((action, severity), (kept, Severity::High), "pid {pid} {path}");
+                    assert_eq!(
+                        (action, severity),
+                        (kept, Severity::High),
+                        "pid {pid} {path}"
+                    );
                     assert!(!why.contains("rotated by hand"), "{why}");
                 }
             }

@@ -1638,7 +1638,8 @@ fn service_uid_credential_read<H: PostureHost>(
         .iter()
         .any(|f| filename == *f || (by_kernel && filename.ends_with(f)));
     // lot 376: or the auth stack's own read by the image at the open
-    if !credential || auth.is_credential_reader(pid, as_of)
+    if !credential
+        || auth.is_credential_reader(pid, as_of)
         || auth.is_auth_binary_image(pid, as_of, exe_file)
     {
         return false;
@@ -3034,7 +3035,10 @@ mod tests {
         };
         // the image alone (no exec of 2999 cached): the auth stack's read
         assert!(
-            !super::sensitive_file_access(&open_by(2999, 1000, "/etc/login.defs", (KDEV, 4242)), &auth),
+            !super::sensitive_file_access(
+                &open_by(2999, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
             "control: no exec cached, sudo's image"
         );
         assert!(
@@ -3060,11 +3064,17 @@ mod tests {
             "control: /tmp/x fires"
         );
         assert!(
-            super::sensitive_file_access(&open_by(3000, 1000, "/etc/login.defs", (KDEV, 777)), &auth),
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 777)),
+                &auth
+            ),
             "control: its own image fires"
         );
         assert!(
-            super::sensitive_file_access(&open_by(3000, 1000, "/etc/login.defs", (KDEV, 4242)), &auth),
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
             "a known /tmp/x exec with sudo's image at the open fires"
         );
         // a service uid's credential read, the same shape

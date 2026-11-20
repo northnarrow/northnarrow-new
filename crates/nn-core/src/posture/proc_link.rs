@@ -130,6 +130,24 @@ pub(crate) fn reopens_a_descriptor(path: &str) -> bool {
     proc_link(path) == Some(ProcLink::Descriptor)
 }
 
+/// Lot 376 (the review of #583, F3): the descriptor of the caller's own
+/// table an exec path reopens, spelled exactly as fexecve(3) and systemd's
+/// `posix_spawn` of its executor spell it — `/proc/self/fd/N` or
+/// `/dev/fd/N`, `N` decimal digits and nothing after. `None` for every other
+/// spelling (a thread's, another pid's, a folded or relative one): an
+/// exemption reads the forker's descriptor `N` only for these.
+pub(crate) fn own_descriptor(path: &str) -> Option<u32> {
+    let segs: Vec<&str> = path.split('/').collect();
+    let n = match segs.as_slice() {
+        ["", "proc", "self", "fd", n] | ["", "dev", "fd", n] => *n,
+        _ => return None,
+    };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
 /// The review of #578 (N1): whose view a link of `/proc` opens — the
 /// process that reads the name (`self`, `thread-self`), or a process by its
 /// pid.
@@ -229,6 +247,30 @@ fn view_link_of<'a>(segs: &[&'a str]) -> Option<ViewLink<'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 376 (the review of #583, F3): only the two spellings of the
+    /// caller's own descriptor name one.
+    #[test]
+    fn own_descriptor_reads_only_the_two_exact_spellings() {
+        assert_eq!(own_descriptor("/proc/self/fd/9"), Some(9));
+        assert_eq!(own_descriptor("/dev/fd/12"), Some(12));
+        for p in [
+            "/proc/thread-self/fd/9",
+            "/proc/self/task/1/fd/9",
+            "/proc/1/fd/9",
+            "/proc/self//fd/9",
+            "/proc/self/fd/9/",
+            "/proc/self/fd/9/x",
+            "/proc/self/fd/",
+            "/proc/self/fd/-1",
+            "/proc/self/fd/9a",
+            "/dev/stdin",
+            "proc/self/fd/9",
+            "/proc/self/fd/99999999999",
+        ] {
+            assert_eq!(own_descriptor(p), None, "{p}");
+        }
+    }
 
     #[test]
     fn dot_segments_fold_and_proc_links_are_doors() {

@@ -77,8 +77,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
-    FIM_RENAMED_AWAY, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
+    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAMED_AWAY,
+    FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
     FIM_WRITE_ONE_WRITER, FIM_WRITE_TRUNCATED_BY_ANOTHER,
 };
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
@@ -3262,7 +3262,10 @@ fn decode_record(
         );
         return Ok((kernel_record(link.drift), Some(path)));
     }
-    Ok((kernel_record(*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?), None))
+    Ok((
+        kernel_record(*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?),
+        None,
+    ))
 }
 
 /// The review of #583 (F1): a record the kernel sent, without the bits only
@@ -5449,7 +5452,10 @@ mod tests {
         forged.op_flags = FIM_RENAMED_AWAY | FIM_WRITE_APPEND_ONLY;
         let mut mounts = crate::sensors::open_sensor::MountTable::default();
         let (decoded, _) = decode_record(bytemuck::bytes_of(&forged), &mut mounts).unwrap();
-        assert_eq!(decoded.op_flags, FIM_WRITE_APPEND_ONLY, "the kernel's bits only");
+        assert_eq!(
+            decoded.op_flags, FIM_WRITE_APPEND_ONLY,
+            "the kernel's bits only"
+        );
     }
 
     /// The review of #554 (named, F1): a record seen at close carries its

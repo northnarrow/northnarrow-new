@@ -120,6 +120,32 @@
 //!
 //! [`exec_image`]: crate::posture::lineage::AuthSessionTracker::exec_image
 //!
+//! # Lot 376 (the review of #583, F3): PID 1's executor without an identity
+//!
+//! At a reboot of Ubuntu 24.04 an exec of `/proc/self/fd/9`, `ppid` 1,
+//! `comm` `9`, came with no identity at all (the exec record was attached
+//! before the exec sensor at the agent's start — now after it — or the
+//! LSM program's handoff was lost) and was gone before the pump read its
+//! `/proc`: the path heuristic below, Critical. Such an exec is PID 1's own
+//! launch of its packaged executor when every fact holds, each the
+//! kernel's or the host's, never `argv[0]` or `comm`:
+//!
+//! - the path names the caller's own descriptor `N` exactly
+//!   (`/proc/self/fd/N`, `/dev/fd/N`: [`crate::posture::proc_link::own_descriptor`]);
+//! - the kernel's fork record says PID 1 forked it and this is its first
+//!   exec since (`fork_parent` 1), its parent is PID 1, it runs as root, and
+//!   the lineage holds no earlier exec of the process;
+//! - PID 1's own descriptor `N` (`/proc/1/fd/N`, which the child's table
+//!   copied at the fork, and which no one but root can change) is a file of
+//!   the executor's identities ([`ExecutorImages`]: the packaged file, the
+//!   copy PID 1 holds).
+//!
+//! A user's manager's launches are not read so (a user may change its own
+//! manager's child before the exec); a shell's child, an orphan PID 1
+//! adopted (its forker is another), a missing fork record, a second exec,
+//! PID 1's descriptor `N` another file or a memfd, another spelling of the
+//! path: the heuristic's Critical, as before.
+//!
 //! Tracepoint mode has no identity: the caller's path is read by the
 //! posture's one reader of a `/proc` link
 //! ([`crate::posture::proc_link::reopens_a_descriptor`]: every per-thread
@@ -490,6 +516,41 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
             || (self.executor.contains(id) && self.forked_by_a_manager(exe.fork_parent, as_of))
     }
 
+    /// Lot 376 (the review of #583, F3; module docs): an exec with no
+    /// identity is PID 1's launch of its packaged executor — the path names
+    /// the caller's own descriptor `N`, the kernel's fork record says PID 1
+    /// forked it (its first exec since), its parent is PID 1, it runs as
+    /// root, the lineage holds no earlier exec of the process, and PID 1's
+    /// own descriptor `N` is one of the executor's identities.
+    fn pid1_executor_launch(&self, event: &Event) -> bool {
+        let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            filename,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        let Some(lineage) = self.lineage.as_ref() else {
+            return false;
+        };
+        let Some(n) = crate::posture::proc_link::own_descriptor(filename) else {
+            return false;
+        };
+        *uid == 0
+            && *ppid == 1
+            && exe.fork_parent == 1
+            && !lineage.executed_before(*pid, *start_ns, *timestamp_ns)
+            && lineage
+                .pid1_descriptor_file(n)
+                .is_some_and(|id| self.executor.held_by_pid1(id) || self.executor.contains(id))
+    }
+
     /// LSM mode, lot 310: the process re-executes the very image its
     /// parent runs (the lineage's record of the parent's exec, its
     /// `(dev, ino)`): `/proc/self/exe` after a package upgrade unlinked it
@@ -763,6 +824,10 @@ impl<H: PostureHost> Rule for R004ExecFromProcSelfFd<H> {
             // by `argv[0]` and a parent of pid 1 any more — the caller
             // chooses `argv[0]`, and an orphan's parent is pid 1; systemd's
             // launch of a unit is judged by its image above (a linked file)
+            return None;
+        } else if self.pid1_executor_launch(event) {
+            // lot 376 (the review of #583, F3): no identity, but PID 1's
+            // fork running the executor PID 1 holds as that descriptor
             return None;
         }
         Some(build_verdict(
@@ -2376,5 +2441,160 @@ mod lot310 {
         assert!(!images.contains((0, 0)));
         assert_eq!(images.len(), 1);
         assert!(!images.replace(vec![(1, 2), (0, 0)]), "the same set");
+    }
+}
+
+/// Lot 376 (the review of #583, F3): PID 1's executor launch with no
+/// identity, told by PID 1's own descriptor.
+#[cfg(test)]
+mod lot376 {
+    use super::*;
+    use crate::posture::host::testing::IdTestHost;
+    type R004 = R004ExecFromProcSelfFd<IdTestHost>;
+    type Tracker = crate::posture::lineage::AuthSessionTracker<IdTestHost>;
+
+    const STAT_DEV: u64 = 64769;
+    const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+    /// The packaged executor, and a file that is not one.
+    const EXECUTOR: (u64, u64) = (KDEV, 555);
+    const OTHER: (u64, u64) = (KDEV, 556);
+
+    /// The record of the 24.04 reboot: `/proc/self/fd/9`, `ppid` 1, `comm`
+    /// `9`, no identity (`exe.flags` 0) — forked by `forker`.
+    fn launch(filename: &str, ppid: u32, uid: u32, forker: u32) -> Event {
+        Event::ProcessSpawn {
+            pid: 1029,
+            ppid,
+            uid,
+            gid: uid,
+            comm: "9".to_string(),
+            filename: filename.to_string(),
+            timestamp_ns: 23_800_000_000,
+            argv: vec![
+                "/usr/lib/systemd/systemd-executor".to_string(),
+                "--deserialize".to_string(),
+                "93".to_string(),
+            ],
+            parent_comm: "systemd".to_string(),
+            parent_start_ns: 0,
+            start_ns: 23_799_000_000,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: filename.to_string(),
+                fork_parent: forker,
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        }
+    }
+
+    fn kills(v: Option<Verdict>) -> bool {
+        v.is_some_and(|v| {
+            v.action == ResponseAction::KillProcessTree && v.severity == Severity::Critical
+        })
+    }
+
+    /// Named test (the review of #583, F3; the lab of lot 376: R004
+    /// Critical ×1 at a reboot of Ubuntu 24.04, `pid 1029 ppid 1 comm "9"
+    /// exe /proc/self/fd/9`). With no identity, PID 1's fork running the
+    /// executor PID 1 holds as that descriptor is no fileless exec — by the
+    /// kernel's fork record and PID 1's own descriptor, never `argv[0]` or
+    /// `comm`. A foreign `fexecve` of `/proc/self/fd/N` stays Critical: a
+    /// shell's child (another forker), an orphan PID 1 adopted, no fork
+    /// record, PID 1's descriptor another file or not readable, a second
+    /// exec of the process, a non-root exec, another spelling, no executor
+    /// identities known, no lineage.
+    #[test]
+    fn pid_1_s_executor_launch_without_an_identity_is_told_by_pid_1_s_descriptor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fd = |n: u32| tmp.path().join("1").join("fd").join(n.to_string());
+        IdTestHost::set_file_id(fd(9), Some((STAT_DEV, EXECUTOR.1)));
+        IdTestHost::set_file_id(fd(10), Some((STAT_DEV, OTHER.1)));
+        let images = ExecutorImages::default();
+        images.replace(vec![EXECUTOR]);
+        images.replace_pid1_held(vec![EXECUTOR]);
+        let lineage = Tracker::new(tmp.path());
+        let r = R004::new(lineage.clone()).with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images.clone(),
+        });
+        for f in ["/proc/self/fd/9", "/dev/fd/9"] {
+            assert!(
+                r.evaluate(&launch(f, 1, 0, 1)).is_none(),
+                "PID 1's executor launch: {f}"
+            );
+        }
+        // the packaged file's identity alone (not held by PID 1) is one too
+        let packaged = ExecutorImages::default();
+        packaged.replace(vec![EXECUTOR]);
+        let r2 = R004::new(lineage.clone()).with_launches(KnownLaunches {
+            own_worker: None,
+            executor: packaged,
+        });
+        assert!(r2.evaluate(&launch("/proc/self/fd/9", 1, 0, 1)).is_none());
+        // CONTROLS: Critical, the kill
+        for (e, what) in [
+            (launch("/proc/self/fd/9", 4444, 0, 4444), "a shell's child"),
+            (
+                launch("/proc/self/fd/9", 1, 0, 4444),
+                "an orphan PID 1 adopted",
+            ),
+            (launch("/proc/self/fd/9", 1, 0, 0), "no fork record"),
+            (
+                launch("/proc/self/fd/10", 1, 0, 1),
+                "PID 1's descriptor another file",
+            ),
+            (
+                launch("/proc/self/fd/11", 1, 0, 1),
+                "PID 1's descriptor not read",
+            ),
+            (launch("/proc/self/fd/9", 1, 1000, 1), "not root"),
+            (
+                launch("/proc/thread-self/fd/9", 1, 0, 1),
+                "another spelling",
+            ),
+            (launch("/proc/1029/fd/9", 1, 0, 1), "its pid's spelling"),
+        ] {
+            assert!(kills(r.evaluate(&e)), "{what}");
+        }
+        // a memfd at PID 1's descriptor (no executor identity): the kill
+        IdTestHost::set_file_id(fd(9), Some((0, 77)));
+        assert!(
+            kills(r.evaluate(&launch("/proc/self/fd/9", 1, 0, 1))),
+            "a memfd"
+        );
+        IdTestHost::set_file_id(fd(9), Some((STAT_DEV, EXECUTOR.1)));
+        // no executor identities known, no lineage
+        let none = R004::new(lineage.clone());
+        assert!(
+            kills(none.evaluate(&launch("/proc/self/fd/9", 1, 0, 1))),
+            "none known"
+        );
+        let bare = R004::default().with_launches(KnownLaunches {
+            own_worker: None,
+            executor: images.clone(),
+        });
+        assert!(
+            kills(bare.evaluate(&launch("/proc/self/fd/9", 1, 0, 1))),
+            "no lineage"
+        );
+        // a second exec of the same process (its first one cached): the kill
+        let mut first = launch("/usr/lib/systemd/systemd-executor", 1, 0, 1);
+        if let Event::ProcessSpawn {
+            timestamp_ns, exe, ..
+        } = &mut first
+        {
+            *timestamp_ns = 23_799_500_000;
+            exe.path = "/usr/lib/systemd/systemd-executor".into();
+        }
+        assert!(lineage.ingest_spawn_event(&first));
+        assert!(
+            kills(r.evaluate(&launch("/proc/self/fd/9", 1, 0, 1))),
+            "a second exec"
+        );
+        IdTestHost::set_file_id(fd(9), None);
+        IdTestHost::set_file_id(fd(10), None);
     }
 }

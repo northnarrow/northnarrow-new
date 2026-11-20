@@ -488,7 +488,7 @@ struct Entry {
     /// scan) — its argv is not known.
     argv: Option<u64>,
     /// Lot 376 (the review of #583, F1): the exec's argv is logrotate's run
-    /// with root's configuration only ([`rotates_with_root_config`]: no
+    /// with root's configuration only ([`rotates_with_root_config`](crate::posture::script_args::rotates_with_root_config): no
     /// option but `-f`/`--force`/`-v`/`--verbose`, no file but
     /// `/etc/logrotate.conf` and `/etc/logrotate.d/<name>`), precomputed at
     /// ingest as [`Self::encrypts`] is (the argv is not kept). `false` for
@@ -1425,7 +1425,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             self.argv_digest(argv)
         };
         // the review of #583 (F1): logrotate run with root's configuration
-        let root_rotation = !*argv_truncated && rotates_with_root_config(argv);
+        let root_rotation =
+            !*argv_truncated && crate::posture::script_args::rotates_with_root_config(argv);
         let runs = with_pump_facts(
             runs_of(Path::new(path), argv),
             Path::new(path),
@@ -1556,7 +1557,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 js_pm,
                 encrypts,
                 self.argv_digest(argv),
-                rotates_with_root_config(argv),
+                crate::posture::script_args::rotates_with_root_config(argv),
             ),
             runs,
             spawn_ns,
@@ -3022,6 +3023,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             == Some(image)
     }
 
+    /// Lot 376 (the review of #583, F3): the file the host's PID 1 holds
+    /// open as its descriptor `n` — `/proc/1/fd/<n>` followed, its device in
+    /// the kernel's form (`MKDEV`, as the exec sensor reports a file) and
+    /// its inode. `None` when it cannot be read. A child of PID 1's
+    /// `posix_spawn` starts with a copy of that table (no `CLONE_FILES`).
+    pub fn pid1_descriptor_file(&self, n: u32) -> Option<(u64, u64)> {
+        H::file_id(
+            self.inner
+                .proc_root
+                .join("1")
+                .join("fd")
+                .join(n.to_string()),
+        )
+        .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
+    }
+
+    /// Lot 376 (the review of #583, F3): the spawn cache holds an exec of
+    /// the process `pid` that started at `start_ns` (an exec event's exact
+    /// start: never the start's scan's or a sweep's entry) from before
+    /// `before_ns` — the process executed something before.
+    pub fn executed_before(&self, pid: u32, start_ns: u64, before_ns: u64) -> bool {
+        if start_ns == 0 || before_ns == 0 {
+            return false;
+        }
+        match self.cached_at(pid, Some(before_ns - 1)) {
+            CachedAt::Current(e) | CachedAt::Past(e) => {
+                e.start_ticks.is_none() && e.start_ns == start_ns && e.spawn_ns < before_ns
+            }
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        }
+    }
+
     /// Lot 348: [`Self::is_host_file`], and the file's directory under the
     /// host's root is root's and writable by no one else
     /// ([`PostureHost::dir_is_root_only`]) — what `ROOT_DIR` says of a
@@ -3918,7 +3951,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
 
     /// Lot 376 (the review of #583, F1): `pid`'s exec, as of `as_of`, ran
     /// logrotate with root's configuration only ([`Entry::root_rotation`]:
-    /// [`rotates_with_root_config`]), and that configuration lies in
+    /// [`rotates_with_root_config`](crate::posture::script_args::rotates_with_root_config)), and that configuration lies in
     /// directories root's and writable by no one else under the host's root
     /// ([`PostureHost::dir_is_root_only`]: `/etc`, `/etc/logrotate.d`) —
     /// what it trusts is root's own, whether or not the FIM watches it.
@@ -3930,9 +3963,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::LaterOnly | CachedAt::Absent => false,
         };
         rotation
-            && ["/etc", LOGROTATE_ROOT_DROP_INS]
+            && crate::posture::script_args::LOGROTATE_ROOT_CONFIG_DIRS
                 .iter()
-                .all(|d| self.is_root_only_host_dir(d.trim_end_matches('/')))
+                .all(|d| self.is_root_only_host_dir(d))
     }
 
     /// Lot 340 (the alpha's daily false positives): `pid` is the Go
@@ -5258,51 +5291,6 @@ fn in_snapd_service(facts: &dyn crate::decision::rule_policy::ActorFacts, pid: u
         .is_some_and(|cg| crate::response::cgroup::cgroup_at(&cg, SNAPD_SERVICE_CGROUP))
         && facts.started_in_cgroup(pid) == Some(true)
         && facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
-}
-
-/// Lot 376 (the review of #583, F1): root's configuration of logrotate —
-/// the main file and the files of its drop-in directory, both root's.
-const LOGROTATE_ROOT_CONFIG: &str = "/etc/logrotate.conf";
-const LOGROTATE_ROOT_DROP_INS: &str = "/etc/logrotate.d/";
-
-/// Lot 376 (the review of #583, F1): `argv` runs logrotate (`argv[0]` by its
-/// basename) with root's configuration only, as an administrator rotates by
-/// hand (`logrotate -f /etc/logrotate.conf`, `logrotate -vf
-/// /etc/logrotate.d/rsyslog`): every option is `-f`, `--force`, `-v` or
-/// `--verbose` (or a cluster of `f` and `v`: `-fv`), every other argument
-/// is [`LOGROTATE_ROOT_CONFIG`] or a name directly in
-/// [`LOGROTATE_ROOT_DROP_INS`] (no `/`, no `.` or `..`), and there is one at
-/// least. A state file of the caller's (`-s`), a configuration elsewhere
-/// (`/tmp/evil.conf`, `/etc/logrotate.d/../../tmp/x`), a mail command
-/// (`-m`), `--`, anything else: `false`.
-fn rotates_with_root_config(argv: &[String]) -> bool {
-    let Some((first, rest)) = argv.split_first() else {
-        return false;
-    };
-    if first.rsplit('/').next() != Some("logrotate") {
-        return false;
-    }
-    let mut files = 0;
-    for a in rest {
-        let ok = match a.as_str() {
-            "--force" | "--verbose" => true,
-            opt if opt.starts_with("--") => false,
-            opt if opt.starts_with('-') => {
-                opt.len() > 1 && opt[1..].bytes().all(|b| b == b'f' || b == b'v')
-            }
-            file => {
-                files += 1;
-                file == LOGROTATE_ROOT_CONFIG
-                    || file
-                        .strip_prefix(LOGROTATE_ROOT_DROP_INS)
-                        .is_some_and(|n| !n.is_empty() && !n.contains('/') && n != "." && n != "..")
-            }
-        };
-        if !ok {
-            return false;
-        }
-    }
-    files > 0
 }
 
 fn is_package_manager_binary(exe: &Path) -> bool {

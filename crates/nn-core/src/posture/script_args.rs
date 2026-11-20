@@ -2427,6 +2427,55 @@ fn crypt_mode(table: &CryptTable, args: &[&str]) -> bool {
     mode.unwrap_or(table.default)
 }
 
+/// Lot 376 (the review of #583, F1): root's configuration of logrotate —
+/// the main file and the files of its drop-in directory, both root's.
+const LOGROTATE_ROOT_CONFIG: &str = "/etc/logrotate.conf";
+const LOGROTATE_ROOT_DROP_INS: &str = "/etc/logrotate.d/";
+
+/// Lot 376 (the review of #583, F1): the directories root's configuration
+/// of logrotate lies in, which must be root's and writable by no one else.
+pub(crate) const LOGROTATE_ROOT_CONFIG_DIRS: &[&str] = &["/etc", "/etc/logrotate.d"];
+
+/// Lot 376 (the review of #583, F1): `argv` runs logrotate (`argv[0]` by its
+/// basename) with root's configuration only, as an administrator rotates by
+/// hand (`logrotate -f /etc/logrotate.conf`, `logrotate -vf
+/// /etc/logrotate.d/rsyslog`): every option is `-f`, `--force`, `-v` or
+/// `--verbose` (or a cluster of `f` and `v`: `-fv`), every other argument
+/// is [`LOGROTATE_ROOT_CONFIG`] or a name directly in
+/// [`LOGROTATE_ROOT_DROP_INS`] (no `/`, no `.` or `..`), and there is one at
+/// least. A state file of the caller's (`-s`), a configuration elsewhere
+/// (`/tmp/evil.conf`, `/etc/logrotate.d/../../tmp/x`), a mail command
+/// (`-m`), `--`, anything else: `false`.
+pub fn rotates_with_root_config(argv: &[String]) -> bool {
+    let Some((first, rest)) = argv.split_first() else {
+        return false;
+    };
+    if first.rsplit('/').next() != Some("logrotate") {
+        return false;
+    }
+    let mut files = 0;
+    for a in rest {
+        let ok = match a.as_str() {
+            "--force" | "--verbose" => true,
+            opt if opt.starts_with("--") => false,
+            opt if opt.starts_with('-') => {
+                opt.len() > 1 && opt[1..].bytes().all(|b| b == b'f' || b == b'v')
+            }
+            file => {
+                files += 1;
+                file == LOGROTATE_ROOT_CONFIG
+                    || file
+                        .strip_prefix(LOGROTATE_ROOT_DROP_INS)
+                        .is_some_and(|n| !n.is_empty() && !n.contains('/') && n != "." && n != "..")
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    files > 0
+}
+
 /// Lot 313 (BUG-49's residue): `exe` is an encryption tool (`openssl enc`,
 /// `gpg -c`/`--symmetric`/`-e`, `age`, `7z a -p`, `zip -e`/`-P`, `rar a -p`,
 /// `ccrypt`, `mcrypt`, `aescrypt -e`, `scrypt enc`) and `argv` asks it to
@@ -3181,6 +3230,54 @@ mod tests {
 
     /// Lot 313 (BUG-49's residue): an encryption tool's argv in its
     /// encryption mode, as each tool reads it; its other modes are not.
+    /// Lot 376 (the review of #583, F1, and its mini-hunt): logrotate run
+    /// with root's configuration only — the spellings an administrator
+    /// types — and the ones that are not (a state file, another file, a
+    /// `..` out of the drop-ins, `-d`, `-m`, `--`, `--force=x`, no file).
+    #[test]
+    fn logrotate_with_root_s_configuration_only() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for ok in [
+            &["logrotate", "-f", "/etc/logrotate.conf"][..],
+            &["/usr/sbin/logrotate", "/etc/logrotate.conf"],
+            &["logrotate", "-vf", "/etc/logrotate.d/rsyslog"],
+            &[
+                "logrotate",
+                "-fvv",
+                "/etc/logrotate.d/wtmp",
+                "/etc/logrotate.d/btmp",
+            ],
+            &["logrotate", "--force", "--verbose", "/etc/logrotate.conf"],
+            &["logrotate", "/etc/logrotate.conf", "-f"],
+        ] {
+            assert!(rotates_with_root_config(&argv(ok)), "{ok:?}");
+        }
+        for not in [
+            &["logrotate", "-f"][..],
+            &["logrotate"],
+            &[],
+            &["logrotate", "-f", "/tmp/evil.conf"],
+            &["logrotate", "-f", "/etc/logrotate.d/../../tmp/x"],
+            &["logrotate", "-f", "/etc/logrotate.d/"],
+            &["logrotate", "-f", "/etc/logrotate.d/.."],
+            &["logrotate", "-f", "/etc/logrotate.d/x/y"],
+            &["logrotate", "-f", "/etc//logrotate.conf"],
+            &["logrotate", "-f", "etc/logrotate.conf"],
+            &["logrotate", "-s", "/tmp/st", "/etc/logrotate.conf"],
+            &["logrotate", "-fs", "/tmp/st", "/etc/logrotate.conf"],
+            &["logrotate", "--state=/tmp/st", "/etc/logrotate.conf"],
+            &["logrotate", "-d", "/etc/logrotate.conf"],
+            &["logrotate", "-m", "/tmp/m", "/etc/logrotate.conf"],
+            &["logrotate", "--", "/etc/logrotate.conf"],
+            &["logrotate", "--force=1", "/etc/logrotate.conf"],
+            &["logrotate", "-", "/etc/logrotate.conf"],
+            &["python3", "-f", "/etc/logrotate.conf"],
+            &["logrotate2", "/etc/logrotate.conf"],
+        ] {
+            assert!(!rotates_with_root_config(&argv(not)), "{not:?}");
+        }
+    }
+
     #[test]
     fn an_encryption_tool_s_encryption_argv() {
         let e = |exe: &str, a: &[&str]| encrypts(Path::new(exe), &argv(a));
