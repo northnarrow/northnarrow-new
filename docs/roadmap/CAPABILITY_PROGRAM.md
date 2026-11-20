@@ -13766,6 +13766,33 @@ number in parentheses is a lab PR.
     its executable.
   - The nightly `lab-vm.yml` on `main`, scheduled runs 7-20 Nov 2026: 6 of
     14 green.
-  - Lab: queued on Debian 13 and Ubuntu 24.04 (after the rc10 release
-    candidate's checks); recorded here as measured.
+  - Fix round 1 (the review of #584 and its lab): the half-install's
+    uninstall on Debian 13 exited 1 and left the whole host. With no list
+    of the agent's programs (each start refused before it loaded
+    anything) it waited for every LSM program, and PID 1's own (systemd's
+    `RestrictFileSystems=`) never detaches. The uninstall's and the
+    upgrade's wait leave out the programs PID 1 holds (`lsm_progs_left`,
+    one text in both scripts); a pin root a unit restart makes again
+    during the uninstall is removed once the units are gone. Tests
+    `uninstall_of_a_half_install_does_not_wait_for_pid_ones_lsm_program`,
+    `both_scripts_leave_out_only_pid_ones_lsm_programs`,
+    `uninstall_removes_a_pin_root_made_again_after_the_units_are_gone`.
+    Lot 374's `a_unit_restart_takes_the_vacated_role_under_enforce` waits
+    for the admin socket before each window (it failed once in CI).
+  - Lab, as measured on Debian 13 (6.12, systemd 257) and Ubuntu 24.04
+    (6.8, systemd 255), each case from a checked clean state: a loadable
+    list refused by `install.sh` (exit 5, nothing changed; a bare name
+    too), `host-check` exit 3; the half-install's starts refused (78 and
+    16, an empty pin root), `host-check` 3, `uninstall.sh` without a key
+    exit 0 with nothing left (on Debian 13 a pin root made again by a unit
+    restart was removed after the units); an inert list noted and
+    installed, no start refused; the watchdog's start and restart judged
+    with no `mount_not_canonical`, the witness bind present in both
+    namespaces; a self-bind below the state directory and one below the
+    witness directory named in the watchdog's namespace (3 signed
+    findings), none after their removal; a cold boot with both units
+    enabled and active, 103 pins and our LSM programs, no drift; a clean
+    uninstall. The first round, before the fix round, had the Debian 13
+    uninstall exit 1, and the cold boot after it found the units never
+    enabled.
   Levels unchanged.
