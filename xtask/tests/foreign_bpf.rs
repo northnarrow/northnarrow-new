@@ -1388,6 +1388,9 @@ fn enforce_mode_tests_read_maps_read_only_and_match_whole_kinds() {
         !wd.contains(".contains(\"witness_row\")"),
         "a witness kind matched by its prefix"
     );
-    let t = body(&wd, "the_watchdog_signs_the_agent_s_vacancy_and_its_successor");
+    let t = body(
+        &wd,
+        "the_watchdog_signs_the_agent_s_vacancy_and_its_successor",
+    );
     assert!(t.contains("format!(\"\\\"kind\\\":\\\"{k}\\\"\")"), "{t}");
 }
