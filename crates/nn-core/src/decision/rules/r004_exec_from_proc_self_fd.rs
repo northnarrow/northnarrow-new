@@ -176,6 +176,25 @@ enum RuntimeCopy {
     NotCompared(Option<program_identity::BudgetEpisode>),
 }
 
+/// Lot 378 (the rc10 soak, Debian 13: a rootless Podman run judged
+/// fileless): `file`, the kernel's identity of a file a process executed (in
+/// any mount namespace: rootless Podman executes conmon in its own), is an
+/// installed program's ([`program_identity::installed_image`]) whose file at
+/// its recorded path under the host's root is that very inode now, in a
+/// directory root's and writable by no one else
+/// ([`crate::posture::lineage::AuthSessionTracker::is_host_file_in_root_dir`])
+/// — what the pump's sight of a manager says of a fork it saw (the inode
+/// still at its path), never a user's file that has the inode number of a
+/// program removed since. `None` otherwise; the caller asks its kind.
+fn installed_file_at_its_path<H: PostureHost>(
+    lineage: &crate::posture::lineage::AuthSessionTracker<H>,
+    file: (u64, u64),
+) -> Option<(u64, u64)> {
+    program_identity::installed_image(file)
+        .filter(|i| lineage.is_host_file_in_root_dir(&i.path, file))
+        .map(|i| i.id)
+}
+
 /// The review of #578 (N3): the sentence an uncompared runtime copy's
 /// record adds when it opened an episode of a spent compare budget — the
 /// uid whose share ran out, and the second's biggest spender — and nothing
@@ -654,10 +673,18 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         // fork the lineage holds no exec of (conmon's monitor, forked as it
         // daemonized) — by the installed file the pump saw it run at the
         // exec; the forker relation is the kernel's
+        // Lot 378 (the rc10 soak, Debian 13: Critical at a rootless Podman
+        // run): or, for a record of no root-only directory of PID 1's mount
+        // namespace — rootless Podman executes conmon in its own; the
+        // lineage's sweep enters conmon's monitor, a fork, with that exec's
+        // file — by the file the kernel executed: an installed manager's
+        // inode still at its path ([`installed_file_at_its_path`])
         let manager = |pid: Option<u32>| {
             pid.is_some_and(|p| {
                 let image = match lineage.exec_file(p, as_of) {
-                    Some(_) => lineage.exec_image(p, as_of),
+                    Some(file) => lineage
+                        .exec_image(p, as_of)
+                        .or_else(|| installed_file_at_its_path(lineage, file)),
                     None => clone.seen_image(p),
                 };
                 image.and_then(program_identity::installed_kind)
@@ -2113,6 +2140,160 @@ mod lot310 {
         let bare = memfd_exec(34_716, 34_701, 34_701, 400);
         keep_runtime_clone(&bare, copy(runc));
         assert!(kills(R004::default().evaluate(&bare)));
+    }
+
+    /// Lot 378 (named, the rc10 soak on Debian 13: R004 Critical, a
+    /// would-have KillProcessTree, at a rootless Podman run —
+    /// `memfd:runc_cloned` executed through `/dev/fd/6` as uid 1000 by `runc
+    /// init`, under `runc --systemd-cgroup … create`; the pump had compared
+    /// the copy and kept it): rootless Podman executes conmon in its own
+    /// mount namespace, so its exec record holds the file the kernel
+    /// executed but no image of a root-only directory of PID 1's, and the
+    /// lineage's sweep enters conmon's monitor (a fork) with that record.
+    /// The manager was then judged by the record's image alone, the pump's
+    /// sight of it no longer asked: Critical whenever a sweep came between
+    /// the monitor's fork and the judgement. A manager is told by the file
+    /// the kernel executed too: an installed manager's inode still at its
+    /// path, in a directory root's only. The attack shapes still fire,
+    /// rootless or not: a memfd the pump found no copy of, under the same
+    /// runtime and manager; a copy of runc under a session's shell; under a
+    /// user's file with the inode number of a manager removed since, or
+    /// with another file at the manager's path; under a manager in a
+    /// directory others can write; and an uncompared copy (the budget) of
+    /// a user.
+    #[test]
+    fn a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless() {
+        use crate::decision::rules::program_identity::{
+            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+        };
+        use crate::posture::host::testing::IdTestHost;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let (runc, conmon, bash) = ((KDEV, 378_001), (KDEV, 378_002), (KDEV, 378_003));
+        for (id, path, kind) in [
+            (runc, "/usr/bin/runc", ProgramKind::ContainerRuntime),
+            (conmon, "/usr/bin/conmon", ProgramKind::RuntimeManager),
+        ] {
+            record_installed(InstalledImage {
+                id,
+                len: 12_000_000,
+                path: path.into(),
+                kind,
+            });
+        }
+        IdTestHost::set_file_id("/usr/bin/runc", Some((STAT_DEV, 378_001)));
+        IdTestHost::set_file_id("/usr/bin/conmon", Some((STAT_DEV, 378_002)));
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let as_user = |mut e: Event| {
+            if let Event::ProcessSpawn { uid, gid, exe, .. } = &mut e {
+                (*uid, *gid) = (1000, 1000);
+                // podman's own mount namespace: no root-only directory of
+                // PID 1's
+                exe.flags &= !ROOT_DIR;
+            }
+            e
+        };
+        // conmon's monitor as the sweep entered it (or conmon forking the
+        // runtime itself), `runc create`, `runc init`; a session's shell
+        // and the runc it runs
+        for e in [
+            lineage_exec(37_800, 37_799, 37_799, conmon, 100),
+            lineage_exec(37_801, 37_800, 37_800, runc, 200),
+            lineage_exec(37_802, 37_801, 37_801, runc, 300),
+            lineage_exec(37_810, 37_809, 37_809, bash, 100),
+            lineage_exec(37_811, 37_810, 37_810, runc, 200),
+            lineage_exec(37_812, 37_811, 37_811, runc, 300),
+        ] {
+            assert!(lineage.ingest_spawn_event(&as_user(e)));
+        }
+        let r = R004ExecFromProcSelfFd::<IdTestHost>::new(lineage.clone());
+        let judged =
+            |pid: u32, ppid: u32, fork_parent: u32, ts: u64, clone: Option<RuntimeClone>| {
+                let e = as_user(memfd_exec(pid, ppid, fork_parent, ts));
+                assert!(lineage.ingest_spawn_event(&e));
+                if let Some(c) = clone {
+                    keep_runtime_clone(&e, c);
+                }
+                r.evaluate(&e)
+            };
+        let copy = || {
+            Some(RuntimeClone {
+                image: runc,
+                seen: Vec::new(),
+                unverified: false,
+                ..Default::default()
+            })
+        };
+        // runc 1.1: `runc init` re-executing its own image
+        assert!(judged(37_802, 37_801, 0, 400, copy()).is_none(), "runc 1.1");
+        // runc 1.2: `runc create`'s child, its first exec
+        assert!(
+            judged(37_803, 37_801, 37_801, 400, copy()).is_none(),
+            "runc 1.2"
+        );
+        // the attack shapes
+        assert!(
+            kills(judged(37_804, 37_801, 37_801, 410, None)),
+            "a memfd the pump found no copy of"
+        );
+        assert!(
+            kills(judged(37_812, 37_811, 0, 410, copy())),
+            "under a session's shell"
+        );
+        let uncompared = RuntimeClone {
+            unverified: true,
+            ..copy().unwrap()
+        };
+        assert!(
+            kills(judged(37_805, 37_801, 37_801, 420, Some(uncompared))),
+            "a user's uncompared copy"
+        );
+        IdTestHost::set_file_id("/usr/bin/conmon", Some((STAT_DEV, 999)));
+        assert!(
+            kills(judged(37_806, 37_801, 37_801, 430, copy())),
+            "another file at the manager's path"
+        );
+        IdTestHost::set_file_id("/usr/bin/conmon", None);
+        assert!(
+            kills(judged(37_807, 37_801, 37_801, 440, copy())),
+            "the manager removed since"
+        );
+        // the mini-hunt's variant: rootless Docker's containerd shim, executed
+        // in RootlessKit's own mount namespace (no root-only image either)
+        IdTestHost::set_file_id("/usr/bin/conmon", Some((STAT_DEV, 378_002)));
+        let shim = (KDEV, 378_004);
+        record_installed(InstalledImage {
+            id: shim,
+            len: 12_000_000,
+            path: "/usr/bin/containerd-shim-runc-v2".into(),
+            kind: ProgramKind::RuntimeManager,
+        });
+        IdTestHost::set_file_id(
+            "/usr/bin/containerd-shim-runc-v2",
+            Some((STAT_DEV, 378_004)),
+        );
+        for e in [
+            lineage_exec(37_820, 37_819, 37_819, shim, 100),
+            lineage_exec(37_821, 37_820, 37_820, runc, 200),
+            lineage_exec(37_822, 37_821, 37_821, runc, 300),
+        ] {
+            assert!(lineage.ingest_spawn_event(&as_user(e)));
+        }
+        assert!(
+            judged(37_822, 37_821, 0, 460, copy()).is_none(),
+            "rootless Docker's shim"
+        );
+        IdTestHost::set_file_id("/usr/bin/containerd-shim-runc-v2", None);
+        IdTestHost::set_dir_root_only("/usr/bin", false);
+        assert!(
+            kills(judged(37_808, 37_801, 37_801, 450, copy())),
+            "a directory others can write"
+        );
+        for path in ["/usr/bin/runc", "/usr/bin/conmon"] {
+            IdTestHost::set_file_id(path, None);
+        }
     }
 
     /// The review of #556 (F1, named): the pump's compare proves the memfd

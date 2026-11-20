@@ -148,8 +148,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
                           user's dropped binary that unlinks and re-executes itself is \
                           killed. Another program that re-executes itself from a memfd \
                           (older runc versions do, to protect their binary), or that execs a \
-                          file at the instant an upgrade unlinks it, is killed: nothing else \
-                          is exempt.",
+                          file at the instant an upgrade unlinks it, is killed. Lot 347: an \
+                          installed OCI runtime's copy of itself, sealed at the exec and \
+                          compared byte for byte, under an installed manager, is not fileless; \
+                          lot 378: the manager also by the file the kernel executed, its inode \
+                          still at its installed path in a root-only directory, in any mount \
+                          namespace (rootless Podman's conmon). Nothing else is exempt.",
         how_to_test: "`python3 -c 'import os; fd = os.memfd_create(\"x\"); \
                       os.write(fd, open(\"/bin/true\", \"rb\").read()); \
                       os.execv(\"/proc/self/fd/%d\" % fd, [\"x\"])'`.",
@@ -163,6 +167,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              a_dropped_binary_that_unlinks_and_reexecutes_itself_is_killed",
             "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
              the_executor_is_a_child_s_first_exec",
+            "crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::\
+             a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              process_memfd_fileless_exec_trips_r004",
             "deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd",

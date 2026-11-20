@@ -2578,6 +2578,7 @@ pub fn round_events_for_tests(
                 path_from_user: false,
                 kernel_class: 0,
                 exe_file: (0, 0),
+                cgroup_id: 0,
             },
         ),
         (
@@ -2593,6 +2594,7 @@ pub fn round_events_for_tests(
                 path_from_user: false,
                 kernel_class: 0,
                 exe_file: (0, 0),
+                cgroup_id: 0,
             },
         ),
         (
@@ -2742,6 +2744,7 @@ pub fn deny_events_for_tests(
         path_from_user: false,
         kernel_class: 0,
         exe_file: (0, 0),
+        cgroup_id: 0,
     };
     v.push((
         None,

@@ -302,8 +302,9 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-core/src/posture/lineage.rs",
-        // lot 376 (the review of #583, F3): 35 → 36, `pid1_descriptor_file`
-        36,
+        // lot 376 (the review of #583, F3): 35 → 36, `pid1_descriptor_file`;
+        // lot 378: 36 → 37, `is_user_manager_scope`
+        37,
         "lot 373: a package's dpkg list (`is_package_file`: R012's maintainer-script setcap \
          on the package's own files, read only for a setcap a maintainer script of a live \
          transaction runs, of a narrow capability — and, for a path no line spells, the \
@@ -346,7 +347,11 @@ const KNOWN: &[(&str, usize, &str)] = &[
          device and inode of PID 1's descriptor N (`/proc/1/fd/N`, one open and `fstat` of \
          procfs, beneath the anchored root) — read only for R004's exec with no identity whose \
          path names its own descriptor N, run as root by a process PID 1 forked, never a \
-         process's image as its identity",
+         process's image as its identity; lot 378: `is_user_manager_scope`, the inode number \
+         of one cgroupfs directory (kernfs: memory, no FUSE) — `user@<uid>.service/init.scope`, \
+         under the hierarchy's mount or its `unified/` — read only for a read of \
+         `/etc/login.defs` or `/etc/passwd` by a process the start's scan found running the \
+         packaged executor as the user, never a process's image as its identity",
     ),
     (
         "crates/nn-core/src/posture/triggers.rs",

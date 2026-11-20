@@ -334,6 +334,9 @@ pub(crate) mod testing {
         fn dir_is_root_only<P: AsRef<Path>>(path: P) -> bool {
             ROOT_ONLY_DIRS.with(|m| m.borrow().contains(path.as_ref()))
         }
+        fn dir_ino<P: AsRef<Path>>(path: P) -> Option<u64> {
+            TestHost::dir_ino(path)
+        }
         fn suspended_ns() -> u64 {
             TestHost::suspended_ns()
         }

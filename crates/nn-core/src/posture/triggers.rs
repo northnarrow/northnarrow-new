@@ -1507,6 +1507,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
         flags,
         kernel_class,
         exe_file,
+        cgroup_id,
         ..
     } = focal
     else {
@@ -1576,9 +1577,33 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // generator's name lookup): or a packaged program its user's own service
     // manager started (`user@<uid>.service`, whose PAM stack may set no login
     // uid), by the lineage's records
+    // Lot 378 (the rc10 soak on Ubuntu 24.04: ALERTED at a reboot): or a
+    // packaged setuid helper looking up its caller's name (`fusermount3`;
+    // the uidmap tools), by the file the kernel executed (a /tmp copy reads
+    // as itself)
     if is_passwd
         && !is_write_open(*flags)
-        && (auth.has_valid_loginuid(*pid) || auth.is_user_manager_program(*pid, *uid, as_of))
+        && (auth.has_valid_loginuid(*pid)
+            || auth.is_user_manager_program(*pid, *uid, as_of)
+            || auth.runs_host_program(
+                *pid,
+                as_of,
+                *exe_file,
+                super::lineage::PASSWD_LOOKUP_HELPER_EXES,
+            ))
+    {
+        return false;
+    }
+    // Lot 378 (the rc10 soak: ALERTED at every boot on the three guests):
+    // the user's service manager's `(sd-pam)` closing its PAM session — its
+    // modules read `/etc/login.defs` (and name lookups `/etc/passwd`) as the
+    // user, by the kernel's fork record and the lineage of PID 1's launch of
+    // `user@<uid>.service` (`cat /etc/login.defs` reads as itself)
+    let is_login_defs =
+        filename == "/etc/login.defs" || (by_kernel && filename.ends_with("/etc/login.defs"));
+    if (is_passwd || is_login_defs)
+        && !is_write_open(*flags)
+        && auth.is_user_manager_pam_keeper(*pid, *uid, as_of, (*exe_file, *cgroup_id))
     {
         return false;
     }
@@ -2746,6 +2771,7 @@ pub mod testutil {
             path_from_user: false,
             kernel_class: 0,
             exe_file: (0, 0),
+            cgroup_id: 0,
         }
     }
 
@@ -3218,6 +3244,411 @@ mod tests {
         for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
             IdTestHost::set_dir_root_only(d, false);
         }
+    }
+
+    /// Lot 378 (named, the rc10 soak: ALERTED at every boot on Debian 13,
+    /// Ubuntu 24.04 and 26.04 — `(sd-pam)`, image
+    /// `/usr/lib/systemd/systemd-executor`, uid 1000, opening
+    /// `/etc/login.defs` once the boot's first login ended and the user's
+    /// service manager stopped): the PAM session keeper of
+    /// `user@<uid>.service` closing its session is no sensitive access —
+    /// a fork that executed nothing since (the kernel's record), of the
+    /// process PID 1 forked to run the host's packaged executor as root,
+    /// which then ran the host's packaged systemd as the user; its image at
+    /// the open that executor. The attack shapes still fire (lot 376's
+    /// `cat /etc/login.defs`): `cat`, whatever image it names; a fork under
+    /// a /tmp copy of the executor; the packaged executor run by hand, and
+    /// its fork; a fork of a user's program naming the executor; a unit
+    /// that runs as the user without being its manager; a fork the kernel
+    /// did not record; a launch PID 1 did not fork; a write open; and
+    /// `/etc/shadow`.
+    #[test]
+    fn the_user_manager_s_sd_pam_closing_its_session_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let (executor, systemd) = (
+            "/usr/lib/systemd/systemd-executor",
+            "/usr/lib/systemd/systemd",
+        );
+        IdTestHost::set_file_id(executor, Some((STAT_DEV, 21)));
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_file_id("/usr/bin/cat", Some((STAT_DEV, 23)));
+        IdTestHost::set_file_id("/usr/bin/python3", Some((STAT_DEV, 24)));
+        IdTestHost::set_file_id("/usr/bin/bash", Some((STAT_DEV, 25)));
+        for d in ["/usr/lib/systemd", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, true);
+        }
+        // one exec: pid, parent, uid, file, inode, the kernel's forker
+        // (`fork_parent`), the process's start, the exec's time
+        let exec =
+            |pid: u32, ppid: u32, uid: u32, path: &str, ino: u64, fp: u32, at: (u64, u64)| {
+                let mut e = spawn_with_exe(pid, ppid, path, 1);
+                if let Event::ProcessSpawn {
+                    uid: u,
+                    exe,
+                    start_ns,
+                    timestamp_ns,
+                    ..
+                } = &mut e
+                {
+                    *u = uid;
+                    (*start_ns, *timestamp_ns) = at;
+                    (exe.path, exe.dev, exe.ino, exe.flags) =
+                        (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                    exe.fork_parent = fp;
+                }
+                assert!(auth.ingest_spawn_event(&e));
+            };
+        // the kernel's record of a fork: the fork, its start, its forker
+        // and the forker's start
+        let fork = |pid: u32, start: u64, forker: u32, forker_start: u64| {
+            auth.ingest_kernel_fork(pid, start, (forker, forker_start), 1000, 10_000);
+        };
+        // user@1000.service: PID 1 forks 800, which runs the executor as
+        // root, forks (sd-pam) 810, then runs the user's manager as 1000
+        exec(800, 1, 0, executor, 21, 1, (1_000, 1_001));
+        fork(810, 2_000, 800, 1_000);
+        exec(800, 1, 1000, systemd, 11, 1, (1_000, 3_000));
+        let fires = |pid: u32, path: &str, flags: u32, image: (u64, u64)| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen { comm, exe_file, .. } = &mut e {
+                (*comm, *exe_file) = ("(sd-pam)".into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let packaged = (KDEV, 21);
+        assert!(
+            !fires(810, "/etc/login.defs", 0, packaged),
+            "(sd-pam) closing the user manager's session"
+        );
+        assert!(!fires(810, "/etc/passwd", 0, packaged), "its name lookup");
+        assert!(
+            fires(810, "/etc/login.defs", 1, packaged),
+            "opened for write"
+        );
+        assert!(fires(810, "/etc/shadow", 0, packaged), "the shadow file");
+        assert!(
+            fires(810, "/etc/login.defs", 0, (KDEV, 99)),
+            "another image at the open"
+        );
+        assert!(fires(810, "/etc/login.defs", 0, (0, 0)), "no image read");
+        // a root no mount shows: the kernel's class and the path's tail
+        let classed = |pid: u32| {
+            let mut e = file_open(pid, 1000, "mnt[0:45:256]/@/etc/login.defs", 0, 10_000);
+            if let Event::FileOpen {
+                exe_file,
+                kernel_class,
+                ..
+            } = &mut e
+            {
+                (*exe_file, *kernel_class) = (packaged, open_reason::SENSITIVE);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        assert!(!classed(810), "(sd-pam), a root no mount shows");
+        // a fork of the launch that executed something since
+        fork(811, 2_100, 800, 1_000);
+        exec(811, 800, 1000, "/usr/bin/cat", 23, 0, (2_100, 2_200));
+        assert!(
+            fires(811, "/etc/login.defs", 0, packaged),
+            "a later exec of its own"
+        );
+        // the forker's pid another process's (its start not the record's)
+        fork(812, 2_300, 800, 999);
+        assert!(fires(812, "/etc/login.defs", 0, packaged), "another forker");
+        // `cat` (lot 376's attack shape), whatever image it names
+        exec(820, 819, 1000, "/usr/bin/cat", 23, 819, (2_000, 2_001));
+        assert!(fires(820, "/etc/login.defs", 0, packaged), "cat");
+        assert!(classed(820), "cat, a root no mount shows");
+        // a fork under a /tmp copy of the executor run by the user
+        exec(
+            825,
+            819,
+            1000,
+            "/tmp/systemd-executor",
+            22,
+            819,
+            (1_500, 1_501),
+        );
+        fork(830, 1_600, 825, 1_500);
+        assert!(fires(830, "/etc/login.defs", 0, (KDEV, 22)), "a /tmp copy");
+        assert!(
+            fires(830, "/etc/login.defs", 0, packaged),
+            "a /tmp copy naming the packaged one"
+        );
+        // the packaged executor run by hand, and its fork
+        exec(840, 819, 1000, executor, 21, 819, (1_600, 1_601));
+        fork(841, 1_700, 840, 1_600);
+        assert!(fires(840, "/etc/login.defs", 0, packaged), "run by hand");
+        assert!(fires(841, "/etc/login.defs", 0, packaged), "its fork");
+        // a fork of a user's program naming the executor (`PR_SET_MM`)
+        exec(850, 819, 1000, "/usr/bin/python3", 24, 819, (1_700, 1_701));
+        fork(851, 1_800, 850, 1_700);
+        assert!(fires(851, "/etc/login.defs", 0, packaged), "a user's fork");
+        // PID 1's launches that are not the user's manager's: then a unit
+        // run as the user (bash); the manager as another uid; another
+        // process at the launch's pid; the launch not PID 1's fork, not PID
+        // 1's child, not root's, not the packaged executor
+        let launch = |pid: u32, ppid: u32, uid: u32, path: &str, ino: u64, fp: u32| {
+            exec(pid, ppid, uid, path, ino, fp, (4_000, 4_001));
+            fork(pid + 1, 4_500, pid, 4_000);
+        };
+        launch(860, 1, 0, executor, 21, 1);
+        exec(860, 1, 1000, "/usr/bin/bash", 25, 1, (4_000, 5_000));
+        assert!(
+            fires(861, "/etc/login.defs", 0, packaged),
+            "a unit run as the user"
+        );
+        launch(862, 1, 0, executor, 21, 1);
+        exec(862, 1, 1001, systemd, 11, 1, (4_000, 5_000));
+        assert!(
+            fires(863, "/etc/login.defs", 0, packaged),
+            "another uid's manager"
+        );
+        launch(864, 1, 0, executor, 21, 1);
+        exec(864, 1, 1000, systemd, 11, 1, (4_900, 5_000));
+        assert!(
+            fires(865, "/etc/login.defs", 0, packaged),
+            "another process at its pid"
+        );
+        launch(866, 1, 0, executor, 21, 879);
+        exec(866, 1, 1000, systemd, 11, 879, (4_000, 5_000));
+        assert!(
+            fires(867, "/etc/login.defs", 0, packaged),
+            "not PID 1's fork"
+        );
+        launch(868, 879, 0, executor, 21, 1);
+        exec(868, 879, 1000, systemd, 11, 1, (4_000, 5_000));
+        assert!(
+            fires(869, "/etc/login.defs", 0, packaged),
+            "not PID 1's child"
+        );
+        launch(870, 1, 1000, executor, 21, 1);
+        exec(870, 1, 1000, systemd, 11, 1, (4_000, 5_000));
+        assert!(
+            fires(871, "/etc/login.defs", 0, packaged),
+            "not run as root"
+        );
+        launch(872, 1, 0, "/opt/x/systemd-executor", 26, 1);
+        exec(872, 1, 1000, systemd, 11, 1, (4_000, 5_000));
+        assert!(
+            fires(873, "/etc/login.defs", 0, (KDEV, 26)),
+            "not the packaged executor"
+        );
+        assert!(
+            fires(873, "/etc/login.defs", 0, packaged),
+            "the launch ran another file than the image at the open"
+        );
+        // the user's manager's launch, the fork not recorded by the kernel
+        exec(874, 1, 0, executor, 21, 1, (4_000, 4_001));
+        exec(874, 1, 1000, systemd, 11, 1, (4_000, 5_000));
+        assert!(fires(875, "/etc/login.defs", 0, packaged), "no fork record");
+        // control: the same launch with the record
+        fork(875, 4_500, 874, 4_000);
+        assert!(
+            !fires(875, "/etc/login.defs", 0, packaged),
+            "with the record"
+        );
+        for path in [
+            executor,
+            systemd,
+            "/usr/bin/cat",
+            "/usr/bin/python3",
+            "/usr/bin/bash",
+        ] {
+            IdTestHost::set_file_id(path, None);
+        }
+        for d in ["/usr/lib/systemd", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
+    }
+
+    /// Lot 378 (named, the rc10 soak: the boot's first login about 4 s
+    /// before the agent was active): `(sd-pam)` of a manager older than the
+    /// agent, as the start's scan found them, is told by the kernel's cgroup
+    /// at the open the event carries — its manager's own `init.scope`. The
+    /// same read in a user unit's cgroup, or with no cgroup read, fires.
+    #[test]
+    fn the_sd_pam_of_a_manager_older_than_the_agent_is_told_by_its_cgroup() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::{symlink, IdTestHost};
+        use crate::posture::host::PostureHost;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let (executor, systemd) = (
+            "/usr/lib/systemd/systemd-executor",
+            "/usr/lib/systemd/systemd",
+        );
+        IdTestHost::set_file_id(executor, Some((STAT_DEV, 21)));
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", true);
+        let proc = tempfile::TempDir::new().unwrap();
+        let cg = tempfile::TempDir::new().unwrap();
+        let unit = |name: &str| {
+            let d = cg.path().join(format!(
+                "user.slice/user-1000.slice/user@1000.service/{name}"
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            IdTestHost::dir_ino(&d).unwrap()
+        };
+        let (init, app) = (unit("init.scope"), unit("app.slice"));
+        let running = |pid: u32, exe: &str, ppid: u32, ticks: u64, ino: u64| {
+            let d = proc.path().join(pid.to_string());
+            std::fs::create_dir_all(d.join("ns")).unwrap();
+            symlink(exe, d.join("exe")).unwrap();
+            symlink("mnt:[4026531841]", d.join("ns/mnt")).unwrap();
+            std::fs::write(
+                d.join("status"),
+                format!("Name:\tx\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t1000\t1000\t1000\t1000\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!(
+                    "{pid} (x) S {ppid} 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+                ),
+            )
+            .unwrap();
+            IdTestHost::set_dir_root_only(d.join("root/usr/lib/systemd"), true);
+            IdTestHost::set_file_id(d.join("exe"), Some((STAT_DEV, ino)));
+        };
+        std::fs::create_dir_all(proc.path().join("1/ns")).unwrap();
+        symlink("mnt:[4026531841]", proc.path().join("1/ns/mnt")).unwrap();
+        running(500, systemd, 1, 100, 11);
+        running(501, executor, 500, 101, 21);
+        let auth = AuthSessionTracker::<IdTestHost>::new(proc.path()).with_cgroup_root(cg.path());
+        assert_eq!(auth.seed_from_proc(), 2);
+        let fires = |cgroup: u64| {
+            let mut e = file_open(501, 1000, "/etc/login.defs", 0, 20_000_000_000);
+            if let Event::FileOpen {
+                comm,
+                exe_file,
+                cgroup_id,
+                ..
+            } = &mut e
+            {
+                (*comm, *exe_file, *cgroup_id) = ("(sd-pam)".into(), (KDEV, 21), cgroup);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        assert!(!fires(init), "the manager's own scope");
+        assert!(fires(app), "a user unit's cgroup");
+        assert!(fires(0), "no cgroup read");
+        for path in [executor, systemd] {
+            IdTestHost::set_file_id(path, None);
+        }
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", false);
+    }
+
+    /// Lot 378 (named, the rc10 soak on Ubuntu 24.04: ALERTED at a reboot —
+    /// `fusermount`, image `/usr/bin/fusermount3`, uid 1000, opening
+    /// `/etc/passwd` as an AppImage's runtime mounted its image; the login
+    /// uid read after it exited): the packaged setuid FUSE mount helper
+    /// looking up its caller's name is no sensitive access — by the file the
+    /// kernel executed (the cached exec; a fork's forker by the kernel's
+    /// record; else, the exec not read yet, its image at the open). The
+    /// attack shapes still fire: a /tmp copy, whatever image it names at
+    /// the open; `cat` naming the helper; a fork of a user's program naming
+    /// it; the helper opening `/etc/passwd` for write, or reading
+    /// `/etc/login.defs` or `/etc/shadow`.
+    #[test]
+    fn the_packaged_fuse_mount_helper_looking_up_its_caller_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let helper = "/usr/bin/fusermount3";
+        IdTestHost::set_file_id(helper, Some((STAT_DEV, 31)));
+        IdTestHost::set_file_id("/usr/bin/cat", Some((STAT_DEV, 33)));
+        IdTestHost::set_file_id("/usr/bin/python3", Some((STAT_DEV, 34)));
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let exec = |pid: u32, path: &str, ino: u64| {
+            let mut e = spawn_with_exe(pid, 690, path, 1);
+            if let Event::ProcessSpawn {
+                exe,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*start_ns, *timestamp_ns) = (u64::from(pid), u64::from(pid) + 1);
+                (exe.path, exe.dev, exe.ino, exe.flags) =
+                    (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                exe.fork_parent = 690;
+            }
+            assert!(auth.ingest_spawn_event(&e));
+        };
+        let fires = |pid: u32, path: &str, flags: u32, image: (u64, u64)| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen { comm, exe_file, .. } = &mut e {
+                (*comm, *exe_file) = ("fusermount".into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let packaged = (KDEV, 31);
+        // the mini-hunt's variant: shadow's uidmap tools, the same shape
+        for (pid, path, ino) in [
+            (740, "/usr/bin/newuidmap", 35),
+            (741, "/usr/bin/newgidmap", 36),
+        ] {
+            IdTestHost::set_file_id(path, Some((STAT_DEV, ino)));
+            exec(pid, path, ino);
+            assert!(!fires(pid, "/etc/passwd", 0, (KDEV, ino)), "{path}");
+            assert!(
+                fires(pid, "/etc/shadow", 0, (KDEV, ino)),
+                "{path}, the shadow file"
+            );
+            IdTestHost::set_file_id(path, None);
+        }
+        exec(700, helper, 31);
+        assert!(
+            !fires(700, "/etc/passwd", 0, packaged),
+            "the helper's lookup"
+        );
+        assert!(
+            !fires(701, "/etc/passwd", 0, packaged),
+            "its exec not read yet: the image at the open"
+        );
+        auth.ingest_kernel_fork(702, 702, (700, 700), 1000, 10_000);
+        assert!(!fires(702, "/etc/passwd", 0, packaged), "its fork");
+        // the attack shapes
+        assert!(fires(700, "/etc/passwd", 1, packaged), "opened for write");
+        assert!(fires(700, "/etc/login.defs", 0, packaged), "another file");
+        assert!(fires(700, "/etc/shadow", 0, packaged), "the shadow file");
+        exec(710, "/tmp/fusermount3", 32);
+        assert!(fires(710, "/etc/passwd", 0, (KDEV, 32)), "a /tmp copy");
+        assert!(
+            fires(710, "/etc/passwd", 0, packaged),
+            "a /tmp copy naming the helper"
+        );
+        assert!(
+            fires(711, "/etc/passwd", 0, (KDEV, 32)),
+            "a copy, its exec not read yet"
+        );
+        assert!(fires(711, "/etc/passwd", 0, (0, 0)), "no image read");
+        exec(720, "/usr/bin/cat", 33);
+        assert!(
+            fires(720, "/etc/passwd", 0, packaged),
+            "cat naming the helper"
+        );
+        exec(730, "/usr/bin/python3", 34);
+        auth.ingest_kernel_fork(731, 731, (730, 730), 1000, 10_000);
+        assert!(
+            fires(731, "/etc/passwd", 0, packaged),
+            "a user's fork naming the helper"
+        );
+        for path in [helper, "/usr/bin/cat", "/usr/bin/python3"] {
+            IdTestHost::set_file_id(path, None);
+        }
+        IdTestHost::set_dir_root_only("/usr/bin", false);
     }
 
     /// Lot 376 (named, the rc9 soak: ALERTED at every boot through

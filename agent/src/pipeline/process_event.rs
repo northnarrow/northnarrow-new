@@ -77,6 +77,35 @@ pub(crate) fn process_event(
     // the kernel's grant ends at the deadline by itself, and the rule reads
     // the window's own deadline) — R12b: no longer swept here.
 
+    // Lot 378 (the rc10 soak, Ubuntu 26.04: NN-L-EPG-001 High and the
+    // posture ENGAGED at a reboot — `blkdeactivate`, lvm2's stop command,
+    // re-taken by the exploit guard 0.9 s after the reboot command, before
+    // the watch's next answer): the guard's degraded evidence is judged on
+    // systemd's answer asked after it, as a relayed signal (lot 344). While
+    // systemd stops the host the change is unknown — Medium
+    // (`epg::verdict_at_shutdown`) — and the posture and the ladder stand
+    // down, as for the shutdown's signals.
+    let epg_at_shutdown = if let Event::ExploitPostcondition {
+        baseline_lost: true,
+        ..
+    } = &event
+    {
+        let stopping = host_stopping.is_stopping()
+            || match systemd.judge(&event, Instant::now()) {
+                SystemdAnswer::Judge(state) => state.as_deref() == Some("stopping"),
+                SystemdAnswer::Deferred => {
+                    debug!("exploit guard's degraded evidence: judged once systemd has answered");
+                    return;
+                }
+            };
+        if stopping {
+            host_stopping.stand_down(ladder);
+        }
+        stopping
+    } else {
+        false
+    };
+
     // External audit EBPF-001: while systemd stops the host, its SIGTERM to
     // the agent and the watchdog is refused until `systemd-shutdown` (the
     // units outlive their stop jobs). Expected, so neither an attempt nor a
@@ -845,7 +874,14 @@ pub(crate) fn process_event(
         } => {
             use northnarrow_agent::decision::rules::epg;
             let rule = epg::rule_for(&event);
-            let verdict = rule.and_then(|r| r.evaluate(&event));
+            // lot 378: degraded evidence at the host's shutdown is unknown
+            let verdict = rule.and_then(|r| {
+                if epg_at_shutdown {
+                    epg::verdict_at_shutdown(r, &event)
+                } else {
+                    r.evaluate(&event)
+                }
+            });
             // R12c (lab PR 270): a task the kernel killed is an action —
             // its record is never held by the budget (its lines are).
             let admit = match &verdict {
@@ -1686,5 +1722,169 @@ mod tests {
             "no action: no intent ({:#?})",
             journal.rows()
         );
+    }
+
+    /// Lot 378 (named, the rc10 soak on Ubuntu 26.04: NN-L-EPG-001 High and
+    /// the posture ENGAGED at a reboot — `blkdeactivate`, lvm2's stop
+    /// command, the guard's degraded evidence 0.9 s after the reboot
+    /// command, the watch's last answer the `running` of just before): the
+    /// degraded evidence waits for systemd's answer asked after it; while
+    /// systemd stops the host it is recorded Medium ("UNKNOWN"), the host
+    /// stands down and the posture is not driven. The attack shapes keep
+    /// their verdicts: a gain the guard saw happen, at the shutdown,
+    /// Critical; the same degraded evidence while the host runs, High and
+    /// driving the posture.
+    #[test]
+    fn the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing() {
+        use nn_core::decision::rules::epg::testutil::epg_event;
+        use nn_model::posture_types::PostureKind;
+        // `answer`: systemd's, asked after the evidence; `stopped`: the
+        // host already known to stop (a shutdown's signal judged before)
+        let run = |answer: &str, stopped: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = Executor::with_config(ExecutorConfig::for_test(tmp.path()));
+            let journal = ActionJournal::memory();
+            let sink = northnarrow_agent::detection_store::DetectionSink::for_test(4096, 0);
+            let cow = northnarrow_agent::cow::CowGuard::off_for_test();
+            let dispatcher = Dispatcher::start(
+                exec.clone(),
+                journal.clone(),
+                Followups {
+                    sink: Some(sink.clone()),
+                    cow: cow.clone(),
+                },
+                None,
+            );
+            let engine = RuleEngine::with_default_rules();
+            let correlation = CorrelationBuffer::with_default_capacity();
+            let posture = PostureMachine::new();
+            let ladder = northnarrow_agent::combat::CombatLadder::new(
+                Box::new(northnarrow_agent::combat::SystemActuator::new(
+                    exec.clone(),
+                    None,
+                    true,
+                    journal.clone(),
+                )),
+                Box::new(northnarrow_agent::combat::AuditEvidence::new(None)),
+                Box::new(northnarrow_agent::combat::NoProtectedProcs),
+                northnarrow_agent::combat::LadderConfig::default(),
+            );
+            let expected = northnarrow_agent::boot::deny_selftest::ExpectedDenial::default();
+            let stopping = HostStopping::default();
+            if stopped {
+                stopping.stand_down(&ladder);
+            }
+            let systemd = SystemdSnapshot::default();
+            systemd
+                .0
+                .watched
+                .store(!stopped, std::sync::atomic::Ordering::Release);
+            let judge = |e: Event| {
+                process_event(
+                    &engine,
+                    &exec,
+                    &correlation,
+                    &posture,
+                    &ladder,
+                    None,
+                    Some(&sink),
+                    &expected,
+                    &stopping,
+                    &systemd,
+                    &cow,
+                    &dispatcher,
+                    e,
+                )
+            };
+            // a uid of this test's own (the budget is the process's)
+            let task = |pid: u32, ts: u64, lost: bool| {
+                let mut e = epg_event(nn_model::EpgKind::CredNoMechanism, false);
+                if let Event::ExploitPostcondition {
+                    pid: p,
+                    tid,
+                    uid,
+                    comm,
+                    before,
+                    after,
+                    variant,
+                    caught_at,
+                    baseline_lost,
+                    rebaselined,
+                    timestamp_ns,
+                    ..
+                } = &mut e
+                {
+                    (*p, *tid, *uid, *timestamp_ns) = (pid, pid, 978, ts);
+                    *comm = "blkdeactivate".into();
+                    *variant = nn_model::GuardVariant::Lite;
+                    *caught_at = nn_model::CatchPoint::Capable;
+                    if lost {
+                        *before = *after;
+                        (*baseline_lost, *rebaselined) = (true, true);
+                    }
+                }
+                e
+            };
+            // the watch's answer asked before the evidence
+            let t0 = Instant::now();
+            systemd.store(t0, 1_000, Some("running".into()));
+            judge(task(978_001, 1_500, true));
+            let deferred = std::mem::take(&mut *systemd.0.deferred.lock());
+            if stopped {
+                // known to stop: judged at once, whatever the snapshot says
+                assert!(deferred.is_empty(), "not handed over");
+            } else {
+                assert_eq!(deferred.len(), 1, "handed to the watch");
+                assert!(sink.queued_for_test().is_empty(), "not judged yet");
+            }
+            // the watch asks at once, after it, and hands it back
+            systemd.store(Instant::now(), 1_600, Some(answer.into()));
+            for e in &deferred {
+                systemd.0.handed.lock().insert(super::super::signal_key(e));
+            }
+            for e in deferred {
+                judge(e);
+            }
+            let posture_after = posture.current_kind();
+            // a gain the guard saw happen, after it
+            judge(task(978_002, 1_700, false));
+            dispatcher.stop(Duration::from_secs(10));
+            let records = sink.queued_for_test();
+            let of = |pid: u32| -> Vec<_> {
+                records.iter().filter(|r| r.principal.pid == pid).collect()
+            };
+            let (lost, seen) = (of(978_001), of(978_002));
+            assert_eq!((lost.len(), seen.len()), (1, 1), "{records:#?}");
+            assert_eq!(
+                seen[0].severity,
+                nn_model::Severity::Critical,
+                "a gain seen"
+            );
+            (
+                lost[0].severity,
+                lost[0].confidence,
+                posture_after,
+                stopping.is_stopping(),
+            )
+        };
+        let (severity, _, posture_at, stood_down) = run("stopping", false);
+        assert_eq!(
+            severity,
+            nn_model::Severity::Medium,
+            "unknown at a shutdown"
+        );
+        assert_eq!(posture_at, PostureKind::Observing, "the posture not driven");
+        assert!(stood_down, "the host stood down");
+        let (severity, _, posture_at, _) = run("running", true);
+        assert_eq!(
+            severity,
+            nn_model::Severity::Medium,
+            "the host known to stop"
+        );
+        assert_eq!(posture_at, PostureKind::Observing);
+        let (severity, _, posture_at, stood_down) = run("running", false);
+        assert_eq!(severity, nn_model::Severity::High, "outside a shutdown");
+        assert_ne!(posture_at, PostureKind::Observing, "the posture driven");
+        assert!(!stood_down);
     }
 }

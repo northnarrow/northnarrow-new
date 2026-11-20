@@ -6,6 +6,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 378 (the rc10 soaks): three false positives judged by identity
+  (`UPGRADE_NOTES_WAVE4.md` §64).
+  - **The posture at every boot.** The `POSTURE TRANSITION` line named
+    `(sd-pam)` (image `systemd-executor`, uid 1000) reading
+    `/etc/login.defs` as the user's service manager stopped after the
+    boot's first login: its PAM session closing. Told by the kernel's fork
+    record and the lineage of PID 1's launch of `user@<uid>.service` (the
+    packaged executor as root, then the packaged systemd as the user), the
+    image at the open the executor's; for a manager older than the agent
+    (the boot's first login before the agent's start), by the start's scan
+    and the reader's cgroup at the open, the manager's own `init.scope`
+    (`FileOpen` carries the kernel's `cgroup_id`). On Ubuntu 24.04 it also named the
+    packaged setuid `fusermount3` looking up its caller in `/etc/passwd`
+    (an AppImage's mount): told by the file the kernel executed (the
+    mini-hunt: `newuidmap`/`newgidmap` the same). Tests
+    `the_user_manager_s_sd_pam_closing_its_session_is_no_sensitive_access`,
+    `the_user_manager_s_sd_pam_is_known_from_the_sweep_and_the_start_s_scan`,
+    `the_sd_pam_of_a_manager_older_than_the_agent_is_told_by_its_cgroup`,
+    `the_opener_s_cgroup_travels_with_the_open`,
+    `the_packaged_fuse_mount_helper_looking_up_its_caller_is_no_sensitive_access`.
+  - **R004 Critical at a rootless Podman run.** The pump had compared runc's
+    sealed copy of itself; the manager failed now and then: rootless
+    Podman executes conmon in its own mount namespace, and the lineage's
+    sweep entered conmon's monitor with a record holding the file but no
+    root-only image, which R004 then read alone. A manager is now also told
+    by the file the kernel executed, an installed manager's inode still at
+    its path in a root-only directory. Test
+    `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`.
+  - **`NN-L-EPG-001` High by `blkdeactivate` at a reboot.** The exploit
+    guard's degraded evidence (a task found without its record, holding
+    root's credential) 0.9 s after the reboot command, before systemd's
+    watch answered "stopping". Degraded evidence now waits for systemd's
+    answer asked after it; while systemd stops the host it is "unknown",
+    Medium, and the posture is not driven. A change the guard saw happen
+    stays Critical. Tests
+    `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
+    `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
 - Lot 376 (the rc9 soaks): three false positives and the Low noise judged
   by identity (`UPGRADE_NOTES_WAVE4.md` §62).
   - **A rotated log's first record.** logrotate's `create` put a new file
