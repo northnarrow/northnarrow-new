@@ -11762,8 +11762,50 @@ number in parentheses is a lab PR.
         `fusermount3`: R003 High and ENGAGED (StagingExec); a memfd exec as
         uid 1000 (`/dev/fd/3`, `/proc/self/fd/3`) and a sealed copy of runc
         executed by `python3`: R004 Critical.
-    - r2 (ubuntu2404) and r3 (ubuntu2604, the reboots' `NN-L-EPG-001`):
-      waiting for their leases (unit `nn-k378-lab`).
+    - The rounds on ubuntu2404 and ubuntu2604 planned with that code ran on
+      the review's fixes instead (below).
+  - **The review's fixes (round 1).**
+    - **`(sd-pam)` on systemd before 255** (Ubuntu 22.04, Debian 12: no
+      executor): a fork of PID 1's own fork before it executed the manager,
+      running the packaged systemd; told by the kernel's fork record and
+      the forker's first exec (`is_pre_executor_pam_keeper`); the start's
+      scan's `(sd-pam)` runs the packaged systemd where the host ships no
+      executor (`is_pam_keeper_image`).
+    - **The quadlet generator under `(sd-exec-strv)`**: lot 376's exemption
+      required the manager's direct child; the manager is also the kernel's
+      anchor of the program's fork (`Entry::fork_anchor`, from the exec
+      record).
+    - **The runtime compare budget**: each uid's share but root's a token
+      bucket, four seconds of it at once (`RUNTIME_BURST_PER_UID`); no
+      identity trusted in place of the compare (the review: "High under the
+      packaged runc" would be a bypass). The deferred compare (the memfd
+      kept, compared when the share refills) is left for after the alpha.
+    - Mutation: 42 mutants of the round's code, 39 caught by a named test,
+      3 argued equivalent (in the PR).
+    - Lab (as measured), at `352edff4`, alpha profile, one guest at a time
+      under its lease, each left uninstalled and powered off; each boot
+      checked after the first manager's stop (older than the agent) and
+      after a manager the agent saw launched; a root inotify watch of
+      `/etc/login.defs` timed each open.
+      - **debian12 (6.1, systemd 252) and ubuntu2204 (5.15, systemd
+        249)**: `(sd-pam)` runs `/usr/lib/systemd/systemd`; a cold boot and
+        a reboot each, no transition; `/etc/login.defs` opened at each
+        manager stop, no transition; `cat /etc/login.defs` ALERTED;
+        `fusermount3` without a login uid, no transition.
+      - **ubuntu2604 (7.0, systemd 259)**: two reboots, `NN-L-EPG-001` 0
+        (the degraded evidence did not recur: the shutdown judgement is
+        covered by its tests), R004 0, no transition.
+      - **ubuntu2404 (6.8, systemd 255)**: a cold boot and two reboots, no
+        transition; a quadlet file, `daemon-reload` ×3 and reboot 2's login
+        with it, no transition; rootless Podman (crun, `--network=none`)
+        ×10 spaced and ×30, R004 0 (crun's copy does not reach the budget);
+        a memfd exec during a loop, R004 Critical; `/var/tmp` copies R003
+        High and ENGAGED.
+      - **debian13 (6.12, runc 1.1.15)**: rootless Podman ×10 spaced, ×30
+        back to back (about five a second), a loop of 30 with a memfd exec in
+        it, `podman exec` ×2: 73 copies compared and kept, 0 not compared
+        (the first head: 8 Criticals per 30), R004 0 under conmon/runc; the
+        memfd exec R004 Critical.
 - **Lot 376 — the rc9 soaks' false positives: a rotated log's first
   record, the boot-time posture rise, `pg_createcluster`, Low noise (C06,
   C14, C18; no level change).**

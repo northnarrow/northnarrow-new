@@ -43,6 +43,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     stays Critical. Tests
     `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
     `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
+  - **Its review's fixes** (§64, "Its review's fixes").
+    - `(sd-pam)` on systemd before 255 (Ubuntu 22.04's 249, Debian 12's
+      252: no executor): a fork of PID 1's own fork made before that fork
+      executed the user's manager, running the packaged systemd. Told by
+      the kernel's fork record and the forker's first exec (PID 1's fork,
+      PID 1's child, the packaged systemd as the user), the image at the
+      open the packaged systemd; for a manager older than the agent, the
+      start's scan finds `(sd-pam)` running the packaged systemd where the
+      host ships no executor. Tests
+      `the_sd_pam_of_systemd_before_255_is_known_by_its_fork_and_its_manager_s_first_exec`,
+      `the_sd_pam_of_systemd_before_255_closing_its_session_is_no_sensitive_access`.
+    - Podman's quadlet user generator as systemd runs it, under
+      `(sd-exec-strv)` (a fork of the user's manager that never executes):
+      lot 376's exemption held only for the manager's direct child. The
+      manager is now also the kernel's anchor of the program's fork. Tests
+      `the_quadlet_generator_under_sd_exec_strv_is_its_manager_s_program`,
+      `the_quadlet_generator_under_sd_exec_strv_reading_passwd_is_no_sensitive_access`.
+    - The runtime compare budget: each user's share is a token bucket, up to
+      four seconds of it at once (256 MiB), paid back at its rate — 30
+      rootless `podman run` in a row are all compared. Past it a copy is
+      still "not compared (budget)", the Critical kill for a uid but root;
+      no identity is trusted instead of the compare. Tests
+      `thirty_rootless_starts_in_a_row_are_all_compared_and_a_flood_still_runs_out`,
+      `a_foreign_memfd_under_a_flood_is_never_kept_as_runc_s_clone`,
+      `a_full_uid_table_keeps_a_uid_whose_burst_owes`.
 - Lot 376 (the rc9 soaks): three false positives and the Low noise judged
   by identity (`UPGRADE_NOTES_WAVE4.md` §62).
   - **A rotated log's first record.** logrotate's `create` put a new file
