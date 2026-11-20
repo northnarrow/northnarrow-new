@@ -156,6 +156,7 @@ impl Ctx {
             Special::HostChecks => {
                 let checks = hh::run();
                 let warns = hh::warn_count(&checks);
+                let fails = hh::fail_count(&checks);
                 let listed: Vec<serde_json::Value> = serde_json::to_value(&checks)
                     .ok()
                     .and_then(|v| v.as_array().cloned())
@@ -171,9 +172,16 @@ impl Ctx {
                     raw.extend_from_slice(stdout);
                     return (raw, stderr.to_vec(), exit);
                 }
-                let code = if warns == 0 { "0" } else { "2" };
+                // lot 377: 3 when a check fails (the agent cannot run here)
+                let code = if fails > 0 {
+                    "3"
+                } else if warns == 0 {
+                    "0"
+                } else {
+                    "2"
+                };
                 let exit = if exit == code {
-                    "<0, or 2 with the host's warnings: checked>".to_string()
+                    "<0, 2 with the host's warnings, 3 with a failure: checked>".to_string()
                 } else {
                     exit
                 };
@@ -202,7 +210,7 @@ impl Ctx {
                         ));
                     }
                     t.push_str(&format!(
-                        "{} check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>\n",
+                        "{} check(s), <warnings> warning(s)<, and the anti-tamper note when there are any><, then a line of the failures when there are any>\n",
                         listed.len()
                     ));
                     t

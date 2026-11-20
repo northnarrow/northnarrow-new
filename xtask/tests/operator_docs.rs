@@ -611,3 +611,114 @@ fn nn_admin_s_permission_exit_is_in_the_operator_table() {
         "NN_ADMIN.md §4 says what exit 5 still means"
     );
 }
+
+/// The rows of the markdown tables of `section` whose first cell is a
+/// number: the exit statuses a table names.
+fn status_rows(section: &str) -> BTreeSet<u32> {
+    section
+        .lines()
+        .filter_map(|l| l.strip_prefix("| "))
+        .filter_map(|l| l.split(" |").next())
+        .filter_map(|c| c.trim().parse().ok())
+        .collect()
+}
+
+/// The text of a guide under the heading `head` (the whole heading line,
+/// or its start when `head` ends with a space) to the next heading of the
+/// same or a higher level; code blocks are not headings.
+fn section_of(text: &str, head: &str) -> String {
+    let level = head.chars().take_while(|c| *c == '#').count();
+    let mut out = String::new();
+    let mut inside = false;
+    let mut fenced = false;
+    for l in text.lines() {
+        if l.starts_with("```") {
+            fenced = !fenced;
+        }
+        let n = l.chars().take_while(|c| *c == '#').count();
+        let heading = !fenced && n > 0 && l[n..].starts_with(' ');
+        if inside && heading && n <= level {
+            break;
+        }
+        if inside {
+            out.push_str(l);
+            out.push('\n');
+        } else if heading && (l == head || (head.ends_with(' ') && l.starts_with(head))) {
+            inside = true;
+        }
+    }
+    assert!(inside, "no heading {head:?}");
+    out
+}
+
+/// `const <name>: i32 = <n>;` in `rel`.
+fn const_status(rel: &str, name: &str) -> u32 {
+    let src = read(rel);
+    let needle = format!("const {name}: i32 = ");
+    let at = src
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{rel}: no {needle:?}"));
+    src[at + needle.len()..]
+        .split(';')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{rel}: {name} is not a number"))
+}
+
+/// Lot 377: every exit status of the watchdog (`ExitReason::code()`) is a
+/// row of the table of INSTALL_UPGRADE_UNINSTALL.md §3.9, and the table
+/// names no status the watchdog does not have; the agent's refused start
+/// (`EX_CONFIG`) and its stop cut at the deadline (`EXIT_STATUS`) are rows
+/// of NN_ADMIN.md's table of the agent. A status added to the code without
+/// its row (16 was missing at rc10) fails here.
+#[test]
+fn every_daemon_exit_status_is_a_row_of_the_operator_tables() {
+    let lib = read("watchdog/src/lib.rs");
+    let at = lib
+        .find("pub fn code(self) -> u8 {")
+        .expect("watchdog/src/lib.rs: ExitReason::code()");
+    let body = &lib[at..];
+    let body = &body[..body.find("\n    }\n").expect("the end of code()")];
+    let codes: BTreeSet<u32> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ExitReason::"))
+        .filter_map(|l| l.split("=> ").nth(1))
+        .filter_map(|n| n.trim_end_matches(',').trim().parse().ok())
+        .collect();
+    let variants: usize = lib
+        .split("pub const ALL: [ExitReason; ")
+        .nth(1)
+        .and_then(|r| r.split(']').next())
+        .and_then(|n| n.parse().ok())
+        .expect("watchdog/src/lib.rs: ExitReason::ALL");
+    assert_eq!(
+        codes.len(),
+        variants,
+        "ExitReason::code() read {codes:?}: one status per reason"
+    );
+    let guide = read("docs/operator/INSTALL_UPGRADE_UNINSTALL.md");
+    let rows = status_rows(&section_of(&guide, "### 3.9 "));
+    let missing: Vec<_> = codes.difference(&rows).collect();
+    let extra: Vec<_> = rows.difference(&codes).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "INSTALL_UPGRADE_UNINSTALL.md §3.9: the watchdog's statuses {codes:?}; \
+         not in the table {missing:?}, in the table but not in the code {extra:?}"
+    );
+    let admin = read("docs/operator/NN_ADMIN.md");
+    let agent_rows = status_rows(&section_of(&admin, "### The agent"));
+    for (rel, name) in [
+        ("agent/src/boot/refusal.rs", "EX_CONFIG"),
+        ("agent/src/stop_deadline.rs", "EXIT_STATUS"),
+    ] {
+        let status = const_status(rel, name);
+        assert!(
+            agent_rows.contains(&status),
+            "NN_ADMIN.md \"The agent\": no row for {status} ({name}, {rel}); rows {agent_rows:?}"
+        );
+    }
+    assert!(
+        admin.contains("### The watchdog") && admin.contains("§3.9"),
+        "NN_ADMIN.md points to the watchdog's table"
+    );
+}

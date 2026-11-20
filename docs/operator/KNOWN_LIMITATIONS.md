@@ -43,6 +43,22 @@ how.
   *Evidence:* `a_host_the_release_cannot_run_on_is_refused_with_what_to_do`;
   `install_sh_refuses_a_host_without_nft_unless_told`; lot 341; internal
   check Phase 2 §4.6.
+- **A host with a library preload list.** When `/etc/ld.so.preload` names
+  a library that exists (a command logger, another vendor's agent), every
+  program on the host loads it, and the agent and the watchdog refuse to
+  start with a library the release does not link (`start_self_check`,
+  `watchdog_start_refused`; exit 78 and 16). `install.sh` (a fresh
+  install, a reinstall, `--upgrade`) reads the list before it changes
+  anything and refuses such a host with exit status 5, naming the files;
+  a list it cannot read as a regular file is refused the same way. An
+  empty list, or one that loads nothing, is noted and the install goes on;
+  each start still refuses a library that becomes loadable later.
+  `nn-admin host-check` fails such a list (exit 3). The `.deb` and `.rpm`
+  do not run this check: on such a host the agent's start is refused.
+  *For you:* remove the entry or the file, or test on a host without one.
+  *Evidence:* `a_preloaded_library_anywhere_is_foreign`;
+  `install_refuses_a_loadable_preload_list_and_notes_an_inert_one`;
+  `host_check_fails_a_loadable_preload_list`; lot 374.
 - **The upgrade has a short window with partial protection.** During
   `install.sh --upgrade`, for about 6 to 15 seconds, not all of the agent's
   kernel programs are attached, and the watchdog is absent for about 18
@@ -56,6 +72,14 @@ how.
   `trusted-installer` role. The key `install.sh` writes,
   `/root/northnarrow-admin.key`, has that role. *For you:* keep it until
   you uninstall. *Evidence:* `an_upgrade_without_a_key_changes_nothing`.
+- **A refused upgrade leaves its window open.** When `install.sh
+  --upgrade` stops on a check after it opened the trusted-installer window
+  (the host, the drop-ins of the agent's units), nothing is installed, but
+  the window stays open until its deadline (300 s), and the whole host with
+  it (see "Self-protection against root"). *Workaround:* end it sooner with
+  a new grant of the shortest length, `sudo nn-admin
+  trusted-installer-grant --key <key> --window-secs 1`. *Evidence:*
+  internal check Phase 3b.
 - **Tracing tools are refused unless you name them at install.** bpftrace,
   BCC tools and `bpftool feature probe` load kernel tracing programs. The
   agent refuses them under every profile; each refusal is a signed High
@@ -185,6 +209,21 @@ how.
   `OK` with 0 rows for each chain and exits 0. *For you:* read the row
   counts, not only `OK`. *Evidence:* `chain.no-audit-log`; internal check
   Phase 0 §5 (F0-3).
+- **The heartbeat verifier and pre-release versions.** The off-host
+  verifier (`nn-admin heartbeat watch`) says `DEGRADED`, "the sensor
+  contract changed backwards", when it cannot tell that the agent's or the
+  kernel's version is newer than the last one it saw: a pre-release tag
+  such as this alpha's, a kernel of another flavour. *For you:* read the
+  version it names; after an upgrade you made, it is not a downgrade.
+  *Evidence:* `a_contract_going_backwards_is_degraded`;
+  `docs/operator/SENSOR_CONTRACT.md` (§5).
+- **A clock set back can hide rows from a `--since` read.** After the
+  host's clock went back across a rotation of a log, a read with `--since`
+  (`fim report`, `net flows`, `net listeners`, `canary list`) can leave out
+  rows of the older archives without saying `truncated`; `nn-admin chain
+  verify` and the files still hold them
+  ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md)). *Evidence:*
+  `a_head_before_since_with_an_older_archive_still_stops`; lot 319.
 
 ## Self-protection against root
 
@@ -224,10 +263,9 @@ not cause as an incident.
   later use is not judged. *For you:* install on a fresh VM. *Evidence:*
   `the_start_is_the_baseline_and_a_later_unseen_program_is_signed_once`;
   internal check Phase 3 §7.1 (residual R002).
-- **Some BPF paths are not judged.** An XDP or tc program attached through
-  netlink, and the program values of some map types, are not judged; their
-  load is still recorded. *Evidence:* internal check Phase 3 §7.1 (residuals
-  R002, R132); lot 356.
+- **Some BPF paths are not judged.** Some network program attachments and
+  some map contents are not judged; their load is still recorded.
+  *Evidence:* internal check Phase 3 §7.1 (residuals R002, R132); lot 356.
 - **An allowed tracing tool can read everything.** With
   `--allow-bpf-tools`, any root process that runs a named program may load
   tracing programs (for BCC that is any root Python script), and a tracing
@@ -240,12 +278,10 @@ not cause as an incident.
   package database or DKMS's registry vouches for its content and the
   write came from a live package transaction: the package manager's
   process held its lock, was not stopped or traced, and the writer
-  descends from it with no code injected. Root that runs the package
-  manager on a package of its own is such a transaction, and a root
-  process can keep a package transaction open, or start one, around writes
-  of its own): a module written by root inside a package transaction it controls is trusted, and recorded Low. Every load the kernel trusted is recorded, Low, with why it was
-  trusted. The lock is read in the kernel
-  at the write, however short the transaction. A transaction that took its
+  descends from it with no code injected. A module written by root inside
+  a package transaction it controls is trusted too. Every load the kernel
+  trusted is recorded, Low, with why it was trusted. The lock is read in
+  the kernel at the write, however short the transaction. A transaction that took its
   lock while the agent's lock observer was not attached — before the
   agent's first start of the boot, or in the moment of an upgrade between
   the old agent's purge and the new one's start — holds no lock the kernel
@@ -271,19 +307,19 @@ not cause as an incident.
   namespace and in the agent's and the watchdog's own; so is one made
   elsewhere that would propagate into those. What is not refused is
   signed:
-  - `mount_setattr(2)` (read-only, propagation) has no kernel hook: a
-    change of a protected mount's attributes is a signed `integrity_drift`
-    (`mount_attrs_changed`, High) within one integrity round;
+  - a change of a protected mount's attributes is not refused: the next
+    integrity round signs it (`integrity_drift`, `mount_attrs_changed`,
+    High);
   - a mount namespace of its own (a container's, one made with `unshare`)
     is judged where it reaches the host's mounts; what it changes in its
     own copies only is its own;
   - on a kernel where the mount guard is not attached, every such mount is
     a signed degradation, and the mount watch (`mount_over_protected`)
     remains;
-  - the emergency remount (`SysRq-u`, which root can trigger) is not
-    refused: it makes every block-backed file system read-only and is
-    signed High (`state_fs_read_only`); restrict `kernel.sysrq` if the host
-    needs no emergency remount.
+  - the emergency remount (`SysRq-u`) is not refused: it makes every
+    block-backed file system read-only and is signed High
+    (`state_fs_read_only`); restrict `kernel.sysrq` if the host needs no
+    emergency remount.
 
   *For you:* some administration needs a window: a runtime `systemd-sysext`
   or `confext` refresh, a remount of `/proc`, `/sys`, the cgroup root or the
@@ -296,28 +332,25 @@ not cause as an incident.
   `a_mount_over_protected_is_signed_high`;
   `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 357;
   internal check Phase 8b §7.
-- **The pin directory's lock: four residuals, each signed.** The
-  directory that keeps the agent's kernel programs pinned is locked (bound
-  onto itself, private and unbindable), so that an unmount of the bpffs
-  cannot take it. For the alpha the lock does not cover four cases. In
-  each, the agent keeps its kernel programs attached (it holds a
-  descriptor of every one), and an integrity round, about 30 seconds
-  apart, signs what happened (High); a loss that comes back soon after one
-  already signed is reported again later, as every drift finding is:
-  - a change of the lock's flags through `mount_setattr(2)`, which has no
-    kernel hook, is not refused. Until the next round puts the lock back,
-    the pins are protected as they were without the lock, and the agent
-    keeps its programs. Signed `pin_lock_changed`;
-  - a raw mount namespace's own copy of the lock is not judged as the
-    host's lock. The host's bpffs view and the pins can be lost through
+- **The pin directory's lock: residuals, each signed.** The directory
+  that keeps the agent's kernel programs pinned is locked in place. For the
+  alpha the lock does not cover every case. In each, the agent keeps its
+  kernel programs attached (it holds a descriptor of every one), and an
+  integrity round, about 30 seconds apart, signs what happened (High); a
+  loss that comes back soon after one already signed is reported again
+  later, as every drift finding is:
+  - a change of the lock's own settings is not refused: the next round
+    signs it (`pin_lock_changed`) and makes the lock again;
+  - another mount namespace's own copy of the lock is not judged as the
+    host's lock: the host's bpffs view and the pins can be lost through
     it. Signed `protected_mount_gone` and `pin_lock_missing`;
   - the systemd units' own mount namespaces, the agent's and the
     watchdog's among them, never have the lock. That namespace's view of
     the bpffs can be lost, not the host's nor the pins; what reads the pins
     by path there fails until a restart. Signed `protected_mount_gone`;
   - a mount namespace that was already a peer of the host's when the lock
-    was made does not hold the lock. The host's bpffs view can be lost
-    through it, as before the lock. Signed `protected_mount_gone`.
+    was made does not hold the lock: the host's bpffs view can be lost
+    through it. Signed `protected_mount_gone`.
 
   A hardening lot after the alpha narrows the first two. A start that finds
   no lock (a kernel without `open_tree(2)`, an error) signs a degradation
@@ -331,12 +364,11 @@ not cause as an incident.
   `a_mount_gone_from_under_the_agents_paths_is_reported`; lot 359;
   internal check Phase 2c §7; internal check Phase 8b §4.2.
 - **The unmount guard reads a bounded part of the mount tree.** An
-  unmount is judged on the part of the mount tree the guard reads. In a
-  namespace that is not the host's, the agent's or the watchdog's, an
-  unmount can still take the host's `/sys/fs/cgroup` mount and, where the
-  pin lock does not hold (above), the host's bpffs view. The agent's hooks
-  stay attached while it runs; the integrity round signs
-  `protected_mount_gone` (High). In the host's namespace an unmount wider
+  unmount is judged on the part of the mount tree the guard reads. Outside
+  the host's namespace some unmounts that take a host mount the agent
+  relies on are not refused; the agent's hooks stay attached while it runs
+  and the integrity round signs `protected_mount_gone` (High). In the
+  host's namespace an unmount wider
   than the guard reads is refused even when it is harmless: use `umount
   -R`, or a window. *Evidence:* `a_mount_gone_from_under_the_agents_paths_is_reported`;
   lots 357 and 359.
@@ -355,10 +387,10 @@ not cause as an incident.
   watchdog run as their units; started by hand, outside them, the guard
   there is not supported. *For you:* start, stop and restart them only
   with `systemctl`, inside a window. *Evidence:* lot 359.
-- **Changes systemd needs are recorded, not refused.** A drop-in in a unit
-  directory the agent does not guard, `systemctl set-property`, a higher
-  `oom_score_adj`, an edit in place of an existing `.local` overlay: each is
-  a signed `integrity_drift` within about 30 s
+- **Changes systemd needs are recorded, not refused.** Some changes
+  systemd itself needs (unit properties, drop-ins outside the directories
+  the agent guards), and some changes to the agent's settings, are a
+  signed `integrity_drift` at the next round, within about 30 s
   ([INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md) §3.5). A
   `daemon-reload` inside a signed window applies a drop-in already on
   disk. *Evidence:* `dropins_are_read_from_every_directory_of_the_unit_search_path`;
@@ -420,14 +452,13 @@ not cause as an incident.
     own start: a change holds the start (`role_respawn_held`,
     `watchdog_respawn_held`, High) until an operator acts; what was there
     before is recorded only. Inside a signed trusted-installer window
-    nothing is held, and the host as the operator leaves it there becomes
-    the reference (`respawn_gate_reference_moved`, signed): a later start
-    in the same watchdog life is judged against it. A change made outside
-    a window stays the reference's difference until an operator starts the
-    agent, the host is as it was, or the next signed window opens: any
-    window, even one granted for something else, takes the host as it then
-    is as the reference (open). A
-    successor that started before that judgement, outside a window, is
+    nothing is held, and the window takes the host as it then is as the
+    new reference, changes made before it included
+    (`respawn_gate_reference_moved`, signed): a later start in the same
+    watchdog life is judged against it. *For you:* when the agent does not
+    come back, read the watchdog's journal before you open a window (a
+    held start is a `watchdog HOLDING` error line there). A successor that
+    started before that judgement, outside a window, is
     recorded as the role taken by a start the watchdog did not make
     (`role_taken_by_another_start`, High), after that start.
   - A clean stop inside a signed trusted-installer window (the operator's
@@ -466,8 +497,7 @@ not cause as an incident.
   memory both writable and executable; a start that finds a loader
   variable, or an executable mapping of a library the release does not
   link, refuses itself before it takes its role, signed
-  (`start_self_check`, `watchdog_start_refused`). That check runs inside
-  the starting process. What is not yet guaranteed: a successor that runs
+  (`start_self_check`, `watchdog_start_refused`). What is not yet guaranteed: a successor that runs
   code root gave it before its start, and that hides it, is not reliably
   told from its unit's clean restart; what it signs then, its import of
   the watchdog's rows included, is not evidence, and neither is the
@@ -475,9 +505,9 @@ not cause as an incident.
   host before a start covers the starts it makes: a start it did not make
   is recorded after it, not prevented. While the watchdog is gone too, or
   runs without its witness (`witness_unavailable`, High), the agent's
-  vacancy is recorded by its successor's own start (`previous_run`, the
-  succession record) and by the gap the next start finds, and a change to
-  the chain made while no watchdog runs is not always detected. On a host without systemd (the watchdog's `exec`
+  vacancy is recorded only by the next start (`previous_run`, the
+  succession record, the gap it finds), and a change to the chains made
+  while neither role runs may not be found without a head kept elsewhere. On a host without systemd (the watchdog's `exec`
   respawn backend) a vacated role is not taken again until the next boot.
   The agent judges a process that takes the watchdog's role at its next
   round, while the kernel's guard refuses one outside the unit at once.
@@ -531,19 +561,16 @@ not cause as an incident.
   *Evidence:* `a_weakening_variable_from_the_service_manager_is_ignored`;
   lot 370.
 - **The agent's CPU time.** Heavy CPU load from root processes can slow the
-  agent: its unit has no raised CPU weight yet. A stall of more than 15 s is
-  a signed `agent_stalled` record. A confinement of the agent to fewer CPUs
-  (a sibling cpuset partition, its cgroup's CPUs, a thread's affinity) is
-  not refused: it is detected and signed (`cpu_confined`, High) and shown
-  in `nn-admin status` (the `own_cpus` degradation), and withdrawn when it
-  ends. A confinement made before the agent's first round is not proven.
-  CPUs taken offline are not recorded, and the watchdog's CPUs are not
-  watched. *Evidence:* `a_sibling_partition_confining_the_agent_is_a_confinement`;
+  agent. A stall of more than 15 s is a signed `agent_stalled` record. A
+  confinement of the agent to fewer CPUs is not refused: it is detected
+  and signed (`cpu_confined`, High), shown in `nn-admin status` (the
+  `own_cpus` degradation), and withdrawn when it ends. Some limits on the
+  agent's or the watchdog's CPUs are not recorded (one made before the
+  agent's first round, CPUs taken offline). *Evidence:* `a_sibling_partition_confining_the_agent_is_a_confinement`;
   `a_cpu_taken_offline_is_no_confinement`; lot 349; internal check Phase 3
   §7.1 (residual R001).
-- **The journal can be emptied.** A root `journalctl --vacuum-*` removes
-  the agent's journal lines like any other's (the anti-tamper lab's known
-  gap). The signed chains are not in the journal. *Evidence:* internal
+- **The journal can be emptied.** Root can empty the system journal, the
+  agent's lines included (the anti-tamper lab's known gap). The signed chains are not in the journal. *Evidence:* internal
   check Phase 3 §7.1 (C57c, as declared).
 - **The kernel is the host's to protect.** A root that can write kernel
   memory can defeat any defence inside the kernel. Kernel lockdown, module
@@ -555,9 +582,9 @@ not cause as an incident.
   agent keeps its signing key in a locked page that is never swapped or
   dumped, and refuses root's ptrace, `/proc/<pid>/mem`,
   `process_vm_readv` and core dumps of its processes. It cannot refuse a
-  read of physical memory: root reads it through `/proc/kcore` unless
-  kernel lockdown is `confidentiality`, and `integrity`, the level
-  recommended, does not close it. On such a host the signing key and the
+  read of physical memory: without kernel lockdown at `confidentiality`,
+  root can read it, the agent's signing key included; `integrity`, the
+  level recommended, does not prevent it. On such a host the signing key and the
   agent's other in-memory secrets are not protected from root.
   `nn-admin host-check` warns when lockdown is off. *Evidence:* lot 367;
   internal check Phase 3b (F3b-4).
@@ -570,11 +597,9 @@ not cause as an incident.
   access mode, recorded Low as
   `ptrace_read`, "denied in kernel (the open …)". The hook's other
   read-mode refusals (`exe`, `ns/*`, `fd/`) are recorded "the hook
-  refused; the kernel's outcome not observed". Not refused there:
-  `process_madvise(2)` hints on the agent's memory (cold, pageout,
-  willneed, collapse): they read none of its content, but their answer
-  can reveal the layout of the agent's memory (which address ranges are
-  mapped). Without the kernel's proc offsets in its
+  refused; the kernel's outcome not observed". Some memory hints on the
+  agent's process are not refused: they read none of its content, but can
+  reveal which address ranges are mapped. Without the kernel's proc offsets in its
   BTF the open refusal is not armed, a signed degradation. *Evidence:*
   `the_memory_views_are_refused_at_their_open_with_the_hooks_decisions`;
   lot 367; internal check Phase 3b (F3b-1).
@@ -583,29 +608,20 @@ not cause as an incident.
 
 - **A program run through the dynamic loader.** The staging rules judge a
   program the dynamic loader runs (its operand, a library it preloads) as
-  if the kernel had executed it. One named through a link of `/proc` (the
-  process's root, its working directory, a descriptor) is placed by the
-  file the loader maps, as the agent reads the process just after the
-  exec; when it cannot be placed that way — the process gone or in another
-  view, the file not mapped yet, a symbolic link on the way — a
-  descriptor's link is judged as fileless code (R004) and any other such
-  name is recorded (R001, Medium) without a response, as is one named
-  relative to the caller's working directory, which the record does not
-  carry. Any other absolute name is also judged where the agent finds the
-  file the loader maps, its symbolic links followed as the kernel follows
-  them (`/usr/tmp` is `../var/tmp` on the RHEL family). A name the agent cannot place where the loader maps it is judged by its text; a staging directory reached only through a symbolic link may then draw no record (a residual, named). The agent judges the process as it reads it just after the exec. A loader that only lists or checks its program does not
-  always run nothing: glibc's `--list`, `LD_TRACE_LOADED_OBJECTS` and `ldd`
-  still load and run the libraries the program names for auditing
-  (`DT_AUDIT`, `DT_DEPAUDIT`) — the program's own code when it names
-  itself. A staged program (in `/tmp`, a memfd, a
-  FUSE file and the like) listed so is never recorded Low (fix round 3,
-  R2-1): the file the agent reads is not always the file the loader maps
-  once code has run, so one the agent read
-  naming an auditor is judged as run (the kill), and every other is
-  recorded Medium, never killed, and its record does not say that nothing
-  ran. `--verify` and musl's `ldd` run nothing (Low); musl's loader ignores
-  `LD_TRACE_LOADED_OBJECTS` and runs the program (judged as run). A library `--audit` names
-  runs in every mode and is judged. *Evidence:*
+  if the kernel had executed it, where the agent finds the file the loader
+  maps (links followed as the kernel follows them), as it reads the
+  process just after the exec. A program the agent cannot place where the
+  loader maps it is recorded (R001, Medium) without a response, or judged
+  by its name (which may draw no record); a descriptor's link it cannot place is judged as fileless
+  code (R004). A loader that only lists or checks a program can still run
+  code the program names, so the agent never takes such a listing as
+  harmless: a staged program (in `/tmp`, a memfd, a FUSE file and the
+  like) listed so is never recorded Low — judged as run (the kill) when
+  the file the agent read names code to run, recorded Medium otherwise,
+  and its record does not say that nothing ran. `--verify` and musl's
+  `ldd` run nothing (Low); musl's loader runs a program it is asked only
+  to list (judged as run). A library `--audit` names runs in every mode
+  and is judged. *Evidence:*
   `a_program_run_through_the_dynamic_loader_is_judged_as_if_executed`;
   `a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec`;
   `a_loader_that_only_lists_is_recorded_low_and_one_that_runs_stays_judged`;
@@ -616,10 +632,9 @@ not cause as an incident.
   `a_loader_operand_through_a_symbolic_link_is_placed_where_the_kernel_finds_it`;
   lot 370.
 - **A file of the FIM watch list absent at the start.** Its creation is an
-  event with its writer, judged as a change of the file would be. One whose
-  creation no record names (its directory itself new) is an event shortly
-  after, its writer unknown. A file already in a directory of the list when
-  that directory appears is watched, not reported.
+  event with its writer, judged as a change of the file would be. Some ways
+  a watched file first appears are reported later with no writer, or not
+  at all; from then on the file is watched.
   *Evidence:* `ld_so_preload_created_after_the_start_is_fim_022_with_its_writer`;
   `root_authorized_keys_created_after_the_start_is_fim_004`; lot 370.
 - **Files written in a package manager's lineage are recorded Low.** A
@@ -655,9 +670,8 @@ not cause as an incident.
   `a_shell_on_an_outbound_socket_is_a_critical_reverse_shell`.
 - **Ransomware detection looks for shapes.** It looks for mass rewrites,
   renames to new extensions and high-entropy writes, by one process or one
-  unit within a time window. Encryption that does not show those shapes,
-  or is spread thin enough over time, processes or units, may be seen only
-  by weaker signals, or not at all; on its own it raises the posture to
+  unit within a time window. Encryption that does not show those shapes
+  may be seen only by weaker signals, or not at all; on its own it raises the posture to
   ENGAGED, not COMBAT. *For you:* keep backups off the host; detection
   does not replace them. *Evidence:* internal check Phase 0, residuals R024,
   R025, R026.
@@ -727,11 +741,10 @@ not cause as an incident.
   *For you:* a record whose program does not match what you ran, on a
   host that was suspended, is worth a report. *Evidence:* lot 360.
 - **Children that only fork.** A process that forks without running a new
-  program is judged by its parent's image. A forker's own later exec read
-  after the child's connection is judged on the earlier image; a fork-only
-  child that sends over UDP, and the fork of a forker that already exited,
-  are judged by their path, as before. A program name cut by the kernel at
-  31 bytes inside a multibyte character is not tied to its image.
+  program is judged by its parent's image. A few fork-only children are
+  judged by their path rather than their image, or on their parent's
+  earlier image. A program name the kernel cut inside a multibyte
+  character is not tied to its image.
   *Evidence:* `fork_only_connects` tests (lot 360); lot 360.
 - **A TLS fingerprint is not an identity.** `NN-L-NET-003_BadJa3` records a
   listed JA3 or JA4 at Medium and never acts on it. *Evidence:* internal
@@ -796,11 +809,9 @@ lists the known false positives of each rule.
   High. *Evidence:* internal check Phase 0, residuals R054. A snap
   install's own units (the snap's mount and service units, written by the
   host's snapd, the process its systemd unit runs, in the unit's cgroup) are
-  recorded Low. The agent takes whatever program the snapd service runs
-  for snapd: a root user who makes that service run a program of their own
-  gets the same Low for unit files, as installing a package of their own
-  already does (the package-manager boundary above); root changing what a
-  system service runs is itself the act to watch for. *Evidence:*
+  recorded Low. The agent trusts snapd's units as the snapd service's own,
+  as it trusts a package transaction (the package-manager boundary above);
+  root changing what a system service runs is the act to watch for. *Evidence:*
   `the_host_s_snapd_writing_its_own_units_is_low_and_nothing_else_is`,
   `snapds_identity_is_snapd_services_process_with_clean_marks`; lot
   367.
@@ -849,9 +860,9 @@ lists the known false positives of each rule.
   with a sign is read as libcap reads it or not at all, and is then High.
 
   Residuals:
-  - **A package's own files.** What says a file is a package's is a line of
-    its dpkg `.list`, which the package's own maintainer script, run as root,
-    can append to; a malicious package can also ship a helper of its own. A
+  - **A package's own files.** A file is taken as a package's from the
+    package database, which a package's own root scripts can change; a
+    malicious package can also ship a helper of its own. A
     narrow capability on such a file is Low: the trust boundary every package
     transaction already is (root installs what it likes through the real
     package manager). The narrow set includes `cap_net_admin`
@@ -861,8 +872,8 @@ lists the known false positives of each rule.
   - **The packaged `systemd-update-utmp` itself.** Root that runs the packaged binary has its appends of whole records kept. A rewrite made
     before an exec of it, through an inherited descriptor, is another
     writer's and stays High; but a rewrite in place made under the packaged binary's own identity, by code root placed in it, is not recorded by `NN-L-FIM-019` (a residual, named); the same holds for a process that takes on that identity.
-  - **bpftool's environment.** The proof of a bpftool listing does not read
-    the taker's environment: a listing by root that is proven the packaged bpftool's has its refused handles recorded Low (`NN-L-AT-001`), and in observe mode its handles by id one Low record (`NN-L-BPF-002`, which does not say which object was asked for); the proof does not cover everything such a process can do with them. In enforce mode the refusal stands, and every other operation (a detach, a dump's or an update's
+  - **bpftool listings.** A listing by root that is proven the packaged
+    bpftool's has its refused handles recorded Low (`NN-L-AT-001`), and in observe mode its handles by id one Low record (`NN-L-BPF-002`, which does not say which object was asked for); the proof does not cover everything such a process can do with them. In enforce mode the refusal stands, and every other operation (a detach, a dump's or an update's
     handle) keeps its own High record.
   - A bait created with no kernel record of its writer that holds the bait's
     own content is High, not Critical (no writer to act on).
@@ -898,22 +909,17 @@ lists the known false positives of each rule.
   `cat /etc/login.defs` from a session (ALERTED).
 
   Residuals:
-  - **A log moved away and re-created late.** A watched log renamed away
-    with nothing at its path when the drain settles the rename is watched
-    again when a file comes back, checked as a creation by an unknown
-    writer: `NN-L-FIM-005` judges modifications only, so the move itself
-    is the drift row's `Renamed` and the line in the journal, not a High.
-    A file put at the path at once is the renamer's change (High).
+  - **A log moved away.** A watched log moved away is recorded as moved
+    (the drift row `Renamed` and a line in the journal), not as a High:
+    `NN-L-FIM-005` judges modifications only. A file that appears later at
+    its path is checked as a creation by an unknown writer.
   - **`NN-L-AT-001`'s boot burst.** The BPF cross-view's baseline of
     systemd's programs (~30 Low records at each boot) is signed once per
     program, a sole trace by design (lot 356); not coalesced.
-  - **A package's own maintainer script starting a generic relay.** The
-    `NN-L-NET-019`/`-006` Low for a package transaction's listener asks for
-    a dpkg maintainer script in the listener's lineage (an APT or dpkg
-    hook does not give it: Medium), and trusts that script: a malicious
-    package's postinst starting the host's `socat` or `nc` as a listener is
-    recorded Low, naming the package. rpm scriptlets give no such identity:
-    their listeners stay Medium.
+  - **A listener a package's own maintainer script starts.** It is
+    recorded Low (`NN-L-NET-019`/`-006`), naming the package: the agent
+    trusts that script as it trusts the package. A listener started from
+    an APT or dpkg hook, or from an rpm scriptlet, stays Medium.
   - **A user's service manager launching a unit with no identity.** R004
     tells an exec with no identity (the agent's start, a lost handoff) of
     `/proc/self/fd/N` as systemd's executor only for PID 1's forks, by PID
@@ -992,6 +998,21 @@ lists the known false positives of each rule.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.
+- **Many hashed DNS names under one domain.** A program that resolves many
+  long, random-looking names under one domain in a short time (a security
+  product's reputation lookups by hash, a client of many hashed
+  sub-domains) draws `NN-L-NET-014_DnsTunnelEntropy` High (`would have:
+  KillProcess`). *For you:* such a record for a tool you know is a known
+  false positive; report the domain. *Evidence:*
+  `net_014_kills_a_tunnel_of_distinct_labels_under_one_parent`; lot 291.
+- **A program that runs its own file again after an upgrade.** A program
+  that, in the same process, runs its own file again through
+  `/proc/self/exe` after a package upgrade replaced that file runs a file
+  that is no longer on disk: `R004_ExecFromProcSelfFd` Critical (`would
+  have: KillProcessTree`). *For you:* such a record right after an
+  upgrade of that program's package is a known false positive.
+  *Evidence:* the residual of `docs/operator/UPGRADE_NOTES_WAVE4.md` §31
+  (a program re-executing itself in place); lot 310.
 
 ## Kernels and distributions
 
@@ -1019,7 +1040,9 @@ lists the known false positives of each rule.
   *Evidence:* internal check Phase 8 §7 (residual R066).
 - **Prerequisites.** Kernel BTF (`/sys/kernel/btf/vmlinux`), `bpf` in the
   active LSM list, bpffs at `/sys/fs/bpf`, systemd, `nft`. Without the BPF
-  LSM the agent does not start. *Evidence:*
+  LSM the agent refuses to start. Only the override
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` starts it then, at trust level L0 (no
+  enforcement, signed): a lab mode, not supported for the alpha. *Evidence:*
   `install_sh_refuses_a_host_without_nft_unless_told`; lot 341.
 - **A kernel update can stop the agent.** At each start the agent checks
   every kernel structure it reads. When a required one is missing, it
@@ -1032,8 +1055,9 @@ lists the known false positives of each rule.
 - **Ubuntu 26.04 (7.0): degraded fallbacks see one CPU.** On that kernel a
   BPF program on a syscall tracepoint runs only for calls made on CPU 0.
   The agent's normal start does not use those tracepoints. Only the
-  fallbacks of a start without the BPF LSM do, and they then miss what runs
-  on other CPUs. *Evidence:* internal check Phase 8 §7 (residual R060).
+  fallbacks do (a sensor's tracepoint mode, a start without the BPF LSM
+  under the lab override above), and they then miss what runs on other
+  CPUs. *Evidence:* internal check Phase 8 §7 (residual R060).
 - **overlayfs, FUSE and NFS.** On these filesystems the kernel's identity of
   a file may not match what `stat()` reports, so a protected or watched
   file there may be neither protected nor watched. The agent signs a

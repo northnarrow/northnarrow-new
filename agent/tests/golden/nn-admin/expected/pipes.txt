@@ -21,7 +21,7 @@ exit: 0
 |   unlock                   Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT)
 |   status                   Print current posture + network isolation state. Add --json to get a machine-readable response for scripting. Without --key the agent answers the posture, the isolation, the last admin action and the COMBAT stage and lock; --key signs the request and adds the telemetry: ring drops and rejected records, the response mode (detect-only), the COMBAT evidence gaps. Run it as root (sudo): exit 17 when this user may not open the admin socket, exit 5 when the agent cannot be reached (not running)
 |   capabilities             This boot's signed capability manifest — kernel, BTF, active LSMs, deny hooks and their self-test, each sensor's attach point, host hardening, degradations, the trust level — with the row of the audit chain that signs it. A key with `audit-read` or `telemetry-read` (the signed telemetry read). Exit 1 when the agent has not signed one yet
-|   host-check               Host hardening checks: kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper. Reads /sys and /proc only; no socket needed. Exit 0 with no warnings, 2 with warnings (`--json` for scripting)
+|   host-check               Host hardening checks: kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper; and whether the agent can run here at all (a library preload list it would refuse at its start: FAIL). Reads the host's files only; no socket needed. Exit 0 with no warnings, 2 with warnings, 3 when a check FAILs (`--json` for scripting)
 |   detections               Read the last N persisted detections (newest-first) over the admin socket. Requires a key carrying the low-privilege `telemetry-read` role — read-only telemetry, no COMBAT/control authority. The records stream as JSONL on stdout (so `| jq` works); a summary goes to stderr
 |   detection-set-status     Change a persisted detection's triage status over the admin socket. Requires a key carrying the `triage` role (which also subsumes `telemetry-read`, so a triage key can both read detections and re-status them). Event-sourced: the agent appends a signed status-change event to a separate chain and never mutates the detection log; the new status surfaces on the next `nn-admin detections` read
 |   verify-keys              Parse the installed admin.pub, count valid keys, print fingerprints. Local-only — does not touch the agent socket
@@ -105,7 +105,7 @@ exit: 141
 ### pipe.stderr.host-check
 $ nn-admin host-check
 stderr: a pipe closed before the start
-exit: <0, or 2 with the host's warnings: checked>
+exit: <0, 2 with the host's warnings, 3 with a failure: checked>
 --- stdout
 | <status>  BPF LSM in the active LSM list   <value>
 | <status>  Kernel lockdown mode             <value>
@@ -120,7 +120,8 @@ exit: <0, or 2 with the host's warnings: checked>
 | <status>  release verified at install      <value>
 | <status>  cgroup v1 controllers not mountable <value>
 | <status>  Kernel fixes the sandbox relies on <value>
-| 13 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+| <status>  Library preload list             <value>
+| 14 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any><, then a line of the failures when there are any>
 
 ### pipe.stdout.host-check-json
 $ nn-admin host-check --json
@@ -132,7 +133,7 @@ exit: 141
 ### pipe.stderr.host-check-json
 $ nn-admin host-check --json
 stderr: a pipe closed before the start
-exit: <0, or 2 with the host's warnings: checked>
+exit: <0, 2 with the host's warnings, 3 with a failure: checked>
 --- stdout
 | [
 |   {
@@ -225,6 +226,13 @@ exit: <0, or 2 with the host's warnings: checked>
 |     "status": "<status>",
 |     "value": "<value>",
 |     "fix": "upgrade to a kernel whose stable branch carries the fix (docs/operator/KERNEL_COMPATIBILITY.md, \"Kernel fix level\"); on a distribution's kernel check its security tracker for each CVE named `unknown` — the agent's workers and anti-tamper rely on these fixes"
+|   },
+|   {
+|     "id": "preload",
+|     "name": "Library preload list",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "remove the entry that names a library (or the file) — the agent and its watchdog check what their start maps and refuse to start with a library the release does not link (exit 78 and 16) — or run the agent on a host without one"
 |   }
 | ]
 
@@ -473,7 +481,7 @@ exit: 0
 | combat stage      : (agent predates the field)
 | last admin action : (none since agent start)
 | telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
-| host hardening : 13 check(s), <the host's warnings: checked>
+| host hardening : 14 check(s), <the host's warnings: checked>
 --- agent
 connection 1
 > {"Status":{}}
@@ -551,7 +559,7 @@ exit: 0
 |   not protected   : budget 1
 |   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
 |   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
-| host hardening : 13 check(s), <the host's warnings: checked>
+| host hardening : 14 check(s), <the host's warnings: checked>
 --- agent
 connection 1
 > {"ChallengeRequest":{}}

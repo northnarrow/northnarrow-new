@@ -141,8 +141,8 @@ by `nn-admin heartbeat watch` — `HEARTBEAT.md`.
 
 `/var/lib/northnarrow/witness/witness.chain` is the watchdog's own record
 of the agent's role, so that the agent's vacancy and the process that took
-it are never recorded only by that process. One JSON row per line: `v`,
-`seq` (from 0), `prev` (the SHA-256, hex, of the line before it; empty for
+it are never recorded only by that process. One JSON row per line: `v`
+(the row's format, now 1), `seq` (from 0), `prev` (the SHA-256, hex, of the line before it; empty for
 the first), `at`, the watchdog's `tgid`, its `key`, `kind`, `detail`,
 `sig`. The key is an Ed25519 key the watchdog makes at its start and keeps
 in its memory for its life; its public half is published in a sealed
@@ -190,6 +190,9 @@ memory file of the watchdog's, never on disk.
   agent's import continues in `witness.chain.1`).
 - A watchdog that cannot open its witness records it, and the agent signs
   `witness_unavailable` (High).
+- `nn-admin chain verify` does not read `witness.chain`: the agent checks
+  each row against the key it certified when it imports it, and the
+  imported rows are verified with the audit log.
 - Each row is also an INFO line of the watchdog's journal (`witness row
   signed`): `journalctl --namespace=northnarrow -u northnarrow-watchdog`.
   To check a row by hand: `sig` is the Ed25519 signature, by `key`, of the

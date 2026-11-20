@@ -93,6 +93,9 @@ pub trait HostChecks {
     fn count(&self) -> usize;
     /// How many warn (`host_hardening::warn_count`).
     fn warn_count(&self) -> usize;
+    /// How many fail: the agent cannot run on this host as it is
+    /// (`host_hardening::fail_count`; lot 377).
+    fn fail_count(&self) -> usize;
     /// The table `host-check` prints (`host_hardening::render_table`).
     fn render_table(&self) -> String;
     /// The checks as `host-check --json` prints them

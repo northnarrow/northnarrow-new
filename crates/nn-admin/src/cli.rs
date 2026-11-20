@@ -262,8 +262,10 @@ enum Cmd {
     /// signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA,
     /// BPF LSM, single bpffs mount — the settings that keep root from
     /// rewriting the kernel at runtime, which is the only way around the
-    /// agent's anti-tamper. Reads /sys and /proc only; no socket needed.
-    /// Exit 0 with no warnings, 2 with warnings (`--json` for scripting).
+    /// agent's anti-tamper; and whether the agent can run here at all (a
+    /// library preload list it would refuse at its start: FAIL). Reads the
+    /// host's files only; no socket needed. Exit 0 with no warnings, 2 with
+    /// warnings, 3 when a check FAILs (`--json` for scripting).
     HostCheck {
         #[arg(long)]
         json: bool,
@@ -1695,11 +1697,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
             } else {
                 print!("{}", checks.render_table());
             }
-            if checks.warn_count() == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            }
+            ExitCode::from(host_check_exit(checks.fail_count(), checks.warn_count()))
         }
         Cmd::Status {
             socket,
@@ -5988,6 +5986,19 @@ fn exit_from_detections(outcome: NetJsonlOutcome) -> ExitCode {
 
 /// Tappa 9.0.c — exit handler for `nn-admin detection-set-status`.
 /// Success prints the id + new status; `NotFound` gets a precise hint.
+/// `host-check`'s exit status: 3 when a check fails (lot 377: the agent
+/// cannot run on this host as it is) — before any warning —, 2 with
+/// warnings, 0 otherwise.
+fn host_check_exit(fails: usize, warns: usize) -> u8 {
+    if fails > 0 {
+        3
+    } else if warns > 0 {
+        2
+    } else {
+        0
+    }
+}
+
 fn exit_from_detection_set_status(outcome: DetectionSetStatusOutcome) -> ExitCode {
     let op = "detection-set-status";
     let tty = colour_on(std::io::stdout().is_terminal());
@@ -6190,6 +6201,20 @@ mod roles_csv_tests {
             vec![Role::Unlock, Role::AuditRead],
             "spaces around an entry are trimmed"
         );
+    }
+}
+
+/// Lot 377 (named): a failed check (the agent cannot run on this host)
+/// is exit 3 whatever the warnings; warnings alone 2; none 0.
+#[cfg(test)]
+mod host_check_exit_tests {
+    #[test]
+    fn host_check_exits_3_on_a_failure_before_its_warnings() {
+        use super::host_check_exit;
+        assert_eq!(host_check_exit(0, 0), 0);
+        assert_eq!(host_check_exit(0, 4), 2);
+        assert_eq!(host_check_exit(1, 0), 3);
+        assert_eq!(host_check_exit(1, 4), 3);
     }
 }
 

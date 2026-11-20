@@ -900,14 +900,34 @@ impl ExemptSleep {
     /// executable the kernel names for it is the one the exemption names
     /// (a test of a revocation, or of none, on a process never exempt
     /// proves nothing).
+    ///
+    /// Lot 377 (a nightly on Debian 12): `spawn` can return before the
+    /// child's `/proc/<pid>/exe` names its new image — the standard library
+    /// spawns with `posix_spawn`, whose parent resumes when the child
+    /// releases the parent's memory during its exec, just before the
+    /// kernel switches the child to the new image. So the test waits, a
+    /// bounded poll, until the kernel names the exemption's executable, and
+    /// fails as before when it never does.
     fn spawn(&self) -> Child {
         use std::os::unix::process::CommandExt;
-        let child = Command::new(&self.exe)
+        let mut child = Command::new(&self.exe)
             .arg("60")
             .process_group(0)
             .spawn()
             .expect("the exempt sleep");
-        let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("its exe");
+        let link = format!("/proc/{}/exe", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exe = loop {
+            let exe = std::fs::read_link(&link).expect("its exe");
+            if exe == self.exe || Instant::now() >= deadline {
+                break exe;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        if exe != self.exe {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         assert_eq!(
             exe, self.exe,
             "the kernel names another executable than the exemption's"

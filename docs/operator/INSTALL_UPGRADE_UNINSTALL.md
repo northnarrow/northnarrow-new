@@ -103,6 +103,23 @@ If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
 with `Operation not permitted` halfway through.
 
+**A library preload list.** Before it changes anything, `install.sh` (a
+fresh install, a reinstall, `--upgrade`) reads `/etc/ld.so.preload` the
+way the dynamic loader does. When the list names a file that exists — a
+library every program on the host would load, the agent and the watchdog
+included (a command logger, another vendor's agent) — it refuses with
+exit status **5**, says that nothing was changed and names the files: the
+agent and the watchdog refuse to start with a library the release does not
+link (their start check: exit 78 and 16, signed). Remove the entry or the
+file, or install on a host without one. A list that cannot be read as a
+regular file (a FIFO, a device, larger than 64 KiB) is refused the same
+way. An empty list, one with comments only, or one whose entries name no
+existing file is reported on a `NOTE` line and the install goes on; each
+start's own check still refuses a library that becomes loadable later.
+The packages (section 6) do not run this check: on such a host their start
+is refused by the agent's own start check. `nn-admin host-check` fails the
+same list (§3.1).
+
 **Copy on first write** (lab PR 222, experimental, off by default).
 `install.sh --cow-guard` installs the drop-in
 `northnarrow-agent.service.d/20-cow-guard.conf`, which adds
@@ -562,7 +579,14 @@ to wait for every LSM program on the host: systemd's own
 30 s with everything left. When nothing of NorthNarrow can hold one — no pin
 root and no unit process when the run starts, no process running a
 NorthNarrow binary — other products' programs are not waited for; any of
-them, and the wait is as before. Every uninstall also stops the journal
+them, and the wait is as before, except for the programs PID 1 holds
+(lot 377): none of them is NorthNarrow's and none detaches while PID 1
+runs, so they are never waited for — by the uninstall nor by the upgrade.
+That is what lets the uninstall of a half-install finish on Debian 13 (a
+start refused by its own check, before it loaded anything: its unit's
+pin-lock step had made an empty pin root first). A pin root that a unit
+restart makes again during the uninstall (the watchdog's `Restart=` after
+a refused start) is removed once the units are gone. Every uninstall also stops the journal
 namespace's varlink socket and removes its runtime directory
 (`/run/systemd/journal.northnarrow`); `--purge` removes `/var/log/northnarrow`
 when nothing else is in it.
@@ -625,6 +649,7 @@ missing and how to fix it:
 | IMA | measurements > 0 | a replaced binary fails before it runs (appraise) or is at least measured |
 | kexec | `kernel.kexec_load_disabled` = 1 | no kernel swap without a reboot; lockdown alone still lets a signed vendor kernel in through `kexec_file_load`, with any command line (one without `bpf` in `lsm=`, for instance). Since review 82 the running agent refuses every kexec image load itself (below); the setting still covers the time before the agent starts |
 | bpffs | mounted once at `/sys/fs/bpf` | a second bpffs can hide pinned objects from the inventory |
+| Library preload list | `/etc/ld.so.preload` absent (`OK`), or loading nothing: empty, comments only, or no entry naming an existing file (`OK`, "present, loads nothing") | a file it names that exists is a library every program loads; the agent and the watchdog refuse to start with a library the release does not link (exit 78 and 16, signed). Such a list is a **FAIL** that names the files: remove the entry or the file (section 1) |
 | nftables | `nft` installed in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`, root's and writable by nobody else — the one the agent runs; a copy in `/usr/local` is not used (external audit ATP-014, lab PR 176) | a BlockOutbound verdict and the COMBAT soft egress block (INVESTIGATE) are nftables rules: without `nft` the offender is not contained while the agent analyses it — the agent records a signed `subsystem_degraded` at boot, and each episode records the failure and shortens INVESTIGATE to 10 s. Reported with `--without-nftables` when the install manifest records it (lab PR 165). A WARN like the other rows: the refusal is the installer's (Prerequisites, above) |
 | cgroup v1 controllers | `cgroup_no_v1=all` on the kernel command line (or no `freezer`, `devices`, `net_cls`, `net_prio`, `perf_event` enabled) | lot 273b: on a host whose systemd runs the unified hierarchy, root can still mount a v1 hierarchy of these controllers and freeze the agent through a v1 `freezer`. The running agent refuses every write to a v1 hierarchy outside a window there (section 3.7); the boot option refuses the mount itself, before the agent runs |
 | Release verified at install | `provenance` `attested`, or `signed-checksums` accepted with no flag, in `install-manifest.json` | only these say the release is the project's (section 5.1); `checksums`, `manifest`, `source-tree`, `unverified` and `package`, and `signed-checksums` accepted with a flag, are a WARN, reported with the flag that accepted them. The agent boots at every level, so the lab and developer hosts keep working (external audit DEP-007) |
@@ -655,7 +680,8 @@ sudo kdumpctl restart
 `install.sh` prints the table after installing; the agent logs one WARN
 per missing setting at boot; `nn-admin status` shows the count and
 `nn-admin host-check [--json]` the full table (exit 2 when something is
-missing). A check that cannot be determined (no EFI, IMA not compiled in)
+missing, 3 when the agent cannot run on this host: a row that is `FAIL`,
+`fail` in `--json`). A check that cannot be determined (no EFI, IMA not compiled in)
 is reported as `n/a`, not as a warning. The lab guests show the expected
 gaps of a cloud image (no Secure Boot, lockdown off, kexec allowed); a
 production host should clear them — the Scout Tappa will automate the
@@ -1183,8 +1209,7 @@ pins it recreates by its predecessor's hooks.
 
 ### 3.9 When the watchdog fails (lab PR 216)
 
-The watchdog supervises the agent; since lab PR 216 its own failures are
-visible too (capability C23; static review C-43, C-44).
+The watchdog supervises the agent; its own failures are visible too.
 
 **Exit statuses.** The watchdog exits 0 only for a stop it was told to
 make: SIGTERM or SIGINT (a maintenance stop inside the trusted-installer
@@ -1203,6 +1228,7 @@ has its own status, logged as `watchdog EXITING on a failure` on
 | 13 | the respawn backend could not be set up |
 | 14 | `READY=1` could not be sent to systemd |
 | 15 | the signal handlers could not be installed |
+| 16 | the start refused itself: a loader variable in its environment, or a mapped file that is neither its binary nor a library the release links (a host whose `/etc/ld.so.preload` makes every program load a library, section 1); recorded for the live agent to sign (`watchdog_start_refused`) |
 | 20 | the wait on the agent's pidfd failed (it used to exit 0, and was never restarted) |
 | 30 | `--record-unit-failure`: the record could not be written |
 
