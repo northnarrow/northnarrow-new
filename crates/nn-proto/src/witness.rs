@@ -76,6 +76,27 @@ pub const KIND_SUCCESSOR_FOREIGN: &str = "role_successor_foreign";
 /// The watchdog's start found the agent's role vacated and no agent: both
 /// roles were vacant.
 pub const KIND_FOUND_VACANT: &str = "role_found_vacant";
+/// The re-check of #582 (N4): the agent's unit's restart took the vacated
+/// role with nothing foreign in it, but a library it maps was replaced on
+/// disk since it mapped it and is not the watchdog's own copy: its identity
+/// not confirmed. The watchdog re-registers it (never withheld for that
+/// alone); the row is High.
+pub const KIND_SUCCESSOR_UNCONFIRMED: &str = "role_successor_unconfirmed";
+/// The re-check of #582 (N3): the vacated role taken by a start the
+/// watchdog did not make — the process had started before the watchdog's
+/// judgement of the host, outside a signed trusted-installer window. What
+/// the watchdog read of the host came after that start.
+pub const KIND_UNMADE_START: &str = "role_taken_by_another_start";
+/// The re-check of #582 (N2): the respawn gate's reference — the host its
+/// later judgements compare with — moved to the host as it is now, after a
+/// change made inside a signed trusted-installer window (a note: what it
+/// moved to, signed).
+pub const KIND_GATE_REFERENCE: &str = "respawn_gate_reference_moved";
+/// The re-check of #582 (N6): an append of the watchdog's failed part-way
+/// (a full disk, an I/O error) and the partial row it left was removed —
+/// the chain ends at the watchdog's last whole row again (a note: torn, not
+/// cut).
+pub const KIND_CHAIN_TORN: &str = "witness_chain_torn";
 
 /// One row of the witness chain (one JSON line).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

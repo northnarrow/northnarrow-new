@@ -505,6 +505,19 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
     Some(holds != neg)
 }
 
+/// The re-check of #582 (N0): a boolean as systemd's `parse_boolean`
+/// reads it — case-insensitive `1`, `yes`, `y`, `true`, `t`, `on` and `0`,
+/// `no`, `n`, `false`, `f`, `off`; `None` for anything else (an empty
+/// value included, which resets the directive).
+pub fn systemd_bool(v: &str) -> Option<bool> {
+    let v = v.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "yes" | "y" | "true" | "t" | "on" => Some(true),
+        "0" | "no" | "n" | "false" | "f" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Why `key=value`, set for `reach`, harms our units; `None` when it does
 /// not (the directive is the host's business, an alert at most).
 pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<String> {
@@ -584,7 +597,8 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         }
         "KillSignal" => (!matches!(v, "SIGTERM" | "TERM" | "15"))
             .then(|| format!("KillSignal {v}, ours is SIGTERM")),
-        "SendSIGKILL" => (!matches!(v, "no" | "false" | "0" | "off"))
+        // the re-check of #582 (N0): a boolean as systemd parses it
+        "SendSIGKILL" => (systemd_bool(v) != Some(false))
             .then(|| "SendSIGKILL on, ours is off".into()),
         "FinalKillSignal" => {
             (!matches!(v, "SIGKILL" | "KILL" | "9")).then(|| format!("FinalKillSignal {v}"))
@@ -605,7 +619,7 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         "User" => {
             (!matches!(v, "" | "root" | "0")).then(|| format!("user {v}: the agent needs root"))
         }
-        "DynamicUser" => (!matches!(v, "no" | "false" | "0" | "off"))
+        "DynamicUser" => (systemd_bool(v) != Some(false))
             .then(|| "a dynamic user: the agent needs root".into()),
         "RootDirectory"
         | "RootImage"
@@ -644,7 +658,9 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         ),
         // The review of #582 (F2 b): our units deny memory both writable
         // and executable; turned off, a start can run code no file backs.
-        "MemoryDenyWriteExecute" if matches!(v, "" | "no" | "false" | "0" | "off") => Some(
+        // The re-check of #582 (N0): off is anything systemd does not parse
+        // as true ([`systemd_bool`]: `n`, `No`, `FALSE`, an empty reset).
+        "MemoryDenyWriteExecute" if systemd_bool(v) != Some(true) => Some(
             "MemoryDenyWriteExecute= turned off: code no file backs could run in our units".into(),
         ),
         "EnvironmentFile" => {
@@ -1385,5 +1401,44 @@ mod tests {
             "{}",
             r[0].detail()
         );
+    }
+
+    /// The re-check of #582 (N0): `MemoryDenyWriteExecute=` turned off in
+    /// any spelling systemd accepts (`parse_boolean` is case-insensitive and
+    /// takes `n` and `f`), reset by an empty value, or set to what systemd
+    /// would not read as true, is a harm; only a true value is not. The
+    /// other booleans of `harms` read the same way, in their safe
+    /// direction.
+    #[test]
+    fn memory_deny_write_execute_off_is_judged_as_systemd_parses_it() {
+        let h = |kv: &str| {
+            let (k, v) = kv.split_once('=').unwrap();
+            harms(Reach::Agent, k, v, &host())
+        };
+        for off in [
+            "n", "N", "No", "NO", "no", "f", "F", "False", "FALSE", "false", "Off", "OFF", "off",
+            "0", "", " ", "maybe", "2",
+        ] {
+            let why = h(&format!("MemoryDenyWriteExecute={off}"))
+                .unwrap_or_else(|| panic!("MemoryDenyWriteExecute={off:?} judged harmless"));
+            assert!(why.contains("turned off"), "{off:?}: {why}");
+        }
+        for on in ["1", "y", "Y", "yes", "YES", "Yes", "t", "T", "true", "TRUE", "on", "ON", " yes "] {
+            assert!(
+                h(&format!("MemoryDenyWriteExecute={on}")).is_none(),
+                "MemoryDenyWriteExecute={on:?} judged harmful"
+            );
+        }
+        for off in ["No", "N", "f", "OFF", "0"] {
+            assert!(h(&format!("SendSIGKILL={off}")).is_none(), "SendSIGKILL={off}");
+            assert!(h(&format!("DynamicUser={off}")).is_none(), "DynamicUser={off}");
+        }
+        for on in ["Yes", "y", "T", "ON", "1", "", "maybe"] {
+            assert!(h(&format!("SendSIGKILL={on}")).is_some(), "SendSIGKILL={on:?}");
+            assert!(h(&format!("DynamicUser={on}")).is_some(), "DynamicUser={on:?}");
+        }
+        assert_eq!(systemd_bool("Y"), Some(true));
+        assert_eq!(systemd_bool("oFf"), Some(false));
+        assert_eq!(systemd_bool(""), None);
     }
 }

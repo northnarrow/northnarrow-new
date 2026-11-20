@@ -168,6 +168,32 @@ pub struct FileFacts {
 /// How [`foreign_mappings`] names executable memory no file backs.
 pub const ANONYMOUS_CODE: &str = "[anonymous executable memory]";
 
+/// The re-check of #582 (N4): the files the judge itself has mapped
+/// executable — `(device as maps shows it, inode)` — which its own start
+/// judged ([`check_self`]). A library a package upgrade replaced on disk
+/// stays mapped as "(deleted)" in every process started before it; one
+/// the judge maps too is the very file the judge runs (a mapped inode is
+/// never freed, so never reused), judged by that identity.
+pub type OwnCode = Vec<(String, u64)>;
+
+/// [`OwnCode`] of a `maps` text.
+pub fn executable_files(maps: &str) -> OwnCode {
+    let mut out: OwnCode = Vec::new();
+    for line in maps.lines() {
+        let mut f = line.splitn(6, ' ');
+        let (Some(_), Some(perms), Some(_), Some(dev), Some(ino)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let ino: u64 = ino.parse().unwrap_or(0);
+        if perms.contains('x') && ino != 0 && !out.iter().any(|(d, i)| d == dev && *i == ino) {
+            out.push((dev.to_string(), ino));
+        }
+    }
+    out
+}
+
 /// The executable file mappings of a `/proc/<pid>/maps` text that are
 /// neither the binary (`exe`: its path as `/proc/<pid>/exe` names it and
 /// its inode) nor an expected library — and executable anonymous memory
@@ -189,12 +215,30 @@ pub fn foreign_mappings(
     libs: Libs,
     facts: impl Fn(&str) -> Option<FileFacts>,
 ) -> Vec<Foreign> {
+    judge_mappings(maps, exe, libs, facts, &[]).0
+}
+
+/// [`foreign_mappings`], and (the re-check of #582, N4) for a running
+/// process ([`Libs::Running`]) a library a package upgrade replaced since
+/// it was mapped ("(deleted)": an expected library's name in a system
+/// library directory) judged by its identity, never as foreign on that
+/// alone: the very file the judge runs (`own`, [`executable_files`]) is
+/// expected; another is returned apart (the second list: replaced, its
+/// identity not confirmed).
+pub fn judge_mappings(
+    maps: &str,
+    exe: (&str, u64),
+    libs: Libs,
+    facts: impl Fn(&str) -> Option<FileFacts>,
+    own: &[(String, u64)],
+) -> (Vec<Foreign>, Vec<String>) {
     let mut out: Vec<Foreign> = Vec::new();
+    let mut replaced: Vec<String> = Vec::new();
     for line in maps.lines() {
         // `start-end perms offset dev inode   path` — the path may hold
         // spaces (and " (deleted)").
         let mut f = line.splitn(6, ' ');
-        let (Some(_range), Some(perms), Some(_off), Some(_dev), Some(ino)) =
+        let (Some(_range), Some(perms), Some(_off), Some(dev), Some(ino)) =
             (f.next(), f.next(), f.next(), f.next(), f.next())
         else {
             continue;
@@ -227,6 +271,17 @@ pub fn foreign_mappings(
         if path == exe.0 && ino == exe.1 {
             continue;
         }
+        if libs == Libs::Running {
+            if let Some(name) = upgraded_library(path) {
+                if own.iter().any(|(d, i)| d == dev && *i == ino) {
+                    continue;
+                }
+                if !replaced.iter().any(|r| r == name) {
+                    replaced.push(name.to_string());
+                }
+                continue;
+            }
+        }
         if let Some(why) = library_refused(path, ino, libs, &facts) {
             out.push(Foreign {
                 path: path.to_string(),
@@ -234,7 +289,24 @@ pub fn foreign_mappings(
             });
         }
     }
-    out
+    (out, replaced)
+}
+
+/// The re-check of #582 (N4): `path` as `maps` shows a library a package
+/// upgrade replaced since it was mapped — " (deleted)" after the path of
+/// an expected library's name (or a name-service module's) in a system
+/// library directory — the path without the suffix; `None` otherwise (a
+/// deleted file of another name or place stays foreign).
+fn upgraded_library(path: &str) -> Option<&str> {
+    let p = path.strip_suffix(" (deleted)")?;
+    if !LIB_DIRS.iter().any(|d| p.starts_with(d)) || p.contains("/../") || p.contains("/./") {
+        return None;
+    }
+    let name = p.rsplit_once('/')?.1;
+    // the versioned file RHEL's `libgcc_s.so.1` links to
+    // (`libgcc_s-<gcc>-<date>.so.1`) is the one other name
+    let rhel_libgcc = name.starts_with("libgcc_s-") && name.ends_with(".so.1");
+    (EXPECTED_LIBS.contains(&name) || rhel_libgcc || is_nss_module(name)).then_some(p)
 }
 
 /// Why the library mapped from `path` (inode `ino`) is not expected;
@@ -316,12 +388,22 @@ pub struct Findings {
     pub loader_vars: Vec<String>,
     pub foreign: Vec<Foreign>,
     pub unreadable: Vec<String>,
+    /// The re-check of #582 (N4): libraries replaced on disk since the
+    /// process mapped them ([`judge_mappings`]), not the judge's own copy:
+    /// their identity not confirmed. Not foreign on that alone.
+    pub replaced: Vec<String>,
 }
 
 impl Findings {
-    /// Nothing found and everything read.
+    /// Nothing foreign found and everything read.
     pub fn clean(&self) -> bool {
         self.loader_vars.is_empty() && self.foreign.is_empty() && self.unreadable.is_empty()
+    }
+
+    /// [`Findings::clean`], and every library's identity confirmed (none
+    /// [`Findings::replaced`]).
+    pub fn confirmed(&self) -> bool {
+        self.clean() && self.replaced.is_empty()
     }
 
     /// One line: what was found, names only.
@@ -344,6 +426,14 @@ impl Findings {
         }
         if !self.unreadable.is_empty() {
             parts.push(format!("not read: {}", self.unreadable.join("; ")));
+        }
+        if !self.replaced.is_empty() {
+            let libs: Vec<&str> = self.replaced.iter().take(8).map(String::as_str).collect();
+            parts.push(format!(
+                "libraries replaced on disk since they were mapped, not the judge's own copy (their \
+                 identity not confirmed): {}",
+                libs.join("; ")
+            ));
         }
         if parts.is_empty() {
             "no loader variable, no executable mapping but the binary and the release's libraries"
@@ -384,6 +474,14 @@ pub fn inspect(pid: u32) -> Findings {
     found
 }
 
+/// [`OwnCode`] of this process, read now (empty when unread: then no
+/// replaced library is confirmed).
+pub fn own_code() -> OwnCode {
+    crate::kernel_roots::read("/proc/self/maps", PROC_MAX)
+        .map(|b| executable_files(&String::from_utf8_lossy(&b)))
+        .unwrap_or_default()
+}
+
 fn mappings_into(found: &mut Findings, proc_dir: &str, libs: Libs) {
     let exe = crate::kernel_roots::read_link(format!("{proc_dir}/exe"));
     let exe_ino = crate::kernel_roots::metadata(format!("{proc_dir}/exe")).map(|m| m.ino());
@@ -392,7 +490,13 @@ fn mappings_into(found: &mut Findings, proc_dir: &str, libs: Libs) {
         (Ok(exe), Ok(ino), Ok(maps)) => {
             let text = String::from_utf8_lossy(&maps);
             let exe = exe.to_string_lossy();
-            found.foreign = foreign_mappings(&text, (&exe, ino), libs, file_facts);
+            let own = if libs == Libs::Running {
+                own_code()
+            } else {
+                Vec::new()
+            };
+            (found.foreign, found.replaced) =
+                judge_mappings(&text, (&exe, ino), libs, file_facts, &own);
         }
         (Err(e), _, _) | (_, Err(e), _) => found.unreadable.push(format!("exe: {e}")),
         (_, _, Err(e)) => found.unreadable.push(format!("maps: {e}")),
@@ -450,6 +554,17 @@ pub fn start_ticks(pid: u32) -> Option<u64> {
     crate::kernel_roots::read_text(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|s| stat_start_ticks(&s))
+}
+
+/// The re-check of #582 (N4): process `pid`'s start in `CLOCK_BOOTTIME`
+/// nanoseconds — its [`stat_start_ticks`] at the clock-tick rate
+/// (`_SC_CLK_TCK`), the clock the kernel's liveness watch stamps a role's
+/// exit with (`ROLE_EXITS`).
+pub fn start_boot_ns(pid: u32) -> Option<u64> {
+    // SAFETY: sysconf has no failure mode but -1 for an unknown name.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(hz).ok().filter(|h| *h > 0)?;
+    start_ticks(pid).map(|t| t.saturating_mul(1_000_000_000) / hz)
 }
 
 /// [`stat_start_ticks`] of this process, read now.
@@ -906,8 +1021,69 @@ mod tests {
                 why: "not in a system library directory",
             }],
             unreadable: vec![],
+            replaced: vec![],
         };
         let d = f.describe();
         assert!(d.contains("LD_PRELOAD") && d.contains("/tmp/x.so"), "{d}");
+    }
+
+    /// The re-check of #582 (N4): a library a package upgrade replaced
+    /// since a running process mapped it ("(deleted)") is judged by its
+    /// identity — the very file the judge maps (the same device and inode)
+    /// is expected; another expected library's name, replaced, is apart
+    /// (its identity not confirmed, never foreign on that alone); a
+    /// deleted file of another name or place stays foreign, and a start
+    /// ([`Libs::Start`]) judges every deleted file as before.
+    #[test]
+    fn a_library_replaced_since_it_was_mapped_is_judged_by_identity() {
+        let maps = "\
+7f00-7f10 r-xp 00000000 fd:01 4242   /usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)
+7f10-7f20 r-xp 00000000 fd:01 4343   /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 (deleted)
+7f20-7f30 r-xp 00000000 fd:01 4444   /usr/lib64/libgcc_s-11-20230605.so.1 (deleted)
+7f30-7f40 r-xp 00000000 fd:01 4545   /tmp/evil.so (deleted)
+7f40-7f50 r-xp 00000000 fd:01 4646   /usr/lib/x86_64-linux-gnu/libevil.so (deleted)
+";
+        let none = |_: &str| None;
+        let own: OwnCode = vec![("fd:01".into(), 4242), ("fd:02".into(), 4343)];
+        let (foreign, replaced) = judge_mappings(maps, ("/x", 1), Libs::Running, none, &own);
+        // libc: the judge's own file (fd:01 4242); libgcc_s: the same inode
+        // number on another device is not the judge's
+        assert_eq!(
+            replaced,
+            [
+                "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+                "/usr/lib64/libgcc_s-11-20230605.so.1"
+            ]
+        );
+        let paths: Vec<&str> = foreign.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/tmp/evil.so (deleted)",
+                "/usr/lib/x86_64-linux-gnu/libevil.so (deleted)"
+            ]
+        );
+        assert!(foreign.iter().all(|f| f.why == "a file deleted since it was mapped"));
+        // a start: every deleted file foreign, as before
+        let (foreign, replaced) = judge_mappings(maps, ("/x", 1), Libs::Start, none, &own);
+        assert_eq!(foreign.len(), 5);
+        assert!(replaced.is_empty());
+        // the judge's own code, read from its maps
+        assert_eq!(
+            executable_files(maps)[..2],
+            [("fd:01".to_string(), 4242), ("fd:01".to_string(), 4343)]
+        );
+        let f = Findings {
+            replaced,
+            ..Findings::default()
+        };
+        assert!(f.clean() && f.confirmed());
+        let f = Findings {
+            replaced: vec!["/usr/lib/x86_64-linux-gnu/libgcc_s.so.1".into()],
+            ..Findings::default()
+        };
+        assert!(f.clean(), "not foreign on that alone");
+        assert!(!f.confirmed());
+        assert!(f.describe().contains("identity not confirmed"), "{}", f.describe());
     }
 }

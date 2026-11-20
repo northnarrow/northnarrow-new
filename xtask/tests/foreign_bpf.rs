@@ -1286,12 +1286,17 @@ fn an_inode_of_one_role_is_changed_by_that_role_alone() {
 }
 
 /// The review of #582 (F4, F6): the kernel's liveness watch marks each
-/// role's vacancy in a map no syscall writes (`BPF_F_RDONLY`), whether the
-/// exit was inside a signed window, right where it vacates the slot.
+/// role's vacancy, whether the exit was inside a signed window, and (the
+/// re-check, N4) when, right where it vacates the slot. The re-check of
+/// #582 (N1): `BPF_F_RDONLY` is a descriptor's flag, not the map's — the
+/// agent's load freezes both maps instead (`BPF_MAP_FREEZE`, map-wide),
+/// before it reads them, and a reader takes a map not frozen as not known.
 #[test]
-fn the_kernel_marks_each_vacancy_where_no_process_writes() {
+fn the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes() {
     let c = code("agent-ebpf/src/bpf_defense.rs");
-    assert!(c.contains("pub static ROLE_MARKS: Array<u32> = Array::pinned(2, BPF_F_RDONLY);"));
+    assert!(c.contains("pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);"));
+    assert!(c.contains("pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);"));
+    assert!(!c.contains("BPF_F_RDONLY"), "a descriptor's flag is no map's");
     in_order(
         body(&c, "role_exit"),
         &[
@@ -1299,7 +1304,27 @@ fn the_kernel_marks_each_vacancy_where_no_process_writes() {
             "unsafe { *t = ROLE_VACATED };",
             "if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {",
             "unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };",
+            "if let Some(e) = ROLE_EXITS.get_ptr_mut(slot) {",
+            "unsafe { *e = bpf_ktime_get_boot_ns() };",
         ],
+    )
+    .unwrap();
+    // frozen at the load, before the start reads them
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    in_order(
+        &m,
+        &[
+            ".load(EBPF_BYTES)",
+            "crate::anti_tamper::bpf_defense::freeze_role_marks(&ebpf)",
+            "crate::anti_tamper::bpf_defense::roles_at_start(&ebpf",
+        ],
+    )
+    .unwrap();
+    // and read only through a frozen descriptor
+    let l = code("antitamper-bpf/src/lib.rs");
+    in_order(
+        body(&l, "frozen_pin"),
+        &["MapData::from_pin(", "fdinfo_frozen(", "not frozen"],
     )
     .unwrap();
 }

@@ -413,10 +413,15 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // The review of #582 (F6): the watchdog's role vacated earlier this
         // boot (the kernel's sticky mark, which no claim clears): the
         // watchdog this agent finds first is a successor nobody saw take
-        // the role — judged as one, as after a death this agent saw.
-        let mut succession_pending = bpffs_root
-            .and_then(|r| antitamper_bpf::role_marks(r, antitamper_bpf::ROLE_SLOT_WATCHDOG).ok())
-            .is_some_and(|m| m & antitamper_bpf::ROLE_MARK_VACATED != 0);
+        // the role — judged as one, as after a death this agent saw. The
+        // re-check of #582 (N4): only when it took its role while the
+        // agent's was vacant (after the agent role's last exit, the
+        // kernel's `ROLE_EXITS`), never a long-running watchdog an earlier
+        // agent saw start; (N5) marks this start could not read are a
+        // signed degradation, and the watchdog is judged.
+        let at_start = nn_linux::witness::roles_at_start();
+        let mut first_found = true;
+        let mut succession_pending = false;
         // The review of #582 (F4 b): both roles found vacated at this start,
         // judged once the chain and the audit log are there.
         let mut gap_judged = false;
@@ -500,6 +505,27 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
             // kernel's guard gives it; recorded either way (the agent, the
             // surviving role, signs the watchdog's succession).
             if let Some(p) = new_pid {
+                if std::mem::take(&mut first_found) {
+                    let (wm, am, ae) = at_start.map_or((None, None, None), |r| {
+                        (r.watchdog_mark, r.agent_mark, r.agent_exit_ns)
+                    });
+                    if wm.is_none() || am.is_none() {
+                        nn_linux::boot::degradation::report(
+                            nn_linux::sensors::multiplexer::ROLE_MARKS_DEGRADATION,
+                            "the agent's start did not read the roles' exit marks: the watchdog \
+                             it found first is judged as a successor",
+                        );
+                    }
+                    if let Some(why) = antitamper_bpf::succession_to_judge(
+                        wm,
+                        am,
+                        ae,
+                        antitamper_bpf::start_check::start_boot_ns(p),
+                    ) {
+                        debug!(watchdog_pid = p, why, "the watchdog found first is judged as a successor");
+                        succession_pending = true;
+                    }
+                }
                 let vacated = bpffs_root
                     .and_then(|r| {
                         antitamper_bpf::role_slot(r, antitamper_bpf::ROLE_SLOT_WATCHDOG).ok()
@@ -530,10 +556,13 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         verified_now.store(0, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
+                    // the re-check of #582 (N4): a library replaced on disk
+                    // whose identity is not confirmed is signed High, the
+                    // registration never withheld for it
                     northnarrow_agent::self_integrity::report_or_note(
                         log,
                         &northnarrow_agent::self_integrity::Finding {
-                            kind: nn_linux::witness::WATCHDOG_SUCCESSION,
+                            kind: v.kind(),
                             detail: v.detail,
                         },
                     );

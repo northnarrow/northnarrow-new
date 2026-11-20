@@ -70,8 +70,8 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, lsm, map, raw_tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
@@ -97,7 +97,7 @@ use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     bpf_held_dev, BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
     BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED, kn_name_words, role_unit_words, OUR_SLICE,
-    role_exit_mark, BPF_F_RDONLY,
+    role_exit_mark,
     BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
@@ -285,12 +285,23 @@ pub static ROLE_TGIDS: Array<u32> = Array::pinned(2, 0);
 /// The review of #582 (F4, F6): per slot of [`ROLE_TGIDS`], what
 /// [`role_exit`] recorded of its holders' exits this boot
 /// (`northnarrow_common::wire::role_exit_mark`: vacated, and whether the last
-/// exit was inside a signed trusted-installer window). No syscall writes it
-/// (`BPF_F_RDONLY`): a successor's claim of its slot, the family's handles
-/// included, leaves the "vacated this boot" the other role reads at its own
-/// start. Pinned by name, as [`ROLE_TGIDS`].
+/// exit was inside a signed trusted-installer window). A successor's claim
+/// of its slot leaves the "vacated this boot" the other role reads at its
+/// own start. The re-check of #582 (N1): frozen by the agent's load
+/// (`BPF_MAP_FREEZE`, map-wide and for good: no descriptor's update is
+/// taken, the family's included), so [`role_exit`] alone writes it — a
+/// program's stores are not a syscall's. Pinned by name, as [`ROLE_TGIDS`].
 #[map]
-pub static ROLE_MARKS: Array<u32> = Array::pinned(2, BPF_F_RDONLY);
+pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);
+
+/// The re-check of #582 (N4): per slot of [`ROLE_TGIDS`], when its holder
+/// last exited — `CLOCK_BOOTTIME` nanoseconds, the clock of a process's
+/// start in `/proc/<pid>/stat` — written by [`role_exit`] beside
+/// [`ROLE_MARKS`], frozen with it. A role's start judges the other role's
+/// process only when it took its role after this role's last exit (no
+/// holder of this role saw it start).
+#[map]
+pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);
 
 /// How long after its start a fresh agent or watchdog may take write
 /// handles before it is a protected pid (the agent registers itself in
@@ -1130,6 +1141,10 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
                 // whether inside a signed window — kept past the next claim
                 if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {
                     unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };
+                }
+                // the re-check of #582 (N4): and when
+                if let Some(e) = ROLE_EXITS.get_ptr_mut(slot) {
+                    unsafe { *e = bpf_ktime_get_boot_ns() };
                 }
             }
         }

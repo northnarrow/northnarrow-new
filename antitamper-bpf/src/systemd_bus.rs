@@ -63,6 +63,73 @@ pub enum Value {
     U32(u32),
     I32(i32),
     Bool(bool),
+    /// The re-check of #582 (N3): an array (`as`, `a(sasbttttuii)`), its
+    /// elements in order.
+    Array(Vec<Value>),
+    /// A structure's fields in order.
+    Struct(Vec<Value>),
+}
+
+impl Value {
+    /// A string's text.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// An array of strings' texts (`None` for anything else).
+    pub fn strings(&self) -> Option<Vec<String>> {
+        match self {
+            Value::Array(v) => v.iter().map(|e| e.as_str().map(str::to_string)).collect(),
+            _ => None,
+        }
+    }
+}
+
+/// How deep a value nests (`a(sas…)` is 3): far above systemd's.
+const MAX_DEPTH: usize = 8;
+
+/// The first complete type of signature `sig` and what follows it.
+fn single_type(sig: &str) -> io::Result<(&str, &str)> {
+    let b = sig.as_bytes();
+    let mut i = 0usize;
+    // an array's element type follows its `a`s
+    while b.get(i) == Some(&b'a') {
+        i += 1;
+    }
+    match b.get(i) {
+        Some(b'(') | Some(b'{') => {
+            let mut depth = 0usize;
+            while let Some(c) = b.get(i) {
+                match c {
+                    b'(' | b'{' => depth += 1,
+                    b')' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok((&sig[..=i], &sig[i + 1..]));
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            Err(other(format!("D-Bus: unbalanced signature {sig:?}")))
+        }
+        Some(_) => Ok((&sig[..=i], &sig[i + 1..])),
+        None => Err(other(format!("D-Bus: incomplete signature {sig:?}"))),
+    }
+}
+
+/// The alignment of a value of (complete) type `t`.
+fn alignment(t: &str) -> usize {
+    match t.as_bytes().first() {
+        Some(b'y' | b'g' | b'v') => 1,
+        Some(b'n' | b'q') => 2,
+        Some(b't' | b'x' | b'd' | b'(' | b'{') => 8,
+        _ => 4,
+    }
 }
 
 /// `Properties.Get(interface, property)` of the object at `path`, on an
@@ -87,6 +154,27 @@ fn get_on(
 pub fn manager_property(socket: &Path, timeout: Duration, property: &str) -> io::Result<Value> {
     let mut s = connect(socket, timeout)?;
     get_on(&mut s, 1, MANAGER_PATH, MANAGER_INTERFACE, property)
+}
+
+/// The re-check of #582 (N3): properties `props` (`(interface, name)`) of
+/// unit `unit` as systemd holds it in memory, asked on one connection, in
+/// their order.
+pub fn unit_properties(
+    socket: &Path,
+    timeout: Duration,
+    unit: &str,
+    props: &[(&str, &str)],
+) -> io::Result<Vec<Value>> {
+    let mut s = connect(socket, timeout)?;
+    let path = unit_path(unit);
+    props
+        .iter()
+        .zip(1u32..)
+        .map(|((iface, name), serial)| {
+            get_on(&mut s, serial, &path, iface, name)
+                .map_err(|e| io::Error::new(e.kind(), format!("{name}: {e}")))
+        })
+        .collect()
 }
 
 /// Lot 273d: a property of unit `unit` as systemd holds it in memory —
@@ -493,6 +581,77 @@ impl Cursor<'_> {
         self.byte()?; // NUL
         Ok(s)
     }
+
+    /// The re-check of #582 (N3): one value of complete type `t` — the
+    /// basic types systemd's properties use, arrays, structures and dict
+    /// entries (as structures), and variants.
+    fn value(&mut self, t: &str, depth: usize) -> io::Result<Value> {
+        if depth > MAX_DEPTH {
+            return Err(other("D-Bus: a value nested too deep".into()));
+        }
+        let b = t.as_bytes();
+        Ok(match b.first().copied() {
+            Some(b's' | b'o') => Value::Str(self.string()?),
+            Some(b'g') => Value::Str(self.signature()?),
+            Some(b'b') => Value::Bool(self.u32()? != 0),
+            Some(b'u') => Value::U32(self.u32()?),
+            Some(b'i') => Value::I32(self.u32()? as i32),
+            Some(b'y') => Value::U32(u32::from(self.byte()?)),
+            Some(b'n' | b'q') => {
+                self.align(2);
+                let v = self.bytes(2)?;
+                let a: [u8; 2] = v.try_into().expect("2 bytes");
+                Value::U32(u32::from(if self.le {
+                    u16::from_le_bytes(a)
+                } else {
+                    u16::from_be_bytes(a)
+                }))
+            }
+            Some(b't' | b'x' | b'd') => Value::U64(self.u64()?),
+            Some(b'v') => {
+                let inner = self.signature()?;
+                let (one, rest) = single_type(&inner)?;
+                if !rest.is_empty() {
+                    return Err(other(format!("D-Bus: a variant of {inner:?}")));
+                }
+                self.value(one, depth + 1)?
+            }
+            Some(b'a') => {
+                let elem = &t[1..];
+                let n = self.u32()? as usize;
+                self.align(alignment(elem));
+                let end = self
+                    .pos
+                    .checked_add(n)
+                    .filter(|e| *e <= self.buf.len())
+                    .ok_or_else(|| other("D-Bus: truncated".into()))?;
+                let mut out = Vec::new();
+                while self.pos < end {
+                    out.push(self.value(elem, depth + 1)?);
+                }
+                if self.pos != end {
+                    return Err(other("D-Bus: an array's length is not its elements'".into()));
+                }
+                Value::Array(out)
+            }
+            Some(b'(' | b'{') => {
+                self.align(8);
+                let mut fields = Vec::new();
+                let mut rest = &t[1..t.len() - 1];
+                while !rest.is_empty() {
+                    let (one, r) = single_type(rest)?;
+                    fields.push(self.value(one, depth + 1)?);
+                    rest = r;
+                }
+                Value::Struct(fields)
+            }
+            _ => {
+                return Err(other(format!(
+                    "D-Bus: a property of type {t:?} is not read here"
+                )))
+            }
+        })
+    }
 }
 
 /// The string a `METHOD_RETURN` to `serial` carries in its variant body;
@@ -545,21 +704,7 @@ fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<Value>> {
     }
     c.pos = fields_end.div_ceil(8) * 8;
     match kind {
-        METHOD_RETURN if signature == "v" => {
-            let inner = c.signature()?;
-            Ok(Some(match inner.as_str() {
-                "s" | "o" => Value::Str(c.string()?),
-                "t" => Value::U64(c.u64()?),
-                "u" => Value::U32(c.u32()?),
-                "i" => Value::I32(c.u32()? as i32),
-                "b" => Value::Bool(c.u32()? != 0),
-                _ => {
-                    return Err(other(format!(
-                        "D-Bus: a property of type {inner:?} is not read here"
-                    )))
-                }
-            }))
-        }
+        METHOD_RETURN if signature == "v" => Ok(Some(c.value("v", 0)?)),
         METHOD_RETURN => Err(other(format!("D-Bus: reply signature {signature:?}"))),
         ERROR => Err(other("D-Bus: systemd answered with an error".into())),
         _ => Ok(None),
@@ -683,6 +828,108 @@ mod tests {
         pad(&mut msg, 8);
         msg.extend_from_slice(&body);
         msg
+    }
+
+    /// An array of strings (`as`), aligned to 4 then its elements'.
+    fn put_strings(buf: &mut Vec<u8>, v: &[&str]) {
+        pad(buf, 4);
+        let at = buf.len();
+        buf.extend_from_slice(&[0; 4]);
+        let start = buf.len();
+        for s in v {
+            put_string(buf, s);
+        }
+        let n = (buf.len() - start) as u32;
+        buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// A reply to `serial` whose variant body is `body` (signature included).
+    fn reply_body(serial: u32, body: &[u8]) -> Vec<u8> {
+        let mut fields = Vec::new();
+        fields.push(FIELD_REPLY_SERIAL);
+        put_signature(&mut fields, "u");
+        pad(&mut fields, 4);
+        fields.extend_from_slice(&serial.to_le_bytes());
+        put_field(&mut fields, FIELD_SIGNATURE, 'g', "v");
+        let mut msg = vec![b'l', METHOD_RETURN, 1, 1];
+        msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&7u32.to_le_bytes());
+        msg.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&fields);
+        pad(&mut msg, 8);
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// The re-check of #582 (N3): the properties of systemd's copy a respawn
+    /// judges are arrays — `DropInPaths` and `Environment` (`as`), each
+    /// `ExecStart*` (`a(sasbttttuii)`) — read as arrays of their elements,
+    /// an empty one included; a length that is not its elements' is
+    /// refused.
+    #[test]
+    fn arrays_and_structures_are_read() {
+        let mut body = Vec::new();
+        put_signature(&mut body, "as");
+        put_strings(&mut body, &["/etc/systemd/system/a.d/x.conf", "/run/y.conf"]);
+        assert_eq!(
+            parse_reply(&reply_body(4, &body), 4).unwrap(),
+            Some(Value::Array(vec![
+                Value::Str("/etc/systemd/system/a.d/x.conf".into()),
+                Value::Str("/run/y.conf".into())
+            ]))
+        );
+        let mut body = Vec::new();
+        put_signature(&mut body, "as");
+        put_strings(&mut body, &[]);
+        assert_eq!(
+            parse_reply(&reply_body(4, &body), 4).unwrap(),
+            Some(Value::Array(vec![]))
+        );
+        // one ExecStart: path, argv, ignore, 4 times, pid, code, status
+        let mut body = Vec::new();
+        put_signature(&mut body, "a(sasbttttuii)");
+        pad(&mut body, 4);
+        let at = body.len();
+        body.extend_from_slice(&[0; 4]);
+        pad(&mut body, 8);
+        let start = body.len();
+        pad(&mut body, 8);
+        put_string(&mut body, "/usr/bin/northnarrow-agent");
+        put_strings(&mut body, &["/usr/bin/northnarrow-agent", "--config", "/etc/x"]);
+        pad(&mut body, 4);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        pad(&mut body, 8);
+        for t in [1u64, 2, 3, 4] {
+            body.extend_from_slice(&t.to_le_bytes());
+        }
+        body.extend_from_slice(&77u32.to_le_bytes());
+        body.extend_from_slice(&1i32.to_le_bytes());
+        body.extend_from_slice(&0i32.to_le_bytes());
+        let n = (body.len() - start) as u32;
+        body[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        let v = parse_reply(&reply_body(4, &body), 4).unwrap().unwrap();
+        let Value::Array(cmds) = v else {
+            panic!("{v:?}")
+        };
+        let Value::Struct(f) = &cmds[0] else {
+            panic!("{cmds:?}")
+        };
+        assert_eq!(f.len(), 10);
+        assert_eq!(f[0].as_str(), Some("/usr/bin/northnarrow-agent"));
+        assert_eq!(
+            f[1].strings().unwrap(),
+            ["/usr/bin/northnarrow-agent", "--config", "/etc/x"]
+        );
+        assert_eq!(f[2], Value::Bool(false));
+        assert_eq!(f[7], Value::U32(77));
+        // a length past its elements
+        let mut body = Vec::new();
+        put_signature(&mut body, "as");
+        put_strings(&mut body, &["a"]);
+        body[4] += 1;
+        assert!(parse_reply(&reply_body(4, &body), 4).is_err());
+        assert_eq!(single_type("a(sasb)x").unwrap(), ("a(sasb)", "x"));
+        assert_eq!(single_type("aas").unwrap(), ("aas", ""));
     }
 
     #[test]

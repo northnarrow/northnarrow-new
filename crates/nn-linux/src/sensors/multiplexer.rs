@@ -66,6 +66,10 @@ pub const BUS_LOSSES_LABEL: &str = "event_bus_losses";
 
 /// The anti-tamper denials' ring (`agent-ebpf/src/inode_protect.rs`).
 pub const FS_PROTECT_RING: &str = "FS_PROTECT_EVENTS";
+/// The re-check of #582 (N1, N5): the degradation's source when the
+/// kernel's record of the roles' exits (`ROLE_MARKS`, `ROLE_EXITS`) is not
+/// frozen, or not read, at a start that needs it.
+pub const ROLE_MARKS_DEGRADATION: &str = "role_marks";
 /// Lot 269 (R12b-1): the size [`FS_PROTECT_RING`] is loaded with — 256 KiB,
 /// 4,096 denials of 64 bytes (the 56-byte record and the ring's 8-byte
 /// header) where the object declares 64 KiB, 1,024. Its pump is a thread
@@ -354,11 +358,29 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             &ebpf,
             crate::telemetry_probe::monotonic_ns(),
         );
+        // The re-check of #582 (N1): the kernel's record of the roles'
+        // exits frozen before it is read — no descriptor writes it after;
+        // what could not be frozen is read as not known (the High paths),
+        // and signed
+        let frozen = match crate::anti_tamper::bpf_defense::freeze_role_marks(&ebpf) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "anti-tamper: the roles' exit marks NOT frozen — read as not known");
+                crate::boot::degradation::report(
+                    ROLE_MARKS_DEGRADATION,
+                    &format!(
+                        "the kernel's record of the roles' exits not frozen ({e}): the vacated \
+                         marks read as not known at this start"
+                    ),
+                );
+                false
+            }
+        };
         // Lot 374: both roles vacated — the gap this start finds, judged and
         // signed by the witness round (the review of #582, F4 b: not after
         // a signed stop) once the chain and the audit log are there; read
         // now, before anything below claims the agent's role
-        if let Some(r) = crate::anti_tamper::bpf_defense::roles_at_start(&ebpf) {
+        if let Some(r) = crate::anti_tamper::bpf_defense::roles_at_start(&ebpf, frozen) {
             if r.both_vacated() {
                 warn!(?r, "anti-tamper: both roles found vacated at this start");
             }

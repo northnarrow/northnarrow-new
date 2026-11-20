@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 use nn_proto::witness::{
     parse_key_record, to_import, Imported, CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE,
-    KEY_MEMFD_NAME, KIND_OPENED, KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
+    KEY_MEMFD_NAME, KIND_CHAIN_TORN, KIND_GATE_REFERENCE, KIND_OPENED, KIND_RELEASED,
+    KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
 };
 
 /// A finding of this module signed as a note ([`WITNESS_OP`]): the
@@ -43,7 +44,12 @@ pub fn is_note(kind: &str) -> bool {
 pub fn row_kind(row_kind: &str) -> &'static str {
     if matches!(
         row_kind,
-        KIND_OPENED | KIND_RELEASED | KIND_RELEASED_IN_WINDOW | KIND_SUCCEEDED
+        KIND_OPENED
+            | KIND_RELEASED
+            | KIND_RELEASED_IN_WINDOW
+            | KIND_SUCCEEDED
+            | KIND_GATE_REFERENCE
+            | KIND_CHAIN_TORN
     ) {
         WITNESS_NOTE
     } else {
@@ -73,6 +79,11 @@ pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
 /// its death is `watchdog_gone`).
 pub const WATCHDOG_SUCCESSION: &str = "watchdog_succession";
+/// The re-check of #582 (N4): the watchdog's vacated role taken by its
+/// unit's clean restart, but a library it maps was replaced on disk since
+/// and is not the agent's own copy — its identity not confirmed (High). The
+/// agent registers it: never withheld for that alone.
+pub const WATCHDOG_SUCCESSOR_UNCONFIRMED: &str = "watchdog_successor_unconfirmed";
 /// The review of #582 (F3): the process that took the watchdog's vacated
 /// role is not its unit's clean restart — not its unit's restart, marks not
 /// clean, or something foreign in it (High). Observed, not refused: the
@@ -276,6 +287,25 @@ pub struct SuccessorVerdict {
     /// Its unit's restart, clean marks, nothing foreign: registered.
     pub given: bool,
     pub detail: String,
+    /// The re-check of #582 (N4): and no library of it replaced on disk
+    /// that is not the agent's own copy (`Findings::replaced`); a given
+    /// successor that is not confirmed is registered, and signed High
+    /// ([`WATCHDOG_SUCCESSOR_UNCONFIRMED`]).
+    pub confirmed: bool,
+}
+
+impl SuccessorVerdict {
+    /// The finding's kind: [`WATCHDOG_SUCCESSION`] (a note) for a given,
+    /// confirmed successor, [`WATCHDOG_SUCCESSOR_UNCONFIRMED`] for a given
+    /// one whose libraries' identity is not confirmed, and
+    /// [`WATCHDOG_SUCCESSOR_FOREIGN`] otherwise.
+    pub fn kind(&self) -> &'static str {
+        match (self.given, self.confirmed) {
+            (true, true) => WATCHDOG_SUCCESSION,
+            (true, false) => WATCHDOG_SUCCESSOR_UNCONFIRMED,
+            (false, _) => WATCHDOG_SUCCESSOR_FOREIGN,
+        }
+    }
 }
 
 /// The process `pid` that took the watchdog's vacated role: `id` where it
@@ -304,6 +334,7 @@ pub fn judge_watchdog_successor(
     };
     SuccessorVerdict {
         given,
+        confirmed: given && found.confirmed(),
         detail: format!(
             "the watchdog's role, vacated, taken by pid {pid}: {}{taken}; {}; {marks}; {}",
             if in_unit {
@@ -329,13 +360,16 @@ pub fn marks_clean(pid: u32) -> Option<bool> {
 
 /// What the agent's start read of both roles before it claimed its own:
 /// the two `ROLE_TGIDS` slots and (the review of #582, F4 b, F6) the
-/// kernel's marks of their holders' exits (`ROLE_MARKS`; `None` unread).
+/// kernel's marks of their holders' exits (`ROLE_MARKS`; `None` unread, or
+/// not frozen), and (the re-check, N4) when the agent's role was last left
+/// (`ROLE_EXITS`, `CLOCK_BOOTTIME` ns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RolesAtStart {
     pub agent: u32,
     pub watchdog: u32,
     pub agent_mark: Option<u32>,
     pub watchdog_mark: Option<u32>,
+    pub agent_exit_ns: Option<u64>,
 }
 
 impl RolesAtStart {
@@ -453,6 +487,7 @@ mod tests {
         ] {
             let v = judge_watchdog_successor(9, &id, marks, &found);
             assert!(!v.given, "{}", v.detail);
+            assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_FOREIGN);
         }
         let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
         assert!(v.detail.contains("taken by pid 9") && v.detail.contains("marks clean"));
@@ -533,6 +568,7 @@ mod tests {
             watchdog,
             agent_mark: marks.0,
             watchdog_mark: marks.1,
+            agent_exit_ns: None,
         }
     }
 

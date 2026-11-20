@@ -1061,6 +1061,8 @@ fn high_kind(kind: &str) -> bool {
             // the review of #582 (F2 d)
             | WATCHDOG_RESPAWN_HELD
             | crate::witness::WATCHDOG_SUCCESSOR_FOREIGN
+            // the re-check of #582 (N4)
+            | crate::witness::WATCHDOG_SUCCESSOR_UNCONFIRMED
             | crate::witness::WITNESS_ROW
             | crate::witness::WITNESS_UNCERTIFIED
             | crate::witness::WITNESS_BROKEN
@@ -3395,6 +3397,8 @@ mod tests {
             w::WITNESS_UNCERTIFIED,
             w::WITNESS_BROKEN,
             w::WATCHDOG_SUCCESSOR_FOREIGN,
+            // the re-check of #582 (N4)
+            w::WATCHDOG_SUCCESSOR_UNCONFIRMED,
             WATCHDOG_START_REFUSED,
             WITNESS_UNAVAILABLE,
         ] {
