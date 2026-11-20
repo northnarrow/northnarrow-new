@@ -1650,7 +1650,7 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
                          (lot 369)"
                             .to_string()
                     } else {
-                        package_listener_text(&transaction, in_transaction)
+                        package_listener_text(&transaction)
                     },
                     not_a_package_listener(nl, &transaction)
                 ),
@@ -1769,9 +1769,9 @@ fn not_a_package_listener(
 /// ([`package_transaction_listener`]) adds to NN-L-NET-006's and -019's
 /// reasoning — the review of #583 (F2): with the package whose maintainer
 /// script ran it.
-fn package_listener_text(transaction: &Result<String, &str>, in_transaction: bool) -> String {
+fn package_listener_text(transaction: &Result<String, &str>) -> String {
     match transaction {
-        Ok(package) if in_transaction => format!(
+        Ok(package) => format!(
             " — a program of a root-owned system tree (the kernel's image), run by root by \
              {package}'s dpkg maintainer script inside a live package transaction (a package \
              manager executed by root): recorded Low (lot 376)"
@@ -2737,7 +2737,7 @@ impl<H: PostureHost> Rule for NnLNet019WildcardListener<H> {
                     "New listener bound to the wildcard address {} from a non-allowlisted \
                      comm — network-exposed backdoor surface (T1571); posture → ALERTED{}{}",
                     listener_port_text(nl, common.is_some()),
-                    package_listener_text(&transaction, in_transaction),
+                    package_listener_text(&transaction),
                     not_a_package_listener(nl, &transaction)
                 ),
                 nl.pid,
