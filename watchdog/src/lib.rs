@@ -80,83 +80,88 @@ pub const PIDFD_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 #[command(
     name = "northnarrow-watchdog",
     version,
-    about = "NorthNarrow XDR anti-tamper supervisor (Tappa 7 task 6)."
+    about = "NorthNarrow watchdog: supervises the agent and restarts it."
 )]
 pub struct Cli {
-    /// Path to the agent's PID file (written atomically by the
-    /// agent's `--pid-file` flow once every LSM hook is attached).
-    /// We `read_to_string` + parse, then `pidfd_open` the PID.
+    // We `read_to_string` + parse, then `pidfd_open` the PID.
+    /// The agent's PID file (what the agent's `--pid-file` writes, once
+    /// every protection hook is attached). The watchdog watches the process
+    /// it names.
     #[arg(long = "agent-pidfile", value_name = "PATH", default_value = DEFAULT_AGENT_PIDFILE)]
     pub agent_pidfile: PathBuf,
 
-    /// Path to the agent's admin socket. Consumed by W5's STATUS
-    /// ping for stuck-detection; ignored in W2. CLI present now
-    /// so the systemd unit file binds the same surface across
-    /// the sprint.
+    // W5's STATUS ping for stuck-detection.
+    /// The agent's admin socket. The watchdog pings the agent there to
+    /// find an agent that is still alive but stuck, and recovers it.
     #[arg(long = "admin-socket", value_name = "PATH", default_value = DEFAULT_ADMIN_SOCKET)]
     pub admin_socket: PathBuf,
 
-    /// Path the watchdog writes ITS own PID into after `pidfd_open`
-    /// succeeds. Atomic tmpfile + fsync + rename so a reader
-    /// (the agent's W6 PROTECTED_PIDS widening, future operator
-    /// tooling) never observes a truncated value.
+    // Atomic tmpfile + fsync + rename so a reader (the agent's W6
+    // PROTECTED_PIDS widening) never observes a truncated value.
+    /// Where the watchdog writes its own PID, atomically (the agent's
+    /// `--watchdog-pidfile` reads it to protect the watchdog's process).
     #[arg(long = "pidfile", value_name = "PATH", default_value = DEFAULT_WATCHDOG_PIDFILE)]
     pub pidfile: PathBuf,
 
-    /// bpffs root holding the agent's pinned anti-tamper objects.
-    /// W3 opens `<root>/PROTECTED_PIDS` via
-    /// [`antitamper_bpf::ProtectedPidsHandle::open`] for the
-    /// layer-2 evict path; W2 stores the flag but doesn't use it.
+    // W3: `<root>/PROTECTED_PIDS` through
+    // `antitamper_bpf::ProtectedPidsHandle::open`, for the layer-2 evict
+    // path and the watchdog's own registration.
+    /// The BPF filesystem directory where the agent pins its protection
+    /// maps. The watchdog adds itself to the protected processes there,
+    /// and removes a dead agent's entry before it restarts it.
     #[arg(long = "bpffs-root", value_name = "PATH", default_value = DEFAULT_BPFFS_ROOT)]
     pub bpffs_root: PathBuf,
-    /// Optional explicit path to the agent binary. When omitted,
-    /// the watchdog reads `/proc/<agent_pid>/exe` to discover it
-    /// at boot. Provided as an escape hatch for environments where
-    /// the agent's `ptrace_access_check` LSM hook is active and the
-    /// watchdog's PID is not yet in PROTECTED_PIDS at boot — the
-    /// agent's mutual-protection insertion (via the W6 watchdog
-    /// pidfile poll) races with the watchdog's own boot, so the
-    /// `/proc/<pid>/exe` readlink can fail with EPERM during the
-    /// race window. Production systemd units pass this explicitly
-    /// to skip the race entirely.
+
+    // External audit WDG-003: the pid the pidfile names is the agent only
+    // if it runs this binary (`DEFAULT_AGENT_BIN` when not given); the exec
+    // backend's argv[0].
+    /// The agent binary. The process the agent's PID file names is
+    /// treated as the agent only if it runs this file; the `exec` restart
+    /// method starts it. Default: /usr/local/bin/northnarrow-agent.
     #[arg(long = "agent-bin", value_name = "PATH")]
     pub agent_bin: Option<PathBuf>,
 
-    /// How the agent is brought back after a crash (respawn v2,
-    /// docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md). `auto` picks
-    /// `systemd` when /run/systemd/system exists, else `exec`.
+    // Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md).
+    /// How the agent is brought back after a crash.
     #[arg(long = "respawn-backend", value_enum, default_value_t = RespawnBackendChoice::Auto)]
     pub respawn_backend: RespawnBackendChoice,
 
-    /// systemd unit started by the `systemd` respawn backend.
+    /// The agent's systemd unit, which the `systemd` restart method starts.
     #[arg(long = "agent-unit", value_name = "UNIT", default_value = DEFAULT_AGENT_UNIT)]
     pub agent_unit: String,
 
-    /// The shutdown-authorisation marker the agent leaves when an admin
-    /// quorum stops it ([`check_shutdown_marker`]).
-    #[arg(long = "shutdown-marker", value_name = "PATH", default_value = nn_proto::shutdown_marker::MARKER_PATH)]
+    // `check_shutdown_marker`. Hidden: the agent writes it at its own
+    // `--shutdown-marker-file`, whose default this is.
+    /// The marker the agent leaves when a signed shutdown stops it.
+    #[arg(long = "shutdown-marker", hide = true, value_name = "PATH", default_value = nn_proto::shutdown_marker::MARKER_PATH)]
     pub shutdown_marker: PathBuf,
 
-    /// Lot 374: the directory of the watchdog's witness chain (the agent
-    /// makes it in its state directory; [`witness`]).
+    // Lot 374: the agent makes it in its state directory (`witness`).
+    /// The directory of the watchdog's witness chain (created at the start,
+    /// protected with the state directory).
     #[arg(long = "witness-dir", value_name = "DIR", default_value = nn_proto::witness::WITNESS_DIR)]
     pub witness_dir: PathBuf,
 
-    /// The admin keys a shutdown must be signed by (external audit
-    /// WDG-001: the watchdog verifies the quorum the agent verified).
+    // External audit WDG-001: the watchdog verifies the quorum the agent
+    // verified.
+    /// The administrators' public keys: a shutdown must be signed by them
+    /// (the watchdog checks the signatures the agent checked) for the
+    /// watchdog to let the agent stop.
     #[arg(long = "admin-pub", value_name = "PATH", default_value = DEFAULT_ADMIN_PUB)]
     pub admin_pub: PathBuf,
 
-    /// This install's id; a shutdown signed for another install is refused.
+    /// This install's agent id; a shutdown signed for another install is
+    /// refused.
     #[arg(long = "agent-id-file", value_name = "PATH", default_value = DEFAULT_AGENT_ID_FILE)]
     pub agent_id_file: PathBuf,
 
-    /// Lab PR 216: record that systemd put the watchdog unit in its failed
-    /// state, and exit — what `northnarrow-watchdog-failed.service`, the
-    /// watchdog unit's `OnFailure=` handler, runs. Reads systemd's
-    /// `MONITOR_*` variables ([`unit_failure_record`]) and appends one
-    /// record beside the shutdown marker (`watchdog.hold`), which the agent
-    /// signs at its next round.
+    // Lab PR 216: reads systemd's `MONITOR_*` variables
+    // (`unit_failure_record`).
+    /// Record that systemd put the watchdog's unit in its failed state,
+    /// and exit: what `northnarrow-watchdog-failed.service` (the watchdog
+    /// unit's `OnFailure=` handler) runs. It appends one record beside the
+    /// shutdown marker (`watchdog.hold`), which the agent signs at its next
+    /// round.
     #[arg(long = "record-unit-failure")]
     pub record_unit_failure: bool,
 }
@@ -1251,12 +1256,15 @@ pub const SYSTEMCTL_CANDIDATES: &[&str] = &["/usr/bin/systemctl", "/bin/systemct
 /// Operator choice for the respawn backend (`--respawn-backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RespawnBackendChoice {
-    /// `systemd` when [`SYSTEMD_RUNTIME_DIR`] exists, else `exec`.
+    // `SYSTEMD_RUNTIME_DIR`.
+    /// `systemd` when systemd runs the host (/run/systemd/system exists),
+    /// else `exec`.
     Auto,
-    /// `systemctl start <unit>`: the agent returns under ITS OWN unit
-    /// (ExecStart argv, cgroup, caps, ProtectHome, journal namespace).
+    /// `systemctl start <unit>`: the agent returns under its own unit (its
+    /// command line, cgroup, capabilities, sandbox and journal).
     Systemd,
-    /// Fork-exec with the persisted first-launch argv (non-systemd hosts).
+    /// Start the agent again with the command line of its first start
+    /// (hosts without systemd).
     Exec,
 }
 
@@ -6181,5 +6189,76 @@ mod tests {
             !still_covering(&[elsewhere], &f),
             "the minor reused by another covering FUSE: not the mount read"
         );
+    }
+
+    /// `[env: NAME=VALUE]` as `[env: NAME]`: what the process environment
+    /// holds is not the help's text (the watchdog has no such option yet).
+    fn without_env_values(help: &str) -> String {
+        let mut out = String::new();
+        for line in help.lines() {
+            let mut rest = line;
+            while let Some(i) = rest.find("[env: ") {
+                let (head, tail) = rest.split_at(i + "[env: ".len());
+                out.push_str(head);
+                let name_end = tail.find(['=', ']']).unwrap_or(tail.len());
+                out.push_str(&tail[..name_end]);
+                rest = &tail[name_end..];
+                if rest.starts_with('=') {
+                    // the `]` that ends the line or opens the next `[…]`
+                    let close = rest
+                        .match_indices(']')
+                        .map(|(j, _)| j)
+                        .find(|&j| j + 1 == rest.len() || rest[j + 1..].starts_with(" ["))
+                        .unwrap_or(rest.len());
+                    rest = &rest[close..];
+                }
+            }
+            out.push_str(rest);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Lot 377: what `northnarrow-watchdog --help` prints is the checked-in
+    /// `watchdog/tests/golden/help/northnarrow-watchdog.txt`, so a change of
+    /// what an operator reads is a reviewed change of that file, and
+    /// xtask/tests/operator_help.rs holds that file to the operator's
+    /// language. `NN_BLESS_HELP=1` writes the file instead.
+    #[test]
+    fn the_help_is_the_checked_in_text() {
+        use clap::CommandFactory;
+        assert_eq!(
+            without_env_values("  [env: NN_X=]\n  [env: NN_Y=a]b] [default: c]\n"),
+            "  [env: NN_X]\n  [env: NN_Y] [default: c]\n"
+        );
+        let help = without_env_values(&Cli::command().render_long_help().to_string());
+        // the crate's own `tests/` (one literal: the lab gate's path scan
+        // takes a join of a `tests` path for the repository's top-level tree)
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/help/northnarrow-watchdog.txt"
+        ));
+        if std::env::var_os("NN_BLESS_HELP").is_some_and(|v| v == "1") {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &help).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(path).unwrap_or_default();
+        if help != want {
+            let line = help
+                .lines()
+                .zip(want.lines())
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| help.lines().count().min(want.lines().count()));
+            panic!(
+                "northnarrow-watchdog --help is not {} (first difference at line {}: {:?} is \
+                 now {:?}); regenerate it with `NN_BLESS_HELP=1 cargo test -p \
+                 northnarrow-watchdog --lib the_help_is_the_checked_in_text` and review the diff",
+                path.display(),
+                line + 1,
+                want.lines().nth(line).unwrap_or("<end of file>"),
+                help.lines().nth(line).unwrap_or("<end of output>"),
+            );
+        }
     }
 }

@@ -76,7 +76,7 @@ pub enum RespawnBackend {
 
 ## 5. Rollout
 
-1. **5.1 VM pre-check (no code):** from a root shell inside a transient unit with the watchdog's sandbox (`systemd-run -p ProtectSystem=strict -p CapabilityBoundingSet="CAP_BPF CAP_SYS_ADMIN" -p NoNewPrivileges=yes --wait systemctl start --no-block northnarrow-agent.service`) confirm the D-Bus connect works under the read-only `/run`. If not: `ReadWritePaths=/run/dbus`.
+1. **5.1 VM pre-check (no code):** confirm that the watchdog's sandbox can reach systemd over D-Bus under the read-only `/run`. If not: `ReadWritePaths=/run/dbus`.
 2. Implement §3.1 + §3.2 + §3.3 in one PR with the unit tests; keep the old `spawn_agent` path as the `exec` backend.
 3. VM validation per §4; update `docs/integration-test-runbook.md`.
 4. Mark `watchdog-respawn-1` / `combat-avail-1` fixed in the audit fix logs; amend `TAPPA7_TASK6_WATCHDOG_DESIGN.md` §5.3 with a pointer to this document.

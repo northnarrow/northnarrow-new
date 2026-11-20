@@ -1,9 +1,12 @@
 //! Lot 354 (pre-alpha, the operator's help, the audit's T7): what an
 //! operator reads when they ask for help speaks their language. The help of
 //! `nn-admin` (every case of the generated help matrix, which `cargo xtask
-//! golden` checks against the binary), of `install.sh` and of
-//! `uninstall.sh` names no lot, review, audit finding, design section or
-//! development stage; every option the scripts accept is in their help; and
+//! golden` checks against the binary), of `install.sh`, of `uninstall.sh`
+//! and (lot 377) of the two daemons (`northnarrow-agent --help` and
+//! `northnarrow-watchdog --help`, the golden files their unit tests check
+//! against the binaries' command lines) names no lot, review, audit finding,
+//! design section, development stage or internal crate; every option the
+//! scripts accept is in their help; and
 //! the scripts print no colour (so `NO_COLOR` holds for them), and every
 //! binary's colour obeys `NO_COLOR` (nn-admin's one helper, the daemons'
 //! log layer).
@@ -21,7 +24,7 @@ fn read(rel: &str) -> String {
 }
 
 /// Words of the project's history that mean nothing to an operator.
-const JARGON: [&str; 17] = [
+const JARGON: [&str; 31] = [
     "Tappa",
     "lab PR",
     "Lab PR",
@@ -40,12 +43,30 @@ const JARGON: [&str; 17] = [
     "lock-in",
     // a rustdoc link: a doc comment written for the code, shown as help
     "[`",
+    // lot 377: the daemons' help
+    "Beta Step",
+    "soak cycle",
+    "Repo dev path",
+    "F10-",
+    "R9-",
+    "R10-",
+    // the internal crates and modules, as a path or a package name
+    "nn_linux",
+    "nn-linux",
+    "northnarrow_agent",
+    "antitamper_bpf",
+    "antitamper-bpf",
+    "nn_core",
+    "nn_proto",
+    "common::",
 ];
 
 /// The internal reference `line` makes, if any: a word of [`JARGON`], a
-/// lot number, a pull request number, an audit finding's id (`ASK-009`,
-/// not a rule id such as `NN-L-FIM-009`), a design question (`Q6`) or a
-/// section sign that follows no operator guide.
+/// lot number, a review number (`review 26`), a pull request number, an
+/// audit finding's id (`ASK-009`, not a rule id such as `NN-L-FIM-009`), a
+/// review finding's (`R10-1`, `F9-2`), a design question (`Q6`), a
+/// development wave's step (`W6`) or a section sign that follows no
+/// operator guide.
 fn jargon(line: &str) -> Option<String> {
     if let Some(w) = JARGON.iter().find(|w| line.contains(*w)) {
         return Some((*w).to_string());
@@ -66,6 +87,36 @@ fn jargon(line: &str) -> Option<String> {
             && !b.get(i + 2).is_some_and(u8::is_ascii_alphanumeric)
         {
             return Some(rest.chars().take(2).collect());
+        }
+        let word_start = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let digits = rest.bytes().skip(1).take_while(u8::is_ascii_digit).count();
+        // a development wave's step: `W` and digits, a whole word
+        if w == 'W'
+            && word_start
+            && digits > 0
+            && !b
+                .get(i + 1 + digits)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            return Some(rest.chars().take(1 + digits).collect());
+        }
+        // a review finding: a capital, digits, `-`, a digit (`R10-1`)
+        if w.is_ascii_uppercase()
+            && word_start
+            && digits > 0
+            && b.get(i + 1 + digits) == Some(&b'-')
+            && digit_after(digits + 2)
+        {
+            return Some(rest.chars().take(digits + 3).collect());
+        }
+        // a review's number
+        let lower = rest.to_ascii_lowercase();
+        if word_start {
+            for word in ["review ", "reviews "] {
+                if lower.starts_with(word) && digit_after(word.len()) {
+                    return Some(rest.chars().take(word.len() + 2).collect());
+                }
+            }
         }
         if w == '§' && !line[..i].trim_end().ends_with(".md") {
             return Some(rest.chars().take(6).collect());
@@ -114,11 +165,39 @@ fn script_help(script: &str) -> String {
     String::from_utf8(out.stdout).expect("utf-8") + &String::from_utf8_lossy(&out.stderr)
 }
 
+/// The options a daemon's rendered help lists (`  -h, --help`,
+/// `      --detect-only`; not the `- value:` lines of a list of values).
+fn listed_options(help: &str) -> usize {
+    help.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('-') && l.len() - t.len() <= 6
+        })
+        .count()
+}
+
+/// Lot 377: the daemons' `--help`, as their unit tests hold it to the
+/// binaries' command lines (`the_help_is_the_checked_in_text`), and the
+/// fewest options each lists (so a deleted or emptied file cannot pass).
+const DAEMON_HELP: [(&str, usize); 2] = [
+    ("agent/tests/golden/help/northnarrow-agent.txt", 40),
+    ("watchdog/tests/golden/help/northnarrow-watchdog.txt", 10),
+];
+
 #[test]
 fn the_help_speaks_the_operator_s_language() {
     let mut problems = jargon_lines("nn-admin --help", &nn_admin_help());
     for script in ["deploy/install.sh", "deploy/uninstall.sh"] {
         problems.extend(jargon_lines(script, &script_help(script)));
+    }
+    for (golden, fewest) in DAEMON_HELP {
+        let help = read(golden);
+        let options = listed_options(&help);
+        assert!(
+            options >= fewest,
+            "{golden}: {options} options listed, {fewest} at least"
+        );
+        problems.extend(jargon_lines(golden, &help));
     }
     problems.sort();
     problems.dedup();
@@ -316,6 +395,37 @@ fn the_jargon_checker_sees_each_kind() {
         ("R018_KernelModuleLoad, exit 78", false),
         ("a beat every 30 s; JA3/JA4, SHA-256", false),
         ("QUIC and DoT", false),
+        // lot 377
+        ("Beta Step 4b: opt-in", true),
+        ("kept for one soak cycle as a fallback", true),
+        ("Repo dev path: configs/combat-rules.v4", true),
+        ("the review's F10-3", true),
+        ("(R9-2)", true),
+        ("R10-1 and R10-2", true),
+        ("F9-2: the move", true),
+        ("crates/nn-linux/src", true),
+        ("nn_linux::sensors", true),
+        ("[`northnarrow_agent::removed_settings`]", true),
+        ("northnarrow_agent::audit", true),
+        ("antitamper_bpf::kernel_roots", true),
+        ("the antitamper-bpf crate", true),
+        ("nn_core::response", true),
+        ("nn_proto::witness::WITNESS_DIR", true),
+        ("common::wire::execq", true),
+        ("Tappa 7 task 6 Watchdog W6: best-effort", true),
+        ("W2/W3/W5", true),
+        ("(W6)", true),
+        ("Default (review 26): the", true),
+        ("(reviews 66, 67)", true),
+        ("Review 61", true),
+        ("SHA-256 of the object, IPv6 and IPv4", false),
+        ("records NN-L-FIM-009 (High)", false),
+        ("NN-L-NET-026 and NN-L-EPG-001/002", false),
+        ("x86-64-v2, TLS 1.3, P-256", false),
+        ("WAL, W, WebSocket, KW6", false),
+        ("R018_KernelModuleLoad", false),
+        ("review the diff before 2 runs", false),
+        ("nn-admin heartbeat export", false),
     ] {
         assert_eq!(jargon(line).is_some(), hit, "{line}: {:?}", jargon(line));
     }

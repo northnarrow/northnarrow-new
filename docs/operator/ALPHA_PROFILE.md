@@ -105,7 +105,7 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
   `--grant-key`) and applies it through the agent (`nn-admin policy set`):
   the signed per-loader opt-out of [`RULE_POLICY.md`](RULE_POLICY.md) §2.5.
   The lines join the policy in force; a loader it already names keeps its
-  line, widened to those five types when it lacks some (lot 345; the
+  line, widened to those five types when it lacks some (the
   summary says `(widened: +…)`). The lines are signed over the policy on
   disk only when it is the verified policy in force (`nn-admin config
   overlay status` does not say NOT LOADED): an unsigned edit of a kept
@@ -124,7 +124,7 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
   included. `install.sh --help` and its summary say so. The other refused
   types (`raw_tracepoint_writable`, `struct_ops`, `ext`, `lsm`) take a
   hook's place and are never named by these flags.
-- **What it does not open (lot 345).** Whoever loads it, opted out or not,
+- **What it does not open.** Whoever loads it, opted out or not,
   the agent refuses a program that would kill or blind it:
   - an **fmod_ret** (`BPF_MODIFY_RETURN`) program — it overrides the return
     of any `security_*` function (`security_file_open` failing for the
@@ -138,7 +138,7 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
     `task_kill` hook, the write rewrites its memory, the override fakes a
     kernel function's return. bpftrace's `signal()` (behind `--unsafe`) is
     refused this way; BCC's tools call none of them.
-    - **The kfuncs, in a load of every type (the review of #553).** The
+    - **The kfuncs, in a load of every type.** The
       kernel also lets a `syscall` program (run with `BPF_PROG_RUN`), an
       XDP, tc or `cgroup_skb` one call them — types any root loads with no
       opt-out. From 6.13 the `bpf_prog_load` hook reads every foreign load
@@ -164,10 +164,9 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
       `CONFIG_BPF_KPROBE_OVERRIDE` has no `bpf_override_return` to refuse.
     - A program longer than 1,048,576 instructions, or one the judge cannot
       read, is refused as if it called one.
-    - **A program loaded inside a window** (lot 349, and its review's
-      fixes): a window lets any load through, but what the judge would
+    - **A program loaded inside a window**: a window lets any load through, but what the judge would
       refuse outside one is held by id and signed at the load
-      (`bpf_held_load`, High; lot 356: through no budget — a flood of
+      (`bpf_held_load`, High, through no budget — a flood of
       refusals on the CPU never holds it back — and when the agent's
       denial ring has no room for that record the load is refused, `EPERM`,
       counted as `held_load_unsigned`, its id still held: a handle taken on
@@ -197,8 +196,8 @@ sudo ./deploy/install.sh --allow-bpf-loader /usr/local/bin/mytool  # any executa
     that reads (the agent's keys in its memory are not protected from it),
     and what a hand-signed line opening `lsm`, `struct_ops` or `ext` gives
     its loader (RULE_POLICY.md §2.5: return values are not judged).
-  - **A start that could not arm the judge suspends the opt-outs** (the
-    review of #553): the calibration failed, or read other calls than its
+  - **A start that could not arm the judge suspends the opt-outs**: the
+    calibration failed, or read other calls than its
     programs make — then no `bpf-loader-allow` line is honoured, their
     types are refused again, and the degradation `bpf content judge` says
     so. The `locked_down` guard for `bpf_probe_write_user` is attached

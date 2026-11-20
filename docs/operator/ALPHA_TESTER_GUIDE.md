@@ -99,6 +99,7 @@ most often missing:
 ```sh
 ls /sys/kernel/btf/vmlinux          # must exist
 cat /sys/kernel/security/lsm        # must contain bpf
+cat /etc/ld.so.preload 2>/dev/null   # empty or absent
 ```
 
 Ubuntu does not put `bpf` in the list by default. Add it to the running
@@ -106,6 +107,12 @@ list and reboot, as
 [KERNEL_COMPATIBILITY.md](KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line)
 shows. Never replace the list with a fixed one: that can switch AppArmor
 or SELinux off.
+
+A preload list that loads a library into every program (a command logger,
+another vendor's agent) keeps the agent from starting, and the installer
+refuses such a host: see
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md#install-and-upgrade), "A host
+with a library preload list".
 
 **If you use bpftrace or BCC**, install them first and add
 `--allow-bpf-tools` to the install command below
@@ -320,7 +327,7 @@ entered and recorded but never isolates the host.
 To see what raised the posture, read the agent's `POSTURE TRANSITION`
 lines: each names the trigger and the event behind it — its kind, pid,
 uid, `comm`, the program the agent knows it ran (`image`) and the file
-(`path`) or other object (lot 376):
+(`path`) or other object:
 
 ```sh
 sudo journalctl --namespace=northnarrow -u northnarrow-agent --no-pager | grep 'POSTURE TRANSITION'
@@ -366,7 +373,8 @@ How to run them:
 - The **record to expect** is the rule and severity listed. Other records
   can appear beside it (the posture's own, or a second rule on the same
   event): that is normal. A scenario whose expected record does not
-  appear is worth a detection-gap report (section 8).
+  appear is worth a detection-gap report (section 9; collect the
+  diagnostics of section 8 first).
 - A few scenarios in a row raise the posture, up to COMBAT (all eight in
   a row did, in our lab). Under `alpha` nothing follows from it but
   records, and it comes down by itself (section 5).

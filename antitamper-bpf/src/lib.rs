@@ -94,6 +94,11 @@ pub mod kernel_roots;
 /// `nr_cpus` read it by path on every fresh thread).
 #[cfg(target_os = "linux")]
 pub mod per_cpu;
+/// Lot 377: the dynamic loader's preload list, read as the loader reads
+/// it — the watchdog's respawn gate, `nn-admin host-check` and
+/// `install.sh`'s preflight judge it by one rule.
+#[cfg(target_os = "linux")]
+pub mod preload;
 /// Lot 374: a start's check of its own environment and mappings before it
 /// takes its role, and the same facts of the process that takes the other
 /// role, read by the surviving one.

@@ -757,6 +757,22 @@ fn view_fs(t: &[u8]) -> bool {
 ///
 /// Each finding names the mount: its point, type, source and root.
 pub fn not_canonical(t: &[MountEntry], points: &[(String, u8)]) -> Vec<String> {
+    not_canonical_in(t, points, &[])
+}
+
+/// [`not_canonical`] in a namespace one of our own units made: there, a
+/// bind of exactly one of `sandbox`'s directories onto itself
+/// ([`crate::mountinfo::is_self_bind`]) is the unit's own `ReadWritePaths=`
+/// or `RuntimeDirectory=`, canonical even below one of the agent's
+/// directories. Lot 377: the watchdog's `ReadWritePaths=` of the witness
+/// directory, below the state directory, was a High at every start of the
+/// watchdog. Another bind there (of another directory, or of a directory
+/// the unit does not name, or below one it names) is still named.
+pub fn not_canonical_in(
+    t: &[MountEntry],
+    points: &[(String, u8)],
+    sandbox: &[String],
+) -> Vec<String> {
     let mut out = Vec::new();
     let point_of = |mp: &Path| points.iter().find(|(p, _)| Path::new(p) == mp);
     let own: Vec<&str> = points
@@ -793,7 +809,9 @@ pub fn not_canonical(t: &[MountEntry], points: &[(String, u8)]) -> Vec<String> {
             } else {
                 None
             }
-        } else if own.iter().any(|d| mp.starts_with(d) && mp != Path::new(d)) {
+        } else if own.iter().any(|d| mp.starts_with(d) && mp != Path::new(d))
+            && !(self_bind && sandbox.iter().any(|d| Path::new(d) == mp))
+        {
             Some("below one of the agent's own directories")
         } else if VIEW_TYPES
             .iter()
@@ -1321,6 +1339,17 @@ pub fn refresh_now(bpffs_root: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// [`not_canonical_in`] the watchdog's mount namespace (`t`): its own
+/// unit's sandbox binds, read from the shipped unit as the integrity round
+/// reads them (`MountSource::Watchdog`), are canonical there (lot 377).
+pub fn watchdog_not_canonical(t: &[MountEntry], points: &[(String, u8)]) -> Vec<String> {
+    not_canonical_in(
+        t,
+        points,
+        &crate::self_integrity::watchdog_unit_sandbox_dirs(),
+    )
+}
+
 /// What a watchdog's registration found: the mounts of its namespace that
 /// are not the canonical ones (each a signed High of the refresh).
 #[derive(Debug, Default)]
@@ -1378,7 +1407,7 @@ pub fn guard_watchdog(bpffs_root: &Path, pid: u32) -> Result<WatchdogGuard> {
     set_guarded(&mut nm, inum, GUARD_WATCHDOG)?;
     Ok(WatchdogGuard {
         mnt_ns: inum,
-        not_canonical: not_canonical(&t, &points),
+        not_canonical: watchdog_not_canonical(&t, &points),
     })
 }
 
@@ -1879,6 +1908,76 @@ mod tests {
         // the same tmpfs mounted over the directory, not a bind of it onto itself
         let over = format!("{unit}304 301 0:23 / /run/northnarrow rw - tmpfs tmpfs rw\n");
         assert!(!not_canonical(&table(&over), &points()).is_empty());
+    }
+
+    /// Lot 377: in the watchdog's namespace systemd binds the witness
+    /// directory (its unit's `ReadWritePaths=`, below the state directory)
+    /// onto itself — canonical there, never a High at the watchdog's start;
+    /// any other mount below the agent's directories stays named: a self-bind
+    /// of a directory the unit does not name, one below the witness
+    /// directory, a bind of another directory, another file system or a
+    /// tmpfs at the witness directory. And only in the watchdog's namespace:
+    /// in another the same bind is named.
+    #[test]
+    fn the_watchdog_s_own_witness_bind_is_canonical_and_a_foreign_one_is_not() {
+        let sandbox = crate::self_integrity::watchdog_unit_sandbox_dirs();
+        assert!(
+            sandbox.iter().any(|d| d == "/var/lib/northnarrow/witness"),
+            "the shipped watchdog unit binds the witness directory: {sandbox:?}"
+        );
+        let ns = "\
+300 299 8:1 / / ro,relatime shared:90 master:1 - ext4 /dev/sda1 rw
+301 300 0:22 / /run rw,nosuid shared:91 master:5 - tmpfs tmpfs rw
+302 301 0:22 /northnarrow /run/northnarrow rw shared:92 master:5 - tmpfs tmpfs rw
+";
+        let own = format!(
+            "{ns}303 300 8:1 /var/lib/northnarrow/witness /var/lib/northnarrow/witness rw,relatime \
+             shared:93 master:1 - ext4 /dev/sda1 rw\n"
+        );
+        let found = watchdog_not_canonical(&table(&own), &points());
+        assert!(found.is_empty(), "{found:?}");
+        // the same bind outside the watchdog's namespace: named
+        let elsewhere = not_canonical(&table(&own), &points());
+        assert!(
+            elsewhere
+                .iter()
+                .any(|f| f.starts_with("/var/lib/northnarrow/witness (")),
+            "{elsewhere:?}"
+        );
+        for (line, point) in [
+            // a self-bind of a directory the unit does not name
+            (
+                "304 300 8:1 /var/lib/northnarrow/state /var/lib/northnarrow/state rw - ext4 /dev/sda1 rw",
+                "/var/lib/northnarrow/state",
+            ),
+            // a self-bind below the one it names
+            (
+                "304 303 8:1 /var/lib/northnarrow/witness/x /var/lib/northnarrow/witness/x rw - ext4 /dev/sda1 rw",
+                "/var/lib/northnarrow/witness/x",
+            ),
+            // another directory bound over it
+            (
+                "304 303 8:1 /tmp/w /var/lib/northnarrow/witness rw - ext4 /dev/sda1 rw",
+                "/var/lib/northnarrow/witness",
+            ),
+            // another file system, with the root that a self-bind would have
+            (
+                "304 303 8:2 /var/lib/northnarrow/witness /var/lib/northnarrow/witness rw - ext4 /dev/sda2 rw",
+                "/var/lib/northnarrow/witness",
+            ),
+            // a memory file system over it
+            (
+                "304 303 0:40 / /var/lib/northnarrow/witness rw - tmpfs tmpfs rw",
+                "/var/lib/northnarrow/witness",
+            ),
+        ] {
+            let found = watchdog_not_canonical(&table(&format!("{own}{line}\n")), &points());
+            assert!(
+                found.iter().any(|f| f.starts_with(&format!("{point} ("))
+                    && f.ends_with("below one of the agent's own directories")),
+                "{line}: {found:?}"
+            );
+        }
     }
 
     /// The re-check of #567 (N1): each held mount's place is also keyed

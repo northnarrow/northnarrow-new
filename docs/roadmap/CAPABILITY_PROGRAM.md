@@ -4921,10 +4921,9 @@ number in parentheses is a lab PR.
     actuators' execs); a change the agent survives is an `integrity_drift`
     (C12). systemd writes them as PID 1 at every realisation, so lot 273b
     refuses the other writers and checks the value PID 1 writes. cgroup v1
-    is not covered, on pure v2 hosts too: root can mount the v1 `freezer`
-    (or `devices`, `net_cls`, `net_prio`, `perf_event`), move both pids
-    there and write `FROZEN` to `freezer.state`, and the move guard does
-    not see the v1 `cgroup.procs` path (to be confirmed in lab, lot 273b).
+    hierarchies mounted on a v2 host were not covered at this lot; a move
+    or a freeze in a v1 hierarchy is refused since (`cgroup_v1`, see the
+    CHANGELOG).
     A write descriptor of `system.slice/cgroup.kill` opened at any time
     before the agent's first start stays usable (the refusal is at open),
     as does one of a unit's opened inside a window. Also open: a thaw
@@ -5733,9 +5732,9 @@ number in parentheses is a lab PR.
   - Levels: unchanged. C23 stays 2 (provisional): the lot closes a way
     around the policy, not a new capability. C15 stays 1: the exemptions
     are the same kinds, bound to a start.
-  - Open: a root that rewrites the exempt unit (a drop-in, a transient
-    unit of that name, systemd's D-Bus attach) gets systemd's placement,
-    and the unit exemption trusts it; `exe … sha256` binds a program. Also
+  - Open: the unit exemption trusts systemd's placement, so a root change
+    to the exempt unit's definition is trusted with it; `exe … sha256`
+    binds a program. Also
     open: a move while no agent runs; a `CLONE_INTO_CGROUP` start is marked
     but not signed; a full map refuses every such exemption until the host
     reboots (changed by the review of #494, below); on systemd 255 — which
@@ -13739,3 +13738,34 @@ number in parentheses is a lab PR.
     failing (`bpf_prog_load_guard` 5,613 processed); cold boot 77 pins, 50
     LSM programs, judge re-armed (5 kfunc keys). `bpftool feature probe`:
     9 High type refusals (named in the docs). Levels unchanged.
+- **Lot 377 (the rc10 findings before the tag).** Four fixes and the
+  operator texts (`UPGRADE_NOTES_WAVE4.md` §63).
+  - The watchdog's witness directory: systemd's bind of it onto itself in
+    the watchdog's namespace (lot 374's `ReadWritePaths=`) was a
+    `mount_not_canonical` High at every start of the watchdog on Debian 13.
+    A bind of exactly a directory the shipped unit names, onto itself, is
+    canonical in the watchdog's namespace only (`watchdog_not_canonical`,
+    from the unit the integrity round reads); every other mount below the
+    agent's directories is still named. Test
+    `the_watchdog_s_own_witness_bind_is_canonical_and_a_foreign_one_is_not`.
+  - A preload list that loads a library (`/etc/ld.so.preload`): refused by
+    `install.sh` before any change (exit 5), `FAIL` and exit 3 in
+    `nn-admin host-check`; an inert list noted. One rule
+    (`antitamper_bpf::preload`, the watchdog's respawn gate's, moved there)
+    and a shell copy tested on the same cases. Tests
+    `install_refuses_a_loadable_preload_list_and_notes_an_inert_one`,
+    `host_check_fails_a_loadable_preload_list`,
+    `a_preload_list_is_judged_by_the_files_its_names_resolve_to`.
+  - The daemons' `--help` in the operator's language, checked in and read
+    by the help ratchet (`the_help_is_the_checked_in_text`,
+    `the_help_speaks_the_operator_s_language`); KNOWN_LIMITATIONS' method
+    texts rewritten as behaviour; the daemons' exit statuses tied to their
+    tables (`every_daemon_exit_status_is_a_row_of_the_operator_tables`).
+  - The flaky `a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed`
+    (Debian 12 nightly): the test waits for the child's exec before reading
+    its executable.
+  - The nightly `lab-vm.yml` on `main`, scheduled runs 7-20 Nov 2026: 6 of
+    14 green.
+  - Lab: queued on Debian 13 and Ubuntu 24.04 (after the rc10 release
+    candidate's checks); recorded here as measured.
+  Levels unchanged.

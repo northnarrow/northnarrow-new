@@ -285,7 +285,10 @@ while [[ $# -gt 0 ]]; do
             echo "Exit codes: 0 done; 1 refused or failed, nothing changed (a check, a verification, a"
             echo "  prerequisite); 2 a usage error (an unknown or conflicting option); 3 an upgrade rolled back:"
             echo "  the previous version runs again; 4 an upgrade whose rollback could not be completed (the"
-            echo "  message says how to finish it); 129, 130, 143 interrupted by a signal (HUP, INT, TERM)."
+            echo "  message says how to finish it); 5 refused, nothing changed: this host's /etc/ld.so.preload"
+            echo "  makes every program load a library, and the agent and its watchdog refuse to start with one"
+            echo "  (an empty list, or one that names no existing file, is only noted); 129, 130, 143"
+            echo "  interrupted by a signal (HUP, INT, TERM)."
             echo "Full guide: docs/operator/INSTALL_UPGRADE_UNINSTALL.md"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
@@ -827,6 +830,96 @@ nft_install_hint() {
     else echo "install the distribution's nftables package"
     fi
 }
+# >>> preload_check (run by xtask/tests/install_scripts.rs)
+# Lot 377: a host whose dynamic loader preloads a library into every
+# program (`/etc/ld.so.preload`: a command logger, another vendor's agent)
+# cannot run NorthNarrow — the agent's and the watchdog's start check
+# refuses an executable mapping of a library the release does not link
+# (exit 78 and 16), at every start. Said before anything changes: the list
+# is read as the loader reads it (`#` to the end of its line a comment;
+# names split at white space and `:`; `$LIB` and `$PLATFORM` expanded; a
+# name without a `/` looked for in the system library directories), the
+# same rule as the watchdog's respawn gate and `nn-admin host-check`
+# (antitamper-bpf/src/preload.rs). A name of a file that exists is refused
+# (exit 5), and so is a list that is no regular file or is larger than
+# 64 KiB; a list that loads nothing (empty, comments, names of no file) is
+# noted. HOST_PRELOAD is the list, HOST_ROOT the root its names resolve in
+# (both for the tests).
+PRELOAD_EXIT=5
+PRELOAD_SEARCH_DIRS=(/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 /lib /usr/lib)
+preload_candidates() { # <name>: every path the loader may load for it, one a line
+    local -a cur=("$1") next
+    local tok c v
+    if [[ $1 != */* ]]; then
+        for c in "${PRELOAD_SEARCH_DIRS[@]}"; do printf '%s\n' "$c/$1"; done
+        return 0
+    fi
+    for tok in '$LIB' '${LIB}' '$PLATFORM' '${PLATFORM}'; do
+        case $tok in
+            *LIB*) set -- lib lib64 lib/x86_64-linux-gnu usr/lib usr/lib64 ;;
+            *) set -- x86_64 haswell xeon_phi ;;
+        esac
+        next=()
+        for c in "${cur[@]}"; do
+            if [[ $c == *"$tok"* ]]; then
+                for v in "$@"; do next+=("${c//"$tok"/"$v"}"); done
+            else
+                next+=("$c")
+            fi
+        done
+        cur=("${next[@]}")
+    done
+    for c in "${cur[@]}"; do
+        [[ $c == /* ]] || c=/$c
+        printf '%s\n' "$c"
+    done
+}
+preload_check() {
+    local list=${HOST_PRELOAD:-/etc/ld.so.preload} root=${HOST_ROOT:-} why= size line n c
+    local -a words names=() found=()
+    [[ -e $list ]] || return 0
+    if [[ ! -f $list ]]; then
+        why="it is not a regular file"
+    else
+        size=$(stat -L -c %s -- "$list" 2>/dev/null || echo unreadable)
+        if [[ $size == unreadable || ! -r $list ]]; then
+            why="it cannot be read"
+        elif (( size > 65536 )); then
+            why="it is larger than 64 KiB"
+        fi
+    fi
+    if [[ -z $why ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            line=${line%%#*}
+            IFS=$' \t\r\f:' read -r -a words <<<"$line" || true
+            for n in "${words[@]}"; do
+                [[ -n $n ]] || continue
+                [[ " ${names[*]} " == *" $n "* ]] || names+=("$n")
+            done
+        done < <(tr -d '\0' < "$list")
+        for n in "${names[@]}"; do
+            while IFS= read -r c; do
+                if [[ -e $root$c ]] && [[ " ${found[*]} " != *" $c "* ]]; then
+                    found+=("$c")
+                fi
+            done < <(preload_candidates "$n")
+        done
+        if (( ! ${#found[@]} )); then
+            echo "install.sh: NOTE: $list is present but loads nothing (${#names[@]} name(s), no file any of them names exists): the agent starts; a library it names that appears later makes each start of the agent refuse itself"
+            return 0
+        fi
+        why="it makes every program load ${found[*]}"
+    else
+        why="it cannot be judged ($why), and the loader reads it at every program's start"
+    fi
+    echo "install.sh: REFUSED — this host's $list: $why." >&2
+    echo "install.sh: The agent and its watchdog refuse to start with a library this release does not link" >&2
+    echo "install.sh: (each start checks what it has mapped; exit 78 and 16), so they would not run here." >&2
+    echo "install.sh: Remove that entry (or the file), or install on a host without one. Nothing was changed." >&2
+    return "$PRELOAD_EXIT"
+}
+# <<< preload_check
+
 require_nft() {
     local nft
     if nft=$(find_nft); then
@@ -1797,6 +1890,8 @@ for bait in agent.dev.lock kill_switch.conf maintenance.mode debug_disable.flag 
 done
 # Before anything on the host changes, a running install's stop included.
 require_nft
+# Lot 377: a preload list that loads a library into every program (exit 5).
+if [[ $MODE == full ]]; then preload_check || exit $?; fi
 # Lot 341: the profile this run records (refused before any change when
 # --profile would switch an installed agent).
 PROFILE_RECORDED=$(install_profile "$ETC_DIR/install-manifest.json" "$PROFILE") || exit 2
@@ -2043,6 +2138,7 @@ wait_own_programs_unloaded() {
 # in a child of it): the binary is this script's shell's child, the window's
 # installer (nn-admin's parent), with no fork between that R009's lineage walk
 # would need to read while it still runs.
+
 # >>> host_support (run by xtask/tests/install_scripts.rs)
 # Lot 341 (alpha 2/4): a host this release cannot run on is refused before
 # anything changes, each reason with what to do: not x86_64, systemd not the

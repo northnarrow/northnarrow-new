@@ -5993,3 +5993,206 @@ fn uninstall_removes_the_journal_runtime_dir_and_the_export_parent() {
         assert_eq!(!dir.join("log/northnarrow").exists(), gone, "{case}");
     }
 }
+
+/// `preload_check` from install.sh on the list `text` (none: `None`) with
+/// the libraries `libs` (empty files) under the case's root: (status,
+/// stdout, stderr).
+fn preload_check(case: &str, libs: &[&str], text: Option<&[u8]>) -> (i32, String, String) {
+    let dir = case_dir(case);
+    let root = dir.join("root");
+    for l in libs {
+        let p = root.join(l.trim_start_matches('/'));
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, b"").unwrap();
+    }
+    let list = dir.join("ld.so.preload");
+    if let Some(t) = text {
+        fs::write(&list, t).unwrap();
+    }
+    let script = format!(
+        "set -euo pipefail\nHOST_PRELOAD='{}'\nHOST_ROOT='{}'\n{}\npreload_check\n",
+        list.display(),
+        root.display(),
+        block("deploy/install.sh", "preload_check"),
+    );
+    let out = Command::new("timeout")
+        .arg("20")
+        .arg("bash")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("bash runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Named (lot 377): a host whose `/etc/ld.so.preload` makes every program
+/// load a library cannot run the agent (its start check refuses it), so
+/// install.sh refuses it before anything changes — exit 5, the files
+/// named, what to do — reading the list as the loader does (a path, a bare
+/// name in a system library directory, `$LIB` and `${PLATFORM}`, after a
+/// `:`; `#` a comment); a list that is no regular file or is too large is
+/// refused too; an absent list says nothing, and an empty or inert one is
+/// noted and installed. The cases of antitamper-bpf's
+/// `a_preload_list_is_judged_by_the_files_its_names_resolve_to`. And the
+/// check runs in a full install's preflight, before anything changes.
+#[test]
+fn install_refuses_a_loadable_preload_list_and_notes_an_inert_one() {
+    let libs = [
+        "/usr/lib/x86_64-linux-gnu/libnnlog.so",
+        "/opt/v/lib64/libv.so",
+        "/opt/v/x86_64/libp.so",
+    ];
+    let (status, out, err) = preload_check("preload-absent", &libs, None);
+    assert_eq!((status, out.as_str(), err.as_str()), (0, "", ""));
+    for (i, (text, names)) in [
+        (&b""[..], 0),
+        (b"  \n\t\n", 0),
+        (b"# /opt/v/lib64/libv.so\n", 0),
+        (b"/nope/x.so  libmissing.so:/also/no.so\n", 3),
+        (b"libv.so # not in a system directory\n", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, out, err) = preload_check(&format!("preload-inert-{i}"), &libs, Some(text));
+        assert_eq!(status, 0, "{out} {err}");
+        assert!(
+            out.contains("NOTE:")
+                && out.contains("loads nothing")
+                && out.contains(&format!("({names} name(s)")),
+            "{}: {out}",
+            String::from_utf8_lossy(text)
+        );
+    }
+    for (i, (text, want)) in [
+        (
+            &b"libnnlog.so\n"[..],
+            "/usr/lib/x86_64-linux-gnu/libnnlog.so",
+        ),
+        (b"/opt/v/$LIB/libv.so", "/opt/v/lib64/libv.so"),
+        (b"/opt/v/${PLATFORM}/libp.so # c\n", "/opt/v/x86_64/libp.so"),
+        (b"a.so:/opt/v/lib64/libv.so\n", "/opt/v/lib64/libv.so"),
+        (b"opt/v/lib64/libv.so\n", "/opt/v/lib64/libv.so"),
+        // the mini-hunt's variants: CRLF lines, `${LIB}`
+        (b"libnnlog.so\r\n", "/usr/lib/x86_64-linux-gnu/libnnlog.so"),
+        (b"/opt/v/${LIB}/libv.so\n", "/opt/v/lib64/libv.so"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, out, err) = preload_check(&format!("preload-loads-{i}"), &libs, Some(text));
+        assert_eq!(status, 5, "{}: {out} {err}", String::from_utf8_lossy(text));
+        assert!(
+            err.contains("REFUSED")
+                && err.contains(&format!("load {want}."))
+                && err.contains("refuse to start")
+                && err.contains("Nothing was changed"),
+            "{}: {err}",
+            String::from_utf8_lossy(text)
+        );
+    }
+    // a list that is a symbolic link to one: followed, as the loader opens
+    // it; a name that is a dangling link: nothing loads
+    let dir = case_dir("preload-linked");
+    fs::write(dir.join("vendor.list"), b"/opt/v/lib64/libv.so\n").unwrap();
+    std::os::unix::fs::symlink(dir.join("vendor.list"), dir.join("linked")).unwrap();
+    let root = case_dir("preload-linked-root");
+    fs::create_dir_all(root.join("opt/v/lib64")).unwrap();
+    fs::write(root.join("opt/v/lib64/libv.so"), b"").unwrap();
+    std::os::unix::fs::symlink("/nonexistent/x.so", root.join("opt/v/dangling.so")).unwrap();
+    for (list, want) in [
+        (dir.join("linked"), 5),
+        (
+            {
+                fs::write(dir.join("dangling"), b"/opt/v/dangling.so\n").unwrap();
+                dir.join("dangling")
+            },
+            0,
+        ),
+    ] {
+        let script = format!(
+            "set -euo pipefail\nHOST_PRELOAD='{}'\nHOST_ROOT='{}'\n{}\npreload_check\n",
+            list.display(),
+            root.display(),
+            block("deploy/install.sh", "preload_check"),
+        );
+        let out = Command::new("timeout")
+            .args(["20", "bash", "-c", &script])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(want), "{}: {out:?}", list.display());
+    }
+    // a list that is no regular file, or too large: refused, not waited on
+    let dir = case_dir("preload-fifo");
+    let fifo = dir.join("ld.so.preload");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let script = format!(
+        "set -euo pipefail\nHOST_PRELOAD='{}'\n{}\npreload_check\n",
+        fifo.display(),
+        block("deploy/install.sh", "preload_check"),
+    );
+    let out = Command::new("timeout")
+        .args(["20", "bash", "-c", &script])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "{err}");
+    assert!(err.contains("not a regular file"), "{err}");
+    let big = vec![b'a'; 64 * 1024 + 1];
+    let (status, _, err) = preload_check("preload-big", &libs, Some(&big));
+    assert_eq!(status, 5, "{err}");
+    assert!(err.contains("larger than 64 KiB"), "{err}");
+    // where it runs: a full install's preflight, before any change, its
+    // status kept
+    let text = read("deploy/install.sh");
+    let at = text
+        .find("if [[ $MODE == full ]]; then preload_check || exit $?; fi")
+        .expect("the preflight's call");
+    assert!(at > text.find("\nrequire_nft\n").unwrap());
+    assert!(at < text.find("check_system_user \"$WORKER_USER\"").unwrap());
+    assert!(
+        at < text
+            .find("# Lab PR 220: replacing an install is a transaction")
+            .unwrap()
+    );
+    // defined before the main flow calls it
+    assert!(text.find("\npreload_check() {").unwrap() < at);
+    assert!(text.contains("PRELOAD_EXIT=5"));
+}
+
+/// Named (lot 377): the half-install a host with a loadable preload list
+/// was left with before install.sh refused it (files installed, units
+/// enabled, each start refused by the start's own check — before any BPF,
+/// so no pin root): uninstall.sh needs no window and no key — it starts
+/// nothing, opens no window, and disables both units.
+#[test]
+fn uninstall_of_a_half_install_whose_start_was_refused_needs_no_window() {
+    let host = Host::new("uninstall-half-install", &[], false, true);
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        fs::write(host.dir.join(format!("state.{u}")), "failed\n").unwrap();
+    }
+    let r = host.uninstall(false, None);
+    assert_eq!(r.status, 0, "{r:#?}");
+    assert_eq!(r.called(START_AGENT), 0, "{r:#?}");
+    assert_eq!(r.called(START_WATCHDOG), 0, "{r:#?}");
+    assert!(r.index(GRANT).is_none(), "{r:#?}");
+    for u in ["northnarrow-agent", "northnarrow-watchdog"] {
+        assert!(
+            r.calls
+                .iter()
+                .any(|c| c.starts_with("systemctl disable") && c.contains(&format!("{u}.service"))),
+            "{u} disabled: {r:#?}"
+        );
+    }
+}

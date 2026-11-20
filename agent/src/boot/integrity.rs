@@ -426,8 +426,16 @@ pub(crate) fn check(
         let checks = northnarrow_agent::host_hardening::run();
         let warns = northnarrow_agent::host_hardening::warn_count(&checks);
         for c in &checks {
-            if c.status == northnarrow_agent::host_hardening::Status::Warn {
-                warn!(check = c.id, value = %c.value, fix = c.fix, "host hardening: {}", c.name);
+            match c.status {
+                northnarrow_agent::host_hardening::Status::Warn => {
+                    warn!(check = c.id, value = %c.value, fix = c.fix, "host hardening: {}", c.name)
+                }
+                // lot 377: a list naming a file the loader did not load
+                // (the start's own check passed)
+                northnarrow_agent::host_hardening::Status::Fail => {
+                    error!(check = c.id, value = %c.value, fix = c.fix, "host check: {}", c.name)
+                }
+                _ => {}
             }
         }
         info!(

@@ -6,6 +6,55 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 377 (the rc10 findings before the tag; `UPGRADE_NOTES_WAVE4.md` §63).
+  - **The watchdog's witness directory is no High at its start.** Its unit
+    makes `/var/lib/northnarrow/witness` writable (`ReadWritePaths=`), and
+    systemd binds the directory onto itself in the watchdog's namespace:
+    below the state directory, the mount guard named it
+    `mount_not_canonical` (High) at every start of the watchdog. In the
+    watchdog's namespace a bind of exactly a directory its own shipped unit
+    names, onto itself, is canonical now; any other mount there (another
+    directory, below that one, another file system, a tmpfs) is still
+    named, and the same bind in another namespace too. Test
+    `the_watchdog_s_own_witness_bind_is_canonical_and_a_foreign_one_is_not`.
+  - **A host whose `/etc/ld.so.preload` loads a library is refused before
+    the install.** The agent's and the watchdog's start check refuses a
+    library the release does not link, so on such a host every start
+    refused itself after `install.sh` had changed the host. `install.sh`
+    (fresh install, reinstall, `--upgrade`) now reads the list as the
+    loader does before any change and refuses it with exit 5, naming the
+    files; an empty list, comments only or names of no existing file are
+    noted and installed. `nn-admin host-check` has a `preload` row: `FAIL`
+    (a new status) when a library would load, and exit 3. One rule for the
+    three readers (the watchdog's respawn gate, `host-check`, the shell
+    copy in `install.sh`, tested on the same cases). Tests
+    `install_refuses_a_loadable_preload_list_and_notes_an_inert_one`,
+    `host_check_fails_a_loadable_preload_list`,
+    `a_preload_list_is_judged_by_the_files_its_names_resolve_to`,
+    `host_check_exits_3_on_a_failure_before_its_warnings`,
+    `uninstall_of_a_half_install_whose_start_was_refused_needs_no_window`.
+  - **The daemons' `--help` speaks the operator's language.** Every option
+    `northnarrow-agent --help` and `northnarrow-watchdog --help` show is
+    described by what it does; the development history moved to code
+    comments; ten state-file and internal options are hidden (they keep
+    working). The rendered help is checked in
+    (`agent/tests/golden/help/`, `watchdog/tests/golden/help/`; test
+    `the_help_is_the_checked_in_text`, `NN_BLESS_HELP=1` rewrites it) and
+    the ratchet `the_help_speaks_the_operator_s_language` reads it for
+    internal references (lot and finding ids, development steps, internal
+    crate names).
+  - **The operator documents describe behaviour.** KNOWN_LIMITATIONS'
+    items that read as a method are rewritten as what happens and what to
+    do; six items added (among them the preload list); the README's nightly
+    line is the measured one (6 of 14 scheduled runs green, 7–20 Nov 2026);
+    the exit statuses of both daemons are tables, held to the code by
+    `every_daemon_exit_status_is_a_row_of_the_operator_tables`.
+  - **A flaky privileged test.** `a_ptrace_attach_to_an_exempt_process_revokes_it_and_is_signed`
+    read the child's `/proc/<pid>/exe` as soon as `spawn` returned; the
+    standard library's `posix_spawn` lets the parent run on just before the
+    kernel switches the child to its new image, and the link still named
+    the test binary (a nightly on Debian 12). The test now waits, bounded,
+    for the exec; the assertion is unchanged.
 - Lot 376 (the rc9 soaks): three false positives and the Low noise judged
   by identity (`UPGRADE_NOTES_WAVE4.md` §62).
   - **A rotated log's first record.** logrotate's `create` put a new file
@@ -69,6 +118,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       `pid_1_s_executor_launch_without_an_identity_is_told_by_pid_1_s_descriptor`,
       `own_descriptor_reads_only_the_two_exact_spellings`,
       `the_exec_record_is_attached_after_the_exec_sensor`.
+  - **Formats.** File-open events carry `exe_file` (the device and inode
+    of the opener's executable; `(0, 0)` when not read, as on the
+    tracepoint sensor); older records read as `(0, 0)`. For the release
+    candidate with lot 374: `PROTOCOL_VERSION` stays 4 (no admin frame
+    changed); the watchdog's witness chain is a new file whose rows carry
+    their own format version, 1.
 - Lot 374 (the pre-alpha's re-check on rc9, R9-1): **the vacated role's
   successor is witnessed and bound to its unit** (`UPGRADE_NOTES_WAVE4.md`
   §61).

@@ -45,6 +45,10 @@ impl nn_admin::host::HostChecks for HostHardening {
         crate::host_hardening::warn_count(&self.0)
     }
 
+    fn fail_count(&self) -> usize {
+        crate::host_hardening::fail_count(&self.0)
+    }
+
     fn render_table(&self) -> String {
         crate::host_hardening::render_table(&self.0)
     }

@@ -393,13 +393,13 @@ signed degradation). The mapping check (§6) does not depend on the string.
 caller's memory after the kernel's copy: from `copy_strings(envp)` to
 `security_bprm_check` the kernel copies `argv` (up to about 6 MB), prepares
 the credentials, may migrate the task (`sched_exec`), opens the file (5.15)
-and reads its first page. Another thread of the caller, a process sharing
-the page (`MAP_SHARED`, `process_vm_writev`) can rewrite `LD_PRELOAD=` or
-unmap the page in that window, and make it deterministic with a
-FUSE-backed `argv` page whose read the daemon holds. The kernel keeps its
-copy; the scan judges what the memory holds when it reads. A string or an
-entry it cannot read is `UNREADABLE`: counted (`ENV_UNREAD`, `nn-admin
-status`: "environments not read") and recorded (`NN-L-EXECENV-002`, High).
+and reads its first page. Memory the caller still shares can change
+between the kernel's copy and the scan, so the scan can judge something
+other than what the kernel copied. The kernel keeps its copy, and the
+second program below judges that copy after the exec's point of no return.
+A string or an entry it cannot read is `UNREADABLE`: counted
+(`ENV_UNREAD`, `nn-admin status`: "environments not read") and recorded
+(`NN-L-EXECENV-002`, High).
 
 **The kernel's own copy, past the point of no return (lot 325).** A second
 program, `execpol_env_commit` on `sched_process_exec` (a tracepoint that is
