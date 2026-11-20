@@ -1682,6 +1682,7 @@ fn kmod_tree_write(r: &OpenRecordRaw, path: &str, comm: &str) -> Option<FimEvent
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         // lot 352 (the re-check of #561, N1): a fork-only process's start
         modifier_start: r.fork_start,
     })
@@ -1765,6 +1766,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             // lot 352: as above
             modifier_start: r.fork_start,
         }));
@@ -1795,6 +1797,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             // lot 352: as above
             modifier_start: r.fork_start,
         }));

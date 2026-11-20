@@ -78,7 +78,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
     FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED,
-    FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
+    FIM_RENAMED_AWAY, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
     FIM_WRITE_ONE_WRITER, FIM_WRITE_TRUNCATED_BY_ANOTHER,
 };
 use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
@@ -1237,7 +1237,10 @@ fn replacement_raw(path: &str, mut raw: FimDriftRaw) -> Option<FimDriftRaw> {
     raw.target_dev = key.dev;
     raw.target_ino = key.ino;
     raw.op = FimOp::Modified as u8;
-    raw.op_flags = 0;
+    // the review of #583 (F1): only the drain's own mark of a rename away
+    // ([`replacement_check`]) is kept — the rename record's bits describe
+    // the rename, not this check
+    raw.op_flags &= FIM_RENAMED_AWAY;
     raw.dest_dev = 0;
     raw.dest_ino = 0;
     raw.child_name = [0u8; FIM_CHILD_NAME_LEN];
@@ -1429,7 +1432,13 @@ fn replacement_check(
     renamer: &FimDriftRaw,
 ) -> Option<FimDriftRaw> {
     replaced.or_else(|| {
-        (settled == Settled::Replaced && class != WatchClass::RuntimeChild).then_some(*renamer)
+        (settled == Settled::Replaced && class != WatchClass::RuntimeChild).then(|| {
+            // the review of #583 (F1): renamed AWAY — the content kept under
+            // the new name — not over (`replaced`), not a write in place
+            let mut away = *renamer;
+            away.op_flags = FIM_RENAMED_AWAY;
+            away
+        })
     })
 }
 
@@ -2446,6 +2455,7 @@ pub fn process_record(
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 // lot 352 (the re-check of #561, N1): the reader's start
                 modifier_start: process_start(raw),
             }));
@@ -2499,6 +2509,9 @@ pub fn process_record(
     let unchanged_since_read = content
         .as_ref()
         .is_some_and(|c| path_map.read_unchanged(&size_key, c.size, &c.sha256));
+    // the review of #583 (F1): the drain's check of a file put at a watched
+    // path whose file was renamed away ([`replacement_check`])
+    let renamed_away = op == FimOp::Modified && raw.op_flags & FIM_RENAMED_AWAY != 0;
     if let Some(c) = &content {
         path_map.note_read(&size_key, c.size, &c.sha256);
     }
@@ -2727,6 +2740,7 @@ pub fn process_record(
             appends_only: appends_only(raw, op),
             truncated_by_another,
             unchanged_since_read,
+            renamed_away,
             modifier_start: process_start(raw),
         };
         // lot 347: a login record's packaged writer, read while it runs —
@@ -3246,9 +3260,16 @@ fn decode_record(
             (link.root_dev, link.root_ino),
             mounts,
         );
-        return Ok((link.drift, Some(path)));
+        return Ok((kernel_record(link.drift), Some(path)));
     }
-    Ok((*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?, None))
+    Ok((kernel_record(*bytemuck::try_from_bytes::<FimDriftRaw>(bytes)?), None))
+}
+
+/// The review of #583 (F1): a record the kernel sent, without the bits only
+/// the drain sets ([`FIM_RENAMED_AWAY`]: its own check of a rename away).
+fn kernel_record(mut raw: FimDriftRaw) -> FimDriftRaw {
+    raw.op_flags &= !FIM_RENAMED_AWAY;
+    raw
 }
 
 /// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
@@ -3689,6 +3710,7 @@ fn self_test_event(raw: &FimDriftRaw, inode_map: &InodePathMap) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         modifier_start: 0,
     })
 }
@@ -5375,6 +5397,61 @@ mod tests {
         assert_eq!(v.severity, nn_model::Severity::High);
     }
 
+    /// The review of #583 (named, F1): the drain's check of a file put at a
+    /// path whose watched file was renamed AWAY (logrotate's `create`: the
+    /// old content kept as `wtmp.1`) carries the mark `renamed_away` — what
+    /// NN-L-FIM-019's rotation arm needs to tell a hand rotation from a
+    /// truncation ([`nn_core::fim::rules::LogRotation`]). Nothing else
+    /// carries it: a rename OVER the watched file (FIMR-004: its content
+    /// gone), a truncation in place, a write, and a kernel record that came
+    /// with the bit set (the drain's alone: cleared at the decode).
+    #[test]
+    fn a_rename_away_check_carries_its_mark_and_nothing_else_does() {
+        let logrotate = 4_200;
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let new = rotate_by_create(&mut fx, logrotate, b"");
+        let check = replacement_raws(&fx.path_map)
+            .into_iter()
+            .find(|r| r.modifier_pid == logrotate)
+            .expect("the rotation's check");
+        assert_eq!(check.op_flags, FIM_RENAMED_AWAY, "the mark alone");
+        let fe = fx.drift(&check).expect("the path's file changed");
+        assert!(fe.renamed_away, "a rename away");
+        assert_eq!((fe.op, fe.modifier_pid), (FimOp::Modified, logrotate));
+        // a truncation in place of the new file, by another writer: no mark
+        fx.append(b"a line\n");
+        fx.truncate(0);
+        let mut cut = fake_raw(new.dev, new.ino, FimOp::Modified as u8);
+        cut.modifier_pid = 4_300;
+        cut.op_flags = FIM_SETATTR_SIZE;
+        let fe = fx.drift(&cut).expect("a truncation");
+        assert!(!fe.renamed_away, "a truncation in place");
+        // a rename OVER the watched file (FIMR-004): no mark
+        let mut fx = LogFixture::new(4_000);
+        fx.baseline_now();
+        let prepared = fx.log.with_extension("new");
+        std::fs::write(&prepared, b"").unwrap();
+        std::fs::rename(&prepared, &fx.log).unwrap();
+        let mut over = fake_raw(fx.key.dev, fx.key.ino, FimOp::Renamed as u8);
+        over.op_flags = FIM_RENAME_REPLACED;
+        over.modifier_pid = 4_400;
+        let _ = fx.drift(&over);
+        let check = replacement_raws(&fx.path_map)
+            .into_iter()
+            .find(|r| r.modifier_pid == 4_400)
+            .expect("the rename over is checked");
+        assert_eq!(check.op_flags, 0, "no mark on a rename over");
+        let fe = fx.drift(&check).expect("the replaced content");
+        assert!(!fe.renamed_away, "a rename over");
+        // a kernel record with the drain's bit: cleared at the decode
+        let mut forged = fake_raw(fx.key.dev, fx.key.ino, FimOp::Modified as u8);
+        forged.op_flags = FIM_RENAMED_AWAY | FIM_WRITE_APPEND_ONLY;
+        let mut mounts = crate::sensors::open_sensor::MountTable::default();
+        let (decoded, _) = decode_record(bytemuck::bytes_of(&forged), &mut mounts).unwrap();
+        assert_eq!(decoded.op_flags, FIM_WRITE_APPEND_ONLY, "the kernel's bits only");
+    }
+
     /// The review of #554 (named, F1): a record seen at close carries its
     /// writer's start, and its pid may name another process by then — an
     /// `rsyslogd` started at the pid lent its image to a log's shrink. The
@@ -6266,6 +6343,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let own_sha = hash(own.as_bytes());
@@ -8332,6 +8410,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let read = |fe: &FimEvent| {
@@ -8465,6 +8544,7 @@ mod tests {
                 appends_only: true,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             kernel_login_unit_writer_owned(&fe, &raw, (&root, owner), &cg);
@@ -8685,6 +8765,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             read_login_unit_writer(&fe, 0, &proc, &root);
@@ -8769,6 +8850,7 @@ mod tests {
                 appends_only: false,
                 truncated_by_another: false,
                 unchanged_since_read: false,
+                renamed_away: false,
                 modifier_start: 0,
             };
             read_login_unit_writer(&fe, writer_start, &proc, &root);

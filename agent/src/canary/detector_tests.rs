@@ -174,6 +174,7 @@ fn fim_event_on(path: &str, pid: u32) -> Event {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         modifier_start: 0,
     })
 }
@@ -1030,6 +1031,7 @@ fn the_trips_own_connection_draws_no_chain_verdict_in_any_order() {
         appends_only: false,
         truncated_by_another: false,
         unchanged_since_read: false,
+        renamed_away: false,
         modifier_start: 0,
     });
     let late_exec = Event::ProcessSpawn {

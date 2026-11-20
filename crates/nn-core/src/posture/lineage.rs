@@ -487,6 +487,15 @@ struct Entry {
     /// every entry no exec of its own gave (a fork, an orphan, the start's
     /// scan) — its argv is not known.
     argv: Option<u64>,
+    /// Lot 376 (the review of #583, F1): the exec's argv is logrotate's run
+    /// with root's configuration only ([`rotates_with_root_config`]: no
+    /// option but `-f`/`--force`/`-v`/`--verbose`, no file but
+    /// `/etc/logrotate.conf` and `/etc/logrotate.d/<name>`), precomputed at
+    /// ingest as [`Self::encrypts`] is (the argv is not kept). `false` for
+    /// an argv the sensor cut and every entry no exec of its own gave (a
+    /// fork, an orphan, the start's scan). Meaningful only with the exe's
+    /// gate ([`AuthSessionTracker::exec_rotates_with_root_config`]).
+    root_rotation: bool,
     /// Review 85: what an interpreter `exe` runs ([`runs_of`]): a script
     /// path or a `-m` module; [`Runs::Inline`] for a binary or an inline
     /// program; lot 292: [`Runs::Unknown`] for an argv its table could not
@@ -1292,7 +1301,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1323,7 +1332,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (start_ns, None),
@@ -1341,7 +1350,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (0, None),
@@ -1415,6 +1424,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         } else {
             self.argv_digest(argv)
         };
+        // the review of #583 (F1): logrotate run with root's configuration
+        let root_rotation = !*argv_truncated && rotates_with_root_config(argv);
         let runs = with_pump_facts(
             runs_of(Path::new(path), argv),
             Path::new(path),
@@ -1429,7 +1440,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             *pid,
             *ppid,
             path,
-            (js_pm, encrypts, digest),
+            (js_pm, encrypts, digest, root_rotation),
             runs,
             *timestamp_ns,
             (*start_ns, None),
@@ -1541,7 +1552,12 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             pid,
             ppid,
             exe,
-            (js_pm, encrypts, self.argv_digest(argv)),
+            (
+                js_pm,
+                encrypts,
+                self.argv_digest(argv),
+                rotates_with_root_config(argv),
+            ),
             runs,
             spawn_ns,
             (start_ns, None),
@@ -1675,6 +1691,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 // exec, an encryption it was asked for included (as `fork_entry`)
                 encrypts: parent.encrypts,
                 argv: None,
+                root_rotation: false,
                 runs: parent.runs,
                 start_ticks: None,
                 uid: k.uid,
@@ -1788,7 +1805,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 pid,
                 ppid,
                 &exe,
-                (None, false, None),
+                (None, false, None, false),
                 runs,
                 0,
                 (start_ns, Some(ticks)),
@@ -1845,7 +1862,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
-        (js_pm, encrypts, argv): (Option<JsPm>, bool, Option<u64>),
+        (js_pm, encrypts, argv, root_rotation): (Option<JsPm>, bool, Option<u64>, bool),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
@@ -1863,6 +1880,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             js_pm,
             encrypts,
             argv,
+            root_rotation,
             runs,
             start_ticks,
             uid,
@@ -2145,7 +2163,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     pid,
                     e.ppid,
                     &e.exe.to_string_lossy(),
-                    (e.js_pm, e.encrypts, e.argv),
+                    (e.js_pm, e.encrypts, e.argv, e.root_rotation),
                     e.runs,
                     e.spawn_ns,
                     (e.start_ns, e.start_ticks),
@@ -2238,6 +2256,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             encrypts: first.encrypts,
             // the review of #552 (F1): its own argv is not known
             argv: None,
+            root_rotation: false,
             runs: first.runs.clone(),
             start_ticks: Some(ticks),
             uid,
@@ -2380,6 +2399,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             encrypts: parent.encrypts,
             // the review of #552 (F1): an exec's argv is its own process's
             argv: None,
+            root_rotation: false,
             runs: parent.runs,
             start_ticks: Some(ticks),
             uid,
@@ -2520,19 +2540,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .unwrap_or(false)
     }
 
-    /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`, run from a
-    /// session right after the boot, reading `/etc/sudoers` at the invoking
-    /// user's uid, judged before its exec reached the cache): `image`, the
-    /// kernel's identity of a process's executable AT an event
-    /// (`mm->exe_file`, the device in the kernel's form and the inode, as
-    /// the LSM file-open sensor reads it at the open), is the host's file
-    /// of an authentication binary ([`AUTH_BINARY_EXES`]) in a directory
-    /// root's and writable by no one else ([`Self::is_host_file_in_root_dir`])
-    /// — the reader itself is the auth stack, as
-    /// [`Self::is_credential_reader`] says of an exec it has. A copy, a
-    /// renamed or replaced binary, a file elsewhere, `(0, 0)` (not read):
-    /// not. The reader's children are not (POS-002: a session's shell reads
-    /// as itself).
     /// Lot 376 (the rc9 soak and its lab on Debian 13: ALERTED at a reboot
     /// — podman's quadlet user generator, run by the user's service manager
     /// as it starts, reading `/etc/passwd` for its name lookup; Debian's
@@ -2572,7 +2579,34 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 .any(|p| self.ran_host_file(manager.pid, as_of, p))
     }
 
-    pub fn is_auth_binary_image(&self, image: (u64, u64)) -> bool {
+    /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`, run from a
+    /// session right after the boot, reading `/etc/sudoers` at the invoking
+    /// user's uid, judged before its exec reached the cache): `image`, the
+    /// kernel's identity of `pid`'s executable AT an event (`mm->exe_file`,
+    /// the device in the kernel's form and the inode, as the LSM file-open
+    /// sensor reads it at the open), is the host's file of an
+    /// authentication binary ([`AUTH_BINARY_EXES`]) in a directory root's
+    /// and writable by no one else ([`Self::is_host_file_in_root_dir`]) —
+    /// the reader itself is the auth stack, as
+    /// [`Self::is_credential_reader`] says of an exec it has. A copy, a
+    /// renamed or replaced binary, a file elsewhere, `(0, 0)` (not read):
+    /// not. The reader's children are not (POS-002: a session's shell reads
+    /// as itself).
+    ///
+    /// The review of #583 (F4): only when the spawn cache holds no exec of
+    /// `pid` as of `as_of` — the race the image closes, an exec not read
+    /// yet. `mm->exe_file` is the process's to change (`prctl(PR_SET_MM,
+    /// PR_SET_MM_MAP)` with an `exe_fd`: CAP_SYS_ADMIN or
+    /// CAP_CHECKPOINT_RESTORE in its own user namespace): an exec the cache
+    /// holds (`/tmp/x`) is what the process runs, whatever image it names
+    /// at the open.
+    pub fn is_auth_binary_image(&self, pid: u32, as_of: AsOf, image: (u64, u64)) -> bool {
+        if matches!(
+            self.cached_live(pid, as_of.time()),
+            CachedAt::Current(_) | CachedAt::Past(_)
+        ) {
+            return false;
+        }
         image.1 != 0
             && AUTH_BINARY_EXES
                 .iter()
@@ -3047,6 +3081,38 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         };
         let (package, kind) = name.rsplit_once('.')?;
         (KINDS.contains(&kind) && is_package_name(package)).then(|| package.to_string())
+    }
+
+    /// The review of #583 (F2): the package whose dpkg maintainer script
+    /// ([`Self::maintainer_script_package`]) runs in `pid`'s lineage as of
+    /// `as_of` — `pid` itself or an ancestor, below the nearest package
+    /// manager proper ([`PACKAGE_MANAGER_EXES`], what the kernel executed)
+    /// above it: what a package's own program in its transaction descends
+    /// from. An APT hook (`APT::Update::Post-Invoke`, `DPkg::Post-Invoke`:
+    /// a shell `apt-get` itself runs, apt-daily's run included), dpkg's own
+    /// hooks (`--pre-invoke`), a script a maintainer script's package
+    /// manager runs above it, an rpm scriptlet (no such file): `None`. A hop
+    /// whose exec is not in the spawn cache vouches for nothing.
+    pub fn maintainer_script_in_lineage(&self, pid: u32, as_of: AsOf) -> Option<String> {
+        let below = std::cell::RefCell::new(Vec::new());
+        let Some(Some(_manager)) = self.lineage_walk(
+            pid,
+            as_of,
+            |hop| {
+                if is_package_manager_binary(&hop.exe) {
+                    return true;
+                }
+                below.borrow_mut().push(hop.pid);
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        ) else {
+            return None;
+        };
+        below
+            .into_inner()
+            .into_iter()
+            .find_map(|p| self.maintainer_script_package(p, as_of))
     }
 
     /// The review of #580's lab: the one file of dpkg's `info` directory
@@ -3848,6 +3914,25 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             CachedAt::Current(e) | CachedAt::Past(e) => e.argv.is_some() && e.argv == want,
             CachedAt::LaterOnly | CachedAt::Absent => false,
         }
+    }
+
+    /// Lot 376 (the review of #583, F1): `pid`'s exec, as of `as_of`, ran
+    /// logrotate with root's configuration only ([`Entry::root_rotation`]:
+    /// [`rotates_with_root_config`]), and that configuration lies in
+    /// directories root's and writable by no one else under the host's root
+    /// ([`PostureHost::dir_is_root_only`]: `/etc`, `/etc/logrotate.d`) —
+    /// what it trusts is root's own, whether or not the FIM watches it.
+    /// From the spawn cache only: `false` when it does not hold the exec.
+    /// The caller checks that the exec is the packaged logrotate.
+    pub fn exec_rotates_with_root_config(&self, pid: u32, as_of: AsOf) -> bool {
+        let rotation = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e.root_rotation,
+            CachedAt::LaterOnly | CachedAt::Absent => false,
+        };
+        rotation
+            && ["/etc", LOGROTATE_ROOT_DROP_INS]
+                .iter()
+                .all(|d| self.is_root_only_host_dir(d.trim_end_matches('/')))
     }
 
     /// Lot 340 (the alpha's daily false positives): `pid` is the Go
@@ -5173,6 +5258,51 @@ fn in_snapd_service(facts: &dyn crate::decision::rule_policy::ActorFacts, pid: u
         .is_some_and(|cg| crate::response::cgroup::cgroup_at(&cg, SNAPD_SERVICE_CGROUP))
         && facts.started_in_cgroup(pid) == Some(true)
         && facts.injected(pid) == Some(crate::decision::rule_policy::Injected::No)
+}
+
+/// Lot 376 (the review of #583, F1): root's configuration of logrotate —
+/// the main file and the files of its drop-in directory, both root's.
+const LOGROTATE_ROOT_CONFIG: &str = "/etc/logrotate.conf";
+const LOGROTATE_ROOT_DROP_INS: &str = "/etc/logrotate.d/";
+
+/// Lot 376 (the review of #583, F1): `argv` runs logrotate (`argv[0]` by its
+/// basename) with root's configuration only, as an administrator rotates by
+/// hand (`logrotate -f /etc/logrotate.conf`, `logrotate -vf
+/// /etc/logrotate.d/rsyslog`): every option is `-f`, `--force`, `-v` or
+/// `--verbose` (or a cluster of `f` and `v`: `-fv`), every other argument
+/// is [`LOGROTATE_ROOT_CONFIG`] or a name directly in
+/// [`LOGROTATE_ROOT_DROP_INS`] (no `/`, no `.` or `..`), and there is one at
+/// least. A state file of the caller's (`-s`), a configuration elsewhere
+/// (`/tmp/evil.conf`, `/etc/logrotate.d/../../tmp/x`), a mail command
+/// (`-m`), `--`, anything else: `false`.
+fn rotates_with_root_config(argv: &[String]) -> bool {
+    let Some((first, rest)) = argv.split_first() else {
+        return false;
+    };
+    if first.rsplit('/').next() != Some("logrotate") {
+        return false;
+    }
+    let mut files = 0;
+    for a in rest {
+        let ok = match a.as_str() {
+            "--force" | "--verbose" => true,
+            opt if opt.starts_with("--") => false,
+            opt if opt.starts_with('-') => {
+                opt.len() > 1 && opt[1..].bytes().all(|b| b == b'f' || b == b'v')
+            }
+            file => {
+                files += 1;
+                file == LOGROTATE_ROOT_CONFIG
+                    || file
+                        .strip_prefix(LOGROTATE_ROOT_DROP_INS)
+                        .is_some_and(|n| !n.is_empty() && !n.contains('/') && n != "." && n != "..")
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    files > 0
 }
 
 fn is_package_manager_binary(exe: &Path) -> bool {
@@ -8713,7 +8843,7 @@ mod tests {
             pid,
             ppid,
             exe,
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             spawn_ns,
             (start_ns, None),
@@ -9411,7 +9541,7 @@ mod tests {
             270,
             100,
             "/usr/bin/bash",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -9425,7 +9555,7 @@ mod tests {
             280,
             100,
             "/home/alice/askpass",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -9444,7 +9574,7 @@ mod tests {
                 pid,
                 ppid,
                 exe,
-                (None, false, None),
+                (None, false, None, false),
                 Runs::Inline,
                 0,
                 (3, Some(0)),
@@ -9636,7 +9766,7 @@ mod tests {
             500,
             50,
             "/usr/bin/sudo",
-            (None, false, None),
+            (None, false, None, false),
             Runs::Inline,
             0,
             (3, Some(0)),
@@ -10699,6 +10829,7 @@ mod tests {
             js_pm: None,
             encrypts: false,
             argv: None,
+            root_rotation: false,
             runs: Runs::Inline,
             start_ticks,
             uid: 0,
