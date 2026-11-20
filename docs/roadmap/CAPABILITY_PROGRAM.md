@@ -11738,12 +11738,33 @@ number in parentheses is a lab PR.
       `roles_released`, a note.
     - F5: the integrity round's agent cgroup is `northnarrow.slice`'s
       (NN-AUD-113's limits and the pin lock's redo run again).
-    - F6: the kernel's "vacated this boot" mark per role (`ROLE_MARKS`, no
-      syscall writes it); each role's start judges the other's process.
+    - F6: the kernel's "vacated this boot" mark per role (`ROLE_MARKS`);
+      each role's start judges the other's process.
     - F7: the privileged `a_unit_restart_takes_the_vacated_role_under_enforce`
       on the installed unit.
     - F8: the public texts say what is recorded and what is not yet
       guaranteed, as behaviour.
+  - The re-check of #582, fix round 2:
+    - N0: `MemoryDenyWriteExecute=` off judged as systemd parses a boolean;
+      the agent's start signs it off in systemd's copy (`units_mdwe`).
+    - N1: `ROLE_MARKS` (and the new `ROLE_EXITS`) frozen at the agent's
+      load (`BPF_F_RDONLY` was a descriptor's flag); read only when frozen.
+    - N2: the respawn gate holds nothing inside a signed window, and the
+      window's host becomes its reference (`respawn_gate_reference_moved`).
+    - N3: systemd's copy of the agent's unit and each preloaded library
+      judged before a start; a start the watchdog did not make is recorded
+      (`role_taken_by_another_start`). The gate is still not binding: a
+      start it did not make is recorded after it, not prevented — with
+      F2 (a), for the post-alpha lot.
+    - N4: a successor judged once, by the next start of the other role
+      after the vacancy (the kernel's exit time per role); a library
+      replaced by a package upgrade judged by identity
+      (`…_successor_unconfirmed` when not the judge's own copy).
+    - N5, N6, N8: what a start cannot read is judged and recorded; a torn
+      append repaired (`witness_chain_torn`), the chain rotated within a
+      life; only a clean stop inside a window is the operator's, a signed
+      stop counts only this boot.
+    - R9-1 stays open (partial) for the alpha (KNOWN_LIMITATIONS, §61).
   - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a

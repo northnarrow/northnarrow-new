@@ -161,13 +161,15 @@ fn every_start_the_watchdog_makes_is_judged_first() {
     // the re-check of #582 (N2, N3): judged with the window's state, the
     // judgement's end kept for the successor
     let gate = wd
-        .find("let (host, adopted) = judge_host(&cli.bpffs_root).await;")
+        .find("let (host, adopted, judged_in_window) = judge_host(&cli.bpffs_root).await;")
         .expect("the gate before the respawn");
     let hold_at = wd[gate..]
         .find("if let Some(why) = &host.hold {")
         .map(|i| i + gate)
         .expect("its verdict");
-    assert!(wd[gate..hold_at].contains("let judged_at = antitamper_bpf::start_check::boot_ns_now();"));
+    assert!(
+        wd[gate..hold_at].contains("let judged_at = antitamper_bpf::start_check::boot_ns_now();")
+    );
     let held = wd[gate..]
         .find("REASON_RESPAWN_HELD")
         .map(|i| i + gate)

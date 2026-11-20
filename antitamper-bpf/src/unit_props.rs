@@ -250,7 +250,11 @@ pub fn loaded_view_of(v: &[Value]) -> io::Result<LoadedView> {
         return Err(bad("MemoryDenyWriteExecute"));
     };
     let mut exec = String::new();
-    for (name, cmds) in [("ExecStartPre", pre), ("ExecStart", start), ("ExecStartPost", post)] {
+    for (name, cmds) in [
+        ("ExecStartPre", pre),
+        ("ExecStart", start),
+        ("ExecStartPost", post),
+    ] {
         let Value::Array(cmds) = cmds else {
             return Err(bad(name));
         };
@@ -337,7 +341,10 @@ mod tests {
         assert_ne!(a.env, d.env);
         assert!(!d.mdwe);
         let shown = format!("{d:?}");
-        assert!(!shown.contains("debug") && !shown.contains("/usr/bin/a"), "{shown}");
+        assert!(
+            !shown.contains("debug") && !shown.contains("/usr/bin/a"),
+            "{shown}"
+        );
         // a value of another type, or another count, is refused
         let mut bad = values(&[], true, "/usr/bin/a", 7);
         bad[4] = Value::U32(1);

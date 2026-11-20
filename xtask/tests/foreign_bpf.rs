@@ -1296,7 +1296,10 @@ fn the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes() {
     let c = code("agent-ebpf/src/bpf_defense.rs");
     assert!(c.contains("pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);"));
     assert!(c.contains("pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);"));
-    assert!(!c.contains("BPF_F_RDONLY"), "a descriptor's flag is no map's");
+    assert!(
+        !c.contains("BPF_F_RDONLY"),
+        "a descriptor's flag is no map's"
+    );
     in_order(
         body(&c, "role_exit"),
         &[

@@ -607,7 +607,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     let clean = northnarrow_watchdog::witness::clean_stop(&cause);
                     // the review of #582 (F2 d): what the host would give a
                     // successor, as the vacancy begins
-                    let (host, adopted) = judge_host(&cli.bpffs_root).await;
+                    let (host, adopted, _) = judge_host(&cli.bpffs_root).await;
                     w.record_or_log(
                         northnarrow_watchdog::witness::vacancy_kind(&verdict, in_window, clean),
                         &format!(
@@ -716,11 +716,10 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // by the witness and in the agent's hold records). The
                 // re-check of #582 (N2): nothing held inside a signed window,
                 // whose host becomes the reference (signed).
-                let (host, adopted) = judge_host(&cli.bpffs_root).await;
+                let (host, adopted, judged_in_window) = judge_host(&cli.bpffs_root).await;
                 // the re-check of #582 (N3): when the judgement ended — a
                 // successor that started before it is not this start's
                 let judged_at = antitamper_bpf::start_check::boot_ns_now();
-                let judged_in_window = host.found.starts_with("inside a signed");
                 if let Some(w) = witness.as_mut() {
                     record_adopted(w, adopted);
                 }
@@ -1165,15 +1164,23 @@ async fn respawn_cycle(
     // The re-check of #582 (N3): never one that started before the gate's
     // judgement (`judged_at`, outside a window): not this start's.
     let mut judged = judge_successor(old_pid, new_pid);
-    judged.unmade = judged_at
-        .is_some_and(|at| antitamper_bpf::start_check::started_before(new_pid, at));
+    judged.unmade =
+        judged_at.is_some_and(|at| antitamper_bpf::start_check::started_before(new_pid, at));
     let given = judged.given && !judged.unmade;
     let successor = judged.detail.clone();
     // Defensive reinsert — never for an agent that already exited (its pid
     // would wait in PROTECTED_PIDS for reuse). Failure here just widens
     // the brief window before the new agent's own register_protected_pids
     // fires — not a fatal restart-cycle error.
-    if !given {
+    if judged.unmade {
+        warn!(
+            target: "watchdog.tamper",
+            new_pid,
+            detail = %successor,
+            "the agent's successor started before the watchdog judged the host — a start the \
+             watchdog did not make; it does not re-register it"
+        );
+    } else if !given {
         warn!(
             target: "watchdog.tamper",
             new_pid,
@@ -1254,10 +1261,7 @@ fn record_adopted(w: &mut northnarrow_watchdog::witness::Witness, adopted: Optio
 /// The re-check of #582 (N2): inside a signed trusted-installer window, the
 /// host as it is becomes the respawn gate's reference — signed when it
 /// moved. Outside a window (or the window not read) nothing moves.
-async fn adopt_in_window(
-    cli: &Cli,
-    witness: &mut Option<northnarrow_watchdog::witness::Witness>,
-) {
+async fn adopt_in_window(cli: &Cli, witness: &mut Option<northnarrow_watchdog::witness::Witness>) {
     if !antitamper_bpf::window_open(&cli.bpffs_root).unwrap_or(false) {
         return;
     }
@@ -1284,21 +1288,28 @@ const WITNESS_HEAD_EVERY: Duration = Duration::from_secs(30);
 /// says so.
 async fn judge_host(
     bpffs_root: &std::path::Path,
-) -> (northnarrow_watchdog::respawn_gate::Verdict, Option<String>) {
+) -> (
+    northnarrow_watchdog::respawn_gate::Verdict,
+    Option<String>,
+    bool,
+) {
     let in_window = antitamper_bpf::window_open(bpffs_root).unwrap_or(false);
-    tokio::task::spawn_blocking(move || northnarrow_watchdog::respawn_gate::judge_now(in_window))
-        .await
-        .unwrap_or_else(|e| {
-            let found = format!("not judged: {e}");
-            (
-                northnarrow_watchdog::respawn_gate::Verdict {
-                    hold: None,
-                    detail: format!("the host before the start {found}"),
-                    found,
-                },
-                None,
-            )
-        })
+    let (v, adopted) = tokio::task::spawn_blocking(move || {
+        northnarrow_watchdog::respawn_gate::judge_now(in_window)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        let found = format!("not judged: {e}");
+        (
+            northnarrow_watchdog::respawn_gate::Verdict {
+                hold: None,
+                detail: format!("the host before the start {found}"),
+                found,
+            },
+            None,
+        )
+    });
+    (v, adopted, in_window)
 }
 
 /// The review of #582 (F6): at this watchdog's start, the agent `pid` it

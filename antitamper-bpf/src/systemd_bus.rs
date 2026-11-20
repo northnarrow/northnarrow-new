@@ -630,7 +630,9 @@ impl Cursor<'_> {
                     out.push(self.value(elem, depth + 1)?);
                 }
                 if self.pos != end {
-                    return Err(other("D-Bus: an array's length is not its elements'".into()));
+                    return Err(other(
+                        "D-Bus: an array's length is not its elements'".into(),
+                    ));
                 }
                 Value::Array(out)
             }
@@ -870,7 +872,10 @@ mod tests {
     fn arrays_and_structures_are_read() {
         let mut body = Vec::new();
         put_signature(&mut body, "as");
-        put_strings(&mut body, &["/etc/systemd/system/a.d/x.conf", "/run/y.conf"]);
+        put_strings(
+            &mut body,
+            &["/etc/systemd/system/a.d/x.conf", "/run/y.conf"],
+        );
         assert_eq!(
             parse_reply(&reply_body(4, &body), 4).unwrap(),
             Some(Value::Array(vec![
@@ -895,7 +900,10 @@ mod tests {
         let start = body.len();
         pad(&mut body, 8);
         put_string(&mut body, "/usr/bin/northnarrow-agent");
-        put_strings(&mut body, &["/usr/bin/northnarrow-agent", "--config", "/etc/x"]);
+        put_strings(
+            &mut body,
+            &["/usr/bin/northnarrow-agent", "--config", "/etc/x"],
+        );
         pad(&mut body, 4);
         body.extend_from_slice(&0u32.to_le_bytes());
         pad(&mut body, 8);

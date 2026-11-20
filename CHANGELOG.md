@@ -59,9 +59,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `a_foreign_watchdog_successor_is_recorded_as_holding_the_role_never_as_refused`.
   - **Each role judges the other's successor at its own start** (the
     review of #582, F6): the kernel marks each role vacated once its holder
-    exits (a mark no process can write, which no claim clears), and the
-    watchdog's start and the agent's judge the other's process when that
-    role was vacated earlier in the boot.
+    exits, and when (a mark no claim clears, in maps the agent's load
+    freezes), and the watchdog's start and the agent's judge the other's
+    process once: when it took its role while their own role was vacant
+    (the re-check, N4: a long-running process an earlier holder saw start
+    is never judged again days later). Test
+    `a_successor_is_judged_once_by_the_next_start_of_the_other_role`.
   - **The operator's own stops are notes** (the review of #582, F4): the
     agent's vacancy inside a signed trusted-installer window (the guide's
     restart) is `role_released_in_window`, a note, not `role_vacated`
@@ -130,6 +133,64 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `the_watchdog_signs_the_agent_s_vacancy_and_its_successor`.
   - KNOWN_LIMITATIONS: the vacated-role item says what is recorded, by
     whom, and what is not yet guaranteed.
+  - **The re-check of #582** (fix round 2):
+    - `MemoryDenyWriteExecute=` off is read as systemd reads a boolean
+      (any case; `n`, `No`, `FALSE`, an empty reset): a harmful drop-in in
+      every spelling (N0). The agent's start reads both units'
+      `MemoryDenyWriteExecute` from systemd's copy and signs a degradation
+      when it is off (`units_mdwe`). Test
+      `memory_deny_write_execute_off_is_judged_as_systemd_parses_it`.
+    - The kernel's record of the roles' exits is frozen by the agent's load
+      (`BPF_MAP_FREEZE`; N1: `BPF_F_RDONLY` was the creating descriptor's
+      flag, not the map's, so the family's handles could write it), and
+      read only when frozen: a map not frozen is not known, the High paths
+      apply, signed (`role_marks`). Tests
+      `the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes`,
+      `a_map_is_read_as_frozen_only_when_its_fdinfo_says_so`.
+    - The respawn gate holds nothing inside a signed trusted-installer
+      window (the guide's `systemctl edit` and restart), and what the host
+      is then becomes its reference, signed (`respawn_gate_reference_moved`,
+      a note); never otherwise (N2). Test
+      `the_gate_holds_nothing_inside_a_signed_window_and_adopts_the_host`.
+    - The gate reads systemd's copy of the agent's unit too — its loaded
+      drop-ins, environment, unset variables, commands and memory
+      protection — and holds on a drop-in it loaded that is no longer on
+      disk or was not loaded at the watchdog's start, or on a change; it
+      judges each library a preload list names, and holds when one became
+      loadable or changed (N3). A successor that had started before the
+      gate's judgement, outside a window, is recorded as the role taken by
+      a start the watchdog did not make (`role_taken_by_another_start`,
+      High), with the host read after it. Tests
+      `systemd_s_copy_of_the_agent_s_unit_is_judged_before_a_start`,
+      `a_library_the_preload_list_names_that_became_loadable_holds`,
+      `arrays_and_structures_are_read`,
+      `systemd_s_copy_of_a_unit_is_read_for_what_its_start_runs`.
+    - A library a package upgrade replaced since a running process mapped
+      it ("(deleted)") is judged by identity, never foreign on that alone:
+      the judge's own copy is expected; another is signed
+      `role_successor_unconfirmed` / `watchdog_successor_unconfirmed`
+      (High), the successor still registered (N4). Tests
+      `a_library_replaced_since_it_was_mapped_is_judged_by_identity`,
+      `a_successor_with_an_unconfirmed_library_is_given_and_high`.
+    - Marks or maps a start cannot read are judged and recorded, never
+      skipped silently (N5): the watchdog's record for the agent to sign,
+      the agent's degradation; a file of one role's alone keeps its plain
+      protection when its role registration fails (`role_write_inodes`).
+    - The witness chain: a torn append of the watchdog's own is cut back
+      and said `witness_chain_torn` (a note), never a cut; the chain
+      rotates within a watchdog's life before it passes what is read, and
+      the agent's import continues through the rotated chain; each cut is
+      set aside under a name of its own; a cut row not written is written
+      before the next (N6). Tests
+      `a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn`,
+      `a_full_chain_rotates_within_a_life_and_cuts_keep_their_own_names`.
+    - Inside a window only a clean stop (exit status 0 or SIGTERM) is the
+      operator's, as the kernel marked the exit; a signed stop counts for
+      the gap only when signed this boot (N8). Tests
+      `inside_a_window_only_a_clean_stop_is_the_operator_s`,
+      `only_a_certified_release_as_the_chain_s_last_row_is_a_signed_stop`.
+    - The units' and KNOWN_LIMITATIONS' claims on memory protection and on
+      the chain's own record corrected (N7).
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep

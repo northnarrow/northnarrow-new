@@ -1088,7 +1088,9 @@ mod tests {
                 "/usr/lib/x86_64-linux-gnu/libevil.so (deleted)"
             ]
         );
-        assert!(foreign.iter().all(|f| f.why == "a file deleted since it was mapped"));
+        assert!(foreign
+            .iter()
+            .all(|f| f.why == "a file deleted since it was mapped"));
         // a start: every deleted file foreign, as before
         let (foreign, replaced) = judge_mappings(maps, ("/x", 1), Libs::Start, none, &own);
         assert_eq!(foreign.len(), 5);
@@ -1109,6 +1111,10 @@ mod tests {
         };
         assert!(f.clean(), "not foreign on that alone");
         assert!(!f.confirmed());
-        assert!(f.describe().contains("identity not confirmed"), "{}", f.describe());
+        assert!(
+            f.describe().contains("identity not confirmed"),
+            "{}",
+            f.describe()
+        );
     }
 }

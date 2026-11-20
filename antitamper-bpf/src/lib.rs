@@ -1273,7 +1273,10 @@ mod tests {
         let v = Some(ROLE_MARK_VACATED);
         let w = Some(ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW);
         // the other role never vacated: its first holder, nothing to judge
-        assert_eq!(succession_to_judge(Some(0), v, Some(100 * S), Some(5 * S)), None);
+        assert_eq!(
+            succession_to_judge(Some(0), v, Some(100 * S), Some(5 * S)),
+            None
+        );
         // it took its role after this role's last exit
         assert!(succession_to_judge(v, v, Some(100 * S), Some(101 * S)).is_some());
         assert!(succession_to_judge(w, w, Some(100 * S), Some(100 * S)).is_some());
@@ -1297,7 +1300,10 @@ mod tests {
             (v, v, Some(0), Some(10 * S)),
             (v, v, Some(100 * S), None),
         ] {
-            assert!(succession_to_judge(o, m, e, st).is_some(), "{o:?} {m:?} {e:?} {st:?}");
+            assert!(
+                succession_to_judge(o, m, e, st).is_some(),
+                "{o:?} {m:?} {e:?} {st:?}"
+            );
         }
     }
 

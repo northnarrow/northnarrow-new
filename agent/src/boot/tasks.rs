@@ -522,7 +522,10 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         ae,
                         antitamper_bpf::start_check::start_boot_ns(p),
                     ) {
-                        debug!(watchdog_pid = p, why, "the watchdog found first is judged as a successor");
+                        debug!(
+                            watchdog_pid = p,
+                            why, "the watchdog found first is judged as a successor"
+                        );
                         succession_pending = true;
                     }
                 }

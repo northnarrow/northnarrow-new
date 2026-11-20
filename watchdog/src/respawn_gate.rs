@@ -187,8 +187,26 @@ pub const SEARCH_DIRS: &[&str] = &[
 pub fn candidates(name: &str) -> Vec<String> {
     let mut out = vec![name.to_string()];
     for (token, values) in [
-        ("$LIB", &["lib", "lib64", "lib/x86_64-linux-gnu", "usr/lib", "usr/lib64"][..]),
-        ("${LIB}", &["lib", "lib64", "lib/x86_64-linux-gnu", "usr/lib", "usr/lib64"][..]),
+        (
+            "$LIB",
+            &[
+                "lib",
+                "lib64",
+                "lib/x86_64-linux-gnu",
+                "usr/lib",
+                "usr/lib64",
+            ][..],
+        ),
+        (
+            "${LIB}",
+            &[
+                "lib",
+                "lib64",
+                "lib/x86_64-linux-gnu",
+                "usr/lib",
+                "usr/lib64",
+            ][..],
+        ),
         ("$PLATFORM", &["x86_64", "haswell", "xeon_phi"][..]),
         ("${PLATFORM}", &["x86_64", "haswell", "xeon_phi"][..]),
     ] {
@@ -430,7 +448,9 @@ fn judge_loaded(
     let now = match now {
         Ok(n) => n,
         Err(why) => {
-            seen.push(format!("systemd's copy of the agent's unit not read ({why})"));
+            seen.push(format!(
+                "systemd's copy of the agent's unit not read ({why})"
+            ));
             return (held, seen);
         }
     };
@@ -488,7 +508,9 @@ fn judge_loaded(
         }
     }
     if now.need_reload {
-        seen.push("systemd's copy of the agent's unit is not what is on disk (NeedDaemonReload)".into());
+        seen.push(
+            "systemd's copy of the agent's unit is not what is on disk (NeedDaemonReload)".into(),
+        );
     }
     (held, seen)
 }
@@ -790,11 +812,9 @@ mod tests {
             "",
             Kind::Harmful,
         );
-        assert!(
-            j(&base, &Preload::Absent, &[other.clone(), unread.clone()])
-                .hold
-                .is_some()
-        );
+        assert!(j(&base, &Preload::Absent, &[other.clone(), unread.clone()])
+            .hold
+            .is_some());
         let changed = Harm {
             value: "x".into(),
             ..other
@@ -854,11 +874,18 @@ mod tests {
         );
         set_baseline(base.clone());
         let moved = adopt(&h).expect("the reference moves");
-        assert!(moved.contains("as a signed trusted-installer window left it"), "{moved}");
+        assert!(
+            moved.contains("as a signed trusted-installer window left it"),
+            "{moved}"
+        );
         assert_eq!(adopt(&h), None, "nothing new: no second row");
         let later = judge_with(&baseline(), &h, false, |_| true);
         assert_eq!(later.hold, None, "{}", later.detail);
-        assert!(later.detail.contains("as at the watchdog's start"), "{}", later.detail);
+        assert!(
+            later.detail.contains("as at the watchdog's start"),
+            "{}",
+            later.detail
+        );
         set_baseline(base);
     }
 
@@ -892,12 +919,26 @@ mod tests {
             loaded: Ok(v),
             ..host(&Preload::Absent, &[])
         };
-        let same = judge_with(&base, &with(view(&[a], &["RUST_LOG=info"], true)), false, |_| true);
+        let same = judge_with(
+            &base,
+            &with(view(&[a], &["RUST_LOG=info"], true)),
+            false,
+            |_| true,
+        );
         assert_eq!(same.hold, None, "{}", same.detail);
         let cases = [
-            (view(&[a, b], &["RUST_LOG=info"], true), "since the watchdog's start: /etc"),
-            (view(&[a], &["RUST_LOG=info", "NN_BPF_DEFENSE_OBSERVE=1"], true), "NN_BPF_DEFENSE_OBSERVE"),
-            (view(&[a], &["RUST_LOG=info"], false), "MemoryDenyWriteExecute turned off"),
+            (
+                view(&[a, b], &["RUST_LOG=info"], true),
+                "since the watchdog's start: /etc",
+            ),
+            (
+                view(&[a], &["RUST_LOG=info", "NN_BPF_DEFENSE_OBSERVE=1"], true),
+                "NN_BPF_DEFENSE_OBSERVE",
+            ),
+            (
+                view(&[a], &["RUST_LOG=info"], false),
+                "MemoryDenyWriteExecute turned off",
+            ),
             (
                 LoadedView {
                     unset: vec![],
@@ -915,14 +956,29 @@ mod tests {
         ];
         for (v, why) in cases {
             let out = judge_with(&base, &with(v), false, |_| true);
-            let held = out.hold.unwrap_or_else(|| panic!("not held: {}", out.detail));
+            let held = out
+                .hold
+                .unwrap_or_else(|| panic!("not held: {}", out.detail));
             assert!(held.contains(why), "{why}: {held}");
             assert!(!held.contains("debug"), "never a value");
         }
         // loaded, then deleted from disk: the copy still applies it
-        let gone = judge_with(&base, &with(view(&[a, b], &["RUST_LOG=info"], true)), false, |p| p != b);
-        assert!(gone.hold.unwrap().contains("no longer on disk: /etc/systemd/system/service.d/zz.conf"));
-        let gone_old = judge_with(&base, &with(view(&[a], &["RUST_LOG=info"], true)), false, |p| p != a);
+        let gone = judge_with(
+            &base,
+            &with(view(&[a, b], &["RUST_LOG=info"], true)),
+            false,
+            |p| p != b,
+        );
+        assert!(gone
+            .hold
+            .unwrap()
+            .contains("no longer on disk: /etc/systemd/system/service.d/zz.conf"));
+        let gone_old = judge_with(
+            &base,
+            &with(view(&[a], &["RUST_LOG=info"], true)),
+            false,
+            |p| p != a,
+        );
         assert!(gone_old.hold.unwrap().contains("no longer on disk"));
         // recorded only
         let stale = judge_with(
@@ -935,7 +991,11 @@ mod tests {
             |_| true,
         );
         assert_eq!(stale.hold, None);
-        assert!(stale.detail.contains("NeedDaemonReload"), "{}", stale.detail);
+        assert!(
+            stale.detail.contains("NeedDaemonReload"),
+            "{}",
+            stale.detail
+        );
         let unread = judge_with(&base, &host(&Preload::Absent, &[]), false, |_| true);
         assert_eq!(unread.hold, None);
         assert!(unread.detail.contains("not read"), "{}", unread.detail);
@@ -972,7 +1032,10 @@ mod tests {
         std::fs::write(&lib, b"\x7fELF not really").unwrap();
         let v = judge_with(&base, &read(), false, |_| true);
         let why = v.hold.expect("a named library became loadable");
-        assert!(why.contains("became loadable or changed since") && why.contains("k374-vendor.so"), "{why}");
+        assert!(
+            why.contains("became loadable or changed since") && why.contains("k374-vendor.so"),
+            "{why}"
+        );
         // as at the start, now with the file: recorded
         let base = Baseline::of_host(&read());
         assert_eq!(judge_with(&base, &read(), false, |_| true).hold, None);

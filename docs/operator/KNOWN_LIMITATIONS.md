@@ -413,17 +413,32 @@ not cause as an incident.
     `witness_row_uncertified`).
   - Before each start of the agent it makes, the watchdog compares what
     the host would give the successor before its start — a loader preload
-    list, a drop-in that changes our units' code — with what it read at
-    its own start: a change holds the start (`role_respawn_held`,
+    list and each library it names, a drop-in that changes our units'
+    code, systemd's copy of the agent's unit — with what it read at its
+    own start: a change holds the start (`role_respawn_held`,
     `watchdog_respawn_held`, High) until an operator acts; what was there
-    before is recorded only.
-  - An exit inside a signed trusted-installer window (the operator's
+    before is recorded only. Inside a signed trusted-installer window
+    nothing is held, and the host as the operator leaves it there becomes
+    the reference (`respawn_gate_reference_moved`, signed): a later start
+    in the same watchdog life is judged against it. A change made outside
+    a window stays the reference's difference for that watchdog's life,
+    until an operator starts the agent or the host is as it was. A
+    successor that started before that judgement, outside a window, is
+    recorded as the role taken by a start the watchdog did not make
+    (`role_taken_by_another_start`, High), after that start.
+  - A clean stop inside a signed trusted-installer window (the operator's
     restart or stop) is a note (`role_released_in_window`), as is a
-    shutdown the admin quorum signed (`role_released`).
+    shutdown the admin quorum signed (`role_released`); another exit inside
+    a window stays `role_vacated`.
   - The watchdog's vacancy and its successor are signed by the live agent
     (`watchdog_gone`, then `watchdog_succession` or
     `watchdog_successor_foreign`). When a role was vacated earlier in the
-    boot, each role's start judges the other role's process.
+    boot, each role's start judges the other role's process once, when it
+    took its role while the judging role was vacant. A library replaced on
+    disk since a process mapped it is judged by identity: not the judging
+    role's own copy, it is signed High (`role_successor_unconfirmed`,
+    `watchdog_successor_unconfirmed`), and the process keeps its
+    registration.
   - When both roles were vacated, the next agent start signs the gap it
     finds (`roles_vacated_gap`), or a note when the operator released both
     (`roles_released`).
@@ -445,13 +460,14 @@ not cause as an incident.
   the starting process. What is not yet guaranteed: a successor that runs
   code root gave it before its start, and that hides it, is not reliably
   told from its unit's clean restart; what it signs then, its import of
-  the watchdog's rows included, is not evidence — the watchdog's chain
-  keeps its own record of that succession. While the watchdog is gone too,
-  or runs without its witness (`witness_unavailable`, High), the agent's
+  the watchdog's rows included, is not evidence, and neither is the
+  absence of the watchdog's rows about it. The watchdog's judgement of the
+  host before a start covers the starts it makes: a start it did not make
+  is recorded after it, not prevented. While the watchdog is gone too, or
+  runs without its witness (`witness_unavailable`, High), the agent's
   vacancy is recorded by its successor's own start (`previous_run`, the
   succession record) and by the gap the next start finds, and a change to
-  the chain made while no watchdog runs is seen only for the rows the agent
-  had already imported. On a host without systemd (the watchdog's `exec`
+  the chain made while no watchdog runs is not always detected. On a host without systemd (the watchdog's `exec`
   respawn backend) a vacated role is not taken again until the next boot.
   The agent judges a process that takes the watchdog's role at its next
   round, while the kernel's guard refuses one outside the unit at once.
@@ -467,6 +483,13 @@ not cause as an incident.
   `the_witness_chain_is_the_watchdog_role_s_alone_and_never_opened_for_writing`;
   `a_preload_new_since_the_watchdog_s_start_holds_and_an_old_one_is_recorded`;
   `a_code_drop_in_new_since_the_watchdog_s_start_holds`;
+  `the_gate_holds_nothing_inside_a_signed_window_and_adopts_the_host`;
+  `systemd_s_copy_of_the_agent_s_unit_is_judged_before_a_start`;
+  `a_library_the_preload_list_names_that_became_loadable_holds`;
+  `a_successor_is_judged_once_by_the_next_start_of_the_other_role`;
+  `a_library_replaced_since_it_was_mapped_is_judged_by_identity`;
+  `a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn`;
+  `inside_a_window_only_a_clean_stop_is_the_operator_s`;
   `a_vacancy_inside_a_signed_window_is_released_not_vacated`;
   `both_roles_released_by_the_operator_is_a_note_not_the_gap`;
   `a_watchdog_successor_is_registered_only_as_its_unit_s_clean_restart`;
@@ -477,6 +500,7 @@ not cause as an incident.
   `both_roles_vacated_is_the_gap_and_nothing_else_is`;
   `every_unit_unsets_every_loader_variable`;
   `every_unit_denies_writable_and_executable_memory`;
+  `memory_deny_write_execute_off_is_judged_as_systemd_parses_it`;
   `a_start_with_a_loader_variable_refuses_itself_before_the_load_and_signs_it`;
   `a_preloaded_library_anywhere_is_foreign`;
   `every_supported_library_layout_is_a_genuine_start`; internal check

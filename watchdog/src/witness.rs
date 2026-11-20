@@ -613,7 +613,11 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
 /// re-check of #582 (N8): inside a window only a clean stop (`clean`,
 /// [`clean_stop`]) is the operator's — an OOM kill or a crash during an
 /// upgrade's window stays a vacancy (High).
-pub fn vacancy_kind(verdict: &crate::ShutdownVerdict, in_window: bool, clean: bool) -> &'static str {
+pub fn vacancy_kind(
+    verdict: &crate::ShutdownVerdict,
+    in_window: bool,
+    clean: bool,
+) -> &'static str {
     match verdict {
         crate::ShutdownVerdict::Authorised => nn_proto::witness::KIND_RELEASED,
         _ if in_window && clean => nn_proto::witness::KIND_RELEASED_IN_WINDOW,
@@ -684,7 +688,9 @@ pub fn vacancy_detail(
         }
     };
     let window = match (in_window, clean) {
-        (true, true) => "; inside a signed trusted-installer window (the operator's restart or stop)",
+        (true, true) => {
+            "; inside a signed trusted-installer window (the operator's restart or stop)"
+        }
         (true, false) => {
             "; inside a signed trusted-installer window, but not a clean stop (exit status 0 or \
              SIGTERM): not taken as the operator's"
@@ -931,7 +937,10 @@ mod tests {
                 "{c}"
             );
             let d = vacancy_detail(41, c, &crate::ShutdownVerdict::Absent, true);
-            assert!(d.contains("not taken as the operator's") && !d.contains("(the operator's restart"), "{d}");
+            assert!(
+                d.contains("not taken as the operator's") && !d.contains("(the operator's restart"),
+                "{d}"
+            );
         }
         assert_eq!(
             vacancy_kind(&crate::ShutdownVerdict::Absent, true, true),
@@ -948,7 +957,9 @@ mod tests {
     /// on that alone, and still given.
     #[test]
     fn a_successor_with_an_unconfirmed_library_is_given_and_high() {
-        use nn_proto::witness::{KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_SUCCESSOR_UNCONFIRMED};
+        use nn_proto::witness::{
+            KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_SUCCESSOR_UNCONFIRMED,
+        };
         assert_eq!(successor_kind(true, true), KIND_SUCCEEDED);
         assert_eq!(successor_kind(true, false), KIND_SUCCESSOR_UNCONFIRMED);
         assert_eq!(successor_kind(false, false), KIND_SUCCESSOR_FOREIGN);
@@ -1131,8 +1142,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with(&format!("{CHAIN_FILE}.cut.")))
+                p.file_name().is_some_and(|n| {
+                    n.to_string_lossy()
+                        .starts_with(&format!("{CHAIN_FILE}.cut."))
+                })
             })
             .collect();
         v.sort();
@@ -1155,9 +1168,13 @@ mod tests {
         w.record(KIND_VACATED, "the vacancy").unwrap();
         let good = chain_text(dir.path());
         // the row it tried, a third of it on disk
-        let tried = "{\"v\":1,\"seq\":2,\"kind\":\"role_succeeded\",\"detail\":\"x\"}\n".to_string();
+        let tried =
+            "{\"v\":1,\"seq\":2,\"kind\":\"role_succeeded\",\"detail\":\"x\"}\n".to_string();
         std::fs::write(&p, format!("{good}{}", &tried[..tried.len() / 3])).unwrap();
-        w.tried = Some((tried.clone(), "No space left on device (os error 28)".into()));
+        w.tried = Some((
+            tried.clone(),
+            "No space left on device (os error 28)".into(),
+        ));
         assert!(!w.check_head(), "torn is not cut");
         assert_eq!(chain_text(dir.path()), good, "the partial row removed");
         w.record(KIND_SUCCEEDED, "the successor").unwrap();
@@ -1169,11 +1186,18 @@ mod tests {
                 Judged::Broken { why, .. } => format!("broken: {why}"),
             })
             .collect();
-        assert_eq!(kinds, [KIND_OPENED, KIND_VACATED, KIND_CHAIN_TORN, KIND_SUCCEEDED]);
+        assert_eq!(
+            kinds,
+            [KIND_OPENED, KIND_VACATED, KIND_CHAIN_TORN, KIND_SUCCEEDED]
+        );
         let Judged::Valid { row, .. } = &j[2] else {
             panic!("{j:?}")
         };
-        assert!(row.detail.contains("failed part-way (No space left"), "{}", row.detail);
+        assert!(
+            row.detail.contains("failed part-way (No space left"),
+            "{}",
+            row.detail
+        );
         assert!(cut_files(dir.path()).is_empty());
         // a whole row whose sync failed: written, the chain continues
         let dir = tempfile::tempdir().unwrap();
