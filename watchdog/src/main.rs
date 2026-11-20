@@ -267,7 +267,9 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     // The review of #582 (F6): the agent's role vacated earlier this boot
     // (the kernel's sticky mark; a vacancy this watchdog's start found
     // included) — the agent this start finds is a successor no watchdog saw
-    // take the role: judged now, and signed by the witness.
+    // take the role: judged now, and signed by the witness. The re-check 3
+    // (R2-1): judged at every start, a verdict of foreign signed whatever
+    // the timing.
     judge_agent_at_start(&cli, &mut witness, agent_pid);
     // Lot 273c (the review of #490): the agent's cgroup, checked from here.
     northnarrow_watchdog::check_agent_cgroup(
@@ -1322,8 +1324,10 @@ async fn judge_host(
 /// vacated earlier this boot ([`antitamper_bpf::ROLE_MARK_VACATED`]): a
 /// witness row, `role_succeeded` or `role_successor_foreign`. Recorded,
 /// never acted on here: the agent registers itself, and at its start this
-/// watchdog re-registers no agent. Nothing when the mark cannot be read
-/// (said in the journal).
+/// watchdog re-registers no agent. The re-check 3 of #582 (R2-1): judged at
+/// every start ([`antitamper_bpf::at_start`]) — an agent that is not its
+/// unit's clean restart is recorded whatever the timing; a given one that
+/// took its role while a watchdog ran is not recorded.
 fn judge_agent_at_start(
     cli: &Cli,
     witness: &mut Option<northnarrow_watchdog::witness::Witness>,
@@ -1363,16 +1367,19 @@ fn judge_agent_at_start(
             &anyhow::anyhow!("{e}"),
         );
     }
-    let Some(why) = why else {
-        return;
-    };
     let judged = judge_successor(0, pid);
+    // the re-check 3 of #582 (R2-1): a verdict of foreign is recorded
+    // whatever the timing; a given one only for a succession nobody judged
+    let context = match (antitamper_bpf::at_start(why.is_some(), judged.given), why) {
+        (antitamper_bpf::AtStart::Held, _) => return,
+        (_, Some(why)) => format!("the agent's role was vacated earlier this boot; {why}"),
+        (_, None) => "judged at every start, whatever an earlier watchdog concluded".to_string(),
+    };
     if let Some(w) = witness.as_mut() {
         w.record_or_log(
             northnarrow_watchdog::witness::successor_kind(judged.given, judged.confirmed),
             &format!(
-                "judged at this watchdog's start (the agent's role was vacated earlier this boot; \
-                 {why}{}): {}",
+                "judged at this watchdog's start ({context}{}): {}",
                 unread
                     .as_deref()
                     .map(|e| format!("; the marks not read: {e}"))

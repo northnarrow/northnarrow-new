@@ -414,11 +414,12 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // boot (the kernel's sticky mark, which no claim clears): the
         // watchdog this agent finds first is a successor nobody saw take
         // the role — judged as one, as after a death this agent saw. The
-        // re-check of #582 (N4): only when it took its role while the
-        // agent's was vacant (after the agent role's last exit, the
-        // kernel's `ROLE_EXITS`), never a long-running watchdog an earlier
-        // agent saw start; (N5) marks this start could not read are a
-        // signed degradation, and the watchdog is judged.
+        // re-check of #582 (N4): a succession only when it took its role
+        // while the agent's was vacant (after the agent role's last exit,
+        // the kernel's `ROLE_EXITS`); a long-running watchdog an earlier
+        // agent saw start is judged too (the re-check 3, R2-1) but, given,
+        // signs nothing; (N5) marks this start could not read are a signed
+        // degradation, and the watchdog is a succession.
         let at_start = nn_linux::witness::roles_at_start();
         let mut first_found = true;
         let mut succession_pending = false;
@@ -503,9 +504,14 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
             // agent's registration only as its unit's restart with clean
             // marks and nothing foreign — the vacated role's right, as the
             // kernel's guard gives it; recorded either way (the agent, the
-            // surviving role, signs the watchdog's succession).
+            // surviving role, signs the watchdog's succession). The re-check
+            // 3 of #582 (R2-1): the watchdog this start finds first is
+            // judged too, whatever an earlier agent concluded — its refusal
+            // was in its memory only — and one refused stays judged at
+            // every round (`successor_step`).
             if let Some(p) = new_pid {
-                if std::mem::take(&mut first_found) {
+                let found_first = std::mem::take(&mut first_found);
+                if found_first {
                     let (wm, am, ae) = at_start.map_or((None, None, None), |r| {
                         (r.watchdog_mark, r.agent_mark, r.agent_exit_ns)
                     });
@@ -534,15 +540,23 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         antitamper_bpf::role_slot(r, antitamper_bpf::ROLE_SLOT_WATCHDOG).ok()
                     })
                     .is_some_and(|s| s == antitamper_bpf::ROLE_VACATED);
-                if succession_pending || vacated {
-                    let v = nn_linux::witness::judge_watchdog_successor(
-                        p,
-                        &antitamper_bpf::start_check::identity(p),
-                        nn_linux::witness::marks_clean(p),
-                        &antitamper_bpf::start_check::inspect(p),
-                    );
-                    let log = audit.get().and_then(|l| l.as_ref());
-                    if !v.given {
+                let step = nn_linux::witness::successor_step(
+                    &mut succession_pending,
+                    vacated,
+                    found_first,
+                    || {
+                        nn_linux::witness::judge_watchdog_successor(
+                            p,
+                            &antitamper_bpf::start_check::identity(p),
+                            nn_linux::witness::marks_clean(p),
+                            &antitamper_bpf::start_check::inspect(p),
+                        )
+                    },
+                );
+                let log = audit.get().and_then(|l| l.as_ref());
+                match step {
+                    nn_linux::witness::SuccessorStep::NotJudged => {}
+                    nn_linux::witness::SuccessorStep::Foreign(v) => {
                         if successor_flagged != Some(p) {
                             warn!(watchdog_pid = p, detail = %v.detail, "the watchdog's successor is not its unit's clean restart — it holds the role the kernel gave it; the agent does not register it");
                             northnarrow_agent::self_integrity::report_event(
@@ -562,15 +576,22 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     // the re-check of #582 (N4): a library replaced on disk
                     // whose identity is not confirmed is signed High, the
                     // registration never withheld for it
-                    northnarrow_agent::self_integrity::report_or_note(
-                        log,
-                        &northnarrow_agent::self_integrity::Finding {
-                            kind: v.kind(),
-                            detail: v.detail,
-                        },
-                    );
-                    succession_pending = false;
-                    successor_flagged = None;
+                    nn_linux::witness::SuccessorStep::Succession(v) => {
+                        northnarrow_agent::self_integrity::report_or_note(
+                            log,
+                            &northnarrow_agent::self_integrity::Finding {
+                                kind: v.kind(),
+                                detail: v.detail,
+                            },
+                        );
+                        successor_flagged = None;
+                    }
+                    // the re-check 3 of #582 (R2-1, N4 kept): a long-running
+                    // watchdog given — nothing signed
+                    nn_linux::witness::SuccessorStep::Held(v) => {
+                        debug!(watchdog_pid = p, kind = v.kind(), detail = %v.detail, "the watchdog found at this start took its role while an agent ran: judged again and given");
+                        successor_flagged = None;
+                    }
                 }
             }
             if let Some(p) = new_pid {

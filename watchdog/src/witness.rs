@@ -752,16 +752,17 @@ pub fn successor_detail(
     } else {
         " — it holds the role the kernel gave it; the watchdog does not re-register it"
     };
-    // old 0: the vacancy is the kernel's mark, its holder not known here
-    let by = if old == 0 {
-        "earlier this boot".to_string()
+    // old 0: found at this watchdog's start (the vacancy, if any, is the
+    // kernel's mark, its holder not known here)
+    let role = if old == 0 {
+        "the agent's role".to_string()
     } else {
-        format!("by pid {old}")
+        format!("the agent's role, vacated by pid {old},")
     };
     (
         ok,
         format!(
-            "the agent's role, vacated {by}, taken by pid {new}: {verdict}{taken}; {}; {}",
+            "{role} taken by pid {new}: {verdict}{taken}; {}; {}",
             id.describe(),
             found.describe()
         ),

@@ -381,7 +381,7 @@ pub fn judge_watchdog_successor(
         given,
         confirmed: given && found.confirmed(),
         detail: format!(
-            "the watchdog's role, vacated, taken by pid {pid}: {}{taken}; {}; {marks}; {}",
+            "the watchdog's role taken by pid {pid}: {}{taken}; {}; {marks}; {}",
             if in_unit {
                 "its unit's restart"
             } else {
@@ -390,6 +390,71 @@ pub fn judge_watchdog_successor(
             id.describe(),
             found.describe()
         ),
+    }
+}
+
+/// The re-check 3 of #582 (R2-1): one step of the agent's watch over the
+/// watchdog it verified ([`successor_step`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorStep {
+    /// Not judged: no succession pending, and not the watchdog this
+    /// agent's start found first — registered as before.
+    NotJudged,
+    /// Not given: not registered nor exempted; the verdict to sign (High).
+    Foreign(SuccessorVerdict),
+    /// Given, a successor nobody judged: registered; the verdict to sign
+    /// ([`SuccessorVerdict::kind`]).
+    Succession(SuccessorVerdict),
+    /// Given, the watchdog this start found first, which took its role
+    /// while an agent ran: registered, nothing signed (no High for a
+    /// library a package upgrade replaced on disk since, N4).
+    Held(SuccessorVerdict),
+}
+
+/// The re-check 3 of #582 (R2-1): whether the agent judges the watchdog it
+/// verified now, and what it does with the verdict (`judge`, called only
+/// when it judges). `pending`: a succession nobody judged yet — a watchdog
+/// death this agent saw, the timing rule at its start
+/// ([`antitamper_bpf::succession_to_judge`]), or a watchdog refused before;
+/// `vacated`: the watchdog's slot vacated now; `found_first`: the watchdog
+/// this agent's start found first, judged whatever the timing rule says (an
+/// earlier agent's refusal was in its memory only, and a successor it never
+/// saw was judged by nobody). A watchdog not given leaves `pending` set:
+/// the next round judges it (or whatever process holds the role then)
+/// again, never registers it because its slot is no longer vacated.
+pub fn successor_step(
+    pending: &mut bool,
+    vacated: bool,
+    found_first: bool,
+    judge: impl FnOnce() -> SuccessorVerdict,
+) -> SuccessorStep {
+    let succession = *pending || vacated;
+    if !succession && !found_first {
+        return SuccessorStep::NotJudged;
+    }
+    let mut v = judge();
+    v.detail = if succession {
+        format!(
+            "the watchdog's role vacated, its successor not judged before: {}",
+            v.detail
+        )
+    } else {
+        format!(
+            "the watchdog found at this agent's start, judged again whatever an earlier agent \
+             concluded: {}",
+            v.detail
+        )
+    };
+    match antitamper_bpf::at_start(succession, v.given) {
+        antitamper_bpf::AtStart::Foreign => {
+            *pending = true;
+            SuccessorStep::Foreign(v)
+        }
+        antitamper_bpf::AtStart::Succession => {
+            *pending = false;
+            SuccessorStep::Succession(v)
+        }
+        antitamper_bpf::AtStart::Held => SuccessorStep::Held(v),
     }
 }
 
@@ -946,5 +1011,148 @@ mod tests {
         );
         let v = judge_watchdog_successor(9, &unit(), Some(false), &replaced);
         assert_eq!((v.given, v.kind()), (false, WATCHDOG_SUCCESSOR_FOREIGN));
+    }
+    fn foreign() -> SuccessorVerdict {
+        judge_watchdog_successor(9, &unit(), Some(false), &Findings::default())
+    }
+
+    /// The re-check 3 of #582 (R2-1, scenario A; the reviewer's probe): a
+    /// watchdog that took its role at 100 s, judged foreign by agent A1 and
+    /// not registered for A1's whole life; A1 exits at 1000 s. The timing
+    /// rule says an agent was there when it took its role — A2's start
+    /// judges it all the same: refused and signed, and refused again at
+    /// every later round, never registered on A1's word.
+    #[test]
+    fn a_watchdog_an_earlier_agent_refused_is_refused_again_at_the_next_agent_start() {
+        const S: u64 = 1_000_000_000;
+        let v = Some(antitamper_bpf::ROLE_MARK_VACATED);
+        let timing = antitamper_bpf::succession_to_judge(v, v, Some(1_000 * S), Some(100 * S));
+        assert_eq!(timing, None, "the probe: no succession by timing");
+        let mut pending = timing.is_some();
+        match successor_step(&mut pending, false, true, foreign) {
+            SuccessorStep::Foreign(v) => {
+                assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_FOREIGN);
+                assert!(
+                    v.detail
+                        .contains("judged again whatever an earlier agent concluded")
+                        && !v.detail.contains("vacated"),
+                    "{}",
+                    v.detail
+                );
+            }
+            s => panic!("A2's start registers the refused watchdog: {s:?}"),
+        }
+        assert!(pending);
+        for _ in 0..3 {
+            assert!(matches!(
+                successor_step(&mut pending, false, false, foreign),
+                SuccessorStep::Foreign(_)
+            ));
+        }
+    }
+
+    /// The re-check 3 of #582 (R2-1, scenario B): a successor that took the
+    /// watchdog's role while agent A1 ran but that A1 never judged (no
+    /// pidfile until A1 exited, or a stalled round): nothing pending, the
+    /// slot held — the next agent's start judges it, and does not register
+    /// it when it is not its unit's clean restart.
+    #[test]
+    fn a_watchdog_successor_no_agent_judged_is_judged_at_the_next_agent_start() {
+        for found in [
+            Findings {
+                loader_vars: vec!["LD_PRELOAD".into()],
+                ..Findings::default()
+            },
+            Findings {
+                unreadable: vec!["environ: gone".into()],
+                ..Findings::default()
+            },
+        ] {
+            let judged = std::cell::Cell::new(0);
+            let mut pending = false;
+            let step = successor_step(&mut pending, false, true, || {
+                judged.set(judged.get() + 1);
+                judge_watchdog_successor(9, &unit(), Some(true), &found)
+            });
+            assert_eq!(judged.get(), 1);
+            assert!(matches!(step, SuccessorStep::Foreign(_)), "{step:?}");
+            assert!(pending);
+        }
+        // outside a start, nothing pending, the slot held: not judged
+        let mut pending = false;
+        assert_eq!(
+            successor_step(&mut pending, false, false, || unreachable!()),
+            SuccessorStep::NotJudged
+        );
+    }
+
+    /// The re-check 3 of #582 (R2-1, N4 kept): the watchdog an agent's
+    /// start finds, long-running and given — its library replaced on disk
+    /// since it mapped it, not the agent's copy — is registered with
+    /// nothing signed (no false High), and not judged again; a successor
+    /// nobody judged with the same verdict is still signed High.
+    #[test]
+    fn a_long_running_watchdog_given_at_an_agent_start_is_registered_with_nothing_signed() {
+        let replaced = Findings {
+            replaced: vec!["/usr/lib/x86_64-linux-gnu/libgcc_s.so.1".into()],
+            ..Findings::default()
+        };
+        let unconfirmed = || judge_watchdog_successor(9, &unit(), Some(true), &replaced);
+        let mut pending = false;
+        match successor_step(&mut pending, false, true, unconfirmed) {
+            SuccessorStep::Held(v) => assert!(v.given && !v.confirmed, "{}", v.detail),
+            s => panic!("{s:?}"),
+        }
+        assert!(!pending);
+        assert_eq!(
+            successor_step(&mut pending, false, false, || unreachable!()),
+            SuccessorStep::NotJudged
+        );
+        let mut pending = false;
+        assert!(matches!(
+            successor_step(&mut pending, false, true, || judge_watchdog_successor(
+                9,
+                &unit(),
+                Some(true),
+                &Findings::default()
+            )),
+            SuccessorStep::Held(_)
+        ));
+        // a succession nobody judged (the timing rule, a death seen, the
+        // slot vacated): the verdict signed, High when not confirmed
+        for (mut pending, vacated) in [(true, false), (false, true), (true, true)] {
+            match successor_step(&mut pending, vacated, false, unconfirmed) {
+                SuccessorStep::Succession(v) => {
+                    assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_UNCONFIRMED);
+                    assert!(v.detail.contains("vacated"), "{}", v.detail);
+                }
+                s => panic!("{s:?}"),
+            }
+            assert!(!pending);
+        }
+    }
+
+    /// The re-check 3 of #582 (R2-1, the mini-hunt): a watchdog refused
+    /// while its slot was vacated (before it claimed its role) is judged
+    /// again at the next round, when its slot holds its tgid — never
+    /// registered because the slot is no longer vacated; once a given
+    /// process holds the role, it is signed as a succession.
+    #[test]
+    fn a_watchdog_refused_while_its_slot_was_vacated_is_judged_again_once_it_holds_the_slot() {
+        let mut pending = false;
+        assert!(matches!(
+            successor_step(&mut pending, true, false, foreign),
+            SuccessorStep::Foreign(_)
+        ));
+        assert!(matches!(
+            successor_step(&mut pending, false, false, foreign),
+            SuccessorStep::Foreign(_)
+        ));
+        let given = || judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
+        match successor_step(&mut pending, false, false, given) {
+            SuccessorStep::Succession(v) => assert_eq!(v.kind(), WATCHDOG_SUCCESSION),
+            s => panic!("{s:?}"),
+        }
+        assert!(!pending);
     }
 }

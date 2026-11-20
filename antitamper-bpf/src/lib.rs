@@ -263,14 +263,16 @@ pub fn fdinfo_frozen(fdinfo: &str) -> Option<bool> {
 /// a process again.
 pub const UNJUDGED_BEFORE_EXIT_NS: u64 = 45 * 1_000_000_000;
 
-/// The re-check of #582 (N4): why a role's start judges the process now in
-/// the other role as a successor nobody judged — `Some(reason)` — or `None`:
-/// a holder of this role was there when it took its role (it was judged
-/// then, or never needed to be), and a long-running process is not judged
-/// again. `other_mark` is the other role's `ROLE_MARKS` word, `own_mark` and
-/// `own_exit_ns` this role's mark and last exit (`ROLE_EXITS`), and
-/// `other_start_ns` the other process's start, all `CLOCK_BOOTTIME`. What is
-/// not known (`None`) is judged.
+/// The re-check of #582 (N4): why the process now in the other role is a
+/// successor nobody judged — `Some(reason)` — or `None`: a holder of this
+/// role was there when it took its role. `other_mark` is the other role's
+/// `ROLE_MARKS` word, `own_mark` and `own_exit_ns` this role's mark and last
+/// exit (`ROLE_EXITS`), and `other_start_ns` the other process's start, all
+/// `CLOCK_BOOTTIME`. What is not known (`None`) is a succession. The
+/// re-check 3 of #582 (R2-1): this says only whether the start's verdict on
+/// that process is recorded as a succession ([`at_start`]); the process is
+/// judged at every start all the same — an earlier holder's verdict is never
+/// inherited.
 pub fn succession_to_judge(
     other_mark: Option<u32>,
     own_mark: Option<u32>,
@@ -294,6 +296,36 @@ pub fn succession_to_judge(
     };
     (start.saturating_add(UNJUDGED_BEFORE_EXIT_NS) >= exit)
         .then_some("it took its role while this role was vacant")
+}
+
+/// The re-check 3 of #582 (R2-1): what a role's start does with its verdict
+/// on the process it finds in the other role, judged at every start. An
+/// earlier holder's verdict is not inherited: it was kept in that holder's
+/// memory only (a refusal would lapse with it), and a successor that holder
+/// never saw was judged by nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtStart {
+    /// Not given: recorded (High), whatever [`succession_to_judge`] says —
+    /// and the agent's start does not register it.
+    Foreign,
+    /// Given, a successor nobody judged ([`succession_to_judge`] said
+    /// why): its verdict recorded (a note, or High when a library's
+    /// identity is not confirmed).
+    Succession,
+    /// Given, and it took its role while this role was held: nothing
+    /// recorded, so a long-running process whose library a package upgrade
+    /// replaced on disk since is no High (the re-check of #582, N4).
+    Held,
+}
+
+/// [`AtStart`] of a verdict: `succession` when [`succession_to_judge`]
+/// gave a reason, `given` the verdict's.
+pub fn at_start(succession: bool, given: bool) -> AtStart {
+    match (given, succession) {
+        (false, _) => AtStart::Foreign,
+        (true, true) => AtStart::Succession,
+        (true, false) => AtStart::Held,
+    }
 }
 
 /// `FS_GRANT`'s slot as aya reads it (`common::wire::FsGrant`).
@@ -1267,15 +1299,16 @@ fn is_not_found_err(e: &aya::maps::MapError) -> bool {
 mod tests {
     use super::*;
 
-    /// The re-check of #582 (N4, N5): a role's start judges the process in
-    /// the other role only when it took its role while this role was
-    /// vacant — after (or just before) this role's last exit — or when this
-    /// role was never held this boot; a process a holder of this role saw
-    /// take its role is not judged again, however long it has run. What is
-    /// not known (a mark not read or not frozen, an exit time or a start
-    /// not read) is judged.
+    /// The re-check of #582 (N4, N5): the process in the other role is a
+    /// succession nobody judged only when it took its role while this role
+    /// was vacant — after (or just before) this role's last exit — or when
+    /// this role was never held this boot; a process a holder of this role
+    /// saw take its role is not, however long it has run. What is not known
+    /// (a mark not read or not frozen, an exit time or a start not read) is
+    /// one. (The re-check 3, R2-1: the process is judged at every start all
+    /// the same, [`at_start`].)
     #[test]
-    fn a_successor_is_judged_once_by_the_next_start_of_the_other_role() {
+    fn a_succession_is_the_other_role_s_process_taken_while_this_role_was_vacant() {
         const S: u64 = 1_000_000_000;
         let v = Some(ROLE_MARK_VACATED);
         let w = Some(ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW);
@@ -1312,6 +1345,36 @@ mod tests {
                 "{o:?} {m:?} {e:?} {st:?}"
             );
         }
+    }
+
+    /// The re-check 3 of #582 (R2-1, the reviewer's probe made a test): a
+    /// watchdog S took its role at 100 s, agent A1 judged it foreign and
+    /// did not register it for its whole life, and exited at 1000 s. The
+    /// timing rule says an agent was there when S took its role — but A1's
+    /// verdict was in A1's memory only: A2's start judges S again, and a
+    /// verdict of foreign is foreign whatever the timing. Only a given
+    /// verdict is left unrecorded for a long-running process (N4).
+    #[test]
+    fn a_successor_refused_by_an_earlier_holder_is_judged_again_at_the_next_start() {
+        const S: u64 = 1_000_000_000;
+        let v = Some(ROLE_MARK_VACATED);
+        let timing = succession_to_judge(v, v, Some(1_000 * S), Some(100 * S));
+        assert_eq!(timing, None, "the probe: no succession by timing");
+        assert_eq!(
+            at_start(timing.is_some(), false),
+            AtStart::Foreign,
+            "A2's start: still foreign, never registered on A1's word"
+        );
+        // the other role never vacated (its first holder): the same
+        let first = succession_to_judge(Some(0), v, Some(1_000 * S), Some(5 * S));
+        assert_eq!(at_start(first.is_some(), false), AtStart::Foreign);
+        // a succession nobody judged: foreign too, or its verdict recorded
+        let late = succession_to_judge(v, v, Some(1_000 * S), Some(1_001 * S));
+        assert_eq!(at_start(late.is_some(), false), AtStart::Foreign);
+        assert_eq!(at_start(late.is_some(), true), AtStart::Succession);
+        // N4: a long-running process given (a library replaced on disk
+        // since, judged by identity): nothing recorded, no High
+        assert_eq!(at_start(timing.is_some(), true), AtStart::Held);
     }
 
     /// The re-check of #582 (N1): a map descriptor's fdinfo says whether the
