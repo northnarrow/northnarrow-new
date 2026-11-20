@@ -145,7 +145,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the \
                    kernel's image), in a system service's own cgroup, listening on loopback \
                    only (a packaged database or mail daemon) is recorded Low. Lot 376: so is \
-                   a package transaction's own program run by root (as NN-L-NET-019 says).",
+                   a program a package's dpkg maintainer script runs as root in a package \
+                   transaction (as NN-L-NET-019 says).",
         false_positives: "Developer servers, test fixtures and user services that listen on \
                           high ports; the netflow comm allowlist (judged on the executed \
                           program, not on `comm`) answers the known daemons.",
@@ -421,9 +422,11 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    own program — the file the kernel executed is the host's file at its path \
                    in a root-only directory, installed in a root-owned system tree (an \
                    interpreter's script there too), executed by root and listening as root, \
-                   inside a live package transaction run by root (`pg_createcluster`'s \
-                   free-port probe in PostgreSQL's postinst) — is recorded Low; a root \
-                   listener's Medium record names the fact that was missing.",
+                   inside a live package transaction run by root, run by a package's dpkg \
+                   maintainer script (`pg_createcluster`'s free-port probe in PostgreSQL's \
+                   postinst; not an APT or dpkg hook, not an rpm scriptlet) — is recorded \
+                   Low, naming the package; a root listener's Medium record names the fact \
+                   that was missing.",
         false_positives: "Developer servers and user services that bind all addresses by \
                           default (`python3 -m http.server`, test fixtures); the allowlist \
                           answers the known daemons.",

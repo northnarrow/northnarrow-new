@@ -230,7 +230,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             preventing the unit is the kernel's deny and the persistence that repairs itself \
             (Wave 3). Lot 376: a package transaction's Low records are one per package-manager \
             process within 15 minutes, the others counted as coalesced (the next record's count, \
-            the reporter's signed entry with their paths).",
+            and up to 8 sample paths in the reporter's signed entry; every change keeps its own \
+            row in the drift log).",
         how_to_test: "`sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, \
             then remove it; expect High, the KillProcess aimed at cp held (Log).",
         tests: &[
@@ -468,7 +469,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
             systemd-update-utmp's shutdown record, its process gone by the judgement, is told by \
             what the kernel recorded at the write (its image, root, the file's only writer — one \
             process running one image at every write — its unit's cgroup or a cgroup removed \
-            since) and an append of whole records.",
+            since) and an append of whole records. Lot 340: the packaged logrotate's scheduled \
+            rotation (its timer's unit, cron's daily run) is recorded Low. Lot 376: a rotation \
+            by hand with root's configuration (`logrotate -f /etc/logrotate.conf`: the file \
+            renamed away, its content kept as wtmp.1, a new one created) by the packaged \
+            logrotate (its device and inode) as root is recorded High, never killed; a \
+            truncation in place, a rename over the file, another configuration or writer keep \
+            the kill.",
 
         how_to_test: "`printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab \
             guest: it appends a byte); expect High, KillProcess aimed at dd.",

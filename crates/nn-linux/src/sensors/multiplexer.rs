@@ -422,7 +422,6 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
 
         let attach_points = crate::boot::manifest::AttachPoints::new();
         attach_fork_parent(&mut ebpf);
-        attach_exec_tracepoint(&mut ebpf, &attach_points)?;
         attach_tracepoint(
             &mut ebpf,
             "sys_enter_openat",
@@ -457,6 +456,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             &mut ebpf,
             exec_program == crate::sensors::exe_identity::EXEC_LSM_PROGRAM,
         );
+        // Lot 376 (the review of #583, F3): the exec record AFTER the exec
+        // sensor. In LSM mode its post-exec record takes the executed file's
+        // identity from the LSM program's handoff; attached first, every
+        // exec between the two attaches (the agent's start, at a boot:
+        // systemd's executor launching the early units by `/proc/self/fd/N`)
+        // had none, and a short-lived one, gone before the pump read its
+        // `/proc`, was judged by R004's path heuristic (Critical at a 24.04
+        // reboot). `xtask/tests/exec_attach_order.rs` keeps the order.
+        attach_exec_tracepoint(&mut ebpf, &attach_points)?;
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
         // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,

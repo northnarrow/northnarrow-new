@@ -1626,7 +1626,7 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
         let packaged = packaged_loopback_daemon(nl, self.lineage.as_ref());
         // lot 376: a package transaction's own program, as root
         let transaction = if packaged {
-            Ok(())
+            Ok(String::new())
         } else {
             package_transaction_listener(nl, self.lineage.as_ref())
         };
@@ -1648,12 +1648,11 @@ impl<H: PostureHost> Rule for NnLNet006UncommonListener<H> {
                         " — a program of a root-owned system tree (the kernel's image), in a \
                          system service's own cgroup, listening on loopback only: recorded Low \
                          (lot 369)"
-                    } else if in_transaction {
-                        PACKAGE_TRANSACTION_LISTENER
+                            .to_string()
                     } else {
-                        ""
+                        package_listener_text(&transaction)
                     },
-                    not_a_package_listener(nl, transaction)
+                    not_a_package_listener(nl, &transaction)
                 ),
                 nl.pid,
                 nl.comm.clone(),
@@ -1700,17 +1699,27 @@ fn packaged_loopback_daemon<H: PostureHost>(
 /// script), and an interpreter's script lies in such a tree too —
 /// executed by root and listening as root, inside a live package
 /// transaction (a package manager proper executed by root whose run covers
-/// the listener: [`AuthSessionTracker::in_package_transaction`]). Recorded
-/// Low. Without a lineage, or any fact missing (a `/tmp` binary a
-/// maintainer script runs, a user's program, a script given inline, a
-/// listener after the transaction): not — `Err` names the first fact
-/// missing, for a root listener's record (as lot 373's R012 names it).
+/// the listener: [`AuthSessionTracker::in_package_transaction`]), and (the
+/// review of #583, F2) run by a package's dpkg maintainer script between
+/// that package manager and the listener
+/// ([`AuthSessionTracker::maintainer_script_in_lineage`]: dpkg's
+/// `/var/lib/dpkg/info/<package>.<preinst|postinst|prerm|postrm>`, in that
+/// root-only directory). Recorded Low, with the package named. Without a
+/// lineage, or any fact missing (a `/tmp` binary a maintainer script runs,
+/// a user's program, a script given inline, a listener after the
+/// transaction, an APT hook — `APT::Update::Post-Invoke`,
+/// `DPkg::Post-Invoke`, a shell `apt-get` itself runs, under apt-daily too
+/// — starting the host's `socat` as a bind shell, an rpm scriptlet, which
+/// has no such identity): not — `Err` names the first fact missing, for a
+/// root listener's record (as lot 373's R012 names it). `Ok` names the
+/// package.
 ///
 /// [`AuthSessionTracker::in_package_transaction`]: crate::posture::lineage::AuthSessionTracker::in_package_transaction
+/// [`AuthSessionTracker::maintainer_script_in_lineage`]: crate::posture::lineage::AuthSessionTracker::maintainer_script_in_lineage
 fn package_transaction_listener<H: PostureHost>(
     nl: &nn_model::telemetry::NetListenerEvent,
     lineage: Option<&crate::posture::lineage::AuthSessionTracker<H>>,
-) -> Result<(), &'static str> {
+) -> Result<String, &'static str> {
     let Some(l) = lineage else {
         return Err("no lineage");
     };
@@ -1736,14 +1745,19 @@ fn package_transaction_listener<H: PostureHost>(
     if !l.in_package_transaction(nl.pid, as_of) {
         return Err("no live package transaction run by root covers it");
     }
-    Ok(())
+    // the review of #583 (F2): a package's own maintainer script runs it —
+    // an APT hook, run by apt-get itself, is no package's
+    l.maintainer_script_in_lineage(nl.pid, as_of).ok_or(
+        "no dpkg maintainer script runs it between the package manager and the listener (an \
+         APT or dpkg hook, an rpm scriptlet)",
+    )
 }
 
 /// Lot 376: what a root listener's NN-L-NET-006 / -019 record adds when it
 /// is not a package transaction's own program — the fact missing.
 fn not_a_package_listener(
     nl: &nn_model::telemetry::NetListenerEvent,
-    why: Result<(), &str>,
+    why: &Result<String, &str>,
 ) -> String {
     match why {
         Err(fact) if nl.uid == 0 => format!(" [not a package transaction's own program: {fact}]"),
@@ -1753,10 +1767,18 @@ fn not_a_package_listener(
 
 /// Lot 376: the text a listener of a package transaction
 /// ([`package_transaction_listener`]) adds to NN-L-NET-006's and -019's
-/// reasoning.
-const PACKAGE_TRANSACTION_LISTENER: &str = " — a program of a root-owned system tree (the \
-     kernel's image), run by root inside a live package transaction (a package manager \
-     executed by root): recorded Low (lot 376)";
+/// reasoning — the review of #583 (F2): with the package whose maintainer
+/// script ran it.
+fn package_listener_text(transaction: &Result<String, &str>) -> String {
+    match transaction {
+        Ok(package) => format!(
+            " — a program of a root-owned system tree (the kernel's image), run by root by \
+             {package}'s dpkg maintainer script inside a live package transaction (a package \
+             manager executed by root): recorded Low (lot 376)"
+        ),
+        _ => String::new(),
+    }
+}
 
 // ── NN-L-NET-007 — Outbound to RFC1918 from unusual process ──────────
 
@@ -2715,12 +2737,8 @@ impl<H: PostureHost> Rule for NnLNet019WildcardListener<H> {
                     "New listener bound to the wildcard address {} from a non-allowlisted \
                      comm — network-exposed backdoor surface (T1571); posture → ALERTED{}{}",
                     listener_port_text(nl, common.is_some()),
-                    if in_transaction {
-                        PACKAGE_TRANSACTION_LISTENER
-                    } else {
-                        ""
-                    },
-                    not_a_package_listener(nl, transaction)
+                    package_listener_text(&transaction),
+                    not_a_package_listener(nl, &transaction)
                 ),
                 nl.pid,
                 nl.comm.clone(),
@@ -5395,11 +5413,13 @@ mod tests {
         // a user's shell (950)
         lineage.ingest_exec(950, 1, "/usr/bin/bash", &[], S, S, 1000);
         running(950);
-        // the host's files: the script and perl, in root-only directories
+        // the host's files: the script and perl, in root-only directories;
+        // the review of #583 (F2): dpkg's maintainer scripts too
         let (script, perl) = ("/usr/bin/pg_createcluster", "/usr/bin/perl");
         IdTestHost::set_file_id(script, Some((STAT_DEV, 7001)));
         IdTestHost::set_file_id(perl, Some((STAT_DEV, 7002)));
         IdTestHost::set_dir_root_only("/usr/bin", true);
+        IdTestHost::set_dir_root_only("/var/lib/dpkg/info", true);
         // an exec as the LSM hook names it: a `#!` script by its own file
         // (no ROOT_DIR from the pump), a binary with ROOT_DIR
         let exec = |pid: u32, ppid: u32, uid: u32, path: &str, argv: &[&str], file: Option<u64>| {
@@ -5487,6 +5507,12 @@ mod tests {
                 "{}",
                 v.reasoning
             );
+            assert!(
+                v.reasoning
+                    .contains("postgresql-16's dpkg maintainer script"),
+                "{}",
+                v.reasoning
+            );
             assert_eq!(sev(&n06, &e), Some(Severity::Low), "{addr}");
         }
         for (pid, uid, ts, what, fact) in [
@@ -5553,12 +5579,143 @@ mod tests {
         );
         IdTestHost::set_file_id(script, None);
         IdTestHost::set_file_id(perl, None);
+        IdTestHost::set_dir_root_only("/var/lib/dpkg/info", false);
         let bare = super::NnLNet019WildcardListener::<IdTestHost>::new(al);
         assert_eq!(
             sev(&bare, &event(902, 0, v4(0, 0, 0, 0), 3 * S)),
             Some(Severity::Medium),
             "no lineage"
         );
+    }
+
+    /// The review of #583 (F2, its probe): an APT hook (`APT::Update::
+    /// Post-Invoke`, `DPkg::Post-Invoke`: a shell `apt-get` itself runs, no
+    /// dpkg maintainer script in the lineage) starting the host's packaged
+    /// `socat` as a wildcard bind shell on 4444, as root, while `apt-get`
+    /// runs (apt-daily's run included). It is no package's own program:
+    /// NN-L-NET-019 and -006 stay Medium, naming the fact missing. Controls:
+    /// the same `socat` under a package's postinst under `dpkg` is Low (the
+    /// residual KNOWN_LIMITATIONS names: a package's own maintainer script
+    /// starting a generic relay); a maintainer script ABOVE a nested
+    /// `apt-get` whose hook starts it, a script named like one outside
+    /// dpkg's directory, dpkg's directory writable by others: Medium.
+    #[test]
+    fn net_019_an_apt_hook_s_packaged_relay_listener_is_no_package_s_own() {
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::ROOT_DIR;
+        const S: u64 = 1_000_000_000;
+        const STAT_DEV: u64 = 2049;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let running = |pid: u32| std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+        let hook = ["/bin/sh", "-c", "socat TCP-LISTEN:4444,fork EXEC:/bin/sh &"].map(String::from);
+        let postinst =
+            ["/bin/sh", "/var/lib/dpkg/info/socat.postinst", "configure"].map(String::from);
+        let fake = ["/bin/sh", "/tmp/x/socat.postinst", "configure"].map(String::from);
+        // root's apt-get (800, running: apt-daily's `apt-get update`) → the
+        // hook's shell (801)
+        lineage.ingest_exec(800, 1, "/usr/bin/apt-get", &[], S, S, 0);
+        lineage.ingest_exec(801, 800, "/usr/bin/dash", &hook, S, S, 0);
+        // root's apt-get (810) → dpkg (811) → a postinst (812)
+        lineage.ingest_exec(810, 1, "/usr/bin/apt-get", &[], S, S, 0);
+        lineage.ingest_exec(811, 810, "/usr/bin/dpkg", &[], S, S, 0);
+        lineage.ingest_exec(812, 811, "/usr/bin/dash", &postinst, S, S, 0);
+        // a postinst (812) → a nested apt-get (820) → its hook (821)
+        lineage.ingest_exec(820, 812, "/usr/bin/apt-get", &[], S, S, 0);
+        lineage.ingest_exec(821, 820, "/usr/bin/dash", &hook, S, S, 0);
+        // dpkg (811) → a script named like a postinst, outside dpkg's (830)
+        lineage.ingest_exec(830, 811, "/usr/bin/dash", &fake, S, S, 0);
+        for pid in [800, 801, 810, 811, 812, 820, 821, 830] {
+            running(pid);
+        }
+        let socat = "/usr/bin/socat";
+        IdTestHost::set_file_id(socat, Some((STAT_DEV, 8001)));
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        IdTestHost::set_dir_root_only("/var/lib/dpkg/info", true);
+        let relay = |pid: u32, ppid: u32| {
+            let mut e =
+                crate::decision::rules::testutil::spawn_exe("socat", socat, socat, ROOT_DIR);
+            if let Event::ProcessSpawn {
+                pid: p,
+                ppid: pp,
+                uid,
+                argv,
+                exe,
+                timestamp_ns,
+                start_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *pp, *uid) = (pid, ppid, 0);
+                (*timestamp_ns, *start_ns) = (2 * S, 2 * S);
+                *argv = vec![
+                    "socat".into(),
+                    "TCP-LISTEN:4444,fork".into(),
+                    "EXEC:/bin/sh".into(),
+                ];
+                (exe.dev, exe.ino) = (KDEV, 8001);
+            }
+            lineage.ingest_spawn_event(&e);
+            running(pid);
+        };
+        relay(802, 801);
+        relay(813, 812);
+        relay(822, 821);
+        relay(831, 830);
+        let al = Arc::new(super::CommAllowlist::<IdTestHost>::from_iter_owned(
+            NETFLOW_COMM_ALLOWLIST_DEFAULTS
+                .iter()
+                .map(|s| s.to_string()),
+        ));
+        let n19 = super::NnLNet019WildcardListener::<IdTestHost>::new(Arc::clone(&al))
+            .with_lineage(Some(lineage.clone()));
+        let n06 = super::NnLNet006UncommonListener::<IdTestHost>::new(Arc::clone(&al))
+            .with_lineage(Some(lineage.clone()));
+        let bind = |pid: u32| {
+            let mut ev = listener_bind(v4(0, 0, 0, 0), 4444, "socat");
+            if let Event::NetListener(nl) = &mut ev {
+                (nl.pid, nl.uid, nl.timestamp_ns) = (pid, 0, 3 * S);
+            }
+            ev
+        };
+        for (pid, what) in [
+            (802, "an APT hook's socat bind shell"),
+            (822, "a nested apt-get's hook under a postinst"),
+            (
+                831,
+                "a script named like a postinst outside dpkg's directory",
+            ),
+        ] {
+            for r in [&n19 as &dyn Rule, &n06] {
+                let v = r.evaluate(&bind(pid)).expect("judged");
+                assert_eq!(v.severity, Severity::Medium, "{what}: {}", v.reasoning);
+                assert!(
+                    v.reasoning.contains("no dpkg maintainer script runs it"),
+                    "{what}: {}",
+                    v.reasoning
+                );
+            }
+        }
+        // control: a package's own postinst (the residual named)
+        for r in [&n19 as &dyn Rule, &n06] {
+            let v = r.evaluate(&bind(813)).expect("judged");
+            assert_eq!(v.severity, Severity::Low, "{}", v.reasoning);
+            assert!(
+                v.reasoning.contains("socat's dpkg maintainer script"),
+                "{}",
+                v.reasoning
+            );
+        }
+        // dpkg's directory writable by others: no maintainer script known
+        IdTestHost::set_dir_root_only("/var/lib/dpkg/info", false);
+        assert_eq!(
+            n19.evaluate(&bind(813)).map(|v| v.severity),
+            Some(Severity::Medium),
+            "dpkg's info directory others write"
+        );
+        IdTestHost::set_file_id(socat, None);
+        IdTestHost::set_dir_root_only("/usr/bin", false);
     }
 
     #[test]

@@ -165,6 +165,17 @@ pub struct FimEvent {
     /// rsyslog daemon as the writer.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub unchanged_since_read: bool,
+    /// Lot 376 (the review of #583, F1): a `Modified` that is the drain's
+    /// check of the file now at a watched path whose watched file was
+    /// RENAMED AWAY — its inode, and so its content, kept under another
+    /// name — and another file put at the path (logrotate's `create`
+    /// rotation: `wtmp` renamed to `wtmp.1`, a new `wtmp` created), by the
+    /// renamer. Not a rename over the watched file (external audit
+    /// FIMR-004: its content replaced, gone), not a write or a truncation in
+    /// place. Set by the drain only (`FIM_RENAMED_AWAY`, which it clears
+    /// from every kernel record).
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub renamed_away: bool,
     /// Lot 352 (the re-check of #561, N1): the start of the process
     /// `modifier_pid` named (its thread group leader's `task->start_time`,
     /// `CLOCK_MONOTONIC` ns) when the kernel's record says it — an open's
@@ -789,6 +800,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let json = serde_json::to_string(&original).expect("serialize");
@@ -897,6 +909,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let json = serde_json::to_string(&original).expect("serialize");

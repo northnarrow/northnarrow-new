@@ -11772,6 +11772,39 @@ number in parentheses is a lab PR.
       - The cold boot and the reboot: `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition. At r3's reboot the quadlet read had raised ALERTED.
       - `cat /etc/login.defs`: ALERTED, the line naming `cat`, `/usr/bin/cat`, `/etc/login.defs`.
       - The `/tmp` truncation found `/var/log/auth.log` already empty (r3 emptied it, and debian13 runs no rsyslog), so there was no change and no record.
+  - Fix round 1 (the review of #583: merge after fixes):
+    - **F1, a hand `logrotate -f`.** The drain marks its check of a file
+      renamed AWAY (`FimEvent::renamed_away`, a userland-only bit the decode
+      clears from kernel records). `LogRotation` records the packaged
+      logrotate (device and inode), as root, with root's configuration only
+      (options `-f`/`-v` and their long forms, files `/etc/logrotate.conf`
+      or `/etc/logrotate.d/<name>` in root-only directories), High with no
+      kill. A truncation in place, a rename over, another configuration or
+      writer keep lot 340's kill.
+    - **F2, the listener carve-out.** It also needs a package's dpkg
+      maintainer script below the nearest package manager
+      (`maintainer_script_in_lineage`): an APT hook's `socat` bind shell is
+      Medium. The residual (a package's own postinst starting a relay) is
+      in KNOWN_LIMITATIONS.
+    - **F3, R004 at a 24.04 reboot (before this lot).** The exec record is
+      attached after the exec sensor (ratchet `exec_attach_order.rs`). An
+      exec with no identity of `/proc/self/fd/N` or `/dev/fd/N`, PID 1's
+      fork (the kernel's record, its first exec), as root, is the executor
+      when PID 1's descriptor `N` is one of the executor's identities.
+    - **F4.** The image at the open stands in only while the cache holds no
+      exec of the reader.
+    - **F6.** The coalescing is keyed by the process (pid and start); the
+      docs say "up to 8 sample paths".
+    - Mutation: 30 mutants of the round's code, 29 caught by a named test; 1 equivalent by construction (the listener text's `in_transaction` guard: the result is `Ok` only inside a transaction where it is read), removed from the code.
+    - Lab (as measured):
+      - **r6 — ubuntu2404 (6.8.0-149), `b51bc5a6`** (the round's product code; the tests and one equivalent refactor came after). Alpha profile (observe-only), under its lease; left uninstalled and powered off, with no `.local` files, no pins and no probe files.
+        - `verifier-check`: 124 programs, every one within the 900,000 budget (highest `mount_guard_sb_umount` 285,254); `mount_guard_sb_mount` 235,430, `fim_file_open_sensor` 137,624, `fim_rename_observe` 218,580; only the two `dns_answer_*_ret6` variants refused (another variant loads). 5.15 is the PR CI's.
+        - The PostgreSQL install: `NN-L-NET-019` Low ×2 and `NN-L-NET-006` Low ×2 (its postinst found).
+        - An APT hook (`APT::Update::Post-Invoke`) starting the host's `socat` on the wildcard of 4444: `NN-L-NET-019` Medium, naming "no dpkg maintainer script runs it" (and `R006` High).
+        - `sudo logrotate -f /etc/logrotate.conf`: `NN-L-FIM-005` High ×3 and `NN-L-FIM-019` High ×1 on logrotate, each "rotated by hand … recorded, not killed"; `NN-L-FIM-019`'s response none (r4: a would-have KillProcess).
+        - The cold boot and the reboot: no `R004`; `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition.
+        - `cat /etc/login.defs`: ALERTED, named. A `/tmp` copy of `truncate` emptying `/var/log/auth.log`: `NN-L-FIM-005` High.
+        - A memfd executed through `/proc/self/fd/3` and `/dev/fd/3` (uid 1000) and as root: `R004` Critical ×1 each (would have KillProcessTree).
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

@@ -1587,7 +1587,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // right after the boot — told by the image the kernel recorded at the
     // open (the reader itself only: its children read as themselves)
     (SENSITIVE_FILES.iter().any(|f| filename == f) || by_kernel)
-        && !auth.is_auth_binary_image(*exe_file)
+        && !auth.is_auth_binary_image(*pid, as_of, *exe_file)
 }
 
 /// External audit POS-007: the credential files a service uid's read is
@@ -1638,7 +1638,10 @@ fn service_uid_credential_read<H: PostureHost>(
         .iter()
         .any(|f| filename == *f || (by_kernel && filename.ends_with(f)));
     // lot 376: or the auth stack's own read by the image at the open
-    if !credential || auth.is_credential_reader(pid, as_of) || auth.is_auth_binary_image(exe_file) {
+    if !credential
+        || auth.is_credential_reader(pid, as_of)
+        || auth.is_auth_binary_image(pid, as_of, exe_file)
+    {
         return false;
     }
     auth.image_path_as(pid, as_of)
@@ -3006,6 +3009,120 @@ mod tests {
         IdTestHost::set_file_id("/usr/bin/sudo", None);
     }
 
+    /// The review of #583 (F4, its probe): the lineage KNOWS the reader ran
+    /// a user's program (`/tmp/x`), yet the open's `mm->exe_file` names the
+    /// host's `sudo` — a field the process changes itself
+    /// (`prctl(PR_SET_MM_MAP)` with an `exe_fd`, in a user namespace of its
+    /// own). The image stands in only while the cache holds no exec of the
+    /// reader (the boot race it closes): the read fires.
+    #[test]
+    fn the_image_at_the_open_does_not_override_a_known_foreign_exec() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::KNOWN;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        IdTestHost::set_file_id("/usr/bin/sudo", Some((STAT_DEV, 4242)));
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let open_by = |pid: u32, uid: u32, path: &str, image: (u64, u64)| {
+            let mut open = file_open(pid, uid, path, 0, 10_000);
+            if let Event::FileOpen { exe_file, .. } = &mut open {
+                *exe_file = image;
+            }
+            open
+        };
+        // the image alone (no exec of 2999 cached): the auth stack's read
+        assert!(
+            !super::sensitive_file_access(
+                &open_by(2999, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
+            "control: no exec cached, sudo's image"
+        );
+        assert!(
+            !super::sensitive_file_access(&open_by(2999, 33, "/etc/shadow", (KDEV, 4242)), &auth),
+            "control: no exec cached, sudo's image, a service uid"
+        );
+        let mut e = spawn_with_exe(3000, 1, "/tmp/x", 1);
+        if let Event::ProcessSpawn {
+            uid,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut e
+        {
+            *uid = 1000;
+            (*start_ns, *timestamp_ns) = (3000, 3001);
+            (exe.path, exe.dev, exe.ino, exe.flags) = ("/tmp/x".into(), KDEV, 777, KNOWN);
+        }
+        assert!(auth.ingest_spawn_event(&e));
+        assert!(
+            super::sensitive_file_access(&open_by(3000, 1000, "/etc/login.defs", (0, 0)), &auth),
+            "control: /tmp/x fires"
+        );
+        assert!(
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 777)),
+                &auth
+            ),
+            "control: its own image fires"
+        );
+        assert!(
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
+            "a known /tmp/x exec with sudo's image at the open fires"
+        );
+        // the process executes something else after the open: the exec it
+        // had at the open (the cache's past) still decides
+        let mut later = spawn_with_exe(3000, 1, "/usr/bin/true", 1);
+        if let Event::ProcessSpawn {
+            uid,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut later
+        {
+            *uid = 1000;
+            (*start_ns, *timestamp_ns) = (3000, 20_000);
+            (exe.path, exe.dev, exe.ino, exe.flags) = ("/usr/bin/true".into(), KDEV, 778, KNOWN);
+        }
+        assert!(auth.ingest_spawn_event(&later));
+        assert!(
+            super::sensitive_file_access(
+                &open_by(3000, 1000, "/etc/login.defs", (KDEV, 4242)),
+                &auth
+            ),
+            "the exec at the open, from the cache's past, with sudo's image fires"
+        );
+        // a service uid's credential read, the same shape
+        let mut e = spawn_with_exe(3001, 1, "/tmp/x", 1);
+        if let Event::ProcessSpawn {
+            uid,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut e
+        {
+            *uid = 33;
+            (*start_ns, *timestamp_ns) = (3000, 3001);
+            (exe.path, exe.dev, exe.ino, exe.flags) = ("/tmp/x".into(), KDEV, 777, KNOWN);
+        }
+        assert!(auth.ingest_spawn_event(&e));
+        assert!(
+            super::sensitive_file_access(&open_by(3001, 33, "/etc/shadow", (KDEV, 4242)), &auth),
+            "a service uid's known /tmp/x exec with sudo's image fires"
+        );
+        IdTestHost::set_file_id("/usr/bin/sudo", None);
+        IdTestHost::set_dir_root_only("/usr/bin", false);
+    }
+
     /// Lot 376 (named, the lab on Debian 13: ALERTED at a reboot, the line
     /// naming `FileOpen /etc/passwd` by `podman-user-gen`, image
     /// `/usr/libexec/podman/quadlet`, uid 1000, scope "unattributed"):
@@ -3176,6 +3293,7 @@ mod tests {
             appends_only: false,
             truncated_by_another: false,
             unchanged_since_read: false,
+            renamed_away: false,
             modifier_start: 0,
         };
         let s = event_subject(&Event::Fim(fe));
