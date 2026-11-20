@@ -4998,11 +4998,26 @@ it resembles still fires.
     path, the new file's size is read as it is watched (as at the start),
     so rsyslogd's appends to it are appends.
   - The rotation is checked once, as the renamer's modification of the path
-    (the check FIMR-004 makes of a file renamed over a watched one).
-    logrotate by hand: `NN-L-FIM-005` High, now on logrotate, and for
-    `wtmp`/`btmp` `NN-L-FIM-019` High with its kill (would-have under
-    `alpha`), lot 340's verdict for a rotation by hand. Under its timer or
-    cron's daily run: Low (lot 340).
+    (the check FIMR-004 makes of a file renamed over a watched one). Under
+    its timer or cron's daily run: Low (lot 340). By hand: `NN-L-FIM-005`
+    High, now on logrotate.
+  - For `wtmp`/`btmp` by hand (the review of #583, F1): `NN-L-FIM-019`
+    High, recorded, never a kill or a would-have kill — a kill mid-run
+    would leave the other logs half rotated. It needs all of these:
+    - the drain's mark that the file was renamed AWAY, its content kept
+      under the new name (`wtmp.1`) — not a rename over it, not a
+      truncation or a write in place;
+    - the packaged logrotate (its device and inode at its path), executed
+      by root;
+    - options only `-f`, `--force`, `-v`, `--verbose`, and files only
+      `/etc/logrotate.conf` or `/etc/logrotate.d/<name>`, in directories
+      root's and writable by no one else (the default FIM paths do not
+      watch them).
+
+    Anything else keeps lot 340's verdict, High with the kill: a
+    truncation of `wtmp`/`btmp` by another writer, logrotate truncating in
+    place (`copytruncate`), a configuration in `/tmp`, a state file (`-s`),
+    `-d`, `-m`, a non-root or copied logrotate, a rename over the file.
   - The same check applies to any watched file renamed away with another
     file put at its path, such as an editor's backup rename of
     `sshd_config`: it is a change of the path by the renamer. A runtime
@@ -5026,6 +5041,10 @@ it resembles still fires.
     image: the host's file of an authentication binary (`sudo`, `su`,
     `passwd`, `unix_chkpwd`, …) in a directory root's and writable by no one
     else. This holds at a user's uid and at a service uid.
+  - Only then (the review of #583, F4): a process can change its own
+    `mm->exe_file` (`prctl(PR_SET_MM_MAP)` in a user namespace of its own).
+    When the cache knows what the reader executed (`/tmp/x`), that exec
+    decides, whatever image the open names.
   - The reader itself only: a session's shell and what it runs read as
     themselves (POS-002). Still ALERTED: `cat /etc/login.defs` from a
     session, a copy of a binary named `sudo`, the same inode in a directory
@@ -5056,18 +5075,28 @@ it resembles still fires.
   - it is installed in a root-owned system tree (an interpreter's script
     there too);
   - it was executed by root and listens as root;
-  - a live package transaction run by root covers it.
+  - a live package transaction run by root covers it;
+  - (the review of #583, F2) a package's dpkg maintainer script
+    (`/var/lib/dpkg/info/<package>.postinst` and its kin, in that root-only
+    directory) runs it, below the nearest package manager. The Low record
+    names the package.
 
   A root listener's Medium record now names the fact that was missing. Still
   Medium: a `/tmp` binary the postinst runs, `perl -e`, the same program
   after the transaction or run by hand from a session, another file at the
-  path, and a user's `python3 -m http.server`.
+  path, a user's `python3 -m http.server`, and an APT or dpkg hook
+  (`APT::Update::Post-Invoke`, `DPkg::Post-Invoke`: a shell `apt-get` runs
+  itself, apt-daily's run included) starting the host's `socat` as a bind
+  shell. rpm scriptlets have no such identity: their listeners stay Medium.
+  A package's own maintainer script starting a generic relay stays Low
+  (KNOWN_LIMITATIONS).
 - **Low noise.**
   - `NN-L-FIM-009`: a package transaction's unit writes (104 Low records in
     one `apt-get` hour on Ubuntu 24.04) are now one record per
-    package-manager process within 15 minutes. The others are counted as
-    coalesced: the next record's count, and the reporter's signed entry with
-    their paths. This is lot 352's coalescing of the module trees
+    package-manager process (its pid and its start) within 15 minutes. The
+    others are counted as coalesced: the next record's count, and up to 8
+    sample paths in the reporter's signed entry; every change keeps its own
+    row in the drift log. This is lot 352's coalescing of the module trees
     (`NN-L-FIM-008`), now shared. 20 records for one PostgreSQL install in
     the lab became 1. A unit dropped outside the transaction keeps its
     verdict, every time.
@@ -5076,13 +5105,29 @@ it resembles still fires.
     program, and lot 356 made them sole traces, never budgeted, so that
     each program a window let through stays named. Coalescing them by
     program kind is a design left for after the alpha (the PR describes it).
+- **R004 Critical at a reboot of Ubuntu 24.04** (P2, before this lot; the
+  review of #583, F3). An exec of `/proc/self/fd/9`, `ppid` 1, `comm` `9`,
+  had no identity and was gone before the pump read its `/proc`: R004's path
+  heuristic, Critical.
+  - The exec record (`sched_process_exec`) was attached before the exec
+    sensor's LSM program at the agent's start, so every exec between the two
+    attaches had no identity. It is now attached after it (a ratchet keeps
+    the order).
+  - An exec with no identity is PID 1's launch of its packaged executor
+    when the kernel's fork record says PID 1 forked it (its first exec
+    since), it runs as root, the path names its own descriptor `N`
+    (`/proc/self/fd/N`, `/dev/fd/N`), and PID 1's own descriptor `N` is one
+    of the executor's identities (the packaged file, the copy PID 1 holds).
+    Never by `argv[0]` or `comm`.
+  - Still Critical: a foreign `fexecve` from `/proc/self/fd` (a shell's
+    child, an orphan PID 1 adopted, no fork record, a second exec, PID 1's
+    descriptor another file or a memfd, a user manager's launch).
 - **Upgrade.** No configuration. The open sensor's ring record grows from
   632 to 648 bytes (the kernel object and the agent are one build).
   - Expect no `NN-L-FIM-005` at shutdown after a rotation, and an
     unchanged posture after a reboot.
-  - A hand `logrotate -f` gives `NN-L-FIM-005` High on logrotate, at the
-    rotation. For `wtmp`/`btmp` it also gives `NN-L-FIM-019` High (lot
-    340's verdict for a rotation by hand, its kill a would-have under
-    `alpha`).
+  - A hand `logrotate -f` with root's configuration gives `NN-L-FIM-005`
+    High on logrotate, at the rotation, and for `wtmp`/`btmp`
+    `NN-L-FIM-019` High, recorded, with no kill and no would-have kill.
   - Expect one `NN-L-FIM-009` Low record per package-manager process in a
     transaction, and Low for a package's own free-port probe.

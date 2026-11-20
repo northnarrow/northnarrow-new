@@ -11772,6 +11772,31 @@ number in parentheses is a lab PR.
       - The cold boot and the reboot: `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition. At r3's reboot the quadlet read had raised ALERTED.
       - `cat /etc/login.defs`: ALERTED, the line naming `cat`, `/usr/bin/cat`, `/etc/login.defs`.
       - The `/tmp` truncation found `/var/log/auth.log` already empty (r3 emptied it, and debian13 runs no rsyslog), so there was no change and no record.
+  - Fix round 1 (the review of #583: merge after fixes):
+    - **F1, a hand `logrotate -f`.** The drain marks its check of a file
+      renamed AWAY (`FimEvent::renamed_away`, a userland-only bit the decode
+      clears from kernel records). `LogRotation` records the packaged
+      logrotate (device and inode), as root, with root's configuration only
+      (options `-f`/`-v` and their long forms, files `/etc/logrotate.conf`
+      or `/etc/logrotate.d/<name>` in root-only directories), High with no
+      kill. A truncation in place, a rename over, another configuration or
+      writer keep lot 340's kill.
+    - **F2, the listener carve-out.** It also needs a package's dpkg
+      maintainer script below the nearest package manager
+      (`maintainer_script_in_lineage`): an APT hook's `socat` bind shell is
+      Medium. The residual (a package's own postinst starting a relay) is
+      in KNOWN_LIMITATIONS.
+    - **F3, R004 at a 24.04 reboot (before this lot).** The exec record is
+      attached after the exec sensor (ratchet `exec_attach_order.rs`). An
+      exec with no identity of `/proc/self/fd/N` or `/dev/fd/N`, PID 1's
+      fork (the kernel's record, its first exec), as root, is the executor
+      when PID 1's descriptor `N` is one of the executor's identities.
+    - **F4.** The image at the open stands in only while the cache holds no
+      exec of the reader.
+    - **F6.** The coalescing is keyed by the process (pid and start); the
+      docs say "up to 8 sample paths".
+    - Mutation: @MUTATION@
+    - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

@@ -2936,18 +2936,22 @@ const KMOD_TRANSACTIONS_MAX: usize = 256;
 /// Lot 352, shared since lot 376: the time of each package-transaction
 /// process's first recorded write of a rule, in insertion order — at most
 /// [`KMOD_TRANSACTIONS_MAX`] processes, the oldest forgotten first.
+///
+/// The review of #583 (F6): keyed by the process — its pid and its start
+/// (`FimEvent::modifier_start`, 0 when the kernel's record gave none) — so
+/// a pid another process takes within the window records its own first.
 #[derive(Default)]
 struct TransactionFirsts {
-    first: Mutex<VecDeque<(u32, u64)>>,
+    first: Mutex<VecDeque<((u32, u64), u64)>>,
 }
 
 impl TransactionFirsts {
-    /// `pid`'s write at `ts_ns` is the first of its transaction to record
-    /// (none of its writes recorded within [`KMOD_TRANSACTION_COALESCE_NS`]
-    /// before it).
-    fn first_of_transaction(&self, pid: u32, ts_ns: u64) -> bool {
+    /// The write at `ts_ns` of `pid` started at `start` is the first of its
+    /// transaction to record (none of that process's writes recorded within
+    /// [`KMOD_TRANSACTION_COALESCE_NS`] before it).
+    fn first_of_transaction(&self, pid: u32, start: u64, ts_ns: u64) -> bool {
         let mut first = self.first.lock();
-        if let Some(i) = first.iter().position(|(p, _)| *p == pid) {
+        if let Some(i) = first.iter().position(|(p, _)| *p == (pid, start)) {
             let at = first[i].1;
             if ts_ns >= at && ts_ns - at < KMOD_TRANSACTION_COALESCE_NS {
                 return false;
@@ -2957,7 +2961,7 @@ impl TransactionFirsts {
         if first.len() >= KMOD_TRANSACTIONS_MAX {
             first.pop_front();
         }
-        first.push_back((pid, ts_ns));
+        first.push_back(((pid, start), ts_ns));
         true
     }
 }
@@ -2972,8 +2976,8 @@ impl TransactionFirsts {
 ///   write of each package-manager process is recorded; the rest of that
 ///   process's writes within [`KMOD_TRANSACTION_COALESCE_NS`] are counted
 ///   into the detection budget as coalesced (the next record's
-///   `suppressed_before`, the reporter's signed entry with their paths) —
-///   no detection is lost, the store is not flooded.
+///   `suppressed_before`, and up to 8 sample paths in the reporter's signed
+///   entry) — no detection is lost, the store is not flooded.
 /// - `depmod`'s own index files (`<tree>/<version>/modules.*`) written by
 ///   the host's `kmod` (the multi-call binary `depmod` is; by the image the
 ///   exec recorded, [`AuthSessionTracker::ran_host_file`]): an
@@ -3030,9 +3034,11 @@ impl<H: PostureHost> Rule for KmodTreeWrites<H> {
             if self
                 .lineage
                 .is_package_transaction_write(fe.modifier_pid, at)
-                && !self
-                    .first
-                    .first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
+                && !self.first.first_of_transaction(
+                    fe.modifier_pid,
+                    fe.modifier_start,
+                    fe.timestamp_ns,
+                )
             {
                 crate::detection_budget::count_coalesced(self.id(), fe.modifier_uid, || {
                     (fe.path.clone(), fe.path.clone())
@@ -3115,7 +3121,7 @@ impl<H: PostureHost> Rule for TransactionCoalesced<H> {
             .is_package_transaction_write(fe.modifier_pid, at)
             && !self
                 .first
-                .first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
+                .first_of_transaction(fe.modifier_pid, fe.modifier_start, fe.timestamp_ns)
         {
             crate::detection_budget::count_coalesced(self.id(), fe.modifier_uid, || {
                 (fe.path.clone(), fe.path.clone())
@@ -9083,18 +9089,38 @@ mod tests {
             let (_tmp, t) = pkg_fixture();
             let rule = KmodTreeWrites::new(Box::new(NnLFim008KernelModuleModified), t);
             for pid in 0..KMOD_TRANSACTIONS_MAX as u32 + 1 {
-                assert!(rule.first.first_of_transaction(10_000 + pid, S));
+                assert!(rule.first.first_of_transaction(10_000 + pid, 0, S));
             }
             assert_eq!(rule.first.first.lock().len(), KMOD_TRANSACTIONS_MAX);
             assert!(
-                rule.first.first_of_transaction(10_000, 2 * S),
+                rule.first.first_of_transaction(10_000, 0, 2 * S),
                 "the oldest was forgotten"
             );
-            assert!(!rule
-                .first
-                .first_of_transaction(10_000 + KMOD_TRANSACTIONS_MAX as u32, 2 * S));
+            assert!(!rule.first.first_of_transaction(
+                10_000 + KMOD_TRANSACTIONS_MAX as u32,
+                0,
+                2 * S
+            ));
             // a write timed before its process's first starts over
-            assert!(rule.first.first_of_transaction(10_000, S / 2));
+            assert!(rule.first.first_of_transaction(10_000, 0, S / 2));
+        }
+
+        /// The review of #583 (F6): a pid another process takes within the
+        /// window (another start) records its own first write; the same
+        /// process's next write is coalesced.
+        #[test]
+        fn a_pid_reused_within_the_window_records_its_own_first() {
+            let first = TransactionFirsts::default();
+            assert!(first.first_of_transaction(20_000, 7 * S, 10 * S));
+            assert!(
+                !first.first_of_transaction(20_000, 7 * S, 11 * S),
+                "the same process"
+            );
+            assert!(
+                first.first_of_transaction(20_000, 9 * S, 12 * S),
+                "another process at the pid"
+            );
+            assert!(!first.first_of_transaction(20_000, 9 * S, 13 * S));
         }
 
         /// Lot 352: depmod — the host's kmod — writing the tree's indexes
