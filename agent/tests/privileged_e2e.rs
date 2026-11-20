@@ -1906,43 +1906,14 @@ fn grant_installed_window(u: &InstalledUnit, secs: u32) -> Result<(), String> {
     }
 }
 
-/// The words of a pinned `Array<u32>` (`bpftool -j map dump`), by slot.
+/// The words of a pinned `Array<u32>` under the agent's pin root, by slot —
+/// through a read-only descriptor ([`common::raw_bpf::pinned_words`]): the
+/// enforce-mode guard refuses `bpftool`'s read-write one even in a window.
 #[cfg(feature = "debug-trigger")]
 fn pinned_words(name: &str) -> Result<Vec<u32>, String> {
-    let pin = Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT).join(name);
-    let out = Command::new("bpftool")
-        .args(["-j", "map", "dump", "pinned"])
-        .arg(&pin)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("spawn bpftool: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "bpftool map dump {name}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("bpftool's JSON: {e}"))?;
-    let word = |x: &serde_json::Value| -> Option<u32> {
-        if let Some(n) = x.as_u64() {
-            return u32::try_from(n).ok();
-        }
-        let b: Vec<u8> = x
-            .as_array()?
-            .iter()
-            .filter_map(|h| u8::from_str_radix(h.as_str()?.trim_start_matches("0x"), 16).ok())
-            .collect();
-        Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?))
-    };
-    let mut slots: Vec<(u32, u32)> = v
-        .as_array()
-        .ok_or("bpftool's dump is not an array")?
-        .iter()
-        .filter_map(|e| Some((word(&e["key"])?, word(&e["value"])?)))
-        .collect();
-    slots.sort_unstable();
-    Ok(slots.into_iter().map(|(_, w)| w).collect())
+    common::raw_bpf::pinned_words(
+        &Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT).join(name),
+    )
 }
 
 /// The review of #582 (F7): the test's installed agent stopped and its pins
@@ -2081,8 +2052,9 @@ fn a_unit_restart_takes_the_vacated_role_under_enforce() {
         "the successor did not record its role:\n{log}"
     );
 
-    // 4. Read in a window: the successor holds the agent's slot; the
-    // kernel's mark of the vacancy outlived the claim.
+    // 4. Read in a window, through read-only descriptors (a write handle
+    // stays refused there while the guard enforces): the successor holds the
+    // agent's slot; the kernel's mark of the vacancy outlived the claim.
     grant_installed_window(&unit, 120).unwrap_or_else(|e| panic!("{e}"));
     let roles = pinned_words("ROLE_TGIDS").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(

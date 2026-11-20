@@ -173,6 +173,9 @@ memory file of the watchdog's, never on disk.
   `role_respawn_held` and `witness_chain_cut` as `witness_row`
   (`integrity_drift`, High); the others as `witness_note` (op `witness`);
   a row whose key it never certified as `witness_row_uncertified` (High).
+  A watchdog the agent does not register — not its unit's clean restart
+  (`watchdog_successor_foreign`) — has no key certified: each of its rows
+  is `witness_row_uncertified`.
 - Only the watchdog writes the chain: the kernel refuses the agent, a
   worker and every other process a write, truncation, rename, link or
   removal of it outside a trusted-installer window (`ROLE_WRITE_INODES`,

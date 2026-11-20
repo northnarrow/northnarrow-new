@@ -11770,6 +11770,10 @@ number in parentheses is a lab PR.
       foreign never inherited from an earlier holder (the agent's start
       does not register such a watchdog, and keeps judging one it
       refused); a clean verdict signed only for a succession nobody judged.
+  - #582's KVM suites, fix round 4 (the tests only): the unit-restart test
+    reads the role maps through a read-only descriptor; the witness test
+    waits for the successor's row and matches the import's kinds whole (its
+    watchdog is the test's, not its unit's restart: its rows uncertified).
   - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
