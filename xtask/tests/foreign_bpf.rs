@@ -1357,3 +1357,40 @@ fn the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes() {
         );
     }
 }
+
+/// Fix round 4 of #582 (its KVM suites): a privileged test reads the
+/// agent's maps while the guard enforces only through a read-only
+/// descriptor — `bpftool`'s `map dump` opens the pin read-write, which the
+/// guard refuses even inside a window (an empty stderr: the error is on its
+/// JSON stdout) — and a witness import is matched by its whole kind
+/// (`witness_row` is a prefix of `witness_row_uncertified`).
+#[test]
+fn enforce_mode_tests_read_maps_read_only_and_match_whole_kinds() {
+    let common = code("agent/tests/common/mod.rs");
+    let reader = body(&common, "pinned_words");
+    in_order(
+        reader,
+        &[
+            "a[3] = BPF_F_RDONLY;",
+            "sys_bpf(BPF_OBJ_GET, &mut a)",
+            "sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a)",
+        ],
+    )
+    .unwrap();
+    let e2e = code("agent/tests/privileged_e2e.rs");
+    let words = body(&e2e, "pinned_words");
+    assert!(words.contains("common::raw_bpf::pinned_words("), "{words}");
+    for b in [reader, words] {
+        assert!(!b.contains("bpftool"), "a read through bpftool: {b}");
+    }
+    let wd = code("watchdog/tests/privileged_e2e.rs");
+    assert!(
+        !wd.contains(".contains(\"witness_row\")"),
+        "a witness kind matched by its prefix"
+    );
+    let t = body(
+        &wd,
+        "the_watchdog_signs_the_agent_s_vacancy_and_its_successor",
+    );
+    assert!(t.contains("format!(\"\\\"kind\\\":\\\"{k}\\\"\")"), "{t}");
+}

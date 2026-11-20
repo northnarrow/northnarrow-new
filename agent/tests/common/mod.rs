@@ -1532,6 +1532,58 @@ pub mod raw_bpf {
         sys_bpf(BPF_OBJ_GET, &mut a).map(close)
     }
 
+    /// Lot 374 (fix round 4; #582's KVM suites): the words of the pinned
+    /// `Array<u32>` at `path`, by slot, through a READ-ONLY descriptor
+    /// (`BPF_OBJ_GET`, `file_flags` `BPF_F_RDONLY`) and `BPF_MAP_LOOKUP_ELEM`.
+    /// While the guard enforces, a write handle on one of the agent's maps is
+    /// refused even inside a trusted-installer window (lot 290's `bpf_map`
+    /// hook) — and the `bpftool` of the 5.15 and 6.8 guests opens a pin
+    /// read-write for a `map dump` (`{"error":…}` on its stdout, nothing on
+    /// its stderr). A read-only one is let through in a window.
+    pub fn pinned_words(path: &std::path::Path) -> Result<Vec<u32>, String> {
+        use ::common::bpf_cmd::BPF_MAP_LOOKUP_ELEM;
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let mut a: Attr = [0; 32];
+        set_ptr(&mut a, 0, c.as_ptr() as u64);
+        a[3] = BPF_F_RDONLY;
+        let fd = sys_bpf(BPF_OBJ_GET, &mut a)
+            .map_err(|e| format!("BPF_OBJ_GET read-only {}: errno {e}", path.display()))?;
+        // struct bpf_map_info: type, id, key_size, value_size, max_entries
+        let mut info = [0u8; 128];
+        let mut a: Attr = [0; 32];
+        a[0] = fd as u32;
+        a[1] = info.len() as u32;
+        set_ptr(&mut a, 2, info.as_mut_ptr() as u64);
+        let read = sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &mut a)
+            .map_err(|e| format!("BPF_OBJ_GET_INFO_BY_FD {}: errno {e}", path.display()))
+            .and_then(|_| {
+                let word = |at: usize| u32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+                let (key_size, value_size, entries) = (word(8), word(12), word(16));
+                if key_size != 4 || value_size != 4 {
+                    return Err(format!(
+                        "{} is not an Array<u32> (key {key_size}, value {value_size} bytes)",
+                        path.display()
+                    ));
+                }
+                (0..entries)
+                    .map(|slot| {
+                        let key = slot;
+                        let mut value = 0u32;
+                        let mut a: Attr = [0; 32];
+                        a[0] = fd as u32;
+                        set_ptr(&mut a, 2, &key as *const u32 as u64);
+                        set_ptr(&mut a, 4, &mut value as *mut u32 as u64);
+                        sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a)
+                            .map(|_| value)
+                            .map_err(|e| format!("{}[{slot}]: errno {e}", path.display()))
+                    })
+                    .collect()
+            });
+        close(fd);
+        read
+    }
+
     /// `BPF_LINK_GET_FD_BY_ID` on `id` (a granted handle is closed at once).
     pub fn link_fd_by_id(id: u32) -> Result<(), i32> {
         let mut a: Attr = [0; 32];

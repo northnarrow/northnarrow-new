@@ -206,6 +206,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       `only_a_certified_release_as_the_chain_s_last_row_is_a_signed_stop`.
     - The units' and KNOWN_LIMITATIONS' claims on memory protection and on
       the chain's own record corrected (N7).
+  - **#582's KVM suites** (fix round 4, the tests only): the unit-restart
+    test reads `ROLE_TGIDS` and `ROLE_MARKS` through a read-only descriptor
+    (while the guard enforces it refuses `bpftool`'s read-write one even
+    inside a window); the witness test waits for the successor's row (signed
+    once that start is over) and matches the import's kinds whole — its
+    watchdog, the test's and not its unit's restart, is
+    `watchdog_successor_foreign` to the agent, its key never certified, its
+    rows `witness_row_uncertified`. Test
+    `enforce_mode_tests_read_maps_read_only_and_match_whole_kinds`.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep
