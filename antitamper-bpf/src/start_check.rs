@@ -567,6 +567,31 @@ pub fn start_boot_ns(pid: u32) -> Option<u64> {
     start_ticks(pid).map(|t| t.saturating_mul(1_000_000_000) / hz)
 }
 
+/// `CLOCK_BOOTTIME` now, in nanoseconds (the clock of [`start_boot_ns`]).
+pub fn boot_ns_now() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// The re-check of #582 (N3): a process's start read from `/proc` is
+/// rounded down to a clock tick; one that started less than this before a
+/// moment may have started after it.
+pub const START_SLACK_NS: u64 = 20_000_000;
+
+/// The re-check of #582 (N3): process `pid` started before `at`
+/// (`CLOCK_BOOTTIME` ns), beyond [`START_SLACK_NS`]; `false` when its start
+/// is not read.
+pub fn started_before(pid: u32, at: u64) -> bool {
+    start_boot_ns(pid).is_some_and(|s| s.saturating_add(START_SLACK_NS) < at)
+}
+
 /// [`stat_start_ticks`] of this process, read now.
 pub fn own_start_ticks() -> Option<u64> {
     crate::kernel_roots::read_text("/proc/self/stat")

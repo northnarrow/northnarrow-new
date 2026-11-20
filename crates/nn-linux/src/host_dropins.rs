@@ -31,6 +31,53 @@ pub fn note_degradation(harms: &[Harm]) {
     }
 }
 
+/// The re-check of #582 (N0): the degradation's source when systemd's copy
+/// of one of our units does not deny memory both writable and executable
+/// (`MemoryDenyWriteExecute=`), whatever spelling turned it off.
+pub const MDWE_DEGRADATION: &str = "units_mdwe";
+
+/// The re-check of #582 (N0): our units' `MemoryDenyWriteExecute` as
+/// systemd holds it (its copy, which the units' starts apply) — off, or not
+/// read, is a degradation of this start (signed at the log's open). Nothing
+/// for a start that is not its unit's (a hand-run binary) or on a host
+/// without systemd's private socket. Blocking (2 s at most each exchange):
+/// at the start, before the runtime.
+pub fn note_units_mdwe() {
+    use antitamper_bpf::systemd_bus::{unit_property, Value, PRIVATE_SOCKET};
+    let socket = std::path::Path::new(PRIVATE_SOCKET);
+    if !socket.exists()
+        || !antitamper_bpf::start_check::identity(std::process::id())
+            .in_unit(antitamper_bpf::start_check::AGENT_UNIT)
+    {
+        return;
+    }
+    for unit in [
+        antitamper_bpf::start_check::AGENT_UNIT,
+        antitamper_bpf::start_check::WATCHDOG_UNIT,
+    ] {
+        let line = match unit_property(
+            socket,
+            std::time::Duration::from_secs(2),
+            unit,
+            antitamper_bpf::unit_props::SERVICE,
+            "MemoryDenyWriteExecute",
+        ) {
+            Ok(Value::Bool(true)) => continue,
+            Ok(v) => mdwe_line(unit, &format!("{v:?}")),
+            Err(e) => mdwe_line(unit, &format!("not read ({e})")),
+        };
+        crate::boot::degradation::report(MDWE_DEGRADATION, &line);
+    }
+}
+
+/// The degradation's line for `unit` whose copy says `value`.
+pub fn mdwe_line(unit: &str, value: &str) -> String {
+    format!(
+        "systemd's copy of {unit}: MemoryDenyWriteExecute {value}, not on — code no file backs \
+         could run in its starts"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

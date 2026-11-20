@@ -486,6 +486,9 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 if let Some(w) = witness.as_mut() {
                     w.check_head();
                 }
+                // The re-check of #582 (N2): a change made inside a signed
+                // window becomes the respawn gate's reference, signed
+                adopt_in_window(&cli, &mut witness).await;
                 continue 'restart_loop;
             }
             SelectOutcome::StaleStuck(pid) => {
@@ -595,14 +598,18 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // systemd's record never delays.
                 // The review of #582 (F4 a): inside a signed window the
                 // vacancy is the operator's (a note), as NN-L-BPF-002 is Low.
-                let in_window = antitamper_bpf::window_open(&cli.bpffs_root).unwrap_or(false);
+                // The re-check of #582 (N8): the window as the kernel marked
+                // the exit itself (the agent slot's mark), not sampled now;
+                // a mark not read is not a window's
+                let in_window = exit_in_window(&cli.bpffs_root);
                 if let Some(w) = witness.as_mut() {
                     let cause = exit_cause(&backend, &reaped, agent_pid).await;
+                    let clean = northnarrow_watchdog::witness::clean_stop(&cause);
                     // the review of #582 (F2 d): what the host would give a
                     // successor, as the vacancy begins
-                    let host = judge_host().await;
+                    let (host, adopted) = judge_host(&cli.bpffs_root).await;
                     w.record_or_log(
-                        northnarrow_watchdog::witness::vacancy_kind(&verdict, in_window),
+                        northnarrow_watchdog::witness::vacancy_kind(&verdict, in_window, clean),
                         &format!(
                             "{}; {}",
                             northnarrow_watchdog::witness::vacancy_detail(
@@ -611,6 +618,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             host.detail
                         ),
                     );
+                    record_adopted(w, adopted);
                 }
                 match verdict {
                     ShutdownVerdict::Authorised => {
@@ -705,8 +713,17 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // The review of #582 (F2 d): the host judged right before
                 // the start — a preload or a drop-in that changes our units'
                 // code, new since this watchdog's start, holds it (signed
-                // by the witness and in the agent's hold records).
-                let host = judge_host().await;
+                // by the witness and in the agent's hold records). The
+                // re-check of #582 (N2): nothing held inside a signed window,
+                // whose host becomes the reference (signed).
+                let (host, adopted) = judge_host(&cli.bpffs_root).await;
+                // the re-check of #582 (N3): when the judgement ended — a
+                // successor that started before it is not this start's
+                let judged_at = antitamper_bpf::start_check::boot_ns_now();
+                let judged_in_window = host.found.starts_with("inside a signed");
+                if let Some(w) = witness.as_mut() {
+                    record_adopted(w, adopted);
+                }
                 if let Some(why) = &host.hold {
                     if let Some(w) = witness.as_mut() {
                         w.record_or_log(
@@ -762,6 +779,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         &agent_bin,
                         &holds,
                         agent_pid,
+                        (!judged_in_window).then_some(judged_at),
                     ) => r,
                     _ = sigint.recv() => {
                         info!(target: "watchdog", signal = "SIGINT", "shutting down during respawn");
@@ -773,14 +791,34 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     }
                 };
                 match respawned {
-                    Ok((new_pid, new_fd, (given, successor))) => {
+                    Ok((new_pid, new_fd, judged)) => {
                         // Lot 374: the successor, signed by the witness —
-                        // with the host the gate judged before its start
+                        // with the host the gate judged before its start.
+                        // The re-check of #582 (N3): a successor that had
+                        // started before that judgement, outside a window,
+                        // took the role by a start the watchdog did not
+                        // make (High); the host was read after its start.
                         if let Some(w) = witness.as_mut() {
-                            w.record_or_log(
-                                northnarrow_watchdog::witness::successor_kind(given),
-                                &format!("{successor}; {}", host.detail),
-                            );
+                            if judged.unmade {
+                                w.record_or_log(
+                                    nn_proto::witness::KIND_UNMADE_START,
+                                    &format!(
+                                        "the agent's role taken by a start the watchdog did not \
+                                         make: pid {new_pid} had started before the watchdog \
+                                         judged the host, outside a signed window; {}; the host \
+                                         as the watchdog read it after that start: {}",
+                                        judged.detail, host.found
+                                    ),
+                                );
+                            } else {
+                                w.record_or_log(
+                                    northnarrow_watchdog::witness::successor_kind(
+                                        judged.given,
+                                        judged.confirmed,
+                                    ),
+                                    &format!("{}; {}", judged.detail, host.detail),
+                                );
+                            }
                         }
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
@@ -1085,7 +1123,8 @@ async fn respawn_cycle(
     agent_bin: &std::path::Path,
     hold_path: &std::path::Path,
     old_pid: u32,
-) -> Result<(u32, OwnedFd, (bool, String))> {
+    judged_at: Option<u64>,
+) -> Result<(u32, OwnedFd, Judged)> {
     info!(
         target: "watchdog.respawn",
         attempt,
@@ -1123,7 +1162,13 @@ async fn respawn_cycle(
     // Lot 374: who took the role — where it was started and what it
     // shows. Only the restart of the agent's unit with nothing foreign in it
     // is given the role's rights by the watchdog (its defensive reinsert).
-    let (given, successor) = judge_successor(old_pid, new_pid);
+    // The re-check of #582 (N3): never one that started before the gate's
+    // judgement (`judged_at`, outside a window): not this start's.
+    let mut judged = judge_successor(old_pid, new_pid);
+    judged.unmade = judged_at
+        .is_some_and(|at| antitamper_bpf::start_check::started_before(new_pid, at));
+    let given = judged.given && !judged.unmade;
+    let successor = judged.detail.clone();
     // Defensive reinsert — never for an agent that already exited (its pid
     // would wait in PROTECTED_PIDS for reuse). Failure here just widens
     // the brief window before the new agent's own register_protected_pids
@@ -1154,16 +1199,75 @@ async fn respawn_cycle(
         pin_handle_failed(hold_path, new_pid, "reinsert_new_agent_pid", &e);
     }
 
-    Ok((new_pid, new_fd, (given, successor)))
+    Ok((new_pid, new_fd, judged))
+}
+
+/// Lot 374: what the watchdog found of the agent's successor.
+struct Judged {
+    /// Its unit's clean restart: the watchdog re-registers it.
+    given: bool,
+    /// The re-check of #582 (N4): and every library's identity confirmed.
+    confirmed: bool,
+    detail: String,
+    /// The re-check of #582 (N3): it started before the gate's judgement,
+    /// outside a window — not the watchdog's start.
+    unmade: bool,
 }
 
 /// Lot 374: the successor `new` of the agent `old` — its identity and its
 /// environment and mappings read now (`antitamper_bpf::start_check`):
 /// whether it is its unit's clean restart, and the witness row's detail.
-fn judge_successor(old: u32, new: u32) -> (bool, String) {
+fn judge_successor(old: u32, new: u32) -> Judged {
     let id = antitamper_bpf::start_check::identity(new);
     let found = antitamper_bpf::start_check::inspect(new);
-    northnarrow_watchdog::witness::successor_detail(old, new, &id, &found)
+    let (given, detail) = northnarrow_watchdog::witness::successor_detail(old, new, &id, &found);
+    Judged {
+        given,
+        confirmed: found.confirmed(),
+        detail,
+        unmade: false,
+    }
+}
+
+/// The re-check of #582 (N8): whether the agent's last exit was inside a
+/// signed trusted-installer window, as the kernel marked it at the exit
+/// (`ROLE_MARKS`' agent word); a mark not read (or not frozen) is not a
+/// window's.
+fn exit_in_window(bpffs_root: &std::path::Path) -> bool {
+    match antitamper_bpf::role_marks(bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT) {
+        Ok(m) => m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0,
+        Err(e) => {
+            warn!(target: "watchdog.witness", error = format!("{e:#}"), "the agent's exit mark not read: the vacancy is not taken as a window's");
+            false
+        }
+    }
+}
+
+/// The re-check of #582 (N2): the respawn gate's reference moved, signed by
+/// the witness (never silently); nothing when it did not move.
+fn record_adopted(w: &mut northnarrow_watchdog::witness::Witness, adopted: Option<String>) {
+    if let Some(what) = adopted {
+        w.record_or_log(nn_proto::witness::KIND_GATE_REFERENCE, &what);
+    }
+}
+
+/// The re-check of #582 (N2): inside a signed trusted-installer window, the
+/// host as it is becomes the respawn gate's reference — signed when it
+/// moved. Outside a window (or the window not read) nothing moves.
+async fn adopt_in_window(
+    cli: &Cli,
+    witness: &mut Option<northnarrow_watchdog::witness::Witness>,
+) {
+    if !antitamper_bpf::window_open(&cli.bpffs_root).unwrap_or(false) {
+        return;
+    }
+    let adopted = tokio::task::spawn_blocking(northnarrow_watchdog::respawn_gate::adopt_now)
+        .await
+        .ok()
+        .flatten();
+    if let Some(w) = witness.as_mut() {
+        record_adopted(w, adopted);
+    }
 }
 
 /// The review of #582 (F2 c): how often the watchdog checks that its
@@ -1171,15 +1275,29 @@ fn judge_successor(old: u32, new: u32) -> (bool, String) {
 const WITNESS_HEAD_EVERY: Duration = Duration::from_secs(30);
 
 /// The review of #582 (F2 d): [`northnarrow_watchdog::respawn_gate::judge_now`]
-/// off the runtime's thread (it reads the drop-in directories and
-/// `/etc/ld.so.preload`). A judgement that could not run holds nothing and
+/// off the runtime's thread (it reads the drop-in directories,
+/// `/etc/ld.so.preload` and systemd's copy of the agent's unit). The
+/// re-check of #582 (N2): inside a signed trusted-installer window (the
+/// kernel's test, read now; not read is outside one) nothing is held, and
+/// the host becomes the reference — its description the second value, for
+/// the caller to sign. A judgement that could not run holds nothing and
 /// says so.
-async fn judge_host() -> northnarrow_watchdog::respawn_gate::Verdict {
-    tokio::task::spawn_blocking(northnarrow_watchdog::respawn_gate::judge_now)
+async fn judge_host(
+    bpffs_root: &std::path::Path,
+) -> (northnarrow_watchdog::respawn_gate::Verdict, Option<String>) {
+    let in_window = antitamper_bpf::window_open(bpffs_root).unwrap_or(false);
+    tokio::task::spawn_blocking(move || northnarrow_watchdog::respawn_gate::judge_now(in_window))
         .await
-        .unwrap_or_else(|e| northnarrow_watchdog::respawn_gate::Verdict {
-            hold: None,
-            detail: format!("the host before the start not judged: {e}"),
+        .unwrap_or_else(|e| {
+            let found = format!("not judged: {e}");
+            (
+                northnarrow_watchdog::respawn_gate::Verdict {
+                    hold: None,
+                    detail: format!("the host before the start {found}"),
+                    found,
+                },
+                None,
+            )
         })
 }
 
@@ -1195,25 +1313,57 @@ fn judge_agent_at_start(
     witness: &mut Option<northnarrow_watchdog::witness::Witness>,
     pid: u32,
 ) {
-    match antitamper_bpf::role_marks(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT) {
-        Ok(m) if m & antitamper_bpf::ROLE_MARK_VACATED != 0 => {
-            let (given, detail) = judge_successor(0, pid);
-            if let Some(w) = witness.as_mut() {
-                w.record_or_log(
-                    northnarrow_watchdog::witness::successor_kind(given),
-                    &format!(
-                        "judged at this watchdog's start (the agent's role was vacated earlier \
-                         this boot): {detail}"
-                    ),
-                );
-            }
+    use antitamper_bpf::{role_exit_ns, role_marks, ROLE_SLOT_AGENT, ROLE_SLOT_WATCHDOG};
+    let root = &cli.bpffs_root;
+    let mut unread = Vec::new();
+    let mut known = |r: anyhow::Result<u64>| match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            unread.push(format!("{e:#}"));
+            None
         }
-        Ok(_) => {}
-        Err(e) => warn!(
-            target: "watchdog.witness",
-            error = format!("{e:#}"),
-            "the agent's role marks not read: the agent found at this start is not judged"
-        ),
+    };
+    // the re-check of #582 (N4): only an agent that took its role while the
+    // watchdog's was vacant — a long-running one an earlier watchdog saw
+    // start is not judged again
+    let agent_mark = known(role_marks(root, ROLE_SLOT_AGENT).map(u64::from)).map(|m| m as u32);
+    let own_mark = known(role_marks(root, ROLE_SLOT_WATCHDOG).map(u64::from)).map(|m| m as u32);
+    let own_exit = known(role_exit_ns(root, ROLE_SLOT_WATCHDOG));
+    let why = antitamper_bpf::succession_to_judge(
+        agent_mark,
+        own_mark,
+        own_exit,
+        antitamper_bpf::start_check::start_boot_ns(pid),
+    );
+    // the re-check of #582 (N5): marks not read are judged, and recorded
+    // for the agent to sign — never a silent skip
+    let unread = (!unread.is_empty()).then(|| unread.join("; "));
+    if let Some(e) = &unread {
+        warn!(target: "watchdog.witness", error = %e, "the roles' exit marks not read: the agent found at this start is judged");
+        pin_handle_failed(
+            &hold_record_path(&cli.shutdown_marker),
+            pid,
+            "role_marks",
+            &anyhow::anyhow!("{e}"),
+        );
+    }
+    let Some(why) = why else {
+        return;
+    };
+    let judged = judge_successor(0, pid);
+    if let Some(w) = witness.as_mut() {
+        w.record_or_log(
+            northnarrow_watchdog::witness::successor_kind(judged.given, judged.confirmed),
+            &format!(
+                "judged at this watchdog's start (the agent's role was vacated earlier this boot; \
+                 {why}{}): {}",
+                unread
+                    .as_deref()
+                    .map(|e| format!("; the marks not read: {e}"))
+                    .unwrap_or_default(),
+                judged.detail
+            ),
+        );
     }
 }
 
@@ -1258,7 +1408,11 @@ fn open_witness(
             // The review of #582 (F2 c): the chain this life writes is the
             // watchdog role's alone (the agent reads it), registered now
             // and for each chain it opens after.
-            w.protect_with(&cli.bpffs_root);
+            // The re-check of #582 (N5): not registered is recorded for
+            // the agent to sign, and said in the chain's next row
+            if let Err(e) = w.protect_with(&cli.bpffs_root) {
+                pin_handle_failed(&holds, 0, "witness_chain_role", &anyhow::anyhow!("{e}"));
+            }
             if let Ok(slot) =
                 antitamper_bpf::role_slot(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)
             {
@@ -1398,7 +1552,7 @@ async fn hold(
     };
     let outcome = tokio::select! {
         out = hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown, agent_bin) => out,
-        never = hold_supervision(why, backend, &path, held.agent_pid, started, &mut *retry) => match never {},
+        never = hold_supervision(why, backend, &path, held.agent_pid, started, &mut *retry, &cli.bpffs_root) => match never {},
     };
     match outcome {
         HoldOutcome::Resumed { pid, pidfd } => {
@@ -1407,13 +1561,18 @@ async fn hold(
             // Lot 374: the agent that ends the hold took the vacated role:
             // signed by the witness; the role's rights only to its unit's
             // clean restart.
-            let (given, successor) = judge_successor(held.agent_pid, pid);
+            let judged = judge_successor(held.agent_pid, pid);
+            let (given, successor) = (judged.given, judged.detail.clone());
             if let Some(w) = witness.as_mut() {
                 w.record_or_log(
-                    northnarrow_watchdog::witness::successor_kind(given),
+                    northnarrow_watchdog::witness::successor_kind(judged.given, judged.confirmed),
                     &successor,
                 );
             }
+            // The re-check of #582 (N2): an operator's start inside a signed
+            // window ends the hold with the host as the operator left it as
+            // the reference (signed); outside one the reference stays.
+            adopt_in_window(cli, witness).await;
             if !given {
                 warn!(
                     target: "watchdog.tamper",
@@ -1478,6 +1637,7 @@ async fn hold_supervision(
     agent_pid: u32,
     started: Instant,
     retry: &mut HoldRetry,
+    bpffs_root: &std::path::Path,
 ) -> std::convert::Infallible {
     let mut tick = ping_ticker(HOLD_STATUS_EVERY);
     tick.tick().await; // the first fires at once
@@ -1513,7 +1673,21 @@ async fn hold_supervision(
             }
             // The review of #582 (F2 d): a retry is a start too — judged
             // first, skipped (and recorded) while the host stays changed.
-            let host = judge_host().await;
+            // The re-check of #582 (N2): inside a signed window it is not
+            // skipped; the reference moves (signed) once the agent is back.
+            let in_window = antitamper_bpf::window_open(bpffs_root).unwrap_or(false);
+            let host = tokio::task::spawn_blocking(move || {
+                northnarrow_watchdog::respawn_gate::judge_now_keeping(in_window)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                let found = format!("not judged: {e}");
+                northnarrow_watchdog::respawn_gate::Verdict {
+                    hold: None,
+                    detail: format!("the host before the start {found}"),
+                    found,
+                }
+            });
             if let Some(why) = host.hold {
                 error!(target: "watchdog.tamper", attempt, why = %why, "hold retry skipped: the host changed during the vacancy");
                 let skipped = nn_proto::watchdog_hold::HoldRecord {

@@ -1363,22 +1363,27 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
                 dev: stat_dev_to_kernel_dev(meta.dev()),
                 ino: meta.ino(),
             };
-            // the review of #582 (F2 c): one role's alone, that role first
+            // the re-check of #582 (N5): the plain protection first — a role
+            // registration that fails keeps it, and the files after it
+            register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE).with_context(
+                || format!("registering {} in {PROTECTED_INODES_MAP}", path.display()),
+            )?;
+            // the review of #582 (F2 c): one role's alone; (N5) a failure is
+            // a signed degradation, never only a line
             if let Some((_, _, role)) = STATE_ROLE_FILES
                 .iter()
                 .find(|(s, f, _)| s == sub && f == name)
             {
-                register_role_inode(ebpf, &key, *role).with_context(|| {
-                    format!(
-                        "registering {} in {}",
+                if let Err(e) = register_role_inode(ebpf, &key, *role) {
+                    let line = format!(
+                        "{} not registered in {} ({e:#}): the family's handles may write it",
                         path.display(),
                         antitamper_bpf::ROLE_WRITE_INODES_MAP_NAME
-                    )
-                })?;
+                    );
+                    warn!(detail = %line, "anti-tamper FS: role registration failed");
+                    crate::boot::degradation::report(ROLE_INODE_DEGRADATION, &line);
+                }
             }
-            register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE).with_context(
-                || format!("registering {} in {PROTECTED_INODES_MAP}", path.display()),
-            )?;
             crate::fs_type::note_identity(&path);
             info!(
                 path = %path.display(),
@@ -2289,6 +2294,10 @@ pub(crate) fn register_agent_file(ebpf: &mut Ebpf, path: &Path) -> Result<()> {
 pub(crate) fn register_cgroup_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
     register_inode(ebpf, key, flags)
 }
+
+/// The re-check of #582 (N5): the degradation's source when a file of one
+/// role's alone is not registered as such.
+pub const ROLE_INODE_DEGRADATION: &str = "role_write_inodes";
 
 /// The review of #582 (F2 c): `key` one role's alone (`ROLE_WRITE_INODES`),
 /// the keys of earlier chains (a rotation, an earlier start) removed first:

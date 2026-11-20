@@ -396,14 +396,24 @@ pub fn protect_for_role(
         AyaHashMap::try_from(AyaMap::HashMap(data))
             .with_context(|| format!("{name} is not a HashMap<InodeKey, u8>"))
     };
-    open(ROLE_WRITE_INODES_MAP_NAME)?
-        .insert(PodInodeKey(key), role, 0)
-        .with_context(|| {
-            format!(
-                "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
-                path.display()
-            )
-        })?;
+    let mut roles = open(ROLE_WRITE_INODES_MAP_NAME)?;
+    // the re-check of #582 (N6): the role's earlier chains (set aside by a
+    // cut or a rotation) leave the small pinned map, as at the agent's start
+    let stale: Vec<PodInodeKey> = roles
+        .iter()
+        .filter_map(|e| e.ok())
+        .filter(|(k, v)| *v == role && k.0 != key)
+        .map(|(k, _)| k)
+        .collect();
+    for k in stale {
+        let _ = roles.remove(&k);
+    }
+    roles.insert(PodInodeKey(key), role, 0).with_context(|| {
+        format!(
+            "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
+            path.display()
+        )
+    })?;
     open(cgroup_guard::PROTECTED_INODES_MAP_NAME)?
         .insert(
             PodInodeKey(key),

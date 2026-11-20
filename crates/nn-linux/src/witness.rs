@@ -217,8 +217,28 @@ impl WitnessReader {
                 )
             }
         };
-        let t = to_import(&text, self.position());
+        let mut t = to_import(&text, self.position());
         let mut out = Vec::new();
+        // The re-check of #582 (N6): the chain rotated (full, at a watchdog's
+        // open or within its life) — the import continues in the rotated
+        // chain (`witness.chain.1`) where it stopped, then the new chain
+        // from its first row: no row is lost, and a rotation is not a cut.
+        if t.position_lost {
+            if let Some(rest) = self.rotated_rest() {
+                let from_start = Imported {
+                    keys: self.position().keys.clone(),
+                    last: String::new(),
+                };
+                let mut whole = to_import(&text, &from_start);
+                if !whole.position_lost {
+                    let mut rows = rest.rows;
+                    rows.append(&mut whole.rows);
+                    whole.rows = rows;
+                    whole.broken = rest.broken.or(whole.broken);
+                    t = whole;
+                }
+            }
+        }
         if t.position_lost {
             out.push(Finding {
                 kind: WITNESS_BROKEN,
@@ -251,12 +271,35 @@ impl WitnessReader {
         (out, last)
     }
 
+    /// The re-check of #582 (N6): the rows of the rotated chain
+    /// (`witness.chain.1`) after the last one imported — `None` when that
+    /// chain does not hold it either.
+    fn rotated_rest(&mut self) -> Option<nn_proto::witness::ToImport> {
+        let path = self.dir.join(format!("{CHAIN_FILE}.1"));
+        let b = crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES).ok()?;
+        let t = to_import(&String::from_utf8_lossy(&b), self.position());
+        (!t.position_lost).then_some(t)
+    }
+
     /// The review of #582 (F4 b): the chain's last valid row is the agent's
     /// role released by a shutdown the admin quorum signed
     /// ([`KIND_RELEASED`]: the watchdog stands down after it), signed by a
     /// key this agent's position certified — a later life of a watchdog
     /// would have opened a row after it.
+    /// The re-check of #582 (N8): signed this boot — a release a previous
+    /// boot's chain ends with (its certified key kept) is not this boot's
+    /// stop.
     pub fn ends_with_signed_release(&mut self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let up = antitamper_bpf::start_check::boot_ns_now() / 1_000_000_000;
+        self.ends_with_signed_release_since(now.saturating_sub(up))
+    }
+
+    /// [`WitnessReader::ends_with_signed_release`], the row written at
+    /// `boot_at` (unix seconds) or after.
+    pub fn ends_with_signed_release_since(&mut self, boot_at: u64) -> bool {
         let path = self.dir.join(CHAIN_FILE);
         let Ok(b) = crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES) else {
             return false;
@@ -269,7 +312,9 @@ impl WitnessReader {
                 nn_proto::witness::Judged::Valid { row, .. } => Some(row),
                 nn_proto::witness::Judged::Broken { .. } => None,
             });
-        last.is_some_and(|row| row.kind == KIND_RELEASED && self.position().certified(&row.key))
+        last.is_some_and(|row| {
+            row.kind == KIND_RELEASED && row.at >= boot_at && self.position().certified(&row.key)
+        })
     }
 
     /// The position after the rows [`WitnessReader::pending`] gave, signed.
@@ -627,6 +672,11 @@ mod tests {
         use nn_proto::witness::{KIND_OPENED, KIND_RELEASED, KIND_VACATED};
         let dir = tempfile::tempdir().unwrap();
         let k = WitnessKey::from_seed([3; 32]);
+        // written now (the re-check of #582, N8: this boot's)
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let write = |kinds: &[&str]| {
             let mut text = String::new();
             let mut prev = String::new();
@@ -635,7 +685,7 @@ mod tests {
                     v: ROW_VERSION,
                     seq: i as u64,
                     prev: prev.clone(),
-                    at: 1,
+                    at,
                     tgid: 7,
                     key: String::new(),
                     kind: kind.to_string(),
@@ -659,6 +709,10 @@ mod tests {
         write(&[KIND_OPENED, KIND_RELEASED]);
         assert!(reader(true).ends_with_signed_release());
         assert!(!reader(false).ends_with_signed_release());
+        // the re-check of #582 (N8): a release written before this boot (a
+        // chain the watchdog did not continue this boot) is not this boot's
+        assert!(reader(true).ends_with_signed_release_since(at));
+        assert!(!reader(true).ends_with_signed_release_since(at + 1));
         write(&[KIND_OPENED, KIND_RELEASED, KIND_OPENED]);
         assert!(!reader(true).ends_with_signed_release());
         write(&[KIND_OPENED, KIND_VACATED]);
