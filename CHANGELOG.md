@@ -198,7 +198,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
       before the next (N6). Tests
       `a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn`,
       `a_full_chain_rotates_within_a_life_and_cuts_keep_their_own_names`.
-    - Inside a window only a clean stop (exit status 0 or SIGTERM) is the
+    - Inside a window only a clean stop (exit status 0 or SIGTERM, or the
+      stop cut at its deadline: exit status 75, re-check 7) is the
       operator's, as the kernel marked the exit — at a vacancy the watchdog
       sees and at one its start finds (systemd's record of the exit); a
       signed stop counts for the gap only when signed this boot (N8). Tests
@@ -234,13 +235,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     PID, and every later start failed (`resources`). systemd also failed
     the unit before it reaped an OOM-killed agent, so the watchdog signed
     the vacancy's cause as "not known". Now the agent's OOM kill is recorded
-    as its exit (`signal 9`). The watchdog names the kernel's OOM killer
-    from the `oom_kill` count of `northnarrow.slice`, read at the agent's
-    registration and at its exit. A drop-in that sets `OOMPolicy=stop` is
-    judged harmful, like `kill`. Tests
+    as its exit (`signal 9`). The watchdog notes the `oom_kill` count of
+    `northnarrow.slice`, read at the agent's registration and at its exit,
+    when it rose (re-check 7: as a count, not as the cause). A drop-in that
+    sets `OOMPolicy=stop` is judged harmful, like `kill`. Tests
     `an_oom_kill_of_one_process_leaves_both_units_running`,
-    `an_oom_kill_recorded_as_signal_9_is_named_the_oom_killer_s` and
+    `an_oom_kill_recorded_as_signal_9_notes_the_slice_s_count` and
     `an_oom_policy_that_stops_or_kills_our_units_is_harmful`.
+  - **Re-check 7 (fix round 7).**
+    - **The operator's stop cut at its deadline inside a window is a
+      note.** On a loaded host the operator's stop or restart in a signed
+      window can overrun the stop's 2 s (the workers' stop alone waits up
+      to 2 s): the agent exits 75 and signs `stop_deadline` (lot 288). That
+      exit inside a window is now the operator's stop
+      (`role_released_in_window`), its row naming the cut; outside a
+      window it stays `role_vacated` (High). Test
+      `a_stop_cut_at_its_deadline_inside_a_window_is_the_operator_s`.
+    - **The OOM wording says only what is known.** The slice's `oom_kill`
+      count also counts the workers (the OOM killer's first pick), so a
+      SIGKILL of the agent after a worker's OOM kill (a write to
+      `cgroup.kill`) was signed as the OOM killer's. The row now keeps the
+      recorded cause, says the cause is not known and notes the count;
+      only for the wait's `signal 9` and systemd's `Result=signal` one,
+      never for systemd's own SIGKILL (`Result=timeout`, `watchdog`).
+      systemd's `Result=oom-kill` is named as the unit's (the agent or
+      another of its processes). Test
+      `a_slice_oom_count_never_names_the_oom_killer_as_the_agent_s`.
 - Lot 373 (the rc7 soaks): six false positives of the host's own routine
   judged by identity (`UPGRADE_NOTES_WAVE4.md` §60).
   - **The agent's own runtime files.** After every boot the agent's sweep

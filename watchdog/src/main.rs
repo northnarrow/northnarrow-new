@@ -607,8 +607,9 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // a mark not read is not a window's
                 let in_window = exit_in_window(&cli.bpffs_root);
                 if let Some(w) = witness.as_mut() {
-                    // the lab round 5 of #582: an OOM kill named as such
-                    let cause = northnarrow_watchdog::witness::with_oom_killer(
+                    // the lab round 5 of #582: the slice's OOM kill count
+                    // noted (re-check 7, G2: its cause is not named by it)
+                    let cause = northnarrow_watchdog::witness::with_slice_oom_count(
                         &exit_cause(&backend, &reaped, agent_pid).await,
                         agent_oom_kills,
                         northnarrow_watchdog::witness::units_oom_kills(),
@@ -1400,8 +1401,8 @@ fn judge_agent_at_start(
 /// The agent `pid`'s life as the watchdog registers it: its start
 /// (`process_start_unix`, external audit WDG-001) and the units' slice's
 /// OOM kill count then (the lab round 5 of #582,
-/// [`northnarrow_watchdog::witness::with_oom_killer`]). One call, so neither
-/// is taken without the other.
+/// [`northnarrow_watchdog::witness::with_slice_oom_count`]). One call, so
+/// neither is taken without the other.
 fn agent_life(pid: u32) -> (Option<u64>, Option<u64>) {
     (
         process_start_unix(pid),

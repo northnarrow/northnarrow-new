@@ -344,11 +344,12 @@ fn the_re_check_s_rules_are_wired_where_they_hold() {
     assert!(e[..400].contains("ROLE_SLOT_AGENT") && e[..400].contains("ROLE_MARK_IN_WINDOW"));
 }
 
-/// The lab r5 of #582 (fix round 6): a SIGKILL vacancy names the kernel's
-/// OOM killer from the units' slice's `oom_kill` count. Every registration
+/// The lab r5 of #582 (fix round 6): a SIGKILL vacancy notes the units'
+/// slice's `oom_kill` count (re-check 7, G2: never as the agent's OOM
+/// kill, the count is the slice's). Every registration
 /// of an agent takes that count with its start (`agent_life`, the one place
 /// a start is read), and the vacancy row's cause goes through
-/// `with_oom_killer` with it; the count is the units' slice's.
+/// `with_slice_oom_count` with it; the count is the units' slice's.
 #[test]
 fn every_agent_registration_takes_the_slice_s_oom_count() {
     let root = repo_root();
@@ -373,7 +374,7 @@ fn every_agent_registration_takes_the_slice_s_oom_count() {
         "each registration after the first"
     );
     let v = &wd[wd
-        .find("witness::with_oom_killer(")
+        .find("witness::with_slice_oom_count(")
         .expect("the vacancy's cause")..];
     let v = &v[..v.find(");").unwrap()];
     assert!(

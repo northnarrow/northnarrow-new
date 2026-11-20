@@ -11783,9 +11783,29 @@ number in parentheses is a lab PR.
     A worker's OOM kill (the kernel's first pick) made systemd stop the
     agent's unit, a stop the hook refused, and the unit was left failed
     with the agent running and no start possible. The agent's own OOM kill
-    is now recorded (`signal 9`), and the vacancy names the OOM killer from
-    the slice's `oom_kill` count. A drop-in that sets `OOMPolicy=stop` is
-    judged harmful.
+    is now recorded (`signal 9`), and the vacancy notes the slice's
+    `oom_kill` count (as a count since fix round 7). A drop-in that sets
+    `OOMPolicy=stop` is judged harmful.
+  - Re-check 7, fix round 7 (product, `watchdog/src/witness.rs`):
+    - The operator's stop inside a window cut at its deadline (exit 75,
+      `stop_deadline`, the r6 window restart on 7.0) is
+      `role_released_in_window`, its row naming the cut; outside a window
+      unchanged. Test
+      `a_stop_cut_at_its_deadline_inside_a_window_is_the_operator_s`.
+    - The slice's `oom_kill` count (the workers' too) no longer names the
+      OOM killer as the agent's: "cause not known" with the count, only
+      for `signal 9` and `Result=signal`; `Result=oom-kill` named as the
+      unit's. Test
+      `a_slice_oom_count_never_names_the_oom_killer_as_the_agent_s`.
+    - Lab (as measured, rounds r7 and r7b on ubuntu2604, 7.0/systemd
+      259, the tree verified by hash): the agent's OOM vacancy reads
+      "signal 9 (systemd Result=signal), cause not known: an OOM kill was
+      counted in northnarrow.slice … from 0 to 1", never the OOM killer.
+      Three window restarts exited 0, each `role_released_in_window`,
+      BPF-002 Low. With the agent's unit frozen 3 s after the SIGTERM (the
+      stall a loaded host gives, made deterministic) the stop was cut:
+      exit status 75, `role_released_in_window` naming the cut, no
+      `witness_row`, BPF-002 Low. No unit left failed, chain links ok.
   - Lab (as measured, round r6 on fix round 6's product, ubuntu2204
     5.15/systemd 249 and ubuntu2604 7.0/systemd 259): the tree verified
     by hash. verifier-check OK (highest `mount_guard_sb_mount` 83.1% on
@@ -11793,7 +11813,8 @@ number in parentheses is a lab PR.
     both units active and their pids in `ROLE_TGIDS`. Every OOM killed the
     process the probe aimed at, as the kernel log names it.
     - Vacancies: the agent's OOM vacancy is signed with its cause
-      (`signal 9`, the OOM killer's, from the slice's `oom_kill` count) and
+      (`signal 9`, with the slice's `oom_kill` count; r6 wording, named
+      the OOM killer's until fix round 7) and
       taken by its unit's restart. The watchdog's OOM vacancy leaves the
       agent running (`watchdog_gone`, `watchdog_succession`).
     - Refusals: a loader variable reaches neither unit. A transient start
@@ -11808,7 +11829,7 @@ number in parentheses is a lab PR.
     - Notes: the maintenance stop is `roles_released`, no gap. On 5.15 the
       window restart is a note. On 7.0 the agent's stop was cut at its
       deadline (exit 75, lot 288, signed `stop_deadline`), so the vacancy
-      is High, as N8 rules.
+      is High, as N8 ruled (a note since fix round 7).
     - Maps: `ROLE_MARKS` and `ROLE_EXITS` frozen, a write handle refused.
     - A `libgcc_s` replacement gives no false High.
     - Totals: no W^X refusal; no unit left failed with its daemon running.
