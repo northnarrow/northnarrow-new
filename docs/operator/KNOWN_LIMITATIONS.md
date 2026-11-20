@@ -341,13 +341,16 @@ not cause as an incident.
   later, as every drift finding is:
   - a change of the lock's own settings is not refused: the next round
     signs it (`pin_lock_changed`) and makes the lock again;
-  - in some other mount namespaces the lock does not hold: the host's
-    bpffs view (and, in one case, the pins) can be lost; each loss is
-    signed (`protected_mount_gone`, `pin_lock_missing`);
+  - another mount namespace's own copy of the lock is not judged as the
+    host's lock: the host's bpffs view and the pins can be lost through
+    it. Signed `protected_mount_gone` and `pin_lock_missing`;
   - the systemd units' own mount namespaces, the agent's and the
     watchdog's among them, never have the lock. That namespace's view of
     the bpffs can be lost, not the host's nor the pins; what reads the pins
-    by path there fails until a restart. Signed `protected_mount_gone`.
+    by path there fails until a restart. Signed `protected_mount_gone`;
+  - a mount namespace that was already a peer of the host's when the lock
+    was made does not hold the lock: the host's bpffs view can be lost
+    through it. Signed `protected_mount_gone`.
 
   A hardening lot after the alpha narrows the first two. A start that finds
   no lock (a kernel without `open_tree(2)`, an error) signs a degradation
@@ -454,7 +457,7 @@ not cause as an incident.
     (`respawn_gate_reference_moved`, signed): a later start in the same
     watchdog life is judged against it. *For you:* when the agent does not
     come back, read the watchdog's journal before you open a window (a
-    held start is a `role_respawn_held` row there). A successor that
+    held start is a `watchdog HOLDING` error line there). A successor that
     started before that judgement, outside a window, is
     recorded as the role taken by a start the watchdog did not make
     (`role_taken_by_another_start`, High), after that start.
@@ -475,7 +478,8 @@ not cause as an incident.
     disk since a process mapped it is judged by identity: not the judging
     role's own copy, it is signed High (`role_successor_unconfirmed`,
     `watchdog_successor_unconfirmed`) for such a successor, and the
-    process keeps its registration.
+    process keeps its registration; a long-running process that an
+    earlier holder saw take its role is not signed for it.
   - When both roles were vacated, the next agent start signs the gap it
     finds (`roles_vacated_gap`), or a note when the operator released both
     (`roles_released`).
@@ -502,7 +506,8 @@ not cause as an incident.
   is recorded after it, not prevented. While the watchdog is gone too, or
   runs without its witness (`witness_unavailable`, High), the agent's
   vacancy is recorded only by the next start (`previous_run`, the
-  succession record, the gap it finds). On a host without systemd (the watchdog's `exec`
+  succession record, the gap it finds), and a change to the chains made
+  while neither role runs may not be found without a head kept elsewhere. On a host without systemd (the watchdog's `exec`
   respawn backend) a vacated role is not taken again until the next boot.
   The agent judges a process that takes the watchdog's role at its next
   round, while the kernel's guard refuses one outside the unit at once.
@@ -607,7 +612,7 @@ not cause as an incident.
   maps (links followed as the kernel follows them), as it reads the
   process just after the exec. A program the agent cannot place where the
   loader maps it is recorded (R001, Medium) without a response, or judged
-  by its name; a descriptor's link it cannot place is judged as fileless
+  by its name (which may draw no record); a descriptor's link it cannot place is judged as fileless
   code (R004). A loader that only lists or checks a program can still run
   code the program names, so the agent never takes such a listing as
   harmless: a staged program (in `/tmp`, a memfd, a FUSE file and the
@@ -738,7 +743,8 @@ not cause as an incident.
 - **Children that only fork.** A process that forks without running a new
   program is judged by its parent's image. A few fork-only children are
   judged by their path rather than their image, or on their parent's
-  earlier image.
+  earlier image. A program name the kernel cut inside a multibyte
+  character is not tied to its image.
   *Evidence:* `fork_only_connects` tests (lot 360); lot 360.
 - **A TLS fingerprint is not an identity.** `NN-L-NET-003_BadJa3` records a
   listed JA3 or JA4 at Medium and never acts on it. *Evidence:* internal
@@ -945,8 +951,8 @@ lists the known false positives of each rule.
   that is no longer on disk: `R004_ExecFromProcSelfFd` Critical (`would
   have: KillProcessTree`). *For you:* such a record right after an
   upgrade of that program's package is a known false positive.
-  *Evidence:* `a_dropped_binary_that_unlinks_and_reexecutes_itself_is_killed`;
-  lot 310.
+  *Evidence:* the residual of `docs/operator/UPGRADE_NOTES_WAVE4.md` §31
+  (a program re-executing itself in place); lot 310.
 
 ## Kernels and distributions
 

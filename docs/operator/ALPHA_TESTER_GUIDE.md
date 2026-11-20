@@ -109,8 +109,11 @@ shows. Never replace the list with a fixed one: that can switch AppArmor
 or SELinux off.
 
 A preload list that loads a library into every program (a command logger,
-another vendor's agent) keeps the agent from starting, and the installer
-refuses such a host: see
+another vendor's agent) keeps the agent from starting. With the tarball,
+`install.sh` refuses such a host before it changes anything (exit 5). The
+`.deb` and `.rpm` do not check the list: the package installs, and then
+the agent refuses each start (exit 78, the library named in its journal),
+so run the `cat` line above first. See
 [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md#install-and-upgrade), "A host
 with a library preload list".
 

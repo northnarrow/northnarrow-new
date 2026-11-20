@@ -5381,7 +5381,16 @@ installer did not refuse, and operator texts written for developers.
     own start check refuses it, as before.
   - A host left with the files installed and each start refused (the
     installer before this lot) needs no window to be uninstalled: nothing
-    was pinned.
+    was loaded (the agent unit's pin-lock step, which runs before the
+    start's own check, leaves an empty pin root).
+  - That uninstall stopped with the whole host left on Debian 13 (exit 1,
+    the lab of this lot): with no list of the agent's programs, it waited
+    for every LSM program on the host, and PID 1's own (systemd's
+    `RestrictFileSystems=`) never detaches. The uninstall and the upgrade
+    no longer wait for the programs PID 1 holds (read from PID 1's
+    descriptors); another product's are waited for as before. A pin root
+    that a unit restart makes again during the uninstall (the watchdog's
+    `Restart=` after a refused start) is removed once the units are gone.
 - **The daemons' `--help`.** Every option they show says what it does;
   internal references moved to the code. Hidden, still accepted: the
   agent's `--install-manifest`, `--shutdown-marker-file`,

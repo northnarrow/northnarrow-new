@@ -579,7 +579,14 @@ to wait for every LSM program on the host: systemd's own
 30 s with everything left. When nothing of NorthNarrow can hold one — no pin
 root and no unit process when the run starts, no process running a
 NorthNarrow binary — other products' programs are not waited for; any of
-them, and the wait is as before. Every uninstall also stops the journal
+them, and the wait is as before, except for the programs PID 1 holds
+(lot 377): none of them is NorthNarrow's and none detaches while PID 1
+runs, so they are never waited for — by the uninstall nor by the upgrade.
+That is what lets the uninstall of a half-install finish on Debian 13 (a
+start refused by its own check, before it loaded anything: its unit's
+pin-lock step had made an empty pin root first). A pin root that a unit
+restart makes again during the uninstall (the watchdog's `Restart=` after
+a refused start) is removed once the units are gone. Every uninstall also stops the journal
 namespace's varlink socket and removes its runtime directory
 (`/run/systemd/journal.northnarrow`); `--purge` removes `/var/log/northnarrow`
 when nothing else is in it.

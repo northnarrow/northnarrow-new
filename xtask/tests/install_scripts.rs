@@ -6238,7 +6238,11 @@ fn uninstall_of_a_half_install_does_not_wait_for_pid_ones_lsm_program() {
         .unwrap();
         let fdinfo = host.dir.join("proc/1/fdinfo");
         fs::create_dir_all(&fdinfo).unwrap();
-        fs::write(fdinfo.join("0"), "pos:\t0\nflags:\t02000002\nmnt_id:\t25\nino:\t7\n").unwrap();
+        fs::write(
+            fdinfo.join("0"),
+            "pos:\t0\nflags:\t02000002\nmnt_id:\t25\nino:\t7\n",
+        )
+        .unwrap();
         fs::write(fdinfo.join("41"), pid_one_lsm_link(pid_one_holds)).unwrap();
         host
     };
@@ -6306,7 +6310,11 @@ fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
         ),
     );
     write_exec(&stub.join("sleep"), "exit 0");
-    let wait = section("deploy/install.sh", "wait_own_programs_unloaded() {", "\n}\n");
+    let wait = section(
+        "deploy/install.sh",
+        "wait_own_programs_unloaded() {",
+        "\n}\n",
+    );
     let run = |call: &str| {
         let out = Command::new("bash")
             .arg("-c")
@@ -6344,7 +6352,10 @@ fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
     // install.sh's wait: two programs left, then only PID 1's
     let (rc, _, err) = run("wait_own_programs_unloaded ''");
     assert_eq!(rc, 1, "{err}");
-    assert!(err.contains("2 LSM program(s) still loaded") && err.contains("31: lsm"), "{err}");
+    assert!(
+        err.contains("2 LSM program(s) still loaded") && err.contains("31: lsm"),
+        "{err}"
+    );
     fs::write(
         &progs,
         "21: lsm  name restrict_filesystems  tag e8932b6bae2b9745  gpl\n",
@@ -6370,7 +6381,9 @@ fn both_scripts_leave_out_only_pid_ones_lsm_programs() {
 #[test]
 fn uninstall_removes_a_pin_root_made_again_after_the_units_are_gone() {
     let text = read("deploy/uninstall.sh");
-    let call = text.rfind("\nlate_pin_sweep\n").expect("late_pin_sweep is run");
+    let call = text
+        .rfind("\nlate_pin_sweep\n")
+        .expect("late_pin_sweep is run");
     let units_removed = text
         .find("rm -f \"$UNIT_DIR/$u.service\"")
         .expect("the unit files are removed");
@@ -6397,8 +6410,15 @@ fn uninstall_removes_a_pin_root_made_again_after_the_units_are_gone() {
             .output()
             .unwrap();
         let so = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && so.ends_with("done\n"), "{case}: {out:?}");
+        assert!(
+            out.status.success() && so.ends_with("done\n"),
+            "{case}: {out:?}"
+        );
         assert_eq!(!dir.join("pins").exists(), removed, "{case}: {so}");
-        assert_eq!(so.matches("removing it").count(), usize::from(removed), "{case}: {so}");
+        assert_eq!(
+            so.matches("removing it").count(),
+            usize::from(removed),
+            "{case}: {so}"
+        );
     }
 }

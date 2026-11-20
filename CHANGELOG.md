@@ -33,6 +33,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `a_preload_list_is_judged_by_the_files_its_names_resolve_to`,
     `host_check_exits_3_on_a_failure_before_its_warnings`,
     `uninstall_of_a_half_install_whose_start_was_refused_needs_no_window`.
+  - **The uninstall of a half-install finishes on Debian 13.** A start
+    refused by its own check loads nothing, so the uninstall has no list
+    of the agent's programs and waited for every LSM program on the host:
+    PID 1's own (systemd's `RestrictFileSystems=` on Debian 13) never
+    detaches, and the uninstall stopped with exit 1 and the whole host
+    left. The uninstall's and the upgrade's wait leave out the programs
+    PID 1 holds (one rule in both scripts, `lsm_progs_left`); a pin root a
+    unit restart makes again during the uninstall is removed once the
+    units are gone. Tests
+    `uninstall_of_a_half_install_does_not_wait_for_pid_ones_lsm_program`,
+    `both_scripts_leave_out_only_pid_ones_lsm_programs`,
+    `uninstall_removes_a_pin_root_made_again_after_the_units_are_gone`.
   - **The daemons' `--help` speaks the operator's language.** Every option
     `northnarrow-agent --help` and `northnarrow-watchdog --help` show is
     described by what it does; the development history moved to code
@@ -54,7 +66,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     standard library's `posix_spawn` lets the parent run on just before the
     kernel switches the child to its new image, and the link still named
     the test binary (a nightly on Debian 12). The test now waits, bounded,
-    for the exec; the assertion is unchanged.
+    for the exec; the assertion is unchanged. So does
+    `a_unit_restart_takes_the_vacated_role_under_enforce` (lot 374) for the
+    admin socket before it opens a window: the agent logs its objects'
+    registration before its admin socket listens, and a slow runner's grant
+    found no socket.
 - Lot 376 (the rc9 soaks): three false positives and the Low noise judged
   by identity (`UPGRADE_NOTES_WAVE4.md` §62).
   - **A rotated log's first record.** logrotate's `create` put a new file
