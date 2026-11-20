@@ -859,7 +859,7 @@ mod tests {
         let mut r = WitnessReader::new(dir.path());
         let f = r.certify(me).expect("certified");
         assert_eq!(f.kind, WITNESS_KEY);
-        assert!(f.detail.contains(&key), "{}", f.detail);
+        assert!(f.detail.contains(&key), "the certification names the key");
         assert!(r.certify(me).is_none(), "once");
         assert!(WitnessReader::new(dir.path()).position().certified(&key));
         drop(fd);
