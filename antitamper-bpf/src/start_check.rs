@@ -585,11 +585,11 @@ pub fn boot_ns_now() -> u64 {
 /// moment may have started after it.
 pub const START_SLACK_NS: u64 = 20_000_000;
 
-/// The re-check of #582 (N3): process `pid` started before `at`
-/// (`CLOCK_BOOTTIME` ns), beyond [`START_SLACK_NS`]; `false` when its start
-/// is not read.
-pub fn started_before(pid: u32, at: u64) -> bool {
-    start_boot_ns(pid).is_some_and(|s| s.saturating_add(START_SLACK_NS) < at)
+/// The re-check of #582 (N3): a process that started at `start`
+/// ([`start_boot_ns`]) started before `at` (`CLOCK_BOOTTIME` ns), beyond
+/// [`START_SLACK_NS`]; `false` when its start is not read.
+pub fn started_before(start: Option<u64>, at: u64) -> bool {
+    start.is_some_and(|s| s.saturating_add(START_SLACK_NS) < at)
 }
 
 /// [`stat_start_ticks`] of this process, read now.
@@ -1050,6 +1050,26 @@ mod tests {
         };
         let d = f.describe();
         assert!(d.contains("LD_PRELOAD") && d.contains("/tmp/x.so"), "{d}");
+    }
+
+    /// The re-check of #582 (N3): a process started before a moment only
+    /// beyond a clock tick's rounding; one not read is not.
+    #[test]
+    fn a_start_is_before_a_moment_only_beyond_the_tick_s_rounding() {
+        const MS: u64 = 1_000_000;
+        assert!(started_before(Some(1_000 * MS), 1_100 * MS));
+        assert!(
+            !started_before(Some(1_000 * MS), 1_010 * MS),
+            "within the slack"
+        );
+        assert!(!started_before(Some(1_000 * MS), 1_000 * MS));
+        assert!(!started_before(Some(1_200 * MS), 1_100 * MS));
+        assert!(!started_before(None, 1_100 * MS));
+        // this process started before now
+        assert!(started_before(
+            start_boot_ns(std::process::id()),
+            boot_ns_now() + START_SLACK_NS + 1
+        ));
     }
 
     /// The re-check of #582 (N4): a library a package upgrade replaced

@@ -228,8 +228,15 @@ pub fn frozen_pin(bpffs_root: &Path, name: &str) -> Result<MapData> {
     let fd = map_data.fd().as_fd().as_raw_fd();
     let info = kernel_roots::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .with_context(|| format!("{name}: its descriptor's fdinfo"))?;
-    match fdinfo_frozen(&info) {
-        Some(true) => Ok(map_data),
+    require_frozen(&info, name)?;
+    Ok(map_data)
+}
+
+/// The re-check of #582 (N1): `Ok` only when the fdinfo of map `name`'s
+/// descriptor says it is frozen.
+pub fn require_frozen(fdinfo: &str, name: &str) -> Result<()> {
+    match fdinfo_frozen(fdinfo) {
+        Some(true) => Ok(()),
         Some(false) => Err(anyhow!(
             "{name} is not frozen: any family handle could have written it, its words are not known"
         )),
@@ -1317,6 +1324,10 @@ mod tests {
         assert_eq!(fdinfo_frozen(&fdinfo("1")), Some(true));
         assert_eq!(fdinfo_frozen(&fdinfo("0")), Some(false));
         assert_eq!(fdinfo_frozen("pos:\t0\nflags:\t02\n"), None);
+        assert!(require_frozen(&fdinfo("1"), "M").is_ok());
+        let e = require_frozen(&fdinfo("0"), "M").unwrap_err().to_string();
+        assert!(e.contains("not frozen"), "{e}");
+        assert!(require_frozen("pos:\t0\n", "M").is_err());
         // a pin that is not there is an error, never a word
         let dir = tempfile::tempdir().unwrap();
         assert!(frozen_pin(dir.path(), ROLE_MARKS_MAP_NAME).is_err());

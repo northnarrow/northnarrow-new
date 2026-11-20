@@ -1323,11 +1323,37 @@ fn the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes() {
         ],
     )
     .unwrap();
+    // both maps frozen, and read as not known when they could not be
+    let f = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let freeze = body(&f, "freeze_role_marks");
+    for needle in [
+        "antitamper_bpf::ROLE_MARKS_MAP_NAME",
+        "antitamper_bpf::ROLE_EXITS_MAP_NAME",
+        "freeze_named(ebpf, name)",
+    ] {
+        assert!(freeze.contains(needle), "{needle}");
+    }
+    assert_eq!(
+        body(&f, "roles_at_start")
+            .matches(".filter(|_| frozen)")
+            .count(),
+        2
+    );
     // and read only through a frozen descriptor
     let l = code("antitamper-bpf/src/lib.rs");
     in_order(
         body(&l, "frozen_pin"),
-        &["MapData::from_pin(", "fdinfo_frozen(", "not frozen"],
+        &[
+            "MapData::from_pin(",
+            "require_frozen(&info, name)?;",
+            "Ok(map_data)",
+        ],
     )
     .unwrap();
+    for reader in ["role_marks", "role_exit_ns"] {
+        assert!(
+            body(&l, reader).contains("frozen_pin(bpffs_root, "),
+            "{reader}"
+        );
+    }
 }

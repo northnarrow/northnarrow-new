@@ -1220,8 +1220,18 @@ mod tests {
         assert!(!w.check_head());
         w.record(KIND_SUCCEEDED, "next").unwrap();
         let j = judge_chain(&chain_text(dir.path()));
-        assert_eq!(j.len(), 3, "{j:?}");
-        assert!(j.iter().all(|x| matches!(x, Judged::Valid { .. })), "{j:?}");
+        let kinds: Vec<&str> = j
+            .iter()
+            .map(|x| match x {
+                Judged::Valid { row, .. } => row.kind.as_str(),
+                Judged::Broken { .. } => "broken",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED],
+            "the whole row kept"
+        );
         // what is past the last row and not the row it tried: a cut
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join(CHAIN_FILE);

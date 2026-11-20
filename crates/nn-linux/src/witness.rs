@@ -872,4 +872,71 @@ mod tests {
         let (f, _) = after.pending();
         assert!(f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
     }
+
+    /// The re-check of #582 (N6): the chain rotated (the watchdog moved it
+    /// to `witness.chain.1` when full, at its start or within its life):
+    /// the import goes on in the moved chain after the last row imported,
+    /// then the new chain from its first row — every row once, and a
+    /// rotation is not a broken chain. A chain cut (no rotated chain holds
+    /// the position) still is.
+    #[test]
+    fn an_import_continues_through_a_rotated_chain() {
+        use nn_proto::witness::{KIND_OPENED, KIND_SUCCEEDED, KIND_VACATED};
+        let dir = tempfile::tempdir().unwrap();
+        let k = WitnessKey::from_seed([5; 32]);
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED]);
+        let mut r = WitnessReader::new(dir.path());
+        r.position().certify(&k.public_hex());
+        let (f, last) = r.pending();
+        assert_eq!(f.len(), 2);
+        r.commit(last);
+        // a row more, then rotated: the old chain moved aside whole
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
+        std::fs::rename(
+            dir.path().join(CHAIN_FILE),
+            dir.path().join(format!("{CHAIN_FILE}.1")),
+        )
+        .unwrap();
+        write_chain(dir.path(), &k, &[KIND_SUCCEEDED, KIND_VACATED]);
+        let (f, last) = r.pending();
+        assert!(!f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
+        assert_eq!(
+            f.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            vec![WITNESS_NOTE, WITNESS_NOTE, WITNESS_ROW],
+            "the moved chain's last row, then the new chain's two"
+        );
+        r.commit(last);
+        assert!(r.pending().0.is_empty());
+        // no rotated chain holds the position: broken, as before
+        let other = WitnessKey::from_seed([6; 32]);
+        write_chain(dir.path(), &other, &[KIND_OPENED]);
+        std::fs::remove_file(dir.path().join(format!("{CHAIN_FILE}.1"))).unwrap();
+        let (f, _) = r.pending();
+        assert!(f.iter().any(|x| x.kind == WITNESS_BROKEN), "{f:?}");
+    }
+
+    /// The re-check of #582 (N4): the watchdog's clean successor whose
+    /// library was replaced on disk since it mapped it, and is not the
+    /// agent's own copy, is registered (never withheld for that alone) and
+    /// signed High; a foreign one is still foreign.
+    #[test]
+    fn a_watchdog_successor_with_an_unconfirmed_library_is_registered_and_high() {
+        let replaced = Findings {
+            replaced: vec!["/usr/lib/x86_64-linux-gnu/libc.so.6".into()],
+            ..Findings::default()
+        };
+        let v = judge_watchdog_successor(9, &unit(), Some(true), &replaced);
+        assert!(v.given, "{}", v.detail);
+        assert!(!v.confirmed);
+        assert_eq!(v.kind(), WATCHDOG_SUCCESSOR_UNCONFIRMED);
+        assert!(!is_note(v.kind()));
+        assert!(v.detail.contains("identity not confirmed"), "{}", v.detail);
+        let v = judge_watchdog_successor(9, &unit(), Some(true), &Findings::default());
+        assert_eq!(
+            (v.given, v.confirmed, v.kind()),
+            (true, true, WATCHDOG_SUCCESSION)
+        );
+        let v = judge_watchdog_successor(9, &unit(), Some(false), &replaced);
+        assert_eq!((v.given, v.kind()), (false, WATCHDOG_SUCCESSOR_FOREIGN));
+    }
 }

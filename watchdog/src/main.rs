@@ -1114,6 +1114,7 @@ fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
 /// pidfile, open a new pidfd, defensive-reinsert the new PID
 /// into PROTECTED_PIDS. Returns the new PID + the new pidfd
 /// for the main loop's next select-arm.
+#[allow(clippy::too_many_arguments)]
 async fn respawn_cycle(
     backend: &RespawnBackend,
     pidfile: &std::path::Path,
@@ -1164,8 +1165,12 @@ async fn respawn_cycle(
     // The re-check of #582 (N3): never one that started before the gate's
     // judgement (`judged_at`, outside a window): not this start's.
     let mut judged = judge_successor(old_pid, new_pid);
-    judged.unmade =
-        judged_at.is_some_and(|at| antitamper_bpf::start_check::started_before(new_pid, at));
+    judged.unmade = judged_at.is_some_and(|at| {
+        antitamper_bpf::start_check::started_before(
+            antitamper_bpf::start_check::start_boot_ns(new_pid),
+            at,
+        )
+    });
     let given = judged.given && !judged.unmade;
     let successor = judged.detail.clone();
     // Defensive reinsert — never for an agent that already exited (its pid
