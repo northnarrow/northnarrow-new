@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+#[cfg(feature = "debug-trigger")]
+use northnarrow_agent::anti_tamper::bpf_defense::OWN_IDS_FILE_NAME;
 
 // The agent's start (BTF, the eBPF object, the rules) took ~5 s on a lab
 // host running two other guests: the 5-s wait failed a gate run with the
@@ -1700,9 +1702,21 @@ const TEARDOWN_WINDOW: Duration = Duration::from_secs(90);
 /// unit's own cgroup, which no agent a test starts runs in): before, a
 /// restore agent started as a transient service put the guard back in
 /// observe mode. After the purge the next fixture's agent is a first claim.
+///
+/// The lab r6 of #582 (ubuntu2604, kernel 7.0, systemd 259): the programs
+/// waited for are the stopped agents' own. The ids are those listed in their
+/// `bpf-own-ids` files (`own_ids`), as `install.sh --upgrade` and
+/// `uninstall.sh` wait for them (external audit DEP-006). The old wait for
+/// "no LSM program on the host" never ended where systemd keeps a BPF-LSM
+/// program of its own, so the teardown failed after the test had passed.
+/// With no list readable, it waits for no LSM program at all, as before.
 #[cfg(feature = "debug-trigger")]
-fn purge_pins_in_window() -> Result<(), String> {
+fn purge_pins_in_window(own_ids: &[PathBuf]) -> Result<(), String> {
     let script = r#"
+ids=""
+for f in "$@"; do
+    [ -r "$f" ] && ids="$ids $(awk '$1 ~ /^[0-9]+$/ {print $1}' "$f")"
+done
 for i in 1 2 3 4; do
     mountpoint -q /sys/fs/bpf/northnarrow 2>/dev/null || break
     umount /sys/fs/bpf/northnarrow 2>/dev/null || umount -l /sys/fs/bpf/northnarrow 2>/dev/null || break
@@ -1712,14 +1726,25 @@ rm -f /run/northnarrow/cgroup-join-pins /run/northnarrow/module-writes-pins 2>/d
 left=$(ls -d /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null)
 [ -z "$left" ] || { echo "pins left: $left"; exit 1; }
 for i in $(seq 1 20); do
-    [ "$(bpftool prog show 2>/dev/null | grep -c ' lsm ')" = 0 ] && exit 0
+    if [ -n "$ids" ]; then
+        left=""
+        for id in $ids; do bpftool prog show id "$id" >/dev/null 2>&1 && left="$left $id"; done
+        [ -z "$left" ] && exit 0
+    else
+        [ "$(bpftool prog show 2>/dev/null | grep -c ' lsm ')" = 0 ] && exit 0
+    fi
     sleep 1
 done
-echo "LSM programs still loaded: $(bpftool prog show 2>/dev/null | grep -c ' lsm ')"
+if [ -n "$ids" ]; then
+    echo "own programs still loaded:$left"
+else
+    echo "LSM programs still loaded: $(bpftool prog show 2>/dev/null | grep -c ' lsm ')"
+fi
 exit 1
 "#;
     let out = Command::new("sudo")
-        .args(["sh", "-c", script])
+        .args(["sh", "-c", script, "sh"])
+        .args(own_ids)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("spawn the purge: {e}"))?;
@@ -1737,7 +1762,9 @@ exit 1
 #[cfg(feature = "debug-trigger")]
 impl Drop for GuardFixture {
     fn drop(&mut self) {
+        let mut own_ids = Vec::new();
         if let Some(mut run) = self.take_for_stop() {
+            own_ids.push(run.pid_file.with_file_name(OWN_IDS_FILE_NAME));
             if let Err(e) = common::shutdown_signed(
                 &mut run.child,
                 &self.signed(&run.socket),
@@ -1751,7 +1778,7 @@ impl Drop for GuardFixture {
                 return;
             }
         }
-        if let Err(e) = purge_pins_in_window() {
+        if let Err(e) = purge_pins_in_window(&own_ids) {
             common::fail_teardown(&format!(
                 "guard e2e: the enforce-mode agent's pins could not be removed in the teardown's \
                  window ({e}). The next fixtures' agents (other binaries) are refused their \
@@ -1940,7 +1967,9 @@ impl Drop for InstalledRun<'_> {
             }
         }
         let _ = systemctl(&["reset-failed", AGENT_UNIT]);
-        if let Err(e) = purge_pins_in_window() {
+        // the unit's agent writes its list beside its pid file
+        let own_ids = [Path::new("/run/northnarrow").join(OWN_IDS_FILE_NAME)];
+        if let Err(e) = purge_pins_in_window(&own_ids) {
             common::fail_teardown(&format!(
                 "unit restart e2e: the installed agent's pins could not be removed ({e}): the \
                  next suites' agents are refused until the pin root is purged"
