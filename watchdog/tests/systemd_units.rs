@@ -421,6 +421,21 @@ fn an_oom_kill_of_one_process_leaves_both_units_running() {
     }
 }
 
+/// The lab r5 of #582 (fix round 6): the OOM kill count the watchdog reads
+/// is the slice's both units run in.
+#[test]
+fn the_oom_count_read_is_the_units_slice_s() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let slice = value(&d, "Slice").expect("Slice=");
+        assert_eq!(
+            northnarrow_watchdog::witness::UNITS_SLICE_EVENTS,
+            format!("/sys/fs/cgroup/{slice}/memory.events"),
+            "{name}"
+        );
+    }
+}
+
 /// Lot 374: the watchdog writes its witness chain in the directory the
 /// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
 /// and nothing else of the agent's state; under `ProtectSystem=strict`
