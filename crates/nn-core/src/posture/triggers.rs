@@ -3468,6 +3468,157 @@ mod tests {
         }
     }
 
+    /// The review of #585 (F1, named): on systemd before 255 (Ubuntu
+    /// 22.04's 249, Debian 12's 252: no executor) the user's manager's
+    /// `(sd-pam)` is a fork of PID 1's own fork made before that fork
+    /// executed the manager, running PID 1's image, the packaged systemd —
+    /// its read of `/etc/login.defs` (and `/etc/passwd`) closing the session
+    /// is no sensitive access. The attack shapes still fire: `cat`, whatever
+    /// image it names; a fork of the manager after its exec (a user's unit)
+    /// naming systemd; a write open; and `/etc/shadow`.
+    #[test]
+    fn the_sd_pam_of_systemd_before_255_closing_its_session_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let systemd = "/usr/lib/systemd/systemd";
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_file_id("/usr/bin/cat", Some((STAT_DEV, 23)));
+        for d in ["/usr/lib/systemd", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, true);
+        }
+        let exec =
+            |pid: u32, ppid: u32, uid: u32, path: &str, ino: u64, fp: u32, at: (u64, u64)| {
+                let mut e = spawn_with_exe(pid, ppid, path, 1);
+                if let Event::ProcessSpawn {
+                    uid: u,
+                    exe,
+                    start_ns,
+                    timestamp_ns,
+                    ..
+                } = &mut e
+                {
+                    *u = uid;
+                    (*start_ns, *timestamp_ns) = at;
+                    (exe.path, exe.dev, exe.ino, exe.flags) =
+                        (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                    exe.fork_parent = fp;
+                }
+                assert!(auth.ingest_spawn_event(&e));
+            };
+        // user@1000.service on systemd 249/252: PID 1's fork 800 forks
+        // (sd-pam) 810, then executes the user's manager as 1000; the open
+        // sensor's record of 810 (its forker gone: no forker's start)
+        exec(800, 1, 1000, systemd, 11, 1, (1_000, 3_000));
+        auth.ingest_kernel_fork(810, 2_000, (800, 0), 1000, 10_000);
+        let fires = |pid: u32, path: &str, flags: u32, image: (u64, u64)| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen { comm, exe_file, .. } = &mut e {
+                (*comm, *exe_file) = ("(sd-pam)".into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let packaged = (KDEV, 11);
+        assert!(
+            !fires(810, "/etc/login.defs", 0, packaged),
+            "(sd-pam) closing the session, systemd 249/252"
+        );
+        assert!(!fires(810, "/etc/passwd", 0, packaged), "its name lookup");
+        assert!(
+            fires(810, "/etc/login.defs", 1, packaged),
+            "opened for write"
+        );
+        assert!(fires(810, "/etc/shadow", 0, packaged), "the shadow file");
+        // a fork of the manager after its exec: a user's unit
+        auth.ingest_kernel_fork(811, 4_000, (800, 0), 1000, 10_000);
+        assert!(
+            fires(811, "/etc/login.defs", 0, packaged),
+            "a user's unit naming systemd"
+        );
+        // `cat`, whatever image it names
+        exec(820, 819, 1000, "/usr/bin/cat", 23, 819, (2_000, 2_001));
+        assert!(fires(820, "/etc/login.defs", 0, packaged), "cat");
+        for path in [systemd, "/usr/bin/cat"] {
+            IdTestHost::set_file_id(path, None);
+        }
+        for d in ["/usr/lib/systemd", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
+    }
+
+    /// The review of #585 (F3, named): podman's quadlet user generator
+    /// reading `/etc/passwd` as systemd really runs it — under
+    /// `(sd-exec-strv)`, a fork of the user's manager that never executes
+    /// and has exited by the judgement — is no sensitive access, by the
+    /// kernel's anchor of its fork (lot 376's exemption held only for the
+    /// manager's direct child). The attack shapes still fire: the same
+    /// program anchored at a unit's shell, and the generator reading
+    /// `/etc/login.defs`.
+    #[test]
+    fn the_quadlet_generator_under_sd_exec_strv_reading_passwd_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let (systemd, quadlet) = ("/usr/lib/systemd/systemd", "/usr/libexec/podman/quadlet");
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_file_id(quadlet, Some((STAT_DEV, 12)));
+        IdTestHost::set_file_id("/usr/bin/bash", Some((STAT_DEV, 13)));
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, true);
+        }
+        let exec = |pid: u32, ppid: u32, path: &str, ino: u64, fork: (u32, u32)| {
+            let mut e = spawn_with_exe(pid, ppid, path, 1);
+            if let Event::ProcessSpawn {
+                uid,
+                exe,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                *uid = 1000;
+                (*start_ns, *timestamp_ns) = (u64::from(pid), u64::from(pid) + 1);
+                (exe.path, exe.dev, exe.ino, exe.flags) =
+                    (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                (exe.fork_parent, exe.fork_anchor) = fork;
+            }
+            assert!(auth.ingest_spawn_event(&e));
+        };
+        // the manager; (sd-exec-strv) 902, gone; the generator 903 under it
+        exec(900, 1, systemd, 11, (1, 1));
+        exec(903, 902, quadlet, 12, (902, 900));
+        // a unit's shell 904 and the generator under its fork 905
+        exec(904, 900, "/usr/bin/bash", 13, (900, 900));
+        exec(906, 905, quadlet, 12, (905, 904));
+        let fires = |pid: u32, path: &str| {
+            let mut e = file_open(pid, 1000, path, 0, 10_000);
+            if let Event::FileOpen { comm, .. } = &mut e {
+                *comm = "podman-user-gen".into();
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        assert!(
+            !fires(903, "/etc/passwd"),
+            "the generator under (sd-exec-strv)"
+        );
+        assert!(fires(903, "/etc/login.defs"), "another file");
+        assert!(fires(906, "/etc/passwd"), "anchored at a unit's shell");
+        for path in [systemd, quadlet, "/usr/bin/bash"] {
+            IdTestHost::set_file_id(path, None);
+        }
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
+    }
+
     /// Lot 378 (named, the rc10 soak: the boot's first login about 4 s
     /// before the agent was active): `(sd-pam)` of a manager older than the
     /// agent, as the start's scan found them, is told by the kernel's cgroup

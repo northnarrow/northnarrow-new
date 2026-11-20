@@ -553,6 +553,13 @@ struct Entry {
     /// `fork_ppid`, the kernel's record at `sched_process_fork`); 0 when not
     /// known — read from `/proc`, a later exec, an older eBPF object.
     fork_parent: u32,
+    /// The review of #585 (F3): with [`Self::fork_parent`], the nearest
+    /// process up the forks that had executed when this one was forked (the
+    /// exec record's `fork_anchor`, the kernel's record at
+    /// `sched_process_fork`: the forker itself, or, past forks that executed
+    /// nothing, the process above them); 0 when not known — every entry no
+    /// exec of its own gave, a later exec, an older eBPF object.
+    fork_anchor: u32,
     /// Lot 355: the exec's file is a file of a user's program image (the
     /// exec pump's `exe_flags::USER_IMAGE`: an AppImage's, served at its
     /// runtime's `/tmp/.mount_*`), judged as that image, never as staged.
@@ -1458,7 +1465,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // verified systemd-executor in the kernel, at the exec)
         let fork_parent = exe.fork_parent;
         let inline = runs == Runs::Inline;
-        self.ingest_inner(
+        // the review of #585 (F3): and the nearest process up the forks that
+        // had executed (systemd's generators run under a fork of the
+        // manager's that never executes)
+        self.ingest_anchored(
             *pid,
             *ppid,
             path,
@@ -1468,6 +1478,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             (*start_ns, None),
             *uid,
             (image, fork_parent, exec_file, exe.has(USER_IMAGE)),
+            exe.fork_anchor,
         );
         // lot 369 (the review of #576, F1): the packaged go's linker, and
         // the file it was run to write; lot 372: also from an argv the
@@ -1720,6 +1731,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 image: parent.image,
                 exec_file: parent.exec_file,
                 fork_parent: k.parent,
+                fork_anchor: 0,
                 user_image: parent.user_image,
             },
         ))
@@ -1884,12 +1896,31 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         pid: u32,
         ppid: u32,
         exe: &str,
+        flags: (Option<JsPm>, bool, Option<u64>, bool),
+        runs: Runs,
+        spawn_ns: u64,
+        start: (u64, Option<u64>),
+        uid: u32,
+        files: (Option<FileId>, u32, Option<FileId>, bool),
+    ) {
+        self.ingest_anchored(pid, ppid, exe, flags, runs, spawn_ns, start, uid, files, 0);
+    }
+
+    /// [`Self::ingest_inner`] with the kernel's anchor of the process's fork
+    /// ([`Entry::fork_anchor`]: an exec event's, 0 for any other ingest).
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_anchored(
+        &self,
+        pid: u32,
+        ppid: u32,
+        exe: &str,
         (js_pm, encrypts, argv, root_rotation): (Option<JsPm>, bool, Option<u64>, bool),
         runs: Runs,
         spawn_ns: u64,
         (start_ns, start_ticks): (u64, Option<u64>),
         uid: u32,
         (image, fork_parent, exec_file, user_image): (Option<FileId>, u32, Option<FileId>, bool),
+        fork_anchor: u32,
     ) {
         if pid == 0 {
             return;
@@ -1909,6 +1940,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image,
             exec_file,
             fork_parent,
+            fork_anchor,
             user_image,
         };
         let mut s = self.inner.state.write();
@@ -2286,6 +2318,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             exec_file: first.exec_file,
             // no exec of its own: no fork parent recorded for one
             fork_parent: 0,
+            fork_anchor: 0,
             // lot 355: its image read from `/proc`: not known to be a user's
             user_image: false,
         })
@@ -2428,6 +2461,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             image: parent.image,
             exec_file: parent.exec_file,
             fork_parent: 0,
+            fork_anchor: 0,
             user_image: parent.user_image,
         })
     }
@@ -2575,9 +2609,20 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     ///   `systemd` ([`SYSTEMD_MANAGER_EXES`], by the file its exec ran),
     ///   executed as `uid`, whose own parent is PID 1 (`user@<uid>.service`).
     ///
+    /// The review of #585 (F3: the lab of lot 378 met the generator's read
+    /// again — lot 376's test had it the manager's direct child): systemd
+    /// runs its generators from a fork of its own that never executes,
+    /// `(sd-exec-strv)` (`(sd-executor)` before 254), each in a fork of that
+    /// one which executes the generator. The manager is then the kernel's
+    /// anchor of the program's fork (its exec record's `fork_anchor`, with
+    /// `fork_parent`: the nearest process up the forks that had executed —
+    /// every fork between them executed nothing, running the manager's
+    /// image), started no later than the program; the same checks of it.
+    ///
     /// A program of the user's (a home), a copy of systemd, a manager run by
-    /// hand from a shell, a child of the program (a shell a unit runs):
-    /// not.
+    /// hand from a shell, a child of the program (a shell a unit runs), a
+    /// program whose anchor is another process (a unit's shell, which
+    /// executed) or a later process at the manager's pid: not.
     pub fn is_user_manager_program(&self, pid: u32, uid: u32, as_of: AsOf) -> bool {
         if uid == 0 || pid <= 1 {
             return false;
@@ -2591,14 +2636,33 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         {
             return false;
         }
-        let Some(manager) = self.hop(me.ppid, as_of).filter(|h| h.cached && h.pid > 1) else {
-            return false;
+        let is_manager = |manager: &Hop| {
+            manager.cached
+                && manager.pid > 1
+                && manager.uid == Some(uid)
+                && manager.ppid == 1
+                && SYSTEMD_MANAGER_EXES
+                    .iter()
+                    .any(|p| self.ran_host_file(manager.pid, as_of, p))
         };
-        manager.uid == Some(uid)
-            && manager.ppid == 1
-            && SYSTEMD_MANAGER_EXES
-                .iter()
-                .any(|p| self.ran_host_file(manager.pid, as_of, p))
+        if self.hop(me.ppid, as_of).is_some_and(|m| is_manager(&m)) {
+            return true;
+        }
+        let anchor = self.fork_anchor(pid, as_of);
+        anchor > 1
+            && self
+                .hop(anchor, as_of)
+                .is_some_and(|m| m.start_ns <= me.start_ns && is_manager(&m))
+    }
+
+    /// The review of #585 (F3): the kernel's anchor of `pid`'s fork
+    /// ([`Entry::fork_anchor`]) when the exec the cache holds as of `as_of`
+    /// was its first since that fork; 0 when not known.
+    fn fork_anchor(&self, pid: u32, as_of: AsOf) -> u32 {
+        match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) if e.fork_parent != 0 => e.fork_anchor,
+            _ => 0,
+        }
     }
 
     /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`, run from a
@@ -2701,7 +2765,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     ///
     /// A manager older than the agent (a login racing the agent's start at
     /// a boot, the agent restarted during a session) left no such records:
-    /// [`Self::is_older_user_manager_pam_keeper`].
+    /// [`Self::is_older_user_manager_pam_keeper`]. systemd before 255, which
+    /// has no executor (the forker executed nothing before the fork):
+    /// [`Self::is_pre_executor_pam_keeper`].
     ///
     /// A program the user runs (`cat`, a copy of the executor, the packaged
     /// executor run by hand: an exec of its own), a fork of a user's process
@@ -2735,7 +2801,10 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         // the forker's exec at the fork: PID 1's launch of the executor
         let launch = match self.cached_live(k.parent, Some(k.start_ns)) {
             CachedAt::Current(e) | CachedAt::Past(e) => e,
-            CachedAt::LaterOnly | CachedAt::Absent => return false,
+            // the review of #585 (F1): systemd before 255 — the forker had
+            // executed nothing yet (PID 1's own fork)
+            CachedAt::LaterOnly => return self.is_pre_executor_pam_keeper(k, uid, t, image),
+            CachedAt::Absent => return false,
         };
         if k.parent_start != 0 && !self.entry_started_at(&launch, k.parent_start) {
             return false;
@@ -2758,6 +2827,81 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         manager.start_ns == launch.start_ns
             && manager.uid == uid
             && manager.exec_file.is_some_and(|f| self.is_host_manager(f))
+    }
+
+    /// The review of #585 (F1: Ubuntu 22.04's systemd 249 and Debian 12's
+    /// 252, alpha targets, have no executor): [`Self::is_user_manager_pam_keeper`]
+    /// for systemd before 255, where PID 1's fork sets the unit up in PID 1's
+    /// own image — it opens the PAM session as root, forks `(sd-pam)`, and
+    /// only then executes the unit's program. `k`, the kernel's record of the
+    /// reader's fork, names a forker that had executed nothing by then:
+    /// - the forker's next exec the cache holds (that process's: started no
+    ///   later than the fork, executed after it, by `t`) is its first since
+    ///   PID 1 forked it (the kernel's `fork_parent`), PID 1's child,
+    ///   running the host's packaged service manager ([`SYSTEMD_MANAGER_EXES`],
+    ///   by the file the kernel executed, in a root-only directory) as `uid`:
+    ///   `user@<uid>.service`'s launch;
+    /// - `image`, the kernel's `mm->exe_file` at the event, is that packaged
+    ///   systemd: the reader runs PID 1's image, as it was forked with.
+    ///
+    /// A fork of the manager after its exec (a user's unit), a fork of a
+    /// process a user's fork reparented to PID 1 (its first exec's forker
+    /// not PID 1), a manager whose first exec ran as another uid or another
+    /// file, a reader naming another image: not.
+    fn is_pre_executor_pam_keeper(
+        &self,
+        k: KernelFork,
+        uid: u32,
+        t: u64,
+        image: (u64, u64),
+    ) -> bool {
+        let Some(first) = self.exec_after(k.parent, k.start_ns, t) else {
+            return false;
+        };
+        (k.parent_start == 0 || self.entry_started_at(&first, k.parent_start))
+            && first.uid == uid
+            && first.ppid == 1
+            && first.fork_parent == 1
+            && first.exec_file == Some(image)
+            && self.is_host_manager(image)
+    }
+
+    /// The review of #585 (F1): the first exec the cache holds of the
+    /// process at `pid` at `after_ns` — an exec event (never an entry read
+    /// from `/proc`) of a process started no later than then, executed after
+    /// it and no later than `by_ns`.
+    fn exec_after(&self, pid: u32, after_ns: u64, by_ns: u64) -> Option<Entry> {
+        let s = self.inner.state.read();
+        let current = s.map.get(&pid).or_else(|| s.daemons.get(&pid));
+        s.history
+            .get(&pid)
+            .into_iter()
+            .flatten()
+            .chain(current)
+            .filter(|e| {
+                e.start_ticks.is_none()
+                    && e.start_ns <= after_ns
+                    && after_ns < e.spawn_ns
+                    && e.spawn_ns <= by_ns
+            })
+            .min_by_key(|e| e.spawn_ns)
+            .cloned()
+    }
+
+    /// The review of #585 (F1): `image` is what a user's manager's
+    /// `(sd-pam)` runs on this host — the packaged executor where the host's
+    /// systemd ships one (255 and later: PID 1's fork executes it, and it
+    /// forks `(sd-pam)`), else the packaged systemd itself (PID 1's image,
+    /// which the fork runs until it executes the manager).
+    fn is_pam_keeper_image(&self, image: (u64, u64)) -> bool {
+        if SYSTEMD_EXECUTOR_EXES
+            .iter()
+            .any(|p| self.host_file_id(p).is_some())
+        {
+            self.is_host_executor(image)
+        } else {
+            self.is_host_manager(image)
+        }
     }
 
     /// Lot 378: `file` is the host's packaged unit launcher
@@ -2784,7 +2928,8 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// - running the host's packaged executor ([`SYSTEMD_EXECUTOR_EXES`]),
     ///   the scan's identity of its image (`/proc/<pid>/exe` in a root-only
     ///   directory) and the kernel's `mm->exe_file` at the open alike, as
-    ///   `uid`;
+    ///   `uid` — on a host whose systemd ships none (before 255: the review
+    ///   of #585, F1), the packaged systemd ([`Self::is_pam_keeper_image`]);
     /// - its parent at the scan the user's manager: the host's packaged
     ///   systemd ([`SYSTEMD_MANAGER_EXES`]) as `uid`, PID 1's child,
     ///   started no later than it;
@@ -2794,8 +2939,9 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     ///   run in its `app.slice`.
     ///
     /// Residual (named in KNOWN_LIMITATIONS): a process of the user's
-    /// running the packaged executor since before the agent's start, which
-    /// the user moved into its manager's scope, reading either file.
+    /// running the packaged executor (before 255: the packaged systemd)
+    /// since before the agent's start, which the user moved into its
+    /// manager's scope, reading either file.
     fn is_older_user_manager_pam_keeper(
         &self,
         e: &Entry,
@@ -2809,7 +2955,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             return false;
         }
         if e.exec_file != Some(image)
-            || !self.is_host_executor(image)
+            || !self.is_pam_keeper_image(image)
             || !self.is_user_manager_scope(cgroup_id, uid)
         {
             return false;
@@ -3240,9 +3386,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// identity). A copy, a file replaced at the path since, another mount
     /// namespace's file at that path: `false`.
     pub fn is_host_file(&self, path: &str, image: (u64, u64)) -> bool {
+        self.host_file_id(path) == Some(image)
+    }
+
+    /// The file at `path` under the host's root now, by its device in the
+    /// kernel's form and its inode ([`Self::is_host_file`]); `None` when
+    /// there is none.
+    fn host_file_id(&self, path: &str) -> Option<(u64, u64)> {
         H::file_id(self.inner.host_root.join(path.trim_start_matches('/')))
             .map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino))
-            == Some(image)
     }
 
     /// Lot 376 (the review of #583, F3): the file the host's PID 1 holds
@@ -11046,6 +11198,7 @@ mod tests {
             image: None,
             exec_file: None,
             fork_parent: 0,
+            fork_anchor: 0,
             user_image: false,
         };
         let exact = e(4_003_217_000, None);
@@ -11368,6 +11521,303 @@ mod tests {
         for path in [executor, systemd] {
             IdTestHost::set_file_id(path, None);
         }
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", false);
+    }
+
+    /// The review of #585 (F3, named; its probe `PROBE5B direct=true
+    /// strv_alive=false strv_gone=false`): podman's quadlet user generator
+    /// as systemd runs it — the manager forks `(sd-exec-strv)`, which never
+    /// executes, and that one forks the process that executes the generator
+    /// — is the manager's program by the kernel's anchor of its fork,
+    /// whether `(sd-exec-strv)` still runs or has exited. Lot 376's test
+    /// had the generator the manager's direct child, and both real shapes
+    /// failed. The shapes that must fail: a program anchored at a unit's
+    /// shell (which executed), an exec that is not its process's first since
+    /// the fork, a later process at the anchor's pid, an anchor running a
+    /// copy of systemd, as another uid or not PID 1's child, PID 1 as the
+    /// anchor, and a program from a home under the manager's fork.
+    #[test]
+    fn the_quadlet_generator_under_sd_exec_strv_is_its_manager_s_program() {
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let (systemd, quadlet, bash) = (
+            "/usr/lib/systemd/systemd",
+            "/usr/libexec/podman/quadlet",
+            "/usr/bin/bash",
+        );
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_file_id(quadlet, Some((STAT_DEV, 12)));
+        IdTestHost::set_file_id(bash, Some((STAT_DEV, 13)));
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, true);
+        }
+        let proc = TempDir::new().unwrap();
+        let t = super::AuthSessionTracker::<IdTestHost>::new(proc.path());
+        // an exec: pid, parent, uid, file, inode, the kernel's forker and
+        // anchor of its fork, its process's start (the exec 1 ns later)
+        let exec = |pid: u32,
+                    ppid: u32,
+                    uid: u32,
+                    exe: &str,
+                    ino: u64,
+                    (fork_parent, fork_anchor): (u32, u32),
+                    start: u64| {
+            let e = Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid,
+                gid: uid,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: start + 1,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: KDEV,
+                    ino,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent,
+                    fork_anchor,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+            assert!(t.ingest_spawn_event(&e));
+        };
+        let at = AsOf::Judged(3 * S + 1_000);
+        let program = |pid: u32| t.is_user_manager_program(pid, 1000, at);
+        // user@1000.service's manager, PID 1's child, as 1000
+        exec(900, 1, 1000, systemd, 11, (1, 1), S);
+        // lot 376's shape: the generator the manager's direct child
+        exec(903, 900, 1000, quadlet, 12, (900, 900), 3 * S);
+        assert!(program(903), "the manager's direct child");
+        // (sd-exec-strv) 901, a fork of the manager that never executed,
+        // running still (started at 2 s: 200 ticks)
+        write_exe(proc.path(), 901, systemd);
+        write_status_uid(proc.path(), 901, 900, 1000);
+        write_started(proc.path(), "901", 900, 200);
+        exec(902, 901, 1000, quadlet, 12, (901, 900), 3 * S);
+        assert!(program(902), "under (sd-exec-strv), running");
+        // (sd-exec-strv) 904 exited before the judgement
+        exec(905, 904, 1000, quadlet, 12, (904, 900), 3 * S);
+        assert!(program(905), "under (sd-exec-strv), gone");
+        // a unit's shell 910 (it executed), its fork 911 that never did, and
+        // the packaged program that fork runs: anchored at the shell
+        exec(910, 900, 1000, bash, 13, (900, 900), 2 * S);
+        exec(912, 911, 1000, quadlet, 12, (911, 910), 3 * S);
+        assert!(!program(912), "anchored at a unit's shell");
+        // an exec not its process's first since the fork: no anchor counts
+        exec(915, 914, 1000, quadlet, 12, (0, 900), 3 * S);
+        assert!(!program(915), "not its first exec since the fork");
+        // a later process at the anchor's pid: a manager started after the
+        // program
+        exec(920, 1, 1000, systemd, 11, (1, 1), 3 * S + 500);
+        exec(922, 921, 1000, quadlet, 12, (921, 920), 3 * S);
+        assert!(!program(922), "a later process at the anchor's pid");
+        // anchors that are no user's manager
+        exec(930, 1, 1000, "/home/u/systemd", 14, (1, 1), S);
+        exec(932, 931, 1000, quadlet, 12, (931, 930), 3 * S);
+        assert!(!program(932), "anchored at a copy of systemd");
+        exec(940, 1, 1001, systemd, 11, (1, 1), S);
+        exec(942, 941, 1000, quadlet, 12, (941, 940), 3 * S);
+        assert!(!program(942), "anchored at another uid's manager");
+        exec(950, 77, 1000, systemd, 11, (77, 77), S);
+        exec(952, 951, 1000, quadlet, 12, (951, 950), 3 * S);
+        assert!(!program(952), "anchored at a manager run by hand");
+        exec(962, 961, 1000, quadlet, 12, (961, 1), 3 * S);
+        assert!(!program(962), "anchored at PID 1");
+        // a program from a home under the manager's fork
+        exec(972, 971, 1000, "/home/u/gen", 15, (971, 900), 3 * S);
+        assert!(!program(972), "a program from a home");
+        for p in [systemd, quadlet, bash] {
+            IdTestHost::set_file_id(p, None);
+        }
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
+    }
+
+    /// The review of #585 (F1, named): `(sd-pam)` of systemd before 255
+    /// (Ubuntu 22.04's 249 and Debian 12's 252, alpha targets with no
+    /// executor) — PID 1's fork opens the PAM session in PID 1's own image,
+    /// forks `(sd-pam)`, and only then executes the user's manager — is that
+    /// manager's PAM session keeper: the kernel's record of its fork names a
+    /// forker that had executed nothing by then, whose next exec is its
+    /// first since PID 1 forked it, PID 1's child, the packaged systemd as
+    /// the user; its image at the open that packaged systemd. A manager
+    /// re-executed since (`daemon-reexec`) still is. The start's scan's
+    /// `(sd-pam)` there runs the packaged systemd, in the manager's scope.
+    /// The shapes that must fail: another image at the open; a fork of the
+    /// manager after its exec (a user's unit); a forker whose first exec
+    /// another process forked (a user's process reparented to PID 1); not
+    /// PID 1's child; its first exec as another uid, or a copy of systemd; a
+    /// forker started after the fork, or another by the start the kernel
+    /// read; the forker's exec after the open; an earlier process's exec at
+    /// the forker's pid; and, on a host whose systemd ships the executor,
+    /// the scan's reader running systemd, or another cgroup.
+    #[test]
+    fn the_sd_pam_of_systemd_before_255_is_known_by_its_fork_and_its_manager_s_first_exec() {
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let (executor, systemd) = (
+            "/usr/lib/systemd/systemd-executor",
+            "/usr/lib/systemd/systemd",
+        );
+        // systemd 249/252: no executor on the host
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", true);
+        let packaged = (KDEV, 11);
+        let proc = TempDir::new().unwrap();
+        let cg = TempDir::new().unwrap();
+        let scope = |unit: &str| {
+            let d = cg.path().join(format!(
+                "user.slice/user-1000.slice/user@1000.service/{unit}"
+            ));
+            fs::create_dir_all(&d).unwrap();
+            IdTestHost::dir_ino(&d).unwrap()
+        };
+        let (init, app) = (scope("init.scope"), scope("app.slice"));
+        let t =
+            super::AuthSessionTracker::<IdTestHost>::new(proc.path()).with_cgroup_root(cg.path());
+        // (2) the start's scan: the manager 500 and its (sd-pam) 501, both
+        // running the packaged systemd, in PID 1's mount namespace
+        fs::create_dir_all(proc.path().join("1/ns")).unwrap();
+        symlink("mnt:[4026531841]", proc.path().join("1/ns/mnt")).unwrap();
+        for (pid, ppid, ticks) in [(500, 1, 100), (501, 500, 101)] {
+            write_exe(proc.path(), pid, systemd);
+            write_status_uid(proc.path(), pid, ppid, 1000);
+            write_started(proc.path(), &pid.to_string(), ppid, ticks);
+            let ns = proc.path().join(pid.to_string()).join("ns");
+            fs::create_dir_all(&ns).unwrap();
+            symlink("mnt:[4026531841]", ns.join("mnt")).unwrap();
+            IdTestHost::set_dir_root_only(
+                proc.path()
+                    .join(pid.to_string())
+                    .join("root/usr/lib/systemd"),
+                true,
+            );
+            IdTestHost::set_file_id(
+                proc.path().join(pid.to_string()).join("exe"),
+                Some((STAT_DEV, 11)),
+            );
+        }
+        assert_eq!(t.seed_from_proc(), 2);
+        let at = AsOf::Judged(20 * S);
+        let keeper = |pid: u32, image: (u64, u64), cgroup: u64| {
+            t.is_user_manager_pam_keeper(pid, 1000, at, (image, cgroup))
+        };
+        assert!(keeper(501, packaged, init), "the scan's (sd-pam), 249/252");
+        assert!(!keeper(501, packaged, app), "a user unit's cgroup");
+        assert!(!keeper(501, (KDEV, 99), init), "another image at the open");
+        // a host whose systemd ships the executor: (sd-pam) runs that one
+        IdTestHost::set_file_id(executor, Some((STAT_DEV, 21)));
+        assert!(
+            !keeper(501, packaged, init),
+            "systemd's image where the executor is shipped"
+        );
+        IdTestHost::set_file_id(executor, None);
+        // (1) an exec: pid, parent, uid, file, inode, the kernel's forker,
+        // its process's start and the exec's time
+        let exec = |pid: u32,
+                    ppid: u32,
+                    uid: u32,
+                    exe: &str,
+                    ino: u64,
+                    fp: u32,
+                    (start, ns): (u64, u64)| {
+            let e = Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid,
+                gid: uid,
+                comm: "x".into(),
+                filename: exe.into(),
+                timestamp_ns: ns,
+                argv: vec![exe.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: start,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: exe.into(),
+                    dev: KDEV,
+                    ino,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: fp,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            };
+            assert!(t.ingest_spawn_event(&e));
+        };
+        // the kernel's record of a fork that never executed, as the open
+        // sensor carries it once its forker executed (the forker's start
+        // not carried)
+        let fork = |pid: u32, start: u64, forker: u32| {
+            t.ingest_kernel_fork(pid, start, (forker, 0), 1000, 30 * S);
+        };
+        let pam = |pid: u32, image: (u64, u64)| keeper(pid, image, 0);
+        // user@1000.service: PID 1's fork 800 (1 s) forks (sd-pam) 810 (2 s),
+        // then executes the user's manager as 1000 (3 s)
+        exec(800, 1, 1000, systemd, 11, 1, (S, 3 * S));
+        fork(810, 2 * S, 800);
+        assert!(pam(810, packaged), "(sd-pam), systemd 249/252");
+        assert!(!pam(810, (KDEV, 99)), "another image at the open");
+        assert!(!pam(810, (0, 0)), "no image read");
+        // the manager re-executed since: its first exec decides
+        exec(800, 1, 1000, systemd, 11, 0, (S, 10 * S));
+        assert!(pam(810, packaged), "the manager re-executed since");
+        // a fork of the manager after its exec: a user's unit
+        fork(811, 4 * S, 800);
+        assert!(!pam(811, packaged), "a fork of the manager after its exec");
+        // the forker's first exec another process's fork (a user's process
+        // reparented to PID 1)
+        exec(820, 1, 1000, systemd, 11, 777, (S, 3 * S));
+        fork(821, 2 * S, 820);
+        assert!(!pam(821, packaged), "its first exec not PID 1's fork");
+        exec(830, 77, 1000, systemd, 11, 1, (S, 3 * S));
+        fork(831, 2 * S, 830);
+        assert!(!pam(831, packaged), "not PID 1's child");
+        exec(840, 1, 1001, systemd, 11, 1, (S, 3 * S));
+        fork(841, 2 * S, 840);
+        assert!(!pam(841, packaged), "its first exec as another uid");
+        exec(850, 1, 1000, "/home/u/systemd", 14, 1, (S, 3 * S));
+        fork(851, 2 * S, 850);
+        assert!(!pam(851, (KDEV, 14)), "a copy of systemd");
+        assert!(!pam(851, packaged), "a copy, the packaged image named");
+        // the forker started after the fork: another process at the pid
+        exec(860, 1, 1000, systemd, 11, 1, (2 * S + 500, 3 * S));
+        fork(861, 2 * S, 860);
+        assert!(!pam(861, packaged), "a forker started after the fork");
+        // the forker's exec after the open
+        exec(870, 1, 1000, systemd, 11, 1, (S, 25 * S));
+        fork(871, 2 * S, 870);
+        assert!(!pam(871, packaged), "the forker's exec after the open");
+        // the forker's start, as the kernel read it, another process's
+        exec(880, 1, 1000, systemd, 11, 1, (S, 3 * S));
+        t.ingest_kernel_fork(881, 2 * S, (880, S + 7), 1000, 30 * S);
+        assert!(!pam(881, packaged), "another forker by its start");
+        t.ingest_kernel_fork(882, 2 * S, (880, S), 1000, 30 * S);
+        assert!(pam(882, packaged), "the forker by its start");
+        // an earlier process at the forker's pid, a manager once: the
+        // forker's own exec decides
+        exec(890, 1, 1000, systemd, 11, 1, (S / 2, S / 2 + 1));
+        exec(890, 1, 1000, systemd, 11, 777, (S, 3 * S));
+        fork(891, 2 * S, 890);
+        assert!(!pam(891, packaged), "an earlier process's exec at its pid");
+        IdTestHost::set_file_id(systemd, None);
         IdTestHost::set_dir_root_only("/usr/lib/systemd", false);
     }
 }
