@@ -271,6 +271,20 @@ TasksMax=512
 # 0 where MemoryMax cannot bind (a host with less memory than the cap: there
 # a leak still weighs on the host before it reaches the cap).
 OOMScoreAdjust=-999
+# OOMPolicy — the lab round 5 of #582: continue. An OOM kill of one
+# process of the unit leaves the rest running. The agent's workers are the
+# OOM killer's first pick (oom_score_adj 1000), and the agent respawns
+# them. With systemd's default (stop), one worker's OOM kill made systemd
+# stop the whole unit. The task_kill hook refuses that stop outside a
+# window, so the unit was left `failed` with the agent still running and
+# no main PID. Every start after it failed ('resources': SendSIGKILL=no
+# with a process left in the cgroup). systemd also failed the unit before
+# it reaped the agent, so the exit was never recorded and the watchdog
+# signed the vacancy's cause "not known". With continue, the agent's own
+# OOM kill is recorded as its exit (signal 9). The watchdog names the
+# OOM killer from the slice's oom_kill count. A drop-in that sets
+# OOMPolicy=stop or kill is judged harmful (antitamper_bpf::host_dropins).
+OOMPolicy=continue
 
 # Hardening — `ProtectSystem=strict` makes the entire filesystem
 # read-only EXCEPT the ReadWritePaths whitelist below. NoNewPrivileges

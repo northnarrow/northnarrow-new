@@ -549,6 +549,47 @@ pub fn cause_from_show(show: &str) -> Option<String> {
     })
 }
 
+/// The lab round 5 of #582: the `memory.events` of the slice both units run
+/// in (`Slice=northnarrow.slice`). Its counters are hierarchical, so they
+/// count the units' processes too. They outlive the agent's cgroup, which
+/// systemd removes once the unit is dead.
+pub const UNITS_SLICE_EVENTS: &str = "/sys/fs/cgroup/northnarrow.slice/memory.events";
+
+/// The `oom_kill` count of a cgroup v2 `memory.events` body: the processes
+/// the kernel's OOM killer (any of them: the host's, a cgroup's, a manual
+/// one) killed in that cgroup and below it.
+pub fn oom_kills_of(body: &str) -> Option<u64> {
+    body.lines()
+        .find_map(|l| l.trim().strip_prefix("oom_kill "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// [`oom_kills_of`] of the units' slice now. Returns `None` when it cannot
+/// be read: a cgroup v1 host, or no slice.
+pub fn units_oom_kills() -> Option<u64> {
+    antitamper_bpf::kernel_roots::read_text(UNITS_SLICE_EVENTS)
+        .ok()
+        .and_then(|b| oom_kills_of(&b))
+}
+
+/// The lab round 5 of #582: the vacancy's `cause` with the kernel's OOM
+/// killer named. It applies when the agent died of SIGKILL and the slice's
+/// `oom_kill` count rose during its life: `before` read at its
+/// registration, `after` now. Under `OOMPolicy=continue` systemd records an
+/// OOM kill of the main process as `signal 9` (`Result=signal`). Outside a
+/// window that SIGKILL is the one the hooks cannot refuse. Otherwise
+/// `cause` is returned as it is.
+pub fn with_oom_killer(cause: &str, before: Option<u64>, after: Option<u64>) -> String {
+    let sigkill = cause == "signal 9" || cause.starts_with("signal 9 ");
+    match (before, after) {
+        (Some(b), Some(a)) if sigkill && a > b => format!(
+            "{cause}, the kernel's OOM killer's (northnarrow.slice's oom_kill count rose from {b} \
+             to {a} during its life)"
+        ),
+        _ => cause.to_string(),
+    }
+}
+
 /// How long [`unit_exit_cause`] waits for systemd to have recorded the
 /// agent's exit (the watchdog's pidfd can see it first).
 pub const EXIT_CAUSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -827,6 +868,53 @@ mod tests {
         assert!(c.starts_with("not known") && c.contains("pid 8"), "{c}");
         let c = exit_from_show(&show("failed", 8, "signal", 2, 9), 7).unwrap();
         assert!(!c.contains("signal 9"), "{c}");
+    }
+
+    /// The lab round 5 of #582: under `OOMPolicy=continue` systemd records
+    /// the agent's OOM kill as its exit, `signal 9` (measured on systemd 249
+    /// and 259: `Result=signal`, `ExecMainCode=2`, `ExecMainStatus=9`). The
+    /// vacancy names the kernel's OOM killer when the units' slice counted
+    /// an OOM kill during the agent's life; never for another cause, nor
+    /// without the count.
+    #[test]
+    fn an_oom_kill_recorded_as_signal_9_is_named_the_oom_killer_s() {
+        let recorded = exit_from_show(&show("failed", 7, "signal", 2, 9), 7).unwrap();
+        assert_eq!(recorded, "signal 9 (systemd Result=signal)");
+        let c = with_oom_killer(&recorded, Some(3), Some(4));
+        assert!(
+            c.starts_with("signal 9 (systemd Result=signal), the kernel's OOM killer's")
+                && c.contains("from 3 to 4"),
+            "{c}"
+        );
+        // the exec backend's wait
+        assert!(with_oom_killer("signal 9", Some(0), Some(1)).contains("OOM killer"));
+        // no kill counted during its life, or a count not read: as recorded
+        for (b, a) in [
+            (Some(4), Some(4)),
+            (None, Some(4)),
+            (Some(3), None),
+            (Some(5), Some(4)),
+        ] {
+            assert_eq!(with_oom_killer(&recorded, b, a), recorded, "{b:?} {a:?}");
+        }
+        // another cause is never the OOM killer's, whatever the count
+        for cause in [
+            "signal 15 (systemd Result=signal)",
+            "signal 6, core dumped",
+            "signal 90",
+            "exit status 9 (systemd Result=exit-code)",
+            "not known (systemd had not recorded the exit of pid 7 within 3 s)",
+        ] {
+            assert_eq!(with_oom_killer(cause, Some(0), Some(1)), cause);
+        }
+        // the clean-stop rule is not changed by the naming
+        assert!(!clean_stop(&c));
+        assert_eq!(
+            oom_kills_of("low 0\nhigh 0\nmax 2\noom 2\noom_kill 1\noom_group_kill 0\n"),
+            Some(1)
+        );
+        assert_eq!(oom_kills_of("oom_group_kill 3\n"), None);
+        assert_eq!(oom_kills_of(""), None);
     }
 
     #[test]

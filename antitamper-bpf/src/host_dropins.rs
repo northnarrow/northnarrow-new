@@ -607,9 +607,19 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         "FinalKillSignal" => {
             (!matches!(v, "SIGKILL" | "KILL" | "9")).then(|| format!("FinalKillSignal {v}"))
         }
-        "OOMPolicy" => {
-            (v == "kill").then(|| "OOMPolicy kill: one worker's OOM ends the unit".into())
-        }
+        // the lab round 5 of #582: our units' own is `continue` — under
+        // `stop` one worker's OOM kill makes systemd stop the unit, which
+        // the task_kill hook refuses: the unit is left failed with its
+        // daemon running and no start possible
+        "OOMPolicy" => match v {
+            "kill" => Some("OOMPolicy kill: one worker's OOM ends the unit".into()),
+            "stop" => Some(
+                "OOMPolicy stop: one worker's OOM stops the unit, a stop our hooks refuse — the \
+                 unit is left failed with its daemon running, and no start succeeds"
+                    .into(),
+            ),
+            _ => None,
+        },
         "OOMScoreAdjust" => v
             .parse::<i32>()
             .ok()
@@ -1150,6 +1160,24 @@ mod tests {
         ] {
             assert_eq!(h(Reach::OurSlice, kv), None, "{kv}");
         }
+    }
+
+    /// The lab round 5 of #582: our units run under `OOMPolicy=continue`; a
+    /// drop-in turning them back to systemd's `stop` (or `kill`) is
+    /// harmful, `continue` (ours) is not.
+    #[test]
+    fn an_oom_policy_that_stops_or_kills_our_units_is_harmful() {
+        for reach in [Reach::Services, Reach::Agent, Reach::Watchdog] {
+            let stop = h(reach, "OOMPolicy=stop").expect("stop harmful");
+            assert!(
+                stop.contains("OOMPolicy stop") && stop.contains("refuse"),
+                "{stop}"
+            );
+            assert!(h(reach, "OOMPolicy=kill").is_some_and(|w| w.contains("kill")));
+            assert_eq!(h(reach, "OOMPolicy=continue"), None);
+        }
+        // not a service's directive
+        assert_eq!(h(Reach::OurSlice, "OOMPolicy=stop"), None);
     }
 
     #[test]

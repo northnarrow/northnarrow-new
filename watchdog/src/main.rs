@@ -373,7 +373,9 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     let mut failure: Option<Failure> = None;
     // External audit WDG-001: a shutdown authorisation must have been
     // signed while the agent it stops was running.
-    let mut agent_started = process_start_unix(agent_pid);
+    // The lab round 5 of #582: and the units' slice's OOM kills then, so a
+    // SIGKILL vacancy names the kernel's OOM killer (`agent_life`)
+    let (mut agent_started, mut agent_oom_kills) = agent_life(agent_pid);
 
     // W5: spawn the parallel STATUS-ping task. It pings the
     // agent's admin socket every STATUS_PING_INTERVAL (30s),
@@ -605,7 +607,12 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // a mark not read is not a window's
                 let in_window = exit_in_window(&cli.bpffs_root);
                 if let Some(w) = witness.as_mut() {
-                    let cause = exit_cause(&backend, &reaped, agent_pid).await;
+                    // the lab round 5 of #582: an OOM kill named as such
+                    let cause = northnarrow_watchdog::witness::with_oom_killer(
+                        &exit_cause(&backend, &reaped, agent_pid).await,
+                        agent_oom_kills,
+                        northnarrow_watchdog::witness::units_oom_kills(),
+                    );
                     let clean = northnarrow_watchdog::witness::clean_stop(&cause);
                     // the review of #582 (F2 d): what the host would give a
                     // successor, as the vacancy begins
@@ -677,7 +684,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
-                                agent_started = process_start_unix(pid);
+                                (agent_started, agent_oom_kills) = agent_life(pid);
                                 new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                                 continue 'restart_loop;
@@ -753,7 +760,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         Some((pid, fd)) => {
                             agent_pid = pid;
                             agent_pidfd = fd;
-                            agent_started = process_start_unix(pid);
+                            (agent_started, agent_oom_kills) = agent_life(pid);
                             new_generation(&current_agent, &mut stuck_rx, pid);
                             backoff = RestartBackoff::new();
                             continue 'restart_loop;
@@ -829,7 +836,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             new_pid,
                             &hold_record_path(&cli.shutdown_marker),
                         );
-                        agent_started = process_start_unix(new_pid);
+                        (agent_started, agent_oom_kills) = agent_life(new_pid);
                         new_generation(&current_agent, &mut stuck_rx, new_pid);
                         info!(
                             target: "watchdog.respawn",
@@ -870,7 +877,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
-                                agent_started = process_start_unix(pid);
+                                (agent_started, agent_oom_kills) = agent_life(pid);
                                 new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                             }
@@ -1388,6 +1395,18 @@ fn judge_agent_at_start(
             ),
         );
     }
+}
+
+/// The agent `pid`'s life as the watchdog registers it: its start
+/// (`process_start_unix`, external audit WDG-001) and the units' slice's
+/// OOM kill count then (the lab round 5 of #582,
+/// [`northnarrow_watchdog::witness::with_oom_killer`]). One call, so neither
+/// is taken without the other.
+fn agent_life(pid: u32) -> (Option<u64>, Option<u64>) {
+    (
+        process_start_unix(pid),
+        northnarrow_watchdog::witness::units_oom_kills(),
+    )
 }
 
 /// Lot 374: why the agent `pid` exited — the wait's status for the exec
