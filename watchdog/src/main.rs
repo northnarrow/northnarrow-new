@@ -258,6 +258,11 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
             .await
             .context("opening initial agent pidfd")
             .exit_as(ExitReason::NoAgent)?;
+    // The review of #582 (F6): the agent's role vacated earlier this boot
+    // (the kernel's sticky mark; a vacancy this watchdog's start found
+    // included) — the agent this start finds is a successor no watchdog saw
+    // take the role: judged now, and signed by the witness.
+    judge_agent_at_start(&cli, &mut witness, agent_pid);
     // Lot 273c (the review of #490): the agent's cgroup, checked from here.
     northnarrow_watchdog::check_agent_cgroup(
         &cli.bpffs_root,
@@ -570,11 +575,16 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 // its cause as the wait or systemd records it and what the
                 // shutdown marker said — after the evict, which the wait on
                 // systemd's record never delays.
+                // The review of #582 (F4 a): inside a signed window the
+                // vacancy is the operator's (a note), as NN-L-BPF-002 is Low.
+                let in_window = antitamper_bpf::window_open(&cli.bpffs_root).unwrap_or(false);
                 if let Some(w) = witness.as_mut() {
                     let cause = exit_cause(&backend, &reaped, agent_pid).await;
                     w.record_or_log(
-                        northnarrow_watchdog::witness::vacancy_kind(&verdict),
-                        &northnarrow_watchdog::witness::vacancy_detail(agent_pid, &cause, &verdict),
+                        northnarrow_watchdog::witness::vacancy_kind(&verdict, in_window),
+                        &northnarrow_watchdog::witness::vacancy_detail(
+                            agent_pid, &cause, &verdict, in_window,
+                        ),
                     );
                 }
                 match verdict {
@@ -1053,7 +1063,8 @@ async fn respawn_cycle(
             target: "watchdog.tamper",
             new_pid,
             detail = %successor,
-            "the agent's successor is not its unit's clean restart — not given the role's rights"
+            "the agent's successor is not its unit's clean restart — the kernel gave it the role; \
+             the watchdog does not re-register it"
         );
     } else if pidfd_exited(&new_fd) {
         info!(
@@ -1083,6 +1094,40 @@ fn judge_successor(old: u32, new: u32) -> (bool, String) {
     let id = antitamper_bpf::start_check::identity(new);
     let found = antitamper_bpf::start_check::inspect(new);
     northnarrow_watchdog::witness::successor_detail(old, new, &id, &found)
+}
+
+/// The review of #582 (F6): at this watchdog's start, the agent `pid` it
+/// found, judged as a successor when the kernel marked the agent's role
+/// vacated earlier this boot ([`antitamper_bpf::ROLE_MARK_VACATED`]): a
+/// witness row, `role_succeeded` or `role_successor_foreign`. Recorded,
+/// never acted on here: the agent registers itself, and at its start this
+/// watchdog re-registers no agent. Nothing when the mark cannot be read
+/// (said in the journal).
+fn judge_agent_at_start(
+    cli: &Cli,
+    witness: &mut Option<northnarrow_watchdog::witness::Witness>,
+    pid: u32,
+) {
+    match antitamper_bpf::role_marks(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT) {
+        Ok(m) if m & antitamper_bpf::ROLE_MARK_VACATED != 0 => {
+            let (given, detail) = judge_successor(0, pid);
+            if let Some(w) = witness.as_mut() {
+                w.record_or_log(
+                    northnarrow_watchdog::witness::successor_kind(given),
+                    &format!(
+                        "judged at this watchdog's start (the agent's role was vacated earlier \
+                         this boot): {detail}"
+                    ),
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(
+            target: "watchdog.witness",
+            error = format!("{e:#}"),
+            "the agent's role marks not read: the agent found at this start is not judged"
+        ),
+    }
 }
 
 /// Lot 374: why the agent `pid` exited — the wait's status for the exec
@@ -1273,7 +1318,8 @@ async fn hold(
                     target: "watchdog.tamper",
                     pid,
                     detail = %successor,
-                    "the agent that ends the hold is not its unit's clean restart — not given the role's rights"
+                    "the agent that ends the hold is not its unit's clean restart — the kernel gave it \
+                     the role; the watchdog does not re-register it"
                 );
             } else if !pidfd_exited(&pidfd) {
                 if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {

@@ -51,13 +51,28 @@ pub const KIND_VACATED: &str = "role_vacated";
 /// The agent's role released by a shutdown the admin quorum signed (no
 /// successor follows).
 pub const KIND_RELEASED: &str = "role_released";
+/// The review of #582 (F4): the agent's role left inside a signed
+/// trusted-installer window — the operator's documented restart or stop
+/// (the installer's own family start, as NN-L-BPF-002 is Low inside one).
+pub const KIND_RELEASED_IN_WINDOW: &str = "role_released_in_window";
+/// The review of #582 (F2 d): the watchdog held instead of starting the
+/// agent again — the host changed during the vacancy (a drop-in that reaches
+/// our units, `/etc/ld.so.preload`) since the watchdog's start.
+pub const KIND_RESPAWN_HELD: &str = "role_respawn_held";
+/// The review of #582 (F2 c): the chain the watchdog appends to no longer
+/// ends where its last row did (cut, changed or replaced since): set aside,
+/// and a new chain opened with what the watchdog expected and found.
+pub const KIND_CHAIN_CUT: &str = "witness_chain_cut";
 /// The agent's unit's restart, nothing foreign in it, took the vacated
 /// role: who it is and what it shows.
 pub const KIND_SUCCEEDED: &str = "role_succeeded";
-/// A process that is not the agent's unit's clean restart took the vacated
-/// role (not given the watchdog's re-registration): who it is, where it was
-/// started and what it shows.
-pub const KIND_SUCCESSOR_REFUSED: &str = "role_successor_refused";
+/// The review of #582 (F3): the process that took the vacated role is not
+/// the agent's unit's clean restart — something foreign in its environment
+/// or mappings, or not started as its unit's restart. Observed, not
+/// refused: the kernel gave it the role (its own registration stands); the
+/// watchdog only withholds its re-registration of it. Who it is, where it
+/// was started and what it shows.
+pub const KIND_SUCCESSOR_FOREIGN: &str = "role_successor_foreign";
 /// The watchdog's start found the agent's role vacated and no agent: both
 /// roles were vacant.
 pub const KIND_FOUND_VACANT: &str = "role_found_vacant";

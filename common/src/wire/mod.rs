@@ -1866,6 +1866,33 @@ pub const BPF_CMD_LISTING_GET_FD: u32 = 0xFFFF_0005;
 /// boot (0: never held). No thread group has this number.
 pub const ROLE_VACATED: u32 = u32::MAX;
 
+/// The review of #582 (F4, F6): the pinned map of what the kernel's
+/// liveness watch (`role_exit`) recorded of each role's holders' exits this
+/// boot — one word per `ROLE_TGIDS` slot, [`ROLE_MARK_VACATED`] and
+/// [`ROLE_MARK_IN_WINDOW`]. Written by that program only: no process can
+/// write it (`BPF_F_RDONLY`, the family included), and a successor's claim
+/// of its slot leaves it as it is — the sticky "vacated this boot" the
+/// other role reads at its own start.
+pub const ROLE_MARKS_MAP_NAME: &str = "ROLE_MARKS";
+/// [`ROLE_MARKS_MAP_NAME`]: the slot's holder exited at least once this
+/// boot (never cleared until the next boot).
+pub const ROLE_MARK_VACATED: u32 = 1;
+/// [`ROLE_MARKS_MAP_NAME`]: the slot's holder's last exit was inside a
+/// signed trusted-installer window (the operator's stop or restart).
+pub const ROLE_MARK_IN_WINDOW: u32 = 2;
+/// `BPF_F_RDONLY` (include/uapi/linux/bpf.h): a map no syscall writes.
+pub const BPF_F_RDONLY: u32 = 1 << 3;
+
+/// The review of #582 (F4, F6): the mark `role_exit` writes for a holder's
+/// exit — vacated, and inside a window or not.
+pub const fn role_exit_mark(in_window: bool) -> u32 {
+    if in_window {
+        ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW
+    } else {
+        ROLE_MARK_VACATED
+    }
+}
+
 /// Lot 374: the slice both our units run in (their `Slice=`).
 pub const OUR_SLICE: &str = "northnarrow.slice";
 /// Lot 374: the agent's unit.

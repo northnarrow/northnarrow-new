@@ -154,14 +154,14 @@ memory file of the watchdog's, never on disk.
 | `role_vacated` | the agent exited: its pid, the cause as systemd recorded it for that process (the OOM killer, a signal, an exit status; "not known" past 3 s), what the shutdown marker said |
 | `role_released` | the agent stopped by a shutdown the admin quorum signed: no successor follows |
 | `role_succeeded` | the agent's unit's clean restart took the role: its pid, parent and cgroup, nothing foreign in its environment and executable mappings |
-| `role_successor_refused` | a process that is not that took the role (not given the watchdog's re-registration): its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
+| `role_successor_foreign` | a process that is not that took the role (not given the watchdog's re-registration): its pid, parent and cgroup, the loader variables and executable mappings not expected that it shows (names only) |
 | `role_found_vacant` | a watchdog start found the agent's role already vacated |
 
 - Every 30 s the agent certifies the verified watchdog's key, read from
   the watchdog's own descriptor table — one `witness_key_certified` entry
   per key, op `witness` — and imports the rows after the last one it
   imported into the audit log: `role_vacated`, `role_found_vacant` and
-  `role_successor_refused` as `witness_row` (`integrity_drift`, High); the
+  `role_successor_foreign` as `witness_row` (`integrity_drift`, High); the
   others as `witness_note` (op `witness`); a row whose key it never
   certified as `witness_row_uncertified` (High).
   Its position is `witness.imported`, beside the chain. A row changed or

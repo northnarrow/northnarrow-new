@@ -279,8 +279,13 @@ const WATCHDOG_UNIT: &str = include_str!(concat!(
     "/deploy/systemd/northnarrow-watchdog.service"
 ));
 
-/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
-const AGENT_UNIT_CGROUP: &str = "/system.slice/northnarrow-agent.service";
+/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`):
+/// its unit under our slice (`common::wire::{OUR_SLICE, AGENT_UNIT}`). The
+/// review of #582 (F5): it named `system.slice` since the units moved to
+/// `northnarrow.slice` (lot 273d), and NN-AUD-113's limits and the pin
+/// lock made again when the unit started without it (#569 F3) never ran;
+/// a test ties it to the shipped unit's `Slice=`.
+const AGENT_UNIT_CGROUP: &str = "/northnarrow.slice/northnarrow-agent.service";
 
 /// Limit names as [`limits`] reports them.
 const LIMIT_CGROUP: &str = "agent cgroup";
@@ -1053,7 +1058,7 @@ fn high_kind(kind: &str) -> bool {
             // lot 374: the other role's vacancy, its successor, a refused start
             | WATCHDOG_START_REFUSED
             | WITNESS_UNAVAILABLE
-            | crate::witness::WATCHDOG_SUCCESSOR_REFUSED
+            | crate::witness::WATCHDOG_SUCCESSOR_FOREIGN
             | crate::witness::WITNESS_ROW
             | crate::witness::WITNESS_UNCERTIFIED
             | crate::witness::WITNESS_BROKEN
@@ -3371,7 +3376,7 @@ mod tests {
             w::WITNESS_ROW,
             w::WITNESS_UNCERTIFIED,
             w::WITNESS_BROKEN,
-            w::WATCHDOG_SUCCESSOR_REFUSED,
+            w::WATCHDOG_SUCCESSOR_FOREIGN,
             WATCHDOG_START_REFUSED,
             WITNESS_UNAVAILABLE,
         ] {
@@ -5007,6 +5012,24 @@ mod tests {
         let f = w.observe(&seen("50000 100000"), &expected);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, "limit_unexpected");
+    }
+
+    /// The review of #582 (F5): the agent unit's cgroup is the shipped
+    /// unit's own — its `Slice=` and its name, as the eBPF programs and
+    /// `start_check` build it (`common::wire`). It named `system.slice`
+    /// after the units had moved, and both checks that read it were dead.
+    #[test]
+    fn the_agent_unit_cgroup_is_the_shipped_unit_s_slice_and_name() {
+        let slice = unit_directive(AGENT_UNIT, "Slice").expect("the agent unit sets Slice=");
+        assert_eq!(slice, common::wire::OUR_SLICE);
+        assert_eq!(
+            AGENT_UNIT_CGROUP,
+            format!("/{slice}/{}", common::wire::AGENT_UNIT)
+        );
+        assert_eq!(
+            unit_directive(WATCHDOG_UNIT, "Slice"),
+            Some(common::wire::OUR_SLICE)
+        );
     }
 
     #[test]

@@ -397,8 +397,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // a watchdog death this agent saw, until a successor is judged; the
         // successor refused (its record signed once).
         let mut witness = nn_linux::witness::WitnessReader::new(&witness_dir);
-        let mut succession_pending = false;
-        let mut successor_refused: Option<u32> = None;
+        let mut successor_flagged: Option<u32> = None;
         // Lot 374: the watchdog registered after the last tick (0: none),
         // for the witness round.
         let verified_now = std::sync::atomic::AtomicU32::new(0);
@@ -411,6 +410,16 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
         // no bpffs ⇒ register_protected_observer is a no-op (it
         // logs the degraded mode internally).
         let bpffs_root = northnarrow_agent::anti_tamper::prepare_pin_root();
+        // The review of #582 (F6): the watchdog's role vacated earlier this
+        // boot (the kernel's sticky mark, which no claim clears): the
+        // watchdog this agent finds first is a successor nobody saw take
+        // the role — judged as one, as after a death this agent saw.
+        let mut succession_pending = bpffs_root
+            .and_then(|r| antitamper_bpf::role_marks(r, antitamper_bpf::ROLE_SLOT_WATCHDOG).ok())
+            .is_some_and(|m| m & antitamper_bpf::ROLE_MARK_VACATED != 0);
+        // The review of #582 (F4 b): both roles found vacated at this start,
+        // judged once the chain and the audit log are there.
+        let mut gap_judged = false;
         // lot 353 (re-check 1 of #563): one tick — the pidfile, the
         // watchdog's binary and the pins read by path — run off the
         // runtime's worker
@@ -505,16 +514,16 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     );
                     let log = audit.get().and_then(|l| l.as_ref());
                     if !v.given {
-                        if successor_refused != Some(p) {
-                            warn!(watchdog_pid = p, detail = %v.detail, "the watchdog's successor is not its unit's clean restart — not registered");
+                        if successor_flagged != Some(p) {
+                            warn!(watchdog_pid = p, detail = %v.detail, "the watchdog's successor is not its unit's clean restart — it holds the role the kernel gave it; the agent does not register it");
                             northnarrow_agent::self_integrity::report_event(
                                 log,
                                 &northnarrow_agent::self_integrity::Finding {
-                                    kind: nn_linux::witness::WATCHDOG_SUCCESSOR_REFUSED,
+                                    kind: nn_linux::witness::WATCHDOG_SUCCESSOR_FOREIGN,
                                     detail: v.detail,
                                 },
                             );
-                            successor_refused = Some(p);
+                            successor_flagged = Some(p);
                         }
                         exempt.clear_watchdog();
                         last = None;
@@ -529,7 +538,7 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                         },
                     );
                     succession_pending = false;
-                    successor_refused = None;
+                    successor_flagged = None;
                 }
             }
             if let Some(p) = new_pid {
@@ -703,6 +712,15 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
             let Some(log) = audit.get().and_then(|l| l.as_ref()) else {
                 return;
             };
+            if !gap_judged {
+                gap_judged = true;
+                if let Some(r) = nn_linux::witness::roles_at_start() {
+                    let signed = r.both_vacated() && witness.ends_with_signed_release();
+                    if let Some(f) = nn_linux::witness::roles_gap(&r, signed) {
+                        northnarrow_agent::self_integrity::report_or_note(Some(log), &f);
+                    }
+                }
+            }
             if let Some(p) = verified {
                 if let Some(f) = witness.certify(p) {
                     northnarrow_agent::self_integrity::report_or_note(Some(log), &f);

@@ -408,7 +408,7 @@ not cause as an incident.
     `witness_row_uncertified`).
   - The watchdog's vacancy and its successor are signed by the live agent
     (`watchdog_gone`, then `watchdog_succession` or
-    `watchdog_successor_refused`).
+    `watchdog_successor_foreign`).
   - When both roles were vacated, the next agent start signs the gap it
     finds (`roles_vacated_gap`).
   - The taking itself is NN-L-BPF-002: High when no signed

@@ -4992,7 +4992,7 @@ was given code before its `main` refuses itself.
     recorded it for that process (the OOM killer, a signal, an exit
     status; "not known" past 3 s) and what the shutdown marker said;
     `role_released` instead for a shutdown the admin quorum signed;
-  - `role_succeeded` (its unit's clean restart) or `role_successor_refused`
+  - `role_succeeded` (its unit's clean restart) or `role_successor_foreign`
     (anything else): the process that took the role — its pid, parent and
     cgroup, and the loader variables and executable mappings not expected
     that it shows (names only);
@@ -5012,7 +5012,7 @@ was given code before its `main` refuses itself.
   unit's restart with clean marks and nothing foreign is registered and
   signed as a note (`watchdog_succession`; the death itself is
   `watchdog_gone`, as before); anything else is not registered
-  (`watchdog_successor_refused`, High). An agent start that
+  (`watchdog_successor_foreign`, High). An agent start that
   finds both roles vacated signs the gap (`roles_vacated_gap`).
 - **Bound to its unit.** The kernel gives a vacated role's rights (its
   handles on the agent's maps) only to a child of PID 1 running in that

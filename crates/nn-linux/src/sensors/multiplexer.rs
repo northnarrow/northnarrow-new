@@ -354,11 +354,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             &ebpf,
             crate::telemetry_probe::monotonic_ns(),
         );
-        // Lot 374: both roles vacated — the gap this start finds, signed
-        // (no role was there to sign the other's exit)
-        if let Some(gap) = crate::anti_tamper::bpf_defense::roles_gap(&ebpf) {
-            warn!(detail = %gap, "anti-tamper: both roles found vacated at this start");
-            crate::boot::degradation::report(crate::witness::ROLES_VACATED_GAP, &gap);
+        // Lot 374: both roles vacated — the gap this start finds, judged and
+        // signed by the witness round (the review of #582, F4 b: not after
+        // a signed stop) once the chain and the audit log are there; read
+        // now, before anything below claims the agent's role
+        if let Some(r) = crate::anti_tamper::bpf_defense::roles_at_start(&ebpf) {
+            if r.both_vacated() {
+                warn!(?r, "anti-tamper: both roles found vacated at this start");
+            }
+            crate::witness::note_roles_at_start(r);
         }
         // Lot 285: the history's maps checked or pinned, and frozen, before
         // the module-load judge's controller takes them.

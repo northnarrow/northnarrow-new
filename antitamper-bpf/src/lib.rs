@@ -128,6 +128,9 @@ use aya::{
 pub use common::wire::pid_role;
 /// Lot 374: `ROLE_TGIDS`' value for a role whose holder exited this boot.
 pub use common::wire::ROLE_VACATED;
+/// The review of #582 (F4, F6): what the kernel recorded of each role's
+/// holders' exits this boot.
+pub use common::wire::{ROLE_MARKS_MAP_NAME, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED};
 use tracing::{error, info, warn};
 
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
@@ -181,6 +184,79 @@ pub fn role_slot(bpffs_root: &Path, slot: u32) -> Result<u32> {
     arr.get(&slot, 0)
         .with_context(|| format!("reading {ROLE_TGIDS_MAP_NAME}[{slot}]"))
 }
+
+/// The review of #582 (F4, F6): slot `slot`'s word of the pinned
+/// `ROLE_MARKS` (`common::wire::ROLE_MARK_VACATED`: its holder exited at
+/// least once this boot; `ROLE_MARK_IN_WINDOW`: the last of those exits was
+/// inside a signed trusted-installer window). Written by the kernel's
+/// liveness watch only. A read handle: the caller must be a protected pid
+/// while the guard enforces.
+pub fn role_marks(bpffs_root: &Path, slot: u32) -> Result<u32> {
+    let pin_path = bpffs_root.join(ROLE_MARKS_MAP_NAME);
+    let map_data = MapData::from_pin(&pin_path).with_context(|| {
+        format!(
+            "opening pinned {ROLE_MARKS_MAP_NAME} at {}",
+            pin_path.display()
+        )
+    })?;
+    let arr: AyaArray<MapData, u32> = AyaArray::try_from(AyaMap::Array(map_data))
+        .with_context(|| format!("{ROLE_MARKS_MAP_NAME} is not an Array<u32>"))?;
+    arr.get(&slot, 0)
+        .with_context(|| format!("reading {ROLE_MARKS_MAP_NAME}[{slot}]"))
+}
+
+/// `FS_GRANT`'s slot as aya reads it (`common::wire::FsGrant`).
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct PodFsGrant(common::wire::FsGrant);
+
+// SAFETY: `FsGrant` is `#[repr(C)]` over u32, u32, u64 — no padding, every
+// bit pattern valid; `PodFsGrant` is `#[repr(transparent)]`.
+unsafe impl aya::Pod for PodFsGrant {}
+
+/// `CLOCK_MONOTONIC` in nanoseconds: the eBPF programs' clock
+/// (`bpf_ktime_get_ns`), which a window's deadline is in.
+pub fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The review of #582 (F4): whether a signed trusted-installer window is
+/// open now — the kernel hooks' own test (`FS_GRANT[0]` against this
+/// boot's `AGENT_SESSION[0]`, `common::wire::FsGrant::active`), read from
+/// the pins under `bpffs_root`. A read handle: the caller must be a
+/// protected pid while the guard enforces.
+pub fn window_open(bpffs_root: &Path) -> Result<bool> {
+    let open = |name: &str| -> Result<MapData> {
+        let pin = bpffs_root.join(name);
+        MapData::from_pin(&pin).with_context(|| format!("opening pinned {name} at {}", pin.display()))
+    };
+    let session: AyaArray<MapData, u32> =
+        AyaArray::try_from(AyaMap::Array(open(AGENT_SESSION_MAP_NAME)?))
+            .with_context(|| format!("{AGENT_SESSION_MAP_NAME} is not an Array<u32>"))?;
+    let session = session
+        .get(&0, 0)
+        .with_context(|| format!("reading {AGENT_SESSION_MAP_NAME}[0]"))?;
+    let grant: AyaArray<MapData, PodFsGrant> =
+        AyaArray::try_from(AyaMap::Array(open(FS_GRANT_MAP_NAME)?))
+            .with_context(|| format!("{FS_GRANT_MAP_NAME} is not an Array<FsGrant>"))?;
+    let grant = grant
+        .get(&0, 0)
+        .with_context(|| format!("reading {FS_GRANT_MAP_NAME}[0]"))?;
+    Ok(grant.0.active(monotonic_ns(), session))
+}
+
+/// The pinned map of this boot's session nonce (mirrors the eBPF object's
+/// `AGENT_SESSION`).
+pub const AGENT_SESSION_MAP_NAME: &str = "AGENT_SESSION";
+/// The pinned map of the trusted-installer window's kernel half (mirrors
+/// the eBPF object's `FS_GRANT`).
+pub const FS_GRANT_MAP_NAME: &str = "FS_GRANT";
 
 /// Lot 370 (F10-4): the `oom_score_adj` the agent and the watchdog hold —
 /// the host OOM killer's last pick (its SIGKILL no hook can refuse: a root

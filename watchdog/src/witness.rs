@@ -310,10 +310,13 @@ pub fn unit_exit_cause(unit: &str, pid: u32) -> Option<String> {
 }
 
 /// The vacancy row's kind: the role released by a shutdown the admin
-/// quorum signed, vacated otherwise.
-pub fn vacancy_kind(verdict: &crate::ShutdownVerdict) -> &'static str {
+/// quorum signed, or inside a signed trusted-installer window (the review of
+/// #582, F4: the operator's documented restart and stop — a note, as the
+/// successor's NN-L-BPF-002 is Low inside one), vacated otherwise.
+pub fn vacancy_kind(verdict: &crate::ShutdownVerdict, in_window: bool) -> &'static str {
     match verdict {
         crate::ShutdownVerdict::Authorised => nn_proto::witness::KIND_RELEASED,
+        _ if in_window => nn_proto::witness::KIND_RELEASED_IN_WINDOW,
         _ => nn_proto::witness::KIND_VACATED,
     }
 }
@@ -324,14 +327,19 @@ pub fn successor_kind(given: bool) -> &'static str {
     if given {
         nn_proto::witness::KIND_SUCCEEDED
     } else {
-        nn_proto::witness::KIND_SUCCESSOR_REFUSED
+        nn_proto::witness::KIND_SUCCESSOR_FOREIGN
     }
 }
 
 /// The vacancy row's detail: the agent `pid` gone, `cause` (the wait's or
 /// systemd's), and what its shutdown marker said — an authorised stop is
 /// one too, and says so.
-pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -> String {
+pub fn vacancy_detail(
+    pid: u32,
+    cause: &str,
+    verdict: &crate::ShutdownVerdict,
+    in_window: bool,
+) -> String {
     let marker = match verdict {
         crate::ShutdownVerdict::Absent => "no shutdown marker",
         crate::ShutdownVerdict::Authorised => {
@@ -341,7 +349,12 @@ pub fn vacancy_detail(pid: u32, cause: &str, verdict: &crate::ShutdownVerdict) -
             "a shutdown marker refused (not signed by the admin quorum for this agent)"
         }
     };
-    format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}")
+    let window = if in_window {
+        "; inside a signed trusted-installer window (the operator's restart or stop)"
+    } else {
+        ""
+    };
+    format!("the agent (pid {pid}) exited, its role vacated: {cause}; {marker}{window}")
 }
 
 /// Why the agent exited, from the wait on the exec backend's child
@@ -357,7 +370,9 @@ pub fn cause_from_wait(si_code: i32, code: i32) -> String {
 
 /// The successor's record: where it was started and what it shows, and
 /// whether it is the restart of the agent's unit with nothing foreign
-/// (the watchdog gives the role's rights only to that one).
+/// (the watchdog re-registers only that one). The review of #582 (F3): a
+/// successor that is not is observed, never refused here — it holds the
+/// role the kernel gave it, and the record says so.
 pub fn successor_detail(
     old: u32,
     new: u32,
@@ -371,10 +386,21 @@ pub fn successor_detail(
         (false, _) => "NOT its unit's restart (not PID 1's child in the agent's own cgroup)",
         (true, false) => "its unit's restart, with something foreign in it",
     };
+    let taken = if ok {
+        ""
+    } else {
+        " — it holds the role the kernel gave it; the watchdog does not re-register it"
+    };
+    // old 0: the vacancy is the kernel's mark, its holder not known here
+    let by = if old == 0 {
+        "earlier this boot".to_string()
+    } else {
+        format!("by pid {old}")
+    };
     (
         ok,
         format!(
-            "the agent's role, vacated by pid {old}, taken by pid {new}: {verdict}; {}; {}",
+            "the agent's role, vacated {by}, taken by pid {new}: {verdict}{taken}; {}; {}",
             id.describe(),
             found.describe()
         ),
@@ -447,12 +473,18 @@ mod tests {
             41,
             "signal 9 (systemd Result=signal)",
             &crate::ShutdownVerdict::Absent,
+            false,
         );
         assert_eq!(
             d,
             "the agent (pid 41) exited, its role vacated: signal 9 (systemd Result=signal); no shutdown marker"
         );
-        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Authorised);
+        let d = vacancy_detail(
+            41,
+            "exit status 0",
+            &crate::ShutdownVerdict::Authorised,
+            false,
+        );
         assert!(
             d.ends_with("a shutdown the admin quorum signed: no successor follows"),
             "{d}"
@@ -461,23 +493,57 @@ mod tests {
             41,
             "exit status 0",
             &crate::ShutdownVerdict::Refused("x".into()),
+            false,
         );
         assert!(d.contains("a shutdown marker refused"), "{d}");
         // only a signed shutdown releases the role; a refused marker vacates it
         use nn_proto::witness::{
-            KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_REFUSED, KIND_VACATED,
+            KIND_RELEASED, KIND_SUCCEEDED, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
         };
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Authorised),
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, false),
             KIND_RELEASED
         );
-        assert_eq!(vacancy_kind(&crate::ShutdownVerdict::Absent), KIND_VACATED);
         assert_eq!(
-            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into())),
+            vacancy_kind(&crate::ShutdownVerdict::Absent, false),
+            KIND_VACATED
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), false),
             KIND_VACATED
         );
         assert_eq!(successor_kind(true), KIND_SUCCEEDED);
-        assert_eq!(successor_kind(false), KIND_SUCCESSOR_REFUSED);
+        assert_eq!(successor_kind(false), KIND_SUCCESSOR_FOREIGN);
+    }
+
+    /// The review of #582 (F4 a): the guide's restart — a window granted,
+    /// the agent stopped, the watchdog starting it again — is the
+    /// operator's: its vacancy is `role_released_in_window` (a note), never
+    /// the High `role_vacated`; a signed shutdown stays `role_released`.
+    #[test]
+    fn a_vacancy_inside_a_signed_window_is_released_not_vacated() {
+        use nn_proto::witness::{KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_VACATED};
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            KIND_RELEASED_IN_WINDOW
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Refused("x".into()), true),
+            KIND_RELEASED_IN_WINDOW
+        );
+        assert_eq!(
+            vacancy_kind(&crate::ShutdownVerdict::Authorised, true),
+            KIND_RELEASED
+        );
+        assert_ne!(
+            vacancy_kind(&crate::ShutdownVerdict::Absent, true),
+            KIND_VACATED
+        );
+        let d = vacancy_detail(41, "exit status 0", &crate::ShutdownVerdict::Absent, true);
+        assert!(
+            d.ends_with("inside a signed trusted-installer window (the operator's restart or stop)"),
+            "{d}"
+        );
     }
 
     fn chain_text(dir: &Path) -> String {
@@ -645,6 +711,34 @@ mod tests {
             !successor_detail(10, 11, &unit, &unread).0,
             "unread is never clean"
         );
+    }
+
+    /// The review of #582 (F3): a successor that is not its unit's clean
+    /// restart is observed — it holds the role the kernel gave it — and its
+    /// record says that, never that it was refused; the row's kind is
+    /// `role_successor_foreign`.
+    #[test]
+    fn a_foreign_successor_is_recorded_as_holding_the_role_never_as_refused() {
+        let unit = Identity {
+            ppid: Some(1),
+            cgroup: Some("/northnarrow.slice/northnarrow-agent.service".into()),
+        };
+        let preloaded = Findings {
+            loader_vars: vec!["LD_PRELOAD".into()],
+            ..Findings::default()
+        };
+        let (ok, d) = successor_detail(10, 11, &unit, &preloaded);
+        assert!(!ok);
+        assert!(
+            d.contains("holds the role the kernel gave it")
+                && d.contains("does not re-register it"),
+            "{d}"
+        );
+        assert!(!d.to_lowercase().contains("refus"), "{d}");
+        assert_eq!(successor_kind(false), "role_successor_foreign");
+        assert_eq!(successor_kind(true), "role_succeeded");
+        let (ok, d) = successor_detail(10, 11, &unit, &Findings::default());
+        assert!(ok && !d.contains("holds the role"), "{d}");
     }
 
     #[test]
