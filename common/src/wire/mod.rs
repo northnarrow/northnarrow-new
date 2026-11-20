@@ -2512,6 +2512,24 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    /// The review of #582 (F4, F6): the mark `role_exit` writes for a
+    /// holder's exit — vacated always, inside a window or not; the two bits
+    /// apart, neither ever a slot's value; the map no syscall writes.
+    #[test]
+    fn an_exit_s_mark_says_vacated_and_whether_inside_a_window() {
+        use super::{
+            role_exit_mark, BPF_F_RDONLY, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED,
+        };
+        assert_eq!(role_exit_mark(false), ROLE_MARK_VACATED);
+        assert_eq!(
+            role_exit_mark(true),
+            ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW
+        );
+        assert_eq!(ROLE_MARK_VACATED & ROLE_MARK_IN_WINDOW, 0);
+        assert_ne!(role_exit_mark(true), ROLE_VACATED);
+        assert_eq!(BPF_F_RDONLY, 8, "include/uapi/linux/bpf.h");
+    }
+
     /// Lot 374: a cgroup's name as the eBPF programs compare it — the
     /// bytes of the kernel's string read (at most 31 and a NUL) in
     /// little-endian words; slot 0 the watchdog's unit, slot 1 the agent's.

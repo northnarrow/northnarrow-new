@@ -1838,8 +1838,29 @@ fn agent_journal(pid: u32) -> String {
         .arg(format!("_PID={pid}"))
         .stdin(Stdio::null())
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .map(|o| without_colours(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
+}
+
+/// `s` without its terminal colour sequences (`ESC [ … letter`): the fmt
+/// layer may colour its fields.
+#[cfg(feature = "debug-trigger")]
+fn without_colours(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' && it.peek() == Some(&'[') {
+            it.next();
+            for d in it.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The agent unit's last journal lines (its log namespace).

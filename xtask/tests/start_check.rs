@@ -132,3 +132,82 @@ fn both_daemons_check_themselves_before_they_take_their_role() {
         "{callers:?}"
     );
 }
+
+/// The review of #582 (F2 d): every start of the agent the watchdog makes —
+/// the respawn after a vacancy and a hold's retry, its only two — is
+/// preceded by the host's judgement, and held (or skipped) on its verdict.
+#[test]
+fn every_start_the_watchdog_makes_is_judged_first() {
+    let root = repo_root();
+    let code = product_code(&root);
+    let wd = &code["watchdog/src/main.rs"];
+    assert_eq!(
+        wd.matches("respawn_cycle(").count(),
+        2,
+        "one call and its definition"
+    );
+    assert_eq!(
+        wd.matches("respawn_agent_off_runtime(").count(),
+        2,
+        "respawn_cycle's and the retry's"
+    );
+    assert_eq!(
+        code["watchdog/src/lib.rs"]
+            .matches("respawn_agent_off_runtime(")
+            .count(),
+        1,
+        "its definition, and no other start"
+    );
+    let gate = wd
+        .find("let host = judge_host().await;\n                if let Some(why) = &host.hold {")
+        .expect("the gate before the respawn");
+    let held = wd[gate..]
+        .find("REASON_RESPAWN_HELD")
+        .map(|i| i + gate)
+        .expect("held");
+    let respawn = wd.find("r = respawn_cycle(").expect("the respawn");
+    assert!(
+        gate < held && held < respawn,
+        "judged and held before the respawn"
+    );
+    let retry = wd.find("fn hold_supervision(").expect("the hold's retries");
+    let r = &wd[retry..];
+    let judged = r
+        .find("let host = judge_host().await;")
+        .expect("the retry judged");
+    let skipped = r
+        .find("if let Some(why) = host.hold {")
+        .expect("skipped on a change");
+    let start = r
+        .find("} else if let Err(e) = respawn_agent_off_runtime(backend).await {")
+        .expect("started only otherwise");
+    assert!(judged < skipped && skipped < start);
+}
+
+/// The review of #582 (F6): each role's start judges the other role's
+/// process when the kernel marked that role vacated earlier this boot.
+#[test]
+fn each_role_s_start_judges_the_other_after_a_vacancy_this_boot() {
+    let root = repo_root();
+    let code = product_code(&root);
+    let wd = &code["watchdog/src/main.rs"];
+    let found = wd
+        .find("open_agent_pidfd_with_retry(&cli.agent_pidfile")
+        .expect("the agent found");
+    let judged = wd
+        .find("judge_agent_at_start(&cli, &mut witness, agent_pid);")
+        .expect("judged");
+    assert!(found < judged);
+    let f = &wd[wd.find("fn judge_agent_at_start(").unwrap()..];
+    assert!(
+        f.contains("antitamper_bpf::role_marks(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)")
+    );
+    assert!(f.contains("Ok(m) if m & antitamper_bpf::ROLE_MARK_VACATED != 0 => {"));
+    let tasks = &code["agent/src/boot/tasks.rs"];
+    let t = tasks
+        .find("let mut succession_pending = bpffs_root")
+        .expect("the agent's start");
+    let rest = &tasks[t..];
+    assert!(rest.contains("antitamper_bpf::role_marks(r, antitamper_bpf::ROLE_SLOT_WATCHDOG)"));
+    assert!(rest[..300].contains("ROLE_MARK_VACATED != 0"));
+}
