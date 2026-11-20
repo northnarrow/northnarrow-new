@@ -11779,7 +11779,47 @@ number in parentheses is a lab PR.
     log from its spawn; bound a few ms after its first round, a foreign
     watchdog found at the start was only logged, never signed (both CI
     guests). Ratchet `the_watchdog_refresh_signs_from_its_first_round`.
-  - Lab (as measured): @LAB@
+  - The lab r5, fix round 6 (product): `OOMPolicy=continue` in both units.
+    A worker's OOM kill (the kernel's first pick) made systemd stop the
+    agent's unit, a stop the hook refused, and the unit was left failed
+    with the agent running and no start possible. The agent's own OOM kill
+    is now recorded (`signal 9`), and the vacancy names the OOM killer from
+    the slice's `oom_kill` count. A drop-in that sets `OOMPolicy=stop` is
+    judged harmful.
+  - Lab (as measured, round r6 on fix round 6's product, ubuntu2204
+    5.15/systemd 249 and ubuntu2604 7.0/systemd 259): the tree verified
+    by hash. verifier-check OK (highest `mount_guard_sb_mount` 83.1% on
+    5.15, `mount_guard_move_mount` 60.3% on 7.0). Every case started with
+    both units active and their pids in `ROLE_TGIDS`. Every OOM killed the
+    process the probe aimed at, as the kernel log names it.
+    - Vacancies: the agent's OOM vacancy is signed with its cause
+      (`signal 9`, the OOM killer's, from the slice's `oom_kill` count) and
+      taken by its unit's restart. The watchdog's OOM vacancy leaves the
+      agent running (`watchdog_gone`, `watchdog_succession`).
+    - Refusals: a loader variable reaches neither unit. A transient start
+      with one is refused (78, 16). The unit's own start with one refuses
+      itself, signed (`start_self_check`, `LD_BIND_NOW`).
+    - Holds: a drop-in clearing `UnsetEnvironment=`, a new
+      `/etc/ld.so.preload`, `MemoryDenyWriteExecute=No` on disk, and
+      systemd's copy holding a deleted drop-in are each held and signed,
+      ended by the operator's start (`units_mdwe` signed). A preload list
+      present at the watchdog's start is recorded, not held. A drop-in
+      made in a window moves the reference and is not held after it.
+    - Notes: the maintenance stop is `roles_released`, no gap. On 5.15 the
+      window restart is a note. On 7.0 the agent's stop was cut at its
+      deadline (exit 75, lot 288, signed `stop_deadline`), so the vacancy
+      is High, as N8 rules.
+    - Maps: `ROLE_MARKS` and `ROLE_EXITS` frozen, a write handle refused.
+    - A `libgcc_s` replacement gives no false High.
+    - Totals: no W^X refusal; no unit left failed with its daemon running.
+      Every limit record is the probe's own `oom_score_adj`. The chain was
+      whole at 44 rows.
+    - The F7 test passed on both. On 7.0 it passed after its teardown
+      waited for the agents' own program ids: systemd 259 keeps a BPF-LSM
+      program of its own.
+    - Install, respawn-check, upgrade-check with a cold boot (both units
+      active, pin root 99/103, deny hooks 26/26 and 28/28) and a clean
+      uninstall.
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

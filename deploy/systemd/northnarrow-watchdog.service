@@ -160,6 +160,12 @@ TasksMax=8
 # by the watchdog at its start; it was -900). Not -1000: its own MemoryMax
 # above must still be able to end a leak.
 OOMScoreAdjust=-999
+# OOMPolicy — the lab round 5 of #582: continue, as the agent's unit.
+# The watchdog's one child is a transient `systemctl`. If the OOM killer
+# took that child, systemd's default (stop) would stop the unit. The hook
+# refuses that stop, which would leave the unit failed with the watchdog
+# running and no restart possible.
+OOMPolicy=continue
 
 # Hardening — same shape as the agent's unit. The watchdog is a
 # smaller target but the same posture (no new privileges, no

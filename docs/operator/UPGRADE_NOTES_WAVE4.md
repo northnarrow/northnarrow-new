@@ -5159,3 +5159,19 @@ signs it, and the successor must be its unit's own restart.
     (NN-AUD-113: the cgroup it compared with named `system.slice` since the
     units moved to `northnarrow.slice`) and makes the pin lock again when
     the unit started without it.
+  - Both units set `OOMPolicy=continue` (fix round 6, from the lab). The
+    kernel's OOM killer picks an agent worker first (`oom_score_adj`
+    1000), and the agent respawns the worker. Under systemd's default
+    (`stop`) one worker's OOM kill made systemd stop the agent's unit. The
+    task_kill hook refused that stop outside a window. The unit stayed
+    `failed`, with the agent still running and no main PID, and every
+    start failed with `Result=resources` until the agent exited. The
+    agent's own OOM kill is now recorded as its exit (`signal 9`,
+    `Result=signal`; before, systemd failed the unit before it reaped the
+    agent and the vacancy's cause read "not known"). The watchdog names
+    the kernel's OOM killer when the slice's `oom_kill` count
+    (`northnarrow.slice/memory.events`) rose during the agent's life.
+  - A host drop-in that sets `OOMPolicy=stop` (or `kill`) for every
+    service, or for our units, is judged harmful (`unit_dropin_harmful`,
+    the `host_dropins` degradation). Remove it before a window's
+    `daemon-reload`.

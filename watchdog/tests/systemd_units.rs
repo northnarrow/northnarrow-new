@@ -401,6 +401,41 @@ fn every_unit_denies_writable_and_executable_memory() {
     }
 }
 
+/// The lab round 5 of #582: an OOM kill of one process of either unit (an
+/// agent worker, the OOM killer's first pick; the watchdog's `systemctl`
+/// child) leaves the unit running. Under systemd's default (`stop`) the
+/// unit's stop, refused by the task_kill hook outside a window, left it
+/// `failed` with its daemon still running, no main PID and every later
+/// start refused (`resources`) — measured on 5.15/systemd 249 and
+/// 7.0/systemd 259.
+#[test]
+fn an_oom_kill_of_one_process_leaves_both_units_running() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let set: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "OOMPolicy")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(set, ["continue"], "{name}: OOMPolicy= {set:?}");
+    }
+}
+
+/// The lab r5 of #582 (fix round 6): the OOM kill count the watchdog reads
+/// is the slice's both units run in.
+#[test]
+fn the_oom_count_read_is_the_units_slice_s() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let slice = value(&d, "Slice").expect("Slice=");
+        assert_eq!(
+            northnarrow_watchdog::witness::UNITS_SLICE_EVENTS,
+            format!("/sys/fs/cgroup/{slice}/memory.events"),
+            "{name}"
+        );
+    }
+}
+
 /// Lot 374: the watchdog writes its witness chain in the directory the
 /// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
 /// and nothing else of the agent's state; under `ProtectSystem=strict`

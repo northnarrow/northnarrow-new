@@ -910,6 +910,17 @@ the unit's -500 — an ordinary OOM candidate, which the watchdog respawns —
 and says so in a WARN (`memory cap at or above the host's memory`); 0 is
 then the value the check expects (external audit DEP-005).
 
+Both units set `OOMPolicy=continue` (lot 374, fix round 6). The OOM killer's
+first pick is an agent worker (`oom_score_adj` 1000), which the agent
+respawns. Under systemd's default (`stop`), that kill made systemd stop the
+whole unit, a stop the task_kill hook refuses outside a window. The unit was
+left `failed` with the agent still running and no main PID, and every start
+failed with `Result=resources`. An OOM kill of the agent itself is recorded
+as its exit (`signal 9`). The watchdog's vacancy row names the OOM killer
+when `northnarrow.slice`'s `oom_kill` count rose during the agent's life. A
+drop-in that sets `OOMPolicy=stop` or `kill` for every service is judged
+harmful (`unit_dropin_harmful`).
+
 **How the previous run ended.** Some kills cannot be refused at all: a write
 to the unit's `cgroup.kill`, the OOM killer — and a crash or a power loss look
 the same. The watchdog brings the agent back; the evidence is in the chain:

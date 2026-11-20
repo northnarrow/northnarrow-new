@@ -343,3 +343,46 @@ fn the_re_check_s_rules_are_wired_where_they_hold() {
     let e = &wd[wd.find("fn exit_in_window(").unwrap()..];
     assert!(e[..400].contains("ROLE_SLOT_AGENT") && e[..400].contains("ROLE_MARK_IN_WINDOW"));
 }
+
+/// The lab r5 of #582 (fix round 6): a SIGKILL vacancy names the kernel's
+/// OOM killer from the units' slice's `oom_kill` count. Every registration
+/// of an agent takes that count with its start (`agent_life`, the one place
+/// a start is read), and the vacancy row's cause goes through
+/// `with_oom_killer` with it; the count is the units' slice's.
+#[test]
+fn every_agent_registration_takes_the_slice_s_oom_count() {
+    let root = repo_root();
+    let code = product_code(&root);
+    let wd = &code["watchdog/src/main.rs"];
+    let life = &wd[wd.find("fn agent_life(").expect("agent_life")..];
+    let life = &life[..life.find("\n}\n").unwrap()];
+    assert!(
+        life.contains("process_start_unix(pid)") && life.contains("units_oom_kills()"),
+        "{life}"
+    );
+    assert_eq!(
+        wd.matches("process_start_unix(").count(),
+        1,
+        "a start read anywhere but agent_life"
+    );
+    assert!(wd.contains("let (mut agent_started, mut agent_oom_kills) = agent_life(agent_pid);"));
+    assert_eq!(
+        wd.matches("(agent_started, agent_oom_kills) = agent_life(")
+            .count(),
+        4,
+        "each registration after the first"
+    );
+    let v = &wd[wd
+        .find("witness::with_oom_killer(")
+        .expect("the vacancy's cause")..];
+    let v = &v[..v.find(");").unwrap()];
+    assert!(
+        v.contains("&exit_cause(&backend, &reaped, agent_pid).await,")
+            && v.contains("agent_oom_kills,")
+            && v.contains("witness::units_oom_kills(),"),
+        "{v}"
+    );
+    let w = &code["watchdog/src/witness.rs"];
+    let u = &w[w.find("pub fn units_oom_kills(").unwrap()..];
+    assert!(u[..300].contains("read_text(UNITS_SLICE_EVENTS)"));
+}
