@@ -620,7 +620,7 @@ pub(crate) mod tests {
             "Never refused or killed",
             "T1068",
         ] {
-            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+            assert!(v.reasoning.contains(want), "the reasoning says {want}");
         }
         assert!(NnLEpg002NamespaceRootPostcondition.evaluate(&ev).is_none());
         assert!(
@@ -650,10 +650,12 @@ pub(crate) mod tests {
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert!(
             v.reasoning.contains("re-taken after the task map lost"),
-            "{}",
-            v.reasoning
+            "the reasoning names the re-taken snapshot"
         );
-        assert!(!v.reasoning.contains("DEGRADED"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("DEGRADED"),
+            "full evidence, not degraded"
+        );
     }
 
     /// Lot 378 (named, the rc10 soak on Ubuntu 26.04: NN-L-EPG-001 High at
@@ -697,7 +699,7 @@ pub(crate) mod tests {
             "not known",
             "never refused or killed",
         ] {
-            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+            assert!(v.reasoning.contains(want), "the reasoning says {want}");
         }
         assert!(
             verdict_at_shutdown(&NnLEpg002NamespaceRootPostcondition, &lost).is_none(),
