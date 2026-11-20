@@ -11609,6 +11609,17 @@ mod tests {
         // (sd-exec-strv) 904 exited before the judgement
         exec(905, 904, 1000, quadlet, 12, (904, 900), 3 * S);
         assert!(program(905), "under (sd-exec-strv), gone");
+        // the mini-hunt's variant: a user environment generator, the same way
+        let envgen =
+            "/usr/lib/systemd/user-environment-generators/30-systemd-environment-d-generator";
+        IdTestHost::set_file_id(envgen, Some((STAT_DEV, 16)));
+        IdTestHost::set_dir_root_only("/usr/lib/systemd/user-environment-generators", true);
+        exec(907, 906, 1000, envgen, 16, (906, 900), 3 * S);
+        assert!(
+            program(907),
+            "an environment generator under (sd-exec-strv)"
+        );
+        IdTestHost::set_file_id(envgen, None);
         // a unit's shell 910 (it executed), its fork 911 that never did, and
         // the packaged program that fork runs: anchored at the shell
         exec(910, 900, 1000, bash, 13, (900, 900), 2 * S);
@@ -11640,7 +11651,12 @@ mod tests {
         for p in [systemd, quadlet, bash] {
             IdTestHost::set_file_id(p, None);
         }
-        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+        for d in [
+            "/usr/lib/systemd",
+            "/usr/libexec/podman",
+            "/usr/bin",
+            "/usr/lib/systemd/user-environment-generators",
+        ] {
             IdTestHost::set_dir_root_only(d, false);
         }
     }

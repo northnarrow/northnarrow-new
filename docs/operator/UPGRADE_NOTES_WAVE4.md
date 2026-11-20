@@ -5369,7 +5369,7 @@ shape it resembles still fires.
     5 s (a fork still running its forker's image): that entry is no exec of
     its own, and the kernel's fork record decides.
   - The boot's first login came about 4 s before the agent was active
-    (the lab's `both_active_after_ssh`), so that manager and its
+    (the soak's boot check), so that manager and its
     `(sd-pam)` were older than the agent and left no such records. For
     them, the agent's start's scan and the kernel's cgroup at the open
     decide:
