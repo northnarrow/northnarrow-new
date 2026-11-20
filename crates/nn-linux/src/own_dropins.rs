@@ -152,8 +152,11 @@ pub const WEAKENING_DROPIN_EXTRA: &[(&str, crate::self_integrity::WeakensWith)] 
     ("NN_EXPLOIT_GUARD", |v| v.trim() == "off"),
     ("NN_EXPLOIT_GUARD_TASKS", tasks_below_default),
     ("NN_EXPLOIT_GUARD_RESPONSE", |v| v.trim() == "detect"),
+    // the re-check of #582 (the mini-hunt of N0): off as the agent's parser
+    // (clap's `BoolishValueParser`, systemd's literals) reads it — `No`,
+    // `N`, `OFF` included
     ("NN_NET_CONNECT_DENY", |v| {
-        matches!(v.trim(), "0" | "false" | "no" | "off")
+        antitamper_bpf::host_dropins::systemd_bool(v) == Some(false)
     }),
 ];
 
@@ -168,9 +171,11 @@ pub const NEUTRAL_ENV: &[&str] = &[
     "NN_EXEC_QUARANTINE_ON_SUSPICIOUS",
 ];
 
-/// A boolean flag set (clap's reading of a `bool` with `env`).
+/// A boolean flag set (clap's reading of a `bool` with `env`). The re-check
+/// of #582 (the mini-hunt of N0): what clap reads as false (`N`, `No`,
+/// `OFF` too) is not set; anything else is, in the safe direction.
 fn flag_set(v: &str) -> bool {
-    !matches!(v.trim(), "" | "0" | "false" | "no" | "off")
+    !v.trim().is_empty() && antitamper_bpf::host_dropins::systemd_bool(v) != Some(false)
 }
 
 /// An exploit guard's task budget below its default, the host's
@@ -1546,6 +1551,13 @@ mod tests {
             ("NN_EXPLOIT_GUARD_TASKS", "100"),
             ("NN_EXPLOIT_GUARD_RESPONSE", "detect"),
             ("NN_NET_CONNECT_DENY", "0"),
+            // the re-check of #582 (the mini-hunt of N0): clap's spellings
+            ("NN_NET_CONNECT_DENY", "No"),
+            ("NN_NET_CONNECT_DENY", "N"),
+            ("NN_NET_CONNECT_DENY", "OFF"),
+            ("NN_NET_CONNECT_DENY", "f"),
+            ("NN_EXEC_POLICY_NO_MAP", "Y"),
+            ("NN_EXEC_POLICY_NO_ENV", "maybe"),
             ("NORTHNARROW_DRY_RUN", "1"),
         ] {
             assert!(nn_weakens(n, v), "{n}={v}");
@@ -1557,6 +1569,9 @@ mod tests {
             ("NN_EXPLOIT_GUARD_TASKS", "99999999"),
             ("NN_EXPLOIT_GUARD_RESPONSE", "kill"),
             ("NN_NET_CONNECT_DENY", "1"),
+            ("NN_NET_CONNECT_DENY", "Yes"),
+            ("NN_EXEC_POLICY_NO_ENV", "N"),
+            ("NN_EXEC_POLICY_NO_MAP", "OFF"),
         ] {
             assert!(!nn_weakens(n, v), "{n}={v}");
         }

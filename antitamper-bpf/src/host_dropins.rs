@@ -449,12 +449,14 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
                 "proot",
                 "pouch",
             ];
-            match p {
-                "yes" | "true" | "1" => !virt.is_empty(),
-                "no" | "false" | "0" => virt.is_empty(),
-                "vm" => vm.contains(&virt),
-                "container" => container.contains(&virt),
-                name => virt == name,
+            // the re-check of #582 (the mini-hunt of N0): a boolean as
+            // systemd parses it, then a name
+            match (systemd_bool(p), p) {
+                (Some(true), _) => !virt.is_empty(),
+                (Some(false), _) => virt.is_empty(),
+                (None, "vm") => vm.contains(&virt),
+                (None, "container") => container.contains(&virt),
+                (None, name) => virt == name,
             }
         }
         "Host" => p == host.hostname || p == host.machine_id,
@@ -480,10 +482,11 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
         "Capability" => true,
         "FirstBoot" => {
             let first = Path::new("/run/systemd/first-boot").exists();
-            match p {
-                "yes" | "true" => first,
-                "no" | "false" => !first,
-                _ => return None,
+            // the re-check of #582 (the mini-hunt of N0)
+            match systemd_bool(p) {
+                Some(true) => first,
+                Some(false) => !first,
+                None => return None,
             }
         }
         "PathExists" => path.exists(),
@@ -503,6 +506,19 @@ fn condition(key: &str, value: &str, host: &HostLimits) -> Option<bool> {
         _ => return None,
     };
     Some(holds != neg)
+}
+
+/// The re-check of #582 (N0): a boolean as systemd's `parse_boolean`
+/// reads it — case-insensitive `1`, `yes`, `y`, `true`, `t`, `on` and `0`,
+/// `no`, `n`, `false`, `f`, `off`; `None` for anything else (an empty
+/// value included, which resets the directive).
+pub fn systemd_bool(v: &str) -> Option<bool> {
+    let v = v.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "yes" | "y" | "true" | "t" | "on" => Some(true),
+        "0" | "no" | "n" | "false" | "f" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Why `key=value`, set for `reach`, harms our units; `None` when it does
@@ -584,14 +600,26 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         }
         "KillSignal" => (!matches!(v, "SIGTERM" | "TERM" | "15"))
             .then(|| format!("KillSignal {v}, ours is SIGTERM")),
-        "SendSIGKILL" => (!matches!(v, "no" | "false" | "0" | "off"))
-            .then(|| "SendSIGKILL on, ours is off".into()),
+        // the re-check of #582 (N0): a boolean as systemd parses it
+        "SendSIGKILL" => {
+            (systemd_bool(v) != Some(false)).then(|| "SendSIGKILL on, ours is off".into())
+        }
         "FinalKillSignal" => {
             (!matches!(v, "SIGKILL" | "KILL" | "9")).then(|| format!("FinalKillSignal {v}"))
         }
-        "OOMPolicy" => {
-            (v == "kill").then(|| "OOMPolicy kill: one worker's OOM ends the unit".into())
-        }
+        // the lab round 5 of #582: our units' own is `continue` — under
+        // `stop` one worker's OOM kill makes systemd stop the unit, which
+        // the task_kill hook refuses: the unit is left failed with its
+        // daemon running and no start possible
+        "OOMPolicy" => match v {
+            "kill" => Some("OOMPolicy kill: one worker's OOM ends the unit".into()),
+            "stop" => Some(
+                "OOMPolicy stop: one worker's OOM stops the unit, a stop our hooks refuse — the \
+                 unit is left failed with its daemon running, and no start succeeds"
+                    .into(),
+            ),
+            _ => None,
+        },
         "OOMScoreAdjust" => v
             .parse::<i32>()
             .ok()
@@ -605,8 +633,9 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
         "User" => {
             (!matches!(v, "" | "root" | "0")).then(|| format!("user {v}: the agent needs root"))
         }
-        "DynamicUser" => (!matches!(v, "no" | "false" | "0" | "off"))
-            .then(|| "a dynamic user: the agent needs root".into()),
+        "DynamicUser" => {
+            (systemd_bool(v) != Some(false)).then(|| "a dynamic user: the agent needs root".into())
+        }
         "RootDirectory"
         | "RootImage"
         | "MountImages"
@@ -637,6 +666,18 @@ pub fn harms(reach: Reach, key: &str, value: &str, host: &HostLimits) -> Option<
             let var = a.trim_matches('"').split('=').next().unwrap_or("");
             dangerous_env(var).then(|| format!("{var} set in our units' environment"))
         }),
+        // Lot 374: an empty assignment clears our units' list of the
+        // loader's variables they unset (`start_check::LOADER_ENV`).
+        "UnsetEnvironment" if v.is_empty() => Some(
+            "UnsetEnvironment= cleared: the loader's variables would reach our units again".into(),
+        ),
+        // The review of #582 (F2 b): our units deny memory both writable
+        // and executable; turned off, a start can run code no file backs.
+        // The re-check of #582 (N0): off is anything systemd does not parse
+        // as true ([`systemd_bool`]: `n`, `No`, `FALSE`, an empty reset).
+        "MemoryDenyWriteExecute" if systemd_bool(v) != Some(true) => Some(
+            "MemoryDenyWriteExecute= turned off: code no file backs could run in our units".into(),
+        ),
         "EnvironmentFile" => {
             let p = v.trim_start_matches('-');
             // lot 311 (F4): read as bytes — a byte that is not UTF-8 (a
@@ -948,6 +989,9 @@ mod tests {
             "ConditionVirtualization=kvm",
             "ConditionVirtualization=vm",
             "ConditionVirtualization=yes",
+            // the re-check of #582 (the mini-hunt of N0): systemd's spellings
+            "ConditionVirtualization=Y",
+            "ConditionVirtualization=TRUE",
             "ConditionHost=nn-lab",
             "ConditionKernelCommandLine=lsm",
             "ConditionArchitecture=x86-64",
@@ -970,8 +1014,34 @@ mod tests {
             "ConditionSecurity=selinux",
             "ConditionControlGroupController=io",
             "ConditionUser=nobody",
+            // the re-check of #582 (the mini-hunt of N0): a VM is not "no"
+            "ConditionVirtualization=No",
+            "ConditionVirtualization=n",
         ] {
             assert!(h(Reach::Services, kv).is_some(), "{kv}");
+        }
+        // ConditionFirstBoot, in systemd's spellings: a later boot fails
+        // "yes" (our units would not start) and holds "no"
+        if !Path::new("/run/systemd/first-boot").exists() {
+            for kv in [
+                "ConditionFirstBoot=yes",
+                "ConditionFirstBoot=Yes",
+                "ConditionFirstBoot=1",
+                "ConditionFirstBoot=on",
+            ] {
+                assert!(
+                    h(Reach::Services, kv).is_some_and(|w| w.contains("condition fails")),
+                    "{kv}"
+                );
+            }
+            for kv in [
+                "ConditionFirstBoot=no",
+                "ConditionFirstBoot=No",
+                "ConditionFirstBoot=0",
+                "ConditionFirstBoot=off",
+            ] {
+                assert_eq!(h(Reach::Services, kv), None, "{kv}");
+            }
         }
         // a small VM: 1 GiB, 1 CPU
         let small = HostLimits {
@@ -1092,6 +1162,24 @@ mod tests {
         }
     }
 
+    /// The lab round 5 of #582: our units run under `OOMPolicy=continue`; a
+    /// drop-in turning them back to systemd's `stop` (or `kill`) is
+    /// harmful, `continue` (ours) is not.
+    #[test]
+    fn an_oom_policy_that_stops_or_kills_our_units_is_harmful() {
+        for reach in [Reach::Services, Reach::Agent, Reach::Watchdog] {
+            let stop = h(reach, "OOMPolicy=stop").expect("stop harmful");
+            assert!(
+                stop.contains("OOMPolicy stop") && stop.contains("refuse"),
+                "{stop}"
+            );
+            assert!(h(reach, "OOMPolicy=kill").is_some_and(|w| w.contains("kill")));
+            assert_eq!(h(reach, "OOMPolicy=continue"), None);
+        }
+        // not a service's directive
+        assert_eq!(h(Reach::OurSlice, "OOMPolicy=stop"), None);
+    }
+
     #[test]
     fn a_value_below_our_floors_or_against_our_semantics_is_harmful() {
         let svc = |kv| h(Reach::Services, kv).unwrap_or_else(|| panic!("{kv} not harmful"));
@@ -1134,6 +1222,25 @@ mod tests {
             svc("Environment=\"A=1\" NN_ANTI_TAMPER_ALLOW_DEGRADED=1").contains("NN_ANTI_TAMPER")
         );
         assert!(svc("Environment=LD_PRELOAD=/usr/lib/libjemalloc.so").contains("LD_PRELOAD"));
+        // lot 374: clearing the units' list of loader variables to unset
+        assert!(svc("UnsetEnvironment=").contains("UnsetEnvironment= cleared"));
+        assert!(
+            h(Reach::Agent, "UnsetEnvironment=TZ").is_none(),
+            "one more unset is no harm"
+        );
+        // the review of #582 (F2 b): the units' denial of writable and
+        // executable memory turned off, or reset
+        for kv in [
+            "MemoryDenyWriteExecute=no",
+            "MemoryDenyWriteExecute=false",
+            "MemoryDenyWriteExecute=",
+        ] {
+            assert!(
+                svc(kv).contains("MemoryDenyWriteExecute= turned off"),
+                "{kv}"
+            );
+        }
+        assert!(h(Reach::Agent, "MemoryDenyWriteExecute=yes").is_none());
         assert!(svc("ConditionPathExists=/nonexistent-nn-lab").contains("fails"));
         // a slice drop-in, judged against the slice's floors
         let sl = |kv| h(Reach::OurSlice, kv).unwrap_or_else(|| panic!("{kv} not harmful"));
@@ -1356,5 +1463,58 @@ mod tests {
             "{}",
             r[0].detail()
         );
+    }
+
+    /// The re-check of #582 (N0): `MemoryDenyWriteExecute=` turned off in
+    /// any spelling systemd accepts (`parse_boolean` is case-insensitive and
+    /// takes `n` and `f`), reset by an empty value, or set to what systemd
+    /// would not read as true, is a harm; only a true value is not. The
+    /// other booleans of `harms` read the same way, in their safe
+    /// direction.
+    #[test]
+    fn memory_deny_write_execute_off_is_judged_as_systemd_parses_it() {
+        let h = |kv: &str| {
+            let (k, v) = kv.split_once('=').unwrap();
+            harms(Reach::Agent, k, v, &host())
+        };
+        for off in [
+            "n", "N", "No", "NO", "no", "f", "F", "False", "FALSE", "false", "Off", "OFF", "off",
+            "0", "", " ", "maybe", "2",
+        ] {
+            let why = h(&format!("MemoryDenyWriteExecute={off}"))
+                .unwrap_or_else(|| panic!("MemoryDenyWriteExecute={off:?} judged harmless"));
+            assert!(why.contains("turned off"), "{off:?}: {why}");
+        }
+        for on in [
+            "1", "y", "Y", "yes", "YES", "Yes", "t", "T", "true", "TRUE", "on", "ON", " yes ",
+        ] {
+            assert!(
+                h(&format!("MemoryDenyWriteExecute={on}")).is_none(),
+                "MemoryDenyWriteExecute={on:?} judged harmful"
+            );
+        }
+        for off in ["No", "N", "f", "OFF", "0"] {
+            assert!(
+                h(&format!("SendSIGKILL={off}")).is_none(),
+                "SendSIGKILL={off}"
+            );
+            assert!(
+                h(&format!("DynamicUser={off}")).is_none(),
+                "DynamicUser={off}"
+            );
+        }
+        for on in ["Yes", "y", "T", "ON", "1", "", "maybe"] {
+            assert!(
+                h(&format!("SendSIGKILL={on}")).is_some(),
+                "SendSIGKILL={on:?}"
+            );
+            assert!(
+                h(&format!("DynamicUser={on}")).is_some(),
+                "DynamicUser={on:?}"
+            );
+        }
+        assert_eq!(systemd_bool("Y"), Some(true));
+        assert_eq!(systemd_bool("oFf"), Some(false));
+        assert_eq!(systemd_bool(""), None);
     }
 }

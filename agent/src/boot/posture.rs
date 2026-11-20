@@ -33,8 +33,6 @@ pub(crate) struct Posture {
     /// data directories in tag order, for the file-open sensor.
     pub(crate) open_sensor_extras: northnarrow_agent::sensors::open_sensor::OpenSensorExtras,
     pub(crate) posture: PostureMachine,
-    /// The audit log the watchdog refresh signs to, set by [`crate::boot::evidence::wire`].
-    pub(crate) watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
     /// A stale COMBAT chain found at boot, signed once the state directory
     /// is protected.
     pub(crate) stale_combat: Option<northnarrow_agent::combat::reconcile::StaleChain>,
@@ -56,6 +54,7 @@ pub(crate) fn machine(
     ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
     rule_policy: &northnarrow_agent::decision::rule_policy::PolicyHandle,
+    audit_log: &AuditHandle,
 ) -> Posture {
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat
@@ -285,9 +284,10 @@ pub(crate) fn machine(
     // when the posture machine actually carries the exemption (the
     // dev-mode `PostureMachine::new()` branch has none).
     // Lab PR 216: the signed log the refresh reports a vanished watchdog
-    // to, set once it is open (below).
-    let watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>> =
-        Arc::new(std::sync::OnceLock::new());
+    // to. Fix round 5 of #582: handed at the spawn (open since the attest
+    // phase) — bound later, the first round's verdict on the watchdog this
+    // start finds was only logged.
+    let watchdog_audit: WatchdogAudit = audit_log.clone();
     // The re-check of #567 (N1): one refresh of the mount guard's maps at a
     // time, the watchdog refresh's and the regroup watch's.
     let mount_refresh: MountGuardRefresh = Arc::new(parking_lot::Mutex::new(()));
@@ -296,8 +296,9 @@ pub(crate) fn machine(
             exempt.clone(),
             cli.watchdog_pidfile.clone(),
             cli.resolved_watchdog_exe(),
-            Arc::clone(&watchdog_audit),
+            watchdog_audit,
             Arc::clone(&mount_refresh),
+            cli.witness_dir.clone(),
         );
     }
     // External audit EBPF-001: PID 1 may signal the agent at the very end
@@ -355,7 +356,6 @@ pub(crate) fn machine(
         exempt,
         open_sensor_extras,
         posture,
-        watchdog_audit,
         stale_combat,
     }
 }

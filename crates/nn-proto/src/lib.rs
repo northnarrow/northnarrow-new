@@ -29,6 +29,10 @@ pub mod shutdown_marker;
 
 pub mod watchdog_hold;
 
+/// Lot 374: the watchdog's witness chain — the surviving role's signed
+/// record of the other role's vacancy and successor.
+pub mod witness;
+
 /// The exec quarantine's agent ↔ scanner protocol and signed hash list (lab
 /// PR 223, EXPERIMENTAL; was `common::execq`, lab PR 241).
 pub mod execq;

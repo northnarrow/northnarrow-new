@@ -11805,6 +11805,147 @@ number in parentheses is a lab PR.
         - The cold boot and the reboot: no `R004`; `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition.
         - `cat /etc/login.defs`: ALERTED, named. A `/tmp` copy of `truncate` emptying `/var/log/auth.log`: `NN-L-FIM-005` High.
         - A memfd executed through `/proc/self/fd/3` and `/dev/fd/3` (uid 1000) and as root: `R004` Critical ×1 each (would have KillProcessTree).
+- **Lot 374 — the vacated role's successor is witnessed and bound to its
+  unit (C23; no level change).**
+  - What was open (the pre-alpha re-check on rc9, R9-1): a role vacated by
+    a kill nothing can refuse was taken by a successor whose own start
+    wrote the only signed record of it; the successor's right asked for
+    PID 1 or the other role as its parent and no injection, not its unit;
+    and the units passed the service manager's loader variables on.
+  - Done:
+    - The watchdog's witness chain: its own in-memory key, certified by
+      the agent from the watchdog's descriptor table; the vacancy with
+      systemd's cause and the successor's identity and findings, imported
+      into the audit log; the agent signs the watchdog's successor; a
+      start signs both roles found vacated.
+    - The kernel's successor right bound to the role's unit cgroup (three
+      new optional BTF offsets) and clean lot 277/281 marks; the same rule
+      in the watchdog's and the agent's registrations of the other role.
+    - `UnsetEnvironment=` of the loader's and libc's variables in the three
+      units and the pin lock's transient unit; a start's own check of its
+      environment and executable mappings, refused and signed.
+    - Ratchets `xtask/tests/start_check.rs`, the units test.
+  - The review of #582, fix round 1:
+    - F1: a library judged by what it is (the expected name in its
+      directory resolving to the mapped file), not by the name the kernel
+      shows — a genuine start on AlmaLinux 9 was refused.
+    - F2 (the parts reachable without a new kernel mark): the units deny
+      writable and executable memory; the chain is the watchdog role's
+      alone (`ROLE_WRITE_INODES`), checked by the watchdog against its last
+      row (`witness_chain_cut`); before each start it makes, the watchdog
+      judges `/etc/ld.so.preload` and the code-changing drop-ins against its
+      own start's and holds on a change (`role_respawn_held`). The kernel's
+      mark on a successor's executable mappings stays for a post-alpha lot.
+    - F3: a successor that shows something foreign is recorded as holding
+      the role (`…_successor_foreign`), never as refused.
+    - F4: an exit inside a signed window is a note
+      (`role_released_in_window`); both roles released by the operator are
+      `roles_released`, a note.
+    - F5: the integrity round's agent cgroup is `northnarrow.slice`'s
+      (NN-AUD-113's limits and the pin lock's redo run again).
+    - F6: the kernel's "vacated this boot" mark per role (`ROLE_MARKS`);
+      each role's start judges the other's process.
+    - F7: the privileged `a_unit_restart_takes_the_vacated_role_under_enforce`
+      on the installed unit.
+    - F8: the public texts say what is recorded and what is not yet
+      guaranteed, as behaviour.
+  - The re-check of #582, fix round 2:
+    - N0: `MemoryDenyWriteExecute=` off judged as systemd parses a boolean;
+      the agent's start signs it off in systemd's copy (`units_mdwe`).
+    - N1: `ROLE_MARKS` (and the new `ROLE_EXITS`) frozen at the agent's
+      load (`BPF_F_RDONLY` was a descriptor's flag); read only when frozen.
+    - N2: the respawn gate holds nothing inside a signed window, and the
+      window's host becomes its reference (`respawn_gate_reference_moved`).
+    - N3: systemd's copy of the agent's unit and each preloaded library
+      judged before a start; a start the watchdog did not make is recorded
+      (`role_taken_by_another_start`). The gate is still not binding: a
+      start it did not make is recorded after it, not prevented — with
+      F2 (a), for the post-alpha lot.
+    - N4: a successor judged once, by the next start of the other role
+      after the vacancy (the kernel's exit time per role); a library
+      replaced by a package upgrade judged by identity
+      (`…_successor_unconfirmed` when not the judge's own copy).
+    - N5, N6, N8: what a start cannot read is judged and recorded; a torn
+      append repaired (`witness_chain_torn`), the chain rotated within a
+      life; only a clean stop inside a window is the operator's, a signed
+      stop counts only this boot.
+    - R9-1 stays open (partial) for the alpha (KNOWN_LIMITATIONS, §61).
+  - The re-check 2 of #582, fix round 3:
+    - R2-1: the other role's process judged at every start; a verdict of
+      foreign never inherited from an earlier holder (the agent's start
+      does not register such a watchdog, and keeps judging one it
+      refused); a clean verdict signed only for a succession nobody judged.
+  - #582's KVM suites, fix round 4 (the tests only): the unit-restart test
+    reads the role maps through a read-only descriptor; the witness test
+    waits for the successor's row and matches the import's kinds whole (its
+    watchdog is the test's, not its unit's restart: its rows uncertified).
+  - #582's KVM suites, fix round 5 (product): the agent's start signs its
+    verdict on the watchdog it finds — the watchdog refresh has the audit
+    log from its spawn; bound a few ms after its first round, a foreign
+    watchdog found at the start was only logged, never signed (both CI
+    guests). Ratchet `the_watchdog_refresh_signs_from_its_first_round`.
+  - The lab r5, fix round 6 (product): `OOMPolicy=continue` in both units.
+    A worker's OOM kill (the kernel's first pick) made systemd stop the
+    agent's unit, a stop the hook refused, and the unit was left failed
+    with the agent running and no start possible. The agent's own OOM kill
+    is now recorded (`signal 9`), and the vacancy notes the slice's
+    `oom_kill` count (as a count since fix round 7). A drop-in that sets
+    `OOMPolicy=stop` is judged harmful.
+  - Re-check 7, fix round 7 (product, `watchdog/src/witness.rs`):
+    - The operator's stop inside a window cut at its deadline (exit 75,
+      `stop_deadline`, the r6 window restart on 7.0) is
+      `role_released_in_window`, its row naming the cut; outside a window
+      unchanged. Test
+      `a_stop_cut_at_its_deadline_inside_a_window_is_the_operator_s`.
+    - The slice's `oom_kill` count (the workers' too) no longer names the
+      OOM killer as the agent's: "cause not known" with the count, only
+      for `signal 9` and `Result=signal`; `Result=oom-kill` named as the
+      unit's. Test
+      `a_slice_oom_count_never_names_the_oom_killer_as_the_agent_s`.
+    - Lab (as measured, rounds r7 and r7b on ubuntu2604, 7.0/systemd
+      259, the tree verified by hash): the agent's OOM vacancy reads
+      "signal 9 (systemd Result=signal), cause not known: an OOM kill was
+      counted in northnarrow.slice … from 0 to 1", never the OOM killer.
+      Three window restarts exited 0, each `role_released_in_window`,
+      BPF-002 Low. With the agent's unit frozen 3 s after the SIGTERM (the
+      stall a loaded host gives, made deterministic) the stop was cut:
+      exit status 75, `role_released_in_window` naming the cut, no
+      `witness_row`, BPF-002 Low. No unit left failed, chain links ok.
+  - Lab (as measured, round r6 on fix round 6's product, ubuntu2204
+    5.15/systemd 249 and ubuntu2604 7.0/systemd 259): the tree verified
+    by hash. verifier-check OK (highest `mount_guard_sb_mount` 83.1% on
+    5.15, `mount_guard_move_mount` 60.3% on 7.0). Every case started with
+    both units active and their pids in `ROLE_TGIDS`. Every OOM killed the
+    process the probe aimed at, as the kernel log names it.
+    - Vacancies: the agent's OOM vacancy is signed with its cause
+      (`signal 9`, with the slice's `oom_kill` count; r6 wording, named
+      the OOM killer's until fix round 7) and
+      taken by its unit's restart. The watchdog's OOM vacancy leaves the
+      agent running (`watchdog_gone`, `watchdog_succession`).
+    - Refusals: a loader variable reaches neither unit. A transient start
+      with one is refused (78, 16). The unit's own start with one refuses
+      itself, signed (`start_self_check`, `LD_BIND_NOW`).
+    - Holds: a drop-in clearing `UnsetEnvironment=`, a new
+      `/etc/ld.so.preload`, `MemoryDenyWriteExecute=No` on disk, and
+      systemd's copy holding a deleted drop-in are each held and signed,
+      ended by the operator's start (`units_mdwe` signed). A preload list
+      present at the watchdog's start is recorded, not held. A drop-in
+      made in a window moves the reference and is not held after it.
+    - Notes: the maintenance stop is `roles_released`, no gap. On 5.15 the
+      window restart is a note. On 7.0 the agent's stop was cut at its
+      deadline (exit 75, lot 288, signed `stop_deadline`), so the vacancy
+      is High, as N8 ruled (a note since fix round 7).
+    - Maps: `ROLE_MARKS` and `ROLE_EXITS` frozen, a write handle refused.
+    - A `libgcc_s` replacement gives no false High.
+    - Totals: no W^X refusal; no unit left failed with its daemon running.
+      Every limit record is the probe's own `oom_score_adj`. The chain was
+      whole at 44 rows.
+    - The F7 test passed on both. On 7.0 it passed after its teardown
+      waited for the agents' own program ids: systemd 259 keeps a BPF-LSM
+      program of its own.
+    - Install, respawn-check, upgrade-check with a cold boot (both units
+      active, pin root 99/103, deny hooks 26/26 and 28/28) and a clean
+      uninstall.
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

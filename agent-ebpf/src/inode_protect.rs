@@ -115,6 +115,17 @@ const BPF_HELD_SET_BPF: u32 = northnarrow_common::wire::BPF_HELD_SET_BPF;
 #[map]
 pub static PROTECTED_INODES: HashMap<InodeKey, u8> = HashMap::pinned(1024, 0);
 
+/// The review of #582 (F2 c): the protected inodes one role alone may
+/// change — the value is that role, as `bpf_defense::OWN_EXE_INODES`' (1 the
+/// watchdog): the watchdog's witness chain. [`protected_verdict`]'s family
+/// exemption holds there for that role's binary only; the agent, a worker
+/// and every other caller are refused its write, truncation, rename, link,
+/// removal and attributes like any foreign caller, outside a
+/// trusted-installer window. Registered by the agent at its start and by
+/// the watchdog for each chain it opens. Pinned by name.
+#[map]
+pub static ROLE_WRITE_INODES: HashMap<InodeKey, u8> = HashMap::pinned(8, 0);
+
 /// External audit EVD-001: inode numbers of the READ-protected inodes (the
 /// agent's private signing key), 0 = empty slot. A read-only open is
 /// matched on the inode number against these few slots first, so the
@@ -742,7 +753,12 @@ unsafe fn protected_verdict(operation: u8, target: *const c_void, hook: u32) -> 
     // paths as any other process is (plan §3.3).
     let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     if crate::task_kill::is_exempt_pid(caller_tgid) {
-        return None;
+        // The review of #582 (F2 c): an inode one role alone changes — the
+        // family's exemption is that role's binary's only.
+        match ROLE_WRITE_INODES.get(&key) {
+            Some(role) if *role != crate::bpf_defense::caller_role() => {}
+            _ => return None,
+        }
     }
     // Lot 273: PID 1 removes a protected unit's cgroup directory once its
     // processes are gone (the kernel refuses a populated one), and

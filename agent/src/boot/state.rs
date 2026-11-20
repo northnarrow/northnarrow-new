@@ -175,6 +175,18 @@ pub(crate) fn bootstrap(
              created on first detection (and unprotected this boot)"
         );
     }
+    // Lot 374: the watchdog's witness directory and files pre-attach — the
+    // same inode-registration rationale.
+    if let Err(e) =
+        northnarrow_agent::anti_tamper::filesystem::bootstrap_witness_dir(&cli.witness_dir)
+    {
+        warn!(
+            error = %e,
+            path = %cli.witness_dir.display(),
+            "witness directory bootstrap failed pre-attach — the watchdog's witness cannot sign \
+             there (signed by the watchdog's record)"
+        );
+    }
     // Tappa 9.0.c: bootstrap the status-event chainlog pre-attach (same
     // detections/ dir, sibling of detections.jsonl) — same inode-
     // registration rationale.

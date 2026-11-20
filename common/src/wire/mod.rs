@@ -1866,6 +1866,69 @@ pub const BPF_CMD_LISTING_GET_FD: u32 = 0xFFFF_0005;
 /// boot (0: never held). No thread group has this number.
 pub const ROLE_VACATED: u32 = u32::MAX;
 
+/// The review of #582 (F4, F6): the pinned map of what the kernel's
+/// liveness watch (`role_exit`) recorded of each role's holders' exits this
+/// boot — one word per `ROLE_TGIDS` slot, [`ROLE_MARK_VACATED`] and
+/// [`ROLE_MARK_IN_WINDOW`]. A successor's claim of its slot leaves it as it
+/// is — the sticky "vacated this boot" the other role reads at its own
+/// start. The re-check of #582 (N1): the agent's load freezes it
+/// (`BPF_MAP_FREEZE`); from then on that program alone writes it, and a
+/// reader that finds it not frozen takes its words as not known.
+pub const ROLE_MARKS_MAP_NAME: &str = "ROLE_MARKS";
+/// The re-check of #582 (N4): the pinned map of when each role's holder
+/// last exited this boot (`CLOCK_BOOTTIME` ns, one `u64` per `ROLE_TGIDS`
+/// slot; 0: never), written by `role_exit` beside [`ROLE_MARKS_MAP_NAME`]
+/// and frozen with it.
+pub const ROLE_EXITS_MAP_NAME: &str = "ROLE_EXITS";
+/// [`ROLE_MARKS_MAP_NAME`]: the slot's holder exited at least once this
+/// boot (never cleared until the next boot).
+pub const ROLE_MARK_VACATED: u32 = 1;
+/// [`ROLE_MARKS_MAP_NAME`]: the slot's holder's last exit was inside a
+/// signed trusted-installer window (the operator's stop or restart).
+pub const ROLE_MARK_IN_WINDOW: u32 = 2;
+/// The review of #582 (F4, F6): the mark `role_exit` writes for a holder's
+/// exit — vacated, and inside a window or not.
+pub const fn role_exit_mark(in_window: bool) -> u32 {
+    if in_window {
+        ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW
+    } else {
+        ROLE_MARK_VACATED
+    }
+}
+
+/// Lot 374: the slice both our units run in (their `Slice=`).
+pub const OUR_SLICE: &str = "northnarrow.slice";
+/// Lot 374: the agent's unit.
+pub const AGENT_UNIT: &str = "northnarrow-agent.service";
+/// Lot 374: the watchdog's unit.
+pub const WATCHDOG_UNIT: &str = "northnarrow-watchdog.service";
+
+/// Lot 374: a cgroup's kernfs name as the eBPF programs compare it — its
+/// first 31 bytes in four little-endian words, zero past its end (the NUL
+/// the kernel's string read writes included). A name of 32 bytes or more
+/// never equals one of ours (all shorter).
+pub const fn kn_name_words(name: &str) -> [u64; 4] {
+    let b = name.as_bytes();
+    let mut w = [0u64; 4];
+    let mut i = 0;
+    while i < b.len() && i < 31 {
+        w[i / 8] |= (b[i] as u64) << ((i % 8) * 8);
+        i += 1;
+    }
+    w
+}
+
+/// Lot 374: the unit whose own cgroup a successor of role slot `slot`
+/// (`ROLE_TGIDS`: 0 the watchdog, 1 the agent) must run in to take the
+/// role its holder vacated, as [`kn_name_words`].
+pub const fn role_unit_words(slot: u32) -> [u64; 4] {
+    if slot == 0 {
+        kn_name_words(WATCHDOG_UNIT)
+    } else {
+        kn_name_words(AGENT_UNIT)
+    }
+}
+
 /// Kernel→userland record of the `bpf()` syscall observer (40 bytes).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -2460,6 +2523,57 @@ pub fn cstr_lossy(buf: &[u8]) -> alloc::borrow::Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    /// The review of #582 (F4, F6): the mark `role_exit` writes for a
+    /// holder's exit — vacated always, inside a window or not; the two bits
+    /// apart, neither ever a slot's value.
+    #[test]
+    fn an_exit_s_mark_says_vacated_and_whether_inside_a_window() {
+        use super::{role_exit_mark, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED};
+        assert_eq!(role_exit_mark(false), ROLE_MARK_VACATED);
+        assert_eq!(
+            role_exit_mark(true),
+            ROLE_MARK_VACATED | ROLE_MARK_IN_WINDOW
+        );
+        assert_eq!(ROLE_MARK_VACATED & ROLE_MARK_IN_WINDOW, 0);
+        assert_ne!(role_exit_mark(true), ROLE_VACATED);
+    }
+
+    /// Lot 374: a cgroup's name as the eBPF programs compare it — the
+    /// bytes of the kernel's string read (at most 31 and a NUL) in
+    /// little-endian words; slot 0 the watchdog's unit, slot 1 the agent's.
+    #[test]
+    fn a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it() {
+        use super::{kn_name_words, role_unit_words, AGENT_UNIT, OUR_SLICE, WATCHDOG_UNIT};
+        let words = |w: [u64; 4]| {
+            let mut b = [0u8; 32];
+            for (i, x) in w.iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        let b = words(kn_name_words(OUR_SLICE));
+        assert_eq!(&b[..OUR_SLICE.len()], OUR_SLICE.as_bytes());
+        assert!(b[OUR_SLICE.len()..].iter().all(|x| *x == 0));
+        assert_eq!(
+            role_unit_words(0),
+            kn_name_words("northnarrow-watchdog.service")
+        );
+        assert_eq!(
+            role_unit_words(1),
+            kn_name_words("northnarrow-agent.service")
+        );
+        assert_ne!(role_unit_words(0), role_unit_words(1));
+        // a name that only starts with ours is not ours: ours end before 31
+        // bytes, where the kernel's read of a longer one does not
+        for n in [OUR_SLICE, AGENT_UNIT, WATCHDOG_UNIT] {
+            assert!(n.len() < 31, "{n}");
+            assert_ne!(kn_name_words(&alloc::format!("{n}x")), kn_name_words(n));
+        }
+        assert_ne!(
+            kn_name_words("northnarrow-agent.servic"),
+            role_unit_words(1)
+        );
+    }
     /// Named test (the review of #555, F5): the exec sensor's argv read —
     /// a block of exactly `ARGV_LEN` bytes is read as `ARGV_LEN - 1` and
     /// marked cut. On 61e15d9a the mark was set only past `ARGV_LEN`, and

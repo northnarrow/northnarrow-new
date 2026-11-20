@@ -213,6 +213,9 @@ const KNOWN: &[(&str, &str, &str)] = &[
         KNOB,
     ),
     ("agent/src/heartbeat.rs", "read_state(path)", OWN),
+    // lot 374: the agent's witness import position — unreadable, no key is
+    // certified and every row is imported again as uncertified (High)
+    ("crates/nn-linux/src/witness.rs", "read_state(&path)", OWN),
     (
         "agent/src/module_trust/mod.rs",
         "read_to_string(\"/proc/sys/kernel/osrelease\")",

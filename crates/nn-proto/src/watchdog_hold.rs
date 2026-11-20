@@ -125,6 +125,23 @@ pub const REASON_SIGNED_RECORDS_FAILED: &str = "signed_records_failed";
 /// handle and the error; the agent signs it as a degradation
 /// (`watchdog_pin_handle_failed`), once per handle and watchdog.
 pub const REASON_PIN_HANDLE_FAILED: &str = "pin_handle_failed";
+/// Lot 374: a start of the watchdog refused itself before it took its role
+/// — a loader variable in its environment, or a mapped file that is neither
+/// its binary nor a library the release links (the detail names them). The
+/// live agent, the surviving role, signs it High
+/// (`watchdog_start_refused`).
+pub const REASON_START_SELF_CHECK: &str = "start_self_check";
+/// Lot 374: the watchdog's witness could not be opened (its key, or its
+/// chain in the agent's state directory): the agent's vacancies are not
+/// signed by the watchdog until it can. The agent signs it High
+/// (`witness_unavailable`).
+pub const REASON_WITNESS_UNAVAILABLE: &str = "witness_unavailable";
+/// The review of #582 (F2 d): the watchdog held instead of starting the
+/// agent — the host changed during the vacancy since the watchdog's start
+/// (`/etc/ld.so.preload`, a drop-in that changes our units' code; the
+/// detail names it). Also a hold's retry it skipped for the same reason.
+/// The agent signs it High (`watchdog_respawn_held`).
+pub const REASON_RESPAWN_HELD: &str = "respawn_held_host_changed";
 /// Lot 353: how many stuck recoveries make a restart loop…
 pub const RESTART_LOOP_RECOVERIES: usize = 3;
 /// …within this many seconds.

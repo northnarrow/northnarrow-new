@@ -556,11 +556,51 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
         ],
     )
     .unwrap();
+    // lot 374: started for it is the restart of the role's unit — PID 1's
+    // child (no longer the other role's), in the unit's own cgroup, with
+    // clean lot 277/281 marks (not only untainted)
+    let sftr = body(&c, "started_for_the_role");
     in_order(
-        body(&c, "started_for_the_role"),
+        sftr,
         &[
-            "Some(t) => *t != 0 && *t != ROLE_VACATED && *t == ptgid,",
-            "(ptgid == 1 || by_family) && crate::cgroup_join::caller_untainted()",
+            "ptgid == 1\n        && nn_in_role_unit(task as u64, u64::from(slot)) == 1\n        && crate::cgroup_join::caller_marks_clean()",
+        ],
+    )
+    .unwrap();
+    for gone in [
+        "by_family",
+        "caller_untainted",
+        "ROLE_TGIDS",
+        "override_active",
+    ] {
+        assert!(!sftr.contains(gone), "started_for_the_role: {gone}");
+    }
+    in_order(
+        body(&c, "in_role_unit"),
+        &[
+            "off_opt!(TASK_STRUCT_CGROUPS_OFFSET)",
+            "off_opt!(CSS_SET_DFL_CGRP_OFFSET)",
+            "off_opt!(CGROUP_KN_OFFSET)",
+            "else {\n        return false;\n    };",
+            "let Some(cset) = read_ptr(task, o_cgroups) else {",
+            "let Some(cgrp) = read_ptr(cset, o_dfl) else {",
+            "let Some(kn) = read_ptr(cgrp, o_kn) else {",
+            "role_unit_words(0)",
+            "role_unit_words(1)",
+            "if !kn_named(kn, o_name, &unit) {\n        return false;\n    }",
+            "let Some(slice) = read_ptr(kn, o_parent) else {",
+            "kn_name_words(OUR_SLICE)",
+            "if !kn_named(slice, o_name, &SLICE) {\n        return false;\n    }",
+            "let Some(root) = read_ptr(slice, o_parent) else {",
+            "Ok(p) if p.is_null()",
+        ],
+    )
+    .unwrap();
+    in_order(
+        body(&c, "kn_named"),
+        &[
+            "32,",
+            "n > 1 && w[0] == want[0] && w[1] == want[1] && w[2] == want[2] && w[3] == want[3]",
         ],
     )
     .unwrap();
@@ -1210,4 +1250,147 @@ fn a_full_held_set_refuses_the_window_s_load_and_the_round_empties_it() {
     );
     assert!(x.contains("pub const HELD_MAP: &str = \"PROG_CONTENT_HELD\";"));
     assert!(c.contains("pub static PROG_CONTENT_HELD: HashMap<u32, u64> ="));
+}
+
+/// The review of #582 (F2 c): the witness chain is the watchdog role's to
+/// change alone — in the deny hooks' shared verdict, the family's exemption
+/// holds for an inode of `ROLE_WRITE_INODES` only when the caller's binary
+/// is that role's; nothing lets an exempt caller through before that test.
+#[test]
+fn an_inode_of_one_role_is_changed_by_that_role_alone() {
+    let c = code("agent-ebpf/src/inode_protect.rs");
+    assert!(
+        c.contains("pub static ROLE_WRITE_INODES: HashMap<InodeKey, u8> = HashMap::pinned(8, 0);")
+    );
+    let v = body(&c, "protected_verdict");
+    in_order(
+        v,
+        &[
+            "let flags = match PROTECTED_INODES.get(&key) {",
+            "if override_active() {\n        return None;\n    }",
+            "if crate::task_kill::is_exempt_pid(caller_tgid) {",
+            "match ROLE_WRITE_INODES.get(&key) {",
+            "Some(role) if *role != crate::bpf_defense::caller_role() => {}",
+            "_ => return None,",
+        ],
+    )
+    .unwrap();
+    let exempt = v
+        .find("if crate::task_kill::is_exempt_pid(caller_tgid) {")
+        .unwrap();
+    let role = v.find("match ROLE_WRITE_INODES.get(&key) {").unwrap();
+    assert!(
+        !v[exempt..role].contains("return None"),
+        "an exempt caller let through before the role's test"
+    );
+}
+
+/// The review of #582 (F4, F6): the kernel's liveness watch marks each
+/// role's vacancy, whether the exit was inside a signed window, and (the
+/// re-check, N4) when, right where it vacates the slot. The re-check of
+/// #582 (N1): `BPF_F_RDONLY` is a descriptor's flag, not the map's — the
+/// agent's load freezes both maps instead (`BPF_MAP_FREEZE`, map-wide),
+/// before it reads them, and a reader takes a map not frozen as not known.
+#[test]
+fn the_kernel_marks_each_vacancy_in_maps_the_agent_s_load_freezes() {
+    let c = code("agent-ebpf/src/bpf_defense.rs");
+    assert!(c.contains("pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);"));
+    assert!(c.contains("pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);"));
+    assert!(
+        !c.contains("BPF_F_RDONLY"),
+        "a descriptor's flag is no map's"
+    );
+    in_order(
+        body(&c, "role_exit"),
+        &[
+            "if unsafe { *t } == tgid {",
+            "unsafe { *t = ROLE_VACATED };",
+            "if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {",
+            "unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };",
+            "if let Some(e) = ROLE_EXITS.get_ptr_mut(slot) {",
+            "unsafe { *e = bpf_ktime_get_boot_ns() };",
+        ],
+    )
+    .unwrap();
+    // frozen at the load, before the start reads them
+    let m = code("crates/nn-linux/src/sensors/multiplexer.rs");
+    in_order(
+        &m,
+        &[
+            ".load(EBPF_BYTES)",
+            "crate::anti_tamper::bpf_defense::freeze_role_marks(&ebpf)",
+            "crate::anti_tamper::bpf_defense::roles_at_start(&ebpf",
+        ],
+    )
+    .unwrap();
+    // both maps frozen, and read as not known when they could not be
+    let f = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
+    let freeze = body(&f, "freeze_role_marks");
+    for needle in [
+        "antitamper_bpf::ROLE_MARKS_MAP_NAME",
+        "antitamper_bpf::ROLE_EXITS_MAP_NAME",
+        "freeze_named(ebpf, name)",
+    ] {
+        assert!(freeze.contains(needle), "{needle}");
+    }
+    assert_eq!(
+        body(&f, "roles_at_start")
+            .matches(".filter(|_| frozen)")
+            .count(),
+        2
+    );
+    // and read only through a frozen descriptor
+    let l = code("antitamper-bpf/src/lib.rs");
+    in_order(
+        body(&l, "frozen_pin"),
+        &[
+            "MapData::from_pin(",
+            "require_frozen(&info, name)?;",
+            "Ok(map_data)",
+        ],
+    )
+    .unwrap();
+    for reader in ["role_marks", "role_exit_ns"] {
+        assert!(
+            body(&l, reader).contains("frozen_pin(bpffs_root, "),
+            "{reader}"
+        );
+    }
+}
+
+/// Fix round 4 of #582 (its KVM suites): a privileged test reads the
+/// agent's maps while the guard enforces only through a read-only
+/// descriptor — `bpftool`'s `map dump` opens the pin read-write, which the
+/// guard refuses even inside a window (an empty stderr: the error is on its
+/// JSON stdout) — and a witness import is matched by its whole kind
+/// (`witness_row` is a prefix of `witness_row_uncertified`).
+#[test]
+fn enforce_mode_tests_read_maps_read_only_and_match_whole_kinds() {
+    let common = code("agent/tests/common/mod.rs");
+    let reader = body(&common, "pinned_words");
+    in_order(
+        reader,
+        &[
+            "a[3] = BPF_F_RDONLY;",
+            "sys_bpf(BPF_OBJ_GET, &mut a)",
+            "sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a)",
+        ],
+    )
+    .unwrap();
+    let e2e = code("agent/tests/privileged_e2e.rs");
+    let words = body(&e2e, "pinned_words");
+    assert!(words.contains("common::raw_bpf::pinned_words("), "{words}");
+    for b in [reader, words] {
+        assert!(!b.contains("bpftool"), "a read through bpftool: {b}");
+    }
+    let wd = code("watchdog/tests/privileged_e2e.rs");
+    assert!(
+        !wd.contains(".contains(\"witness_row\")"),
+        "a witness kind matched by its prefix"
+    );
+    let t = body(
+        &wd,
+        "the_watchdog_signs_the_agent_s_vacancy_and_its_successor",
+    );
+    assert!(t.contains("format!(\"\\\"kind\\\":\\\"{k}\\\"\")"), "{t}");
 }

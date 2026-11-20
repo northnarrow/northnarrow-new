@@ -279,8 +279,13 @@ const WATCHDOG_UNIT: &str = include_str!(concat!(
     "/deploy/systemd/northnarrow-watchdog.service"
 ));
 
-/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
-const AGENT_UNIT_CGROUP: &str = "/system.slice/northnarrow-agent.service";
+/// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`):
+/// its unit under our slice (`common::wire::{OUR_SLICE, AGENT_UNIT}`). The
+/// review of #582 (F5): it named `system.slice` since the units moved to
+/// `northnarrow.slice` (lot 273d), and NN-AUD-113's limits and the pin
+/// lock made again when the unit started without it (#569 F3) never ran;
+/// a test ties it to the shipped unit's `Slice=`.
+const AGENT_UNIT_CGROUP: &str = "/northnarrow.slice/northnarrow-agent.service";
 
 /// Limit names as [`limits`] reports them.
 const LIMIT_CGROUP: &str = "agent cgroup";
@@ -1050,8 +1055,28 @@ fn high_kind(kind: &str) -> bool {
             // lot 359 (the re-check 3 of #567, N4)
             | crate::anti_tamper::pin_lock::MISSING
             | crate::anti_tamper::pin_lock::CHANGED
+            // lot 374: the other role's vacancy, its successor, a refused start
+            | WATCHDOG_START_REFUSED
+            | WITNESS_UNAVAILABLE
+            // the review of #582 (F2 d)
+            | WATCHDOG_RESPAWN_HELD
+            | crate::witness::WATCHDOG_SUCCESSOR_FOREIGN
+            // the re-check of #582 (N4)
+            | crate::witness::WATCHDOG_SUCCESSOR_UNCONFIRMED
+            | crate::witness::WITNESS_ROW
+            | crate::witness::WITNESS_UNCERTIFIED
+            | crate::witness::WITNESS_BROKEN
+            | crate::witness::ROLES_VACATED_GAP
     )
 }
+
+/// Lot 374: a start of the watchdog that refused itself (its hold record).
+pub const WATCHDOG_START_REFUSED: &str = "watchdog_start_refused";
+/// Lot 374: the watchdog's witness not opened (its hold record).
+pub const WITNESS_UNAVAILABLE: &str = "witness_unavailable";
+/// The review of #582 (F2 d): the watchdog held a start of the agent — the
+/// host changed during the vacancy (its hold record, High).
+pub const WATCHDOG_RESPAWN_HELD: &str = "watchdog_respawn_held";
 
 /// Fix round 3 of #567: a pin of the agent's gone while it holds the object
 /// (`antitamper_bpf::held`) — High.
@@ -1752,9 +1777,28 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             PIN_HANDLE_FAILED,
                             "the watchdog's handle on the agent's pinned maps failed",
                         ),
+                        // Lot 374: the watchdog's start refused itself
+                        // (a loader variable, a mapping not expected), and
+                        // its witness not opened — the surviving role signs
+                        wh::REASON_START_SELF_CHECK => (
+                            WATCHDOG_START_REFUSED,
+                            "a start of the watchdog refused itself before it took its role",
+                        ),
+                        wh::REASON_WITNESS_UNAVAILABLE => (
+                            WITNESS_UNAVAILABLE,
+                            "the watchdog could not open its witness: the agent's vacancies are \
+                             not signed by it",
+                        ),
                         wh::REASON_HOLD_RETRY => (
                             "watchdog_hold",
                             "the holding watchdog tried to start the agent again",
+                        ),
+                        // The review of #582 (F2 d): the host changed during
+                        // the vacancy — the start held, or a retry skipped
+                        wh::REASON_RESPAWN_HELD => (
+                            WATCHDOG_RESPAWN_HELD,
+                            "the watchdog held instead of starting the agent: the host changed \
+                             during the vacancy",
                         ),
                         wh::REASON_HOLD_ENDED => ("watchdog_hold", "the watchdog's hold ended"),
                         // Lot 273c: the agent's fresh cgroup, or the
@@ -2781,6 +2825,25 @@ fn append_entry(
 /// admin socket's own watch, external audit WDG-007): an ERROR and one
 /// signed `integrity_drift`, as a round records one. The caller bounds
 /// how often.
+/// Lot 374: a finding of the witness's bookkeeping (`witness::is_note`)
+/// signed as a note — op [`crate::witness::WITNESS_OP`], an INFO line —
+/// never as a drift of the host.
+pub fn record_note(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    tracing::info!(kind = f.kind, detail = %f.detail, "witness: recorded");
+    let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail });
+    append_entry(audit_log, crate::witness::WITNESS_OP, extra, "recorded");
+}
+
+/// Lot 374: a finding signed as [`record_note`] when it is the witness's
+/// bookkeeping, else as [`report_event`].
+pub fn report_or_note(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    if crate::witness::is_note(f.kind) {
+        record_note(audit_log, f);
+    } else {
+        report_event(audit_log, f);
+    }
+}
+
 pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
     error!(
         kind = f.kind,
@@ -3276,6 +3339,12 @@ mod tests {
             (wh::REASON_SIGNED_RECORDS_FAILED, "signed_records_failed"),
             // lot 359 (the re-check 3 of #567, P3 e)
             (wh::REASON_PIN_HANDLE_FAILED, PIN_HANDLE_FAILED),
+            // lot 374: a watchdog start that refused itself, a watchdog
+            // without its witness — signed by the agent, the surviving role
+            (wh::REASON_START_SELF_CHECK, WATCHDOG_START_REFUSED),
+            (wh::REASON_WITNESS_UNAVAILABLE, WITNESS_UNAVAILABLE),
+            // the review of #582 (F2 d): a respawn held, the host changed
+            (wh::REASON_RESPAWN_HELD, WATCHDOG_RESPAWN_HELD),
         ];
         let body = reasons
             .iter()
@@ -3298,6 +3367,46 @@ mod tests {
             "{}",
             f[4].detail
         );
+        // lot 374: both High
+        for kind in [
+            WATCHDOG_START_REFUSED,
+            WITNESS_UNAVAILABLE,
+            WATCHDOG_RESPAWN_HELD,
+        ] {
+            assert!(high_kind(kind), "{kind}");
+        }
+        let refused = f.iter().find(|x| x.kind == WATCHDOG_START_REFUSED).unwrap();
+        assert!(
+            refused
+                .detail
+                .contains("refused itself before it took its role"),
+            "{}",
+            refused.detail
+        );
+    }
+
+    /// Lot 374: what the surviving role signs of the other's vacancy and
+    /// successor is High — a witness row, one of a key never certified, a
+    /// broken chain, the watchdog's refused successor — and its bookkeeping
+    /// (a key certified, a note, the watchdog's clean succession) is not.
+    #[test]
+    fn the_witness_records_are_high_and_its_bookkeeping_is_not() {
+        use crate::witness as w;
+        for kind in [
+            w::WITNESS_ROW,
+            w::WITNESS_UNCERTIFIED,
+            w::WITNESS_BROKEN,
+            w::WATCHDOG_SUCCESSOR_FOREIGN,
+            // the re-check of #582 (N4)
+            w::WATCHDOG_SUCCESSOR_UNCONFIRMED,
+            WATCHDOG_START_REFUSED,
+            WITNESS_UNAVAILABLE,
+        ] {
+            assert!(high_kind(kind), "{kind}");
+        }
+        for kind in [w::WITNESS_KEY, w::WITNESS_NOTE, w::WATCHDOG_SUCCESSION] {
+            assert!(!high_kind(kind), "{kind}");
+        }
     }
 
     /// External audit WDG-007: a finding another task reports between two
@@ -4925,6 +5034,24 @@ mod tests {
         let f = w.observe(&seen("50000 100000"), &expected);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, "limit_unexpected");
+    }
+
+    /// The review of #582 (F5): the agent unit's cgroup is the shipped
+    /// unit's own — its `Slice=` and its name, as the eBPF programs and
+    /// `start_check` build it (`common::wire`). It named `system.slice`
+    /// after the units had moved, and both checks that read it were dead.
+    #[test]
+    fn the_agent_unit_cgroup_is_the_shipped_unit_s_slice_and_name() {
+        let slice = unit_directive(AGENT_UNIT, "Slice").expect("the agent unit sets Slice=");
+        assert_eq!(slice, common::wire::OUR_SLICE);
+        assert_eq!(
+            AGENT_UNIT_CGROUP,
+            format!("/{slice}/{}", common::wire::AGENT_UNIT)
+        );
+        assert_eq!(
+            unit_directive(WATCHDOG_UNIT, "Slice"),
+            Some(common::wire::OUR_SLICE)
+        );
     }
 
     #[test]

@@ -414,6 +414,10 @@ pub mod sd_notify;
 // names, came first, R09a).
 pub mod self_integrity;
 
+// Lot 374: the agent's side of the witness — the watchdog's witness key
+// certified, its signed rows imported, the watchdog's successor judged.
+pub mod witness;
+
 // Tappa 10.9, step 0, lab builds only (`--sensor-feasibility`): the
 // throw-away probes of the candidate attach points, loaded and exercised on
 // the running kernel (R09c, lab PR 257; was the agent's
