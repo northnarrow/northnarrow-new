@@ -73,6 +73,11 @@ use super::host::PostureHost;
 pub use super::script_args::Runs;
 use super::script_args::{family_of, go_link_output, runs_of};
 
+/// Lot 376: the packaged service manager's binary, a user's manager
+/// (`systemd --user`, `user@<uid>.service`) included
+/// ([`AuthSessionTracker::is_user_manager_program`]).
+pub const SYSTEMD_MANAGER_EXES: &[&str] = &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"];
+
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
 ///
@@ -2513,6 +2518,65 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     pub fn is_credential_reader(&self, pid: u32, as_of: AsOf) -> bool {
         self.lineage_match(pid, as_of, is_auth_binary, 1)
             .unwrap_or(false)
+    }
+
+    /// Lot 376 (the rc9 soak: ALERTED at every boot — `sudo`, run from a
+    /// session right after the boot, reading `/etc/sudoers` at the invoking
+    /// user's uid, judged before its exec reached the cache): `image`, the
+    /// kernel's identity of a process's executable AT an event
+    /// (`mm->exe_file`, the device in the kernel's form and the inode, as
+    /// the LSM file-open sensor reads it at the open), is the host's file
+    /// of an authentication binary ([`AUTH_BINARY_EXES`]) in a directory
+    /// root's and writable by no one else ([`Self::is_host_file_in_root_dir`])
+    /// — the reader itself is the auth stack, as
+    /// [`Self::is_credential_reader`] says of an exec it has. A copy, a
+    /// renamed or replaced binary, a file elsewhere, `(0, 0)` (not read):
+    /// not. The reader's children are not (POS-002: a session's shell reads
+    /// as itself).
+    /// Lot 376 (the rc9 soak and its lab on Debian 13: ALERTED at a reboot
+    /// — podman's quadlet user generator, run by the user's service manager
+    /// as it starts, reading `/etc/passwd` for its name lookup; Debian's
+    /// `systemd-user` PAM stack sets no login uid, so BUG-018's carve-out
+    /// did not hold): `pid` runs a packaged program its user's own service
+    /// manager started.
+    /// - Its exec as of `as_of` (the spawn cache) is the host's file at its
+    ///   path in a root-only directory ([`Self::is_host_file_in_root_dir`]),
+    ///   executed as `uid`, not root.
+    /// - Its parent is that user's service manager: the host's packaged
+    ///   `systemd` ([`SYSTEMD_MANAGER_EXES`], by the file its exec ran),
+    ///   executed as `uid`, whose own parent is PID 1 (`user@<uid>.service`).
+    ///
+    /// A program of the user's (a home), a copy of systemd, a manager run by
+    /// hand from a shell, a child of the program (a shell a unit runs):
+    /// not.
+    pub fn is_user_manager_program(&self, pid: u32, uid: u32, as_of: AsOf) -> bool {
+        if uid == 0 || pid <= 1 {
+            return false;
+        }
+        let (Some(me), Some(file)) = (self.hop(pid, as_of), self.exec_file(pid, as_of)) else {
+            return false;
+        };
+        if !me.cached
+            || me.uid != Some(uid)
+            || !self.is_host_file_in_root_dir(&me.exe.to_string_lossy(), file)
+        {
+            return false;
+        }
+        let Some(manager) = self.hop(me.ppid, as_of).filter(|h| h.cached && h.pid > 1) else {
+            return false;
+        };
+        manager.uid == Some(uid)
+            && manager.ppid == 1
+            && SYSTEMD_MANAGER_EXES
+                .iter()
+                .any(|p| self.ran_host_file(manager.pid, as_of, p))
+    }
+
+    pub fn is_auth_binary_image(&self, image: (u64, u64)) -> bool {
+        image.1 != 0
+            && AUTH_BINARY_EXES
+                .iter()
+                .any(|p| self.is_host_file_in_root_dir(p, image))
     }
 
     /// True iff `pid` or any ancestor's exe is a known system

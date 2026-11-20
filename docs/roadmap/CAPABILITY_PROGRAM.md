@@ -11700,6 +11700,78 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 376 — the rc9 soaks' false positives: a rotated log's first
+  record, the boot-time posture rise, `pg_createcluster`, Low noise (C06,
+  C14, C18; no level change).**
+  - What was open (Phase 5 "passed with conditions"):
+    - `NN-L-FIM-005` High by rsyslogd at a cold boot's shutdown (2604 ×3,
+      2404 ×1).
+    - The posture at ALERTED after every boot, through
+      `SensitiveFileAccess`, on all three guests. The line did not say
+      which access.
+    - `NN-L-NET-019`/`-006` Medium from `pg_createcluster`.
+    - `NN-L-AT-001` (149 Low in 12 h on 2604) and `NN-L-FIM-009` (142 on
+      2404) noise.
+  - Done, each by identity:
+    - **The rotated log.** The cause was not the writer's identity. A file
+      put at a watched path by a rename-away (logrotate's `create`) was
+      watched with no check and no size, so its first record, often at the
+      shutdown, was measured against the old file's baseline. Its size is
+      now read as it is watched. The rotation is checked once as the
+      renamer's change of the path (FIMR-004's check): logrotate by hand
+      High, under its timer Low.
+    - **The posture at boot.** The `POSTURE TRANSITION` line names the
+      event. It named `sudo` reading `/etc/sudoers` at uid 1000, before its
+      exec reached the lineage. The file-open sensor's record carries the
+      opener's executable at the open (eBPF: `OpenRecordRaw` grows from 632
+      to 648 bytes). The host's packaged authentication binary, in a
+      root-only directory, is the auth stack's own read. On Debian 13 the
+      line also named podman's quadlet user generator reading `/etc/passwd`
+      under a user manager with no login uid. BUG-018's carve-out now also
+      holds for a packaged program the user's own manager started (the
+      host's systemd, as the user, PID 1's child).
+    - **`pg_createcluster`.** A package transaction's own installed program
+      (a `#!` script by its executed file, the host's, lot 348), executed
+      and listening as root, binding the wildcard: `NN-L-NET-019`/`-006`
+      Low. A root listener's Medium names the missing fact.
+    - **`NN-L-FIM-009`.** Coalesced per package-manager process within 15
+      minutes (lot 352's mechanism, shared: `TransactionFirsts`).
+      `NN-L-AT-001`'s boot burst is lot 356's sole traces: design only,
+      after the alpha.
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §62 and the CHANGELOG.
+  - Mutation: 33 mutants of the lot's new code, 32 caught by a named test, 1 equivalent by construction (argued in the PR); three survivors of the first pass caught after their tests were strengthened.
+  - Lab (as measured):
+    Alpha profile (observe-only), one guest at a time under its lease. Each guest was left uninstalled and powered off, with no `.local` files, no pins and no probe files.
+    - **r1 — ubuntu2604 (7.0.0-43), `31f3ecec`.** The rotation fix and the transition line, before the opener's image.
+      - `sudo logrotate -f /etc/logrotate.conf`: `NN-L-FIM-005` High ×3 and `NN-L-FIM-019` High ×1, on logrotate.
+      - The cold boot's and the reboot's shutdowns: `NN-L-FIM-005`/`-019`/`-024` 0.
+      - At both boots the line named `event="FileOpen" … uid=1000 comm=sudo image=- path=/etc/sudoers`.
+      - `pg_createcluster`: `NN-L-NET-019` Medium ×2.
+      - The PostgreSQL install: `NN-L-FIM-009` Low ×20.
+    - **r2 — ubuntu2404 (6.8.0-149), `de85dee3`+.** The opener's image.
+      - The cold boot and the reboot: Observing two minutes after each, no transition.
+      - `NN-L-FIM-005` 0 at both shutdowns after `logrotate -f`.
+      - The PostgreSQL install: `NN-L-FIM-009` Low ×1.
+      - `cat /etc/login.defs` from the session: ALERTED, the line naming `cat`, `/usr/bin/cat`, `/etc/login.defs`.
+      - A `/tmp` copy of `truncate` emptying `/var/log/auth.log`: `NN-L-FIM-005` High.
+      - `NN-L-NET-019` was still Medium. Its record named the missing fact, "the kernel's image of its exec is not known": the pump gives a `#!` script no `ROOT_DIR`. That led to the executed-file fix.
+    - **r3 — debian13 (6.12.117), `2dd01e36`.**
+      - The install and the cold boot: Observing.
+      - At the reboot: ALERTED by `FileOpen /etc/passwd`, `podman-user-gen`, image `/usr/libexec/podman/quadlet`, uid 1000. That led to the user-manager fix.
+      - `logrotate -f`: `NN-L-FIM-019` High ×1 (wtmp).
+      - The `/tmp` truncation: `NN-L-FIM-005` High.
+    - **r4 — ubuntu2404, `9f6068c7` (the final code).**
+      - `pg_createcluster`: `NN-L-NET-019` Low ×2 and `NN-L-NET-006` Low ×2.
+      - The PostgreSQL install: `NN-L-FIM-009` Low ×1.
+      - `logrotate -f`: `NN-L-FIM-005` High ×3 and `NN-L-FIM-019` High ×1, on logrotate.
+      - The cold boot and the reboot: `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition.
+      - `cat /etc/login.defs`: ALERTED, named.
+      - The `/tmp` truncation: `NN-L-FIM-005` High.
+      - Seen, not this lot's code: one `R004` Critical at the reboot (pid 1029, ppid 1, comm `9`, `/proc/self/fd/9`: systemd's executor `fexecve`). Tappa 10.6.5's exemption missed it once; left to a later lot.
+    - **r5 — debian13 (6.12.117), `da0dba78` (the final code, a boot round).**
+      - The cold boot and the reboot: `NN-L-FIM-005`/`-019`/`-024` 0; Observing two minutes after each, no transition. At r3's reboot the quadlet read had raised ALERTED.
+      - `cat /etc/login.defs`: ALERTED, the line naming `cat`, `/usr/bin/cat`, `/etc/login.defs`.
+      - The `/tmp` truncation found `/var/log/auth.log` already empty (r3 emptied it, and debian13 runs no rsyslog), so there was no change and no record.
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
   racy R011 (C06, C14, C18; no level change).**

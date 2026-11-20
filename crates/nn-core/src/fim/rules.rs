@@ -2925,12 +2925,42 @@ impl<H: PostureHost> Rule for SnapdOwnUnits<H> {
 }
 
 /// Lot 352: how long the records of one package-manager process's writes
-/// in the kernel's module trees are coalesced into its first.
+/// in the kernel's module trees are coalesced into its first (lot 376: and
+/// its Low records of a rule [`TransactionCoalesced`] wraps).
 const KMOD_TRANSACTION_COALESCE_NS: u64 = 15 * 60 * 1_000_000_000;
 
 /// Lot 352: the package-manager processes whose first module-tree record
 /// is remembered at most (the oldest forgotten first).
 const KMOD_TRANSACTIONS_MAX: usize = 256;
+
+/// Lot 352, shared since lot 376: the time of each package-transaction
+/// process's first recorded write of a rule, in insertion order — at most
+/// [`KMOD_TRANSACTIONS_MAX`] processes, the oldest forgotten first.
+#[derive(Default)]
+struct TransactionFirsts {
+    first: Mutex<VecDeque<(u32, u64)>>,
+}
+
+impl TransactionFirsts {
+    /// `pid`'s write at `ts_ns` is the first of its transaction to record
+    /// (none of its writes recorded within [`KMOD_TRANSACTION_COALESCE_NS`]
+    /// before it).
+    fn first_of_transaction(&self, pid: u32, ts_ns: u64) -> bool {
+        let mut first = self.first.lock();
+        if let Some(i) = first.iter().position(|(p, _)| *p == pid) {
+            let at = first[i].1;
+            if ts_ns >= at && ts_ns - at < KMOD_TRANSACTION_COALESCE_NS {
+                return false;
+            }
+            first.remove(i);
+        }
+        if first.len() >= KMOD_TRANSACTIONS_MAX {
+            first.pop_front();
+        }
+        first.push_back((pid, ts_ns));
+        true
+    }
+}
 
 /// Lot 352 (pre-alpha Phase 4, NN-L-FIM-008 over the whole tree): the
 /// module trees' writes that are no module installed behind the package
@@ -2955,8 +2985,8 @@ const KMOD_TRANSACTIONS_MAX: usize = 256;
 pub struct KmodTreeWrites<H: PostureHost> {
     inner: Box<dyn Rule>,
     lineage: AuthSessionTracker<H>,
-    /// pid → the time of its first recorded write, in insertion order.
-    first: Mutex<VecDeque<(u32, u64)>>,
+    /// pid → the time of its first recorded write.
+    first: TransactionFirsts,
 }
 
 impl<H: PostureHost> KmodTreeWrites<H> {
@@ -2964,26 +2994,8 @@ impl<H: PostureHost> KmodTreeWrites<H> {
         Self {
             inner,
             lineage,
-            first: Mutex::new(VecDeque::new()),
+            first: TransactionFirsts::default(),
         }
-    }
-
-    /// `pid`'s write at `ts_ns` is the first of its transaction to record
-    /// (none of its writes recorded within the window before it).
-    fn first_of_transaction(&self, pid: u32, ts_ns: u64) -> bool {
-        let mut first = self.first.lock();
-        if let Some(i) = first.iter().position(|(p, _)| *p == pid) {
-            let at = first[i].1;
-            if ts_ns >= at && ts_ns - at < KMOD_TRANSACTION_COALESCE_NS {
-                return false;
-            }
-            first.remove(i);
-        }
-        if first.len() >= KMOD_TRANSACTIONS_MAX {
-            first.pop_front();
-        }
-        first.push_back((pid, ts_ns));
-        true
     }
 
     /// The writer ran the host's `kmod` (`/usr/bin/kmod`, `/bin/kmod`).
@@ -3018,7 +3030,9 @@ impl<H: PostureHost> Rule for KmodTreeWrites<H> {
             if self
                 .lineage
                 .is_package_transaction_write(fe.modifier_pid, at)
-                && !self.first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
+                && !self
+                    .first
+                    .first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
             {
                 crate::detection_budget::count_coalesced(self.id(), fe.modifier_uid, || {
                     (fe.path.clone(), fe.path.clone())
@@ -3039,6 +3053,74 @@ impl<H: PostureHost> Rule for KmodTreeWrites<H> {
                 ),
                 ..verdict
             });
+        }
+        Some(verdict)
+    }
+}
+
+/// Lot 376 (the rc9 soak: NN-L-FIM-009 Low ×142 on ubuntu2404, 104 of them
+/// in the hour of one `apt-get` run — `dpkg` unpacking the packages' unit
+/// files): a rule's Low record of a package transaction's write — its
+/// package carve-out's ([`PackageManaged`]) — is coalesced as lot 352
+/// coalesces the module trees' ([`KmodTreeWrites`]): the first of each
+/// package-manager process within [`KMOD_TRANSACTION_COALESCE_NS`] is
+/// recorded; the rest are counted into the detection budget as coalesced
+/// (the next record's `suppressed_before`, the reporter's signed entry
+/// with their paths) — the evidence kept, the count truthful.
+///
+/// Anything else passes unchanged: a record that is not Low and `Log` (an
+/// administrator's High, a held or acted kill), a write outside a package
+/// transaction (by the lineage, as of the write), the same process's first
+/// write after the window.
+pub struct TransactionCoalesced<H: PostureHost> {
+    inner: Box<dyn Rule>,
+    lineage: AuthSessionTracker<H>,
+    first: TransactionFirsts,
+}
+
+impl<H: PostureHost> TransactionCoalesced<H> {
+    pub fn new(inner: Box<dyn Rule>, lineage: AuthSessionTracker<H>) -> Self {
+        Self {
+            inner,
+            lineage,
+            first: TransactionFirsts::default(),
+        }
+    }
+}
+
+impl<H: PostureHost> Rule for TransactionCoalesced<H> {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn category(&self) -> &'static str {
+        self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
+    fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        let verdict = self.inner.evaluate(event)?;
+        let Event::Fim(fe) = event else {
+            return Some(verdict);
+        };
+        if verdict.action != ResponseAction::Log || verdict.severity != Severity::Low {
+            return Some(verdict);
+        }
+        let at = crate::posture::lineage::AsOf::judged(fe.timestamp_ns);
+        if self
+            .lineage
+            .is_package_transaction_write(fe.modifier_pid, at)
+            && !self
+                .first
+                .first_of_transaction(fe.modifier_pid, fe.timestamp_ns)
+        {
+            crate::detection_budget::count_coalesced(self.id(), fe.modifier_uid, || {
+                (fe.path.clone(), fe.path.clone())
+            });
+            return None;
         }
         Some(verdict)
     }
@@ -3628,14 +3710,18 @@ pub fn fim_rules_with_lineage<H: DecisionHost>(
             FIM_007_KILL,
         )),
         // Lot 367 (F3b-5): snapd's own units by the host's snapd, Low.
+        // Lot 376: a package transaction's Low records coalesced per process.
         Box::new(SwitchHeld::new(
-            admin(Box::new(SnapdOwnUnits::new(
-                Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
-                    &installer_override,
+            Box::new(TransactionCoalesced::new(
+                admin(Box::new(SnapdOwnUnits::new(
+                    Box::new(NnLFim009SystemdUnitDropped::<H>::new(Arc::clone(
+                        &installer_override,
+                    ))),
+                    lineage.clone(),
+                    facts,
                 ))),
                 lineage.clone(),
-                facts,
-            ))),
+            )),
             FIM_009_KILL,
         )),
         // C5.3 — cloud credential read family. Same High
@@ -6808,6 +6894,141 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log, "the administrator's sudo");
     }
 
+    /// Lot 376: the tests that read the process-wide detection budget's held
+    /// counts ([`crate::detection_budget::take_held`] takes every pair's)
+    /// run one at a time.
+    static TAKE_HELD: Mutex<()> = Mutex::new(());
+
+    /// Lot 376 (named, the rc9 soak: NN-L-FIM-009 Low ×142 on ubuntu2404,
+    /// 104 in the hour of one `apt-get` run): a package transaction's unit
+    /// writes are one Low record per package-manager process within the
+    /// window, the rest counted as coalesced (their paths kept as samples);
+    /// the same process past the window records again. The attack shapes
+    /// keep their verdict, uncoalesced: a unit dropped by a process outside
+    /// the transaction (its kill, held), every time. Fails on main (three
+    /// Low records).
+    #[test]
+    fn fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window() {
+        const S: u64 = 1_000_000_000;
+        const UID: u32 = 4_243;
+        let _one = TAKE_HELD.lock();
+        let (_tmp, lineage) = pkg_fixture();
+        let rules = rules_by_id(&lineage);
+        let r = &rules["NN-L-FIM-009_SystemdUnitDropped"];
+        let unit = |path: &str, pid: u32, ts: u64| {
+            let mut e = written_by(FimOp::Created, path, pid, "dpkg");
+            if let Event::Fim(fe) = &mut e {
+                (fe.timestamp_ns, fe.modifier_uid) = (ts, UID);
+            }
+            e
+        };
+        let first = r
+            .evaluate(&unit("/usr/lib/systemd/system/a.service", 200, 10 * S))
+            .expect("the first is recorded");
+        assert_eq!(
+            (first.action, first.severity),
+            (ResponseAction::Log, Severity::Low)
+        );
+        for (i, leaf) in ["b.service", "c.timer"].iter().enumerate() {
+            let path = format!("/usr/lib/systemd/system/{leaf}");
+            assert!(
+                r.evaluate(&unit(&path, 200, (11 + i as u64) * S)).is_none(),
+                "{leaf}: coalesced"
+            );
+        }
+        let held: Vec<_> = crate::detection_budget::take_held()
+            .into_iter()
+            .filter(|h| h.rule == "NN-L-FIM-009_SystemdUnitDropped" && h.uid == UID)
+            .collect();
+        assert_eq!(held.len(), 1, "one held pair");
+        assert_eq!(held[0].count, 2, "the count is truthful");
+        assert!(held[0].samples.iter().any(|s| s.ends_with("c.timer")));
+        // the attack shape: a unit dropped outside the transaction — its
+        // verdict (not Low), every time
+        for ts in [12 * S, 13 * S] {
+            let v = r
+                .evaluate(&unit("/etc/systemd/system/evil.service", 600, ts))
+                .expect("a foreign unit is judged");
+            assert_ne!(v.severity, Severity::Low);
+        }
+        // past the window, the same process records again
+        assert!(r
+            .evaluate(&unit(
+                "/usr/lib/systemd/system/d.service",
+                200,
+                10 * S + KMOD_TRANSACTION_COALESCE_NS
+            ))
+            .is_some());
+    }
+
+    /// Lot 376 (mutation guard): [`TransactionCoalesced`] coalesces a Low
+    /// `Log` record of a package transaction's write only — a High `Log`
+    /// record, a kill, and a Low record of a write outside the transaction
+    /// are each kept, every time.
+    #[test]
+    fn transaction_coalesced_keeps_what_is_not_a_transaction_s_low_record() {
+        struct Fixed(ResponseAction, Severity);
+        impl Rule for Fixed {
+            fn id(&self) -> &'static str {
+                "NN-L-TEST-376"
+            }
+            fn name(&self) -> &'static str {
+                "fixed"
+            }
+            fn category(&self) -> &'static str {
+                "test"
+            }
+            fn attack(&self) -> &'static [AttackRef] {
+                &[]
+            }
+            fn evaluate(&self, event: &Event) -> Option<Verdict> {
+                let fe = as_fim(event)?;
+                Some(fim_verdict(self, fe, self.0.clone(), self.1, "fixed"))
+            }
+        }
+        let (_tmp, lineage) = pkg_fixture();
+        let unit = |pid: u32| {
+            let mut e = written_by(
+                FimOp::Created,
+                "/usr/lib/systemd/system/a.service",
+                pid,
+                "w",
+            );
+            if let Event::Fim(fe) = &mut e {
+                fe.timestamp_ns = 1_000_000_000;
+            }
+            e
+        };
+        for (action, severity, pid, what) in [
+            (ResponseAction::Log, Severity::High, 200, "a High record"),
+            (ResponseAction::KillProcess, Severity::High, 200, "a kill"),
+            (
+                ResponseAction::KillProcess,
+                Severity::Low,
+                200,
+                "a Low kill",
+            ),
+            (
+                ResponseAction::Log,
+                Severity::Low,
+                600,
+                "outside the transaction",
+            ),
+        ] {
+            let r = TransactionCoalesced::new(Box::new(Fixed(action, severity)), lineage.clone());
+            for _ in 0..3 {
+                assert!(r.evaluate(&unit(pid)).is_some(), "{what}");
+            }
+        }
+        // CONTROL: a transaction's Low record, the second coalesced
+        let _one = TAKE_HELD.lock();
+        let r =
+            TransactionCoalesced::new(Box::new(Fixed(ResponseAction::Log, Severity::Low)), lineage);
+        assert!(r.evaluate(&unit(200)).is_some());
+        assert!(r.evaluate(&unit(200)).is_none());
+        let _ = crate::detection_budget::take_held();
+    }
+
     /// The package carve-out still applies inside an admin session (`sudo
     /// apt install`: Log + Low), and the rootkit-shaped rules are not
     /// wrapped: an admin session writing them is still acted on.
@@ -8585,6 +8806,8 @@ mod tests {
         /// again.
         #[test]
         fn a_package_transaction_s_tree_writes_are_coalesced_into_one_record() {
+            // lot 376: the held counts are process-wide
+            let _one = TAKE_HELD.lock();
             let (_tmp, t) = pkg_fixture();
             let rule = KmodTreeWrites::new(
                 Box::new(PackageManaged::new(
@@ -8669,16 +8892,18 @@ mod tests {
             let (_tmp, t) = pkg_fixture();
             let rule = KmodTreeWrites::new(Box::new(NnLFim008KernelModuleModified), t);
             for pid in 0..KMOD_TRANSACTIONS_MAX as u32 + 1 {
-                assert!(rule.first_of_transaction(10_000 + pid, S));
+                assert!(rule.first.first_of_transaction(10_000 + pid, S));
             }
-            assert_eq!(rule.first.lock().len(), KMOD_TRANSACTIONS_MAX);
+            assert_eq!(rule.first.first.lock().len(), KMOD_TRANSACTIONS_MAX);
             assert!(
-                rule.first_of_transaction(10_000, 2 * S),
+                rule.first.first_of_transaction(10_000, 2 * S),
                 "the oldest was forgotten"
             );
-            assert!(!rule.first_of_transaction(10_000 + KMOD_TRANSACTIONS_MAX as u32, 2 * S));
+            assert!(!rule
+                .first
+                .first_of_transaction(10_000 + KMOD_TRANSACTIONS_MAX as u32, 2 * S));
             // a write timed before its process's first starts over
-            assert!(rule.first_of_transaction(10_000, S / 2));
+            assert!(rule.first.first_of_transaction(10_000, S / 2));
         }
 
         /// Lot 352: depmod — the host's kmod — writing the tree's indexes

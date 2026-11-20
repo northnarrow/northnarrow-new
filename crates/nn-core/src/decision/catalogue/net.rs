@@ -144,7 +144,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    process outside the netflow comm allowlist. A wildcard bind is \
                    NN-L-NET-019's. Lot 369: a program of a root-owned system tree (the \
                    kernel's image), in a system service's own cgroup, listening on loopback \
-                   only (a packaged database or mail daemon) is recorded Low.",
+                   only (a packaged database or mail daemon) is recorded Low. Lot 376: so is \
+                   a package transaction's own program run by root (as NN-L-NET-019 says).",
         false_positives: "Developer servers, test fixtures and user services that listen on \
                           high ports; the netflow comm allowlist (judged on the executed \
                           program, not on `comm`) answers the known daemons.",
@@ -155,6 +156,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
              net_006_fires_on_uncommon_port_non_allowlist_comm",
             "crates/nn-core/src/decision/rules/net.rs::\
              net_006_a_packaged_service_daemon_on_loopback_is_low",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low",
             "agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event",
         ],
         attack_note: "A bind shell or a backdoor listener has no ATT&CK technique of its own; \
@@ -407,14 +410,20 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-NET-019_WildcardListener",
-        severities: &[Severity::Medium],
+        severities: &[Severity::Medium, Severity::Low],
         actions: &[ResponseAction::Log],
         sensors: &[Sensor::Network],
         data_components: &["DC0021"],
         observes: "A new TCP listener bound to the wildcard address (`0.0.0.0` or `::`) on an \
                    uncommon port — or on a common one from a program not installed in a \
                    root-owned system tree — by a process outside the netflow comm allowlist: \
-                   the port is reachable from other hosts.",
+                   the port is reachable from other hosts. Lot 376: a package transaction's \
+                   own program — the file the kernel executed is the host's file at its path \
+                   in a root-only directory, installed in a root-owned system tree (an \
+                   interpreter's script there too), executed by root and listening as root, \
+                   inside a live package transaction run by root (`pg_createcluster`'s \
+                   free-port probe in PostgreSQL's postinst) — is recorded Low; a root \
+                   listener's Medium record names the fact that was missing.",
         false_positives: "Developer servers and user services that bind all addresses by \
                           default (`python3 -m http.server`, test fixtures); the allowlist \
                           answers the known daemons.",
@@ -423,6 +432,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/net.rs::\
              net_019_fires_on_wildcard_uncommon_port_non_allowlist",
+            "crates/nn-core/src/decision/rules/net.rs::\
+             net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::\
              net_wildcard_listener_trips_net_019",
         ],

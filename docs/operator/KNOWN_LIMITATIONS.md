@@ -761,6 +761,45 @@ lists the known false positives of each rule.
   `an_exec_between_two_writes_is_another_writer`,
   `a_postinst_setcap_of_a_root_equivalent_capability_stays_high`,
   `fim025_a_root_equivalent_grant_in_a_package_transaction_stays_high`.
+- **The host's rotations, boots and package installs** (lot 376, the rc9
+  soak). Judged by identity now:
+  - rsyslogd's appends to a log logrotate re-created, its last flush at the
+    shutdown included: the new file is measured from the size it had when
+    watched (no `NN-L-FIM-005`);
+  - the first `sudo` of a session after a boot: its read of
+    `/etc/sudoers` at the invoking user's uid is told by the image the
+    kernel recorded at the open (no ALERTED posture);
+  - a packaged program the user's own service manager starts (podman's
+    quadlet user generator on Debian 13, whose `systemd-user` PAM stack
+    sets no login uid) reading `/etc/passwd` for a name lookup;
+  - `pg_createcluster`'s free-port probe in PostgreSQL's postinst:
+    `NN-L-NET-019`/`-006` Low;
+  - a package transaction's unit writes: one `NN-L-FIM-009` Low record per
+    package-manager process within 15 minutes, the rest counted.
+
+  Still recorded High: `sudo logrotate -f` by hand, now on logrotate at the
+  rotation (`NN-L-FIM-005`; for `wtmp`/`btmp` also `NN-L-FIM-019` with its
+  kill, a would-have under `alpha` — lot 340's verdict for a rotation by
+  hand); a truncation of a log by any other writer; `cat /etc/login.defs`
+  from a session (ALERTED).
+
+  Residuals:
+  - **A log moved away and re-created late.** A watched log renamed away
+    with nothing at its path when the drain settles the rename is watched
+    again when a file comes back, checked as a creation by an unknown
+    writer: `NN-L-FIM-005` judges modifications only, so the move itself
+    is the drift row's `Renamed` and the line in the journal, not a High.
+    A file put at the path at once is the renamer's change (High).
+  - **`NN-L-AT-001`'s boot burst.** The BPF cross-view's baseline of
+    systemd's programs (~30 Low records at each boot) is signed once per
+    program, a sole trace by design (lot 356); not coalesced.
+
+  *Evidence:* lot 376;
+  `a_rotated_log_is_judged_on_its_renamer_and_its_new_file_from_its_own_size`,
+  `sudo_s_own_read_before_its_exec_is_known_is_told_by_its_image`,
+  `a_user_manager_s_packaged_generator_reading_passwd_is_no_sensitive_access`,
+  `net_019_a_package_transaction_s_own_program_binding_the_wildcard_is_low`,
+  `fim_009_a_package_transaction_s_unit_writes_are_one_record_per_process_and_window`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

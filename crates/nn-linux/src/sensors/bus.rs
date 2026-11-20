@@ -2152,6 +2152,7 @@ mod tests {
             timestamp_ns: 0,
             path_from_user: false,
             kernel_class: 0,
+            exe_file: (0, 0),
         }
     }
 
@@ -3030,6 +3031,7 @@ mod tests {
                 timestamp_ns: 0,
                 path_from_user: false,
                 kernel_class,
+                exe_file: (0, 0),
             };
             use common::wire::open_sensor::open_reason;
             tx.send(write_open(open_reason::PERSIST)).await.unwrap();

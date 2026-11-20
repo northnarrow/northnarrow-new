@@ -713,6 +713,14 @@ impl<H: DecisionHost> TriggerDetector<H> {
         self.auth.interactive_admin_status(pid, as_of)
     }
 
+    /// Lot 376: the image the process `event` names executed, as the
+    /// lineage knows it as of the event ([`AuthSessionTracker::image_path_as`])
+    /// — for the POSTURE TRANSITION line ([`event_subject`]).
+    pub fn image_of(&self, event: &Event) -> Option<String> {
+        let pid = event_owner_pid(event)?;
+        self.auth.image_path_as(pid, AsOf::of_event(event))
+    }
+
     /// Review 52: a pending writer placed —
     /// [`AuthSessionTracker::interactive_admin_status`] and its session's
     /// scope — or `None` while it still cannot be. As of `as_of` (R12b,
@@ -1184,6 +1192,191 @@ pub fn event_kind(event: &Event) -> &'static str {
     }
 }
 
+/// Lot 376 (the rc9 soak: the posture rose to ALERTED at every boot, and the
+/// journal's POSTURE TRANSITION line named the trigger only — not which
+/// access raised it): what the event that moved the posture names — its kind
+/// ([`event_kind`]), its process (pid, uid, `comm`) and its object (the file,
+/// the protected object, the peer, the query, the canary). The process's
+/// executed image is the lineage's to say
+/// ([`TriggerDetector::image_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSubject {
+    pub kind: &'static str,
+    pub pid: Option<u32>,
+    pub uid: Option<u32>,
+    pub comm: Option<String>,
+    /// The file the event is about (an open's, an exec's, a write's, a
+    /// module's, a FIM change's).
+    pub path: Option<String>,
+    /// Any other object (a protected object's operation and inode, a
+    /// signal's target, a port, a query, a canary).
+    pub object: Option<String>,
+}
+
+/// Lot 376: [`EventSubject`] of `event`.
+pub fn event_subject(event: &Event) -> EventSubject {
+    let (pid, uid, comm, object): (Option<u32>, Option<u32>, Option<&str>, Option<String>) =
+        match event {
+            Event::ProcessSpawn {
+                pid,
+                uid,
+                comm,
+                filename,
+                ..
+            }
+            | Event::FileOpen {
+                pid,
+                uid,
+                comm,
+                filename,
+                ..
+            }
+            | Event::MassWrite {
+                pid,
+                uid,
+                comm,
+                filename,
+                ..
+            }
+            | Event::FileBurst {
+                pid,
+                uid,
+                comm,
+                filename,
+                ..
+            }
+            | Event::ExecCheck {
+                pid,
+                uid,
+                comm,
+                filename,
+                ..
+            } => (Some(*pid), Some(*uid), Some(comm), Some(filename.clone())),
+            Event::DefenderSignal {
+                pid,
+                uid,
+                comm,
+                target_pid,
+                signal,
+                ..
+            } => (
+                Some(*pid),
+                Some(*uid),
+                Some(comm),
+                Some(format!("signal {signal} to pid {target_pid}")),
+            ),
+            Event::ModuleLoad {
+                loader_pid,
+                loader_uid,
+                loader_comm,
+                path,
+                ..
+            } => (
+                Some(*loader_pid),
+                Some(*loader_uid),
+                Some(loader_comm),
+                path.clone(),
+            ),
+            Event::BpfSyscall {
+                pid,
+                uid,
+                comm,
+                cmd,
+                ..
+            } => (
+                Some(*pid),
+                Some(*uid),
+                Some(comm),
+                Some(format!("bpf command {cmd}")),
+            ),
+            Event::IoUring { pid, uid, comm, .. }
+            | Event::DnsFlood { pid, uid, comm, .. }
+            | Event::SensorFlood { pid, uid, comm, .. }
+            | Event::ExploitPostcondition { pid, uid, comm, .. } => {
+                (Some(*pid), Some(*uid), Some(comm), None)
+            }
+            Event::TcpConnect {
+                pid,
+                uid,
+                comm,
+                dst_port,
+                ..
+            } => (
+                Some(*pid),
+                Some(*uid),
+                Some(comm),
+                Some(format!("port {dst_port}")),
+            ),
+            Event::DnsQuery {
+                pid,
+                uid,
+                comm,
+                query_name,
+                ..
+            } => (Some(*pid), Some(*uid), Some(comm), Some(query_name.clone())),
+            Event::FsProtectDenial {
+                pid,
+                uid,
+                comm,
+                target_dev,
+                target_ino,
+                operation,
+                ..
+            } => (
+                Some(*pid),
+                Some(*uid),
+                Some(comm),
+                Some(format!("{operation} of dev {target_dev} ino {target_ino}")),
+            ),
+            Event::Fim(fe) => (
+                Some(fe.modifier_pid),
+                Some(fe.modifier_uid),
+                Some(&fe.modifier_comm),
+                Some(fe.path.clone()),
+            ),
+            Event::CanaryTripped {
+                accessor_pid,
+                accessor_uid,
+                accessor_comm,
+                canary_name,
+                ..
+            } => (
+                Some(*accessor_pid),
+                Some(*accessor_uid),
+                Some(accessor_comm),
+                Some(format!("canary {canary_name}")),
+            ),
+            Event::NetFlow(_)
+            | Event::NetListener(_)
+            | Event::NetInbound(_)
+            | Event::DnsAnswer(_)
+            | Event::TlsClientHello(_) => (event_owner_pid(event), None, None, None),
+        };
+    let is_path = matches!(
+        event,
+        Event::ProcessSpawn { .. }
+            | Event::FileOpen { .. }
+            | Event::MassWrite { .. }
+            | Event::FileBurst { .. }
+            | Event::ExecCheck { .. }
+            | Event::ModuleLoad { .. }
+            | Event::Fim(_)
+    );
+    let (path, object) = if is_path {
+        (object, None)
+    } else {
+        (None, object)
+    };
+    EventSubject {
+        kind: event_kind(event),
+        pid,
+        uid,
+        comm: comm.map(str::to_string),
+        path,
+        object,
+    }
+}
+
 fn recon_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     if let Event::ProcessSpawn { comm, .. } = focal {
         if RECON_TOOL_COMMS.iter().any(|c| comm == c) {
@@ -1313,6 +1506,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
         filename,
         flags,
         kernel_class,
+        exe_file,
         ..
     } = focal
     else {
@@ -1329,7 +1523,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // as well, before any other check — a web shell running as www-data
     // reading `/etc/shadow` raised nothing. It is judged on its own terms.
     if *uid < 1000 {
-        return service_uid_credential_read(*pid, filename, by_kernel, auth, as_of);
+        return service_uid_credential_read(*pid, *exe_file, filename, by_kernel, auth, as_of);
     }
     // T7.13 — an authentication chain opens /etc/shadow (or
     // /etc/gshadow) under the caller's uid: the LSM file_open hook can
@@ -1378,10 +1572,22 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     // A kernel-classed sensitive file under an unplaced root is named by
     // its path's tail (`mnt[…]/@/etc/passwd`).
     let is_passwd = filename == "/etc/passwd" || (by_kernel && filename.ends_with("/etc/passwd"));
-    if is_passwd && !is_write_open(*flags) && auth.has_valid_loginuid(*pid) {
+    // Lot 376 (Debian 13's lab: ALERTED at a reboot — podman's quadlet user
+    // generator's name lookup): or a packaged program its user's own service
+    // manager started (`user@<uid>.service`, whose PAM stack may set no login
+    // uid), by the lineage's records
+    if is_passwd
+        && !is_write_open(*flags)
+        && (auth.has_valid_loginuid(*pid) || auth.is_user_manager_program(*pid, *uid, as_of))
+    {
         return false;
     }
-    SENSITIVE_FILES.iter().any(|f| filename == f) || by_kernel
+    // Lot 376 (the rc9 soak: ALERTED at every boot): the auth stack's own
+    // read, its exec not in the cache yet — `sudo` reading `/etc/sudoers`
+    // right after the boot — told by the image the kernel recorded at the
+    // open (the reader itself only: its children read as themselves)
+    (SENSITIVE_FILES.iter().any(|f| filename == f) || by_kernel)
+        && !auth.is_auth_binary_image(*exe_file)
 }
 
 /// External audit POS-007: the credential files a service uid's read is
@@ -1422,6 +1628,7 @@ const INTERPRETER_EXES: &[&str] = &[
 /// `apache2`) reads as the daemon.
 fn service_uid_credential_read<H: PostureHost>(
     pid: u32,
+    exe_file: (u64, u64),
     filename: &str,
     by_kernel: bool,
     auth: &AuthSessionTracker<H>,
@@ -1430,7 +1637,8 @@ fn service_uid_credential_read<H: PostureHost>(
     let credential = SERVICE_UID_CREDENTIAL_FILES
         .iter()
         .any(|f| filename == *f || (by_kernel && filename.ends_with(f)));
-    if !credential || auth.is_credential_reader(pid, as_of) {
+    // lot 376: or the auth stack's own read by the image at the open
+    if !credential || auth.is_credential_reader(pid, as_of) || auth.is_auth_binary_image(exe_file) {
         return false;
     }
     auth.image_path_as(pid, as_of)
@@ -2534,6 +2742,7 @@ pub mod testutil {
             timestamp_ns: ts,
             path_from_user: false,
             kernel_class: 0,
+            exe_file: (0, 0),
         }
     }
 
@@ -2739,6 +2948,242 @@ mod tests {
         let focal = file_open(42, 1001, "/etc/shadow", 0, 1);
         let hits = det.detect(&focal, &[]);
         assert!(hits.contains(&TriggerType::SensitiveFileAccess));
+    }
+
+    /// Lot 376 (named, the rc9 soak: ALERTED at every boot, on Ubuntu 26.04,
+    /// 24.04 and Debian 13). The lab's POSTURE TRANSITION line named it:
+    /// `FileOpen` of `/etc/sudoers` by `sudo` at uid 1000, image `-` — the
+    /// first `sudo` of a session after the boot, its read judged before its
+    /// exec reached the lineage (a judgement reads the spawn cache only).
+    /// The kernel's record of the open now carries the opener's executable
+    /// at the open (`mm->exe_file`): the host's packaged `sudo`, in a
+    /// root-only directory, is the auth stack's own read — no trigger, at
+    /// a user's uid or a service uid. The attack shapes still fire: a
+    /// foreign reader named `sudo` (a copy, another inode), the same inode
+    /// in a directory others can write, no image read, and `cat` from a
+    /// session.
+    #[test]
+    fn sudo_s_own_read_before_its_exec_is_known_is_told_by_its_image() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        // no exec of pid 2282 in the cache: the boot's race
+        let auth = AuthSessionTracker::<IdTestHost>::new("/this/path/does/not/exist");
+        IdTestHost::set_file_id("/usr/bin/sudo", Some((STAT_DEV, 4242)));
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let fires = |uid: u32, path: &str, image: (u64, u64)| {
+            let mut e = file_open(2282, uid, path, 0, 5);
+            if let Event::FileOpen { comm, exe_file, .. } = &mut e {
+                (*comm, *exe_file) = ("sudo".into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let sudo = (KDEV, 4242);
+        for path in ["/etc/sudoers", "/etc/shadow", "/etc/login.defs"] {
+            assert!(!fires(1000, path, sudo), "sudo's own read of {path}");
+        }
+        assert!(!fires(33, "/etc/shadow", sudo), "at a service uid");
+        // the attack shapes
+        assert!(
+            fires(1000, "/etc/sudoers", (KDEV, 999)),
+            "a copy named sudo"
+        );
+        assert!(
+            fires(33, "/etc/shadow", (KDEV, 999)),
+            "a copy, a service uid"
+        );
+        assert!(fires(1000, "/etc/sudoers", (0, 0)), "no image read");
+        assert!(
+            fires(1000, "/etc/sudoers", (STAT_DEV, 4242)),
+            "the device in another form is another file"
+        );
+        IdTestHost::set_dir_root_only("/usr/bin", false);
+        assert!(
+            fires(1000, "/etc/sudoers", sudo),
+            "a directory others write"
+        );
+        IdTestHost::set_file_id("/usr/bin/sudo", None);
+    }
+
+    /// Lot 376 (named, the lab on Debian 13: ALERTED at a reboot, the line
+    /// naming `FileOpen /etc/passwd` by `podman-user-gen`, image
+    /// `/usr/libexec/podman/quadlet`, uid 1000, scope "unattributed"):
+    /// podman's quadlet user generator, run by the user's service manager
+    /// as it starts, looks up a name. Debian's `systemd-user` PAM stack sets
+    /// no login uid, so BUG-018's carve-out did not hold. A packaged program
+    /// the user's own manager started (the host's systemd, executed as the
+    /// user, PID 1's child) reading `/etc/passwd` read-only is no
+    /// sensitive access. The attack shapes still fire: the same program
+    /// opening it for write or reading `/etc/login.defs`; a program from a
+    /// home under the manager; a program under a copy of systemd or under a
+    /// manager run by hand from a shell; a shell the program runs; and
+    /// `cat /etc/passwd` from a context without a login uid.
+    #[test]
+    fn a_user_manager_s_packaged_generator_reading_passwd_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let (systemd, quadlet) = ("/usr/lib/systemd/systemd", "/usr/libexec/podman/quadlet");
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_file_id(quadlet, Some((STAT_DEV, 12)));
+        IdTestHost::set_file_id("/usr/bin/bash", Some((STAT_DEV, 13)));
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, true);
+        }
+        let exec = |pid: u32, ppid: u32, uid: u32, path: &str, ino: u64| {
+            let mut e = spawn_with_exe(pid, ppid, path, 1);
+            if let Event::ProcessSpawn {
+                uid: u,
+                exe,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                *u = uid;
+                (*start_ns, *timestamp_ns) = (u64::from(pid), u64::from(pid) + 1);
+                (exe.path, exe.dev, exe.ino, exe.flags) =
+                    (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+            }
+            assert!(auth.ingest_spawn_event(&e));
+        };
+        // user@1000.service: the packaged systemd, as 1000, PID 1's child
+        exec(900, 1, 1000, systemd, 11);
+        exec(901, 900, 1000, quadlet, 12);
+        // a program from a home under the manager
+        exec(902, 900, 1000, "/home/u/bin/gen", 14);
+        // a copy of systemd run as 1000 by PID 1, and its generator
+        exec(910, 1, 1000, "/home/u/systemd", 15);
+        exec(911, 910, 1000, quadlet, 12);
+        // the manager run by hand from a shell (950), and its generator
+        exec(950, 1, 1000, "/usr/bin/bash", 13);
+        exec(951, 950, 1000, systemd, 11);
+        exec(952, 951, 1000, quadlet, 12);
+        // a shell the generator runs
+        exec(903, 901, 1000, "/usr/bin/bash", 13);
+        // a manager running as another uid (root), and its generator
+        exec(920, 1, 0, systemd, 11);
+        exec(921, 920, 1000, quadlet, 12);
+        // the generator executed as another uid than it opens as
+        exec(930, 900, 1001, quadlet, 12);
+        let fires = |pid: u32, path: &str, flags: u32| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen { comm, .. } = &mut e {
+                *comm = "podman-user-gen".into();
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        assert!(
+            !fires(901, "/etc/passwd", 0),
+            "the manager's packaged generator"
+        );
+        assert!(fires(901, "/etc/passwd", 1), "opened for write");
+        assert!(fires(901, "/etc/login.defs", 0), "another file");
+        for (pid, what) in [
+            (902, "a program from a home"),
+            (911, "under a copy of systemd"),
+            (952, "under a manager run by hand"),
+            (903, "a shell the generator runs"),
+            (950, "a shell"),
+            (921, "under a manager of another uid"),
+            (930, "executed as another uid"),
+        ] {
+            assert!(fires(pid, "/etc/passwd", 0), "{what}");
+        }
+        for (path, _) in [(systemd, ()), (quadlet, ()), ("/usr/bin/bash", ())] {
+            IdTestHost::set_file_id(path, None);
+        }
+        for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
+            IdTestHost::set_dir_root_only(d, false);
+        }
+    }
+
+    /// Lot 376 (named, the rc9 soak: ALERTED at every boot through
+    /// `SensitiveFileAccess`, the journal naming the trigger only): the
+    /// event that moved the posture is named — its kind, its process (pid,
+    /// uid, comm, the image the lineage knows it executed) and its file or
+    /// object.
+    #[test]
+    fn the_event_that_raised_a_trigger_is_named() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(4242, 1, "/usr/bin/cat", 1), &[]);
+        let mut focal = file_open(4242, 1000, "/etc/shadow", 0, 2);
+        if let Event::FileOpen { comm, .. } = &mut focal {
+            *comm = "cat".into();
+        }
+        assert!(det
+            .detect(&focal, &[])
+            .contains(&TriggerType::SensitiveFileAccess));
+        assert_eq!(
+            event_subject(&focal),
+            EventSubject {
+                kind: "FileOpen",
+                pid: Some(4242),
+                uid: Some(1000),
+                comm: Some("cat".into()),
+                path: Some("/etc/shadow".into()),
+                object: None,
+            }
+        );
+        assert_eq!(det.image_of(&focal).as_deref(), Some("/usr/bin/cat"));
+        // a refused read of the agent's key names the operation and inode
+        let denial = Event::FsProtectDenial {
+            pid: 77,
+            uid: 0,
+            comm: "tar".into(),
+            target_dev: 8,
+            target_ino: 1234,
+            operation: nn_model::FsProtectOperation::Read,
+            timestamp_ns: 3,
+        };
+        let s = event_subject(&denial);
+        assert_eq!(
+            (s.kind, s.pid, s.uid),
+            ("FsProtectDenial", Some(77), Some(0))
+        );
+        assert_eq!(s.comm.as_deref(), Some("tar"));
+        assert_eq!(s.path, None);
+        let object = s.object.expect("the protected object");
+        assert!(object.contains("ino 1234"), "{object}");
+        // a FIM change names its writer and its path
+        let fe = nn_model::telemetry::FimEvent {
+            timestamp_ns: 4,
+            path: "/etc/sudoers".into(),
+            op: nn_model::telemetry::FimOp::Modified,
+            new_sha256: None,
+            baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: None,
+            modifier_pid: 9,
+            modifier_uid: 1000,
+            modifier_comm: "vim".into(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
+            capability: None,
+            attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
+            appends_only: false,
+            truncated_by_another: false,
+            unchanged_since_read: false,
+            modifier_start: 0,
+        };
+        let s = event_subject(&Event::Fim(fe));
+        assert_eq!((s.kind, s.pid, s.uid), ("Fim", Some(9), Some(1000)));
+        assert_eq!(
+            (s.comm.as_deref(), s.path.as_deref()),
+            (Some("vim"), Some("/etc/sudoers"))
+        );
     }
 
     /// External audit POS-007: root's read is routine; a service uid's is

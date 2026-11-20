@@ -198,12 +198,24 @@ pub(crate) fn process_event(
         // `firing_trigger` is `Some` for any upward crossing and `None`
         // for same-tier re-arms; the latter case still gets a log line
         // because the kind() display alone is enough to follow state.
+        // Lot 376 (the rc9 soak: ALERTED at every boot, the trigger alone
+        // named): and the event that raised it — its kind, its process (pid,
+        // uid, comm, the image the lineage knows it executed) and its object.
+        let subject = nn_core::posture::triggers::event_subject(&event);
+        let image = posture.image_of(&event);
         warn!(
             state = %new_state.kind(),
             // External audit POS-001: a COMBAT reached on heuristics alone
             // is unlocked — no isolation, and it decays once quiet.
             locked = new_state.is_combat_locked(),
             trigger = ?firing_trigger,
+            event = subject.kind,
+            pid = ?subject.pid,
+            uid = ?subject.uid,
+            comm = %Escaped(subject.comm.as_deref().unwrap_or("-")),
+            image = %Escaped(image.as_deref().unwrap_or("-")),
+            path = %Escaped(subject.path.as_deref().unwrap_or("-")),
+            object = %Escaped(subject.object.as_deref().unwrap_or("-")),
             "POSTURE TRANSITION"
         );
         // On the non-Combat → Combat edge the combat-entry hook, inside

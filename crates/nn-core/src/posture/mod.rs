@@ -457,6 +457,13 @@ impl<H: DecisionHost> PostureMachine<H> {
         self.inner.triggers.interactive_admin_status(pid, as_of)
     }
 
+    /// Lot 376: the image the process `event` names executed, as the
+    /// lineage knows it — the POSTURE TRANSITION line's
+    /// ([`triggers::TriggerDetector::image_of`]).
+    pub fn image_of(&self, event: &Event) -> Option<String> {
+        self.inner.triggers.image_of(event)
+    }
+
     /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
     /// Set once; a second call is ignored.
     pub fn on_combat_decay(&self, hook: CombatDecayHook) {

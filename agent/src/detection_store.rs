@@ -1941,6 +1941,7 @@ mod tests {
             timestamp_ns: 789,
             path_from_user: false,
             kernel_class: 0,
+            exe_file: (0, 0),
         }
     }
 

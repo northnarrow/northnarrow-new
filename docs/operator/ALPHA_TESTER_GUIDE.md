@@ -317,6 +317,14 @@ an unlocked COMBAT 30 minutes after its last signal. A COMBAT shown as
 `sudo nn-admin unlock --key "$KEY"`
 ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md) §3). Under `alpha`, COMBAT is
 entered and recorded but never isolates the host.
+To see what raised the posture, read the agent's `POSTURE TRANSITION`
+lines: each names the trigger and the event behind it — its kind, pid,
+uid, `comm`, the program the agent knows it ran (`image`) and the file
+(`path`) or other object (lot 376):
+
+```sh
+sudo journalctl --namespace=northnarrow -u northnarrow-agent --no-pager | grep 'POSTURE TRANSITION'
+```
 
 **If the agent does not run**, `sudo nn-admin status` exits 5 (17 means a
 permission was denied: run it with `sudo`). Look at:

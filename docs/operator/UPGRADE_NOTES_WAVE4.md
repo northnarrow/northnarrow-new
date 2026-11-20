@@ -4975,3 +4975,114 @@ still fires.
     on the RPM family, `newuidmap`'s `cap_setuid` at each `shadow-utils`
     install or upgrade.
 
+
+## 62. The rc9 soak's false positives: a rotated log's first record, the boot-time posture rise, `pg_createcluster`, Low noise (lot 376)
+
+The rc9 soaks (Ubuntu 26.04, Ubuntu 24.04, Debian 13) left three false
+positives and two noisy Low rules. Each is judged by identity — the kernel's
+facts about the process, its lineage and its binary — and each attack shape
+it resembles still fires.
+
+- **`NN-L-FIM-005` High by rsyslogd at a cold boot's shutdown** (P2). The
+  writer's identity was not the cause: lot 373's kernel record of the
+  writer's image was there. The cause was the log rotation hours before.
+  - logrotate's `create` renames the log away and puts a new file at its
+    path. The FIM drain watched the new file with no check and without
+    reading its size.
+  - Its first record — rsyslogd's next close, often its last flush at the
+    shutdown — was measured against the OLD file's baseline: a "shrink" by
+    rsyslogd, High. It was the rotation's shrink, judged late and on the
+    wrong writer. The soak's logs rotated by the bench's `logrotate -f` gave
+    it at the cold boot's shutdown. Reboots before any rotation gave none.
+  - Now, when the rename of a watched file lands with another file at its
+    path, the new file's size is read as it is watched (as at the start),
+    so rsyslogd's appends to it are appends.
+  - The rotation is checked once, as the renamer's modification of the path
+    (the check FIMR-004 makes of a file renamed over a watched one).
+    logrotate by hand: `NN-L-FIM-005` High, now on logrotate, and for
+    `wtmp`/`btmp` `NN-L-FIM-019` High with its kill (would-have under
+    `alpha`), lot 340's verdict for a rotation by hand. Under its timer or
+    cron's daily run: Low (lot 340).
+  - The same check applies to any watched file renamed away with another
+    file put at its path, such as an editor's backup rename of
+    `sshd_config`: it is a change of the path by the renamer. A runtime
+    child of a watched directory is left to its directory's own event.
+  - Still High: a truncation of a log by any other writer (`truncate -s 0
+    /var/log/auth.log` by a `/tmp` binary in the lab), a log moved away with
+    a forged file put in its place.
+- **The posture rose to ALERTED at every boot** (P2), through
+  `SensitiveFileAccess`.
+  - The `POSTURE TRANSITION` line now names the event: its kind, pid, uid,
+    `comm`, the image the lineage knows the process ran (`image`), and its
+    file (`path`) or other object.
+  - In the lab it named `FileOpen` of `/etc/sudoers` by `sudo`, at uid 1000,
+    `image=-`: the first `sudo` of a session after the boot. setuid `sudo`
+    reads its policy at the invoking user's uid, and the read was judged
+    before its exec reached the lineage (a judgement reads the spawn cache
+    only).
+  - The LSM file-open sensor's record now carries the opener's executable
+    at the open (`mm->exe_file`: device, inode). When the cache has no exec
+    for the reader, the posture tells the auth stack's own read by that
+    image: the host's file of an authentication binary (`sudo`, `su`,
+    `passwd`, `unix_chkpwd`, …) in a directory root's and writable by no one
+    else. This holds at a user's uid and at a service uid.
+  - The reader itself only: a session's shell and what it runs read as
+    themselves (POS-002). Still ALERTED: `cat /etc/login.defs` from a
+    session, a copy of a binary named `sudo`, the same inode in a directory
+    others can write, and a read whose image was not recorded.
+  - On Debian 13 the line then named a second access at a reboot:
+    `FileOpen /etc/passwd` by podman's quadlet user generator
+    (`/usr/libexec/podman/quadlet`, uid 1000). The user's service manager
+    runs the generator as it starts, for a name lookup. Debian's
+    `systemd-user` PAM stack sets no login uid, so BUG-018's carve-out for
+    `/etc/passwd` did not hold.
+  - That carve-out now also holds, by the lineage's records, for a packaged
+    program (the host's file in a root-only directory, executed as the
+    user) that the user's own service manager started. The manager must be
+    the host's `systemd`, executed as the user, as PID 1's child
+    (`user@<uid>.service`).
+  - For that program, still ALERTED: opening `/etc/passwd` for write and
+    reading `/etc/login.defs`.
+  - Still ALERTED: a program from a home under the manager; a program under
+    a copy of systemd, under a manager run by hand from a shell, or under a
+    manager of another uid; and a shell the program runs.
+- **`NN-L-NET-019` and `NN-L-NET-006` Medium from `pg_createcluster`** (P3).
+  PostgreSQL's postinst runs `pg_createcluster`, whose search for a free
+  port binds the wildcard address of 5432 (IPv4 and IPv6). That bind is now
+  Low when all of these hold:
+  - the file the kernel executed (a `#!` script's own file,
+    `/usr/bin/pg_createcluster`) is the host's file at its path, in a
+    root-only directory, as lot 348 tells a script;
+  - it is installed in a root-owned system tree (an interpreter's script
+    there too);
+  - it was executed by root and listens as root;
+  - a live package transaction run by root covers it.
+
+  A root listener's Medium record now names the fact that was missing. Still
+  Medium: a `/tmp` binary the postinst runs, `perl -e`, the same program
+  after the transaction or run by hand from a session, another file at the
+  path, and a user's `python3 -m http.server`.
+- **Low noise.**
+  - `NN-L-FIM-009`: a package transaction's unit writes (104 Low records in
+    one `apt-get` hour on Ubuntu 24.04) are now one record per
+    package-manager process within 15 minutes. The others are counted as
+    coalesced: the next record's count, and the reporter's signed entry with
+    their paths. This is lot 352's coalescing of the module trees
+    (`NN-L-FIM-008`), now shared. 20 records for one PostgreSQL install in
+    the lab became 1. A unit dropped outside the transaction keeps its
+    verdict, every time.
+  - `NN-L-AT-001`'s ~30 Low records at each boot are unchanged. They are
+    the BPF cross-view's baseline of systemd's programs, signed once per
+    program, and lot 356 made them sole traces, never budgeted, so that
+    each program a window let through stays named. Coalescing them by
+    program kind is a design left for after the alpha (the PR describes it).
+- **Upgrade.** No configuration. The open sensor's ring record grows from
+  632 to 648 bytes (the kernel object and the agent are one build).
+  - Expect no `NN-L-FIM-005` at shutdown after a rotation, and an
+    unchanged posture after a reboot.
+  - A hand `logrotate -f` gives `NN-L-FIM-005` High on logrotate, at the
+    rotation. For `wtmp`/`btmp` it also gives `NN-L-FIM-019` High (lot
+    340's verdict for a rotation by hand, its kill a would-have under
+    `alpha`).
+  - Expect one `NN-L-FIM-009` Low record per package-manager process in a
+    transaction, and Low for a package's own free-port probe.
