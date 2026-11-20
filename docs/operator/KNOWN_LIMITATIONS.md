@@ -432,13 +432,18 @@ not cause as an incident.
     a window stays `role_vacated`.
   - The watchdog's vacancy and its successor are signed by the live agent
     (`watchdog_gone`, then `watchdog_succession` or
-    `watchdog_successor_foreign`). When a role was vacated earlier in the
-    boot, each role's start judges the other role's process once, when it
-    took its role while the judging role was vacant. A library replaced on
+    `watchdog_successor_foreign`). Each role's start judges the other
+    role's process at every start: one that is not its unit's clean
+    restart is signed (`…_successor_foreign`) and the agent's start does
+    not register a watchdog it finds so, whatever an earlier holder
+    concluded — an earlier refusal never lapses with the holder that made
+    it. A verdict that the process is clean is signed only when it took
+    its role while the judging role was vacant. A library replaced on
     disk since a process mapped it is judged by identity: not the judging
     role's own copy, it is signed High (`role_successor_unconfirmed`,
-    `watchdog_successor_unconfirmed`), and the process keeps its
-    registration.
+    `watchdog_successor_unconfirmed`) for such a successor, and the
+    process keeps its registration; a long-running process that an
+    earlier holder saw take its role is not signed for it.
   - When both roles were vacated, the next agent start signs the gap it
     finds (`roles_vacated_gap`), or a note when the operator released both
     (`roles_released`).
@@ -486,7 +491,12 @@ not cause as an incident.
   `the_gate_holds_nothing_inside_a_signed_window_and_adopts_the_host`;
   `systemd_s_copy_of_the_agent_s_unit_is_judged_before_a_start`;
   `a_library_the_preload_list_names_that_became_loadable_holds`;
-  `a_successor_is_judged_once_by_the_next_start_of_the_other_role`;
+  `a_succession_is_the_other_role_s_process_taken_while_this_role_was_vacant`;
+  `a_successor_refused_by_an_earlier_holder_is_judged_again_at_the_next_start`;
+  `a_watchdog_an_earlier_agent_refused_is_refused_again_at_the_next_agent_start`;
+  `a_watchdog_successor_no_agent_judged_is_judged_at_the_next_agent_start`;
+  `a_long_running_watchdog_given_at_an_agent_start_is_registered_with_nothing_signed`;
+  `a_watchdog_refused_while_its_slot_was_vacated_is_judged_again_once_it_holds_the_slot`;
   `a_library_replaced_since_it_was_mapped_is_judged_by_identity`;
   `a_torn_append_of_the_watchdog_s_own_is_repaired_and_said_torn`;
   `inside_a_window_only_a_clean_stop_is_the_operator_s`;

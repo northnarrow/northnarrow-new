@@ -11765,6 +11765,11 @@ number in parentheses is a lab PR.
       life; only a clean stop inside a window is the operator's, a signed
       stop counts only this boot.
     - R9-1 stays open (partial) for the alpha (KNOWN_LIMITATIONS, §61).
+  - The re-check 2 of #582, fix round 3:
+    - R2-1: the other role's process judged at every start; a verdict of
+      foreign never inherited from an earlier holder (the agent's start
+      does not register such a watchdog, and keeps judging one it
+      refused); a clean verdict signed only for a succession nobody judged.
   - Lab (as measured): @LAB@
 - **Lot 373 — the rc7 soaks' false positives: the agent's own runtime
   files, a read-only BPF listing, shutdown writes, package setcap, NTP, a
