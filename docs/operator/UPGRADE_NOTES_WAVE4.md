@@ -4736,7 +4736,7 @@ left too little trace.
   leaking agent outlives every other process (the workload and `sshd`
   included), which the OOM killer picks first. A drop-in that sets a
   higher value is judged harmful. A role (the agent's, the watchdog's)
-  whose holder exited this boot is taken by a successor started for it (by PID 1 or by the other role's holder), and the taking is recorded NN-L-BPF-002: High outside a signed
+  whose holder exited this boot is taken by a successor started for it (by PID 1 or by the other role's holder; since lot 374, §61, only by its own unit's restart, witnessed by the surviving role), and the taking is recorded NN-L-BPF-002: High outside a signed
   trusted-installer window, Low inside one (an upgrade's restart); a first
   start of the boot stays Low. The review of #578 (N2): the agent's own
   successor's record was never delivered — its handles on the pins are
@@ -4975,3 +4975,207 @@ still fires.
     on the RPM family, `newuidmap`'s `cap_setuid` at each `shadow-utils`
     install or upgrade.
 
+## 61. The vacated role's successor is witnessed and bound to its unit (lot 374)
+
+A kill nothing can refuse (the OOM killer, a crash) ends the agent or the
+watchdog and leaves its role vacated until a successor takes it. Until
+this version the successor's record was the successor's own: written at
+its start, by the process that took the role. Now the role that survives
+signs it, and the successor must be its unit's own restart.
+
+- **The watchdog's witness chain.** The watchdog makes an Ed25519 key at
+  its start and keeps it in its memory for its life; its public half is in
+  a sealed memory file of the watchdog's. It signs, in
+  `/var/lib/northnarrow/witness/witness.chain`:
+  - `role_vacated`: the agent exited — its pid, the cause as systemd
+    recorded it for that process (the OOM killer, a signal, an exit
+    status; "not known" when systemd has not recorded it in time), what
+    the shutdown marker said, and what the host would give a successor
+    (below); `role_released` instead for a shutdown the admin quorum
+    signed, `role_released_in_window` for an exit inside a signed
+    trusted-installer window (the operator's restart or stop);
+  - `role_succeeded` (its unit's clean restart) or `role_successor_foreign`
+    (anything else, which holds the role the kernel gave it; the watchdog
+    does not re-register it): the process that took the role — its pid,
+    parent and cgroup, and the loader variables and executable mappings
+    not expected that it shows (names only);
+  - `role_respawn_held`: a start of the agent the watchdog held (below);
+    `respawn_gate_reference_moved` (a note): the host as a signed
+    trusted-installer window left it became the reference of the
+    watchdog's later judgements;
+  - `role_taken_by_another_start` (High): the agent's role taken by a
+    start the watchdog did not make — the process had started before the
+    watchdog judged the host, outside a window; the host is recorded as
+    read after that start;
+  - `role_successor_unconfirmed` (High): the unit's clean restart, but a
+    library it maps was replaced on disk since it mapped it and is not the
+    watchdog's own copy (re-registered all the same);
+  - `witness_chain_cut`: the chain no longer ended at the watchdog's last
+    row (it is set aside under a name of its own, a new chain begins);
+    `witness_chain_torn` (a note): an append of the watchdog's failed
+    part-way and its partial row was removed;
+  - `role_found_vacant`: a watchdog start that found the agent's role
+    already vacated; `witness_opened`: each watchdog life's first row, with
+    the host as that start read it.
+  The agent certifies the key from the watchdog's own descriptor table and
+  imports every row it can verify into its audit log at each of its
+  rounds: a vacancy outside a window, a successor that is not its unit's
+  clean restart, a held start and a cut chain as `witness_row`
+  (`integrity_drift`, High); the key's certification, a life's first row,
+  a release and a clean restart as notes (op `witness`:
+  `witness_key_certified`, `witness_note`). A row changed, a chain that no
+  longer holds the last row imported, or a row signed by a key it never
+  certified is High (`witness_chain_broken`, `witness_row_uncertified`). A
+  watchdog that cannot open its witness records it, and the agent signs
+  `witness_unavailable` (High). See `EVIDENCE_CHAINS.md`.
+- **The chain is the watchdog's alone.** The kernel refuses the agent, a
+  worker and every other process a write, truncation, rename, link or
+  removal of it outside a trusted-installer window; the agent reads it and
+  writes only its import position beside it. The watchdog checks that the
+  chain still ends at its last row before each row it signs and at a
+  regular interval, and moves it aside (`witness.chain.1`) before it grows
+  past what is read, within a life as at its start; the agent's import
+  continues in the moved chain.
+- **The watchdog's successor**, judged by the agent at its next round: its
+  unit's restart with clean marks and nothing foreign is registered and
+  signed as a note (`watchdog_succession`; the death itself is
+  `watchdog_gone`, as before); anything else holds the role the kernel gave
+  it and registers itself, and the agent neither registers nor exempts it
+  (`watchdog_successor_foreign`, High); its unit's clean restart with a
+  library replaced on disk since it mapped it, not the agent's own copy,
+  is registered and signed High (`watchdog_successor_unconfirmed`).
+- **Each role's start judges the other.** The kernel marks a role vacated
+  once its holder exits, and when, in maps the agent's load freezes (no
+  process's handle writes them after; one read not frozen is not known,
+  and the start signs `role_marks`); no claim clears the mark. The
+  watchdog's start and the agent's judge the other role's process at
+  every start. One that is not its unit's clean restart is recorded, and
+  the agent does not register such a watchdog, whatever an earlier holder
+  concluded: a refusal does not lapse when the agent restarts. A clean
+  verdict is recorded when the process took its role while their own role
+  was vacant, as after a death they saw; a process an earlier holder saw
+  start is not recorded again. A library replaced on disk since a process
+  mapped it (a package upgrade leaves it "(deleted)") is judged by
+  identity, never foreign on that alone. Marks a start cannot read are
+  judged, and recorded.
+- **Both roles vacated.** An agent start that finds both roles vacated
+  signs the gap (`roles_vacated_gap`, High) — or a note (`roles_released`)
+  when the operator released both: both last exits inside a signed window
+  (the guide's maintenance stop), or a shutdown the admin quorum signed
+  this boot. Inside a window only a clean stop (exit status 0 or SIGTERM,
+  or that stop cut at its deadline: exit status 75, the agent signs
+  `stop_deadline`) is the operator's: an OOM kill or a crash during an
+  upgrade's window stays `role_vacated`.
+- **Bound to its unit.** The kernel gives a vacated role's rights (its
+  handles on the agent's maps) only to a child of PID 1 running in that
+  role's own unit cgroup under `northnarrow.slice`, with clean lot 277/281
+  marks — in or out of a trusted-installer window. A child of the other
+  role, a transient unit or a shell gets nothing. The watchdog gives its
+  defensive re-registration of a new agent, and the agent its registration
+  of a new watchdog, only to its unit's clean restart. The kernel reads the
+  cgroup through three new BTF offsets (`task_struct.cgroups`,
+  `css_set.dfl_cgrp`, `cgroup.kn`; optional: without one, no vacated role
+  is taken again this boot).
+- **The host before each start the watchdog makes.** Before it starts the
+  agent again — after a vacancy, or as a hold's retry — the watchdog reads
+  `/etc/ld.so.preload` and each library it names, the drop-ins that reach
+  our units and change their code (their environment, their commands,
+  their memory's protection, their root), and systemd's copy of the
+  agent's unit (the drop-ins it loaded, its environment, the variables it
+  unsets, its commands, its memory's protection), and compares them with
+  what it read at its own start (signed in its first row). One that is new
+  or changed since — a drop-in systemd loaded that is no longer on disk
+  included — holds the start (`role_respawn_held`; the agent signs
+  `watchdog_respawn_held`, High) until an operator starts the agent or the
+  host is as it was; one that was already there (another vendor's own
+  preload list) is recorded, not held. Inside a signed trusted-installer
+  window nothing is held (the guide's `systemctl edit` and restart), and
+  the host as the operator leaves it there becomes the reference, signed
+  (`respawn_gate_reference_moved`): a later start in the same watchdog
+  life is judged against the host as the operator left it. A change made
+  outside a window stays a difference for that watchdog's life.
+- **Nothing given before `main` openly.** The agent, watchdog and
+  watchdog-failed units unset the dynamic loader's and the C library's
+  variables (`UnsetEnvironment=`: `LD_PRELOAD`, `LD_AUDIT`,
+  `LD_LIBRARY_PATH`, `GLIBC_TUNABLES`, `GCONV_PATH`, `LOCPATH`, the
+  `MALLOC_` tunables and the rest of glibc's list), applied last whatever
+  the service manager's environment or a drop-in sets, and deny memory
+  both writable and executable (`MemoryDenyWriteExecute=yes`); the
+  transient unit the agent starts for the pin lock unsets the variables
+  too. A drop-in that clears the list or turns the denial off is
+  `unit_dropin_harmful`. Each start checks its own environment and
+  executable mappings before it takes its role: a loader variable, a
+  library the release does not link (the release gate's list: glibc's
+  libraries, its loader, `libgcc_s` — each judged by what it is, so a
+  distribution's versioned file its name links to is the library) or
+  executable memory no file backs refuses it. `MemoryDenyWriteExecute=`
+  is read as systemd reads a boolean (`n`, `No`, `FALSE`: off), and the
+  agent's start signs a degradation when systemd's copy of either unit has
+  it off (`units_mdwe`). The agent signs
+  `start_self_check` in its refusal chain and exits 78; the watchdog exits
+  16 and leaves a record the agent signs (`watchdog_start_refused`, High).
+  The check runs inside the starting process: it refuses a start given
+  such code openly.
+- **What is not yet guaranteed.** A successor that runs code root gave it
+  before its start, and that hides it, is not reliably told from its
+  unit's clean restart; what it signs then, its import of the watchdog's
+  rows included, is not evidence, and neither is the absence of the
+  watchdog's rows about it. The watchdog's judgement of the host covers
+  the starts it makes: a start it did not make is recorded after it, not
+  prevented. While the watchdog is gone too, or runs without its witness,
+  the agent's vacancy is recorded by its successor's start
+  (`previous_run`, the succession record) and by the gap the next start
+  finds, and a change to the chain made while no watchdog runs is not
+  always detected. On a host
+  without systemd (the watchdog's `exec` backend) a vacated role is not
+  taken again until the next boot. The agent judges a process that takes
+  the watchdog's role at its next round; the kernel's guard refuses one
+  outside the unit at once.
+- **Upgrade.** No configuration. The units change (`UnsetEnvironment=`,
+  `MemoryDenyWriteExecute=yes`; the watchdog's `ReadWritePaths=` adds
+  `-/var/lib/northnarrow/witness`): `install.sh --upgrade` installs them.
+  The agent makes the witness directory at its start, before the
+  watchdog's. The kernel object and the agent are one build (three BTF
+  offset slots added, three pinned maps added: `ROLE_MARKS`, `ROLE_EXITS`
+  — both frozen at the agent's load — and `ROLE_WRITE_INODES`).
+  - Expect one `witness_key_certified` and one `witness_note` (the first
+    row) per watchdog start, under the new audit op `witness`.
+  - Expect a `witness_row` (High) for each agent exit the watchdog sees
+    outside a signed window that is not a signed shutdown, then a
+    `witness_note` for its unit's restart; a `witness_note` for a clean
+    stop inside a window (the documented restart), and one when the window
+    moved the gate's reference; a `watchdog_succession` note after each
+    watchdog restart.
+  - A unit drop-in or a manager environment that set a loader variable for
+    the agent or the watchdog no longer reaches them; one that a test
+    harness relied on (a `LD_LIBRARY_PATH` for a build's own libraries)
+    now refuses the start.
+  - A host with a preload list of its own (`/etc/ld.so.preload`, another
+    vendor's agent or a command logger): every start of the agent and of
+    the watchdog maps the libraries it names and refuses itself
+    (`start_self_check`, `watchdog_start_refused`). Check for one before
+    the upgrade; the host stays on the previous version while it is
+    needed.
+  - The integrity round compares the agent's limits with its unit's again
+    (NN-AUD-113: the cgroup it compared with named `system.slice` since the
+    units moved to `northnarrow.slice`) and makes the pin lock again when
+    the unit started without it.
+  - Both units set `OOMPolicy=continue` (fix round 6, from the lab). The
+    kernel's OOM killer picks an agent worker first (`oom_score_adj`
+    1000), and the agent respawns the worker. Under systemd's default
+    (`stop`) one worker's OOM kill made systemd stop the agent's unit. The
+    task_kill hook refused that stop outside a window. The unit stayed
+    `failed`, with the agent still running and no main PID, and every
+    start failed with `Result=resources` until the agent exited. The
+    agent's own OOM kill is now recorded as its exit (`signal 9`,
+    `Result=signal`; before, systemd failed the unit before it reaped the
+    agent and the vacancy's cause read "not known"). When the agent died
+    of SIGKILL and the slice's `oom_kill` count
+    (`northnarrow.slice/memory.events`) rose during its life, the
+    watchdog notes the count and says the cause is not known: the count
+    also counts the workers, so it never names the OOM killer as the
+    agent's (re-check 7).
+  - A host drop-in that sets `OOMPolicy=stop` (or `kill`) for every
+    service, or for our units, is judged harmful (`unit_dropin_harmful`,
+    the `host_dropins` degradation). Remove it before a window's
+    `daemon-reload`.

@@ -1390,6 +1390,143 @@ fn heads(records: &[&String]) -> Vec<String> {
         .collect()
 }
 
+/// Lot 374 (the witness record when the agent dies): the watchdog, the
+/// surviving role, signs each vacancy of the agent's role and the process
+/// that takes it in its own chain — never the successor's to write — and
+/// the next agent imports the rows into its signed audit log. The first
+/// agent is the test's (no wait of the watchdog's: its cause not known);
+/// its successor is the watchdog's child (the exec backend: a signal the
+/// wait reports, and not its unit's restart).
+///
+/// Fix round 4 of #582 (its KVM suites): the watchdog signs a successor
+/// once that start is over — seconds after the respawn the agent's pidfile
+/// shows — so the rows are waited for, not read at once. And the watchdog
+/// here is the test's, not its unit's restart: the agent judges it at its
+/// start (the review of #582, F3 and F6; the re-check 3, R2-1), signs
+/// `watchdog_successor_foreign` and does not register it — so it vouches
+/// for no key of it, and imports its rows as `witness_row_uncertified`
+/// (High: the watchdog's claim alone). The kinds are matched whole: the old
+/// `contains("witness_row")` took an uncertified row for a certified one.
+/// The certified import — a unit's watchdog, its key read from its sealed
+/// memory file — is the lab's `witness_open` case and nn-linux's
+/// `witness_rows_are_imported_once_after_their_key_is_certified`.
+///
+/// Fix round 5 of #582: the verdict was only logged on both CI guests — the
+/// agent's watchdog refresh judged the watchdog at its first round, a few
+/// ms before the start handed it the audit log. It has the log from its
+/// spawn now (the agent's `the_watchdog_refresh_signs_from_its_first_round`).
+#[test]
+fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
+    use nn_proto::witness::{
+        judge_chain, Judged, CHAIN_FILE, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
+    };
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let wd_pid: u32 = fs::read_to_string(fx.watchdog_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("watchdog pidfile");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !dump_protected_pids().contains(&wd_pid) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    fx.unprotect_and_sigkill_agent(pid0);
+    let pid1 = new_agent_pid(&fx, pid0, Duration::from_secs(30)).expect("no successor of pid0");
+    // the successor's start over (its own registration) before its kill
+    std::thread::sleep(Duration::from_secs(5));
+    fx.unprotect_and_sigkill_agent(pid1);
+    let pid2 = new_agent_pid(&fx, pid1, Duration::from_secs(30)).expect("no successor of pid1");
+    let chain = fx.state().witness_dir().join(CHAIN_FILE);
+    let read = |p: &Path| {
+        let out = Command::new("sudo")
+            .arg("cat")
+            .arg(p)
+            .output()
+            .expect("sudo cat");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let wanted = [
+        (KIND_VACATED, format!("the agent (pid {pid0}) exited")),
+        (KIND_SUCCESSOR_FOREIGN, format!("taken by pid {pid1}:")),
+        (KIND_VACATED, format!("the agent (pid {pid1}) exited")),
+        (KIND_SUCCESSOR_FOREIGN, format!("taken by pid {pid2}:")),
+    ];
+    let has = |rows: &[nn_proto::witness::Row], kind: &str, needle: &str| {
+        rows.iter()
+            .position(|r| r.kind == kind && r.detail.contains(needle))
+    };
+    // the successor's row follows its start (its registration): waited for
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let rows: Vec<nn_proto::witness::Row> = loop {
+        let rows: Vec<nn_proto::witness::Row> = judge_chain(&read(&chain))
+            .into_iter()
+            .map(|j| match j {
+                Judged::Valid { row, .. } => row,
+                Judged::Broken { line, why } => {
+                    panic!("witness chain broken at line {line}: {why}")
+                }
+            })
+            .collect();
+        if wanted.iter().all(|(k, n)| has(&rows, k, n).is_some()) || Instant::now() >= deadline {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let find = |kind: &str, needle: &str| {
+        has(&rows, kind, needle)
+            .map(|i| &rows[i])
+            .unwrap_or_else(|| panic!("no {kind} row naming `{needle}` in {} rows", rows.len()))
+    };
+    assert!(
+        rows.iter().all(|r| r.tgid == wd_pid),
+        "signed by the watchdog"
+    );
+    find(KIND_VACATED, &wanted[0].1);
+    let s1 = find(KIND_SUCCESSOR_FOREIGN, &wanted[1].1);
+    assert!(
+        s1.detail.contains("NOT its unit's restart"),
+        "the watchdog's child is not its unit's restart"
+    );
+    let v1 = find(KIND_VACATED, &wanted[2].1);
+    assert!(v1.detail.contains("signal 9"), "the wait's cause");
+    find(KIND_SUCCESSOR_FOREIGN, &wanted[3].1);
+    // imported by the agent into its signed audit log — the kinds whole
+    let kind = |k: &str| format!("\"kind\":\"{k}\"");
+    let needle = &wanted[2].1;
+    // the agent's round every 30 s, its first before its audit log is open
+    let deadline = Instant::now() + Duration::from_secs(70);
+    let audit = loop {
+        let audit = read(&fx.state().audit_log());
+        if audit
+            .lines()
+            .any(|l| l.contains(&kind("witness_row_uncertified")) && l.contains(needle.as_str()))
+        {
+            break audit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the witness rows never reached the audit log"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let judged = format!("taken by pid {wd_pid}: NOT its unit's restart");
+    assert!(
+        audit
+            .lines()
+            .any(|l| l.contains(&kind("watchdog_successor_foreign")) && l.contains(&judged)),
+        "the agent did not sign its verdict on the test's watchdog (not its unit's restart)"
+    );
+    assert!(
+        !audit.contains(&kind("witness_key_certified")),
+        "the key of a watchdog the agent does not register was certified"
+    );
+    assert!(
+        !audit.contains(&kind("witness_row")),
+        "a row signed by a key the agent never certified was imported as certified"
+    );
+}
+
 /// Lot 344 (the alpha's false positives, item 1): a freshly started
 /// watchdog opens `PROTECTED_PIDS`' pin to register itself before it is
 /// a protected pid. The `bpf` hook let that through (the watchdog's

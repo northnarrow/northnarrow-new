@@ -392,6 +392,16 @@ pub(crate) struct Cli {
     )]
     pub(crate) detections_file: PathBuf,
 
+    /// Lot 374: the directory of the watchdog's witness chain (made at the
+    /// start, protected with the state directory's chains; the watchdog's
+    /// `--witness-dir`).
+    #[arg(
+        long = "witness-dir",
+        value_name = "DIR",
+        default_value = nn_proto::witness::WITNESS_DIR,
+    )]
+    pub(crate) witness_dir: PathBuf,
+
     /// Tappa 9.0.c: configurable path of the chained status-event log
     /// (default `/var/lib/northnarrow/detections/status_events.jsonl`).
     /// The event-sourced triage-status chain, sibling of the detection

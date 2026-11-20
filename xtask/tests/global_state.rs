@@ -654,6 +654,12 @@ const STATICS: &[Kept] = &[
         "lot 285: the module-load judge's controller's last report on the one eBPF object's trust map (the journal and the status read it)",
     ),
     kept(
+        "crates/nn-linux/src/witness.rs",
+        "ROLES_AT_START",
+        Kernel,
+        "the review of #582 (F4 b): both roles' ROLE_TGIDS slots and ROLE_MARKS words as the one eBPF object's load reused them, read once before the start claims its role; the witness round judges the gap from them",
+    ),
+    kept(
         "crates/nn-linux/src/anti_tamper/bpf_defense.rs",
         "LOADER_OPT_OUTS",
         Kernel,
@@ -1002,6 +1008,11 @@ const STATICS: &[Kept] = &[
 /// The free functions the start calls that name a static of their module,
 /// and why each may: `module::function`.
 const START_CALLS: &[(&str, &str)] = &[
+    (
+        "witness::roles_at_start",
+        "the review of #582 (F4 b): both roles as the one eBPF load found them (kept once, \
+         before the start claimed its role), read by the witness round to judge the gap",
+    ),
     (
         "degradation::note",
         "lot 353 (re-check 2 of #563, R2-3): the dispatcher of slow work's hold, a degradation \

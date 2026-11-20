@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cgroup_floors::{below_floor, floor_of, FloorRole};
-use crate::systemd_bus::{unit_property, Value};
+use crate::systemd_bus::{unit_properties, unit_property, Value};
 use common::cgroup_limits::limit_kind_of;
 
 /// The service interface and the slice interface of systemd's units.
@@ -169,8 +169,189 @@ pub fn configured_text(
     )
 }
 
+/// The re-check of #582 (N3): what systemd holds in memory of a unit for
+/// the code its next start runs — the copy the start applies, which a
+/// drop-in loaded by a `daemon-reload` and deleted since still holds.
+/// Kept in memory to compare; a record names drop-in paths and variable
+/// names only, never an environment value or a command line.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct LoadedView {
+    /// `DropInPaths`: every drop-in systemd loaded for the unit.
+    pub dropins: Vec<String>,
+    /// `NeedDaemonReload`: its files on disk are not what it loaded.
+    pub need_reload: bool,
+    /// `Environment`'s entries.
+    pub env: Vec<String>,
+    /// `UnsetEnvironment`'s entries.
+    pub unset: Vec<String>,
+    /// `MemoryDenyWriteExecute`.
+    pub mdwe: bool,
+    /// `ExecStartPre`, `ExecStart` and `ExecStartPost`: each command's
+    /// path, arguments and ignore flag (never its run times).
+    pub exec: String,
+}
+
+impl std::fmt::Debug for LoadedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedView")
+            .field("dropins", &self.dropins)
+            .field("need_reload", &self.need_reload)
+            .field("env_names", &self.env_names())
+            .field("unset", &self.unset.len())
+            .field("mdwe", &self.mdwe)
+            .field("exec_bytes", &self.exec.len())
+            .finish()
+    }
+}
+
+impl LoadedView {
+    /// The names `Environment` sets (never their values), sorted, once each.
+    pub fn env_names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .env
+            .iter()
+            .map(|e| e.split('=').next().unwrap_or("").to_string())
+            .collect();
+        n.sort();
+        n.dedup();
+        n
+    }
+}
+
+/// The properties a [`LoadedView`] is read from, in order.
+pub const LOADED_VIEW: &[(&str, &str)] = &[
+    (UNIT, "DropInPaths"),
+    (UNIT, "NeedDaemonReload"),
+    (SERVICE, "Environment"),
+    (SERVICE, "UnsetEnvironment"),
+    (SERVICE, "MemoryDenyWriteExecute"),
+    (SERVICE, "ExecStartPre"),
+    (SERVICE, "ExecStart"),
+    (SERVICE, "ExecStartPost"),
+];
+
+/// [`LoadedView`] of the values of [`LOADED_VIEW`], in order.
+pub fn loaded_view_of(v: &[Value]) -> io::Result<LoadedView> {
+    let bad = |what: &str| io::Error::other(format!("{what}: not the type systemd gives"));
+    let [dropins, need, env, unset, mdwe, pre, start, post] = v else {
+        return Err(io::Error::other(format!(
+            "{} values for {} properties",
+            v.len(),
+            LOADED_VIEW.len()
+        )));
+    };
+    let dropins = dropins.strings().ok_or_else(|| bad("DropInPaths"))?;
+    let Value::Bool(need_reload) = need else {
+        return Err(bad("NeedDaemonReload"));
+    };
+    let env = env.strings().ok_or_else(|| bad("Environment"))?;
+    let unset = unset.strings().ok_or_else(|| bad("UnsetEnvironment"))?;
+    let Value::Bool(mdwe) = mdwe else {
+        return Err(bad("MemoryDenyWriteExecute"));
+    };
+    let mut exec = String::new();
+    for (name, cmds) in [
+        ("ExecStartPre", pre),
+        ("ExecStart", start),
+        ("ExecStartPost", post),
+    ] {
+        let Value::Array(cmds) = cmds else {
+            return Err(bad(name));
+        };
+        for c in cmds {
+            // (path, argv, ignore, start and exit times, pid, code, status)
+            let Value::Struct(f) = c else {
+                return Err(bad(name));
+            };
+            let (Some(path), Some(argv), Some(Value::Bool(ignore))) = (
+                f.first().and_then(Value::as_str),
+                f.get(1).and_then(Value::strings),
+                f.get(2),
+            ) else {
+                return Err(bad(name));
+            };
+            exec.push_str(&format!("{name}\0{path}\0{}\0{ignore}\n", argv.join("\0")));
+        }
+    }
+    Ok(LoadedView {
+        dropins,
+        need_reload: *need_reload,
+        env,
+        unset,
+        mdwe: *mdwe,
+        exec,
+    })
+}
+
+/// The re-check of #582 (N3): [`LoadedView`] of unit `unit` as systemd
+/// holds it, through its private socket `socket` (each exchange bounded by
+/// `timeout`).
+pub fn loaded_view(socket: &Path, timeout: Duration, unit: &str) -> io::Result<LoadedView> {
+    loaded_view_of(&unit_properties(socket, timeout, unit, LOADED_VIEW)?)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The re-check of #582 (N3): systemd's copy of a unit, as a respawn
+    /// judges it — its drop-ins, whether its files changed since it loaded
+    /// them, its environment, the variables it unsets, its memory's
+    /// protection and its commands (never their run times) — and a record
+    /// of it never shows a value or a command line.
+    #[test]
+    fn systemd_s_copy_of_a_unit_is_read_for_what_its_start_runs() {
+        use super::*;
+        let s = |x: &str| Value::Str(x.into());
+        let strings = |v: &[&str]| Value::Array(v.iter().map(|x| s(x)).collect());
+        let cmd = |path: &str, pid: u32| {
+            Value::Struct(vec![
+                s(path),
+                strings(&[path, "--x"]),
+                Value::Bool(false),
+                Value::U64(1),
+                Value::U64(2),
+                Value::U64(3),
+                Value::U64(4),
+                Value::U32(pid),
+                Value::I32(1),
+                Value::I32(0),
+            ])
+        };
+        let values = |env: &[&str], mdwe: bool, path: &str, pid: u32| {
+            vec![
+                strings(&["/etc/systemd/system/northnarrow-agent.service.d/10-x.conf"]),
+                Value::Bool(false),
+                strings(env),
+                strings(&["LD_PRELOAD", "LD_AUDIT"]),
+                Value::Bool(mdwe),
+                Value::Array(vec![]),
+                Value::Array(vec![cmd(path, pid)]),
+                Value::Array(vec![]),
+            ]
+        };
+        let a = loaded_view_of(&values(&["RUST_LOG=info"], true, "/usr/bin/a", 7)).unwrap();
+        assert_eq!(a.dropins.len(), 1);
+        assert!(a.mdwe && !a.need_reload);
+        assert_eq!(a.env_names(), ["RUST_LOG"]);
+        // the run's times and pid are not the command
+        let b = loaded_view_of(&values(&["RUST_LOG=info"], true, "/usr/bin/a", 9)).unwrap();
+        assert_eq!(a, b);
+        let c = loaded_view_of(&values(&["RUST_LOG=info"], true, "/usr/bin/b", 7)).unwrap();
+        assert_ne!(a.exec, c.exec);
+        let d = loaded_view_of(&values(&["RUST_LOG=debug"], false, "/usr/bin/a", 7)).unwrap();
+        assert_ne!(a.env, d.env);
+        assert!(!d.mdwe);
+        let shown = format!("{d:?}");
+        assert!(
+            !shown.contains("debug") && !shown.contains("/usr/bin/a"),
+            "{shown}"
+        );
+        // a value of another type, or another count, is refused
+        let mut bad = values(&[], true, "/usr/bin/a", 7);
+        bad[4] = Value::U32(1);
+        assert!(loaded_view_of(&bad).is_err());
+        assert!(loaded_view_of(&bad[..3]).is_err());
+    }
+
     use super::*;
 
     #[test]

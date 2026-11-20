@@ -954,6 +954,61 @@ pub fn succession_record(ebpf: &Ebpf, now_ns: u64) -> Option<nn_model::Event> {
     })
 }
 
+/// Lot 374: what the agent's start read of both roles from `ebpf`'s reused
+/// `ROLE_TGIDS`, before it claims its own — and (the review of #582, F4 b)
+/// the kernel's marks of their last exits (`ROLE_MARKS`), and (the re-check,
+/// N4) when the agent's role was last left (`ROLE_EXITS`): both vacated is
+/// the gap `nn_linux::witness::roles_gap` judges once the witness chain and
+/// the audit log are there. The re-check of #582 (N1): `frozen` is what
+/// [`freeze_role_marks`] said — maps it could not freeze are read as not
+/// known (`None`), never as their words. `None` with no pinned map.
+pub fn roles_at_start(ebpf: &Ebpf, frozen: bool) -> Option<crate::witness::RolesAtStart> {
+    let a: Array<&MapData, u32> =
+        Array::try_from(ebpf.map(antitamper_bpf::ROLE_TGIDS_MAP_NAME)?).ok()?;
+    let agent = a.get(&antitamper_bpf::ROLE_SLOT_AGENT, 0).ok()?;
+    let watchdog = a.get(&antitamper_bpf::ROLE_SLOT_WATCHDOG, 0).ok()?;
+    let marks = ebpf
+        .map(antitamper_bpf::ROLE_MARKS_MAP_NAME)
+        .filter(|_| frozen)
+        .and_then(|m| Array::<&MapData, u32>::try_from(m).ok());
+    let mark = |slot: u32| marks.as_ref().and_then(|m| m.get(&slot, 0).ok());
+    let exits = ebpf
+        .map(antitamper_bpf::ROLE_EXITS_MAP_NAME)
+        .filter(|_| frozen)
+        .and_then(|m| Array::<&MapData, u64>::try_from(m).ok());
+    Some(crate::witness::RolesAtStart {
+        agent,
+        watchdog,
+        agent_mark: mark(antitamper_bpf::ROLE_SLOT_AGENT),
+        watchdog_mark: mark(antitamper_bpf::ROLE_SLOT_WATCHDOG),
+        agent_exit_ns: exits
+            .as_ref()
+            .and_then(|m| m.get(&antitamper_bpf::ROLE_SLOT_AGENT, 0).ok()),
+    })
+}
+
+/// The re-check of #582 (N1): the maps of the kernel's record of the roles'
+/// exits (`ROLE_MARKS`, `ROLE_EXITS`) frozen right after the load
+/// ([`freeze_named`]: `BPF_MAP_FREEZE`, map-wide and for good — no
+/// descriptor's update is taken any more, the family's included; the
+/// liveness watch's stores are a program's, not a syscall's). A pin reused
+/// from an earlier start this boot is frozen already. `Err` names each map
+/// not frozen: its words are then not known to the start.
+pub fn freeze_role_marks(ebpf: &Ebpf) -> std::result::Result<(), String> {
+    let failed: Vec<String> = [
+        antitamper_bpf::ROLE_MARKS_MAP_NAME,
+        antitamper_bpf::ROLE_EXITS_MAP_NAME,
+    ]
+    .iter()
+    .filter_map(|name| freeze_named(ebpf, name).err())
+    .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
 impl BpfGuard {
     /// External audit ATP-013: record the ids of every map of `ebpf` — call
     /// right after the load, before any `take_map`.
@@ -2461,6 +2516,9 @@ mod tests {
         assert_ne!(ROLE_WATCHDOG, ROLE_AGENT);
         assert_ne!(ROLE_WATCHDOG, 0, "0 is \"not one of ours\" in the guard");
         assert_ne!(ROLE_AGENT, 0, "0 is \"not one of ours\" in the guard");
+        // the review of #582 (F2 c): the role a file of the watchdog's alone
+        // is registered under is the one the guard gives its binary
+        assert_eq!(antitamper_bpf::WATCHDOG_EXE_ROLE, ROLE_WATCHDOG);
     }
 
     /// Lot 344 (#554's KVM suites): the hook's roles are the executables

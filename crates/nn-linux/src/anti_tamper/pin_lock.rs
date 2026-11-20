@@ -720,6 +720,8 @@ pub fn remake(pin_root: &Path, until: std::time::Instant) -> Outcome {
         "--pipe",
         "--service-type=oneshot",
         "--property=RuntimeMaxSec=20",
+        // lot 374: the units' UnsetEnvironment= (the loader's variables)
+        &antitamper_bpf::start_check::systemd_run_unset(),
         &format!("--unit={REMAKE_UNIT}"),
         "--description=NorthNarrow pin directory lock",
     ])

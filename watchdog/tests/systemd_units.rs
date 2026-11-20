@@ -337,6 +337,127 @@ fn both_units_set_a_path_without_usr_local() {
     }
 }
 
+/// Lot 374: every unit of ours unsets the loader's and the C library's
+/// variables — all of `start_check::LOADER_ENV`, nothing reset or cleared
+/// (an empty `UnsetEnvironment=` empties the list) — and sets none of them.
+#[test]
+fn every_unit_unsets_every_loader_variable() {
+    use antitamper_bpf::start_check::LOADER_ENV;
+    for name in [
+        "northnarrow-agent.service",
+        "northnarrow-watchdog.service",
+        "northnarrow-watchdog-failed.service",
+    ] {
+        let d = directives(&unit(name));
+        let lines: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "UnsetEnvironment")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert!(
+            lines.iter().all(|v| !v.is_empty()),
+            "{name}: an empty UnsetEnvironment= resets the list"
+        );
+        let mut unset: Vec<&str> = lines.iter().flat_map(|v| v.split_whitespace()).collect();
+        assert!(
+            unset.iter().all(|v| !v.contains('=')),
+            "{name}: a NAME=value entry unsets only that value: {unset:?}"
+        );
+        unset.sort_unstable();
+        unset.dedup();
+        let mut want: Vec<&str> = LOADER_ENV.to_vec();
+        want.sort_unstable();
+        assert_eq!(unset, want, "{name}: UnsetEnvironment= is not LOADER_ENV");
+        for (k, v) in &d {
+            if k == "Environment" || k == "PassEnvironment" {
+                for a in v.split_whitespace() {
+                    let var = a.trim_matches('"').split('=').next().unwrap_or("");
+                    assert!(!LOADER_ENV.contains(&var), "{name}: {k}={a}");
+                }
+            }
+        }
+    }
+}
+
+/// The review of #582 (F2 b): every unit of ours that runs one of our
+/// binaries denies memory both writable and executable
+/// (`MemoryDenyWriteExecute=yes`), set once and never reset: code a start
+/// was given, or copied anywhere, is then a file mapping its executable
+/// mappings show.
+#[test]
+fn every_unit_denies_writable_and_executable_memory() {
+    for name in [
+        "northnarrow-agent.service",
+        "northnarrow-watchdog.service",
+        "northnarrow-watchdog-failed.service",
+    ] {
+        let d = directives(&unit(name));
+        let set: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "MemoryDenyWriteExecute")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(set, ["yes"], "{name}: MemoryDenyWriteExecute= {set:?}");
+    }
+}
+
+/// The lab round 5 of #582: an OOM kill of one process of either unit (an
+/// agent worker, the OOM killer's first pick; the watchdog's `systemctl`
+/// child) leaves the unit running. Under systemd's default (`stop`) the
+/// unit's stop, refused by the task_kill hook outside a window, left it
+/// `failed` with its daemon still running, no main PID and every later
+/// start refused (`resources`) — measured on 5.15/systemd 249 and
+/// 7.0/systemd 259.
+#[test]
+fn an_oom_kill_of_one_process_leaves_both_units_running() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let set: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "OOMPolicy")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(set, ["continue"], "{name}: OOMPolicy= {set:?}");
+    }
+}
+
+/// The lab r5 of #582 (fix round 6): the OOM kill count the watchdog reads
+/// is the slice's both units run in.
+#[test]
+fn the_oom_count_read_is_the_units_slice_s() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let slice = value(&d, "Slice").expect("Slice=");
+        assert_eq!(
+            northnarrow_watchdog::witness::UNITS_SLICE_EVENTS,
+            format!("/sys/fs/cgroup/{slice}/memory.events"),
+            "{name}"
+        );
+    }
+}
+
+/// Lot 374: the watchdog writes its witness chain in the directory the
+/// agent makes for it (`nn_proto::witness::WITNESS_DIR`, optional: `-`)
+/// and nothing else of the agent's state; under `ProtectSystem=strict`
+/// a chain anywhere else would be read-only to it.
+#[test]
+fn the_watchdog_writes_its_witness_chain_and_nothing_else_of_the_state() {
+    let d = directives(&unit("northnarrow-watchdog.service"));
+    let rw: Vec<String> = d
+        .iter()
+        .filter(|(k, _)| k == "ReadWritePaths")
+        .flat_map(|(_, v)| v.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        rw,
+        [
+            "/run/northnarrow".to_string(),
+            format!("-{}", nn_proto::witness::WITNESS_DIR)
+        ]
+    );
+    assert_eq!(value(&d, "ProtectSystem"), Some("strict"));
+}
+
 // ── Lab PR 216 (capability C23): fail-visible supervision ──────────────
 
 const WATCHDOG: &str = "northnarrow-watchdog.service";

@@ -212,6 +212,12 @@ fn sites(text: &str) -> Vec<String> {
 /// option read.
 const KNOWN: &[(&str, usize, &str)] = &[
     (
+        "antitamper-bpf/src/start_check.rs",
+        1,
+        "lot 374: an environment block's variable names (`/proc/<pid>/environ`, NUL-separated \
+         `NAME=value` strings), judged against the loader's list — no command line read",
+    ),
+    (
         "crates/nn-linux/src/anti_tamper/pin_lock.rs",
         5,
         "lot 359: the options the agent passes (never reads): `systemd-run`'s own (`--wait`, \

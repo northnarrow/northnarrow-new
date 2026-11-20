@@ -531,7 +531,7 @@ fn the_agent_s_stop_runs_under_its_deadline() {
         &[
             "let stop = crate::stop_deadline::StopDeadline::start();",
             "tokio::runtime::Builder::new_multi_thread()",
-            "runtime.block_on(run(cli, undumpable, image, &stop));",
+            "runtime.block_on(run(cli, undumpable, image, &stop, self_check));",
             "stop.stage(\"runtime\");",
             "runtime.shutdown_timeout(stop.left());",
             "stop.finish();",

@@ -93,6 +93,16 @@ async fn main() -> ExitCode {
     if cli.record_unit_failure {
         return record_unit_failure(&cli);
     }
+    // Lot 374: first, before it takes its role (its PROTECTED_PIDS entry,
+    // its ROLE_TGIDS slot) — its environment and the files it has mapped
+    // executable. A loader variable, or a mapping that is neither this
+    // binary nor a library the release links, refuses the start: recorded
+    // for the live agent (the surviving role) to sign High, and an exit
+    // status of its own.
+    let self_check = antitamper_bpf::start_check::check_self();
+    if !self_check.clean() {
+        return refuse_start(&cli, &self_check);
+    }
     // Lot 370 (F10-4): no candidate of the OOM killer (the unit's
     // OOMScoreAdjust=-999, written again whoever started it): the process
     // that brings the agent back is the last thing to go.
@@ -156,6 +166,28 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Lot 374: a start that refused itself ([`check_self`]): an ERROR, the
+/// record the live agent signs (`watchdog_start_refused`), and
+/// [`ExitReason::StartSelfCheck`] — nothing registered, no pidfile written.
+///
+/// [`check_self`]: antitamper_bpf::start_check::check_self
+fn refuse_start(cli: &Cli, found: &antitamper_bpf::start_check::Findings) -> ExitCode {
+    error!(
+        target: "watchdog.tamper",
+        detail = %found.describe(),
+        "watchdog start REFUSED before it took its role — the agent signs the record"
+    );
+    let agent_pid = read_pid_from_file(&cli.agent_pidfile).unwrap_or(0);
+    let path = hold_record_path(&cli.shutdown_marker);
+    if let Err(e) = record_hold(
+        &path,
+        &northnarrow_watchdog::start_refused_record(found, agent_pid, unix_now()),
+    ) {
+        error!(target: "watchdog.tamper", error = %e, path = %path.display(), "could not record the refused start");
+    }
+    ExitCode::from(ExitReason::StartSelfCheck.code())
+}
+
 /// Lab PR 216: `--record-unit-failure`, the mode
 /// `northnarrow-watchdog-failed.service` runs when systemd puts the
 /// watchdog unit in its failed state (`OnFailure=`): one
@@ -217,11 +249,28 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     let self_registered = register_self_pid(&cli.bpffs_root, own_pid, |e| {
         role_error = Some(format!("{e:#}"));
     });
+    // Lot 374: the agent's witness — its own key and signed chain, opened
+    // now that it is a protected pid (the chain is in the agent's state
+    // directory), before it waits for the agent.
+    // The review of #582 (F2 d): the host as this start reads it — the
+    // reference each later start of the agent is judged against, signed in
+    // the witness's first row of this life.
+    let baseline = northnarrow_watchdog::respawn_gate::Baseline::now();
+    let baseline_note = baseline.describe();
+    northnarrow_watchdog::respawn_gate::set_baseline(baseline);
+    let mut witness = open_witness(&cli, own_pid, &baseline_note);
     let (mut agent_pid, mut agent_pidfd) =
         open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE, &agent_bin)
             .await
             .context("opening initial agent pidfd")
             .exit_as(ExitReason::NoAgent)?;
+    // The review of #582 (F6): the agent's role vacated earlier this boot
+    // (the kernel's sticky mark; a vacancy this watchdog's start found
+    // included) — the agent this start finds is a successor no watchdog saw
+    // take the role: judged now, and signed by the witness. The re-check 3
+    // (R2-1): judged at every start, a verdict of foreign signed whatever
+    // the timing.
+    judge_agent_at_start(&cli, &mut witness, agent_pid);
     // Lot 273c (the review of #490): the agent's cgroup, checked from here.
     northnarrow_watchdog::check_agent_cgroup(
         &cli.bpffs_root,
@@ -324,7 +373,9 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     let mut failure: Option<Failure> = None;
     // External audit WDG-001: a shutdown authorisation must have been
     // signed while the agent it stops was running.
-    let mut agent_started = process_start_unix(agent_pid);
+    // The lab round 5 of #582: and the units' slice's OOM kills then, so a
+    // SIGKILL vacancy names the kernel's OOM killer (`agent_life`)
+    let (mut agent_started, mut agent_oom_kills) = agent_life(agent_pid);
 
     // W5: spawn the parallel STATUS-ping task. It pings the
     // agent's admin socket every STATUS_PING_INTERVAL (30s),
@@ -370,10 +421,16 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
     //   4. On ceiling breach, or a failed respawn: log, then hold —
     //      alive and protected, no respawn — until an operator starts
     //      the agent again (external audit WDG-004; see `hold`)
+    // The review of #582 (F2 c): the chain checked against this watchdog's
+    // last row every WITNESS_HEAD_EVERY (and before every row it appends).
+    let mut witness_tick = tokio::time::interval(WITNESS_HEAD_EVERY);
+    witness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    witness_tick.tick().await;
     'restart_loop: loop {
         let select_outcome = tokio::select! {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
             _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
+            _ = witness_tick.tick() => SelectOutcome::WitnessTick,
             result = wait_agent(&agent_pidfd, &cli.agent_pidfile) => SelectOutcome::AgentDied(result),
             // W5 stuck-recovery arm: the parallel ping task has
             // observed two consecutive STATUS-ping timeouts and
@@ -429,6 +486,15 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 info!(target: "watchdog", signal = name, "shutting down");
                 break 'restart_loop;
             }
+            SelectOutcome::WitnessTick => {
+                if let Some(w) = witness.as_mut() {
+                    w.check_head();
+                }
+                // The re-check of #582 (N2): a change made inside a signed
+                // window becomes the respawn gate's reference, signed
+                adopt_in_window(&cli, &mut witness).await;
+                continue 'restart_loop;
+            }
             SelectOutcome::StaleStuck(pid) => {
                 info!(
                     target: "watchdog.stuck_recovery",
@@ -470,7 +536,8 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                 current_agent.send_replace(None);
                 // External audit WDG-010: an agent the exec backend started
                 // is our child — collect it, or it stays a zombie.
-                match reap_agent(&agent_pidfd) {
+                let reaped = reap_agent(&agent_pidfd);
+                match &reaped {
                     Ok(Reaped::Collected { pid, si_code, code }) => info!(
                         target: "watchdog.respawn",
                         pid,
@@ -528,7 +595,42 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     agent_started,
                 };
                 // lot 357 (re-check 3 of #563, R3-2): bounded, off this thread
-                match check_shutdown_marker_bounded(&check) {
+                let verdict = check_shutdown_marker_bounded(&check);
+                // Lot 374: the vacancy, signed by the surviving role, with
+                // its cause as the wait or systemd records it and what the
+                // shutdown marker said — after the evict, which the wait on
+                // systemd's record never delays.
+                // The review of #582 (F4 a): inside a signed window the
+                // vacancy is the operator's (a note), as NN-L-BPF-002 is Low.
+                // The re-check of #582 (N8): the window as the kernel marked
+                // the exit itself (the agent slot's mark), not sampled now;
+                // a mark not read is not a window's
+                let in_window = exit_in_window(&cli.bpffs_root);
+                if let Some(w) = witness.as_mut() {
+                    // the lab round 5 of #582: the slice's OOM kill count
+                    // noted (re-check 7, G2: its cause is not named by it)
+                    let cause = northnarrow_watchdog::witness::with_slice_oom_count(
+                        &exit_cause(&backend, &reaped, agent_pid).await,
+                        agent_oom_kills,
+                        northnarrow_watchdog::witness::units_oom_kills(),
+                    );
+                    let clean = northnarrow_watchdog::witness::clean_stop(&cause);
+                    // the review of #582 (F2 d): what the host would give a
+                    // successor, as the vacancy begins
+                    let (host, adopted, _) = judge_host(&cli.bpffs_root).await;
+                    w.record_or_log(
+                        northnarrow_watchdog::witness::vacancy_kind(&verdict, in_window, clean),
+                        &format!(
+                            "{}; {}",
+                            northnarrow_watchdog::witness::vacancy_detail(
+                                agent_pid, &cause, &verdict, in_window,
+                            ),
+                            host.detail
+                        ),
+                    );
+                    record_adopted(w, adopted);
+                }
+                match verdict {
                     ShutdownVerdict::Authorised => {
                         info!(
                             target: "watchdog.shutdown_marker",
@@ -576,13 +678,14 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             held,
                             &agent_bin,
                             &mut hold_retry,
+                            &mut witness,
                         )
                         .await
                         {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
-                                agent_started = process_start_unix(pid);
+                                (agent_started, agent_oom_kills) = agent_life(pid);
                                 new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                                 continue 'restart_loop;
@@ -617,6 +720,56 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     .await;
                 }
 
+                // The review of #582 (F2 d): the host judged right before
+                // the start — a preload or a drop-in that changes our units'
+                // code, new since this watchdog's start, holds it (signed
+                // by the witness and in the agent's hold records). The
+                // re-check of #582 (N2): nothing held inside a signed window,
+                // whose host becomes the reference (signed).
+                let (host, adopted, judged_in_window) = judge_host(&cli.bpffs_root).await;
+                // the re-check of #582 (N3): when the judgement ended — a
+                // successor that started before it is not this start's
+                let judged_at = antitamper_bpf::start_check::boot_ns_now();
+                if let Some(w) = witness.as_mut() {
+                    record_adopted(w, adopted);
+                }
+                if let Some(why) = &host.hold {
+                    if let Some(w) = witness.as_mut() {
+                        w.record_or_log(
+                            nn_proto::witness::KIND_RESPAWN_HELD,
+                            &format!("the start of the agent after pid {agent_pid} held: {why}"),
+                        );
+                    }
+                    let held = Hold {
+                        why: nn_proto::watchdog_hold::REASON_RESPAWN_HELD,
+                        detail: why.clone(),
+                        agent_pid,
+                    };
+                    match hold(
+                        &cli,
+                        &backend,
+                        &mut sigint,
+                        &mut sigterm,
+                        &mut stuck_rx,
+                        held,
+                        &agent_bin,
+                        &mut hold_retry,
+                        &mut witness,
+                    )
+                    .await
+                    {
+                        Some((pid, fd)) => {
+                            agent_pid = pid;
+                            agent_pidfd = fd;
+                            (agent_started, agent_oom_kills) = agent_life(pid);
+                            new_generation(&current_agent, &mut stuck_rx, pid);
+                            backoff = RestartBackoff::new();
+                            continue 'restart_loop;
+                        }
+                        None => break 'restart_loop,
+                    }
+                }
+
                 // Best-effort: remove the dead agent's pidfile
                 // BEFORE respawn so the wait for the new agent
                 // doesn't immediately read the dead PID.
@@ -634,6 +787,8 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                         attempt,
                         &agent_bin,
                         &holds,
+                        agent_pid,
+                        (!judged_in_window).then_some(judged_at),
                     ) => r,
                     _ = sigint.recv() => {
                         info!(target: "watchdog", signal = "SIGINT", "shutting down during respawn");
@@ -645,7 +800,35 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                     }
                 };
                 match respawned {
-                    Ok((new_pid, new_fd)) => {
+                    Ok((new_pid, new_fd, judged)) => {
+                        // Lot 374: the successor, signed by the witness —
+                        // with the host the gate judged before its start.
+                        // The re-check of #582 (N3): a successor that had
+                        // started before that judgement, outside a window,
+                        // took the role by a start the watchdog did not
+                        // make (High); the host was read after its start.
+                        if let Some(w) = witness.as_mut() {
+                            if judged.unmade {
+                                w.record_or_log(
+                                    nn_proto::witness::KIND_UNMADE_START,
+                                    &format!(
+                                        "the agent's role taken by a start the watchdog did not \
+                                         make: pid {new_pid} had started before the watchdog \
+                                         judged the host, outside a signed window; {}; the host \
+                                         as the watchdog read it after that start: {}",
+                                        judged.detail, host.found
+                                    ),
+                                );
+                            } else {
+                                w.record_or_log(
+                                    northnarrow_watchdog::witness::successor_kind(
+                                        judged.given,
+                                        judged.confirmed,
+                                    ),
+                                    &format!("{}; {}", judged.detail, host.detail),
+                                );
+                            }
+                        }
                         agent_pid = new_pid;
                         agent_pidfd = new_fd;
                         // Lot 273c: the respawned agent's fresh cgroup.
@@ -654,7 +837,7 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             new_pid,
                             &hold_record_path(&cli.shutdown_marker),
                         );
-                        agent_started = process_start_unix(new_pid);
+                        (agent_started, agent_oom_kills) = agent_life(new_pid);
                         new_generation(&current_agent, &mut stuck_rx, new_pid);
                         info!(
                             target: "watchdog.respawn",
@@ -688,13 +871,14 @@ async fn run(cli: Cli) -> std::result::Result<(), Failure> {
                             held,
                             &agent_bin,
                             &mut hold_retry,
+                            &mut witness,
                         )
                         .await
                         {
                             Some((pid, fd)) => {
                                 agent_pid = pid;
                                 agent_pidfd = fd;
-                                agent_started = process_start_unix(pid);
+                                (agent_started, agent_oom_kills) = agent_life(pid);
                                 new_generation(&current_agent, &mut stuck_rx, pid);
                                 backoff = RestartBackoff::new();
                             }
@@ -809,6 +993,8 @@ enum SelectOutcome {
     StaleStuck(u32),
     /// Lab PR 216: stuck recovery could not confirm the agent's exit.
     RecoveryFailed(String),
+    /// The review of #582 (F2 c): the witness chain's head checked.
+    WitnessTick,
 }
 
 /// Lab PR 216 (static review C-44 / G-05): stuck recovery failed and the
@@ -938,6 +1124,7 @@ fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
 /// pidfile, open a new pidfd, defensive-reinsert the new PID
 /// into PROTECTED_PIDS. Returns the new PID + the new pidfd
 /// for the main loop's next select-arm.
+#[allow(clippy::too_many_arguments)]
 async fn respawn_cycle(
     backend: &RespawnBackend,
     pidfile: &std::path::Path,
@@ -945,7 +1132,9 @@ async fn respawn_cycle(
     attempt: u8,
     agent_bin: &std::path::Path,
     hold_path: &std::path::Path,
-) -> Result<(u32, OwnedFd)> {
+    old_pid: u32,
+    judged_at: Option<u64>,
+) -> Result<(u32, OwnedFd, Judged)> {
     info!(
         target: "watchdog.respawn",
         attempt,
@@ -980,11 +1169,41 @@ async fn respawn_cycle(
                 ),
             })?;
 
+    // Lot 374: who took the role — where it was started and what it
+    // shows. Only the restart of the agent's unit with nothing foreign in it
+    // is given the role's rights by the watchdog (its defensive reinsert).
+    // The re-check of #582 (N3): never one that started before the gate's
+    // judgement (`judged_at`, outside a window): not this start's.
+    let mut judged = judge_successor(old_pid, new_pid);
+    judged.unmade = judged_at.is_some_and(|at| {
+        antitamper_bpf::start_check::started_before(
+            antitamper_bpf::start_check::start_boot_ns(new_pid),
+            at,
+        )
+    });
+    let given = judged.given && !judged.unmade;
+    let successor = judged.detail.clone();
     // Defensive reinsert — never for an agent that already exited (its pid
     // would wait in PROTECTED_PIDS for reuse). Failure here just widens
     // the brief window before the new agent's own register_protected_pids
     // fires — not a fatal restart-cycle error.
-    if pidfd_exited(&new_fd) {
+    if judged.unmade {
+        warn!(
+            target: "watchdog.tamper",
+            new_pid,
+            detail = %successor,
+            "the agent's successor started before the watchdog judged the host — a start the \
+             watchdog did not make; it does not re-register it"
+        );
+    } else if !given {
+        warn!(
+            target: "watchdog.tamper",
+            new_pid,
+            detail = %successor,
+            "the agent's successor is not its unit's clean restart — the kernel gave it the role; \
+             the watchdog does not re-register it"
+        );
+    } else if pidfd_exited(&new_fd) {
         info!(
             target: "watchdog.respawn",
             new_pid,
@@ -1002,7 +1221,280 @@ async fn respawn_cycle(
         pin_handle_failed(hold_path, new_pid, "reinsert_new_agent_pid", &e);
     }
 
-    Ok((new_pid, new_fd))
+    Ok((new_pid, new_fd, judged))
+}
+
+/// Lot 374: what the watchdog found of the agent's successor.
+struct Judged {
+    /// Its unit's clean restart: the watchdog re-registers it.
+    given: bool,
+    /// The re-check of #582 (N4): and every library's identity confirmed.
+    confirmed: bool,
+    detail: String,
+    /// The re-check of #582 (N3): it started before the gate's judgement,
+    /// outside a window — not the watchdog's start.
+    unmade: bool,
+}
+
+/// Lot 374: the successor `new` of the agent `old` — its identity and its
+/// environment and mappings read now (`antitamper_bpf::start_check`):
+/// whether it is its unit's clean restart, and the witness row's detail.
+fn judge_successor(old: u32, new: u32) -> Judged {
+    let id = antitamper_bpf::start_check::identity(new);
+    let found = antitamper_bpf::start_check::inspect(new);
+    let (given, detail) = northnarrow_watchdog::witness::successor_detail(old, new, &id, &found);
+    Judged {
+        given,
+        confirmed: found.confirmed(),
+        detail,
+        unmade: false,
+    }
+}
+
+/// The re-check of #582 (N8): whether the agent's last exit was inside a
+/// signed trusted-installer window, as the kernel marked it at the exit
+/// (`ROLE_MARKS`' agent word); a mark not read (or not frozen) is not a
+/// window's.
+fn exit_in_window(bpffs_root: &std::path::Path) -> bool {
+    match antitamper_bpf::role_marks(bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT) {
+        Ok(m) => m & antitamper_bpf::ROLE_MARK_IN_WINDOW != 0,
+        Err(e) => {
+            warn!(target: "watchdog.witness", error = format!("{e:#}"), "the agent's exit mark not read: the vacancy is not taken as a window's");
+            false
+        }
+    }
+}
+
+/// The re-check of #582 (N2): the respawn gate's reference moved, signed by
+/// the witness (never silently); nothing when it did not move.
+fn record_adopted(w: &mut northnarrow_watchdog::witness::Witness, adopted: Option<String>) {
+    if let Some(what) = adopted {
+        w.record_or_log(nn_proto::witness::KIND_GATE_REFERENCE, &what);
+    }
+}
+
+/// The re-check of #582 (N2): inside a signed trusted-installer window, the
+/// host as it is becomes the respawn gate's reference — signed when it
+/// moved. Outside a window (or the window not read) nothing moves.
+async fn adopt_in_window(cli: &Cli, witness: &mut Option<northnarrow_watchdog::witness::Witness>) {
+    if !antitamper_bpf::window_open(&cli.bpffs_root).unwrap_or(false) {
+        return;
+    }
+    let adopted = tokio::task::spawn_blocking(northnarrow_watchdog::respawn_gate::adopt_now)
+        .await
+        .ok()
+        .flatten();
+    if let Some(w) = witness.as_mut() {
+        record_adopted(w, adopted);
+    }
+}
+
+/// The review of #582 (F2 c): how often the watchdog checks that its
+/// witness chain still ends at the last row it wrote.
+const WITNESS_HEAD_EVERY: Duration = Duration::from_secs(30);
+
+/// The review of #582 (F2 d): [`northnarrow_watchdog::respawn_gate::judge_now`]
+/// off the runtime's thread (it reads the drop-in directories,
+/// `/etc/ld.so.preload` and systemd's copy of the agent's unit). The
+/// re-check of #582 (N2): inside a signed trusted-installer window (the
+/// kernel's test, read now; not read is outside one) nothing is held, and
+/// the host becomes the reference — its description the second value, for
+/// the caller to sign. A judgement that could not run holds nothing and
+/// says so.
+async fn judge_host(
+    bpffs_root: &std::path::Path,
+) -> (
+    northnarrow_watchdog::respawn_gate::Verdict,
+    Option<String>,
+    bool,
+) {
+    let in_window = antitamper_bpf::window_open(bpffs_root).unwrap_or(false);
+    let (v, adopted) = tokio::task::spawn_blocking(move || {
+        northnarrow_watchdog::respawn_gate::judge_now(in_window)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        let found = format!("not judged: {e}");
+        (
+            northnarrow_watchdog::respawn_gate::Verdict {
+                hold: None,
+                detail: format!("the host before the start {found}"),
+                found,
+            },
+            None,
+        )
+    });
+    (v, adopted, in_window)
+}
+
+/// The review of #582 (F6): at this watchdog's start, the agent `pid` it
+/// found, judged as a successor when the kernel marked the agent's role
+/// vacated earlier this boot ([`antitamper_bpf::ROLE_MARK_VACATED`]): a
+/// witness row, `role_succeeded` or `role_successor_foreign`. Recorded,
+/// never acted on here: the agent registers itself, and at its start this
+/// watchdog re-registers no agent. The re-check 3 of #582 (R2-1): judged at
+/// every start ([`antitamper_bpf::at_start`]) — an agent that is not its
+/// unit's clean restart is recorded whatever the timing; a given one that
+/// took its role while a watchdog ran is not recorded.
+fn judge_agent_at_start(
+    cli: &Cli,
+    witness: &mut Option<northnarrow_watchdog::witness::Witness>,
+    pid: u32,
+) {
+    use antitamper_bpf::{role_exit_ns, role_marks, ROLE_SLOT_AGENT, ROLE_SLOT_WATCHDOG};
+    let root = &cli.bpffs_root;
+    let mut unread = Vec::new();
+    let mut known = |r: anyhow::Result<u64>| match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            unread.push(format!("{e:#}"));
+            None
+        }
+    };
+    // the re-check of #582 (N4): only an agent that took its role while the
+    // watchdog's was vacant — a long-running one an earlier watchdog saw
+    // start is not judged again
+    let agent_mark = known(role_marks(root, ROLE_SLOT_AGENT).map(u64::from)).map(|m| m as u32);
+    let own_mark = known(role_marks(root, ROLE_SLOT_WATCHDOG).map(u64::from)).map(|m| m as u32);
+    let own_exit = known(role_exit_ns(root, ROLE_SLOT_WATCHDOG));
+    let why = antitamper_bpf::succession_to_judge(
+        agent_mark,
+        own_mark,
+        own_exit,
+        antitamper_bpf::start_check::start_boot_ns(pid),
+    );
+    // the re-check of #582 (N5): marks not read are judged, and recorded
+    // for the agent to sign — never a silent skip
+    let unread = (!unread.is_empty()).then(|| unread.join("; "));
+    if let Some(e) = &unread {
+        warn!(target: "watchdog.witness", error = %e, "the roles' exit marks not read: the agent found at this start is judged");
+        pin_handle_failed(
+            &hold_record_path(&cli.shutdown_marker),
+            pid,
+            "role_marks",
+            &anyhow::anyhow!("{e}"),
+        );
+    }
+    let judged = judge_successor(0, pid);
+    // the re-check 3 of #582 (R2-1): a verdict of foreign is recorded
+    // whatever the timing; a given one only for a succession nobody judged
+    let context = match (antitamper_bpf::at_start(why.is_some(), judged.given), why) {
+        (antitamper_bpf::AtStart::Held, _) => return,
+        (_, Some(why)) => format!("the agent's role was vacated earlier this boot; {why}"),
+        (_, None) => "judged at every start, whatever an earlier watchdog concluded".to_string(),
+    };
+    if let Some(w) = witness.as_mut() {
+        w.record_or_log(
+            northnarrow_watchdog::witness::successor_kind(judged.given, judged.confirmed),
+            &format!(
+                "judged at this watchdog's start ({context}{}): {}",
+                unread
+                    .as_deref()
+                    .map(|e| format!("; the marks not read: {e}"))
+                    .unwrap_or_default(),
+                judged.detail
+            ),
+        );
+    }
+}
+
+/// The agent `pid`'s life as the watchdog registers it: its start
+/// (`process_start_unix`, external audit WDG-001) and the units' slice's
+/// OOM kill count then (the lab round 5 of #582,
+/// [`northnarrow_watchdog::witness::with_slice_oom_count`]). One call, so
+/// neither is taken without the other.
+fn agent_life(pid: u32) -> (Option<u64>, Option<u64>) {
+    (
+        process_start_unix(pid),
+        northnarrow_watchdog::witness::units_oom_kills(),
+    )
+}
+
+/// Lot 374: why the agent `pid` exited — the wait's status for the exec
+/// backend's child, systemd's record of the unit otherwise.
+async fn exit_cause(
+    backend: &RespawnBackend,
+    reaped: &std::io::Result<Reaped>,
+    pid: u32,
+) -> String {
+    use northnarrow_watchdog::witness::{cause_from_wait, unit_exit_cause};
+    if let Ok(Reaped::Collected { si_code, code, .. }) = reaped {
+        return cause_from_wait(*si_code, *code);
+    }
+    match backend {
+        RespawnBackend::SystemdUnit { unit } => {
+            let unit = unit.clone();
+            tokio::task::spawn_blocking(move || unit_exit_cause(&unit, pid))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "not known (systemd reported none)".to_string())
+        }
+        RespawnBackend::ForkExec { .. } => "not known (the wait reported none)".to_string(),
+    }
+}
+
+/// Lot 374: the witness of this watchdog ([`northnarrow_watchdog::witness`])
+/// — its key made and published, its chain opened — and, when the agent's
+/// role is already vacated (its holder exited with no watchdog to see it),
+/// a row that says so. `None` when no row can be written: recorded for the
+/// agent to sign (`witness_unavailable`).
+fn open_witness(
+    cli: &Cli,
+    own_pid: u32,
+    note: &str,
+) -> Option<northnarrow_watchdog::witness::Witness> {
+    let holds = hold_record_path(&cli.shutdown_marker);
+    match northnarrow_watchdog::witness::Witness::open_noting(&cli.witness_dir, own_pid, note) {
+        Ok(mut w) => {
+            info!(target: "watchdog.witness", key = %w.key_hex(), dir = %cli.witness_dir.display(), "witness opened");
+            // The review of #582 (F2 c): the chain this life writes is the
+            // watchdog role's alone (the agent reads it), registered now
+            // and for each chain it opens after.
+            // The re-check of #582 (N5): not registered is recorded for
+            // the agent to sign, and said in the chain's next row
+            if let Err(e) = w.protect_with(&cli.bpffs_root) {
+                pin_handle_failed(&holds, 0, "witness_chain_role", &anyhow::anyhow!("{e}"));
+            }
+            if let Ok(slot) =
+                antitamper_bpf::role_slot(&cli.bpffs_root, antitamper_bpf::ROLE_SLOT_AGENT)
+            {
+                if slot == antitamper_bpf::ROLE_VACATED {
+                    // The review of #582 (F4, the mini-hunt): its holder's
+                    // last exit inside a signed window (the kernel's mark) is
+                    // the operator's stop — a note, as the vacancy the
+                    // watchdog sees inside one
+                    let marks = antitamper_bpf::role_marks(
+                        &cli.bpffs_root,
+                        antitamper_bpf::ROLE_SLOT_AGENT,
+                    )
+                    .ok();
+                    // the re-check of #582 (the mini-hunt of N8): a clean
+                    // stop only, as systemd recorded the agent's last exit
+                    let clean = systemd_is_booted(std::path::Path::new(SYSTEMD_RUNTIME_DIR))
+                        && northnarrow_watchdog::witness::unit_last_exit(&cli.agent_unit)
+                            .is_some_and(|c| northnarrow_watchdog::witness::clean_stop(&c));
+                    let (kind, detail) = northnarrow_watchdog::witness::found_vacant(marks, clean);
+                    w.record_or_log(kind, detail);
+                }
+            }
+            Some(w)
+        }
+        Err(e) => {
+            error!(target: "watchdog.witness", error = format!("{e:#}"), "the witness is NOT opened: the agent's vacancies are not signed by the watchdog");
+            let _ = record_hold(
+                &holds,
+                &nn_proto::watchdog_hold::HoldRecord {
+                    at: unix_now(),
+                    agent_pid: 0,
+                    reason: nn_proto::watchdog_hold::REASON_WITNESS_UNAVAILABLE.to_string(),
+                    detail: format!("{e:#}").chars().take(400).collect(),
+                    unit_state: None,
+                },
+            );
+            None
+        }
+    }
 }
 
 /// Why the watchdog holds ([`hold`]).
@@ -1046,6 +1538,7 @@ async fn hold(
     held: Hold,
     agent_bin: &std::path::Path,
     retry: &mut HoldRetry,
+    witness: &mut Option<northnarrow_watchdog::witness::Witness>,
 ) -> Option<(u32, OwnedFd)> {
     let why = held.why;
     // Once the dead agent's PID is reused its pidfile would read as live.
@@ -1107,13 +1600,36 @@ async fn hold(
     };
     let outcome = tokio::select! {
         out = hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown, agent_bin) => out,
-        never = hold_supervision(why, backend, &path, held.agent_pid, started, &mut *retry) => match never {},
+        never = hold_supervision(why, backend, &path, held.agent_pid, started, &mut *retry, &cli.bpffs_root) => match never {},
     };
     match outcome {
         HoldOutcome::Resumed { pid, pidfd } => {
             // Pings failed while no agent ran: those stuck signals are stale.
             while stuck_rx.try_recv().is_ok() {}
-            if !pidfd_exited(&pidfd) {
+            // Lot 374: the agent that ends the hold took the vacated role:
+            // signed by the witness; the role's rights only to its unit's
+            // clean restart.
+            let judged = judge_successor(held.agent_pid, pid);
+            let (given, successor) = (judged.given, judged.detail.clone());
+            if let Some(w) = witness.as_mut() {
+                w.record_or_log(
+                    northnarrow_watchdog::witness::successor_kind(judged.given, judged.confirmed),
+                    &successor,
+                );
+            }
+            // The re-check of #582 (N2): an operator's start inside a signed
+            // window ends the hold with the host as the operator left it as
+            // the reference (signed); outside one the reference stays.
+            adopt_in_window(cli, witness).await;
+            if !given {
+                warn!(
+                    target: "watchdog.tamper",
+                    pid,
+                    detail = %successor,
+                    "the agent that ends the hold is not its unit's clean restart — the kernel gave it \
+                     the role; the watchdog does not re-register it"
+                );
+            } else if !pidfd_exited(&pidfd) {
                 if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, pid) {
                     warn!(target: "watchdog", error = %e, pid, "PROTECTED_PIDS reinsert after hold failed");
                     // lot 359 (P3 e)
@@ -1169,6 +1685,7 @@ async fn hold_supervision(
     agent_pid: u32,
     started: Instant,
     retry: &mut HoldRetry,
+    bpffs_root: &std::path::Path,
 ) -> std::convert::Infallible {
     let mut tick = ping_ticker(HOLD_STATUS_EVERY);
     tick.tick().await; // the first fires at once
@@ -1202,7 +1719,36 @@ async fn hold_supervision(
             if let Err(e) = record_hold(holds, &record) {
                 warn!(target: "watchdog.tamper", error = %e, "could not record the hold retry");
             }
-            if let Err(e) = respawn_agent_off_runtime(backend).await {
+            // The review of #582 (F2 d): a retry is a start too — judged
+            // first, skipped (and recorded) while the host stays changed.
+            // The re-check of #582 (N2): inside a signed window it is not
+            // skipped; the reference moves (signed) once the agent is back.
+            let in_window = antitamper_bpf::window_open(bpffs_root).unwrap_or(false);
+            let host = tokio::task::spawn_blocking(move || {
+                northnarrow_watchdog::respawn_gate::judge_now_keeping(in_window)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                let found = format!("not judged: {e}");
+                northnarrow_watchdog::respawn_gate::Verdict {
+                    hold: None,
+                    detail: format!("the host before the start {found}"),
+                    found,
+                }
+            });
+            if let Some(why) = host.hold {
+                error!(target: "watchdog.tamper", attempt, why = %why, "hold retry skipped: the host changed during the vacancy");
+                let skipped = nn_proto::watchdog_hold::HoldRecord {
+                    at: unix_now(),
+                    agent_pid,
+                    reason: nn_proto::watchdog_hold::REASON_RESPAWN_HELD.to_string(),
+                    detail: format!("retry {attempt} skipped: {why}"),
+                    unit_state: None,
+                };
+                if let Err(e) = record_hold(holds, &skipped) {
+                    warn!(target: "watchdog.tamper", error = %e, "could not record the skipped retry");
+                }
+            } else if let Err(e) = respawn_agent_off_runtime(backend).await {
                 error!(target: "watchdog.respawn", attempt, error = %e, "hold retry: the start failed");
             }
             next_retry = now + retry.next_wait();

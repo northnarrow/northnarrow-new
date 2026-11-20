@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+#[cfg(feature = "debug-trigger")]
+use northnarrow_agent::anti_tamper::bpf_defense::OWN_IDS_FILE_NAME;
 
 // The agent's start (BTF, the eBPF object, the rules) took ~5 s on a lab
 // host running two other guests: the 5-s wait failed a gate run with the
@@ -1670,59 +1672,99 @@ impl GuardFixture {
         }
     }
 
-    /// A run of the same binary without the variable: the guard re-armed
-    /// in observe mode. Stopped signed, else by the fixtures' eviction
-    /// (which observe mode allows).
-    ///
-    /// Lot 370 (F10-4; the re-check of #578): the enforce-mode agent's exit
-    /// vacated its role, and while the guard enforces only a successor
-    /// started for the role takes a handle on the pins — PID 1's child, as
-    /// the unit's restart. Started from the test's shell it was refused
-    /// (`BPF_OBJ_GET`: EPERM, exit 78), the guard stayed in enforce mode and
-    /// every later agent of the suite was refused: 18 tests on #578's KVM
-    /// suites. It starts as a transient service ([`Launch::Unit`]).
-    fn restore_observe(&self) -> Result<(), String> {
-        let mut run = self.spawn_as("restore", false, Launch::Unit)?;
-        let ready = wait_ready(&mut run).and_then(|_| {
-            let reg = wait_for_log_line(&run.log, &["own objects registered"], GUARD_LOG_TIMEOUT)
-                .ok_or("no BPF self-defence registration line")?;
-            if reg.contains("mode=\"observe\"") {
-                Ok(())
-            } else {
-                Err(format!("the guard re-armed in another mode: {reg}"))
-            }
-        });
-        let stopped = common::shutdown_signed(
-            &mut run.child,
-            &self.signed(&run.socket),
-            GUARD_STOP_TIMEOUT,
-        )
-        .or_else(|e| {
-            // the agent is PID 1's child: its pid from its pid file
-            let agent: Vec<u32> = std::fs::read_to_string(&run.pid_file)
-                .ok()
-                .and_then(|b| b.trim().parse().ok())
-                .into_iter()
-                .collect();
-            common::try_quit_agent_with(&mut run.child, &agent, common::QUIT_TIMEOUT)
-                .map_err(|q| format!("{e}; then {q}"))
-        });
-        match (ready, stopped) {
-            (Ok(()), Ok(())) => Ok(()),
-            (r, s) => Err(format!(
-                "{}{}\n{}",
-                r.err().unwrap_or_default(),
-                s.err().map(|e| format!(" (stop: {e})")).unwrap_or_default(),
-                log_tail(&run.log)
-            )),
+    /// Lot 374: the enforce run, for its signed stop, with a
+    /// trusted-installer window opened on it first ([`TEARDOWN_WINDOW`]):
+    /// the window outlives the agent, and in it the teardown removes the
+    /// pins its guard keeps ([`purge_pins_in_window`]).
+    fn take_for_stop(&mut self) -> Option<GuardRun> {
+        let run = self.enforce_run.take()?;
+        if let Err(e) = self.grant_window(run.name, TEARDOWN_WINDOW.as_secs() as u32) {
+            eprintln!(
+                "guard e2e: no teardown window on the {} agent: {e}",
+                run.name
+            );
         }
+        Some(run)
+    }
+}
+
+/// Lot 374: how long the teardown's window lasts (the signed stop, then the
+/// purge).
+#[cfg(feature = "debug-trigger")]
+const TEARDOWN_WINDOW: Duration = Duration::from_secs(90);
+
+/// Lot 374: the pins an enforce-mode agent's guard keeps after its stop,
+/// removed inside the window opened before it (as the lab's
+/// `lab_purge_pins` and `install.sh` purge them): the pin root (its lock
+/// unmounted first), the tracker's, the judges' and the module history's,
+/// then their LSM programs gone. The enforce run's exit vacated its role,
+/// and only its unit's restart takes a vacated role (lot 374: in the
+/// unit's own cgroup, which no agent a test starts runs in): before, a
+/// restore agent started as a transient service put the guard back in
+/// observe mode. After the purge the next fixture's agent is a first claim.
+///
+/// The lab r6 of #582 (ubuntu2604, kernel 7.0, systemd 259): the programs
+/// waited for are the stopped agents' own. The ids are those listed in their
+/// `bpf-own-ids` files (`own_ids`), as `install.sh --upgrade` and
+/// `uninstall.sh` wait for them (external audit DEP-006). The old wait for
+/// "no LSM program on the host" never ended where systemd keeps a BPF-LSM
+/// program of its own, so the teardown failed after the test had passed.
+/// With no list readable, it waits for no LSM program at all, as before.
+#[cfg(feature = "debug-trigger")]
+fn purge_pins_in_window(own_ids: &[PathBuf]) -> Result<(), String> {
+    let script = r#"
+ids=""
+for f in "$@"; do
+    [ -r "$f" ] && ids="$ids $(awk '$1 ~ /^[0-9]+$/ {print $1}' "$f")"
+done
+for i in 1 2 3 4; do
+    mountpoint -q /sys/fs/bpf/northnarrow 2>/dev/null || break
+    umount /sys/fs/bpf/northnarrow 2>/dev/null || umount -l /sys/fs/bpf/northnarrow 2>/dev/null || break
+done
+rm -rf /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null
+rm -f /run/northnarrow/cgroup-join-pins /run/northnarrow/module-writes-pins 2>/dev/null
+left=$(ls -d /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null)
+[ -z "$left" ] || { echo "pins left: $left"; exit 1; }
+for i in $(seq 1 20); do
+    if [ -n "$ids" ]; then
+        left=""
+        for id in $ids; do bpftool prog show id "$id" >/dev/null 2>&1 && left="$left $id"; done
+        [ -z "$left" ] && exit 0
+    else
+        [ "$(bpftool prog show 2>/dev/null | grep -c ' lsm ')" = 0 ] && exit 0
+    fi
+    sleep 1
+done
+if [ -n "$ids" ]; then
+    echo "own programs still loaded:$left"
+else
+    echo "LSM programs still loaded: $(bpftool prog show 2>/dev/null | grep -c ' lsm ')"
+fi
+exit 1
+"#;
+    let out = Command::new("sudo")
+        .args(["sh", "-c", script, "sh"])
+        .args(own_ids)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn the purge: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the pin purge failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
     }
 }
 
 #[cfg(feature = "debug-trigger")]
 impl Drop for GuardFixture {
     fn drop(&mut self) {
-        if let Some(mut run) = self.enforce_run.take() {
+        let mut own_ids = Vec::new();
+        if let Some(mut run) = self.take_for_stop() {
+            own_ids.push(run.pid_file.with_file_name(OWN_IDS_FILE_NAME));
             if let Err(e) = common::shutdown_signed(
                 &mut run.child,
                 &self.signed(&run.socket),
@@ -1736,14 +1778,331 @@ impl Drop for GuardFixture {
                 return;
             }
         }
-        if let Err(e) = self.restore_observe() {
+        if let Err(e) = purge_pins_in_window(&own_ids) {
             common::fail_teardown(&format!(
-                "guard e2e: the BPF guard could not be put back in observe mode ({e}). The next \
-                 fixtures' agents (other binaries) are refused their registration until the pin \
-                 root is purged or the host restarted (nn-lab.sh: lab_purge_pins restarts the guest)."
+                "guard e2e: the enforce-mode agent's pins could not be removed in the teardown's \
+                 window ({e}). The next fixtures' agents (other binaries) are refused their \
+                 registration until the pin root is purged or the host restarted (nn-lab.sh: \
+                 lab_purge_pins restarts the guest)."
             ));
         }
     }
+}
+
+/// The review of #582 (F7): the installed agent unit — its unit file, its
+/// binary and `nn-admin` beside it, the bootstrap admin key `install.sh`
+/// writes. `None` on a host without an install (the CI guests and the lab
+/// install one before the privileged suites).
+#[cfg(feature = "debug-trigger")]
+struct InstalledUnit {
+    nn_admin: PathBuf,
+    key: PathBuf,
+}
+
+#[cfg(feature = "debug-trigger")]
+const AGENT_UNIT: &str = "northnarrow-agent.service";
+
+#[cfg(feature = "debug-trigger")]
+fn installed_unit() -> Option<InstalledUnit> {
+    let listed = Command::new("systemctl")
+        .args(["list-unit-files", AGENT_UNIT, "--no-legend"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !String::from_utf8_lossy(&listed.stdout).contains(AGENT_UNIT) {
+        return None;
+    }
+    let exec = unit_property("ExecStart");
+    let exe = exec
+        .split(['{', ';', ' '])
+        .find_map(|w| w.strip_prefix("path="))
+        .unwrap_or("/usr/local/bin/northnarrow-agent")
+        .to_string();
+    let nn_admin = Path::new(&exe).with_file_name("nn-admin");
+    let key = ["/root/northnarrow-admin.key", "/etc/northnarrow/admin.key"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|k| k.exists())?;
+    nn_admin.exists().then_some(InstalledUnit { nn_admin, key })
+}
+
+#[cfg(feature = "debug-trigger")]
+fn unit_property(p: &str) -> String {
+    Command::new("systemctl")
+        .args(["show", "-p", p, "--value", AGENT_UNIT])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "debug-trigger")]
+fn main_pid() -> u32 {
+    unit_property("MainPID").parse().unwrap_or(0)
+}
+
+#[cfg(feature = "debug-trigger")]
+fn unit_active() -> bool {
+    unit_property("ActiveState") == "active"
+}
+
+#[cfg(feature = "debug-trigger")]
+fn systemctl(args: &[&str]) -> std::process::Output {
+    Command::new("timeout")
+        .arg("200")
+        .arg("systemctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn systemctl")
+}
+
+/// The agent `pid`'s journal (its unit's log namespace), one string.
+#[cfg(feature = "debug-trigger")]
+fn agent_journal(pid: u32) -> String {
+    Command::new("journalctl")
+        .args(["--namespace=northnarrow", "-o", "cat", "--no-pager"])
+        .arg(format!("_PID={pid}"))
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| without_colours(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// `s` without its terminal colour sequences (`ESC [ … letter`): the fmt
+/// layer may colour its fields.
+#[cfg(feature = "debug-trigger")]
+fn without_colours(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' && it.peek() == Some(&'[') {
+            it.next();
+            for d in it.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The agent unit's last journal lines (its log namespace).
+#[cfg(feature = "debug-trigger")]
+fn unit_journal_tail() -> String {
+    Command::new("journalctl")
+        .args([
+            "--namespace=northnarrow",
+            "-o",
+            "cat",
+            "--no-pager",
+            "-n",
+            "60",
+            "-u",
+            AGENT_UNIT,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// A trusted-installer window of `secs` on the installed agent.
+#[cfg(feature = "debug-trigger")]
+fn grant_installed_window(u: &InstalledUnit, secs: u32) -> Result<(), String> {
+    let out = Command::new(&u.nn_admin)
+        .arg("trusted-installer-grant")
+        .arg("--key")
+        .arg(&u.key)
+        .arg("--window-secs")
+        .arg(secs.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn nn-admin: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "trusted-installer-grant: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+/// The words of a pinned `Array<u32>` under the agent's pin root, by slot —
+/// through a read-only descriptor ([`common::raw_bpf::pinned_words`]): the
+/// enforce-mode guard refuses `bpftool`'s read-write one even in a window.
+#[cfg(feature = "debug-trigger")]
+fn pinned_words(name: &str) -> Result<Vec<u32>, String> {
+    common::raw_bpf::pinned_words(
+        &Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT).join(name),
+    )
+}
+
+/// The review of #582 (F7): the test's installed agent stopped and its pins
+/// removed whatever happened — inside a window, as the lab's
+/// `lab_purge_pins` does — and the service manager's variable unset.
+#[cfg(feature = "debug-trigger")]
+struct InstalledRun<'a>(&'a InstalledUnit);
+
+#[cfg(feature = "debug-trigger")]
+impl Drop for InstalledRun<'_> {
+    fn drop(&mut self) {
+        let _ = systemctl(&[
+            "unset-environment",
+            northnarrow_agent::anti_tamper::bpf_defense::ENFORCE_ENV,
+        ]);
+        if unit_active() {
+            if let Err(e) = grant_installed_window(self.0, 120) {
+                eprintln!("unit restart e2e: no teardown window: {e}");
+            }
+            let _ = systemctl(&["kill", "-s", "SIGTERM", AGENT_UNIT]);
+            let until = Instant::now() + Duration::from_secs(30);
+            while unit_active() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        let _ = systemctl(&["reset-failed", AGENT_UNIT]);
+        // the unit's agent writes its list beside its pid file
+        let own_ids = [Path::new("/run/northnarrow").join(OWN_IDS_FILE_NAME)];
+        if let Err(e) = purge_pins_in_window(&own_ids) {
+            common::fail_teardown(&format!(
+                "unit restart e2e: the installed agent's pins could not be removed ({e}): the \
+                 next suites' agents are refused until the pin root is purged"
+            ));
+        }
+    }
+}
+
+/// The review of #582 (F7): the availability side of the vacated role —
+/// after its holder exits, the restart of the agent's unit takes the role
+/// back while the BPF guard enforces (lot 374 binds the role to that
+/// restart: PID 1's child, in the unit's own cgroup, clean marks). The
+/// installed agent is started in enforce mode, stopped inside a signed
+/// window (its role vacated; the kernel marks the exit in-window), then its
+/// unit is started again outside the window: the new agent runs on, in
+/// enforce mode, and holds the role (`ROLE_TGIDS`), while `ROLE_MARKS` keeps
+/// "vacated this boot, last exit in a window" — what the other role reads.
+/// Needs the install (the CI guests' and the lab's); says so and returns
+/// without one.
+#[cfg(feature = "debug-trigger")]
+#[test]
+fn a_unit_restart_takes_the_vacated_role_under_enforce() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+    common::require_bpftool();
+    let Some(unit) = installed_unit() else {
+        eprintln!(
+            "unit restart e2e: not applicable here — no installed {AGENT_UNIT} (the CI guests \
+             and the lab install one before the privileged suites)"
+        );
+        return;
+    };
+    assert!(
+        !unit_active(),
+        "the installed agent must be stopped before this test (nn-lab.sh test-ignored stops it)"
+    );
+    let _run = InstalledRun(&unit);
+    let env = format!(
+        "{}=1",
+        northnarrow_agent::anti_tamper::bpf_defense::ENFORCE_ENV
+    );
+    let o = systemctl(&["set-environment", &env]);
+    assert!(o.status.success(), "set-environment: {o:?}");
+
+    // 1. The first claim this boot, in enforce mode.
+    let o = systemctl(&["start", AGENT_UNIT]);
+    assert!(o.status.success(), "the first start: {o:?}");
+    let first = main_pid();
+    assert!(first > 0 && unit_active(), "no agent after the first start");
+    let until = Instant::now() + Duration::from_secs(90);
+    let mut log = String::new();
+    while Instant::now() < until {
+        log = agent_journal(first);
+        if log.contains("own objects registered") {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let reg = log
+        .lines()
+        .find(|l| l.contains("own objects registered"))
+        .unwrap_or_else(|| panic!("no registration line of the first agent:\n{log}"));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the guard does not enforce: {reg}"
+    );
+
+    // 2. Its role vacated: stopped inside a signed window.
+    grant_installed_window(&unit, 15).unwrap_or_else(|e| panic!("{e}"));
+    let granted = Instant::now();
+    let o = systemctl(&["kill", "-s", "SIGTERM", AGENT_UNIT]);
+    assert!(o.status.success(), "kill in the window: {o:?}");
+    let until = Instant::now() + Duration::from_secs(30);
+    while unit_active() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(!unit_active(), "the agent did not stop inside the window");
+
+    // 3. Outside the window, the unit's restart takes the vacated role.
+    let left = Duration::from_secs(20).saturating_sub(granted.elapsed());
+    std::thread::sleep(left);
+    let o = systemctl(&["start", AGENT_UNIT]);
+    assert!(
+        o.status.success(),
+        "the unit's restart was refused the vacated role under enforce: {o:?}\n{}",
+        unit_journal_tail()
+    );
+    let second = main_pid();
+    assert!(
+        second > 0 && second != first,
+        "no new agent ({first} → {second})"
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        unit_active() && main_pid() == second,
+        "the successor did not stay up:\n{}",
+        agent_journal(second)
+    );
+    let log = agent_journal(second);
+    let reg = log
+        .lines()
+        .find(|l| l.contains("own objects registered"))
+        .unwrap_or_else(|| panic!("no registration line of the successor:\n{log}"));
+    assert!(
+        reg.contains("mode=\"enforce\""),
+        "the successor's guard: {reg}"
+    );
+    assert!(
+        !log.contains("role NOT recorded"),
+        "the successor did not record its role:\n{log}"
+    );
+
+    // 4. Read in a window, through read-only descriptors (a write handle
+    // stays refused there while the guard enforces): the successor holds the
+    // agent's slot; the kernel's mark of the vacancy outlived the claim.
+    grant_installed_window(&unit, 120).unwrap_or_else(|e| panic!("{e}"));
+    let roles = pinned_words("ROLE_TGIDS").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        roles.get(1).copied(),
+        Some(second),
+        "ROLE_TGIDS[agent] is not the successor: {roles:?}"
+    );
+    let marks = pinned_words("ROLE_MARKS").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        marks.get(1).copied(),
+        Some(common_wire_mark_in_window()),
+        "ROLE_MARKS[agent] after a stop inside a window: {marks:?}"
+    );
+}
+
+/// `role_exit`'s mark of an exit inside a window.
+#[cfg(feature = "debug-trigger")]
+fn common_wire_mark_in_window() -> u32 {
+    antitamper_bpf::ROLE_MARK_VACATED | antitamper_bpf::ROLE_MARK_IN_WINDOW
 }
 
 /// External audit TST-001 (NN-AUD-224) and TST-010 (NN-AUD-231): with the
@@ -1888,9 +2247,9 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         "the agent is gone after the refused teardown"
     );
 
-    // 6. The authorised stop: a 2-of-N signed shutdown. Drop then puts
-    //    the guard back in observe mode.
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    // 6. The authorised stop: a 2-of-N signed shutdown. Drop then removes
+    //    its pins in the window opened before it (lot 374).
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2131,8 +2490,8 @@ fn a_bpf_handle_loop_does_not_bury_a_refused_kill() {
         log_tail(&log)
     );
 
-    // The authorised stop, signed; Drop puts the guard back in observe mode.
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    // The authorised stop, signed; Drop removes the pins in its window.
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2287,7 +2646,7 @@ fn a_bpf_handle_loop_does_not_hide_a_decisive_refusal() {
         "a decisive record or the ring lost: {drops:#?}"
     );
 
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2537,7 +2896,7 @@ fn a_flood_of_minor_refusals_never_hides_a_held_load() {
         "a held load refused unsigned, or the ring lost: {drops:#?}"
     );
 
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -2594,7 +2953,7 @@ fn assert_decisive_record_after_flood(
             .any(|l| l.contains("fs_protect") || l.contains(&decisive)),
         "a decisive record or the ring lost: {drops:#?}"
     );
-    let mut run = fx.enforce_run.take().expect("enforce run");
+    let mut run = fx.take_for_stop().expect("enforce run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {
@@ -3050,8 +3409,8 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // 3. The authorised stop. Drop then restores the guard's mode.
-    let mut run = fx.enforce_run.take().expect("the sigio run");
+    // 3. The authorised stop. Drop then removes the pins in its window.
+    let mut run = fx.take_for_stop().expect("the sigio run");
     if let Err(e) =
         common::shutdown_signed(&mut run.child, &fx.signed(&run.socket), GUARD_STOP_TIMEOUT)
     {

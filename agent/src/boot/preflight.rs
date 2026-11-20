@@ -47,13 +47,31 @@ pub(crate) struct Preflight {
     pub(crate) rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,
 }
 
+/// Lot 374: the gate a start's own check refuses through (`refused_by`).
+pub(crate) const SELF_CHECK_GATE: &str = "start_self_check";
+
+/// Lot 374: the refusal's detail when the start's own check found
+/// anything (names only), `None` when it is clean.
+pub(crate) fn self_check_refusal(found: &antitamper_bpf::start_check::Findings) -> Option<String> {
+    (!found.clean()).then(|| {
+        format!(
+            "the start's own check: {} — code or a library given to the process before its \
+             main is not the agent's",
+            found.describe()
+        )
+    })
+}
+
 /// `BootPhase::Preflight`, its first checks: the embedded eBPF object, the
 /// state directory, the kernel's offsets from its BTF (R11b, lab PR 262: a
 /// refusal is kept in [`Preflight::refused`], signed and exited 78 at the
 /// start of the integrity phase), the rlimits, the chains against their
 /// heads and the overlays' rollback floor — nothing written yet, nothing
 /// loaded into the kernel.
-pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
+pub(crate) fn check(
+    cli: &Cli,
+    self_check: &antitamper_bpf::start_check::Findings,
+) -> Result<Preflight> {
     // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
     // order the code enforces (`northnarrow_agent::boot`). Preflight —
     // checks only — until `verify_integrity` hands out the proof the load,
@@ -107,6 +125,14 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // R011's PF_KTHREAD signal (the exact blindness that let R011
     // over-fire when a stale .o was embedded by a workspace build).
     let mut refused: Option<Refusal> = None;
+    // Lot 374: the start's own check (`start_check::check_self`, made first
+    // thing in `main`): a loader variable, or an executable mapping that is
+    // neither this binary nor a library the release links. Refused before
+    // the role is taken (the attach claims it), signed like the gates below.
+    if let Some(why) = self_check_refusal(self_check) {
+        error!("refusing to start: {why}");
+        refused.get_or_insert(Refusal::new(SELF_CHECK_GATE, why));
+    }
     if let Verdict::Refused(why) = checks::ebpf_object(&mut boot)? {
         error!(error = %why, "eBPF object boot preflight failed — refusing to start");
         refused.get_or_insert(Refusal::new("ebpf_object", why));
@@ -571,5 +597,49 @@ mod absent_field_effect_tests {
             mv,
             northnarrow_agent::anti_tamper::cgroup_guard::MOVE_GUARD_ABSENT_EFFECT
         );
+    }
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::self_check_refusal;
+    use antitamper_bpf::start_check::{Findings, Foreign};
+
+    /// Lot 374: a start's own check refuses the start when it found
+    /// anything — a loader variable, a mapping not expected, or what it
+    /// could not read — naming it, never a value; nothing found, no refusal.
+    #[test]
+    fn a_start_that_finds_anything_of_its_own_refuses_itself() {
+        assert_eq!(self_check_refusal(&Findings::default()), None);
+        for (found, name) in [
+            (
+                Findings {
+                    loader_vars: vec!["LD_PRELOAD".into()],
+                    ..Findings::default()
+                },
+                "LD_PRELOAD",
+            ),
+            (
+                Findings {
+                    foreign: vec![Foreign {
+                        path: "/tmp/x.so".into(),
+                        why: "not in a system library directory",
+                    }],
+                    ..Findings::default()
+                },
+                "/tmp/x.so",
+            ),
+            (
+                Findings {
+                    unreadable: vec!["maps: denied".into()],
+                    ..Findings::default()
+                },
+                "maps: denied",
+            ),
+        ] {
+            let why = self_check_refusal(&found).expect("refused");
+            assert!(why.starts_with("the start's own check: "), "{why}");
+            assert!(why.contains(name), "{why}");
+        }
     }
 }

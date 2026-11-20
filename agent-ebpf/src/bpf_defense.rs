@@ -70,8 +70,8 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_ktime_get_ns, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, lsm, map, raw_tracepoint},
     maps::{Array, HashMap, LruHashMap, RingBuf},
@@ -96,7 +96,8 @@ use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::exe::TaskKey;
 use northnarrow_common::wire::{
     bpf_held_dev, BpfSyscallRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED,
+    BPF_CMD_VACATED_ROLE_GET_FD, ROLE_VACATED, kn_name_words, role_unit_words, OUR_SLICE,
+    role_exit_mark,
     BPF_HELD_FULL, BPF_HELD_SLOT_UNREAD, FS_OP_BPF_HANDLE, FS_OP_BPF_HELD_LOAD, FS_OP_BPF_HELD_USE, FS_OP_BPF_LINK, FS_OP_BPF_MAP,
     FS_OP_BPF_PROG_OPT_OUT, FS_OP_BPF_PROG_TYPE, FS_OP_SYSCTL_ROOT_ATTACH,
 };
@@ -108,6 +109,9 @@ use crate::btf_offsets::{
     INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
     TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
     TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+    // lot 374: the successor's cgroup
+    CGROUP_KN_OFFSET, CSS_SET_DFL_CGRP_OFFSET, KERNFS_NODE_NAME_OFFSET, KERNFS_NODE_PARENT_OFFSET,
+    TASK_STRUCT_CGROUPS_OFFSET,
 };
 use northnarrow_common::wire::{InodeKey, PIN_NAME_HASH_PRIME, PIN_NAME_HASH_SEED};
 
@@ -277,6 +281,27 @@ pub const ROLE_AGENT: u8 = 2;
 /// loads, and reads this to know the role is vacant.
 #[map]
 pub static ROLE_TGIDS: Array<u32> = Array::pinned(2, 0);
+
+/// The review of #582 (F4, F6): per slot of [`ROLE_TGIDS`], what
+/// [`role_exit`] recorded of its holders' exits this boot
+/// (`northnarrow_common::wire::role_exit_mark`: vacated, and whether the last
+/// exit was inside a signed trusted-installer window). A successor's claim
+/// of its slot leaves the "vacated this boot" the other role reads at its
+/// own start. The re-check of #582 (N1): frozen by the agent's load
+/// (`BPF_MAP_FREEZE`, map-wide and for good: no descriptor's update is
+/// taken, the family's included), so [`role_exit`] alone writes it — a
+/// program's stores are not a syscall's. Pinned by name, as [`ROLE_TGIDS`].
+#[map]
+pub static ROLE_MARKS: Array<u32> = Array::pinned(2, 0);
+
+/// The re-check of #582 (N4): per slot of [`ROLE_TGIDS`], when its holder
+/// last exited — `CLOCK_BOOTTIME` nanoseconds, the clock of a process's
+/// start in `/proc/<pid>/stat` — written by [`role_exit`] beside
+/// [`ROLE_MARKS`], frozen with it. A role's start judges the other role's
+/// process only when it took its role after this role's last exit (no
+/// holder of this role saw it start).
+#[map]
+pub static ROLE_EXITS: Array<u64> = Array::pinned(2, 0);
 
 /// How long after its start a fresh agent or watchdog may take write
 /// handles before it is a protected pid (the agent registers itself in
@@ -924,10 +949,11 @@ pub(crate) fn caller_role() -> u8 {
 ///
 /// Lot 370 (F10-4): a role whose holder exited this boot
 /// ([`ROLE_VACATED`]: the OOM killer, a crash) is taken only by a
-/// successor started for it — a child of PID 1 (its unit's restart) or of
-/// the live holder of the other role (the watchdog's respawn) — with no
-/// code injected (lot 281's taint); a preloaded instance started from a
-/// shell gets nothing. A first claim this boot is as before.
+/// successor started for it; a first claim this boot is as before. Lot
+/// 374: started for it is the restart systemd makes of the role's unit —
+/// a child of PID 1, in that unit's own cgroup, with clean lot 277/281
+/// marks ([`started_for_the_role`]) — in or out of a trusted-installer
+/// window (the window changes the record, never this right).
 #[inline(always)]
 fn fresh_instance_may_load() -> bool {
     let pid_tgid = bpf_get_current_pid_tgid();
@@ -960,9 +986,13 @@ fn fresh_instance_may_load() -> bool {
     !vacated || unsafe { started_for_the_role(task, slot) }
 }
 
-/// Lot 370 (F10-4): `task` (claiming role slot `slot`, vacated) is a child
-/// of PID 1 or of the live holder of the other role, and no code was
-/// injected into it.
+/// Lot 374: `task` (claiming role slot `slot`, vacated) is the restart of
+/// its role's unit: a child of PID 1 (no longer the other role's child:
+/// the watchdog respawns through systemd), running in that unit's own
+/// cgroup ([`nn_in_role_unit`]), with clean lot 277/281 marks — not moved
+/// into its cgroup, not born there by another, nothing injected into it
+/// (lot 370 asked only the last). A process started anywhere else, a
+/// transient unit included, never takes a vacated role.
 #[inline(always)]
 unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
     let parent = match bpf_probe_read_kernel::<*const u8>(
@@ -977,11 +1007,93 @@ unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
         Ok(t) => t,
         Err(_) => return false,
     };
-    let by_family = match ROLE_TGIDS.get(1 - (slot & 1)) {
-        Some(t) => *t != 0 && *t != ROLE_VACATED && *t == ptgid,
-        None => false,
+    ptgid == 1
+        && nn_in_role_unit(task as u64, u64::from(slot)) == 1
+        && crate::cgroup_join::caller_marks_clean()
+}
+
+/// Lot 374: whether `task`'s cgroup of the default hierarchy is role slot
+/// `slot`'s unit's own (`common::wire::role_unit_words`): its kernfs node
+/// named as the unit, that node's parent as our slice, the slice's parent
+/// the hierarchy's root (a node without a parent). 1 when it is, 0 when
+/// it is not or an offset or a read is missing (fail closed). A global
+/// BPF function (exported, never inlined, scalar arguments): the verifier
+/// checks it once, not in every hook that inlines the successor's right.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_in_role_unit(task: u64, slot: u64) -> u64 {
+    u64::from(unsafe { in_role_unit(task as *const u8, slot as u32) })
+}
+
+#[inline(always)]
+unsafe fn in_role_unit(task: *const u8, slot: u32) -> bool {
+    let (Some(o_cgroups), Some(o_dfl), Some(o_kn), Some(o_name), Some(o_parent)) = (
+        off_opt!(TASK_STRUCT_CGROUPS_OFFSET),
+        off_opt!(CSS_SET_DFL_CGRP_OFFSET),
+        off_opt!(CGROUP_KN_OFFSET),
+        off_opt!(KERNFS_NODE_NAME_OFFSET),
+        off_opt!(KERNFS_NODE_PARENT_OFFSET),
+    ) else {
+        return false;
     };
-    (ptgid == 1 || by_family) && crate::cgroup_join::caller_untainted()
+    if task.is_null() {
+        return false;
+    }
+    let Some(cset) = read_ptr(task, o_cgroups) else {
+        return false;
+    };
+    let Some(cgrp) = read_ptr(cset, o_dfl) else {
+        return false;
+    };
+    let Some(kn) = read_ptr(cgrp, o_kn) else {
+        return false;
+    };
+    let unit = if slot == 0 {
+        role_unit_words(0)
+    } else {
+        role_unit_words(1)
+    };
+    if !kn_named(kn, o_name, &unit) {
+        return false;
+    }
+    let Some(slice) = read_ptr(kn, o_parent) else {
+        return false;
+    };
+    const SLICE: [u64; 4] = kn_name_words(OUR_SLICE);
+    if !kn_named(slice, o_name, &SLICE) {
+        return false;
+    }
+    let Some(root) = read_ptr(slice, o_parent) else {
+        return false;
+    };
+    matches!(
+        bpf_probe_read_kernel::<*const u8>(root.add(o_parent) as *const *const u8),
+        Ok(p) if p.is_null()
+    )
+}
+
+/// The non-null pointer at `base + off`.
+#[inline(always)]
+unsafe fn read_ptr(base: *const u8, off: usize) -> Option<*const u8> {
+    match bpf_probe_read_kernel::<*const u8>(base.add(off) as *const *const u8) {
+        Ok(p) if !p.is_null() => Some(p),
+        _ => None,
+    }
+}
+
+/// Kernfs node `kn`'s name is `want` (`common::wire::kn_name_words`).
+#[inline(always)]
+unsafe fn kn_named(kn: *const u8, o_name: usize, want: &[u64; 4]) -> bool {
+    let Some(name) = read_ptr(kn, o_name) else {
+        return false;
+    };
+    let mut w = [0u64; 4];
+    let n = aya_ebpf::helpers::generated::bpf_probe_read_kernel_str(
+        w.as_mut_ptr() as *mut c_void,
+        32,
+        name as *const c_void,
+    );
+    n > 1 && w[0] == want[0] && w[1] == want[1] && w[2] == want[2] && w[3] == want[3]
 }
 
 /// Lot 370 (F10-4): the record of a fresh instance's handle — a first
@@ -1025,6 +1137,15 @@ pub fn role_exit(_ctx: RawTracePointContext) -> i32 {
                 // the review of #567 (F2): its mount namespace is no longer
                 // judged as PID 1's
                 crate::mount_guard::vacate(slot);
+                // the review of #582 (F4, F6): vacated this boot, and
+                // whether inside a signed window — kept past the next claim
+                if let Some(m) = ROLE_MARKS.get_ptr_mut(slot) {
+                    unsafe { *m = role_exit_mark(crate::inode_protect::override_active()) };
+                }
+                // the re-check of #582 (N4): and when
+                if let Some(e) = ROLE_EXITS.get_ptr_mut(slot) {
+                    unsafe { *e = bpf_ktime_get_boot_ns() };
+                }
             }
         }
         slot += 1;
