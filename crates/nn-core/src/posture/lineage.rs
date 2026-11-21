@@ -2753,6 +2753,11 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 None => Some(image),
             },
         };
+        // lot 380: the image at the event, when read, is that file (a later
+        // exec not read yet names another)
+        if image != (0, 0) && file != Some(image) {
+            return false;
+        }
         file.is_some_and(|f| paths.iter().any(|p| self.is_host_file_in_root_dir(p, f)))
     }
 
@@ -2773,11 +2778,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     ///   identity is compared with — and never when an exec is cached (the
     ///   review of #583, F4).
     ///
+    /// The image at the event, when read, must be the file the records
+    /// hold, or the records must lag the open (a fork; a cached exec as root
+    /// of a process that opens as a user): then the image decides, as for
+    /// an exec not read yet (the lab of lot 380: a unit's packaged executor
+    /// cached, the program it then executed not read yet).
+    ///
     /// `None`: a copy, a renamed or replaced binary, a file elsewhere, an
-    /// exec whose file was not recorded, `(0, 0)`.
+    /// exec whose file was not recorded, another image at the event,
+    /// `(0, 0)`.
     pub fn host_program(
         &self,
         pid: u32,
+        uid: u32,
         as_of: AsOf,
         image: (u64, u64),
         comm: &str,
@@ -2785,26 +2798,45 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if pid <= 1 {
             return None;
         }
-        let entry = match self.cached_live(pid, as_of.time()) {
-            CachedAt::Current(e) | CachedAt::Past(e) => e,
+        // what the records hold: its own exec, else its fork's forker's
+        let (entry, own_exec) = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => (Some(e), true),
             CachedAt::LaterOnly => return None,
-            CachedAt::Absent => match self.kernel_fork_record(pid, as_of.time(), 0) {
-                Some((_, forker)) => forker,
-                // the name another file's (`..`, a path, nothing): no file
-                // has the image's identity there, or it is no system tree's
-                None => {
-                    return SYSTEM_PROGRAM_DIRS
-                        .iter()
-                        .map(|d| format!("{d}/{comm}"))
-                        .find(|p| self.is_host_file_in_root_dir(p, image))
-                }
-            },
+            CachedAt::Absent => (
+                self.kernel_fork_record(pid, as_of.time(), 0)
+                    .map(|(_, forker)| forker),
+                false,
+            ),
         };
-        let path = entry.exe.to_string_lossy().into_owned();
-        entry
-            .exec_file
-            .is_some_and(|f| self.is_host_file_in_root_dir(&path, f))
-            .then_some(path)
+        if let Some(entry) = entry {
+            if image == (0, 0) || entry.exec_file == Some(image) {
+                let path = entry.exe.to_string_lossy().into_owned();
+                return entry
+                    .exec_file
+                    .is_some_and(|f| self.is_host_file_in_root_dir(&path, f))
+                    .then_some(path);
+            }
+            // The image at the event is another file than the records':
+            // they lag the open (the exec pump reads an exec's facts before
+            // the exec reaches the lineage) for a fork, which executed since
+            // its record, and for a process whose cached exec ran as root
+            // and which opens as a user — a unit's executor that dropped to
+            // the unit's user and executed its program (the lab of lot 380:
+            // `cat` judged as `systemd-executor`). Its own exec as that user,
+            // with another image at the open (`PR_SET_MM`, the review of
+            // #583, F4): what it runs is that exec, not vouched for.
+            if own_exec && (entry.uid != 0 || uid == 0) {
+                return None;
+            }
+        }
+        // the image decides: the host's file of its name in a system
+        // program directory (a name another file's — `..`, a path, nothing
+        // — has no file with the image's identity there, or none in a
+        // system tree)
+        SYSTEM_PROGRAM_DIRS
+            .iter()
+            .map(|d| format!("{d}/{comm}"))
+            .find(|p| self.is_host_file_in_root_dir(p, image))
     }
 
     /// Lot 378 (the rc10 soak: ALERTED at every boot on Debian 13, Ubuntu

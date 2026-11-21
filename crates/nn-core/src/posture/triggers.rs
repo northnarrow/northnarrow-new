@@ -1609,7 +1609,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     if is_passwd
         && !is_write_open(*flags)
         && auth
-            .host_program(*pid, as_of, *exe_file, comm)
+            .host_program(*pid, *uid, as_of, *exe_file, comm)
             .is_some_and(|program| !reads_like_a_tool(&program))
     {
         return false;
@@ -3992,6 +3992,10 @@ mod tests {
         auth.ingest_kernel_fork(803, 803, (800, 800), 1000, 10_000);
         assert!(!fires(803, "/etc/login.defs", 0, uidmap), "its fork");
         // the attack shapes
+        assert!(
+            fires(800, "/etc/login.defs", 0, (KDEV, 43)),
+            "a later exec not read yet (cat's image at the open)"
+        );
         assert!(fires(800, "/etc/login.defs", 1, uidmap), "opened for write");
         assert!(fires(800, "/etc/shadow", 0, uidmap), "the shadow file");
         exec(810, "/tmp/newuidmap", 46);
@@ -4220,6 +4224,54 @@ mod tests {
             fires(926, "/etc/passwd", 0, (KDEV, 66)),
             "a program of a directory not root's only"
         );
+        // the lab's case: a unit's packaged executor cached (run by root),
+        // the program it then executed as the unit's user not read yet —
+        // the image at the open decides: `cat` fires, `id` does not
+        IdTestHost::set_file_id("/usr/lib/systemd/systemd-executor", Some((STAT_DEV, 67)));
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", true);
+        let mut executor = spawn_with_exe(928, 1, "/usr/lib/systemd/systemd-executor", 1);
+        if let Event::ProcessSpawn {
+            uid,
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut executor
+        {
+            *uid = 0;
+            (*start_ns, *timestamp_ns) = (928, 929);
+            (exe.path, exe.dev, exe.ino, exe.flags) = (
+                "/usr/lib/systemd/systemd-executor".into(),
+                KDEV,
+                67,
+                KNOWN | ROOT_DIR,
+            );
+        }
+        assert!(auth.ingest_spawn_event(&executor));
+        assert!(
+            opens(928, "cat", "/etc/passwd", 0, (KDEV, 52)),
+            "the unit's cat, its exec not read yet"
+        );
+        assert!(
+            !opens(928, "id", "/etc/passwd", 0, id),
+            "the unit's id, its exec not read yet"
+        );
+        // its own exec as the user, another image at the open: the exec
+        exec(929, "/usr/lib/systemd/systemd-executor", 67);
+        assert!(
+            opens(929, "id", "/etc/passwd", 0, id),
+            "an exec of its own as the user naming another image"
+        );
+        // a fork of a shell that executed `id`, not read yet; and `cat`
+        auth.ingest_kernel_fork(930, 930, (915, 915), 1000, 10_000);
+        assert!(
+            !opens(930, "id", "/etc/passwd", 0, id),
+            "a fork that executed id since"
+        );
+        assert!(
+            opens(930, "cat", "/etc/passwd", 0, (KDEV, 52)),
+            "a fork that executed cat since"
+        );
         // its only exec cached came after the open (a fork then): what it
         // ran then is not known, whatever image it names
         let mut later = spawn_with_exe(927, 690, "/usr/bin/id", 1);
@@ -4273,6 +4325,8 @@ mod tests {
         IdTestHost::set_file_id("/home/u/bin/id", None);
         IdTestHost::set_file_id("/usr/sbin/idx", None);
         IdTestHost::set_file_id("/usr/local/bin/id", None);
+        IdTestHost::set_file_id("/usr/lib/systemd/systemd-executor", None);
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", false);
         IdTestHost::set_dir_root_only("/usr/bin", false);
     }
 
