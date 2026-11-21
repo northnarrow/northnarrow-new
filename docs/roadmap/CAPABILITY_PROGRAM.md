@@ -11720,13 +11720,15 @@ number in parentheses is a lab PR.
       `--version`. Ratchet `xtask/tests/release_version.rs`.
     - **Our programs by identity.** The guard fixture keeps the ids of
       every run's `bpf-own-ids` list (the runs of one directory share the
-      file) and its teardown waits for them; with none readable, for our
-      LSM programs by name (`deploy/lab/lib/our-lsm-programs.txt`, held
-      equal to agent-ebpf's 63 `#[lsm]` functions), never for every LSM
-      program. The lab's helpers that counted every one (`lab_purge_pins`,
-      the uninstall check's fallback, `pkg-check.sh`, `perf-run.sh`) use
-      `deploy/lab/lib/our-lsm.sh`; `xtask/tests/our_lsm_identity.rs`
-      forbids the old count.
+      file) and its teardown waits for them and for our LSM programs by
+      name, both (`deploy/lab/lib/our-lsm-programs.txt`, held equal to
+      agent-ebpf's 63 `lsm` programs, in any module and under any path
+      to the macro), never for every LSM program. The lab's helpers that
+      counted every one (`lab_purge_pins`, the uninstall check's
+      fallback, `pkg-check.sh`, `perf-run.sh`) and the range bootstrap
+      use `deploy/lab/lib/our-lsm.sh`; `xtask/tests/our_lsm_identity.rs`
+      forbids the old count in the tests, `deploy/`, the docs' scripts
+      and every shell script (the review of #590).
     - **`agent_stalled`** names the agent's own memory throttling
       (`MemoryHigh`) besides a pause of the machine (from lot 382's
       review); the testers' guide and the known limitations are no longer

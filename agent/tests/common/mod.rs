@@ -1364,11 +1364,13 @@ pub mod our_bpf {
     }
 
     /// The header lines of a `bpftool prog show` listing (`<id>: <type>
-    /// name <name>  tag …`) that are programs of ours: with `ids`, those
-    /// among them, whatever their type; without (no list was readable: an
-    /// agent stopped before it wrote one), the LSM programs that carry one
-    /// of [`lsm_names`]. Another product's program and PID 1's are never
-    /// in it, so they are never waited for; one of ours always is.
+    /// name <name>  tag …`) that are programs of ours: those among `ids`,
+    /// whatever their type, and the LSM programs that carry one of
+    /// [`lsm_names`] — both, always (the review of #590, P3-1: with an id
+    /// known the names were skipped, so a run that never wrote its list,
+    /// or an earlier binary's program, was not waited for). Another
+    /// product's program and PID 1's are never in it, so they are never
+    /// waited for; one of ours always is.
     pub fn ours_left(listing: &str, ids: &BTreeSet<u32>) -> Vec<String> {
         let names = lsm_names();
         listing
@@ -1382,8 +1384,8 @@ pub mod our_bpf {
                 else {
                     return false;
                 };
-                if !ids.is_empty() {
-                    return ids.contains(&id);
+                if ids.contains(&id) {
+                    return true;
                 }
                 let kind = f.next();
                 let rest: Vec<&str> = f.collect();
@@ -1422,13 +1424,9 @@ pub mod our_bpf {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let by = if ids.is_empty() {
-                    "by name: no list of program ids was readable".to_string()
-                } else {
-                    format!("ids {ids:?}")
-                };
                 return Err(format!(
-                    "programs of ours still loaded after {timeout:?} ({by}): {left:?}"
+                    "programs of ours still loaded after {timeout:?} (ids {ids:?}, and our LSM \
+                     programs by name): {left:?}"
                 ));
             }
             std::thread::sleep(Duration::from_secs(1));

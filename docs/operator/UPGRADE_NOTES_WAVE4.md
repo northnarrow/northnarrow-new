@@ -5998,13 +5998,16 @@ fires.
   enforce run itself left the fixture no list of program ids, and the
   fallback counted every LSM program. The fixture now keeps the ids of
   every run's `bpf-own-ids` list (read before a new run replaces it, and
-  at the teardown) and waits for those; with none readable, for our LSM
-  programs by name (`deploy/lab/lib/our-lsm-programs.txt`, held equal to
-  the eBPF sources). A program of ours still loaded fails the teardown as
-  before. The lab's helpers that counted every LSM program
-  (`lab_purge_pins`, the uninstall check, `pkg-check.sh`, `perf-run.sh`)
-  count ours the same way (`deploy/lab/lib/our-lsm.sh`), and a ratchet
-  (`xtask/tests/our_lsm_identity.rs`) forbids the old count.
+  at the teardown) and waits for those and for our LSM programs by name,
+  both (`deploy/lab/lib/our-lsm-programs.txt`, held equal to every `lsm`
+  program of the eBPF sources, in any module). A program of ours still
+  loaded fails the teardown as before, whether or not a list names it.
+  The lab's helpers that counted every LSM program (`lab_purge_pins`, the
+  uninstall check, `pkg-check.sh`, `perf-run.sh`) and the range bootstrap
+  (`deploy/adversarial/bootstrap-target-prod.sh`, step 1) count ours the
+  same way (`deploy/lab/lib/our-lsm.sh`), and a ratchet
+  (`xtask/tests/our_lsm_identity.rs`, over the tests, `deploy/`, the
+  docs' scripts and every shell script) forbids the old count.
 - **`agent_stalled`'s reason** names the agent's own memory throttling:
   the kernel holding the agent back above its unit's `MemoryHigh` (768M
   since lot 381) stalls its loop too, not only a pause of the whole

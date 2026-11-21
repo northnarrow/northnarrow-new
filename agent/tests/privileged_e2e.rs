@@ -1739,9 +1739,9 @@ const TEARDOWN_WINDOW: Duration = Duration::from_secs(90);
 /// fixture, and the fixture's drop had no run left to name — it still
 /// waited for no LSM program at all, PID 1's included. `seen` now carries
 /// every id the fixture read from its runs' lists, and the wait is
-/// [`common::our_bpf::wait_ours_gone`]: those ids, or, when none was ever
-/// readable, our LSM programs by name. Never every LSM program on the host;
-/// a program of ours still loaded fails the teardown as before.
+/// [`common::our_bpf::wait_ours_gone`]: those ids and our LSM programs by
+/// name, both (the review of #590, P3-1). Never every LSM program on the
+/// host; a program of ours still loaded fails the teardown as before.
 #[cfg(feature = "debug-trigger")]
 fn purge_pins_in_window(
     own_ids: &[PathBuf],

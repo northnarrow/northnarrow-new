@@ -11,10 +11,12 @@
 #
 #   our_progs_left [<id>...]   the `bpftool prog show` header line of every
 #                              program of ours still loaded: the ids given
-#                              (an agent's bpf-own-ids list; any type), or,
-#                              with none (an agent older than the list, or
-#                              one stopped before it wrote it), the LSM
-#                              programs named like one in our-lsm-programs.txt.
+#                              (an agent's bpf-own-ids list; any type), and,
+#                              always, the LSM programs named like one in
+#                              our-lsm-programs.txt — a run that never wrote
+#                              its list, an agent older than the list, an
+#                              earlier binary's leftover (the review of #590,
+#                              P3-1: with ids given, the names were skipped).
 #                              Exit 2, printing nothing, when it cannot tell:
 #                              bpftool fails, or the list of names is missing.
 #   our_progs_count [<id>...]  how many: a number, or `unknown` (exit 2), which
@@ -32,18 +34,16 @@ own_ids_of() {
 }
 
 our_progs_left() {
-    local listing names=""
-    if [ $# = 0 ]; then
-        [ -r "$NN_OUR_LSM_NAMES" ] || { echo "our-lsm: $NN_OUR_LSM_NAMES is missing" >&2; return 2; }
-        # the kernel keeps 15 bytes of a name
-        names=$(grep -v -e '^#' -e '^$' "$NN_OUR_LSM_NAMES" | cut -c1-15 | tr '\n' ' ')
-        [ -n "$names" ] || { echo "our-lsm: $NN_OUR_LSM_NAMES lists no name" >&2; return 2; }
-    fi
+    local listing names
+    [ -r "$NN_OUR_LSM_NAMES" ] || { echo "our-lsm: $NN_OUR_LSM_NAMES is missing" >&2; return 2; }
+    # the kernel keeps 15 bytes of a name
+    names=$(grep -v -e '^#' -e '^$' "$NN_OUR_LSM_NAMES" | cut -c1-15 | tr '\n' ' ')
+    [ -n "$names" ] || { echo "our-lsm: $NN_OUR_LSM_NAMES lists no name" >&2; return 2; }
     listing=$(_nn_as_root bpftool prog show 2>/dev/null) || { echo "our-lsm: bpftool prog show failed" >&2; return 2; }
-    awk -v ids=" $* " -v byid=$# -v names=" $names " '
+    awk -v ids=" $* " -v names=" $names " '
         $1 ~ /^[0-9]+:$/ {
             id = substr($1, 1, length($1) - 1)
-            if (byid) { if (index(ids, " " id " ")) print; next }
+            if (index(ids, " " id " ")) { print; next }
             if ($2 != "lsm") next
             for (i = 3; i < NF; i++) if ($i == "name") { if (index(names, " " $(i + 1) " ")) print; break }
         }' <<<"$listing"

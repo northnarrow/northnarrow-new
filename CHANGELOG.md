@@ -41,14 +41,20 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     the nightly of 2026-11-21 on Ubuntu 26.04 and Debian 13: seven guard
     tests failed after passing, "LSM programs still loaded: 1", systemd's
     own `RestrictFileSystems=` program). The fixture keeps the program ids
-    of every run's list and waits for those, or, with none, for our LSM
-    programs by name — never every LSM program on the host; one of ours
-    still loaded fails the teardown as before. The lab's helpers do the
-    same (`deploy/lab/lib/our-lsm.sh`). Tests
+    of every run's list and waits for those and for our LSM programs by
+    name, both — never every LSM program on the host; one of ours still
+    loaded fails the teardown as before. The lab's helpers and the range
+    bootstrap (`deploy/adversarial/bootstrap-target-prod.sh`) do the same
+    (`deploy/lab/lib/our-lsm.sh`). Tests
     `the_teardown_does_not_wait_for_pid_ones_lsm_program`,
     `a_leftover_program_of_ours_still_fails_the_teardown`,
-    `the_lab_helper_never_counts_pid_ones_lsm_program`, and the ratchet
-    `no_test_helper_counts_every_lsm_program_on_the_host`.
+    `a_leftover_of_ours_outside_the_kept_ids_still_fails_the_teardown`,
+    `the_lab_helper_never_counts_pid_ones_lsm_program`,
+    `the_lab_helper_counts_a_leftover_of_ours_outside_the_ids`, and the
+    ratchets `no_test_helper_counts_every_lsm_program_on_the_host` (tests,
+    `deploy/`, the docs' scripts, every shell script) and
+    `the_ratchet_sees_every_lsm_program_of_the_ebpf_sources` (module
+    directories, the macro under any path).
   - **`agent_stalled`** names the agent's own memory throttling
     (`MemoryHigh`) besides a pause of the machine. Test
     `the_stall_advisory_names_the_agents_own_memory_throttling`.

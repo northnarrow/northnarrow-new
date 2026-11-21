@@ -373,8 +373,8 @@ fn the_teardown_does_not_wait_for_pid_ones_lsm_program() {
 }
 
 /// No weakening: a program of ours still loaded is waited for — by its id
-/// whatever its type, or, with no id readable, by its name as the kernel
-/// keeps it (15 bytes), LSM programs only.
+/// whatever its type, and by its name as the kernel keeps it (15 bytes),
+/// LSM programs only.
 #[test]
 fn a_leftover_program_of_ours_still_fails_the_teardown() {
     let listing = format!(
@@ -398,9 +398,30 @@ fn a_leftover_program_of_ours_still_fails_the_teardown() {
     assert_eq!(
         common::our_bpf::ours_left(&listing, &ids),
         vec![
+            "40: lsm  name task_kill  tag 0011223344556677  gpl".to_string(),
             "41: lsm  name mount_guard_sb_  tag 0011223344556678  gpl".to_string(),
             "42: kprobe  name udp_send_skb  tag 0011223344556679  gpl".to_string(),
         ]
+    );
+}
+
+/// The review of #590, P3-1: with an id known, the names were no longer
+/// looked at — a run that loaded its programs but never wrote its list (a
+/// failed write is only a warning; a run killed between the attach and
+/// the write), or a program of an earlier binary, was then never waited
+/// for. The ids and the names are both looked at, always.
+#[test]
+fn a_leftover_of_ours_outside_the_kept_ids_still_fails_the_teardown() {
+    let listing = format!(
+        "{PID1_ONLY}\
+40: lsm  name task_kill  tag 0011223344556677  gpl
+"
+    );
+    // the fixture keeps the ids of earlier runs, none of them 40
+    let kept: std::collections::BTreeSet<u32> = [7, 8, 9].into();
+    assert_eq!(
+        common::our_bpf::ours_left(&listing, &kept),
+        vec!["40: lsm  name task_kill  tag 0011223344556677  gpl".to_string()]
     );
 }
 
