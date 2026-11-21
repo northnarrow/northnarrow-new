@@ -176,10 +176,13 @@ impl ChainHost for LinuxHost {
     /// kind, the time and row of its signed row and its rule, `sensors`
     /// says DEGRADED, the trust level is at most L2, the capability manifest
     /// signs them. Told at the log's open and at each change; called with
-    /// the writer's lock held, it never signs (they are signed rows).
-    fn integrity_held(_path: &Path, lines: &[String]) {
+    /// the writer's lock held, it never signs (they are signed rows). The
+    /// review of #586 (P2-1): its advisories are the status's advisories —
+    /// listed, never a degradation.
+    fn integrity_held(_path: &Path, held: &nn_evidence::held::Held) {
         if registry_told() {
-            crate::boot::degradation::hold(nn_evidence::held::SOURCE, lines);
+            crate::boot::degradation::hold(nn_evidence::held::SOURCE, &held.lines());
+            crate::boot::degradation::advise(nn_evidence::held::SOURCE, &held.advisories());
         }
     }
 
@@ -614,6 +617,51 @@ mod tests {
         .join()
         .unwrap();
         assert!(held().is_empty(), "{:?}", held());
+        crate::boot::degradation::reset_for_tests();
+    }
+
+    /// Lot 379 (the review of #586, P2-1): an advisory the agent's audit log
+    /// holds (the admin key left on the host) is the status's advisory, not
+    /// a degradation: no `integrity:` line in the registry's degradations,
+    /// the advisory listed with its row. On the PR's head every default
+    /// install said `sensors: DEGRADED` for it.
+    #[test]
+    fn a_held_advisory_is_an_advisory_of_the_status_not_a_degradation() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        tell_registry_in_tests();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut log = AuditLog::open(&path, key(dir.path()), [4; 16]).unwrap();
+        log.append(crate::audit::AuditEntryDraft {
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": "admin_key_on_host",
+                "detail": "/root/northnarrow-admin.key: an admin private key on this host",
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .unwrap();
+        let row = log.rows() - 1;
+        assert!(
+            crate::boot::degradation::snapshot().is_empty(),
+            "{:?}",
+            crate::boot::degradation::snapshot()
+        );
+        assert_eq!(crate::boot::degradation::count(), 0);
+        let adv = crate::boot::degradation::advisories();
+        assert_eq!(adv.len(), 1, "{adv:?}");
+        assert!(
+            adv[0].starts_with("integrity: admin_key_on_host — signed ")
+                && adv[0].contains(&format!("(audit row {row})")),
+            "{adv:?}"
+        );
         crate::boot::degradation::reset_for_tests();
     }
 

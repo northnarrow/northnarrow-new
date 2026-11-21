@@ -3129,6 +3129,14 @@ fn summary_lines(out: &StatusOutcome, tty: bool) -> Vec<String> {
         }
     };
     lines.push(format!("sensors           : {sensors}"));
+    // lot 379 (the review of #586, P2-1): what is signed but degrades no
+    // sensor, apart — never in `sensors`
+    if let Some(a) = out.advisories.as_ref().filter(|a| !a.is_empty()) {
+        lines.push(format!(
+            "advisories        : {} — signed, no sensor degraded; listed below",
+            a.len()
+        ));
+    }
     match &out.records_today {
         None => lines.push("records today     : (not reported: the agent predates it)".to_string()),
         Some(r) => {
@@ -3349,6 +3357,26 @@ fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
             }
             lines
         }
+    }
+}
+
+/// Lot 379 (the review of #586, P2-1): the advisories — signed findings of
+/// the host's state or the operator's choice (an admin key left on the
+/// host, a signed sysctl opt-out, a pause of the whole machine) that
+/// degrade no sensor: listed on their own, never counted in `sensors`.
+/// Nothing when there is none (or the agent predates them).
+fn advisory_lines(out: &StatusOutcome) -> Vec<String> {
+    match &out.advisories {
+        Some(a) if !a.is_empty() => {
+            let mut lines = vec![format!(
+                "advisories        : {} (each signed in the audit log; not degradations — \
+                 shown while found)",
+                a.len()
+            )];
+            lines.extend(a.iter().map(|l| format!("  - {}", clean(l))));
+            lines
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -4019,7 +4047,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{},\"runtime_clones\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"open_sensor_per_call_total\":{},\"event_bus\":{},\"event_bus_decision\":{},\"response_dispatch\":{},\"capabilities\":{},\"profile\":{},\"records_today\":{},\"telemetry_signed\":{},\"program_copies\":{},\"kernel_state_held_back\":{},\"runtime_clones\":{},\"advisories\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -4087,6 +4115,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             kernel_state_held_back_json(out),
             // lot 369
             runtime_clones_json(out),
+            // lot 379
+            serde_json::to_string(&out.advisories).unwrap_or_else(|_| "null".to_string()),
         );
         return;
     }
@@ -4138,6 +4168,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
         // degraded.
         println!("{}", trust_line(out, tty));
         for line in degradation_lines(out) {
+            println!("{line}");
+        }
+        for line in advisory_lines(out) {
             println!("{line}");
         }
         // R13 (lab PR 271): the signed capability manifest's newest revision.
@@ -6505,6 +6538,7 @@ mod flow_sock_line_tests {
             program_copy_skipped_total: None,
             kernel_state_held_back: None,
             runtime_clones: None,
+            advisories: None,
             execq_script_refused_total: None,
             event_bus: None,
             event_bus_decision: None,
@@ -6565,6 +6599,48 @@ mod flow_sock_line_tests {
             serde_json::from_str(&super::kernel_state_held_back_json(&o)).unwrap();
         assert_eq!(j["bpf_unseen"], 12_000);
         assert_eq!(j["bpf_baseline"], 3);
+    }
+
+    /// Lot 379 (the review of #586, P2-1): the advisories — signed findings
+    /// that degrade no sensor (the admin key left on the host of a default
+    /// install) — are listed apart, with their row: `sensors` stays OK. On
+    /// the PR's head the agent sent them as degradations: `sensors:
+    /// DEGRADED` on every default install.
+    #[test]
+    fn status_lists_the_advisories_apart_and_sensors_stay_ok() {
+        let mut o = outcome(None, None, None);
+        o.degradations = Some(vec![]);
+        o.ringbuf_drops_total = Some(0);
+        o.advisories = Some(vec![
+            "integrity: admin_key_on_host — signed t (audit row 7) — an advisory, not a \
+             degradation: shown while found: /root/northnarrow-admin.key"
+                .to_string(),
+        ]);
+        let l = summary_lines(&o, false);
+        assert!(
+            l.contains(&"sensors           : OK — no degradation, no event lost".to_string()),
+            "{l:?}"
+        );
+        assert!(
+            l.contains(
+                &"advisories        : 1 — signed, no sensor degraded; listed below".to_string()
+            ),
+            "{l:?}"
+        );
+        let a = super::advisory_lines(&o);
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert!(a[0].starts_with("advisories        : 1 (each signed"), "{a:?}");
+        assert!(a[1].starts_with("  - integrity: admin_key_on_host"), "{a:?}");
+        assert!(a[1].contains("(audit row 7)"), "{a:?}");
+        assert_eq!(degradation_lines(&o), ["degradations      : none"]);
+        // none, or an agent that predates them: no line
+        for none in [Some(vec![]), None] {
+            o.advisories = none;
+            assert!(super::advisory_lines(&o).is_empty());
+            assert!(!summary_lines(&o, false)
+                .iter()
+                .any(|l| l.starts_with("advisories")));
+        }
     }
 
     /// Named (lot 341, alpha 2/4): `status` starts with a human summary —

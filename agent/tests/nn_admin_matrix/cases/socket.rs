@@ -684,6 +684,20 @@ pub fn verbs() -> Vec<Verb> {
                     .to_string(),
             ]);
             success.push(("integrity-held".to_string(), telemetry(Some(held))));
+            // lot 379 (the review of #586, P2-1): a default install with the
+            // admin key left on the host — an advisory, not a degradation:
+            // `sensors: OK`, the advisory listed on its own with its row
+            let mut adv = full_status();
+            adv.degradations = Some(Vec::new());
+            adv.ringbuf_drops_total = Some(0);
+            adv.ringbuf_drops = Some(Vec::new());
+            adv.advisories = Some(vec![
+                "integrity: admin_key_on_host — signed 2026-11-21T05:41:15.000000Z (audit row 7) \
+                 — an advisory, not a degradation: shown while found: \
+                 /root/northnarrow-admin.key: an admin private key on this host"
+                    .to_string(),
+            ]);
+            success.push(("advisories".to_string(), telemetry(Some(adv))));
         }
         // R13 (lab PR 271): a revision of the sensor contract's manifest
         if !name.starts_with("net-") && !name.starts_with("export-") {

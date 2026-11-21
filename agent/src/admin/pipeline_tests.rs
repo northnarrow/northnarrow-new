@@ -2399,3 +2399,77 @@ fn a_grant_for_an_installer_is_verified_and_rowed_as_the_grant() {
         json!({ "window_secs": 300, "for_installer": true, "installer_pid": null })
     );
 }
+
+/// Lot 379 (the review of #586, P3-1): the acknowledgement is its signed
+/// row. Written, the reply counts what the log ended and the transport adds
+/// no second row; not written (the append fails), nothing is acknowledged
+/// and the findings stay held. On the PR's head the reply said
+/// `acknowledged: 1` (exit 0) over a row that was never written.
+#[test]
+fn an_acknowledgement_whose_row_is_not_written_acknowledges_nothing() {
+    let k = keys();
+    let drift = |fx: &Fixture| -> u64 {
+        let mut log = fx.audit.lock();
+        log.append(crate::audit::AuditEntryDraft {
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
+            extra: json!({ "kind": "chain_truncated", "chain": "detections",
+                           "detail": "the anchored head is not in the file" }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .unwrap();
+        log.rows() - 1
+    };
+    let ack = |fx: &Fixture, through: u64| -> IntegrityAcknowledgeResponse {
+        let conn = ConnAuth::new(&fx.auth);
+        let nonce = fx.challenge(&conn);
+        let p = payload(
+            OperationExtra::IntegrityAcknowledge(IntegrityAcknowledgeExtra {
+                through_row: through,
+                note: "investigated".to_string(),
+            }),
+            nonce,
+            now_unix_secs(),
+            AGENT_ID,
+        );
+        let signatures = signatures(&p, &[&k.a]);
+        match fx.serve(
+            &conn,
+            &AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+                payload: p,
+                signatures,
+            }),
+        ) {
+            AdminMessage::IntegrityAcknowledgeResponse(r) => r,
+            other => panic!("{other:?}"),
+        }
+    };
+    // written: one row, the acknowledgement's own, and the reply its count
+    let fx = Fixture::new(&k);
+    let row = drift(&fx);
+    let before = fx.rows().len();
+    let r = ack(&fx, row);
+    assert_eq!((r.result, r.acknowledged, r.still_held), (AdminResult::Success, 1, 0));
+    let rows = fx.rows();
+    assert_eq!(rows.len(), before + 1, "one row: the acknowledgement");
+    let last = rows.last().unwrap();
+    assert_eq!(last.op, nn_evidence::held::ACK_OP);
+    assert_eq!(last.result, "success");
+    assert_eq!(last.extra["through_row"], row);
+    assert_eq!(last.key_fp, fp(&k.a), "the signer named");
+    assert!(fx.audit.lock().held().is_empty());
+    // not written: every append fails (a directory at the log's name)
+    let fx = Fixture::new(&k);
+    let row = drift(&fx);
+    std::fs::remove_file(&fx.log_path).unwrap();
+    std::fs::create_dir(&fx.log_path).unwrap();
+    let r = ack(&fx, row);
+    assert_eq!(r.acknowledged, 0, "{r:?}");
+    assert!(r.message.contains("not written"), "{r:?}");
+    assert_eq!(fx.audit.lock().held().count(), 1, "still held");
+}

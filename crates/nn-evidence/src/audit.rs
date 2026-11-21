@@ -472,7 +472,7 @@ impl<K: ChainSigner> AuditLog<K> {
         };
         // Lot 379: what the chain holds is told at every open (nothing
         // included), before the first row of this open
-        K::Host::integrity_held(path, &log.held.lines());
+        K::Host::integrity_held(path, &log.held);
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
         }
@@ -874,7 +874,7 @@ impl<K: ChainSigner> AuditLog<K> {
         // Lot 379: a row this log signed is genuine; what it holds is told
         // to the host at each change
         if self.held.observe(self.rows, &entry, &|_| true) && self.memory.is_none() {
-            K::Host::integrity_held(&self.path, &self.held.lines());
+            K::Host::integrity_held(&self.path, &self.held);
         }
         self.rows += 1;
         self.numbered = true;
@@ -941,7 +941,7 @@ impl<K: ChainSigner> AuditLog<K> {
             // lot 379: the row of the failed append, if it reached the file
             if tail.held != self.held {
                 self.held = tail.held;
-                K::Host::integrity_held(&self.path, &self.held.lines());
+                K::Host::integrity_held(&self.path, &self.held);
             }
             Ok(repair)
         })();

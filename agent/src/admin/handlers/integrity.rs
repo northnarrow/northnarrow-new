@@ -7,7 +7,10 @@
 //! (`integrity_acknowledged`, `through_row`, the operator's note, the key's
 //! fingerprint), which the audit log reads as the end of the holds it
 //! covers — at once, and at every later open. A refused request's row says
-//! `failure` and ends nothing.
+//! `failure` and ends nothing. The review of #586 (P3-1): the handler
+//! appends that row itself, under the lock its judgement was made under,
+//! and answers from the append — a row not written acknowledges nothing,
+//! and the counts are the log's, not a guess made before it.
 
 use std::sync::Arc;
 
@@ -20,6 +23,7 @@ use nn_proto::admin_protocol::{
 use nn_proto::admin_signed_payload::INTEGRITY_ACK_NOTE_MAX;
 
 use crate::admin::verify::{signed, Verified};
+use crate::admin::AuditClient;
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::audit::AuditLog;
 
@@ -29,6 +33,7 @@ pub(in crate::admin) fn dispatch_integrity_acknowledge(
     req: IntegrityAcknowledgeRequest,
     auth: &ConnAuth<'_>,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    client: &AuditClient,
     fps_out: &mut Vec<String>,
 ) -> IntegrityAcknowledgeResponse {
     let refuse = |result: AdminResult, message: String| IntegrityAcknowledgeResponse {
@@ -42,7 +47,7 @@ pub(in crate::admin) fn dispatch_integrity_acknowledge(
         auth,
         fps_out,
         |r| refuse(r, String::new()),
-        |v| acknowledge(v, audit_log, refuse),
+        |v| acknowledge(v, audit_log, client, refuse),
     )
 }
 
@@ -70,7 +75,7 @@ pub(crate) fn judge(
             rows.saturating_sub(1)
         ));
     }
-    let total = held.findings().len() as u64 + held.more();
+    let total = held.count();
     let covered = held.covered_by(through);
     if covered == 0 {
         return Err(match held.newest_row() {
@@ -87,6 +92,7 @@ pub(crate) fn judge(
 fn acknowledge(
     v: Verified<'_, IntegrityAcknowledgeRequest>,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    client: &AuditClient,
     refuse: impl Fn(AdminResult, String) -> IntegrityAcknowledgeResponse,
 ) -> IntegrityAcknowledgeResponse {
     let extra = v.extra();
@@ -97,34 +103,66 @@ fn acknowledge(
             "the agent runs without its signed audit log: nothing is held".to_string(),
         );
     };
-    let (rows, judged) = {
-        let log = log.lock();
-        (
-            log.rows(),
-            judge(log.held(), log.rows(), extra.through_row, extra.note.len()),
-        )
+    let mut log = log.lock();
+    let rows = log.rows();
+    let (covered, still) = match judge(log.held(), rows, extra.through_row, extra.note.len()) {
+        Err(why) => return refuse(AdminResult::Success, why),
+        Ok(judged) => judged,
     };
-    match judged {
-        Err(why) => refuse(AdminResult::Success, why),
-        Ok((covered, still)) => {
-            info!(
-                through_row = extra.through_row,
-                acknowledged = covered,
-                still_held = still,
-                rows,
-                "integrity acknowledge: held findings acknowledged (signed in the audit log)"
-            );
-            IntegrityAcknowledgeResponse {
-                result: AdminResult::Success,
-                acknowledged: covered,
-                still_held: still,
-                message: format!(
-                    "{covered} held integrity finding(s) acknowledged through audit row {}; \
-                     {still} still held; their rows stay in the chain",
-                    extra.through_row
-                ),
-            }
-        }
+    let held_before = log.held().count();
+    let message = format!(
+        "{covered} held integrity finding(s) acknowledged through audit row {}; {still} still \
+         held; their rows stay in the chain",
+        extra.through_row
+    );
+    let row = crate::admin::audit::admin_row(
+        nn_evidence::held::ACK_OP,
+        serde_json::json!({
+            "through_row": extra.through_row,
+            "note": extra.note,
+            "acknowledged": covered,
+            "still_held": still,
+            "detail": message,
+        }),
+        "success".to_string(),
+        client,
+        v.fingerprints(),
+        v.request().signatures.len().saturating_sub(1),
+    );
+    // the acknowledgement is this row: not written, nothing acknowledged
+    if let Err(e) = log.append(row) {
+        warn!(
+            through_row = extra.through_row,
+            error = %format!("{e:#}"),
+            "integrity acknowledge: its signed row was not written — nothing acknowledged"
+        );
+        return refuse(
+            AdminResult::Success,
+            format!(
+                "the acknowledgement's signed audit row was not written ({e:#}): nothing is \
+                 acknowledged, {held_before} finding(s) still held"
+            ),
+        );
+    }
+    // what the row ended, as the log now holds it
+    let still = log.held().count();
+    let acknowledged = held_before.saturating_sub(still);
+    info!(
+        through_row = extra.through_row,
+        acknowledged,
+        still_held = still,
+        rows,
+        "integrity acknowledge: held findings acknowledged (signed in the audit log)"
+    );
+    IntegrityAcknowledgeResponse {
+        result: AdminResult::Success,
+        acknowledged,
+        still_held: still,
+        message: format!(
+            "{acknowledged} held integrity finding(s) acknowledged through audit row {}; {still} \
+             still held; their rows stay in the chain",
+            extra.through_row
+        ),
     }
 }
 
