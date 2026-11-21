@@ -428,6 +428,21 @@ each open (a restart reads the chain again: it clears nothing):
   overlays' rollback floor reset (`overlay_rollback_floor_unavailable`) —
   are held until a signed acknowledgement covers them. No later state is
   clean: the alteration stays in the evidence for good.
+- **The deaths of the agent's and the watchdog's roles** (pre-alpha Phase
+  7b, F7-6) — the agent's crash, kill or OOM (the witness's row, signed by
+  the start that follows it: `witness_row`), the watchdog gone
+  (`watchdog_gone`, `witness_row_uncertified`: a row only the new
+  watchdog's own claim vouches for), both roles found vacated, a successor
+  not confirmed or foreign — are held until acknowledged too: the restart
+  the death caused is no clean state. The witness records the agent's
+  release inside a signed window (maintenance) as a note, not held; the
+  agent's round names a verified watchdog it no longer finds
+  (`watchdog_gone`) whatever stopped it, a stop in a window included:
+  acknowledge it then. Restarts closer than
+  one integrity round (about 30 s) can sign `witness_row_uncertified` for a
+  watchdog whose key the agent had not certified yet: acknowledge it once
+  read. A worker's death (`worker_parse`) is a degradation of the run, as
+  before.
 - **Every other finding** — an unauthorized overlay, a modified or
   unavailable default list, the integrity round's drifts (a drop-in, a
   mount over the agent's paths, a foreign pin…), an event of the run (a

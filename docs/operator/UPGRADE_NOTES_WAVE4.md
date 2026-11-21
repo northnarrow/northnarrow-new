@@ -5583,6 +5583,10 @@ shape it resembles still fires.
   - a finding of the evidence (a chain cut, rewritten, missing or
     unverifiable; the witness chain broken; `agent_id_changed`; the
     overlays' rollback floor reset): until an acknowledgement covers it;
+  - a death of the agent's or the watchdog's role (a crash, a kill, an
+    OOM: the witness's `witness_row`, `watchdog_gone`,
+    `witness_row_uncertified`; pre-alpha Phase 7b, F7-6): until an
+    acknowledgement covers it — the restart it caused is no clean state;
   - any other (an unauthorized overlay, a modified or unavailable default
     list, the integrity round's drifts, an event of the run): while it is
     found — until its check signs its end or the next start checks again —,

@@ -209,6 +209,9 @@ how.
   degradation, the trust level at most L2) until `nn-admin integrity
   acknowledge` covers its row; a configuration or host finding until its
   check no longer finds it ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+  A death of the agent or the watchdog (a crash, an OOM, a kill) is held
+  until acknowledged as well; restarts closer than about 30 s can sign one
+  for a watchdog whose key the agent had not certified yet.
   The acknowledgement takes a key with `triage` or `config-manage`: a
   holder of such a key can clear the status, not the evidence (the rows,
   its own signed row, `chain verify`). A drift of the integrity round that
@@ -216,6 +219,7 @@ how.
   round's back-off ends. *Evidence:*
   `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
   `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
+  `an_agent_or_watchdog_death_is_held_until_acknowledged`;
   `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`; lot
   379.
 - **`nn-admin chain verify` with no chains says OK.** On a state directory

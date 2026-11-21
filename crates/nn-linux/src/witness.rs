@@ -552,6 +552,46 @@ pub fn roles_gap(r: &RolesAtStart, signed_stop: bool) -> Option<Finding> {
 mod tests {
     use super::*;
     use antitamper_bpf::start_check::{Findings, Identity};
+
+    /// Lot 379 (pre-alpha Phase 7b, F7-6): the deaths the status holds until
+    /// acknowledged (`nn_evidence::held::DEATH_KINDS`, which cannot name
+    /// this crate) are the witness's and the round's own kinds — every row
+    /// that is no bookkeeping, a row only the watchdog's claim vouches for,
+    /// both roles vacated, a successor not confirmed or foreign, the
+    /// watchdog gone — and the bookkeeping notes are not among them.
+    #[test]
+    fn the_held_deaths_are_the_witness_s_and_the_round_s_kinds() {
+        use nn_evidence::held::{hold_of, Hold, DEATH_KINDS};
+        let gone = crate::self_integrity::watchdog_gone(
+            812,
+            &crate::posture::exempt::WatchdogResolution::NotPresent,
+        );
+        for kind in [
+            WITNESS_ROW,
+            WITNESS_UNCERTIFIED,
+            ROLES_VACATED_GAP,
+            WATCHDOG_SUCCESSOR_FOREIGN,
+            WATCHDOG_SUCCESSOR_UNCONFIRMED,
+            gone.kind,
+            row_kind(nn_proto::witness::KIND_VACATED),
+            row_kind(nn_proto::witness::KIND_FOUND_VACANT),
+            row_kind(nn_proto::witness::KIND_SUCCESSOR_FOREIGN),
+        ] {
+            assert!(DEATH_KINDS.contains(&kind), "{kind}");
+            assert_eq!(hold_of(kind, "detected"), Hold::UntilAcknowledged, "{kind}");
+            assert!(!is_note(kind), "{kind}");
+        }
+        for note in [
+            WITNESS_KEY,
+            WITNESS_NOTE,
+            WATCHDOG_SUCCESSION,
+            ROLES_RELEASED,
+        ] {
+            assert!(is_note(note), "{note}");
+            assert!(!DEATH_KINDS.contains(&note), "{note}");
+        }
+        assert_eq!(row_kind(nn_proto::witness::KIND_OPENED), WITNESS_NOTE);
+    }
     use nn_proto::witness::{
         line_hash, Row, WitnessKey, KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION,
     };

@@ -17,7 +17,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     the status, the trust level and the capability manifest. The rule: an
     evidence finding until a signed acknowledgement covers its row, any
     other while its check finds it (its `cleared` row, or the next start);
-    a row that ends a hold counts only with a verifying signature. Tests
+    a row that ends a hold counts only with a verifying signature. Phase
+    7b's F7-6: the deaths of the agent's and the watchdog's roles (a crash,
+    an OOM, a kill: `witness_row`, `watchdog_gone`,
+    `witness_row_uncertified`, …) are held until acknowledged as well; a
+    worker's death stays a degradation of the run. Tests
+    `an_agent_or_watchdog_death_is_held_until_acknowledged`,
+    `the_held_deaths_are_the_witness_s_and_the_round_s_kinds`,
+    `a_worker_s_death_is_reported_for_the_status`,
     `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`,
     `a_config_finding_is_held_while_found`,
     `a_start_or_a_cleared_row_never_ends_an_evidence_finding`,

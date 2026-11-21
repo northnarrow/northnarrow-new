@@ -18,10 +18,13 @@
 //!
 //! - a row of the **evidence** class ([`EVIDENCE_KINDS`]: a chain cut,
 //!   rewritten, unverifiable or missing, the witness chain broken, the
-//!   agent's identity changed, the overlays' rollback floor lost) is held
-//!   until a signed operator acknowledgement covers it ([`ACK_OP`], `nn-admin
+//!   agent's identity changed, the overlays' rollback floor lost) or a
+//!   **death** of the agent's or the watchdog's role ([`DEATH_KINDS`]: a
+//!   crash, a kill, an OOM, the watchdog gone; Phase 7b F7-6) is held until a
+//!   signed operator acknowledgement covers it ([`ACK_OP`], `nn-admin
 //!   integrity acknowledge --through <row>`): the alteration stays in the
-//!   evidence for good, no later state is clean;
+//!   evidence for good, a death is not undone by the restart it causes — no
+//!   later state is clean;
 //! - any other finding ([`Hold::WhileFound`]: an unauthorized overlay, a
 //!   modified default list, the integrity round's drifts, an event of the
 //!   run) is held while it is found: until the check that signed it signs
@@ -93,6 +96,24 @@ pub const EVIDENCE_KINDS: &[&str] = &[
     "overlay_rollback_floor_unavailable",
 ];
 
+/// Lot 379 (pre-alpha Phase 7b, F7-6): the deaths of the agent's and the
+/// watchdog's roles — an event no later state undoes, and the restart it
+/// causes is the next start: held until an acknowledgement covers them, like
+/// the evidence. The witness's findings (nn-linux `witness`: the agent's role
+/// vacated — a crash, a kill, an OOM —, a successor not its unit's clean
+/// restart, both roles found vacated, a row only the watchdog's own claim
+/// vouches for) and the round's `watchdog_gone` (the verified watchdog no
+/// longer runs). Its bookkeeping (a key certified, a clean succession, a
+/// release in a window) is signed as a note, never held.
+pub const DEATH_KINDS: &[&str] = &[
+    "witness_row",
+    "witness_row_uncertified",
+    "roles_vacated_gap",
+    "watchdog_successor_foreign",
+    "watchdog_successor_unconfirmed",
+    "watchdog_gone",
+];
+
 /// The kinds of `integrity_drift` rows that are not held, and why: each is
 /// a degradation of the registry already, kept while it holds and
 /// withdrawn by its own finder.
@@ -131,7 +152,7 @@ pub fn hold_of(kind: &str, result: &str) -> Hold {
     if NOT_HELD_KINDS.iter().any(|(k, _)| *k == kind) {
         return Hold::NotHeld;
     }
-    if EVIDENCE_KINDS.contains(&kind) {
+    if EVIDENCE_KINDS.contains(&kind) || DEATH_KINDS.contains(&kind) {
         Hold::UntilAcknowledged
     } else {
         Hold::WhileFound
