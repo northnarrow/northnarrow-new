@@ -154,12 +154,18 @@ writes and removes each task's bundle under `/run/containerd` as containers
 start and stop — new files beside originals destroyed, the shape the
 posture's mass-write arm counts. The shipped `daemon-data.v1` lists
 `/run/containerd/` for `containerd.service` (and `/run/docker/` for
-`docker.service`, beside `/var/lib/containerd/` and `/var/lib/docker/`): a
-crossing whose every file lay there, by the unit's own cgroup, raises
+`docker.service`, beside `/var/lib/containerd/` and `/var/lib/docker/`); a
+unit's directories share one tag, so a crossing whose every file lay in
+them — containerd's removal of a task takes its bundle under `/run` and its
+snapshot under `/var/lib` in one window — by the unit's own cgroup, raises
 nothing. Another unit's burst there, or a container's (a cgroup below the
 unit's), still counts; add a runtime's other directories with
 `+<unit>.service <directory>/` lines in the signed
-`mass-write-carveout.local`.
+`mass-write-carveout.local`. With Docker's own `overlay2` image store,
+dockerd writes each container's init files through the layer's overlay
+mount, which the kernel does not place under `/var/lib/docker`: twenty or
+more containers started and removed within a minute still raise ENGAGED
+(a known limitation).
 
 **The cpuset controller on kernels before 6.5 (NN-L-AT-001 `sched`, lot
 348).** At a container's start systemd, runc and containerd-shim enable the

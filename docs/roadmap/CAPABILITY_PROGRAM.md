@@ -11732,7 +11732,12 @@ number in parentheses is a lab PR.
       Low with the environment unread.
     - **containerd.** `daemon-data.v1` gains `/run/containerd/`
       (`containerd.service`) and `/run/docker/` (`docker.service`); the
-      earlier list's hash is known to the agent and `install.sh`.
+      earlier list's hash is known to the agent and `install.sh`. The
+      lab's first round (debian13) still crossed: an strace of containerd's
+      own process (ubuntu2604, containerd 2.2) showed its removal of a task
+      taking the bundle under `/run/containerd` and the container's
+      snapshot under `/var/lib/containerd` in one window; a unit's
+      directories now share the kernel's tag (`tagged_dirs`).
   - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §66 and the CHANGELOG.
   - Mutation and lab: below, as measured.
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,

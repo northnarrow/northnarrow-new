@@ -33,8 +33,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **containerd's mass-write ENGAGED** (its task bundles under
     `/run/containerd`): `daemon-data.v1` lists `/run/containerd/` for
     `containerd.service` and `/run/docker/` for `docker.service`; the
-    earlier shipped list's hash is known to the agent and `install.sh`.
-    Test `containerd_replacing_its_task_bundles_under_run_raises_nothing`.
+    earlier shipped list's hash is known to the agent and `install.sh`. A
+    unit's directories share the kernel's tag (containerd's removal of a
+    task mixes `/run/containerd` and its snapshot under
+    `/var/lib/containerd`). Tests
+    `containerd_replacing_its_task_bundles_under_run_raises_nothing`,
+    `a_unit_s_directories_share_one_tag`.
 - Lot 378 (the rc10 soaks): three false positives judged by identity
   (`UPGRADE_NOTES_WAVE4.md` §64).
   - **The posture at every boot.** The `POSTURE TRANSITION` line named

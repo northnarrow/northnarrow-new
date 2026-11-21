@@ -5651,9 +5651,18 @@ fires.
   originals destroyed, the replacement shape.
   - The shipped `daemon-data.v1` names `/run/containerd/` for
     `containerd.service`, and (the variant) `/run/docker/` for
-    `docker.service`. A replacement whose two halves were the unit's own
-    data there — every file of each window in that directory, the writer's
-    cgroup the unit's — crosses nothing.
+    `docker.service`.
+  - The lab found that alone not enough: containerd's removal of a task
+    mixes the bundle under `/run/containerd` and the container's snapshot
+    under `/var/lib/containerd` (containerd 2.2 on Ubuntu 26.04, Docker
+    29's image store) in one window, and the kernel's summary named one
+    directory's tag. The directories of one set of units now share the
+    kernel's tag (`DaemonData::tagged_dirs`: the index of the set's first
+    directory), so a window across a unit's own directories is its own
+    data; directories of another set keep their tags.
+  - A replacement whose two halves were the unit's own data there — every
+    file of each window under that tag, the writer's cgroup the unit's —
+    crosses nothing.
   - Still counted: the same burst from another unit, or from a cgroup
     containerd made below its own (a container's payload); containerd's
     burst in another daemon's directory; a window that left the directory.
@@ -5668,6 +5677,14 @@ fires.
   - **A module tool that is not its process's first exec.** A shell that
     `exec`s `modprobe` in its own place is not read from its forker: when
     it exited first, R011 judges it as before (High for a user).
+  - **dockerd's container setup in a burst.** With Docker's own image
+    store (`overlay2`, Docker 26 on Debian 13), dockerd writes and removes
+    each container's init files (`/etc/hosts`, `/etc/hostname`,
+    `/.dockerenv`, …) through the layer's overlay mount, which the kernel's
+    classification does not place under `/var/lib/docker`: twenty or more
+    containers started and removed within a minute still cross the
+    mass-write arm (ENGAGED, its record naming `dockerd` and a
+    `mnt[…]/etc/hosts` path). The soak's load did not reach it.
   - **Packaged readers off the list.** A packaged program that reads a file
     it is told to and is not on the list (`sqlite3 /etc/passwd`, `getent
     passwd`, which lists the file through the name service as every lookup

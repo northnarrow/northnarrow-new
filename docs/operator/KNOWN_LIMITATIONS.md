@@ -1025,6 +1025,11 @@ lists the known false positives of each rule.
   - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
     /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
     access.
+  - **dockerd's container setup in a burst** (Docker's own `overlay2`
+    image store): twenty or more containers started and removed within a
+    minute still raise ENGAGED through the mass-write arm — dockerd writes
+    each container's init files through the layer's overlay mount, which
+    the kernel does not place under `/var/lib/docker`.
 
   *Evidence:* lot 380;
   `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
@@ -1032,7 +1037,8 @@ lists the known false positives of each rule.
   `a_packaged_program_s_name_lookup_is_no_sensitive_access`,
   `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
   `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
-  `containerd_replacing_its_task_bundles_under_run_raises_nothing`.
+  `containerd_replacing_its_task_bundles_under_run_raises_nothing`,
+  `a_unit_s_directories_share_one_tag`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.
