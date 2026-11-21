@@ -209,9 +209,14 @@ how.
   degradation, the trust level at most L2) until `nn-admin integrity
   acknowledge` covers its row; a configuration or host finding until its
   check no longer finds it ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
-  A death of the agent or the watchdog (a crash, an OOM, a kill) is held
-  until acknowledged as well; restarts closer than about 30 s can sign one
-  for a watchdog whose key the agent had not certified yet.
+  A death of the agent or the watchdog (a crash, an OOM, a kill) and an
+  attack-class event (a refused shutdown marker, the admin socket removed)
+  are held until acknowledged as well, across a host reboot. A witness row
+  of a key no live watchdog vouches for (a watchdog that lived less than
+  one 30 s round) is held by its declared kind: a vacancy until
+  acknowledged, a bookkeeping row while found. An admin key left on the
+  host, strict overcommit, the operator's signed sysctl opt-out and a pause
+  of the whole machine are advisories: listed, not degradations.
   The acknowledgement takes a key with `triage` or `config-manage`: a
   holder of such a key can clear the status, not the evidence (the rows,
   its own signed row, `chain verify`). A drift of the integrity round that
@@ -220,8 +225,10 @@ how.
   `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
   `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
   `an_agent_or_watchdog_death_is_held_until_acknowledged`;
-  `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`; lot
-  379.
+  `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`;
+  `benign_states_are_advisories_not_degradations`;
+  `an_attack_class_event_is_held_across_a_reboot_until_acknowledged`;
+  `a_restart_of_both_units_holds_no_witness_row`; lot 379.
 - **`nn-admin chain verify` with no chains says OK.** On a state directory
   that holds no chain (a purged host, a wrong `--state-dir`), it prints
   `OK` with 0 rows for each chain and exits 0. *For you:* read the row
@@ -1052,8 +1059,9 @@ lists the known false positives of each rule.
   mount guard: 4 of 5 hooks attached (sb_mount: verifier rejected LSM
   program …)`), listed by `nn-admin status` (`sensors: DEGRADED`) and in
   the signed capability manifest (`nn-admin capabilities`); the by-path
-  defences and the signed mount watch remain. This is tested, not argued:
-  a test build refuses the program at its load as the verifier would, and
+  defences and the signed mount watch remain. The agent's handling of the
+  refusal is tested (an injected load error), the kernel's verifier itself
+  is not exercised: a test build refuses the program at its load, and
   the privileged suite checks the signed row, the manifest and the status
   on a real agent; release builds cannot carry that fault injection. *For
   you:* on any kernel, a mount-guard degradation in `nn-admin status` is
@@ -1145,12 +1153,16 @@ kernel.
 
 ## Performance
 
-- **Narrow measurements.** The cost of one `exec` or one `open` has been
-  measured on Ubuntu 24.04 only, against one committed baseline, older
-  than this release: file-open-heavy work pays most, an `open`
-  microbenchmark about 41 % slower with the agent on, `git status` about
-  24 %. The release candidate's own per-operation exec and open latency is
-  not measured yet. Its resources and its cost on real work were measured
+- **Narrow measurements.** The cost of one `exec` or one `open` of the
+  release candidate (rc11) was measured in the lab on one QEMU guest only
+  (QEMU under Windows (WHPX), Ubuntu 24.04, kernel 6.8, 2 vCPU, three
+  complete runs, A/A at most 7 %): file-open-heavy work pays most, an
+  `open` + `read` + `close` about 2.1–2.2 µs slower with the agent on
+  (+55…+64 %), a `fork` + `exec` + `wait` about 0.08 ms slower (+9…+16 %).
+  These are lower bounds: the reference with the agent off still ran three
+  of the agent's LSM programs. `git status` about 24 % slower is the older
+  committed baseline's (Ubuntu 24.04, a lab build), not measured again on
+  this release. Its resources and its cost on real work were measured
   in the lab, on QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and
   6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB, the watchdog's
   about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest,
@@ -1158,8 +1170,9 @@ kernel.
   3–5 ms (p99); a kernel build 4 to 17 % slower, the other workloads
   (package installs, container runs, `fio`, `pgbench`) within the lab's
   noise of about 5–25 %. A QEMU guest is noisier than a real host.
-  *Evidence:* lot 273b (the per-operation figures, on Ubuntu 24.04);
-  internal check Phase 6 (rc10).
+  *Evidence:* lot 273b (the git status figure, on Ubuntu 24.04);
+  internal check Phase 6 (rc10); internal check Phase 6b (rc11: the
+  per-operation figures).
 - **Network.** UDP receives are about 20 % slower, TCP sends about 10 %
   (the TLS fingerprint sensor), connects about 6 %
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*

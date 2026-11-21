@@ -429,9 +429,16 @@ impl Held {
 
     /// The degradations `nn-admin status` lists: one a finding, then one
     /// counting those not listed. The review of #586 (P2-1): an advisory is
-    /// not among them ([`Held::advisories`]), nor a `config_overlay` whose
-    /// overlay a held `unauthorized_overlay` names (one fact, one line).
+    /// not among them ([`Held::advisories`]); a `config_overlay` whose file
+    /// a held `unauthorized_overlay` names is that line's (one fact, one
+    /// line, which names both rows).
     pub fn lines(&self) -> Vec<String> {
+        let twin = |f: &HeldFinding| {
+            let path = overlay_path(f)?;
+            self.findings
+                .iter()
+                .find(|g| g.kind == "config_overlay" && overlay_path(g) == Some(path))
+        };
         let refused: Vec<&str> = self
             .findings
             .iter()
@@ -445,7 +452,14 @@ impl Held {
             .filter(|f| {
                 f.kind != "config_overlay" || !overlay_path(f).is_some_and(|p| refused.contains(&p))
             })
-            .map(HeldFinding::line)
+            .map(|f| match twin(f).filter(|_| f.kind == "unauthorized_overlay") {
+                Some(g) => format!(
+                    "{} — the integrity round signs the same file as config_overlay (audit row {})",
+                    f.line(),
+                    g.last_row
+                ),
+                None => f.line(),
+            })
             .collect();
         if self.more() > 0 {
             out.push(format!(

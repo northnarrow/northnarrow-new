@@ -3489,37 +3489,38 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
         .filter(|d| d.kind == "normal" && d.path)
         .map(|d| d.name.as_str())
         .collect();
+    // lot 379 (the review of #586, P3-5): every test-only feature of a
+    // linked crate, not only `test-util` (a `nn-linux/test-privileged`
+    // build without the agent's own feature said `none`), named with the
+    // crate's own `cfg!` of it
     let mut unnamed = Vec::new();
+    let mut named = 0;
     for m in members.iter().filter(|m| linked.contains(&m.name.as_str())) {
-        for f in m.features.iter().filter(|f| f.as_str() == "test-util") {
-            let entry = format!("(\"{}/{f}\", ", m.name);
-            if !info.contains(&entry) {
+        for f in m
+            .features
+            .iter()
+            .filter(|f| TEST_ONLY_FEATURES.contains(&f.as_str()))
+        {
+            let krate = m.name.replace('-', "_");
+            let konst = f.to_uppercase().replace('-', "_");
+            let entry = format!("(\"{}/{f}\", {krate}::{konst}),", m.name);
+            let lib = repo_root().join(&m.dir).join("src/lib.rs");
+            let defined = fs::read_to_string(&lib)
+                .unwrap_or_default()
+                .contains(&format!("pub const {konst}: bool = cfg!(feature = \"{f}\");"));
+            if !info.contains(&entry) || !defined {
                 unnamed.push(format!("{}/{f}", m.name));
             }
+            named += 1;
         }
     }
     assert!(
         unnamed.is_empty(),
-        "build_info::DEPENDENCY_TEST_FEATURES must name {}",
+        "build_info::DEPENDENCY_TEST_FEATURES must name, with the crate's own `pub const \
+         <FEATURE>: bool = cfg!(feature = …)`, {}",
         unnamed.join(", ")
     );
-    for (entry, krate) in [
-        ("nn-core/test-util", "nn_core"),
-        ("nn-linux/test-util", "nn_linux"),
-    ] {
-        assert!(
-            info.contains(&format!("(\"{entry}\", {krate}::TEST_UTIL),")),
-            "build_info names {entry} with what {krate} was compiled with"
-        );
-        let lib = if krate == "nn_core" {
-            "crates/nn-core/src/lib.rs"
-        } else {
-            "crates/nn-linux/src/lib.rs"
-        };
-        assert!(fs::read_to_string(repo_root().join(lib))
-            .unwrap()
-            .contains("pub const TEST_UTIL: bool = cfg!(feature = \"test-util\");"));
-    }
+    assert!(named >= 9, "the linked crates' test-only features: {named}");
     assert!(
         info.contains(".chain(DEPENDENCY_TEST_FEATURES)"),
         "build_features() names the dependencies' test features"

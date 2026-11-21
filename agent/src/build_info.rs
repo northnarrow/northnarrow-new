@@ -29,10 +29,20 @@ pub fn build_features() -> Vec<&'static str> {
 /// build (`cargo xtask build --release`). Named by [`build_features`], so the
 /// release workflow's `--build-features` check (`none`) refuses a shipped
 /// binary carrying one; xtask/tests/supply_chain.rs holds this list to every
-/// such feature of the workspace.
+/// such feature of the workspace. Lot 379 (the review of #586, P3-5): every
+/// test-only feature of every crate the agent links, not only `test-util` —
+/// a `--features nn-linux/test-privileged` build without the agent's own
+/// feature reported `none`.
 pub const DEPENDENCY_TEST_FEATURES: &[(&str, bool)] = &[
+    ("nn-admin/debug-trigger", nn_admin::DEBUG_TRIGGER),
+    ("nn-core/debug-trigger", nn_core::DEBUG_TRIGGER),
+    ("nn-core/demo-tappa5", nn_core::DEMO_TAPPA5),
     ("nn-core/test-util", nn_core::TEST_UTIL),
+    ("nn-export/schema-check", nn_export::SCHEMA_CHECK),
+    ("nn-linux/debug-trigger", nn_linux::DEBUG_TRIGGER),
+    ("nn-linux/test-privileged", nn_linux::TEST_PRIVILEGED),
     ("nn-linux/test-util", nn_linux::TEST_UTIL),
+    ("nn-proto/debug-trigger", nn_proto::DEBUG_TRIGGER),
 ];
 
 /// External audit PROC-015 (NN-AUD-302): every cargo feature of this crate
@@ -73,6 +83,12 @@ mod tests {
         assert_eq!(
             b.features.contains(&"test-privileged"),
             cfg!(feature = "test-privileged")
+        );
+        // lot 379 (the review of #586, P3-5): nn-linux's own test door is
+        // named whoever turned it on
+        assert_eq!(
+            b.features.contains(&"nn-linux/test-privileged"),
+            nn_linux::TEST_PRIVILEGED
         );
     }
 }

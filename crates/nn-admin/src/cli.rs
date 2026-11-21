@@ -3381,15 +3381,15 @@ fn advisory_lines(out: &StatusOutcome) -> Vec<String> {
 }
 
 /// Lot 379: the newest audit row a held integrity finding names (`(audit
-/// row N)` in its `integrity:` line), if any is held.
+/// row N)` in its `integrity:` line — every one a line names: an overlay
+/// the start refused names the round's row of the same file too), if any
+/// is held.
 fn newest_held_row(degradations: &[String]) -> Option<u64> {
     degradations
         .iter()
         .filter(|l| l.starts_with("integrity: "))
-        .filter_map(|l| {
-            let at = l.find("(audit row ")? + "(audit row ".len();
-            l[at..].split(')').next()?.parse::<u64>().ok()
-        })
+        .flat_map(|l| l.split("(audit row ").skip(1))
+        .filter_map(|r| r.split(')').next()?.parse::<u64>().ok())
         .max()
 }
 
@@ -6641,6 +6641,27 @@ mod flow_sock_line_tests {
                 .iter()
                 .any(|l| l.starts_with("advisories")));
         }
+    }
+
+    /// Lot 379 (the review of #586, P2-1): an overlay the start refused and
+    /// the round signed again is one line naming both rows; the hint
+    /// acknowledges through the newer, so one acknowledgement covers both.
+    #[test]
+    fn the_acknowledgement_hint_names_the_newest_row_a_line_names() {
+        let mut o = outcome(None, None, None);
+        o.degradations = Some(vec![
+            "integrity: unauthorized_overlay — signed t (audit row 20) — held while found: \
+             x (/etc/northnarrow/x.local): no signature file — the integrity round signs the \
+             same file as config_overlay (audit row 25)"
+                .to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert!(
+            d.last()
+                .unwrap()
+                .contains("nn-admin integrity acknowledge --through 25 --key"),
+            "{d:?}"
+        );
     }
 
     /// Named (lot 341, alpha 2/4): `status` starts with a human summary —

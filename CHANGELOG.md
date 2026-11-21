@@ -46,10 +46,54 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     (`a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`,
     `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`;
     `a_build_without_the_test_feature_injects_nothing`).
+  - **Every kind has a class; advisories apart** (the review of #586,
+    P2-1). An admin key left on the host, strict overcommit, the
+    operator's signed sysctl opt-out, a VM pause and the quarantine's
+    index rebuilt were held as degradations: `sensors: DEGRADED` on every
+    default install, hiding a real degradation. Each `integrity_drift` kind
+    the agent signs is now in one table of `nn_evidence::held` (evidence,
+    death, attack-class event, degradation, advisory, not held), and
+    `xtask/tests/integrity_kinds.rs` fails on a kind signed and in none.
+    The advisories are listed by `status` on their own (`advisories`, the
+    status reply's new field, protocol version 5), never in `sensors`, the
+    trust level or the manifest. One fact, one line: an overlay refused at
+    the start and found again by the round, a harmful host drop-in. Tests
+    `benign_states_are_advisories_not_degradations`,
+    `a_fact_signed_twice_is_one_line`,
+    `every_integrity_relevant_kind_stays_a_degradation`,
+    `an_advisory_is_listed_and_never_a_degradation`,
+    `a_held_advisory_is_an_advisory_of_the_status_not_a_degradation`,
+    `status_lists_the_advisories_apart_and_sensors_stay_ok`,
+    `the_advisories_are_appended_last`,
+    `every_integrity_kind_the_product_signs_has_a_class`.
+  - **No false hold after a restart of both units** (P2-2). The new
+    watchdog's `witness_opened`, read before the agent verified that
+    watchdog, was a `witness_row_uncertified` held as a death (7 of 12
+    restarts in the lab, `install.sh`'s among them). A row of a key not
+    certified yet waits, at most four rounds, while the watchdog it names
+    publishes that key; a key no live watchdog vouches for is imported by
+    the row's declared kind (`witness_note_uncertified` for a bookkeeping
+    row, held while found). Tests
+    `a_restart_of_both_units_holds_no_witness_row`,
+    `an_uncertified_row_is_held_by_its_declared_kind`,
+    `the_wait_for_a_certification_is_bounded`.
+  - **Events held across a reboot; the acknowledgement is its row** (P3-1
+    to P3-5). A refused shutdown marker, the admin socket removed or
+    reached by a refused peer are held until acknowledged
+    (`an_attack_class_event_is_held_across_a_reboot_until_acknowledged`);
+    an acknowledgement whose row was not written acknowledges nothing
+    (`an_acknowledgement_whose_row_is_not_written_acknowledges_nothing`);
+    an evidence finding past the cap keeps its kind and row
+    (`an_evidence_finding_past_the_cap_keeps_its_kind_and_row`); a held
+    line's kind and chain are cut (`a_held_line_s_kind_and_chain_are_cut`);
+    `--build-features` names every test-only feature of the linked crates,
+    `nn-linux/test-privileged` among them
+    (`every_feature_is_classified_and_the_shipped_binary_names_its_test_ones`).
   - Docs: README and KNOWN_LIMITATIONS give the lab's resource figures
-    (QEMU guests) and say that the per-operation exec and open latency is
-    not measured yet; the rootless burst's figures corrected; two long
-    lines rewrapped.
+    (QEMU guests) and the release's per-operation cost (Phase 6b, rc11,
+    lower bounds: an `open` about +2.1–2.2 µs, a `fork` + `exec` about
+    +0.08 ms; the older `open` +41 % removed); the rootless burst's figures
+    corrected; two long lines rewrapped.
 - Lot 378 (the rc10 soaks): three false positives judged by identity
   (`UPGRADE_NOTES_WAVE4.md` §64).
   - **The posture at every boot.** The `POSTURE TRANSITION` line named

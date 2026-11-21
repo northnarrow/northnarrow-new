@@ -625,6 +625,15 @@ fn a_fact_signed_twice_is_one_line() {
     let lines = log.held().lines();
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines[0].starts_with("unauthorized_overlay — "), "{lines:?}");
+    // the one line names both rows (an acknowledgement through the newest
+    // covers both)
+    assert!(
+        lines[0].ends_with(&format!(
+            "the integrity round signs the same file as config_overlay (audit row {})",
+            log.rows() - 2
+        )),
+        "{lines:?}"
+    );
     assert!(lines[1].contains("other.local"), "{lines:?}");
     // the twin is still held: the start ends the refusal, the round's
     // finding of the file still on disk is listed then

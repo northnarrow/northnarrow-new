@@ -5587,10 +5587,25 @@ shape it resembles still fires.
     OOM: the witness's `witness_row`, `watchdog_gone`,
     `witness_row_uncertified`; pre-alpha Phase 7b, F7-6): until an
     acknowledgement covers it — the restart it caused is no clean state;
-  - any other (an unauthorized overlay, a modified or unavailable default
-    list, the integrity round's drifts, an event of the run): while it is
-    found — until its check signs its end or the next start checks again —,
-    or until acknowledged.
+  - an attack-class event of the run (a shutdown marker the watchdog
+    refused, the admin socket removed or reached by a refused peer): until
+    an acknowledgement covers it — a start, a host reboot included, does
+    not undo it;
+  - a degradation (an unauthorized overlay, a modified or unavailable
+    default list, the integrity round's drifts): while it is found — until
+    its check signs its end or the next start checks again —, or until
+    acknowledged.
+  Every kind the agent signs is in exactly one class
+  (`nn_evidence::held`; a test fails on a new kind with none). A state of
+  the host or a choice of the operator that degrades no sensor — the admin
+  key left on the host (`admin_key_on_host`), strict overcommit
+  (`sysctl_strict`), the operator's signed sysctl opt-out
+  (`sysctl_opted_out`), a pause of the whole machine (`agent_stalled`), the
+  quarantine's index rebuilt — is an **advisory**: `status` lists it on its
+  own (`advisories`, with its signed row), never in `sensors`, the trust
+  level or the capability manifest. One fact is one line: an overlay the
+  start refused and the round found again is one line naming both rows; a
+  harmful host drop-in is the `host_dropins` degradation's.
   The audit log keeps the holds from its own rows, so a restart keeps them;
   a row that ends one counts only when its signature verifies.
   ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds).)
@@ -5609,18 +5624,43 @@ shape it resembles still fires.
   four hooks, and the signed row (`subsystem_degraded`, source
   `anti_tamper`), `nn-admin capabilities` and `nn-admin status` say it.
   No behaviour changed: the test proves what the release does.
+- **The witness after a restart of both units.** The new watchdog's first
+  witness row (`witness_opened`) can be read by the agent before it has
+  verified that watchdog (`install.sh`'s upgrade and the documented restart
+  stop both units, start the agent, then the watchdog): it was signed
+  `witness_row_uncertified`, held as a death, in 7 of 12 such restarts in
+  the lab. A row signed by a key not certified yet now waits — at most four
+  rounds of 30 s — while the watchdog it names still runs and publishes
+  that very key; the agent certifies the key at its next round and the row
+  is a note. A key no live watchdog vouches for is imported by the row's
+  declared kind: a vacancy or a successor as `witness_row_uncertified`
+  (held until acknowledged), a bookkeeping row as
+  `witness_note_uncertified` (a degradation while found).
+- **`integrity acknowledge`.** The acknowledgement is its signed row, now
+  written by the handler under the lock it judged under: a row that could
+  not be written acknowledges nothing (exit 9, the reason printed), and the
+  counts are the log's.
+- **`--build-features`.** It names every test-only feature of the crates
+  the agent links (for instance `nn-linux/test-privileged`), not only
+  their `test-util`: a release built with one is refused by the release's
+  check, as before for the agent's own features.
+- **Protocol.** The status reply gains `advisories` (protocol version 5):
+  upgrade the agent with `nn-admin` and the watchdog, as for every
+  appended status field.
 - **Upgrade.** No configuration. Expect `sensors: DEGRADED` and the trust
   level at most L2 on a host where the agent had signed such findings,
   until each ends by its rule: read them (`nn-admin status --key`),
   investigate, then acknowledge the evidence's. The install's admin key
-  left at `/root/northnarrow-admin.key` is one (`admin_key_on_host`, held
-  while it is there): move it off the host. An agent installed with
+  left at `/root/northnarrow-admin.key` is an advisory (`advisories` in
+  `status`, shown while it is there): move it off the host. An agent installed with
   test lists or overlays of its own (the lab's escape hatch,
   `NN_OVERLAY_ALLOW_UNSIGNED=1`) holds each of them as
   `unauthorized_overlay` or `default_list_modified` for the run.
 - **Docs.** README and KNOWN_LIMITATIONS: the lab's resource figures (QEMU
   guests: RSS, CPU at rest, event-to-record latency, the cost on real
-  work), and that the per-operation exec and open latency of this release
-  is not measured yet; the rootless runtime burst's figures corrected
+  work), and the per-operation cost of this release (Phase 6b, rc11, QEMU
+  under Windows, Ubuntu 24.04, kernel 6.8, 2 vCPU, lower bounds: an
+  `open` about +2.1–2.2 µs, a `fork` + `exec` about +0.08 ms; the older
+  `open` +41 % figure removed); the rootless runtime burst's figures corrected
   (about fifty-four starts at four a second by the budget's model; the lab
   ran about two a second).

@@ -294,7 +294,9 @@ impl Fixture {
     }
 }
 
-/// The `integrity:` lines of a status, with the audit row each names.
+/// The `integrity:` lines of a status, with the newest audit row each
+/// names (the review of #586: an overlay the start refused names the
+/// round's row of the same file too).
 fn held_lines(status: &str) -> Vec<(String, u64)> {
     status
         .lines()
@@ -302,9 +304,9 @@ fn held_lines(status: &str) -> Vec<(String, u64)> {
         .map(|l| {
             let row = l
                 .split("(audit row ")
-                .nth(1)
-                .and_then(|r| r.split(')').next())
-                .and_then(|r| r.parse().ok())
+                .skip(1)
+                .filter_map(|r| r.split(')').next()?.parse::<u64>().ok())
+                .max()
                 .unwrap_or_else(|| panic!("no audit row in {l:?}"));
             (l.to_string(), row)
         })

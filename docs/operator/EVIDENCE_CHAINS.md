@@ -438,24 +438,57 @@ each open (a restart reads the chain again: it clears nothing):
   release inside a signed window (maintenance) as a note, not held; the
   agent's round names a verified watchdog it no longer finds
   (`watchdog_gone`) whatever stopped it, a stop in a window included:
-  acknowledge it then. Restarts closer than
-  one integrity round (about 30 s) can sign `witness_row_uncertified` for a
-  watchdog whose key the agent had not certified yet: acknowledge it once
-  read. A worker's death (`worker_parse`) is a degradation of the run, as
-  before.
-- **Every other finding** — an unauthorized overlay, a modified or
+  acknowledge it then. A worker's death (`worker_parse`) is a degradation
+  of the run, as before.
+- **The witness rows of a key not certified yet** (the review of #586,
+  P2-2). A restart of both units (`install.sh`'s upgrade, the documented
+  restart) can let the agent read the new watchdog's first row before it
+  verified that watchdog. Such a row waits, at most four rounds of 30 s,
+  while the watchdog it names still runs and publishes the key that signed
+  it; the agent certifies that key at its next round and imports the row
+  as a note. A key no live watchdog vouches for is imported by the row's
+  declared kind: a vacancy or a successor as `witness_row_uncertified`
+  (held until acknowledged, a death), a bookkeeping row (a life opened, a
+  release, a clean succession) as `witness_note_uncertified` (held while
+  found).
+- **The attack-class events of the run** (the review of #586, P3-2) — a
+  shutdown marker the watchdog refused (`shutdown_marker_rejected`), the
+  admin socket removed (`admin_socket_removed`) or reached by a peer it
+  refused (`admin_socket_foreign_peer`) — are held until acknowledged:
+  nothing checks an event again at a start, and a host reboot is a start.
+- **The degradations** — an unauthorized overlay, a modified or
   unavailable default list, the integrity round's drifts (a drop-in, a
-  mount over the agent's paths, a foreign pin…), an event of the run (a
-  foreign peer on the admin socket, the watchdog's death) — is held
-  **while it is found**: until the check that signed it signs its end
+  mount over the agent's paths, a foreign pin…), the watchdog's holds —
+  are held **while found**: until the check that signed it signs its end
   (`integrity_drift_cleared`, the same kind and detail), or until the next
   start, which checks again and signs it again if it still holds — or
   until an acknowledgement covers it. Removing the unsigned overlay, or
   signing it (`nn-admin config overlay set`), and restoring the shipped
   list are clean states: the next start no longer finds them.
+- **The advisories** (the review of #586, P2-1) — a state of the host or a
+  choice of the operator that degrades no sensor: an admin private key
+  left on the host (`admin_key_on_host`), strict overcommit with a high
+  ratio (`sysctl_strict`), the operator's signed opt-out of a guarded
+  sysctl (`sysctl_opted_out`), a pause of the whole machine
+  (`agent_stalled`), the quarantine's index rebuilt
+  (`quarantine_index_rebuilt`) — are kept as the degradations are, and
+  listed on their own (`advisories`, each with its signed row). They are
+  never counted in `sensors`, the trust level or the capability manifest:
+  a default install with the key left on the host says `sensors: OK`.
+- **One fact, one line.** An overlay the start refused
+  (`unauthorized_overlay`) and the round found again on disk
+  (`config_overlay`) is one line naming both rows (the hint acknowledges
+  through the newer); a harmful host drop-in is the `host_dropins`
+  degradation's, not held twice.
+- **Every kind has its class.** Each kind of `integrity_drift` row the
+  agent signs is in one table of `nn_evidence::held` (evidence, death,
+  event, degradation, advisory, not held); `xtask/tests/integrity_kinds.rs`
+  fails on a kind signed and in none. A kind of another build is held as a
+  degradation.
 - **Not held**: the degradations the status shows already, which their
   finder withdraws when they end (`subsystem_degraded`, the pin lock, the
-  profile downgrade, a restart loop), and rows that are no finding (a note,
+  profile downgrade, a restart loop, the host's harmful drop-ins), and rows
+  that are no finding (a note,
   a repair, an end) — a torn tail's repair among them
   (`chain_tail_repaired`, below: a crash's normal end, its cut signed and
   verifiable).
@@ -465,12 +498,17 @@ each open (a restart reads the chain again: it clears nothing):
 - `nn-admin integrity acknowledge --through <row> [--note …] --key <key>`
   (`triage` or `config-manage`) signs the acknowledgement
   (`integrity_acknowledged`: the row, the note, the key's fingerprint, how
-  many it covered). It covers the findings whose newest row is at or
-  before `<row>`; a row not signed yet is refused (exit 9), and a finding
+  many it covered), written under the lock it was judged under: a row that
+  could not be written acknowledges nothing (exit 9). It covers the
+  findings whose newest row is at or before `<row>`, advisories included;
+  a row not signed yet is refused (exit 9), and a finding
   signed after it — the same chain found broken at the next start — is
   held again. The status prints the command with the newest held row.
 - At most 16 findings are listed; the rows of the others are counted (`…
-  and N more held integrity row(s)`) and acknowledged the same way.
+  and N more held integrity row(s)`, `… and N more advisory row(s)`) and
+  acknowledged the same way. A finding held until acknowledged is listed
+  before one a start ends: past the cap, the newest of those is counted in
+  its stead, so its kind, row and command stay shown.
 - Residual: the integrity round reports a finding that ended and came back
   within 10 minutes only at the end of its back-off (external audit
   NN-AUD-114); until then it is not held. The `cleared` row and the

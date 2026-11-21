@@ -13996,4 +13996,35 @@ number in parentheses is a lab PR.
       `watchdog_gone` (`NRestarts=1`); both still held after a documented
       restart; the acknowledgement through row 46 ended them, `sensors:
       OK`.
+  - Fix round 1 (the review of #586):
+    - P2-1: every `integrity_drift` kind the product signs is in one table
+      of `nn_evidence::held` — evidence, death, attack-class event,
+      degradation, advisory, not held — and `xtask/tests/integrity_kinds.rs`
+      reads the production code's kind positions (literals, constants,
+      `ChainFinding::new`, the named producers) and fails on a kind in
+      none. Advisories (`admin_key_on_host`, `sysctl_strict`,
+      `sysctl_opted_out`, `agent_stalled`, `quarantine_index_rebuilt`) are
+      kept as degradations are and listed apart (`boot::degradation::advise`,
+      the status reply's `advisories`, protocol version 5): never in
+      `sensors`, the trust level or the manifest. Twins: a harmful host
+      drop-in not held twice; an overlay refused at the start and found by
+      the round, one line naming both rows.
+    - P2-2: a witness row of a key not certified yet waits, at most 4
+      rounds, while the watchdog it names publishes that key (its sealed
+      memory file); a key no live watchdog vouches for is imported by the
+      row's declared kind (`witness_note_uncertified`, a degradation while
+      found, for a bookkeeping row).
+    - P3: attack-class events held until acknowledged across a reboot; the
+      acknowledgement's row written by its handler (not written: nothing
+      acknowledged); an evidence finding past the cap listed before
+      while-found ones; a held line's kind and chain cut; `--build-features`
+      names every test-only feature of the linked crates.
+    - Docs, Phase 6b (rc11; QEMU under Windows (WHPX), Ubuntu 24.04, kernel
+      6.8, 2 vCPU, three complete runs, A/A at most 7 %; lower bounds, the
+      agent-off reference still ran three of its LSM programs): open + read
+      + close +55…+64 %, about +2.1–2.2 µs; fork + exec + wait +9…+16 %,
+      about +0.08 ms. The older `open` +41 % removed from the README and
+      KNOWN_LIMITATIONS; `git status` +24 % kept with its source (lot 273b,
+      PERF_BASELINE).
+    - Lab: LAB_ROUND1_PLACEHOLDER
 
