@@ -14173,4 +14173,17 @@ number in parentheses is a lab PR.
         `success` with the key's fingerprint, then `sensors: OK`; the next
         start signed `chain_verify_failed` again (the chain still broken)
         and it was held again.
+  - Fix round 2 (the KVM suites of #586, failing since fix round 1; the
+    merge of lot 380): `the_watchdog_signs_the_agent_s_vacancy_and_its_successor`
+    waited 70 s for the import of its watchdog's rows. That watchdog (the
+    test's, not its unit's restart) is never registered and publishes its
+    key: since P2-2 its rows wait the 4 rounds, then are imported by their
+    declared kind — about 120 s after the agent's start, none lost. The
+    test polls for that window (`UNCERTIFIED_WAIT_ROUNDS` and the agent's
+    round, now in `nn_proto::witness`, which the agent's round uses) plus
+    two rounds, and asserts more: all four rows as
+    `witness_row_uncertified`, the watchdog's first row as
+    `witness_note_uncertified`, no certified `witness_note`. Three test
+    messages that printed an admin reply whole (CodeQL
+    rust/cleartext-logging) are fixed messages now.
 
