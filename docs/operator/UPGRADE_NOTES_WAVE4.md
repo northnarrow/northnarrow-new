@@ -5608,6 +5608,19 @@ fires.
     accounts with (`cut`, `sort`, `uniq`, `diff`, …), the editors, the
     copiers (`rsync`, `scp`, `install`), the compressors and the multi-call
     binaries (`coreutils`, `toybox`).
+  - **The records may lag the open.** The exec pump reads an exec's facts
+    before the exec reaches the lineage, so at the open of a short-lived
+    program the lineage may still hold its fork's record (the shell that
+    forked it) or, for a unit's program, the unit's executor (run as root).
+    The lab measured it: `cat /etc/passwd` in a unit run as the user was
+    judged as `systemd-executor` and raised nothing. The image at the open
+    (`mm->exe_file`) must now be the file the records hold; when it is
+    not, the image decides, as for an exec not read yet, for a fork (it
+    executed since its record) and for a cached exec run as root by a
+    process that opens as a user (a unit's executor). An exec of its own as
+    the user with another image at the open (`PR_SET_MM`) is not vouched
+    for. Lot 378's helpers are judged the same strict way: another image
+    than the records' file is never their read.
   - Lot 376's and 378's carve-outs (a user's manager's program, the
     uidmap and FUSE helpers, `(sd-pam)`) stay, for the readers this rule
     does not vouch for.
@@ -5685,6 +5698,10 @@ fires.
     containers started and removed within a minute still cross the
     mass-write arm (ENGAGED, its record naming `dockerd` and a
     `mnt[…]/etc/hosts` path). The soak's load did not reach it.
+  - **A fork that changes its image.** A fork whose image at the open is
+    another packaged program's (`PR_SET_MM` with capabilities in a user
+    namespace of its own) reads `/etc/passwd` as that program: nothing
+    `getent passwd` does not already list without a sensitive access.
   - **Packaged readers off the list.** A packaged program that reads a file
     it is told to and is not on the list (`sqlite3 /etc/passwd`, `getent
     passwd`, which lists the file through the name service as every lookup

@@ -2790,7 +2790,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     pub fn host_program(
         &self,
         pid: u32,
-        uid: u32,
         as_of: AsOf,
         image: (u64, u64),
         comm: &str,
@@ -2820,12 +2819,13 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             // they lag the open (the exec pump reads an exec's facts before
             // the exec reaches the lineage) for a fork, which executed since
             // its record, and for a process whose cached exec ran as root
-            // and which opens as a user — a unit's executor that dropped to
-            // the unit's user and executed its program (the lab of lot 380:
-            // `cat` judged as `systemd-executor`). Its own exec as that user,
-            // with another image at the open (`PR_SET_MM`, the review of
-            // #583, F4): what it runs is that exec, not vouched for.
-            if own_exec && (entry.uid != 0 || uid == 0) {
+            // and which opens as a user (the caller judges a user's open) —
+            // a unit's executor that dropped to the unit's user and executed
+            // its program (the lab of lot 380: `cat` judged as
+            // `systemd-executor`). Its own exec as that user, with another
+            // image at the open (`PR_SET_MM`, the review of #583, F4): what
+            // it runs is that exec, not vouched for.
+            if own_exec && entry.uid != 0 {
                 return None;
             }
         }

@@ -1609,7 +1609,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     if is_passwd
         && !is_write_open(*flags)
         && auth
-            .host_program(*pid, *uid, as_of, *exe_file, comm)
+            .host_program(*pid, as_of, *exe_file, comm)
             .is_some_and(|program| !reads_like_a_tool(&program))
     {
         return false;
@@ -4168,6 +4168,10 @@ mod tests {
         let id = (KDEV, 51);
         exec(900, "/usr/bin/id", 51);
         assert!(!fires(900, "/etc/passwd", 0, id), "id's lookup");
+        assert!(
+            !fires(900, "/etc/passwd", 0, (0, 0)),
+            "its image not read (tracepoint mode): the records decide"
+        );
         exec(901, "/usr/bin/whoami", 58);
         assert!(
             !opens(901, "whoami", "/etc/passwd", 0, (KDEV, 58)),

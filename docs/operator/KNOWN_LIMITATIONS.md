@@ -1024,7 +1024,8 @@ lists the known false positives of each rule.
     before for a user's, when it exited first).
   - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
     /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
-    access.
+    access; so does a fork that changed its image to a packaged program's
+    (`PR_SET_MM`, capabilities in a user namespace of its own).
   - **dockerd's container setup in a burst** (Docker's own `overlay2`
     image store): twenty or more containers started and removed within a
     minute still raise ENGAGED through the mass-write arm — dockerd writes

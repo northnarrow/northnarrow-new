@@ -11722,7 +11722,10 @@ number in parentheses is a lab PR.
       its image at the open as the host's file of its name in a system
       program directory: `host_program`) is no sensitive access unless the
       program is a file tool, a shell or an interpreter (POS-007's
-      `reads_like_a_tool`, its list grown).
+      `reads_like_a_tool`, its list grown). The lab's round 2 found the
+      lineage lagging the open (`cat` in a unit judged as the unit's
+      executor, quiet): the image at the open must be the records' file,
+      else it decides for a fork or a cached root exec opening as a user.
     - **R011.** The exec pump reads a gone tool's credentials from its
       forker, as lot 373 reads the package manager from the parent: the
       kernel's fork record (first exec since the fork, the parent it
