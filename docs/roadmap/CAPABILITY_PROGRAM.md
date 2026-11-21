@@ -11795,7 +11795,34 @@ number in parentheses is a lab PR.
     - Tests: `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`,
       `a_runtime_compare_past_its_deadline_counts_and_keeps_nothing_more`;
       the R004 and pump tests extended (runc 1.2's shape gone: Critical).
-    - @LAB2@
+    - Lab (as measured): debian13 (6.12.117, systemd 257, Podman 5.4.2,
+      runc 1.1.15+ds1), 4 vCPU, 6 GiB, alpha profile; three short rounds
+      under the lease, each a fresh install of the fix's tree (1230 files,
+      0 mismatches), uninstalled and powered off with no `.local`, pins or
+      probe files (r3 and r4 only to run the hook: Podman read no hook from
+      `/etc/containers/oci/hooks.d`, then the probe's workdir was not the
+      user's).
+      - The burst: 300 rootful `podman run -d` in three streams (39 s) and
+        100 rootless (4 × 25): `runtime clones` 400 kept of 400 compared,
+        21 through a process still running the copy, 0 budget, 0 gone, 0
+        not read; the 3 sealed foreign memfds 2 `no_runtime` and 1 `lost`
+        (its parent, `timeout`, gone by the read). R004 from runc: 0; the
+        4 foreign execs Critical.
+      - F1: a static payload in a sealed root memfd run by runc as a
+        `createRuntime` OCI hook (its parent `runc create`, forked by
+        conmon: R004's runtime lineage), its main thread calling `exit`
+        while a second thread runs 4 s (that thread read its leader's
+        state: `Z`): R004 Critical (`would have: KillProcessTree`,
+        "fileless"), counted `no_runtime`, never "gone"; the container's own
+        runc copy compared and kept. The payload from a root shell:
+        Critical.
+      - The watchdog at an agent respawn (the agent made the OOM killer's
+        pick inside a window, SysRq-f): its cgroup's `memory.peak` from a
+        reset just before the kill to 78 s after, 2,273,280 B (2.2 MiB);
+        `memory.current` sampled every 50 ms at most 0.93 MiB;
+        `memory.events` all 0; the agent respawned (witness row signed), no
+        restart of either unit. `MemoryMax=32M` kept (14× that peak), the
+        ratchet unchanged.
   Levels unchanged.
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,

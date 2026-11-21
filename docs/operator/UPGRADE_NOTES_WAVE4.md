@@ -5621,7 +5621,9 @@ shape it resembles still fires.
   at a cold start (about 165 MiB of it the kernel's BPF maps) and at most
   264 MiB under the storms; this lot's lab saw 344 MiB, the highest yet,
   after 400 container starts and a 2,500 fork/s storm (no `memory.high`
-  event). The watchdog's RSS is about 5 MiB, its cgroup at most 2.2 MiB.
+  event). The watchdog's RSS is about 5 MiB, its cgroup at most 2.2 MiB,
+  through an agent respawn too (the fix round's lab: `memory.peak` 2.2 MiB
+  from just before the agent's OOM kill to its successor's witness row).
   - The agent's unit: `MemoryHigh=768M` and `MemoryMax=1G` (they were 9G
     and 11G, sized for the LLM advisor removed in Wave 4). The watchdog's:
     `MemoryMax=32M` (64M). `OOMPolicy=continue` and `OOMScoreAdjust=-999`
