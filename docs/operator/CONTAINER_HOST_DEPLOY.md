@@ -138,6 +138,29 @@ recorded under `alert`, `audit` or `off R018` or before its maps are armed
 R011's verdict. `containerd.service`'s own `ExecStartPre=modprobe overlay`
 (PID 1's child) was already a Low record.
 
+**Rootless Podman's `modprobe overlay` (R011, lots 369 and 380).** Podman
+run by a user asks for `overlay` as that user. R011 records the exec Low
+when the process cannot load a module: no uid 0 among its ids and no
+`CAP_SYS_MODULE` in PID 1's user namespace (rootless Podman's capabilities
+are its own namespace's). A `modprobe` that exits before the exec pump reads
+it (a module already loaded) is judged from the process that forked it, when
+the kernel's record says the exec is that fork's first and the system's
+tool has no set-id bit or file capability: every thread of the forker with
+no uid 0 and no capability in PID 1's namespace, or in a namespace of its
+own. A forker with a uid 0 or a capability keeps High.
+
+**containerd's task bundles (the mass-write arm, lot 380).** containerd
+writes and removes each task's bundle under `/run/containerd` as containers
+start and stop — new files beside originals destroyed, the shape the
+posture's mass-write arm counts. The shipped `daemon-data.v1` lists
+`/run/containerd/` for `containerd.service` (and `/run/docker/` for
+`docker.service`, beside `/var/lib/containerd/` and `/var/lib/docker/`): a
+crossing whose every file lay there, by the unit's own cgroup, raises
+nothing. Another unit's burst there, or a container's (a cgroup below the
+unit's), still counts; add a runtime's other directories with
+`+<unit>.service <directory>/` lines in the signed
+`mass-write-carveout.local`.
+
 **The cpuset controller on kernels before 6.5 (NN-L-AT-001 `sched`, lot
 348).** At a container's start systemd, runc and containerd-shim enable the
 cgroup v2 controllers for the new cgroup's ancestors (`+cpuset +cpu +io …`

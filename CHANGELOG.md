@@ -6,6 +6,35 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 380 (the rc11 soaks): the last false positives judged by identity
+  (`UPGRADE_NOTES_WAVE4.md` §66).
+  - **`newuidmap` reading `/etc/login.defs`** (ALERTED at each rootless
+    Podman burst): shadow's packaged uidmap tools read shadow's settings as
+    their caller — told by the file the kernel executed, as lot 378's
+    `/etc/passwd` lookup. The mini-hunt: `newgrp` (`/etc/gshadow`,
+    `/etc/login.defs`) is an authentication binary. Tests
+    `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
+    `newgrp_reading_the_group_shadow_as_its_caller_is_no_sensitive_access`.
+  - **Routine `/etc/passwd` reads** (`id` in the bench's preparation, its
+    login uid read after it exited): a packaged program's read-only open
+    of the world-readable `/etc/passwd` is a name lookup, no sensitive
+    access, unless the program is a file tool, a shell or an interpreter
+    (POS-007's list, grown by the text tools, editors, copiers and
+    multi-call binaries). Test
+    `a_packaged_program_s_name_lookup_is_no_sensitive_access`.
+  - **R011 High for a user's `modprobe overlay` under `podman info`**: gone
+    before the exec pump read it, its credentials are read from the
+    process that forked it (the kernel's fork record, every thread, its
+    start, the tool with no set-id bit or file capability); a forker with
+    no uid 0 and no capability in PID 1's namespace (or in a user
+    namespace of its own) gives a fork that cannot load a module: Low.
+    Tests `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
+    `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`.
+  - **containerd's mass-write ENGAGED** (its task bundles under
+    `/run/containerd`): `daemon-data.v1` lists `/run/containerd/` for
+    `containerd.service` and `/run/docker/` for `docker.service`; the
+    earlier shipped list's hash is known to the agent and `install.sh`.
+    Test `containerd_replacing_its_task_bundles_under_run_raises_nothing`.
 - Lot 378 (the rc10 soaks): three false positives judged by identity
   (`UPGRADE_NOTES_WAVE4.md` §64).
   - **The posture at every boot.** The `POSTURE TRANSITION` line named

@@ -4196,8 +4196,29 @@ mod tests {
             fires(920, "/etc/passwd", 0, id),
             "a /tmp exec naming id's image (PR_SET_MM)"
         );
+        IdTestHost::set_file_id("/home/u/bin/id", Some((STAT_DEV, 60)));
         exec(921, "/home/u/bin/id", 60);
         assert!(fires(921, "/etc/passwd", 0, (KDEV, 60)), "a home's program");
+        // the exec of the packaged file the kernel did not describe (no LSM
+        // identity: tracepoint mode)
+        let mut bare = spawn_with_exe(925, 690, "/usr/bin/id", 1);
+        if let Event::ProcessSpawn {
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut bare
+        {
+            (*start_ns, *timestamp_ns) = (925, 926);
+        }
+        assert!(auth.ingest_spawn_event(&bare));
+        assert!(fires(925, "/etc/passwd", 0, id), "its file not described");
+        // not read yet, the image a file of its name in a directory a user
+        // can write
+        IdTestHost::set_file_id("/usr/sbin/idx", Some((STAT_DEV, 65)));
+        assert!(
+            opens(924, "idx", "/etc/passwd", 0, (KDEV, 65)),
+            "not read yet, its name's file in a directory not root's only"
+        );
         assert!(
             fires(922, "/etc/passwd", 0, (KDEV, 59)),
             "a copy, its exec not read yet"
@@ -4222,6 +4243,8 @@ mod tests {
         for (path, _) in files {
             IdTestHost::set_file_id(path, None);
         }
+        IdTestHost::set_file_id("/home/u/bin/id", None);
+        IdTestHost::set_file_id("/usr/sbin/idx", None);
         IdTestHost::set_dir_root_only("/usr/bin", false);
     }
 
