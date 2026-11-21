@@ -4654,8 +4654,14 @@ mod tests {
         let b = IdBench::new(&[("/usr/sbin/exim4", Some(80))], &["/usr/sbin"]);
         b.exec(42, 1000, "/usr/sbin/exim4", 80, &["exim4"]);
         assert!(!b.opens(42, 0, "exim4", "/etc/shadow", 80), "root's read");
-        assert!(!b.opens(42, 1, "exim4", "/etc/shadow", 80), "a low service uid's read");
-        assert!(!b.opens(42, 999, "exim4", "/etc/shadow", 80), "a high service uid's read");
+        assert!(
+            !b.opens(42, 1, "exim4", "/etc/shadow", 80),
+            "a low service uid's read"
+        );
+        assert!(
+            !b.opens(42, 999, "exim4", "/etc/shadow", 80),
+            "a high service uid's read"
+        );
     }
 
     #[test]
