@@ -2587,6 +2587,7 @@ mod tests {
             "a forker of 33 threads"
         );
         // the review of #587 (F2): past the forker route's budget, not read
+        write_forker(150, &[(forker, 1000, 0, init)]);
         let budget = Mutex::new(ForkerBudget::default());
         let now = Instant::now();
         let budgeted = || {
