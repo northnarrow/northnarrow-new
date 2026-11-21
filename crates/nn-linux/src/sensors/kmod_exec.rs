@@ -2477,6 +2477,21 @@ mod tests {
         assert_eq!(read(&exe, forker), Credentials::NotRead, "set-uid");
         std::fs::set_permissions(&kmod, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(read(&exe, forker), Credentials::CannotLoad(_)));
+        // more threads than are read: not vouched for
+        let many: Vec<_> = (0..=FORKER_THREADS as u32)
+            .map(|i| (forker + i, 1000, 0, init))
+            .collect();
+        write_forker(150, &many);
+        assert_eq!(
+            read(&exe, forker),
+            Credentials::NotRead,
+            "past the threads read"
+        );
+        write_forker(150, &many[..FORKER_THREADS]);
+        assert!(
+            matches!(read(&exe, forker), Credentials::CannotLoad(_)),
+            "as many threads as are read"
+        );
         // the forker gone
         child.kill().unwrap();
         child.wait().unwrap();
