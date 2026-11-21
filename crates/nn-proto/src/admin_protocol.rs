@@ -1035,11 +1035,16 @@ pub struct StatusResponse {
 /// containers start while `kept` stays 0 has lost the exemption. Lot 381
 /// (appended): of `compared`, those read through another process running
 /// the copy (`through`: the exec's own gone); not compared because the copy
-/// was gone before the read (`gone`: kept unverified when its process exited
-/// under an installed runtime — R004: root's High, any other uid's Critical;
-/// else nothing kept, Critical); no runtime's clone at all (`no_runtime`: R004 judges them
-/// fileless) — every sealed memfd exec in exactly one of `compared`,
-/// `unverified`, `gone`, `no_runtime`, `not_read`.
+/// was gone before the read in runc 1.1's re-exec under an installed
+/// runtime (`gone`: kept unverified — R004: root's High, any other uid's
+/// Critical); no runtime's copy (`no_runtime`: under no installed runtime
+/// or manager, no runtime's length, not sealed — R004 judges them
+/// fileless); the review of #588 (F4, appended): not compared and nothing
+/// kept (`lost`: the copy gone in any other shape, the parent gone, the
+/// process running another file, a thread of it running whose copy was not
+/// read — R004 judges them fileless). Every sealed memfd exec is in exactly
+/// one of `compared`, `unverified`, `gone`, `lost`, `no_runtime`,
+/// `not_read`, once (the review of #588, F3).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeClones {
     pub compared: u64,
@@ -1052,6 +1057,8 @@ pub struct RuntimeClones {
     pub gone: u64,
     #[serde(default)]
     pub no_runtime: u64,
+    #[serde(default)]
+    pub lost: u64,
 }
 
 /// Lot 341 (alpha 2/4): the detection records of the current UTC day this
@@ -3990,8 +3997,9 @@ mod tests {
         let before = without.len() - 1;
         assert_eq!(&with[..before], &without[..before]);
         assert_eq!(&without[before - 2..], &[1, 0, 0]);
-        // lot 381: its three counts follow lot 369's four, inside it
-        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0]);
+        // lot 381: its three counts follow lot 369's four, inside it; the
+        // review of #588 (F4): `lost` after them
+        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0, 0]);
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
     }
@@ -4000,7 +4008,8 @@ mod tests {
     /// another process, gone before the read and no runtime's are appended
     /// inside lot 369's object, the status's last field — an `nn-admin`
     /// that knows only lot 369's four reads them as before, and ignores the
-    /// rest.
+    /// rest. The review of #588 (F4): the copies lost (nothing kept) after
+    /// them.
     #[test]
     fn the_runtime_clones_lot_381_counts_are_appended_inside_it() {
         #[derive(Debug, Deserialize, PartialEq)]
@@ -4018,9 +4027,10 @@ mod tests {
             through: 2,
             gone: 1,
             no_runtime: 4,
+            lost: 5,
         };
         let bytes = postcard::to_allocvec(&c).unwrap();
-        assert_eq!(&bytes[bytes.len() - 3..], &[2, 1, 4]);
+        assert_eq!(&bytes[bytes.len() - 4..], &[2, 1, 4, 5]);
         let (old, rest): (Lot369, &[u8]) = postcard::take_from_bytes(&bytes).unwrap();
         assert_eq!(
             old,
@@ -4031,7 +4041,7 @@ mod tests {
                 not_read: 0
             }
         );
-        assert_eq!(rest, &[2, 1, 4]);
+        assert_eq!(rest, &[2, 1, 4, 5]);
         assert_eq!(postcard::from_bytes::<RuntimeClones>(&bytes).unwrap(), c);
     }
 
