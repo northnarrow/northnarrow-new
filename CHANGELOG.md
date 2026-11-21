@@ -52,6 +52,11 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   - **`agent_stalled`** names the agent's own memory throttling
     (`MemoryHigh`) besides a pause of the machine. Test
     `the_stall_advisory_names_the_agents_own_memory_throttling`.
+- Lot 382 (docs only, the last hygiene pass before the tag). Open residuals
+  are written as behaviour, without timings or steps; two superseded notes
+  point to what replaced them; the protocol comments are true after the
+  merge; `agent_stalled` is documented as a paused machine or the agent's
+  own memory throttling under `MemoryHigh`.
 - Lot 381 (the pre-alpha's Phase 6b, rc11; `UPGRADE_NOTES_WAVE4.md` §67).
   - **R004 Critical at one rootful runc start in about 300** (Debian 13,
     Podman 5.4.2, runc 1.1.15: 200 containers started in a row). runc
@@ -185,7 +190,7 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     `a_build_without_the_test_feature_injects_nothing`).
   - **Every kind has a class; advisories apart** (the review of #586,
     P2-1). An admin key left on the host, strict overcommit, the
-    operator's signed sysctl opt-out, a VM pause and the quarantine's
+    operator's signed sysctl opt-out, a stall of the agent's loop and the quarantine's
     index rebuilt were held as degradations: `sensors: DEGRADED` on every
     default install, hiding a real degradation. Each `integrity_drift` kind
     the agent signs is now in one table of `nn_evidence::held` (evidence,

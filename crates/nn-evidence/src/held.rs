@@ -16,7 +16,7 @@
 //!
 //! The rule ([`hold_of`]) — every kind the product signs is in one table
 //! (the review of #586, P2-1: the default class held an admin key left on
-//! the host, a VM pause, the operator's own signed sysctl opt-out as
+//! the host, a stalled agent loop, the operator's own signed sysctl opt-out as
 //! degradations, `sensors: DEGRADED` on every default install, which hid a
 //! real one; the ratchet `xtask/tests/integrity_kinds.rs` fails on a kind
 //! signed and in none):

@@ -3,7 +3,7 @@
 //!
 //! The status held every signed finding of a kind its tables did not name
 //! as a degradation (`hold_of`'s default): an admin key left on the host,
-//! the operator's own signed sysctl opt-out, strict overcommit, a VM pause
+//! the operator's own signed sysctl opt-out, strict overcommit, a stalled agent loop
 //! made every default install `sensors: DEGRADED`, which hid a real
 //! degradation behind it. Each kind is now in one table of
 //! `crates/nn-evidence/src/held.rs` — evidence, a death, an event of the

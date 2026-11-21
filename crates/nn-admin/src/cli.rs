@@ -3362,7 +3362,7 @@ fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
 
 /// Lot 379 (the review of #586, P2-1): the advisories — signed findings of
 /// the host's state or the operator's choice (an admin key left on the
-/// host, a signed sysctl opt-out, a pause of the whole machine) that
+/// host, a signed sysctl opt-out, a stall of the agent's loop) that
 /// degrade no sensor: listed on their own, never counted in `sensors`.
 /// Nothing when there is none (or the agent predates them).
 fn advisory_lines(out: &StatusOutcome) -> Vec<String> {
