@@ -11772,6 +11772,54 @@ number in parentheses is a lab PR.
       produce a second record (the file-open sensor's read-repeat filter
       spans an exec). Keying it on the exec is planned for the first eBPF
       lot after the alpha.
+  - **Fix round 1 (the review of #587).**
+    - **F1/F4: the reader judged by the file that runs.** The class of a
+      packaged reader of `/etc/passwd` is the executed file's by its
+      identity (`reads_files_it_is_told`): its own name, the same device
+      and inode as an installed tool's file in `/usr/bin`, `/bin` or uutils'
+      directory (a multi-call binary under any link and `argv[0]`, an
+      alias), the loader by its operand. Ratchet
+      `xtask/tests/reader_identity.rs`. On Ubuntu 26.04 uutils' `id`,
+      `whoami`, `ls` reading it without a login uid stay ALERTED.
+    - **POS-007.** At a service uid `/etc/shadow`, `/etc/gshadow` and
+      `/etc/sudoers` are quiet only for the authentication stack and Exim
+      by identity (`CREDENTIAL_CONSUMER_EXES`); the loader, uutils' links,
+      `getent shadow`, `wc` now fire.
+    - **F2.** R011's forker route: a forker of at most 32 threads, two
+      reads a second per forker and eight for all; past them not read
+      (never Low).
+    - Mutation: 31 mutants of the round's code, 28 caught by a named test
+      (five survivors of the first pass got test cases), 2 argued
+      equivalent (the operand's own checks repeated by its judgement), 1
+      redundant flag removed.
+    - Lab (as measured, alpha profile, under leases, guests uninstalled and
+      powered off):
+      - **ubuntu2604 (7.0; uutils, one file under 116 names).** Routine
+        readers: `ps` and `getent` in a session ×50 and with no login uid
+        ×3, `id` in a session ×100, rootless `podman info` ×5, a user's
+        `modprobe -n overlay` ×5 (R011 Low ×5): no transition. Each shape
+        first after its own boot, ALERTED (SensitiveFileAccess): uutils'
+        `id` link run with `argv[0]` `cat` (uutils ran `id`; a tool by its
+        file), the loader running `grep` (judged on the lagging records:
+        the shell's own exec with the loader's image), `nawk` (gawk),
+        `pager` (less), uutils' `wc`; as `daemon` in group `shadow`, on
+        `/etc/shadow`: the loader running `grep`, `getent shadow`, uutils'
+        `wc`. uutils itself refused the loader running its `cat` ("does not
+        match executable name").
+      - **ubuntu2404 (6.8; GNU coreutils).** The same routine readers plus
+        `id`, `whoami`, `groups`, `ls -l`, `stat` with no login uid: no
+        transition; `podman info`'s `modprobe overlay` as uid 1000 R011 Low
+        (podman 4.9, 11 threads). Each shape first after its own boot,
+        ALERTED: the loader running `cat` (the loader's own record, judged
+        by its operand), `nawk`, `pager`; as `daemon` in group `shadow`:
+        the loader running `grep` (the loader's record), `getent shadow`,
+        `wc`. Control: GNU `wc` reading `/etc/passwd` with no login uid, no
+        transition (a packaged program off the list, world-readable data).
+      - Heads: the routine readers and each guest's first shape on
+        `1c644146`, the other shapes on `82fef15a` (the reset of the posture
+        is refused to the lab's key, so each further shape needed a boot);
+        the final code differs by tests and one equivalent change (a
+        redundant flag of the operand's judgement).
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
   C18; no level change).**
