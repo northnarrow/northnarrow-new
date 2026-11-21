@@ -13927,6 +13927,16 @@ number in parentheses is a lab PR.
     found (its check's `integrity_drift_cleared`, or the next start's
     check). A row that ends a hold counts only when its signature verifies
     with the log's key.
+  - Phase 7b's F7-6 (the coordinator's addition): `nn-admin status` had
+    nothing after the agent's crash, its OOM or the watchdog's death,
+    signed all the same. The deaths of the two roles (`witness_row`,
+    `watchdog_gone`, `witness_row_uncertified`, both roles vacated, a
+    successor not confirmed or foreign) are held until acknowledged, like
+    the evidence (`nn_evidence::held::DEATH_KINDS`, tied to the witness's
+    and the round's own kinds by
+    `the_held_deaths_are_the_witness_s_and_the_round_s_kinds`); a worker's
+    death stays a degradation of the run
+    (`a_worker_s_death_is_reported_for_the_status`).
   - New signed verb: `nn-admin integrity acknowledge --through <row>`
     (operation 27, `triage` or `config-manage`, 1-of-N); its audit row is
     the acknowledgement; a row not signed yet is refused.
@@ -13980,4 +13990,10 @@ number in parentheses is a lab PR.
       created anew), and passed on ubuntu2604 run as `test-ignored` runs
       the suites (the install kept, its units stopped, the pins purged): 2
       passed.
+    - F7-6, debian12 (6.1, systemd 252): the agent killed (SIGKILL in a
+      signed window) came back in seconds and held `witness_row` ("role
+      vacated: signal 9"); the watchdog killed the same way held
+      `watchdog_gone` (`NRestarts=1`); both still held after a documented
+      restart; the acknowledgement through row 46 ended them, `sensors:
+      OK`.
 

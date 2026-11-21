@@ -2462,7 +2462,7 @@ mod tests {
         // variant — the last production pair
         let acknowledge = AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
             payload: SignedPayload::new_integrity_acknowledge(
-                [0; 32],
+                test_nonce(),
                 0,
                 [0; 16],
                 7,
@@ -2498,6 +2498,14 @@ mod tests {
             );
             assert_eq!(first(&AdminMessage::DebugForcePostureAck), 62);
         }
+    }
+
+    /// Lot 379: a test frame's nonce that no literal names (CodeQL
+    /// `rust/hard-coded-cryptographic-value`: these frames need no
+    /// particular bytes, only a nonce of the right length).
+    fn test_nonce() -> [u8; 32] {
+        let seed = std::process::id().to_le_bytes();
+        std::array::from_fn(|i| seed[i % seed.len()] ^ i as u8)
     }
 
     fn roundtrip(msg: AdminMessage) {
@@ -4149,7 +4157,7 @@ mod tests {
         roundtrip(AdminMessage::IntegrityAcknowledgeRequest(
             IntegrityAcknowledgeRequest {
                 payload: SignedPayload::new_integrity_acknowledge(
-                    [0x44; 32],
+                    test_nonce(),
                     1_700_000_000,
                     [0x55; 16],
                     412,

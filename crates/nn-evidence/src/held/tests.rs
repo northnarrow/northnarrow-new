@@ -120,6 +120,53 @@ fn the_findings_phase_7_saw_unseen_are_held() {
     }
 }
 
+/// Phase 7b F7-6: a crash or an OOM of the agent (the witness's
+/// `role_vacated`, signed by the start that follows it) and the watchdog's
+/// death (`watchdog_gone`, then its `cleared` when a new one runs) are held
+/// until acknowledged: the restart the death caused, a later start, the
+/// round's end of it — none ends it. On main the status said `sensors: OK`
+/// after each.
+#[test]
+fn an_agent_or_watchdog_death_is_held_until_acknowledged() {
+    for kind in DEATH_KINDS {
+        assert_eq!(hold_of(kind, "detected"), Hold::UntilAcknowledged, "{kind}");
+        assert!(!EVIDENCE_KINDS.contains(kind), "{kind} in both lists");
+    }
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    boot(&mut log);
+    let crash = "watchdog 812 at 1795240000: role_vacated: the agent (pid 4410) left its role: \
+                 killed by SIGKILL (row hash 0a1b2c3d4e5f6a7b)";
+    log.append(drift("witness_row", crash)).unwrap();
+    let gone = "the verified watchdog (pid 812) no longer runs; a new watchdog (pid 901) is \
+                verified";
+    log.append(drift("watchdog_gone", gone)).unwrap();
+    log.append(cleared("watchdog_gone", gone)).unwrap();
+    log.append(drift(
+        "witness_row_uncertified",
+        "watchdog 901: witness_opened",
+    ))
+    .unwrap();
+    let line = log.held().lines()[0].clone();
+    assert!(
+        line.starts_with("witness_row — signed ") && line.contains("held until acknowledged"),
+        "{line}"
+    );
+    drop(log);
+    let mut log = open(&key, &path);
+    boot(&mut log);
+    assert_eq!(
+        kinds(&log),
+        [
+            format!("witness_row:{crash}"),
+            format!("watchdog_gone:{gone}"),
+            "witness_row_uncertified:watchdog 901: witness_opened".to_string()
+        ]
+    );
+    log.append(ack(log.rows() - 1)).unwrap();
+    assert!(log.held().is_empty());
+}
+
 /// F7-1, case C2: a cut chain is held across the agent's restarts (the
 /// walk at the open) until a signed acknowledgement covers its row; a start
 /// does not end it.

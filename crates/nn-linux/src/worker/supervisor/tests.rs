@@ -651,6 +651,25 @@ fn a_worker_that_dies_with_a_request_is_reaped() {
     assert_eq!(f.workers.status()[0].deaths, 1);
 }
 
+/// Lot 379 (pre-alpha Phase 7b, F7-6): a worker's death (an OOM kill, a
+/// crash) is reported to the degradation registry — signed, in `nn-admin
+/// status` for the rest of the run, never withdrawn when the worker is back.
+#[test]
+fn a_worker_s_death_is_reported_for_the_status() {
+    let f = fixture(Script::DieOnRequest);
+    assert!(tick_until(&f.workers, Health::Ready));
+    let _ = f
+        .workers
+        .request(WorkerKind::Parse, &names(), Duration::from_secs(2));
+    let reports = f.reports.lock().clone();
+    assert!(
+        reports
+            .iter()
+            .any(|(source, detail)| source == "worker_parse" && detail.contains("died")),
+        "{reports:?}"
+    );
+}
+
 #[test]
 fn failures_in_a_row_back_off_then_disable_then_a_stable_worker_enables() {
     let f = fixture(Script::DieOnRequest);

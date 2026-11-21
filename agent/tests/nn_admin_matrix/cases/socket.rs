@@ -675,6 +675,13 @@ pub fn verbs() -> Vec<Verb> {
                  415) — held while found, or until acknowledged: process-comm-allowlist \
                  (process-comm-allowlist.local): no signature file"
                     .to_string(),
+                // lot 379 (Phase 7b F7-6): the agent's crash, as the start
+                // after it signs the witness's row, held until acknowledged
+                "integrity: witness_row — signed 2026-11-20T16:46:10.000000Z (audit row 421) — \
+                 held until acknowledged (`nn-admin integrity acknowledge --through <row>`): \
+                 watchdog 812 at 1795240000: role_vacated: the agent (pid 4410) left its role \
+                 (row hash 0a1b2c3d4e5f6a7b)"
+                    .to_string(),
             ]);
             success.push(("integrity-held".to_string(), telemetry(Some(held))));
         }
