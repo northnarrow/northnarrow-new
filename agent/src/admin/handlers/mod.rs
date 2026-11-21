@@ -6,6 +6,7 @@ pub(in crate::admin) mod config;
 pub(in crate::admin) mod detections;
 pub(in crate::admin) mod fim;
 pub(in crate::admin) mod installer;
+pub(in crate::admin) mod integrity;
 pub(in crate::admin) mod keys;
 pub(in crate::admin) mod net;
 pub(in crate::admin) mod posture;
@@ -16,6 +17,7 @@ pub(in crate::admin) mod status;
 pub(in crate::admin) mod unlock;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use tracing::{error, warn};
 
@@ -38,6 +40,7 @@ use config::dispatch_config_overlay_set;
 use detections::{dispatch_detection_set_status, dispatch_detections};
 use fim::{dispatch_fim_baseline, dispatch_fim_report, dispatch_fim_status};
 use installer::dispatch_trusted_installer_grant;
+use integrity::dispatch_integrity_acknowledge;
 use keys::{dispatch_rotate_keys_add, dispatch_rotate_keys_revoke};
 use net::{
     dispatch_net_fingerprint, dispatch_net_flows, dispatch_net_listeners, dispatch_net_resolve,
@@ -68,6 +71,9 @@ pub(in crate::admin) struct Wired<'a> {
     pub(in crate::admin) read_paths: &'a AdminReadPaths,
     /// R11c (lab PR 264): the start's handles (the per-rule policy, …).
     pub(in crate::admin) handles: &'a AdminHandles,
+    /// Lot 379: the signed audit log — what it holds, for `integrity
+    /// acknowledge` (`None`: unaudited).
+    pub(in crate::admin) audit_log: Option<&'a Arc<parking_lot::Mutex<crate::audit::AuditLog>>>,
 }
 
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
@@ -95,6 +101,7 @@ pub(super) fn dispatch(
         response_state,
         read_paths,
         handles,
+        audit_log,
     } = ctx;
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -292,6 +299,12 @@ pub(super) fn dispatch(
         AdminMessage::RemediateRansomwareRequest(req) => AdminMessage::RemediateRansomwareResponse(
             dispatch_remediate_ransomware(req, auth, handles.cow_guard.as_ref(), fps_out),
         ),
+        // Lot 379 (pre-alpha F7-1) — acknowledge the held integrity findings.
+        AdminMessage::IntegrityAcknowledgeRequest(req) => {
+            AdminMessage::IntegrityAcknowledgeResponse(dispatch_integrity_acknowledge(
+                req, auth, audit_log, fps_out,
+            ))
+        }
 
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
@@ -324,7 +337,8 @@ pub(super) fn dispatch(
         | AdminMessage::TelemetryStatusResponse(_)
         | AdminMessage::LoopProgressResponse(_)
         | AdminMessage::SignedUnlockResponse(_)
-        | AdminMessage::RemediateRansomwareResponse(_) => {
+        | AdminMessage::RemediateRansomwareResponse(_)
+        | AdminMessage::IntegrityAcknowledgeResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }

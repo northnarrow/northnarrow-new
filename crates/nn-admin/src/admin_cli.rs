@@ -3222,6 +3222,44 @@ pub fn run_response_status(
     }
 }
 
+/// Lot 379 (pre-alpha F7-1): `nn-admin integrity acknowledge --through
+/// <row>` (role `triage` or `config-manage`): the agent signs the
+/// acknowledgement and the held integrity findings whose newest row is at or
+/// before `through_row` leave `nn-admin status`; their rows stay in the
+/// chain.
+pub fn run_integrity_acknowledge(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    through_row: u64,
+    note: String,
+) -> Result<ResponseActionOutcome> {
+    use nn_proto::admin_protocol::IntegrityAcknowledgeRequest;
+    match signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        |n, ts, id| SignedPayload::new_integrity_acknowledge(n, ts, id, through_row, note.clone()),
+        |payload, signatures| {
+            AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+                payload,
+                signatures,
+            })
+        },
+    )? {
+        AdminMessage::IntegrityAcknowledgeResponse(r) => Ok(ResponseActionOutcome {
+            result: r.result,
+            done: r.acknowledged > 0,
+            path: None,
+            message: r.message,
+        }),
+        other => bail!(
+            "unexpected reply to IntegrityAcknowledgeRequest: {other:?} (an agent older than lot \
+             379 has no integrity verb)"
+        ),
+    }
+}
+
 /// `nn-admin response release --pid N` (role `response-manage`): the agent
 /// writes the process back to the cgroup it came from.
 pub fn run_response_release(

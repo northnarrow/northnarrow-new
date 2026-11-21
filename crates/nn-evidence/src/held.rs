@@ -178,10 +178,7 @@ impl HeldFinding {
             }
             _ => "held while found, or until acknowledged",
         };
-        format!(
-            "{}{about} — {times} — {until}: {}",
-            self.kind, self.detail
-        )
+        format!("{}{about} — {times} — {until}: {}", self.kind, self.detail)
     }
 }
 
@@ -257,7 +254,11 @@ impl Held {
     /// How many held findings an acknowledgement through `through` covers
     /// (their newest row at or before it).
     pub fn covered_by(&self, through: u64) -> u64 {
-        let listed = self.findings.iter().filter(|f| f.last_row <= through).count() as u64;
+        let listed = self
+            .findings
+            .iter()
+            .filter(|f| f.last_row <= through)
+            .count() as u64;
         let counted: u64 = self
             .more
             .iter()
@@ -270,7 +271,12 @@ impl Held {
     /// Row `row` of the chain (0-based), `entry`: whether what is held
     /// changed. `genuine` says whether a row's signature verifies with the
     /// log's key; asked only of the rows that end a hold.
-    pub fn observe(&mut self, row: u64, entry: &AuditEntry, genuine: &dyn Fn(&AuditEntry) -> bool) -> bool {
+    pub fn observe(
+        &mut self,
+        row: u64,
+        entry: &AuditEntry,
+        genuine: &dyn Fn(&AuditEntry) -> bool,
+    ) -> bool {
         match entry.op.as_str() {
             INTEGRITY_DRIFT_OP => self.finding(row, entry),
             INTEGRITY_CLEARED_OP => {
@@ -281,9 +287,11 @@ impl Held {
                 };
                 let subject = cut(detail);
                 let before = self.findings.len();
-                if !self.findings.iter().any(|f| {
-                    f.hold == Hold::WhileFound && f.kind == kind && f.subject == subject
-                }) || !genuine(entry)
+                if !self
+                    .findings
+                    .iter()
+                    .any(|f| f.hold == Hold::WhileFound && f.kind == kind && f.subject == subject)
+                    || !genuine(entry)
                 {
                     return false;
                 }
@@ -294,8 +302,8 @@ impl Held {
             }
             // a start checks again: what it still finds, it signs again
             "agent_boot" if entry.result == "success" => {
-                let found = self.findings.iter().any(|f| f.hold == Hold::WhileFound)
-                    || self.more[1].0 > 0;
+                let found =
+                    self.findings.iter().any(|f| f.hold == Hold::WhileFound) || self.more[1].0 > 0;
                 if !found || !genuine(entry) {
                     return false;
                 }

@@ -222,7 +222,7 @@ exit: 0
 | response mode     : DETECT-ONLY (config file) — no response action and no COMBAT isolation touch the system
 | combat evidence   : 1 stage transition(s) not written to the signed audit log when they happened — 2 queued for a late write, 0 dropped (never written); see the agent ERRORs
 | trust level       : L2 (enforcing and verified, degraded) — BTF offsets drifted: 5
-| degradations      : 1 this run (each signed in the audit log)
+| degradations      : 1 (each signed in the audit log)
 |   - bpf_lsm: anti-tamper: no enforcement
 | capabilities      : the boot's manifest, older than the sensor contract — nn-admin capabilities --key
 | exploit guard     : strict detect (experimental) — 12 calls judged, 30 skipped (fully privileged), 1 anomalies, 0 killed; 2 task(s) untracked (task map full: their calls are not judged)
@@ -5416,6 +5416,178 @@ exit: 5
 (empty)
 --- stderr
 | response release: reading agent_id id.d: Is a directory (os error 21)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-missing
+$ nn-admin integrity acknowledge --through 412 --note investigated --key absent.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: reading private key absent.key: No such file or directory (os error 2)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-group-readable
+$ nn-admin integrity acknowledge --through 412 --note investigated --key loose.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key loose.key is accessible to group or others (mode 640): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-world-readable
+$ nn-admin integrity acknowledge --through 412 --note investigated --key loose.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key loose.key is accessible to group or others (mode 644): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-loose-allowed
+$ nn-admin integrity acknowledge --through 412 --note investigated --key loose.key --agent-id-file agent_id --socket admin.sock
+env NN_ADMIN_ALLOW_LOOSE_KEY=1
+exit: 0
+--- stdout
+| integrity acknowledge: 1 held integrity finding(s) acknowledged through audit row 412; 1 still held; their rows stay in the chain
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"IntegrityAcknowledgeRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"IntegrityAcknowledge":{"note":"investigated","through_row":412}},"nonce":"<challenge>","op":27,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< IntegrityAcknowledgeResponse (the verb's first success)
+> (closed)
+
+### keyid.integrity-acknowledge.key-loose-allow-not-1
+$ nn-admin integrity acknowledge --through 412 --note investigated --key loose.key --agent-id-file agent_id --socket admin.sock
+env NN_ADMIN_ALLOW_LOOSE_KEY=yes
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key loose.key is accessible to group or others (mode 644): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-empty
+$ nn-admin integrity acknowledge --through 412 --note investigated --key bad.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key file bad.key is empty
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-short
+$ nn-admin integrity acknowledge --through 412 --note investigated --key bad.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key must be 64 hex chars (got 4): bad.key
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-not-hex
+$ nn-admin integrity acknowledge --through 412 --note investigated --key bad.key --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key hex decode failed: Invalid character 'z' at position 0
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-a-directory
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key.d --agent-id-file agent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: private key key.d is accessible to group or others (mode 755): `chmod 600` it (or set NN_ADMIN_ALLOW_LOOSE_KEY=1 for read-only media)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.key-not-installed
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-c --agent-id-file agent_id --socket admin.sock
+exit: 0
+--- stdout
+| integrity acknowledge: 1 held integrity finding(s) acknowledged through audit row 412; 1 still held; their rows stay in the chain
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"IntegrityAcknowledgeRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"IntegrityAcknowledge":{"note":"investigated","through_row":412}},"nonce":"<challenge>","op":27,"ts":"<now>"},"signatures":["<sig of key-c>"]}}
+< IntegrityAcknowledgeResponse (the verb's first success)
+> (closed)
+
+### keyid.integrity-acknowledge.agent-id-missing
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file absent_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id not found at absent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.agent-id-all-zero
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file bad_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id file bad_id present but corrupted: agent_id is all zeros — the test fixtures' identity, never minted
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.agent-id-short
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file bad_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id file bad_id present but corrupted: agent_id has 4 hex chars (expected 32)
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.agent-id-not-hex
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file bad_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id file bad_id present but corrupted: agent_id is not valid hex: Invalid character 'z' at position 0
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.agent-id-two-lines
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file bad_id --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id file bad_id present but corrupted: agent_id file has embedded newline — expected single-line hex
+--- agent
+(no connection)
+
+### keyid.integrity-acknowledge.agent-id-a-directory
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file id.d --socket admin.sock
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: reading agent_id id.d: Is a directory (os error 21)
 --- agent
 (no connection)
 

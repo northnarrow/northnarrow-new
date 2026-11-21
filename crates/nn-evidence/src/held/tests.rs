@@ -67,7 +67,8 @@ fn boot(log: &mut AuditLog<TestKey>) -> u64 {
         features: Vec::new(),
         bpf_guard_enforce: false,
     };
-    log.boot_probe(None, "verified", "attested", &build).unwrap();
+    log.boot_probe(None, "verified", "attested", &build)
+        .unwrap();
     log.rows() - 1
 }
 
@@ -95,14 +96,22 @@ fn the_findings_phase_7_saw_unseen_are_held() {
     for kind in ["chain_truncated", "chain_rewritten", "chain_verify_failed"] {
         assert_eq!(hold_of(kind, "detected"), Hold::UntilAcknowledged, "{kind}");
     }
-    for kind in ["unauthorized_overlay", "default_list_modified", "mount_not_canonical"] {
+    for kind in [
+        "unauthorized_overlay",
+        "default_list_modified",
+        "mount_not_canonical",
+    ] {
         assert_eq!(hold_of(kind, "detected"), Hold::WhileFound, "{kind}");
     }
     // a finding that failed to repair holds too (a COMBAT chain not torn down)
     assert_eq!(hold_of("combat_reconcile", "failed"), Hold::WhileFound);
     // not findings: a repair, a note, an end
     for result in ["repaired", "recorded", "cleared", "success"] {
-        assert_eq!(hold_of("combat_reconcile", result), Hold::NotHeld, "{result}");
+        assert_eq!(
+            hold_of("combat_reconcile", result),
+            Hold::NotHeld,
+            "{result}"
+        );
     }
     // shown by the registry already, ended by their finders
     for (kind, why) in NOT_HELD_KINDS {
@@ -123,9 +132,15 @@ fn a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement() {
     let row = log.rows() - 1;
     assert_eq!(kinds(&log), ["chain_truncated:detections"]);
     let f = &log.held().findings()[0];
-    assert_eq!((f.last_row, f.rows, f.hold), (row, 1, Hold::UntilAcknowledged));
+    assert_eq!(
+        (f.last_row, f.rows, f.hold),
+        (row, 1, Hold::UntilAcknowledged)
+    );
     let line = log.held().lines()[0].clone();
-    assert!(line.starts_with("chain_truncated (detections) — signed "), "{line}");
+    assert!(
+        line.starts_with("chain_truncated (detections) — signed "),
+        "{line}"
+    );
     assert!(line.contains(&format!("(audit row {row})")), "{line}");
     assert!(line.contains("held until acknowledged"), "{line}");
     drop(log);
@@ -175,8 +190,11 @@ fn a_config_finding_is_held_while_found() {
     let overlay = "process-comm-allowlist (/etc/northnarrow/process-comm-allowlist.local): no \
                    signature file";
     log.append(drift("unauthorized_overlay", overlay)).unwrap();
-    log.append(drift("default_list_modified", "fim-paths (/usr/share/northnarrow/fim-paths.v1)"))
-        .unwrap();
+    log.append(drift(
+        "default_list_modified",
+        "fim-paths (/usr/share/northnarrow/fim-paths.v1)",
+    ))
+    .unwrap();
     assert_eq!(log.held().findings().len(), 2);
     drop(log);
     // held across the restart's open, until its start checks again
@@ -187,12 +205,18 @@ fn a_config_finding_is_held_while_found() {
     // still there at that start: signed again, held again
     log.append(drift("unauthorized_overlay", overlay)).unwrap();
     // a cleared row of another detail ends nothing; of its own, ends it
-    log.append(cleared("unauthorized_overlay", "another overlay")).unwrap();
+    log.append(cleared("unauthorized_overlay", "another overlay"))
+        .unwrap();
     assert_eq!(log.held().findings().len(), 1);
-    log.append(cleared("unauthorized_overlay", overlay)).unwrap();
+    log.append(cleared("unauthorized_overlay", overlay))
+        .unwrap();
     assert!(log.held().is_empty());
     // or the operator acknowledges it
-    log.append(drift("mount_not_canonical", "a bind over /var/lib/northnarrow")).unwrap();
+    log.append(drift(
+        "mount_not_canonical",
+        "a bind over /var/lib/northnarrow",
+    ))
+    .unwrap();
     let row = log.rows() - 1;
     log.append(ack(row)).unwrap();
     assert!(log.held().is_empty());
@@ -222,19 +246,25 @@ fn a_row_not_signed_by_the_log_s_key_ends_no_hold() {
     let mut log = open(&key, &path);
     log.append(cut("detections", &path)).unwrap();
     let row = log.rows() - 1;
-    log.append(drift("unauthorized_overlay", "x.local")).unwrap();
+    log.append(drift("unauthorized_overlay", "x.local"))
+        .unwrap();
     drop(log);
     // the same rows, signed by another key, appended to the file
     let (_o, other_key, other) = paths();
     let mut forger = open(&other_key, &other);
     for _ in 0..row + 2 {
-        forger.append(draft("pad", "success", serde_json::json!({}))).unwrap();
+        forger
+            .append(draft("pad", "success", serde_json::json!({})))
+            .unwrap();
     }
     forger.append(ack(row + 1)).unwrap();
     boot(&mut forger);
     let lines = std::fs::read_to_string(&other).unwrap();
     let forged: Vec<&str> = lines.lines().rev().take(2).collect();
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     for l in forged.iter().rev() {
         use std::io::Write;
         writeln!(file, "{l}").unwrap();
@@ -258,9 +288,12 @@ fn a_row_not_signed_by_the_log_s_key_ends_no_hold() {
 fn rows_that_are_no_finding_are_not_held() {
     let (_d, key, path) = paths();
     let mut log = open(&key, &path);
-    log.append(drift("subsystem_degraded", "exec sensor on its fallback")).unwrap();
-    log.append(drift("pin_lock_missing", "the lock is gone")).unwrap();
-    log.append(drift("profile_downgraded", "alpha after enforcing")).unwrap();
+    log.append(drift("subsystem_degraded", "exec sensor on its fallback"))
+        .unwrap();
+    log.append(drift("pin_lock_missing", "the lock is gone"))
+        .unwrap();
+    log.append(drift("profile_downgraded", "alpha after enforcing"))
+        .unwrap();
     log.append(draft(
         INTEGRITY_DRIFT_OP,
         "repaired",
@@ -290,12 +323,16 @@ fn the_host_is_told_at_the_open_and_at_each_change() {
     let _ = helds::take(&path);
     let mut log = open(&key, &path);
     assert_eq!(helds::take(&path), vec![Vec::<String>::new()]);
-    log.append(draft("unlock", "success", serde_json::json!({}))).unwrap();
+    log.append(draft("unlock", "success", serde_json::json!({})))
+        .unwrap();
     assert!(helds::take(&path).is_empty());
     log.append(cut("audit", &path)).unwrap();
     let told = helds::take(&path);
     assert_eq!(told.len(), 1);
-    assert!(told[0][0].starts_with("chain_truncated (audit)"), "{told:?}");
+    assert!(
+        told[0][0].starts_with("chain_truncated (audit)"),
+        "{told:?}"
+    );
     log.append(ack(log.rows() - 1)).unwrap();
     assert_eq!(helds::take(&path), vec![Vec::<String>::new()]);
     // a log kept in memory (a refused start's fallback) tells nothing
@@ -312,14 +349,20 @@ fn past_the_cap_findings_are_counted_and_acknowledged() {
     let (_d, key, path) = paths();
     let mut log = open(&key, &path);
     for i in 0..MAX_HELD + 3 {
-        log.append(drift("unit_dropin", &format!("/etc/systemd/system/x.d/{i}.conf")))
-            .unwrap();
+        log.append(drift(
+            "unit_dropin",
+            &format!("/etc/systemd/system/x.d/{i}.conf"),
+        ))
+        .unwrap();
     }
     assert_eq!(log.held().findings().len(), MAX_HELD);
     assert_eq!(log.held().more(), 3);
     let lines = log.held().lines();
     assert_eq!(lines.len(), MAX_HELD + 1);
-    assert!(lines[MAX_HELD].contains("3 more held integrity row(s)"), "{lines:?}");
+    assert!(
+        lines[MAX_HELD].contains("3 more held integrity row(s)"),
+        "{lines:?}"
+    );
     let newest = log.held().newest_row().unwrap();
     assert_eq!(newest, log.rows() - 1);
     assert_eq!(log.held().covered_by(newest), MAX_HELD as u64 + 3);
@@ -332,7 +375,8 @@ fn past_the_cap_findings_are_counted_and_acknowledged() {
 fn a_long_detail_is_cut() {
     let (_d, key, path) = paths();
     let mut log = open(&key, &path);
-    log.append(drift("config_overlay", &"x".repeat(DETAIL_CHARS + 50))).unwrap();
+    log.append(drift("config_overlay", &"x".repeat(DETAIL_CHARS + 50)))
+        .unwrap();
     let f = &log.held().findings()[0];
     assert_eq!(f.detail.chars().count(), DETAIL_CHARS + 1);
     assert!(f.detail.ends_with('…'));

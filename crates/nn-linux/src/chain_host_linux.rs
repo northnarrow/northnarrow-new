@@ -573,7 +573,10 @@ mod tests {
             lines[0].starts_with("integrity: chain_truncated (detections) — signed "),
             "{lines:?}"
         );
-        assert!(lines[0].contains(&format!("(audit row {row})")), "{lines:?}");
+        assert!(
+            lines[0].contains(&format!("(audit row {row})")),
+            "{lines:?}"
+        );
         drop(log);
         // the restart: the registry of the new process starts empty, the
         // open of the log fills it again
