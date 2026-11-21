@@ -217,8 +217,8 @@ how.
   acknowledged, a bookkeeping row while found. An admin key left on the
   host, strict overcommit, the operator's signed sysctl opt-out and a stall of the agent's loop
   (`agent_stalled`: a paused machine, or the agent's own memory throttling
-  under `MemoryHigh`) are advisories: listed, not degradations. Events lost
-  during a stall are counted apart and make `sensors` DEGRADED.
+  under `MemoryHigh`) are advisories: listed, not degradations. Events the
+  agent lost are counted apart (since its start) and make `sensors` DEGRADED.
   The acknowledgement takes a key with `triage` or `config-manage`: a
   holder of such a key can clear the status, not the evidence (the rows,
   its own signed row, `chain verify`). A drift of the integrity round that
@@ -1295,7 +1295,7 @@ kernel.
   `sensors` reads `DEGRADED`. Records can be missing for such a burst.
   *Evidence:* internal check Phase 0, residuals R022.
 - **Long runs.** The long-run soaks are done: 48 hours on rc5, then
-  confirmation soaks of 4 and 12 hours up to rc12. They show no
+  confirmation soaks of 4 and 12 hours up to rc11. They show no
   regression of stability; a longer run on your own hosts may still
   find something we did not. *Evidence:* internal check Phase 0 §7.
 
