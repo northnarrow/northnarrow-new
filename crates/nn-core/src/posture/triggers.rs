@@ -4099,6 +4099,7 @@ mod tests {
                 ("/usr/sbin/hostinfo", Some(77)),
                 ("/opt/bin/jq", Some(85)),
                 ("/usr/lib/initramfs-tools/bin/busybox", Some(86)),
+                ("/etc/k380/lookup", Some(88)),
             ],
             &[
                 UU,
@@ -4107,6 +4108,7 @@ mod tests {
                 "/usr/sbin",
                 "/opt/bin",
                 "/usr/lib/initramfs-tools/bin",
+                "/etc/k380",
             ],
         );
         b.exec(980, 1000, &format!("{UU}/id"), 71, &["id", "-un"]);
@@ -4138,6 +4140,11 @@ mod tests {
             b.opens(984, 1000, "busybox", "/etc/passwd", 86),
             "busybox by its name"
         );
+        b.exec(985, 1000, "/etc/k380/lookup", 88, &["lookup"]);
+        assert!(
+            b.opens(985, 1000, "lookup", "/etc/passwd", 88),
+            "a root-only directory outside the system trees"
+        );
     }
 
     /// Lot 380 (named, the review of #587, F1 and F4: V2, V3, with GNU
@@ -4159,6 +4166,8 @@ mod tests {
                 ("/usr/libexec/runner", Some(72)),
                 ("/tmp/id", Some(59)),
                 ("/usr/local/bin/id", Some(66)),
+                ("/usr/bin/node", Some(87)),
+                ("/usr/bin/js", Some(87)),
             ],
             &["/usr/bin", "/usr/lib/x86_64-linux-gnu", "/usr/libexec"],
         );
@@ -4213,6 +4222,10 @@ mod tests {
         assert!(
             b.opens(971, 1000, "pager", "/etc/passwd", 75),
             "pager, less's link"
+        );
+        assert!(
+            b.opens(971, 1000, "js", "/etc/passwd", 87),
+            "js, node's link: an interpreter by its file"
         );
         assert!(!b.opens(971, 1000, "id", "/etc/passwd", 51), "id: a lookup");
         // the exec of an alias, the kernel's name its target's
