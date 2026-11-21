@@ -113,6 +113,202 @@ pub const LOGIN_DEFS_HELPER_EXES: &[&str] = &["/usr/bin/newuidmap", "/usr/bin/ne
 /// ([`AuthSessionTracker::host_program`]).
 pub const SYSTEM_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/usr/sbin", "/bin", "/sbin"];
 
+/// Lot 380 (the review of #587, F1, F4, F5): the programs that read the
+/// files they are told to — what a user lists the accounts with and what a
+/// web shell or a dropper reads credentials with: the text tools, pagers,
+/// editors, copiers and archivers, compressors and encoders, network
+/// clients, and the multi-call binaries whose name is every tool's. With
+/// the shells and interpreters of
+/// [`crate::decision::rules::program_identity`] (a version suffix allowed),
+/// and the dynamic loader judged by its operand, they are the class
+/// [`AuthSessionTracker::reads_files_it_is_told`] gives the file the kernel
+/// executed, BY THAT FILE'S IDENTITY: a name here also picks the installed
+/// files whose device and inode an executed file is compared with
+/// ([`READER_TOOL_DIRS`]), so a hard link of a multi-call binary under any
+/// name (uutils' `…/coreutils/id` is `cat`'s file) and an alias (`nawk` →
+/// `mawk`, `pager` → `less`, `editor` → `nano`) are the tool they run.
+pub const READER_TOOL_EXES: &[&str] = &[
+    "cat",
+    "tac",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "cp",
+    "dd",
+    "tar",
+    "cpio",
+    "zip",
+    "gzip",
+    "base64",
+    "base32",
+    "basenc",
+    "xxd",
+    "od",
+    "hexdump",
+    "strings",
+    "grep",
+    "sed",
+    "awk",
+    "gawk",
+    "mawk",
+    "openssl",
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "socat",
+    "busybox",
+    "cut",
+    "sort",
+    "uniq",
+    "nl",
+    "paste",
+    "join",
+    "column",
+    "comm",
+    "diff",
+    "diff3",
+    "sdiff",
+    "cmp",
+    "split",
+    "csplit",
+    "tee",
+    "rev",
+    "fold",
+    "fmt",
+    "pr",
+    "ptx",
+    "shuf",
+    "expand",
+    "unexpand",
+    "iconv",
+    "look",
+    "pv",
+    "jq",
+    "m4",
+    "uuencode",
+    "egrep",
+    "fgrep",
+    "rg",
+    "zcat",
+    "vi",
+    "vim",
+    "vim.basic",
+    "vim.tiny",
+    "vim.nox",
+    "vim.gtk3",
+    "nvim",
+    "view",
+    "nano",
+    "ed",
+    "ex",
+    "emacs",
+    "emacs-nox",
+    "emacs-gtk",
+    "mcedit",
+    "rsync",
+    "scp",
+    "sftp",
+    "install",
+    "gpg",
+    "xz",
+    "bzip2",
+    "zstd",
+    "lz4",
+    "7z",
+    "coreutils",
+    "toybox",
+];
+
+/// Lot 380 (the review of #587, F1): an interpreter by its executed file's
+/// name beside [`crate::decision::rules::program_identity::INTERPRETERS`]
+/// (a version suffix allowed): PHP's FastCGI server runs the scripts a web
+/// request names.
+const READER_INTERPRETER_EXTRAS: &[&str] = &["php-fpm"];
+
+/// Lot 380 (the review of #587, F1, F4): the directories whose files of
+/// [`READER_TOOL_EXES`]' names (and the shells' and interpreters') are
+/// compared with an executed file — where a distribution installs a tool,
+/// its aliases (`/etc/alternatives` resolves into them) and uutils'
+/// multi-call file under every utility's name (Ubuntu 26.04).
+pub const READER_TOOL_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/lib/cargo/bin/coreutils"];
+
+/// Lot 380 (the review of #587, F1): where the distributions install the
+/// dynamic loader (and `/usr/bin/ld.so`, a link to it on some): compared
+/// with an executed file, so the loader under any name is judged by its
+/// operand.
+const LOADER_FILES: &[&str] = &[
+    "/lib64/ld-linux-x86-64.so.2",
+    "/usr/lib64/ld-linux-x86-64.so.2",
+    "/lib/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-armhf.so.3",
+    "/lib/ld-linux.so.2",
+    "/lib64/ld64.so.2",
+    "/lib/ld64.so.1",
+    "/lib/ld-musl-x86_64.so.1",
+    "/lib/ld-musl-aarch64.so.1",
+    "/usr/bin/ld.so",
+];
+
+/// Lot 380 (the review of #587, F1; external audit POS-007): the packaged
+/// daemons that read the shadow file as their own service account, a member
+/// of the `shadow` group (Exim's SMTP authentication against the system's
+/// accounts) — by the file the kernel executed
+/// ([`AuthSessionTracker::runs_host_program`]). With the authentication
+/// stack, the only readers of `/etc/shadow`, `/etc/gshadow` and
+/// `/etc/sudoers` at a service uid that raise nothing.
+pub const CREDENTIAL_CONSUMER_EXES: &[&str] = &["/usr/sbin/exim4", "/usr/sbin/exim"];
+
+/// Lot 380 (the review of #587, F1): an executed file's name (its last
+/// component) is a reader tool's ([`READER_TOOL_EXES`]), a shell's or an
+/// interpreter's (a version suffix allowed), busybox's (`busybox.static`).
+fn names_a_reader_tool(base: &str) -> bool {
+    use crate::decision::rules::program_identity::{program_is, INTERPRETERS, SHELLS};
+    READER_TOOL_EXES.contains(&base)
+        || base.starts_with("busybox")
+        || SHELLS
+            .iter()
+            .chain(INTERPRETERS)
+            .chain(READER_INTERPRETER_EXTRAS)
+            .any(|n| program_is(base, n))
+}
+
+/// Lot 380 (the review of #587, F1): the reader tools' installed files, by
+/// identity ([`AuthSessionTracker::reads_files_it_is_told`]).
+#[derive(Debug, Default)]
+struct ToolFiles {
+    /// When the installed files were last looked at (the host's monotonic
+    /// clock); 0: never.
+    scanned_ns: u64,
+    /// The device (kernel's form) and inode of each file of a reader tool's
+    /// name in [`READER_TOOL_DIRS`].
+    tools: std::collections::HashSet<(u64, u64)>,
+    /// … of each of [`LOADER_FILES`].
+    loaders: std::collections::HashSet<(u64, u64)>,
+    /// The answers given, by executed file, with the time of the look
+    /// they came from.
+    answers: HashMap<(u64, u64), (Option<ToolClass>, u64)>,
+}
+
+/// Lot 380: what an executed file is to [`ToolFiles`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolClass {
+    Tool,
+    Loader,
+}
+
+/// Lot 380: the installed files are looked at again at most this often
+/// (only when an answer is missing: a file the last look did not judge).
+const TOOL_FILES_RESCAN_NS: u64 = 1_000_000_000;
+
+/// Lot 380: an answer is kept this long (an install or an upgrade by root
+/// gives a program a new inode, which no kept answer names).
+const TOOL_ANSWER_TTL_NS: u64 = 60_000_000_000;
+
+/// Lot 380: the answers kept at most (all dropped past it).
+const TOOL_ANSWERS_CAP: usize = 1024;
+
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
 ///
@@ -600,6 +796,19 @@ pub struct HopFacts {
     pub fork_parent: u32,
     /// Its exec was seen (the spawn cache), not read from `/proc`.
     pub cached: bool,
+}
+
+/// Lot 380 (the review of #587, F1): a packaged program a process runs
+/// ([`AuthSessionTracker::host_program`]): the host's file at `path` in a
+/// root-only directory, its identity, and what its exec's argv said it runs
+/// (`None`: not known — the image at an event decided).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostProgram {
+    pub path: String,
+    /// The file the kernel executed: its device (the kernel's form) and
+    /// inode.
+    pub file: (u64, u64),
+    pub runs: Option<Runs>,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -1226,6 +1435,9 @@ struct Inner {
     /// ([`AuthSessionTracker::argv_digest`]), drawn at random per tracker:
     /// no argv can be chosen to collide with another's.
     argv_key: std::collections::hash_map::RandomState,
+    /// Lot 380 (the review of #587, F1): the reader tools' installed files
+    /// by identity, and the answers given.
+    tool_files: parking_lot::Mutex<ToolFiles>,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -1283,6 +1495,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 },
                 host_root: PathBuf::from(H::HOST_ROOT),
                 argv_key: std::collections::hash_map::RandomState::new(),
+                tool_files: parking_lot::Mutex::new(ToolFiles::default()),
             }),
             host: PhantomData,
         }
@@ -2783,13 +2996,18 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// `None`: a copy, a renamed or replaced binary, a file elsewhere, an
     /// exec whose file was not recorded, another image at the event,
     /// `(0, 0)`.
+    ///
+    /// The review of #587 (F1, F4): what the program IS is then its file's
+    /// class ([`Self::reads_files_it_is_told`]), never the name it ran by —
+    /// the path found by `comm` is an alias's (`/usr/bin/nawk`), and a link
+    /// of a multi-call binary is named after any utility.
     pub fn host_program(
         &self,
         pid: u32,
         as_of: AsOf,
         image: (u64, u64),
         comm: &str,
-    ) -> Option<String> {
+    ) -> Option<HostProgram> {
         if pid <= 1 {
             return None;
         }
@@ -2806,10 +3024,14 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         if let Some(entry) = entry {
             if image == (0, 0) || entry.exec_file == Some(image) {
                 let path = entry.exe.to_string_lossy().into_owned();
-                return entry
+                let file = entry
                     .exec_file
-                    .is_some_and(|f| self.is_host_file_in_root_dir(&path, f))
-                    .then_some(path);
+                    .filter(|f| self.is_host_file_in_root_dir(&path, *f))?;
+                return Some(HostProgram {
+                    path,
+                    file,
+                    runs: Some(entry.runs),
+                });
             }
             // The image at the event is another file than the records':
             // they lag the open (the exec pump reads an exec's facts before
@@ -2833,6 +3055,130 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .iter()
             .map(|d| format!("{d}/{comm}"))
             .find(|p| self.is_host_file_in_root_dir(p, image))
+            .map(|path| HostProgram {
+                path,
+                file: image,
+                runs: None,
+            })
+    }
+
+    /// Lot 380 (the review of #587, F1, F4): `program` — a packaged program
+    /// a process runs ([`Self::host_program`]) — reads the files it is told
+    /// to, by the IDENTITY of the file the kernel executed, never by the
+    /// name it ran by:
+    /// - a file outside a root-owned system tree;
+    /// - a file named as a reader tool, a shell, an interpreter or busybox
+    ///   ([`READER_TOOL_EXES`]; the kernel's name of the executed file, its
+    ///   links resolved);
+    /// - a file that IS one of them: the same device and inode as the
+    ///   host's file of such a name in [`READER_TOOL_DIRS`] — a multi-call
+    ///   binary run through any of its links and with any `argv[0]`
+    ///   (uutils' `…/coreutils/id` is `cat`'s file: a generic tool, whatever
+    ///   utility it was asked for), an alias (`nawk` → `mawk`);
+    /// - the dynamic loader (by its name, or the identity of one of
+    ///   [`LOADER_FILES`]), judged by its operand as the loader's exec is
+    ///   read ([`Runs::Script`]): an operand that is not the host's file at
+    ///   an absolute path in a root-only directory, the loader again, or
+    ///   not known (no argv: the image decided) is one.
+    ///
+    /// The installed files are looked at at most once a second, and only
+    /// for a file no answer of the last minute names (a stat of each name
+    /// in each directory, under the host's root).
+    pub fn reads_files_it_is_told(&self, program: &HostProgram) -> bool {
+        self.file_reads_what_it_is_told(&program.path, program.file, program.runs.as_ref(), true)
+    }
+
+    /// [`Self::reads_files_it_is_told`] of the file at `path` with the
+    /// identity `file`; `runs`: what its exec's argv said it runs; `operand`:
+    /// a loader's operand may decide (not for an operand itself).
+    fn file_reads_what_it_is_told(
+        &self,
+        path: &str,
+        file: (u64, u64),
+        runs: Option<&Runs>,
+        operand: bool,
+    ) -> bool {
+        use crate::decision::rules::program_identity::base_of;
+        if !in_system_tree(path) {
+            return true;
+        }
+        let base = base_of(path);
+        let class = self.tool_class(file);
+        if super::script_args::is_loader_name(base) || class == Some(ToolClass::Loader) {
+            let Some(Runs::Script(op)) = runs.filter(|_| operand) else {
+                return true;
+            };
+            if !op.starts_with('/') || !in_system_tree(op) {
+                return true;
+            }
+            let Some(op_file) = self.host_file_id(op) else {
+                return true;
+            };
+            return !self.is_host_file_in_root_dir(op, op_file)
+                || self.file_reads_what_it_is_told(op, op_file, None, false);
+        }
+        names_a_reader_tool(base) || class == Some(ToolClass::Tool)
+    }
+
+    /// Lot 380 (the review of #587, F1): what the executed file `file` is,
+    /// by its identity: a reader tool's or a loader's installed file
+    /// ([`ToolFiles`]); `None`: neither.
+    fn tool_class(&self, file: (u64, u64)) -> Option<ToolClass> {
+        let now = H::monotonic_ns();
+        let mut t = self.inner.tool_files.lock();
+        if let Some(&(class, at)) = t.answers.get(&file) {
+            if now.saturating_sub(at) < TOOL_ANSWER_TTL_NS {
+                return class;
+            }
+        }
+        if t.scanned_ns == 0 || now.saturating_sub(t.scanned_ns) >= TOOL_FILES_RESCAN_NS {
+            let (tools, loaders) = self.reader_tool_files();
+            (t.tools, t.loaders, t.scanned_ns) = (tools, loaders, now.max(1));
+        }
+        let class = if t.loaders.contains(&file) {
+            Some(ToolClass::Loader)
+        } else if t.tools.contains(&file) {
+            Some(ToolClass::Tool)
+        } else {
+            None
+        };
+        if t.answers.len() >= TOOL_ANSWERS_CAP {
+            t.answers.clear();
+        }
+        let at = t.scanned_ns;
+        t.answers.insert(file, (class, at));
+        class
+    }
+
+    /// Lot 380 (the review of #587, F1): the identities of the host's files
+    /// of the reader tools' names in [`READER_TOOL_DIRS`] (each link
+    /// followed), and of the loader's files.
+    #[allow(clippy::type_complexity)]
+    fn reader_tool_files(
+        &self,
+    ) -> (
+        std::collections::HashSet<(u64, u64)>,
+        std::collections::HashSet<(u64, u64)>,
+    ) {
+        use crate::decision::rules::program_identity::{INTERPRETERS, SHELLS};
+        let names: Vec<&str> = READER_TOOL_EXES
+            .iter()
+            .chain(SHELLS)
+            .chain(INTERPRETERS)
+            .chain(READER_INTERPRETER_EXTRAS)
+            .copied()
+            .collect();
+        let tools = READER_TOOL_DIRS
+            .iter()
+            .filter(|d| H::is_dir(&self.inner.host_root.join(d.trim_start_matches('/'))))
+            .flat_map(|d| names.iter().map(move |n| format!("{d}/{n}")))
+            .filter_map(|p| self.host_file_id(&p))
+            .collect();
+        let loaders = LOADER_FILES
+            .iter()
+            .filter_map(|p| self.host_file_id(p))
+            .collect();
+        (tools, loaders)
     }
 
     /// Lot 378 (the rc10 soak: ALERTED at every boot on Debian 13, Ubuntu
