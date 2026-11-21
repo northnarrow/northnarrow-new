@@ -129,7 +129,13 @@
 //! says "not compared (budget)" — a memfd of the runtime's length, any
 //! program's — never a copy of the runtime. Residual: root spending its
 //! own budget, then executing its own memfd under the runtime, is recorded
-//! High, not killed — root, who needs no such route. Residual: the kernel reads the file's first bytes
+//! High, not killed — root, who needs no such route. Residual (lot 381,
+//! the review of #588): a root process forked by runc under its manager
+//! (as `runc init` is) executing the installed runc, then a sealed memfd of
+//! its own, every thread of it exiting before the pump reads it — "not
+//! compared (gone)", recorded
+//! High, not killed, any program of any length; the same class, with no
+//! budget to spend. Residual: the kernel reads the file's first bytes
 //! (the binary's header, `bprm->buf`) just before the LSM hook reads the
 //! seals; a writer racing that window chooses the header of a run whose
 //! every mapped byte is the sealed runtime's (no code of its own: the

@@ -5587,22 +5587,35 @@ shape it resembles still fires.
     `/proc/<parent>/task/<tid>/children` (runc's second stage runs the copy
     until the container's program starts). It is compared whole as
     before and kept.
-  - When no process runs it any more and the parent is the installed
-    runtime, every fact but the bytes holds: "not compared (gone)", judged
-    as a copy past the compare budget — root's (uid 0 of the initial user
-    namespace) recorded High, never killed; any other uid's the Critical
-    kill (a user chooses how long its process runs). A parent gone too, a
-    manager parent (which runtime it copied is not known), or a process
-    that runs another file by the read (a runtime's copy never executes
-    again): nothing kept, the Critical kill as before. A foreign memfd stays Critical, rootful
-    or rootless.
+  - A process whose main thread exited alone (a plain `exit`, not
+    `exit_group`) while its other threads run on is still running: its
+    `/proc/<pid>/exe` cannot be read, so the copy is read through one of its
+    live threads (`/proc/<pid>/task/<tid>/exe`). The process counts as
+    exited only when every thread has exited; a thread still running whose
+    copy cannot be read keeps nothing (the Critical kill).
+  - When no process runs it any more, neither its bytes nor its length are
+    known: what holds is the seal at the exec, the lineage and the parent's
+    image. Only in runc 1.1's own shape — the process re-executed the
+    installed runtime's file with no fork since its last exec, under that
+    runtime's process — is it "not compared (gone)", judged as a copy past
+    the compare budget: root's (uid 0 of the initial user namespace)
+    recorded High, never killed; any other uid's the Critical kill (a user
+    chooses how long its process runs). Any other shape — runc 1.2's (`runc
+    init`'s first exec since `runc create` forked it) and every OCI hook a
+    runtime runs, a manager parent (which runtime it copied is not known) —
+    a parent gone too, or a process that runs another file by the read (a
+    runtime's copy never executes again): nothing kept, the Critical kill as
+    before. A foreign memfd stays Critical, rootful or rootless.
   - Every sealed memfd exec the exec sensor describes is now counted in
-    exactly one count. `nn-admin status`'s `runtime clones` line says, after
-    the kept and compared counts, how many were read through another
-    process, not compared for the budget, gone before the read, not read in
-    time and under no installed runtime; JSON `runtime_clones` gains
-    `through`, `gone` and `no_runtime` (appended inside the object: an older
-    `nn-admin` reads the four fields it knows).
+    exactly one count, once: a read that finishes after the exec pump
+    stopped waiting for it (counted "not read in time") counts nothing more
+    and keeps nothing. `nn-admin status`'s `runtime clones` line says,
+    after the kept and compared counts, how many were read through another
+    process, not compared for the budget, gone before the read and kept
+    unverified, gone or unreadable with nothing kept (judged fileless), not
+    read in time, and no runtime's copy at all; JSON `runtime_clones` gains
+    `through`, `gone`, `no_runtime` and `lost` (appended inside the object:
+    an older `nn-admin` reads the four fields it knows).
 - **The memory limits** (Phase 6b's measure on QEMU guests of 2 and 4
   vCPU, Ubuntu 24.04 and Debian 13): the agent's cgroup peaked at 316 MiB
   at a cold start (about 165 MiB of it the kernel's BPF maps) and at most
@@ -5625,4 +5638,6 @@ shape it resembles still fires.
   watchdog's `MemoryMax` 33554432. A drop-in of your own that raised them
   (`systemctl set-property`, made inside a window) still wins over the
   unit. Expect no R004 Critical at rootful container starts; under a burst
-  a High "not compared (gone)" is possible, and is counted.
+  a High "not compared (gone)" is possible with runc 1.1, and is counted
+  (`gone`). With runc 1.2 or later such a copy, when the agent could not
+  read it, is Critical and counted `lost`.

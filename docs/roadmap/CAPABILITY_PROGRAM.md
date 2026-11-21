@@ -11714,16 +11714,17 @@ number in parentheses is a lab PR.
       judged it fileless. The compare now returns its outcome (`CloneRead`)
       and one function counts it: every sealed memfd exec the LSM program
       describes lands in exactly one of `compared`, `unverified`, `gone`,
-      `no_runtime`, `not_read`.
+      `lost`, `no_runtime`, `not_read`, once (fix round 1).
     - **Read through a holder.** With the exec's process gone, the copy is
       read through a child of the exec's parent still running that very
       inode (`/proc/<ppid>/task/<tid>/children`: runc's stages, forked
       with `CLONE_PARENT`), compared whole and kept (`through`).
-    - **Not compared (gone).** None left, the process exited under the
-      installed runtime: kept unverified; R004 says so — root's High,
-      never killed; any other uid's the Critical kill, as past the budget.
-      A parent gone too, a manager parent, a process running another file
-      by the read: nothing kept, Critical. A foreign memfd stays Critical.
+    - **Not compared (gone).** None left, every thread of the process
+      exited, runc 1.1's re-exec under the installed runtime (fix round 1):
+      kept unverified; R004 says so — root's High, never killed; any other
+      uid's the Critical kill, as past the budget. Any other shape, a
+      parent gone too, a manager parent, a process running another file by
+      the read: nothing kept, Critical. A foreign memfd stays Critical.
     - **Memory limits.** The agent's `MemoryHigh=768M`, `MemoryMax=1G`;
       the watchdog's `MemoryMax=32M` (its floor). A ratchet ties them to
       the measures (`the_memory_limits_are_sized_from_the_measured_peaks`).
@@ -11771,6 +11772,30 @@ number in parentheses is a lab PR.
       enabled): active, the same limits; a cold boot, both active, 103
       pins, 56 LSM programs. Each uninstall left no unit, `/etc/northnarrow`
       or pin root (one LSM program left: PID 1's own, lot 377).
+  - Fix round 1 (the review of #588):
+    - **F1 (P2).** A process whose main thread exited alone (`exit`, not
+      `exit_group`) while a thread ran a root memfd on was taken as
+      exited (`/proc/<pid>/exe` unreadable): a foreign memfd was kept "not
+      compared (gone)", High, never killed. The copy is now read through
+      the live threads (`/proc/<pid>/task/<tid>/exe`); exited only when
+      every listed thread is a zombie or gone, at most 64 threads read (a
+      group past them, or a thread whose state is not read, is never told
+      exited).
+    - **F2.** "Gone" is judged only in runc 1.1's re-exec (`fork_parent`
+      0, the parent the very runtime by its image), in the pump and in
+      R004; runc 1.2's shape and every OCI hook keep nothing (Critical).
+      The root residual is written in KNOWN_LIMITATIONS.
+    - **F3.** The pump's step and `not_read` settle one exec between them
+      (`Settle`): a compare finishing past its deadline counts and keeps
+      nothing more. A ratchet in `decision_path_io` ties the multiplexer's
+      two closures to one `Settle`.
+    - **F4.** `lost` (appended): not compared, nothing kept; the status
+      line says which gone copies were kept unverified; `no_runtime` reads
+      "no runtime's copy".
+    - Tests: `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`,
+      `a_runtime_compare_past_its_deadline_counts_and_keeps_nothing_more`;
+      the R004 and pump tests extended (runc 1.2's shape gone: Critical).
+    - @LAB2@
   Levels unchanged.
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,

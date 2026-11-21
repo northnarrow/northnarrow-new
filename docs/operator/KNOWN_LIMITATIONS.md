@@ -1103,13 +1103,36 @@ kernel.
 - **A runtime's copy gone before it was compared.** runc 1.1's copy of
   itself runs a few milliseconds; under a burst of container starts the
   agent may read it once that process has exited. It then reads the copy
-  through a process still running it (runc's own stages); only when none
-  is left is the copy "not compared (gone)": root's recorded High
-  (`R004_ExecFromProcSelfFd`), never killed; another uid's the Critical
-  kill, as past the budget. Every such case is counted in `nn-admin
-  status` (`runtime clones`, `gone`). *Evidence:*
+  through a process still running it (runc's own stages, or a thread of
+  the process whose main thread exited alone). When none is left, neither
+  the copy's bytes nor its length can be read any more.
+  - In runc 1.1's own shape — the process re-executed the installed
+    runtime's file with no fork since, under that runtime's process — the
+    copy is "not compared (gone)": root's is recorded High
+    (`R004_ExecFromProcSelfFd`), never killed; another uid's is the
+    Critical kill, as past the budget. Counted in `nn-admin status`
+    (`runtime clones`, `gone`).
+  - Residual, named: a root process forked by runc under a container
+    manager (as `runc init` is) that executes the installed runc, then,
+    with no fork since, a sealed memfd of its own, and whose every thread
+    exits before the agent reads it, is recorded High,
+    not killed, whatever that memfd held — root, who needs no such route.
+    It is the same class as the budget's residual above, without a budget
+    to spend. What it ran is not known; its kill would have found the
+    process gone anyway.
+  - Any other shape keeps nothing and stays the Critical kill: runc 1.2's
+    (`runc init`'s first exec since `runc create` forked it) and every OCI
+    hook a runtime runs, a copy under a manager, a parent gone too, a
+    process running another file, a process with a thread still running
+    whose copy cannot be read. Counted `lost`. On a host with runc 1.2 or
+    later a burst may therefore give a rare Critical at a container start
+    the agent read too late (the lab's runc 1.1 burst: 400 starts, none
+    gone).
+  *Evidence:*
   `a_runc_clone_gone_before_the_read_is_compared_through_a_child_still_running_it`;
   `a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user`;
+  `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`;
+  `a_runtime_clone_with_nothing_left_running_it_is_counted_not_compared`;
   lot 381.
 - **k3s.** Its runc runs from a non-standard path: a
   `R013_NamespaceEscapeTooling` High record. Its installer writes

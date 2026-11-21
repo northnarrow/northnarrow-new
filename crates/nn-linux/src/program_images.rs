@@ -2377,6 +2377,14 @@ mod tests {
         thread(58_810, 58_811, None, None);
         std::fs::create_dir_all(proc.0.join("58810/task/58811/stat")).unwrap();
         assert_eq!(read(58_810, &clone), (None, lost));
+        // a thread running another file (the process executed again):
+        // nothing kept
+        let bash = put(&root, "/usr/bin/bash", b"bash image, 588");
+        thread(58_816, 58_816, None, Some("Z"));
+        let d = proc.0.join("58816/task/58817");
+        std::fs::create_dir_all(&d).unwrap();
+        symlink(&bash, d.join("exe")).unwrap();
+        assert_eq!(read(58_816, &clone), (None, lost));
         // more threads than are read, those read all exited
         for tid in 0..=HOLDERS_MAX as u32 {
             thread(58_812, 59_000 + tid, None, Some("Z"));

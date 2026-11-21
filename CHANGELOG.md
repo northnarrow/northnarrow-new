@@ -18,13 +18,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     compared (gone)": root's recorded High, never killed, any other uid's
     the Critical kill, as past the budget; a foreign memfd stays Critical.
     Every sealed memfd exec now lands in exactly one count of `nn-admin
-    status`'s `runtime clones` (JSON `through`, `gone`, `no_runtime`
-    appended). Tests
+    status`'s `runtime clones` (JSON `through`, `gone`, `no_runtime`,
+    `lost` appended). Tests
     `a_runc_clone_gone_before_the_read_is_compared_through_a_child_still_running_it`,
     `a_runtime_clone_with_nothing_left_running_it_is_counted_not_compared`,
     `every_sealed_memfd_exec_lands_in_exactly_one_runtime_counter`,
     `a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user`,
     `the_runtime_clones_lot_381_counts_are_appended_inside_it`.
+  - **The review of #588.** A process whose main thread exited alone
+    (`exit`, not `exit_group`) while a thread runs a root memfd on was
+    taken as exited: a foreign memfd was kept "not compared (gone)", High,
+    never killed. The copy is now read through the live threads
+    (`/proc/<pid>/task/<tid>/exe`), and a process counts as exited only
+    when every thread has (F1). "Gone" is judged only in runc 1.1's
+    re-exec under the installed runtime; runc 1.2's shape and every OCI
+    hook stay Critical (F2). A read that finishes after the pump stopped
+    waiting for it counts and keeps nothing more (F3), and the status line
+    tells the gone copies kept unverified from those of which nothing was
+    kept (`lost`; `no_runtime` reads "no runtime's copy", F4). Tests
+    `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`,
+    `a_runtime_compare_past_its_deadline_counts_and_keeps_nothing_more`.
   - **The memory limits from the lab's measure.** The agent's unit sets
     `MemoryHigh=768M` and `MemoryMax=1G` (9G and 11G before, sized for the
     LLM advisor removed in Wave 4), the watchdog's `MemoryMax=32M` (64M):

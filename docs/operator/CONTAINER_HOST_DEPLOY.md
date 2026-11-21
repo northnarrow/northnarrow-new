@@ -78,12 +78,16 @@ A clone whose process exited before the agent read it (runc 1.1's
 `runc init` lives a few milliseconds past its exec; under a burst of
 container starts the read can come later) is read through a process still
 running that very memfd: `runc init`'s two stages, children of
-`runc create`, run it until the container's program starts (lot 381). Only
-when none is left is it "not compared (gone)" and judged like a copy past
-the budget below: root's recorded High, never killed; any other uid's the
-Critical kill. Under a parent that is gone too, or a manager (which runtime
-it copied is not known), or when the process runs another file by then (a
-runtime's copy never executes again), nothing is kept: Critical.
+`runc create`, run it until the container's program starts (lot 381), or a
+thread of its own process still running (its main thread exited alone).
+Only when none is left, and only in runc 1.1's shape (the process
+re-executed the installed runtime with no fork since, under that runtime's
+process), is it "not compared (gone)" and judged like a copy past the
+budget below: root's recorded High, never killed; any other uid's the
+Critical kill. In any other shape (runc 1.2's, an OCI hook), under a parent
+that is gone too, or a manager (which runtime it copied is not known), or
+when the process runs another file by then (a runtime's copy never executes
+again) or still runs with its copy unreadable, nothing is kept: Critical.
 
 The compares have a budget of their own, per user, with a share kept for
 root's starts (Docker's, rootful Podman's) that other users cannot take;
@@ -103,12 +107,18 @@ Residual, named: a root memfd past the comparison budget is recorded High, not k
 since the agent's start (lot 369), once one was seen: `runtime clones : N
 sealed memfds kept as an installed runtime's clone (R004 has no verdict on
 them), of M compared (T through a process still running the copy); U not
-compared (the budget), G not compared (gone before the read), R not read
-in time (judged fileless), F under no installed runtime (judged fileless)` — JSON `runtime_clones` (`compared`,
-`kept`, `unverified`, `not_read`, and since lot 381 `through`, `gone`,
-`no_runtime`). Every sealed memfd exec the agent saw is in exactly one of
-M, U, G, R and F (lot 381: rc11 judged one rootful runc clone in 300
-fileless outside every count). On a container host with runc 1.1 the kept count
+compared (the budget), G not compared (gone before the read, kept
+unverified), L not compared (gone, replaced or unreadable: judged
+fileless), R not read in time (judged fileless), F no runtime's copy
+(judged fileless)` — JSON `runtime_clones` (`compared`, `kept`,
+`unverified`, `not_read`, and since lot 381 `through`, `gone`,
+`no_runtime`, `lost`). F counts every sealed memfd that is no runtime's
+copy: under no installed runtime or manager, of no installed runtime's
+length, or not sealed by the read. Every sealed memfd exec the agent saw is
+in exactly one of M, U, G, L, R and F, once (lot 381: rc11 judged one
+rootful runc clone in 300 fileless outside every count; a read that
+finishes after the agent stopped waiting for it is counted only in R). On a
+container host with runc 1.1 the kept count
 grows with every container start; containers that start while it stays at
 zero mean the exemption is lost and R004 judges every start (rc5's
 regression: the exec pump handed only the socket programs' execs to its
