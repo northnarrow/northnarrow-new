@@ -803,6 +803,7 @@ pub(super) fn bare_context<'a>(
         response_state: None,
         read_paths,
         handles,
+        audit_log: None,
     }
 }
 

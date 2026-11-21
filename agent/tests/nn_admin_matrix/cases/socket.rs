@@ -659,6 +659,25 @@ pub fn verbs() -> Vec<Verb> {
             none.export = None;
             success.push(("no-export".to_string(), telemetry(Some(none))));
         }
+        // lot 379 (pre-alpha F7-1): signed integrity findings the audit log
+        // holds — a cut chain (until acknowledged) and an unauthorized
+        // overlay (while found) — as the agent lists them
+        if name.starts_with("status-key") {
+            let mut held = full_status();
+            held.degradations = Some(vec![
+                "bpf_lsm: anti-tamper: no enforcement".to_string(),
+                "integrity: chain_truncated (detections) — signed 2 times since \
+                 2026-11-20T16:40:12.000000Z, last 2026-11-20T16:45:01.000000Z (audit row 412) — \
+                 held until acknowledged (`nn-admin integrity acknowledge --through <row>`): the \
+                 anchored head is not in the file"
+                    .to_string(),
+                "integrity: unauthorized_overlay — signed 2026-11-20T16:45:02.000000Z (audit row \
+                 415) — held while found, or until acknowledged: process-comm-allowlist \
+                 (process-comm-allowlist.local): no signature file"
+                    .to_string(),
+            ]);
+            success.push(("integrity-held".to_string(), telemetry(Some(held))));
+        }
         // R13 (lab PR 271): a revision of the sensor contract's manifest
         if !name.starts_with("net-") && !name.starts_with("export-") {
             let mut r13 = full_status();
@@ -903,6 +922,41 @@ pub fn verbs() -> Vec<Verb> {
             json!({"released": false, "message": ""}),
         ),
     ));
+    // lot 379 (pre-alpha F7-1): the acknowledgement of the held integrity
+    // findings
+    let acknowledged = |n: u64, still: u64, m: &str| {
+        msg(json!({"IntegrityAcknowledgeResponse": {
+            "result": "Success", "acknowledged": n, "still_held": still, "message": m,
+        }}))
+    };
+    v.push(verb(
+        "integrity-acknowledge",
+        &format!("integrity acknowledge --through 412 --note investigated {SIGNED}"),
+        vec![
+            (
+                "acknowledged",
+                acknowledged(
+                    1,
+                    1,
+                    "1 held integrity finding(s) acknowledged through audit row 412; 1 still held; \
+                     their rows stay in the chain",
+                ),
+            ),
+            (
+                "not-done",
+                acknowledged(
+                    0,
+                    0,
+                    "audit row 412 is not in the audit log (its newest row is 300): an \
+                     acknowledgement covers only rows already signed",
+                ),
+            ),
+        ],
+        with(
+            "IntegrityAcknowledgeResponse",
+            json!({"acknowledged": 0, "still_held": 0, "message": ""}),
+        ),
+    ));
     let restore = |restored: bool, path: &str, m: &str| {
         msg(
             json!({"ResponseRestoreResponse": {"result": "Success", "restored": restored, "path": path, "message": m}}),
@@ -1058,6 +1112,8 @@ fn variants() -> Vec<(&'static str, String, AdminMessage, Vec<Put>)> {
         ("net-flows.no-since", format!("net flows {SIGNED}"), msg(json!({"NetFlowsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
         ("fim-report.no-since", format!("fim report {SIGNED}"), msg(json!({"FimReportResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
         ("detections.limit-zero", format!("detections --limit 0 {SIGNED}"), msg(json!({"DetectionsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
+        // lot 379: a note past its bound (refused before any request)
+        ("integrity-acknowledge.note-too-long", format!("integrity acknowledge --through 1 --note {} {SIGNED}", "n".repeat(513)), msg(json!({"IntegrityAcknowledgeResponse": {"result": "Success", "acknowledged": 1, "still_held": 0, "message": "unreached"}})), vec![]),
     ];
     // config overlay set: every kind, a comment-only overlay (the loader's
     // parse decides), and an unknown kind.

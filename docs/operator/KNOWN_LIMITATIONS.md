@@ -204,6 +204,20 @@ how.
   *For you:* turn on the export to keep a copy off the host
   ([EXPORT.md](EXPORT.md)). *Evidence:* `an_archive_evicted_young_is_said`;
   lot 370.
+- **A held integrity finding ends at the operator's acknowledgement.** A
+  cut or rewritten chain stays in `nn-admin status` (an `integrity:`
+  degradation, the trust level at most L2) until `nn-admin integrity
+  acknowledge` covers its row; a configuration or host finding until its
+  check no longer finds it ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+  The acknowledgement takes a key with `triage` or `config-manage`: a
+  holder of such a key can clear the status, not the evidence (the rows,
+  its own signed row, `chain verify`). A drift of the integrity round that
+  ends and comes back within ten minutes is held again only when the
+  round's back-off ends. *Evidence:*
+  `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
+  `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
+  `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`; lot
+  379.
 - **`nn-admin chain verify` with no chains says OK.** On a state directory
   that holds no chain (a purged host, a wrong `--state-dir`), it prints
   `OK` with 0 rows for each chain and exits 0. *For you:* read the row
@@ -1025,16 +1039,25 @@ lists the known false positives of each rule.
 - **The verifier margin on 5.15 and 6.1.** The kernel's verifier accepts
   every program on the five kernels, but two programs of the mount guard
   use about 92 % of the instruction budget the project allows itself on
-  5.15 (91 % on 6.1). A kernel whose verifier counts differently could
-  refuse one. Then the agent does not stop: it starts without that hook,
-  signs a degradation (`mount guard: <n> of <m> hooks attached`, shown
-  in `nn-admin status`), and the rest loads; the by-path defences and the signed mount
-  watch remain. *For you:* on any kernel, a mount-guard degradation in
-  `nn-admin status` is worth a report with `uname -r`. *Evidence:*
-  internal check Phase 8b §4.3 and §5 (F8b-1);
-  `the_guard_is_not_attached_without_the_offsets_it_reads` (a guard not
-  attached is a signed degradation; a fault-injection check of the
-  verifier's refusal is planned before the tag).
+  5.15 (91 % on 6.1): `mount_guard_sb_mount` processed 830,908
+  instructions on 5.15 at rc10 (internal check Phase 8g), 83.1 % of the
+  kernel's limit of one million and 92.3 % of the project's gate of
+  900,000. A kernel whose verifier counts differently could refuse one.
+  Then the agent does not stop: it starts without that hook, the other
+  hooks of the guard attached, and signs a degradation (`anti_tamper:
+  mount guard: 4 of 5 hooks attached (sb_mount: verifier rejected LSM
+  program …)`), listed by `nn-admin status` (`sensors: DEGRADED`) and in
+  the signed capability manifest (`nn-admin capabilities`); the by-path
+  defences and the signed mount watch remain. This is tested, not argued:
+  a test build refuses the program at its load as the verifier would, and
+  the privileged suite checks the signed row, the manifest and the status
+  on a real agent; release builds cannot carry that fault injection. *For
+  you:* on any kernel, a mount-guard degradation in `nn-admin status` is
+  worth a report with `uname -r`. *Evidence:* internal check Phase 8b
+  §4.3 and §5 (F8b-1); `a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`
+  (a privileged suite of the CI's KVM guests);
+  `a_build_without_the_test_feature_injects_nothing`;
+  `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 379.
 - **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
   build and not since many recent changes; the `.rpm` is untested (above).
   *Evidence:* internal check Phase 8 §7 (residual R066).
@@ -1087,11 +1110,13 @@ kernel.
   Criticals, twice. Each user's share now holds a burst: four seconds of
   it may be spent at once, paid back at its rate, so a loop of that length
   is compared whole (the fix round's lab on Debian 13: 30 runs back to
-  back at about five a second, and 43 more, all compared, none "not
-  compared"). Under a longer burst of container starts by one user
-  (with runc 1.1's copy, past about seventy starts in a row at the lab's
-  pace of about four a second; fewer on a faster host), some starts can
-  still be reported Critical as not compared. The burst trusts nothing: a
+  back at about two a second — 30 in 14 s, under the share's refill, so
+  the burst was not drawn on — and 43 more, all compared, none "not
+  compared"). With runc 1.1's copy, up to about three starts a second by
+  one user are always compared; faster, the burst covers about
+  fifty-four starts in a row at four a second, about thirty at five (the budget's
+  model, not a lab run; fewer on a host whose runc is larger). Past it,
+  some starts can still be reported Critical as not compared. The burst trusts nothing: a
   copy past it is not compared, and a foreign memfd is the Critical kill
   either way.
   *Evidence:* `an_uncompared_runtime_copy_is_recorded_never_killed`;
@@ -1116,10 +1141,21 @@ kernel.
 
 ## Performance
 
-- **Narrow measurements.** Overhead has been measured on Ubuntu 24.04 only,
-  against one committed baseline. File-open-heavy work pays most: an `open`
-  microbenchmark is about 41 % slower with the agent on, `git status` about
-  24 %. *Evidence:* lot 273b (both figures, on Ubuntu 24.04).
+- **Narrow measurements.** The cost of one `exec` or one `open` has been
+  measured on Ubuntu 24.04 only, against one committed baseline, older
+  than this release: file-open-heavy work pays most, an `open`
+  microbenchmark about 41 % slower with the agent on, `git status` about
+  24 %. The release candidate's own per-operation exec and open latency is
+  not measured yet. Its resources and its cost on real work were measured
+  in the lab, on QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and
+  6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB, the watchdog's
+  about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest,
+  14–25 % under exec-heavy work; an event recorded in about 0.5 ms (p50),
+  3–5 ms (p99); a kernel build 4 to 17 % slower, the other workloads
+  (package installs, container runs, `fio`, `pgbench`) within the lab's
+  noise of about 5–25 %. A QEMU guest is noisier than a real host.
+  *Evidence:* lot 273b (the per-operation figures, on Ubuntu 24.04);
+  internal check Phase 6 (rc10).
 - **Network.** UDP receives are about 20 % slower, TCP sends about 10 %
   (the TLS fingerprint sensor), connects about 6 %
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*

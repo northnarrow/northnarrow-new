@@ -45,6 +45,9 @@ pub mod detection_payload;
 /// The agent's signed heartbeat and the external verifier's checks (R12c-2,
 /// lab PR 270; report 06 INI-14).
 pub mod heartbeat;
+/// Lot 379 (pre-alpha F7-1, F3b-6): the signed integrity findings the audit
+/// log holds for `nn-admin status`, and the rule that ends each hold.
+pub mod held;
 // The OS CSPRNG as an infallible generator, behind the keys and nonces of
 // the signed artifacts (lab PR 234). R10 (lab PR 259): moved from
 // nn-linux, so that nn-linux and nn-admin both draw from it; rand's

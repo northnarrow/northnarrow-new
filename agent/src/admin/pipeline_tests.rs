@@ -33,24 +33,25 @@ use nn_proto::admin_protocol::{
     ConfigOverlaySetRequest, ConfigOverlaySetResponse, DetectionSetStatusRequest,
     DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse, FimBaselineRequest,
     FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
-    KeyedSignature, LoopProgressRequest, NetFingerprintRequest, NetFingerprintResponse,
-    NetFlowsRequest, NetFlowsResponse, NetListenersRequest, NetListenersResponse,
-    NetResolveRequest, NetResolveResponse, RemediateRansomwareRequest, RemediateRansomwareResponse,
-    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
-    ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse,
-    StatusRequest, TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
-    UnlockRequest, UnlockResult,
+    IntegrityAcknowledgeRequest, IntegrityAcknowledgeResponse, KeyedSignature, LoopProgressRequest,
+    NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
+    NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
+    RemediateRansomwareRequest, RemediateRansomwareResponse, ResponseReleaseRequest,
+    ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
+    ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest, RotateKeysRevokeRequest,
+    ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse, StatusRequest,
+    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockRequest,
+    UnlockResult,
 };
 use nn_proto::admin_quorum::role_keyword;
 use nn_proto::admin_signed_payload::{
     sign, CanaryBurnExtra, CanaryDeployExtra, CanaryDeploymentWire, CanaryListExtra,
     CanaryRefreshExtra, CanaryTypeWire, ConfigOverlaySetExtra, DetectionSetStatusExtra,
     DetectionsExtra, FimBaselineExtra, FimReportExtra, FimStatusExtra, ForcePostureExtra,
-    NetFingerprintExtra, NetFlowsExtra, NetListenersExtra, NetResolveExtra, OperationExtra,
-    OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra, ResponseRestoreExtra,
-    ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra, ShutdownExtra,
-    SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
+    IntegrityAcknowledgeExtra, NetFingerprintExtra, NetFlowsExtra, NetListenersExtra,
+    NetResolveExtra, OperationExtra, OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra,
+    ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra,
+    ShutdownExtra, SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 
@@ -208,13 +209,18 @@ impl Fixture {
         serve_request(
             msg,
             conn,
-            bare_context(
-                &self.posture,
-                &self.isolator,
-                &self.marker,
-                &self.read_paths,
-                &self.handles,
-            ),
+            // lot 379: the handlers see the log the rows go to, as the
+            // transport hands them
+            super::handlers::Wired {
+                audit_log: Some(&self.audit),
+                ..bare_context(
+                    &self.posture,
+                    &self.isolator,
+                    &self.marker,
+                    &self.read_paths,
+                    &self.handles,
+                )
+            },
             &fake_client(),
             Some(&self.audit),
             &self.polls,
@@ -919,6 +925,41 @@ fn verbs() -> Vec<Verb> {
                 })
             },
         },
+        // Lot 379 (pre-alpha F7-1)
+        Verb {
+            request: "IntegrityAcknowledgeRequest",
+            op: "integrity_acknowledged",
+            quorum: 1,
+            extra: |_| {
+                OperationExtra::IntegrityAcknowledge(IntegrityAcknowledgeExtra {
+                    through_row: 7,
+                    note: "seen".to_string(),
+                })
+            },
+            wrap: |payload, signatures| {
+                AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+                    payload,
+                    signatures,
+                })
+            },
+            refused: |result, _| {
+                AdminMessage::IntegrityAcknowledgeResponse(IntegrityAcknowledgeResponse {
+                    result,
+                    acknowledged: 0,
+                    still_held: 0,
+                    message: String::new(),
+                })
+            },
+            row: |_, _, own| {
+                json!({
+                    "through_row": if own { Some(7) } else { None },
+                    "note": if own { "seen" } else { "" },
+                    "acknowledged": 0,
+                    "still_held": 0,
+                    "detail": "",
+                })
+            },
+        },
     ]
 }
 
@@ -1028,6 +1069,7 @@ fn result_of(reply: &AdminMessage) -> AdminResult {
         AdminMessage::ResponseRestoreResponse(x) => x.result,
         AdminMessage::TelemetryStatusResponse(x) => x.result,
         AdminMessage::RemediateRansomwareResponse(x) => x.result,
+        AdminMessage::IntegrityAcknowledgeResponse(x) => x.result,
         other => panic!("not a signed verb's reply: {other:?}"),
     }
 }
@@ -1286,7 +1328,8 @@ fn every_verb_refuses_every_reason_with_its_reply_and_row() {
             // a refusal names no signer — but the read role the
             // telemetry status lacks, whose signer the row names (lab PR
             // 213, `Roles::AnyOf`)
-            let telemetry_role = verb.op == "telemetry_status" && reason == Reason::WrongRole;
+            // lot 379: so does the integrity acknowledgement (`AnyOf` too)
+            let telemetry_role = designed_roles(verb.op).len() > 1 && reason == Reason::WrongRole;
             let submitted = match reason {
                 Reason::UnknownKey => 1,
                 Reason::WrongRole => weak_keys(verb, &k).len(),
@@ -1837,6 +1880,8 @@ fn designed_roles(op: &str) -> &'static [Role] {
         "response_release" | "response_restore" | "remediate_ransomware" => &[Role::ResponseManage],
         // either read role (lab PR 213)
         "telemetry_status" => &[Role::AuditRead, Role::TelemetryRead],
+        // lot 379: acknowledging is triage, or the install key's control role
+        "integrity_acknowledged" => &[Role::Triage, Role::ConfigManage],
         other => panic!("{other}: a signed verb without a designed role"),
     }
 }
@@ -1913,8 +1958,9 @@ fn every_verb_refuses_the_keys_of_every_other_role() {
             "{what}"
         );
         assert_eq!(row.result, "failure: role_denied", "{what}");
-        // the telemetry status names the key that tried (lab PR 213)
-        let named = if verb.op == "telemetry_status" {
+        // the telemetry status names the key that tried (lab PR 213), and
+        // the integrity acknowledgement (lot 379): the verbs of `AnyOf` roles
+        let named = if designed_roles(verb.op).len() > 1 {
             fp(&spare[0])
         } else {
             String::new()

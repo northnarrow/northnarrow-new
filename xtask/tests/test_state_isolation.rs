@@ -119,6 +119,10 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "purges the pin root before its agent starts",
     ),
     (
+        "agent/tests/integrity_status_privileged_e2e.rs",
+        "purges the pin root before each of its agents starts (lot 379: two in one run)",
+    ),
+    (
         "agent/tests/detection_rules_at_scale_privileged_e2e.rs",
         "purges the pin root before its agent starts",
     ),

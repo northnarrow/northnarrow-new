@@ -45,20 +45,21 @@
 use nn_proto::admin_protocol::{
     AdminResult, CanaryBurnRequest, CanaryDeployRequest, CanaryListRequest, CanaryRefreshRequest,
     ConfigOverlaySetRequest, DetectionSetStatusRequest, DetectionsRequest, FimBaselineRequest,
-    FimReportRequest, FimStatusRequest, ForcePostureRequest, KeyedSignature, NetFingerprintRequest,
-    NetFlowsRequest, NetListenersRequest, NetResolveRequest, RemediateRansomwareRequest,
-    ResponseReleaseRequest, ResponseRestoreRequest, ResponseStatusRequest, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, SignedUnlockRequest, TelemetryStatusRequest,
-    TrustedInstallerGrantRequest,
+    FimReportRequest, FimStatusRequest, ForcePostureRequest, IntegrityAcknowledgeRequest,
+    KeyedSignature, NetFingerprintRequest, NetFlowsRequest, NetListenersRequest, NetResolveRequest,
+    RemediateRansomwareRequest, ResponseReleaseRequest, ResponseRestoreRequest,
+    ResponseStatusRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
+    SignedUnlockRequest, TelemetryStatusRequest, TrustedInstallerGrantRequest,
 };
 use nn_proto::admin_quorum::{role_keyword, AdminKey};
 use nn_proto::admin_signed_payload::{
     CanaryBurnExtra, CanaryDeployExtra, CanaryListExtra, CanaryRefreshExtra, ConfigOverlaySetExtra,
     DetectionSetStatusExtra, DetectionsExtra, FimBaselineExtra, FimReportExtra, FimStatusExtra,
-    ForcePostureExtra, NetFingerprintExtra, NetFlowsExtra, NetListenersExtra, NetResolveExtra,
-    OperationCode, OperationExtra, RemediateRansomwareExtra, ResponseReleaseExtra,
-    ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra,
-    ShutdownExtra, SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
+    ForcePostureExtra, IntegrityAcknowledgeExtra, NetFingerprintExtra, NetFlowsExtra,
+    NetListenersExtra, NetResolveExtra, OperationCode, OperationExtra, RemediateRansomwareExtra,
+    ResponseReleaseExtra, ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra,
+    RotateKeysRevokeExtra, ShutdownExtra, SignedPayload, TelemetryStatusExtra,
+    TrustedInstallerGrantExtra, UnlockExtra,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 use tracing::warn;
@@ -240,6 +241,11 @@ signed_verbs! {
     // Lab PR 222: `response-manage`, a restore can put malware back.
     RemediateRansomwareRequest: RemediateRansomware(RemediateRansomwareExtra),
         Quorum::Of(1), Roles::Each(&[Role::ResponseManage]), "remediate-ransomware";
+    // Lot 379 (pre-alpha F7-1): acknowledging a held integrity finding is
+    // triage; the install's key carries config-manage. 1-of-N: the
+    // findings' rows stay in the chain, the acknowledgement names its key.
+    IntegrityAcknowledgeRequest: IntegrityAcknowledge(IntegrityAcknowledgeExtra),
+        Quorum::Of(1), Roles::AnyOf(&[Role::Triage, Role::ConfigManage]), "integrity-acknowledge";
 }
 
 /// A signed request [`signed`] verified by its verb's [`Rule`]. Only this
@@ -658,6 +664,12 @@ mod tests {
                 OperationCode::RemediateRansomware,
                 Quorum::Of(1),
                 Roles::Each(&[ResponseManage]),
+            ),
+            (
+                "IntegrityAcknowledgeRequest",
+                OperationCode::IntegrityAcknowledge,
+                Quorum::Of(1),
+                Roles::AnyOf(&[Triage, ConfigManage]),
             ),
         ];
         assert_eq!(RULES.len(), want.len());

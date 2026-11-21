@@ -38,6 +38,7 @@ exit: 0
 |   trusted-installer-grant  Open a trusted-installer window, for an upgrade, an uninstall or a restart of the agent. Submits a grant signed by one key; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's file protection is suspended (so install.sh can replace the protected binaries), the units may be stopped, and a write to the agent's own systemd units is recorded, not answered with a kill. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 Undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Undo what ransomware rewrote, from the copy-on-first-write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   integrity                The signed integrity findings `nn-admin status` holds (a cut or rewritten chain, an unauthorized overlay, a modified default list, a drift of the host): `integrity acknowledge --through <row>` signs the operator's acknowledgement (`triage` or `config-manage`), and the findings whose newest audit row is at or before it leave the status
 |   config                   Operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
 |   policy                   The signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
 |   help                     Print this message or the help of the given subcommand(s)
@@ -518,7 +519,7 @@ exit: 0
 | response mode     : DETECT-ONLY (config file) — no response action and no COMBAT isolation touch the system
 | combat evidence   : 1 stage transition(s) not written to the signed audit log when they happened — 2 queued for a late write, 0 dropped (never written); see the agent ERRORs
 | trust level       : L2 (enforcing and verified, degraded) — BTF offsets drifted: 5
-| degradations      : 1 this run (each signed in the audit log)
+| degradations      : 1 (each signed in the audit log)
 |   - bpf_lsm: anti-tamper: no enforcement
 | capabilities      : the boot's manifest, older than the sensor contract — nn-admin capabilities --key
 | exploit guard     : strict detect (experimental) — 12 calls judged, 30 skipped (fully privileged), 1 anomalies, 0 killed; 2 task(s) untracked (task map full: their calls are not judged)

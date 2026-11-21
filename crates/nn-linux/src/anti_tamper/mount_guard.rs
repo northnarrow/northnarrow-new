@@ -1037,6 +1037,80 @@ pub fn points_now() -> Vec<(String, u8)> {
     points_in_host(antitamper_bpf::prepare_pin_root())
 }
 
+/// Lot 379 (pre-alpha F8b-1, F7-2): the test builds' fault injection of a
+/// verifier refusal — the guard's programs named here (comma-separated:
+/// `mount_guard_sb_mount`, … `mount_guard_reconfigure`) are refused at
+/// their load as a verifier refusal would refuse them, the rest of the
+/// start untouched. Read only in a build with `test-privileged` (nn-linux's
+/// test-only feature, the agent's privileged suites'; never in a release:
+/// `xtask/tests/supply_chain.rs`, release.yml's `--build-features` check);
+/// in any other build nothing reads it. A weakening variable
+/// ([`refusal_weakens`]): a test build that honours it reports it.
+pub const VERIFIER_REFUSE_ENV: &str = "NN_TEST_VERIFIER_REFUSE";
+
+/// Whether [`VERIFIER_REFUSE_ENV`] set to `value` weakens this build: in a
+/// test build (`test-privileged`), any program named.
+pub fn refusal_weakens(value: &str) -> bool {
+    cfg!(feature = "test-privileged") && value.split(',').any(|p| !p.trim().is_empty())
+}
+
+/// The verifier refusal [`VERIFIER_REFUSE_ENV`] injects for `program`, in a
+/// test build: the error the load gives (`antitamper_bpf::reattach_fresh`'s
+/// context over aya's `BPF_PROG_LOAD` failure), marked as injected.
+#[cfg(feature = "test-privileged")]
+fn injected_refusal(program: &str) -> Option<anyhow::Error> {
+    let named = std::env::var(VERIFIER_REFUSE_ENV).ok()?;
+    if !named.split(',').any(|p| p.trim() == program) {
+        return None;
+    }
+    warn!(
+        program,
+        env = VERIFIER_REFUSE_ENV,
+        "TEST FAULT INJECTION: the verifier's refusal of this program is simulated (a test \
+         build only)"
+    );
+    Some(
+        anyhow!(
+            "the BPF_PROG_LOAD syscall failed. Verifier output: BPF program is too large. \
+             Processed 1000001 insn (injected by {VERIFIER_REFUSE_ENV}, a test build)"
+        )
+        .context(format!("verifier rejected LSM program `{program}`")),
+    )
+}
+
+#[cfg(not(feature = "test-privileged"))]
+fn injected_refusal(_program: &str) -> Option<anyhow::Error> {
+    None
+}
+
+/// One hook of the guard loaded (the verifier) and attached, pinned.
+fn load_lsm(
+    ebpf: &mut Ebpf,
+    program: &str,
+    hook: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    if let Some(e) = injected_refusal(program) {
+        return Err(e);
+    }
+    super::reattach_fresh(ebpf, program, hook, btf, pin_root)
+}
+
+/// The reconfigure's `fentry` loaded and attached, pinned.
+fn load_fentry(
+    ebpf: &mut Ebpf,
+    program: &str,
+    target: &str,
+    btf: &Btf,
+    pin_root: Option<&Path>,
+) -> Result<()> {
+    if let Some(e) = injected_refusal(program) {
+        return Err(e);
+    }
+    antitamper_bpf::reattach_fresh_fentry(ebpf, program, target, btf, pin_root)
+}
+
 /// Register, arm and attach the guard. Never fails the start: what is not
 /// attached is a signed degradation.
 pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Health {
@@ -1119,7 +1193,7 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
     health.points = keys.len();
     let mut missing = Vec::new();
     for (program, hook) in PROGRAMS {
-        match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
+        match load_lsm(ebpf, program, hook, btf, pin_root) {
             Ok(()) => health.attached += 1,
             Err(e) => {
                 let why = if super::filesystem::lsm_hook_absent(&e, hook) {
@@ -1139,13 +1213,7 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
     }
     // the reconfigure's flags (without them every remount of a held super
     // block is refused, whatever it asks)
-    if let Err(e) = antitamper_bpf::reattach_fresh_fentry(
-        ebpf,
-        RECONF_PROGRAM.0,
-        RECONF_PROGRAM.1,
-        btf,
-        pin_root,
-    ) {
+    if let Err(e) = load_fentry(ebpf, RECONF_PROGRAM.0, RECONF_PROGRAM.1, btf, pin_root) {
         warn!(error = %format!("{e:#}"), "anti-tamper mount guard: reconfigure flags not read");
         health.degraded.push(format!(
             "mount guard: a remount's new flags are not read ({e:#}): every remount of the file \
@@ -1593,6 +1661,50 @@ mod tests {
             assert_eq!(HOOKS[i], *hook);
             assert!(common::fail_open::FAIL_OPEN_HOOKS.contains(hook), "{hook}");
         }
+    }
+
+    /// Lot 379 (F8b-1): the injected verifier refusal of a test build names
+    /// the program as the real load refuses it, only for the programs the
+    /// variable names, and is a weakening the test build reports.
+    #[cfg(feature = "test-privileged")]
+    #[test]
+    fn a_test_build_injects_the_verifier_refusal_it_is_asked_for() {
+        let program = PROGRAMS[0].0;
+        std::env::set_var(
+            VERIFIER_REFUSE_ENV,
+            format!("{program}, {}", RECONF_PROGRAM.0),
+        );
+        let e = injected_refusal(program).expect("injected");
+        let text = format!("{e:#}");
+        assert!(
+            text.starts_with(&format!("verifier rejected LSM program `{program}`: ")),
+            "{text}"
+        );
+        assert!(
+            text.contains("injected by NN_TEST_VERIFIER_REFUSE"),
+            "{text}"
+        );
+        assert!(injected_refusal(RECONF_PROGRAM.0).is_some());
+        for (other, _) in &PROGRAMS[1..] {
+            assert!(injected_refusal(other).is_none(), "{other}");
+        }
+        std::env::remove_var(VERIFIER_REFUSE_ENV);
+        assert!(injected_refusal(program).is_none());
+        assert!(refusal_weakens(program));
+        assert!(!refusal_weakens(" , "));
+    }
+
+    /// Lot 379 (F8b-1): a build without `test-privileged` — every release —
+    /// reads nothing: the variable set, every program loads as it would.
+    #[cfg(not(feature = "test-privileged"))]
+    #[test]
+    fn a_build_without_the_test_feature_injects_nothing() {
+        std::env::set_var(VERIFIER_REFUSE_ENV, PROGRAMS[0].0);
+        for (program, _) in PROGRAMS.iter().chain([&RECONF_PROGRAM]) {
+            assert!(injected_refusal(program).is_none(), "{program}");
+        }
+        assert!(!refusal_weakens(PROGRAMS[0].0));
+        std::env::remove_var(VERIFIER_REFUSE_ENV);
     }
 
     fn table(text: &str) -> Vec<MountEntry> {

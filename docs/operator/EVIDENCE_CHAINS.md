@@ -354,6 +354,12 @@ after this version has written is not supported.
 5. **Treat it as an incident.** Missing evidence means someone with root
    and a degraded window wanted it gone. Investigate the host as
    compromised; the rows that remain still verify and are still evidence.
+6. **Acknowledge it, once investigated** (lot 379). `nn-admin status --key`
+   keeps listing the finding as an `integrity:` degradation, with the
+   audit row that signed it, until you do: `sudo nn-admin integrity
+   acknowledge --through <row> --note "<what you found>" --key <key>`
+   ([below](#what-nn-admin-status-holds)). The chain stays broken for
+   `chain verify`; the acknowledgement is a signed row of its own.
 
 ### What `chain_verify_failed` says (lab PR 256)
 
@@ -400,6 +406,60 @@ start's own findings (`chain_truncated`, …) and are reported apart.
    (lot 255): rows in that window from the suites' rules and fixtures
    (`bpftool`, `fim_child_…`) are theirs. Any other case is an incident
    (step 5 above).
+
+## What `nn-admin status` holds
+
+Lot 379 (pre-alpha Phase 7, F7-1; Phase 3-bis, F3b-6). Every signed
+integrity finding is a degradation of the agent's status as well:
+`nn-admin status --key` lists each as an `integrity:` line — its kind,
+what it is about (the chain, else its detail), when its row was signed and
+the row's position in the audit chain (`audit row N`) —, `sensors` says
+`DEGRADED`, the trust level is at most L2, and the capability manifest and
+the heartbeat carry it. Until then a cut chain, an unauthorized overlay or
+a modified default list left `sensors: OK — no degradation`: only the
+journal's ERROR and `nn-admin chain verify` said them.
+
+The rule. The audit log keeps it from its own rows, at each append and at
+each open (a restart reads the chain again: it clears nothing):
+
+- **The evidence findings** — the kinds of the table above (a chain cut,
+  rewritten, missing or unverifiable, its rows unreadable), the watchdog's
+  witness chain broken (`witness_chain_broken`), `agent_id_changed` and the
+  overlays' rollback floor reset (`overlay_rollback_floor_unavailable`) —
+  are held until a signed acknowledgement covers them. No later state is
+  clean: the alteration stays in the evidence for good.
+- **Every other finding** — an unauthorized overlay, a modified or
+  unavailable default list, the integrity round's drifts (a drop-in, a
+  mount over the agent's paths, a foreign pin…), an event of the run (a
+  foreign peer on the admin socket, the watchdog's death) — is held
+  **while it is found**: until the check that signed it signs its end
+  (`integrity_drift_cleared`, the same kind and detail), or until the next
+  start, which checks again and signs it again if it still holds — or
+  until an acknowledgement covers it. Removing the unsigned overlay, or
+  signing it (`nn-admin config overlay set`), and restoring the shipped
+  list are clean states: the next start no longer finds them.
+- **Not held**: the degradations the status shows already, which their
+  finder withdraws when they end (`subsystem_degraded`, the pin lock, the
+  profile downgrade, a restart loop), and rows that are no finding (a note,
+  a repair, an end) — a torn tail's repair among them
+  (`chain_tail_repaired`, below: a crash's normal end, its cut signed and
+  verifiable).
+- A row that ends a hold — an acknowledgement, a `cleared`, a start's
+  `agent_boot` — counts only when its signature verifies with the agent's
+  key: a line written into the file by hand ends nothing.
+- `nn-admin integrity acknowledge --through <row> [--note …] --key <key>`
+  (`triage` or `config-manage`) signs the acknowledgement
+  (`integrity_acknowledged`: the row, the note, the key's fingerprint, how
+  many it covered). It covers the findings whose newest row is at or
+  before `<row>`; a row not signed yet is refused (exit 9), and a finding
+  signed after it — the same chain found broken at the next start — is
+  held again. The status prints the command with the newest held row.
+- At most 16 findings are listed; the rows of the others are counted (`…
+  and N more held integrity row(s)`) and acknowledged the same way.
+- Residual: the integrity round reports a finding that ended and came back
+  within 10 minutes only at the end of its back-off (external audit
+  NN-AUD-114); until then it is not held. The `cleared` row and the
+  journal's ERRORs say it.
 
 ## What the agent did about it
 

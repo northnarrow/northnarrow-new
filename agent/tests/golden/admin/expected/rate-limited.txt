@@ -98,3 +98,7 @@ remediate_ransomware | RateLimitSequence | row result="failure: invalid_signatur
 remediate_ransomware | RateLimitSequence | row result="failure: invalid_signature" key_fp="" cosigners=[]
 remediate_ransomware | RateLimitSequence | row result="failure: rate_limited (retry_after_secs=1)" key_fp="" cosigners=[]
 remediate_ransomware | RateLimitSequence | row result="failure: rate_limited (retry_after_secs=1)" key_fp="" cosigners=[]
+integrity_acknowledged | RateLimitSequence | row result="failure: invalid_signature" key_fp="" cosigners=[]
+integrity_acknowledged | RateLimitSequence | row result="failure: invalid_signature" key_fp="" cosigners=[]
+integrity_acknowledged | RateLimitSequence | row result="failure: rate_limited (retry_after_secs=1)" key_fp="" cosigners=[]
+integrity_acknowledged | RateLimitSequence | row result="failure: rate_limited (retry_after_secs=1)" key_fp="" cosigners=[]

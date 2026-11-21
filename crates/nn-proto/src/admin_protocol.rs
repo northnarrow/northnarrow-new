@@ -1677,6 +1677,25 @@ pub struct ResponseStatusResponse {
     pub combat_locked: Option<bool>,
 }
 
+/// Lot 379 (pre-alpha F7-1): signed `integrity acknowledge` request
+/// (`IntegrityAcknowledgeExtra { through_row, note }`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityAcknowledgeRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Reply to [`IntegrityAcknowledgeRequest`]: `acknowledged` held findings
+/// the acknowledgement covers (0: refused, `message` says why), the ones
+/// `still_held` after it (signed after its row), and what was done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityAcknowledgeResponse {
+    pub result: AdminResult,
+    pub acknowledged: u64,
+    pub still_held: u64,
+    pub message: String,
+}
+
 /// Signed `response release` request (`ResponseReleaseExtra { pid }`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseReleaseRequest {
@@ -2074,6 +2093,13 @@ pub enum AdminMessage {
     /// the variant cannot decode it and closes the connection (`nn-admin`
     /// then asks for the plain grant).
     TrustedInstallerGrantForInstallerRequest(TrustedInstallerGrantRequest),
+    /// Lot 379 (pre-alpha F7-1) — signed acknowledgement of the integrity
+    /// findings the status holds. Triggers
+    /// [`AdminMessage::IntegrityAcknowledgeResponse`]. An agent older than
+    /// the variant cannot decode it and closes the connection.
+    IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest),
+    /// Reply to [`AdminMessage::IntegrityAcknowledgeRequest`].
+    IntegrityAcknowledgeResponse(IntegrityAcknowledgeResponse),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -2421,13 +2447,38 @@ mod tests {
         });
         assert_eq!(first(&remediated), 57, "RemediateRansomwareResponse");
         // Lot 278 (review of #493): the grant asked for an installer,
-        // appended after lab PR 222's pair — the last production variant
+        // appended after lab PR 222's pair
         let for_installer =
             AdminMessage::TrustedInstallerGrantForInstallerRequest(TrustedInstallerGrantRequest {
                 payload: SignedPayload::new_trusted_installer_grant([0; 32], 0, [0; 16], 1),
                 signatures: Vec::new(),
             });
-        assert_eq!(first(&for_installer), 58, "the last production variant");
+        assert_eq!(
+            first(&for_installer),
+            58,
+            "TrustedInstallerGrantForInstallerRequest"
+        );
+        // Lot 379: the integrity acknowledgement, appended after lot 278's
+        // variant — the last production pair
+        let acknowledge = AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+            payload: SignedPayload::new_integrity_acknowledge(
+                [0; 32],
+                0,
+                [0; 16],
+                7,
+                String::new(),
+            ),
+            signatures: Vec::new(),
+        });
+        assert_eq!(first(&acknowledge), 59, "IntegrityAcknowledgeRequest");
+        let acknowledged =
+            AdminMessage::IntegrityAcknowledgeResponse(IntegrityAcknowledgeResponse {
+                result: AdminResult::Success,
+                acknowledged: 1,
+                still_held: 0,
+                message: String::new(),
+            });
+        assert_eq!(first(&acknowledged), 60, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -2443,9 +2494,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                59
+                61
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 60);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 62);
         }
     }
 
@@ -2826,7 +2877,9 @@ mod tests {
                 | AdminMessage::SignedUnlockRequest(_)
                 | AdminMessage::SignedUnlockResponse(_)
                 | AdminMessage::RemediateRansomwareRequest(_)
-                | AdminMessage::RemediateRansomwareResponse(_) => {}
+                | AdminMessage::RemediateRansomwareResponse(_)
+                | AdminMessage::IntegrityAcknowledgeRequest(_)
+                | AdminMessage::IntegrityAcknowledgeResponse(_) => {}
             }
         }
     }
@@ -4084,6 +4137,35 @@ mod tests {
                 restored: false,
                 path: String::new(),
                 message: String::new(),
+            },
+        ));
+    }
+
+    /// Lot 379: the integrity acknowledgement survives the wire, its longest
+    /// note included.
+    #[test]
+    fn roundtrip_integrity_acknowledge() {
+        use crate::wire::admin_signed_payload::{SignedPayload, INTEGRITY_ACK_NOTE_MAX};
+        roundtrip(AdminMessage::IntegrityAcknowledgeRequest(
+            IntegrityAcknowledgeRequest {
+                payload: SignedPayload::new_integrity_acknowledge(
+                    [0x44; 32],
+                    1_700_000_000,
+                    [0x55; 16],
+                    412,
+                    "n".repeat(INTEGRITY_ACK_NOTE_MAX),
+                ),
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        roundtrip(AdminMessage::IntegrityAcknowledgeResponse(
+            IntegrityAcknowledgeResponse {
+                result: AdminResult::Success,
+                acknowledged: 2,
+                still_held: 1,
+                message: "2 held findings acknowledged through audit row 412".to_string(),
             },
         ));
     }

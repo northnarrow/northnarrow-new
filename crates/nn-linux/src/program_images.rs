@@ -1662,6 +1662,10 @@ mod tests {
     #[test]
     fn a_users_payload_of_runc_len_past_its_own_share_is_kept_not_compared() {
         use nn_core::decision::rules::program_identity::runtime_clone_of;
+        // lot 379: it reads the process's degradation registry, which the
+        // tests that reset it do under this lock (a reset between the report
+        // and the read below failed a gate run)
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
         let t = tempfile::tempdir().unwrap();
         let (root, proc) = (t.path().join("root"), t.path().join("proc"));
         // a length no other test's runtime has: the installed runtimes are

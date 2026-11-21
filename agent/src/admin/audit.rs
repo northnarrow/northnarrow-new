@@ -568,6 +568,30 @@ pub(super) fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
+        // Lot 379 (pre-alpha F7-1): the acknowledgement IS this row — the
+        // audit log reads a successful one as the end of the holds it
+        // covers (`nn_evidence::held`); a refused one ends nothing.
+        (
+            AdminMessage::IntegrityAcknowledgeRequest(req),
+            AdminMessage::IntegrityAcknowledgeResponse(r),
+        ) => {
+            let (through_row, note) = match &req.payload.extra {
+                OperationExtra::IntegrityAcknowledge(e) => (Some(e.through_row), e.note.clone()),
+                _ => (None, String::new()),
+            };
+            (
+                nn_evidence::held::ACK_OP,
+                serde_json::json!({
+                    "through_row": through_row,
+                    "note": note,
+                    "acknowledged": r.acknowledged,
+                    "still_held": r.still_held,
+                    "detail": r.message,
+                }),
+                verified_result_str(r.result, r.acknowledged > 0, &r.message),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable here: ChallengeRequest, the debug path. The unsigned
         // Status is summarised per peer by `StatusPolls` (external audit
         // ASK-009). Server-only reply variants reaching dispatch are

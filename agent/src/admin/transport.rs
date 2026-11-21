@@ -677,6 +677,7 @@ pub(super) async fn handle_connection(
         response_state: response_state.map(|s| s.as_ref()),
         read_paths,
         handles,
+        audit_log,
     };
     let limits = slot.limits();
     loop {

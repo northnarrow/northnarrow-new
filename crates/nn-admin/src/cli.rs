@@ -605,6 +605,17 @@ enum Cmd {
         sub: RemediateCmd,
     },
 
+    // Lot 379 (pre-alpha F7-1).
+    /// The signed integrity findings `nn-admin status` holds (a cut or
+    /// rewritten chain, an unauthorized overlay, a modified default list, a
+    /// drift of the host): `integrity acknowledge --through <row>` signs
+    /// the operator's acknowledgement (`triage` or `config-manage`), and the
+    /// findings whose newest audit row is at or before it leave the status.
+    Integrity {
+        #[command(subcommand)]
+        sub: IntegrityCmd,
+    },
+
     // Tappa 10.8.
     /// Operator configuration the agent loads only when an
     /// admin key signed it (`config overlay set|sign|status`).
@@ -662,6 +673,33 @@ enum RemediateCmd {
         socket: PathBuf,
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IntegrityCmd {
+    /// Acknowledge the held integrity findings through one audit row (the
+    /// row `nn-admin status --key` names for each). The agent signs the
+    /// acknowledgement with the key's fingerprint and your note; the
+    /// findings whose newest row is at or before it leave the status, the
+    /// trust level and the capability manifest. Their rows stay in the
+    /// chain (`nn-admin chain verify` still fails on a cut chain), and a
+    /// finding signed after that row is held again. A row not signed yet
+    /// is refused.
+    Acknowledge {
+        /// The newest audit row acknowledged (`nn-admin status --key`).
+        #[arg(long)]
+        through: u64,
+        /// What you found, recorded in the signed row (at most 512 bytes).
+        #[arg(long, default_value = "")]
+        note: String,
+        /// A key with `triage` or `config-manage`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
     },
 }
 
@@ -2253,6 +2291,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
         },
 
         Cmd::Response { sub } => run_response_cmd(sub),
+        Cmd::Integrity { sub } => run_integrity_cmd(sub),
         Cmd::Remediate { sub } => run_remediate_cmd(sub),
         Cmd::Config {
             sub: ConfigCmd::Overlay { sub },
@@ -3288,20 +3327,42 @@ fn exploit_guard_line(out: &StatusOutcome, tty: bool) -> String {
 }
 
 /// Lab PR 218: every degradation of this run, each also signed in the audit
-/// chain (`subsystem_degraded`).
+/// chain (`subsystem_degraded`). Lot 379 (pre-alpha F7-1): and the signed
+/// integrity findings the audit log holds (`integrity:` lines, from this
+/// run or an earlier one), with the command that acknowledges them.
 fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
     match &out.degradations {
         None => vec!["degradations      : (not reported: the agent predates them)".to_string()],
         Some(d) if d.is_empty() => vec!["degradations      : none".to_string()],
         Some(d) => {
             let mut lines = vec![format!(
-                "degradations      : {} this run (each signed in the audit log)",
+                "degradations      : {} (each signed in the audit log)",
                 d.len()
             )];
             lines.extend(d.iter().map(|l| format!("  - {}", clean(l))));
+            if let Some(row) = newest_held_row(d) {
+                lines.push(format!(
+                    "  integrity findings are held until their rule ends them; once \
+                     investigated: nn-admin integrity acknowledge --through {row} --key <key \
+                     with triage or config-manage>"
+                ));
+            }
             lines
         }
     }
+}
+
+/// Lot 379: the newest audit row a held integrity finding names (`(audit
+/// row N)` in its `integrity:` line), if any is held.
+fn newest_held_row(degradations: &[String]) -> Option<u64> {
+    degradations
+        .iter()
+        .filter(|l| l.starts_with("integrity: "))
+        .filter_map(|l| {
+            let at = l.find("(audit row ")? + "(audit row ".len();
+            l[at..].split(')').next()?.parse::<u64>().ok()
+        })
+        .max()
 }
 
 /// Lab PR 218: `nn-admin capabilities` — the boot's signed capability
@@ -4888,6 +4949,51 @@ fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
             "response restore",
             run_response_restore(&socket, &key, &agent_id_file, vault_id, to),
         ),
+    }
+}
+
+/// Lot 379 (pre-alpha F7-1): `nn-admin integrity acknowledge`. Exit 0 when
+/// the findings were acknowledged, 9 when the agent verified the request
+/// and refused it (a row not signed yet, nothing held at or before it: the
+/// reason is printed), the usual codes otherwise (2 signature, 3
+/// challenge, 4 rate limit, 5 transport / version, 7 role).
+fn run_integrity_cmd(sub: IntegrityCmd) -> ExitCode {
+    use nn_proto::admin_protocol::AdminResult;
+    match sub {
+        IntegrityCmd::Acknowledge {
+            through,
+            note,
+            key,
+            agent_id_file,
+            socket,
+        } => {
+            let op = "integrity acknowledge";
+            if note.len() > nn_proto::admin_signed_payload::INTEGRITY_ACK_NOTE_MAX {
+                eprintln!(
+                    "{op}: --note is longer than {} bytes",
+                    nn_proto::admin_signed_payload::INTEGRITY_ACK_NOTE_MAX
+                );
+                return ExitCode::from(1);
+            }
+            match crate::admin_cli::run_integrity_acknowledge(
+                &socket,
+                &key,
+                &agent_id_file,
+                through,
+                note,
+            ) {
+                Ok(o) if o.done => {
+                    println!("{op}: {}", clean(&o.message));
+                    ExitCode::SUCCESS
+                }
+                Ok(o) if o.result == AdminResult::Success => {
+                    eprintln!("{op}: not done: {}", clean(&o.message));
+                    ExitCode::from(9)
+                }
+                Ok(o) => exit_from_admin_result(op, o.result),
+                Err(e) => exit_from_request_error(op, &e),
+            }
+        }
     }
 }
 
@@ -6743,8 +6849,29 @@ mod flow_sock_line_tests {
         ]);
         let d = degradation_lines(&o);
         assert_eq!(d.len(), 3);
-        assert!(d[0].contains("2 this run"), "{d:?}");
+        // lot 379: a held integrity finding can be an earlier run's, so the
+        // count no longer says "this run"
+        assert_eq!(d[0], "degradations      : 2 (each signed in the audit log)");
         assert!(!d[2].contains('\n'), "escaped: {d:?}");
+        // lot 379: held integrity findings add the acknowledgement's line,
+        // naming the newest row an `integrity:` line holds — never a row
+        // another degradation's text happens to name
+        o.degradations = Some(vec![
+            "integrity: chain_truncated (detections) — signed t (audit row 5) — held until \
+             acknowledged: cut"
+                .to_string(),
+            "net_drain: a reader said (audit row 999)".to_string(),
+            "integrity: unauthorized_overlay — signed t (audit row 7) — held while found: x"
+                .to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert_eq!(d.len(), 5, "{d:?}");
+        assert!(
+            d[4].contains("nn-admin integrity acknowledge --through 7 --key"),
+            "{d:?}"
+        );
+        o.degradations = Some(vec!["net_drain: a reader said (audit row 999)".to_string()]);
+        assert_eq!(degradation_lines(&o).len(), 2, "no held finding, no line");
         // withheld only when every telemetry field is
         let mut unsigned = outcome(None, None, None);
         unsigned.telemetry_signed = false;
