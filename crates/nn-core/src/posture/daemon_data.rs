@@ -10,13 +10,14 @@
 //! are its own, and the operator adds entries in the signed mass-write
 //! overlay (`mass-write-carveout.local`, lines `+<unit>.service <dir>/`).
 //!
-//! The kernel tags each listed directory ([`DaemonData::dirs`]: the tag is
-//! the directory's index) and tells, for every crossing of the mass-write
-//! counters, whether every file the window counted lay in one tagged
-//! directory (`common::wire::open_sensor::own_data`). The posture then
-//! leaves the crossing out only when the writer's cgroup is one of the
-//! units of that directory (`/system.slice/<unit>`): a root process outside
-//! the unit, or the unit writing anywhere else, still counts. The counters
+//! The kernel tags each listed directory ([`DaemonData::tagged_dirs`]: lot
+//! 380, the directories of one set of units share a tag, the index of its
+//! first) and tells, for every crossing of the mass-write counters, whether
+//! every file the window counted lay under one tag
+//! (`common::wire::open_sensor::own_data`). The posture then leaves the
+//! crossing out only when the writer's cgroup is one of the units of that
+//! tag (`/system.slice/<unit>`): a root process outside the unit, or the
+//! unit writing anywhere else, still counts. The counters
 //! themselves count everything, and the ransomware tracker (NN-L-IMP-001)
 //! reads every crossing.
 //!
@@ -45,7 +46,11 @@ pub const DAEMON_DATA_V1: &str = "/etc/northnarrow/daemon-data.v1";
 pub const BUILTIN_DAEMON_DATA_V1: &str =
     include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/daemon-data.v1"));
 /// SHA-256 of every `daemon-data.v1` an earlier release shipped.
-pub const EARLIER_DAEMON_DATA_V1_SHA256: &[&str] = &[];
+pub const EARLIER_DAEMON_DATA_V1_SHA256: &[&str] = &[
+    // lot 283c (e24430a), before lot 380 added containerd's and dockerd's
+    // runtime state under /run
+    "b2ce219ecbf149981fbef7e23a04de42e8a06a43a474173da7c9a4b7f9804292",
+];
 /// The shipped `daemon-data.v1` (built-in copy, earlier ones).
 pub const DAEMON_DATA_SHIPPED: Shipped<'static> =
     Shipped::new(BUILTIN_DAEMON_DATA_V1, EARLIER_DAEMON_DATA_V1_SHA256);
@@ -209,13 +214,38 @@ impl DaemonData {
         (data, source)
     }
 
-    /// The listed directories, in tag order.
+    /// The listed directories, in list order.
     pub fn dirs(&self) -> &[DaemonDir] {
         &self.dirs
     }
 
-    /// The units of the directory an own-data code names
-    /// (`own_data::UNIT_BASE` + its tag); `None` for any other code.
+    /// Lot 380 (the rc11 soak on Ubuntu 26.04: containerd's crossing raised
+    /// ENGAGED with `/run/containerd/` listed — its removals of a task mixed
+    /// the bundle under `/run/containerd` and the container's snapshot under
+    /// `/var/lib/containerd`, two directories, so the kernel's summary of the
+    /// window was no one's): each listed directory with the kernel's tag, the
+    /// index of the first directory whose units are the same set — a unit's
+    /// directories share one tag, so a window across them is still its own
+    /// data. Directories of different unit sets keep different tags.
+    pub fn tagged_dirs(&self) -> Vec<(String, u32)> {
+        let set = |d: &DaemonDir| {
+            let mut u = d.units.clone();
+            u.sort();
+            u
+        };
+        self.dirs
+            .iter()
+            .map(|d| {
+                let own = set(d);
+                let tag = self.dirs.iter().position(|o| set(o) == own).unwrap_or(0);
+                (d.dir.clone(), tag as u32)
+            })
+            .collect()
+    }
+
+    /// The units of the directories an own-data code names
+    /// (`own_data::UNIT_BASE` + its tag, [`Self::tagged_dirs`]: every
+    /// directory of a tag has the same units); `None` for any other code.
     pub fn units_of(&self, code: u8) -> Option<&[String]> {
         let tag = code.checked_sub(own_data::UNIT_BASE)?;
         self.dirs.get(usize::from(tag)).map(|d| d.units.as_slice())
@@ -280,6 +310,40 @@ mod tests {
         assert!(units("/var/lib/kubelet/").contains(&"kubelet.service".to_string()));
         assert!(units("/var/lib/kubelet/").contains(&"k3s.service".to_string()));
         assert_eq!(units("/var/lib/etcd/"), vec!["etcd.service"]);
+        // lot 380: containerd's and dockerd's runtime state
+        assert_eq!(units("/run/containerd/"), vec!["containerd.service"]);
+        assert_eq!(units("/run/docker/"), vec!["docker.service"]);
+    }
+
+    /// Lot 380 (named, the rc11 soak on Ubuntu 26.04: containerd's removal
+    /// of a task mixed `/run/containerd` and `/var/lib/containerd` in one
+    /// window): a unit's directories share the kernel's tag, so its window
+    /// across them is its own data; another unit set's directories keep
+    /// their own tags (dockerd's, the kubelet's directory k3s shares), and
+    /// the code of a tag names that set's units.
+    #[test]
+    fn a_unit_s_directories_share_one_tag() {
+        let (data, refused) = DaemonData::build(entries(BUILTIN_DAEMON_DATA_V1));
+        assert!(refused.is_empty(), "{refused:?}");
+        let tagged = data.tagged_dirs();
+        let tag = |dir: &str| tagged.iter().find(|(d, _)| d == dir).map(|(_, t)| *t);
+        assert_eq!(tag("/run/containerd/"), tag("/var/lib/containerd/"));
+        assert_eq!(tag("/run/docker/"), tag("/var/lib/docker/"));
+        assert_ne!(tag("/run/containerd/"), tag("/run/docker/"));
+        assert_eq!(tag("/run/k3s/"), tag("/var/lib/rancher/"));
+        assert_ne!(tag("/var/lib/kubelet/"), tag("/var/lib/rancher/"));
+        assert_ne!(tag("/var/lib/etcd/"), tag("/var/lib/containerd/"));
+        for (dir, t) in &tagged {
+            let code = own_data::UNIT_BASE + *t as u8;
+            let own = data.dirs().iter().find(|d| &d.dir == dir).unwrap();
+            assert_eq!(data.units_of(code), Some(own.units.as_slice()), "{dir}");
+        }
+        // the order of a directory's units does not split a set
+        let (two, _) = DaemonData::build(entries(
+            "a.service /var/lib/a/\nb.service /var/lib/a/\nb.service /run/a/\na.service /run/a/\n",
+        ));
+        let t = two.tagged_dirs();
+        assert_eq!(t[0].1, t[1].1);
     }
 
     /// An entry is a service and a directory; what the mass-write overlay

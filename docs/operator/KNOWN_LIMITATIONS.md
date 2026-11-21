@@ -995,6 +995,55 @@ lists the known false positives of each rule.
   `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`,
   `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
   `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
+- **Rootless Podman's uidmap tools, name lookups, a user's `modprobe`,
+  containerd's task bundles** (lot 380, the rc11 soak). Judged by identity
+  now:
+  - the packaged `newuidmap`/`newgidmap` reading `/etc/login.defs` as
+    their caller;
+  - a packaged program's read-only open of `/etc/passwd` (a name lookup:
+    `id`, `whoami`, `ls -l`), by the file the kernel executed, unless the
+    program is a file tool, a shell or an interpreter;
+  - a user's `modprobe` gone before the exec pump read it, its credentials
+    read from the process that forked it: Low when that process held no
+    uid 0 and no capability in PID 1's user namespace (or ran in a user
+    namespace of its own, rootless Podman);
+  - containerd writing and removing its task bundles under
+    `/run/containerd` (and dockerd under `/run/docker`), from its unit.
+
+  Still recorded: `cat`, `cut`, `python3` or a shell reading `/etc/passwd`
+  without a login uid, and any reader but those named reading
+  `/etc/login.defs` (ALERTED); a copy of a packaged program; a user's
+  `modprobe` whose forker holds a uid 0 or a capability (High); another
+  unit's burst under `/run/containerd`.
+
+  Residuals:
+  - **A read just after an exec in the same process.** The file-open
+    sensor reports a task's read of a file once within a second, across
+    an exec: a unit's program reading `/etc/passwd` or `/etc/login.defs`
+    right after its executor looked the user up is not reported (an eBPF
+    change for a later lot); `newgrp` is not exempted for that reason.
+  - **A forker that gave up its privilege** between the fork and the
+    pump's read is taken for one that never held it (only root's own
+    process can; R018 judges any module its fork loads). A `modprobe` a
+    shell `exec`s in its own place is not read from its forker (High as
+    before for a user's, when it exited first).
+  - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
+    /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
+    access; so does a fork that changed its image to a packaged program's
+    (`PR_SET_MM`, capabilities in a user namespace of its own).
+  - **dockerd's container setup in a burst** (Docker's own `overlay2`
+    image store): twenty or more containers started and removed within a
+    minute still raise ENGAGED through the mass-write arm — dockerd writes
+    each container's init files through the layer's overlay mount, which
+    the kernel does not place under `/var/lib/docker`.
+
+  *Evidence:* lot 380;
+  `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
+  `a_packaged_program_s_name_lookup_is_no_sensitive_access`,
+  `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
+  `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
+  `containerd_replacing_its_task_bundles_under_run_raises_nothing`,
+  `a_unit_s_directories_share_one_tag`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

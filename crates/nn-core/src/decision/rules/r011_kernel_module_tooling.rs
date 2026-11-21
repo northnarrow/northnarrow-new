@@ -464,6 +464,14 @@ fn is_module_tool_image(exe: &str) -> bool {
 /// its credentials from the running exec ([`Credentials::CannotLoad`]) — is
 /// Low too: the kernel refuses its every load. Credentials not read, uid 0,
 /// `CAP_SYS_MODULE` held: judged as before (High for a non-root exec).
+///
+/// Lot 380 (the rc11 soak on Ubuntu 24.04: `modprobe overlay` as uid 1000
+/// under `podman info` High once, Low the other times): and when its
+/// process had exited before its environment could be read, its
+/// credentials then read from the process that forked it
+/// ([`Credentials::of_forker`]) — Low too: an environment changes nothing
+/// the kernel lets a process without the means to load a module do. A
+/// variable read stays a kill; a root exec, Medium.
 pub fn plain_root_record_severity(
     judged: &Result<(String, bool), String>,
     uid: u32,
@@ -472,7 +480,7 @@ pub fn plain_root_record_severity(
     match judged {
         Ok((_, false)) if uid == 0 => Severity::Low,
         Ok((_, true)) if uid == 0 => Severity::Medium,
-        Ok((_, false)) if matches!(credentials, Credentials::CannotLoad(_)) => Severity::Low,
+        Ok(_) if matches!(credentials, Credentials::CannotLoad(_)) => Severity::Low,
         _ => Severity::High,
     }
 }
@@ -656,6 +664,12 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
             .map(|f| f.credentials)
             .unwrap_or_default();
         let severity = plain_root_record_severity(&judged, *uid, &credentials);
+        let cannot_load = match (&credentials, *uid) {
+            (Credentials::CannotLoad(why), u) if u != 0 => {
+                format!("; it cannot load a module — {why} (lot 369)")
+            }
+            _ => String::new(),
+        };
         let (action, mut reasoning) = match judged {
             Ok((what, false)) => (
                 ResponseAction::Log,
@@ -663,20 +677,17 @@ impl<H: PostureHost> Rule for R011KernelModuleTooling<H> {
                     "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
                      tool, nothing moved or forced, no MODPROBE_OPTIONS or LD_* — recorded, not \
                      killed (lot 279): what the names load is the kernel's to judge (its \
-                     signature policy; R018 judges the load it reports, after it){} (T1547.006)",
-                    match (&credentials, *uid) {
-                        (Credentials::CannotLoad(why), u) if u != 0 =>
-                            format!("; it cannot load a module — {why} (lot 369)"),
-                        _ => String::new(),
-                    }
+                     signature policy; R018 judges the load it reports, after it){cannot_load} \
+                     (T1547.006)"
                 ),
             ),
+            // lot 380: what its credentials allow, said too
             Ok((what, true)) => (
                 ResponseAction::Log,
                 format!(
                     "Kernel-module tooling ({comm}) exec by module name — {what}: the system's \
-                     tool, nothing moved or forced; {EXITED_NOTE} — recorded, not killed (lot \
-                     279) (T1547.006)"
+                     tool, nothing moved or forced; {EXITED_NOTE}{cannot_load} — recorded, not \
+                     killed (lot 279) (T1547.006)"
                 ),
             ),
             Err(why) => (
@@ -1324,6 +1335,110 @@ mod tests {
                 Severity::High,
                 "a process that can load a module is High"
             );
+        }
+    }
+
+    /// Lot 380 (named, the rc11 soak on Ubuntu 24.04: `modprobe overlay` as
+    /// uid 1000 under `podman info` High once, Low the other times — it had
+    /// exited before the exec pump read its environment and credentials): a
+    /// user's exec of the system's tool by module name, gone before the
+    /// read, whose credentials were read from the process that forked it
+    /// ([`Credentials::of_forker`]: rootless Podman in its user namespace, a
+    /// session's process with no capability) is Low, said so. The attack
+    /// shapes keep High: a forker thread with a uid 0, with a capability in
+    /// PID 1's namespace (`CAP_SETUID` would give its fork a uid 0;
+    /// `CAP_SYS_MODULE`), its namespace not read, one privileged thread
+    /// among others, a status cut, no thread read; root's exec stays Medium,
+    /// and every kill stays a kill.
+    #[test]
+    fn a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker() {
+        let r = rule();
+        let status = |uid: u32, caps: u64| {
+            format!(
+                "Name:\tpodman\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nCapInh:\t0000000000000000\n\
+                 CapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapBnd:\t000001ffffffffff\n\
+                 CapAmb:\t0000000000000000\n"
+            )
+        };
+        let full = 0x0000_01ff_ffff_ffffu64;
+        let setuid = 1u64 << 7;
+        let module = 1u64 << super::kmod_exec_facts::CAP_SYS_MODULE;
+        let gone = |credentials: Credentials| ExecFacts {
+            program: Ok(()),
+            environment: Environment::Exited("no process had its pid any more".into()),
+            package_manager: None,
+            initramfs_builder: None,
+            interpreter: None,
+            library_path: None,
+            credentials,
+        };
+        let user = || as_uid(modprobe(&["overlay"]), 1000);
+        let thread = |uid: u32, caps: u64, other: Option<bool>| (status(uid, caps), other);
+        for (threads, why) in [
+            (vec![thread(1000, full, Some(true))], "rootless Podman's"),
+            (
+                vec![thread(1000, full, Some(true)), thread(1000, 0, Some(false))],
+                "its threads, one in PID 1's namespace with no capability",
+            ),
+            (vec![thread(1000, 0, Some(false))], "a session's"),
+        ] {
+            let creds = Credentials::of_forker(&threads);
+            assert!(matches!(creds, Credentials::CannotLoad(_)), "{why}");
+            let v = r.evaluate(&read_as(user(), gone(creds))).expect("recorded");
+            assert_eq!(
+                (v.action.clone(), v.severity),
+                (ResponseAction::Log, Severity::Low),
+                "{why}: recorded at Low",
+            );
+            assert!(
+                v.reasoning.contains("it cannot load a module")
+                    && v.reasoning.contains(EXITED_NOTE)
+                    && v.reasoning.contains("lot 380"),
+                "the reasoning says it exited and cannot load a module",
+            );
+        }
+        // the attack shapes: High, as before
+        for (threads, why) in [
+            (vec![thread(0, 0, Some(true))], "a uid 0"),
+            (vec![thread(1000, setuid, Some(false))], "CAP_SETUID"),
+            (vec![thread(1000, module, Some(false))], "CAP_SYS_MODULE"),
+            (vec![thread(1000, 0, None)], "its namespace not read"),
+            (
+                vec![
+                    thread(1000, 0, Some(false)),
+                    thread(1000, setuid, Some(false)),
+                ],
+                "one privileged thread",
+            ),
+            (
+                vec![thread(1000, 0, Some(false)), thread(0, 0, Some(true))],
+                "a thread with a uid 0",
+            ),
+            (
+                vec![("Uid:\t1000\t1000\t1000\n".to_string(), Some(true))],
+                "cut",
+            ),
+            (vec![], "no thread read"),
+        ] {
+            let creds = Credentials::of_forker(&threads);
+            assert!(!matches!(creds, Credentials::CannotLoad(_)), "{why}");
+            let v = r.evaluate(&read_as(user(), gone(creds))).expect("recorded");
+            assert_eq!(v.severity, Severity::High, "{why}: High");
+        }
+        // root's exec gone before the read: Medium, as before
+        let cannot = || Credentials::of_forker(&[thread(1000, 0, Some(false))]);
+        let v = r
+            .evaluate(&read_as(modprobe(&["overlay"]), gone(cannot())))
+            .expect("recorded");
+        assert_eq!(v.severity, Severity::Medium);
+        // the kills stay kills
+        for e in [
+            as_uid(modprobe(&["/tmp/rk.ko"]), 1000),
+            as_uid(modprobe(&["-d", "/tmp/x", "loop"]), 1000),
+        ] {
+            let v = r.evaluate(&read_as(e, gone(cannot()))).expect("killed");
+            assert_ne!(v.action, ResponseAction::Log, "a kill stays a kill");
+            assert_eq!(v.severity, Severity::High, "a kill is High");
         }
     }
 
