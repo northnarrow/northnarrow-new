@@ -11801,7 +11801,8 @@ number in parentheses is a lab PR.
         a memfd exec during a loop, R004 Critical; `/var/tmp` copies R003
         High and ENGAGED.
       - **debian13 (6.12, runc 1.1.15)**: rootless Podman ×10 spaced, ×30
-        back to back (about five a second), a loop of 30 with a memfd exec in
+        back to back (about two a second: 30 in 14 s; lot 379 corrected
+        "about five"), a loop of 30 with a memfd exec in
         it, `podman exec` ×2: 73 copies compared and kept, 0 not compared
         (the first head: 8 Criticals per 30), R004 0 under conmon/runc; the
         memfd exec R004 Critical.
@@ -13902,3 +13903,153 @@ number in parentheses is a lab PR.
     uninstall exit 1, and the cold boot after it found the units never
     enabled.
   Levels unchanged.
+- **Lot 379 — the status tells every signed integrity finding (pre-alpha
+  Phase 7, F7-1; Phase 3-bis, F3b-6's class); the mount guard's verifier
+  refusal proven a signed degradation (F8b-1 / F7-2); the final docs pass
+  (`UPGRADE_NOTES_WAVE4.md` §65; no level change).**
+  - What was open: Phase 7 found `sensors: OK — no degradation`,
+    `degradations: none` and trust L2 unchanged in `nn-admin status` after
+    the agent had signed a cut chain (`chain_truncated`, `chain_rewritten`,
+    `chain_verify_failed`), an unauthorized overlay and a modified default
+    list; `chain verify` said rc 8 and the journal ERROR. And the proof that
+    a verifier's refusal of a mount-guard program is a signed degradation
+    could not run (the lab's BTF swap was stopped by the BTF provenance
+    check first).
+  - Structural: the audit log keeps the findings that hold, from its own
+    rows (`nn_evidence::held`: at each append and at each open — a restart
+    reads them again) and tells its host at each change
+    (`ChainHost::integrity_held`); the agent's host makes them `integrity:`
+    degradations (`boot::degradation::hold`), so the status, the trust
+    level, the capability manifest and the heartbeat say them. One table
+    classifies the kinds: the evidence's (held until a signed
+    acknowledgement covers their row), the degradations shown already (not
+    held twice), and every other kind — a new one included — held while
+    found (its check's `integrity_drift_cleared`, or the next start's
+    check). A row that ends a hold counts only when its signature verifies
+    with the log's key.
+  - Phase 7b's F7-6 (the coordinator's addition): `nn-admin status` had
+    nothing after the agent's crash, its OOM or the watchdog's death,
+    signed all the same. The deaths of the two roles (`witness_row`,
+    `watchdog_gone`, `witness_row_uncertified`, both roles vacated, a
+    successor not confirmed or foreign) are held until acknowledged, like
+    the evidence (`nn_evidence::held::DEATH_KINDS`, tied to the witness's
+    and the round's own kinds by
+    `the_held_deaths_are_the_witness_s_and_the_round_s_kinds`); a worker's
+    death stays a degradation of the run
+    (`a_worker_s_death_is_reported_for_the_status`).
+  - New signed verb: `nn-admin integrity acknowledge --through <row>`
+    (operation 27, `triage` or `config-manage`, 1-of-N); its audit row is
+    the acknowledgement; a row not signed yet is refused.
+  - F8b-1: `NN_TEST_VERIFIER_REFUSE`, read only with nn-linux's
+    `test-privileged` (the release graph's and release.yml's checks keep it
+    out of every release; a weakening variable in a test build), refuses a
+    guard program at its load as the verifier would. The privileged suite
+    `integrity_status_privileged_e2e` (the CI's KVM guests, `test-ignored`)
+    checks the agent runs, the signed `subsystem_degraded` row (verified
+    with the agent's key), `nn-admin capabilities` and `nn-admin status`.
+    The product's behaviour needed no fix.
+  - Docs: the README's and KNOWN_LIMITATIONS' resource figures from Phase 6
+    (lab, QEMU guests), the per-operation exec/open latency said not
+    measured; KL's verifier paragraph rewritten as tested behaviour
+    (`mount_guard_sb_mount` 830,908 instructions on 5.15 at rc10: 83.1 % of
+    the kernel's limit); the rootless burst's figures corrected (about 54
+    starts at 4/s by the budget's model; lot 378's lab ran about 2/s, not
+    5); the long lines of rev581 and rev584 rewrapped. `MemoryMax` not
+    changed (after Phase 6b).
+  - Mutation: 47 mutants of the new code run on the host, 47 caught by a
+    named test; one more (the injection's call removed) is caught by the
+    privileged suite only.
+  - Lab, as measured (our QEMU guests, one at a time under a lease; the
+    tree verified by hash; the operator's install, `alpha`; Phase 7's cases
+    each written in a signed window, the agent restarted the documented
+    way; each guest uninstalled and powered off):
+    - ubuntu2204 (5.15), debian13 (6.12, systemd 257), ubuntu2604 (7.0):
+      a fresh install held `admin_key_on_host` (the install's key left on
+      the host); an unsigned `process-comm-allowlist.local` held
+      `unauthorized_overlay` (and the round's `config_overlay`) across a
+      restart, gone at the start after its removal; `fim-paths.v1` with
+      2,000 random bytes appended held `default_list_modified` (listed by
+      `nn-admin capabilities`), gone at the start after its restore; three
+      lines cut from the middle of `detections.jsonl` held
+      `chain_truncated`, `chain_rewritten` and `chain_verify_failed` across
+      a restart (`chain verify` rc 8); an acknowledgement through 99999999
+      refused (exit 9).
+    - debian13 and ubuntu2604: the acknowledgement through the newest held
+      row (135, 132) exit 0, "4 … acknowledged", its row `success` with the
+      key's fingerprint, `sensors: OK`, `chain verify` still rc 8; the next
+      start signed `chain_verify_failed` again and it was held again. (On
+      ubuntu2204 the probe did not parse the row; not exercised there.)
+    - Documented restarts about 25 s apart also signed
+      `witness_row_uncertified` (a watchdog life whose key the agent had not
+      certified yet), held until the next start.
+    - `integrity_status_privileged_e2e` in a test build: the verifier
+      refusal test passed on ubuntu2204, debian13 and ubuntu2604; the
+      overlay test failed on the first two, run after `uninstall.sh
+      --purge` (the second agent's start refused by the `agent_mounts`
+      gate: the first agent's pins protected a `/etc/northnarrow` it had
+      created anew), and passed on ubuntu2604 run as `test-ignored` runs
+      the suites (the install kept, its units stopped, the pins purged): 2
+      passed.
+    - F7-6, debian12 (6.1, systemd 252): the agent killed (SIGKILL in a
+      signed window) came back in seconds and held `witness_row` ("role
+      vacated: signal 9"); the watchdog killed the same way held
+      `watchdog_gone` (`NRestarts=1`); both still held after a documented
+      restart; the acknowledgement through row 46 ended them, `sensors:
+      OK`.
+  - Fix round 1 (the review of #586):
+    - P2-1: every `integrity_drift` kind the product signs is in one table
+      of `nn_evidence::held` — evidence, death, attack-class event,
+      degradation, advisory, not held — and `xtask/tests/integrity_kinds.rs`
+      reads the production code's kind positions (literals, constants,
+      `ChainFinding::new`, the named producers) and fails on a kind in
+      none. Advisories (`admin_key_on_host`, `sysctl_strict`,
+      `sysctl_opted_out`, `agent_stalled`, `quarantine_index_rebuilt`) are
+      kept as degradations are and listed apart (`boot::degradation::advise`,
+      the status reply's `advisories`, protocol version 5): never in
+      `sensors`, the trust level or the manifest. Twins: a harmful host
+      drop-in not held twice; an overlay refused at the start and found by
+      the round, one line naming both rows.
+    - P2-2: a witness row of a key not certified yet waits, at most 4
+      rounds, while the watchdog it names publishes that key (its sealed
+      memory file); a key no live watchdog vouches for is imported by the
+      row's declared kind (`witness_note_uncertified`, a degradation while
+      found, for a bookkeeping row).
+    - P3: attack-class events held until acknowledged across a reboot; the
+      acknowledgement's row written by its handler (not written: nothing
+      acknowledged); an evidence finding past the cap listed before
+      while-found ones; a held line's kind and chain cut; `--build-features`
+      names every test-only feature of the linked crates.
+    - Docs, Phase 6b (rc11; QEMU under Windows (WHPX), Ubuntu 24.04, kernel
+      6.8, 2 vCPU, three complete runs, A/A at most 7 %; lower bounds, the
+      agent-off reference still ran three of its LSM programs): open + read
+      + close +55…+64 %, about +2.1–2.2 µs; fork + exec + wait +9…+16 %,
+      about +0.08 ms. The older `open` +41 % removed from the README and
+      KNOWN_LIMITATIONS; `git status` +24 % kept with its source (lot 273b,
+      PERF_BASELINE).
+    - Mutation: 33 mutants of this round's rules, all caught by a named
+      test (four survivors of the first run — the advisories past the cap
+      and a counted finding's rows — got their tests; one mutant redone
+      after a compile error).
+    - Lab, as measured (ubuntu2204, 5.15, and debian13, 6.12 with systemd
+      257, at the same time under two leases; the tree verified by hash; the
+      operator's install, `alpha`; each guest uninstalled with `--purge` and
+      powered off), the same on both:
+      - the fresh install: `sensors: OK — no degradation, no event lost`,
+        `advisories : 1` listing `admin_key_on_host` with its row;
+      - ten documented restarts (both units stopped in a signed window, the
+        pins purged, the agent started, the watchdog 3 s later, 75 s
+        between): 10 `witness_key_certified` and 10 `witness_note`, no
+        `witness_row_uncertified` nor `witness_note_uncertified`, no witness
+        line held, `sensors: OK` after each;
+      - `install.sh --source-tree --upgrade`: "UPGRADE complete", no
+        rollback; one key certified, one note, nothing held, `sensors: OK`;
+      - three lines cut from `detections.jsonl` (`chain verify` rc 8):
+        `sensors: DEGRADED — 3 degradation(s)` (`chain_truncated`,
+        `chain_rewritten`, `chain_verify_failed`), the same after a
+        documented restart; an acknowledgement through 99999999 refused
+        (exit 9); through the newest held row (241, 243) exit 0, "3 …
+        acknowledged; 1 still held" (the advisory, signed after it), its row
+        `success` with the key's fingerprint, then `sensors: OK`; the next
+        start signed `chain_verify_failed` again (the chain still broken)
+        and it was held again.
+

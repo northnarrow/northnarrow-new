@@ -203,6 +203,15 @@ pub trait ChainHost: 'static {
     /// agent: a degradation in `nn-admin status`, and the watchdog's
     /// `LoopProgress`). Default: nothing.
     fn append_failed(_path: &Path, _why: Option<&str>) {}
+
+    /// Lot 379 (pre-alpha F7-1, F3b-6): the signed integrity findings the
+    /// audit log at `path` holds now ([`crate::held`]), one line each —
+    /// told at its open and at each change. A finding the agent signed is
+    /// never in the chain alone: the host makes it seen (the agent: its
+    /// degradations in `nn-admin status`, the trust level, the capability
+    /// manifest) until its hold ends — and its advisories apart, never
+    /// degradations (the review of #586, P2-1). Default: nothing.
+    fn integrity_held(_path: &Path, _held: &crate::held::Held) {}
 }
 
 /// The host of a reader that anchors nothing (a verifier, `nn-admin`'s
@@ -307,6 +316,33 @@ pub(crate) mod testing {
         }
         fn retention_stalled(active: &Path, why: Option<&str>) {
             stalls::told(active, why);
+        }
+        fn integrity_held(path: &Path, held: &crate::held::Held) {
+            helds::told(path, &held.lines());
+        }
+    }
+
+    /// Lot 379: what the audit logs told the portable host they hold
+    /// ([`ChainHost::integrity_held`]), by log (the tests run in parallel,
+    /// each its own directory).
+    pub(crate) mod helds {
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        static TOLD: Mutex<Vec<(PathBuf, Vec<String>)>> = Mutex::new(Vec::new());
+
+        pub(crate) fn told(path: &Path, lines: &[String]) {
+            TOLD.lock()
+                .unwrap()
+                .push((path.to_path_buf(), lines.to_vec()));
+        }
+
+        /// What the log at `path` told, in order (taken).
+        pub(crate) fn take(path: &Path) -> Vec<Vec<String>> {
+            let mut all = TOLD.lock().unwrap();
+            let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(p, _)| p == path);
+            *all = rest;
+            mine.into_iter().map(|(_, l)| l).collect()
         }
     }
 

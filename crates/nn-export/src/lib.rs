@@ -36,3 +36,10 @@ pub mod worker;
 
 #[cfg(test)]
 pub(crate) mod testing;
+
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `schema-check` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const SCHEMA_CHECK: bool = cfg!(feature = "schema-check");

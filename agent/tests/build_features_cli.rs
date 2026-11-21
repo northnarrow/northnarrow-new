@@ -29,12 +29,22 @@ fn expected() -> String {
         features.push("test-privileged");
     }
     // lot 349: the linked crates' test features, as this test build compiled
-    // them (the agent's dev-dependencies turn them on; a release never)
-    if nn_core::TEST_UTIL {
-        features.push("nn-core/test-util");
-    }
-    if nn_linux::TEST_UTIL {
-        features.push("nn-linux/test-util");
+    // them (the agent's dev-dependencies turn them on; a release never);
+    // lot 379 (the review of #586, P3-5): every test-only one
+    for (name, on) in [
+        ("nn-admin/debug-trigger", nn_admin::DEBUG_TRIGGER),
+        ("nn-core/debug-trigger", nn_core::DEBUG_TRIGGER),
+        ("nn-core/demo-tappa5", nn_core::DEMO_TAPPA5),
+        ("nn-core/test-util", nn_core::TEST_UTIL),
+        ("nn-export/schema-check", nn_export::SCHEMA_CHECK),
+        ("nn-linux/debug-trigger", nn_linux::DEBUG_TRIGGER),
+        ("nn-linux/test-privileged", nn_linux::TEST_PRIVILEGED),
+        ("nn-linux/test-util", nn_linux::TEST_UTIL),
+        ("nn-proto/debug-trigger", nn_proto::DEBUG_TRIGGER),
+    ] {
+        if on {
+            features.push(name);
+        }
     }
     if features.is_empty() {
         "none".to_string()

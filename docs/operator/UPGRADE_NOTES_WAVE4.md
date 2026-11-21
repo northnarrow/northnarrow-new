@@ -4953,7 +4953,10 @@ still fires.
   `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
   `openntpd.service`), started there and never injected (the kernel's lot
   277 and 281 marks).
-  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named).
+  - Still a beacon: any other program to UDP 123, and systemd-timesyncd
+    to another port or over TCP, from a session, traced or injected.
+    chronyd and ntpd also keep their netflow allowlist entry, which is
+    broader than this exemption (a residual, named).
 - **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
@@ -5566,3 +5569,98 @@ shape it resembles still fires.
   no R004 at a rootless Podman run, a loop of a few dozen included; and at
   a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
   guard lost.
+
+## 65. The status shows every signed integrity finding; a verifier's refusal of the mount guard, tested (lot 379)
+
+- **What changed.** `nn-admin status --key` said `sensors: OK — no
+  degradation` after the agent had detected and signed a cut or rewritten
+  chain (`chain_truncated`, `chain_verify_failed`), an unauthorized overlay
+  or a modified default list: only the journal's ERROR and `nn-admin chain
+  verify` told (pre-alpha Phase 7, F7-1; the same class as Phase 3-bis
+  F3b-6). Every signed integrity finding is now an `integrity:`
+  degradation — its kind, what it is about, the time and audit row of its
+  signed row — until its hold ends:
+  - a finding of the evidence (a chain cut, rewritten, missing or
+    unverifiable; the witness chain broken; `agent_id_changed`; the
+    overlays' rollback floor reset): until an acknowledgement covers it;
+  - a death of the agent's or the watchdog's role (a crash, a kill, an
+    OOM: the witness's `witness_row`, `watchdog_gone`,
+    `witness_row_uncertified`; pre-alpha Phase 7b, F7-6): until an
+    acknowledgement covers it — the restart it caused is no clean state;
+  - an attack-class event of the run (a shutdown marker the watchdog
+    refused, the admin socket removed or reached by a refused peer): until
+    an acknowledgement covers it — a start, a host reboot included, does
+    not undo it;
+  - a degradation (an unauthorized overlay, a modified or unavailable
+    default list, the integrity round's drifts): while it is found — until
+    its check signs its end or the next start checks again —, or until
+    acknowledged.
+  Every kind the agent signs is in exactly one class
+  (`nn_evidence::held`; a test fails on a new kind with none). A state of
+  the host or a choice of the operator that degrades no sensor — the admin
+  key left on the host (`admin_key_on_host`), strict overcommit
+  (`sysctl_strict`), the operator's signed sysctl opt-out
+  (`sysctl_opted_out`), a pause of the whole machine (`agent_stalled`), the
+  quarantine's index rebuilt — is an **advisory**: `status` lists it on its
+  own (`advisories`, with its signed row), never in `sensors`, the trust
+  level or the capability manifest. One fact is one line: an overlay the
+  start refused and the round found again is one line naming both rows; a
+  harmful host drop-in is the `host_dropins` degradation's.
+  The audit log keeps the holds from its own rows, so a restart keeps them;
+  a row that ends one counts only when its signature verifies.
+  ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds).)
+- **New command.** `nn-admin integrity acknowledge --through <row> [--note
+  <text>] --key <key>`, a key with `triage` or `config-manage` (the key
+  `install.sh` writes has `config-manage`). The agent signs the
+  acknowledgement (`integrity_acknowledged`); the findings whose newest row
+  is at or before `<row>` leave the status. A row not signed yet is refused
+  (exit 9). `nn-admin status --key` prints the command with the newest held
+  row. An agent older than this lot does not know the command (exit 5).
+- **The mount guard's verifier refusal, tested.** A mount-guard program the
+  kernel's verifier refuses at its load was argued, from the code, to be a
+  signed degradation. It is now tested on a real agent: a test build
+  (feature `test-privileged`, never a release) refuses
+  `mount_guard_sb_mount` at its load; the agent runs with the guard's other
+  four hooks, and the signed row (`subsystem_degraded`, source
+  `anti_tamper`), `nn-admin capabilities` and `nn-admin status` say it.
+  No behaviour changed: the test proves what the release does.
+- **The witness after a restart of both units.** The new watchdog's first
+  witness row (`witness_opened`) can be read by the agent before it has
+  verified that watchdog (`install.sh`'s upgrade and the documented restart
+  stop both units, start the agent, then the watchdog): it was signed
+  `witness_row_uncertified`, held as a death, in 7 of 12 such restarts in
+  the lab. A row signed by a key not certified yet now waits — at most four
+  rounds of 30 s — while the watchdog it names still runs and publishes
+  that very key; the agent certifies the key at its next round and the row
+  is a note. A key no live watchdog vouches for is imported by the row's
+  declared kind: a vacancy or a successor as `witness_row_uncertified`
+  (held until acknowledged), a bookkeeping row as
+  `witness_note_uncertified` (a degradation while found).
+- **`integrity acknowledge`.** The acknowledgement is its signed row, now
+  written by the handler under the lock it judged under: a row that could
+  not be written acknowledges nothing (exit 9, the reason printed), and the
+  counts are the log's.
+- **`--build-features`.** It names every test-only feature of the crates
+  the agent links (for instance `nn-linux/test-privileged`), not only
+  their `test-util`: a release built with one is refused by the release's
+  check, as before for the agent's own features.
+- **Protocol.** The status reply gains `advisories` (protocol version 5):
+  upgrade the agent with `nn-admin` and the watchdog, as for every
+  appended status field.
+- **Upgrade.** No configuration. Expect `sensors: DEGRADED` and the trust
+  level at most L2 on a host where the agent had signed such findings,
+  until each ends by its rule: read them (`nn-admin status --key`),
+  investigate, then acknowledge the evidence's. The install's admin key
+  left at `/root/northnarrow-admin.key` is an advisory (`advisories` in
+  `status`, shown while it is there): move it off the host. An agent installed with
+  test lists or overlays of its own (the lab's escape hatch,
+  `NN_OVERLAY_ALLOW_UNSIGNED=1`) holds each of them as
+  `unauthorized_overlay` or `default_list_modified` for the run.
+- **Docs.** README and KNOWN_LIMITATIONS: the lab's resource figures (QEMU
+  guests: RSS, CPU at rest, event-to-record latency, the cost on real
+  work), and the per-operation cost of this release (Phase 6b, rc11, QEMU
+  under Windows, Ubuntu 24.04, kernel 6.8, 2 vCPU, lower bounds: an
+  `open` about +2.1–2.2 µs, a `fork` + `exec` about +0.08 ms; the older
+  `open` +41 % figure removed); the rootless runtime burst's figures corrected
+  (about fifty-four starts at four a second by the budget's model; the lab
+  ran about two a second).
