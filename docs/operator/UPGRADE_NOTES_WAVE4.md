@@ -5587,10 +5587,10 @@ fires.
   - The lot's search for variants found `newgrp` (`newgrp docker` after a
     group change): shadow's setuid tool reads `/etc/gshadow` and
     `/etc/login.defs` as its caller, and still raises ALERTED. It is not
-    exempted: it then executes the user's shell in its own process, and
-    the file-open sensor does not report a read of the same file by the
-    same task again within a second (see the residuals) — `sg <group> -c
-    'exec cat /etc/login.defs'` would read as `newgrp`'s.
+    exempted: it then executes a command in its own process, and a file
+    re-read by the same process shortly after an exec may not produce a
+    second record (see the residuals) — what that command read would be
+    taken for `newgrp`'s own read.
   - Still ALERTED: `cat /etc/login.defs`; a /tmp copy of a uidmap tool,
     whatever image it names; a copy not read yet; `fusermount3` reading
     it; a uidmap tool opening it for write or reading `/etc/shadow`.
@@ -5604,11 +5604,31 @@ fires.
     at the open, as the host's file of its name in `/usr/bin`,
     `/usr/sbin`, `/bin` or `/sbin`) — is no sensitive access, unless the
     program reads the files it is told to: a generic file tool, a shell or
-    an interpreter. That is the list POS-007 judges a service account's
-    reader of `/etc/shadow` by, and it grew the text tools a user lists
-    accounts with (`cut`, `sort`, `uniq`, `diff`, …), the editors, the
-    copiers (`rsync`, `scp`, `install`), the compressors and the multi-call
-    binaries (`coreutils`, `toybox`).
+    an interpreter — the text tools a user lists accounts with (`cut`,
+    `sort`, `uniq`, `diff`, `shuf`, `iconv`, `jq`, …), the pagers and
+    editors, the copiers (`rsync`, `scp`, `install`), the compressors and
+    encoders, the network clients, and every shell and interpreter the
+    rules know (`pypy3`, `luajit`, `deno`, `pwsh` included).
+  - **What runs decides, not its name** (the review of this lot). The class
+    is that of the FILE the kernel executed, by its identity (its device
+    and inode): a file that is one of those tools' installed files — in
+    `/usr/bin`, `/bin` or uutils' `/usr/lib/cargo/bin/coreutils`, each link
+    followed — is that tool, whatever name it ran by. So:
+    - a multi-call binary is a generic tool whatever `argv[0]` or the link
+      it ran through says: uutils (Ubuntu 26.04's coreutils, one file under
+      every utility's name), busybox, toybox, a single-binary GNU
+      coreutils. On Ubuntu 26.04 `id`, `whoami`, `groups`, `ls` and `stat`
+      are uutils' file too: their read of `/etc/passwd` without a login uid
+      is ALERTED there, as before this lot (the rule holds for them on
+      Debian 13 and Ubuntu 24.04, whose coreutils are one file per tool);
+    - an alias is the tool it resolves to (`nawk` → `mawk`, `pager` →
+      `less`, `editor` → `nano`), also when the image at the open decides;
+    - the dynamic loader (`ld-linux-x86-64.so.2`, by its name or by the
+      identity of its installed file) is judged by its operand, as the
+      rules read a loader's exec: the host's packaged program at an
+      absolute path in a root-only directory, judged in turn; any other
+      operand (a relative path, a file elsewhere, the loader again, none)
+      is a tool.
   - **The records may lag the open.** The exec pump reads an exec's facts
     before the exec reaches the lineage, so at the open of a short-lived
     program the lineage may still hold its fork's record (the shell that
@@ -5626,12 +5646,33 @@ fires.
     uidmap and FUSE helpers, `(sd-pam)`) stay, for the readers this rule
     does not vouch for.
   - Still ALERTED without a login uid: `cat`, `cut`, `vim`, `python3`,
-    `bash` reading it, and a fork of a shell; a copy of `id` in /tmp or a
+    `bash` reading it, and a fork of a shell; uutils' file under any name,
+    the loader running `cat`, `nawk`, `pager`; a copy of `id` in /tmp or a
     home, a program of a home; a copy not read yet, no image read; a /tmp
     exec naming `id`'s image; a packaged program opening it for write.
     `/etc/shadow`, `/etc/gshadow` and `/etc/sudoers` stay sensitive for
-    every reader but the authentication stack, `/etc/login.defs` for every
-    reader but those named above.
+    every reader but the authentication stack (at a service uid, also
+    their packaged consumers: below), `/etc/login.defs` for every reader
+    but those named above.
+- **A service account's read of `/etc/shadow`, `/etc/gshadow` or
+  `/etc/sudoers`** (external audit POS-007; the review of this lot). It was
+  quiet for any program in a system tree but a list of tools judged by
+  their names — the loader running `cat`, or uutils' `id` link run as
+  `cat`, read as packaged programs. Now only the authentication stack and
+  the files' packaged consumers are quiet — Exim (`/usr/sbin/exim4`,
+  `/usr/sbin/exim`), whose account the `shadow` group may hold for SMTP
+  authentication — by the file the kernel executed (the cached exec, a
+  fork's forker by the kernel's record, else the image at the open). Every
+  other reader at a service uid raises ALERTED: a tool under any name, a
+  packaged program that is no consumer (`getent shadow`), a copy of a
+  consumer, a consumer's exec with no identity, a consumer replaced by an
+  upgrade and not restarted yet (its file is no longer the host's: restart
+  it), a consumer's fork that executed a tool.
+  - **Upgrade.** A daemon whose service account reads the shadow file and
+    is not one of those (another mail server's authentication, a custom
+    service in the `shadow` group) now raises ALERTED at each read; such a
+    daemon is rare (a service account cannot read the file unless the
+    `shadow` group is given to it).
 - **`R011_KernelModuleTooling` High for `modprobe overlay` as uid 1000
   under `podman info`** (once on Ubuntu 24.04; Low the other times). The
   process had exited before the exec pump read its environment and its
@@ -5658,6 +5699,12 @@ fires.
     since its fork; a tool that is not the system's, or one with a set-uid
     bit. Root's exec gone before the read stays Medium; every kill stays a
     kill.
+  - **Bounded** (the review of this lot): the exec pump reads one exec
+    after another, so the forker route costs it at most a forker of 32
+    threads, read at most twice a second for one forker (its pid and
+    start) and eight times a second for all. Past a bound the forker is not
+    read: its credentials are not compared, and R011 judges the exec as
+    when they are not known — High for a user's, never Low.
 - **containerd's mass-write ENGAGED** (Ubuntu 26.04, a container burst).
   containerd, from its unit, writes and removes each task's bundle under
   `/run/containerd` (the bundle's `config.json`, the shim's address and
@@ -5682,16 +5729,17 @@ fires.
     burst in another daemon's directory; a window that left the directory.
     The ransomware tracker reads every crossing, these included.
 - **Residuals.**
-  - **A read just after an exec in the same process** (the lab of this
-    lot; the file-open sensor's read-repeat filter, review 75). The sensor
-    reports a task's read-only open of a file once within a second; the
-    task stays the same across an exec. A unit's executor looks the unit's
-    user up in `/etc/passwd`, then executes the unit's program in the same
-    process: a `cat /etc/passwd` that is that program, within the second,
-    is not reported (measured: `systemd-run --uid=<user> --pipe bash -c
-    'cat /etc/passwd'` raised nothing; with `sleep 2; exec cat` before it,
-    ALERTED). Keying the filter on the task's exec as well is an eBPF
-    change left to a later lot.
+  - **A file re-read shortly after an exec** (the lab of this lot; the
+    file-open sensor's read-repeat filter, review 75). A file re-read by
+    the same process within a short interval (about a second) after an
+    exec may not produce a second record: the read the process made before
+    the exec stands for both. It holds for every file the sensor reports
+    on a read-only open — `/etc/passwd`, `/etc/login.defs`, `/etc/shadow`,
+    `/etc/gshadow`, the credential files, and the files FIM watches for
+    opens — and for every exec that keeps its process (a unit's program
+    after its executor, a command a set-id tool executes in its own
+    place), as root or as a user. A write is always reported. It is an
+    eBPF change, planned for the first eBPF lot after the alpha.
   - **A forker that gave up its privilege.** A forker that held a uid 0 or
     a capability in PID 1's namespace at the fork and gave it up before
     the pump read it (`setresuid`, `capset`, a new user namespace, its
@@ -5701,14 +5749,16 @@ fires.
   - **A module tool that is not its process's first exec.** A shell that
     `exec`s `modprobe` in its own place is not read from its forker: when
     it exited first, R011 judges it as before (High for a user).
-  - **dockerd's container setup in a burst.** With Docker's own image
-    store (`overlay2`, Docker 26 on Debian 13), dockerd writes and removes
-    each container's init files (`/etc/hosts`, `/etc/hostname`,
-    `/.dockerenv`, …) through the layer's overlay mount, which the kernel's
-    classification does not place under `/var/lib/docker`: twenty or more
-    containers started and removed within a minute still cross the
-    mass-write arm (ENGAGED, its record naming `dockerd` and a
-    `mnt[…]/etc/hosts` path). The soak's load did not reach it.
+  - **dockerd's container setup in a burst (a known false positive).**
+    With Docker's own image store (`overlay2`), twenty or more containers
+    started and removed within a minute raise ENGAGED: the mass-write
+    arm's record names `dockerd` and a `mnt[…]/etc/hosts`-like path. dockerd
+    writes and removes each container's init files (`/etc/hosts`,
+    `/etc/hostname`, `/.dockerenv`, …) through the layer's overlay mount,
+    which the kernel's classification does not place under
+    `/var/lib/docker`. In the observe-only profile it is a posture change
+    only. The soak's load did not reach it; a CI host running Docker
+    builds may (an eBPF change, a later lot).
   - **A fork that changes its image.** A fork whose image at the open is
     another packaged program's (`PR_SET_MM` with capabilities in a user
     namespace of its own) reads `/etc/passwd` as that program: nothing
@@ -5717,10 +5767,13 @@ fires.
     it is told to and is not on the list (`sqlite3 /etc/passwd`, `getent
     passwd`, which lists the file through the name service as every lookup
     does) reads `/etc/passwd` without a sensitive access: world-readable
-    data.
+    data. The list is best effort; at a service uid the shadow file is
+    judged the other way round (an allowlist of consumers, above).
 - **Upgrade.** `install.sh` replaces the `daemon-data.v1` the earlier
   release shipped (its hash is now known to the installer and the agent);
   an edited copy is kept as before. No configuration. Expect no ALERTED
-  from a rootless Podman burst or from a name lookup without a login uid,
-  R011 Low for a user's `modprobe` under Podman, and no ENGAGED from
-  containerd's task bundles.
+  from a rootless Podman burst or from a name lookup without a login uid
+  (on Ubuntu 26.04 a uutils utility's still raises it), R011 Low for a
+  user's `modprobe` under Podman, and no ENGAGED from containerd's task
+  bundles. A service account other than Exim's reading the shadow file
+  now raises ALERTED.

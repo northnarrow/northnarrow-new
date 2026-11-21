@@ -11722,8 +11722,10 @@ number in parentheses is a lab PR.
       directory, by the file the kernel executed; an exec not read yet by
       its image at the open as the host's file of its name in a system
       program directory: `host_program`) is no sensitive access unless the
-      program is a file tool, a shell or an interpreter (POS-007's
-      `reads_like_a_tool`, its list grown). The lab's round 2 found the
+      program is a file tool, a shell or an interpreter — after the review
+      of #587 by the executed file's identity (`reads_files_it_is_told`:
+      a multi-call binary under any name, an alias, the loader by its
+      operand). The lab's round 2 found the
       lineage lagging the open (`cat` in a unit judged as the unit's
       executor, quiet): the image at the open must be the records' file,
       else it decides for a fork or a cached root exec opening as a user.
@@ -11762,13 +11764,14 @@ number in parentheses is a lab PR.
       A Docker burst: containerd's crossing left out after the shared
       tags (it crossed before them on debian13); dockerd's still ENGAGED
       (`overlay2` init files through an overlay mount: not done).
-    - **The read-repeat filter (a finding).** `bash -c 'cat /etc/passwd'`
-      in a unit run as the user raised nothing on both guests, before and
-      after the lagging-records fix; with `sleep 2; exec cat` ALERTED
-      (debian13): the file-open sensor drops a task's read of a file
-      within a second of its last, across an exec, and the unit's executor
-      had looked the user up in the same process. Keying it on the exec
-      is left to a later lot.
+    - **The read-repeat filter (a finding).** One attack shape run in a
+      unit as the user raised nothing on both guests, before and after the
+      lagging-records fix; run so that the unit's own lookup was more than
+      a second earlier, it ALERTED (debian13). Behaviour: a file re-read by
+      the same process within a short interval after an exec may not
+      produce a second record (the file-open sensor's read-repeat filter
+      spans an exec). Keying it on the exec is planned for the first eBPF
+      lot after the alpha.
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
   C18; no level change).**

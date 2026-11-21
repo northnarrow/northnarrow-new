@@ -3170,7 +3170,6 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             .collect();
         let tools = READER_TOOL_DIRS
             .iter()
-            .filter(|d| H::is_dir(&self.inner.host_root.join(d.trim_start_matches('/'))))
             .flat_map(|d| names.iter().map(move |n| format!("{d}/{n}")))
             .filter_map(|p| self.host_file_id(&p))
             .collect();

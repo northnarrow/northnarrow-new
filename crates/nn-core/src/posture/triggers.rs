@@ -4080,6 +4080,38 @@ mod tests {
         assert!(!b.opens(954, 1000, "ps", "/etc/passwd", 76), "ps's lookup");
     }
 
+    /// Lot 380 (the review of #587, F1): uutils installed beside GNU
+    /// coreutils (its multi-call file only under
+    /// `/usr/lib/cargo/bin/coreutils`, `/usr/bin` GNU's), and busybox's
+    /// file under `/bin` hard-linked as a tool of its own name: each is a
+    /// generic tool by its identity, whatever name it ran by.
+    #[test]
+    fn a_multi_call_file_off_the_path_is_a_tool_by_its_identity() {
+        let b = IdBench::new(
+            &[
+                (&format!("{UU}/id"), Some(71)),
+                (&format!("{UU}/cat"), Some(71)),
+                ("/usr/bin/id", Some(51)),
+                ("/usr/bin/cat", Some(52)),
+                ("/bin/busybox", Some(77)),
+                ("/usr/sbin/hostinfo", Some(77)),
+            ],
+            &[UU, "/usr/bin", "/bin", "/usr/sbin"],
+        );
+        b.exec(980, 1000, &format!("{UU}/id"), 71, &["id", "-un"]);
+        assert!(
+            b.opens(980, 1000, "id", "/etc/passwd", 71),
+            "uutils off the path"
+        );
+        b.exec(981, 1000, "/usr/sbin/hostinfo", 77, &["cat", "/etc/passwd"]);
+        assert!(
+            b.opens(981, 1000, "hostinfo", "/etc/passwd", 77),
+            "busybox's file under another name"
+        );
+        b.exec(982, 1000, "/usr/bin/id", 51, &["id", "-un"]);
+        assert!(!b.opens(982, 1000, "id", "/etc/passwd", 51), "GNU's id");
+    }
+
     /// Lot 380 (named, the review of #587, F1 and F4: V2, V3, with GNU
     /// coreutils — one file per tool).
     #[test]

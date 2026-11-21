@@ -2578,6 +2578,14 @@ mod tests {
             matches!(read(&exe, forker), Credentials::CannotLoad(_)),
             "as many threads as are read"
         );
+        // the review of #587 (F2): a forker of 33 threads is not read
+        let thirty_three: Vec<_> = (0..33).map(|i| (forker + i, 1000, 0, init)).collect();
+        write_forker(150, &thirty_three);
+        assert_eq!(
+            read(&exe, forker),
+            Credentials::NotRead,
+            "a forker of 33 threads"
+        );
         // the review of #587 (F2): past the forker route's budget, not read
         let budget = Mutex::new(ForkerBudget::default());
         let now = Instant::now();
@@ -2615,13 +2623,12 @@ mod tests {
     /// The next second reads again.
     #[test]
     fn the_forker_route_is_bounded_per_forker_and_per_second() {
-        const { assert!(FORKER_THREADS <= 32 && FORKER_READS_PER_SECOND <= 8) };
         let mut b = ForkerBudget::default();
         let t0 = Instant::now();
         let one = (4242, 150);
-        for _ in 0..FORKER_READS_PER_FORKER {
-            assert!(b.admit(one, t0));
-        }
+        // two reads of one forker in a second
+        assert!(b.admit(one, t0));
+        assert!(b.admit(one, t0));
         assert!(!b.admit(one, t0), "one forker past its reads in the second");
         assert!(
             !b.admit(one, t0 + Duration::from_millis(999)),
@@ -2631,7 +2638,8 @@ mod tests {
             b.admit((4242, 151), t0),
             "another start at its pid: another forker"
         );
-        for i in 0..FORKER_READS_PER_SECOND - FORKER_READS_PER_FORKER - 1 {
+        // eight of all forkers in a second
+        for i in 0..5 {
             assert!(b.admit((5000 + i, 1), t0), "{i}");
         }
         assert!(
