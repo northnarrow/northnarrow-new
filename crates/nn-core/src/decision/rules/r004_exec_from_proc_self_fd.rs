@@ -103,8 +103,11 @@
 //! container's program starts. When none is left, every fact but the bytes
 //! holds and the parent runs an installed runtime: "not compared (gone)",
 //! judged as past the budget — root's recorded High, never killed; any
-//! other uid's the Critical kill. A parent gone too, or a manager parent
-//! (which runtime it copied is not known): nothing kept, Critical. A clone whose every fact
+//! other uid's the Critical kill. A parent gone too, a manager parent (which
+//! runtime it copied is not known), or a process that runs another file by
+//! the read (a runtime's copy never executes again): nothing kept, Critical.
+//!
+//! A clone whose every fact
 //! holds but whose bytes were not compared — its uid's share of the
 //! compare budget spent this second (the review of #556, F2: each uid but
 //! root has its own share, root a reserve no user can spend) — is recorded
@@ -2649,6 +2652,17 @@ mod lot310 {
         assert!(
             !v.reasoning.contains("budget") && !v.reasoning.contains("copy of"),
             "the record names no budget and vouches for no copy"
+        );
+        // the mini-hunt: runc 1.2's shape (`runc init` executing the copy
+        // `runc create` made, its first exec since the fork): the same
+        let e = memfd_exec(38_106, 38_101, 38_101, 400);
+        assert!(lineage.ingest_spawn_event(&e));
+        keep_runtime_clone(&e, gone.clone());
+        let v = r.evaluate(&e).expect("recorded");
+        assert_eq!(
+            (v.action.clone(), v.severity),
+            (ResponseAction::Log, Severity::High),
+            "runc 1.2's shape"
         );
         // a user's (rootless, or a payload exiting at once): the kill
         let v = judged(38_112, 38_111, 1000).expect("judged");

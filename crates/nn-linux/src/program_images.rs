@@ -1902,6 +1902,18 @@ mod tests {
                 ..Default::default()
             }
         );
+        // at most HOLDERS_MAX children read of one thread (the read's cost
+        // bounded): a holder listed past them is not looked at
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        proc.link(38_030, &runc);
+        let many: Vec<String> = (0..HOLDERS_MAX as u32)
+            .map(|i| (39_000 + i).to_string())
+            .collect();
+        proc.children(38_030, 38_030, &format!("{} 38034", many.join(" ")));
+        proc.link(38_034, &FakeProc::fd(&clone));
+        let e = memfd_exec(38_031, 38_030, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks);
+        assert_eq!(checks.counts().gone, 1, "the holder past the bound");
         // the exec's own process still running it: read there, not through
         let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
         proc.link(38_021, &FakeProc::fd(&clone));
@@ -1999,12 +2011,13 @@ mod tests {
             e
         };
         let mut n = 0u64;
-        let mut run = |pid: u32, ppid: u32, running: Option<&std::fs::File>, uid: u32| {
-            if let Some(f) = running {
-                proc.link(pid, &FakeProc::fd(f));
+        // `ran`: the file the exec ran (its identity in the event);
+        // `running`: what its `/proc/<pid>/exe` names now (none: gone)
+        let mut run = |pid: u32, ppid: u32, ran: &std::fs::File, running: Option<&Path>, uid: u32| {
+            if let Some(to) = running {
+                proc.link(pid, to);
             }
-            let f = running.unwrap_or(&clone);
-            let e = as_uid(memfd_exec(pid, ppid, 381, f), uid);
+            let e = as_uid(memfd_exec(pid, ppid, 381, ran), uid);
             let before = checks.counts();
             read_runtime_clone_with(&e, &proc.0, &root, &checks);
             let after = checks.counts();
@@ -2015,20 +2028,33 @@ mod tests {
             assert_eq!(moved, 1, "pid {pid}: {before:?} → {after:?}");
             n += 1;
         };
-        run(38_201, 38_200, Some(&clone), 0); // compared, kept
-        run(38_202, 38_200, Some(&patched), 0); // compared, not kept
-        run(38_203, 38_200, Some(&clone), 1000); // its share spent
-        run(38_204, 38_200, None, 0); // gone
-        run(38_205, 38_299, Some(&clone), 0); // its parent gone
-        run(38_206, 38_290, Some(&clone), 0); // under bash
-        run(38_207, 38_200, Some(&short), 0); // no runtime's length
-        run(38_208, 38_200, Some(&unsealed), 0); // not sealed now
+        let fd = FakeProc::fd;
+        run(38_201, 38_200, &clone, Some(&fd(&clone)), 0); // compared, kept
+        run(38_202, 38_200, &patched, Some(&fd(&patched)), 0); // compared, not kept
+        run(38_203, 38_200, &clone, Some(&fd(&clone)), 1000); // its share spent
+        run(38_204, 38_200, &clone, None, 0); // gone
+        run(38_205, 38_299, &clone, Some(&fd(&clone)), 0); // its parent gone
+        run(38_206, 38_290, &clone, Some(&fd(&clone)), 0); // under bash
+        run(38_207, 38_200, &short, Some(&fd(&short)), 0); // no runtime's length
+        run(38_208, 38_200, &unsealed, Some(&fd(&unsealed)), 0); // not sealed now
+        // the mini-hunt: its pid running another file now (executed again,
+        // or reused), and a zombie (its `/proc` entry, no `exe`)
+        run(38_210, 38_200, &clone, Some(&bash), 0);
+        std::fs::create_dir_all(proc.0.join("38211")).unwrap();
+        run(38_211, 38_200, &clone, None, 0);
         let c = checks.counts();
         assert_eq!(c.compared + c.unverified + c.gone + c.no_runtime, n);
         assert_eq!(
             (c.compared, c.kept, c.unverified, c.gone, c.no_runtime),
-            (2, 1, 1, 2, 3)
+            (2, 1, 1, 4, 3)
         );
+        // the pid running another file keeps nothing (R004's Critical);
+        // the zombie's copy, every fact but the bytes held, is kept
+        // unverified: "not compared (gone)"
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let at = |pid: u32| runtime_clone_of(&memfd_exec(pid, 38_200, 381, &clone));
+        assert_eq!(at(38_210), None);
+        assert_eq!(at(38_211).map(|c| (c.unverified, c.gone)), Some((true, true)));
         // not described by the LSM program (tracepoint mode): not read
         let mut tp = memfd_exec(38_209, 38_200, 381, &clone);
         if let Event::ProcessSpawn { exe, .. } = &mut tp {

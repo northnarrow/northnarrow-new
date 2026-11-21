@@ -82,7 +82,8 @@ running that very memfd: `runc init`'s two stages, children of
 when none is left is it "not compared (gone)" and judged like a copy past
 the budget below: root's recorded High, never killed; any other uid's the
 Critical kill. Under a parent that is gone too, or a manager (which runtime
-it copied is not known), nothing is kept: Critical.
+it copied is not known), or when the process runs another file by then (a
+runtime's copy never executes again), nothing is kept: Critical.
 
 The compares have a budget of their own, per user, with a share kept for
 root's starts (Docker's, rootful Podman's) that other users cannot take;
@@ -102,9 +103,8 @@ Residual, named: a root memfd past the comparison budget is recorded High, not k
 since the agent's start (lot 369), once one was seen: `runtime clones : N
 sealed memfds kept as an installed runtime's clone (R004 has no verdict on
 them), of M compared (T through a process still running the copy); U not
-compared (the budget), G not compared (gone before the read: root's High,
-any other uid's Critical), R not read in time (judged fileless), F under no
-installed runtime (judged fileless)` — JSON `runtime_clones` (`compared`,
+compared (the budget), G not compared (gone before the read), R not read
+in time (judged fileless), F under no installed runtime (judged fileless)` — JSON `runtime_clones` (`compared`,
 `kept`, `unverified`, `not_read`, and since lot 381 `through`, `gone`,
 `no_runtime`). Every sealed memfd exec the agent saw is in exactly one of
 M, U, G, R and F (lot 381: rc11 judged one rootful runc clone in 300

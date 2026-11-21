@@ -5591,9 +5591,10 @@ shape it resembles still fires.
     runtime, every fact but the bytes holds: "not compared (gone)", judged
     as a copy past the compare budget — root's (uid 0 of the initial user
     namespace) recorded High, never killed; any other uid's the Critical
-    kill (a user chooses how long its process runs). A parent gone too, or
-    a manager parent (which runtime it copied is not known): nothing kept,
-    the Critical kill as before. A foreign memfd stays Critical, rootful
+    kill (a user chooses how long its process runs). A parent gone too, a
+    manager parent (which runtime it copied is not known), or a process
+    that runs another file by the read (a runtime's copy never executes
+    again): nothing kept, the Critical kill as before. A foreign memfd stays Critical, rootful
     or rootless.
   - Every sealed memfd exec the exec sensor describes is now counted in
     exactly one count. `nn-admin status`'s `runtime clones` line says, after

@@ -1035,8 +1035,9 @@ pub struct StatusResponse {
 /// containers start while `kept` stays 0 has lost the exemption. Lot 381
 /// (appended): of `compared`, those read through another process running
 /// the copy (`through`: the exec's own gone); not compared because the copy
-/// was gone before the read (`gone`: root's recorded High, any other uid's
-/// Critical); no runtime's clone at all (`no_runtime`: R004 judges them
+/// was gone before the read (`gone`: kept unverified when its process exited
+/// under an installed runtime — R004: root's High, any other uid's Critical;
+/// else nothing kept, Critical); no runtime's clone at all (`no_runtime`: R004 judges them
 /// fileless) — every sealed memfd exec in exactly one of `compared`,
 /// `unverified`, `gone`, `no_runtime`, `not_read`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

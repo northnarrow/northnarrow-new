@@ -3873,9 +3873,8 @@ fn runtime_clones_line(out: &StatusOutcome, tty: bool) -> Option<String> {
     Some(format!(
         "runtime clones    : {} sealed memfds kept as an installed runtime's clone (R004 has no \
          verdict on them), of {} compared ({} through a process still running the copy); {} not \
-         compared (the budget), {} not compared (gone before the read: root's High, any other \
-         uid's Critical), {} not read in time (judged fileless), {} under no installed runtime \
-         (judged fileless)",
+         compared (the budget), {} not compared (gone before the read), {} not read in time \
+         (judged fileless), {} under no installed runtime (judged fileless)",
         c.kept,
         c.compared,
         c.through,
