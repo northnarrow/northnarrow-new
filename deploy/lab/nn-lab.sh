@@ -1014,12 +1014,21 @@ if sudo test -d /sys/fs/bpf/northnarrow || sudo test -d /sys/fs/bpf/northnarrow-
     sudo grep -q "evil-implant" /etc/northnarrow/process-comm-allowlist.local 2>/dev/null \
         && sudo rm -f /etc/northnarrow/process-comm-allowlist.local /etc/northnarrow/process-comm-allowlist.local.sig
 fi
-for i in $(seq 1 20); do
-    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")
-    [ "$n" = "0" ] && break
-    sleep 1
-done
-echo "lsm programs still loaded: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+# Lot 383: NorthNarrow's LSM programs, by name (deploy/lab/lib/our-lsm.sh):
+# systemd 257+ keeps one of its own (RestrictFileSystems=) that never goes,
+# so the count of every LSM program waited 20 s here on Debian 13 and
+# Ubuntu 26.04 and said "1 still loaded".
+if [ -r ~/northnarrow/deploy/lab/lib/our-lsm.sh ]; then
+    . ~/northnarrow/deploy/lab/lib/our-lsm.sh
+    for i in $(seq 1 20); do
+        n=$(our_progs_count)
+        [ "$n" = "0" ] && break
+        sleep 1
+    done
+    echo "lsm programs of ours still loaded: $(our_progs_count)"
+else
+    echo "lsm programs of ours: unknown (deploy/lab/lib/our-lsm.sh not synced: nn-lab.sh sync)"
+fi
 REMOTE
 )
     echo "$out" | grep -vE "^PINS_PROTECTED$"
@@ -1036,7 +1045,7 @@ REMOTE
         vssh bash -s <<'REMOTE'
 sudo rm -rf /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl 2>/dev/null
 sudo systemctl enable northnarrow-agent northnarrow-watchdog 2>/dev/null; true
-echo "lsm programs after restart: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
+echo "lsm programs after restart: $(. ~/northnarrow/deploy/lab/lib/our-lsm.sh 2>/dev/null && our_progs_count || echo unknown) of ours"
 REMOTE
     fi
 }
@@ -1376,7 +1385,8 @@ cmd_perf() {
     vssh 'rm -rf ~/nn-perf && mkdir -p ~/nn-perf'
     vrsync -a "$REPO/deploy/lab/perf/perf-run.sh" "$REPO/deploy/lab/perf/perf_lib.py" \
         "$REPO/deploy/lab/perf/nn-perf-probe.c" "$REPO/deploy/lab/overhead/nn-bench.c" \
-        "$REPO/deploy/lab/soak/generate.sh" "$REPO/deploy/lab/lib/lab-records.py" "$GUEST:nn-perf/"
+        "$REPO/deploy/lab/soak/generate.sh" "$REPO/deploy/lab/lib/lab-records.py" \
+        "$REPO/deploy/lab/lib/our-lsm.sh" "$REPO/deploy/lab/lib/our-lsm-programs.txt" "$GUEST:nn-perf/"
     vssh 'sudo rm -rf /usr/local/libexec/nn-lab/perf && sudo install -d -m 0755 /usr/local/libexec/nn-lab/perf && sudo install -m 0644 ~/nn-perf/* /usr/local/libexec/nn-lab/perf/ && sudo chmod 0755 /usr/local/libexec/nn-lab/perf/perf-run.sh && rm -rf ~/nn-perf'
     local stamp gdir rc=0 args=""
     stamp=$(date -u +%Y%m%d-%H%M%S)
@@ -2425,11 +2435,13 @@ if [[ -n "$own_ids" ]]; then
     for id in $own_ids; do
         if sudo bpftool prog show id "$id" >/dev/null 2>&1; then echo "FAIL: own program id $id still loaded"; fail=1; fi
     done
-    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-    (( n == foreign_before )) || { echo "FAIL: LSM programs $n after, $foreign_before foreign before"; fail=1; }
+    # lot 383: the others' (PID 1's among them) are all still there, no more
+    n=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^(${own_ids// /|}x):" || true)
+    (( n == foreign_before )) || { echo "FAIL: foreign LSM programs $n after, $foreign_before before"; fail=1; }
 else
-    n=$(sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true)
-    [[ "$n" == 0 ]] || { echo "FAIL: $n LSM programs still loaded (no bpf-own-ids: an agent older than the list)"; fail=1; }
+    # lot 383: by name, not every LSM program (PID 1's stays on systemd 257+)
+    n=$(. ~/northnarrow/deploy/lab/lib/our-lsm.sh && our_progs_count || echo unknown)
+    [[ "$n" == 0 ]] || { echo "FAIL: $n LSM programs of ours still loaded (no bpf-own-ids: an agent older than the list)"; fail=1; }
 fi
 for u in northnarrow-agent northnarrow-watchdog; do
     st=$(systemctl is-active "$u" 2>/dev/null || true)

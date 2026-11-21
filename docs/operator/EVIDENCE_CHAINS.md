@@ -475,7 +475,9 @@ each open (a restart reads the chain again: it clears nothing):
   left on the host (`admin_key_on_host`), strict overcommit with a high
   ratio (`sysctl_strict`), the operator's signed opt-out of a guarded
   sysctl (`sysctl_opted_out`), a stall of the agent's loop
-  (`agent_stalled`: a paused machine, or the agent's own memory throttling under `MemoryHigh`), the quarantine's index rebuilt
+  (`agent_stalled`: a paused machine, or the agent's own memory
+  throttling, the kernel holding it back above its unit's `MemoryHigh`),
+  the quarantine's index rebuilt
   (`quarantine_index_rebuilt`) — are kept as the degradations are, and
   listed on their own (`advisories`, each with its signed row). They are
   never counted in `sensors`, the trust level or the capability manifest:

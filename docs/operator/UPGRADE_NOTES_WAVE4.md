@@ -5951,3 +5951,65 @@ fires.
   a High "not compared (gone)" is possible with runc 1.1, and is counted
   (`gone`). With runc 1.2 or later such a copy, when the agent could not
   read it, is Critical and counted `lost`.
+
+## 68. The alpha's version, 0.1.0-alpha; the guard e2e teardown waits for our programs only (lot 383)
+
+- **The version.** The workspace was `0.0.1`, so a `v0.1.0-alpha` tag
+  would have published 0.0.1 artefacts. Everything now says
+  `0.1.0-alpha`: the workspace and `agent-ebpf` (its own project), every
+  binary's `--version` (`northnarrow-agent 0.1.0-alpha`), the signed rows
+  that carry the agent's version (`agent_boot`, the heartbeat, the
+  capability manifest's `agent_version`), the install manifest, and the
+  file names: `northnarrow-0.1.0-alpha-x86_64-linux.tar.gz`,
+  `northnarrow_0.1.0-alpha-1_amd64.deb`,
+  `northnarrow-0.1.0-alpha-1.x86_64.rpm`.
+  - The packages carry it as `0.1.0~alpha-1`. rpm refuses `-` in a
+    Version; `~` is accepted by rpm 4.10 and newer (AlmaLinux/RHEL 9 ship
+    4.16) and by dpkg, and both sort it before `0.1.0` and after `0.0.1`:
+    a package of `0.0.1` upgrades to the alpha, and a final `0.1.0` will
+    upgrade the alpha. `Version 0.1.0, Release 0.alpha` was not chosen: the
+    .deb could not say the same, and the release number would mean two
+    things. A file name has no `~` (a release asset's name keeps the
+    workspace's form).
+  - Upgrading from a build of `main` before this lot: `install.sh
+    --upgrade` prints `northnarrow-agent 0.0.1 → northnarrow-agent
+    0.1.0-alpha`; nothing else changes. A tool that matched `0.0.1` in
+    `--version`, `nn-admin status` or the signed rows matches the new
+    version.
+- **The tag.** release.yml's `verify-tag` job now also runs
+  `verify-release-tag.sh version "$TAG"`: the tag must be `v` and the
+  workspace version (`v0.1.0-alpha`), and `CHANGELOG.md` must open with
+  that version's section, dated (`## [0.1.0-alpha] - YYYY-MM-DD`). The
+  section reads `- unreleased` until the last commit before the tag, which
+  writes the day of the tag (the maintainer's release steps); a tag on a tree
+  that still says `unreleased`, or with `[Unreleased]` above the version,
+  stops there and nothing is built. The package job checks on every run
+  (pull requests included) that the tarball's and the packages' names,
+  the packages' versions and every binary's `--version` carry the
+  workspace version.
+- **The CHANGELOG.** `[Unreleased]` is now `[0.1.0-alpha] - unreleased`:
+  everything since `0.0.1`. A later lot's entry goes into that section
+  until the tag.
+- **Tests and lab only: the guard e2e teardown.** On Debian 13 and Ubuntu
+  26.04 (systemd 257 and 259) the nightly of 2026-11-21 failed seven
+  guard tests after they had passed: their teardown waited for "no LSM
+  program on the host", and PID 1 keeps one of its own loaded
+  (`RestrictFileSystems=`, `restrict_filesy`). A test that stopped its
+  enforce run itself left the fixture no list of program ids, and the
+  fallback counted every LSM program. The fixture now keeps the ids of
+  every run's `bpf-own-ids` list (read before a new run replaces it, and
+  at the teardown) and waits for those and for our LSM programs by name,
+  both (`deploy/lab/lib/our-lsm-programs.txt`, held equal to every `lsm`
+  program of the eBPF sources, in any module). A program of ours still
+  loaded fails the teardown as before, whether or not a list names it.
+  The lab's helpers that counted every LSM program (`lab_purge_pins`, the
+  uninstall check, `pkg-check.sh`, `perf-run.sh`) and the range bootstrap
+  (`deploy/adversarial/bootstrap-target-prod.sh`, step 1) count ours the
+  same way (`deploy/lab/lib/our-lsm.sh`), and a ratchet
+  (`xtask/tests/our_lsm_identity.rs`, over the tests, `deploy/`, the
+  docs' scripts and every shell script) forbids the old count.
+- **`agent_stalled`'s reason** names the agent's own memory throttling:
+  the kernel holding the agent back above its unit's `MemoryHigh` (768M
+  since lot 381) stalls its loop too, not only a pause of the whole
+  machine. The signed row's detail says so as well ("…, starvation or
+  memory throttling (its MemoryHigh)").

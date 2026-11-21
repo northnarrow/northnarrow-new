@@ -206,7 +206,11 @@ trap '' PIPE
 # pin root, protected while an agent ran, can be removed. The deny hooks
 # outlive the agent through their pinned links (by design): with the pins
 # gone, nothing of the agent stays attached.
-lsm_programs() { bpftool prog show 2>/dev/null | grep -c " lsm "; }
+# Lot 383: NorthNarrow's LSM programs, by name (our-lsm.sh, copied beside
+# this script): systemd 257+ keeps one of its own (RestrictFileSystems=).
+# shellcheck source=../lib/our-lsm.sh
+. "$SCRIPT_DIR/our-lsm.sh"
+lsm_programs() { our_progs_count; }
 agent_off() {
     if [[ -d $PIN_ROOT ]] || systemctl is-active --quiet northnarrow-agent; then
         if ! systemctl is-active --quiet northnarrow-agent; then
@@ -242,7 +246,7 @@ agent_off() {
         done
     fi
     py emit "$RAW" off "label=$1" "lsm_programs_left=$n"
-    [[ $n == 0 || $n == unknown ]] || py emit "$RAW" note "text=agent off ($1): $n LSM program(s) still loaded (another program's, or the agent's not detached)"
+    [[ $n == 0 || $n == unknown ]] || py emit "$RAW" note "text=agent off ($1): $n LSM program(s) still loaded (the agent's not detached)"
 }
 
 # The agent's own health line (lab-records.py: the journal's trusted fields).

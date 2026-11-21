@@ -525,6 +525,20 @@ fn a_long_detail_is_cut() {
     assert_eq!(log.held().findings()[1].detail, exact);
 }
 
+/// Lot 383 (from lot 382's review): a stall is also the kernel holding the
+/// agent back above its unit's `MemoryHigh` (768M since lot 381), not only
+/// a pause of the whole machine; the advisory's reason names it.
+#[test]
+fn the_stall_advisory_names_the_agents_own_memory_throttling() {
+    let (_, why) = ADVISORY_KINDS
+        .iter()
+        .find(|(k, _)| *k == "agent_stalled")
+        .expect("agent_stalled is an advisory");
+    for cause in ["a VM pause", "a host suspend", "MemoryHigh"] {
+        assert!(why.contains(cause), "{why}");
+    }
+}
+
 /// The review of #586 (P2-1, its probe 2): a state of the host or a choice
 /// of the operator that degrades no sensor is an advisory — listed on its
 /// own with its signed row, never among the degradations (`sensors`, the

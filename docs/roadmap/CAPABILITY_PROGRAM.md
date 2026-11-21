@@ -11699,6 +11699,42 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 383 — the alpha's version, 0.1.0-alpha everywhere; the guard e2e
+  teardown waits for our LSM programs only (release engineering and test
+  fixtures; no level change).**
+  - What was open: the workspace said `0.0.1`, so a `v0.1.0-alpha` tag
+    would have published 0.0.1 artefacts, and nothing in release.yml tied
+    a tag to the version; the CHANGELOG had only `[Unreleased]`. The
+    nightly of 2026-11-21 (684b6d49) was red on ubuntu2604 and debian13:
+    seven guard e2e tests passed and then failed their teardown ("LSM
+    programs still loaded: 1", systemd's `RestrictFileSystems=` program).
+  - Done:
+    - **One version.** `0.1.0-alpha` in the workspace and `agent-ebpf`,
+      the three lockfiles' entries of our crates, `--version`, the signed
+      rows and the file names; the .deb and .rpm versioned `0.1.0~alpha`
+      (rpm refuses `-`; `~` sorts before `0.1.0` in both, rpm 4.10+).
+      `verify-release-tag.sh version` (release.yml's `verify-tag`): the tag
+      is `v` and the workspace version, the CHANGELOG opens with its dated
+      section (9 selftest cases). The package job checks the artefacts'
+      names, the packages' versions and their order, and every binary's
+      `--version`. Ratchet `xtask/tests/release_version.rs`.
+    - **Our programs by identity.** The guard fixture keeps the ids of
+      every run's `bpf-own-ids` list (the runs of one directory share the
+      file) and its teardown waits for them and for our LSM programs by
+      name, both (`deploy/lab/lib/our-lsm-programs.txt`, held equal to
+      agent-ebpf's 63 `lsm` programs, in any module and under any path
+      to the macro), never for every LSM program. The lab's helpers that
+      counted every one (`lab_purge_pins`, the uninstall check's
+      fallback, `pkg-check.sh`, `perf-run.sh`) and the range bootstrap
+      use `deploy/lab/lib/our-lsm.sh`; `xtask/tests/our_lsm_identity.rs`
+      forbids the old count in the tests, `deploy/`, the docs' scripts
+      and every shell script (the review of #590).
+    - **`agent_stalled`** names the agent's own memory throttling
+      (`MemoryHigh`) besides a pause of the machine (from lot 382's
+      review); the testers' guide and the known limitations are no longer
+      drafts.
+  - Lab: none in this lot (not run). The teardown's fix is measured by the
+    next nightly on ubuntu2604 and debian13.
 - **Lot 381 — a rootful runc copy compared, never Critical by a race; the
   units' memory limits from the lab's measure (C11, C14, C23; no level
   change).**

@@ -3,6 +3,8 @@
 # `cargo xtask build --release` (the same inputs as mk-tarball.sh):
 #   <out>/northnarrow_<ver>-<rel>_amd64.deb     (dpkg-deb)
 #   <out>/northnarrow-<ver>-<rel>.x86_64.rpm    (rpmbuild)
+# <ver> is the workspace version (0.1.0-alpha); the packages' own version is
+# <ver> with its pre-release's `-` as `~` (0.1.0~alpha), lot 383 below.
 #
 # Layout (review 26):
 #   /usr/bin/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}
@@ -55,9 +57,29 @@ MAINTAINER="NorthNarrow <279109805+northnarrow@users.noreply.github.com>"
 HOMEPAGE="https://github.com/northnarrow/northnarrow-new"
 SUMMARY="NorthNarrow XDR: eBPF endpoint detection and response for Linux"
 cd "$REPO_ROOT"
+ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+# Lot 383 (the alpha's version): the workspace version is SemVer, with at
+# most one pre-release part (`0.1.0-alpha`). The file names carry it as it
+# is (the tarball's too, mk-tarball.sh): no `~` in a release asset's name.
+# The packages carry it as their managers order it: the pre-release's `-`
+# becomes `~` (`0.1.0~alpha`), which dpkg and rpm sort before the release
+# (`0.1.0`) and after every earlier version (`0.0.1`). rpm refuses `-` in a
+# Version and takes `~` since 4.10 (AlmaLinux/RHEL 9 ship 4.16), so the one
+# form serves both: the alpha is `0.1.0~alpha-1` in `dpkg -l` and `rpm -q`.
+if [[ ! $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+    echo "mk-packages: the workspace version '$ver' is not X.Y.Z or X.Y.Z-<pre-release> (letters, digits, dots)" >&2
+    exit 1
+fi
+pkgver=${ver/-/\~}
+# NN_PKG_PRINT_VERSIONS=1: print the versions and the file names, build nothing
+# (xtask/tests/release_version.rs).
+if [[ ${NN_PKG_PRINT_VERSIONS:-} == 1 ]]; then
+    printf 'version %s\npackage %s\ndeb %s-%s\nrpm %s %s\n' "$ver" "$pkgver" "$pkgver" "$REL" "$pkgver" "$REL"
+    printf 'deb_file northnarrow_%s-%s_amd64.deb\nrpm_file northnarrow-%s-%s.x86_64.rpm\n' "$ver" "$REL" "$ver" "$REL"
+    exit 0
+fi
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
-ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 ebpf=agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
 for f in target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
          target/release/northnarrow-scan "$ebpf" "$ebpf.buildhash"; do
@@ -139,7 +161,7 @@ if [[ " $FORMATS " == *" deb "* ]]; then
     (cd "$deb" && find usr -type f -print0 | LC_ALL=C sort -z | xargs -0 md5sum) > "$deb/DEBIAN/md5sums"
     cat > "$deb/DEBIAN/control" <<EOT
 Package: northnarrow
-Version: ${ver}-${REL}
+Version: ${pkgver}-${REL}
 Architecture: amd64
 Maintainer: ${MAINTAINER}
 Section: admin
@@ -169,7 +191,7 @@ if [[ " $FORMATS " == *" rpm "* ]]; then
     {
         cat <<EOT
 Name:           northnarrow
-Version:        ${ver}
+Version:        ${pkgver}
 Release:        ${REL}
 Summary:        ${SUMMARY}
 License:        Apache-2.0
@@ -224,7 +246,7 @@ EOT
     } > "$top/SPECS/northnarrow.spec"
     rpmbuild --quiet --define "_topdir $top" -bb "$top/SPECS/northnarrow.spec"
     pkg="$OUT/northnarrow-${ver}-${REL}.x86_64.rpm"
-    cp "$top/RPMS/x86_64/northnarrow-${ver}-${REL}.x86_64.rpm" "$pkg"
+    cp "$top/RPMS/x86_64/northnarrow-${pkgver}-${REL}.x86_64.rpm" "$pkg"
     built+=("$pkg")
 fi
 

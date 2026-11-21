@@ -1308,6 +1308,132 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Lot 383: NorthNarrow's BPF programs among those loaded, told by identity
+/// — never another product's, never PID 1's. systemd 257 and newer (Debian
+/// 13, Ubuntu 26.04) keep a BPF-LSM program of their own loaded for
+/// `RestrictFileSystems=` (`restrict_filesy`), held by PID 1 for as long as
+/// it runs: a teardown that waited for "no LSM program on the host" failed
+/// there after its test had passed (the nightly of 2026-11-21: "LSM
+/// programs still loaded: 1"). The lab's shell helpers do the same
+/// (`deploy/lab/lib/our-lsm.sh`), from the same list of names.
+pub mod our_bpf {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// The eBPF object's LSM programs, one name a line
+    /// (`xtask/tests/our_lsm_identity.rs` holds it equal to agent-ebpf's
+    /// `#[lsm]` functions).
+    pub const LSM_PROGRAMS: &str = include_str!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/deploy/lab/lib/our-lsm-programs.txt"
+    ));
+
+    /// The kernel keeps `BPF_OBJ_NAME_LEN - 1` bytes of a program's name,
+    /// and `bpftool prog show` prints those.
+    pub const KERNEL_NAME_LEN: usize = 15;
+
+    /// [`LSM_PROGRAMS`] as the kernel names them.
+    pub fn lsm_names() -> BTreeSet<&'static str> {
+        LSM_PROGRAMS
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|n| &n[..n.len().min(KERNEL_NAME_LEN)])
+            .collect()
+    }
+
+    /// The ids a `bpf-own-ids` file lists: the first field of every line
+    /// that starts with a digit, as `install.sh` reads it.
+    pub fn listed_ids(body: &str) -> BTreeSet<u32> {
+        body.lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|f| f.bytes().all(|b| b.is_ascii_digit()))
+            .filter_map(|f| f.parse().ok())
+            .collect()
+    }
+
+    /// The ids every readable file of `files` lists (a missing one adds none).
+    pub fn ids_in(files: &[impl AsRef<Path>]) -> BTreeSet<u32> {
+        files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .flat_map(|b| listed_ids(&b))
+            .collect()
+    }
+
+    /// The header lines of a `bpftool prog show` listing (`<id>: <type>
+    /// name <name>  tag …`) that are programs of ours: those among `ids`,
+    /// whatever their type, and the LSM programs that carry one of
+    /// [`lsm_names`] — both, always (the review of #590, P3-1: with an id
+    /// known the names were skipped, so a run that never wrote its list,
+    /// or an earlier binary's program, was not waited for). Another
+    /// product's program and PID 1's are never in it, so they are never
+    /// waited for; one of ours always is.
+    pub fn ours_left(listing: &str, ids: &BTreeSet<u32>) -> Vec<String> {
+        let names = lsm_names();
+        listing
+            .lines()
+            .filter(|l| {
+                let mut f = l.split_whitespace();
+                let Some(id) = f
+                    .next()
+                    .and_then(|h| h.strip_suffix(':'))
+                    .and_then(|h| h.parse::<u32>().ok())
+                else {
+                    return false;
+                };
+                if ids.contains(&id) {
+                    return true;
+                }
+                let kind = f.next();
+                let rest: Vec<&str> = f.collect();
+                let name = rest
+                    .iter()
+                    .position(|w| *w == "name")
+                    .and_then(|i| rest.get(i + 1));
+                kind == Some("lsm") && name.is_some_and(|n| names.contains(n))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Wait up to `timeout` until no program of ours ([`ours_left`]) is
+    /// loaded. `bpftool prog show` that fails is an error, never "none
+    /// left". Err names the programs still loaded.
+    pub fn wait_ours_gone(ids: &BTreeSet<u32>, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // through sudo, as the fixtures' other bpftool calls
+            // ([`super::require_bpftool`]): its secure_path has /usr/sbin
+            let out = Command::new("sudo")
+                .args(["bpftool", "prog", "show"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("spawn sudo bpftool prog show: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "sudo bpftool prog show failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let left = ours_left(&String::from_utf8_lossy(&out.stdout), ids);
+            if left.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "programs of ours still loaded after {timeout:?} (ids {ids:?}, and our LSM \
+                     programs by name): {left:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
 /// Lab PR 215: raw `bpf(2)` calls for the link checks of the enforce-mode
 /// guard test. The command numbers are `common::bpf_cmd`'s, the one copy
 /// the hooks compile; the `bpf_attr` fields are placed by hand in a zeroed

@@ -5,6 +5,7 @@
 # built; `package`, and through it every later job, needs it on a tag.
 #
 #   verify-release-tag.sh verify <tag> <commit> [allowed_signers]
+#   verify-release-tag.sh version <tag> [Cargo.toml] [CHANGELOG.md]
 #   verify-release-tag.sh selftest
 #
 # verify, in a clone where refs/tags/<tag> is the tag as pushed, refuses
@@ -23,11 +24,28 @@
 # .github/allowed_signers next to this script): adding or rotating a key is
 # a reviewed PR like any other change.
 #
+# version (lot 383, the alpha's version), in the checkout of the tagged
+# commit, refuses (exit 1) unless:
+#   - <tag> is `v` and the workspace version of Cargo.toml
+#     ([workspace.package] version): `v0.1.0-alpha` for "0.1.0-alpha". The
+#     artefacts are named and versioned from Cargo.toml (mk-tarball.sh,
+#     mk-packages.sh), so a tag of another version would publish them under
+#     a name that is not theirs (a `v0.1.0-alpha` tag once had 0.0.1 ones);
+#   - CHANGELOG.md opens with that version's section, dated: its first `## `
+#     heading is `## [<version>] - YYYY-MM-DD`, a real date. Not
+#     `[Unreleased]` above it, not `- unreleased` for the date: the date is
+#     written in the last commit before the tag (CONTRIBUTING.md,
+#     "Rilasci"), the day of the tag.
+# release.yml's `verify-tag` job runs it after `verify`.
+#
 # selftest runs the same checks on a scratch repository with throwaway keys
 # (no network): a tag signed by the listed key passes; another key, an
 # unsigned or lightweight tag, a renamed tag, a tag of another commit, an
 # altered tag, an expired key, a key for another namespace and an empty list
-# are refused (a key still valid at the tag's date passes). xtask/tests/supply_chain.rs runs it in the CI test job.
+# are refused (a key still valid at the tag's date passes); for `version`,
+# a tag of another version, a CHANGELOG with `[Unreleased]` or an undated or
+# impossible date on top, and a Cargo.toml without a workspace version are
+# refused. xtask/tests/supply_chain.rs runs it in the CI test job.
 # Needs git >= 2.34 and ssh-keygen (OpenSSH >= 8.8).
 # Exit 0 = verified; 1 = refused; 2 = usage.
 set -euo pipefail
@@ -54,6 +72,25 @@ verify() { # <tag> <commit> [allowed_signers]
     git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$tag" \
         || refuse "git verify-tag refused $tag against $signers"
     echo "verify-release-tag: $tag ($commit) is signed by a key of $signers"
+}
+
+version_check() { # <tag> [Cargo.toml] [CHANGELOG.md]
+    local tag="$1" cargo="${2:-$ROOT/Cargo.toml}" changelog="${3:-$ROOT/CHANGELOG.md}" ver head date
+    [ -f "$cargo" ] || refuse "no $cargo"
+    [ -f "$changelog" ] || refuse "no $changelog"
+    ver="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)" *$/\1/p;}' "$cargo" | head -1)"
+    [ -n "$ver" ] || refuse "$cargo has no [workspace.package] version"
+    [ "$tag" = "v$ver" ] || refuse "the tag $tag is not v$ver: $cargo says $ver, and the artefacts are named and versioned from it"
+    head="$(grep -m1 '^## ' "$changelog" || true)"
+    case "$head" in
+        "## [$ver] - "*) ;;
+        *) refuse "$changelog opens with '${head:-no section}', not the section of $ver ('## [$ver] - YYYY-MM-DD')" ;;
+    esac
+    date="${head#"## [$ver] - "}"
+    if ! [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [ "$(date -u -d "$date" +%F 2>/dev/null)" != "$date" ]; then
+        refuse "the section of $ver in $changelog is dated '$date', not YYYY-MM-DD: write the day of the tag in the last commit before it"
+    fi
+    echo "verify-release-tag: $tag is the workspace version $ver, and $(basename "$changelog") opens with its section ($date)"
 }
 
 selftest() {
@@ -107,6 +144,28 @@ selftest() {
     expect 0 "a key valid at the tag's date passes" v1.0.0 "$c2" "$t/valid-until"
     expect 1 "a missing list refuses" v1.0.0 "$c2" "$t/absent"
     expect 1 "a missing tag refuses" v9.9.9 "$c2" "$t/allowed"
+
+    # lot 383: the tag and the version the artefacts are built as
+    expect_version() { # <want exit> <what> <tag> <workspace version line> <changelog top heading> [<said>]
+        local want="$1" what="$2" tag="$3" said="${6:-}" got
+        printf '[package]\nname = "root"\nversion = "9.9.9"\n\n[workspace]\nmembers = []\n\n[workspace.package]\n%s\nedition = "2021"\n\n[profile.release]\nversion = "9.9.8"\n' "$4" > "$t/Cargo.toml"
+        printf '# Changelog\n\nFormat: Keep a Changelog.\n\n%s\n\n### Added\n- a change\n\n## [0.0.1] - 2026-10-09\n' "$5" > "$t/CHANGELOG.md"
+        set +e; ( version_check "$tag" "$t/Cargo.toml" "$t/CHANGELOG.md" ) > "$t/out" 2>&1; got=$?; set -e
+        if [ -n "$said" ] && ! grep -qF -- "$said" "$t/out"; then
+            echo "not ok - $what: it did not say '$said'"; sed 's/^/    /' "$t/out"; fails=$((fails + 1))
+        elif [ "$got" = "$want" ]; then echo "ok - $what"
+        else echo "not ok - $what: exit $got, want $want"; sed 's/^/    /' "$t/out"; fails=$((fails + 1)); fi
+    }
+    local v='version = "1.2.0-beta"'
+    expect_version 0 "the tag of the workspace version, its dated section on top, passes" v1.2.0-beta "$v" "## [1.2.0-beta] - 2026-11-21"
+    expect_version 1 "a tag of another version is refused" v1.2.0 "$v" "## [1.2.0-beta] - 2026-11-21"
+    expect_version 1 "a tag without its v is refused" 1.2.0-beta "$v" "## [1.2.0-beta] - 2026-11-21"
+    expect_version 1 "a version only in another section of Cargo.toml is refused" v9.9.9 "$v" "## [9.9.9] - 2026-11-21"
+    expect_version 1 "a Cargo.toml without a workspace version is refused" v1.2.0-beta 'rust-version = "1.89"' "## [1.2.0-beta] - 2026-11-21"
+    expect_version 1 "[Unreleased] on top is refused" v1.2.0-beta "$v" "## [Unreleased]" "not the section of 1.2.0-beta"
+    expect_version 1 "another version's section on top is refused" v1.2.0-beta "$v" "## [1.1.0] - 2026-11-21" "opens with '## [1.1.0] - 2026-11-21'"
+    expect_version 1 "an undated section is refused" v1.2.0-beta "$v" "## [1.2.0-beta] - unreleased" "dated 'unreleased'"
+    expect_version 1 "an impossible date is refused" v1.2.0-beta "$v" "## [1.2.0-beta] - 2026-02-30"
     [ "$fails" = 0 ] || { echo "selftest: $fails case(s) failed" >&2; exit 1; }
     echo "selftest: all cases passed"
 }
@@ -114,6 +173,8 @@ selftest() {
 case "${1:-}" in
     verify) [ $# -ge 3 ] && [ $# -le 4 ] || { echo "usage: $0 verify <tag> <commit> [allowed_signers]" >&2; exit 2; }
             shift; verify "$@" ;;
+    version) [ $# -ge 2 ] && [ $# -le 4 ] || { echo "usage: $0 version <tag> [Cargo.toml] [CHANGELOG.md]" >&2; exit 2; }
+             shift; version_check "$@" ;;
     selftest) selftest ;;
-    *) echo "usage: $0 verify <tag> <commit> [allowed_signers] | selftest" >&2; exit 2 ;;
+    *) echo "usage: $0 verify <tag> <commit> [allowed_signers] | version <tag> [Cargo.toml] [CHANGELOG.md] | selftest" >&2; exit 2 ;;
 esac

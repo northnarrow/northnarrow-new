@@ -26,7 +26,7 @@ members = [
 exclude = ["agent-ebpf", "fuzz"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0-alpha"
 edition = "2021"
 # External audit SUP-015: the oldest rustc that builds this workspace with
 # the committed Cargo.lock. It was "1.83", which no build could meet:

@@ -1287,7 +1287,8 @@ kernel.
   16 or more CPUs (per-CPU rings) and with larger FIM sets the kernel
   memory was not measured: there the cap may be closer to the use than on
   the lab's guests. Above `MemoryHigh` the kernel slows the agent down,
-  which may then lose events (counted). *Evidence:* lot 381
+  which may then lose events (counted); a long slowdown is also a signed
+  `agent_stalled` advisory (lot 383). *Evidence:* lot 381
   (`the_memory_limits_are_sized_from_the_measured_peaks`).
 - **Events can be lost under load.** Under a burst, the kernel rings and
   the agent's queues drop new events rather than slow the host. Each loss

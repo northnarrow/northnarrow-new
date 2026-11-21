@@ -37,6 +37,15 @@ name: release
 # with `contents: write`; it holds no OIDC token and no key, and fails
 # rather than replace an asset already published (no --clobber).
 #
+# Lot 383 (the alpha's version): verify-tag also requires the tag to be `v`
+# and the workspace version of Cargo.toml (`v0.1.0-alpha` for
+# "0.1.0-alpha"), and CHANGELOG.md to open with that version's section,
+# dated (`verify-release-tag.sh version`). Before, nothing tied the two: a
+# `v0.1.0-alpha` tag would have published 0.0.1 artefacts. The package job
+# checks on every run that the artefacts carry that version: the tarball's
+# and the packages' file names, the packages' own version (`-` as `~`:
+# 0.1.0~alpha) and every binary's `--version`.
+#
 # External audit SUP-002: every action is pinned by commit SHA (the
 # version in the comment); Dependabot (github-actions) proposes updates.
 
@@ -79,6 +88,16 @@ jobs:
           # repository is public, so no token is needed for it.
           git fetch --no-tags --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
           .github/scripts/verify-release-tag.sh verify "$TAG" "$GITHUB_SHA"
+
+      # Lot 383: the tag names the version the artefacts are built as (the
+      # workspace version: mk-tarball.sh and mk-packages.sh read it), and
+      # the CHANGELOG opens with that version's section, dated with the day
+      # of the tag. A tag of another version, or an `[Unreleased]` or
+      # `- unreleased` heading on top, stops the release here.
+      - name: The tag is the workspace version, and the CHANGELOG's dated section
+        env:
+          TAG: ${{ github.ref_name }}
+        run: .github/scripts/verify-release-tag.sh version "$TAG"
 
   package:
     name: package (x86_64-linux)
@@ -213,6 +232,43 @@ jobs:
           test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 5
           rpm -qp --scripts "$rpm" | grep -q -- '--package-verify'
           "$tmp/usr/bin/northnarrow-agent" --version
+
+      # Lot 383: every artefact carries the workspace version — the file
+      # names (`0.1.0-alpha`), the packages' own version (the pre-release's
+      # `-` as `~`, `0.1.0~alpha`, sorted before the release by dpkg and by
+      # rpm) and the `--version` of every binary of the tarball and the .deb.
+      - name: The artefacts carry the workspace version
+        run: |
+          set -euo pipefail
+          vers=$(NN_PKG_PRINT_VERSIONS=1 deploy/release/mk-packages.sh)
+          ver=$(awk '$1 == "version" {print $2}' <<<"$vers")
+          pkgver=$(awk '$1 == "package" {print $2}' <<<"$vers")
+          echo "workspace version $ver, package version $pkgver"
+          tgz=northnarrow-$ver-x86_64-linux.tar.gz deb=northnarrow_$ver-1_amd64.deb rpm=northnarrow-$ver-1.x86_64.rpm
+          for f in "$tgz" "$deb" "$rpm"; do
+            test -f "dist/$f" || { echo "::error::dist/$f is missing: $(ls dist | tr '\n' ' ')"; exit 1; }
+          done
+          got=$(dpkg-deb -f "dist/$deb" Version)
+          test "$got" = "$pkgver-1" || { echo "::error::the .deb is version $got, not $pkgver-1"; exit 1; }
+          got=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "dist/$rpm")
+          test "$got" = "$pkgver-1" || { echo "::error::the .rpm is version $got, not $pkgver-1"; exit 1; }
+          if [ "$pkgver" != "$ver" ]; then
+            rel=${ver%%-*}
+            dpkg --compare-versions "$pkgver-1" lt "$rel-1" \
+              || { echo "::error::dpkg does not sort $pkgver before $rel"; exit 1; }
+            test "$(rpm --eval "%{lua: print(rpm.vercmp('$pkgver-1', '$rel-1'))}")" = -1 \
+              || { echo "::error::rpm does not sort $pkgver before $rel"; exit 1; }
+          fi
+          tmp=$(mktemp -d) && mkdir "$tmp/tgz" "$tmp/deb"
+          tar -C "$tmp/tgz" -xzf "dist/$tgz"
+          dpkg-deb -x "dist/$deb" "$tmp/deb"
+          for d in "$tmp/tgz/northnarrow-$ver-x86_64-linux/target/release" "$tmp/deb/usr/bin"; do
+            for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
+              got=$("$d/$b" --version | head -1)
+              test "$got" = "$b $ver" || { echo "::error::$d/$b --version prints '$got', not '$b $ver'"; exit 1; }
+            done
+          done
+          echo "every artefact carries $ver"
 
       # External audit DEP-008: the rpm-sign job signs the .rpm on a tag with
       # the release key. The same script runs here on every run, pull

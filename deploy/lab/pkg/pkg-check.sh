@@ -26,16 +26,14 @@ check() { local what=$1; shift; if "$@"; then ok "$what"; else bad "$what"; fi; 
 quiet() { "$@" >>"$log" 2>&1; }
 units() { systemctl is-active northnarrow-agent northnarrow-watchdog 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
 mainpid() { systemctl show -p MainPID --value northnarrow-agent; }
-lsm() { sudo bpftool prog show 2>/dev/null | grep -c " lsm " || true; }
 # External audit DEP-006: the agent lists its own program ids; another
-# product's LSM programs (bpftrace in the lab) are not NorthNarrow's hooks.
-own_ids() { sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null | tr '\n' ' '; }
-own_loaded() {
-    local id n=0
-    [ -n "$1" ] || { lsm; return; }   # an agent older than the list: every LSM program
-    for id in $1; do sudo bpftool prog show id "$id" >/dev/null 2>&1 && n=$((n + 1)); done
-    echo "$n"
-}
+# product's LSM programs (bpftrace in the lab, systemd's own on 257+) are not
+# NorthNarrow's hooks. Lot 383: without a list (an agent older than it), ours
+# by name, never every LSM program on the host (deploy/lab/lib/our-lsm.sh).
+. deploy/lab/lib/our-lsm.sh
+own_ids() { own_ids_of /run/northnarrow/bpf-own-ids; }
+# shellcheck disable=SC2086 # the ids, one argument each
+own_loaded() { our_progs_count $1; }
 # the lab's admin key: /root/northnarrow-admin.key since external audit
 # DEP-001, /etc/northnarrow/admin.key on a guest installed before
 labkey() { for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; return; }; done; }
@@ -55,7 +53,10 @@ trap 'rm -rf "$PKGDIR"' EXIT
 for r in 1 2 3; do
     NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
-pkg() { ls "$PKGDIR"/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
+# lot 383: <ver>-<rel> in the file name, <ver> with a pre-release (0.1.0-alpha)
+pkg() { ls "$PKGDIR"/* | grep -E "[-_][0-9][0-9A-Za-z.-]*-$1[._](amd64|x86_64)" | head -1; }
+# the package's own version of release $1 (the pre-release's `-` as `~`: 0.1.0~alpha-2)
+want_ver() { NN_PKG_PRINT_VERSIONS=1 NN_PKG_RELEASE=$1 deploy/release/mk-packages.sh | awk '$1 == "deb" {print $2}'; }
 # Lab follow-up (lab PR 165): the per-process outbound block needs nft. The
 # package declares it (on the .deb a Pre-Depends: dpkg refuses before the
 # pre-unpack hook stops the agent); dpkg -i and rpm -U do not fetch it, so
@@ -107,12 +108,12 @@ check "2 upgrade to release 2" quiet pinstall "$(pkg 2)" "$(labkey)"
 sleep 5
 check "  units active after the upgrade" test "$(units)" = "active active"
 check "  agent restarted (pid $p1 -> $(mainpid))" test "$(mainpid)" != "$p1"
-check "  version $(pver)" test "$(pver)" = "0.0.1-2"
+check "  version $(pver)" test "$(pver)" = "$(want_ver 2)"
 p2=$(mainpid)
 if pinstall "$(pkg 3)" /nonexistent/key >>"$log" 2>&1; then bad "3 upgrade with an unusable key was accepted"; else ok "3 upgrade with an unusable key refused"; fi
 sleep 3
 check "  agent untouched (pid $(mainpid))" test "$(mainpid)" = "$p2" -a "$(units)" = "active active"
-check "  version still 0.0.1-2" test "$(pver)" = "0.0.1-2"
+check "  version still $(want_ver 2)" test "$(pver)" = "$(want_ver 2)"
 ids=$(own_ids)
 check "4 remove" quiet premove
 check "  units gone ($(units))" test "$(units)" != "active active"

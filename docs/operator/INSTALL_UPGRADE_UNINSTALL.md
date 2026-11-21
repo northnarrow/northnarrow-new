@@ -918,7 +918,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `tracefs_mount` | a mount at `/sys/kernel/tracing` or `/sys/kernel/debug/tracing` that is not a whole tracefs, or any mount below them: the tracepoint sensors take their field offsets from there at the next start (external audit NN-AUD-098) |
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
 | `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
-| `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
+| `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation, the kernel's throttling of the agent above its unit's `MemoryHigh`) |
 | `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004). Since lab PR 216 also each bounded retry of a hold (`hold_retry`) and its end, with its length (`hold_ended`) |
 | `watchdog_exit` | the watchdog exited on a failure, with its exit status and reason (§3.9); systemd restarts it, as often as it fails (one record per run). Written by the watchdog just before it exits (lab PR 216) |
 | `watchdog_failed` | systemd put `northnarrow-watchdog.service` in the failed state — a start or stop job of the unit failed (a death of the process is restarted, without limit) — and no longer restarts it: the agent runs without a supervisor until the unit is started. Written by the unit's `OnFailure=` handler with systemd's `service_result`, `exit_code` and `exit_status` (lab PR 216, §3.9) |
@@ -1444,6 +1444,19 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | `northnarrow-<ver>-x86_64-linux.{agent,watchdog,scan}.sbom.cdx.json` | CycloneDX SBOMs, three files: the agent (it covers `nn-admin` too), the watchdog, the scanner. They do not cover the eBPF object's own crates (`agent-ebpf`, aya-ebpf among them), built from a lockfile of their own (`agent-ebpf/Cargo.lock`) and embedded in the agent |
 | `SHA256SUMS` | checksums of the files above |
 | `SHA256SUMS.asc` | a detached OpenPGP signature of `SHA256SUMS` by the same release key as the `.rpm` (releases from `v0.1.0-alpha` on): the check without `gh` below, and the one `install.sh` makes itself on a host without `gh attestation` (§5.1) |
+
+**The version (lot 383).** `<ver>` is the workspace version of the tagged
+tree, and the tag is `v<ver>`: the release workflow's `verify-tag` job
+refuses a tag of another version (`verify-release-tag.sh version`), and
+one whose `CHANGELOG.md` does not open with that version's dated section.
+For the alpha, `<ver>` is `0.1.0-alpha` and `<rel>` is `1`:
+`northnarrow-0.1.0-alpha-x86_64-linux.tar.gz`,
+`northnarrow_0.1.0-alpha-1_amd64.deb`,
+`northnarrow-0.1.0-alpha-1.x86_64.rpm`. Inside, the packages carry the
+pre-release as their managers order it, `0.1.0~alpha-1` (`dpkg -l
+northnarrow`, `rpm -q northnarrow`): `~` sorts before the release, so a
+final `0.1.0` upgrades it, and after `0.0.1`. Every binary's `--version`
+prints `0.1.0-alpha` (`northnarrow-agent 0.1.0-alpha`).
 
 The tarball, the packages and the SBOMs carry a SLSA build-provenance
 attestation signed by GitHub's OIDC identity for this repository and

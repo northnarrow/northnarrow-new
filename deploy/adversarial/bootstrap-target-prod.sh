@@ -219,15 +219,23 @@ if [ "$units_present" = 1 ] || [ -d /sys/fs/bpf/northnarrow ]; then
     rm -rf /sys/fs/bpf/northnarrow 2>/dev/null || true
     [ ! -d /sys/fs/bpf/northnarrow ] \
         || die "/sys/fs/bpf/northnarrow is still protected (no window: the agent was not running) — reboot the target (bpffs does not survive it) and re-run"
-    n=0
+    # NorthNarrow's programs only, by the stopped agent's bpf-own-ids list
+    # and by our LSM programs' names (deploy/lab/lib/our-lsm.sh): systemd
+    # 257 and newer keep an LSM program of their own loaded for
+    # RestrictFileSystems=, which no stop of NorthNarrow detaches (the
+    # review of #590, P3-3)
+    # shellcheck source=../lab/lib/our-lsm.sh
+    . "$NN_REPO_DIR/deploy/lab/lib/our-lsm.sh"
+    read -ra own_ids <<<"$(own_ids_of "$NN_RUN_DIR/bpf-own-ids")"
+    n=unknown
     for _ in $(seq 1 30); do
-        progs=$(bpftool prog show 2>/dev/null) || die "bpftool prog show failed"
-        n=$(grep -c ' lsm ' <<<"$progs" || true)
-        [ "${n:-0}" = 0 ] && break
+        n=$(our_progs_count "${own_ids[@]}") \
+            || die "cannot tell NorthNarrow's BPF programs (bpftool prog show failed, or deploy/lab/lib/our-lsm-programs.txt is missing)"
+        [ "$n" = 0 ] && break
         sleep 1
     done
-    [ "${n:-0}" = 0 ] || die "$n LSM program(s) still loaded 30 s after the stop — another NorthNarrow process holds them"
-    log "  units stopped, pin root dropped, no LSM program left"
+    [ "$n" = 0 ] || die "$n BPF program(s) of NorthNarrow still loaded 30 s after the stop — another NorthNarrow process holds them"
+    log "  units stopped, pin root dropped, no program of NorthNarrow left"
 fi
 
 # ── 2. scrub dev/smoke RUNTIME state (NOT config, NOT honeypot baits) ─
