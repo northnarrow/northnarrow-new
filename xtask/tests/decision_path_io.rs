@@ -717,11 +717,26 @@ fn the_exec_pump_reads_a_module_tool_s_exec() {
     // lot 313: an exec with its stdio on a socket has its running image
     // compared with the installed shells, while it runs, first too
     let copy = step
-        .find("program_images::read_and_keep(&e)")
+        .find("program_images::read_and_keep(&e, &late)")
         .expect("the running image compared with the installed programs");
     assert!(
         copy < resolve,
         "compared after its path was resolved: {step}"
+    );
+    // the review of #588 (F3): the step and its `not_read` settle one
+    // runtime compare between them — the same `Settle`, made for this exec
+    let made = step
+        .find("let settle = crate::program_images::Settle::default();")
+        .expect("one Settle for the exec");
+    let shared = step
+        .find("let late = settle.clone();")
+        .expect("the step's copy of it");
+    let given_up = step
+        .find("program_images::not_read(e, &settle)")
+        .expect("not_read settles with it");
+    assert!(
+        made < shared && shared < copy && copy < given_up && given_up < resolve,
+        "the runtime compare's Settle: {step}"
     );
     // lot 348 (the mini-hunt; Debian 13's `apt install docker.io`): the
     // pump's read of a module tool's exec records the runtimes and their

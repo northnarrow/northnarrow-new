@@ -148,6 +148,7 @@ fn telemetry_status(
                 through: c.through,
                 gone: c.gone,
                 no_runtime: c.no_runtime,
+                lost: c.lost,
             }
         }),
         execq_script_refused_total: Some(execq.script_refused),

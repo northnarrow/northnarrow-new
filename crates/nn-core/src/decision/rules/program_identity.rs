@@ -719,12 +719,13 @@ pub struct RuntimeClone {
     pub unverified: bool,
     /// Lot 381 (F6-6 of the pre-alpha's Phase 6b): with `unverified`, the
     /// bytes were not compared because the copy was gone before the pump
-    /// read it — the exec's process, and every process it looked at for
-    /// the copy, exited (runc 1.1's `runc init` lives a few milliseconds
-    /// past its exec) — not the budget; `image` is then the installed
-    /// runtime the exec's parent runs, every other fact held. R004 records
-    /// root's High, never killing it, and kills any other uid's, as past
-    /// the budget.
+    /// read it — every thread of the exec's process exited, and none of
+    /// its parent's children the pump read ran the copy (runc 1.1's `runc
+    /// init` lives a few milliseconds past its exec) — not the budget;
+    /// `image` is then the installed runtime the exec's parent runs, the
+    /// length not known (the review of #588, F2: kept only in runc 1.1's
+    /// re-exec). R004 records root's High, never killing it, and kills any
+    /// other uid's, as past the budget.
     pub gone: bool,
     /// The review of #578 (N3): with `unverified`, this skip opened an
     /// episode of its uid's spent budget (none for that uid in the minute

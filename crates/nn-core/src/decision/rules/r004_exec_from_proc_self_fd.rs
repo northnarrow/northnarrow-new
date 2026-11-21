@@ -100,12 +100,18 @@
 //! before the pump read it is compared through a process still running that
 //! very memfd — runc 1.1's `runc init` forks its two stages with
 //! `CLONE_PARENT`, children of `runc create` running the copy until the
-//! container's program starts. When none is left, every fact but the bytes
-//! holds and the parent runs an installed runtime: "not compared (gone)",
-//! judged as past the budget — root's recorded High, never killed; any
-//! other uid's the Critical kill. A parent gone too, a manager parent (which
-//! runtime it copied is not known), or a process that runs another file by
-//! the read (a runtime's copy never executes again): nothing kept, Critical.
+//! container's program starts (the review of #588, F1: or a thread of its
+//! own, its leader exited alone). When none is left, neither its bytes nor
+//! its length are known: what holds is the seal at the exec, the lineage and
+//! the parent's image. The review of #588 (F2): only in runc 1.1's re-exec
+//! — the process ran that installed runtime's file itself just before, no
+//! fork since (`fork_parent` 0), under that runtime's process — is it "not
+//! compared (gone)", judged as past the budget: root's recorded High, never
+//! killed; any other uid's the Critical kill. Any other shape — runc 1.2's
+//! (`runc init`'s first exec since `runc create` forked it), every OCI hook
+//! a runtime runs, a manager parent (which runtime it copied is not known)
+//! — a parent gone too, or a process that runs another file by the read (a
+//! runtime's copy never executes again): nothing kept, Critical.
 //!
 //! A clone whose every fact
 //! holds but whose bytes were not compared — its uid's share of the
@@ -123,7 +129,13 @@
 //! says "not compared (budget)" — a memfd of the runtime's length, any
 //! program's — never a copy of the runtime. Residual: root spending its
 //! own budget, then executing its own memfd under the runtime, is recorded
-//! High, not killed — root, who needs no such route. Residual: the kernel reads the file's first bytes
+//! High, not killed — root, who needs no such route. Residual (lot 381,
+//! the review of #588): a root process forked by runc under its manager
+//! (as `runc init` is) executing the installed runc, then a sealed memfd of
+//! its own, every thread of it exiting before the pump reads it — "not
+//! compared (gone)", recorded
+//! High, not killed, any program of any length; the same class, with no
+//! budget to spend. Residual: the kernel reads the file's first bytes
 //! (the binary's header, `bprm->buf`) just before the LSM hook reads the
 //! seals; a writer racing that window chooses the header of a run whose
 //! every mapped byte is the sealed runtime's (no code of its own: the
@@ -199,9 +211,10 @@ enum Uncompared {
     /// (the review of #578, N3).
     Budget(Option<program_identity::BudgetEpisode>),
     /// Lot 381 (F6-6 of the pre-alpha's Phase 6b): the copy was gone before
-    /// the pump read it — the exec's process and every process the pump
-    /// looked at for it had exited (runc 1.1's `runc init`, a few
-    /// milliseconds past its exec, under a 200-container start).
+    /// the pump read it — every thread of the exec's process had exited and
+    /// none of its parent's children the pump read ran it (runc 1.1's `runc
+    /// init`, a few milliseconds past its exec, under a 200-container
+    /// start). Judged only in runc 1.1's re-exec (the review of #588, F2).
     Gone,
 }
 
@@ -630,6 +643,9 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
     /// bytes. The first of a budget's episode names who spent the budget
     /// ([`episode_text`]).
     fn not_compared(&self, event: &Event, uid: u32, why: Uncompared) -> Verdict {
+        const GONE: &str = "not compared (gone): every thread of its process had exited before \
+                            the pump read it, and none of its parent's children the pump read \
+                            still ran its copy";
         let (what, root_why, user_why, episode) = match why {
             Uncompared::Budget(episode) => (
                 "of an installed runtime's length",
@@ -641,13 +657,9 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 episode_text(episode),
             ),
             Uncompared::Gone => (
-                "run by an installed runtime's process",
-                "not compared (gone): the process and every process running its copy had \
-                 exited before the pump read it"
-                    .to_string(),
-                "not compared (gone): the process and every process running its copy had \
-                 exited before the pump read it"
-                    .to_string(),
+                "re-executed under an installed runtime's process (its length not known)",
+                GONE.to_string(),
+                GONE.to_string(),
                 String::new(),
             ),
         };
@@ -691,6 +703,7 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
         use common::wire::exe::exe_flags::MEMFD_SEALED;
         let Event::ProcessSpawn {
             pid,
+            ppid,
             exe,
             timestamp_ns,
             ..
@@ -746,9 +759,22 @@ impl<H: PostureHost> R004ExecFromProcSelfFd<H> {
                 && manager(lineage.fork_parent(pid, as_of))
         };
         if exe.fork_parent != 0 {
+            // the review of #588 (F2): a copy gone before the read is never
+            // judged at a first exec since a fork — runc 1.2's `runc init`,
+            // and every OCI hook a runtime runs: its length not known, a
+            // root hook from a sealed memfd of any size passed for the
+            // runtime's copy. Nothing kept: Critical
+            if clone.gone {
+                return None;
+            }
             // the first exec since the fork: the forker made the copy of
             // its own image (runc 1.2's `runc create`)
             return managed_runtime(exe.fork_parent).then_some(copy);
+        }
+        // the review of #588 (F2): gone, only under the very runtime's
+        // process (runc 1.1's `runc create`, as the pump read its image)
+        if clone.gone && clone.seen_image(*ppid) != Some(content) {
+            return None;
         }
         // a re-exec: the process ran the runtime's image itself just before
         // (runc 1.1's `runc init`), forked by the runtime under its manager
@@ -2576,7 +2602,10 @@ mod lot310 {
     /// kill, as past the budget. A gone memfd whose facts fail — a shell's
     /// runc, a process that never ran the runtime — stays Critical,
     /// rootful or rootless. On rc11 the pump kept nothing: Critical for
-    /// root's too (fails there: no `gone`).
+    /// root's too (fails there: no `gone`). The review of #588 (F2): only
+    /// runc 1.1's re-exec — runc 1.2's shape (a first exec since the fork:
+    /// every OCI hook too) and a gone copy whose parent the pump did not see
+    /// run that runtime stay the Critical kill (High at 51a0f11d).
     #[test]
     fn a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user() {
         use crate::decision::rules::program_identity::{
@@ -2611,6 +2640,7 @@ mod lot310 {
             // `runc create`, then `runc init` running the packaged runc
             (lineage_exec(38_101, 38_100, 38_100, runc, 200), 0),
             (lineage_exec(38_102, 38_101, 38_101, runc, 300), 0),
+            (lineage_exec(38_108, 38_101, 38_101, runc, 300), 0),
             // rootless: the same, as uid 1000
             (lineage_exec(38_110, 1, 1, conmon, 100), 1000),
             (lineage_exec(38_111, 38_110, 38_110, runc, 200), 1000),
@@ -2632,10 +2662,17 @@ mod lot310 {
             episode: None,
         };
         let judged = |pid: u32, ppid: u32, uid: u32| {
-            // runc 1.1: the re-exec (no fork since its last exec)
+            // runc 1.1: the re-exec (no fork since its last exec), under
+            // the runc process the pump saw
             let e = as_uid(memfd_exec(pid, ppid, 0, 400), uid);
             assert!(lineage.ingest_spawn_event(&e));
-            keep_runtime_clone(&e, gone.clone());
+            keep_runtime_clone(
+                &e,
+                RuntimeClone {
+                    seen: vec![(ppid, runc)],
+                    ..gone.clone()
+                },
+            );
             r.evaluate(&e)
         };
         // root's: recorded High, not killed, "not compared (gone)"
@@ -2653,17 +2690,36 @@ mod lot310 {
             !v.reasoning.contains("budget") && !v.reasoning.contains("copy of"),
             "the record names no budget and vouches for no copy"
         );
-        // the mini-hunt: runc 1.2's shape (`runc init` executing the copy
-        // `runc create` made, its first exec since the fork): the same
+        // the review of #588 (F2): runc 1.2's shape (`runc init` executing
+        // the copy `runc create` made, its first exec since the fork — the
+        // shape of every OCI hook a runtime runs): its length not known, the
+        // Critical kill
         let e = memfd_exec(38_106, 38_101, 38_101, 400);
         assert!(lineage.ingest_spawn_event(&e));
         keep_runtime_clone(&e, gone.clone());
-        let v = r.evaluate(&e).expect("recorded");
-        assert_eq!(
-            (v.action.clone(), v.severity),
-            (ResponseAction::Log, Severity::High),
-            "runc 1.2's shape"
+        assert!(kills(r.evaluate(&e)), "runc 1.2's shape, gone");
+        // ... the same exec compared whole is still runc 1.2's clone
+        let e = memfd_exec(38_107, 38_101, 38_101, 400);
+        assert!(lineage.ingest_spawn_event(&e));
+        keep_runtime_clone(
+            &e,
+            RuntimeClone {
+                image: runc,
+                ..Default::default()
+            },
         );
+        assert!(r.evaluate(&e).is_none(), "runc 1.2's shape, compared");
+        // a re-exec gone whose parent the pump did not see run that runtime
+        let e = memfd_exec(38_108, 38_101, 0, 400);
+        assert!(lineage.ingest_spawn_event(&e));
+        keep_runtime_clone(
+            &e,
+            RuntimeClone {
+                seen: vec![(38_100, runc)],
+                ..gone.clone()
+            },
+        );
+        assert!(kills(r.evaluate(&e)), "gone, the parent not seen as runc");
         // a user's (rootless, or a payload exiting at once): the kill
         let v = judged(38_112, 38_111, 1000).expect("judged");
         assert_eq!(
