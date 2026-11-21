@@ -209,8 +209,9 @@ pub trait ChainHost: 'static {
     /// told at its open and at each change. A finding the agent signed is
     /// never in the chain alone: the host makes it seen (the agent: its
     /// degradations in `nn-admin status`, the trust level, the capability
-    /// manifest) until its hold ends. Default: nothing.
-    fn integrity_held(_path: &Path, _lines: &[String]) {}
+    /// manifest) until its hold ends — and its advisories apart, never
+    /// degradations (the review of #586, P2-1). Default: nothing.
+    fn integrity_held(_path: &Path, _held: &crate::held::Held) {}
 }
 
 /// The host of a reader that anchors nothing (a verifier, `nn-admin`'s
@@ -316,8 +317,8 @@ pub(crate) mod testing {
         fn retention_stalled(active: &Path, why: Option<&str>) {
             stalls::told(active, why);
         }
-        fn integrity_held(path: &Path, lines: &[String]) {
-            helds::told(path, lines);
+        fn integrity_held(path: &Path, held: &crate::held::Held) {
+            helds::told(path, &held.lines());
         }
     }
 

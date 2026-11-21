@@ -568,9 +568,16 @@ pub(super) fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
-        // Lot 379 (pre-alpha F7-1): the acknowledgement IS this row — the
+        // Lot 379 (pre-alpha F7-1): the acknowledgement IS its row — the
         // audit log reads a successful one as the end of the holds it
-        // covers (`nn_evidence::held`); a refused one ends nothing.
+        // covers (`nn_evidence::held`); a refused one ends nothing. The
+        // review of #586 (P3-1): an acknowledgement done was written by its
+        // handler, under the lock it was judged under, and answered from
+        // that append (`handlers::integrity`): here only a refusal's row.
+        (
+            AdminMessage::IntegrityAcknowledgeRequest(_),
+            AdminMessage::IntegrityAcknowledgeResponse(r),
+        ) if r.acknowledged > 0 => return,
         (
             AdminMessage::IntegrityAcknowledgeRequest(req),
             AdminMessage::IntegrityAcknowledgeResponse(r),
@@ -598,6 +605,28 @@ pub(super) fn emit_audit_for(
         // out-of-spec and already logged; no audit row.
         _ => return,
     };
+    let draft = admin_row(op, extra, result, client, matched_fps, cosigner_count);
+    let mut log = audit_log.lock();
+    if let Err(e) = log.append(draft) {
+        warn!(
+            error = %e,
+            op,
+            "audit log append failed — admin op succeeded, audit row missing"
+        );
+    }
+}
+
+/// The signed row of an admin request: what [`emit_audit_for`] appends, and
+/// what a handler whose act is its row appends itself (lot 379, the review
+/// of #586, P3-1: `integrity acknowledge`).
+pub(super) fn admin_row(
+    op: &str,
+    extra: serde_json::Value,
+    result: String,
+    client: &AuditClient,
+    matched_fps: &[String],
+    cosigner_count: usize,
+) -> AuditEntryDraft {
     // PHASE_D_004: split matched_fps into primary + cosigners.
     // matched_fps is in admin.pub index-order — the first slot
     // is the canonical "key_fp" (primary signer), the rest are
@@ -611,7 +640,7 @@ pub(super) fn emit_audit_for(
         let primary = iter.next().unwrap_or_default();
         (primary, iter.collect())
     };
-    let draft = AuditEntryDraft {
+    AuditEntryDraft {
         op: op.to_string(),
         extra,
         key_fp,
@@ -621,14 +650,6 @@ pub(super) fn emit_audit_for(
         client_uid: client.uid,
         client_comm: client.comm.clone(),
         client_exe: client.exe.clone(),
-    };
-    let mut log = audit_log.lock();
-    if let Err(e) = log.append(draft) {
-        warn!(
-            error = %e,
-            op,
-            "audit log append failed — admin op succeeded, audit row missing"
-        );
     }
 }
 

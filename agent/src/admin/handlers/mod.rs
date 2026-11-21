@@ -302,7 +302,7 @@ pub(super) fn dispatch(
         // Lot 379 (pre-alpha F7-1) — acknowledge the held integrity findings.
         AdminMessage::IntegrityAcknowledgeRequest(req) => {
             AdminMessage::IntegrityAcknowledgeResponse(dispatch_integrity_acknowledge(
-                req, auth, audit_log, fps_out,
+                req, auth, audit_log, client, fps_out,
             ))
         }
 

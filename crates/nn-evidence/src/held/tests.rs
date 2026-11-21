@@ -524,3 +524,338 @@ fn a_long_detail_is_cut() {
     log.append(drift("config_overlay", &exact)).unwrap();
     assert_eq!(log.held().findings()[1].detail, exact);
 }
+
+/// The review of #586 (P2-1, its probe 2): a state of the host or a choice
+/// of the operator that degrades no sensor is an advisory — listed on its
+/// own with its signed row, never among the degradations (`sensors`, the
+/// trust level, the manifest). On the PR's head each was held as a
+/// degradation: `sensors: DEGRADED` on every default install (the admin key
+/// the testers' guide leaves on the host).
+#[test]
+fn benign_states_are_advisories_not_degradations() {
+    let advisories = [
+        "admin_key_on_host",
+        "sysctl_strict",
+        "sysctl_opted_out",
+        "agent_stalled",
+        "quarantine_index_rebuilt",
+    ];
+    for k in advisories {
+        assert_eq!(hold_of(k, "detected"), Hold::Advisory, "{k}");
+    }
+    // exactly these: an advisory more is a deliberate change of this test
+    let mut table: Vec<&str> = ADVISORY_KINDS.iter().map(|(k, _)| *k).collect();
+    table.sort_unstable();
+    let mut want = advisories.to_vec();
+    want.sort_unstable();
+    assert_eq!(table, want);
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    helds::take(&path);
+    let row = log.rows();
+    log.append(drift(
+        "admin_key_on_host",
+        "/root/northnarrow-admin.key: an admin private key on this host",
+    ))
+    .unwrap();
+    // the default install: no degradation, one advisory with its row
+    assert!(log.held().lines().is_empty(), "{:?}", log.held().lines());
+    assert_eq!(log.held().more(), 0);
+    assert!(!log.held().is_empty(), "kept, as a degradation is");
+    let adv = log.held().advisories();
+    assert_eq!(adv.len(), 1, "{adv:?}");
+    assert!(
+        adv[0].starts_with("admin_key_on_host — signed ")
+            && adv[0].contains(&format!("(audit row {row})"))
+            && adv[0].contains("an advisory, not a degradation"),
+        "{}",
+        adv[0]
+    );
+    // the host is told no degradation line for it
+    assert!(helds::take(&path).iter().all(|l| l.is_empty()));
+    // a real degradation beside it is one line, on its own
+    log.append(drift(
+        "config_overlay",
+        "/etc/northnarrow/x.local (3 bytes)",
+    ))
+    .unwrap();
+    assert_eq!(log.held().lines().len(), 1);
+    assert!(log.held().lines()[0].starts_with("config_overlay — "));
+    assert_eq!(log.held().advisories().len(), 1);
+    // ended as a degradation while found is: its `cleared`, the next start,
+    // an acknowledgement
+    log.append(cleared(
+        "admin_key_on_host",
+        "/root/northnarrow-admin.key: an admin private key on this host",
+    ))
+    .unwrap();
+    assert!(log.held().advisories().is_empty());
+    log.append(drift("sysctl_strict", "vm.overcommit_ratio 80"))
+        .unwrap();
+    boot(&mut log);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    log.append(drift("agent_stalled", "the loop stood still 40 s"))
+        .unwrap();
+    log.append(ack(log.rows() - 1)).unwrap();
+    assert!(log.held().is_empty());
+}
+
+/// The review of #586 (P2-1): one fact, one line — the host's harmful
+/// drop-in is the `host_dropins` degradation's (not held twice), and an
+/// overlay the start refused (`unauthorized_overlay`) is not listed again
+/// by the round's `config_overlay` of the same file. On the PR's head the
+/// lab showed three degradations for two facts.
+#[test]
+fn a_fact_signed_twice_is_one_line() {
+    assert_eq!(hold_of("unit_dropin_harmful", "detected"), Hold::NotHeld);
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    log.append(drift(
+        "unauthorized_overlay",
+        "process-comm-allowlist (/etc/northnarrow/process-comm-allowlist.local): no signature \
+         file",
+    ))
+    .unwrap();
+    log.append(drift(
+        "config_overlay",
+        "/etc/northnarrow/process-comm-allowlist.local (4053 bytes, sha256 a864bcbb…)",
+    ))
+    .unwrap();
+    // another overlay's round finding stays listed
+    log.append(drift(
+        "config_overlay",
+        "/etc/northnarrow/other.local (3 bytes, sha256 00…)",
+    ))
+    .unwrap();
+    let lines = log.held().lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("unauthorized_overlay — "), "{lines:?}");
+    // the one line names both rows (an acknowledgement through the newest
+    // covers both)
+    assert!(
+        lines[0].ends_with(&format!(
+            "the integrity round signs the same file as config_overlay (audit row {})",
+            log.rows() - 2
+        )),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("other.local"), "{lines:?}");
+    // the twin is still held: the start ends the refusal, the round's
+    // finding of the file still on disk is listed then
+    assert_eq!(log.held().findings().len(), 3);
+    log.append(drift(
+        "unit_dropin_harmful",
+        "/etc/systemd/system/x.d/y.conf",
+    ))
+    .unwrap();
+    assert_eq!(log.held().findings().len(), 3, "not held twice");
+}
+
+/// The review of #586 (P2-1): every kind whose finding is integrity
+/// relevant — the evidence altered, a death, an attack-class event, a state
+/// that weakens what the agent sees or defends — stays a degradation; no
+/// kind is in two tables.
+#[test]
+fn every_integrity_relevant_kind_stays_a_degradation() {
+    for k in EVIDENCE_KINDS.iter().chain(DEATH_KINDS).chain(EVENT_KINDS) {
+        assert_eq!(hold_of(k, "detected"), Hold::UntilAcknowledged, "{k}");
+    }
+    for k in DEGRADATION_KINDS {
+        assert_eq!(hold_of(k, "detected"), Hold::WhileFound, "{k}");
+    }
+    for k in [
+        "config_overlay",
+        "unauthorized_overlay",
+        "default_list_modified",
+        "weakening_env",
+        "weakening_flag",
+        "own_dropin_weakening",
+        "unit_dropin",
+        "unit_dropin_breaks_agent",
+        "mount_over_protected",
+        "mount_not_canonical",
+        "protected_mount_gone",
+        "bpf_pin_vanished",
+        "foreign_pin",
+        "sysctl_restored",
+        "sysctl_not_restored",
+        "canary_decoy_tampered",
+        "bait_missing_at_boot",
+        "fuse_aborted",
+        "signed_records_failed",
+        "witness_unavailable",
+        "witness_note_uncertified",
+    ] {
+        assert_eq!(hold_of(k, "detected"), Hold::WhileFound, "{k}");
+    }
+    let mut all: Vec<&str> = EVIDENCE_KINDS
+        .iter()
+        .chain(DEATH_KINDS)
+        .chain(EVENT_KINDS)
+        .chain(DEGRADATION_KINDS)
+        .copied()
+        .chain(ADVISORY_KINDS.iter().map(|(k, _)| *k))
+        .chain(NOT_HELD_KINDS.iter().map(|(k, _)| *k))
+        .collect();
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), n, "a kind in two tables");
+    // a kind of another build: the safe side
+    assert_eq!(
+        hold_of("k379_a_kind_of_another_build", "detected"),
+        UNKNOWN_KIND
+    );
+    assert_eq!(UNKNOWN_KIND, Hold::WhileFound);
+}
+
+/// The review of #586 (P3-2, its probe 2): an attack-class event of the
+/// run — a forged shutdown marker, the admin socket removed — is not undone
+/// by a start, a host reboot included: held until acknowledged. On the PR's
+/// head the next `agent_boot` ended both.
+#[test]
+fn an_attack_class_event_is_held_across_a_reboot_until_acknowledged() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    log.append(drift(
+        "shutdown_marker_rejected",
+        "the watchdog refused a shutdown marker",
+    ))
+    .unwrap();
+    log.append(drift(
+        "admin_socket_removed",
+        "/run/northnarrow/admin.sock removed",
+    ))
+    .unwrap();
+    assert_eq!(log.held().findings().len(), 2);
+    drop(log);
+    let mut log = open(&key, &path);
+    assert_eq!(log.held().findings().len(), 2, "a restart keeps them");
+    boot(&mut log);
+    assert_eq!(log.held().findings().len(), 2, "a start ends neither");
+    assert!(log.held().lines()[0].contains("held until acknowledged"));
+    log.append(ack(log.rows() - 1)).unwrap();
+    assert!(log.held().is_empty());
+}
+
+/// The review of #586 (P3-3, its probe 1): an evidence finding signed past
+/// the cap, behind findings a start ends, is listed — its kind, its row,
+/// the command that ends it — the newest of those counted in its stead. On
+/// the PR's head it was a bare "and 1 more held integrity row(s)" once the
+/// next start ended the others.
+#[test]
+fn an_evidence_finding_past_the_cap_keeps_its_kind_and_row() {
+    let (d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD {
+        log.append(drift(
+            "unit_dropin",
+            &format!("/etc/systemd/system/x.d/{i}.conf"),
+        ))
+        .unwrap();
+    }
+    log.append(cut("detections", &d.path().join("detections.jsonl")))
+        .unwrap();
+    let cut_row = log.rows() - 1;
+    assert_eq!(log.held().findings().len(), MAX_HELD);
+    assert_eq!(log.held().more(), 1, "the newest while found, counted");
+    assert_eq!(log.held().count(), MAX_HELD as u64 + 1);
+    boot(&mut log);
+    let lines = log.held().lines();
+    assert_eq!(log.held().more(), 0, "{lines:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("chain_truncated (detections)")
+            && lines[0].contains(&format!("(audit row {cut_row})")),
+        "{lines:?}"
+    );
+    // advisories past the cap: their own counter, never a degradation's
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 2 {
+        log.append(drift("sysctl_opted_out", &format!("kernel.x{i}")))
+            .unwrap();
+    }
+    assert_eq!(log.held().more(), 0);
+    assert!(log.held().lines().is_empty());
+    let adv = log.held().advisories();
+    assert_eq!(adv.len(), MAX_HELD + 1, "{adv:?}");
+    assert!(adv[MAX_HELD].contains("2 more advisory row(s)"), "{adv:?}");
+    log.append(ack(log.rows() - 1)).unwrap();
+    assert!(log.held().is_empty());
+}
+
+/// The review of #586 (P3-4): every part of a held line is bounded — a
+/// forged row's kind and chain too, not only its detail.
+#[test]
+fn a_held_line_s_kind_and_chain_are_cut() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    let long = "k".repeat(DETAIL_CHARS + 50);
+    log.append(draft(
+        INTEGRITY_DRIFT_OP,
+        "detected",
+        serde_json::json!({ "kind": long, "chain": long, "detail": "x" }),
+    ))
+    .unwrap();
+    let f = &log.held().findings()[0];
+    assert_eq!(f.kind.chars().count(), DETAIL_CHARS + 1);
+    assert_eq!(f.subject.chars().count(), DETAIL_CHARS + 1);
+    assert!(log.held().lines()[0].chars().count() < 4 * DETAIL_CHARS);
+}
+
+/// The review of #586 (P2-1, mutation round): advisories past the cap are
+/// counted among what an acknowledgement can cover (`count`), still held
+/// once an acknowledgement ends the listed ones (`is_empty` is false while
+/// only counted ones remain), and ended by the next start as the listed
+/// ones are.
+#[test]
+fn advisories_past_the_cap_are_counted_kept_and_ended_by_a_start() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 2 {
+        log.append(drift("sysctl_opted_out", &format!("kernel.x{i}")))
+            .unwrap();
+    }
+    assert_eq!(log.held().count(), MAX_HELD as u64 + 2);
+    let listed_newest = log
+        .held()
+        .findings()
+        .iter()
+        .map(|f| f.last_row)
+        .max()
+        .unwrap();
+    log.append(ack(listed_newest)).unwrap();
+    assert!(log.held().findings().is_empty());
+    assert!(!log.held().is_empty(), "two advisories are still counted");
+    assert_eq!(log.held().count(), 2);
+    let adv = log.held().advisories();
+    assert_eq!(adv.len(), 1, "{adv:?}");
+    assert!(adv[0].contains("2 more advisory row(s)"), "{adv:?}");
+    boot(&mut log);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    assert!(log.held().advisories().is_empty());
+}
+
+/// The review of #586 (P3-3, mutation round): the finding counted in the
+/// stead of an evidence finding past the cap brings all its rows to the
+/// counter, not one.
+#[test]
+fn a_finding_counted_past_the_cap_brings_its_rows() {
+    let (d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD {
+        for _ in 0..2 {
+            log.append(drift(
+                "unit_dropin",
+                &format!("/etc/systemd/system/x.d/{i}.conf"),
+            ))
+            .unwrap();
+        }
+    }
+    log.append(cut("detections", &d.path().join("detections.jsonl")))
+        .unwrap();
+    assert_eq!(log.held().more(), 2, "the counted finding's two rows");
+    assert_eq!(log.held().count(), MAX_HELD as u64 + 2);
+    assert!(log.held().lines()[MAX_HELD].contains("2 more held integrity row(s)"));
+}

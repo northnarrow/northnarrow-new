@@ -49,3 +49,10 @@ pub(crate) use nn_evidence::{audit, os_rng, verify_lines};
 pub fn main<H: host::AdminHost>(host: &H) -> ExitCode {
     cli::run(host)
 }
+
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `debug-trigger` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const DEBUG_TRIGGER: bool = cfg!(feature = "debug-trigger");

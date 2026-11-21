@@ -275,6 +275,10 @@ pub struct StatusOutcome {
     /// (`StatusResponse::runtime_clones`; `None` from an older agent or the
     /// unsigned reply).
     pub runtime_clones: Option<nn_proto::admin_protocol::RuntimeClones>,
+    /// Lot 379 (the review of #586, P2-1): the advisories — signed findings
+    /// that degrade no sensor (`StatusResponse::advisories`; `None` from an
+    /// older agent or the unsigned reply).
+    pub advisories: Option<Vec<String>>,
     pub execq_script_refused_total: Option<u64>,
     /// Lab PR 267 (R12a): the priority event bus and the loss counters by
     /// stage (`StatusResponse::event_bus`; `None` from an older agent or
@@ -562,6 +566,7 @@ fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) 
         program_copy_skipped_total: resp.program_copy_skipped_total,
         kernel_state_held_back: resp.kernel_state_held_back,
         runtime_clones: resp.runtime_clones,
+        advisories: resp.advisories,
         execq_script_refused_total: resp.execq_script_refused_total,
         event_bus: resp.event_bus,
         event_bus_decision: resp.event_bus_decision,
@@ -4168,6 +4173,7 @@ mod tests {
                         unverified: 30,
                         not_read: 31,
                     }),
+                    advisories: Some(vec!["integrity: admin_key_on_host".to_string()]),
                     execq_script_refused_total: Some(19),
                     event_bus: None,
                     event_bus_decision: None,
@@ -4208,6 +4214,11 @@ mod tests {
             out.runtime_clones
                 .map(|c| (c.compared, c.kept, c.unverified, c.not_read)),
             Some((28, 29, 30, 31))
+        );
+        // lot 379: the advisories
+        assert_eq!(
+            out.advisories,
+            Some(vec!["integrity: admin_key_on_host".to_string()])
         );
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));

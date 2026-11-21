@@ -69,6 +69,20 @@ pub mod impact;
 /// resolved features to none of them.
 pub const TEST_UTIL: bool = cfg!(feature = "test-util");
 
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `debug-trigger` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const DEBUG_TRIGGER: bool = cfg!(feature = "debug-trigger");
+
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `demo-tappa5` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const DEMO_TAPPA5: bool = cfg!(feature = "demo-tappa5");
+
 // Defences switched off (R08b, lab PR 251; was the agent's `impair`): the
 // security-tool detector the NN-L-EVA rules and the posture share, and its
 // shipped list.
