@@ -183,6 +183,10 @@ pub const AUTH_BINARY_EXES: &[&str] = &[
     "/usr/bin/gpasswd",
     "/usr/bin/login",
     "/usr/bin/machinectl",
+    // lot 380 (the mini-hunt of the uidmap tools' read): shadow's setuid
+    // `newgrp` (and `sg`, a link to it) reads `/etc/gshadow` and
+    // `/etc/login.defs` as its caller — `newgrp docker` after a group change
+    "/usr/bin/newgrp",
     "/usr/bin/passwd",
     "/usr/bin/pkexec",
     "/usr/bin/su",
