@@ -45,7 +45,11 @@ pub const DAEMON_DATA_V1: &str = "/etc/northnarrow/daemon-data.v1";
 pub const BUILTIN_DAEMON_DATA_V1: &str =
     include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/daemon-data.v1"));
 /// SHA-256 of every `daemon-data.v1` an earlier release shipped.
-pub const EARLIER_DAEMON_DATA_V1_SHA256: &[&str] = &[];
+pub const EARLIER_DAEMON_DATA_V1_SHA256: &[&str] = &[
+    // lot 283c (e24430a), before lot 380 added containerd's and dockerd's
+    // runtime state under /run
+    "b2ce219ecbf149981fbef7e23a04de42e8a06a43a474173da7c9a4b7f9804292",
+];
 /// The shipped `daemon-data.v1` (built-in copy, earlier ones).
 pub const DAEMON_DATA_SHIPPED: Shipped<'static> =
     Shipped::new(BUILTIN_DAEMON_DATA_V1, EARLIER_DAEMON_DATA_V1_SHA256);
@@ -280,6 +284,9 @@ mod tests {
         assert!(units("/var/lib/kubelet/").contains(&"kubelet.service".to_string()));
         assert!(units("/var/lib/kubelet/").contains(&"k3s.service".to_string()));
         assert_eq!(units("/var/lib/etcd/"), vec!["etcd.service"]);
+        // lot 380: containerd's and dockerd's runtime state
+        assert_eq!(units("/run/containerd/"), vec!["containerd.service"]);
+        assert_eq!(units("/run/docker/"), vec!["docker.service"]);
     }
 
     /// An entry is a service and a directory; what the mass-write overlay

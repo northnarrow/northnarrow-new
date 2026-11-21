@@ -1503,6 +1503,7 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     let Event::FileOpen {
         pid,
         uid,
+        comm,
         filename,
         flags,
         kernel_class,
@@ -1594,6 +1595,25 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     {
         return false;
     }
+    // Lot 380 (the rc11 soak on Debian 13: ALERTED in the bench's
+    // preparation — `id` looking up a name, its login uid read after it
+    // exited): `/etc/passwd` is world-readable, holds no secret, and every
+    // name lookup opens it. A packaged program's read-only open — the
+    // host's file in a root-only directory, by the kernel's identity of the
+    // file it executed — is no sensitive access, unless the program reads
+    // the files it is told to: a generic file tool, a shell or an
+    // interpreter (`cat /etc/passwd`, `cut -d: -f1 /etc/passwd`,
+    // `python3 -c …`), as POS-007 judges a service account's reader of the
+    // shadow file. A program of the user's, a copy, an image not read: as
+    // before.
+    if is_passwd
+        && !is_write_open(*flags)
+        && auth
+            .host_program(*pid, as_of, *exe_file, comm)
+            .is_some_and(|program| !reads_like_a_tool(&program))
+    {
+        return false;
+    }
     // Lot 378 (the rc10 soak: ALERTED at every boot on the three guests):
     // the user's service manager's `(sd-pam)` closing its PAM session — its
     // modules read `/etc/login.defs` (and name lookups `/etc/passwd`) as the
@@ -1604,6 +1624,21 @@ fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracke
     if (is_passwd || is_login_defs)
         && !is_write_open(*flags)
         && auth.is_user_manager_pam_keeper(*pid, *uid, as_of, (*exe_file, *cgroup_id))
+    {
+        return false;
+    }
+    // Lot 380 (the rc11 soak on Debian 13 and Ubuntu 24.04: ALERTED at each
+    // rootless `podman` burst): shadow's uidmap tools read its settings as
+    // their caller — lot 378's identity of the file the kernel executed (a
+    // /tmp copy, `cat /etc/login.defs` read as themselves)
+    if is_login_defs
+        && !is_write_open(*flags)
+        && auth.runs_host_program(
+            *pid,
+            as_of,
+            *exe_file,
+            super::lineage::LOGIN_DEFS_HELPER_EXES,
+        )
     {
         return false;
     }
@@ -1623,11 +1658,84 @@ const SERVICE_UID_CREDENTIAL_FILES: &[&str] = &["/etc/shadow", "/etc/gshadow", "
 
 /// External audit POS-007: generic file tools, by the basename of the
 /// file the kernel executed — what a web shell or a dropper reads
-/// credentials with; no daemon reads them with these.
+/// credentials with; no daemon reads them with these. Lot 380: and what a
+/// user's `/etc/passwd` is listed with (the text tools, the editors, the
+/// copiers and archivers, the multi-call binaries whose name is every
+/// tool's), now that a packaged program's read of it is judged by this
+/// list.
 const GENERIC_READER_EXES: &[&str] = &[
-    "cat", "tac", "head", "tail", "less", "more", "cp", "dd", "tar", "cpio", "zip", "gzip",
-    "base64", "base32", "xxd", "od", "hexdump", "strings", "grep", "sed", "awk", "gawk", "mawk",
-    "openssl", "curl", "wget", "nc", "ncat", "socat", "busybox",
+    "cat",
+    "tac",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "cp",
+    "dd",
+    "tar",
+    "cpio",
+    "zip",
+    "gzip",
+    "base64",
+    "base32",
+    "xxd",
+    "od",
+    "hexdump",
+    "strings",
+    "grep",
+    "sed",
+    "awk",
+    "gawk",
+    "mawk",
+    "openssl",
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "socat",
+    "busybox", // lot 380
+    "cut",
+    "sort",
+    "uniq",
+    "nl",
+    "paste",
+    "join",
+    "column",
+    "comm",
+    "diff",
+    "cmp",
+    "split",
+    "tee",
+    "rev",
+    "fold",
+    "fmt",
+    "pr",
+    "egrep",
+    "fgrep",
+    "rg",
+    "zcat",
+    "vi",
+    "vim",
+    "vim.basic",
+    "vim.tiny",
+    "nvim",
+    "view",
+    "nano",
+    "ed",
+    "ex",
+    "emacs",
+    "rsync",
+    "scp",
+    "sftp",
+    "install",
+    "gpg",
+    "xz",
+    "bzip2",
+    "zstd",
+    "lz4",
+    "7z",
+    "coreutils",
+    "toybox",
 ];
 
 /// External audit POS-007: shells and interpreters, by exe basename with
@@ -3200,20 +3308,26 @@ mod tests {
         exec(901, 900, 1000, quadlet, 12);
         // a program from a home under the manager
         exec(902, 900, 1000, "/home/u/bin/gen", 14);
-        // a copy of systemd run as 1000 by PID 1, and its generator
+        // Lot 380: a packaged program that reads no file it is told to
+        // (the generator) looks up names whoever started it; the lineage's
+        // attack shapes below run the packaged `cat` instead, which only
+        // this carve-out could vouch for
+        IdTestHost::set_file_id("/usr/bin/cat", Some((STAT_DEV, 16)));
+        let cat = "/usr/bin/cat";
+        // a copy of systemd run as 1000 by PID 1, and its program
         exec(910, 1, 1000, "/home/u/systemd", 15);
-        exec(911, 910, 1000, quadlet, 12);
-        // the manager run by hand from a shell (950), and its generator
+        exec(911, 910, 1000, cat, 16);
+        // the manager run by hand from a shell (950), and its program
         exec(950, 1, 1000, "/usr/bin/bash", 13);
         exec(951, 950, 1000, systemd, 11);
-        exec(952, 951, 1000, quadlet, 12);
+        exec(952, 951, 1000, cat, 16);
         // a shell the generator runs
         exec(903, 901, 1000, "/usr/bin/bash", 13);
-        // a manager running as another uid (root), and its generator
+        // a manager running as another uid (root), and its program
         exec(920, 1, 0, systemd, 11);
-        exec(921, 920, 1000, quadlet, 12);
-        // the generator executed as another uid than it opens as
-        exec(930, 900, 1001, quadlet, 12);
+        exec(921, 920, 1000, cat, 16);
+        // the program executed as another uid than it opens as
+        exec(930, 900, 1001, cat, 16);
         let fires = |pid: u32, path: &str, flags: u32| {
             let mut e = file_open(pid, 1000, path, flags, 10_000);
             if let Event::FileOpen { comm, .. } = &mut e {
@@ -3238,7 +3352,12 @@ mod tests {
         ] {
             assert!(fires(pid, "/etc/passwd", 0), "{what}");
         }
-        for (path, _) in [(systemd, ()), (quadlet, ()), ("/usr/bin/bash", ())] {
+        for (path, _) in [
+            (systemd, ()),
+            (quadlet, ()),
+            ("/usr/bin/bash", ()),
+            (cat, ()),
+        ] {
             IdTestHost::set_file_id(path, None);
         }
         for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
@@ -3595,9 +3714,13 @@ mod tests {
         // the manager; (sd-exec-strv) 902, gone; the generator 903 under it
         exec(900, 1, systemd, 11, (1, 1));
         exec(903, 902, quadlet, 12, (902, 900));
-        // a unit's shell 904 and the generator under its fork 905
+        // a unit's shell 904 and a program under its fork 905 — lot 380:
+        // the packaged `cat`, which only the anchor could vouch for (a
+        // packaged program that reads no file it is told to, the generator,
+        // looks up names whoever started it)
+        IdTestHost::set_file_id("/usr/bin/cat", Some((STAT_DEV, 14)));
         exec(904, 900, "/usr/bin/bash", 13, (900, 900));
-        exec(906, 905, quadlet, 12, (905, 904));
+        exec(906, 905, "/usr/bin/cat", 14, (905, 904));
         let fires = |pid: u32, path: &str| {
             let mut e = file_open(pid, 1000, path, 0, 10_000);
             if let Event::FileOpen { comm, .. } = &mut e {
@@ -3611,7 +3734,7 @@ mod tests {
         );
         assert!(fires(903, "/etc/login.defs"), "another file");
         assert!(fires(906, "/etc/passwd"), "anchored at a unit's shell");
-        for path in [systemd, quadlet, "/usr/bin/bash"] {
+        for path in [systemd, quadlet, "/usr/bin/bash", "/usr/bin/cat"] {
             IdTestHost::set_file_id(path, None);
         }
         for d in ["/usr/lib/systemd", "/usr/libexec/podman", "/usr/bin"] {
@@ -3797,6 +3920,241 @@ mod tests {
             "a user's fork naming the helper"
         );
         for path in [helper, "/usr/bin/cat", "/usr/bin/python3"] {
+            IdTestHost::set_file_id(path, None);
+        }
+        IdTestHost::set_dir_root_only("/usr/bin", false);
+    }
+
+    /// Lot 380 (named, the rc11 soak on Debian 13 and Ubuntu 24.04: ALERTED
+    /// at each rootless `podman` burst — `newuidmap`, image
+    /// `/usr/bin/newuidmap`, uid 1000, opening `/etc/login.defs`): shadow's
+    /// packaged uidmap tools reading its settings as their caller are no
+    /// sensitive access — by the file the kernel executed (the cached exec;
+    /// a fork's forker by the kernel's record; else, the exec not read yet,
+    /// its image at the open), as lot 378 judged their `/etc/passwd`
+    /// lookup. The attack shapes still fire: a /tmp copy, whatever image it
+    /// names at the open; a copy not read yet; no image read; `cat
+    /// /etc/login.defs` naming the tool; a user's fork naming it; the tool
+    /// opening `login.defs` for write, or reading `/etc/shadow`; the FUSE
+    /// mount helper (lot 378's other passwd reader) reading `login.defs`.
+    #[test]
+    fn the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let files = [
+            ("/usr/bin/newuidmap", 41),
+            ("/usr/bin/newgidmap", 42),
+            ("/usr/bin/cat", 43),
+            ("/usr/bin/python3", 44),
+            ("/usr/bin/fusermount3", 45),
+        ];
+        for (path, ino) in files {
+            IdTestHost::set_file_id(path, Some((STAT_DEV, ino)));
+        }
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let exec = |pid: u32, path: &str, ino: u64| {
+            let mut e = spawn_with_exe(pid, 690, path, 1);
+            if let Event::ProcessSpawn {
+                exe,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*start_ns, *timestamp_ns) = (u64::from(pid), u64::from(pid) + 1);
+                (exe.path, exe.dev, exe.ino, exe.flags) =
+                    (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                exe.fork_parent = 690;
+            }
+            assert!(auth.ingest_spawn_event(&e));
+        };
+        let fires = |pid: u32, path: &str, flags: u32, image: (u64, u64)| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen { comm, exe_file, .. } = &mut e {
+                (*comm, *exe_file) = ("newuidmap".into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let (uidmap, gidmap) = ((KDEV, 41), (KDEV, 42));
+        exec(800, "/usr/bin/newuidmap", 41);
+        exec(801, "/usr/bin/newgidmap", 42);
+        assert!(!fires(800, "/etc/login.defs", 0, uidmap), "newuidmap");
+        assert!(!fires(801, "/etc/login.defs", 0, gidmap), "newgidmap");
+        assert!(
+            !fires(802, "/etc/login.defs", 0, uidmap),
+            "its exec not read yet: the image at the open"
+        );
+        auth.ingest_kernel_fork(803, 803, (800, 800), 1000, 10_000);
+        assert!(!fires(803, "/etc/login.defs", 0, uidmap), "its fork");
+        // the attack shapes
+        assert!(fires(800, "/etc/login.defs", 1, uidmap), "opened for write");
+        assert!(fires(800, "/etc/shadow", 0, uidmap), "the shadow file");
+        exec(810, "/tmp/newuidmap", 46);
+        assert!(fires(810, "/etc/login.defs", 0, (KDEV, 46)), "a /tmp copy");
+        assert!(
+            fires(810, "/etc/login.defs", 0, uidmap),
+            "a /tmp copy naming the tool"
+        );
+        assert!(
+            fires(811, "/etc/login.defs", 0, (KDEV, 46)),
+            "a copy, its exec not read yet"
+        );
+        assert!(fires(811, "/etc/login.defs", 0, (0, 0)), "no image read");
+        exec(820, "/usr/bin/cat", 43);
+        assert!(
+            fires(820, "/etc/login.defs", 0, uidmap),
+            "cat naming the tool"
+        );
+        exec(830, "/usr/bin/python3", 44);
+        auth.ingest_kernel_fork(831, 831, (830, 830), 1000, 10_000);
+        assert!(
+            fires(831, "/etc/login.defs", 0, uidmap),
+            "a user's fork naming the tool"
+        );
+        exec(840, "/usr/bin/fusermount3", 45);
+        assert!(
+            fires(840, "/etc/login.defs", 0, (KDEV, 45)),
+            "the FUSE mount helper reads no login.defs"
+        );
+        for (path, _) in files {
+            IdTestHost::set_file_id(path, None);
+        }
+        IdTestHost::set_dir_root_only("/usr/bin", false);
+    }
+
+    /// Lot 380 (named, the rc11 soak on Debian 13: ALERTED in the bench's
+    /// preparation — `id`, image `/usr/bin/id`, uid 1000, opening
+    /// `/etc/passwd`; BUG-018's login uid read after it exited):
+    /// `/etc/passwd` is world-readable and every name lookup opens it, so a
+    /// packaged program's read-only open of it — the host's file in a
+    /// root-only directory, by the file the kernel executed (the cached
+    /// exec; a fork's forker by the kernel's record; else, the exec not read
+    /// yet, its image at the open as the host's file of its name in a
+    /// system program directory) — is no sensitive access, unless the
+    /// program reads the files it is told to. The attack shapes still fire:
+    /// `cat`, `cut`, `vim`, a multi-call `coreutils`, `python3`, `bash`
+    /// reading it, and a fork of a shell; a /tmp copy of `id`, a program of
+    /// a home; a copy not read yet, no image read, a name that is no file
+    /// of a program directory; the image of `id` named by a process whose
+    /// cached exec is a /tmp file (`prctl(PR_SET_MM)`); `id` opening it for
+    /// write, or reading `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers` or
+    /// `/etc/login.defs`.
+    #[test]
+    fn a_packaged_program_s_name_lookup_is_no_sensitive_access() {
+        use super::super::lineage::AuthSessionTracker;
+        use crate::posture::host::testing::IdTestHost;
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = AuthSessionTracker::<IdTestHost>::new(tmp.path());
+        let files = [
+            ("/usr/bin/id", 51),
+            ("/usr/bin/cat", 52),
+            ("/usr/bin/cut", 53),
+            ("/usr/bin/vim.basic", 54),
+            ("/usr/bin/coreutils", 55),
+            ("/usr/bin/python3.12", 56),
+            ("/usr/bin/bash", 57),
+            ("/usr/bin/whoami", 58),
+        ];
+        for (path, ino) in files {
+            IdTestHost::set_file_id(path, Some((STAT_DEV, ino)));
+        }
+        IdTestHost::set_dir_root_only("/usr/bin", true);
+        let exec = |pid: u32, path: &str, ino: u64| {
+            let mut e = spawn_with_exe(pid, 690, path, 1);
+            if let Event::ProcessSpawn {
+                exe,
+                start_ns,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*start_ns, *timestamp_ns) = (u64::from(pid), u64::from(pid) + 1);
+                (exe.path, exe.dev, exe.ino, exe.flags) =
+                    (path.into(), KDEV, ino, KNOWN | ROOT_DIR);
+                exe.fork_parent = 690;
+            }
+            assert!(auth.ingest_spawn_event(&e));
+        };
+        let opens = |pid: u32, comm: &str, path: &str, flags: u32, image: (u64, u64)| {
+            let mut e = file_open(pid, 1000, path, flags, 10_000);
+            if let Event::FileOpen {
+                comm: c, exe_file, ..
+            } = &mut e
+            {
+                (*c, *exe_file) = (comm.into(), image);
+            }
+            super::sensitive_file_access(&e, &auth)
+        };
+        let fires = |pid: u32, path: &str, flags: u32, image: (u64, u64)| {
+            opens(pid, "id", path, flags, image)
+        };
+        let id = (KDEV, 51);
+        exec(900, "/usr/bin/id", 51);
+        assert!(!fires(900, "/etc/passwd", 0, id), "id's lookup");
+        exec(901, "/usr/bin/whoami", 58);
+        assert!(
+            !opens(901, "whoami", "/etc/passwd", 0, (KDEV, 58)),
+            "whoami's lookup"
+        );
+        assert!(
+            !fires(902, "/etc/passwd", 0, id),
+            "its exec not read yet: the image at the open"
+        );
+        auth.ingest_kernel_fork(903, 903, (900, 900), 1000, 10_000);
+        assert!(!fires(903, "/etc/passwd", 0, id), "its fork");
+        // the attack shapes: what reads the files it is told to
+        for (pid, path, ino) in [
+            (910, "/usr/bin/cat", 52),
+            (911, "/usr/bin/cut", 53),
+            (912, "/usr/bin/vim.basic", 54),
+            (913, "/usr/bin/coreutils", 55),
+            (914, "/usr/bin/python3.12", 56),
+            (915, "/usr/bin/bash", 57),
+        ] {
+            exec(pid, path, ino);
+            assert!(fires(pid, "/etc/passwd", 0, (KDEV, ino)), "{path}");
+        }
+        auth.ingest_kernel_fork(916, 916, (915, 915), 1000, 10_000);
+        assert!(fires(916, "/etc/passwd", 0, (KDEV, 57)), "a shell's fork");
+        // a copy, a home's program
+        exec(920, "/tmp/id", 59);
+        assert!(fires(920, "/etc/passwd", 0, (KDEV, 59)), "a /tmp copy");
+        assert!(
+            fires(920, "/etc/passwd", 0, id),
+            "a /tmp exec naming id's image (PR_SET_MM)"
+        );
+        exec(921, "/home/u/bin/id", 60);
+        assert!(fires(921, "/etc/passwd", 0, (KDEV, 60)), "a home's program");
+        assert!(
+            fires(922, "/etc/passwd", 0, (KDEV, 59)),
+            "a copy, its exec not read yet"
+        );
+        assert!(fires(922, "/etc/passwd", 0, (0, 0)), "no image read");
+        for comm in ["cat", "../bin/id", "", ".id"] {
+            assert!(
+                opens(923, comm, "/etc/passwd", 0, id),
+                "not read yet, named {comm:?}: not the file of its name"
+            );
+        }
+        // id on other files
+        assert!(fires(900, "/etc/passwd", 1, id), "opened for write");
+        for path in [
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/sudoers",
+            "/etc/login.defs",
+        ] {
+            assert!(fires(900, path, 0, id), "{path}");
+        }
+        for (path, _) in files {
             IdTestHost::set_file_id(path, None);
         }
         IdTestHost::set_dir_root_only("/usr/bin", false);
@@ -8310,6 +8668,68 @@ mod tests {
             own_data::NONE
         )));
         assert!(raised(own(mass_write(CONTAINERD, false, 1201 * s), code)));
+    }
+
+    /// Lot 380 (named, the rc11 soak on Ubuntu 26.04: ENGAGED during a
+    /// container burst — containerd, its unit's process, replacing the task
+    /// bundles it writes and removes under `/run/containerd` as containers
+    /// start and stop): the shipped list names containerd's runtime state
+    /// (and dockerd's, the mini-hunt's variant), so the replacement crosses
+    /// nothing when both its halves were its unit's own data there, by the
+    /// writer's cgroup. Still counted: the same burst from another unit, or
+    /// from a cgroup containerd made below its own (a container's payload);
+    /// containerd's burst in dockerd's directory; a window that left the
+    /// directory.
+    #[test]
+    fn containerd_replacing_its_task_bundles_under_run_raises_nothing() {
+        let h = own_host();
+        let ci = TriggerType::ConfirmedIntrusion;
+        let code = unit_code(&h.det, "/run/containerd/");
+        let docker = unit_code(&h.det, "/run/docker/");
+        let bundle = "/run/containerd/io.containerd.runtime.v2.task/moby/0f3c/config.json";
+        let own = |mut e: Event, o: u8| {
+            match &mut e {
+                Event::MassWrite {
+                    uid,
+                    own_data,
+                    filename,
+                    ..
+                }
+                | Event::FileBurst {
+                    uid,
+                    own_data,
+                    filename,
+                    ..
+                } => (*uid, *own_data, *filename) = (0, o, bundle.to_string()),
+                _ => unreachable!(),
+            }
+            e
+        };
+        let det = &h.det;
+        let s = 1_000_000_000u64;
+        let raised = |e: Event| det.detect(&e, &[]).contains(&ci);
+        assert!(!raised(own(mass_write(CONTAINERD, false, 10 * s), code)));
+        assert!(
+            !raised(own(destroyed(CONTAINERD, 11 * s), code)),
+            "containerd's own bundles"
+        );
+        for (pid, t, why) in [
+            (OTHER_UNIT, 300, "another unit"),
+            (CONTAINERD_SUBGROUP, 600, "a cgroup below containerd's"),
+        ] {
+            let _ = raised(own(mass_write(pid, false, t * s), code));
+            assert!(raised(own(destroyed(pid, (t + 1) * s), code)), "{why}");
+        }
+        let _ = raised(own(mass_write(CONTAINERD, false, 900 * s), docker));
+        assert!(
+            raised(own(destroyed(CONTAINERD, 901 * s), docker)),
+            "containerd in dockerd's directory"
+        );
+        let _ = raised(own(mass_write(CONTAINERD, false, 1200 * s), code));
+        assert!(
+            raised(own(destroyed(CONTAINERD, 1201 * s), own_data::NONE)),
+            "a window that left the directory"
+        );
     }
 
     /// Lot 283c, decision 3: a person's process rewriting its own

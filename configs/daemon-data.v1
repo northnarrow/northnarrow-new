@@ -31,6 +31,12 @@
 
 containerd.service /var/lib/containerd/
 docker.service /var/lib/docker/
+# Lot 380 (the rc11 soak on Ubuntu 26.04: ENGAGED during a container burst):
+# containerd writes and removes each task's bundle (config.json, the shim's
+# address and pid files, runc's log) under /run/containerd as containers start
+# and stop; dockerd its containers' runtime state under /run/docker.
+containerd.service /run/containerd/
+docker.service /run/docker/
 kubelet.service /var/lib/kubelet/
 etcd.service /var/lib/etcd/
 

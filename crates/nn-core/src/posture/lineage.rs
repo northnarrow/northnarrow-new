@@ -99,6 +99,20 @@ pub const PASSWD_LOOKUP_HELPER_EXES: &[&str] = &[
     "/usr/bin/newgidmap",
 ];
 
+/// Lot 380 (the rc11 soak on Debian 13 and Ubuntu 24.04: ALERTED at each
+/// rootless `podman` burst — `newuidmap`, uid 1000, opening
+/// `/etc/login.defs`): shadow's setuid uidmap tools read shadow's settings
+/// as their caller while they map a rootless user namespace — the file
+/// lot 378's carve-out of their `/etc/passwd` lookup did not name
+/// ([`AuthSessionTracker::runs_host_program`], the same identity).
+/// `fusermount3` reads no `login.defs`: it is not listed.
+pub const LOGIN_DEFS_HELPER_EXES: &[&str] = &["/usr/bin/newuidmap", "/usr/bin/newgidmap"];
+
+/// Lot 380: the directories where a program's file is looked for by its
+/// name when only the kernel's identity of the image is known
+/// ([`AuthSessionTracker::host_program`]).
+pub const SYSTEM_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/usr/sbin", "/bin", "/sbin"];
+
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
 ///
@@ -2736,6 +2750,57 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             },
         };
         file.is_some_and(|f| paths.iter().any(|p| self.is_host_file_in_root_dir(p, f)))
+    }
+
+    /// Lot 380 (the rc11 soak on Debian 13: ALERTED in the bench's
+    /// preparation — `id`, uid 1000, looking up a name in `/etc/passwd`;
+    /// BUG-018's login uid read after it exited): the path of the host's
+    /// program `pid` runs as of `as_of`, when the file the kernel executed
+    /// is the host's file at that path, in a directory root's and writable
+    /// by no one else ([`Self::is_host_file_in_root_dir`]):
+    /// - the exec the spawn cache holds for that time (its path, and the
+    ///   file the kernel executed);
+    /// - else, for a fork that executed nothing since (the kernel's record
+    ///   of the fork, [`Self::ingest_kernel_fork`]), its forker's exec at
+    ///   the fork;
+    /// - else (its exec not read yet) `image`, the kernel's `mm->exe_file`
+    ///   at the event, when it is the host's file named `comm` in one of
+    ///   [`SYSTEM_PROGRAM_DIRS`] — the name only picks the file the
+    ///   identity is compared with — and never when an exec is cached (the
+    ///   review of #583, F4).
+    ///
+    /// `None`: a copy, a renamed or replaced binary, a file elsewhere, an
+    /// exec whose file was not recorded, `(0, 0)`.
+    pub fn host_program(
+        &self,
+        pid: u32,
+        as_of: AsOf,
+        image: (u64, u64),
+        comm: &str,
+    ) -> Option<String> {
+        if pid <= 1 {
+            return None;
+        }
+        let entry = match self.cached_live(pid, as_of.time()) {
+            CachedAt::Current(e) | CachedAt::Past(e) => e,
+            CachedAt::LaterOnly => return None,
+            CachedAt::Absent => match self.kernel_fork_record(pid, as_of.time(), 0) {
+                Some((_, forker)) => forker,
+                // the name another file's (`..`, a path, nothing): no file
+                // has the image's identity there, or it is no system tree's
+                None => {
+                    return SYSTEM_PROGRAM_DIRS
+                        .iter()
+                        .map(|d| format!("{d}/{comm}"))
+                        .find(|p| self.is_host_file_in_root_dir(p, image))
+                }
+            },
+        };
+        let path = entry.exe.to_string_lossy().into_owned();
+        entry
+            .exec_file
+            .is_some_and(|f| self.is_host_file_in_root_dir(&path, f))
+            .then_some(path)
     }
 
     /// Lot 378 (the rc10 soak: ALERTED at every boot on Debian 13, Ubuntu
