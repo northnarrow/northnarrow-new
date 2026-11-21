@@ -5074,8 +5074,9 @@ mod tests {
                 want("agent cgroup", AGENT_UNIT_CGROUP, true),
                 // lot 370 (F10-4): -999, the units' and every host's
                 want("agent oom_score_adj", "-999", true),
-                want("agent memory.high", "9663676416", true),
-                want("agent memory.max", "11811160064", true),
+                // lot 381: the Phase 6b sizes (768M, 1G)
+                want("agent memory.high", "805306368", true),
+                want("agent memory.max", "1073741824", true),
                 want("agent pids.max", "512", true),
                 want("agent cpu.max", "max 100000", false),
                 want(LIMIT_NNP, "1", true),

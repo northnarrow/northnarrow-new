@@ -421,6 +421,82 @@ fn an_oom_kill_of_one_process_leaves_both_units_running() {
     }
 }
 
+/// A systemd byte size of the units (`768M`, `1G`, `4096`; base 1024), in
+/// bytes; `None` for anything else (a percentage, `infinity`).
+fn unit_bytes(v: &str) -> Option<u64> {
+    let (num, mult) = match v.as_bytes().last()? {
+        b'K' => (&v[..v.len() - 1], 1u64 << 10),
+        b'M' => (&v[..v.len() - 1], 1 << 20),
+        b'G' => (&v[..v.len() - 1], 1 << 30),
+        b'T' => (&v[..v.len() - 1], 1 << 40),
+        _ => (v, 1),
+    };
+    num.parse::<u64>().ok()?.checked_mul(mult)
+}
+
+/// Every value `key` is set to in `name` (non-comment lines).
+fn all_set<'a>(d: &'a [(String, String)], key: &str) -> Vec<&'a str> {
+    d.iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
+/// Lot 381 (the pre-alpha's Phase 6b, rc11): the units' memory limits are
+/// sized from what the lab measured, and this ratchet keeps them so — a
+/// new size comes with a new measure, written here. The agent's cgroup
+/// peaked at 316 MiB at a cold start (about 165 MiB of it the kernel's BPF
+/// maps) and at most 264 MiB under the storms (2,600 exec/s, a full FIM
+/// set, 200 container starts); the watchdog's RSS is 5 MiB, its cgroup at
+/// most 2.2 MiB. `MemoryMax=1G` is over three times the peak (a cap near it
+/// fails the maps' load at a start); `MemoryHigh=768M` throttles only far
+/// above every measured load (above it the kernel stalls the agent, which
+/// would lose events); the watchdog's `MemoryMax=32M` is six times its RSS.
+/// Each is set once, absolute (the self-integrity check compares the
+/// cgroup files with them: external audit DEP-005), never below its floor
+/// (`antitamper_bpf::cgroup_floors`: a lower value would not be
+/// registered). They were 9G / 11G (the LLM advisor's, removed in Wave 4)
+/// and 64M — this test fails there.
+#[test]
+fn the_memory_limits_are_sized_from_the_measured_peaks() {
+    use antitamper_bpf::cgroup_floors::{floor_of, FloorRole};
+    const MIB: u64 = 1 << 20;
+    // Phase 6b's measures (docs/operator/KNOWN_LIMITATIONS.md quotes them)
+    const AGENT_CGROUP_PEAK: u64 = 316 * MIB;
+    const AGENT_STORM_PEAK: u64 = 264 * MIB;
+    const WATCHDOG_RSS: u64 = 5 * MIB;
+    let floor = |role, file: &str| -> u64 {
+        floor_of(role, file)
+            .and_then(|f| f.parse().ok())
+            .expect("a byte floor")
+    };
+    let agent = directives(&unit("northnarrow-agent.service"));
+    let wd = directives(&unit("northnarrow-watchdog.service"));
+    assert_eq!(all_set(&agent, "MemoryMax"), ["1G"], "the agent's MemoryMax=");
+    assert_eq!(all_set(&agent, "MemoryHigh"), ["768M"], "the agent's MemoryHigh=");
+    assert_eq!(all_set(&wd, "MemoryMax"), ["32M"], "the watchdog's MemoryMax=");
+    assert!(
+        all_set(&wd, "MemoryHigh").is_empty(),
+        "the watchdog has no MemoryHigh="
+    );
+    let max = unit_bytes(all_set(&agent, "MemoryMax")[0]).unwrap();
+    let high = unit_bytes(all_set(&agent, "MemoryHigh")[0]).unwrap();
+    let wd_max = unit_bytes(all_set(&wd, "MemoryMax")[0]).unwrap();
+    assert!(max >= 3 * AGENT_CGROUP_PEAK, "MemoryMax over 3× the peak");
+    assert!(max <= 4 * AGENT_CGROUP_PEAK, "MemoryMax near the measure, not a guess");
+    assert!(
+        high >= 2 * AGENT_CGROUP_PEAK && high >= 2 * AGENT_STORM_PEAK,
+        "MemoryHigh twice every measured peak"
+    );
+    assert!(high < max, "MemoryHigh below MemoryMax");
+    assert!(wd_max >= 6 * WATCHDOG_RSS, "the watchdog's cap six times its RSS");
+    assert!(max >= floor(FloorRole::Agent, "memory.max"));
+    assert!(high >= floor(FloorRole::Agent, "memory.high"));
+    assert!(wd_max >= floor(FloorRole::Watchdog, "memory.max"));
+    assert_eq!(unit_bytes("1G"), Some(1 << 30));
+    assert_eq!(unit_bytes("80%"), None);
+}
+
 /// The lab r5 of #582 (fix round 6): the OOM kill count the watchdog reads
 /// is the slice's both units run in.
 #[test]

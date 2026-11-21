@@ -234,13 +234,21 @@ RuntimeDirectoryPreserve=yes
 #   MemoryMax — hard ceiling. The cgroup's own OOM-killer fires here,
 #     killing ONLY the agent (the watchdog then respawns it per its
 #     own restart policy).
-#   The sizes (9G / 11G) were set for the on-host LLM advisor
-#     (Foundation-Sec-8B Q4_K_M, ~7 GB peak RSS), removed in Wave 4 (lab
-#     PR 214). Without the model the agent needs a small fraction of
-#     that; the values stay until the lab has measured the agent's RSS
-#     without it (a smaller cap is a change of its own: the self-integrity
-#     check depends on it). On a host whose memory is not above
-#     MemoryMax the cap cannot bind: see OOMScoreAdjust below. The sizes stay absolute (external audit
+#   The sizes — lot 381, from the pre-alpha's Phase 6b (rc11, 2 and 4
+#     vCPU, Ubuntu 24.04 and Debian 13): the agent's cgroup peaked at
+#     316 MiB at a cold start (about 165 MiB of it kernel memory, the BPF
+#     maps), at most 264 MiB under a 2,600 exec/s storm, a full FIM set and
+#     200 container starts; about 200 MiB at rest. MemoryMax=1G is 3.2
+#     times the peak: a cap near it would fail the maps' load at a start,
+#     not just a malloc. MemoryHigh=768M throttles only well above every
+#     measured load (above it the kernel reclaims and stalls the agent,
+#     which would then lose events). Not measured: hosts of 16 or more
+#     CPUs (the per-CPU rings) and larger FIM sets — re-checked in the
+#     final release candidate's soak. They replace 9G / 11G, sized for the
+#     on-host LLM advisor removed in Wave 4 (lab PR 214). A ratchet test
+#     (watchdog/tests/systemd_units.rs) keeps them tied to that measure.
+#     On a host whose memory is not above MemoryMax the cap cannot bind:
+#     see OOMScoreAdjust below. The sizes stay absolute (external audit
 #     DEP-005): the self-integrity check compares them with the cgroup
 #     files, which it cannot do for a percentage.
 #   TasksMax — fork/thread-leak backstop. The agent runs a tokio
@@ -252,8 +260,8 @@ RuntimeDirectoryPreserve=yes
 # detection; throttling CPU would slow verdicts without bounding the OOM
 # vector this block exists to contain. Memory is the cascade risk, so
 # memory is what we cap.
-MemoryHigh=9G
-MemoryMax=11G
+MemoryHigh=768M
+MemoryMax=1G
 TasksMax=512
 # OOMScoreAdjust — lot 370 (F10-4): -999, the host OOM killer's last pick.
 # Its SIGKILL is one no hook can refuse, so the agent's role can fall

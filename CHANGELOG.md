@@ -6,6 +6,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 381 (the pre-alpha's Phase 6b, rc11; `UPGRADE_NOTES_WAVE4.md` §67).
+  - **R004 Critical at one rootful runc start in about 300** (Debian 13,
+    Podman 5.4.2, runc 1.1.15: 200 containers started in a row). runc
+    1.1's `runc init` executes its sealed copy and exits a few
+    milliseconds later; the exec pump read that one copy once the process
+    had exited, returned before any counter and kept nothing: R004 judged
+    it fileless. The copy is now read through a child of the exec's parent
+    still running that very memfd (runc's stages, forked with
+    `CLONE_PARENT`), compared whole and kept. When none is left it is "not
+    compared (gone)": root's recorded High, never killed, any other uid's
+    the Critical kill, as past the budget; a foreign memfd stays Critical.
+    Every sealed memfd exec now lands in exactly one count of `nn-admin
+    status`'s `runtime clones` (JSON `through`, `gone`, `no_runtime`
+    appended). Tests
+    `a_runc_clone_gone_before_the_read_is_compared_through_a_child_still_running_it`,
+    `a_runtime_clone_with_nothing_left_running_it_is_counted_not_compared`,
+    `every_sealed_memfd_exec_lands_in_exactly_one_runtime_counter`,
+    `a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user`,
+    `the_runtime_clones_lot_381_counts_are_appended_inside_it`.
+  - **The memory limits from the lab's measure.** The agent's unit sets
+    `MemoryHigh=768M` and `MemoryMax=1G` (9G and 11G before, sized for the
+    LLM advisor removed in Wave 4), the watchdog's `MemoryMax=32M` (64M):
+    the agent's cgroup peaked at 316 MiB at a cold start and at most
+    264 MiB under the storms, the watchdog's RSS is about 5 MiB. Test
+    `the_memory_limits_are_sized_from_the_measured_peaks` (a ratchet: a new
+    size comes with a new measure).
 - Lot 378 (the rc10 soaks): three false positives judged by identity
   (`UPGRADE_NOTES_WAVE4.md` §64).
   - **The posture at every boot.** The `POSTURE TRANSITION` line named

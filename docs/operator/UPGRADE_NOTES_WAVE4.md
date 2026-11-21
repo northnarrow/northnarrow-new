@@ -5566,3 +5566,61 @@ shape it resembles still fires.
   no R004 at a rootless Podman run, a loop of a few dozen included; and at
   a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
   guard lost.
+
+## 67. A rootful runc copy compared, never Critical by a race; memory limits from the lab's measure (lot 381)
+
+- **R004 Critical at one rootful runc start in about 300** (P2, the
+  pre-alpha's Phase 6b, Debian 13, Podman 5.4.2, runc 1.1.15, rc11). 200
+  rootful containers started in a row gave one `R004_ExecFromProcSelfFd`
+  Critical (`memfd:runc_clon`, uid 0, `would have: KillProcessTree`); the
+  other 299 copies were compared and kept, and `runtime clones` counted
+  that one nowhere.
+  - runc 1.1's `runc init` executes its sealed copy of the packaged runc,
+    forks its two stages with `CLONE_PARENT` (children of `runc create`)
+    and exits a few milliseconds later. The exec pump reads the copy
+    through `/proc/<pid>/exe`; reading it once the process had exited, it
+    returned before any counter and kept nothing, and R004 judged the copy
+    fileless.
+  - The copy is now read through a process still running that very memfd
+    (the same inode the kernel executed, sealed at the exec, so the same
+    bytes): a child of the exec's parent, read from
+    `/proc/<parent>/task/<tid>/children` (runc's second stage runs the copy
+    until the container's program starts). It is compared whole as
+    before and kept.
+  - When no process runs it any more and the parent is the installed
+    runtime, every fact but the bytes holds: "not compared (gone)", judged
+    as a copy past the compare budget — root's (uid 0 of the initial user
+    namespace) recorded High, never killed; any other uid's the Critical
+    kill (a user chooses how long its process runs). A parent gone too, or
+    a manager parent (which runtime it copied is not known): nothing kept,
+    the Critical kill as before. A foreign memfd stays Critical, rootful
+    or rootless.
+  - Every sealed memfd exec the exec sensor describes is now counted in
+    exactly one count. `nn-admin status`'s `runtime clones` line says, after
+    the kept and compared counts, how many were read through another
+    process, not compared for the budget, gone before the read, not read in
+    time and under no installed runtime; JSON `runtime_clones` gains
+    `through`, `gone` and `no_runtime` (appended inside the object: an older
+    `nn-admin` reads the four fields it knows).
+- **The memory limits** (Phase 6b's measure on QEMU guests of 2 and 4
+  vCPU, Ubuntu 24.04 and Debian 13): the agent's cgroup peaked at 316 MiB
+  at a cold start (about 165 MiB of it the kernel's BPF maps) and at most
+  264 MiB under the storms; the watchdog's RSS is about 5 MiB, its cgroup
+  at most 2.2 MiB.
+  - The agent's unit: `MemoryHigh=768M` and `MemoryMax=1G` (they were 9G
+    and 11G, sized for the LLM advisor removed in Wave 4). The watchdog's:
+    `MemoryMax=32M` (64M). `OOMPolicy=continue` and `OOMScoreAdjust=-999`
+    are unchanged.
+  - An upgrade applies them to the running cgroups inside its window (the
+    deny hooks refuse any other change of these files); the self-integrity
+    check then compares the cgroup files with the new values.
+  - On a host of 16 or more CPUs or with a large FIM set the kernel memory
+    was not measured: the release candidate's soak checks it again.
+  - A ratchet test (`the_memory_limits_are_sized_from_the_measured_peaks`)
+    ties the values to the measure: a new size comes with a new measure.
+- **Upgrade.** No configuration. After it, `systemctl show -p MemoryMax -p
+  MemoryHigh northnarrow-agent` reads 1073741824 and 805306368, and the
+  watchdog's `MemoryMax` 33554432. A drop-in of your own that raised them
+  (`systemctl set-property`, made inside a window) still wins over the
+  unit. Expect no R004 Critical at rootful container starts; under a burst
+  a High "not compared (gone)" is possible, and is counted.
