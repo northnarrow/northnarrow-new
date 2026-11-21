@@ -11,10 +11,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **`newuidmap` reading `/etc/login.defs`** (ALERTED at each rootless
     Podman burst): shadow's packaged uidmap tools read shadow's settings as
     their caller — told by the file the kernel executed, as lot 378's
-    `/etc/passwd` lookup. The mini-hunt: `newgrp` (`/etc/gshadow`,
-    `/etc/login.defs`) is an authentication binary. Tests
-    `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
-    `newgrp_reading_the_group_shadow_as_its_caller_is_no_sensitive_access`.
+    `/etc/passwd` lookup. Test
+    `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`.
   - **Routine `/etc/passwd` reads** (`id` in the bench's preparation, its
     login uid read after it exited): a packaged program's read-only open
     of the world-readable `/etc/passwd` is a name lookup, no sensitive

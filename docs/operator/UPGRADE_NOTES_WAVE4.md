@@ -5586,13 +5586,14 @@ fires.
     at the open), as lot 378 judges their `/etc/passwd` lookup.
   - The lot's search for variants found `newgrp` (`newgrp docker` after a
     group change): shadow's setuid tool reads `/etc/gshadow` and
-    `/etc/login.defs` as its caller. It is now an authentication binary,
-    as `chage` and `expiry` are (the reader itself; POS-002: what its
-    shell runs reads as itself).
+    `/etc/login.defs` as its caller, and still raises ALERTED. It is not
+    exempted: it then executes the user's shell in its own process, and
+    the file-open sensor does not report a read of the same file by the
+    same task again within a second (see the residuals) — `sg <group> -c
+    'exec cat /etc/login.defs'` would read as `newgrp`'s.
   - Still ALERTED: `cat /etc/login.defs`; a /tmp copy of a uidmap tool,
     whatever image it names; a copy not read yet; `fusermount3` reading
-    it; a uidmap tool opening it for write or reading `/etc/shadow`; `cat`
-    run from the shell `newgrp` starts.
+    it; a uidmap tool opening it for write or reading `/etc/shadow`.
 - **Routine `/etc/passwd` reads** (ALERTED in the bench's preparation,
   Debian 13). `id`, uid 1000, looked up a name in an SSH session; BUG-018's
   login uid was read after `id` had exited.
@@ -5681,6 +5682,16 @@ fires.
     burst in another daemon's directory; a window that left the directory.
     The ransomware tracker reads every crossing, these included.
 - **Residuals.**
+  - **A read just after an exec in the same process** (the lab of this
+    lot; the file-open sensor's read-repeat filter, review 75). The sensor
+    reports a task's read-only open of a file once within a second; the
+    task stays the same across an exec. A unit's executor looks the unit's
+    user up in `/etc/passwd`, then executes the unit's program in the same
+    process: a `cat /etc/passwd` that is that program, within the second,
+    is not reported (measured: `systemd-run --uid=<user> --pipe bash -c
+    'cat /etc/passwd'` raised nothing; with `sleep 2; exec cat` before it,
+    ALERTED). Keying the filter on the task's exec as well is an eBPF
+    change left to a later lot.
   - **A forker that gave up its privilege.** A forker that held a uid 0 or
     a capability in PID 1's namespace at the fork and gave it up before
     the pump read it (`setresuid`, `capset`, a new user namespace, its

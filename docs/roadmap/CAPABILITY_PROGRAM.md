@@ -11715,7 +11715,8 @@ number in parentheses is a lab PR.
     - **`newuidmap`.** Lot 378's carve-out named the uidmap tools'
       `/etc/passwd` lookup only; their `/etc/login.defs` read is judged the
       same way (`runs_host_program`, `LOGIN_DEFS_HELPER_EXES`). Mini-hunt:
-      `newgrp` joins the authentication binaries.
+      `newgrp` (gshadow, login.defs) not exempted — see the read-repeat
+      finding below.
     - **`/etc/passwd`.** World-readable, read by every name lookup: a
       packaged program's read-only open (the host's file in a root-only
       directory, by the file the kernel executed; an exec not read yet by

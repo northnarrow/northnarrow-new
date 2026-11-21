@@ -998,8 +998,8 @@ lists the known false positives of each rule.
 - **Rootless Podman's uidmap tools, name lookups, a user's `modprobe`,
   containerd's task bundles** (lot 380, the rc11 soak). Judged by identity
   now:
-  - the packaged `newuidmap`/`newgidmap` reading `/etc/login.defs` (and
-    `newgrp` reading `/etc/gshadow` and `/etc/login.defs`) as their caller;
+  - the packaged `newuidmap`/`newgidmap` reading `/etc/login.defs` as
+    their caller;
   - a packaged program's read-only open of `/etc/passwd` (a name lookup:
     `id`, `whoami`, `ls -l`), by the file the kernel executed, unless the
     program is a file tool, a shell or an interpreter;
@@ -1017,6 +1017,11 @@ lists the known false positives of each rule.
   unit's burst under `/run/containerd`.
 
   Residuals:
+  - **A read just after an exec in the same process.** The file-open
+    sensor reports a task's read of a file once within a second, across
+    an exec: a unit's program reading `/etc/passwd` or `/etc/login.defs`
+    right after its executor looked the user up is not reported (an eBPF
+    change for a later lot); `newgrp` is not exempted for that reason.
   - **A forker that gave up its privilege** between the fork and the
     pump's read is taken for one that never held it (only root's own
     process can; R018 judges any module its fork loads). A `modprobe` a
@@ -1034,7 +1039,6 @@ lists the known false positives of each rule.
 
   *Evidence:* lot 380;
   `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
-  `newgrp_reading_the_group_shadow_as_its_caller_is_no_sensitive_access`,
   `a_packaged_program_s_name_lookup_is_no_sensitive_access`,
   `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
   `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
