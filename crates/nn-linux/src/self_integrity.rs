@@ -214,6 +214,13 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     ("NN_NET_SNAPSHOT_MAX", |v| {
         v.trim().parse::<u64>().map_or(true, |n| n == 0)
     }),
+    // Lot 379 (F8b-1): a test build's injected verifier refusal of a mount
+    // guard program (in any other build nothing reads it, so it is not
+    // reported there).
+    (
+        crate::anti_tamper::mount_guard::VERIFIER_REFUSE_ENV,
+        crate::anti_tamper::mount_guard::refusal_weakens,
+    ),
 ];
 
 /// Does this value of the variable weaken the agent?

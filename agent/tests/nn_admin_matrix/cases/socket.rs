@@ -673,7 +673,7 @@ pub fn verbs() -> Vec<Verb> {
                     .to_string(),
                 "integrity: unauthorized_overlay — signed 2026-11-20T16:45:02.000000Z (audit row \
                  415) — held while found, or until acknowledged: process-comm-allowlist \
-                 (/etc/northnarrow/process-comm-allowlist.local): no signature file"
+                 (process-comm-allowlist.local): no signature file"
                     .to_string(),
             ]);
             success.push(("integrity-held".to_string(), telemetry(Some(held))));
