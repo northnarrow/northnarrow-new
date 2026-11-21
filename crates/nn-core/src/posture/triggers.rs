@@ -4084,7 +4084,9 @@ mod tests {
     /// coreutils (its multi-call file only under
     /// `/usr/lib/cargo/bin/coreutils`, `/usr/bin` GNU's), and busybox's
     /// file under `/bin` hard-linked as a tool of its own name: each is a
-    /// generic tool by its identity, whatever name it ran by.
+    /// generic tool by its identity, whatever name it ran by. A tool's file
+    /// outside the directories compared (`/opt/bin/jq`, the initramfs'
+    /// busybox) is one by its own name.
     #[test]
     fn a_multi_call_file_off_the_path_is_a_tool_by_its_identity() {
         let b = IdBench::new(
@@ -4095,8 +4097,17 @@ mod tests {
                 ("/usr/bin/cat", Some(52)),
                 ("/bin/busybox", Some(77)),
                 ("/usr/sbin/hostinfo", Some(77)),
+                ("/opt/bin/jq", Some(85)),
+                ("/usr/lib/initramfs-tools/bin/busybox", Some(86)),
             ],
-            &[UU, "/usr/bin", "/bin", "/usr/sbin"],
+            &[
+                UU,
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/opt/bin",
+                "/usr/lib/initramfs-tools/bin",
+            ],
         );
         b.exec(980, 1000, &format!("{UU}/id"), 71, &["id", "-un"]);
         assert!(
@@ -4110,6 +4121,23 @@ mod tests {
         );
         b.exec(982, 1000, "/usr/bin/id", 51, &["id", "-un"]);
         assert!(!b.opens(982, 1000, "id", "/etc/passwd", 51), "GNU's id");
+        b.exec(
+            983,
+            1000,
+            "/opt/bin/jq",
+            85,
+            &["jq", "-R", ".", "/etc/passwd"],
+        );
+        assert!(
+            b.opens(983, 1000, "jq", "/etc/passwd", 85),
+            "a tool by its name"
+        );
+        let bb = "/usr/lib/initramfs-tools/bin/busybox";
+        b.exec(984, 1000, bb, 86, &["busybox", "cat", "/etc/passwd"]);
+        assert!(
+            b.opens(984, 1000, "busybox", "/etc/passwd", 86),
+            "busybox by its name"
+        );
     }
 
     /// Lot 380 (named, the review of #587, F1 and F4: V2, V3, with GNU
@@ -4130,6 +4158,7 @@ mod tests {
                 ("/lib64/ld-linux-x86-64.so.2", Some(72)),
                 ("/usr/libexec/runner", Some(72)),
                 ("/tmp/id", Some(59)),
+                ("/usr/local/bin/id", Some(66)),
             ],
             &["/usr/bin", "/usr/lib/x86_64-linux-gnu", "/usr/libexec"],
         );
@@ -4156,6 +4185,10 @@ mod tests {
         assert!(
             ld(964, &[LD, LD, "/usr/bin/id"]),
             "the loader running the loader"
+        );
+        assert!(
+            ld(967, &[LD, "/usr/local/bin/id"]),
+            "an operand in a directory not root's only"
         );
         assert!(ld(965, &[LD]), "no operand");
         b.exec(

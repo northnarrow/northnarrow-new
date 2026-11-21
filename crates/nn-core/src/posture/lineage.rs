@@ -3085,18 +3085,17 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// for a file no answer of the last minute names (a stat of each name
     /// in each directory, under the host's root).
     pub fn reads_files_it_is_told(&self, program: &HostProgram) -> bool {
-        self.file_reads_what_it_is_told(&program.path, program.file, program.runs.as_ref(), true)
+        self.file_reads_what_it_is_told(&program.path, program.file, program.runs.as_ref())
     }
 
     /// [`Self::reads_files_it_is_told`] of the file at `path` with the
-    /// identity `file`; `runs`: what its exec's argv said it runs; `operand`:
-    /// a loader's operand may decide (not for an operand itself).
+    /// identity `file`; `runs`: what its exec's argv said it runs (`None`
+    /// for a loader's operand, judged in turn: a loader there is a tool).
     fn file_reads_what_it_is_told(
         &self,
         path: &str,
         file: (u64, u64),
         runs: Option<&Runs>,
-        operand: bool,
     ) -> bool {
         use crate::decision::rules::program_identity::base_of;
         if !in_system_tree(path) {
@@ -3105,7 +3104,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         let base = base_of(path);
         let class = self.tool_class(file);
         if super::script_args::is_loader_name(base) || class == Some(ToolClass::Loader) {
-            let Some(Runs::Script(op)) = runs.filter(|_| operand) else {
+            let Some(Runs::Script(op)) = runs else {
                 return true;
             };
             if !op.starts_with('/') || !in_system_tree(op) {
@@ -3115,7 +3114,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                 return true;
             };
             return !self.is_host_file_in_root_dir(op, op_file)
-                || self.file_reads_what_it_is_told(op, op_file, None, false);
+                || self.file_reads_what_it_is_told(op, op_file, None);
         }
         names_a_reader_tool(base) || class == Some(ToolClass::Tool)
     }
