@@ -1,6 +1,6 @@
 # Known limitations of the alpha
 
-> Draft until rc-final: the list is checked again before the v0.1.0-alpha tag.
+> Checked again for the v0.1.0-alpha tag.
 
 This page is for people who test the NorthNarrow alpha. It lists what we
 know does not work yet, or works only in part, so that you can tell a
@@ -215,13 +215,15 @@ how.
   of a key no live watchdog vouches for (a watchdog that lived less than
   one 30 s round) is held by its declared kind: a vacancy until
   acknowledged, a bookkeeping row while found. An admin key left on the
-  host, strict overcommit, the operator's signed sysctl opt-out and a pause
-  of the whole machine are advisories: listed, not degradations.
+  host, strict overcommit, the operator's signed sysctl opt-out and a stall of the agent's loop
+  (`agent_stalled`: a paused machine, or the agent's own memory throttling
+  under `MemoryHigh`) are advisories: listed, not degradations. Events the
+  agent lost are counted apart (since its start) and make `sensors` DEGRADED.
   The acknowledgement takes a key with `triage` or `config-manage`: a
   holder of such a key can clear the status, not the evidence (the rows,
   its own signed row, `chain verify`). A drift of the integrity round that
-  ends and comes back within ten minutes is held again only when the
-  round's back-off ends. *Evidence:*
+  ends and comes back is signed again with its count; until that next
+  signed row, `status` may show it as ended. *Evidence:*
   `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
   `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
   `an_agent_or_watchdog_death_is_held_until_acknowledged`;
@@ -1055,15 +1057,10 @@ lists the known false positives of each rule.
   loader, uutils' links, `getent shadow` raise ALERTED.
 
   Residuals:
-  - **A file re-read shortly after an exec.** A file re-read by the same
-    process within a short interval (about a second) after an exec may not
-    produce a second record. It holds for every file the file-open sensor
-    reports on a read-only open (`/etc/passwd`, `/etc/login.defs`,
-    `/etc/shadow`, `/etc/gshadow`, the credential files, the files FIM
-    watches for opens) and every exec that keeps its process, as root or
-    as a user; a write is always reported. An eBPF change, planned for the
-    first eBPF lot after the alpha; `newgrp` is not exempted for that
-    reason.
+  - **A file re-read after an exec.** A read-only open that a process
+    repeats after it executes another program may be recorded once, under
+    the program that ran first; a write is always recorded. An eBPF
+    change, planned for the first eBPF lot after the alpha.
   - **A forker that gave up its privilege** between the fork and the
     pump's read is taken for one that never held it (only root's own
     process can; R018 judges any module its fork loads). A `modprobe` a
@@ -1071,9 +1068,8 @@ lists the known false positives of each rule.
     before for a user's, when it exited first).
   - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
     /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
-    access; so does a fork that changed its image to a packaged program's
-    (`PR_SET_MM`, capabilities in a user namespace of its own). The list is
-    best effort.
+    access; so does a fork whose image at the open is another packaged
+    program's. The list is best effort.
   - **dockerd's container setup in a burst** (a known false positive;
     Docker's own `overlay2` image store): twenty or more containers
     started and removed within a minute raise ENGAGED through the
@@ -1221,15 +1217,8 @@ kernel.
     copy is "not compared (gone)": root's is recorded High
     (`R004_ExecFromProcSelfFd`), never killed; another uid's is the
     Critical kill, as past the budget. Counted in `nn-admin status`
-    (`runtime clones`, `gone`).
-  - Residual, named: a root process forked by runc under a container
-    manager (as `runc init` is) that executes the installed runc, then,
-    with no fork since, a sealed memfd of its own, and whose every thread
-    exits before the agent reads it, is recorded High,
-    not killed, whatever that memfd held — root, who needs no such route.
-    It is the same class as the budget's residual above, without a budget
-    to spend. What it ran is not known; its kill would have found the
-    process gone anyway.
+    (`runtime clones`, `gone`), whatever that memfd held: what it ran is
+    not known, and the process is gone.
   - Any other shape keeps nothing and stays the Critical kill: runc 1.2's
     (`runc init`'s first exec since `runc create` forked it) and every OCI
     hook a runtime runs, a copy under a manager, a parent gone too, a
@@ -1305,8 +1294,10 @@ kernel.
   is counted in `nn-admin status` (`ringbuf drops`, `loss by stage`) and
   `sensors` reads `DEGRADED`. Records can be missing for such a burst.
   *Evidence:* internal check Phase 0, residuals R022.
-- **Long runs.** The long-run stability of this release is still being
-  measured. *Evidence:* internal check Phase 0 §7.
+- **Long runs.** The long-run soaks are done: 48 hours on rc5, then
+  confirmation soaks of 4 and 12 hours up to rc11. They show no
+  regression of stability; a longer run on your own hosts may still
+  find something we did not. *Evidence:* internal check Phase 0 §7.
 
 ## Export
 

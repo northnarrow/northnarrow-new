@@ -1027,8 +1027,8 @@ pub struct StatusResponse {
     pub runtime_clones: Option<RuntimeClones>,
     /// Lot 379 (the review of #586, P2-1): the advisories — signed integrity
     /// findings of a kind that degrades no sensor (an admin key left on the
-    /// host, the operator's signed sysctl opt-out, a pause of the whole
-    /// machine), each line naming its signed row: listed by `nn-admin
+    /// host, the operator's signed sysctl opt-out, a stall of the agent's loop: a paused
+    /// machine, or its own memory throttling), each line naming its signed row: listed by `nn-admin
     /// status` on their own, never among `degradations`, in `sensors` or the
     /// trust level. Appended after lot 369's `runtime_clones`; telemetry;
     /// `None` from an older agent.
@@ -2168,6 +2168,12 @@ pub const MAX_FRAME_BODY: usize = 64 * 1024;
 /// the agent must come from the same release. 3 (the review of #565, F2):
 /// the status reply grew by `kernel_state_held_back`. 4 (lot 369): by
 /// `runtime_clones`. 5 (lot 379, the review of #586): by `advisories`.
+/// Lot 381 grew `RuntimeClones` itself by four counters, inside a field
+/// version 4 already had: the number does not see that nested growth (the
+/// pinned frames leave `runtime_clones` empty). That is harmless, because
+/// the live socket speaks bare frames and the version has no effect on
+/// it: an older `nn-admin` reads the counters it knows, a newer one
+/// refuses an older reply with an error, never a status.
 pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The oldest envelope version this build decodes. Version 1 named
@@ -2178,7 +2184,9 @@ pub const PROTOCOL_VERSION: u16 = 5;
 /// 3 (the review of #565, F2): a version 2 status reply lacks the appended
 /// `kernel_state_held_back`, which this build would read past its end. 4
 /// (lot 369): a version 3 one lacks `runtime_clones`. 5 (lot 379): a
-/// version 4 one lacks `advisories`.
+/// version 4 one lacks `advisories`. (A version 4 reply that carries
+/// `runtime_clones` also lacks the four counters lot 381 added to it;
+/// the number does not track that nested growth.)
 pub const OLDEST_PROTOCOL_VERSION: u16 = 5;
 
 /// Errors that can occur when encoding or decoding a frame.
@@ -4058,9 +4066,10 @@ mod tests {
         roundtrip(AdminMessage::StatusResponse(status));
     }
 
-    /// Lot 369: the runtimes' sealed clones are the status's last field,
-    /// after the review of #565's held-back counts — an older `nn-admin`
-    /// reads every field it knows.
+    /// Lot 369: the runtimes' sealed clones follow the review of #565's
+    /// held-back counts, and they are appended to the status — since lot
+    /// 379 `advisories` comes after them, so they are no longer the last
+    /// field. An older `nn-admin` reads every field it knows.
     #[test]
     fn the_runtime_clones_are_appended_last() {
         let mut status = StatusResponse::public(PostureKind::Combat, true, Some(7), None, None);
