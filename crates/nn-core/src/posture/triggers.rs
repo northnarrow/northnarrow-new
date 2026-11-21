@@ -4653,9 +4653,9 @@ mod tests {
     fn sensitive_file_access_skips_root_and_a_daemons_own_read() {
         let b = IdBench::new(&[("/usr/sbin/exim4", Some(80))], &["/usr/sbin"]);
         b.exec(42, 1000, "/usr/sbin/exim4", 80, &["exim4"]);
-        for uid in [0, 1, 999] {
-            assert!(!b.opens(42, uid, "exim4", "/etc/shadow", 80), "uid {uid}");
-        }
+        assert!(!b.opens(42, 0, "exim4", "/etc/shadow", 80), "root's read");
+        assert!(!b.opens(42, 1, "exim4", "/etc/shadow", 80), "a low service uid's read");
+        assert!(!b.opens(42, 999, "exim4", "/etc/shadow", 80), "a high service uid's read");
     }
 
     #[test]
