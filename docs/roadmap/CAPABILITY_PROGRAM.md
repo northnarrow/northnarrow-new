@@ -14206,7 +14206,7 @@ number in parentheses is a lab PR.
     the kernel's limit); the rootless burst's figures corrected (about 54
     starts at 4/s by the budget's model; lot 378's lab ran about 2/s, not
     5); the long lines of rev581 and rev584 rewrapped. `MemoryMax` not
-    changed (after Phase 6b).
+    changed (after Phase 6b; superseded: lot 381, UPGRADE_NOTES_WAVE4 §67).
   - Mutation: 47 mutants of the new code run on the host, 47 caught by a
     named test; one more (the injection's call removed) is caught by the
     privileged suite only.

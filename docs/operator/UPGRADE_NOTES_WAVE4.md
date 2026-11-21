@@ -180,7 +180,8 @@ The unit's memory limits are unchanged (`MemoryHigh=9G`, `MemoryMax=11G`,
 `OOMScoreAdjust=-500`): they were sized for the model, and stay until the
 lab has measured the agent's memory without it. On a host whose memory is
 not above 11G the agent still raises its own `oom_score_adj` to 0 at start
-(`UPGRADE_NOTES_AUDIT_16f7563.md` §1).
+(`UPGRADE_NOTES_AUDIT_16f7563.md` §1). (Superseded: §67 for the memory
+limits; lot 370 for `oom_score_adj`.)
 
 ## 3. Detections and evidence
 
@@ -5600,7 +5601,7 @@ shape it resembles still fires.
   the host or a choice of the operator that degrades no sensor — the admin
   key left on the host (`admin_key_on_host`), strict overcommit
   (`sysctl_strict`), the operator's signed sysctl opt-out
-  (`sysctl_opted_out`), a pause of the whole machine (`agent_stalled`), the
+  (`sysctl_opted_out`), a stall of the agent's loop (`agent_stalled`: a paused machine, or the agent's own memory throttling under `MemoryHigh`), the
   quarantine's index rebuilt — is an **advisory**: `status` lists it on its
   own (`advisories`, with its signed row), never in `sensors`, the trust
   level or the capability manifest. One fact is one line: an overlay the
@@ -5828,16 +5829,11 @@ fires.
     The ransomware tracker reads every crossing, these included.
 - **Residuals.**
   - **A file re-read shortly after an exec** (the lab of this lot; the
-    file-open sensor's read-repeat filter, review 75). A file re-read by
-    the same process within a short interval (about a second) after an
-    exec may not produce a second record: the read the process made before
-    the exec stands for both. It holds for every file the sensor reports
-    on a read-only open — `/etc/passwd`, `/etc/login.defs`, `/etc/shadow`,
-    `/etc/gshadow`, the credential files, and the files FIM watches for
-    opens — and for every exec that keeps its process (a unit's program
-    after its executor, a command a set-id tool executes in its own
-    place), as root or as a user. A write is always reported. It is an
-    eBPF change, planned for the first eBPF lot after the alpha.
+    file-open sensor's read-repeat filter, review 75). A read-only
+    open that a process repeats after it executes another program may be
+    recorded once, under the program that ran first; a write is always
+    recorded. It is an eBPF change, planned for the first eBPF lot after
+    the alpha.
   - **A forker that gave up its privilege.** A forker that held a uid 0 or
     a capability in PID 1's namespace at the fork and gave it up before
     the pump read it (`setresuid`, `capset`, a new user namespace, its
@@ -5858,8 +5854,7 @@ fires.
     only. The soak's load did not reach it; a CI host running Docker
     builds may (an eBPF change, a later lot).
   - **A fork that changes its image.** A fork whose image at the open is
-    another packaged program's (`PR_SET_MM` with capabilities in a user
-    namespace of its own) reads `/etc/passwd` as that program: nothing
+    another packaged program's reads `/etc/passwd` as that program: nothing
     `getent passwd` does not already list without a sensitive access.
   - **Packaged readers off the list.** A packaged program that reads a file
     it is told to and is not on the list (`sqlite3 /etc/passwd`, `getent
