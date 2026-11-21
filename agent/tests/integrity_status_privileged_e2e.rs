@@ -56,6 +56,25 @@ fn combat_rules_path() -> PathBuf {
         .join("combat-rules.v4")
 }
 
+/// The agent's production pin root. A test agent pins there; an agent
+/// that quit leaves its pins (by design: its hooks outlive it), and the
+/// next start of this suite met them. Wiped before each agent starts, as
+/// `canary_privileged_e2e` and `fim_privileged_e2e` do.
+const BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
+
+fn wipe_pin_tree() {
+    let pin = Path::new(BPFFS_PIN_ROOT);
+    if !pin.exists() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(pin) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(pin);
+}
+
 /// SIGQUIT-on-drop (the task_kill hook refuses SIGKILL/SIGTERM).
 struct AgentGuard(Option<Child>);
 impl Drop for AgentGuard {
@@ -85,6 +104,7 @@ impl Fixture {
         common::require_root("start a test agent");
         common::require_bpftool();
         common::refuse_if_northnarrow_running("start a test agent");
+        wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
         let state = AgentState::new(&dir);
