@@ -4172,6 +4172,7 @@ mod tests {
                         kept: 29,
                         unverified: 30,
                         not_read: 31,
+                        ..Default::default()
                     }),
                     advisories: Some(vec!["integrity: admin_key_on_host".to_string()]),
                     execq_script_refused_total: Some(19),

@@ -145,6 +145,10 @@ fn telemetry_status(
                 kept: c.kept,
                 unverified: c.unverified,
                 not_read: c.not_read,
+                through: c.through,
+                gone: c.gone,
+                no_runtime: c.no_runtime,
+                lost: c.lost,
             }
         }),
         // lot 379 (the review of #586, P2-1): the signed findings that

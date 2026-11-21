@@ -3944,11 +3944,18 @@ fn kernel_state_held_back_json(out: &StatusOutcome) -> String {
 /// Lot 369: the container runtimes' sealed clones of themselves the exec
 /// pump judged — compared with an installed runtime, kept as its clone
 /// (R004's exemption), not compared for the budget, not read in time —
-/// `None` from an agent before the field, and when none was seen.
+/// `None` from an agent before the field, and when none was seen. Lot 381:
+/// and those compared through another process running the copy, not
+/// compared because the copy was gone before the read, and the sealed
+/// memfds that are no runtime's copy — every one in exactly one count,
+/// once. The review of #588 (F4): the copies gone and kept unverified
+/// apart from those of which nothing was kept (judged fileless), and
+/// `no_runtime` named for what it counts (an installed runtime's parent
+/// too, the memfd of no runtime's length or not sealed).
 fn runtime_clones_line(out: &StatusOutcome, tty: bool) -> Option<String> {
     let c = out
         .runtime_clones
-        .filter(|c| c.compared + c.unverified + c.not_read > 0)?;
+        .filter(|c| c.compared + c.unverified + c.not_read + c.gone + c.lost + c.no_runtime > 0)?;
     let red = |n: u64| {
         if n == 0 {
             colorize("0", "32", tty)
@@ -3958,12 +3965,18 @@ fn runtime_clones_line(out: &StatusOutcome, tty: bool) -> Option<String> {
     };
     Some(format!(
         "runtime clones    : {} sealed memfds kept as an installed runtime's clone (R004 has no \
-         verdict on them), of {} compared; {} not compared (the budget), {} not read in time \
-         (judged fileless)",
+         verdict on them), of {} compared ({} through a process still running the copy); {} not \
+         compared (the budget), {} not compared (gone before the read, kept unverified), {} not \
+         compared (gone, replaced or unreadable: judged fileless), {} not read in time (judged \
+         fileless), {} no runtime's copy (judged fileless)",
         c.kept,
         c.compared,
+        c.through,
         red(c.unverified),
-        red(c.not_read)
+        red(c.gone),
+        red(c.lost),
+        red(c.not_read),
+        red(c.no_runtime)
     ))
 }
 
@@ -3971,8 +3984,9 @@ fn runtime_clones_line(out: &StatusOutcome, tty: bool) -> Option<String> {
 fn runtime_clones_json(out: &StatusOutcome) -> String {
     match out.runtime_clones {
         Some(c) => format!(
-            "{{\"compared\":{},\"kept\":{},\"unverified\":{},\"not_read\":{}}}",
-            c.compared, c.kept, c.unverified, c.not_read
+            "{{\"compared\":{},\"kept\":{},\"unverified\":{},\"not_read\":{},\"through\":{},\
+             \"gone\":{},\"no_runtime\":{},\"lost\":{}}}",
+            c.compared, c.kept, c.unverified, c.not_read, c.through, c.gone, c.no_runtime, c.lost
         ),
         None => "null".to_string(),
     }
@@ -6565,14 +6579,51 @@ mod flow_sock_line_tests {
             kept: 6,
             unverified: 0,
             not_read: 1,
+            ..Default::default()
         });
         let l = super::runtime_clones_line(&o, false).unwrap();
         assert!(l.contains("6 sealed memfds kept"), "{l}");
         assert!(l.contains("1 not read in time"), "{l}");
         assert_eq!(
             super::runtime_clones_json(&o),
-            "{\"compared\":6,\"kept\":6,\"unverified\":0,\"not_read\":1}"
+            "{\"compared\":6,\"kept\":6,\"unverified\":0,\"not_read\":1,\"through\":0,\"gone\":0,\
+             \"no_runtime\":0,\"lost\":0}"
         );
+        // lot 381: a copy gone before the read, or under no runtime, is
+        // counted and said — the line shows even with nothing compared
+        o.runtime_clones = Some(nn_proto::admin_protocol::RuntimeClones {
+            gone: 1,
+            ..Default::default()
+        });
+        let l = super::runtime_clones_line(&o, false).unwrap();
+        assert!(
+            l.contains("1 not compared (gone before the read, kept unverified)"),
+            "{l}"
+        );
+        // the review of #588 (F4): a copy of which nothing was kept is said
+        // apart, judged fileless — the line shows for it alone too
+        o.runtime_clones = Some(nn_proto::admin_protocol::RuntimeClones {
+            lost: 1,
+            ..Default::default()
+        });
+        let l = super::runtime_clones_line(&o, false).unwrap();
+        assert!(
+            l.contains("0 not compared (gone before the read, kept unverified), 1 not compared (gone, replaced or unreadable: judged fileless)"),
+            "{l}"
+        );
+        o.runtime_clones = Some(nn_proto::admin_protocol::RuntimeClones {
+            compared: 300,
+            kept: 300,
+            through: 2,
+            no_runtime: 1,
+            ..Default::default()
+        });
+        let l = super::runtime_clones_line(&o, false).unwrap();
+        assert!(
+            l.contains("of 300 compared (2 through a process still running the copy)"),
+            "{l}"
+        );
+        assert!(l.contains("1 no runtime's copy (judged fileless)"), "{l}");
     }
 
     /// The review of #565 (F2): the kernel-state round's findings its quota

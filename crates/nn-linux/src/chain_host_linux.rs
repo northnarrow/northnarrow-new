@@ -649,12 +649,14 @@ mod tests {
         })
         .unwrap();
         let row = log.rows() - 1;
-        assert!(
-            crate::boot::degradation::snapshot().is_empty(),
-            "{:?}",
-            crate::boot::degradation::snapshot()
-        );
-        assert_eq!(crate::boot::degradation::count(), 0);
+        // no `integrity:` degradation — the registry is process-wide, and a
+        // parallel test that does not hold the lock may add its own lines
+        // (lot 381's runtime budget), which are not this test's subject
+        let integrity: Vec<String> = crate::boot::degradation::snapshot()
+            .into_iter()
+            .filter(|l| l.starts_with("integrity:"))
+            .collect();
+        assert!(integrity.is_empty(), "{integrity:?}");
         let adv = crate::boot::degradation::advisories();
         assert_eq!(adv.len(), 1, "{adv:?}");
         assert!(

@@ -444,8 +444,8 @@ not cause as an incident.
   `"ended":"abrupt"` in its signed `agent_boot` entry). The agent and the
   watchdog run with `oom_score_adj` -999: the host's OOM killer picks them
   last, and their own memory cap still ends a leak with a kill and a
-  restart. On a host with less memory than the agent's cap (11 GiB) the cap
-  cannot bind: a leaking agent outlives every other process, the
+  restart. On a host with less memory than the agent's cap (1 GiB since
+  lot 381; it was 11 GiB) the cap cannot bind: a leaking agent outlives every other process, the
   workload and `sshd` included, which the OOM killer picks first. A kill
   nothing can refuse can still end the agent or the watchdog, and its role
   stays vacated until a successor takes it. What is recorded then, and by
@@ -1210,6 +1210,40 @@ kernel.
   `thirty_rootless_starts_in_a_row_are_all_compared_and_a_flood_still_runs_out`;
   `a_foreign_memfd_under_a_flood_is_never_kept_as_runc_s_clone`;
   lot 370; lot 378.
+- **A runtime's copy gone before it was compared.** runc 1.1's copy of
+  itself runs a few milliseconds; under a burst of container starts the
+  agent may read it once that process has exited. It then reads the copy
+  through a process still running it (runc's own stages, or a thread of
+  the process whose main thread exited alone). When none is left, neither
+  the copy's bytes nor its length can be read any more.
+  - In runc 1.1's own shape — the process re-executed the installed
+    runtime's file with no fork since, under that runtime's process — the
+    copy is "not compared (gone)": root's is recorded High
+    (`R004_ExecFromProcSelfFd`), never killed; another uid's is the
+    Critical kill, as past the budget. Counted in `nn-admin status`
+    (`runtime clones`, `gone`).
+  - Residual, named: a root process forked by runc under a container
+    manager (as `runc init` is) that executes the installed runc, then,
+    with no fork since, a sealed memfd of its own, and whose every thread
+    exits before the agent reads it, is recorded High,
+    not killed, whatever that memfd held — root, who needs no such route.
+    It is the same class as the budget's residual above, without a budget
+    to spend. What it ran is not known; its kill would have found the
+    process gone anyway.
+  - Any other shape keeps nothing and stays the Critical kill: runc 1.2's
+    (`runc init`'s first exec since `runc create` forked it) and every OCI
+    hook a runtime runs, a copy under a manager, a parent gone too, a
+    process running another file, a process with a thread still running
+    whose copy cannot be read. Counted `lost`. On a host with runc 1.2 or
+    later a burst may therefore give a rare Critical at a container start
+    the agent read too late (the lab's runc 1.1 burst: 400 starts, none
+    gone).
+  *Evidence:*
+  `a_runc_clone_gone_before_the_read_is_compared_through_a_child_still_running_it`;
+  `a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user`;
+  `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`;
+  `a_runtime_clone_with_nothing_left_running_it_is_counted_not_compared`;
+  lot 381.
 - **k3s.** Its runc runs from a non-standard path: a
   `R013_NamespaceEscapeTooling` High record. Its installer writes
   `k3s.service`: an `NN-L-FIM-009_SystemdUnitDropped` High record. An
@@ -1251,11 +1285,21 @@ kernel.
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*
   `docs/operator/NETWORK_TELEMETRY.md` (§6); `deploy/lab/overhead/prog-cost.sh`;
   lot 275.
-- **Oversized memory limits.** The agent's unit sets `MemoryHigh=9G` and
-  `MemoryMax=11G`, far above what the agent uses; they have not been
-  resized yet. On a VM with less memory than that the cap cannot bind, and
-  the agent says so in a WARN at start. *Evidence:* internal check Phase 0
-  §5 (F0-5).
+- **Memory limits sized on a small lab.** The agent's unit sets
+  `MemoryHigh=768M` and `MemoryMax=1G`, the watchdog's `MemoryMax=32M`
+  (lot 381; they were 9G, 11G and 64M). They come from the lab's measure
+  on QEMU guests of 2 and 4 vCPU: the agent's cgroup peaked at 316 MiB at a
+  cold start, about 165 MiB of it the kernel's BPF maps, and at most
+  264 MiB under the storms (thousands of execs a second, a full FIM set,
+  200 container starts); 344 MiB, the highest yet, in lot 381's lab after
+  400 container starts and a 2,500 fork/s storm, with no throttling event;
+  the watchdog's RSS is about 5 MiB, its cgroup 2.2 MiB at most through
+  an agent respawn (lot 381's fix round). On hosts of
+  16 or more CPUs (per-CPU rings) and with larger FIM sets the kernel
+  memory was not measured: there the cap may be closer to the use than on
+  the lab's guests. Above `MemoryHigh` the kernel slows the agent down,
+  which may then lose events (counted). *Evidence:* lot 381
+  (`the_memory_limits_are_sized_from_the_measured_peaks`).
 - **Events can be lost under load.** Under a burst, the kernel rings and
   the agent's queues drop new events rather than slow the host. Each loss
   is counted in `nn-admin status` (`ringbuf drops`, `loss by stage`) and

@@ -11699,6 +11699,136 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 381 — a rootful runc copy compared, never Critical by a race; the
+  units' memory limits from the lab's measure (C11, C14, C23; no level
+  change).**
+  - What was open (Phase 6b on rc11): F6-6 (P2), one `R004` Critical (a
+    would-have `KillProcessTree`) in about 300 rootful runc starts on
+    Debian 13 (Podman 5.4.2, runc 1.1.15), the copy in no counter of
+    `runtime clones`; and the units' memory limits still the LLM
+    advisor's (9G / 11G, the watchdog's 64M).
+  - Done:
+    - **Why it escaped.** runc 1.1's `runc init` executes its sealed copy
+      and exits a few milliseconds later; the pump read the copy once it
+      had exited, returned before any counter and kept nothing, and R004
+      judged it fileless. The compare now returns its outcome (`CloneRead`)
+      and one function counts it: every sealed memfd exec the LSM program
+      describes lands in exactly one of `compared`, `unverified`, `gone`,
+      `lost`, `no_runtime`, `not_read`, once (fix round 1).
+    - **Read through a holder.** With the exec's process gone, the copy is
+      read through a child of the exec's parent still running that very
+      inode (`/proc/<ppid>/task/<tid>/children`: runc's stages, forked
+      with `CLONE_PARENT`), compared whole and kept (`through`).
+    - **Not compared (gone).** None left, every thread of the process
+      exited, runc 1.1's re-exec under the installed runtime (fix round 1):
+      kept unverified; R004 says so — root's High, never killed; any other
+      uid's the Critical kill, as past the budget. Any other shape, a
+      parent gone too, a manager parent, a process running another file by
+      the read: nothing kept, Critical. A foreign memfd stays Critical.
+    - **Memory limits.** The agent's `MemoryHigh=768M`, `MemoryMax=1G`;
+      the watchdog's `MemoryMax=32M` (its floor). A ratchet ties them to
+      the measures (`the_memory_limits_are_sized_from_the_measured_peaks`).
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §67 and the CHANGELOG.
+  - Mutation: 17 mutants of the new code (the holder search, its identity checks and
+    bounds, exited and replaced, the counts, the gone verdict, the status
+    line): 15 caught by a named test; 2 argued — the second identity check
+    after the reopen (the reopen of the same `O_PATH` file is that inode)
+    and the thread listing's bound (a cost bound; equal behaviour up to 64
+    threads, a runtime's Go process has about ten).
+  - Lab (as measured): debian13 (6.12.117, systemd 257, Podman 5.4.2, runc
+    1.1.15+ds1), 4 vCPU, 6 GiB, alpha profile (observe-only), one guest
+    under its lease, left uninstalled and powered off, no `.local`, pins
+    or probe files; the tree checked by hash (1230 files, 0 mismatches).
+    - **The upgrade.** rc11's release (`release.yml` run 44840767348)
+      installed as the tester does: active, `MemoryHigh` 9663676416,
+      `MemoryMax` 11811160064, the watchdog's 67108864. `upgrade-check` to
+      the lot's tree (rc 0, its cold boot: 103 pins, 55 own LSM programs,
+      28 of 28 deny hooks): `systemctl show` and the cgroup files 805306368 /
+      1073741824, the watchdog's 33554432; `OOMPolicy=continue`,
+      `oom_score_adj` -999 for both. A second cold boot: both active at
+      once and 30 s later, 103 pins, 56 LSM programs, no restart.
+    - **F6-6.** 300 rootful `podman run -d` in three streams of 100 at once
+      (25 s), then 100 rootless `podman run --rm` (four loops of 25, 10 s
+      apart: one user's back-to-back loop past about 70 starts spends its
+      budget, lot 378): `runtime clones` 400 kept of 400 compared, 16 of
+      them read through a process still running the copy (each one a
+      copy rc11 would have judged Critical, uncounted), 0 not compared
+      (budget or gone), 0 not read in time.
+      R004 from runc: 0.
+    - **Foreign memfd execs during the burst** (Python's `memfd_create` and
+      `fexecve`): a sealed copy of `true` and a sealed copy of runc's bytes
+      as root, a sealed and an unsealed copy of `true` as uid 1000: 4 R004
+      Critical (`would have: KillProcessTree`); the three sealed ones
+      counted "under no installed runtime".
+    - **Memory.** 60 s of six fork-and-exec loops (2,493 forks a second):
+      the agent's cgroup peaked at 344 MiB (`memory.peak` since its start,
+      the 400 container starts included), `memory.events` all 0 (no
+      `high`, `max`, `oom`, `oom_kill`), the same agent. The global OOM
+      killer (SysRq-f): its pick the parse worker (`oom_score_adj` 1000,
+      score 1333; the agent -999, score 14); the agent kept running, a new
+      worker 1 s later, the slice's `oom_kill` 0 → 1, signed
+      `capability_manifest_change` and `telemetry_loss`.
+    - **A fresh install** of the lot's tree after the purge (alpha,
+      enabled): active, the same limits; a cold boot, both active, 103
+      pins, 56 LSM programs. Each uninstall left no unit, `/etc/northnarrow`
+      or pin root (one LSM program left: PID 1's own, lot 377).
+  - Fix round 1 (the review of #588):
+    - **F1 (P2).** A process whose main thread exited alone (`exit`, not
+      `exit_group`) while a thread ran a root memfd on was taken as
+      exited (`/proc/<pid>/exe` unreadable): a foreign memfd was kept "not
+      compared (gone)", High, never killed. The copy is now read through
+      the live threads (`/proc/<pid>/task/<tid>/exe`); exited only when
+      every listed thread is a zombie or gone, at most 64 threads read (a
+      group past them, or a thread whose state is not read, is never told
+      exited). The re-check (N1, N2): and the leader's `num_threads` is 1
+      (a thread made after the listing, its listed predecessor exited
+      before its read: 1.7% of reads of such a group on 6.18 were "gone");
+      a listing error other than the process's absence is never gone. Test
+      `a_group_whose_listing_missed_a_live_thread_is_never_gone`.
+    - **F2.** "Gone" is judged only in runc 1.1's re-exec (`fork_parent`
+      0, the parent the very runtime by its image), in the pump and in
+      R004; runc 1.2's shape and every OCI hook keep nothing (Critical).
+      The root residual is written in KNOWN_LIMITATIONS.
+    - **F3.** The pump's step and `not_read` settle one exec between them
+      (`Settle`): a compare finishing past its deadline counts and keeps
+      nothing more. A ratchet in `decision_path_io` ties the multiplexer's
+      two closures to one `Settle`.
+    - **F4.** `lost` (appended): not compared, nothing kept; the status
+      line says which gone copies were kept unverified; `no_runtime` reads
+      "no runtime's copy".
+    - Tests: `a_live_thread_group_whose_leader_exited_is_read_through_its_threads`,
+      `a_runtime_compare_past_its_deadline_counts_and_keeps_nothing_more`;
+      the R004 and pump tests extended (runc 1.2's shape gone: Critical).
+    - Lab (as measured): debian13 (6.12.117, systemd 257, Podman 5.4.2,
+      runc 1.1.15+ds1), 4 vCPU, 6 GiB, alpha profile; three short rounds
+      under the lease, each a fresh install of the fix's tree (1230 files,
+      0 mismatches), uninstalled and powered off with no `.local`, pins or
+      probe files (r3 and r4 only to run the hook: Podman read no hook from
+      `/etc/containers/oci/hooks.d`, then the probe's workdir was not the
+      user's).
+      - The burst: 300 rootful `podman run -d` in three streams (39 s) and
+        100 rootless (4 × 25): `runtime clones` 400 kept of 400 compared,
+        21 through a process still running the copy, 0 budget, 0 gone, 0
+        not read; the 3 sealed foreign memfds 2 `no_runtime` and 1 `lost`
+        (its parent, `timeout`, gone by the read). R004 from runc: 0; the
+        4 foreign execs Critical.
+      - F1: a static payload in a sealed root memfd run by runc as a
+        `createRuntime` OCI hook (its parent `runc create`, forked by
+        conmon: R004's runtime lineage), its main thread calling `exit`
+        while a second thread runs 4 s (that thread read its leader's
+        state: `Z`): R004 Critical (`would have: KillProcessTree`,
+        "fileless"), counted `no_runtime`, never "gone"; the container's own
+        runc copy compared and kept. The payload from a root shell:
+        Critical.
+      - The watchdog at an agent respawn (the agent made the OOM killer's
+        pick inside a window, SysRq-f): its cgroup's lifetime
+        `memory.peak` 2,154,496 B before the kill and 2,273,280 B (2.2 MiB)
+        78 s after (an upper bound of the respawn's);
+        `memory.current` sampled every 50 ms at most 0.93 MiB;
+        `memory.events` all 0; the agent respawned (witness row signed), no
+        restart of either unit. `MemoryMax=32M` kept (14× that peak), the
+        ratchet unchanged.
+  Levels unchanged.
 - **Lot 380 — the rc11 soaks' last false positives: `newuidmap` reading
   `login.defs`, `modprobe` as a user, routine `passwd` reads, containerd's
   task bundles (C06, C14, C18; no level change).**

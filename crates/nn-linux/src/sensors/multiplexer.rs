@@ -1705,17 +1705,21 @@ fn kmod_read_then_resolved(raw: &ProcessSpawnRaw, e: Event) -> (Event, [Option<E
     // lot 366: each step's reads on the pumps' reader, with a deadline —
     // only an exec they read anything of hands its step over
     let e = if crate::sensors::kmod_exec::reads(&e) || crate::program_images::reads(&e) {
+        // the review of #588 (F3): a runtime compare finishing past the
+        // deadline counts and keeps nothing more — `not_read` settled it
+        let settle = crate::program_images::Settle::default();
+        let late = settle.clone();
         bounded_step(
             "a module tool's or a socket program's image",
             e,
-            |e| {
+            move |e| {
                 crate::sensors::kmod_exec::read_and_keep(&e);
-                crate::program_images::read_and_keep(&e);
+                crate::program_images::read_and_keep(&e, &late);
                 e
             },
-            |e| {
+            move |e| {
                 crate::sensors::kmod_exec::not_read(e);
-                crate::program_images::not_read(e);
+                crate::program_images::not_read(e, &settle);
             },
         )
     } else {
