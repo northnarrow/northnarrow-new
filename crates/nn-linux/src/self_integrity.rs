@@ -258,7 +258,7 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 pub const STALL_SLACK_SECS: u64 = 15;
 
 /// Audit op of a recomputed finding that went away (external audit NN-AUD-114).
-pub const CLEARED_OP: &str = "integrity_drift_cleared";
+pub const CLEARED_OP: &str = crate::audit::INTEGRITY_CLEARED_OP;
 
 /// External audit NN-AUD-114: a finding that clears and comes back is
 /// reported again at most once per this many seconds.

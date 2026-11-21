@@ -373,6 +373,39 @@ pub fn keep(source: &str, detail: &str, signed: bool) {
     );
 }
 
+/// Lot 379 (pre-alpha F7-1, F3b-6): the degradations of `source` are now
+/// `lines`, every one signed already in a row of its own — the signed
+/// integrity findings the audit log holds
+/// ([`nn_evidence::held`], told by [`crate::chain_host_linux::LinuxHost`]):
+/// the lines no longer held leave the status, the new ones join it, nothing
+/// is signed here (safe with the audit log's lock held). Kept within a
+/// budget of their own (the audit log bounds them), never against
+/// [`MAX_KEPT`]. Returns whether the registry changed.
+pub fn hold(source: &str, lines: &[String]) -> bool {
+    let mut r = REGISTRY.lock();
+    let now: Vec<&str> = r
+        .entries
+        .iter()
+        .filter(|d| d.source == source)
+        .map(|d| d.detail.as_str())
+        .collect();
+    if now.len() == lines.len() && now.iter().zip(lines).all(|(a, b)| *a == b.as_str()) {
+        return false;
+    }
+    r.entries.retain(|d| d.source != source);
+    let at_boot = !r.boot_over;
+    for line in lines {
+        r.entries.push(Degradation {
+            source: source.to_string(),
+            detail: line.clone(),
+            at_boot,
+            signed: true,
+            own_budget: true,
+        });
+    }
+    true
+}
+
 /// Keep `d`, or count it past [`MAX_KEPT`]: then it is returned with the
 /// sink, to be signed once the registry's lock is released (it is not kept,
 /// so no flush would sign it).
