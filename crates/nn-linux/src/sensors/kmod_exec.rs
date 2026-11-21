@@ -256,7 +256,6 @@ fn credentials_of_exec(
 ) -> Credentials {
     let own = credentials(proc, pid, start_ns);
     if own != Credentials::NotRead
-        || exe.fork_parent == 0
         || exe.fork_parent != ppid
         || exe.fork_parent_start == 0
         || program(root, exe).is_err()
