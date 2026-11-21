@@ -2446,7 +2446,9 @@ fn an_acknowledgement_whose_row_is_not_written_acknowledges_nothing() {
             }),
         ) {
             AdminMessage::IntegrityAcknowledgeResponse(r) => r,
-            other => panic!("{other:?}"),
+            // a fixed message: the reply is never printed (CodeQL
+            // rust/cleartext-logging)
+            _ => panic!("not an integrity acknowledgement's reply"),
         }
     };
     // written: one row, the acknowledgement's own, and the reply its count
@@ -2472,7 +2474,13 @@ fn an_acknowledgement_whose_row_is_not_written_acknowledges_nothing() {
     std::fs::remove_file(&fx.log_path).unwrap();
     std::fs::create_dir(&fx.log_path).unwrap();
     let r = ack(&fx, row);
-    assert_eq!(r.acknowledged, 0, "{r:?}");
-    assert!(r.message.contains("not written"), "{r:?}");
+    assert_eq!(
+        r.acknowledged, 0,
+        "acknowledged although its row was not written"
+    );
+    assert!(
+        r.message.contains("not written"),
+        "the reply does not say the row was not written"
+    );
     assert_eq!(fx.audit.lock().held().count(), 1, "still held");
 }

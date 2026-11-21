@@ -450,7 +450,12 @@ each open (a restart reads the chain again: it clears nothing):
   declared kind: a vacancy or a successor as `witness_row_uncertified`
   (held until acknowledged, a death), a bookkeeping row (a life opened, a
   release, a clean succession) as `witness_note_uncertified` (held while
-  found).
+  found). A watchdog the agent does not register (a successor that is not
+  its unit's restart, `watchdog_successor_foreign`) still publishes its
+  key, which the agent never certifies: its rows are imported by their
+  declared kind once the four rounds are over — about two minutes after the
+  agent's start, never lost, never as a certified `witness_row` or
+  `witness_note`.
 - **The attack-class events of the run** (the review of #586, P3-2) — a
   shutdown marker the watchdog refused (`shutdown_marker_rejected`), the
   admin socket removed (`admin_socket_removed`) or reached by a peer it

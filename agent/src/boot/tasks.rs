@@ -396,7 +396,8 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
     witness_dir: PathBuf,
 ) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(nn_proto::witness::AGENT_ROUND_SECS));
         // Last verified PID we stored (`None` == exemption cleared).
         let mut last: Option<u32> = None;
         // Lot 374: the watchdog's witness chain read and its key certified;
