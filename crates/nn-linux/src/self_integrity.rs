@@ -5101,7 +5101,7 @@ mod tests {
             ("agent oom_score_adj", "-999"),
             ("agent cgroup", AGENT_UNIT_CGROUP),
             ("agent memory.max", "104857600"),
-            ("agent memory.high", "9663676416"),
+            ("agent memory.high", "805306368"),
             ("agent pids.max", "512"),
             ("agent cpu.max", "max 100000"),
             ("agent cgroup.freeze", "0"),
@@ -5115,12 +5115,12 @@ mod tests {
             got,
             vec![(
                 "limit_unexpected",
-                "agent memory.max: expected 11811160064 (unit), found 104857600"
+                "agent memory.max: expected 1073741824 (unit), found 104857600"
             )]
         );
         // put back as the unit sets it: the finding goes away
         let mut fixed = boot.clone();
-        fixed[2].1 = "11811160064".to_string();
+        fixed[2].1 = "1073741824".to_string();
         assert!(w.observe(&fixed, &[]).is_empty());
         // without the cpu controller cpu.max is not required
         let mut w = LimitWatch::default();
@@ -5146,8 +5146,8 @@ mod tests {
         let full = |extra: &[(&str, &str)]| {
             let mut v = lim(&base);
             v.extend(lim(&[
-                ("agent memory.max", "11811160064"),
-                ("agent memory.high", "9663676416"),
+                ("agent memory.max", "1073741824"),
+                ("agent memory.high", "805306368"),
                 ("agent pids.max", "512"),
                 (LIMIT_NNP, "1"),
                 (LIMIT_SECCOMP, "2"),
@@ -5206,8 +5206,8 @@ mod tests {
             lim(&[
                 ("agent oom_score_adj", oom),
                 ("agent cgroup", AGENT_UNIT_CGROUP),
-                ("agent memory.max", "11811160064"),
-                ("agent memory.high", "9663676416"),
+                ("agent memory.max", "1073741824"),
+                ("agent memory.high", "805306368"),
                 ("agent pids.max", "512"),
                 (LIMIT_NNP, "1"),
                 (LIMIT_SECCOMP, "2"),
@@ -5319,8 +5319,8 @@ mod tests {
             lim(&[
                 ("agent oom_score_adj", "-999"),
                 ("agent cgroup", AGENT_UNIT_CGROUP),
-                ("agent memory.max", "11811160064"),
-                ("agent memory.high", "9663676416"),
+                ("agent memory.max", "1073741824"),
+                ("agent memory.high", "805306368"),
                 ("agent pids.max", "512"),
                 (LIMIT_NNP, nnp),
                 (LIMIT_SECCOMP, sec),
