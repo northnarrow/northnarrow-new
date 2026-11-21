@@ -1334,8 +1334,7 @@ const HOLDERS_MAX: usize = 64;
 /// while a process maps it, and its number is not reused meanwhile), sealed
 /// at the exec, so its bytes are the ones that ran.
 fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
-    // `Err(true)`: the link read, another file; `Err(false)`: not read
-    let open = |link: &Path| -> Result<(std::fs::File, std::fs::Metadata), bool> {
+    let open = |link: &Path| -> Opened {
         let (link, id) = antitamper_bpf::kernel_roots::link_target(link).map_err(|_| false)?;
         if (id.dev, id.ino) != exe {
             return Err(true);
@@ -1387,6 +1386,11 @@ fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
     }
 }
 
+/// Lot 381: a process's link to the file it runs, opened read-only when it
+/// is the copy; `Err(true)`: the link read, another file; `Err(false)`:
+/// not read.
+type Opened = Result<(std::fs::File, std::fs::Metadata), bool>;
+
 /// The review of #588 (F1): what the threads of a process whose leader's
 /// `exe` was not read run ([`group_copy`]).
 enum Group {
@@ -1409,10 +1413,7 @@ enum Group {
 /// threads run the payload: taken as exited, a foreign root memfd was kept
 /// "not compared (gone)" — High, never killed. Gone only when no thread
 /// listed has not exited ([`thread_runs`]).
-fn group_copy(
-    at: &Path,
-    open: &dyn Fn(&Path) -> Result<(std::fs::File, std::fs::Metadata), bool>,
-) -> Group {
+fn group_copy(at: &Path, open: &dyn Fn(&Path) -> Opened) -> Group {
     let task = at.join("task");
     let Ok(tids) = antitamper_bpf::kernel_roots::read_dir_max(&task, HOLDERS_MAX + 1) else {
         return Group::Gone;
@@ -2373,10 +2374,14 @@ mod tests {
         thread(58_808, 58_808, None, Some("Z"));
         thread(58_808, 58_809, None, Some("R"));
         assert_eq!(read(58_808, &clone), (None, lost));
-        // a thread whose state is not read (not for its absence)
+        // a thread whose state is not read (not for its absence), or not
+        // understood
         thread(58_810, 58_811, None, None);
         std::fs::create_dir_all(proc.0.join("58810/task/58811/stat")).unwrap();
         assert_eq!(read(58_810, &clone), (None, lost));
+        thread(58_818, 58_819, None, None);
+        std::fs::write(proc.0.join("58818/task/58819/stat"), "58819 no state").unwrap();
+        assert_eq!(read(58_818, &clone), (None, lost));
         // a thread running another file (the process executed again):
         // nothing kept
         let bash = put(&root, "/usr/bin/bash", b"bash image, 588");
