@@ -43,6 +43,14 @@
 //!   starts in a loop); a clone past it is kept unverified, "not compared (budget)"
 //!   (R004: root's recorded, never killed; any other uid's the Critical
 //!   kill — the re-check of #556, N1: a user spends its own share).
+//!   Lot 381: a copy whose process was gone before the read is read
+//!   through a child of the exec's parent still running that very memfd
+//!   ([`open_copy`]; the review of #588, F1: or through a thread of its own
+//!   still running, its leader exited alone); none left, it is "not
+//!   compared (gone)" — kept unverified with the runtime its parent runs
+//!   only in runc 1.1's re-exec (the review of #588, F2), else nothing
+//!   kept. Every such exec lands in exactly one counter
+//!   ([`RuntimeCloneCounts`]), once ([`Settle`]: the review of #588, F3).
 //!
 //! A name only chooses which installed files are recorded; what an exec
 //! runs is then told by the file, never by its name.
@@ -509,10 +517,28 @@ pub fn seed() -> usize {
 }
 
 /// The exec pump's step (module docs): lot 313's socket-stdio execs, and
-/// (lot 347) a memfd exec's runtime clone ([`read_runtime_clone`]).
-pub fn read_and_keep(event: &Event) {
+/// (lot 347) a memfd exec's runtime clone ([`read_runtime_clone`]) —
+/// counted and kept unless `settle` was taken by [`not_read`] already (the
+/// review of #588, F3).
+pub fn read_and_keep(event: &Event, settle: &Settle) {
     read_and_keep_at(event, Path::new("/proc"));
-    read_runtime_clone(event);
+    read_runtime_clone(event, settle);
+}
+
+/// The review of #588 (F3): one exec's runtime compare settled once — by
+/// the pump's step that read it ([`read_and_keep`]) or by [`not_read`]
+/// when the pump stopped waiting for that step, whichever comes first; the
+/// other then counts nothing and keeps nothing. A step that finished past
+/// its deadline counted the exec a second time (`not_read` had counted it)
+/// and kept a clone R004 had judged the exec without.
+#[derive(Clone, Debug, Default)]
+pub struct Settle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Settle {
+    /// Whether this caller settles the exec: the first to ask.
+    fn take(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
 }
 
 /// Lot 366: whether [`read_and_keep`] reads anything of `event` — the
@@ -547,18 +573,25 @@ fn reads_runtime_clone(event: &Event) -> bool {
 /// Lot 366: `event`'s reads were not waited for (a file system whose server
 /// does not answer held them): an exec with its stdio on an inet socket is
 /// kept unverified — R020 records it, as an image it could not open.
-pub fn not_read(event: &mut Event) {
+pub fn not_read(event: &mut Event, settle: &Settle) {
     // lot 369: a sealed memfd not compared keeps no clone — R004 judges it
     // fileless, as before — and is counted ([`runtime_clone_counts`])
-    if reads_runtime_clone(event) {
-        RUNTIMES.not_read.fetch_add(1, Ordering::Relaxed);
-    }
+    count_not_read(event, &RUNTIMES, settle);
     if let Event::ProcessSpawn { exe, .. } = &*event {
         let installed = exe.has(common::wire::exe::exe_flags::KNOWN)
             && program_identity::installed_kind((exe.dev, exe.ino)).is_some();
         if !installed && reads_socket_exec(event) {
             program_identity::keep_unverified(event);
         }
+    }
+}
+
+/// [`not_read`]'s count in `checks`: a sealed memfd exec the pump did not
+/// wait for — unless its step, finishing at the deadline, settled it first
+/// (the review of #588, F3: its count and clone are the step's then).
+fn count_not_read(event: &Event, checks: &RuntimeChecks, settle: &Settle) {
+    if reads_runtime_clone(event) && settle.take() {
+        checks.not_read.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -796,6 +829,17 @@ pub struct RuntimeChecks {
     /// Lot 369: the sealed memfd execs whose reads the pump did not wait
     /// for (no clone kept).
     not_read: AtomicU64,
+    /// Lot 381: of `compared`, those read through another process running
+    /// the copy (the exec's own gone: [`open_copy`]).
+    through: AtomicU64,
+    /// Lot 381: not compared, the copy gone before the read, kept
+    /// unverified ([`CloneRead::Gone`]).
+    gone: AtomicU64,
+    /// The review of #588 (F4): not compared, nothing kept
+    /// ([`CloneRead::Lost`]).
+    lost: AtomicU64,
+    /// Lot 381: no runtime's clone ([`CloneRead::NoRuntime`]).
+    no_runtime: AtomicU64,
     /// The review of #578 (N3): each uid's last skip for the budget — an
     /// episode of its spent budget opens at a skip with none in the
     /// [`EPISODE_QUIET`] before ([`RuntimeChecks::opens_episode`]).
@@ -813,12 +857,22 @@ const EPISODE_QUIET: Duration = Duration::from_secs(60);
 /// for the budget (kept unverified), and those whose reads it did not wait
 /// for (nothing kept). A container host where `kept` stays at zero while
 /// containers start has lost the exemption (lot 366 lost it on Debian 13).
+/// Lot 381: every sealed memfd exec the LSM program described is in
+/// exactly one of `compared`, `unverified`, `gone`, `lost`, `no_runtime`
+/// and `not_read`, once (the review of #588, F3: a read finishing past its
+/// deadline counts nothing more) — rc11 judged one runc clone in 300
+/// fileless outside every counter; `through` is the part of `compared`
+/// read through another process running the copy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuntimeCloneCounts {
     pub compared: u64,
     pub kept: u64,
     pub unverified: u64,
     pub not_read: u64,
+    pub through: u64,
+    pub gone: u64,
+    pub lost: u64,
+    pub no_runtime: u64,
 }
 
 /// Lot 369: [`RuntimeCloneCounts`] since the agent's start.
@@ -835,6 +889,10 @@ impl RuntimeChecks {
             refreshed: Mutex::new(None),
             kept: AtomicU64::new(0),
             not_read: AtomicU64::new(0),
+            through: AtomicU64::new(0),
+            gone: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            no_runtime: AtomicU64::new(0),
             episodes: Mutex::new(HashMap::new()),
         }
     }
@@ -874,6 +932,33 @@ impl RuntimeChecks {
             kept: self.kept.load(Ordering::Relaxed),
             unverified: self.bounds.skipped.load(Ordering::Relaxed),
             not_read: self.not_read.load(Ordering::Relaxed),
+            through: self.through.load(Ordering::Relaxed),
+            gone: self.gone.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
+            no_runtime: self.no_runtime.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Lot 381: `read`, one sealed memfd exec's outcome, counted — the one
+    /// place the compare's counters move ([`CloneRead`]).
+    fn count(&self, read: CloneRead) {
+        let one = |c: &AtomicU64| {
+            c.fetch_add(1, Ordering::Relaxed);
+        };
+        match read {
+            CloneRead::Compared { kept, through } => {
+                one(&self.bounds.compared);
+                if kept {
+                    one(&self.kept);
+                }
+                if through {
+                    one(&self.through);
+                }
+            }
+            CloneRead::Budget => one(&self.bounds.skipped),
+            CloneRead::Gone => one(&self.gone),
+            CloneRead::Lost => one(&self.lost),
+            CloneRead::NoRuntime => one(&self.no_runtime),
         }
     }
 
@@ -974,14 +1059,27 @@ fn sealed(file: &std::fs::File) -> bool {
 /// is that runtime's image whole, byte for byte. Past the budget's share
 /// (F2) such an exec is kept UNVERIFIED, with the installed runtime of its
 /// length. Anything else keeps nothing: R004 judges a memfd exec fileless
-/// without the clone.
-pub fn read_runtime_clone(event: &Event) {
-    read_runtime_clone_with(event, Path::new("/proc"), Path::new("/"), &RUNTIMES);
+/// without the clone. The review of #588 (F3): counted and kept only when
+/// `settle` was not taken by [`not_read`] already.
+pub fn read_runtime_clone(event: &Event, settle: &Settle) {
+    read_runtime_clone_with(event, Path::new("/proc"), Path::new("/"), &RUNTIMES, settle);
 }
 
 /// [`read_runtime_clone`] with `/proc` at `proc_root`, the host's root at
-/// `root` and `checks` (tests).
-fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks: &RuntimeChecks) {
+/// `root` and `checks` (tests). Lot 381: every exec it reads is counted in
+/// exactly one of [`RuntimeCloneCounts`] ([`RuntimeChecks::count`]) — the
+/// outcome is what [`runtime_clone_read`] returns, never a bare `return`.
+/// The review of #588 (F3): once — the count and the clone are this read's
+/// only when it settles the exec ([`Settle`]); a read the pump stopped
+/// waiting for was counted "not read in time" by [`not_read`], and R004
+/// judged the exec without its clone: nothing more is counted or kept.
+fn read_runtime_clone_with(
+    event: &Event,
+    proc_root: &Path,
+    root: &Path,
+    checks: &RuntimeChecks,
+    settle: &Settle,
+) {
     // the review of #556 (F1): sealed when the kernel executed it, by the
     // LSM program's read of its seals — sealed only when the pump reads it,
     // its bytes may have been rewritten after the exec (any holder of a
@@ -990,6 +1088,57 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     if !reads_runtime_clone(event) {
         return;
     }
+    let (read, clone) = runtime_clone_read(event, proc_root, root, checks);
+    if !settle.take() {
+        return;
+    }
+    if let Some(clone) = clone {
+        program_identity::keep_runtime_clone(event, clone);
+    }
+    checks.count(read);
+}
+
+/// Lot 381 (F6-6 of the pre-alpha's Phase 6b): what the runtime compare
+/// made of one sealed memfd exec ([`reads_runtime_clone`]). On rc11 one
+/// rootful runc clone in 300 (Debian 13, 200 containers started in a row)
+/// was judged fileless, Critical, and counted nowhere: the pump read it
+/// once its process had exited, and returned before any counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneRead {
+    /// Compared whole: `kept` as an installed runtime's clone (byte for
+    /// byte its image), the copy read `through` another process running
+    /// that very memfd — the exec's own gone before the read
+    /// ([`open_copy`]).
+    Compared { kept: bool, through: bool },
+    /// Not compared: its uid's share of the compare budget spent this
+    /// second (kept unverified, "not compared (budget)").
+    Budget,
+    /// Not compared: the copy gone before the read — every thread of the
+    /// exec's process exited and none of its parent's children the pump
+    /// read runs it — in runc 1.1's re-exec under an installed runtime
+    /// ([`gone_unverified`]): kept unverified, "not compared (gone)".
+    Gone,
+    /// The review of #588 (F4): not compared, nothing kept (R004 judges it
+    /// fileless): the copy gone in any other shape (runc 1.2's, an OCI
+    /// hook's, under a manager), the parent gone too (no runtime to tell),
+    /// the process running another file by the read, or a thread of it
+    /// still running whose copy could not be read.
+    Lost,
+    /// No runtime's copy: its parent runs no installed runtime or manager,
+    /// no installed runtime has its length, or it is no sealed file a
+    /// runtime's size — nothing kept, R004 judges it fileless.
+    NoRuntime,
+}
+
+/// [`read_runtime_clone_with`]'s step: the exec read and compared — what
+/// came of it, and the clone to keep (the review of #588, F3: kept only by
+/// the read that settles the exec).
+fn runtime_clone_read(
+    event: &Event,
+    proc_root: &Path,
+    root: &Path,
+    checks: &RuntimeChecks,
+) -> (CloneRead, Option<program_identity::RuntimeClone>) {
     let Event::ProcessSpawn {
         pid,
         ppid,
@@ -998,7 +1147,7 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
         ..
     } = event
     else {
-        return;
+        return (CloneRead::NoRuntime, None);
     };
     checks.refresh(root, Instant::now());
     // first the parent, one `stat` of its image: a runtime's or a manager's
@@ -1009,8 +1158,12 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
             .ok()
             .map(|(_, c)| (c.dev, c.ino))
     };
-    let Some(parent) = image(*ppid).filter(|id| installed_at_its_path(*id).is_some()) else {
-        return;
+    // lot 381: a parent gone tells no runtime — not compared, counted
+    let Some(parent) = image(*ppid) else {
+        return (CloneRead::Lost, None);
+    };
+    let Some(parent_kind) = installed_at_its_path(parent) else {
+        return (CloneRead::NoRuntime, None);
     };
     // the processes above the exec as they run now: the parent, and its
     // parent when it started no later (the pid not reused since), each an
@@ -1029,40 +1182,30 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
     // lot 353: through the `/proc` root the agent's start anchored; lot
     // 366: opened only once it is the file the kernel executed — a memfd
     // (the kernel's own memory, no file system's daemon to ask) — by its
-    // cached identity, then again through this thread's descriptor
-    let Ok((link, id)) =
-        antitamper_bpf::kernel_roots::link_target(&proc_root.join(pid.to_string()).join("exe"))
-    else {
-        return;
+    // cached identity, then again through this thread's descriptor; lot
+    // 381: or through a process still running that very memfd
+    let (file, m, through) = match open_copy(proc_root, *pid, *ppid, (exe.dev, exe.ino)) {
+        Copy::Read { file, m, through } => (file, m, through),
+        // the process runs another file now (it executed again, or its pid
+        // is another process's): nothing kept, R004's fileless Critical as
+        // before — a runtime's copy never re-executes; the review of #588
+        // (F1): a thread of it still runs, its copy not read: not exited
+        Copy::Replaced | Copy::Running => return (CloneRead::Lost, None),
+        Copy::Exited => return gone_unverified(event, parent, parent_kind, seen),
     };
-    if (id.dev, id.ino) != (exe.dev, exe.ino) {
-        return;
-    }
-    let Ok(file) = antitamper_bpf::kernel_roots::reopen_fd(&link, libc::O_RDONLY) else {
-        return;
-    };
-    let Ok(m) = file.metadata() else {
-        return;
-    };
-    if kernel_id(&m) != (exe.dev, exe.ino)
-        || !m.is_file()
-        || m.len() == 0
-        || m.len() > RUNTIME_MAX_LEN
-        || !sealed(&file)
-    {
-        return;
+    if !m.is_file() || m.len() == 0 || m.len() > RUNTIME_MAX_LEN || !sealed(&file) {
+        return (CloneRead::NoRuntime, None);
     }
     let candidates: Vec<InstalledImage> = program_identity::runtimes_of_len(m.len())
         .into_iter()
         .take(MAX_COMPARED)
         .collect();
     if candidates.is_empty() {
-        return;
+        return (CloneRead::NoRuntime, None);
     }
     let cost = 2 * m.len() * candidates.len() as u64;
     let now = Instant::now();
     if !checks.bounds.take(*uid, cost, now) {
-        checks.bounds.skipped.fetch_add(1, Ordering::Relaxed);
         // lot 370 (F10-6): the budget spent is a signed event of its own —
         // the uid that spent it said (one line per uid, signed when new)
         crate::boot::degradation::report("runtime_copy_compare", &budget_spent_line(*uid));
@@ -1075,38 +1218,291 @@ fn read_runtime_clone_with(event: &Event, proc_root: &Path, root: &Path, checks:
                 uid: *uid,
                 top: checks.bounds.top_spender(now),
             });
-        // the review of #556 (F2): every fact but the bytes holds — kept
-        // unverified, any program of that length (R004: root's recorded
-        // High, never killed; any other uid's the Critical kill — the
-        // review of #578, N3, reverting lot 370's F10-6)
-        program_identity::keep_runtime_clone(
-            event,
-            program_identity::RuntimeClone {
-                image: candidates[0].id,
-                seen,
-                unverified: true,
-                episode,
-            },
-        );
-        return;
+        // the review of #556 (F2): every fact but the bytes holds (the
+        // parent, the seal at the exec and now, an installed runtime's
+        // length) — kept unverified, any program of that length (R004:
+        // root's recorded High, never killed; any other uid's the Critical
+        // kill — the review of #578, N3, reverting lot 370's F10-6)
+        let clone = program_identity::RuntimeClone {
+            image: candidates[0].id,
+            seen,
+            unverified: true,
+            gone: false,
+            episode,
+        };
+        return (CloneRead::Budget, Some(clone));
     }
-    checks.bounds.compared.fetch_add(1, Ordering::Relaxed);
     let whole = [(0, m.len())];
-    if let Some(found) = candidates
+    let Some(found) = candidates
         .iter()
         .find(|i| same_over(&file, Path::new(&i.path), m.len(), Some(i.id), &whole))
-    {
-        checks.kept.fetch_add(1, Ordering::Relaxed);
-        program_identity::keep_runtime_clone(
-            event,
-            program_identity::RuntimeClone {
-                image: found.id,
-                seen,
-                unverified: false,
-                episode: None,
+    else {
+        return (
+            CloneRead::Compared {
+                kept: false,
+                through,
             },
+            None,
+        );
+    };
+    let clone = program_identity::RuntimeClone {
+        image: found.id,
+        seen,
+        unverified: false,
+        gone: false,
+        episode: None,
+    };
+    (
+        CloneRead::Compared {
+            kept: true,
+            through,
+        },
+        Some(clone),
+    )
+}
+
+/// Lot 381: a copy whose process exited before the read (every thread of
+/// it) and that none of its parent's children the pump read still runs.
+/// Its length is not known (nothing left to `stat`), its seal is the LSM
+/// program's at the exec: what holds is the parent's image and R004's
+/// lineage. The review of #588 (F2): kept unverified with the runtime its
+/// parent runs (R004: root's recorded High, never killed; any other uid's
+/// the Critical kill, as past the budget) only in runc 1.1's re-exec — the
+/// process executed again with no fork since its last exec
+/// (`fork_parent` 0: `runc init` re-executing its copy) under an installed
+/// runtime's process. runc 1.2's shape (`runc init` executing the copy
+/// `runc create` made, its first exec since the fork) — every OCI hook a
+/// runtime runs is such an exec — and a manager's parent (which runtime it
+/// copied is not known) keep nothing: R004's fileless Critical.
+fn gone_unverified(
+    event: &Event,
+    parent: (u64, u64),
+    parent_kind: ProgramKind,
+    seen: Vec<(u32, (u64, u64))>,
+) -> (CloneRead, Option<program_identity::RuntimeClone>) {
+    let reexec = matches!(event, Event::ProcessSpawn { exe, .. } if exe.fork_parent == 0);
+    if parent_kind != ProgramKind::ContainerRuntime || !reexec {
+        return (CloneRead::Lost, None);
+    }
+    let clone = program_identity::RuntimeClone {
+        image: parent,
+        seen,
+        unverified: true,
+        gone: true,
+        episode: None,
+    };
+    (CloneRead::Gone, Some(clone))
+}
+
+/// Lot 381: where [`open_copy`] found the exec's memfd.
+enum Copy {
+    /// Opened read-only — `through` another process running that very
+    /// inode (the exec's own gone).
+    Read {
+        file: std::fs::File,
+        m: std::fs::Metadata,
+        through: bool,
+    },
+    /// Every thread of the exec's process exited (no thread's `exe` read,
+    /// each a zombie or gone: [`group_copy`]), and no process looked at
+    /// runs the copy.
+    Exited,
+    /// The exec's process runs another file now, and no process looked at
+    /// runs the copy.
+    Replaced,
+    /// The review of #588 (F1): a thread of the exec's process still runs
+    /// (or more threads than are read), no thread's copy read, and no
+    /// process looked at runs it: never told exited.
+    Running,
+}
+
+/// Lot 381: the children of one thread read at most (a runtime's: its
+/// `runc init` and that one's two clones); the review of #588 (F1): and
+/// the threads of one process.
+const HOLDERS_MAX: usize = 64;
+
+/// Lot 381 (F6-6): the memfd `exe` (the kernel's identity of the file the
+/// exec `pid` ran), opened read-only — through `/proc/<pid>/exe` while the
+/// process runs it, else through a thread of it still running it (the
+/// review of #588, F1: its leader exited alone — a plain `exit` of the
+/// main thread — its other threads running on), else (`through`) through a
+/// child of the exec's parent `ppid` still running that very inode. runc
+/// 1.1's `runc init` re-executes its sealed copy, then forks its two stages
+/// with `CLONE_PARENT` — children of `runc create`, running the copy until
+/// the container's program starts — and exits: a pump a few milliseconds
+/// late found it gone. The inode is the one executed (a memfd's inode lives
+/// while a process maps it, and its number is not reused meanwhile), sealed
+/// at the exec, so its bytes are the ones that ran.
+fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
+    let open = |link: &Path| -> Opened {
+        let (link, id) = antitamper_bpf::kernel_roots::link_target(link).map_err(|_| false)?;
+        if (id.dev, id.ino) != exe {
+            return Err(true);
+        }
+        let file =
+            antitamper_bpf::kernel_roots::reopen_fd(&link, libc::O_RDONLY).map_err(|_| false)?;
+        let m = file.metadata().map_err(|_| false)?;
+        if kernel_id(&m) != exe {
+            return Err(true);
+        }
+        Ok((file, m))
+    };
+    let at = proc_root.join(pid.to_string());
+    let own = match open(&at.join("exe")) {
+        Ok((file, m)) => {
+            return Copy::Read {
+                file,
+                m,
+                through: false,
+            }
+        }
+        Err(true) => Copy::Replaced,
+        // the review of #588 (F1): its `exe` (its leader's) not read — the
+        // process exited, or only its leader did
+        Err(false) => match group_copy(&at, &open) {
+            Group::Copy(file, m) => {
+                return Copy::Read {
+                    file,
+                    m,
+                    through: false,
+                }
+            }
+            Group::Replaced => Copy::Replaced,
+            Group::Running => Copy::Running,
+            Group::Gone => Copy::Exited,
+        },
+    };
+    let held = children_of(proc_root, ppid)
+        .into_iter()
+        .filter(|c| *c != pid)
+        .find_map(|c| open(&proc_root.join(c.to_string()).join("exe")).ok());
+    match held {
+        Some((file, m)) => Copy::Read {
+            file,
+            m,
+            through: true,
+        },
+        None => own,
+    }
+}
+
+/// Lot 381: a process's link to the file it runs, opened read-only when it
+/// is the copy; `Err(true)`: the link read, another file; `Err(false)`:
+/// not read.
+type Opened = Result<(std::fs::File, std::fs::Metadata), bool>;
+
+/// The review of #588 (F1): what the threads of a process whose leader's
+/// `exe` was not read run ([`group_copy`]).
+enum Group {
+    /// A thread runs the copy: opened read-only.
+    Copy(std::fs::File, std::fs::Metadata),
+    /// A thread runs another file.
+    Replaced,
+    /// A thread has not exited (or more threads than are read), its copy
+    /// not read.
+    Running,
+    /// No thread runs: none listed (the process reaped), or each a zombie
+    /// or gone and the leader counted alone (the re-check of #588, N1).
+    Gone,
+}
+
+/// The review of #588 (F1): the copy read through a thread of the process
+/// at `at` (`/proc/<pid>`) still running it (`task/<tid>/exe`, `open`), at
+/// most [`HOLDERS_MAX`] threads. A leader that called `exit` (not
+/// `exit_group`) is a zombie whose `exe` is not read while its other
+/// threads run the payload: taken as exited, a foreign root memfd was kept
+/// "not compared (gone)" — High, never killed. Gone only when no thread
+/// listed has not exited ([`thread_runs`]) and the kernel counts the
+/// leader alone ([`leader_alone`]: the re-check of #588, N1).
+fn group_copy(at: &Path, open: &dyn Fn(&Path) -> Opened) -> Group {
+    let task = at.join("task");
+    let tids = match antitamper_bpf::kernel_roots::read_dir_max(&task, HOLDERS_MAX + 1) {
+        Ok(tids) => tids,
+        // the process reaped
+        Err(e) if reaped(&e) => return Group::Gone,
+        // the re-check of #588 (N2): any other failure (`EMFILE`, a
+        // `readdir` error) on a group that may live: never told gone
+        Err(_) => return Group::Running,
+    };
+    // a thread past the bound may run it: never told gone
+    let mut running = tids.len() > HOLDERS_MAX;
+    for tid in tids.iter().take(HOLDERS_MAX) {
+        let thread = task.join(tid);
+        match open(&thread.join("exe")) {
+            Ok((file, m)) => return Group::Copy(file, m),
+            Err(true) => return Group::Replaced,
+            Err(false) => running |= thread_runs(&thread),
+        }
+    }
+    // the re-check of #588 (N1): the listing is no snapshot — a thread made
+    // after it, while the listed one exits before its read, is not seen
+    // (1.7% of reads of such a group on 6.18): gone only when the kernel's
+    // count of the group's threads (the leader's `num_threads`) is the
+    // leader alone
+    if running || !leader_alone(at) {
+        Group::Running
+    } else {
+        Group::Gone
+    }
+}
+
+/// The re-check of #588 (N1): the process at `at` (`/proc/<pid>`) counts
+/// its leader alone, or none — `num_threads` of its `stat` (the kernel's
+/// `signal->nr_threads`, one read) at most 1, or its `stat` gone (the
+/// process reaped). Any other failure to read or parse it: not alone.
+fn leader_alone(at: &Path) -> bool {
+    match crate::state_read::read_state(at.join("stat")) {
+        // after the name: the state is field 3, `num_threads` field 20
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| {
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                fields.get(17)?.parse::<u64>().ok()
+            })
+            .is_some_and(|n| n <= 1),
+        Err(e) => reaped(&e),
+    }
+}
+
+/// A read of a process's or a thread's `/proc` entry failed because it is
+/// gone (reaped): `ENOENT`, `ESRCH`.
+fn reaped(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The review of #588 (F1): the thread at `thread` (`/proc/<pid>/task/<tid>`)
+/// has not exited — its `stat` state no zombie's (`Z`) nor a dead task's
+/// (`X`, `x`). Its `stat` not found (the thread reaped): exited; any other
+/// failure to read or parse it: not told exited.
+fn thread_runs(thread: &Path) -> bool {
+    match crate::state_read::read_state(thread.join("stat")) {
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_none_or(|state| !matches!(state, "Z" | "X" | "x")),
+        Err(e) => !reaped(&e),
+    }
+}
+
+/// Lot 381: the children of `pid`'s threads (`/proc/<pid>/task/<tid>/children`,
+/// procfs's own: the kernel lists them), at most [`HOLDERS_MAX`] from each.
+fn children_of(proc_root: &Path, pid: u32) -> Vec<u32> {
+    let task = proc_root.join(pid.to_string()).join("task");
+    let Ok(threads) = antitamper_bpf::kernel_roots::read_dir_max(&task, HOLDERS_MAX) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tid in threads {
+        let Ok(text) = crate::state_read::read_state(task.join(&tid).join("children")) else {
+            continue;
+        };
+        out.extend(
+            text.split_whitespace()
+                .filter_map(|c| c.parse::<u32>().ok())
+                .take(HOLDERS_MAX),
         );
     }
+    out
 }
 
 /// Lot 370 (F10-6): the signed line of a runtime copy not compared, uid
@@ -1369,7 +1765,7 @@ mod tests {
                 link(ppid, parent);
                 link(pid, &fd_path(f));
                 let e = memfd_exec(pid, ppid, 347, f);
-                read_runtime_clone_with(&e, &proc, &root, checks);
+                read_runtime_clone_with(&e, &proc, &root, checks, &Settle::default());
                 runtime_clone_of(&e)
                     .filter(|c| !c.unverified)
                     .map(|c| c.image)
@@ -1393,7 +1789,7 @@ mod tests {
         stat(34_715, 1, 100);
         link(34_716, &fd_path(&clone));
         let e = memfd_exec(34_716, 34_700, 347, &clone);
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         let shim_id = kernel_id(&std::fs::metadata(&shim).unwrap());
         assert_eq!(
             runtime_clone_of(&e).map(|c| c.seen),
@@ -1406,7 +1802,7 @@ mod tests {
         stat(34_718, 1, 100);
         link(34_719, &fd_path(&clone));
         let e = memfd_exec(34_719, 34_700, 347, &clone);
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         assert_eq!(
             runtime_clone_of(&e).map(|c| c.seen),
             Some(vec![(34_700, runc_id)])
@@ -1415,7 +1811,7 @@ mod tests {
         stat(34_715, 1, 300);
         link(34_717, &fd_path(&clone));
         let e = memfd_exec(34_717, 34_700, 347, &clone);
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         assert_eq!(
             runtime_clone_of(&e).map(|c| c.seen),
             Some(vec![(34_700, runc_id)]),
@@ -1455,7 +1851,7 @@ mod tests {
         if let Event::ProcessSpawn { exe, .. } = &mut other {
             exe.ino ^= 1;
         }
-        read_runtime_clone_with(&other, &proc, &root, &checks);
+        read_runtime_clone_with(&other, &proc, &root, &checks, &Settle::default());
         assert_eq!(runtime_clone_of(&other), None);
         // no identity from the LSM program (tracepoint mode): not compared
         let mut tp = memfd_exec(34_709, 34_700, 347, &clone);
@@ -1463,7 +1859,7 @@ mod tests {
             exe.flags = common::wire::exe::exe_flags::MEMFD;
         }
         link(34_709, &fd_path(&clone));
-        read_runtime_clone_with(&tp, &proc, &root, &checks);
+        read_runtime_clone_with(&tp, &proc, &root, &checks, &Settle::default());
         assert_eq!(runtime_clone_of(&tp), None);
         // the budget spent: counted, not compared — kept unverified, with
         // the installed runtime of its length (the review of #556, F2)
@@ -1479,7 +1875,7 @@ mod tests {
         let open = memfd(&image, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW);
         link(34_724, &fd_path(&open));
         let e = memfd_exec(34_724, 34_700, 347, &open);
-        read_runtime_clone_with(&e, &proc, &root, &poor);
+        read_runtime_clone_with(&e, &proc, &root, &poor, &Settle::default());
         assert_eq!(runtime_clone_of(&e), None);
         // the runtime upgraded: a new image at the path is the one compared
         // (the old inode's record names a file no longer there)
@@ -1548,7 +1944,7 @@ mod tests {
             &PathBuf::from(format!("/proc/self/fd/{}", clone.as_raw_fd())),
         );
         let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         assert_eq!(
             runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
             Some((runc_id, false))
@@ -1559,7 +1955,11 @@ mod tests {
                 compared: 1,
                 kept: 1,
                 unverified: 0,
-                not_read: 0
+                not_read: 0,
+                through: 0,
+                gone: 0,
+                lost: 0,
+                no_runtime: 0,
             }
         );
         // CONTROLS: not sealed at the exec (an OCI hook's memfd), no identity
@@ -1577,10 +1977,10 @@ mod tests {
         // counted
         let before = runtime_clone_counts().not_read;
         let mut late = memfd_exec(36_904, 36_900, 369, &clone);
-        not_read(&mut late);
+        not_read(&mut late, &Settle::default());
         assert_eq!(runtime_clone_of(&late), None);
         assert_eq!(runtime_clone_counts().not_read, before + 1);
-        not_read(&mut unsealed);
+        not_read(&mut unsealed, &Settle::default());
         assert_eq!(runtime_clone_counts().not_read, before + 1, "not a clone's");
         // a socket program's exec is still handed over (lot 313)
         let mut sock = nn_core::decision::rules::testutil::spawn("bash", "/tmp/bash");
@@ -1588,6 +1988,598 @@ mod tests {
             (stdio.own.read, stdio.own.inet_fds) = (true, 0b001);
         }
         assert!(reads(&sock));
+    }
+
+    /// Lot 381: a fake `/proc` for the runtime compare's tests — `exe`
+    /// links and a thread's `children` (`/proc/<pid>/task/<tid>/children`).
+    struct FakeProc(PathBuf);
+
+    impl FakeProc {
+        fn link(&self, pid: u32, to: &Path) {
+            let d = self.0.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            let _ = std::fs::remove_file(d.join("exe"));
+            symlink(to, d.join("exe")).unwrap();
+        }
+
+        fn children(&self, pid: u32, tid: u32, kids: &str) {
+            let d = self.0.join(format!("{pid}/task/{tid}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("children"), kids).unwrap();
+        }
+
+        fn fd(f: &std::fs::File) -> PathBuf {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()))
+        }
+    }
+
+    /// Lot 381 (F6-6 of the pre-alpha's Phase 6b, named): runc 1.1's
+    /// `runc init` re-executes its sealed copy, forks its two stages with
+    /// `CLONE_PARENT` (children of `runc create`, on whichever of its threads
+    /// forked `runc init`) and exits. Under 200 rootful container starts in a
+    /// row (Debian 13, rc11) the pump read one such clone in 300 once
+    /// `runc init` was gone: it returned before any counter, kept nothing,
+    /// and R004 judged the clone fileless, Critical (fails on 684b6d49:
+    /// nothing kept). Now the copy is read through a child of `runc create`
+    /// still running that very memfd — compared whole and kept, counted
+    /// "through". A child running another memfd of the same bytes is not
+    /// that copy: not compared, "gone", counted.
+    #[test]
+    fn a_runc_clone_gone_before_the_read_is_compared_through_a_child_still_running_it() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        // a length no other test's runtime has
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 381)).map(|i| (i % 239) as u8).collect();
+        image[..4].copy_from_slice(b"r381");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let bash = put(&root, "/usr/bin/bash", b"bash image, 381");
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        // `runc create` runs the installed runc; `runc init` (38_001) is
+        // gone; on one thread its sibling running bash, on another its two
+        // stages — the first gone too, the second running the copy
+        proc.link(38_000, &runc);
+        proc.children(38_000, 38_000, "38001 38002\n");
+        proc.children(38_000, 38_005, "38003 38004 ");
+        proc.link(38_002, &bash);
+        proc.link(38_004, &FakeProc::fd(&clone));
+        let e = memfd_exec(38_001, 38_000, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
+            Some((runc_id, false)),
+            "compared through the stage still running the copy"
+        );
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                compared: 1,
+                kept: 1,
+                through: 1,
+                ..Default::default()
+            }
+        );
+        // CONTROL: the child runs another memfd of the very same bytes, not
+        // the exec's inode — not read through it: not compared (gone), kept
+        // unverified with the runtime its parent runs
+        let twin = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        proc.link(38_010, &runc);
+        proc.children(38_010, 38_010, "38011 38014");
+        proc.link(38_014, &FakeProc::fd(&twin));
+        let e = memfd_exec(38_011, 38_010, 381, &clone);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(
+            runtime_clone_of(&e).map(|c| (c.image, c.unverified, c.gone)),
+            Some((runc_id, true, true))
+        );
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                gone: 1,
+                ..Default::default()
+            }
+        );
+        // at most HOLDERS_MAX children read of one thread (the read's cost
+        // bounded): a holder listed past them is not looked at
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        proc.link(38_030, &runc);
+        let many: Vec<String> = (0..HOLDERS_MAX as u32)
+            .map(|i| (39_000 + i).to_string())
+            .collect();
+        proc.children(38_030, 38_030, &format!("{} 38034", many.join(" ")));
+        proc.link(38_034, &FakeProc::fd(&clone));
+        let e = memfd_exec(38_031, 38_030, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(checks.counts().gone, 1, "the holder past the bound");
+        // the exec's own process still running it: read there, not through
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        proc.link(38_021, &FakeProc::fd(&clone));
+        proc.link(38_020, &runc);
+        let e = memfd_exec(38_021, 38_020, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                compared: 1,
+                kept: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// Lot 381 (F6-6, named): a sealed memfd exec whose copy no process
+    /// runs any more by the pump's read is counted, never outside every
+    /// counter (fails on 684b6d49: no count moved) — "gone", kept unverified
+    /// with the runtime its parent runs, when the parent is an installed
+    /// runtime and the exec runc 1.1's re-exec (R004: root's High, any other
+    /// uid's the Critical kill); its parent gone too, its parent a manager
+    /// (which runtime it copied is not known), or (the review of #588, F2)
+    /// runc 1.2's shape — a first exec since the fork, every OCI hook's —
+    /// nothing kept, counted "lost": R004's fileless Critical (kept "gone"
+    /// at 51a0f11d).
+    #[test]
+    fn a_runtime_clone_with_nothing_left_running_it_is_counted_not_compared() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 3810))
+            .map(|i| (i % 233) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"g381");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let shim = put(&root, "/usr/bin/conmon", b"conmon image, 381");
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        let before = checks.counts();
+        // under `runc create`, nothing running the copy any more
+        proc.link(38_100, &runc);
+        let e = memfd_exec(38_101, 38_100, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_ne!(checks.counts(), before, "counted");
+        let kept = runtime_clone_of(&e).expect("kept unverified");
+        assert_eq!(
+            (kept.image, kept.unverified, kept.gone, kept.seen),
+            (runc_id, true, true, vec![(38_100, runc_id)])
+        );
+        // its parent gone too: no runtime to tell — nothing kept
+        let e = memfd_exec(38_111, 38_110, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(runtime_clone_of(&e), None);
+        // under a manager (crun's shape): which runtime it copied is not
+        // known — nothing kept
+        proc.link(38_120, &shim);
+        let e = memfd_exec(38_121, 38_120, 381, &clone);
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(runtime_clone_of(&e), None);
+        // the review of #588 (F2): runc 1.2's shape under `runc create` —
+        // the exec's first since its fork (an OCI hook's too): nothing kept
+        let mut e = memfd_exec(38_102, 38_100, 381, &clone);
+        if let Event::ProcessSpawn { exe, .. } = &mut e {
+            exe.fork_parent = 38_100;
+        }
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(runtime_clone_of(&e), None, "runc 1.2's shape, gone");
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                gone: 1,
+                lost: 3,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// Lot 381 (the ratchet of F6-6): every sealed memfd exec the LSM
+    /// program described lands in exactly one of the compare's counters —
+    /// compared (kept or not, read through a child or not), not compared
+    /// for the budget, gone, lost (the review of #588, F4), no runtime's,
+    /// not read in time — whatever stops it; one the LSM program did not
+    /// describe moves none (it is not read).
+    #[test]
+    fn every_sealed_memfd_exec_lands_in_exactly_one_runtime_counter() {
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 3820))
+            .map(|i| (i % 229) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"e381");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let bash = put(&root, "/usr/bin/bash", b"bash image, 381 e");
+        let sealed_copy = |bytes: &[u8]| memfd(bytes, SEALED | libc::F_SEAL_SEAL);
+        let clone = sealed_copy(&image);
+        let mut patched = image.clone();
+        patched[1 << 19] ^= 1;
+        let patched = sealed_copy(&patched);
+        let short = sealed_copy(&image[..image.len() - 1]);
+        let unsealed = memfd(&image, 0);
+        // uid 1000's share too small for one compare; root's ample (its
+        // reserve given: root's budget is the global one)
+        let checks = RuntimeChecks::new(1 << 20, 1 << 30, 1 << 29);
+        proc.link(38_200, &runc);
+        proc.link(38_290, &bash);
+        let as_uid = |mut e: Event, uid: u32| {
+            if let Event::ProcessSpawn { uid: u, .. } = &mut e {
+                *u = uid;
+            }
+            e
+        };
+        let mut n = 0u64;
+        // the exec whose step the pump stopped waiting for
+        const LATE: u32 = 38_212;
+        // `ran`: the file the exec ran (its identity in the event);
+        // `running`: what its `/proc/<pid>/exe` names now (none: gone)
+        let mut run =
+            |pid: u32, ppid: u32, ran: &std::fs::File, running: Option<&Path>, uid: u32| {
+                if let Some(to) = running {
+                    proc.link(pid, to);
+                }
+                let e = as_uid(memfd_exec(pid, ppid, 381, ran), uid);
+                let before = checks.counts();
+                // the review of #588 (F3): the pump's step and, past its
+                // deadline, `not_read` — one count between them
+                let settle = Settle::default();
+                if pid == LATE {
+                    count_not_read(&e, &checks, &settle);
+                }
+                read_runtime_clone_with(&e, &proc.0, &root, &checks, &settle);
+                count_not_read(&e, &checks, &settle);
+                let after = checks.counts();
+                let moved = (after.compared - before.compared)
+                    + (after.unverified - before.unverified)
+                    + (after.gone - before.gone)
+                    + (after.lost - before.lost)
+                    + (after.no_runtime - before.no_runtime)
+                    + (after.not_read - before.not_read);
+                assert_eq!(moved, 1, "pid {pid}: {before:?} → {after:?}");
+                n += 1;
+            };
+        let fd = FakeProc::fd;
+        run(38_201, 38_200, &clone, Some(&fd(&clone)), 0); // compared, kept
+        run(38_202, 38_200, &patched, Some(&fd(&patched)), 0); // compared, not kept
+        run(38_203, 38_200, &clone, Some(&fd(&clone)), 1000); // its share spent
+        run(38_204, 38_200, &clone, None, 0); // gone
+        run(38_205, 38_299, &clone, Some(&fd(&clone)), 0); // its parent gone
+        run(38_206, 38_290, &clone, Some(&fd(&clone)), 0); // under bash
+        run(38_207, 38_200, &short, Some(&fd(&short)), 0); // no runtime's length
+        run(38_208, 38_200, &unsealed, Some(&fd(&unsealed)), 0); // not sealed now
+                                                                 // the mini-hunt: its pid running another file now (executed again,
+                                                                 // or reused), and a zombie (its `/proc` entry, no `exe`)
+        run(38_210, 38_200, &clone, Some(&bash), 0);
+        std::fs::create_dir_all(proc.0.join("38211/task/38211")).unwrap();
+        std::fs::write(
+            proc.0.join("38211/task/38211/stat"),
+            "38211 (runc:[1:CHILD]) Z 38200 1",
+        )
+        .unwrap();
+        run(38_211, 38_200, &clone, None, 0);
+        // the review of #588: not read in time (F3); its leader exited, a
+        // thread running the copy (F1); a thread of it running, its copy
+        // not read (F1)
+        run(LATE, 38_200, &clone, Some(&fd(&clone)), 0);
+        let thread = proc.0.join("38213/task/38214");
+        std::fs::create_dir_all(&thread).unwrap();
+        symlink(fd(&clone), thread.join("exe")).unwrap();
+        run(38_213, 38_200, &clone, None, 0);
+        let thread = proc.0.join("38215/task/38216");
+        std::fs::create_dir_all(&thread).unwrap();
+        std::fs::write(thread.join("stat"), "38216 (k381) S 38200 1").unwrap();
+        run(38_215, 38_200, &clone, None, 0);
+        let c = checks.counts();
+        assert_eq!(
+            c.compared + c.unverified + c.gone + c.lost + c.no_runtime + c.not_read,
+            n
+        );
+        assert_eq!(
+            (
+                c.compared,
+                c.kept,
+                c.unverified,
+                c.gone,
+                c.lost,
+                c.no_runtime,
+                c.not_read
+            ),
+            (3, 2, 1, 2, 3, 3, 1)
+        );
+        // the pid running another file keeps nothing (R004's Critical);
+        // the zombie's copy (every thread exited), its length not known, is
+        // kept unverified: "not compared (gone)"; the late one keeps nothing
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let at = |pid: u32| runtime_clone_of(&memfd_exec(pid, 38_200, 381, &clone));
+        assert_eq!(at(38_210), None);
+        assert_eq!(
+            at(38_211).map(|c| (c.unverified, c.gone)),
+            Some((true, true))
+        );
+        assert_eq!(at(LATE), None, "kept past the deadline");
+        assert_eq!(at(38_213).map(|c| c.unverified), Some(false));
+        assert_eq!(at(38_215), None);
+        // not described by the LSM program (tracepoint mode): not read
+        let mut tp = memfd_exec(38_209, 38_200, 381, &clone);
+        if let Event::ProcessSpawn { exe, .. } = &mut tp {
+            exe.flags &= !common::wire::exe::exe_flags::KNOWN;
+        }
+        read_runtime_clone_with(&tp, &proc.0, &root, &checks, &Settle::default());
+        assert_eq!(checks.counts(), c);
+    }
+
+    /// The review of #588 (F1, named): the exec's leader exited alone (a
+    /// plain `exit` of its main thread, not `exit_group`) while another of
+    /// its threads runs the payload — a zombie leader of a live thread
+    /// group: `/proc/<pid>/exe` unreadable, `/proc/<pid>/task/<tid>/exe` the
+    /// memfd, the process alive (a kill ends it). At 51a0f11d the pump took
+    /// it as exited and kept a foreign root memfd "not compared (gone)" —
+    /// R004 High, never killed. Now the copy is read through the live
+    /// thread: a foreign memfd (of no runtime's length, or of its length
+    /// with other bytes) keeps nothing — R004's fileless Critical with the
+    /// kill — and runc's own copy is compared and kept. Exited only when no
+    /// listed thread has not exited: a thread still running whose copy is
+    /// not read, a thread past the bound, a thread whose state cannot be
+    /// read — nothing kept, "lost".
+    #[test]
+    fn a_live_thread_group_whose_leader_exited_is_read_through_its_threads() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 5880))
+            .map(|i| (i % 227) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"p588");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let sealed_copy = |bytes: &[u8]| memfd(bytes, SEALED | libc::F_SEAL_SEAL);
+        let foreign = sealed_copy(b"a foreign payload, not the runtime");
+        let mut other = image.clone();
+        other[1 << 19] ^= 1;
+        let other = sealed_copy(&other);
+        let clone = sealed_copy(&image);
+        proc.link(58_800, &runc);
+        // `tid` of `pid`: running `exe` (a link), or in `state` (no link)
+        let thread = |pid: u32, tid: u32, exe: Option<&std::fs::File>, state: Option<&str>| {
+            let d = proc.0.join(format!("{pid}/task/{tid}"));
+            std::fs::create_dir_all(&d).unwrap();
+            if let Some(f) = exe {
+                symlink(FakeProc::fd(f), d.join("exe")).unwrap();
+            }
+            if let Some(s) = state {
+                std::fs::write(d.join("stat"), format!("{tid} (k 588) {s} 58800 1")).unwrap();
+            }
+        };
+        let read = |pid: u32, ran: &std::fs::File| {
+            let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+            let e = memfd_exec(pid, 58_800, 588, ran);
+            read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+            (
+                runtime_clone_of(&e).map(|c| (c.image, c.unverified, c.gone)),
+                checks.counts(),
+            )
+        };
+        // the leader a zombie, a thread running a foreign memfd: nothing
+        // kept (the review's probe)
+        thread(58_801, 58_801, None, Some("Z"));
+        thread(58_801, 58_802, Some(&foreign), None);
+        assert_eq!(
+            read(58_801, &foreign),
+            (
+                None,
+                RuntimeCloneCounts {
+                    no_runtime: 1,
+                    ..Default::default()
+                }
+            ),
+            "a running thread group's foreign memfd kept as a gone runtime copy"
+        );
+        // ... of the runtime's length, other bytes: compared, not kept
+        thread(58_803, 58_803, None, Some("Z"));
+        thread(58_803, 58_804, Some(&other), None);
+        assert_eq!(
+            read(58_803, &other),
+            (
+                None,
+                RuntimeCloneCounts {
+                    compared: 1,
+                    ..Default::default()
+                }
+            )
+        );
+        // ... runc's own copy: compared whole, kept (its own process's)
+        thread(58_805, 58_806, Some(&clone), None);
+        assert_eq!(
+            read(58_805, &clone),
+            (
+                Some((runc_id, false, false)),
+                RuntimeCloneCounts {
+                    compared: 1,
+                    kept: 1,
+                    ..Default::default()
+                }
+            )
+        );
+        let lost = RuntimeCloneCounts {
+            lost: 1,
+            ..Default::default()
+        };
+        // a thread still running, its copy not read: never "gone"
+        thread(58_807, 58_807, None, Some("Z"));
+        thread(58_808, 58_808, None, Some("Z"));
+        thread(58_808, 58_809, None, Some("R"));
+        assert_eq!(read(58_808, &clone), (None, lost));
+        // a thread whose state is not read (not for its absence), or not
+        // understood
+        thread(58_810, 58_811, None, None);
+        std::fs::create_dir_all(proc.0.join("58810/task/58811/stat")).unwrap();
+        assert_eq!(read(58_810, &clone), (None, lost));
+        thread(58_818, 58_819, None, None);
+        std::fs::write(proc.0.join("58818/task/58819/stat"), "58819 no state").unwrap();
+        assert_eq!(read(58_818, &clone), (None, lost));
+        // a thread running another file (the process executed again):
+        // nothing kept
+        let bash = put(&root, "/usr/bin/bash", b"bash image, 588");
+        thread(58_816, 58_816, None, Some("Z"));
+        let d = proc.0.join("58816/task/58817");
+        std::fs::create_dir_all(&d).unwrap();
+        symlink(&bash, d.join("exe")).unwrap();
+        assert_eq!(read(58_816, &clone), (None, lost));
+        // more threads than are read, those read all exited
+        for tid in 0..=HOLDERS_MAX as u32 {
+            thread(58_812, 59_000 + tid, None, Some("Z"));
+        }
+        assert_eq!(read(58_812, &clone), (None, lost));
+        // CONTROLS — every thread exited (the zombie leader, a thread dead,
+        // one reaped as it was listed): gone, kept unverified (runc 1.1's
+        // re-exec under runc)
+        let gone = (
+            Some((runc_id, true, true)),
+            RuntimeCloneCounts {
+                gone: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(read(58_807, &clone), gone);
+        thread(58_813, 58_813, None, Some("Z"));
+        thread(58_813, 58_814, None, Some("X"));
+        thread(58_813, 58_815, None, None);
+        assert_eq!(read(58_813, &clone), gone);
+    }
+
+    /// The re-check of #588 (N1, N2; named): the threads' listing is no
+    /// snapshot — a thread made after the `readdir` while the listed one
+    /// exits before its read is not seen (1.7% of reads of such a group on
+    /// 6.18, a live group taken as exited: "gone", root's High) — and a
+    /// listing that fails for another reason than the process's absence
+    /// (`EMFILE`, a `readdir` error) said nothing of the group either. At
+    /// c0868bb9 both were "gone", kept unverified. Now gone only when the
+    /// leader's `num_threads` (the kernel's count, one read) is 1 or its
+    /// `stat` is gone; else nothing kept, "lost" (R004's fileless
+    /// Critical).
+    #[test]
+    fn a_group_whose_listing_missed_a_live_thread_is_never_gone() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 5884))
+            .map(|i| (i % 211) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"n588");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        proc.link(58_840, &runc);
+        // `pid`: its leader a listed zombie; its own `stat` (none: reaped)
+        // counting `threads`
+        let zombie = |pid: u32, threads: Option<&str>| {
+            let d = proc.0.join(format!("{pid}/task/{pid}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), format!("{pid} (k 588) Z 58840 1")).unwrap();
+            if let Some(n) = threads {
+                // fields 3 to 19, then `num_threads` (field 20)
+                let fields = format!("Z 58840 {} {n} 0 0", "0 ".repeat(15).trim_end());
+                std::fs::write(
+                    proc.0.join(format!("{pid}/stat")),
+                    format!("{pid} (k 588) {fields}"),
+                )
+                .unwrap();
+            }
+        };
+        let read = |pid: u32| {
+            let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+            let e = memfd_exec(pid, 58_840, 588, &clone);
+            read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+            (
+                runtime_clone_of(&e).map(|c| (c.image, c.unverified, c.gone)),
+                checks.counts(),
+            )
+        };
+        let lost = (
+            None,
+            RuntimeCloneCounts {
+                lost: 1,
+                ..Default::default()
+            },
+        );
+        // N1: every listed thread exited, the kernel counting two
+        zombie(58_841, Some("2"));
+        assert_eq!(read(58_841), lost, "a live thread the listing missed");
+        // ... or a count not read as one
+        zombie(58_842, Some("many"));
+        assert_eq!(read(58_842), lost);
+        // N2: the listing failed, not for the process's absence
+        std::fs::create_dir_all(proc.0.join("58843")).unwrap();
+        std::fs::write(proc.0.join("58843/task"), "not a directory").unwrap();
+        assert_eq!(read(58_843), lost, "a listing error taken as gone");
+        // CONTROLS: the leader alone (its zombie counted), or the process
+        // reaped (no `stat`, no `task`): gone, kept unverified
+        let gone = (
+            Some((runc_id, true, true)),
+            RuntimeCloneCounts {
+                gone: 1,
+                ..Default::default()
+            },
+        );
+        zombie(58_844, Some("1"));
+        assert_eq!(read(58_844), gone);
+        zombie(58_845, None);
+        assert_eq!(read(58_845), gone);
+        assert_eq!(read(58_846), gone);
+    }
+
+    /// The review of #588 (F3, named): the pump stopped waiting for a
+    /// runtime compare (its deadline passed: `not_read` counted the exec
+    /// "not read in time", R004 judged it without a clone), and the compare
+    /// finished later. At 51a0f11d it counted the exec a second time
+    /// (compared) and kept a clone R004 had judged without. Now one count
+    /// and one clone per exec, whichever of the step and `not_read` comes
+    /// first ([`Settle`]); a step in time keeps its count and clone, and
+    /// a `not_read` after it moves nothing.
+    #[test]
+    fn a_runtime_compare_past_its_deadline_counts_and_keeps_nothing_more() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 5883))
+            .map(|i| (i % 223) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"d588");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+        proc.link(58_830, &runc);
+        proc.link(58_831, &FakeProc::fd(&clone));
+        proc.link(58_832, &FakeProc::fd(&clone));
+        // past the deadline: `not_read` first, the step's late answer after
+        let late = memfd_exec(58_831, 58_830, 588, &clone);
+        let settle = Settle::default();
+        count_not_read(&late, &checks, &settle);
+        read_runtime_clone_with(&late, &proc.0, &root, &checks, &settle);
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                not_read: 1,
+                ..Default::default()
+            },
+            "counted twice"
+        );
+        assert_eq!(runtime_clone_of(&late), None, "kept after R004 judged");
+        // in time: the step's count and clone; a `not_read` after it, none
+        let e = memfd_exec(58_832, 58_830, 588, &clone);
+        let settle = Settle::default();
+        read_runtime_clone_with(&e, &proc.0, &root, &checks, &settle);
+        count_not_read(&e, &checks, &settle);
+        assert_eq!(
+            checks.counts(),
+            RuntimeCloneCounts {
+                not_read: 1,
+                compared: 1,
+                kept: 1,
+                ..Default::default()
+            }
+        );
+        assert!(runtime_clone_of(&e).is_some());
     }
 
     /// The review of #556 (F1, named): the memfd runc's OCI hook is executed
@@ -1638,7 +2630,7 @@ mod tests {
         if let Event::ProcessSpawn { exe, .. } = &mut e {
             exe.flags &= !MEMFD_SEALED;
         }
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         assert_eq!(runtime_clone_of(&e), None, "sealed after the exec");
         // the same file, the record sealed at the exec: runc's clone
         let e = memfd_exec(35_602, 35_600, 556, &hook);
@@ -1646,7 +2638,7 @@ mod tests {
             35_602,
             &PathBuf::from(format!("/proc/self/fd/{}", hook.as_raw_fd())),
         );
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         assert_eq!(
             runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
             Some((kernel_id(&std::fs::metadata(&runc).unwrap()), false))
@@ -1697,7 +2689,7 @@ mod tests {
         if let Event::ProcessSpawn { uid, .. } = &mut e {
             *uid = 1000;
         }
-        read_runtime_clone_with(&e, &proc, &root, &checks);
+        read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
         let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
         assert_eq!(
             runtime_clone_of(&e).map(|c| (c.image, c.unverified)),
@@ -1731,7 +2723,7 @@ mod tests {
         if let Event::ProcessSpawn { uid, .. } = &mut e2 {
             *uid = 1000;
         }
-        read_runtime_clone_with(&e2, &proc, &root, &checks);
+        read_runtime_clone_with(&e2, &proc, &root, &checks, &Settle::default());
         assert_eq!(
             runtime_clone_of(&e2).map(|c| (c.unverified, c.episode)),
             Some((true, None))
@@ -1939,7 +2931,7 @@ mod tests {
             if let Event::ProcessSpawn { uid, .. } = &mut e {
                 *uid = 1000;
             }
-            read_runtime_clone_with(&e, &proc, &root, &checks);
+            read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
             (runtime_clone_of(&e).map(|c| c.unverified), hook)
         };
         // within the burst: compared, no clone kept
@@ -2429,7 +3421,7 @@ mod tests {
             let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
             let e = memfd_exec(36_611, 36_610, 366, &clone);
             let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
-            read_runtime_clone_with(&e, &proc, &root, &checks);
+            read_runtime_clone_with(&e, &proc, &root, &checks, &Settle::default());
             runtime_clone_of(&e).is_none()
         });
         if let Some(rc) = rc {
@@ -2456,10 +3448,10 @@ mod tests {
     #[test]
     fn an_exec_not_read_in_time_is_unverified() {
         let mut e = exec(31_800, 11, outbound());
-        not_read(&mut e);
+        not_read(&mut e, &Settle::default());
         assert!(program_identity::unverified(&e));
         let mut quiet = exec(31_801, 12, StdioSocket::default());
-        not_read(&mut quiet);
+        not_read(&mut quiet, &Settle::default());
         assert!(!program_identity::unverified(&quiet));
     }
 

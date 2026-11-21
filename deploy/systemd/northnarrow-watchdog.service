@@ -141,9 +141,12 @@ RuntimeDirectoryPreserve=yes
 # Resource ceilings per design §9 "Resource ceiling (V1 targets)":
 #   RSS ≤ 10 MB steady state. The whole binary is a tokio runtime
 #     + one pidfd + an aya map handle. No model, no rules, no
-#     telemetry buffers. 64 MB cap is 6× over target, leaves
-#     headroom for legitimate spikes (Command::spawn allocations,
-#     log-buffer transients).
+#     telemetry buffers. Lot 381 (the pre-alpha's Phase 6b): measured
+#     RSS 4.8–5.0 MiB, its cgroup 0.6 MiB at rest and at most 2.2 MiB;
+#     the 32 MB cap (it was 64 MB) is six times the RSS and fifteen times
+#     the cgroup's peak, headroom for legitimate spikes (Command::spawn
+#     allocations, log-buffer transients); it is also the watchdog's
+#     floor (antitamper_bpf::cgroup_floors).
 #   CPU ≤ 0.1% steady state. Nothing happens until the agent
 #     dies or 30 s elapses (the STATUS-ping tick). 10% cap is
 #     100× over target — generous slack for restart-cycle bursts
@@ -152,10 +155,10 @@ RuntimeDirectoryPreserve=yes
 #     a handful of tokio worker threads, plus one transient
 #     `systemctl` child during a respawn. 8 catches any thread leak
 #     well before it matters.
-MemoryMax=64M
+MemoryMax=32M
 CPUQuota=10%
 TasksMax=8
-# OOMScoreAdjust — 64 MiB at most, and the process that brings the agent
+# OOMScoreAdjust — 32 MiB at most, and the process that brings the agent
 # back: the host OOM killer's last pick (lot 370, F10-4: -999, written again
 # by the watchdog at its start; it was -900). Not -1000: its own MemoryMax
 # above must still be able to end a leak.

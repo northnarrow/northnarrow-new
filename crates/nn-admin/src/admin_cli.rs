@@ -4129,6 +4129,7 @@ mod tests {
                         kept: 29,
                         unverified: 30,
                         not_read: 31,
+                        ..Default::default()
                     }),
                     execq_script_refused_total: Some(19),
                     event_bus: None,

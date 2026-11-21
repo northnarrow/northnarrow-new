@@ -585,6 +585,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
     ),
+    // lot 381 (F6-6): a thread's children, where the runtime compare looks
+    // for a process still running a copy whose own process exited
+    (
+        "crates/nn-linux/src/program_images.rs",
+        "read_state(task.join(&tid).join(\"children\"))",
+        "lot 381: a thread of the exec's parent lists its children (procfs's own); \
+         unreadable (the thread gone), no holder of the copy is found there — the copy is then \
+         gone, counted, and never kept as the runtime's clone: in runc 1.1's re-exec under an \
+         installed runtime it is kept UNVERIFIED (R004: root's High, never killed — a declared \
+         residual, the review of #588 F4; any other uid's the Critical kill), in any other \
+         shape nothing is kept (Critical)",
+    ),
     (
         "crates/nn-linux/src/fim/drain.rs",
         "read_state(dir.join(\"cgroup\"))",
