@@ -1383,10 +1383,7 @@ mod tests {
             (vec![thread(1000, 0, Some(false))], "a session's"),
         ] {
             let creds = Credentials::of_forker(&threads);
-            assert!(
-                matches!(creds, Credentials::CannotLoad(_)),
-                "{why}: {creds:?}"
-            );
+            assert!(matches!(creds, Credentials::CannotLoad(_)), "{why}");
             let v = r.evaluate(&read_as(user(), gone(creds))).expect("recorded");
             assert_eq!(
                 (v.action.clone(), v.severity),
@@ -1424,10 +1421,7 @@ mod tests {
             (vec![], "no thread read"),
         ] {
             let creds = Credentials::of_forker(&threads);
-            assert!(
-                !matches!(creds, Credentials::CannotLoad(_)),
-                "{why}: {creds:?}"
-            );
+            assert!(!matches!(creds, Credentials::CannotLoad(_)), "{why}");
             let v = r.evaluate(&read_as(user(), gone(creds))).expect("recorded");
             assert_eq!(v.severity, Severity::High, "{why}: High");
         }

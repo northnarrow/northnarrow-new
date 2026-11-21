@@ -305,6 +305,9 @@ fn grants_no_privilege(root: &Path) -> bool {
         )
 }
 
+/// Lot 380: the most threads of a forker [`forker_credentials`] reads.
+const FORKER_THREADS: usize = 1024;
+
 /// Lot 380: [`Credentials::of_forker`] of `pid`, the process that started
 /// at `start_ns` — each of its threads' `status` and user namespace
 /// (`task/<tid>/ns/user` against PID 1's), read while a pidfd holds it, its
@@ -328,15 +331,18 @@ fn forker_credentials(proc: &Path, pid: u32, start_ns: u64) -> Credentials {
     let Some(init) = antitamper_bpf::kernel_roots::read_link(proc.join("1/ns/user")).ok() else {
         return Credentials::NotRead;
     };
-    let Ok(tasks) = std::fs::read_dir(proc.join(format!("{pid}/task"))) else {
+    let task_dir = proc.join(format!("{pid}/task"));
+    let Ok(tasks) = antitamper_bpf::kernel_roots::read_dir_max(&task_dir, FORKER_THREADS + 1)
+    else {
         return Credentials::NotRead;
     };
+    // a forker with more threads than are read is not vouched for
+    if tasks.len() > FORKER_THREADS {
+        return Credentials::NotRead;
+    }
     let mut threads = Vec::new();
     for task in tasks {
-        let Ok(task) = task else {
-            return Credentials::NotRead;
-        };
-        let dir = task.path();
+        let dir = task_dir.join(task);
         let Ok(status) = crate::state_read::read_state(dir.join("status")) else {
             return Credentials::NotRead;
         };
@@ -2426,8 +2432,10 @@ mod tests {
             150,
             &[(forker, 1000, full, own), (forker + 1, 1000, full, own)],
         );
-        let creds = read(&exe, forker);
-        assert!(matches!(creds, Credentials::CannotLoad(_)), "{creds:?}");
+        assert!(
+            matches!(read(&exe, forker), Credentials::CannotLoad(_)),
+            "rootless Podman's forker"
+        );
         // a session's forker, no capability
         write_forker(150, &[(forker, 1000, 0, init)]);
         assert!(matches!(read(&exe, forker), Credentials::CannotLoad(_)));

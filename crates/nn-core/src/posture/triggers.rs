@@ -4212,6 +4212,33 @@ mod tests {
         }
         assert!(auth.ingest_spawn_event(&bare));
         assert!(fires(925, "/etc/passwd", 0, id), "its file not described");
+        // the host's file in a system tree whose directory a user's group
+        // may write (`/usr/local/bin`, `staff`'s on older Debian)
+        IdTestHost::set_file_id("/usr/local/bin/id", Some((STAT_DEV, 66)));
+        exec(926, "/usr/local/bin/id", 66);
+        assert!(
+            fires(926, "/etc/passwd", 0, (KDEV, 66)),
+            "a program of a directory not root's only"
+        );
+        // its only exec cached came after the open (a fork then): what it
+        // ran then is not known, whatever image it names
+        let mut later = spawn_with_exe(927, 690, "/usr/bin/id", 1);
+        if let Event::ProcessSpawn {
+            exe,
+            start_ns,
+            timestamp_ns,
+            ..
+        } = &mut later
+        {
+            (*start_ns, *timestamp_ns) = (5_000, 20_001);
+            (exe.path, exe.dev, exe.ino, exe.flags) =
+                ("/usr/bin/id".into(), KDEV, 51, KNOWN | ROOT_DIR);
+        }
+        assert!(auth.ingest_spawn_event(&later));
+        assert!(
+            fires(927, "/etc/passwd", 0, id),
+            "an exec cached after the open"
+        );
         // not read yet, the image a file of its name in a directory a user
         // can write
         IdTestHost::set_file_id("/usr/sbin/idx", Some((STAT_DEV, 65)));
@@ -4245,6 +4272,7 @@ mod tests {
         }
         IdTestHost::set_file_id("/home/u/bin/id", None);
         IdTestHost::set_file_id("/usr/sbin/idx", None);
+        IdTestHost::set_file_id("/usr/local/bin/id", None);
         IdTestHost::set_dir_root_only("/usr/bin", false);
     }
 
@@ -8364,10 +8392,16 @@ mod tests {
         e
     }
 
-    /// The code of the shipped list's directory `dir`.
+    /// The code of the shipped list's directory `dir` (lot 380: its unit
+    /// set's tag).
     fn unit_code(det: &TriggerDetector, dir: &str) -> u8 {
         let data = det.daemon_data.get().unwrap();
-        let tag = data.dirs().iter().position(|d| d.dir == dir).unwrap();
+        let tag = data
+            .tagged_dirs()
+            .into_iter()
+            .find(|(d, _)| d == dir)
+            .map(|(_, t)| t)
+            .unwrap();
         own_data::UNIT_BASE + tag as u8
     }
 
@@ -8761,8 +8795,10 @@ mod tests {
     /// Lot 380 (named, the rc11 soak on Ubuntu 26.04: ENGAGED during a
     /// container burst — containerd, its unit's process, replacing the task
     /// bundles it writes and removes under `/run/containerd` as containers
-    /// start and stop): the shipped list names containerd's runtime state
-    /// (and dockerd's, the mini-hunt's variant), so the replacement crosses
+    /// start and stop, its removals mixing the container's snapshot under
+    /// `/var/lib/containerd` in the same window): the shipped list names
+    /// containerd's runtime state (and dockerd's, the mini-hunt's variant),
+    /// a unit's directories share one tag, so the replacement crosses
     /// nothing when both its halves were its unit's own data there, by the
     /// writer's cgroup. Still counted: the same burst from another unit, or
     /// from a cgroup containerd made below its own (a container's payload);
@@ -8773,6 +8809,9 @@ mod tests {
         let h = own_host();
         let ci = TriggerType::ConfirmedIntrusion;
         let code = unit_code(&h.det, "/run/containerd/");
+        // one tag for containerd's two directories: a window that removed
+        // its bundle under /run and its snapshot under /var/lib is one code
+        assert_eq!(code, unit_code(&h.det, "/var/lib/containerd/"));
         let docker = unit_code(&h.det, "/run/docker/");
         let bundle = "/run/containerd/io.containerd.runtime.v2.task/moby/0f3c/config.json";
         let own = |mut e: Event, o: u8| {
