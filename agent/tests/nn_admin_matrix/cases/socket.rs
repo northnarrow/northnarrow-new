@@ -659,6 +659,46 @@ pub fn verbs() -> Vec<Verb> {
             none.export = None;
             success.push(("no-export".to_string(), telemetry(Some(none))));
         }
+        // lot 379 (pre-alpha F7-1): signed integrity findings the audit log
+        // holds — a cut chain (until acknowledged) and an unauthorized
+        // overlay (while found) — as the agent lists them
+        if name.starts_with("status-key") {
+            let mut held = full_status();
+            held.degradations = Some(vec![
+                "bpf_lsm: anti-tamper: no enforcement".to_string(),
+                "integrity: chain_truncated (detections) — signed 2 times since \
+                 2026-11-20T16:40:12.000000Z, last 2026-11-20T16:45:01.000000Z (audit row 412) — \
+                 held until acknowledged (`nn-admin integrity acknowledge --through <row>`): the \
+                 anchored head is not in the file"
+                    .to_string(),
+                "integrity: unauthorized_overlay — signed 2026-11-20T16:45:02.000000Z (audit row \
+                 415) — held while found, or until acknowledged: process-comm-allowlist \
+                 (process-comm-allowlist.local): no signature file"
+                    .to_string(),
+                // lot 379 (Phase 7b F7-6): the agent's crash, as the start
+                // after it signs the witness's row, held until acknowledged
+                "integrity: witness_row — signed 2026-11-20T16:46:10.000000Z (audit row 421) — \
+                 held until acknowledged (`nn-admin integrity acknowledge --through <row>`): \
+                 watchdog 812 at 1795240000: role_vacated: the agent (pid 4410) left its role \
+                 (row hash 0a1b2c3d4e5f6a7b)"
+                    .to_string(),
+            ]);
+            success.push(("integrity-held".to_string(), telemetry(Some(held))));
+            // lot 379 (the review of #586, P2-1): a default install with the
+            // admin key left on the host — an advisory, not a degradation:
+            // `sensors: OK`, the advisory listed on its own with its row
+            let mut adv = full_status();
+            adv.degradations = Some(Vec::new());
+            adv.ringbuf_drops_total = Some(0);
+            adv.ringbuf_drops = Some(Vec::new());
+            adv.advisories = Some(vec![
+                "integrity: admin_key_on_host — signed 2026-11-21T05:41:15.000000Z (audit row 7) \
+                 — an advisory, not a degradation: shown while found: \
+                 /root/northnarrow-admin.key: an admin private key on this host"
+                    .to_string(),
+            ]);
+            success.push(("advisories".to_string(), telemetry(Some(adv))));
+        }
         // R13 (lab PR 271): a revision of the sensor contract's manifest
         if !name.starts_with("net-") && !name.starts_with("export-") {
             let mut r13 = full_status();
@@ -903,6 +943,41 @@ pub fn verbs() -> Vec<Verb> {
             json!({"released": false, "message": ""}),
         ),
     ));
+    // lot 379 (pre-alpha F7-1): the acknowledgement of the held integrity
+    // findings
+    let acknowledged = |n: u64, still: u64, m: &str| {
+        msg(json!({"IntegrityAcknowledgeResponse": {
+            "result": "Success", "acknowledged": n, "still_held": still, "message": m,
+        }}))
+    };
+    v.push(verb(
+        "integrity-acknowledge",
+        &format!("integrity acknowledge --through 412 --note investigated {SIGNED}"),
+        vec![
+            (
+                "acknowledged",
+                acknowledged(
+                    1,
+                    1,
+                    "1 held integrity finding(s) acknowledged through audit row 412; 1 still held; \
+                     their rows stay in the chain",
+                ),
+            ),
+            (
+                "not-done",
+                acknowledged(
+                    0,
+                    0,
+                    "audit row 412 is not in the audit log (its newest row is 300): an \
+                     acknowledgement covers only rows already signed",
+                ),
+            ),
+        ],
+        with(
+            "IntegrityAcknowledgeResponse",
+            json!({"acknowledged": 0, "still_held": 0, "message": ""}),
+        ),
+    ));
     let restore = |restored: bool, path: &str, m: &str| {
         msg(
             json!({"ResponseRestoreResponse": {"result": "Success", "restored": restored, "path": path, "message": m}}),
@@ -1058,6 +1133,8 @@ fn variants() -> Vec<(&'static str, String, AdminMessage, Vec<Put>)> {
         ("net-flows.no-since", format!("net flows {SIGNED}"), msg(json!({"NetFlowsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
         ("fim-report.no-since", format!("fim report {SIGNED}"), msg(json!({"FimReportResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
         ("detections.limit-zero", format!("detections --limit 0 {SIGNED}"), msg(json!({"DetectionsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
+        // lot 379: a note past its bound (refused before any request)
+        ("integrity-acknowledge.note-too-long", format!("integrity acknowledge --through 1 --note {} {SIGNED}", "n".repeat(513)), msg(json!({"IntegrityAcknowledgeResponse": {"result": "Success", "acknowledged": 1, "still_held": 0, "message": "unreached"}})), vec![]),
     ];
     // config overlay set: every kind, a comment-only overlay (the loader's
     // parse decides), and an unknown kind.

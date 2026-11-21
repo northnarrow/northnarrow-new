@@ -99,6 +99,9 @@ struct Registry {
     /// Notes past that bound: their count is signed at the next flush
     /// ([`NOTES_DROPPED`]).
     unkept_dropped: u64,
+    /// The review of #586 (P2-1): the advisories ([`advise`]), `(source,
+    /// line)` — never a degradation.
+    advisories: Vec<(String, String)>,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -111,6 +114,7 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     repairs_dropped: 0,
     unkept: Vec::new(),
     unkept_dropped: 0,
+    advisories: Vec::new(),
 });
 
 /// A degradation found by a part of the agent without the audit log at
@@ -371,6 +375,54 @@ pub fn keep(source: &str, detail: &str, signed: bool) {
             own_budget: false,
         },
     );
+}
+
+/// Lot 379 (pre-alpha F7-1, F3b-6): the degradations of `source` are now
+/// `lines`, every one signed already in a row of its own — the signed
+/// integrity findings the audit log holds
+/// ([`nn_evidence::held`], told by [`crate::chain_host_linux::LinuxHost`]):
+/// the lines no longer held leave the status, the new ones join it, nothing
+/// is signed here (safe with the audit log's lock held). Kept within a
+/// budget of their own (the audit log bounds them), never against
+/// [`MAX_KEPT`].
+pub fn hold(source: &str, lines: &[String]) {
+    let mut r = REGISTRY.lock();
+    r.entries.retain(|d| d.source != source);
+    let at_boot = !r.boot_over;
+    for line in lines {
+        r.entries.push(Degradation {
+            source: source.to_string(),
+            detail: line.clone(),
+            at_boot,
+            signed: true,
+            own_budget: true,
+        });
+    }
+}
+
+/// The review of #586 (P2-1): the advisories of `source` are now `lines`,
+/// every one signed already in a row of its own (the audit log's held
+/// advisories, [`nn_evidence::held::Held::advisories`]): a state of the host
+/// or a choice of the operator that degrades no sensor. Listed by `nn-admin
+/// status` on their own ([`advisories`]); never in [`snapshot`],
+/// [`count`] or [`entries`] — the status's `sensors`, the trust level, the
+/// capability manifest, the heartbeat. Bounded by the audit log.
+pub fn advise(source: &str, lines: &[String]) {
+    let mut r = REGISTRY.lock();
+    r.advisories.retain(|(s, _)| s != source);
+    for line in lines {
+        r.advisories.push((source.to_string(), line.clone()));
+    }
+}
+
+/// The advisories `nn-admin status` lists ([`advise`]), as `source: line`.
+pub fn advisories() -> Vec<String> {
+    REGISTRY
+        .lock()
+        .advisories
+        .iter()
+        .map(|(s, l)| format!("{s}: {l}"))
+        .collect()
 }
 
 /// Keep `d`, or count it past [`MAX_KEPT`]: then it is returned with the
@@ -702,6 +754,7 @@ pub fn entries() -> Vec<Degradation> {
 pub(crate) fn reset_for_tests() {
     let mut r = REGISTRY.lock();
     r.entries.clear();
+    r.advisories.clear();
     r.withdrawn_unsigned.clear();
     r.overflow = 0;
     r.sink = None;
@@ -1158,5 +1211,80 @@ mod tests {
             "not told: nothing done"
         );
         reset_for_tests();
+    }
+
+    /// Lot 379 (pre-alpha F7-1): the held integrity findings replace their
+    /// source's lines, each already signed in a row of its own — never
+    /// signed again by a flush (a `subsystem_degraded` twin) — and kept
+    /// within their own budget: a full registry neither drops them nor is
+    /// crowded by them.
+    #[test]
+    fn held_findings_replace_their_lines_and_are_never_signed_again() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        for i in 0..MAX_KEPT - 1 {
+            report("k379_fill", &format!("{i}"));
+        }
+        let held = |n: usize| -> Vec<String> { (0..n).map(|i| format!("finding {i}")).collect() };
+        hold("k379_held", &held(3));
+        // the shared room's last place is still the next report's
+        report("k379_fill", "the last");
+        let lines = snapshot();
+        assert!(
+            lines.contains(&"k379_fill: the last".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), MAX_KEPT + 3, "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(" more ")), "{lines:?}");
+        assert!(lines.contains(&"k379_held: finding 2".to_string()));
+        // the next state replaces the lines: one gone, none added twice
+        hold("k379_held", &held(2));
+        let lines = snapshot();
+        assert!(!lines.contains(&"k379_held: finding 2".to_string()));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("k379_held: "))
+                .count(),
+            2
+        );
+        let dir = tempfile::tempdir().unwrap();
+        attach_audit_log(Some(open_log(dir.path())));
+        flush();
+        let rows = degraded_rows(dir.path());
+        assert!(
+            !rows.iter().any(|r| r["source"] == "k379_held"),
+            "a held finding is its own signed row: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r["source"] == "k379_fill"), "{rows:?}");
+        hold("k379_held", &[]);
+        assert!(!snapshot().iter().any(|l| l.starts_with("k379_held: ")));
+        reset_for_tests();
+    }
+
+    /// Lot 379 (the review of #586, P2-1): an advisory is listed on its own
+    /// and is never a degradation — not in the snapshot (the status's
+    /// `sensors` and degradations, the heartbeat), the count (the trust
+    /// level) or the entries (the capability manifest); the next state of
+    /// its source replaces it. On the PR's head the registry had no other
+    /// place: the admin key left on the host was a degradation.
+    #[test]
+    fn an_advisory_is_listed_and_never_a_degradation() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        advise("k379_src", &["admin_key_on_host — signed".to_string()]);
+        assert_eq!(advisories(), ["k379_src: admin_key_on_host — signed"]);
+        assert!(snapshot().is_empty(), "{:?}", snapshot());
+        assert_eq!(count(), 0);
+        assert!(entries().is_empty());
+        hold("k379_src", &["chain_truncated — signed".to_string()]);
+        assert_eq!(snapshot(), ["k379_src: chain_truncated — signed"]);
+        assert_eq!(count(), 1);
+        assert_eq!(advisories().len(), 1, "a degradation leaves it be");
+        advise("k379_other", &["sysctl_strict".to_string()]);
+        advise("k379_src", &[]);
+        assert_eq!(advisories(), ["k379_other: sysctl_strict"]);
+        reset_for_tests();
+        assert!(advisories().is_empty());
     }
 }

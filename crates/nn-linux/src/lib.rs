@@ -63,6 +63,20 @@
 /// resolved features to none of them.
 pub const TEST_UTIL: bool = cfg!(feature = "test-util");
 
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `test-privileged` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const TEST_PRIVILEGED: bool = cfg!(feature = "test-privileged");
+
+/// Lot 379 (the review of #586, P3-5): whether this build has its
+/// `debug-trigger` feature (test-only, `xtask/tests/supply_chain.rs`'s
+/// `TEST_ONLY_FEATURES`). The agent's `--build-features` names it
+/// (`build_info::DEPENDENCY_TEST_FEATURES`): a binary built with it — even
+/// without the agent's own feature — is refused by the release's check.
+pub const DEBUG_TRIGGER: bool = cfg!(feature = "debug-trigger");
+
 // Lot 283b: whose account a uid is (`login.defs`, `passwd`), for the
 // decision engine's host.
 pub mod accounts;

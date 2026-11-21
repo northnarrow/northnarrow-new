@@ -367,6 +367,9 @@ pub struct AuditLog<K> {
     /// The review of #553 (F2): when the chain's unacknowledged
     /// `profile_downgraded` was signed ([`Self::profile_downgrade_pending`]).
     profile_downgrade_pending: Option<String>,
+    /// Lot 379 (pre-alpha F7-1): the signed integrity findings that hold,
+    /// from the chain's rows ([`Self::held`]).
+    held: crate::held::Held,
     /// External audit ATP-004: the chain holds a successful
     /// `rotate_keys_add` — the one-key bootstrap is over for good. The
     /// log is never rotated (module doc); a rotation must carry this.
@@ -431,7 +434,8 @@ impl<K: ChainSigner> AuditLog<K> {
         let repair = crate::chainlog::repair_torn_tail::<K::Host>(path, |l| {
             serde_json::from_slice::<AuditEntry>(l).is_ok()
         })?;
-        let tail = read_tail::<K::Host>(path)?;
+        let pk = key.verifying_key();
+        let tail = read_tail::<K::Host>(path, Some(&pk))?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -454,6 +458,7 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_boot_enforced: tail.previous_boot_enforced,
             previous_boot_profile: tail.previous_boot_profile,
             profile_downgrade_pending: tail.profile_downgrade_pending,
+            held: tail.held,
             second_key_added: tail.second_key_added,
             rows: tail.seq.rows(),
             numbered: tail.seq.numbered(),
@@ -465,6 +470,9 @@ impl<K: ChainSigner> AuditLog<K> {
             poisoned: None,
             unattested: Vec::new(),
         };
+        // Lot 379: what the chain holds is told at every open (nothing
+        // included), before the first row of this open
+        K::Host::integrity_held(path, &log.held);
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
         }
@@ -490,6 +498,7 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_boot_enforced: None,
             previous_boot_profile: None,
             profile_downgrade_pending: None,
+            held: crate::held::Held::default(),
             second_key_added: false,
             rows: 0,
             numbered: false,
@@ -621,6 +630,13 @@ impl<K: ChainSigner> AuditLog<K> {
     /// boot that alarmed, which ran alpha, and said nothing.
     pub fn profile_downgrade_pending(&self) -> Option<&str> {
         self.profile_downgrade_pending.as_deref()
+    }
+
+    /// Lot 379 (pre-alpha F7-1, F3b-6): the signed integrity findings that
+    /// hold ([`crate::held`]'s rule), from the chain's rows — read at the
+    /// open, kept at each append.
+    pub fn held(&self) -> &crate::held::Held {
+        &self.held
     }
 
     /// Lot 341 (the review of #550, F8): sign that this boot observes only
@@ -855,6 +871,11 @@ impl<K: ChainSigner> AuditLog<K> {
             return Err(e);
         }
         self.last_hash = entry.entry_hash.clone();
+        // Lot 379: a row this log signed is genuine; what it holds is told
+        // to the host at each change
+        if self.held.observe(self.rows, &entry, &|_| true) && self.memory.is_none() {
+            K::Host::integrity_held(&self.path, &self.held);
+        }
         self.rows += 1;
         self.numbered = true;
         // External audit ATP-004 / NN-AUD-108: the head anchor carries this
@@ -902,7 +923,8 @@ impl<K: ChainSigner> AuditLog<K> {
             let repair = crate::chainlog::repair_torn_tail::<K::Host>(&self.io_path, |l| {
                 serde_json::from_slice::<AuditEntry>(l).is_ok()
             })?;
-            let tail = read_tail::<K::Host>(&self.io_path)?;
+            let pk = self.key.verifying_key();
+            let tail = read_tail::<K::Host>(&self.io_path, Some(&pk))?;
             if tail.last_hash != self.last_hash {
                 tracing::warn!(
                     file = %self.path.display(),
@@ -916,6 +938,11 @@ impl<K: ChainSigner> AuditLog<K> {
             self.numbered = tail.seq.numbered();
             self.second_key_added |= tail.second_key_added;
             self.anchoring_started |= tail.anchoring_started;
+            // lot 379: the row of the failed append, if it reached the file
+            if tail.held != self.held {
+                self.held = tail.held;
+                K::Host::integrity_held(&self.path, &self.held);
+            }
             Ok(repair)
         })();
         match reread {
@@ -1102,6 +1129,11 @@ pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 /// so the chain code that writes findings names no module of the host.
 pub const INTEGRITY_DRIFT_OP: &str = "integrity_drift";
 
+/// External audit NN-AUD-114: the op of a recomputed integrity finding
+/// that went away (`self_integrity::CLEARED_OP`); lot 379: it ends that
+/// finding's hold ([`crate::held`]).
+pub const INTEGRITY_CLEARED_OP: &str = "integrity_drift_cleared";
+
 /// External audit EVD-020: the agent minted its identity
 /// ([`AuditLog::attest_identity`]).
 pub const AGENT_ID_MINTED_OP: &str = "agent_id_minted";
@@ -1132,7 +1164,7 @@ pub fn audit_failure_is_fatal(allow_env: Option<&str>) -> bool {
 /// [`AuditLog::open`], through `H`'s open that follows no final symlink and
 /// blocks on no FIFO (R11b, lab PR 262).
 pub fn verified_boot_recorded<H: ChainHost>(path: &Path) -> Result<bool> {
-    Ok(read_tail::<H>(path)?.verified_boot)
+    Ok(read_tail::<H>(path, None)?.verified_boot)
 }
 
 /// R11b (lab PR 262): the head of the audit chain at `path` — its rows and
@@ -1141,7 +1173,7 @@ pub fn verified_boot_recorded<H: ChainHost>(path: &Path) -> Result<bool> {
 /// refusal the log cannot take names (the agent's fallback chain). An error
 /// says why without the file's content.
 pub fn read_head<H: ChainHost>(path: &Path) -> Result<(u64, String)> {
-    let tail = read_tail::<H>(path)?;
+    let tail = read_tail::<H>(path, None)?;
     Ok((tail.seq.rows(), tail.last_hash))
 }
 
@@ -1242,6 +1274,9 @@ struct TailState {
     previous_boot_profile: Option<String>,
     /// The review of #553 (F2): [`AuditLog::profile_downgrade_pending`].
     profile_downgrade_pending: Option<String>,
+    /// Lot 379: [`AuditLog::held`] (the rows that end a hold counted only
+    /// with the key that verifies them).
+    held: crate::held::Held,
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -1258,7 +1293,7 @@ struct TailState {
 /// R11b (lab PR 262, review #466 F1): through `H`'s open that follows no
 /// final symlink and blocks on no FIFO, only a regular file; a line that is
 /// not a row is named by its number and length, never its content.
-fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
+fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<TailState> {
     let mut seq = crate::chain_anchor::RowSeq::default();
     let mut seq_break = None;
     let f = match H::open_read_nofollow(path) {
@@ -1276,6 +1311,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
                 previous_boot_enforced: None,
                 previous_boot_profile: None,
                 profile_downgrade_pending: None,
+                held: crate::held::Held::default(),
             });
         }
         Err(e) => return Err(refused_open::<H>(e, path, "to read its chain")),
@@ -1295,6 +1331,9 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     let mut previous_boot_enforced = None;
     let mut profile_downgrade_pending: Option<String> = None;
     let mut previous_boot_profile = None;
+    let mut held = crate::held::Held::default();
+    let genuine = |e: &AuditEntry| pk.is_some_and(|pk| verify_entry(0, e, pk).is_ok());
+    let mut row = 0u64;
     for (n, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -1315,6 +1354,8 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
         if let Err(b) = seq.push(entry.seq) {
             seq_break.get_or_insert_with(|| format!("{}: {b}", path.display()));
         }
+        held.observe(row, &entry, &genuine);
+        row += 1;
         match entry.op.as_str() {
             // Lot 298 (BUG16): a refused start (`result` `refused`, the
             // process exits without `agent_stop`) is not a run: it neither
@@ -1409,6 +1450,7 @@ fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
         previous_boot_enforced,
         previous_boot_profile,
         profile_downgrade_pending,
+        held,
     })
 }
 
@@ -3705,6 +3747,35 @@ mod tests {
             [0u8; 16]
         )
         .is_ok());
+    }
+
+    /// Lot 379: an integrity finding whose row reached the file whole though
+    /// its fsync failed is held once the next append reads the tail again —
+    /// as the next open would read it.
+    #[test]
+    fn a_finding_written_whole_before_a_failed_fsync_is_held_at_the_next_append() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        let finding = crate::chain_anchor::ChainFinding::new(
+            "detections",
+            &log_path,
+            "chain_truncated",
+            "the anchored head is not in the file",
+        );
+        assert!(
+            log.append(finding.draft()).is_err(),
+            "premise: the fsync fails"
+        );
+        assert!(log.held().is_empty(), "not known to be on the disk yet");
+        log.append(sample_draft(3)).unwrap();
+        let held = log.held().findings();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            (held[0].kind.as_str(), held[0].last_row),
+            ("chain_truncated", 1)
+        );
     }
 
     /// A cut whose attestation fails too (the disk still full) is attested

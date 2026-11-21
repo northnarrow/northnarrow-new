@@ -147,6 +147,9 @@ fn telemetry_status(
                 not_read: c.not_read,
             }
         }),
+        // lot 379 (the review of #586, P2-1): the signed findings that
+        // degrade no sensor, listed apart from the degradations
+        advisories: Some(crate::boot::degradation::advisories()),
         execq_script_refused_total: Some(execq.script_refused),
         // Lab PR 267 (R12a): the event bus and the losses by stage.
         event_bus: handles
