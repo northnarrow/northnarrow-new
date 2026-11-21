@@ -46,15 +46,23 @@ pub(in crate::admin) fn dispatch_integrity_acknowledge(
     )
 }
 
-/// What an acknowledgement through `through` would end in `held`, when
-/// the log holds `rows` rows: `Ok((covered, still held))`, or why it is
-/// refused — a row the log does not hold yet (an acknowledgement of the
-/// future would end findings nobody saw), or one that covers nothing.
+/// What an acknowledgement through `through` with a note of `note_len`
+/// bytes would end in `held`, when the log holds `rows` rows: `Ok((covered,
+/// still held))`, or why it is refused — a note past its bound (a client
+/// other than `nn-admin`, which refuses it first), a row the log does not
+/// hold yet (an acknowledgement of the future would end findings nobody
+/// saw), or one that covers nothing.
 pub(crate) fn judge(
     held: &nn_evidence::held::Held,
     rows: u64,
     through: u64,
+    note_len: usize,
 ) -> Result<(u64, u64), String> {
+    if note_len > INTEGRITY_ACK_NOTE_MAX {
+        return Err(format!(
+            "the note is longer than {INTEGRITY_ACK_NOTE_MAX} bytes"
+        ));
+    }
     if through >= rows {
         return Err(format!(
             "audit row {through} is not in the audit log (its newest row is {}): an \
@@ -82,12 +90,6 @@ fn acknowledge(
     refuse: impl Fn(AdminResult, String) -> IntegrityAcknowledgeResponse,
 ) -> IntegrityAcknowledgeResponse {
     let extra = v.extra();
-    if extra.note.len() > INTEGRITY_ACK_NOTE_MAX {
-        return refuse(
-            AdminResult::Success,
-            format!("the note is longer than {INTEGRITY_ACK_NOTE_MAX} bytes"),
-        );
-    }
     let Some(log) = audit_log else {
         warn!("integrity acknowledge: the agent runs without its audit log");
         return refuse(
@@ -97,7 +99,10 @@ fn acknowledge(
     };
     let (rows, judged) = {
         let log = log.lock();
-        (log.rows(), judge(log.held(), log.rows(), extra.through_row))
+        (
+            log.rows(),
+            judge(log.held(), log.rows(), extra.through_row, extra.note.len()),
+        )
     };
     match judged {
         Err(why) => refuse(AdminResult::Success, why),
@@ -152,7 +157,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
         let mut log = AuditLog::open(&dir.path().join("audit.log"), key, [1; 16]).unwrap();
-        let none = judge(log.held(), log.rows(), 0).unwrap_err();
+        let none = judge(log.held(), log.rows(), 0, 0).unwrap_err();
         assert!(none.contains("is not in the audit log"), "{none}");
         log.append(AuditEntryDraft {
             op: "unlock".to_string(),
@@ -166,18 +171,25 @@ mod tests {
             client_exe: None,
         })
         .unwrap();
-        let nothing = judge(log.held(), log.rows(), 0).unwrap_err();
+        let nothing = judge(log.held(), log.rows(), 0, 0).unwrap_err();
         assert!(nothing.contains("nothing is held"), "{nothing}");
         let first = drift(&mut log, "unauthorized_overlay", "a.local");
         let second = drift(&mut log, "default_list_modified", "fim-paths");
-        let early = judge(log.held(), log.rows(), first - 1).unwrap_err();
+        let early = judge(log.held(), log.rows(), first - 1, 0).unwrap_err();
         assert!(
             early.contains(&format!("the newest held row is {second}")),
             "{early}"
         );
-        assert_eq!(judge(log.held(), log.rows(), first), Ok((1, 1)));
-        assert_eq!(judge(log.held(), log.rows(), second), Ok((2, 0)));
-        let future = judge(log.held(), log.rows(), second + 1).unwrap_err();
+        assert_eq!(judge(log.held(), log.rows(), first, 0), Ok((1, 1)));
+        assert_eq!(judge(log.held(), log.rows(), second, 0), Ok((2, 0)));
+        let future = judge(log.held(), log.rows(), second + 1, 0).unwrap_err();
         assert!(future.contains("is not in the audit log"), "{future}");
+        // the note's bound: at it accepted, past it refused
+        assert_eq!(
+            judge(log.held(), log.rows(), second, INTEGRITY_ACK_NOTE_MAX),
+            Ok((2, 0))
+        );
+        let long = judge(log.held(), log.rows(), second, INTEGRITY_ACK_NOTE_MAX + 1).unwrap_err();
+        assert!(long.contains("note is longer"), "{long}");
     }
 }

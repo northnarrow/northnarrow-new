@@ -3749,6 +3749,35 @@ mod tests {
         .is_ok());
     }
 
+    /// Lot 379: an integrity finding whose row reached the file whole though
+    /// its fsync failed is held once the next append reads the tail again —
+    /// as the next open would read it.
+    #[test]
+    fn a_finding_written_whole_before_a_failed_fsync_is_held_at_the_next_append() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        let finding = crate::chain_anchor::ChainFinding::new(
+            "detections",
+            &log_path,
+            "chain_truncated",
+            "the anchored head is not in the file",
+        );
+        assert!(
+            log.append(finding.draft()).is_err(),
+            "premise: the fsync fails"
+        );
+        assert!(log.held().is_empty(), "not known to be on the disk yet");
+        log.append(sample_draft(3)).unwrap();
+        let held = log.held().findings();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(
+            (held[0].kind.as_str(), held[0].last_row),
+            ("chain_truncated", 1)
+        );
+    }
+
     /// A cut whose attestation fails too (the disk still full) is attested
     /// at the next append, with the second fragment's: no cut is left
     /// without its row while the log runs. Nothing is written before both.

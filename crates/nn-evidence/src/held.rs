@@ -286,19 +286,14 @@ impl Held {
                     return false;
                 };
                 let subject = cut(detail);
-                let before = self.findings.len();
-                if !self
-                    .findings
-                    .iter()
-                    .any(|f| f.hold == Hold::WhileFound && f.kind == kind && f.subject == subject)
-                    || !genuine(entry)
-                {
+                let ends = |f: &HeldFinding| {
+                    f.hold == Hold::WhileFound && f.kind == kind && f.subject == subject
+                };
+                if !self.findings.iter().any(ends) || !genuine(entry) {
                     return false;
                 }
-                self.findings.retain(|f| {
-                    !(f.hold == Hold::WhileFound && f.kind == kind && f.subject == subject)
-                });
-                before != self.findings.len()
+                self.findings.retain(|f| !ends(f));
+                true
             }
             // a start checks again: what it still finds, it signs again
             "agent_boot" if entry.result == "success" => {
@@ -315,8 +310,7 @@ impl Held {
                 let Some(through) = entry.extra.get("through_row").and_then(|v| v.as_u64()) else {
                     return false;
                 };
-                // never past the acknowledgement's own row
-                let through = through.min(row.saturating_sub(1));
+                // it covers only rows already observed, all before its own
                 if self.covered_by(through) == 0 || !genuine(entry) {
                     return false;
                 }
@@ -353,10 +347,6 @@ impl Held {
             f.last_ts = entry.ts.clone();
             f.last_row = row;
             f.rows += 1;
-            // an evidence row also holds what it says until acknowledged
-            if hold == Hold::UntilAcknowledged {
-                f.hold = hold;
-            }
             return true;
         }
         if self.findings.len() >= MAX_HELD {

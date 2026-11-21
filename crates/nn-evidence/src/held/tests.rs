@@ -154,6 +154,14 @@ fn a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement() {
     let again = log.rows() - 1;
     let f = &log.held().findings()[0];
     assert_eq!((f.rows, f.last_row), (2, again));
+    let line = log.held().lines()[0].clone();
+    assert!(
+        line.contains(&format!(
+            "signed 2 times since {}, last {} (audit row {again})",
+            f.first_ts, f.last_ts
+        )),
+        "{line}"
+    );
     // an acknowledgement of the first row only does not cover the second
     log.append(ack(row)).unwrap();
     assert_eq!(kinds(&log), ["chain_truncated:detections"]);
@@ -196,6 +204,15 @@ fn a_config_finding_is_held_while_found() {
     ))
     .unwrap();
     assert_eq!(log.held().findings().len(), 2);
+    let line = log.held().lines()[0].clone();
+    assert!(
+        line.starts_with("unauthorized_overlay — signed "),
+        "the detail is the subject, said once: {line}"
+    );
+    assert!(
+        line.contains("— held while found, or until acknowledged: process-comm-allowlist"),
+        "{line}"
+    );
     drop(log);
     // held across the restart's open, until its start checks again
     let mut log = open(&key, &path);
@@ -259,8 +276,12 @@ fn a_row_not_signed_by_the_log_s_key_ends_no_hold() {
     }
     forger.append(ack(row + 1)).unwrap();
     boot(&mut forger);
+    forger
+        .append(cleared("unauthorized_overlay", "x.local"))
+        .unwrap();
     let lines = std::fs::read_to_string(&other).unwrap();
-    let forged: Vec<&str> = lines.lines().rev().take(2).collect();
+    // an acknowledgement, a start and the overlay's end: none genuine here
+    let forged: Vec<&str> = lines.lines().rev().take(3).collect();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -325,6 +346,9 @@ fn the_host_is_told_at_the_open_and_at_each_change() {
     assert_eq!(helds::take(&path), vec![Vec::<String>::new()]);
     log.append(draft("unlock", "success", serde_json::json!({})))
         .unwrap();
+    // rows that could end a hold, with nothing held: no change, no word
+    boot(&mut log);
+    let before = log.rows() - 1;
     assert!(helds::take(&path).is_empty());
     log.append(cut("audit", &path)).unwrap();
     let told = helds::take(&path);
@@ -333,6 +357,14 @@ fn the_host_is_told_at_the_open_and_at_each_change() {
         told[0][0].starts_with("chain_truncated (audit)"),
         "{told:?}"
     );
+    // an acknowledgement that covers nothing, a start, an end of another
+    // finding: the evidence finding holds, nothing is told
+    log.append(ack(before)).unwrap();
+    boot(&mut log);
+    log.append(cleared("chain_truncated", "the anchored head"))
+        .unwrap();
+    assert!(helds::take(&path).is_empty());
+    assert_eq!(log.held().findings().len(), 1);
     log.append(ack(log.rows() - 1)).unwrap();
     assert_eq!(helds::take(&path), vec![Vec::<String>::new()]);
     // a log kept in memory (a refused start's fallback) tells nothing
@@ -368,6 +400,45 @@ fn past_the_cap_findings_are_counted_and_acknowledged() {
     assert_eq!(log.held().covered_by(newest), MAX_HELD as u64 + 3);
     log.append(ack(newest)).unwrap();
     assert!(log.held().is_empty());
+    // the found ones counted past the cap end at the next start too
+    for i in 0..MAX_HELD + 2 {
+        log.append(drift("mount_not_canonical", &format!("/run/x{i}")))
+            .unwrap();
+    }
+    assert_eq!(log.held().more(), 2);
+    boot(&mut log);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+}
+
+/// A refused start is no start (it checked nothing: the process exits),
+/// and a refused acknowledgement acknowledged nothing: neither ends a hold.
+#[test]
+fn a_refused_start_or_a_refused_acknowledgement_ends_nothing() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    log.append(drift("unauthorized_overlay", "y.local"))
+        .unwrap();
+    let row = log.rows() - 1;
+    let build = AgentBuild {
+        version: "0.0.0-test",
+        features: Vec::new(),
+        bpf_guard_enforce: false,
+    };
+    log.boot_refused_by("bpf_lsm", "verified", "attested", "no bpf", &build)
+        .unwrap();
+    let mut refused = ack(row);
+    refused.result = "failure: rejected (nothing held)".to_string();
+    log.append(refused).unwrap();
+    let mut denied = ack(row);
+    denied.result = "failure: role_denied".to_string();
+    log.append(denied).unwrap();
+    // an acknowledgement without its row says nothing it covers
+    let mut bare = ack(row);
+    bare.extra = serde_json::json!({ "note": "no row" });
+    log.append(bare).unwrap();
+    assert_eq!(kinds(&log), ["unauthorized_overlay:y.local"]);
+    drop(log);
+    assert_eq!(kinds(&open(&key, &path)), ["unauthorized_overlay:y.local"]);
 }
 
 /// A detail longer than [`DETAIL_CHARS`] is cut, said with an ellipsis.

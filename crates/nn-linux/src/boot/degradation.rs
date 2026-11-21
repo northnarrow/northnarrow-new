@@ -380,18 +380,9 @@ pub fn keep(source: &str, detail: &str, signed: bool) {
 /// the lines no longer held leave the status, the new ones join it, nothing
 /// is signed here (safe with the audit log's lock held). Kept within a
 /// budget of their own (the audit log bounds them), never against
-/// [`MAX_KEPT`]. Returns whether the registry changed.
-pub fn hold(source: &str, lines: &[String]) -> bool {
+/// [`MAX_KEPT`].
+pub fn hold(source: &str, lines: &[String]) {
     let mut r = REGISTRY.lock();
-    let now: Vec<&str> = r
-        .entries
-        .iter()
-        .filter(|d| d.source == source)
-        .map(|d| d.detail.as_str())
-        .collect();
-    if now.len() == lines.len() && now.iter().zip(lines).all(|(a, b)| *a == b.as_str()) {
-        return false;
-    }
     r.entries.retain(|d| d.source != source);
     let at_boot = !r.boot_over;
     for line in lines {
@@ -403,7 +394,6 @@ pub fn hold(source: &str, lines: &[String]) -> bool {
             own_budget: true,
         });
     }
-    true
 }
 
 /// Keep `d`, or count it past [`MAX_KEPT`]: then it is returned with the
@@ -1190,6 +1180,49 @@ mod tests {
             0,
             "not told: nothing done"
         );
+        reset_for_tests();
+    }
+
+    /// Lot 379 (pre-alpha F7-1): the held integrity findings replace their
+    /// source's lines, each already signed in a row of its own — never
+    /// signed again by a flush (a `subsystem_degraded` twin) — and kept
+    /// within their own budget: a full registry neither drops them nor is
+    /// crowded by them.
+    #[test]
+    fn held_findings_replace_their_lines_and_are_never_signed_again() {
+        let _g = TEST_LOCK.lock();
+        reset_for_tests();
+        for i in 0..MAX_KEPT {
+            report("k379_fill", &format!("{i}"));
+        }
+        let held = |n: usize| -> Vec<String> { (0..n).map(|i| format!("finding {i}")).collect() };
+        hold("k379_held", &held(3));
+        let lines = snapshot();
+        assert_eq!(lines.len(), MAX_KEPT + 3, "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains(" more ")), "{lines:?}");
+        assert!(lines.contains(&"k379_held: finding 2".to_string()));
+        // the next state replaces the lines: one gone, none added twice
+        hold("k379_held", &held(2));
+        let lines = snapshot();
+        assert!(!lines.contains(&"k379_held: finding 2".to_string()));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("k379_held: "))
+                .count(),
+            2
+        );
+        let dir = tempfile::tempdir().unwrap();
+        attach_audit_log(Some(open_log(dir.path())));
+        flush();
+        let rows = degraded_rows(dir.path());
+        assert!(
+            !rows.iter().any(|r| r["source"] == "k379_held"),
+            "a held finding is its own signed row: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r["source"] == "k379_fill"), "{rows:?}");
+        hold("k379_held", &[]);
+        assert!(!snapshot().iter().any(|l| l.starts_with("k379_held: ")));
         reset_for_tests();
     }
 }

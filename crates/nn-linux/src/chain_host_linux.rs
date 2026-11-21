@@ -596,6 +596,24 @@ mod tests {
         })
         .unwrap();
         assert!(held().is_empty(), "{:?}", held());
+        // a thread the registry was not told for (another test's log, a
+        // tool's): its log's findings never reach the agent's status
+        let other = dir.path().join("other.log");
+        let k = key(dir.path());
+        std::thread::spawn(move || {
+            let mut log = AuditLog::open(&other, k, [4; 16]).unwrap();
+            let finding = crate::chain_anchor::ChainFinding::new(
+                "audit",
+                &other,
+                "chain_truncated",
+                "not the agent's",
+            );
+            assert!(finding.attest(Some(&mut log)));
+            assert_eq!(log.held().findings().len(), 1);
+        })
+        .join()
+        .unwrap();
+        assert!(held().is_empty(), "{:?}", held());
         crate::boot::degradation::reset_for_tests();
     }
 
