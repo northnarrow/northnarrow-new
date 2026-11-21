@@ -30,7 +30,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     taken as exited: a foreign memfd was kept "not compared (gone)", High,
     never killed. The copy is now read through the live threads
     (`/proc/<pid>/task/<tid>/exe`), and a process counts as exited only
-    when every thread has (F1). "Gone" is judged only in runc 1.1's
+    when every thread listed has exited and the kernel counts its leader
+    alone (`num_threads`); a listing that fails never counts as exited
+    (F1 and its re-check). Test
+    `a_group_whose_listing_missed_a_live_thread_is_never_gone`. "Gone" is judged only in runc 1.1's
     re-exec under the installed runtime; runc 1.2's shape and every OCI
     hook stay Critical (F2). A read that finishes after the pump stopped
     waiting for it counts and keeps nothing more (F3), and the status line

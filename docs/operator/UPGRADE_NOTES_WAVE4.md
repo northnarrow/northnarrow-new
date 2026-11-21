@@ -5591,8 +5591,11 @@ shape it resembles still fires.
     `exit_group`) while its other threads run on is still running: its
     `/proc/<pid>/exe` cannot be read, so the copy is read through one of its
     live threads (`/proc/<pid>/task/<tid>/exe`). The process counts as
-    exited only when every thread has exited; a thread still running whose
-    copy cannot be read keeps nothing (the Critical kill).
+    exited only when every thread the agent lists has exited and the
+    kernel counts no thread but its leader (`num_threads` in
+    `/proc/<pid>/stat`: a thread made after the listing is counted there);
+    a thread still running whose copy cannot be read, or a listing that
+    fails, keeps nothing (the Critical kill).
   - When no process runs it any more, neither its bytes nor its length are
     known: what holds is the seal at the exec, the lineage and the parent's
     image. Only in runc 1.1's own shape — the process re-executed the
@@ -5622,8 +5625,9 @@ shape it resembles still fires.
   264 MiB under the storms; this lot's lab saw 344 MiB, the highest yet,
   after 400 container starts and a 2,500 fork/s storm (no `memory.high`
   event). The watchdog's RSS is about 5 MiB, its cgroup at most 2.2 MiB,
-  through an agent respawn too (the fix round's lab: `memory.peak` 2.2 MiB
-  from just before the agent's OOM kill to its successor's witness row).
+  through an agent respawn too (the fix round's lab: the cgroup's lifetime
+  `memory.peak`, 2.1 MiB before the agent's OOM kill, 2.2 MiB after its
+  successor's witness row).
   - The agent's unit: `MemoryHigh=768M` and `MemoryMax=1G` (they were 9G
     and 11G, sized for the LLM advisor removed in Wave 4). The watchdog's:
     `MemoryMax=32M` (64M). `OOMPolicy=continue` and `OOMScoreAdjust=-999`

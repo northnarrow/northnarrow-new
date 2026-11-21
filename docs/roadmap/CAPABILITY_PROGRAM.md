@@ -11780,7 +11780,11 @@ number in parentheses is a lab PR.
       the live threads (`/proc/<pid>/task/<tid>/exe`); exited only when
       every listed thread is a zombie or gone, at most 64 threads read (a
       group past them, or a thread whose state is not read, is never told
-      exited).
+      exited). The re-check (N1, N2): and the leader's `num_threads` is 1
+      (a thread made after the listing, its listed predecessor exited
+      before its read: 1.7% of reads of such a group on 6.18 were "gone");
+      a listing error other than the process's absence is never gone. Test
+      `a_group_whose_listing_missed_a_live_thread_is_never_gone`.
     - **F2.** "Gone" is judged only in runc 1.1's re-exec (`fork_parent`
       0, the parent the very runtime by its image), in the pump and in
       R004; runc 1.2's shape and every OCI hook keep nothing (Critical).
@@ -11817,8 +11821,9 @@ number in parentheses is a lab PR.
         runc copy compared and kept. The payload from a root shell:
         Critical.
       - The watchdog at an agent respawn (the agent made the OOM killer's
-        pick inside a window, SysRq-f): its cgroup's `memory.peak` from a
-        reset just before the kill to 78 s after, 2,273,280 B (2.2 MiB);
+        pick inside a window, SysRq-f): its cgroup's lifetime
+        `memory.peak` 2,154,496 B before the kill and 2,273,280 B (2.2 MiB)
+        78 s after (an upper bound of the respawn's);
         `memory.current` sampled every 50 ms at most 0.93 MiB;
         `memory.events` all 0; the agent respawned (witness row signed), no
         restart of either unit. `MemoryMax=32M` kept (14× that peak), the
