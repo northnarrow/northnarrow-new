@@ -4085,8 +4085,8 @@ mod tests {
     /// `/usr/lib/cargo/bin/coreutils`, `/usr/bin` GNU's), and busybox's
     /// file under `/bin` hard-linked as a tool of its own name: each is a
     /// generic tool by its identity, whatever name it ran by. A tool's file
-    /// outside the directories compared (`/opt/bin/jq`, the initramfs'
-    /// busybox) is one by its own name.
+    /// outside the directories compared (`/opt/bin/jq`, Alpine's
+    /// `busybox.static`) is one by its own name.
     #[test]
     fn a_multi_call_file_off_the_path_is_a_tool_by_its_identity() {
         let b = IdBench::new(
@@ -4098,18 +4098,10 @@ mod tests {
                 ("/bin/busybox", Some(77)),
                 ("/usr/sbin/hostinfo", Some(77)),
                 ("/opt/bin/jq", Some(85)),
-                ("/usr/lib/initramfs-tools/bin/busybox", Some(86)),
+                ("/usr/sbin/busybox.static", Some(86)),
                 ("/etc/k380/lookup", Some(88)),
             ],
-            &[
-                UU,
-                "/usr/bin",
-                "/bin",
-                "/usr/sbin",
-                "/opt/bin",
-                "/usr/lib/initramfs-tools/bin",
-                "/etc/k380",
-            ],
+            &[UU, "/usr/bin", "/bin", "/usr/sbin", "/opt/bin", "/etc/k380"],
         );
         b.exec(980, 1000, &format!("{UU}/id"), 71, &["id", "-un"]);
         assert!(
@@ -4134,8 +4126,8 @@ mod tests {
             b.opens(983, 1000, "jq", "/etc/passwd", 85),
             "a tool by its name"
         );
-        let bb = "/usr/lib/initramfs-tools/bin/busybox";
-        b.exec(984, 1000, bb, 86, &["busybox", "cat", "/etc/passwd"]);
+        let bb = "/usr/sbin/busybox.static";
+        b.exec(984, 1000, bb, 86, &["busybox.static", "cat", "/etc/passwd"]);
         assert!(
             b.opens(984, 1000, "busybox", "/etc/passwd", 86),
             "busybox by its name"
