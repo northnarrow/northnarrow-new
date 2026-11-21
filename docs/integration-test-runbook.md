@@ -891,7 +891,7 @@ The W7 install skeleton (`deploy/install.sh`) ships:
   with `RestartPreventExitStatus=0`, no start limit and
   `OnFailure=northnarrow-watchdog-failed.service`),
   `After=northnarrow-agent.service`, `BindsTo=northnarrow-agent.service`,
-  resource ceilings (`MemoryMax=64M`, `CPUQuota=10%`, `TasksMax=8`),
+  resource ceilings (`MemoryMax=64M`, since lot 381 `32M`; `CPUQuota=10%`, `TasksMax=8`),
   hardening (`NoNewPrivileges`, `ProtectSystem=strict`,
   `CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN`)
 

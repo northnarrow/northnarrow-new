@@ -928,13 +928,18 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `fuse_aborted` | the stuck recovery's SIGKILL could not end the agent — a thread of it held in a FUSE request its daemon never answered — and the watchdog aborted that FUSE connection: only a FUSE over `/proc`, `/sys` (the cgroup tree) or the agent's own directories with requests waiting, never a user's FUSE elsewhere. The detail names the mount, its source, the connection and whether the abort took. Signed High (lot 353) |
 | `agent_restart_loop` | three stuck recoveries within 10 minutes: the agent is restarted again and again and blind meanwhile (a mount over a path it reads held for long, a starved host). Signed High; a degradation of `nn-admin status` for that run; the watchdog's unit status reads `DEGRADED: … (a restart loop)` (lot 353) |
 
-The memory limits are absolute (`MemoryHigh=9G`, `MemoryMax=11G`, sized
-for the model of the LLM advisor, removed in Wave 4, and not re-sized yet:
-[`UPGRADE_NOTES_WAVE4.md`](UPGRADE_NOTES_WAVE4.md) §2). On a host with no more memory than `MemoryMax` the cap
-cannot bind, so the agent starts there with `oom_score_adj` 0 instead of
-the unit's -500 — an ordinary OOM candidate, which the watchdog respawns —
-and says so in a WARN (`memory cap at or above the host's memory`); 0 is
-then the value the check expects (external audit DEP-005).
+The memory limits are absolute (`MemoryHigh=768M`, `MemoryMax=1G` for the
+agent, `MemoryMax=32M` for the watchdog: lot 381,
+[`UPGRADE_NOTES_WAVE4.md`](UPGRADE_NOTES_WAVE4.md) §67), sized from the
+lab's measure: the agent's cgroup peaked at 316 MiB at a cold start (about
+165 MiB of it the kernel's BPF maps), at most 264 MiB under the storms, and
+344 MiB after 400 container starts and a 2,500 fork/s storm (lot 381); the
+watchdog's RSS is about 5 MiB. They were 9G and 11G, sized for the
+model of the LLM advisor removed in Wave 4, and 64M. The agent and the
+watchdog run with `oom_score_adj` -999 on every host (lot 370), which the
+self-integrity check expects; on a host with no more memory than
+`MemoryMax` the cap cannot bind, and the host's OOM killer then picks every
+other process first.
 
 Both units set `OOMPolicy=continue` (lot 374, fix round 6). The OOM killer's
 first pick is an agent worker (`oom_score_adj` 1000), which the agent

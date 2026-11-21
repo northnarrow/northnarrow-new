@@ -524,10 +524,16 @@ mod tests {
             "536870912",
             &f(Agent, "memory.max")
         ));
-        // the watchdog's own unit settings are its floors
+        // the watchdog's own unit settings are its floors (lot 381: its
+        // MemoryMax=32M is the floor itself)
         assert!(!below_floor(
             LIMIT_UNSIGNED_MAX,
-            "67108864",
+            "33554432",
+            &f(Watchdog, "memory.max")
+        ));
+        assert!(below_floor(
+            LIMIT_UNSIGNED_MAX,
+            "33554431",
             &f(Watchdog, "memory.max")
         ));
         assert!(!below_floor(

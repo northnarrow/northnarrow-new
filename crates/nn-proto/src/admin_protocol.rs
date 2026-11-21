@@ -1032,13 +1032,26 @@ pub struct StatusResponse {
 /// clone (`kept`: R004 has no verdict on them), not compared for the
 /// budget (`unverified`), and those whose reads the exec pump did not wait
 /// for (`not_read`: R004 judges them fileless). A container host whose
-/// containers start while `kept` stays 0 has lost the exemption.
+/// containers start while `kept` stays 0 has lost the exemption. Lot 381
+/// (appended): of `compared`, those read through another process running
+/// the copy (`through`: the exec's own gone); not compared because the copy
+/// was gone before the read (`gone`: kept unverified when its process exited
+/// under an installed runtime — R004: root's High, any other uid's Critical;
+/// else nothing kept, Critical); no runtime's clone at all (`no_runtime`: R004 judges them
+/// fileless) — every sealed memfd exec in exactly one of `compared`,
+/// `unverified`, `gone`, `no_runtime`, `not_read`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeClones {
     pub compared: u64,
     pub kept: u64,
     pub unverified: u64,
     pub not_read: u64,
+    #[serde(default)]
+    pub through: u64,
+    #[serde(default)]
+    pub gone: u64,
+    #[serde(default)]
+    pub no_runtime: u64,
 }
 
 /// Lot 341 (alpha 2/4): the detection records of the current UTC day this
@@ -3971,14 +3984,55 @@ mod tests {
             kept: 5,
             unverified: 300,
             not_read: 1,
+            ..Default::default()
         });
         let with = postcard::to_allocvec(&status).unwrap();
         let before = without.len() - 1;
         assert_eq!(&with[..before], &without[..before]);
         assert_eq!(&without[before - 2..], &[1, 0, 0]);
-        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1]);
+        // lot 381: its three counts follow lot 369's four, inside it
+        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0]);
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
+    }
+
+    /// Lot 381: the runtime compare's counts of the copies read through
+    /// another process, gone before the read and no runtime's are appended
+    /// inside lot 369's object, the status's last field — an `nn-admin`
+    /// that knows only lot 369's four reads them as before, and ignores the
+    /// rest.
+    #[test]
+    fn the_runtime_clones_lot_381_counts_are_appended_inside_it() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Lot369 {
+            compared: u64,
+            kept: u64,
+            unverified: u64,
+            not_read: u64,
+        }
+        let c = RuntimeClones {
+            compared: 300,
+            kept: 299,
+            unverified: 0,
+            not_read: 0,
+            through: 2,
+            gone: 1,
+            no_runtime: 4,
+        };
+        let bytes = postcard::to_allocvec(&c).unwrap();
+        assert_eq!(&bytes[bytes.len() - 3..], &[2, 1, 4]);
+        let (old, rest): (Lot369, &[u8]) = postcard::take_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            old,
+            Lot369 {
+                compared: 300,
+                kept: 299,
+                unverified: 0,
+                not_read: 0
+            }
+        );
+        assert_eq!(rest, &[2, 1, 4]);
+        assert_eq!(postcard::from_bytes::<RuntimeClones>(&bytes).unwrap(), c);
     }
 
     /// Lot 341 (alpha 2/4): the response profile and today's records are

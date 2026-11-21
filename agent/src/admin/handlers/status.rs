@@ -145,6 +145,9 @@ fn telemetry_status(
                 kept: c.kept,
                 unverified: c.unverified,
                 not_read: c.not_read,
+                through: c.through,
+                gone: c.gone,
+                no_runtime: c.no_runtime,
             }
         }),
         execq_script_refused_total: Some(execq.script_refused),

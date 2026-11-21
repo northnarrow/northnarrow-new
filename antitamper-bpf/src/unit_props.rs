@@ -384,18 +384,19 @@ mod tests {
                 ))
             }
         };
-        // the agent's unit as shipped: MemoryHigh 9G, MemoryMax 11G, 512 tasks
+        // the agent's unit as shipped (lot 381): MemoryHigh 768M, MemoryMax
+        // 1G, 512 tasks
         let shipped: &[(&str, u64)] = &[
-            ("MemoryHigh", 9 << 30),
-            ("MemoryMax", 11 << 30),
+            ("MemoryHigh", 768 << 20),
+            ("MemoryMax", 1 << 30),
             ("TasksMax", 512),
         ];
         assert!(below_with("a", FloorRole::Agent, get(shipped))
             .unwrap()
             .is_empty());
-        // the watchdog's: 64M, 10 %, 8 tasks
+        // the watchdog's: 32M (lot 381), 10 %, 8 tasks
         let wd: &[(&str, u64)] = &[
-            ("MemoryMax", 64 << 20),
+            ("MemoryMax", 32 << 20),
             ("CPUQuotaPerSecUSec", 100_000),
             ("TasksMax", 8),
         ];

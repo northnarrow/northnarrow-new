@@ -585,6 +585,15 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(proc_root.join(pid.to_string()).join(\"stat\"))",
         PROC,
     ),
+    // lot 381 (F6-6): a thread's children, where the runtime compare looks
+    // for a process still running a copy whose own process exited
+    (
+        "crates/nn-linux/src/program_images.rs",
+        "read_state(task.join(&tid).join(\"children\"))",
+        "lot 381: a thread of the exec's parent lists its children (procfs's own); \
+         unreadable (the thread gone), no holder of the copy is found there — the copy is then \
+         \"not compared (gone)\", counted, and nothing is trusted in its place",
+    ),
     (
         "crates/nn-linux/src/fim/drain.rs",
         "read_state(dir.join(\"cgroup\"))",
