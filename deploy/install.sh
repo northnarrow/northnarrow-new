@@ -2824,7 +2824,7 @@ declare -A SHIPPED_V1_EARLIER=(
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
     [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
     [security-tools.v1]="38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335"
-    [daemon-data.v1]=""
+    [daemon-data.v1]="b2ce219ecbf149981fbef7e23a04de42e8a06a43a474173da7c9a4b7f9804292"
 )
 install_shipped_v1() {
     local name=$1 src=$2 what=$3 dst="$ETC_DIR/$1" on_disk keep

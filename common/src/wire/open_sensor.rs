@@ -242,7 +242,8 @@ pub mod own_data {
     pub const SERVICE: u8 = 1;
     /// Every file lay in the writer's person's `~/.cache`, owned by it.
     pub const CACHE: u8 = 2;
-    /// Every file lay in one listed daemon directory: `UNIT_BASE + tag`.
+    /// Every file lay in listed daemon directories of one tag (lot 380: a
+    /// unit's directories share one): `UNIT_BASE + tag`.
     pub const UNIT_BASE: u8 = 3;
     /// Tags of daemon directories: `0..UNIT_TAGS` (a byte, less the codes
     /// above).

@@ -798,6 +798,18 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "read_state(proc.join(format!(\"{pid}/status\")))",
         PROC,
     ),
+    // lot 380: the forker's start and each of its threads' uids and
+    // capability sets, procfs's own (a failed read: not vouched for)
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(proc.join(format!(\"{pid}/stat\")))",
+        PROC,
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "read_state(dir.join(\"status\"))",
+        PROC,
+    ),
     (
         "crates/nn-linux/src/sensors/multiplexer.rs",
         "read_to_string(\"/proc/sys/kernel/perf_event_paranoid\")",
