@@ -95,13 +95,10 @@ pub const WITNESS_UNCERTIFIED: &str = "witness_row_uncertified";
 /// a clean succession) signed by a key the agent never certified, past the
 /// wait for its watchdog's certification ([`UNCERTIFIED_WAIT_ROUNDS`]).
 pub const WITNESS_NOTE_UNCERTIFIED: &str = "witness_note_uncertified";
-/// The review of #586 (P2-2): how many import rounds (30 s each) a row
-/// signed by a key not certified yet waits while the watchdog it names
-/// still runs and publishes that very key in its sealed memory file — the
-/// agent verifies, then certifies it at a next round (a restart of both
-/// units: the agent's first round can come before the new watchdog is
-/// verified). Bounded: past it the row is imported by its declared kind.
-pub const UNCERTIFIED_WAIT_ROUNDS: u32 = 4;
+/// The review of #586 (P2-2): the bounded wait of a row signed by a key not
+/// certified yet (defined beside the chain's format, so that the privileged
+/// e2e of the watchdog waits as long as the agent does).
+pub use nn_proto::witness::{AGENT_ROUND_SECS, UNCERTIFIED_WAIT_ROUNDS};
 /// The witness chain broken: a row changed, removed or not one (High).
 pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
