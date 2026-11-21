@@ -167,9 +167,10 @@ pub struct RuleInputs {
     /// Lot 283c: the POSIX shared memory directory (`/dev/shm`,
     /// `TREE_SHM`): a segment there is its owner's own data.
     pub shm: Option<PathBuf>,
-    /// Lot 283c: the daemons' data directories, in tag order
-    /// (`TREE_UNIT_DATA`; nn-core's `posture::daemon_data`).
-    pub unit_dirs: Vec<String>,
+    /// Lot 283c: the daemons' data directories, each with its tag
+    /// (`TREE_UNIT_DATA`; nn-core's `posture::daemon_data`; lot 380: a
+    /// unit's directories share one).
+    pub unit_dirs: Vec<(String, u32)>,
 }
 
 /// Lot 283c: what the agent adds to the file-open sensor's rules from its
@@ -179,7 +180,7 @@ pub struct RuleInputs {
 #[derive(Debug, Clone, Default)]
 pub struct OpenSensorExtras {
     pub carveout: Vec<String>,
-    pub unit_dirs: Vec<String>,
+    pub unit_dirs: Vec<(String, u32)>,
 }
 
 impl RuleInputs {
@@ -435,14 +436,14 @@ impl RuleSet {
         if let Some(m) = inputs.shm.as_deref().and_then(|d| owned_dir(d, None)) {
             *set.inodes.entry(key_of(&m)).or_default() |= TREE_SHM;
         }
-        for (tag, dir) in inputs.unit_dirs.iter().enumerate() {
-            set.add_unit_dir(dir, tag as u32);
+        for (dir, tag) in &inputs.unit_dirs {
+            set.add_unit_dir(dir, *tag);
         }
         set
     }
 
-    /// Lot 283c: a daemon's data directory, tagged with its index in the
-    /// list. Placed as a carve-out is (walked from `/` — a view's from its
+    /// Lot 283c: a daemon's data directory, with its tag (lot 380: its
+    /// unit set's, `DaemonData::tagged_dirs`). Placed as a carve-out is (walked from `/` — a view's from its
     /// anchored root, [`place_carveout`] —, no symbolic link
     /// followed: one refuses it); a missing directory whose parent exists
     /// is a rule under that parent by its name, one missing deeper waits
@@ -3806,10 +3807,12 @@ mod tests {
             caches: vec![(cache.clone(), me), (t.path().join("v/.cache"), me)],
             shm: Some(shm.clone()),
             unit_dirs: vec![
-                format!("{}/", data.display()),
-                format!("{}/run-k3s/", t.path().display()),
-                format!("{}/link/", t.path().display()),
-                format!("{}/a/b/", t.path().display()),
+                (format!("{}/", data.display()), 0),
+                (format!("{}/run-k3s/", t.path().display()), 1),
+                (format!("{}/link/", t.path().display()), 2),
+                (format!("{}/a/b/", t.path().display()), 3),
+                // lot 380: a second directory of the first one's unit
+                (format!("{}/run-cd/", t.path().display()), 0),
             ],
             ..RuleInputs::default()
         };
@@ -3833,6 +3836,12 @@ mod tests {
             set.children.get(&missing),
             Some(&(TREE_UNIT_DATA | (1 << UNIT_TAG_SHIFT)))
         );
+        // lot 380: the tag given, its unit's, not the directory's index
+        let shared = ChildRuleKey {
+            parent: key(t.path()),
+            name: name32("run-cd"),
+        };
+        assert_eq!(set.children.get(&shared), Some(&TREE_UNIT_DATA));
         assert!(
             set.refused.iter().any(|r| r.contains("link")),
             "{:?}",
@@ -4220,7 +4229,7 @@ mod tests {
             let reader = crate::state_read::TimedReader::new(Duration::from_millis(500), 1);
             let mut refresh = RuleRefresh::new(OpenSensorExtras {
                 carveout: Vec::new(),
-                unit_dirs: vec![format!("{}/data", held.display())],
+                unit_dirs: vec![(format!("{}/data", held.display()), 0)],
             });
             let (rtx, rrx) = std::sync::mpsc::channel();
             let rt = tokio::runtime::Builder::new_multi_thread()

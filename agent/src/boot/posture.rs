@@ -122,7 +122,7 @@ pub(crate) fn machine(
     );
     let open_sensor_extras = northnarrow_agent::sensors::open_sensor::OpenSensorExtras {
         carveout: open_sensor_carveout.clone(),
-        unit_dirs: daemon_data.dirs().iter().map(|d| d.dir.clone()).collect(),
+        unit_dirs: daemon_data.tagged_dirs(),
     };
     let posture = if let Some(iso) = isolator.as_ref() {
         // T7.13 (Beta Step 5): the auth-lineage tracker shared with

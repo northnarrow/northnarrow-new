@@ -11699,6 +11699,127 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 380 — the rc11 soaks' last false positives: `newuidmap` reading
+  `login.defs`, `modprobe` as a user, routine `passwd` reads, containerd's
+  task bundles (C06, C14, C18; no level change).**
+  - What was open (Phase 5 on rc11; the posture Observing at every boot):
+    - ALERTED by `newuidmap` reading `/etc/login.defs` at each rootless
+      Podman burst (Debian 13 ×2, Ubuntu 24.04 ×2).
+    - ALERTED by `id` reading `/etc/passwd` in the bench's preparation
+      (Debian 13), its login uid read after it exited.
+    - ENGAGED by containerd's mass-write under `/run/containerd` (Ubuntu
+      26.04).
+    - `R011_KernelModuleTooling` High once for `modprobe overlay` as uid
+      1000 under `podman info` (Ubuntu 24.04), Low the other times.
+  - Done, each by identity:
+    - **`newuidmap`.** Lot 378's carve-out named the uidmap tools'
+      `/etc/passwd` lookup only; their `/etc/login.defs` read is judged the
+      same way (`runs_host_program`, `LOGIN_DEFS_HELPER_EXES`). Mini-hunt:
+      `newgrp` (gshadow, login.defs) not exempted — see the read-repeat
+      finding below.
+    - **`/etc/passwd`.** World-readable, read by every name lookup: a
+      packaged program's read-only open (the host's file in a root-only
+      directory, by the file the kernel executed; an exec not read yet by
+      its image at the open as the host's file of its name in a system
+      program directory: `host_program`) is no sensitive access unless the
+      program is a file tool, a shell or an interpreter — after the review
+      of #587 by the executed file's identity (`reads_files_it_is_told`:
+      a multi-call binary under any name, an alias, the loader by its
+      operand). The lab's round 2 found the
+      lineage lagging the open (`cat` in a unit judged as the unit's
+      executor, quiet): the image at the open must be the records' file,
+      else it decides for a fork or a cached root exec opening as a user.
+    - **R011.** The exec pump reads a gone tool's credentials from its
+      forker, as lot 373 reads the package manager from the parent: the
+      kernel's fork record (first exec since the fork, the parent it
+      names, the forker's start), the tool with no set-id bit or file
+      capability, every thread of the forker (`Credentials::of_forker`: no
+      uid 0, no capability in PID 1's namespace, or another namespace).
+      Low with the environment unread.
+    - **containerd.** `daemon-data.v1` gains `/run/containerd/`
+      (`containerd.service`) and `/run/docker/` (`docker.service`); the
+      earlier list's hash is known to the agent and `install.sh`. The
+      lab's first round (debian13) still crossed: an strace of containerd's
+      own process (ubuntu2604, containerd 2.2) showed its removal of a task
+      taking the bundle under `/run/containerd` and the container's
+      snapshot under `/var/lib/containerd` in one window; a unit's
+      directories now share the kernel's tag (`tagged_dirs`).
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §66 and the CHANGELOG.
+  - Mutation: 51 mutants of the final code in four rounds, 46 caught by a
+    named test (the survivors of each round got test cases), 5 argued
+    equivalent in the PR (a zero forker start, a file capability no
+    unprivileged test can set, the start and pidfd checks that bracket a
+    pid reused during the reads).
+  - Lab (as measured): alpha profile, each round under its lease, each
+    guest left uninstalled and powered off.
+    - **debian13 (6.12) and ubuntu2404 (6.8).** Name lookups (`id` in a
+      session ×200; `id`, `whoami`, `groups`, `ls -l`, `stat` in units run
+      as the user with no login uid), rootless Podman (`podman info` with
+      a fresh user namespace ×5, pull, run ×20), a user's `modprobe` ×5,
+      `sg` ×3: no transition; ubuntu2404's `podman info` `modprobe overlay`
+      as uid 1000 R011 Low. Three reboots each: Observing. `cat
+      /etc/login.defs` and `cat /etc/shadow` (the user in group `shadow`)
+      ALERTED, each first after a boot; a copy of `kmod` as root High
+      (would-kill), a user's `modprobe` with ambient `CAP_SYS_MODULE` High.
+      A Docker burst: containerd's crossing left out after the shared
+      tags (it crossed before them on debian13); dockerd's still ENGAGED
+      (`overlay2` init files through an overlay mount: not done).
+    - **The read-repeat filter (a finding).** One attack shape run in a
+      unit as the user raised nothing on both guests, before and after the
+      lagging-records fix; run so that the unit's own lookup was more than
+      a second earlier, it ALERTED (debian13). Behaviour: a file re-read by
+      the same process within a short interval after an exec may not
+      produce a second record (the file-open sensor's read-repeat filter
+      spans an exec). Keying it on the exec is planned for the first eBPF
+      lot after the alpha.
+  - **Fix round 1 (the review of #587).**
+    - **F1/F4: the reader judged by the file that runs.** The class of a
+      packaged reader of `/etc/passwd` is the executed file's by its
+      identity (`reads_files_it_is_told`): its own name, the same device
+      and inode as an installed tool's file in `/usr/bin`, `/bin` or uutils'
+      directory (a multi-call binary under any link and `argv[0]`, an
+      alias), the loader by its operand. Ratchet
+      `xtask/tests/reader_identity.rs`. On Ubuntu 26.04 uutils' `id`,
+      `whoami`, `ls` reading it without a login uid stay ALERTED.
+    - **POS-007.** At a service uid `/etc/shadow`, `/etc/gshadow` and
+      `/etc/sudoers` are quiet only for the authentication stack and Exim
+      by identity (`CREDENTIAL_CONSUMER_EXES`); the loader, uutils' links,
+      `getent shadow`, `wc` now fire.
+    - **F2.** R011's forker route: a forker of at most 32 threads, two
+      reads a second per forker and eight for all; past them not read
+      (never Low).
+    - Mutation: 31 mutants of the round's code, 28 caught by a named test
+      (five survivors of the first pass got test cases), 2 argued
+      equivalent (the operand's own checks repeated by its judgement), 1
+      redundant flag removed.
+    - Lab (as measured, alpha profile, under leases, guests uninstalled and
+      powered off):
+      - **ubuntu2604 (7.0; uutils, one file under 116 names).** Routine
+        readers: `ps` and `getent` in a session ×50 and with no login uid
+        ×3, `id` in a session ×100, rootless `podman info` ×5, a user's
+        `modprobe -n overlay` ×5 (R011 Low ×5): no transition. Each shape
+        first after its own boot, ALERTED (SensitiveFileAccess): uutils'
+        `id` link run with `argv[0]` `cat` (uutils ran `id`; a tool by its
+        file), the loader running `grep` (judged on the lagging records:
+        the shell's own exec with the loader's image), `nawk` (gawk),
+        `pager` (less), uutils' `wc`; as `daemon` in group `shadow`, on
+        `/etc/shadow`: the loader running `grep`, `getent shadow`, uutils'
+        `wc`. uutils itself refused the loader running its `cat` ("does not
+        match executable name").
+      - **ubuntu2404 (6.8; GNU coreutils).** The same routine readers plus
+        `id`, `whoami`, `groups`, `ls -l`, `stat` with no login uid: no
+        transition; `podman info`'s `modprobe overlay` as uid 1000 R011 Low
+        (podman 4.9, 11 threads). Each shape first after its own boot,
+        ALERTED: the loader running `cat` (the loader's own record, judged
+        by its operand), `nawk`, `pager`; as `daemon` in group `shadow`:
+        the loader running `grep` (the loader's record), `getent shadow`,
+        `wc`. Control: GNU `wc` reading `/etc/passwd` with no login uid, no
+        transition (a packaged program off the list, world-readable data).
+      - Heads: the routine readers and each guest's first shape on
+        `1c644146`, the other shapes on `82fef15a` (the reset of the posture
+        is refused to the lab's key, so each further shape needed a boot);
+        the final code differs by tests and one equivalent change (a
+        redundant flag of the operand's judgement).
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
   C18; no level change).**
