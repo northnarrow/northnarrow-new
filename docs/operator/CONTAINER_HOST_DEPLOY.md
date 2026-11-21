@@ -147,7 +147,11 @@ it (a module already loaded) is judged from the process that forked it, when
 the kernel's record says the exec is that fork's first and the system's
 tool has no set-id bit or file capability: every thread of the forker with
 no uid 0 and no capability in PID 1's namespace, or in a namespace of its
-own. A forker with a uid 0 or a capability keeps High.
+own. A forker with a uid 0 or a capability keeps High. The route is bounded
+so a loop of exits cannot slow the exec pump: a forker of at most 32
+threads, read at most twice a second for one forker and eight times a second
+for all; past a bound the forker is not read and the exec keeps R011's
+earlier judgement (High for a user's), never Low.
 
 **containerd's task bundles (the mass-write arm, lot 380).** containerd
 writes and removes each task's bundle under `/run/containerd` as containers
@@ -164,8 +168,9 @@ unit's), still counts; add a runtime's other directories with
 `mass-write-carveout.local`. With Docker's own `overlay2` image store,
 dockerd writes each container's init files through the layer's overlay
 mount, which the kernel does not place under `/var/lib/docker`: twenty or
-more containers started and removed within a minute still raise ENGAGED
-(a known limitation).
+more containers started and removed within a minute raise ENGAGED (a known
+false positive; a posture change only in the observe-only profile — a CI
+host running Docker builds may meet it).
 
 **The cpuset controller on kernels before 6.5 (NN-L-AT-001 `sched`, lot
 348).** At a container's start systemd, runc and containerd-shim enable the

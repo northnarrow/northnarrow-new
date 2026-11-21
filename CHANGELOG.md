@@ -16,18 +16,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   - **Routine `/etc/passwd` reads** (`id` in the bench's preparation, its
     login uid read after it exited): a packaged program's read-only open
     of the world-readable `/etc/passwd` is a name lookup, no sensitive
-    access, unless the program is a file tool, a shell or an interpreter
-    (POS-007's list, grown by the text tools, editors, copiers and
-    multi-call binaries). Test
-    `a_packaged_program_s_name_lookup_is_no_sensitive_access`.
+    access, unless the program is a file tool, a shell or an interpreter.
+    Test `a_packaged_program_s_name_lookup_is_no_sensitive_access`. The
+    review of #587: that class is the executed FILE's, by its identity —
+    a multi-call binary (uutils, busybox) is a generic tool whatever
+    `argv[0]` or link it ran by, an alias (`nawk`, `pager`) the tool it
+    resolves to, the dynamic loader judged by its operand
+    (`AuthSessionTracker::reads_files_it_is_told`; ratchet
+    `xtask/tests/reader_identity.rs`). On Ubuntu 26.04 uutils' `id`,
+    `whoami`, `ls` stay ALERTED without a login uid. Tests
+    `a_passwd_reader_is_judged_by_the_file_that_runs_not_by_its_name`,
+    `the_loader_is_judged_by_its_operand_and_an_alias_by_its_file`.
+  - **A service account's read of the shadow file** (POS-007, the review
+    of #587): quiet only for the authentication stack and the packaged
+    consumers (Exim), by the file the kernel executed; the loader, uutils'
+    links and every other packaged program now raise ALERTED. Test
+    `a_service_account_s_shadow_read_is_quiet_only_for_its_packaged_consumers`.
   - **R011 High for a user's `modprobe overlay` under `podman info`**: gone
     before the exec pump read it, its credentials are read from the
     process that forked it (the kernel's fork record, every thread, its
     start, the tool with no set-id bit or file capability); a forker with
     no uid 0 and no capability in PID 1's namespace (or in a user
     namespace of its own) gives a fork that cannot load a module: Low.
-    Tests `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
-    `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`.
+    Bounded (the review of #587): a forker of at most 32 threads, read at
+    most twice a second for one forker and eight times for all; past a
+    bound it is not read (R011 as before, never Low). Tests
+    `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
+    `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
+    `the_forker_route_is_bounded_per_forker_and_per_second`.
   - **containerd's mass-write ENGAGED** (its task bundles under
     `/run/containerd`): `daemon-data.v1` lists `/run/containerd/` for
     `containerd.service` and `/run/docker/` for `docker.service`; the
