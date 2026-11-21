@@ -276,11 +276,18 @@ fn credentials_of_exec(
         || exe.fork_parent_start == 0
         || program(root, exe).is_err()
         || !grants_no_privilege(root)
-        || !budget.lock().admit((ppid, exe.fork_parent_start), now)
+        || !admitted(budget, (ppid, exe.fork_parent_start), now)
     {
         return own;
     }
     forker_credentials(proc, ppid, exe.fork_parent_start)
+}
+
+/// Lot 380 (the review of #587, F2): one more read of `forker` within the
+/// budget ([`ForkerBudget::admit`]) — the lock held to count only, never
+/// across a read.
+fn admitted(budget: &Mutex<ForkerBudget>, forker: (u32, u64), now: Instant) -> bool {
+    budget.lock().admit(forker, now)
 }
 
 /// Lot 380 (the review of #587, F2): what the forker route may cost the
@@ -2620,11 +2627,17 @@ mod tests {
             !b.admit(one, t0 + Duration::from_millis(999)),
             "within the same second"
         );
-        assert!(b.admit((4242, 151), t0), "another start at its pid: another forker");
+        assert!(
+            b.admit((4242, 151), t0),
+            "another start at its pid: another forker"
+        );
         for i in 0..FORKER_READS_PER_SECOND - FORKER_READS_PER_FORKER - 1 {
             assert!(b.admit((5000 + i, 1), t0), "{i}");
         }
-        assert!(!b.admit((6000, 1), t0), "past every forker's reads in the second");
+        assert!(
+            !b.admit((6000, 1), t0),
+            "past every forker's reads in the second"
+        );
         let t1 = t0 + Duration::from_secs(1);
         assert!(b.admit(one, t1), "the next second");
         assert!(b.admit((6000, 1), t1), "the next second, another forker");

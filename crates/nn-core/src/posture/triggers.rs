@@ -4015,7 +4015,11 @@ mod tests {
             } = &mut e
             {
                 *c = comm.into();
-                *exe_file = if image == 0 { (0, 0) } else { (BENCH_KDEV, image) };
+                *exe_file = if image == 0 {
+                    (0, 0)
+                } else {
+                    (BENCH_KDEV, image)
+                };
             }
             super::sensitive_file_access(&e, &self.auth)
         }
@@ -4101,16 +4105,34 @@ mod tests {
             b.exec(pid, 1000, LD, 72, argv);
             b.opens(pid, 1000, "ld-linux-x86-6", "/etc/passwd", 72)
         };
-        assert!(ld(960, &[LD, "/usr/bin/cat", "/etc/passwd"]), "V2: the loader running cat");
+        assert!(
+            ld(960, &[LD, "/usr/bin/cat", "/etc/passwd"]),
+            "V2: the loader running cat"
+        );
         assert!(
             !ld(961, &[LD, "/usr/bin/id", "-un"]),
             "the loader running id: its operand's lookup"
         );
-        assert!(ld(962, &[LD, "cat", "/etc/passwd"]), "an operand by a relative path");
-        assert!(ld(963, &[LD, "/tmp/id"]), "an operand outside a system tree");
-        assert!(ld(964, &[LD, LD, "/usr/bin/id"]), "the loader running the loader");
+        assert!(
+            ld(962, &[LD, "cat", "/etc/passwd"]),
+            "an operand by a relative path"
+        );
+        assert!(
+            ld(963, &[LD, "/tmp/id"]),
+            "an operand outside a system tree"
+        );
+        assert!(
+            ld(964, &[LD, LD, "/usr/bin/id"]),
+            "the loader running the loader"
+        );
         assert!(ld(965, &[LD]), "no operand");
-        b.exec(966, 1000, "/usr/libexec/runner", 72, &["runner", "/usr/bin/id"]);
+        b.exec(
+            966,
+            1000,
+            "/usr/libexec/runner",
+            72,
+            &["runner", "/usr/bin/id"],
+        );
         assert!(
             b.opens(966, 1000, "runner", "/etc/passwd", 72),
             "the loader's file under another name"
@@ -4118,13 +4140,28 @@ mod tests {
         // V3: the image decides (a shell's fork, its exec not read yet)
         b.exec(970, 1000, "/usr/bin/bash", 74, &["bash"]);
         b.fork(971, 970, 1000);
-        assert!(b.opens(971, 1000, "nawk", "/etc/passwd", 73), "V3: nawk, mawk's link");
+        assert!(
+            b.opens(971, 1000, "nawk", "/etc/passwd", 73),
+            "V3: nawk, mawk's link"
+        );
         assert!(b.opens(971, 1000, "mawk", "/etc/passwd", 73), "mawk");
-        assert!(b.opens(971, 1000, "pager", "/etc/passwd", 75), "pager, less's link");
+        assert!(
+            b.opens(971, 1000, "pager", "/etc/passwd", 75),
+            "pager, less's link"
+        );
         assert!(!b.opens(971, 1000, "id", "/etc/passwd", 51), "id: a lookup");
         // the exec of an alias, the kernel's name its target's
-        b.exec(972, 1000, "/usr/bin/mawk", 73, &["nawk", "-F:", "{print $1}", "/etc/passwd"]);
-        assert!(b.opens(972, 1000, "nawk", "/etc/passwd", 73), "an alias executed");
+        b.exec(
+            972,
+            1000,
+            "/usr/bin/mawk",
+            73,
+            &["nawk", "-F:", "{print $1}", "/etc/passwd"],
+        );
+        assert!(
+            b.opens(972, 1000, "nawk", "/etc/passwd", 73),
+            "an alias executed"
+        );
     }
 
     /// Lot 380 (named, the review of #587, F1: V4, V5; external audit
@@ -4165,31 +4202,52 @@ mod tests {
             shadow(pid, uid, comm, image).iter().all(|f| !*f)
         };
         b.exec(1001, 33, LD, 72, &[LD, "/usr/bin/cat", "/etc/shadow"]);
-        assert!(fires(1001, 33, "ld-linux-x86-6", 72), "V4: through the loader");
+        assert!(
+            fires(1001, 33, "ld-linux-x86-6", 72),
+            "V4: through the loader"
+        );
         b.exec(1002, 33, &format!("{UU}/id"), 71, &["cat", "/etc/shadow"]);
         assert!(fires(1002, 33, "id", 71), "V5: through uutils' id link");
         b.exec(1003, 33, "/usr/bin/id", 51, &["id"]);
-        assert!(fires(1003, 33, "id", 51), "a packaged program that is no consumer");
+        assert!(
+            fires(1003, 33, "id", 51),
+            "a packaged program that is no consumer"
+        );
         b.exec(1004, 33, "/usr/sbin/apache2", 83, &["apache2"]);
         assert!(fires(1004, 33, "apache2", 83), "a web server");
         b.exec(1005, 101, "/var/www/exim4", 81, &["exim4"]);
         assert!(fires(1005, 101, "exim4", 81), "a copy of the consumer");
         b.exec(1006, 101, "/usr/sbin/exim4", 0, &["exim4"]);
-        assert!(fires(1006, 101, "exim4", 80), "the consumer's exec with no identity");
+        assert!(
+            fires(1006, 101, "exim4", 80),
+            "the consumer's exec with no identity"
+        );
         b.exec(1007, 101, "/usr/sbin/exim4", 82, &["exim4"]);
-        assert!(fires(1007, 101, "exim4", 82), "the consumer replaced since its exec");
+        assert!(
+            fires(1007, 101, "exim4", 82),
+            "the consumer replaced since its exec"
+        );
         // the consumer, its fork, its exec not read yet, its auth helper
         b.exec(1010, 101, "/usr/sbin/exim4", 80, &["exim4", "-bd"]);
-        assert!(quiet(1010, 101, "exim4", 80), "exim4, a shadow group member");
+        assert!(
+            quiet(1010, 101, "exim4", 80),
+            "exim4, a shadow group member"
+        );
         b.fork(1011, 1010, 101);
         assert!(quiet(1011, 101, "exim4", 80), "exim4's fork");
-        assert!(quiet(1012, 101, "exim4", 80), "its exec not read yet: the image");
+        assert!(
+            quiet(1012, 101, "exim4", 80),
+            "its exec not read yet: the image"
+        );
         b.exec(1013, 101, "/usr/sbin/unix_chkpwd", 84, &["unix_chkpwd"]);
         assert!(quiet(1013, 101, "unix_chkpwd", 84), "the auth stack");
         // a fork of the consumer that executed a tool
         b.fork(1014, 1010, 101);
         b.exec(1014, 101, "/usr/bin/cat", 71, &["cat", "/etc/shadow"]);
-        assert!(fires(1014, 101, "cat", 71), "the consumer's fork that executed cat");
+        assert!(
+            fires(1014, 101, "cat", 71),
+            "the consumer's fork that executed cat"
+        );
     }
 
     /// Lot 380 (named, the rc11 soak on Debian 13: ALERTED in the bench's
@@ -4526,10 +4584,7 @@ mod tests {
         let b = IdBench::new(&[("/usr/sbin/exim4", Some(80))], &["/usr/sbin"]);
         b.exec(42, 1000, "/usr/sbin/exim4", 80, &["exim4"]);
         for uid in [0, 1, 999] {
-            assert!(
-                !b.opens(42, uid, "exim4", "/etc/shadow", 80),
-                "uid {uid}"
-            );
+            assert!(!b.opens(42, uid, "exim4", "/etc/shadow", 80), "uid {uid}");
         }
     }
 
@@ -5740,10 +5795,7 @@ mod tests {
         }
         assert!(b.auth.ingest_spawn_event(&chkpwd));
         for (pid, comm, image) in [(3500, "exim4", 80), (3502, "unix_chkpwd", 84)] {
-            assert!(
-                !b.opens(pid, 101, comm, "/etc/shadow", image),
-                "{pid}"
-            );
+            assert!(!b.opens(pid, 101, comm, "/etc/shadow", image), "{pid}");
         }
     }
 
