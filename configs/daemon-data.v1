@@ -3,9 +3,10 @@
 # Lot 283c. A server doing its normal job does not sit in ENGAGED: the
 # mass-write arm of the posture's ConfirmedIntrusion leaves out a crossing
 # of the kernel's write counters when every file its window counted lies in
-# one directory listed here AND the writer's cgroup is one of that
-# directory's units (/system.slice/<unit>). A root process outside the unit,
-# and the unit writing anywhere else, still count. The counters count every
+# the directories listed here for one unit (lot 380: for one set of units,
+# which share the kernel's tag) AND the writer's cgroup is one of those
+# units (/system.slice/<unit>). A root process outside the unit, and the
+# unit writing anywhere else, still count. The counters count every
 # write, and the ransomware tracker (NN-L-IMP-001: entropy, renames, copies
 # and deletions) judges every crossing, these included.
 #
@@ -31,6 +32,13 @@
 
 containerd.service /var/lib/containerd/
 docker.service /var/lib/docker/
+# Lot 380 (the rc11 soak on Ubuntu 26.04: ENGAGED during a container burst):
+# containerd writes and removes each task's bundle (config.json, the shim's
+# address and pid files, runc's log) under /run/containerd as containers start
+# and stop, in the same window as the container's snapshot under
+# /var/lib/containerd; dockerd its runtime state under /run/docker.
+containerd.service /run/containerd/
+docker.service /run/docker/
 kubelet.service /var/lib/kubelet/
 etcd.service /var/lib/etcd/
 

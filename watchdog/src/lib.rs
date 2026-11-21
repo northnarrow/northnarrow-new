@@ -5575,6 +5575,7 @@ mod tests {
                 program_copy_skipped_total: None,
                 kernel_state_held_back: None,
                 runtime_clones: None,
+                advisories: None,
                 execq_script_refused_total: None,
                 event_bus: None,
                 event_bus_decision: None,

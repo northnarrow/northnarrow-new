@@ -38,6 +38,23 @@ pub fn is_note(kind: &str) -> bool {
     )
 }
 
+/// The finding of an imported row by its declared kind: certified, the
+/// watchdog's bookkeeping a [`WITNESS_NOTE`], its record of the role's
+/// vacancy or of a successor not its unit's clean restart a [`WITNESS_ROW`]
+/// (High). The review of #586 (P2-2): a row whose key no watchdog vouched
+/// for is its claim alone — a vacancy or a successor a
+/// [`WITNESS_UNCERTIFIED`] (High, held until acknowledged, as a death), a
+/// bookkeeping row a [`WITNESS_NOTE_UNCERTIFIED`] (a degradation while
+/// found: the witness could not vouch for it, nobody died).
+pub fn import_kind(declared: &str, certified: bool) -> &'static str {
+    match (row_kind(declared) == WITNESS_NOTE, certified) {
+        (true, true) => WITNESS_NOTE,
+        (false, true) => WITNESS_ROW,
+        (true, false) => WITNESS_NOTE_UNCERTIFIED,
+        (false, false) => WITNESS_UNCERTIFIED,
+    }
+}
+
 /// A verified row's finding: the watchdog's bookkeeping a note, its record
 /// of the role's vacancy or of a successor not its unit's clean restart a
 /// [`WITNESS_ROW`] (High).
@@ -74,6 +91,14 @@ pub const WITNESS_OP: &str = "witness";
 /// A witness row signed by a key the agent never certified (High: what it
 /// says is the watchdog's claim alone).
 pub const WITNESS_UNCERTIFIED: &str = "witness_row_uncertified";
+/// The review of #586 (P2-2): a bookkeeping row (a life opened, a release,
+/// a clean succession) signed by a key the agent never certified, past the
+/// wait for its watchdog's certification ([`UNCERTIFIED_WAIT_ROUNDS`]).
+pub const WITNESS_NOTE_UNCERTIFIED: &str = "witness_note_uncertified";
+/// The review of #586 (P2-2): the bounded wait of a row signed by a key not
+/// certified yet (defined beside the chain's format, so that the privileged
+/// e2e of the watchdog waits as long as the agent does).
+pub use nn_proto::witness::{AGENT_ROUND_SECS, UNCERTIFIED_WAIT_ROUNDS};
 /// The witness chain broken: a row changed, removed or not one (High).
 pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
@@ -140,6 +165,10 @@ pub fn published_key(pid: u32) -> Result<String, String> {
 pub struct WitnessReader {
     dir: PathBuf,
     imported: Option<Imported>,
+    /// The review of #586 (P2-2): the key whose rows wait for its
+    /// certification, and the rounds they waited (kept once spent: that
+    /// key's later rows do not wait again).
+    waiting: Option<(String, u32)>,
 }
 
 impl WitnessReader {
@@ -147,7 +176,22 @@ impl WitnessReader {
         WitnessReader {
             dir: dir.to_path_buf(),
             imported: None,
+            waiting: None,
         }
+    }
+
+    /// Whether the rows of `key` wait one more round for its
+    /// certification ([`UNCERTIFIED_WAIT_ROUNDS`] at most).
+    fn waits(&mut self, key: &str) -> bool {
+        let rounds = match &self.waiting {
+            Some((k, n)) if k == key => *n,
+            _ => 0,
+        };
+        if rounds >= UNCERTIFIED_WAIT_ROUNDS {
+            return false;
+        }
+        self.waiting = Some((key.to_string(), rounds + 1));
+        true
     }
 
     fn position(&mut self) -> &mut Imported {
@@ -201,8 +245,22 @@ impl WitnessReader {
     /// The witness rows after the last one imported, as findings, and the
     /// position they move it to. The caller signs them, then
     /// [`WitnessReader::commit`]s the position (a row is never skipped
-    /// unsigned).
+    /// unsigned). The review of #586 (P2-2): a row of a key not certified
+    /// yet, whose watchdog still runs and publishes that key
+    /// ([`published_key`]), waits — it and the rows after it — for that
+    /// watchdog's certification, at most [`UNCERTIFIED_WAIT_ROUNDS`]
+    /// rounds; then, or at once when no live watchdog vouches for the key,
+    /// it is imported by its declared kind ([`import_kind`]).
     pub fn pending(&mut self) -> (Vec<Finding>, Option<String>) {
+        self.pending_with(&published_key)
+    }
+
+    /// [`WitnessReader::pending`], the public half a watchdog publishes
+    /// read by `published`.
+    pub fn pending_with(
+        &mut self,
+        published: &dyn Fn(u32) -> Result<String, String>,
+    ) -> (Vec<Finding>, Option<String>) {
         let path = self.dir.join(CHAIN_FILE);
         let text = match crate::state_read::read_bounded(&path, CHAIN_MAX_BYTES) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -248,17 +306,31 @@ impl WitnessReader {
             });
         }
         let mut last = None;
+        let mut waits = false;
         for (row, hash, certified) in &t.rows {
-            let kind = if *certified {
-                row_kind(&row.kind)
-            } else {
-                WITNESS_UNCERTIFIED
-            };
+            if !*certified
+                && published(row.tgid).is_ok_and(|key| key == row.key)
+                && self.waits(&row.key)
+            {
+                tracing::debug!(
+                    watchdog_pid = row.tgid,
+                    seq = row.seq,
+                    "witness: a row of a key not certified yet waits for its watchdog's \
+                     certification"
+                );
+                waits = true;
+                break;
+            }
+            let kind = import_kind(&row.kind, *certified);
             out.push(Finding {
                 kind,
                 detail: format!("{} (row hash {})", row.describe(), &hash[..16]),
             });
             last = Some(hash.clone());
+        }
+        if waits {
+            // what follows the row that waits is read with it
+            return (out, last);
         }
         if let Some(why) = t.broken {
             out.push(Finding {
@@ -552,6 +624,46 @@ pub fn roles_gap(r: &RolesAtStart, signed_stop: bool) -> Option<Finding> {
 mod tests {
     use super::*;
     use antitamper_bpf::start_check::{Findings, Identity};
+
+    /// Lot 379 (pre-alpha Phase 7b, F7-6): the deaths the status holds until
+    /// acknowledged (`nn_evidence::held::DEATH_KINDS`, which cannot name
+    /// this crate) are the witness's and the round's own kinds — every row
+    /// that is no bookkeeping, a row only the watchdog's claim vouches for,
+    /// both roles vacated, a successor not confirmed or foreign, the
+    /// watchdog gone — and the bookkeeping notes are not among them.
+    #[test]
+    fn the_held_deaths_are_the_witness_s_and_the_round_s_kinds() {
+        use nn_evidence::held::{hold_of, Hold, DEATH_KINDS};
+        let gone = crate::self_integrity::watchdog_gone(
+            812,
+            &crate::posture::exempt::WatchdogResolution::NotPresent,
+        );
+        for kind in [
+            WITNESS_ROW,
+            WITNESS_UNCERTIFIED,
+            ROLES_VACATED_GAP,
+            WATCHDOG_SUCCESSOR_FOREIGN,
+            WATCHDOG_SUCCESSOR_UNCONFIRMED,
+            gone.kind,
+            row_kind(nn_proto::witness::KIND_VACATED),
+            row_kind(nn_proto::witness::KIND_FOUND_VACANT),
+            row_kind(nn_proto::witness::KIND_SUCCESSOR_FOREIGN),
+        ] {
+            assert!(DEATH_KINDS.contains(&kind), "{kind}");
+            assert_eq!(hold_of(kind, "detected"), Hold::UntilAcknowledged, "{kind}");
+            assert!(!is_note(kind), "{kind}");
+        }
+        for note in [
+            WITNESS_KEY,
+            WITNESS_NOTE,
+            WATCHDOG_SUCCESSION,
+            ROLES_RELEASED,
+        ] {
+            assert!(is_note(note), "{note}");
+            assert!(!DEATH_KINDS.contains(&note), "{note}");
+        }
+        assert_eq!(row_kind(nn_proto::witness::KIND_OPENED), WITNESS_NOTE);
+    }
     use nn_proto::witness::{
         line_hash, Row, WitnessKey, KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION,
     };
@@ -888,6 +1000,190 @@ mod tests {
         lines
     }
 
+    /// No live watchdog publishes a key.
+    fn no_watchdog(_pid: u32) -> Result<String, String> {
+        Err("no such watchdog".to_string())
+    }
+
+    /// One more row of watchdog `tgid` signed by `k`, appended to the chain
+    /// as the watchdog appends it.
+    fn append_row(dir: &Path, k: &WitnessKey, tgid: u32, kind: &str) {
+        let path = dir.join(CHAIN_FILE);
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        let prev = lines.last().map(|l| line_hash(l)).unwrap_or_default();
+        let r = k.sign(Row {
+            v: ROW_VERSION,
+            seq: lines.len() as u64,
+            prev,
+            at: 1,
+            tgid,
+            key: String::new(),
+            kind: kind.to_string(),
+            detail: format!("row {}", lines.len()),
+            sig: String::new(),
+        });
+        let mut text = text;
+        text.push_str(&serde_json::to_string(&r).unwrap());
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// The review of #586 (P2-2): a row of a key no live watchdog vouches
+    /// for is held by its declared kind — a vacancy or a successor as a
+    /// death (until acknowledged), a bookkeeping row as a degradation while
+    /// found. On the PR's head every one was `witness_row_uncertified`,
+    /// held until acknowledged, the new watchdog's `witness_opened` too.
+    #[test]
+    fn an_uncertified_row_is_held_by_its_declared_kind() {
+        use nn_evidence::held::{hold_of, Hold};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        let k = WitnessKey::from_seed([6; 32]);
+        write_chain(
+            dir.path(),
+            &k,
+            &[
+                KIND_OPENED,
+                KIND_VACATED,
+                KIND_SUCCEEDED,
+                KIND_RELEASED_IN_WINDOW,
+            ],
+        );
+        let mut r = WitnessReader::new(dir.path());
+        let (f, _) = r.pending_with(&no_watchdog);
+        let kinds: Vec<&str> = f.iter().map(|x| x.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                WITNESS_NOTE_UNCERTIFIED,
+                WITNESS_UNCERTIFIED,
+                WITNESS_NOTE_UNCERTIFIED,
+                WITNESS_NOTE_UNCERTIFIED
+            ]
+        );
+        assert_eq!(
+            hold_of(WITNESS_UNCERTIFIED, "detected"),
+            Hold::UntilAcknowledged
+        );
+        assert_eq!(
+            hold_of(WITNESS_NOTE_UNCERTIFIED, "detected"),
+            Hold::WhileFound
+        );
+        assert!(!is_note(WITNESS_NOTE_UNCERTIFIED), "an integrity_drift row");
+        for (declared, certified, kind) in [
+            (KIND_OPENED, true, WITNESS_NOTE),
+            (KIND_VACATED, true, WITNESS_ROW),
+            (KIND_OPENED, false, WITNESS_NOTE_UNCERTIFIED),
+            (KIND_VACATED, false, WITNESS_UNCERTIFIED),
+            (
+                nn_proto::witness::KIND_SUCCESSOR_FOREIGN,
+                false,
+                WITNESS_UNCERTIFIED,
+            ),
+        ] {
+            assert_eq!(
+                import_kind(declared, certified),
+                kind,
+                "{declared} {certified}"
+            );
+        }
+    }
+
+    /// The review of #586 (P2-2): the restarts of both units (`install.sh`'s
+    /// upgrade and the lab's: both stopped, the agent started, the watchdog
+    /// 3 s later) — the agent's first round can read the new watchdog's
+    /// `witness_opened` before it verified that watchdog. The row waits
+    /// while the watchdog it names publishes the key that signed it; the
+    /// next round verifies and certifies that key, and the row is a note.
+    /// Ten restarts and the installer's: nothing held. On the PR's head 7
+    /// of 12 such restarts in the lab signed `witness_row_uncertified`.
+    #[test]
+    fn a_restart_of_both_units_holds_no_witness_row() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        // the watchdog of the install, certified, its life imported
+        let first = WitnessKey::from_seed([10; 32]);
+        append_row(dir.path(), &first, 100, KIND_OPENED);
+        let mut agent = WitnessReader::new(dir.path());
+        agent.position().certify(&first.public_hex());
+        let (_, last) = agent.pending_with(&no_watchdog);
+        agent.commit(last);
+        for restart in 0..11u8 {
+            // both units stopped: the watchdog's release (a signed stop)
+            let old = WitnessKey::from_seed([10 + restart; 32]);
+            append_row(dir.path(), &old, 100 + u32::from(restart), KIND_RELEASED);
+            // the agent starts again (a new reader, the position kept) and
+            // the new watchdog opens its life with its new key
+            let new = WitnessKey::from_seed([11 + restart; 32]);
+            let pid = 101 + u32::from(restart);
+            append_row(dir.path(), &new, pid, KIND_OPENED);
+            let publishes = new.public_hex();
+            let live = move |p: u32| {
+                if p == pid {
+                    Ok(publishes.clone())
+                } else {
+                    Err("gone".to_string())
+                }
+            };
+            let mut agent = WitnessReader::new(dir.path());
+            // round 1: the new watchdog not verified yet — no certification
+            let (found, last) = agent.pending_with(&live);
+            assert!(
+                found.iter().all(|f| f.kind == WITNESS_NOTE),
+                "restart {restart}: {found:?}"
+            );
+            agent.commit(last);
+            // round 2: verified, its key certified first (`certify`), then
+            // the rows
+            assert!(agent.position().certify(&new.public_hex()));
+            let (found, last) = agent.pending_with(&live);
+            assert_eq!(
+                found.iter().map(|f| f.kind).collect::<Vec<_>>(),
+                [WITNESS_NOTE],
+                "restart {restart}: the new watchdog's opened row, a note"
+            );
+            // a note: signed under the witness's op, never held
+            assert!(found.iter().all(|f| is_note(f.kind)));
+            agent.commit(last);
+        }
+    }
+
+    /// The review of #586 (P2-2): the wait is bounded — a key its watchdog
+    /// publishes but the agent never certifies (never verified: a pidfile
+    /// naming another process, a successor refused) is imported by the
+    /// row's declared kind after [`UNCERTIFIED_WAIT_ROUNDS`] rounds; a key
+    /// the named watchdog does not publish waits not at all.
+    #[test]
+    fn the_wait_for_a_certification_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        let k = WitnessKey::from_seed([30; 32]);
+        append_row(dir.path(), &k, 300, KIND_OPENED);
+        append_row(dir.path(), &k, 300, KIND_VACATED);
+        let publishes = k.public_hex();
+        let live = move |_| Ok(publishes.clone());
+        let mut r = WitnessReader::new(dir.path());
+        for round in 0..UNCERTIFIED_WAIT_ROUNDS {
+            let (f, last) = r.pending_with(&live);
+            assert!(f.is_empty() && last.is_none(), "round {round}: {f:?}");
+        }
+        let (f, last) = r.pending_with(&live);
+        assert_eq!(
+            f.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            [WITNESS_NOTE_UNCERTIFIED, WITNESS_UNCERTIFIED]
+        );
+        r.commit(last);
+        // another key than the one the named watchdog publishes: no wait
+        let other = WitnessKey::from_seed([31; 32]);
+        append_row(dir.path(), &other, 300, KIND_VACATED);
+        let (f, _) = r.pending_with(&live);
+        assert_eq!(
+            f.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            [WITNESS_UNCERTIFIED]
+        );
+    }
+
     /// Lot 374: a line that breaks the chain after the last row imported
     /// is said on its own (the position still found: nothing is imported
     /// again).
@@ -914,16 +1210,22 @@ mod tests {
 
     #[test]
     fn witness_rows_are_imported_once_after_their_key_is_certified() {
+        let k = WitnessKey::from_seed([4; 32]);
+        // not certified, no live watchdog vouching for the key: recorded as
+        // the watchdog's claim alone (the review of #586, P2-2: the
+        // vacancies here — a bookkeeping row is
+        // `an_uncertified_row_is_held_by_its_declared_kind`'s)
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
-        let k = WitnessKey::from_seed([4; 32]);
-        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
+        write_chain(dir.path(), &k, &[KIND_VACATED, KIND_VACATED, KIND_VACATED]);
         let mut r = WitnessReader::new(dir.path());
-        // not certified: recorded as the watchdog's claim alone
-        let (f, last) = r.pending();
+        let (f, last) = r.pending_with(&no_watchdog);
         assert_eq!(f.len(), 3);
         assert!(f.iter().all(|x| x.kind == WITNESS_UNCERTIFIED));
         assert!(last.is_some());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
+        write_chain(dir.path(), &k, &[KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
         // certified (as `certify` does from the memory file), from scratch
         let mut r = WitnessReader::new(dir.path());
         r.position().certify(&k.public_hex());

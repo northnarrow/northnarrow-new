@@ -928,6 +928,22 @@ exit: 5
 --- stderr
 | response release: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
 
+### default.integrity-acknowledge.agent-id
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: agent_id not found at /etc/northnarrow/agent_id: the agent creates it at its first start (start northnarrow-agent once, or pass the right --agent-id-file)
+
+### default.integrity-acknowledge.socket
+$ nn-admin integrity acknowledge --through 412 --note investigated --key key-a --agent-id-file agent_id
+exit: 5
+--- stdout
+(empty)
+--- stderr
+| integrity acknowledge: connecting to /run/northnarrow/admin.sock: No such file or directory (os error 2)
+
 ### default.response-restore.agent-id
 $ nn-admin response restore --vault-id 1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b --to /srv/matrix/restored --key key-a
 exit: 5

@@ -204,6 +204,31 @@ how.
   *For you:* turn on the export to keep a copy off the host
   ([EXPORT.md](EXPORT.md)). *Evidence:* `an_archive_evicted_young_is_said`;
   lot 370.
+- **A held integrity finding ends at the operator's acknowledgement.** A
+  cut or rewritten chain stays in `nn-admin status` (an `integrity:`
+  degradation, the trust level at most L2) until `nn-admin integrity
+  acknowledge` covers its row; a configuration or host finding until its
+  check no longer finds it ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+  A death of the agent or the watchdog (a crash, an OOM, a kill) and an
+  attack-class event (a refused shutdown marker, the admin socket removed)
+  are held until acknowledged as well, across a host reboot. A witness row
+  of a key no live watchdog vouches for (a watchdog that lived less than
+  one 30 s round) is held by its declared kind: a vacancy until
+  acknowledged, a bookkeeping row while found. An admin key left on the
+  host, strict overcommit, the operator's signed sysctl opt-out and a pause
+  of the whole machine are advisories: listed, not degradations.
+  The acknowledgement takes a key with `triage` or `config-manage`: a
+  holder of such a key can clear the status, not the evidence (the rows,
+  its own signed row, `chain verify`). A drift of the integrity round that
+  ends and comes back within ten minutes is held again only when the
+  round's back-off ends. *Evidence:*
+  `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
+  `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
+  `an_agent_or_watchdog_death_is_held_until_acknowledged`;
+  `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`;
+  `benign_states_are_advisories_not_degradations`;
+  `an_attack_class_event_is_held_across_a_reboot_until_acknowledged`;
+  `a_restart_of_both_units_holds_no_witness_row`; lot 379.
 - **`nn-admin chain verify` with no chains says OK.** On a state directory
   that holds no chain (a purged host, a wrong `--state-dir`), it prints
   `OK` with 0 rows for each chain and exits 0. *For you:* read the row
@@ -995,6 +1020,79 @@ lists the known false positives of each rule.
   `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`,
   `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
   `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
+- **Rootless Podman's uidmap tools, name lookups, a user's `modprobe`,
+  containerd's task bundles** (lot 380, the rc11 soak). Judged by identity
+  now:
+  - the packaged `newuidmap`/`newgidmap` reading `/etc/login.defs` as
+    their caller;
+  - a packaged program's read-only open of `/etc/passwd` (a name lookup:
+    `id`, `whoami`, `ls -l`), by the file the kernel executed, unless the
+    program is a file tool, a shell or an interpreter — that class is the
+    executed file's, by its identity: a multi-call binary under any name
+    (uutils, busybox) is a tool, an alias the tool it resolves to, the
+    dynamic loader judged by its operand. On Ubuntu 26.04, whose `id`,
+    `whoami`, `ls` and `stat` are uutils' one file, their read without a
+    login uid stays ALERTED;
+  - a user's `modprobe` gone before the exec pump read it, its credentials
+    read from the process that forked it: Low when that process held no
+    uid 0 and no capability in PID 1's user namespace (or ran in a user
+    namespace of its own, rootless Podman) — within bounds: a forker of at
+    most 32 threads, read at most twice a second for one forker and eight
+    times for all; past them it is not read and the exec is judged as
+    before (High for a user's, never Low);
+  - containerd writing and removing its task bundles under
+    `/run/containerd` (and dockerd under `/run/docker`), from its unit.
+
+  Still recorded: `cat`, `cut`, `python3` or a shell reading `/etc/passwd`
+  without a login uid, uutils' file under any name, the loader running
+  `cat`, `nawk`, `pager`, and any reader but those named reading
+  `/etc/login.defs` (ALERTED); a copy of a packaged program; a user's
+  `modprobe` whose forker holds a uid 0 or a capability (High); another
+  unit's burst under `/run/containerd`. A service account's read of
+  `/etc/shadow`, `/etc/gshadow` or `/etc/sudoers` is now quiet only for
+  the authentication stack and Exim, by the file the kernel executed
+  (external audit POS-007): any other daemon in the `shadow` group, the
+  loader, uutils' links, `getent shadow` raise ALERTED.
+
+  Residuals:
+  - **A file re-read shortly after an exec.** A file re-read by the same
+    process within a short interval (about a second) after an exec may not
+    produce a second record. It holds for every file the file-open sensor
+    reports on a read-only open (`/etc/passwd`, `/etc/login.defs`,
+    `/etc/shadow`, `/etc/gshadow`, the credential files, the files FIM
+    watches for opens) and every exec that keeps its process, as root or
+    as a user; a write is always reported. An eBPF change, planned for the
+    first eBPF lot after the alpha; `newgrp` is not exempted for that
+    reason.
+  - **A forker that gave up its privilege** between the fork and the
+    pump's read is taken for one that never held it (only root's own
+    process can; R018 judges any module its fork loads). A `modprobe` a
+    shell `exec`s in its own place is not read from its forker (High as
+    before for a user's, when it exited first).
+  - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
+    /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
+    access; so does a fork that changed its image to a packaged program's
+    (`PR_SET_MM`, capabilities in a user namespace of its own). The list is
+    best effort.
+  - **dockerd's container setup in a burst** (a known false positive;
+    Docker's own `overlay2` image store): twenty or more containers
+    started and removed within a minute raise ENGAGED through the
+    mass-write arm, a posture change only in the observe-only profile —
+    dockerd writes each container's init files through the layer's overlay
+    mount, which the kernel does not place under `/var/lib/docker`. A CI
+    host running Docker builds may meet it.
+
+  *Evidence:* lot 380;
+  `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
+  `a_packaged_program_s_name_lookup_is_no_sensitive_access`,
+  `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
+  `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
+  `a_passwd_reader_is_judged_by_the_file_that_runs_not_by_its_name`,
+  `the_loader_is_judged_by_its_operand_and_an_alias_by_its_file`,
+  `a_service_account_s_shadow_read_is_quiet_only_for_its_packaged_consumers`,
+  `the_forker_route_is_bounded_per_forker_and_per_second`,
+  `containerd_replacing_its_task_bundles_under_run_raises_nothing`,
+  `a_unit_s_directories_share_one_tag`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.
@@ -1025,16 +1123,26 @@ lists the known false positives of each rule.
 - **The verifier margin on 5.15 and 6.1.** The kernel's verifier accepts
   every program on the five kernels, but two programs of the mount guard
   use about 92 % of the instruction budget the project allows itself on
-  5.15 (91 % on 6.1). A kernel whose verifier counts differently could
-  refuse one. Then the agent does not stop: it starts without that hook,
-  signs a degradation (`mount guard: <n> of <m> hooks attached`, shown
-  in `nn-admin status`), and the rest loads; the by-path defences and the signed mount
-  watch remain. *For you:* on any kernel, a mount-guard degradation in
-  `nn-admin status` is worth a report with `uname -r`. *Evidence:*
-  internal check Phase 8b §4.3 and §5 (F8b-1);
-  `the_guard_is_not_attached_without_the_offsets_it_reads` (a guard not
-  attached is a signed degradation; a fault-injection check of the
-  verifier's refusal is planned before the tag).
+  5.15 (91 % on 6.1): `mount_guard_sb_mount` processed 830,908
+  instructions on 5.15 at rc10 (internal check Phase 8g), 83.1 % of the
+  kernel's limit of one million and 92.3 % of the project's gate of
+  900,000. A kernel whose verifier counts differently could refuse one.
+  Then the agent does not stop: it starts without that hook, the other
+  hooks of the guard attached, and signs a degradation (`anti_tamper:
+  mount guard: 4 of 5 hooks attached (sb_mount: verifier rejected LSM
+  program …)`), listed by `nn-admin status` (`sensors: DEGRADED`) and in
+  the signed capability manifest (`nn-admin capabilities`); the by-path
+  defences and the signed mount watch remain. The agent's handling of the
+  refusal is tested (an injected load error), the kernel's verifier itself
+  is not exercised: a test build refuses the program at its load, and
+  the privileged suite checks the signed row, the manifest and the status
+  on a real agent; release builds cannot carry that fault injection. *For
+  you:* on any kernel, a mount-guard degradation in `nn-admin status` is
+  worth a report with `uname -r`. *Evidence:* internal check Phase 8b
+  §4.3 and §5 (F8b-1); `a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`
+  (a privileged suite of the CI's KVM guests);
+  `a_build_without_the_test_feature_injects_nothing`;
+  `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 379.
 - **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
   build and not since many recent changes; the `.rpm` is untested (above).
   *Evidence:* internal check Phase 8 §7 (residual R066).
@@ -1087,11 +1195,13 @@ kernel.
   Criticals, twice. Each user's share now holds a burst: four seconds of
   it may be spent at once, paid back at its rate, so a loop of that length
   is compared whole (the fix round's lab on Debian 13: 30 runs back to
-  back at about five a second, and 43 more, all compared, none "not
-  compared"). Under a longer burst of container starts by one user
-  (with runc 1.1's copy, past about seventy starts in a row at the lab's
-  pace of about four a second; fewer on a faster host), some starts can
-  still be reported Critical as not compared. The burst trusts nothing: a
+  back at about two a second — 30 in 14 s, under the share's refill, so
+  the burst was not drawn on — and 43 more, all compared, none "not
+  compared"). With runc 1.1's copy, up to about three starts a second by
+  one user are always compared; faster, the burst covers about
+  fifty-four starts in a row at four a second, about thirty at five (the budget's
+  model, not a lab run; fewer on a host whose runc is larger). Past it,
+  some starts can still be reported Critical as not compared. The burst trusts nothing: a
   copy past it is not compared, and a foreign memfd is the Critical kill
   either way.
   *Evidence:* `an_uncompared_runtime_copy_is_recorded_never_killed`;
@@ -1150,10 +1260,26 @@ kernel.
 
 ## Performance
 
-- **Narrow measurements.** Overhead has been measured on Ubuntu 24.04 only,
-  against one committed baseline. File-open-heavy work pays most: an `open`
-  microbenchmark is about 41 % slower with the agent on, `git status` about
-  24 %. *Evidence:* lot 273b (both figures, on Ubuntu 24.04).
+- **Narrow measurements.** The cost of one `exec` or one `open` of the
+  release candidate (rc11) was measured in the lab on one QEMU guest only
+  (QEMU under Windows (WHPX), Ubuntu 24.04, kernel 6.8, 2 vCPU, three
+  complete runs, A/A at most 7 %): file-open-heavy work pays most, an
+  `open` + `read` + `close` about 2.1–2.2 µs slower with the agent on
+  (+55…+64 %), a `fork` + `exec` + `wait` about 0.08 ms slower (+9…+16 %).
+  These are lower bounds: the reference with the agent off still ran three
+  of the agent's LSM programs. `git status` about 24 % slower is the older
+  committed baseline's (Ubuntu 24.04, a lab build), not measured again on
+  this release. Its resources and its cost on real work were measured
+  in the lab, on QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and
+  6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB, the watchdog's
+  about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest,
+  14–25 % under exec-heavy work; an event recorded in about 0.5 ms (p50),
+  3–5 ms (p99); a kernel build 4 to 17 % slower, the other workloads
+  (package installs, container runs, `fio`, `pgbench`) within the lab's
+  noise of about 5–25 %. A QEMU guest is noisier than a real host.
+  *Evidence:* lot 273b (the git status figure, on Ubuntu 24.04);
+  internal check Phase 6 (rc10); internal check Phase 6b (rc11: the
+  per-operation figures).
 - **Network.** UDP receives are about 20 % slower, TCP sends about 10 %
   (the TLS fingerprint sensor), connects about 6 %
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*

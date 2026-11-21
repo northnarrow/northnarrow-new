@@ -3211,6 +3211,118 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.integrity.unknown-flag
+$ nn-admin integrity --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin integrity <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.integrity.unknown-subcommand
+$ nn-admin integrity nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin integrity <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.unknown-flag
+$ nn-admin integrity acknowledge --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin integrity acknowledge [OPTIONS] --through <THROUGH> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.missing-required
+$ nn-admin integrity acknowledge
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --through <THROUGH>
+|   --key <KEY>
+|
+| Usage: nn-admin integrity acknowledge --through <THROUGH> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.stray-positional
+$ nn-admin integrity acknowledge stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin integrity acknowledge [OPTIONS] --through <THROUGH> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.through.missing-value
+$ nn-admin integrity acknowledge --through
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--through <THROUGH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.note.missing-value
+$ nn-admin integrity acknowledge --note
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--note <NOTE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.key.missing-value
+$ nn-admin integrity acknowledge --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.agent-id-file.missing-value
+$ nn-admin integrity acknowledge --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.integrity.acknowledge.socket.missing-value
+$ nn-admin integrity acknowledge --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.config.unknown-flag
 $ nn-admin config --no-such-flag
 exit: 2

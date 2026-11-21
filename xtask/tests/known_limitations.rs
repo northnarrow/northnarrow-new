@@ -22,7 +22,11 @@ const GUIDE: &str = "docs/operator/ALPHA_TESTER_GUIDE.md";
 const CATALOGUE: &str = "docs/detection/RULE_CATALOGUE.md";
 const FORMS: &str = ".github/ISSUE_TEMPLATE";
 /// The pre-alpha phases a limitation may cite as an internal check.
-const PHASES: [&str; 11] = ["0", "1", "2", "2b", "2c", "3", "3b", "4", "4b", "8", "8b"];
+/// Lot 379: Phase 6 (resources and performance, rc10); Phase 6b (its
+/// per-operation figures, rc11).
+const PHASES: [&str; 13] = [
+    "0", "1", "2", "2b", "2c", "3", "3b", "4", "4b", "6", "6b", "8", "8b",
+];
 const EVIDENCE: &str = "*Evidence:*";
 
 fn read(rel: &str) -> String {

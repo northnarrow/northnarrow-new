@@ -32,6 +32,7 @@ exit: 2
 |   trusted-installer-grant  Open a trusted-installer window, for an upgrade, an uninstall or a restart of the agent. Submits a grant signed by one key; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's file protection is suspended (so install.sh can replace the protected binaries), the units may be stopped, and a write to the agent's own systemd units is recorded, not answered with a kill. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 Undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Undo what ransomware rewrote, from the copy-on-first-write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   integrity                The signed integrity findings `nn-admin status` holds (a cut or rewritten chain, an unauthorized overlay, a modified default list, a drift of the host): `integrity acknowledge --through <row>` signs the operator's acknowledgement (`triage` or `config-manage`), and the findings whose newest audit row is at or before it leave the status
 |   config                   Operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
 |   policy                   The signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
 |   help                     Print this message or the help of the given subcommand(s)
@@ -86,6 +87,7 @@ exit: 0
 |   trusted-installer-grant  Open a trusted-installer window, for an upgrade, an uninstall or a restart of the agent. Submits a grant signed by one key; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's file protection is suspended (so install.sh can replace the protected binaries), the units may be stopped, and a write to the agent's own systemd units is recorded, not answered with a kill. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
 |   response                 Undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
 |   remediate                Undo what ransomware rewrote, from the copy-on-first-write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   integrity                The signed integrity findings `nn-admin status` holds (a cut or rewritten chain, an unauthorized overlay, a modified default list, a drift of the host): `integrity acknowledge --through <row>` signs the operator's acknowledgement (`triage` or `config-manage`), and the findings whose newest audit row is at or before it leave the status
 |   config                   Operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
 |   policy                   The signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
 |   help                     Print this message or the help of the given subcommand(s)
@@ -2217,6 +2219,90 @@ $ nn-admin help remediate ransomware
 exit: 0
 --- stdout
 (the same bytes as in help.remediate.ransomware.long)
+--- stderr
+(empty)
+
+### help.integrity.long
+$ nn-admin integrity --help
+exit: 0
+--- stdout
+| The signed integrity findings `nn-admin status` holds (a cut or rewritten chain, an unauthorized overlay, a modified default list, a drift of the host): `integrity acknowledge --through <row>` signs the operator's acknowledgement (`triage` or `config-manage`), and the findings whose newest audit row is at or before it leave the status
+|
+| Usage: nn-admin integrity <COMMAND>
+|
+| Commands:
+|   acknowledge  Acknowledge the held integrity findings through one audit row (the row `nn-admin status --key` names for each). The agent signs the acknowledgement with the key's fingerprint and your note; the findings whose newest row is at or before it leave the status, the trust level and the capability manifest. Their rows stay in the chain (`nn-admin chain verify` still fails on a cut chain), and a finding signed after that row is held again. A row not signed yet is refused
+|   help         Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.integrity.short
+$ nn-admin integrity -h
+exit: 0
+--- stdout
+(the same bytes as in help.integrity.long)
+--- stderr
+(empty)
+
+### help.integrity.subcommand
+$ nn-admin help integrity
+exit: 0
+--- stdout
+(the same bytes as in help.integrity.long)
+--- stderr
+(empty)
+
+### help.integrity.without-subcommand
+$ nn-admin integrity
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| The signed integrity findings `nn-admin status` holds (a cut or rewritten chain, an unauthorized overlay, a modified default list, a drift of the host): `integrity acknowledge --through <row>` signs the operator's acknowledgement (`triage` or `config-manage`), and the findings whose newest audit row is at or before it leave the status
+|
+| Usage: nn-admin integrity <COMMAND>
+|
+| Commands:
+|   acknowledge  Acknowledge the held integrity findings through one audit row (the row `nn-admin status --key` names for each). The agent signs the acknowledgement with the key's fingerprint and your note; the findings whose newest row is at or before it leave the status, the trust level and the capability manifest. Their rows stay in the chain (`nn-admin chain verify` still fails on a cut chain), and a finding signed after that row is held again. A row not signed yet is refused
+|   help         Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.integrity.acknowledge.long
+$ nn-admin integrity acknowledge --help
+exit: 0
+--- stdout
+| Acknowledge the held integrity findings through one audit row (the row `nn-admin status --key` names for each). The agent signs the acknowledgement with the key's fingerprint and your note; the findings whose newest row is at or before it leave the status, the trust level and the capability manifest. Their rows stay in the chain (`nn-admin chain verify` still fails on a cut chain), and a finding signed after that row is held again. A row not signed yet is refused
+|
+| Usage: nn-admin integrity acknowledge [OPTIONS] --through <THROUGH> --key <KEY>
+|
+| Options:
+|       --through <THROUGH>              The newest audit row acknowledged (`nn-admin status --key`)
+|       --note <NOTE>                    What you found, recorded in the signed row (at most 512 bytes) [default: ""]
+|       --key <KEY>                      A key with `triage` or `config-manage`
+|       --agent-id-file <AGENT_ID_FILE>  Path of this install's agent id, which binds a signed request to this agent [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                Path of the agent's admin socket [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.integrity.acknowledge.short
+$ nn-admin integrity acknowledge -h
+exit: 0
+--- stdout
+(the same bytes as in help.integrity.acknowledge.long)
+--- stderr
+(empty)
+
+### help.integrity.acknowledge.subcommand
+$ nn-admin help integrity acknowledge
+exit: 0
+--- stdout
+(the same bytes as in help.integrity.acknowledge.long)
 --- stderr
 (empty)
 

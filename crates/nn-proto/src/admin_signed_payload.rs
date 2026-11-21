@@ -204,6 +204,16 @@ pub enum OperationCode {
     /// from the guard's journal. Authorised by `Role::ResponseManage`,
     /// 1-of-N: a restore writes into users' files. `dry_run` only plans.
     RemediateRansomware = 26,
+    /// Lot 379 (pre-alpha F7-1) — acknowledge the signed integrity findings
+    /// `nn-admin status` holds, through one row of the audit log
+    /// ([`IntegrityAcknowledgeExtra::through_row`]): the agent signs the
+    /// acknowledgement (`integrity_acknowledged`, naming the key) and the
+    /// findings whose newest row is at or before that row leave the status;
+    /// their rows stay in the chain, and a finding signed after it is held
+    /// again. Authorised by `Role::Triage` (acknowledging is triage) or
+    /// `Role::ConfigManage` (the control role the install's key carries),
+    /// 1-of-N.
+    IntegrityAcknowledge = 27,
 }
 
 impl From<OperationCode> for u8 {
@@ -242,6 +252,7 @@ impl TryFrom<u8> for OperationCode {
             24 => Ok(Self::ResponseRestore),
             25 => Ok(Self::TelemetryStatus),
             26 => Ok(Self::RemediateRansomware),
+            27 => Ok(Self::IntegrityAcknowledge),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -918,6 +929,20 @@ pub struct RemediateRansomwareExtra {
     pub dry_run: bool,
 }
 
+/// Op-specific signed-scope fields for
+/// [`OperationCode::IntegrityAcknowledge`] (lot 379): the newest audit row
+/// the acknowledgement covers (0-based, as `nn-admin status` names each held
+/// finding's), and the operator's note (at most
+/// [`INTEGRITY_ACK_NOTE_MAX`] bytes, recorded in the row).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityAcknowledgeExtra {
+    pub through_row: u64,
+    pub note: String,
+}
+
+/// Lot 379: the longest note an integrity acknowledgement carries (bytes).
+pub const INTEGRITY_ACK_NOTE_MAX: usize = 512;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationExtra {
     Unlock(UnlockExtra),
@@ -967,6 +992,8 @@ pub enum OperationExtra {
     TelemetryStatus(TelemetryStatusExtra),
     /// Lab PR 222. Pairs with [`OperationCode::RemediateRansomware`].
     RemediateRansomware(RemediateRansomwareExtra),
+    /// Lot 379. Pairs with [`OperationCode::IntegrityAcknowledge`].
+    IntegrityAcknowledge(IntegrityAcknowledgeExtra),
 }
 
 impl OperationExtra {
@@ -1001,6 +1028,7 @@ impl OperationExtra {
             OperationExtra::ResponseRestore(_) => OperationCode::ResponseRestore,
             OperationExtra::TelemetryStatus(_) => OperationCode::TelemetryStatus,
             OperationExtra::RemediateRansomware(_) => OperationCode::RemediateRansomware,
+            OperationExtra::IntegrityAcknowledge(_) => OperationCode::IntegrityAcknowledge,
         }
     }
 }
@@ -1636,6 +1664,27 @@ impl SignedPayload {
             }),
         }
     }
+
+    /// Lot 379 — `integrity acknowledge` signed payload constructor.
+    /// Authorised by `Role::Triage` or `Role::ConfigManage`.
+    pub fn new_integrity_acknowledge(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        through_row: u64,
+        note: String,
+    ) -> Self {
+        Self {
+            op: OperationCode::IntegrityAcknowledge,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::IntegrityAcknowledge(IntegrityAcknowledgeExtra {
+                through_row,
+                note,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1957,6 +2006,8 @@ mod tests {
             (OperationCode::TelemetryStatus, 25),
             // Lab PR 222 — APPENDED, never renumber.
             (OperationCode::RemediateRansomware, 26),
+            // Lot 379 — APPENDED, never renumber.
+            (OperationCode::IntegrityAcknowledge, 27),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");

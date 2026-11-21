@@ -33,24 +33,25 @@ use nn_proto::admin_protocol::{
     ConfigOverlaySetRequest, ConfigOverlaySetResponse, DetectionSetStatusRequest,
     DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse, FimBaselineRequest,
     FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
-    KeyedSignature, LoopProgressRequest, NetFingerprintRequest, NetFingerprintResponse,
-    NetFlowsRequest, NetFlowsResponse, NetListenersRequest, NetListenersResponse,
-    NetResolveRequest, NetResolveResponse, RemediateRansomwareRequest, RemediateRansomwareResponse,
-    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
-    ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse,
-    StatusRequest, TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
-    UnlockRequest, UnlockResult,
+    IntegrityAcknowledgeRequest, IntegrityAcknowledgeResponse, KeyedSignature, LoopProgressRequest,
+    NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
+    NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
+    RemediateRansomwareRequest, RemediateRansomwareResponse, ResponseReleaseRequest,
+    ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
+    ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest, RotateKeysRevokeRequest,
+    ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse, StatusRequest,
+    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockRequest,
+    UnlockResult,
 };
 use nn_proto::admin_quorum::role_keyword;
 use nn_proto::admin_signed_payload::{
     sign, CanaryBurnExtra, CanaryDeployExtra, CanaryDeploymentWire, CanaryListExtra,
     CanaryRefreshExtra, CanaryTypeWire, ConfigOverlaySetExtra, DetectionSetStatusExtra,
     DetectionsExtra, FimBaselineExtra, FimReportExtra, FimStatusExtra, ForcePostureExtra,
-    NetFingerprintExtra, NetFlowsExtra, NetListenersExtra, NetResolveExtra, OperationExtra,
-    OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra, ResponseRestoreExtra,
-    ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra, ShutdownExtra,
-    SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
+    IntegrityAcknowledgeExtra, NetFingerprintExtra, NetFlowsExtra, NetListenersExtra,
+    NetResolveExtra, OperationExtra, OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra,
+    ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra,
+    ShutdownExtra, SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 
@@ -208,13 +209,18 @@ impl Fixture {
         serve_request(
             msg,
             conn,
-            bare_context(
-                &self.posture,
-                &self.isolator,
-                &self.marker,
-                &self.read_paths,
-                &self.handles,
-            ),
+            // lot 379: the handlers see the log the rows go to, as the
+            // transport hands them
+            super::handlers::Wired {
+                audit_log: Some(&self.audit),
+                ..bare_context(
+                    &self.posture,
+                    &self.isolator,
+                    &self.marker,
+                    &self.read_paths,
+                    &self.handles,
+                )
+            },
             &fake_client(),
             Some(&self.audit),
             &self.polls,
@@ -919,6 +925,41 @@ fn verbs() -> Vec<Verb> {
                 })
             },
         },
+        // Lot 379 (pre-alpha F7-1)
+        Verb {
+            request: "IntegrityAcknowledgeRequest",
+            op: "integrity_acknowledged",
+            quorum: 1,
+            extra: |_| {
+                OperationExtra::IntegrityAcknowledge(IntegrityAcknowledgeExtra {
+                    through_row: 7,
+                    note: "seen".to_string(),
+                })
+            },
+            wrap: |payload, signatures| {
+                AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+                    payload,
+                    signatures,
+                })
+            },
+            refused: |result, _| {
+                AdminMessage::IntegrityAcknowledgeResponse(IntegrityAcknowledgeResponse {
+                    result,
+                    acknowledged: 0,
+                    still_held: 0,
+                    message: String::new(),
+                })
+            },
+            row: |_, _, own| {
+                json!({
+                    "through_row": if own { Some(7) } else { None },
+                    "note": if own { "seen" } else { "" },
+                    "acknowledged": 0,
+                    "still_held": 0,
+                    "detail": "",
+                })
+            },
+        },
     ]
 }
 
@@ -1028,6 +1069,7 @@ fn result_of(reply: &AdminMessage) -> AdminResult {
         AdminMessage::ResponseRestoreResponse(x) => x.result,
         AdminMessage::TelemetryStatusResponse(x) => x.result,
         AdminMessage::RemediateRansomwareResponse(x) => x.result,
+        AdminMessage::IntegrityAcknowledgeResponse(x) => x.result,
         other => panic!("not a signed verb's reply: {other:?}"),
     }
 }
@@ -1286,7 +1328,8 @@ fn every_verb_refuses_every_reason_with_its_reply_and_row() {
             // a refusal names no signer — but the read role the
             // telemetry status lacks, whose signer the row names (lab PR
             // 213, `Roles::AnyOf`)
-            let telemetry_role = verb.op == "telemetry_status" && reason == Reason::WrongRole;
+            // lot 379: so does the integrity acknowledgement (`AnyOf` too)
+            let telemetry_role = designed_roles(verb.op).len() > 1 && reason == Reason::WrongRole;
             let submitted = match reason {
                 Reason::UnknownKey => 1,
                 Reason::WrongRole => weak_keys(verb, &k).len(),
@@ -1837,6 +1880,8 @@ fn designed_roles(op: &str) -> &'static [Role] {
         "response_release" | "response_restore" | "remediate_ransomware" => &[Role::ResponseManage],
         // either read role (lab PR 213)
         "telemetry_status" => &[Role::AuditRead, Role::TelemetryRead],
+        // lot 379: acknowledging is triage, or the install key's control role
+        "integrity_acknowledged" => &[Role::Triage, Role::ConfigManage],
         other => panic!("{other}: a signed verb without a designed role"),
     }
 }
@@ -1913,8 +1958,9 @@ fn every_verb_refuses_the_keys_of_every_other_role() {
             "{what}"
         );
         assert_eq!(row.result, "failure: role_denied", "{what}");
-        // the telemetry status names the key that tried (lab PR 213)
-        let named = if verb.op == "telemetry_status" {
+        // the telemetry status names the key that tried (lab PR 213), and
+        // the integrity acknowledgement (lot 379): the verbs of `AnyOf` roles
+        let named = if designed_roles(verb.op).len() > 1 {
             fp(&spare[0])
         } else {
             String::new()
@@ -2352,4 +2398,89 @@ fn a_grant_for_an_installer_is_verified_and_rowed_as_the_grant() {
         row.extra,
         json!({ "window_secs": 300, "for_installer": true, "installer_pid": null })
     );
+}
+
+/// Lot 379 (the review of #586, P3-1): the acknowledgement is its signed
+/// row. Written, the reply counts what the log ended and the transport adds
+/// no second row; not written (the append fails), nothing is acknowledged
+/// and the findings stay held. On the PR's head the reply said
+/// `acknowledged: 1` (exit 0) over a row that was never written.
+#[test]
+fn an_acknowledgement_whose_row_is_not_written_acknowledges_nothing() {
+    let k = keys();
+    let drift = |fx: &Fixture| -> u64 {
+        let mut log = fx.audit.lock();
+        log.append(crate::audit::AuditEntryDraft {
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
+            extra: json!({ "kind": "chain_truncated", "chain": "detections",
+                           "detail": "the anchored head is not in the file" }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .unwrap();
+        log.rows() - 1
+    };
+    let ack = |fx: &Fixture, through: u64| -> IntegrityAcknowledgeResponse {
+        let conn = ConnAuth::new(&fx.auth);
+        let nonce = fx.challenge(&conn);
+        let p = payload(
+            OperationExtra::IntegrityAcknowledge(IntegrityAcknowledgeExtra {
+                through_row: through,
+                note: "investigated".to_string(),
+            }),
+            nonce,
+            now_unix_secs(),
+            AGENT_ID,
+        );
+        let signatures = signatures(&p, &[&k.a]);
+        match fx.serve(
+            &conn,
+            &AdminMessage::IntegrityAcknowledgeRequest(IntegrityAcknowledgeRequest {
+                payload: p,
+                signatures,
+            }),
+        ) {
+            AdminMessage::IntegrityAcknowledgeResponse(r) => r,
+            // a fixed message: the reply is never printed (CodeQL
+            // rust/cleartext-logging)
+            _ => panic!("not an integrity acknowledgement's reply"),
+        }
+    };
+    // written: one row, the acknowledgement's own, and the reply its count
+    let fx = Fixture::new(&k);
+    let row = drift(&fx);
+    let before = fx.rows().len();
+    let r = ack(&fx, row);
+    assert_eq!(
+        (r.result, r.acknowledged, r.still_held),
+        (AdminResult::Success, 1, 0)
+    );
+    let rows = fx.rows();
+    assert_eq!(rows.len(), before + 1, "one row: the acknowledgement");
+    let last = rows.last().unwrap();
+    assert_eq!(last.op, nn_evidence::held::ACK_OP);
+    assert_eq!(last.result, "success");
+    assert_eq!(last.extra["through_row"], row);
+    assert_eq!(last.key_fp, fp(&k.a), "the signer named");
+    assert!(fx.audit.lock().held().is_empty());
+    // not written: every append fails (a directory at the log's name)
+    let fx = Fixture::new(&k);
+    let row = drift(&fx);
+    std::fs::remove_file(&fx.log_path).unwrap();
+    std::fs::create_dir(&fx.log_path).unwrap();
+    let r = ack(&fx, row);
+    assert_eq!(
+        r.acknowledged, 0,
+        "acknowledged although its row was not written"
+    );
+    assert!(
+        r.message.contains("not written"),
+        "the reply does not say the row was not written"
+    );
+    assert_eq!(fx.audit.lock().held().count(), 1, "still held");
 }

@@ -170,6 +170,22 @@ impl ChainHost for LinuxHost {
         }
     }
 
+    /// Lot 379 (pre-alpha F7-1, F3b-6): the signed integrity findings the
+    /// agent's audit log holds are its degradations (source
+    /// [`nn_evidence::held::SOURCE`]): `nn-admin status` lists each with its
+    /// kind, the time and row of its signed row and its rule, `sensors`
+    /// says DEGRADED, the trust level is at most L2, the capability manifest
+    /// signs them. Told at the log's open and at each change; called with
+    /// the writer's lock held, it never signs (they are signed rows). The
+    /// review of #586 (P2-1): its advisories are the status's advisories —
+    /// listed, never a degradation.
+    fn integrity_held(_path: &Path, held: &nn_evidence::held::Held) {
+        if registry_told() {
+            crate::boot::degradation::hold(nn_evidence::held::SOURCE, &held.lines());
+            crate::boot::degradation::advise(nn_evidence::held::SOURCE, &held.advisories());
+        }
+    }
+
     /// Lot 353 (the review of #563, F1): a signed log whose appends fail is
     /// a degradation of the agent ([`SIGNING_DEGRADATION`], one line per
     /// log, named by its file — in `nn-admin status`, the trust level, and
@@ -523,6 +539,129 @@ mod tests {
             "it leaves the status"
         );
         assert!(!is_failing(&path));
+        crate::boot::degradation::reset_for_tests();
+    }
+
+    /// Lot 379 (pre-alpha F7-1): the agent's audit log holds the integrity
+    /// findings it signed, and each is a degradation of the status — with
+    /// its kind, the time and row of its row — until its hold ends (here a
+    /// signed acknowledgement); a restart (the log opened again) shows it
+    /// again. On main the registry never saw them: `degradations: none`.
+    #[test]
+    fn a_held_integrity_finding_is_a_degradation_until_its_hold_ends() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        tell_registry_in_tests();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        let held = || {
+            crate::boot::degradation::snapshot()
+                .into_iter()
+                .filter(|l| l.starts_with("integrity: "))
+                .collect::<Vec<_>>()
+        };
+        let mut log = AuditLog::open(&path, key(dir.path()), [4; 16]).unwrap();
+        assert!(held().is_empty());
+        let finding = crate::chain_anchor::ChainFinding::new(
+            "detections",
+            &dir.path().join("detections.jsonl"),
+            "chain_truncated",
+            "the anchored head is not in the file",
+        );
+        assert!(finding.attest(Some(&mut log)));
+        let row = log.rows() - 1;
+        let lines = held();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("integrity: chain_truncated (detections) — signed "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains(&format!("(audit row {row})")),
+            "{lines:?}"
+        );
+        drop(log);
+        // the restart: the registry of the new process starts empty, the
+        // open of the log fills it again
+        crate::boot::degradation::reset_for_tests();
+        let mut log = AuditLog::open(&path, key(dir.path()), [4; 16]).unwrap();
+        assert_eq!(held().len(), 1);
+        log.append(crate::audit::AuditEntryDraft {
+            op: nn_evidence::held::ACK_OP.to_string(),
+            extra: serde_json::json!({ "through_row": row }),
+            key_fp: "0a1b2c3d".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "success".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "nn-admin".to_string(),
+            client_exe: None,
+        })
+        .unwrap();
+        assert!(held().is_empty(), "{:?}", held());
+        // a thread the registry was not told for (another test's log, a
+        // tool's): its log's findings never reach the agent's status
+        let other = dir.path().join("other.log");
+        let k = key(dir.path());
+        std::thread::spawn(move || {
+            let mut log = AuditLog::open(&other, k, [4; 16]).unwrap();
+            let finding = crate::chain_anchor::ChainFinding::new(
+                "audit",
+                &other,
+                "chain_truncated",
+                "not the agent's",
+            );
+            assert!(finding.attest(Some(&mut log)));
+            assert_eq!(log.held().findings().len(), 1);
+        })
+        .join()
+        .unwrap();
+        assert!(held().is_empty(), "{:?}", held());
+        crate::boot::degradation::reset_for_tests();
+    }
+
+    /// Lot 379 (the review of #586, P2-1): an advisory the agent's audit log
+    /// holds (the admin key left on the host) is the status's advisory, not
+    /// a degradation: no `integrity:` line in the registry's degradations,
+    /// the advisory listed with its row. On the PR's head every default
+    /// install said `sensors: DEGRADED` for it.
+    #[test]
+    fn a_held_advisory_is_an_advisory_of_the_status_not_a_degradation() {
+        let _g = crate::boot::degradation::TEST_LOCK.lock();
+        crate::boot::degradation::reset_for_tests();
+        tell_registry_in_tests();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut log = AuditLog::open(&path, key(dir.path()), [4; 16]).unwrap();
+        log.append(crate::audit::AuditEntryDraft {
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": "admin_key_on_host",
+                "detail": "/root/northnarrow-admin.key: an admin private key on this host",
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: 1,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .unwrap();
+        let row = log.rows() - 1;
+        assert!(
+            crate::boot::degradation::snapshot().is_empty(),
+            "{:?}",
+            crate::boot::degradation::snapshot()
+        );
+        assert_eq!(crate::boot::degradation::count(), 0);
+        let adv = crate::boot::degradation::advisories();
+        assert_eq!(adv.len(), 1, "{adv:?}");
+        assert!(
+            adv[0].starts_with("integrity: admin_key_on_host — signed ")
+                && adv[0].contains(&format!("(audit row {row})")),
+            "{adv:?}"
+        );
         crate::boot::degradation::reset_for_tests();
     }
 

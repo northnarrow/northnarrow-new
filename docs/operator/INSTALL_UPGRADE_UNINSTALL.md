@@ -586,10 +586,11 @@ That is what lets the uninstall of a half-install finish on Debian 13 (a
 start refused by its own check, before it loaded anything: its unit's
 pin-lock step had made an empty pin root first). A pin root that a unit
 restart makes again during the uninstall (the watchdog's `Restart=` after
-a refused start) is removed once the units are gone. Every uninstall also stops the journal
-namespace's varlink socket and removes its runtime directory
-(`/run/systemd/journal.northnarrow`); `--purge` removes `/var/log/northnarrow`
-when nothing else is in it.
+a refused start) is removed once the units are gone.
+
+Every uninstall also stops the journal namespace's varlink socket and
+removes its runtime directory (`/run/systemd/journal.northnarrow`);
+`--purge` removes `/var/log/northnarrow` when nothing else is in it.
 
 **A wedged agent** (lot 341): its unit active but `nn-admin status` not
 answered within 10 s (`ANSWER_TIMEOUT`), or, with stale protected pins, an

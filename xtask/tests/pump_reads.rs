@@ -141,11 +141,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/sensors/kmod_exec.rs",
-        19,
+        27,
         "`/proc/<pid>/environ`, `stat` (lot 373: the exec's and its parent's start before the \
          package manager's walk), `status`, `exe`, `task`, and (lot 369) `ns/user`'s \
-         link text and PID 1's (procfs's own, beneath the anchored root); the system's module tool and the initramfs builders at their fixed, \
-         root-owned paths (`/usr/bin/kmod`, `/usr/sbin/update-initramfs`, …), on the reader; \
+         link text and PID 1's (procfs's own, beneath the anchored root); lot 380: the \
+         forker's `stat`, its `task` listing, each thread's `status` and `ns/user` link text \
+         (procfs's own); the system's module tool and the initramfs builders at their fixed, \
+         root-owned paths (`/usr/bin/kmod`, `/usr/sbin/update-initramfs`, …; lot 380: the \
+         tool's mode and `security.capability` through its descriptor), on the reader; \
          `Cached::is_dir`/`is_file` (memory)",
     ),
     (

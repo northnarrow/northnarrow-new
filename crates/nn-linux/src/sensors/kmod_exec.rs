@@ -65,6 +65,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use common::wire::exe::exe_flags;
 use nn_core::decision::rules::kmod_exec_facts::{
@@ -172,8 +173,16 @@ fn facts_in(
     }
     // the environment first: the process may be short-lived
     let (environment, library_path) = environment_read(proc, *pid, *start_ns);
-    // lot 369: then its credentials, tied to the exec the same way
-    let credentials = credentials(proc, *pid, *start_ns);
+    // lot 369: then its credentials, tied to the exec the same way — lot
+    // 380: from its forker when its own process is gone
+    let credentials = credentials_of_exec(
+        root,
+        proc,
+        (*pid, *start_ns),
+        *ppid,
+        exe,
+        (&FORKER_BUDGET, Instant::now()),
+    );
     // the review of #556 (F4): kept only when what it names only root can
     // change
     let library_path = library_path.filter(|v| root_only_library_path(v, root));
@@ -231,6 +240,197 @@ fn credentials(proc: &Path, pid: u32, start_ns: u64) -> Credentials {
         return Credentials::NotRead;
     }
     Credentials::of_status(&status, other_user_ns)
+}
+
+/// Lot 380 (the rc11 soak on Ubuntu 24.04: `modprobe overlay` as uid 1000
+/// under `podman info` High once, Low the other times — it had exited
+/// before its credentials were read): [`credentials`] of an exec, read from
+/// its own process while `/proc/<pid>` is the exec's, else — as lot 373
+/// reads the package manager from the parent — from the process that
+/// forked it ([`Credentials::of_forker`]), when the kernel's record says
+/// the exec is the first since that fork and by the parent it names
+/// (`fork_parent`, the forker's start read at the fork), the file executed
+/// is the system's module tool ([`program`]) with no set-id bit and no
+/// file capability ([`grants_no_privilege`]), and every thread of the
+/// forker is read while a pidfd holds it and its start is the one the
+/// kernel read at the fork, before and after the reads. Anything else:
+/// [`Credentials::NotRead`] (R011 judges the exec as before).
+///
+/// The review of #587 (F2): within the forker route's bounds — a forker of
+/// at most [`FORKER_THREADS`] threads, read at most
+/// [`FORKER_READS_PER_FORKER`] times a second for one forker (its pid and
+/// start) and [`FORKER_READS_PER_SECOND`] times a second for all
+/// (`budget`, at `now`). Past them the forker is not read:
+/// [`Credentials::NotRead`], never Low.
+fn credentials_of_exec(
+    root: &Path,
+    proc: &Path,
+    (pid, start_ns): (u32, u64),
+    ppid: u32,
+    exe: &ExeIdentity,
+    (budget, now): (&Mutex<ForkerBudget>, Instant),
+) -> Credentials {
+    let own = credentials(proc, pid, start_ns);
+    if own != Credentials::NotRead
+        || exe.fork_parent != ppid
+        || exe.fork_parent_start == 0
+        || program(root, exe).is_err()
+        || !grants_no_privilege(root)
+        || !admitted(budget, (ppid, exe.fork_parent_start), now)
+    {
+        return own;
+    }
+    forker_credentials(proc, ppid, exe.fork_parent_start)
+}
+
+/// Lot 380 (the review of #587, F2): one more read of `forker` within the
+/// budget ([`ForkerBudget::admit`]) — the lock held to count only, never
+/// across a read.
+fn admitted(budget: &Mutex<ForkerBudget>, forker: (u32, u64), now: Instant) -> bool {
+    budget.lock().admit(forker, now)
+}
+
+/// Lot 380 (the review of #587, F2): what the forker route may cost the
+/// exec pump, which reads one exec after another — a user's process that
+/// forks `modprobe` in a loop, each exiting at once, would otherwise have
+/// each of its exits read thread by thread. The reads of the current
+/// second: all forkers', and each forker's (by pid and start).
+#[derive(Debug, Default)]
+struct ForkerBudget {
+    second: Option<Instant>,
+    reads: u32,
+    by_forker: HashMap<(u32, u64), u32>,
+}
+
+impl ForkerBudget {
+    /// One more read of `forker` at `now`, within [`FORKER_READS_PER_SECOND`]
+    /// and [`FORKER_READS_PER_FORKER`]: counted, `true`; past either,
+    /// `false`.
+    fn admit(&mut self, forker: (u32, u64), now: Instant) -> bool {
+        if self
+            .second
+            .is_none_or(|s| now.saturating_duration_since(s) >= Duration::from_secs(1))
+        {
+            (self.second, self.reads) = (Some(now), 0);
+            self.by_forker.clear();
+        }
+        let mine = self.by_forker.get(&forker).copied().unwrap_or(0);
+        if self.reads >= FORKER_READS_PER_SECOND || mine >= FORKER_READS_PER_FORKER {
+            return false;
+        }
+        self.reads += 1;
+        self.by_forker.insert(forker, mine + 1);
+        true
+    }
+}
+
+/// Lot 380 (the review of #587, F2): the exec pump's forker reads in the
+/// current second (one host, one exec pump).
+static FORKER_BUDGET: std::sync::LazyLock<Mutex<ForkerBudget>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Lot 380 (the review of #587, F2): the forker route's reads in a second,
+/// for all forkers — at most [`FORKER_THREADS`] threads' `status` and
+/// `ns/user` each.
+const FORKER_READS_PER_SECOND: u32 = 8;
+
+/// … and for one forker (its pid and start): a loop of execs from one
+/// process.
+const FORKER_READS_PER_FORKER: u32 = 2;
+
+/// Lot 380: the system's module tool (the file `/usr/bin/kmod` resolves
+/// to, else `/bin/kmod`) has no set-uid or set-gid bit and no
+/// `security.capability` attribute: its exec gives a process no uid and no
+/// capability it did not hold. Not read: `false`.
+fn grants_no_privilege(root: &Path) -> bool {
+    let Some(path) = KMOD_PATHS
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| antitamper_bpf::kernel_roots::metadata(p).is_ok())
+    else {
+        return false;
+    };
+    let Ok(file) = antitamper_bpf::kernel_roots::open(&path, libc::O_RDONLY | libc::O_NONBLOCK)
+    else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if meta.mode() & (libc::S_ISUID | libc::S_ISGID) != 0 {
+        return false;
+    }
+    let name = c"security.capability";
+    // SAFETY: a live descriptor, a NUL-terminated name, no buffer (size 0).
+    let n = unsafe {
+        libc::fgetxattr(
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    n < 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::ENOTSUP)
+        )
+}
+
+/// Lot 380: the most threads of a forker [`forker_credentials`] reads —
+/// the review of #587 (F2): 1024 before, about 2,000 procfs reads for an
+/// exec that exited; a forker with more threads is not read (NotRead).
+/// Rootless Podman's forker, a Go program, runs about one thread per CPU
+/// in use and a few more.
+const FORKER_THREADS: usize = 32;
+
+/// Lot 380: [`Credentials::of_forker`] of `pid`, the process that started
+/// at `start_ns` — each of its threads' `status` and user namespace
+/// (`task/<tid>/ns/user` against PID 1's), read while a pidfd holds it, its
+/// start the one given before and after the reads.
+fn forker_credentials(proc: &Path, pid: u32, start_ns: u64) -> Credentials {
+    let Ok(raw) = pidfd_open(pid) else {
+        return Credentials::NotRead;
+    };
+    // SAFETY: pidfd_open returned this fd to us; we own it.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let started = || {
+        crate::state_read::read_state(proc.join(format!("{pid}/stat")))
+            .ok()
+            .as_deref()
+            .and_then(stat_start_ticks)
+            .is_some_and(|ticks| started_at(ticks, start_ns))
+    };
+    if !started() {
+        return Credentials::NotRead;
+    }
+    let Some(init) = antitamper_bpf::kernel_roots::read_link(proc.join("1/ns/user")).ok() else {
+        return Credentials::NotRead;
+    };
+    let task_dir = proc.join(format!("{pid}/task"));
+    let Ok(tasks) = antitamper_bpf::kernel_roots::read_dir_max(&task_dir, FORKER_THREADS + 1)
+    else {
+        return Credentials::NotRead;
+    };
+    // a forker with more threads than are read is not vouched for
+    if tasks.len() > FORKER_THREADS {
+        return Credentials::NotRead;
+    }
+    let mut threads = Vec::new();
+    for task in tasks {
+        let dir = task_dir.join(task);
+        let Ok(status) = crate::state_read::read_state(dir.join("status")) else {
+            return Credentials::NotRead;
+        };
+        let other = antitamper_bpf::kernel_roots::read_link(dir.join("ns/user"))
+            .ok()
+            .map(|own| own != init);
+        threads.push((status, other));
+    }
+    if pidfd_exited(&fd) || !started() {
+        return Credentials::NotRead;
+    }
+    Credentials::of_forker(&threads)
 }
 
 /// Lot 287: the initramfs builders, as the distributions package them —
@@ -2220,6 +2420,236 @@ mod tests {
             Credentials::NotRead,
             "reaped"
         );
+    }
+
+    /// Lot 380 (named, the rc11 soak on Ubuntu 24.04: `modprobe overlay` as
+    /// uid 1000 under `podman info` High once — it had exited before its
+    /// credentials were read): the credentials of a module tool gone before
+    /// the read are read from the process that forked it — the exec its
+    /// first since that fork, by the parent it names (the kernel's record),
+    /// every thread of the forker read while a pidfd holds it and its start
+    /// is the one read at the fork. Rootless Podman's forker (a user
+    /// namespace of its own) and a session's (no capability): it cannot
+    /// load a module. Not vouched for: a thread with a uid 0 or a capability
+    /// in PID 1's namespace, a thread's namespace not read; a forker that is
+    /// not the exec's parent (reparented, or the exec not the first since
+    /// the fork), another start at its pid, no fork record; a tool that is
+    /// not the system's, the system's with a set-uid bit; a forker gone.
+    #[test]
+    fn a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host.path().join("usr/bin")).unwrap();
+        let kmod = host.path().join("usr/bin/kmod");
+        std::fs::write(&kmod, b"\x7fELF kmod").unwrap();
+        std::fs::write(host.path().join("usr/bin/copy"), b"\x7fELF kmod").unwrap();
+        let tool = |rel: &str| {
+            let m = std::fs::metadata(host.path().join(rel)).unwrap();
+            ExeIdentity {
+                path: format!("/{rel}"),
+                dev: stat_dev_to_kernel_dev(m.dev()),
+                ino: m.ino(),
+                flags: exe_flags::KNOWN,
+                ..Default::default()
+            }
+        };
+        // the forker: this test's child, its /proc entry a fixture's
+        let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let forker = child.id();
+        let mut gone = Command::new("true").spawn().expect("true");
+        let pid = gone.id();
+        gone.wait().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proc = tmp.path();
+        let t = tick();
+        let at = |ticks: u64| ticks * t;
+        std::fs::create_dir_all(proc.join("1/ns")).unwrap();
+        std::os::unix::fs::symlink("user:[4026531837]", proc.join("1/ns/user")).unwrap();
+        let dir = proc.join(forker.to_string());
+        let write_forker = |start: u64, threads: &[(u32, u32, u64, Option<&str>)]| {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("task")).unwrap();
+            std::fs::write(
+                dir.join("stat"),
+                format!(
+                    "{forker} (podman) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} \
+                     1000000 100\n"
+                ),
+            )
+            .unwrap();
+            for (tid, uid, caps, ns) in threads {
+                let d = dir.join(format!("task/{tid}"));
+                std::fs::create_dir_all(d.join("ns")).unwrap();
+                std::fs::write(
+                    d.join("status"),
+                    format!(
+                        "Name:\tpodman\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+                         CapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapAmb:\t0000000000000000\n"
+                    ),
+                )
+                .unwrap();
+                if let Some(ns) = ns {
+                    std::os::unix::fs::symlink(ns, d.join("ns/user")).unwrap();
+                }
+            }
+        };
+        let (init, own) = (Some("user:[4026531837]"), Some("user:[4026532900]"));
+        let full = 0x0000_01ff_ffff_ffffu64;
+        // each read within the budget (a fresh one: the bounds have a test
+        // of their own)
+        let read = |exe: &ExeIdentity, ppid: u32| {
+            let budget = Mutex::new(ForkerBudget::default());
+            credentials_of_exec(
+                host.path(),
+                proc,
+                (pid, at(200)),
+                ppid,
+                exe,
+                (&budget, Instant::now()),
+            )
+        };
+        let first = |rel: &str, parent: u32, parent_start: u64| ExeIdentity {
+            fork_parent: parent,
+            fork_parent_start: parent_start,
+            ..tool(rel)
+        };
+        let exe = first("usr/bin/kmod", forker, at(150));
+        // rootless Podman's forker, its threads in a user namespace of its own
+        write_forker(
+            150,
+            &[(forker, 1000, full, own), (forker + 1, 1000, full, own)],
+        );
+        assert!(
+            matches!(read(&exe, forker), Credentials::CannotLoad(_)),
+            "rootless Podman's forker"
+        );
+        // a session's forker, no capability
+        write_forker(150, &[(forker, 1000, 0, init)]);
+        assert!(matches!(read(&exe, forker), Credentials::CannotLoad(_)));
+        // not vouched for
+        for (threads, why) in [
+            (vec![(forker, 0, 0, own)], "a uid 0"),
+            (vec![(forker, 1000, 1 << 7, init)], "CAP_SETUID"),
+            (
+                vec![(forker, 1000, 0, init), (forker + 1, 1000, full, init)],
+                "a thread",
+            ),
+            (vec![(forker, 1000, 0, None)], "a namespace not read"),
+        ] {
+            write_forker(150, &threads);
+            assert_eq!(read(&exe, forker), Credentials::MayLoad, "{why}");
+        }
+        write_forker(150, &[(forker, 1000, 0, init)]);
+        for (exe, ppid, why) in [
+            (first("usr/bin/kmod", forker, at(150)), 1, "reparented"),
+            (
+                first("usr/bin/kmod", 4242, at(150)),
+                forker,
+                "another forker",
+            ),
+            (
+                first("usr/bin/kmod", forker, at(140)),
+                forker,
+                "another start",
+            ),
+            (first("usr/bin/kmod", 0, 0), forker, "no fork record"),
+            (first("usr/bin/kmod", forker, 0), forker, "no forker start"),
+            (first("usr/bin/copy", forker, at(150)), forker, "a copy"),
+        ] {
+            assert_eq!(read(&exe, ppid), Credentials::NotRead, "{why}");
+        }
+        // the system's tool with a set-uid bit
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&kmod, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        assert_eq!(read(&exe, forker), Credentials::NotRead, "set-uid");
+        std::fs::set_permissions(&kmod, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(read(&exe, forker), Credentials::CannotLoad(_)));
+        // more threads than are read: not vouched for
+        let many: Vec<_> = (0..=FORKER_THREADS as u32)
+            .map(|i| (forker + i, 1000, 0, init))
+            .collect();
+        write_forker(150, &many);
+        assert_eq!(
+            read(&exe, forker),
+            Credentials::NotRead,
+            "past the threads read"
+        );
+        write_forker(150, &many[..FORKER_THREADS]);
+        assert!(
+            matches!(read(&exe, forker), Credentials::CannotLoad(_)),
+            "as many threads as are read"
+        );
+        // the review of #587 (F2): a forker of 33 threads is not read
+        let thirty_three: Vec<_> = (0..33).map(|i| (forker + i, 1000, 0, init)).collect();
+        write_forker(150, &thirty_three);
+        assert_eq!(
+            read(&exe, forker),
+            Credentials::NotRead,
+            "a forker of 33 threads"
+        );
+        // the review of #587 (F2): past the forker route's budget, not read
+        write_forker(150, &[(forker, 1000, 0, init)]);
+        let budget = Mutex::new(ForkerBudget::default());
+        let now = Instant::now();
+        let budgeted = || {
+            credentials_of_exec(
+                host.path(),
+                proc,
+                (pid, at(200)),
+                forker,
+                &exe,
+                (&budget, now),
+            )
+        };
+        for _ in 0..FORKER_READS_PER_FORKER {
+            assert!(matches!(budgeted(), Credentials::CannotLoad(_)));
+        }
+        assert_eq!(
+            budgeted(),
+            Credentials::NotRead,
+            "past one forker's reads in a second"
+        );
+        // the forker gone
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(read(&exe, forker), Credentials::NotRead, "the forker gone");
+    }
+
+    /// Lot 380 (named, the review of #587, F2: a user's process forking
+    /// `modprobe` in a loop, each exiting at once, had the exec pump read up
+    /// to 1024 threads of it per exec): the forker route is bounded — at
+    /// most [`FORKER_READS_PER_FORKER`] reads of one forker (its pid and
+    /// start) in a second, [`FORKER_READS_PER_SECOND`] of all, at most
+    /// [`FORKER_THREADS`] threads each (the test above). Past a bound the
+    /// forker is not read: `NotRead`, R011's judgement as before, never Low.
+    /// The next second reads again.
+    #[test]
+    fn the_forker_route_is_bounded_per_forker_and_per_second() {
+        let mut b = ForkerBudget::default();
+        let t0 = Instant::now();
+        let one = (4242, 150);
+        // two reads of one forker in a second
+        assert!(b.admit(one, t0));
+        assert!(b.admit(one, t0));
+        assert!(!b.admit(one, t0), "one forker past its reads in the second");
+        assert!(
+            !b.admit(one, t0 + Duration::from_millis(999)),
+            "within the same second"
+        );
+        assert!(
+            b.admit((4242, 151), t0),
+            "another start at its pid: another forker"
+        );
+        // eight of all forkers in a second
+        for i in 0..5 {
+            assert!(b.admit((5000 + i, 1), t0), "{i}");
+        }
+        assert!(
+            !b.admit((6000, 1), t0),
+            "past every forker's reads in the second"
+        );
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(b.admit(one, t1), "the next second");
+        assert!(b.admit((6000, 1), t1), "the next second, another forker");
     }
 
     /// Another user's process, which an unprivileged reader may not read

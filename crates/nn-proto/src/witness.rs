@@ -98,6 +98,20 @@ pub const KIND_GATE_REFERENCE: &str = "respawn_gate_reference_moved";
 /// cut).
 pub const KIND_CHAIN_TORN: &str = "witness_chain_torn";
 
+/// The agent's watchdog round, in seconds: its refresh of the verified
+/// watchdog, then the import of the witness rows — the first at its start.
+pub const AGENT_ROUND_SECS: u64 = 30;
+/// The review of #586 (P2-2): how many import rounds
+/// ([`AGENT_ROUND_SECS`] each) a row signed by a key not certified yet
+/// waits while the watchdog it names still runs and publishes that very key
+/// in its sealed memory file — the agent verifies, then certifies it at a
+/// next round (a restart of both units: the agent's first round can come
+/// before the new watchdog is verified). Bounded: past it the row is
+/// imported by its declared kind, at the round after the last wait. A
+/// watchdog the agent does not register (a successor not its unit's
+/// restart) publishes its key too: its rows are imported that late.
+pub const UNCERTIFIED_WAIT_ROUNDS: u32 = 4;
+
 /// One row of the witness chain (one JSON line).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {

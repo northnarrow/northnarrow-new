@@ -429,6 +429,15 @@ record, none of them visible in `nn-admin status`. Every one now:
 - is listed by `nn-admin status --key` (`degradations`), and counted
   against the trust level.
 
+Lot 379 (pre-alpha F7-1): the other signed integrity findings too — a cut
+or rewritten chain, an unauthorized overlay, a modified default list, the
+integrity round's drifts — are degradations of source `integrity`, held by
+the audit log from its own rows (a restart keeps them) until their rule
+ends them: an acknowledgement (`nn-admin integrity acknowledge`) for the
+evidence's, the check's end or the next start's check for the others
+([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)). They
+count against the trust level like the rest (L2 at most).
+
 The sources added by this PR: `bpf_lsm`, `deny_self_test`, `exec_sensor`
 (the exec sensor on `sys_enter_execve`: the path read from the caller's
 memory), `file_open_sensor` (the file-open sensor on `sys_enter_openat`,

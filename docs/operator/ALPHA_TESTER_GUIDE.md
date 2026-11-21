@@ -219,6 +219,14 @@ sudo nn-admin status --key "$KEY"
 
 The first summary line must say `OBSERVE-ONLY — profile alpha`.
 
+With the key left on the host, the summary adds `advisories : 1` and the
+details list `integrity: admin_key_on_host` under `advisories`: the agent
+signs the key it finds there (a credential for whoever is root on the
+host) and shows it while it is found. It is an advisory, not a
+degradation: `sensors` stays `OK`. On a throwaway VM that is expected; on
+any other machine, move the key off the host — the next start no longer
+finds it (lot 379, [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+
 Run `nn-admin` with `sudo`: the agent's socket and the key are root's.
 Without `sudo`, a command that talks to the agent is refused with exit 17
 and "Run it with sudo"; that does not mean the agent is stopped. If
@@ -283,6 +291,7 @@ would have        : KillProcessTree x2
 |---|---|---|
 | `posture` | how alarmed the agent is (OBSERVING, ALERTED, ENGAGED, COMBAT) and the profile | the profile is not `alpha` on a fresh install |
 | `sensors` | `OK`, or `DEGRADED` with the number of degradations and of events lost | a degradation you cannot explain from [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) |
+| `advisories` | shown only when there is one: signed states of the host or your own choices that degrade no sensor (the admin key left on the host) | — |
 | `records today` | the records of the current UTC day, by severity | — |
 | `would have` | the responses the profile held back, by action | — |
 

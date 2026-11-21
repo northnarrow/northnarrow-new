@@ -11829,6 +11829,127 @@ number in parentheses is a lab PR.
         restart of either unit. `MemoryMax=32M` kept (14× that peak), the
         ratchet unchanged.
   Levels unchanged.
+- **Lot 380 — the rc11 soaks' last false positives: `newuidmap` reading
+  `login.defs`, `modprobe` as a user, routine `passwd` reads, containerd's
+  task bundles (C06, C14, C18; no level change).**
+  - What was open (Phase 5 on rc11; the posture Observing at every boot):
+    - ALERTED by `newuidmap` reading `/etc/login.defs` at each rootless
+      Podman burst (Debian 13 ×2, Ubuntu 24.04 ×2).
+    - ALERTED by `id` reading `/etc/passwd` in the bench's preparation
+      (Debian 13), its login uid read after it exited.
+    - ENGAGED by containerd's mass-write under `/run/containerd` (Ubuntu
+      26.04).
+    - `R011_KernelModuleTooling` High once for `modprobe overlay` as uid
+      1000 under `podman info` (Ubuntu 24.04), Low the other times.
+  - Done, each by identity:
+    - **`newuidmap`.** Lot 378's carve-out named the uidmap tools'
+      `/etc/passwd` lookup only; their `/etc/login.defs` read is judged the
+      same way (`runs_host_program`, `LOGIN_DEFS_HELPER_EXES`). Mini-hunt:
+      `newgrp` (gshadow, login.defs) not exempted — see the read-repeat
+      finding below.
+    - **`/etc/passwd`.** World-readable, read by every name lookup: a
+      packaged program's read-only open (the host's file in a root-only
+      directory, by the file the kernel executed; an exec not read yet by
+      its image at the open as the host's file of its name in a system
+      program directory: `host_program`) is no sensitive access unless the
+      program is a file tool, a shell or an interpreter — after the review
+      of #587 by the executed file's identity (`reads_files_it_is_told`:
+      a multi-call binary under any name, an alias, the loader by its
+      operand). The lab's round 2 found the
+      lineage lagging the open (`cat` in a unit judged as the unit's
+      executor, quiet): the image at the open must be the records' file,
+      else it decides for a fork or a cached root exec opening as a user.
+    - **R011.** The exec pump reads a gone tool's credentials from its
+      forker, as lot 373 reads the package manager from the parent: the
+      kernel's fork record (first exec since the fork, the parent it
+      names, the forker's start), the tool with no set-id bit or file
+      capability, every thread of the forker (`Credentials::of_forker`: no
+      uid 0, no capability in PID 1's namespace, or another namespace).
+      Low with the environment unread.
+    - **containerd.** `daemon-data.v1` gains `/run/containerd/`
+      (`containerd.service`) and `/run/docker/` (`docker.service`); the
+      earlier list's hash is known to the agent and `install.sh`. The
+      lab's first round (debian13) still crossed: an strace of containerd's
+      own process (ubuntu2604, containerd 2.2) showed its removal of a task
+      taking the bundle under `/run/containerd` and the container's
+      snapshot under `/var/lib/containerd` in one window; a unit's
+      directories now share the kernel's tag (`tagged_dirs`).
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §66 and the CHANGELOG.
+  - Mutation: 51 mutants of the final code in four rounds, 46 caught by a
+    named test (the survivors of each round got test cases), 5 argued
+    equivalent in the PR (a zero forker start, a file capability no
+    unprivileged test can set, the start and pidfd checks that bracket a
+    pid reused during the reads).
+  - Lab (as measured): alpha profile, each round under its lease, each
+    guest left uninstalled and powered off.
+    - **debian13 (6.12) and ubuntu2404 (6.8).** Name lookups (`id` in a
+      session ×200; `id`, `whoami`, `groups`, `ls -l`, `stat` in units run
+      as the user with no login uid), rootless Podman (`podman info` with
+      a fresh user namespace ×5, pull, run ×20), a user's `modprobe` ×5,
+      `sg` ×3: no transition; ubuntu2404's `podman info` `modprobe overlay`
+      as uid 1000 R011 Low. Three reboots each: Observing. `cat
+      /etc/login.defs` and `cat /etc/shadow` (the user in group `shadow`)
+      ALERTED, each first after a boot; a copy of `kmod` as root High
+      (would-kill), a user's `modprobe` with ambient `CAP_SYS_MODULE` High.
+      A Docker burst: containerd's crossing left out after the shared
+      tags (it crossed before them on debian13); dockerd's still ENGAGED
+      (`overlay2` init files through an overlay mount: not done).
+    - **The read-repeat filter (a finding).** One attack shape run in a
+      unit as the user raised nothing on both guests, before and after the
+      lagging-records fix; run so that the unit's own lookup was more than
+      a second earlier, it ALERTED (debian13). Behaviour: a file re-read by
+      the same process within a short interval after an exec may not
+      produce a second record (the file-open sensor's read-repeat filter
+      spans an exec). Keying it on the exec is planned for the first eBPF
+      lot after the alpha.
+  - **Fix round 1 (the review of #587).**
+    - **F1/F4: the reader judged by the file that runs.** The class of a
+      packaged reader of `/etc/passwd` is the executed file's by its
+      identity (`reads_files_it_is_told`): its own name, the same device
+      and inode as an installed tool's file in `/usr/bin`, `/bin` or uutils'
+      directory (a multi-call binary under any link and `argv[0]`, an
+      alias), the loader by its operand. Ratchet
+      `xtask/tests/reader_identity.rs`. On Ubuntu 26.04 uutils' `id`,
+      `whoami`, `ls` reading it without a login uid stay ALERTED.
+    - **POS-007.** At a service uid `/etc/shadow`, `/etc/gshadow` and
+      `/etc/sudoers` are quiet only for the authentication stack and Exim
+      by identity (`CREDENTIAL_CONSUMER_EXES`); the loader, uutils' links,
+      `getent shadow`, `wc` now fire.
+    - **F2.** R011's forker route: a forker of at most 32 threads, two
+      reads a second per forker and eight for all; past them not read
+      (never Low).
+    - Mutation: 31 mutants of the round's code, 28 caught by a named test
+      (five survivors of the first pass got test cases), 2 argued
+      equivalent (the operand's own checks repeated by its judgement), 1
+      redundant flag removed.
+    - Lab (as measured, alpha profile, under leases, guests uninstalled and
+      powered off):
+      - **ubuntu2604 (7.0; uutils, one file under 116 names).** Routine
+        readers: `ps` and `getent` in a session ×50 and with no login uid
+        ×3, `id` in a session ×100, rootless `podman info` ×5, a user's
+        `modprobe -n overlay` ×5 (R011 Low ×5): no transition. Each shape
+        first after its own boot, ALERTED (SensitiveFileAccess): uutils'
+        `id` link run with `argv[0]` `cat` (uutils ran `id`; a tool by its
+        file), the loader running `grep` (judged on the lagging records:
+        the shell's own exec with the loader's image), `nawk` (gawk),
+        `pager` (less), uutils' `wc`; as `daemon` in group `shadow`, on
+        `/etc/shadow`: the loader running `grep`, `getent shadow`, uutils'
+        `wc`. uutils itself refused the loader running its `cat` ("does not
+        match executable name").
+      - **ubuntu2404 (6.8; GNU coreutils).** The same routine readers plus
+        `id`, `whoami`, `groups`, `ls -l`, `stat` with no login uid: no
+        transition; `podman info`'s `modprobe overlay` as uid 1000 R011 Low
+        (podman 4.9, 11 threads). Each shape first after its own boot,
+        ALERTED: the loader running `cat` (the loader's own record, judged
+        by its operand), `nawk`, `pager`; as `daemon` in group `shadow`:
+        the loader running `grep` (the loader's record), `getent shadow`,
+        `wc`. Control: GNU `wc` reading `/etc/passwd` with no login uid, no
+        transition (a packaged program off the list, world-readable data).
+      - Heads: the routine readers and each guest's first shape on
+        `1c644146`, the other shapes on `82fef15a` (the reset of the posture
+        is refused to the lab's key, so each further shape needed a boot);
+        the final code differs by tests and one equivalent change (a
+        redundant flag of the operand's judgement).
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
   C18; no level change).**
@@ -11931,7 +12052,8 @@ number in parentheses is a lab PR.
         a memfd exec during a loop, R004 Critical; `/var/tmp` copies R003
         High and ENGAGED.
       - **debian13 (6.12, runc 1.1.15)**: rootless Podman ×10 spaced, ×30
-        back to back (about five a second), a loop of 30 with a memfd exec in
+        back to back (about two a second: 30 in 14 s; lot 379 corrected
+        "about five"), a loop of 30 with a memfd exec in
         it, `podman exec` ×2: 73 copies compared and kept, 0 not compared
         (the first head: 8 Criticals per 30), R004 0 under conmon/runc; the
         memfd exec R004 Critical.
@@ -14032,3 +14154,166 @@ number in parentheses is a lab PR.
     uninstall exit 1, and the cold boot after it found the units never
     enabled.
   Levels unchanged.
+- **Lot 379 — the status tells every signed integrity finding (pre-alpha
+  Phase 7, F7-1; Phase 3-bis, F3b-6's class); the mount guard's verifier
+  refusal proven a signed degradation (F8b-1 / F7-2); the final docs pass
+  (`UPGRADE_NOTES_WAVE4.md` §65; no level change).**
+  - What was open: Phase 7 found `sensors: OK — no degradation`,
+    `degradations: none` and trust L2 unchanged in `nn-admin status` after
+    the agent had signed a cut chain (`chain_truncated`, `chain_rewritten`,
+    `chain_verify_failed`), an unauthorized overlay and a modified default
+    list; `chain verify` said rc 8 and the journal ERROR. And the proof that
+    a verifier's refusal of a mount-guard program is a signed degradation
+    could not run (the lab's BTF swap was stopped by the BTF provenance
+    check first).
+  - Structural: the audit log keeps the findings that hold, from its own
+    rows (`nn_evidence::held`: at each append and at each open — a restart
+    reads them again) and tells its host at each change
+    (`ChainHost::integrity_held`); the agent's host makes them `integrity:`
+    degradations (`boot::degradation::hold`), so the status, the trust
+    level, the capability manifest and the heartbeat say them. One table
+    classifies the kinds: the evidence's (held until a signed
+    acknowledgement covers their row), the degradations shown already (not
+    held twice), and every other kind — a new one included — held while
+    found (its check's `integrity_drift_cleared`, or the next start's
+    check). A row that ends a hold counts only when its signature verifies
+    with the log's key.
+  - Phase 7b's F7-6 (the coordinator's addition): `nn-admin status` had
+    nothing after the agent's crash, its OOM or the watchdog's death,
+    signed all the same. The deaths of the two roles (`witness_row`,
+    `watchdog_gone`, `witness_row_uncertified`, both roles vacated, a
+    successor not confirmed or foreign) are held until acknowledged, like
+    the evidence (`nn_evidence::held::DEATH_KINDS`, tied to the witness's
+    and the round's own kinds by
+    `the_held_deaths_are_the_witness_s_and_the_round_s_kinds`); a worker's
+    death stays a degradation of the run
+    (`a_worker_s_death_is_reported_for_the_status`).
+  - New signed verb: `nn-admin integrity acknowledge --through <row>`
+    (operation 27, `triage` or `config-manage`, 1-of-N); its audit row is
+    the acknowledgement; a row not signed yet is refused.
+  - F8b-1: `NN_TEST_VERIFIER_REFUSE`, read only with nn-linux's
+    `test-privileged` (the release graph's and release.yml's checks keep it
+    out of every release; a weakening variable in a test build), refuses a
+    guard program at its load as the verifier would. The privileged suite
+    `integrity_status_privileged_e2e` (the CI's KVM guests, `test-ignored`)
+    checks the agent runs, the signed `subsystem_degraded` row (verified
+    with the agent's key), `nn-admin capabilities` and `nn-admin status`.
+    The product's behaviour needed no fix.
+  - Docs: the README's and KNOWN_LIMITATIONS' resource figures from Phase 6
+    (lab, QEMU guests), the per-operation exec/open latency said not
+    measured; KL's verifier paragraph rewritten as tested behaviour
+    (`mount_guard_sb_mount` 830,908 instructions on 5.15 at rc10: 83.1 % of
+    the kernel's limit); the rootless burst's figures corrected (about 54
+    starts at 4/s by the budget's model; lot 378's lab ran about 2/s, not
+    5); the long lines of rev581 and rev584 rewrapped. `MemoryMax` not
+    changed (after Phase 6b).
+  - Mutation: 47 mutants of the new code run on the host, 47 caught by a
+    named test; one more (the injection's call removed) is caught by the
+    privileged suite only.
+  - Lab, as measured (our QEMU guests, one at a time under a lease; the
+    tree verified by hash; the operator's install, `alpha`; Phase 7's cases
+    each written in a signed window, the agent restarted the documented
+    way; each guest uninstalled and powered off):
+    - ubuntu2204 (5.15), debian13 (6.12, systemd 257), ubuntu2604 (7.0):
+      a fresh install held `admin_key_on_host` (the install's key left on
+      the host); an unsigned `process-comm-allowlist.local` held
+      `unauthorized_overlay` (and the round's `config_overlay`) across a
+      restart, gone at the start after its removal; `fim-paths.v1` with
+      2,000 random bytes appended held `default_list_modified` (listed by
+      `nn-admin capabilities`), gone at the start after its restore; three
+      lines cut from the middle of `detections.jsonl` held
+      `chain_truncated`, `chain_rewritten` and `chain_verify_failed` across
+      a restart (`chain verify` rc 8); an acknowledgement through 99999999
+      refused (exit 9).
+    - debian13 and ubuntu2604: the acknowledgement through the newest held
+      row (135, 132) exit 0, "4 … acknowledged", its row `success` with the
+      key's fingerprint, `sensors: OK`, `chain verify` still rc 8; the next
+      start signed `chain_verify_failed` again and it was held again. (On
+      ubuntu2204 the probe did not parse the row; not exercised there.)
+    - Documented restarts about 25 s apart also signed
+      `witness_row_uncertified` (a watchdog life whose key the agent had not
+      certified yet), held until the next start.
+    - `integrity_status_privileged_e2e` in a test build: the verifier
+      refusal test passed on ubuntu2204, debian13 and ubuntu2604; the
+      overlay test failed on the first two, run after `uninstall.sh
+      --purge` (the second agent's start refused by the `agent_mounts`
+      gate: the first agent's pins protected a `/etc/northnarrow` it had
+      created anew), and passed on ubuntu2604 run as `test-ignored` runs
+      the suites (the install kept, its units stopped, the pins purged): 2
+      passed.
+    - F7-6, debian12 (6.1, systemd 252): the agent killed (SIGKILL in a
+      signed window) came back in seconds and held `witness_row` ("role
+      vacated: signal 9"); the watchdog killed the same way held
+      `watchdog_gone` (`NRestarts=1`); both still held after a documented
+      restart; the acknowledgement through row 46 ended them, `sensors:
+      OK`.
+  - Fix round 1 (the review of #586):
+    - P2-1: every `integrity_drift` kind the product signs is in one table
+      of `nn_evidence::held` — evidence, death, attack-class event,
+      degradation, advisory, not held — and `xtask/tests/integrity_kinds.rs`
+      reads the production code's kind positions (literals, constants,
+      `ChainFinding::new`, the named producers) and fails on a kind in
+      none. Advisories (`admin_key_on_host`, `sysctl_strict`,
+      `sysctl_opted_out`, `agent_stalled`, `quarantine_index_rebuilt`) are
+      kept as degradations are and listed apart (`boot::degradation::advise`,
+      the status reply's `advisories`, protocol version 5): never in
+      `sensors`, the trust level or the manifest. Twins: a harmful host
+      drop-in not held twice; an overlay refused at the start and found by
+      the round, one line naming both rows.
+    - P2-2: a witness row of a key not certified yet waits, at most 4
+      rounds, while the watchdog it names publishes that key (its sealed
+      memory file); a key no live watchdog vouches for is imported by the
+      row's declared kind (`witness_note_uncertified`, a degradation while
+      found, for a bookkeeping row).
+    - P3: attack-class events held until acknowledged across a reboot; the
+      acknowledgement's row written by its handler (not written: nothing
+      acknowledged); an evidence finding past the cap listed before
+      while-found ones; a held line's kind and chain cut; `--build-features`
+      names every test-only feature of the linked crates.
+    - Docs, Phase 6b (rc11; QEMU under Windows (WHPX), Ubuntu 24.04, kernel
+      6.8, 2 vCPU, three complete runs, A/A at most 7 %; lower bounds, the
+      agent-off reference still ran three of its LSM programs): open + read
+      + close +55…+64 %, about +2.1–2.2 µs; fork + exec + wait +9…+16 %,
+      about +0.08 ms. The older `open` +41 % removed from the README and
+      KNOWN_LIMITATIONS; `git status` +24 % kept with its source (lot 273b,
+      PERF_BASELINE).
+    - Mutation: 33 mutants of this round's rules, all caught by a named
+      test (four survivors of the first run — the advisories past the cap
+      and a counted finding's rows — got their tests; one mutant redone
+      after a compile error).
+    - Lab, as measured (ubuntu2204, 5.15, and debian13, 6.12 with systemd
+      257, at the same time under two leases; the tree verified by hash; the
+      operator's install, `alpha`; each guest uninstalled with `--purge` and
+      powered off), the same on both:
+      - the fresh install: `sensors: OK — no degradation, no event lost`,
+        `advisories : 1` listing `admin_key_on_host` with its row;
+      - ten documented restarts (both units stopped in a signed window, the
+        pins purged, the agent started, the watchdog 3 s later, 75 s
+        between): 10 `witness_key_certified` and 10 `witness_note`, no
+        `witness_row_uncertified` nor `witness_note_uncertified`, no witness
+        line held, `sensors: OK` after each;
+      - `install.sh --source-tree --upgrade`: "UPGRADE complete", no
+        rollback; one key certified, one note, nothing held, `sensors: OK`;
+      - three lines cut from `detections.jsonl` (`chain verify` rc 8):
+        `sensors: DEGRADED — 3 degradation(s)` (`chain_truncated`,
+        `chain_rewritten`, `chain_verify_failed`), the same after a
+        documented restart; an acknowledgement through 99999999 refused
+        (exit 9); through the newest held row (241, 243) exit 0, "3 …
+        acknowledged; 1 still held" (the advisory, signed after it), its row
+        `success` with the key's fingerprint, then `sensors: OK`; the next
+        start signed `chain_verify_failed` again (the chain still broken)
+        and it was held again.
+  - Fix round 2 (the KVM suites of #586, failing since fix round 1; the
+    merge of lot 380): `the_watchdog_signs_the_agent_s_vacancy_and_its_successor`
+    waited 70 s for the import of its watchdog's rows. That watchdog (the
+    test's, not its unit's restart) is never registered and publishes its
+    key: since P2-2 its rows wait the 4 rounds, then are imported by their
+    declared kind — about 120 s after the agent's start, none lost. The
+    test polls for that window (`UNCERTIFIED_WAIT_ROUNDS` and the agent's
+    round, now in `nn_proto::witness`, which the agent's round uses) plus
+    two rounds, and asserts more: all four rows as
+    `witness_row_uncertified`, the watchdog's first row as
+    `witness_note_uncertified`, no certified `witness_note`. Three test
+    messages that printed an admin reply whole (CodeQL
+    rust/cleartext-logging) are fixed messages now.
+

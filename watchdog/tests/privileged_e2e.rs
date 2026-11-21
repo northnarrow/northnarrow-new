@@ -1415,10 +1415,22 @@ fn heads(records: &[&String]) -> Vec<String> {
 /// agent's watchdog refresh judged the watchdog at its first round, a few
 /// ms before the start handed it the audit log. It has the log from its
 /// spawn now (the agent's `the_watchdog_refresh_signs_from_its_first_round`).
+///
+/// Fix round 2 of #586 (its KVM suites): the review of #586 (P2-2) has a row
+/// of a key not certified yet wait while the watchdog that signed it still
+/// runs and publishes that key — at most `UNCERTIFIED_WAIT_ROUNDS` rounds of
+/// the agent, then it is imported by its declared kind. This test's
+/// watchdog publishes its key and is never registered: its rows reach the
+/// audit log at the agent's round after the last wait, not at its first —
+/// waited for that long, with a margin. Every row it signed is imported as
+/// its claim alone: the vacancies and the successors `witness_row_uncertified`,
+/// its life's first row (bookkeeping) `witness_note_uncertified` — never a
+/// certified `witness_row` or `witness_note`.
 #[test]
 fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     use nn_proto::witness::{
-        judge_chain, Judged, CHAIN_FILE, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
+        judge_chain, Judged, AGENT_ROUND_SECS, CHAIN_FILE, KIND_OPENED, KIND_SUCCESSOR_FOREIGN,
+        KIND_VACATED, UNCERTIFIED_WAIT_ROUNDS,
     };
     let mut fx = E2eFixture::setup();
     let pid0 = fx.spawn_agent();
@@ -1491,25 +1503,46 @@ fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     let v1 = find(KIND_VACATED, &wanted[2].1);
     assert!(v1.detail.contains("signal 9"), "the wait's cause");
     find(KIND_SUCCESSOR_FOREIGN, &wanted[3].1);
-    // imported by the agent into its signed audit log — the kinds whole
+    // imported by the agent into its signed audit log — the kinds whole,
+    // the row's declared kind and what it names
     let kind = |k: &str| format!("\"kind\":\"{k}\"");
-    let needle = &wanted[2].1;
-    // the agent's round every 30 s, its first before its audit log is open
-    let deadline = Instant::now() + Duration::from_secs(70);
+    let imported = |audit: &str, as_kind: &str, declared: &str, needle: &str| {
+        let declared = format!(": {declared}: ");
+        audit
+            .lines()
+            .any(|l| l.contains(&kind(as_kind)) && l.contains(&declared) && l.contains(needle))
+    };
+    // Fix round 2 of #586: the rows wait `UNCERTIFIED_WAIT_ROUNDS` rounds of
+    // the agent (its first at its start, about when the successor's row is
+    // signed) for a certification that never comes, and are imported at the
+    // next one: `UNCERTIFIED_WAIT_ROUNDS` rounds after the first. Polled up
+    // to two rounds more (a margin for a slow guest)
+    let window = Duration::from_secs(AGENT_ROUND_SECS * (u64::from(UNCERTIFIED_WAIT_ROUNDS) + 2));
+    let deadline = Instant::now() + window;
     let audit = loop {
         let audit = read(&fx.state().audit_log());
-        if audit
-            .lines()
-            .any(|l| l.contains(&kind("witness_row_uncertified")) && l.contains(needle.as_str()))
+        if wanted
+            .iter()
+            .all(|(k, n)| imported(&audit, "witness_row_uncertified", k, n))
         {
             break audit;
         }
         assert!(
             Instant::now() < deadline,
-            "the witness rows never reached the audit log"
+            "the witness rows never reached the audit log as witness_row_uncertified \
+             (waited {window:?})"
         );
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_secs(1));
     };
+    assert!(
+        imported(
+            &audit,
+            "witness_note_uncertified",
+            KIND_OPENED,
+            &format!("watchdog {wd_pid} at ")
+        ),
+        "the test's watchdog's first row (bookkeeping) not imported as its claim alone"
+    );
     let judged = format!("taken by pid {wd_pid}: NOT its unit's restart");
     assert!(
         audit
@@ -1524,6 +1557,10 @@ fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     assert!(
         !audit.contains(&kind("witness_row")),
         "a row signed by a key the agent never certified was imported as certified"
+    );
+    assert!(
+        !audit.contains(&kind("witness_note")),
+        "a bookkeeping row signed by a key the agent never certified was imported as certified"
     );
 }
 

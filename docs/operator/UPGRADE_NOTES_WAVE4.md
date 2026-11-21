@@ -4953,7 +4953,10 @@ still fires.
   `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
   `openntpd.service`), started there and never injected (the kernel's lot
   277 and 281 marks).
-  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named).
+  - Still a beacon: any other program to UDP 123, and systemd-timesyncd
+    to another port or over TCP, from a session, traced or injected.
+    chronyd and ntpd also keep their netflow allowlist entry, which is
+    broader than this exemption (a residual, named).
 - **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
@@ -5566,6 +5569,312 @@ shape it resembles still fires.
   no R004 at a rootless Podman run, a loop of a few dozen included; and at
   a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
   guard lost.
+
+## 65. The status shows every signed integrity finding; a verifier's refusal of the mount guard, tested (lot 379)
+
+- **What changed.** `nn-admin status --key` said `sensors: OK — no
+  degradation` after the agent had detected and signed a cut or rewritten
+  chain (`chain_truncated`, `chain_verify_failed`), an unauthorized overlay
+  or a modified default list: only the journal's ERROR and `nn-admin chain
+  verify` told (pre-alpha Phase 7, F7-1; the same class as Phase 3-bis
+  F3b-6). Every signed integrity finding is now an `integrity:`
+  degradation — its kind, what it is about, the time and audit row of its
+  signed row — until its hold ends:
+  - a finding of the evidence (a chain cut, rewritten, missing or
+    unverifiable; the witness chain broken; `agent_id_changed`; the
+    overlays' rollback floor reset): until an acknowledgement covers it;
+  - a death of the agent's or the watchdog's role (a crash, a kill, an
+    OOM: the witness's `witness_row`, `watchdog_gone`,
+    `witness_row_uncertified`; pre-alpha Phase 7b, F7-6): until an
+    acknowledgement covers it — the restart it caused is no clean state;
+  - an attack-class event of the run (a shutdown marker the watchdog
+    refused, the admin socket removed or reached by a refused peer): until
+    an acknowledgement covers it — a start, a host reboot included, does
+    not undo it;
+  - a degradation (an unauthorized overlay, a modified or unavailable
+    default list, the integrity round's drifts): while it is found — until
+    its check signs its end or the next start checks again —, or until
+    acknowledged.
+  Every kind the agent signs is in exactly one class
+  (`nn_evidence::held`; a test fails on a new kind with none). A state of
+  the host or a choice of the operator that degrades no sensor — the admin
+  key left on the host (`admin_key_on_host`), strict overcommit
+  (`sysctl_strict`), the operator's signed sysctl opt-out
+  (`sysctl_opted_out`), a pause of the whole machine (`agent_stalled`), the
+  quarantine's index rebuilt — is an **advisory**: `status` lists it on its
+  own (`advisories`, with its signed row), never in `sensors`, the trust
+  level or the capability manifest. One fact is one line: an overlay the
+  start refused and the round found again is one line naming both rows; a
+  harmful host drop-in is the `host_dropins` degradation's.
+  The audit log keeps the holds from its own rows, so a restart keeps them;
+  a row that ends one counts only when its signature verifies.
+  ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds).)
+- **New command.** `nn-admin integrity acknowledge --through <row> [--note
+  <text>] --key <key>`, a key with `triage` or `config-manage` (the key
+  `install.sh` writes has `config-manage`). The agent signs the
+  acknowledgement (`integrity_acknowledged`); the findings whose newest row
+  is at or before `<row>` leave the status. A row not signed yet is refused
+  (exit 9). `nn-admin status --key` prints the command with the newest held
+  row. An agent older than this lot does not know the command (exit 5).
+- **The mount guard's verifier refusal, tested.** A mount-guard program the
+  kernel's verifier refuses at its load was argued, from the code, to be a
+  signed degradation. It is now tested on a real agent: a test build
+  (feature `test-privileged`, never a release) refuses
+  `mount_guard_sb_mount` at its load; the agent runs with the guard's other
+  four hooks, and the signed row (`subsystem_degraded`, source
+  `anti_tamper`), `nn-admin capabilities` and `nn-admin status` say it.
+  No behaviour changed: the test proves what the release does.
+- **The witness after a restart of both units.** The new watchdog's first
+  witness row (`witness_opened`) can be read by the agent before it has
+  verified that watchdog (`install.sh`'s upgrade and the documented restart
+  stop both units, start the agent, then the watchdog): it was signed
+  `witness_row_uncertified`, held as a death, in 7 of 12 such restarts in
+  the lab. A row signed by a key not certified yet now waits — at most four
+  rounds of 30 s — while the watchdog it names still runs and publishes
+  that very key; the agent certifies the key at its next round and the row
+  is a note. A key no live watchdog vouches for is imported by the row's
+  declared kind: a vacancy or a successor as `witness_row_uncertified`
+  (held until acknowledged), a bookkeeping row as
+  `witness_note_uncertified` (a degradation while found).
+- **`integrity acknowledge`.** The acknowledgement is its signed row, now
+  written by the handler under the lock it judged under: a row that could
+  not be written acknowledges nothing (exit 9, the reason printed), and the
+  counts are the log's.
+- **`--build-features`.** It names every test-only feature of the crates
+  the agent links (for instance `nn-linux/test-privileged`), not only
+  their `test-util`: a release built with one is refused by the release's
+  check, as before for the agent's own features.
+- **Protocol.** The status reply gains `advisories` (protocol version 5):
+  upgrade the agent with `nn-admin` and the watchdog, as for every
+  appended status field.
+- **Upgrade.** No configuration. Expect `sensors: DEGRADED` and the trust
+  level at most L2 on a host where the agent had signed such findings,
+  until each ends by its rule: read them (`nn-admin status --key`),
+  investigate, then acknowledge the evidence's. The install's admin key
+  left at `/root/northnarrow-admin.key` is an advisory (`advisories` in
+  `status`, shown while it is there): move it off the host. An agent installed with
+  test lists or overlays of its own (the lab's escape hatch,
+  `NN_OVERLAY_ALLOW_UNSIGNED=1`) holds each of them as
+  `unauthorized_overlay` or `default_list_modified` for the run.
+- **Docs.** README and KNOWN_LIMITATIONS: the lab's resource figures (QEMU
+  guests: RSS, CPU at rest, event-to-record latency, the cost on real
+  work), and the per-operation cost of this release (Phase 6b, rc11, QEMU
+  under Windows, Ubuntu 24.04, kernel 6.8, 2 vCPU, lower bounds: an
+  `open` about +2.1–2.2 µs, a `fork` + `exec` about +0.08 ms; the older
+  `open` +41 % figure removed); the rootless runtime burst's figures corrected
+  (about fifty-four starts at four a second by the budget's model; the lab
+  ran about two a second).
+
+## 66. The rc11 soak's last false positives: `newuidmap` reading `login.defs`, `modprobe` as a user, routine `passwd` reads, containerd's task bundles (lot 380)
+
+The rc11 soaks (Debian 13, Ubuntu 24.04, Ubuntu 26.04) kept the posture
+Observing at every boot; four shapes raised it while the bench ran. Each is
+judged by identity now — the file the kernel executed, the kernel's fork
+record, the set-id fact, the unit — and each attack shape it resembles still
+fires.
+
+- **`newuidmap` reading `/etc/login.defs`** (ALERTED at each rootless Podman
+  burst, Debian 13 and Ubuntu 24.04). shadow's setuid uidmap tools read
+  shadow's settings as their caller while they map rootless Podman's user
+  namespace; lot 378's carve-out named only their `/etc/passwd` lookup.
+  - The packaged `newuidmap`/`newgidmap` reading `/etc/login.defs`
+    read-only is no sensitive access: the host's file in a root-only
+    directory, by the file the kernel executed (the cached exec; a fork's
+    forker by the kernel's record; else, its exec not read yet, its image
+    at the open), as lot 378 judges their `/etc/passwd` lookup.
+  - The lot's search for variants found `newgrp` (`newgrp docker` after a
+    group change): shadow's setuid tool reads `/etc/gshadow` and
+    `/etc/login.defs` as its caller, and still raises ALERTED. It is not
+    exempted: it then executes a command in its own process, and a file
+    re-read by the same process shortly after an exec may not produce a
+    second record (see the residuals) — what that command read would be
+    taken for `newgrp`'s own read.
+  - Still ALERTED: `cat /etc/login.defs`; a /tmp copy of a uidmap tool,
+    whatever image it names; a copy not read yet; `fusermount3` reading
+    it; a uidmap tool opening it for write or reading `/etc/shadow`.
+- **Routine `/etc/passwd` reads** (ALERTED in the bench's preparation,
+  Debian 13). `id`, uid 1000, looked up a name in an SSH session; BUG-018's
+  login uid was read after `id` had exited.
+  - `/etc/passwd` is world-readable and holds no secret (the hashes are in
+    `/etc/shadow`); every name lookup opens it. A read-only open of it by
+    a packaged program — the host's file in a root-only directory, by the
+    file the kernel executed (as above; an exec not read yet by its image
+    at the open, as the host's file of its name in `/usr/bin`,
+    `/usr/sbin`, `/bin` or `/sbin`) — is no sensitive access, unless the
+    program reads the files it is told to: a generic file tool, a shell or
+    an interpreter — the text tools a user lists accounts with (`cut`,
+    `sort`, `uniq`, `diff`, `shuf`, `iconv`, `jq`, …), the pagers and
+    editors, the copiers (`rsync`, `scp`, `install`), the compressors and
+    encoders, the network clients, and every shell and interpreter the
+    rules know (`pypy3`, `luajit`, `deno`, `pwsh` included).
+  - **What runs decides, not its name** (the review of this lot). The class
+    is that of the FILE the kernel executed, by its identity (its device
+    and inode): a file that is one of those tools' installed files — in
+    `/usr/bin`, `/bin` or uutils' `/usr/lib/cargo/bin/coreutils`, each link
+    followed — is that tool, whatever name it ran by. So:
+    - a multi-call binary is a generic tool whatever `argv[0]` or the link
+      it ran through says: uutils (Ubuntu 26.04's coreutils, one file under
+      every utility's name), busybox, toybox, a single-binary GNU
+      coreutils. On Ubuntu 26.04 `id`, `whoami`, `groups`, `ls` and `stat`
+      are uutils' file too: their read of `/etc/passwd` without a login uid
+      is ALERTED there, as before this lot (the rule holds for them on
+      Debian 13 and Ubuntu 24.04, whose coreutils are one file per tool);
+    - an alias is the tool it resolves to (`nawk` → `mawk`, `pager` →
+      `less`, `editor` → `nano`), also when the image at the open decides;
+    - the dynamic loader (`ld-linux-x86-64.so.2`, by its name or by the
+      identity of its installed file) is judged by its operand, as the
+      rules read a loader's exec: the host's packaged program at an
+      absolute path in a root-only directory, judged in turn; any other
+      operand (a relative path, a file elsewhere, the loader again, none)
+      is a tool.
+  - **The records may lag the open.** The exec pump reads an exec's facts
+    before the exec reaches the lineage, so at the open of a short-lived
+    program the lineage may still hold its fork's record (the shell that
+    forked it) or, for a unit's program, the unit's executor (run as root).
+    The lab measured it: `cat /etc/passwd` in a unit run as the user was
+    judged as `systemd-executor` and raised nothing. The image at the open
+    (`mm->exe_file`) must now be the file the records hold; when it is
+    not, the image decides, as for an exec not read yet, for a fork (it
+    executed since its record) and for a cached exec run as root by a
+    process that opens as a user (a unit's executor). An exec of its own as
+    the user with another image at the open (`PR_SET_MM`) is not vouched
+    for. Lot 378's helpers are judged the same strict way: another image
+    than the records' file is never their read.
+  - Lot 376's and 378's carve-outs (a user's manager's program, the
+    uidmap and FUSE helpers, `(sd-pam)`) stay, for the readers this rule
+    does not vouch for.
+  - Still ALERTED without a login uid: `cat`, `cut`, `vim`, `python3`,
+    `bash` reading it, and a fork of a shell; uutils' file under any name,
+    the loader running `cat`, `nawk`, `pager`; a copy of `id` in /tmp or a
+    home, a program of a home; a copy not read yet, no image read; a /tmp
+    exec naming `id`'s image; a packaged program opening it for write.
+    `/etc/shadow`, `/etc/gshadow` and `/etc/sudoers` stay sensitive for
+    every reader but the authentication stack (at a service uid, also
+    their packaged consumers: below), `/etc/login.defs` for every reader
+    but those named above.
+- **A service account's read of `/etc/shadow`, `/etc/gshadow` or
+  `/etc/sudoers`** (external audit POS-007; the review of this lot). It was
+  quiet for any program in a system tree but a list of tools judged by
+  their names — the loader running `cat`, or uutils' `id` link run as
+  `cat`, read as packaged programs. Now only the authentication stack and
+  the files' packaged consumers are quiet — Exim (`/usr/sbin/exim4`,
+  `/usr/sbin/exim`), whose account the `shadow` group may hold for SMTP
+  authentication — by the file the kernel executed (the cached exec, a
+  fork's forker by the kernel's record, else the image at the open). Every
+  other reader at a service uid raises ALERTED: a tool under any name, a
+  packaged program that is no consumer (`getent shadow`), a copy of a
+  consumer, a consumer's exec with no identity, a consumer replaced by an
+  upgrade and not restarted yet (its file is no longer the host's: restart
+  it), a consumer's fork that executed a tool.
+  - **Upgrade.** A daemon whose service account reads the shadow file and
+    is not one of those (another mail server's authentication, a custom
+    service in the `shadow` group) now raises ALERTED at each read; such a
+    daemon is rare (a service account cannot read the file unless the
+    `shadow` group is given to it).
+- **`R011_KernelModuleTooling` High for `modprobe overlay` as uid 1000
+  under `podman info`** (once on Ubuntu 24.04; Low the other times). The
+  process had exited before the exec pump read its environment and its
+  credentials, which lot 369's "it cannot load a module" needs.
+  - As lot 373 reads the package manager from the parent, the pump now
+    reads the credentials from the process that forked the tool, when
+    every fact holds: the kernel's record says the exec is the first since
+    that fork, by the parent it names; the file executed is the system's
+    module tool, with no set-id bit and no file capability; every thread
+    of the forker is read while a pidfd holds it, its start the one the
+    kernel read at the fork, before and after the reads.
+  - A fork starts with its forker's credentials and, before an exec, can
+    only keep or drop them or move into a new user namespace; the tool's
+    exec grants none. When no thread of the forker holds a uid 0 and each
+    holds no capability at all in PID 1's user namespace (or is in another
+    one: rootless Podman), the tool cannot load a module, and R011 records
+    it Low, its environment unread — an environment changes nothing the
+    kernel lets such a process do.
+  - Still High: a forker with a uid 0, with any capability in PID 1's
+    namespace (`CAP_SETUID` would give its fork a uid 0; `CAP_SYS_MODULE`
+    as an ambient capability), a thread whose namespace was not read, one
+    privileged thread among others; the forker gone, reparented, or
+    another process at its pid; an exec that is not its process's first
+    since its fork; a tool that is not the system's, or one with a set-uid
+    bit. Root's exec gone before the read stays Medium; every kill stays a
+    kill.
+  - **Bounded** (the review of this lot): the exec pump reads one exec
+    after another, so the forker route costs it at most a forker of 32
+    threads, read at most twice a second for one forker (its pid and
+    start) and eight times a second for all. Past a bound the forker is not
+    read: its credentials are not compared, and R011 judges the exec as
+    when they are not known — High for a user's, never Low.
+- **containerd's mass-write ENGAGED** (Ubuntu 26.04, a container burst).
+  containerd, from its unit, writes and removes each task's bundle under
+  `/run/containerd` (the bundle's `config.json`, the shim's address and
+  pid files, runc's log) as containers start and stop: new files beside
+  originals destroyed, the replacement shape.
+  - The shipped `daemon-data.v1` names `/run/containerd/` for
+    `containerd.service`, and (the variant) `/run/docker/` for
+    `docker.service`.
+  - The lab found that alone not enough: containerd's removal of a task
+    mixes the bundle under `/run/containerd` and the container's snapshot
+    under `/var/lib/containerd` (containerd 2.2 on Ubuntu 26.04, Docker
+    29's image store) in one window, and the kernel's summary named one
+    directory's tag. The directories of one set of units now share the
+    kernel's tag (`DaemonData::tagged_dirs`: the index of the set's first
+    directory), so a window across a unit's own directories is its own
+    data; directories of another set keep their tags.
+  - A replacement whose two halves were the unit's own data there — every
+    file of each window under that tag, the writer's cgroup the unit's —
+    crosses nothing.
+  - Still counted: the same burst from another unit, or from a cgroup
+    containerd made below its own (a container's payload); containerd's
+    burst in another daemon's directory; a window that left the directory.
+    The ransomware tracker reads every crossing, these included.
+- **Residuals.**
+  - **A file re-read shortly after an exec** (the lab of this lot; the
+    file-open sensor's read-repeat filter, review 75). A file re-read by
+    the same process within a short interval (about a second) after an
+    exec may not produce a second record: the read the process made before
+    the exec stands for both. It holds for every file the sensor reports
+    on a read-only open — `/etc/passwd`, `/etc/login.defs`, `/etc/shadow`,
+    `/etc/gshadow`, the credential files, and the files FIM watches for
+    opens — and for every exec that keeps its process (a unit's program
+    after its executor, a command a set-id tool executes in its own
+    place), as root or as a user. A write is always reported. It is an
+    eBPF change, planned for the first eBPF lot after the alpha.
+  - **A forker that gave up its privilege.** A forker that held a uid 0 or
+    a capability in PID 1's namespace at the fork and gave it up before
+    the pump read it (`setresuid`, `capset`, a new user namespace, its
+    privileged thread gone) is taken for one that never held it. Only a
+    process with root's power can do that, and a module its fork loads is
+    judged by R018 from the kernel's record of the load.
+  - **A module tool that is not its process's first exec.** A shell that
+    `exec`s `modprobe` in its own place is not read from its forker: when
+    it exited first, R011 judges it as before (High for a user).
+  - **dockerd's container setup in a burst (a known false positive).**
+    With Docker's own image store (`overlay2`), twenty or more containers
+    started and removed within a minute raise ENGAGED: the mass-write
+    arm's record names `dockerd` and a `mnt[…]/etc/hosts`-like path. dockerd
+    writes and removes each container's init files (`/etc/hosts`,
+    `/etc/hostname`, `/.dockerenv`, …) through the layer's overlay mount,
+    which the kernel's classification does not place under
+    `/var/lib/docker`. In the observe-only profile it is a posture change
+    only. The soak's load did not reach it; a CI host running Docker
+    builds may (an eBPF change, a later lot).
+  - **A fork that changes its image.** A fork whose image at the open is
+    another packaged program's (`PR_SET_MM` with capabilities in a user
+    namespace of its own) reads `/etc/passwd` as that program: nothing
+    `getent passwd` does not already list without a sensitive access.
+  - **Packaged readers off the list.** A packaged program that reads a file
+    it is told to and is not on the list (`sqlite3 /etc/passwd`, `getent
+    passwd`, which lists the file through the name service as every lookup
+    does) reads `/etc/passwd` without a sensitive access: world-readable
+    data. The list is best effort; at a service uid the shadow file is
+    judged the other way round (an allowlist of consumers, above).
+- **Upgrade.** `install.sh` replaces the `daemon-data.v1` the earlier
+  release shipped (its hash is now known to the installer and the agent);
+  an edited copy is kept as before. No configuration. Expect no ALERTED
+  from a rootless Podman burst or from a name lookup without a login uid
+  (on Ubuntu 26.04 a uutils utility's still raises it), R011 Low for a
+  user's `modprobe` under Podman, and no ENGAGED from containerd's task
+  bundles. A service account other than Exim's reading the shadow file
+  now raises ALERTED.
 
 ## 67. A rootful runc copy compared, never Critical by a race; memory limits from the lab's measure (lot 381)
 
