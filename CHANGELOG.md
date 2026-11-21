@@ -29,7 +29,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `MemoryHigh=768M` and `MemoryMax=1G` (9G and 11G before, sized for the
     LLM advisor removed in Wave 4), the watchdog's `MemoryMax=32M` (64M):
     the agent's cgroup peaked at 316 MiB at a cold start and at most
-    264 MiB under the storms, the watchdog's RSS is about 5 MiB. Test
+    264 MiB under the storms (344 MiB in this lot's lab after 400
+    container starts and a 2,500 fork/s storm), the watchdog's RSS is
+    about 5 MiB. Test
     `the_memory_limits_are_sized_from_the_measured_peaks` (a ratchet: a new
     size comes with a new measure).
 - Lot 378 (the rc10 soaks): three false positives judged by identity

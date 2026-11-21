@@ -238,9 +238,11 @@ RuntimeDirectoryPreserve=yes
 #     vCPU, Ubuntu 24.04 and Debian 13): the agent's cgroup peaked at
 #     316 MiB at a cold start (about 165 MiB of it kernel memory, the BPF
 #     maps), at most 264 MiB under a 2,600 exec/s storm, a full FIM set and
-#     200 container starts; about 200 MiB at rest. MemoryMax=1G is 3.2
-#     times the peak: a cap near it would fail the maps' load at a start,
-#     not just a malloc. MemoryHigh=768M throttles only well above every
+#     200 container starts; about 200 MiB at rest. Lot 381's own lab
+#     (Debian 13, 4 vCPU) saw 344 MiB, the highest yet, after 400 container
+#     starts and a 2,500 fork/s storm. MemoryMax=1G is about three times
+#     that: a cap near it would fail the maps' load at a start, not just a
+#     malloc. MemoryHigh=768M throttles only well above every
 #     measured load (above it the kernel reclaims and stalls the agent,
 #     which would then lose events). Not measured: hosts of 16 or more
 #     CPUs (the per-CPU rings) and larger FIM sets — re-checked in the

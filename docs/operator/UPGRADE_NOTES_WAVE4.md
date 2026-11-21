@@ -5606,8 +5606,9 @@ shape it resembles still fires.
 - **The memory limits** (Phase 6b's measure on QEMU guests of 2 and 4
   vCPU, Ubuntu 24.04 and Debian 13): the agent's cgroup peaked at 316 MiB
   at a cold start (about 165 MiB of it the kernel's BPF maps) and at most
-  264 MiB under the storms; the watchdog's RSS is about 5 MiB, its cgroup
-  at most 2.2 MiB.
+  264 MiB under the storms; this lot's lab saw 344 MiB, the highest yet,
+  after 400 container starts and a 2,500 fork/s storm (no `memory.high`
+  event). The watchdog's RSS is about 5 MiB, its cgroup at most 2.2 MiB.
   - The agent's unit: `MemoryHigh=768M` and `MemoryMax=1G` (they were 9G
     and 11G, sized for the LLM advisor removed in Wave 4). The watchdog's:
     `MemoryMax=32M` (64M). `OOMPolicy=continue` and `OOMScoreAdjust=-999`

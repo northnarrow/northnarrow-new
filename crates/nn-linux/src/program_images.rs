@@ -1264,15 +1264,14 @@ const HOLDERS_MAX: usize = 64;
 fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
     // `Err(true)`: the link read, another file; `Err(false)`: not read
     let open = |pid: u32| -> Result<(std::fs::File, std::fs::Metadata), bool> {
-        let (link, id) = antitamper_bpf::kernel_roots::link_target(
-            &proc_root.join(pid.to_string()).join("exe"),
-        )
-        .map_err(|_| false)?;
+        let (link, id) =
+            antitamper_bpf::kernel_roots::link_target(&proc_root.join(pid.to_string()).join("exe"))
+                .map_err(|_| false)?;
         if (id.dev, id.ino) != exe {
             return Err(true);
         }
-        let file = antitamper_bpf::kernel_roots::reopen_fd(&link, libc::O_RDONLY)
-            .map_err(|_| false)?;
+        let file =
+            antitamper_bpf::kernel_roots::reopen_fd(&link, libc::O_RDONLY).map_err(|_| false)?;
         let m = file.metadata().map_err(|_| false)?;
         if kernel_id(&m) != exe {
             return Err(true);
@@ -1942,7 +1941,9 @@ mod tests {
         use nn_core::decision::rules::program_identity::runtime_clone_of;
         let t = tempfile::tempdir().unwrap();
         let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
-        let mut image: Vec<u8> = (0..((1u32 << 20) + 3810)).map(|i| (i % 233) as u8).collect();
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 3810))
+            .map(|i| (i % 233) as u8)
+            .collect();
         image[..4].copy_from_slice(b"g381");
         let runc = put(&root, "/usr/sbin/runc", &image);
         let shim = put(&root, "/usr/bin/conmon", b"conmon image, 381");
@@ -1988,7 +1989,9 @@ mod tests {
     fn every_sealed_memfd_exec_lands_in_exactly_one_runtime_counter() {
         let t = tempfile::tempdir().unwrap();
         let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
-        let mut image: Vec<u8> = (0..((1u32 << 20) + 3820)).map(|i| (i % 229) as u8).collect();
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 3820))
+            .map(|i| (i % 229) as u8)
+            .collect();
         image[..4].copy_from_slice(b"e381");
         let runc = put(&root, "/usr/sbin/runc", &image);
         let bash = put(&root, "/usr/bin/bash", b"bash image, 381 e");
@@ -2013,21 +2016,22 @@ mod tests {
         let mut n = 0u64;
         // `ran`: the file the exec ran (its identity in the event);
         // `running`: what its `/proc/<pid>/exe` names now (none: gone)
-        let mut run = |pid: u32, ppid: u32, ran: &std::fs::File, running: Option<&Path>, uid: u32| {
-            if let Some(to) = running {
-                proc.link(pid, to);
-            }
-            let e = as_uid(memfd_exec(pid, ppid, 381, ran), uid);
-            let before = checks.counts();
-            read_runtime_clone_with(&e, &proc.0, &root, &checks);
-            let after = checks.counts();
-            let moved = (after.compared - before.compared)
-                + (after.unverified - before.unverified)
-                + (after.gone - before.gone)
-                + (after.no_runtime - before.no_runtime);
-            assert_eq!(moved, 1, "pid {pid}: {before:?} → {after:?}");
-            n += 1;
-        };
+        let mut run =
+            |pid: u32, ppid: u32, ran: &std::fs::File, running: Option<&Path>, uid: u32| {
+                if let Some(to) = running {
+                    proc.link(pid, to);
+                }
+                let e = as_uid(memfd_exec(pid, ppid, 381, ran), uid);
+                let before = checks.counts();
+                read_runtime_clone_with(&e, &proc.0, &root, &checks);
+                let after = checks.counts();
+                let moved = (after.compared - before.compared)
+                    + (after.unverified - before.unverified)
+                    + (after.gone - before.gone)
+                    + (after.no_runtime - before.no_runtime);
+                assert_eq!(moved, 1, "pid {pid}: {before:?} → {after:?}");
+                n += 1;
+            };
         let fd = FakeProc::fd;
         run(38_201, 38_200, &clone, Some(&fd(&clone)), 0); // compared, kept
         run(38_202, 38_200, &patched, Some(&fd(&patched)), 0); // compared, not kept
@@ -2037,8 +2041,8 @@ mod tests {
         run(38_206, 38_290, &clone, Some(&fd(&clone)), 0); // under bash
         run(38_207, 38_200, &short, Some(&fd(&short)), 0); // no runtime's length
         run(38_208, 38_200, &unsealed, Some(&fd(&unsealed)), 0); // not sealed now
-        // the mini-hunt: its pid running another file now (executed again,
-        // or reused), and a zombie (its `/proc` entry, no `exe`)
+                                                                 // the mini-hunt: its pid running another file now (executed again,
+                                                                 // or reused), and a zombie (its `/proc` entry, no `exe`)
         run(38_210, 38_200, &clone, Some(&bash), 0);
         std::fs::create_dir_all(proc.0.join("38211")).unwrap();
         run(38_211, 38_200, &clone, None, 0);
@@ -2054,7 +2058,10 @@ mod tests {
         use nn_core::decision::rules::program_identity::runtime_clone_of;
         let at = |pid: u32| runtime_clone_of(&memfd_exec(pid, 38_200, 381, &clone));
         assert_eq!(at(38_210), None);
-        assert_eq!(at(38_211).map(|c| (c.unverified, c.gone)), Some((true, true)));
+        assert_eq!(
+            at(38_211).map(|c| (c.unverified, c.gone)),
+            Some((true, true))
+        );
         // not described by the LSM program (tracepoint mode): not read
         let mut tp = memfd_exec(38_209, 38_200, 381, &clone);
         if let Event::ProcessSpawn { exe, .. } = &mut tp {

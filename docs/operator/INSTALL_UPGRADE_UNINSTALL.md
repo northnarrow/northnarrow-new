@@ -932,8 +932,9 @@ The memory limits are absolute (`MemoryHigh=768M`, `MemoryMax=1G` for the
 agent, `MemoryMax=32M` for the watchdog: lot 381,
 [`UPGRADE_NOTES_WAVE4.md`](UPGRADE_NOTES_WAVE4.md) §67), sized from the
 lab's measure: the agent's cgroup peaked at 316 MiB at a cold start (about
-165 MiB of it the kernel's BPF maps) and at most 264 MiB under the storms;
-the watchdog's RSS is about 5 MiB. They were 9G and 11G, sized for the
+165 MiB of it the kernel's BPF maps), at most 264 MiB under the storms, and
+344 MiB after 400 container starts and a 2,500 fork/s storm (lot 381); the
+watchdog's RSS is about 5 MiB. They were 9G and 11G, sized for the
 model of the LLM advisor removed in Wave 4, and 64M. The agent and the
 watchdog run with `oom_score_adj` -999 on every host (lot 370), which the
 self-integrity check expects; on a host with no more memory than

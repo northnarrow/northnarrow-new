@@ -1142,7 +1142,9 @@ kernel.
   on QEMU guests of 2 and 4 vCPU: the agent's cgroup peaked at 316 MiB at a
   cold start, about 165 MiB of it the kernel's BPF maps, and at most
   264 MiB under the storms (thousands of execs a second, a full FIM set,
-  200 container starts); the watchdog's RSS is about 5 MiB. On hosts of
+  200 container starts); 344 MiB, the highest yet, in lot 381's lab after
+  400 container starts and a 2,500 fork/s storm, with no throttling event;
+  the watchdog's RSS is about 5 MiB. On hosts of
   16 or more CPUs (per-CPU rings) and with larger FIM sets the kernel
   memory was not measured: there the cap may be closer to the use than on
   the lab's guests. Above `MemoryHigh` the kernel slows the agent down,
