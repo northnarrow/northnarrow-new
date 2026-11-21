@@ -452,14 +452,16 @@ impl Held {
             .filter(|f| {
                 f.kind != "config_overlay" || !overlay_path(f).is_some_and(|p| refused.contains(&p))
             })
-            .map(|f| match twin(f).filter(|_| f.kind == "unauthorized_overlay") {
-                Some(g) => format!(
+            .map(
+                |f| match twin(f).filter(|_| f.kind == "unauthorized_overlay") {
+                    Some(g) => format!(
                     "{} — the integrity round signs the same file as config_overlay (audit row {})",
                     f.line(),
                     g.last_row
                 ),
-                None => f.line(),
-            })
+                    None => f.line(),
+                },
+            )
             .collect();
         if self.more() > 0 {
             out.push(format!(

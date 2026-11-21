@@ -1046,7 +1046,12 @@ mod tests {
         write_chain(
             dir.path(),
             &k,
-            &[KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED, KIND_RELEASED_IN_WINDOW],
+            &[
+                KIND_OPENED,
+                KIND_VACATED,
+                KIND_SUCCEEDED,
+                KIND_RELEASED_IN_WINDOW,
+            ],
         );
         let mut r = WitnessReader::new(dir.path());
         let (f, _) = r.pending_with(&no_watchdog);
@@ -1060,17 +1065,31 @@ mod tests {
                 WITNESS_NOTE_UNCERTIFIED
             ]
         );
-        assert_eq!(hold_of(WITNESS_UNCERTIFIED, "detected"), Hold::UntilAcknowledged);
-        assert_eq!(hold_of(WITNESS_NOTE_UNCERTIFIED, "detected"), Hold::WhileFound);
+        assert_eq!(
+            hold_of(WITNESS_UNCERTIFIED, "detected"),
+            Hold::UntilAcknowledged
+        );
+        assert_eq!(
+            hold_of(WITNESS_NOTE_UNCERTIFIED, "detected"),
+            Hold::WhileFound
+        );
         assert!(!is_note(WITNESS_NOTE_UNCERTIFIED), "an integrity_drift row");
         for (declared, certified, kind) in [
             (KIND_OPENED, true, WITNESS_NOTE),
             (KIND_VACATED, true, WITNESS_ROW),
             (KIND_OPENED, false, WITNESS_NOTE_UNCERTIFIED),
             (KIND_VACATED, false, WITNESS_UNCERTIFIED),
-            (nn_proto::witness::KIND_SUCCESSOR_FOREIGN, false, WITNESS_UNCERTIFIED),
+            (
+                nn_proto::witness::KIND_SUCCESSOR_FOREIGN,
+                false,
+                WITNESS_UNCERTIFIED,
+            ),
         ] {
-            assert_eq!(import_kind(declared, certified), kind, "{declared} {certified}");
+            assert_eq!(
+                import_kind(declared, certified),
+                kind,
+                "{declared} {certified}"
+            );
         }
     }
 

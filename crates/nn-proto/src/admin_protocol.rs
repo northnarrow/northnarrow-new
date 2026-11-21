@@ -3935,10 +3935,7 @@ mod tests {
         // absent here
         let before = without.len() - 13;
         assert_eq!(&with[..before], &without[..before]);
-        assert_eq!(
-            &without[before..],
-            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(&without[before..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // Some(300): tag 1, varint 0xac 0x02; Some(5): tag 1, 5.
         assert_eq!(
             &with[before..],

@@ -2454,7 +2454,10 @@ fn an_acknowledgement_whose_row_is_not_written_acknowledges_nothing() {
     let row = drift(&fx);
     let before = fx.rows().len();
     let r = ack(&fx, row);
-    assert_eq!((r.result, r.acknowledged, r.still_held), (AdminResult::Success, 1, 0));
+    assert_eq!(
+        (r.result, r.acknowledged, r.still_held),
+        (AdminResult::Success, 1, 0)
+    );
     let rows = fx.rows();
     assert_eq!(rows.len(), before + 1, "one row: the acknowledgement");
     let last = rows.last().unwrap();

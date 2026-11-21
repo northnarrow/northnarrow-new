@@ -14026,5 +14026,30 @@ number in parentheses is a lab PR.
       about +0.08 ms. The older `open` +41 % removed from the README and
       KNOWN_LIMITATIONS; `git status` +24 % kept with its source (lot 273b,
       PERF_BASELINE).
-    - Lab: LAB_ROUND1_PLACEHOLDER
+    - Mutation: 33 mutants of this round's rules, all caught by a named
+      test (four survivors of the first run — the advisories past the cap
+      and a counted finding's rows — got their tests; one mutant redone
+      after a compile error).
+    - Lab, as measured (ubuntu2204, 5.15, and debian13, 6.12 with systemd
+      257, at the same time under two leases; the tree verified by hash; the
+      operator's install, `alpha`; each guest uninstalled with `--purge` and
+      powered off), the same on both:
+      - the fresh install: `sensors: OK — no degradation, no event lost`,
+        `advisories : 1` listing `admin_key_on_host` with its row;
+      - ten documented restarts (both units stopped in a signed window, the
+        pins purged, the agent started, the watchdog 3 s later, 75 s
+        between): 10 `witness_key_certified` and 10 `witness_note`, no
+        `witness_row_uncertified` nor `witness_note_uncertified`, no witness
+        line held, `sensors: OK` after each;
+      - `install.sh --source-tree --upgrade`: "UPGRADE complete", no
+        rollback; one key certified, one note, nothing held, `sensors: OK`;
+      - three lines cut from `detections.jsonl` (`chain verify` rc 8):
+        `sensors: DEGRADED — 3 degradation(s)` (`chain_truncated`,
+        `chain_rewritten`, `chain_verify_failed`), the same after a
+        documented restart; an acknowledgement through 99999999 refused
+        (exit 9); through the newest held row (241, 243) exit 0, "3 …
+        acknowledged; 1 still held" (the advisory, signed after it), its row
+        `success` with the key's fingerprint, then `sensors: OK`; the next
+        start signed `chain_verify_failed` again (the chain still broken)
+        and it was held again.
 

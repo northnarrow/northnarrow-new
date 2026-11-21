@@ -3507,7 +3507,9 @@ fn every_feature_is_classified_and_the_shipped_binary_names_its_test_ones() {
             let lib = repo_root().join(&m.dir).join("src/lib.rs");
             let defined = fs::read_to_string(&lib)
                 .unwrap_or_default()
-                .contains(&format!("pub const {konst}: bool = cfg!(feature = \"{f}\");"));
+                .contains(&format!(
+                    "pub const {konst}: bool = cfg!(feature = \"{f}\");"
+                ));
             if !info.contains(&entry) || !defined {
                 unnamed.push(format!("{}/{f}", m.name));
             }

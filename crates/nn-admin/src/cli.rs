@@ -6629,8 +6629,14 @@ mod flow_sock_line_tests {
         );
         let a = super::advisory_lines(&o);
         assert_eq!(a.len(), 2, "{a:?}");
-        assert!(a[0].starts_with("advisories        : 1 (each signed"), "{a:?}");
-        assert!(a[1].starts_with("  - integrity: admin_key_on_host"), "{a:?}");
+        assert!(
+            a[0].starts_with("advisories        : 1 (each signed"),
+            "{a:?}"
+        );
+        assert!(
+            a[1].starts_with("  - integrity: admin_key_on_host"),
+            "{a:?}"
+        );
         assert!(a[1].contains("(audit row 7)"), "{a:?}");
         assert_eq!(degradation_lines(&o), ["degradations      : none"]);
         // none, or an agent that predates them: no line

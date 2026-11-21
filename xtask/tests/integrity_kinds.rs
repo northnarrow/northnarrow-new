@@ -35,12 +35,30 @@ const HELD: &str = "crates/nn-evidence/src/held.rs";
 /// Kinds written at a kind position by rows that are no `integrity_drift`
 /// (their op is another), and why each is not classified by `held`.
 const OTHER_ROWS: &[(&str, &str)] = &[
-    ("posture_trigger", "a posture transition's cause (op posture_*)"),
-    ("admin_force_posture", "a posture transition's cause (op posture_*)"),
-    ("debug_force_posture", "a posture transition's cause (op posture_*)"),
-    ("deferred", "the exec quarantine's controller rows (op execq_*)"),
-    ("recovered_at_boot", "the exec quarantine's controller rows (op execq_*)"),
-    ("stopping", "the exec quarantine's controller rows (op execq_*)"),
+    (
+        "posture_trigger",
+        "a posture transition's cause (op posture_*)",
+    ),
+    (
+        "admin_force_posture",
+        "a posture transition's cause (op posture_*)",
+    ),
+    (
+        "debug_force_posture",
+        "a posture transition's cause (op posture_*)",
+    ),
+    (
+        "deferred",
+        "the exec quarantine's controller rows (op execq_*)",
+    ),
+    (
+        "recovered_at_boot",
+        "the exec quarantine's controller rows (op execq_*)",
+    ),
+    (
+        "stopping",
+        "the exec quarantine's controller rows (op execq_*)",
+    ),
     ("exec", "an exec policy record's subject (op execpol_*)"),
     ("map", "an exec policy record's subject (op execpol_*)"),
     ("record", "an exec policy record's subject (op execpol_*)"),
@@ -102,12 +120,18 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     (
         "crates/nn-linux/src/self_integrity.rs",
         "kind (shorthand)",
-        Source::Producer("crates/nn-linux/src/self_integrity.rs", "pub fn watchdog_holds(path: &Path)"),
+        Source::Producer(
+            "crates/nn-linux/src/self_integrity.rs",
+            "pub fn watchdog_holds(path: &Path)",
+        ),
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
         "kind (shorthand)",
-        Source::Producer("crates/nn-linux/src/self_integrity.rs", "fn observe(&mut self, now: &[(String, String)]"),
+        Source::Producer(
+            "crates/nn-linux/src/self_integrity.rs",
+            "fn observe(&mut self, now: &[(String, String)]",
+        ),
     ),
     (
         "crates/nn-linux/src/self_integrity.rs",
@@ -127,7 +151,10 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     (
         "crates/nn-linux/src/self_integrity.rs",
         "kind (shorthand)",
-        Source::Producer("crates/nn-linux/src/anti_tamper/pin_lock.rs", "pub fn round("),
+        Source::Producer(
+            "crates/nn-linux/src/anti_tamper/pin_lock.rs",
+            "pub fn round(",
+        ),
     ),
     (
         "crates/nn-linux/src/witness.rs",
@@ -152,7 +179,10 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     (
         "crates/nn-evidence/src/chain_anchor.rs",
         "finding.0",
-        Source::Producer("crates/nn-evidence/src/chain_anchor.rs", "fn report_head<H: ChainHost>("),
+        Source::Producer(
+            "crates/nn-evidence/src/chain_anchor.rs",
+            "fn report_head<H: ChainHost>(",
+        ),
     ),
     (
         "crates/nn-evidence/src/held.rs",
@@ -267,7 +297,9 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     (
         "watchdog/src/witness.rs",
         "kind.to_string()",
-        Source::NotDrift("a row of the watchdog's own witness chain (imported by the agent as witness_*)"),
+        Source::NotDrift(
+            "a row of the watchdog's own witness chain (imported by the agent as witness_*)",
+        ),
     ),
 ];
 
@@ -433,8 +465,18 @@ fn not_a_string(expr: &str) -> bool {
     let first = path.split("::").next().unwrap_or("");
     if matches!(
         first,
-        "u8" | "u16" | "u32" | "u64" | "usize" | "i32" | "i64" | "bool" | "char" | "String"
-            | "Option" | "Vec" | "Box"
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "i32"
+            | "i64"
+            | "bool"
+            | "char"
+            | "String"
+            | "Option"
+            | "Vec"
+            | "Box"
     ) {
         return true;
     }
@@ -469,8 +511,7 @@ fn positions(rel: &str, code: &str) -> Vec<Position> {
             if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
                 continue;
             }
-            if b
-                .get(at + 4)
+            if b.get(at + 4)
                 .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
             {
                 continue;
@@ -483,8 +524,8 @@ fn positions(rel: &str, code: &str) -> Vec<Position> {
             // `Finding { kind, …` — the field's shorthand
             if !quoted && (trimmed.starts_with(',') || trimmed.starts_with('}')) {
                 let head = code[..at].trim_end();
-                let open = head.ends_with('{')
-                    && head[..head.len() - 1].trim_end().ends_with("Finding");
+                let open =
+                    head.ends_with('{') && head[..head.len() - 1].trim_end().ends_with("Finding");
                 if open {
                     out.push(Position {
                         rel: rel.to_string(),
@@ -682,7 +723,10 @@ fn inventory(code: &BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<
                 .get(*file)
                 .unwrap_or_else(|| panic!("{file} (the producer of {rel}) not found"));
             let body = item(text, file, head);
-            add(kinds_in(body, file, &consts, true), format!("{file} `{head}`"));
+            add(
+                kinds_in(body, file, &consts, true),
+                format!("{file} `{head}`"),
+            );
         }
     }
     (kinds, unknown)
@@ -697,10 +741,7 @@ fn held_code() -> String {
 }
 
 /// The kinds signed that `held` does not classify.
-fn unclassified(
-    kinds: &BTreeMap<String, String>,
-    classified: &BTreeSet<String>,
-) -> Vec<String> {
+fn unclassified(kinds: &BTreeMap<String, String>, classified: &BTreeSet<String>) -> Vec<String> {
     kinds
         .iter()
         .filter(|(k, _)| {
@@ -756,9 +797,7 @@ fn every_integrity_kind_the_product_signs_has_a_class() {
 fn every_dynamic_kind_position_exists() {
     let code = product();
     for (rel, expr, source) in DYNAMIC {
-        let text = code
-            .get(*rel)
-            .unwrap_or_else(|| panic!("{rel} not found"));
+        let text = code.get(*rel).unwrap_or_else(|| panic!("{rel} not found"));
         assert!(
             positions(rel, text).iter().any(|p| p.expr == *expr),
             "{rel}: no kind position `{expr}`"
@@ -769,7 +808,10 @@ fn every_dynamic_kind_position_exists() {
                 assert!(!why.trim().is_empty(), "{rel}: `{expr}`: no reason")
             }
             Source::Producer(file, head) => {
-                assert!(code.get(*file).is_some_and(|t| t.contains(head)), "{file}: {head}")
+                assert!(
+                    code.get(*file).is_some_and(|t| t.contains(head)),
+                    "{file}: {head}"
+                )
             }
         }
     }
@@ -777,7 +819,10 @@ fn every_dynamic_kind_position_exists() {
     let classified = classified(&held_code());
     for (kind, why) in OTHER_ROWS {
         assert!(!why.trim().is_empty(), "{kind}");
-        assert!(!classified.contains(*kind), "{kind} is classified and in OTHER_ROWS");
+        assert!(
+            !classified.contains(*kind),
+            "{kind} is classified and in OTHER_ROWS"
+        );
     }
 }
 
@@ -791,18 +836,18 @@ fn the_scan_fails_on_a_planted_kind_without_class() {
     let mut code = product();
     let planted = [
         (
-            "crates/nn-linux/src/k379_planted_a.rs",
+            "k379-planted-a",
             "fn a() -> Finding { Finding { kind: \"k379_planted_literal\", detail: d } }",
             "k379_planted_literal",
         ),
         (
-            "crates/nn-linux/src/k379_planted_b.rs",
+            "k379-planted-b",
             "pub const K379_PLANTED: &str = \"k379_planted_const\";\n\
              fn b() { json!({ \"kind\": K379_PLANTED, \"detail\": d }); }",
             "k379_planted_const",
         ),
         (
-            "crates/nn-linux/src/k379_planted_c.rs",
+            "k379-planted-c",
             "fn c() { ChainFinding::new(\"audit\", p, \"k379_planted_chain\", \"x\"); }",
             "k379_planted_chain",
         ),
@@ -831,12 +876,12 @@ fn the_scan_fails_on_a_planted_kind_without_class() {
         .any(|m| m.starts_with("k379_planted_arm")));
     // a kind position the scan cannot read
     code.insert(
-        "crates/nn-linux/src/k379_planted_d.rs".to_string(),
+        "k379-planted-d".to_string(),
         "fn d(k: &str) { json!({ \"kind\": k.trim(), \"detail\": d }); }".to_string(),
     );
     let (_, unknown) = inventory(&code);
     assert!(
-        unknown.iter().any(|u| u.contains("k379_planted_d.rs")),
+        unknown.iter().any(|u| u.contains("k379-planted-d")),
         "{unknown:?}"
     );
 }

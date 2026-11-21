@@ -574,8 +574,11 @@ fn benign_states_are_advisories_not_degradations() {
     // the host is told no degradation line for it
     assert!(helds::take(&path).iter().all(|l| l.is_empty()));
     // a real degradation beside it is one line, on its own
-    log.append(drift("config_overlay", "/etc/northnarrow/x.local (3 bytes)"))
-        .unwrap();
+    log.append(drift(
+        "config_overlay",
+        "/etc/northnarrow/x.local (3 bytes)",
+    ))
+    .unwrap();
     assert_eq!(log.held().lines().len(), 1);
     assert!(log.held().lines()[0].starts_with("config_overlay — "));
     assert_eq!(log.held().advisories().len(), 1);
@@ -587,10 +590,12 @@ fn benign_states_are_advisories_not_degradations() {
     ))
     .unwrap();
     assert!(log.held().advisories().is_empty());
-    log.append(drift("sysctl_strict", "vm.overcommit_ratio 80")).unwrap();
+    log.append(drift("sysctl_strict", "vm.overcommit_ratio 80"))
+        .unwrap();
     boot(&mut log);
     assert!(log.held().is_empty(), "{:?}", log.held());
-    log.append(drift("agent_stalled", "the loop stood still 40 s")).unwrap();
+    log.append(drift("agent_stalled", "the loop stood still 40 s"))
+        .unwrap();
     log.append(ack(log.rows() - 1)).unwrap();
     assert!(log.held().is_empty());
 }
@@ -638,8 +643,11 @@ fn a_fact_signed_twice_is_one_line() {
     // the twin is still held: the start ends the refusal, the round's
     // finding of the file still on disk is listed then
     assert_eq!(log.held().findings().len(), 3);
-    log.append(drift("unit_dropin_harmful", "/etc/systemd/system/x.d/y.conf"))
-        .unwrap();
+    log.append(drift(
+        "unit_dropin_harmful",
+        "/etc/systemd/system/x.d/y.conf",
+    ))
+    .unwrap();
     assert_eq!(log.held().findings().len(), 3, "not held twice");
 }
 
@@ -694,7 +702,10 @@ fn every_integrity_relevant_kind_stays_a_degradation() {
     all.dedup();
     assert_eq!(all.len(), n, "a kind in two tables");
     // a kind of another build: the safe side
-    assert_eq!(hold_of("k379_a_kind_of_another_build", "detected"), UNKNOWN_KIND);
+    assert_eq!(
+        hold_of("k379_a_kind_of_another_build", "detected"),
+        UNKNOWN_KIND
+    );
     assert_eq!(UNKNOWN_KIND, Hold::WhileFound);
 }
 
@@ -791,4 +802,60 @@ fn a_held_line_s_kind_and_chain_are_cut() {
     assert_eq!(f.kind.chars().count(), DETAIL_CHARS + 1);
     assert_eq!(f.subject.chars().count(), DETAIL_CHARS + 1);
     assert!(log.held().lines()[0].chars().count() < 4 * DETAIL_CHARS);
+}
+
+/// The review of #586 (P2-1, mutation round): advisories past the cap are
+/// counted among what an acknowledgement can cover (`count`), still held
+/// once an acknowledgement ends the listed ones (`is_empty` is false while
+/// only counted ones remain), and ended by the next start as the listed
+/// ones are.
+#[test]
+fn advisories_past_the_cap_are_counted_kept_and_ended_by_a_start() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 2 {
+        log.append(drift("sysctl_opted_out", &format!("kernel.x{i}")))
+            .unwrap();
+    }
+    assert_eq!(log.held().count(), MAX_HELD as u64 + 2);
+    let listed_newest = log
+        .held()
+        .findings()
+        .iter()
+        .map(|f| f.last_row)
+        .max()
+        .unwrap();
+    log.append(ack(listed_newest)).unwrap();
+    assert!(log.held().findings().is_empty());
+    assert!(!log.held().is_empty(), "two advisories are still counted");
+    assert_eq!(log.held().count(), 2);
+    let adv = log.held().advisories();
+    assert_eq!(adv.len(), 1, "{adv:?}");
+    assert!(adv[0].contains("2 more advisory row(s)"), "{adv:?}");
+    boot(&mut log);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    assert!(log.held().advisories().is_empty());
+}
+
+/// The review of #586 (P3-3, mutation round): the finding counted in the
+/// stead of an evidence finding past the cap brings all its rows to the
+/// counter, not one.
+#[test]
+fn a_finding_counted_past_the_cap_brings_its_rows() {
+    let (d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD {
+        for _ in 0..2 {
+            log.append(drift(
+                "unit_dropin",
+                &format!("/etc/systemd/system/x.d/{i}.conf"),
+            ))
+            .unwrap();
+        }
+    }
+    log.append(cut("detections", &d.path().join("detections.jsonl")))
+        .unwrap();
+    assert_eq!(log.held().more(), 2, "the counted finding's two rows");
+    assert_eq!(log.held().count(), MAX_HELD as u64 + 2);
+    assert!(log.held().lines()[MAX_HELD].contains("2 more held integrity row(s)"));
 }
