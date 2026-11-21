@@ -4080,10 +4080,7 @@ mod tests {
         assert_eq!(&without[before - 2..], &[1, 0, 0, 0]);
         // lot 381: its three counts follow lot 369's four, inside it; the
         // review of #588 (F4): `lost` after them; then lot 379's field, absent
-        assert_eq!(
-            &with[before..],
-            &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(&with[before..], &[1, 6, 5, 0xac, 0x02, 1, 0, 0, 0, 0, 0]);
         assert!(!status.telemetry_withheld());
         roundtrip(AdminMessage::StatusResponse(status));
     }
