@@ -5401,3 +5401,168 @@ installer did not refuse, and operator texts written for developers.
   watchdog's start, a 14th row in `nn-admin host-check`, and `host-check`
   exit 3 on a host whose preload list loads a library. A script that read
   `host-check`'s exit 2 as "something to fix" should read 3 the same way.
+
+## 64. The rc10 soak's false positives: `(sd-pam)` at a login's end, rootless runc's copy of itself, `blkdeactivate` at a shutdown (lot 378)
+
+The rc10 soaks (Debian 13, Ubuntu 24.04, Ubuntu 26.04) left three false
+positives. Each is judged by identity — the kernel's facts about the
+process, its lineage, its binary and the host's state — and each attack
+shape it resembles still fires.
+
+- **The posture rose to ALERTED at every boot** (P2), on all three guests.
+  - The `POSTURE TRANSITION` line named `FileOpen /etc/login.defs` by
+    `(sd-pam)`, image `/usr/lib/systemd/systemd-executor`, uid 1000, some
+    seconds after the boot's first login ended: the user's service manager
+    (`user@<uid>.service`) stops then, and its `(sd-pam)` closes the PAM
+    session. systemd's executor opens that session as root, forks
+    `(sd-pam)`, which drops to the user and waits, and then becomes the
+    manager; once the manager is gone, `(sd-pam)` closes the session and
+    PAM's modules read their configuration as the user.
+  - That read (of `/etc/login.defs`, or `/etc/passwd` for a name lookup,
+    read-only) is no sensitive access when every fact holds:
+    - the reader executed nothing of its own, and the kernel recorded its
+      fork (the file-open sensor's record carries the forker of a process
+      that never executed);
+    - its forker had executed, as of that fork, the host's packaged
+      `systemd-executor` (the file the kernel executed, in a root-only
+      directory) as root, forked by PID 1 for that exec — a unit's launch;
+    - that same process then executed the host's packaged `systemd` as the
+      reader's uid: the unit is the user's manager;
+    - the reader's image at the open (`mm->exe_file`) is that executor's
+      file.
+
+    The lineage's sweep enters the running `(sd-pam)` from `/proc` within
+    5 s (a fork still running its forker's image): that entry is no exec of
+    its own, and the kernel's fork record decides.
+  - The boot's first login came about 4 s before the agent was active
+    (the soak's boot check), so that manager and its
+    `(sd-pam)` were older than the agent and left no such records. For
+    them, the agent's start's scan and the kernel's cgroup at the open
+    decide:
+    - the scan found the reader running the host's packaged executor (its
+      image's identity in a root-only directory, the same as
+      `mm->exe_file` at the open), as the user, with no exec of its own
+      since;
+    - its parent at the scan ran the host's packaged `systemd` as the
+      user, PID 1's child, started no later;
+    - the reader's cgroup at the open (the file-open sensor's record
+      carries the kernel's cgroup id; `FileOpen` now has `cgroup_id`) is
+      that manager's own scope, `user@<uid>.service/init.scope`, where the
+      manager moves itself and `(sd-pam)` (the user's units run in its
+      `app.slice`).
+  - On Ubuntu 24.04 the line also named `FileOpen /etc/passwd` by
+    `fusermount`, image `/usr/bin/fusermount3`, uid 1000: an AppImage's
+    runtime mounting its image, libfuse's setuid helper looking up its
+    caller's name. BUG-018's login-uid carve-out read `/proc` after the
+    helper exited. The packaged `fusermount3`/`fusermount` (the host's file
+    in a root-only directory, by the file the kernel executed: the cached
+    exec; a fork's forker by the kernel's record; else, its exec not read
+    yet, its image at the open) reading `/etc/passwd` read-only is no
+    sensitive access. The same holds for shadow's setuid `newuidmap` and
+    `newgidmap` (rootless Podman's user namespace, from a user unit with no
+    login uid): the same shape, found by the lot's search for variants.
+  - Still ALERTED: `cat /etc/login.defs` (lot 376's attack shape) and `cat
+    /etc/passwd` without a login uid, whatever image the reader names; a
+    /tmp copy of the executor or of `fusermount3`; the packaged executor
+    run by hand, and its fork; a fork of a user's program naming either
+    image; a unit run as the user that is not the user's manager; a fork
+    the kernel did not record; either reader opening the file for write,
+    or reading `/etc/shadow`. For a manager older than the agent: another
+    cgroup at the open (a user's unit), another image, a copy of the
+    executor, a parent that is not the user's manager (another uid, a copy
+    of systemd, a manager run by hand), a later exec of its own.
+- **R004 Critical at a rootless Podman run on Debian 13** (P1 for the
+  alpha: a would-have `KillProcessTree`). `runc init`, under `runc
+  --systemd-cgroup … create`, executed its sealed copy
+  (`memfd:runc_cloned`, `/dev/fd/6`) as uid 1000. The exemption of lot 347
+  (an installed runtime's sealed copy of itself, compared byte for byte by
+  the exec pump, under an installed manager) applies to rootless runs: the
+  pump had compared the copy and kept it. The manager was the fact that
+  failed, now and then (1 of the 9 rootless runs of the rc7, rc9 and rc10
+  soaks):
+  - rootless Podman executes conmon in its own mount namespace, so the
+    lineage's record of that exec holds the file the kernel executed but
+    no image of a root-only directory of PID 1's;
+  - the lineage's sweep (every 5 s) enters conmon's monitor, a fork that
+    never executed, with that record. R004 then judged the manager by the
+    record's image alone and no longer asked the pump's sight of it: a
+    sweep between the monitor's fork and the judgement made the copy
+    fileless (that hour's decisions waited up to 5.5 s).
+  - A manager is now also told by the file the kernel executed: an
+    installed manager's inode still at its installed path, in a root-only
+    directory, whatever the mount namespace.
+  - Still Critical, rootless or not: a memfd the pump found no copy of
+    under the same runtime and manager; a copy of runc under a session's
+    shell; under a user's file with the inode number of a manager removed
+    since, or with another file at the manager's path; under a manager in
+    a directory others can write; a user's copy not compared (the budget).
+- **`NN-L-EPG-001` High at a reboot of Ubuntu 26.04** (`blkdeactivate`,
+  lvm2's stop command of `blk-availability.service`), with the posture
+  raised to ENGAGED. The exploit guard found the task without its record
+  (degraded evidence: "the task's record was lost and re-taken") 0.9 s
+  after the reboot command, holding root's credential; systemd's watch,
+  asked every 2 s, had not yet answered "stopping", so the shutdown's
+  stand-down had not happened.
+  - The guard's degraded evidence is now judged, like a signal PID 1
+    relays, on systemd's answer asked after the record: handed to the
+    watch, which asks at once.
+  - While systemd stops the host, it is "unknown": `NN-L-EPG-001` Medium,
+    Log, and the host stands down as for the shutdown's signals (the
+    posture and the ladder are not driven).
+  - Still Critical, at a shutdown too: a credential change the guard saw
+    happen (a write in place, a `commit_creds` for a call that never makes
+    that change), against a re-taken snapshot included. Still High: the
+    degraded evidence while the host runs.
+- **Its review's fixes.**
+  - **`(sd-pam)` on systemd before 255** (Ubuntu 22.04's 249, Debian 12's
+    252, alpha targets: no `systemd-executor`). PID 1's fork sets the unit
+    up in PID 1's own image: it opens the PAM session as root, forks
+    `(sd-pam)`, and only then executes the user's manager. Its read is no
+    sensitive access when every fact holds:
+    - the reader executed nothing of its own, and the kernel recorded its
+      fork, by a forker that had executed nothing by then;
+    - the forker's next exec (that process's: started no later than the
+      fork) is its first since PID 1 forked it, PID 1's child, the host's
+      packaged `systemd` (the file the kernel executed, in a root-only
+      directory) as the reader's uid: `user@<uid>.service`'s launch;
+    - the reader's image at the open is that packaged `systemd`.
+
+    A manager re-executed since (`daemon-reexec`) still is: the forker's
+    first exec decides. For a manager older than the agent, the start's
+    scan finds `(sd-pam)` running the packaged `systemd` where the host's
+    systemd ships no executor (where it ships one, only the executor).
+    Still ALERTED: a fork of the manager after its exec (a user's unit), a
+    forker whose first exec another process forked (a user's process
+    reparented to PID 1), not PID 1's child, its first exec as another uid
+    or of a copy, another image at the open, a forker started after the
+    fork.
+  - **Podman's quadlet user generator** (lot 376's case; the lab met it
+    again). systemd runs its generators from `(sd-exec-strv)`
+    (`(sd-executor)` before 254), a fork of the user's manager that never
+    executes, each in a fork of that one which executes the generator: the
+    generator is never the manager's direct child, which lot 376's
+    exemption required. The manager is now also the kernel's anchor of the
+    program's fork (the exec record's `fork_anchor`: the nearest process
+    up the forks that had executed — every fork between them executed
+    nothing, running the manager's image), started no later than the
+    program; the same checks of it. Still ALERTED: a program anchored at a
+    unit's shell (which executed), an exec that is not its process's first
+    since its fork, a later process at the anchor's pid, an anchor that is
+    no user's manager.
+  - **The runtime compare budget** (rootless loops). Lot 378's lab: 30
+    `podman run` in a row by one rootless user met the user's share of a
+    second eight times (runc 1.1's 10.7 MB copy, compared about four times
+    a second): eight R004 Critical "not compared (budget)". Each uid's share
+    but root's is now a token bucket: up to four seconds of it (256 MiB) at
+    once, paid back at its rate (64 MiB a second); the global budget's
+    second and root's reserve are unchanged. Past it a copy is still not
+    compared, the Critical kill for a uid but root: the burst only costs
+    more to exhaust, it trusts no identity in place of the compare (the
+    review showed that "High when the parent is the packaged runc" would
+    be a bypass: a user can run the installed conmon and runc, preload
+    their code into runc, and spend its own share on purpose).
+- **Upgrade.** No configuration. Expect an unchanged posture after a login
+  ends, on systemd 249 and 252 too, and after a quadlet generator's run;
+  no R004 at a rootless Podman run, a loop of a few dozen included; and at
+  a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
+  guard lost.

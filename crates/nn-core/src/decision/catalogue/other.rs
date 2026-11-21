@@ -492,7 +492,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
     // ── exploit post-condition guard (lab PR 219, experimental) ─────
     RuleDoc {
         id: "NN-L-EPG-001_CredentialPostcondition",
-        severities: &[Severity::Critical, Severity::High],
+        severities: &[Severity::Critical, Severity::High, Severity::Medium],
         actions: &[ResponseAction::KillProcess, ResponseAction::Log],
         sensors: &[Sensor::ExploitGuard],
         data_components: &["DC0034", "DC0021"],
@@ -504,7 +504,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    (capable, exec, a root-private open); strict compares around every system \
                    call. High, Log only: lite's degraded evidence, a task whose record the LRU \
                    task map evicted, re-taken holding uid or gid 0 or a capability that no \
-                   mechanism is known to have given. Issued by process_event outside the engine.",
+                   mechanism is known to have given. Lot 378: that degraded evidence while \
+                   systemd stops the host (its answer asked after the record) is unknown — \
+                   Medium, Log, the posture not driven. Issued by process_event outside the \
+                   engine.",
         false_positives: "None expected from the legitimate transitions (sudo, su, newgrp, \
                           setpriv, capsh, unshare, rootless and rootful containers, \
                           systemd-run --uid, cron): the guard allows by mechanism, not by \
@@ -523,6 +526,8 @@ pub(super) const DOCS: &[RuleDoc] = &[
             "crates/nn-core/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log",
             "crates/nn-core/src/decision/rules/epg.rs::enforce_kill_is_recorded_as_a_kernel_kill",
             "crates/nn-core/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence",
+            "crates/nn-core/src/decision/rules/epg.rs::\
+             degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium",
             "deploy/lab/epg/epg-check.sh::inject",
         ],
         attack_note: "Exploitation for Privilege Escalation (T1068) by its result: the rule \

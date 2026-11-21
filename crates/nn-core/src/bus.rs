@@ -1646,6 +1646,7 @@ mod tests {
             path_from_user: false,
             kernel_class: 0,
             exe_file: (0, 0),
+            cgroup_id: 0,
         };
         assert_eq!(when_full(&open), WhenFull::DropNew);
         let mass = Event::MassWrite {
@@ -1751,6 +1752,7 @@ mod tests {
             path_from_user: false,
             kernel_class,
             exe_file: (0, 0),
+            cgroup_id: 0,
         };
         for (flags, class, waits) in [
             (1, open_reason::PERSIST, true),
@@ -2178,6 +2180,7 @@ mod tests {
             path_from_user: false,
             kernel_class: 0,
             exe_file: (0, 0),
+            cgroup_id: 0,
         };
         assert_eq!(FloodKind::of(&open), None);
     }

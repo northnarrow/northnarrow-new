@@ -1729,6 +1729,8 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             path_from_user: false,
             kernel_class: r.reason,
             exe_file: (r.exe_dev, r.exe_ino),
+            // lot 378: the opener's cgroup at the open
+            cgroup_id: r.cgroup,
         });
     }
     if r.reason & open_reason::CRED != 0 {
@@ -3482,6 +3484,31 @@ mod tests {
         assert_eq!(image(&r, &mut mounts), (0, 0));
         (r.exe_dev, r.exe_ino) = (0x80_0001, 4242);
         assert_eq!(image(&r, &mut mounts), (0x80_0001, 4242));
+    }
+
+    /// Lot 378 (named): the opener's cgroup v2 id the kernel read at the
+    /// open travels with the `FileOpen` event — the posture tells the user's
+    /// manager's `(sd-pam)` (its manager's own scope) by it when the manager
+    /// is older than the agent; a record without it says 0.
+    #[test]
+    fn the_opener_s_cgroup_travels_with_the_open() {
+        let mut mounts = MountTable {
+            loaded: Some(Instant::now()),
+            ..MountTable::default()
+        };
+        let dev = (0x2d << 20) | 7;
+        let mut r = record(
+            open_reason::SENSITIVE,
+            &["login.defs", "etc", "/"],
+            (dev, 2),
+        );
+        let cgroup = |r: &OpenRecordRaw, mounts: &mut MountTable| match &events_of(r, mounts)[0] {
+            Event::FileOpen { cgroup_id, .. } => *cgroup_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cgroup(&r, &mut mounts), 0);
+        r.cgroup = 8_675;
+        assert_eq!(cgroup(&r, &mut mounts), 8_675);
     }
 
     /// External audit SNS-005: a record whose filesystem root no mount of

@@ -207,7 +207,9 @@ impl SystemdSnapshot {
     }
 }
 
-/// A relayed signal's identity: its record's time, signal and target.
+/// A relayed signal's identity: its record's time, signal and target. Lot
+/// 378: the exploit guard's degraded evidence too — its record's time, and
+/// its task (the high bit apart from any signal number).
 fn signal_key(event: &nn_model::Event) -> (u64, u64, u64) {
     match event {
         nn_model::Event::FsProtectDenial {
@@ -216,6 +218,12 @@ fn signal_key(event: &nn_model::Event) -> (u64, u64, u64) {
             target_ino,
             ..
         } => (*timestamp_ns, *target_dev, *target_ino),
+        nn_model::Event::ExploitPostcondition {
+            timestamp_ns,
+            pid,
+            tid,
+            ..
+        } => (*timestamp_ns, (1 << 63) | u64::from(*pid), u64::from(*tid)),
         _ => (0, 0, 0),
     }
 }
@@ -351,6 +359,43 @@ mod tests {
             snap.judge(&relayed(999), later),
             SystemdAnswer::Judge(Some("stopping".into()))
         );
+    }
+
+    /// Lot 378 (named): the exploit guard's degraded evidence handed to the
+    /// watch is known by its record's time and its task — each task's its
+    /// own, and none a relayed signal's that has the same numbers.
+    #[test]
+    fn each_task_s_degraded_evidence_is_its_own_hand_over() {
+        use nn_core::decision::rules::epg::testutil::epg_event;
+        let task = |pid: u32, tid: u32| {
+            let mut e = epg_event(nn_model::EpgKind::CredNoMechanism, false);
+            if let nn_model::Event::ExploitPostcondition {
+                pid: p,
+                tid: t,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *t, *timestamp_ns) = (pid, tid, 1_500);
+            }
+            e
+        };
+        assert_ne!(
+            signal_key(&task(4242, 4243)),
+            signal_key(&task(4242, 4244)),
+            "two threads"
+        );
+        assert_ne!(
+            signal_key(&task(4242, 4243)),
+            signal_key(&task(4241, 4243)),
+            "two tasks"
+        );
+        assert_ne!(
+            signal_key(&task(15, 4242)),
+            signal_key(&relayed(1_500)),
+            "a relayed signal"
+        );
+        assert_eq!(signal_key(&task(4242, 4243)).0, 1_500, "its record's time");
     }
 
     /// Lot 344 (named, the alpha's false positives): `systemctl poweroff`

@@ -245,6 +245,51 @@ fn degraded_verdict(rule: &dyn Rule, event: &Event, technique: &str) -> Verdict 
     build_verdict(rule, event, ResponseAction::Log, Severity::High, &reasoning)
 }
 
+/// Lot 378 (the rc10 soak, Ubuntu 26.04: NN-L-EPG-001 High and the posture
+/// ENGAGED at a reboot — `blkdeactivate`, lvm2's stop command of
+/// `blk-availability.service`, re-taken by the guard 0.9 s after the reboot
+/// command): `rule`'s verdict on `event` while systemd stops the host. A
+/// shutdown stops every unit at once, and lite's degraded evidence (a task
+/// found without its record, re-taken holding privilege no mechanism the
+/// guard saw gave it) cannot tell a legitimate start from a write in place:
+/// the change is unknown — Medium, recorded only. A change the guard saw
+/// happen is Critical at a shutdown too, and degraded evidence outside one
+/// stays High ([`degraded_verdict`]).
+pub fn verdict_at_shutdown(rule: &dyn Rule, event: &Event) -> Option<Verdict> {
+    let Event::ExploitPostcondition {
+        baseline_lost: true,
+        abi,
+        syscall,
+        after,
+        variant,
+        caught_at,
+        ..
+    } = event
+    else {
+        return rule.evaluate(event);
+    };
+    rule.evaluate(event)?;
+    let reasoning = format!(
+        "UNKNOWN, at the host's shutdown (systemd stopping the host) — the exploit guard's task \
+         map lost this task's record and re-took it at {} ({}), call {}: it holds [{}], privilege \
+         that no mechanism the guard saw gave it. A shutdown stops every unit at once; whether \
+         the task gained it legitimately is not known (degraded evidence, not established as an \
+         exploit): recorded Medium, never refused or killed, the posture not driven while the \
+         host stops. A credential change the guard saw happen is Critical, at a shutdown too",
+        caught_at.as_str(),
+        variant.as_str(),
+        abi.describe_call(*syscall),
+        after.summary(),
+    );
+    Some(build_verdict(
+        rule,
+        event,
+        ResponseAction::Log,
+        Severity::Medium,
+        &reasoning,
+    ))
+}
+
 impl Rule for NnLEpg001CredentialPostcondition {
     fn id(&self) -> &'static str {
         EPG_001_ID
@@ -575,7 +620,7 @@ pub(crate) mod tests {
             "Never refused or killed",
             "T1068",
         ] {
-            assert!(v.reasoning.contains(want), "{want}: {}", v.reasoning);
+            assert!(v.reasoning.contains(want), "the reasoning says {want}");
         }
         assert!(NnLEpg002NamespaceRootPostcondition.evaluate(&ev).is_none());
         assert!(
@@ -605,10 +650,80 @@ pub(crate) mod tests {
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert!(
             v.reasoning.contains("re-taken after the task map lost"),
-            "{}",
-            v.reasoning
+            "the reasoning names the re-taken snapshot"
         );
-        assert!(!v.reasoning.contains("DEGRADED"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("DEGRADED"),
+            "full evidence, not degraded"
+        );
+    }
+
+    /// Lot 378 (named, the rc10 soak on Ubuntu 26.04: NN-L-EPG-001 High at
+    /// a reboot — `blkdeactivate`, uid 0, "recorded only (degraded
+    /// evidence…)", 0.9 s after the reboot command): while systemd stops the
+    /// host, the guard's degraded evidence is unknown — Medium, Log, saying
+    /// so. The attack shapes keep their verdicts at a shutdown too: a gain
+    /// the guard saw happen is Critical (killed in enforce), against a
+    /// re-taken snapshot included; and degraded evidence outside a shutdown
+    /// stays High.
+    #[test]
+    fn degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium() {
+        let mut lost = epg_event(EpgKind::CredNoMechanism, false);
+        if let Event::ExploitPostcondition {
+            before,
+            after,
+            variant,
+            caught_at,
+            baseline_lost,
+            rebaselined,
+            comm,
+            ..
+        } = &mut lost
+        {
+            *before = *after;
+            *variant = nn_model::GuardVariant::Lite;
+            *caught_at = nn_model::CatchPoint::Capable;
+            *baseline_lost = true;
+            *rebaselined = true;
+            *comm = "blkdeactivate".into();
+        }
+        let v = verdict_at_shutdown(&NnLEpg001CredentialPostcondition, &lost).expect("recorded");
+        assert_eq!(v.rule_id, EPG_001_ID);
+        assert_eq!(v.severity, Severity::Medium);
+        assert_eq!(v.action, ResponseAction::Log);
+        for want in [
+            "UNKNOWN, at the host's shutdown",
+            "lost this task's record",
+            "capable() (lite)",
+            "uid=0",
+            "not known",
+            "never refused or killed",
+        ] {
+            assert!(v.reasoning.contains(want), "the reasoning says {want}");
+        }
+        assert!(
+            verdict_at_shutdown(&NnLEpg002NamespaceRootPostcondition, &lost).is_none(),
+            "the other rule's event is not this one's"
+        );
+        // outside a shutdown: High, as before
+        let outside = NnLEpg001CredentialPostcondition
+            .evaluate(&lost)
+            .expect("fires");
+        assert_eq!(outside.severity, Severity::High);
+        // a gain the guard saw happen, at a shutdown: Critical, killed in
+        // enforce — against a re-taken snapshot too
+        for rebaselined_ in [false, true] {
+            let mut seen = epg_event(EpgKind::CredNoMechanism, true);
+            if let Event::ExploitPostcondition { rebaselined, .. } = &mut seen {
+                *rebaselined = rebaselined_;
+            }
+            let v = verdict_at_shutdown(&NnLEpg001CredentialPostcondition, &seen).expect("fires");
+            assert_eq!(v.severity, Severity::Critical, "re-taken: {rebaselined_}");
+            assert_eq!(v.action, ResponseAction::KillProcess);
+        }
+        let escape = epg_event(EpgKind::NsNoMechanism, false);
+        let v = verdict_at_shutdown(&NnLEpg002NamespaceRootPostcondition, &escape).expect("fires");
+        assert_eq!(v.severity, Severity::Critical);
     }
 
     /// The lab's injected anomaly says so first, so no reader takes it for

@@ -11699,6 +11699,112 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
+  rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
+  C18; no level change).**
+  - What was open (Phase 5 on rc10):
+    - The posture at ALERTED after every boot (P2), on all three guests:
+      `(sd-pam)` reading `/etc/login.defs`; once on Ubuntu 24.04
+      `fusermount` reading `/etc/passwd`.
+    - R004 Critical (a would-have `KillProcessTree`) at a rootless Podman
+      run on Debian 13 (P1 for the alpha).
+    - `NN-L-EPG-001` High by `blkdeactivate` at a reboot of Ubuntu 26.04.
+  - Done, each by identity:
+    - **`(sd-pam)`.** The read comes as the user's manager stops after a
+      login ends: `(sd-pam)` closing its PAM session. Told by the kernel's
+      fork record (the open sensor carries it) and the lineage of PID 1's
+      launch of `user@<uid>.service`: the packaged executor as root, then
+      the packaged systemd as the user; its image at the open the
+      executor's (`is_user_manager_pam_keeper`; the sweep's `/proc` entry
+      of the running fork is no exec of its own). A manager older than the
+      agent (the boot's first login ~4 s before it): the start's scan and
+      the cgroup at the open, the manager's `init.scope` (`FileOpen` gains
+      `cgroup_id`).
+    - **`fusermount`.** The packaged setuid FUSE helper's own name lookup,
+      by the file the kernel executed (`runs_host_program`, shared: the
+      cached exec, a fork's forker, else the image at the open); the
+      mini-hunt adds `newuidmap`/`newgidmap` (`PASSWD_LOOKUP_HELPER_EXES`).
+    - **R004.** The pump had compared the copy (the counters: 5 kept of 5).
+      The manager failed: rootless Podman's conmon executed in its own
+      mount namespace holds no root-only image, and the lineage's 5 s sweep
+      enters its monitor with that record; R004 then read the image alone.
+      A manager is also told by the file the kernel executed, an installed
+      manager's inode still at its path (`installed_file_at_its_path`).
+    - **`NN-L-EPG-001` at a shutdown.** Degraded evidence waits for
+      systemd's answer asked after it (as a relayed signal, lot 344);
+      stopping: Medium "unknown", the host stood down.
+  - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §64 and the CHANGELOG.
+  - Mutation: 54 mutants of the final code, each caught by a named test
+    (rounds 2 and 3); round 1, on the first shape, left 24 survivors, which
+    showed the lineage's sweep entering `(sd-pam)` before its session
+    closes (the first shape would never have applied) — reworked.
+  - Lab (as measured): alpha profile (observe-only), one guest at a time
+    under its lease, each left uninstalled and powered off, no `.local`,
+    pins or probe files.
+    - **r1 — debian13 (6.12.117), `90b3c3af` (the code of the PR).**
+      - Cold boot, reboot, reboot, each checked 45 s after the logins'
+        sessions ended and again after the probe's own: no `(sd-pam)`
+        transition, `NN-L-EPG-001` 0, R004 0. At the cold boot the user's
+        manager started 5 s before the agent was active (the older-manager
+        path).
+      - Seen, not this lot's code: once, at reboot 2's later login, ALERTED
+        by `podman-user-gen` (`/usr/libexec/podman/quadlet`) reading
+        `/etc/passwd` — lot 376's class, left to a later lot.
+      - Rootless Podman, 30 runs back to back, twice: 25 copies compared and
+        kept; 8 R004 Critical each time, every one "not compared (budget):
+        uid 1000's share" (runc 10.7 MB), all among each loop's first
+        starts: the budget's design (#556 N1, #578 N3), not the soak's case.
+        `podman exec` ×2: none.
+      - Attack shapes: `cat /etc/login.defs` ALERTED, named; the packaged
+        `fusermount3` without a login uid (`systemd-run --uid=1000`): no
+        transition; copies in `/var/tmp` named `systemd-executor` and
+        `fusermount3`: R003 High and ENGAGED (StagingExec); a memfd exec as
+        uid 1000 (`/dev/fd/3`, `/proc/self/fd/3`) and a sealed copy of runc
+        executed by `python3`: R004 Critical.
+    - The rounds on ubuntu2404 and ubuntu2604 planned with that code ran on
+      the review's fixes instead (below).
+  - **The review's fixes (round 1).**
+    - **`(sd-pam)` on systemd before 255** (Ubuntu 22.04, Debian 12: no
+      executor): a fork of PID 1's own fork before it executed the manager,
+      running the packaged systemd; told by the kernel's fork record and
+      the forker's first exec (`is_pre_executor_pam_keeper`); the start's
+      scan's `(sd-pam)` runs the packaged systemd where the host ships no
+      executor (`is_pam_keeper_image`).
+    - **The quadlet generator under `(sd-exec-strv)`**: lot 376's exemption
+      required the manager's direct child; the manager is also the kernel's
+      anchor of the program's fork (`Entry::fork_anchor`, from the exec
+      record).
+    - **The runtime compare budget**: each uid's share but root's a token
+      bucket, four seconds of it at once (`RUNTIME_BURST_PER_UID`); no
+      identity trusted in place of the compare (the review: "High under the
+      packaged runc" would be a bypass). The deferred compare (the memfd
+      kept, compared when the share refills) is left for after the alpha.
+    - Mutation: 42 mutants of the round's code, 39 caught by a named test,
+      3 argued equivalent (in the PR).
+    - Lab (as measured), at `352edff4`, alpha profile, one guest at a time
+      under its lease, each left uninstalled and powered off; each boot
+      checked after the first manager's stop (older than the agent) and
+      after a manager the agent saw launched; a root inotify watch of
+      `/etc/login.defs` timed each open.
+      - **debian12 (6.1, systemd 252) and ubuntu2204 (5.15, systemd
+        249)**: `(sd-pam)` runs `/usr/lib/systemd/systemd`; a cold boot and
+        a reboot each, no transition; `/etc/login.defs` opened at each
+        manager stop, no transition; `cat /etc/login.defs` ALERTED;
+        `fusermount3` without a login uid, no transition.
+      - **ubuntu2604 (7.0, systemd 259)**: two reboots, `NN-L-EPG-001` 0
+        (the degraded evidence did not recur: the shutdown judgement is
+        covered by its tests), R004 0, no transition.
+      - **ubuntu2404 (6.8, systemd 255)**: a cold boot and two reboots, no
+        transition; a quadlet file, `daemon-reload` ×3 and reboot 2's login
+        with it, no transition; rootless Podman (crun, `--network=none`)
+        ×10 spaced and ×30, R004 0 (crun's copy does not reach the budget);
+        a memfd exec during a loop, R004 Critical; `/var/tmp` copies R003
+        High and ENGAGED.
+      - **debian13 (6.12, runc 1.1.15)**: rootless Podman ×10 spaced, ×30
+        back to back (about five a second), a loop of 30 with a memfd exec in
+        it, `podman exec` ×2: 73 copies compared and kept, 0 not compared
+        (the first head: 8 Criticals per 30), R004 0 under conmon/runc; the
+        memfd exec R004 Critical.
 - **Lot 376 — the rc9 soaks' false positives: a rotated log's first
   record, the boot-time posture rise, `pg_createcluster`, Low noise (C06,
   C14, C18; no level change).**

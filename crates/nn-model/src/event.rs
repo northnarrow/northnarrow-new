@@ -130,6 +130,13 @@ pub enum Event {
         /// when not read: tracepoint mode, older records.
         #[serde(default)]
         exe_file: (u64, u64),
+        /// Lot 378: the opener's cgroup v2 id at the open, as the LSM
+        /// file-open sensor read it (`bpf_get_current_cgroup_id`: the inode
+        /// number of the cgroup's directory) — the unit the process ran in
+        /// when it opened, whether or not it runs still. 0 when not read:
+        /// tracepoint mode, older records.
+        #[serde(default)]
+        cgroup_id: u64,
     },
     /// Tappa 10.9 step 1: one process crossed the mass-write threshold
     /// (`OPEN_MASS_WRITE_MIN` write-opens within the window), counted in
@@ -1490,6 +1497,7 @@ impl From<&FileOpenRaw> for Event {
             path_from_user: true,
             kernel_class: 0,
             exe_file: (0, 0),
+            cgroup_id: 0,
         }
     }
 }

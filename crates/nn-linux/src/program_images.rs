@@ -38,7 +38,9 @@
 //!   again at such an exec (at most once a second: a runtime installed this
 //!   minute), under a budget of their own: each uid's share, root's reserve
 //!   ([`RUNTIME_BUDGET_PER_UID`], [`RUNTIME_ROOT_RESERVE`]: the review of
-//!   #556, F2); a clone past it is kept unverified, "not compared (budget)"
+//!   #556, F2; the review of #585, F2: each uid's share a token bucket, up
+//!   to [`RUNTIME_BURST_PER_UID`] at once, a rootless user's container
+//!   starts in a loop); a clone past it is kept unverified, "not compared (budget)"
 //!   (R004: root's recorded, never killed; any other uid's the Critical
 //!   kill — the re-check of #556, N1: a user spends its own share).
 //!
@@ -120,6 +122,11 @@ pub struct Bounds {
     /// global one the other uids together never spend (root's reserve).
     root_budget: u64,
     root_reserve: u64,
+    /// The review of #585 (F2): a uid but root may read up to this much at
+    /// once, its share paying it back at `budget` a second (a token bucket:
+    /// a rootless user's container starts in a loop, their compares
+    /// bunched); 0: no more than `budget` in any second, as before.
+    burst: u64,
     compared: AtomicU64,
     skipped: AtomicU64,
     remembered: AtomicU64,
@@ -130,10 +137,43 @@ pub struct Bounds {
 /// of them (its re-check 2, N1).
 #[derive(Default)]
 struct Spent {
-    /// uid → (its second's start, the bytes it read in it, its last take).
-    uids: HashMap<u32, (Instant, u64, Instant)>,
+    /// uid → what it read.
+    uids: HashMap<u32, UidSpent>,
     /// every uid's: (the second's start, the bytes read in it).
     all: Option<(Instant, u64)>,
+}
+
+/// One uid's reads ([`Spent::uids`]).
+#[derive(Clone, Copy)]
+struct UidSpent {
+    /// Its second's start and the bytes it read in it.
+    second: Instant,
+    read: u64,
+    /// Its last take.
+    last: Instant,
+    /// The review of #585 (F2): the bytes its burst owes ([`Bounds::burst`])
+    /// as of `owed_at`, paid back at its share's rate.
+    owed: u64,
+    owed_at: Instant,
+}
+
+impl UidSpent {
+    fn new(now: Instant) -> Self {
+        Self {
+            second: now,
+            read: 0,
+            last: now,
+            owed: 0,
+            owed_at: now,
+        }
+    }
+
+    /// What its burst owes at `now`, `rate` bytes paid back a second.
+    fn owed_at(&self, now: Instant, rate: u64) -> u64 {
+        let paid = now.duration_since(self.owed_at).as_nanos() * u128::from(rate) / 1_000_000_000;
+        self.owed
+            .saturating_sub(u64::try_from(paid).unwrap_or(u64::MAX))
+    }
 }
 
 impl Bounds {
@@ -156,6 +196,7 @@ impl Bounds {
                 global_budget
             },
             root_reserve: root_reserve.min(global_budget),
+            burst: 0,
             compared: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             remembered: AtomicU64::new(0),
@@ -181,7 +222,10 @@ impl Bounds {
     /// `bytes` taken from `uid`'s budget and from every uid's for this
     /// second; `false` when they do not fit in either (nothing is taken).
     /// The review of #556 (F2): a uid but root fits in the global budget
-    /// less root's reserve.
+    /// less root's reserve. The review of #585 (F2): with a burst, a uid but
+    /// root fits while what its burst owes, with `bytes`, is no more than
+    /// the burst — whatever it read this second (the global budget's second
+    /// still bounds every uid's together).
     fn take(&self, uid: u32, bytes: u64, now: Instant) -> bool {
         let second = Duration::from_secs(1);
         let mut s = self.spent.lock();
@@ -199,15 +243,17 @@ impl Bounds {
             return false;
         }
         if s.uids.len() >= UIDS_CAP && !s.uids.contains_key(&uid) {
+            // the review of #585 (F2): a uid whose burst still owes is kept
+            let rate = self.budget;
             s.uids
-                .retain(|_, (t, _, _)| now.duration_since(*t) < second);
+                .retain(|_, e| now.duration_since(e.second) < second || e.owed_at(now, rate) > 0);
             // never all of them at once (the re-check 2 of #549, N1: that
             // gave each uid its budget again): the least recently used out
             while s.uids.len() >= UIDS_CAP {
                 let Some(oldest) = s
                     .uids
                     .iter()
-                    .min_by_key(|(_, (_, _, last))| *last)
+                    .min_by_key(|(_, e)| e.last)
                     .map(|(uid, _)| *uid)
                 else {
                     break;
@@ -215,15 +261,22 @@ impl Bounds {
                 s.uids.remove(&oldest);
             }
         }
-        let e = s.uids.entry(uid).or_insert((now, 0, now));
-        if now.duration_since(e.0) >= second {
-            (e.0, e.1) = (now, 0);
+        let bursts = uid != 0 && self.burst != 0;
+        let e = s.uids.entry(uid).or_insert(UidSpent::new(now));
+        if now.duration_since(e.second) >= second {
+            (e.second, e.read) = (now, 0);
         }
-        e.2 = now;
-        if e.1.saturating_add(bytes) > budget {
+        e.last = now;
+        if bursts {
+            let owed = e.owed_at(now, budget);
+            if owed.saturating_add(bytes) > self.burst {
+                return false;
+            }
+            (e.owed, e.owed_at) = (owed + bytes, now);
+        } else if e.read.saturating_add(bytes) > budget {
             return false;
         }
-        e.1 += bytes;
+        e.read += bytes;
         s.all = Some((all.0, all.1 + bytes));
         true
     }
@@ -238,9 +291,9 @@ impl Bounds {
             .lock()
             .uids
             .iter()
-            .filter(|(_, (t, n, _))| *n > 0 && now.duration_since(*t) < second)
-            .max_by_key(|(uid, (_, n, _))| (*n, std::cmp::Reverse(**uid)))
-            .map(|(uid, (_, n, _))| (*uid, *n))
+            .filter(|(_, e)| e.read > 0 && now.duration_since(e.second) < second)
+            .max_by_key(|(uid, e)| (e.read, std::cmp::Reverse(**uid)))
+            .map(|(uid, e)| (*uid, e.read))
     }
 }
 
@@ -713,6 +766,16 @@ const RUNTIME_BUDGET_PER_UID: u64 = 64 << 20;
 /// at least this whatever the users run.
 const RUNTIME_ROOT_RESERVE: u64 = 256 << 20;
 
+/// The review of #585 (F2: the lab of lot 378 — thirty `podman run` in a
+/// row by one rootless user, runc 1.1's 10 MiB copy compared about four
+/// times a second, met its share eight times: eight Criticals "not
+/// compared (budget)"): a uid but root may read four seconds of its share
+/// at once, its share paying it back ([`Bounds::burst`]) — about twelve
+/// runc 1.1 starts more than its rate. Spent, a copy is still not compared
+/// (R004's Critical for a uid but root): no trust is added, a payload costs
+/// only more to hide among compares.
+const RUNTIME_BURST_PER_UID: u64 = 4 * RUNTIME_BUDGET_PER_UID;
+
 /// Lot 347: the runtimes recorded again at a memfd exec at most this often
 /// (a runtime installed since the minute's refresh: Docker's first
 /// container right after its install).
@@ -776,6 +839,13 @@ impl RuntimeChecks {
         }
     }
 
+    /// The review of #585 (F2): each uid but root may read up to `burst`
+    /// at once, its share paying it back at its rate ([`Bounds::burst`]).
+    fn with_burst(mut self, burst: u64) -> Self {
+        self.bounds.burst = burst;
+        self
+    }
+
     /// The review of #578 (N3): `uid`'s skip at `now` opens an episode of
     /// its spent budget — none of its skips in the [`EPISODE_QUIET`] before
     /// (each skip is remembered, so a steady flood stays one episode). At
@@ -836,6 +906,7 @@ static RUNTIMES: LazyLock<RuntimeChecks> = LazyLock::new(|| {
         RUNTIME_BUDGET_PER_SECOND,
         RUNTIME_ROOT_RESERVE,
     )
+    .with_burst(RUNTIME_BURST_PER_UID)
 });
 
 /// Lot 347: the installed OCI runtimes and their managers under `root` —
@@ -1114,6 +1185,16 @@ mod tests {
     /// the file 0644 — as a distribution installs them, whatever the test's
     /// umask (0002 under a user unit): only root-only files are runtimes
     /// (the review of #556, F7).
+    /// The exec pump's own runtime checks ([`RUNTIMES`]'s bounds), fresh.
+    fn production_checks() -> RuntimeChecks {
+        RuntimeChecks::new(
+            RUNTIME_BUDGET_PER_UID,
+            RUNTIME_BUDGET_PER_SECOND,
+            RUNTIME_ROOT_RESERVE,
+        )
+        .with_burst(RUNTIME_BURST_PER_UID)
+    }
+
     fn put(root: &Path, path: &str, content: &[u8]) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let f = root.join(path.trim_start_matches('/'));
@@ -1592,15 +1673,12 @@ mod tests {
             .map(|i| (i % 241) as u8)
             .collect();
         let runc = put(&root, "/usr/sbin/runc", &image);
-        let checks = RuntimeChecks::new(
-            RUNTIME_BUDGET_PER_UID,
-            RUNTIME_BUDGET_PER_SECOND,
-            RUNTIME_ROOT_RESERVE,
-        );
-        // the user's own decoys spend its share
+        let checks = production_checks();
+        // the user's own decoys spend its share (the review of #585, F2: the
+        // whole of its burst)
         assert!(checks
             .bounds
-            .take(1000, RUNTIME_BUDGET_PER_UID, Instant::now()));
+            .take(1000, RUNTIME_BURST_PER_UID, Instant::now()));
         let link = |pid: u32, to: &Path| {
             std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
             symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
@@ -1637,7 +1715,7 @@ mod tests {
             runtime_clone_of(&e).and_then(|c| c.episode),
             Some(program_identity::BudgetEpisode {
                 uid: 1000,
-                top: Some((1000, RUNTIME_BUDGET_PER_UID)),
+                top: Some((1000, RUNTIME_BURST_PER_UID)),
             })
         );
         // the next skip of the same episode names nothing
@@ -1666,11 +1744,7 @@ mod tests {
     /// own; the biggest spender is the uid that read the most this second.
     #[test]
     fn a_spent_budget_is_one_episode_per_quiet_minute_and_names_its_spender() {
-        let checks = RuntimeChecks::new(
-            RUNTIME_BUDGET_PER_UID,
-            RUNTIME_BUDGET_PER_SECOND,
-            RUNTIME_ROOT_RESERVE,
-        );
+        let checks = production_checks();
         let t0 = Instant::now();
         assert!(checks.opens_episode(0, t0));
         assert!(!checks.opens_episode(0, t0 + Duration::from_secs(30)));
@@ -1700,12 +1774,13 @@ mod tests {
     /// lot's first head: per-uid == global, nothing reserved).
     #[test]
     fn one_uid_cannot_spend_root_s_runtime_budget() {
-        let c = RuntimeChecks::new(
-            RUNTIME_BUDGET_PER_UID,
-            RUNTIME_BUDGET_PER_SECOND,
-            RUNTIME_ROOT_RESERVE,
-        );
-        let now = Instant::now();
+        let c = production_checks();
+        // the review of #585 (F2): the user's burst spent a second before
+        // (its loop's first starts) — what its share paid back since is all
+        // it has
+        let t0 = Instant::now();
+        assert!(c.bounds.take(1000, RUNTIME_BURST_PER_UID, t0));
+        let now = t0 + Duration::from_secs(1);
         let start = 30 << 20;
         assert!(c.bounds.take(1000, start, now));
         assert!(c.bounds.take(1000, start, now));
@@ -1735,24 +1810,171 @@ mod tests {
         const {
             assert!(RUNTIME_BUDGET_PER_UID * 4 <= RUNTIME_BUDGET_PER_SECOND - RUNTIME_ROOT_RESERVE);
             assert!(RUNTIME_ROOT_RESERVE >= 8 * (30 << 20));
+            // the review of #585 (F2): a burst fits in one second of the
+            // users' part of the global budget, never in root's reserve
+            assert!(RUNTIME_BURST_PER_UID > RUNTIME_BUDGET_PER_UID);
+            assert!(RUNTIME_BURST_PER_UID <= RUNTIME_BUDGET_PER_SECOND - RUNTIME_ROOT_RESERVE);
         }
         // the next second: the user's share again
         assert!(c.bounds.take(1000, start, now + Duration::from_secs(1)));
         // the pump's own checks are these
         let b = &RUNTIMES.bounds;
         assert_eq!(
-            (b.budget, b.global_budget, b.root_budget, b.root_reserve),
+            (
+                b.budget,
+                b.global_budget,
+                b.root_budget,
+                b.root_reserve,
+                b.burst
+            ),
             (
                 RUNTIME_BUDGET_PER_UID,
                 RUNTIME_BUDGET_PER_SECOND,
                 RUNTIME_BUDGET_PER_SECOND,
-                RUNTIME_ROOT_RESERVE
+                RUNTIME_ROOT_RESERVE,
+                RUNTIME_BURST_PER_UID
             )
         );
-        // lot 313's compares keep their own (no reserve: root a uid as any)
+        // lot 313's compares keep their own (no reserve: root a uid as any;
+        // no burst)
         assert_eq!(
-            (BOUNDS.budget, BOUNDS.root_budget, BOUNDS.root_reserve),
-            (BUDGET_PER_SECOND, BUDGET_PER_SECOND, 0)
+            (
+                BOUNDS.budget,
+                BOUNDS.root_budget,
+                BOUNDS.root_reserve,
+                BOUNDS.burst
+            ),
+            (BUDGET_PER_SECOND, BUDGET_PER_SECOND, 0, 0)
+        );
+    }
+
+    /// The review of #585 (F2, named; the lab of lot 378 on Debian 13):
+    /// thirty `podman run` in a row by one rootless user — runc 1.1.15's
+    /// sealed copy of itself (10,683,064 bytes, compared against the
+    /// installed runc: twice its length read) about every 0.27 s — met the
+    /// share of a second eight times: eight copies not compared, R004's
+    /// Critical. With the share a token bucket every one of them is
+    /// compared, at that pace and at a faster host's (0.2 s); a sustained
+    /// flood still runs out (the share's rate holds), and its debt is paid
+    /// back at that rate only. Fails on 68d3e37b (eight refused).
+    #[test]
+    fn thirty_rootless_starts_in_a_row_are_all_compared_and_a_flood_still_runs_out() {
+        let start: u64 = 2 * 10_683_064;
+        for every_ms in [270, 200] {
+            let c = production_checks();
+            let t0 = Instant::now();
+            let refused = (0..30u64)
+                .filter(|i| {
+                    !c.bounds
+                        .take(1000, start, t0 + Duration::from_millis(i * every_ms))
+                })
+                .count();
+            assert_eq!(refused, 0, "one start every {every_ms} ms");
+        }
+        // a flood: ten starts a second for ten seconds
+        let c = production_checks();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let granted = (0..100u64)
+            .filter(|i| c.bounds.take(1000, start, at(i * 100)))
+            .count() as u64;
+        // no more than the burst and ten seconds of the share
+        assert!(
+            granted * start <= RUNTIME_BURST_PER_UID + 10 * RUNTIME_BUDGET_PER_UID,
+            "{granted} granted"
+        );
+        assert!(granted < 100, "the flood runs out");
+        // spent: paid back at the share's rate, never at once
+        while c.bounds.take(1000, start, at(10_000)) {}
+        assert!(!c.bounds.take(1000, start, at(10_000)), "spent");
+        assert!(
+            c.bounds.take(1000, start, at(10_340)),
+            "a start's worth paid back in a third of a second"
+        );
+        assert!(
+            !c.bounds.take(1000, 3 * start, at(10_680)),
+            "never three starts' worth in a third more"
+        );
+        // root keeps its second's budget, no burst: its own share of the
+        // global one, untouched by the user's
+        let r = production_checks();
+        assert!(r.bounds.take(0, RUNTIME_BUDGET_PER_SECOND, t0));
+        assert!(!r.bounds.take(0, 1, t0), "root's second spent");
+        assert!(r.bounds.take(0, 1, t0 + Duration::from_secs(1)));
+    }
+
+    /// The review of #585 (F2, named): a foreign sealed memfd of runc's
+    /// length under an installed runtime stays the Critical one whatever
+    /// the user's flood does — within its burst it is compared and kept as
+    /// no clone (R004: fileless); past it, kept unverified (R004: "not
+    /// compared (budget)", the kill for a uid but root). The burst adds no
+    /// trust.
+    #[test]
+    fn a_foreign_memfd_under_a_flood_is_never_kept_as_runc_s_clone() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), t.path().join("proc"));
+        // a length no other test's runtime has (one registry per binary)
+        let image: Vec<u8> = (0..((1u32 << 20) + 5851))
+            .map(|i| (i % 239) as u8)
+            .collect();
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let checks = production_checks();
+        let link = |pid: u32, to: &Path| {
+            std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
+            symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
+        };
+        link(35_850, &runc);
+        let payload: Vec<u8> = image.iter().map(|b| b ^ 0x3c).collect();
+        let exec = |pid: u32, ts: u64| {
+            let hook = memfd(&payload, SEALED | libc::F_SEAL_SEAL);
+            link(
+                pid,
+                &PathBuf::from(format!(
+                    "/proc/self/fd/{}",
+                    std::os::fd::AsRawFd::as_raw_fd(&hook)
+                )),
+            );
+            let mut e = memfd_exec(pid, 35_850, ts, &hook);
+            if let Event::ProcessSpawn { uid, .. } = &mut e {
+                *uid = 1000;
+            }
+            read_runtime_clone_with(&e, &proc, &root, &checks);
+            (runtime_clone_of(&e).map(|c| c.unverified), hook)
+        };
+        // within the burst: compared, no clone kept
+        assert_eq!(exec(35_851, 851).0, None, "compared: no clone");
+        assert_eq!(checks.bounds.compared.load(Ordering::Relaxed), 1);
+        // the user's flood spends the rest of its burst: kept unverified
+        while checks.bounds.take(1000, 1 << 20, Instant::now()) {}
+        assert_eq!(
+            exec(35_852, 852).0,
+            Some(true),
+            "past the burst: not compared, unverified"
+        );
+        assert_eq!(checks.bounds.compared.load(Ordering::Relaxed), 1);
+    }
+
+    /// The review of #585 (F2): a full uid table keeps a uid whose burst
+    /// still owes, whatever its second — clearing it would give it its burst
+    /// again; a uid whose debt is paid and second is over leaves.
+    #[test]
+    fn a_full_uid_table_keeps_a_uid_whose_burst_owes() {
+        let c = production_checks();
+        let t0 = Instant::now();
+        assert!(c.bounds.take(1000, RUNTIME_BURST_PER_UID, t0));
+        // other uids, a byte each, fill the table a second later (the global
+        // budget's next second; their debts paid back at once)
+        for uid in 2000..(2000 + UIDS_CAP as u32 - 1) {
+            assert!(c.bounds.take(uid, 1, t0 + Duration::from_secs(1)));
+        }
+        // a new uid 1.1 s after those: the paid-up uids leave, the owing one
+        // stays
+        let later = t0 + Duration::from_millis(2100);
+        assert!(c.bounds.take(70_000, 1, later));
+        assert!(
+            !c.bounds.take(1000, RUNTIME_BURST_PER_UID * 3 / 4, later),
+            "its burst still owes"
         );
     }
 

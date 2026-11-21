@@ -6,6 +6,68 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 378 (the rc10 soaks): three false positives judged by identity
+  (`UPGRADE_NOTES_WAVE4.md` §64).
+  - **The posture at every boot.** The `POSTURE TRANSITION` line named
+    `(sd-pam)` (image `systemd-executor`, uid 1000) reading
+    `/etc/login.defs` as the user's service manager stopped after the
+    boot's first login: its PAM session closing. Told by the kernel's fork
+    record and the lineage of PID 1's launch of `user@<uid>.service` (the
+    packaged executor as root, then the packaged systemd as the user), the
+    image at the open the executor's; for a manager older than the agent
+    (the boot's first login before the agent's start), by the start's scan
+    and the reader's cgroup at the open, the manager's own `init.scope`
+    (`FileOpen` carries the kernel's `cgroup_id`). On Ubuntu 24.04 it also named the
+    packaged setuid `fusermount3` looking up its caller in `/etc/passwd`
+    (an AppImage's mount): told by the file the kernel executed (the
+    mini-hunt: `newuidmap`/`newgidmap` the same). Tests
+    `the_user_manager_s_sd_pam_closing_its_session_is_no_sensitive_access`,
+    `the_user_manager_s_sd_pam_is_known_from_the_sweep_and_the_start_s_scan`,
+    `the_sd_pam_of_a_manager_older_than_the_agent_is_told_by_its_cgroup`,
+    `the_opener_s_cgroup_travels_with_the_open`,
+    `the_packaged_fuse_mount_helper_looking_up_its_caller_is_no_sensitive_access`.
+  - **R004 Critical at a rootless Podman run.** The pump had compared runc's
+    sealed copy of itself; the manager failed now and then: rootless
+    Podman executes conmon in its own mount namespace, and the lineage's
+    sweep entered conmon's monitor with a record holding the file but no
+    root-only image, which R004 then read alone. A manager is now also told
+    by the file the kernel executed, an installed manager's inode still at
+    its path in a root-only directory. Test
+    `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`.
+  - **`NN-L-EPG-001` High by `blkdeactivate` at a reboot.** The exploit
+    guard's degraded evidence (a task found without its record, holding
+    root's credential) 0.9 s after the reboot command, before systemd's
+    watch answered "stopping". Degraded evidence now waits for systemd's
+    answer asked after it; while systemd stops the host it is "unknown",
+    Medium, and the posture is not driven. A change the guard saw happen
+    stays Critical. Tests
+    `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
+    `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
+  - **Its review's fixes** (`UPGRADE_NOTES_WAVE4.md` §64).
+    - `(sd-pam)` on systemd before 255 (Ubuntu 22.04's 249, Debian 12's
+      252: no executor): a fork of PID 1's own fork made before that fork
+      executed the user's manager, running the packaged systemd. Told by
+      the kernel's fork record and the forker's first exec (PID 1's fork,
+      PID 1's child, the packaged systemd as the user), the image at the
+      open the packaged systemd; for a manager older than the agent, the
+      start's scan finds `(sd-pam)` running the packaged systemd where the
+      host ships no executor. Tests
+      `the_sd_pam_of_systemd_before_255_is_known_by_its_fork_and_its_manager_s_first_exec`,
+      `the_sd_pam_of_systemd_before_255_closing_its_session_is_no_sensitive_access`.
+    - Podman's quadlet user generator as systemd runs it, under
+      `(sd-exec-strv)` (a fork of the user's manager that never executes):
+      lot 376's exemption held only for the manager's direct child. The
+      manager is now also the kernel's anchor of the program's fork. Tests
+      `the_quadlet_generator_under_sd_exec_strv_is_its_manager_s_program`,
+      `the_quadlet_generator_under_sd_exec_strv_reading_passwd_is_no_sensitive_access`.
+    - The runtime compare budget: each user's share is a token bucket, up to
+      four seconds of it at once (256 MiB), paid back at its rate — 30
+      rootless `podman run` in a row are all compared. Past it a copy is
+      still "not compared (budget)", the Critical kill for a uid but root;
+      no identity is trusted instead of the compare. Tests
+      `thirty_rootless_starts_in_a_row_are_all_compared_and_a_flood_still_runs_out`,
+      `a_foreign_memfd_under_a_flood_is_never_kept_as_runc_s_clone`,
+      `a_full_uid_table_keeps_a_uid_whose_burst_owes`.
 - Lot 377 (the rc10 findings before the tag; `UPGRADE_NOTES_WAVE4.md` §63).
   - **The watchdog's witness directory is no High at its start.** Its unit
     makes `/var/lib/northnarrow/witness` writable (`ReadWritePaths=`), and
