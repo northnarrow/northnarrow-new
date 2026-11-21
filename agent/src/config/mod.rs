@@ -221,7 +221,7 @@ mod tests {
             ),
             (
                 "daemon-data.v1",
-                "b2ce219ecbf149981fbef7e23a04de42e8a06a43a474173da7c9a4b7f9804292",
+                "2c5076ed6a3b30b45b4a2e6cc4b23ff680e7f4766c2496ae636c2df51e75e312",
             ),
         ];
         for ((name, shipped), (pin_name, pin)) in shipped_lists().into_iter().zip(pins) {

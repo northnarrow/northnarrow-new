@@ -1020,6 +1020,79 @@ lists the known false positives of each rule.
   `a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless`,
   `degraded_evidence_at_the_host_s_shutdown_is_unknown_at_most_medium`,
   `the_guard_s_degraded_evidence_at_a_shutdown_is_unknown_and_drives_nothing`.
+- **Rootless Podman's uidmap tools, name lookups, a user's `modprobe`,
+  containerd's task bundles** (lot 380, the rc11 soak). Judged by identity
+  now:
+  - the packaged `newuidmap`/`newgidmap` reading `/etc/login.defs` as
+    their caller;
+  - a packaged program's read-only open of `/etc/passwd` (a name lookup:
+    `id`, `whoami`, `ls -l`), by the file the kernel executed, unless the
+    program is a file tool, a shell or an interpreter — that class is the
+    executed file's, by its identity: a multi-call binary under any name
+    (uutils, busybox) is a tool, an alias the tool it resolves to, the
+    dynamic loader judged by its operand. On Ubuntu 26.04, whose `id`,
+    `whoami`, `ls` and `stat` are uutils' one file, their read without a
+    login uid stays ALERTED;
+  - a user's `modprobe` gone before the exec pump read it, its credentials
+    read from the process that forked it: Low when that process held no
+    uid 0 and no capability in PID 1's user namespace (or ran in a user
+    namespace of its own, rootless Podman) — within bounds: a forker of at
+    most 32 threads, read at most twice a second for one forker and eight
+    times for all; past them it is not read and the exec is judged as
+    before (High for a user's, never Low);
+  - containerd writing and removing its task bundles under
+    `/run/containerd` (and dockerd under `/run/docker`), from its unit.
+
+  Still recorded: `cat`, `cut`, `python3` or a shell reading `/etc/passwd`
+  without a login uid, uutils' file under any name, the loader running
+  `cat`, `nawk`, `pager`, and any reader but those named reading
+  `/etc/login.defs` (ALERTED); a copy of a packaged program; a user's
+  `modprobe` whose forker holds a uid 0 or a capability (High); another
+  unit's burst under `/run/containerd`. A service account's read of
+  `/etc/shadow`, `/etc/gshadow` or `/etc/sudoers` is now quiet only for
+  the authentication stack and Exim, by the file the kernel executed
+  (external audit POS-007): any other daemon in the `shadow` group, the
+  loader, uutils' links, `getent shadow` raise ALERTED.
+
+  Residuals:
+  - **A file re-read shortly after an exec.** A file re-read by the same
+    process within a short interval (about a second) after an exec may not
+    produce a second record. It holds for every file the file-open sensor
+    reports on a read-only open (`/etc/passwd`, `/etc/login.defs`,
+    `/etc/shadow`, `/etc/gshadow`, the credential files, the files FIM
+    watches for opens) and every exec that keeps its process, as root or
+    as a user; a write is always reported. An eBPF change, planned for the
+    first eBPF lot after the alpha; `newgrp` is not exempted for that
+    reason.
+  - **A forker that gave up its privilege** between the fork and the
+    pump's read is taken for one that never held it (only root's own
+    process can; R018 judges any module its fork loads). A `modprobe` a
+    shell `exec`s in its own place is not read from its forker (High as
+    before for a user's, when it exited first).
+  - **Packaged readers off the tool list** (`getent passwd`, `sqlite3
+    /etc/passwd`) read `/etc/passwd`, world-readable, without a sensitive
+    access; so does a fork that changed its image to a packaged program's
+    (`PR_SET_MM`, capabilities in a user namespace of its own). The list is
+    best effort.
+  - **dockerd's container setup in a burst** (a known false positive;
+    Docker's own `overlay2` image store): twenty or more containers
+    started and removed within a minute raise ENGAGED through the
+    mass-write arm, a posture change only in the observe-only profile —
+    dockerd writes each container's init files through the layer's overlay
+    mount, which the kernel does not place under `/var/lib/docker`. A CI
+    host running Docker builds may meet it.
+
+  *Evidence:* lot 380;
+  `the_uidmap_tools_reading_shadow_s_settings_is_no_sensitive_access`,
+  `a_packaged_program_s_name_lookup_is_no_sensitive_access`,
+  `a_tool_gone_before_the_read_is_judged_by_its_forker_s_credentials`,
+  `a_user_s_modprobe_gone_before_the_read_is_judged_by_its_forker`,
+  `a_passwd_reader_is_judged_by_the_file_that_runs_not_by_its_name`,
+  `the_loader_is_judged_by_its_operand_and_an_alias_by_its_file`,
+  `a_service_account_s_shadow_read_is_quiet_only_for_its_packaged_consumers`,
+  `the_forker_route_is_bounded_per_forker_and_per_second`,
+  `containerd_replacing_its_task_bundles_under_run_raises_nothing`,
+  `a_unit_s_directories_share_one_tag`.
 - **Package builders in a chroot** (pbuilder, mock) may draw new records:
   a recent change made the checks of sudo and su stricter. We are watching
   for them. *Evidence:* lot 351.

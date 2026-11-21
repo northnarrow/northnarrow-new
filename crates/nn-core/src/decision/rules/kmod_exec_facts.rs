@@ -140,25 +140,78 @@ pub enum Credentials {
 /// `CAP_SYS_MODULE`'s bit (`linux/capability.h`).
 pub const CAP_SYS_MODULE: u32 = 16;
 
+/// A `/proc/<pid>/status`'s four uids and its permitted, effective and
+/// ambient capability sets; `None` when one does not parse.
+fn ids_and_caps(status: &str) -> Option<(Vec<u32>, Vec<u64>)> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+    };
+    let uids: Option<Vec<u32>> = field("Uid:")
+        .map(|v| v.split_whitespace().map(|u| u.parse().ok()).collect())
+        .and_then(|v: Option<Vec<u32>>| v.filter(|v| v.len() == 4));
+    let caps: Option<Vec<u64>> = ["CapPrm:", "CapEff:", "CapAmb:"]
+        .iter()
+        .map(|n| field(n).and_then(|v| u64::from_str_radix(v, 16).ok()))
+        .collect();
+    Some((uids?, caps?))
+}
+
 impl Credentials {
+    /// Lot 380 (the rc11 soak on Ubuntu 24.04: `modprobe overlay` as uid
+    /// 1000 under `podman info` High once, Low the other times — it had
+    /// exited before its credentials were read): what a fork of a process
+    /// may do at its first exec, the system's module tool (no set-id bit,
+    /// no file capability), from that process's credentials — `threads`,
+    /// each of its threads' `status` and whether that thread's user
+    /// namespace is not PID 1's (`None`: not known), read while it runs. A
+    /// fork starts with its forker's credentials and, before an exec, can
+    /// only keep or drop them or move into a new user namespace: it takes a
+    /// uid only among its own ids, a capability only from its permitted
+    /// set, and the tool's exec grants none. It cannot load a module when
+    /// no thread holds a uid 0 and each holds no capability at all in PID
+    /// 1's user namespace (not `CAP_SETUID`, which would give it a uid 0,
+    /// nor any other) or is in another one, which loads no module. A uid 0,
+    /// a capability in PID 1's namespace, a namespace not known: `MayLoad`;
+    /// nothing read, a status that does not parse: `NotRead`.
+    pub fn of_forker(threads: &[(String, Option<bool>)]) -> Credentials {
+        if threads.is_empty() {
+            return Credentials::NotRead;
+        }
+        let mut other_ns = false;
+        for (status, other) in threads {
+            let Some((uids, caps)) = ids_and_caps(status) else {
+                return Credentials::NotRead;
+            };
+            if uids.contains(&0) {
+                return Credentials::MayLoad;
+            }
+            match other {
+                Some(true) => other_ns = true,
+                Some(false) if caps.iter().all(|c| *c == 0) => {}
+                _ => return Credentials::MayLoad,
+            }
+        }
+        Credentials::CannotLoad(format!(
+            "read from the process that forked it, its first exec since: no uid 0 among the ids \
+             of any of its threads, and {} — a fork gains no capability before an exec, and the \
+             system's tool grants none (lot 380)",
+            if other_ns {
+                "each holds no capability in PID 1's user namespace (or is in another one, which \
+                 loads no module)"
+            } else {
+                "no capability in any of its sets"
+            }
+        ))
+    }
+
     /// What `status` (a `/proc/<pid>/status` read from the running exec)
     /// says the process may do; `other_user_ns`: its user namespace is not
     /// PID 1's (`None`: not known).
     pub fn of_status(status: &str, other_user_ns: Option<bool>) -> Credentials {
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(name))
-                .map(str::trim)
-        };
-        let uids: Option<Vec<u32>> = field("Uid:")
-            .map(|v| v.split_whitespace().map(|u| u.parse().ok()).collect())
-            .and_then(|v: Option<Vec<u32>>| v.filter(|v| v.len() == 4));
-        let caps: Option<Vec<u64>> = ["CapPrm:", "CapEff:", "CapAmb:"]
-            .iter()
-            .map(|n| field(n).and_then(|v| u64::from_str_radix(v, 16).ok()))
-            .collect();
-        let (Some(uids), Some(caps)) = (uids, caps) else {
+        let Some((uids, caps)) = ids_and_caps(status) else {
             return Credentials::NotRead;
         };
         if uids.contains(&0) {

@@ -782,6 +782,15 @@ const STATICS: &[Kept] = &[
          exec, bounded, the oldest out first)",
     ),
     kept(
+        "crates/nn-linux/src/sensors/kmod_exec.rs",
+        "FORKER_BUDGET",
+        HostFact,
+        "lot 380 (the review of #587, F2): the exec pump's reads of a module tool's forker in \
+         the current second — all forkers' and each forker's (by pid and start), which bound \
+         what a user's loop of exits costs the pump (one host, one exec pump; cleared each \
+         second, at most a few entries)",
+    ),
+    kept(
         "crates/nn-linux/src/sensors/app_image.rs",
         "PUMP",
         HostFact,
