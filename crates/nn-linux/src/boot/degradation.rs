@@ -1192,12 +1192,18 @@ mod tests {
     fn held_findings_replace_their_lines_and_are_never_signed_again() {
         let _g = TEST_LOCK.lock();
         reset_for_tests();
-        for i in 0..MAX_KEPT {
+        for i in 0..MAX_KEPT - 1 {
             report("k379_fill", &format!("{i}"));
         }
         let held = |n: usize| -> Vec<String> { (0..n).map(|i| format!("finding {i}")).collect() };
         hold("k379_held", &held(3));
+        // the shared room's last place is still the next report's
+        report("k379_fill", "the last");
         let lines = snapshot();
+        assert!(
+            lines.contains(&"k379_fill: the last".to_string()),
+            "{lines:?}"
+        );
         assert_eq!(lines.len(), MAX_KEPT + 3, "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains(" more ")), "{lines:?}");
         assert!(lines.contains(&"k379_held: finding 2".to_string()));

@@ -6849,8 +6849,29 @@ mod flow_sock_line_tests {
         ]);
         let d = degradation_lines(&o);
         assert_eq!(d.len(), 3);
-        assert!(d[0].contains("2 this run"), "{d:?}");
+        // lot 379: a held integrity finding can be an earlier run's, so the
+        // count no longer says "this run"
+        assert_eq!(d[0], "degradations      : 2 (each signed in the audit log)");
         assert!(!d[2].contains('\n'), "escaped: {d:?}");
+        // lot 379: held integrity findings add the acknowledgement's line,
+        // naming the newest row an `integrity:` line holds — never a row
+        // another degradation's text happens to name
+        o.degradations = Some(vec![
+            "integrity: chain_truncated (detections) — signed t (audit row 5) — held until \
+             acknowledged: cut"
+                .to_string(),
+            "net_drain: a reader said (audit row 999)".to_string(),
+            "integrity: unauthorized_overlay — signed t (audit row 7) — held while found: x"
+                .to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert_eq!(d.len(), 5, "{d:?}");
+        assert!(
+            d[4].contains("nn-admin integrity acknowledge --through 7 --key"),
+            "{d:?}"
+        );
+        o.degradations = Some(vec!["net_drain: a reader said (audit row 999)".to_string()]);
+        assert_eq!(degradation_lines(&o).len(), 2, "no held finding, no line");
         // withheld only when every telemetry field is
         let mut unsigned = outcome(None, None, None);
         unsigned.telemetry_signed = false;

@@ -250,8 +250,21 @@ fn a_start_or_a_cleared_row_never_ends_an_evidence_finding() {
     verify.extra["chain"] = "detections".into();
     log.append(verify).unwrap();
     log.append(cleared("chain_verify_failed", detail)).unwrap();
+    // a `cleared` naming exactly what it is about ends nothing either
+    log.append(cleared("chain_verify_failed", "detections"))
+        .unwrap();
+    log.append(drift("overlay_rollback_floor_unavailable", "no anchor"))
+        .unwrap();
+    log.append(cleared("overlay_rollback_floor_unavailable", "no anchor"))
+        .unwrap();
     boot(&mut log);
-    assert_eq!(kinds(&log), ["chain_verify_failed:detections"]);
+    assert_eq!(
+        kinds(&log),
+        [
+            "chain_verify_failed:detections",
+            "overlay_rollback_floor_unavailable:no anchor"
+        ]
+    );
 }
 
 /// A row that ends a hold counts only when its signature verifies with the
@@ -372,6 +385,7 @@ fn the_host_is_told_at_the_open_and_at_each_change() {
     memory.append(cut("audit", &path)).unwrap();
     assert_eq!(memory.held().findings().len(), 1);
     assert!(helds::take(&path).is_empty());
+    assert!(helds::take(Path::new("")).is_empty(), "told under no path");
 }
 
 /// Past [`MAX_HELD`] findings are counted, not listed, and an
@@ -400,12 +414,19 @@ fn past_the_cap_findings_are_counted_and_acknowledged() {
     assert_eq!(log.held().covered_by(newest), MAX_HELD as u64 + 3);
     log.append(ack(newest)).unwrap();
     assert!(log.held().is_empty());
+    assert_eq!(log.held().newest_row(), None);
+    assert!(log.held().lines().is_empty());
     // the found ones counted past the cap end at the next start too
-    for i in 0..MAX_HELD + 2 {
+    for i in 0..MAX_HELD + 1 {
         log.append(drift("mount_not_canonical", &format!("/run/x{i}")))
             .unwrap();
     }
-    assert_eq!(log.held().more(), 2);
+    assert_eq!(log.held().more(), 1);
+    let lines = log.held().lines();
+    assert!(
+        lines[MAX_HELD].contains("1 more held integrity row(s)"),
+        "{lines:?}"
+    );
     boot(&mut log);
     assert!(log.held().is_empty(), "{:?}", log.held());
 }
@@ -451,4 +472,8 @@ fn a_long_detail_is_cut() {
     let f = &log.held().findings()[0];
     assert_eq!(f.detail.chars().count(), DETAIL_CHARS + 1);
     assert!(f.detail.ends_with('…'));
+    // at the bound it is whole
+    let exact = "y".repeat(DETAIL_CHARS);
+    log.append(drift("config_overlay", &exact)).unwrap();
+    assert_eq!(log.held().findings()[1].detail, exact);
 }

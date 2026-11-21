@@ -441,7 +441,9 @@ each open (a restart reads the chain again: it clears nothing):
 - **Not held**: the degradations the status shows already, which their
   finder withdraws when they end (`subsystem_degraded`, the pin lock, the
   profile downgrade, a restart loop), and rows that are no finding (a note,
-  a repair, an end).
+  a repair, an end) — a torn tail's repair among them
+  (`chain_tail_repaired`, below: a crash's normal end, its cut signed and
+  verifiable).
 - A row that ends a hold — an acknowledgement, a `cleared`, a start's
   `agent_boot` — counts only when its signature verifies with the agent's
   key: a line written into the file by hand ends nothing.

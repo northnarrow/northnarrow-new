@@ -1055,7 +1055,7 @@ lists the known false positives of each rule.
   you:* on any kernel, a mount-guard degradation in `nn-admin status` is
   worth a report with `uname -r`. *Evidence:* internal check Phase 8b
   §4.3 and §5 (F8b-1); `a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`
-  (`integrity_status_privileged_e2e`, the CI's KVM guests);
+  (a privileged suite of the CI's KVM guests);
   `a_build_without_the_test_feature_injects_nothing`;
   `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 379.
 - **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
