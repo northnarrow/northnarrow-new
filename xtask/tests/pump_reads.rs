@@ -160,13 +160,14 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/program_images.rs",
-        22,
+        23,
         "the installed programs' list (`/etc/shells`, the system's binary directories and \
          the runtimes' fixed paths, resolved and checked root-only at a refresh); the \
          installed program a running image is compared with, and a runtime at its recorded \
          path (root's); procfs's own `stat`/`status`, and (lot 381) a parent's threads \
          (`/proc/<pid>/task` listed) and their `children`, (the review of #588, F1) the \
-         exec's own threads listed and each one's `stat` — procfs's own, beneath the \
+         exec's own threads listed and each one's `stat`, (the re-check of #588, N1) its own \
+         `stat` (`num_threads`) — procfs's own, beneath the \
          anchored `/proc` root; `Cached::is_dir`, `Metadata::is_file` (memory)",
     ),
     (

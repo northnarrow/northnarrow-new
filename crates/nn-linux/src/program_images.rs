@@ -1402,7 +1402,7 @@ enum Group {
     /// not read.
     Running,
     /// No thread runs: none listed (the process reaped), or each a zombie
-    /// or gone.
+    /// or gone and the leader counted alone (the re-check of #588, N1).
     Gone,
 }
 
@@ -1412,11 +1412,17 @@ enum Group {
 /// `exit_group`) is a zombie whose `exe` is not read while its other
 /// threads run the payload: taken as exited, a foreign root memfd was kept
 /// "not compared (gone)" — High, never killed. Gone only when no thread
-/// listed has not exited ([`thread_runs`]).
+/// listed has not exited ([`thread_runs`]) and the kernel counts the
+/// leader alone ([`leader_alone`]: the re-check of #588, N1).
 fn group_copy(at: &Path, open: &dyn Fn(&Path) -> Opened) -> Group {
     let task = at.join("task");
-    let Ok(tids) = antitamper_bpf::kernel_roots::read_dir_max(&task, HOLDERS_MAX + 1) else {
-        return Group::Gone;
+    let tids = match antitamper_bpf::kernel_roots::read_dir_max(&task, HOLDERS_MAX + 1) {
+        Ok(tids) => tids,
+        // the process reaped
+        Err(e) if reaped(&e) => return Group::Gone,
+        // the re-check of #588 (N2): any other failure (`EMFILE`, a
+        // `readdir` error) on a group that may live: never told gone
+        Err(_) => return Group::Running,
     };
     // a thread past the bound may run it: never told gone
     let mut running = tids.len() > HOLDERS_MAX;
@@ -1428,11 +1434,40 @@ fn group_copy(at: &Path, open: &dyn Fn(&Path) -> Opened) -> Group {
             Err(false) => running |= thread_runs(&thread),
         }
     }
-    if running {
+    // the re-check of #588 (N1): the listing is no snapshot — a thread made
+    // after it, while the listed one exits before its read, is not seen
+    // (1.7% of reads of such a group on 6.18): gone only when the kernel's
+    // count of the group's threads (the leader's `num_threads`) is the
+    // leader alone
+    if running || !leader_alone(at) {
         Group::Running
     } else {
         Group::Gone
     }
+}
+
+/// The re-check of #588 (N1): the process at `at` (`/proc/<pid>`) counts
+/// its leader alone, or none — `num_threads` of its `stat` (the kernel's
+/// `signal->nr_threads`, one read) at most 1, or its `stat` gone (the
+/// process reaped). Any other failure to read or parse it: not alone.
+fn leader_alone(at: &Path) -> bool {
+    match crate::state_read::read_state(at.join("stat")) {
+        // after the name: the state is field 3, `num_threads` field 20
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| {
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                fields.get(17)?.parse::<u64>().ok()
+            })
+            .is_some_and(|n| n <= 1),
+        Err(e) => reaped(&e),
+    }
+}
+
+/// A read of a process's or a thread's `/proc` entry failed because it is
+/// gone (reaped): `ENOENT`, `ESRCH`.
+fn reaped(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// The review of #588 (F1): the thread at `thread` (`/proc/<pid>/task/<tid>`)
@@ -1445,7 +1480,7 @@ fn thread_runs(thread: &Path) -> bool {
             .rsplit_once(')')
             .and_then(|(_, rest)| rest.split_whitespace().next())
             .is_none_or(|state| !matches!(state, "Z" | "X" | "x")),
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound && e.raw_os_error() != Some(libc::ESRCH),
+        Err(e) => !reaped(&e),
     }
 }
 
@@ -2410,6 +2445,87 @@ mod tests {
         thread(58_813, 58_814, None, Some("X"));
         thread(58_813, 58_815, None, None);
         assert_eq!(read(58_813, &clone), gone);
+    }
+
+    /// The re-check of #588 (N1, N2; named): the threads' listing is no
+    /// snapshot — a thread made after the `readdir` while the listed one
+    /// exits before its read is not seen (1.7% of reads of such a group on
+    /// 6.18, a live group taken as exited: "gone", root's High) — and a
+    /// listing that fails for another reason than the process's absence
+    /// (`EMFILE`, a `readdir` error) said nothing of the group either. At
+    /// c0868bb9 both were "gone", kept unverified. Now gone only when the
+    /// leader's `num_threads` (the kernel's count, one read) is 1 or its
+    /// `stat` is gone; else nothing kept, "lost" (R004's fileless
+    /// Critical).
+    #[test]
+    fn a_group_whose_listing_missed_a_live_thread_is_never_gone() {
+        use nn_core::decision::rules::program_identity::runtime_clone_of;
+        let t = tempfile::tempdir().unwrap();
+        let (root, proc) = (t.path().join("root"), FakeProc(t.path().join("proc")));
+        let mut image: Vec<u8> = (0..((1u32 << 20) + 5884))
+            .map(|i| (i % 211) as u8)
+            .collect();
+        image[..4].copy_from_slice(b"n588");
+        let runc = put(&root, "/usr/sbin/runc", &image);
+        let runc_id = kernel_id(&std::fs::metadata(&runc).unwrap());
+        let clone = memfd(&image, SEALED | libc::F_SEAL_SEAL);
+        proc.link(58_840, &runc);
+        // `pid`: its leader a listed zombie; its own `stat` (none: reaped)
+        // counting `threads`
+        let zombie = |pid: u32, threads: Option<&str>| {
+            let d = proc.0.join(format!("{pid}/task/{pid}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), format!("{pid} (k 588) Z 58840 1")).unwrap();
+            if let Some(n) = threads {
+                // fields 3 to 19, then `num_threads` (field 20)
+                let fields = format!("Z 58840 {} {n} 0 0", "0 ".repeat(15).trim_end());
+                std::fs::write(
+                    proc.0.join(format!("{pid}/stat")),
+                    format!("{pid} (k 588) {fields}"),
+                )
+                .unwrap();
+            }
+        };
+        let read = |pid: u32| {
+            let checks = RuntimeChecks::new(1 << 30, 1 << 30, 0);
+            let e = memfd_exec(pid, 58_840, 588, &clone);
+            read_runtime_clone_with(&e, &proc.0, &root, &checks, &Settle::default());
+            (
+                runtime_clone_of(&e).map(|c| (c.image, c.unverified, c.gone)),
+                checks.counts(),
+            )
+        };
+        let lost = (
+            None,
+            RuntimeCloneCounts {
+                lost: 1,
+                ..Default::default()
+            },
+        );
+        // N1: every listed thread exited, the kernel counting two
+        zombie(58_841, Some("2"));
+        assert_eq!(read(58_841), lost, "a live thread the listing missed");
+        // ... or a count not read as one
+        zombie(58_842, Some("many"));
+        assert_eq!(read(58_842), lost);
+        // N2: the listing failed, not for the process's absence
+        std::fs::create_dir_all(proc.0.join("58843")).unwrap();
+        std::fs::write(proc.0.join("58843/task"), "not a directory").unwrap();
+        assert_eq!(read(58_843), lost, "a listing error taken as gone");
+        // CONTROLS: the leader alone (its zombie counted), or the process
+        // reaped (no `stat`, no `task`): gone, kept unverified
+        let gone = (
+            Some((runc_id, true, true)),
+            RuntimeCloneCounts {
+                gone: 1,
+                ..Default::default()
+            },
+        );
+        zombie(58_844, Some("1"));
+        assert_eq!(read(58_844), gone);
+        zombie(58_845, None);
+        assert_eq!(read(58_845), gone);
+        assert_eq!(read(58_846), gone);
     }
 
     /// The review of #588 (F3, named): the pump stopped waiting for a
