@@ -5608,7 +5608,9 @@ shape it resembles still fires.
 - **Upgrade.** No configuration. Expect `sensors: DEGRADED` and the trust
   level at most L2 on a host where the agent had signed such findings,
   until each ends by its rule: read them (`nn-admin status --key`),
-  investigate, then acknowledge the evidence's. An agent installed with
+  investigate, then acknowledge the evidence's. The install's admin key
+  left at `/root/northnarrow-admin.key` is one (`admin_key_on_host`, held
+  while it is there): move it off the host. An agent installed with
   test lists or overlays of its own (the lab's escape hatch,
   `NN_OVERLAY_ALLOW_UNSIGNED=1`) holds each of them as
   `unauthorized_overlay` or `default_list_modified` for the run.

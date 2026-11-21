@@ -219,6 +219,13 @@ sudo nn-admin status --key "$KEY"
 
 The first summary line must say `OBSERVE-ONLY — profile alpha`.
 
+With the key left on the host, `sensors` says `DEGRADED` and the
+degradations list `integrity: admin_key_on_host`: the agent signs the key
+it finds there (a credential for whoever is root on the host), and the
+status holds it while it is found. On a throwaway VM that is expected; on
+any other machine, move the key off the host — the next start no longer
+finds it (lot 379, [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+
 Run `nn-admin` with `sudo`: the agent's socket and the key are root's.
 Without `sudo`, a command that talks to the agent is refused with exit 17
 and "Run it with sudo"; that does not mean the agent is stopped. If
