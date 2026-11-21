@@ -1455,8 +1455,10 @@ fn leader_alone(at: &Path) -> bool {
         // after the name: the state is field 3, `num_threads` field 20
         Ok(stat) => stat
             .rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().nth(17))
-            .and_then(|n| n.parse::<u64>().ok())
+            .and_then(|(_, rest)| {
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                fields.get(17)?.parse::<u64>().ok()
+            })
             .is_some_and(|n| n <= 1),
         Err(e) => reaped(&e),
     }
