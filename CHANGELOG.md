@@ -6,6 +6,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Lot 379 (pre-alpha Phase 7, F7-1; Phase 8b, F8b-1 / F7-2): the status
+  tells every signed integrity finding (`UPGRADE_NOTES_WAVE4.md` §65).
+  - **Held integrity findings.** `nn-admin status --key` showed
+    `sensors: OK` over a cut chain, an unauthorized overlay and a modified
+    default list the agent had signed. The audit log now keeps, from its
+    own rows (at each append and each open), the integrity findings that
+    hold (`nn_evidence::held`), and tells its host at each change
+    (`ChainHost::integrity_held`): each is an `integrity:` degradation of
+    the status, the trust level and the capability manifest. The rule: an
+    evidence finding until a signed acknowledgement covers its row, any
+    other while its check finds it (its `cleared` row, or the next start);
+    a row that ends a hold counts only with a verifying signature. Tests
+    `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`,
+    `a_config_finding_is_held_while_found`,
+    `a_start_or_a_cleared_row_never_ends_an_evidence_finding`,
+    `a_row_not_signed_by_the_log_s_key_ends_no_hold`,
+    `an_acknowledgement_never_covers_a_later_row`,
+    `rows_that_are_no_finding_are_not_held`,
+    `a_held_integrity_finding_is_a_degradation_until_its_hold_ends`.
+  - **`nn-admin integrity acknowledge --through <row>`** (operation 27,
+    `triage` or `config-manage`): the signed acknowledgement, refused for a
+    row not signed yet. Tests
+    `an_acknowledgement_covers_only_signed_rows_that_hold`,
+    `roundtrip_integrity_acknowledge`, the admin pipeline's and nn-admin's
+    golden tables.
+  - **The mount guard's verifier refusal, proven.** A test-only fault
+    injection (`NN_TEST_VERIFIER_REFUSE`, feature `test-privileged`: never
+    in a release) refuses a guard program at its load; the privileged suite
+    `integrity_status_privileged_e2e` checks the signed row, `nn-admin
+    capabilities` and `nn-admin status` on a real agent
+    (`a_verifier_refusal_of_the_mount_guard_is_a_signed_degradation`,
+    `an_unauthorized_overlay_is_held_in_the_status_until_acknowledged`;
+    `a_build_without_the_test_feature_injects_nothing`).
+  - Docs: README and KNOWN_LIMITATIONS give the lab's resource figures
+    (QEMU guests) and say that the per-operation exec and open latency is
+    not measured yet; the rootless burst's figures corrected; two long
+    lines rewrapped.
 - Lot 378 (the rc10 soaks): three false positives judged by identity
   (`UPGRADE_NOTES_WAVE4.md` §64).
   - **The posture at every boot.** The `POSTURE TRANSITION` line named

@@ -4953,7 +4953,10 @@ still fires.
   `chronyd.service`, `ntp.service`, `ntpd.service`, `ntpsec.service`,
   `openntpd.service`), started there and never injected (the kernel's lot
   277 and 281 marks).
-  - Still a beacon: any other program to UDP 123, and systemd-timesyncd to another port or over TCP, from a session, traced or injected. chronyd and ntpd also keep their netflow allowlist entry, which is broader than this exemption (a residual, named).
+  - Still a beacon: any other program to UDP 123, and systemd-timesyncd
+    to another port or over TCP, from a session, traced or injected.
+    chronyd and ntpd also keep their netflow allowlist entry, which is
+    broader than this exemption (a residual, named).
 - **`R011` High, intermittent, on Debian 12.** This was a race. A
   `modprobe --show-depends` of a dpkg trigger's initramfs build exits
   within milliseconds. The exec pump looked for the package manager from
@@ -5566,3 +5569,52 @@ shape it resembles still fires.
   no R004 at a rootless Podman run, a loop of a few dozen included; and at
   a shutdown at most a Medium `NN-L-EPG-001` for a task whose record the
   guard lost.
+
+## 65. The status shows every signed integrity finding; a verifier's refusal of the mount guard, tested (lot 379)
+
+- **What changed.** `nn-admin status --key` said `sensors: OK — no
+  degradation` after the agent had detected and signed a cut or rewritten
+  chain (`chain_truncated`, `chain_verify_failed`), an unauthorized overlay
+  or a modified default list: only the journal's ERROR and `nn-admin chain
+  verify` told (pre-alpha Phase 7, F7-1; the same class as Phase 3-bis
+  F3b-6). Every signed integrity finding is now an `integrity:`
+  degradation — its kind, what it is about, the time and audit row of its
+  signed row — until its hold ends:
+  - a finding of the evidence (a chain cut, rewritten, missing or
+    unverifiable; the witness chain broken; `agent_id_changed`; the
+    overlays' rollback floor reset): until an acknowledgement covers it;
+  - any other (an unauthorized overlay, a modified or unavailable default
+    list, the integrity round's drifts, an event of the run): while it is
+    found — until its check signs its end or the next start checks again —,
+    or until acknowledged.
+  The audit log keeps the holds from its own rows, so a restart keeps them;
+  a row that ends one counts only when its signature verifies.
+  ([EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds).)
+- **New command.** `nn-admin integrity acknowledge --through <row> [--note
+  <text>] --key <key>`, a key with `triage` or `config-manage` (the key
+  `install.sh` writes has `config-manage`). The agent signs the
+  acknowledgement (`integrity_acknowledged`); the findings whose newest row
+  is at or before `<row>` leave the status. A row not signed yet is refused
+  (exit 9). `nn-admin status --key` prints the command with the newest held
+  row. An agent older than this lot does not know the command (exit 5).
+- **The mount guard's verifier refusal, tested.** A mount-guard program the
+  kernel's verifier refuses at its load was argued, from the code, to be a
+  signed degradation. It is now tested on a real agent: a test build
+  (feature `test-privileged`, never a release) refuses
+  `mount_guard_sb_mount` at its load; the agent runs with the guard's other
+  four hooks, and the signed row (`subsystem_degraded`, source
+  `anti_tamper`), `nn-admin capabilities` and `nn-admin status` say it.
+  No behaviour changed: the test proves what the release does.
+- **Upgrade.** No configuration. Expect `sensors: DEGRADED` and the trust
+  level at most L2 on a host where the agent had signed such findings,
+  until each ends by its rule: read them (`nn-admin status --key`),
+  investigate, then acknowledge the evidence's. An agent installed with
+  test lists or overlays of its own (the lab's escape hatch,
+  `NN_OVERLAY_ALLOW_UNSIGNED=1`) holds each of them as
+  `unauthorized_overlay` or `default_list_modified` for the run.
+- **Docs.** README and KNOWN_LIMITATIONS: the lab's resource figures (QEMU
+  guests: RSS, CPU at rest, event-to-record latency, the cost on real
+  work), and that the per-operation exec and open latency of this release
+  is not measured yet; the rootless runtime burst's figures corrected
+  (about fifty-four starts at four a second by the budget's model; the lab
+  ran about two a second).
