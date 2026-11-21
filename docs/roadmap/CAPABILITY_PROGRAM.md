@@ -11743,7 +11743,32 @@ number in parentheses is a lab PR.
       snapshot under `/var/lib/containerd` in one window; a unit's
       directories now share the kernel's tag (`tagged_dirs`).
   - Tests, each named in `UPGRADE_NOTES_WAVE4.md` §66 and the CHANGELOG.
-  - Mutation and lab: below, as measured.
+  - Mutation: 51 mutants of the final code in four rounds, 46 caught by a
+    named test (the survivors of each round got test cases), 5 argued
+    equivalent in the PR (a zero forker start, a file capability no
+    unprivileged test can set, the start and pidfd checks that bracket a
+    pid reused during the reads).
+  - Lab (as measured): alpha profile, each round under its lease, each
+    guest left uninstalled and powered off.
+    - **debian13 (6.12) and ubuntu2404 (6.8).** Name lookups (`id` in a
+      session ×200; `id`, `whoami`, `groups`, `ls -l`, `stat` in units run
+      as the user with no login uid), rootless Podman (`podman info` with
+      a fresh user namespace ×5, pull, run ×20), a user's `modprobe` ×5,
+      `sg` ×3: no transition; ubuntu2404's `podman info` `modprobe overlay`
+      as uid 1000 R011 Low. Three reboots each: Observing. `cat
+      /etc/login.defs` and `cat /etc/shadow` (the user in group `shadow`)
+      ALERTED, each first after a boot; a copy of `kmod` as root High
+      (would-kill), a user's `modprobe` with ambient `CAP_SYS_MODULE` High.
+      A Docker burst: containerd's crossing left out after the shared
+      tags (it crossed before them on debian13); dockerd's still ENGAGED
+      (`overlay2` init files through an overlay mount: not done).
+    - **The read-repeat filter (a finding).** `bash -c 'cat /etc/passwd'`
+      in a unit run as the user raised nothing on both guests, before and
+      after the lagging-records fix; with `sleep 2; exec cat` ALERTED
+      (debian13): the file-open sensor drops a task's read of a file
+      within a second of its last, across an exec, and the unit's executor
+      had looked the user up in the same process. Keying it on the exec
+      is left to a later lot.
 - **Lot 378 — the rc10 soaks' false positives: `(sd-pam)` at a login's end,
   rootless runc's copy of itself, `blkdeactivate` at a shutdown (C06, C14,
   C18; no level change).**
