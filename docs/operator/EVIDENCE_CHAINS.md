@@ -474,8 +474,9 @@ each open (a restart reads the chain again: it clears nothing):
   choice of the operator that degrades no sensor: an admin private key
   left on the host (`admin_key_on_host`), strict overcommit with a high
   ratio (`sysctl_strict`), the operator's signed opt-out of a guarded
-  sysctl (`sysctl_opted_out`), a pause of the whole machine
-  (`agent_stalled`), the quarantine's index rebuilt
+  sysctl (`sysctl_opted_out`), a stall of the agent's loop — a pause of
+  the whole machine, or the kernel holding the agent back above its unit's
+  `MemoryHigh` (`agent_stalled`) —, the quarantine's index rebuilt
   (`quarantine_index_rebuilt`) — are kept as the degradations are, and
   listed on their own (`advisories`, each with its signed row). They are
   never counted in `sensors`, the trust level or the capability manifest:

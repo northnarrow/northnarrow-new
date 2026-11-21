@@ -339,6 +339,104 @@ fn what_is_not_a_regular_file_is_named_and_never_restored_or_removed() {
     assert!(!gone.exists());
 }
 
+// ── our BPF programs, by identity (lot 383) ───────────────────────────
+
+/// `bpftool prog show` on Ubuntu 26.04 (systemd 259) after a guard test:
+/// PID 1's `RestrictFileSystems=` program, and a nameless LSM program of
+/// another product.
+const PID1_ONLY: &str = "\
+12: lsm  name restrict_filesy  tag 9f8e7d6c5b4a3210  gpl
+\tloaded_at 2026-11-21T08:00:00+0000  uid 0
+\txlated 1000B  jited 600B  memlock 4096B  map_ids 3
+\tbtf_id 7
+43: lsm  tag 001122334455667a  gpl
+";
+
+/// The nightly of 2026-11-21 (ubuntu2604, debian13): a guard test stopped
+/// its enforce run itself, the fixture's teardown had no list in hand and
+/// counted every LSM program on the host — systemd's one among them — and
+/// failed after the test had passed ("LSM programs still loaded: 1").
+/// Whether by the ids the fixture kept or, with none, by our names, PID 1's
+/// program is never ours.
+#[test]
+fn the_teardown_does_not_wait_for_pid_ones_lsm_program() {
+    let none = Default::default();
+    assert_eq!(
+        common::our_bpf::ours_left(PID1_ONLY, &none),
+        Vec::<String>::new()
+    );
+    let kept: std::collections::BTreeSet<u32> = [40, 41, 77].into();
+    assert_eq!(
+        common::our_bpf::ours_left(PID1_ONLY, &kept),
+        Vec::<String>::new()
+    );
+}
+
+/// No weakening: a program of ours still loaded is waited for — by its id
+/// whatever its type, or, with no id readable, by its name as the kernel
+/// keeps it (15 bytes), LSM programs only.
+#[test]
+fn a_leftover_program_of_ours_still_fails_the_teardown() {
+    let listing = format!(
+        "{PID1_ONLY}\
+40: lsm  name task_kill  tag 0011223344556677  gpl
+41: lsm  name mount_guard_sb_  tag 0011223344556678  gpl
+\tloaded_at 2026-11-21T08:00:00+0000  uid 0
+42: kprobe  name udp_send_skb  tag 0011223344556679  gpl
+44: kprobe  name task_kill  tag 001122334455667b  gpl
+"
+    );
+    let none = Default::default();
+    assert_eq!(
+        common::our_bpf::ours_left(&listing, &none),
+        vec![
+            "40: lsm  name task_kill  tag 0011223344556677  gpl".to_string(),
+            "41: lsm  name mount_guard_sb_  tag 0011223344556678  gpl".to_string(),
+        ]
+    );
+    let ids: std::collections::BTreeSet<u32> = [42, 41, 99].into();
+    assert_eq!(
+        common::our_bpf::ours_left(&listing, &ids),
+        vec![
+            "41: lsm  name mount_guard_sb_  tag 0011223344556678  gpl".to_string(),
+            "42: kprobe  name udp_send_skb  tag 0011223344556679  gpl".to_string(),
+        ]
+    );
+}
+
+/// The ids of a `bpf-own-ids` list, as `install.sh` reads them (the first
+/// field of every line that starts with a digit, `kept` ones included);
+/// the lists of several files together, a missing one adding none.
+#[test]
+fn the_ids_of_every_list_are_read_as_install_sh_reads_them() {
+    let body = "# northnarrow-agent pid 4242: loaded BPF programs (id name [kept])\n\
+                40 task_kill\n41 mount_guard_sb_umount\n77 cgroup_join_inject kept\n\
+                x9 not_an_id\n\n";
+    let want: std::collections::BTreeSet<u32> = [40, 41, 77].into();
+    assert_eq!(common::our_bpf::listed_ids(body), want);
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::write(&a, body).unwrap();
+    std::fs::write(&b, "# pid 1\n90 task_kill\n").unwrap();
+    let all = common::our_bpf::ids_in(&[a, b, dir.path().join("missing")]);
+    assert_eq!(all, [40, 41, 77, 90].into());
+}
+
+/// The names come from the one list the lab reads too, every one a name
+/// the kernel can keep, and none is systemd's.
+#[test]
+fn our_lsm_names_are_the_ebpf_objects_as_the_kernel_keeps_them() {
+    let names = common::our_bpf::lsm_names();
+    assert!(names.len() >= 55, "{names:?}");
+    assert!(names.contains("task_kill") && names.contains("mount_guard_sb_"));
+    assert!(names
+        .iter()
+        .all(|n| n.len() <= common::our_bpf::KERNEL_NAME_LEN
+            && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')));
+    assert!(!names.contains("restrict_filesy"));
+}
+
 // ── EniIptablesGuard (moved from common/mod.rs) ───────────────────────
 
 #[cfg(feature = "test-privileged")]

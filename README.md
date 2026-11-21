@@ -343,7 +343,10 @@ sudo ./deploy/install.sh --source-tree     # bootstraps an admin key at /root/no
 sudo systemctl enable --now northnarrow-agent northnarrow-watchdog
 ```
 
-**From a release (once one is published).** A release is verified and installed like this:
+**From a release (once one is published).** The first is `v0.1.0-alpha`: `<ver>` below is
+`0.1.0-alpha`, and the packages are `northnarrow_0.1.0-alpha-1_amd64.deb` and
+`northnarrow-0.1.0-alpha-1.x86_64.rpm` (versioned `0.1.0~alpha-1` inside: dpkg's and rpm's form of a
+pre-release). A release is verified and installed like this:
 
 ```sh
 # 1. Download the release tarball + checksums from the Releases page, then verify

@@ -2951,7 +2951,7 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
                 checker.report_once(
                     Finding {
                         kind: "agent_stalled",
-                        detail: format!("did not run for ~{} s (from unix {at}): cgroup freeze, stopped VM or starvation", late.as_secs()),
+                        detail: format!("did not run for ~{} s (from unix {at}): cgroup freeze, stopped VM, starvation or memory throttling (its MemoryHigh)", late.as_secs()),
                     },
                     false,
                 );

@@ -1,6 +1,6 @@
 # Alpha tester guide
 
-> Draft until rc-final: this guide is checked again before the v0.1.0-alpha tag.
+> For NorthNarrow 0.1.0-alpha (the `v0.1.0-alpha` release).
 
 NorthNarrow is an open-source endpoint detection and response (EDR) agent
 for Linux. It watches what runs on a host, the files it touches and the
@@ -142,8 +142,11 @@ curl -fLO "$base/SHA256SUMS.asc"
 ```
 
 For the `.deb` instead of the tarball, download it the same way, by the
-name the release page lists (`northnarrow_<ver>-<rel>_amd64.deb`), next
-to `SHA256SUMS` and `SHA256SUMS.asc`.
+name the release page lists (`northnarrow_<ver>-<rel>_amd64.deb`: for the
+alpha `northnarrow_0.1.0-alpha-1_amd64.deb`), next to `SHA256SUMS` and
+`SHA256SUMS.asc`. Installed, the package's version reads `0.1.0~alpha-1`
+(`dpkg -l northnarrow`): dpkg's form of the same pre-release, which sorts
+before a final `0.1.0`.
 
 Verify them with the release key committed at the release tag, never
 with a copy from the release page
@@ -259,7 +262,9 @@ source) cannot be proven to be the release:
   For a CI build the installer prints `tarball matches SHA256SUMS` (not
   "signed"), and `nn-admin host-check` shows `release verified at
   install` as a WARN naming the flag. Both are expected for such a build.
-  Its version can read `0.0.1`.
+  Its version reads `0.1.0-alpha`, as the release's: the `Build:` line of
+  its tree's `README-RELEASE.md` names the commit it was built from (and
+  `install.sh --upgrade` prints it).
 - A `.deb` of such a build has only its `SHA256SUMS` line: nothing
   checks more.
 

@@ -45,7 +45,7 @@ exit: 2
 $ nn-admin --version
 exit: 0
 --- stdout
-| nn-admin 0.0.1
+| nn-admin 0.1.0-alpha
 --- stderr
 (empty)
 
@@ -53,7 +53,7 @@ exit: 0
 $ nn-admin -V
 exit: 0
 --- stdout
-| nn-admin 0.0.1
+| nn-admin 0.1.0-alpha
 --- stderr
 (empty)
 

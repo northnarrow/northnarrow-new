@@ -1,11 +1,57 @@
 # Changelog
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions
-follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
+follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0, and
+`0.1.0-alpha` everything since, up to the first alpha. A section's date is
+the day of its tag, written in the last commit before the tag (until then
+it reads `unreleased`); release.yml's `verify-tag` refuses a tag that is
+not `v` and the workspace version, or whose section is not the first one
+here, dated (CONTRIBUTING.md, "Rilasci").
 
-## [Unreleased]
+## [0.1.0-alpha] - unreleased
+
+Tag `v0.1.0-alpha`: the first alpha, everything since `0.0.1` (Wave 4 and
+the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
+`--version`, the tarball and the packages say `0.1.0-alpha`; the `.deb` and
+the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
 
 ### Added
+- Lot 383 (the alpha's version; `UPGRADE_NOTES_WAVE4.md` §68).
+  - **0.1.0-alpha everywhere.** The workspace said `0.0.1`: a
+    `v0.1.0-alpha` tag would have published 0.0.1 artefacts. The workspace
+    and `agent-ebpf`, the lockfiles, every binary's `--version`, the signed
+    rows and the file names (`northnarrow-0.1.0-alpha-x86_64-linux.tar.gz`,
+    `northnarrow_0.1.0-alpha-1_amd64.deb`,
+    `northnarrow-0.1.0-alpha-1.x86_64.rpm`) say `0.1.0-alpha`; the
+    packages' own version is `0.1.0~alpha` (rpm refuses `-`; dpkg and rpm
+    4.10+ sort `~` before `0.1.0`). Tests
+    `every_crate_carries_the_workspace_version`,
+    `the_lockfiles_carry_the_workspace_version_of_our_crates`,
+    `the_changelog_opens_with_the_workspace_versions_section`,
+    `the_packages_carry_the_pre_release_with_a_tilde_and_the_files_with_a_dash`.
+  - **A tag is the workspace version.** release.yml's `verify-tag` runs
+    `verify-release-tag.sh version`: the tag must be `v` and the workspace
+    version, and this file must open with that version's dated section
+    (the date is written in the last commit before the tag). The package
+    job checks the artefacts' names and versions and every `--version` on
+    every run. Test
+    `a_tag_is_released_only_as_the_workspace_version_with_its_dated_section`,
+    and the script's selftest (9 more cases).
+  - **The guard e2e teardown waits for our programs only** (tests and lab;
+    the nightly of 2026-11-21 on Ubuntu 26.04 and Debian 13: seven guard
+    tests failed after passing, "LSM programs still loaded: 1", systemd's
+    own `RestrictFileSystems=` program). The fixture keeps the program ids
+    of every run's list and waits for those, or, with none, for our LSM
+    programs by name — never every LSM program on the host; one of ours
+    still loaded fails the teardown as before. The lab's helpers do the
+    same (`deploy/lab/lib/our-lsm.sh`). Tests
+    `the_teardown_does_not_wait_for_pid_ones_lsm_program`,
+    `a_leftover_program_of_ours_still_fails_the_teardown`,
+    `the_lab_helper_never_counts_pid_ones_lsm_program`, and the ratchet
+    `no_test_helper_counts_every_lsm_program_on_the_host`.
+  - **`agent_stalled`** names the agent's own memory throttling
+    (`MemoryHigh`) besides a pause of the machine. Test
+    `the_stall_advisory_names_the_agents_own_memory_throttling`.
 - Lot 381 (the pre-alpha's Phase 6b, rc11; `UPGRADE_NOTES_WAVE4.md` §67).
   - **R004 Critical at one rootful runc start in about 300** (Debian 13,
     Podman 5.4.2, runc 1.1.15: 200 containers started in a row). runc

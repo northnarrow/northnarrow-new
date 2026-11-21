@@ -241,7 +241,8 @@ pub const ADVISORY_KINDS: &[(&str, &str)] = &[
     ),
     (
         "agent_stalled",
-        "the agent's loop stood still (a VM pause, a host suspend): nothing it guards changed",
+        "the agent's loop stood still (a VM pause, a host suspend, the kernel holding the agent back \
+         above its own MemoryHigh): nothing it guards changed; a loss it caused is counted on its own",
     ),
     (
         "quarantine_index_rebuilt",

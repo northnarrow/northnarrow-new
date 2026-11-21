@@ -88,6 +88,15 @@ fonde.
   .github/scripts/verify-release-tag.sh verify vX.Y.Z "$(git rev-parse 'vX.Y.Z^{commit}')"
   ```
 
+- La versione (lotto 383): il tag è `v` più la versione del workspace
+  (`[workspace.package] version` di `Cargo.toml`: `v0.1.0-alpha` per
+  `0.1.0-alpha`), e `CHANGELOG.md` si apre con la sezione di quella
+  versione, datata. Fino al tag la sezione dice `- unreleased`;
+  nell'ultimo commit prima del tag si scrive al suo posto il giorno del tag
+  (UTC): `## [0.1.0-alpha] - AAAA-MM-GG`. Il job `verify-tag` lo controlla
+  (`verify-release-tag.sh version`): un tag di un'altra versione, un
+  `[Unreleased]` sopra la versione o una sezione senza data si fermano lì.
+  Prima del push: `.github/scripts/verify-release-tag.sh version vX.Y.Z`.
 - Aggiungere, ruotare o revocare una chiave è una PR su
   `.github/allowed_signers`; conta la lista committata nel commit taggato.
   Ruotando, la vecchia chiave resta con `valid-before="AAAAMMGG"`, così i

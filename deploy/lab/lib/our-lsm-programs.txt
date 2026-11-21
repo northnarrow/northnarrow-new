@@ -1,0 +1,70 @@
+# NorthNarrow's LSM programs: the #[lsm] functions of agent-ebpf/src, one
+# name a line (lot 383). The kernel keeps the first 15 bytes of a program's
+# name, and `bpftool prog show` prints those. The test fixtures
+# (agent/tests/common/mod.rs, our_bpf) and the lab (deploy/lab/lib/our-lsm.sh)
+# tell our LSM programs from another product's or PID 1's by these names when
+# no list of program ids (bpf-own-ids) is readable. xtask/tests/release_version.rs
+# holds this list equal to the source.
+bpf_map_guard
+bpf_prog_guard
+bpf_prog_load_guard
+bpf_syscall_observe
+bpf_write_user_guard
+cgroup_join_inject
+cgroup_join_traceme
+cgroup_move_deny
+epg_lite_capable
+epg_lite_exec
+epg_lite_file_open
+exec_check_lsm
+exec_env_lsm
+execmap_check
+execq_exec_failed
+file_ioctl
+file_send_sigiotask_deny
+fim_close_emit_observe
+fim_create_observe
+fim_file_cap_observe
+fim_file_open_observe
+fim_file_open_sensor
+fim_link_observe
+fim_rename_observe
+fim_setattr_observe
+fim_unlink_observe
+fim_write_intent_observe
+inode_rename
+inode_rmdir
+inode_setattr
+inode_unlink
+module_load_data_observe
+module_lock_observe
+module_read_file_observe
+module_write_observe
+mount_guard_move_mount
+mount_guard_sb_mount
+mount_guard_sb_pivotroot
+mount_guard_sb_remount
+mount_guard_sb_umount
+nn_task_free
+open_sensor_rmdir
+probe_bprm
+probe_file_open
+protected_create_deny
+protected_ioctl_compat_deny
+protected_link_deny
+protected_mkdir_deny
+protected_mknod_deny
+protected_open_deny
+protected_remove_acl_deny
+protected_removexattr_deny
+protected_set_acl_deny
+protected_setxattr_deny
+protected_symlink_deny
+protected_write_deny
+ptrace_access_check
+socket_connect_deny
+task_kill
+task_setioprio_deny
+task_setnice_deny
+task_setrlimit_deny
+task_setscheduler_deny

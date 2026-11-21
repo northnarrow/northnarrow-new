@@ -1539,6 +1539,9 @@ struct GuardFixture {
     key_a: PathBuf,
     key_b: PathBuf,
     enforce_run: Option<GuardRun>,
+    /// Lot 383: the program ids read from the runs' lists so far
+    /// ([`Self::note_own_ids`]), which the teardown waits for.
+    own_ids_seen: std::sync::Mutex<std::collections::BTreeSet<u32>>,
     // Removed only after `drop` ran: the restore run needs this binary.
     agent: InstalledAgent,
     _installed_admin: InstalledBin,
@@ -1582,8 +1585,28 @@ impl GuardFixture {
             key_a,
             key_b,
             enforce_run: None,
+            own_ids_seen: Default::default(),
             agent: installed_agent,
             _installed_admin: installed_admin,
+        }
+    }
+
+    /// Lot 383: where the runs write the ids of their programs. They are
+    /// agents of one directory, so one file: each run's list replaces the
+    /// one before.
+    fn own_ids_file(&self) -> PathBuf {
+        AgentState::new(self.dir.path())
+            .pid_file()
+            .with_file_name(OWN_IDS_FILE_NAME)
+    }
+
+    /// Lot 383: keep the ids the runs' list names now, before a new run
+    /// replaces it ([`Self::spawn_as`]) and at the teardown: the teardown
+    /// waits for the programs of every run, whoever stopped it.
+    fn note_own_ids(&self) {
+        let ids = common::our_bpf::ids_in(&[self.own_ids_file()]);
+        if let Ok(mut seen) = self.own_ids_seen.lock() {
+            seen.extend(ids);
         }
     }
 
@@ -1599,6 +1622,7 @@ impl GuardFixture {
         enforce: bool,
         launch: Launch,
     ) -> Result<GuardRun, String> {
+        self.note_own_ids();
         let d = self.dir.path();
         let log = d.join(format!("{name}.log"));
         let out = std::fs::File::create(&log).map_err(|e| format!("create {name}.log: {e}"))?;
@@ -1709,14 +1733,21 @@ const TEARDOWN_WINDOW: Duration = Duration::from_secs(90);
 /// `uninstall.sh` wait for them (external audit DEP-006). The old wait for
 /// "no LSM program on the host" never ended where systemd keeps a BPF-LSM
 /// program of its own, so the teardown failed after the test had passed.
-/// With no list readable, it waits for no LSM program at all, as before.
+///
+/// Lot 383 (the nightly of 2026-11-21, ubuntu2604 and debian13): with no
+/// list given — a test that stopped its enforce run itself took it from the
+/// fixture, and the fixture's drop had no run left to name — it still
+/// waited for no LSM program at all, PID 1's included. `seen` now carries
+/// every id the fixture read from its runs' lists, and the wait is
+/// [`common::our_bpf::wait_ours_gone`]: those ids, or, when none was ever
+/// readable, our LSM programs by name. Never every LSM program on the host;
+/// a program of ours still loaded fails the teardown as before.
 #[cfg(feature = "debug-trigger")]
-fn purge_pins_in_window(own_ids: &[PathBuf]) -> Result<(), String> {
+fn purge_pins_in_window(
+    own_ids: &[PathBuf],
+    seen: &std::collections::BTreeSet<u32>,
+) -> Result<(), String> {
     let script = r#"
-ids=""
-for f in "$@"; do
-    [ -r "$f" ] && ids="$ids $(awk '$1 ~ /^[0-9]+$/ {print $1}' "$f")"
-done
 for i in 1 2 3 4; do
     mountpoint -q /sys/fs/bpf/northnarrow 2>/dev/null || break
     umount /sys/fs/bpf/northnarrow 2>/dev/null || umount -l /sys/fs/bpf/northnarrow 2>/dev/null || break
@@ -1725,46 +1756,38 @@ rm -rf /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northn
 rm -f /run/northnarrow/cgroup-join-pins /run/northnarrow/module-writes-pins 2>/dev/null
 left=$(ls -d /sys/fs/bpf/northnarrow /sys/fs/bpf/northnarrow-sysctl /sys/fs/bpf/northnarrow-module-writes /sys/fs/bpf/northnarrow-cgroup-join-v* 2>/dev/null)
 [ -z "$left" ] || { echo "pins left: $left"; exit 1; }
-for i in $(seq 1 20); do
-    if [ -n "$ids" ]; then
-        left=""
-        for id in $ids; do bpftool prog show id "$id" >/dev/null 2>&1 && left="$left $id"; done
-        [ -z "$left" ] && exit 0
-    else
-        [ "$(bpftool prog show 2>/dev/null | grep -c ' lsm ')" = 0 ] && exit 0
-    fi
-    sleep 1
-done
-if [ -n "$ids" ]; then
-    echo "own programs still loaded:$left"
-else
-    echo "LSM programs still loaded: $(bpftool prog show 2>/dev/null | grep -c ' lsm ')"
-fi
-exit 1
 "#;
+    // the lists, read before the pins go (they outlive the agents on purpose)
+    let mut ids = seen.clone();
+    ids.extend(common::our_bpf::ids_in(own_ids));
     let out = Command::new("sudo")
         .args(["sh", "-c", script, "sh"])
-        .args(own_ids)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("spawn the purge: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !out.status.success() {
+        return Err(format!(
             "the pin purge failed: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
-        ))
+        ));
     }
+    common::our_bpf::wait_ours_gone(&ids, PURGE_UNLOAD_TIMEOUT)
+        .map_err(|e| format!("the pin purge failed: {e}"))
 }
+
+/// Lot 383: how long the purge waits for our programs to unload once the
+/// pins are gone (the script's old 20 rounds of 1 s).
+#[cfg(feature = "debug-trigger")]
+const PURGE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(feature = "debug-trigger")]
 impl Drop for GuardFixture {
     fn drop(&mut self) {
-        let mut own_ids = Vec::new();
+        // lot 383: every run's list, whoever stopped it (the runs of one
+        // directory write theirs to the same file: [`GuardFixture::note_own_ids`])
+        let own_ids = vec![self.own_ids_file()];
         if let Some(mut run) = self.take_for_stop() {
-            own_ids.push(run.pid_file.with_file_name(OWN_IDS_FILE_NAME));
             if let Err(e) = common::shutdown_signed(
                 &mut run.child,
                 &self.signed(&run.socket),
@@ -1778,7 +1801,12 @@ impl Drop for GuardFixture {
                 return;
             }
         }
-        if let Err(e) = purge_pins_in_window(&own_ids) {
+        let seen = self
+            .own_ids_seen
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        if let Err(e) = purge_pins_in_window(&own_ids, &seen) {
             common::fail_teardown(&format!(
                 "guard e2e: the enforce-mode agent's pins could not be removed in the teardown's \
                  window ({e}). The next fixtures' agents (other binaries) are refused their \
@@ -1969,7 +1997,7 @@ impl Drop for InstalledRun<'_> {
         let _ = systemctl(&["reset-failed", AGENT_UNIT]);
         // the unit's agent writes its list beside its pid file
         let own_ids = [Path::new("/run/northnarrow").join(OWN_IDS_FILE_NAME)];
-        if let Err(e) = purge_pins_in_window(&own_ids) {
+        if let Err(e) = purge_pins_in_window(&own_ids, &Default::default()) {
             common::fail_teardown(&format!(
                 "unit restart e2e: the installed agent's pins could not be removed ({e}): the \
                  next suites' agents are refused until the pin root is purged"

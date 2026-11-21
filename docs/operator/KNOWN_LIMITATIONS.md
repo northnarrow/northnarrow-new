@@ -1,6 +1,6 @@
 # Known limitations of the alpha
 
-> Draft until rc-final: the list is checked again before the v0.1.0-alpha tag.
+> For NorthNarrow 0.1.0-alpha (the `v0.1.0-alpha` release).
 
 This page is for people who test the NorthNarrow alpha. It lists what we
 know does not work yet, or works only in part, so that you can tell a
@@ -1298,7 +1298,8 @@ kernel.
   16 or more CPUs (per-CPU rings) and with larger FIM sets the kernel
   memory was not measured: there the cap may be closer to the use than on
   the lab's guests. Above `MemoryHigh` the kernel slows the agent down,
-  which may then lose events (counted). *Evidence:* lot 381
+  which may then lose events (counted); a slowdown of more than 15 s is
+  also a signed `agent_stalled` advisory (lot 383). *Evidence:* lot 381
   (`the_memory_limits_are_sized_from_the_measured_peaks`).
 - **Events can be lost under load.** Under a burst, the kernel rings and
   the agent's queues drop new events rather than slow the host. Each loss

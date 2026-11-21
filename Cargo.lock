@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "ebpf-guard"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "sha2 0.11.1",
 ]
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "nn-admin"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "nn-core"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "nn-evidence"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "nn-export"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "nn-linux"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "nn-model"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "ciborium",
  "northnarrow-common",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "nn-parse"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "hex",
  "md-5",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "nn-proto"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "ciborium",
  "ed25519-dalek 3.0.0",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "northnarrow-agent"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "northnarrow-antitamper-bpf"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "aya",
@@ -1391,14 +1391,14 @@ dependencies = [
 
 [[package]]
 name = "northnarrow-cli"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "northnarrow-common"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "bytemuck",
  "serde",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "northnarrow-scan"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "libc",
  "nn-proto",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "northnarrow-watchdog"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "aya-obj",
