@@ -924,8 +924,10 @@ const KNOWN: &[(&str, &str, &str)] = &[
         "fs::read(audit_log)",
         OWN,
     ),
+    // lot 388: the one reader of PID 1's comm, moved from the agent's
+    // pipeline (shared with the workers' supervisor and the watchdog's round)
     (
-        "agent/src/pipeline/mod.rs",
+        "crates/nn-linux/src/self_integrity.rs",
         "read_state(\"/proc/1/comm\")",
         PROC,
     ),
