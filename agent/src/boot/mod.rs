@@ -480,6 +480,9 @@ async fn run(
         &audit_log,
         stop.begun_handle(),
     );
+    // Lot 388: a worker the stop's SIGTERM ends in a window or the agent's
+    // own stop is the stop's own (the host's shutdown read by the supervisor)
+    workers::stop_facts(&workers, &installer_override, stop.begun_handle());
     let evidence::Wired { telemetry_probe } = evidence::wire(
         &cli,
         &sensor,

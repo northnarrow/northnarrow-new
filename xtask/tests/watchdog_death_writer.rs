@@ -109,3 +109,46 @@ fn a_planted_second_writer_or_a_public_death_is_found() {
     let home = code[HOME].replace("e.stop_not_death()", "None::<&str>");
     assert!(!home_problems(&home).is_empty());
 }
+
+/// Lot 388 (the triage of #595, its follow-up): a worker's failure is
+/// judged against the stop under way (`StopExit::now`, with the agent's
+/// facts) before it is reported, in the supervisor's one failure path; the
+/// start hands the facts over. Without it the parse worker, ended by
+/// `systemd-shutdown`'s SIGTERM, was a degradation and a revision of the
+/// manifest in every reboot's stop beat.
+fn worker_problems(supervisor: &str, boot: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(at) = supervisor.find("    fn fail(") else {
+        return vec!["the supervisor's `fn fail(` is gone".into()];
+    };
+    let body = &supervisor[at..];
+    let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+    match (
+        body.find("StopExit::now("),
+        body.find("exit.stop_not_death()"),
+        body.find("self.report_failure("),
+    ) {
+        (Some(n), Some(j), Some(r)) if n < j && j < r => {}
+        _ => out.push(
+            "the supervisor's `fail` reports before it judges the stop under way".to_string(),
+        ),
+    }
+    if !boot.contains("workers::stop_facts(&workers, &installer_override, stop.begun_handle());") {
+        out.push("the start does not hand the stop's facts to the supervisor".into());
+    }
+    out
+}
+
+#[test]
+fn a_worker_s_failure_is_judged_against_the_stop_before_its_report() {
+    let code = product_code(&repo_root());
+    let sup = &code["crates/nn-linux/src/worker/supervisor.rs"];
+    let boot = &code["agent/src/boot/mod.rs"];
+    let problems = worker_problems(sup, boot);
+    assert!(problems.is_empty(), "{problems:#?}");
+    // planted: the judgement removed, or the facts not handed over
+    assert!(
+        !worker_problems(&sup.replace("exit.stop_not_death()", "None::<&str>"), boot).is_empty()
+    );
+    assert!(!worker_problems(sup, &boot.replace("workers::stop_facts(", "drop(")).is_empty());
+}

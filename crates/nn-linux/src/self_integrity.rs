@@ -1923,19 +1923,23 @@ fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution) ->
     }
 }
 
-/// Lot 388 (the triage of #595, a): what the agent's watchdog round knows
-/// when it finds the verified watchdog gone. At a normal reboot
-/// `systemd-shutdown` signals the agent and the watchdog at the same moment
-/// (the only time PID 1 may outside a signed window, EBPF-001): the
-/// watchdog's stop is quick, the agent's takes longer, and a round that
-/// landed in between signed the watchdog's "death" — held until
-/// acknowledged (lot 379, F7-6), so `nn-admin status` said `DEGRADED` after
-/// a normal reboot, now and then.
+/// Lot 388 (the triage of #595, a): what the agent knows when one of its
+/// own processes ends — the watchdog its round finds gone, a worker its
+/// supervisor sees die. At a normal reboot `systemd-shutdown` signals the
+/// agent, the watchdog and the workers at the same moment (the only time
+/// PID 1 may outside a signed window, EBPF-001): the watchdog's and a
+/// worker's ends are quick, the agent's stop takes longer, and what landed
+/// in between was signed as a death or a degradation — the watchdog's
+/// `watchdog_gone`, held until acknowledged (lot 379, F7-6), and the parse
+/// worker's `worker_parse` with a revision of the capability manifest in
+/// the stop beat: `nn-admin status` said `DEGRADED` after a normal reboot
+/// now and then, the off-host verifier after every one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WatchdogExit {
-    /// The watchdog's own stop ran: its pidfile is gone (removed by its
-    /// teardown; a kill, an OOM or a crash leaves it naming the dead pid,
-    /// and a successor's names the successor).
+pub struct StopExit {
+    /// The process's own stop: the watchdog's pidfile is gone (removed by
+    /// its teardown; a kill, an OOM or a crash leaves it naming the dead
+    /// pid, and a successor's names the successor); a worker ended by the
+    /// stop's `SIGTERM` (a crash, an OOM or a kill ends it otherwise).
     pub clean: bool,
     /// PID 1 is `systemd-shutdown`, the last stage of the host's shutdown
     /// (its comm, which no other process can write).
@@ -1947,7 +1951,35 @@ pub struct WatchdogExit {
     pub agent_stopping: bool,
 }
 
-impl WatchdogExit {
+/// The watchdog's exit ([`StopExit`]).
+pub type WatchdogExit = StopExit;
+
+/// Lot 388: what the agent knows of a stop under way, for [`StopExit`]: a
+/// signed trusted-installer window open, its own stop begun — `(window,
+/// stopping)`. Handed over by the start once both exist.
+pub type StopFacts = std::sync::Arc<dyn Fn() -> (bool, bool) + Send + Sync>;
+
+/// Lot 388: PID 1 is `systemd-shutdown` (its comm, truncated to 15 bytes):
+/// the machine is in the last stage of a shutdown. The one reader (the
+/// agent's `system_shutdown` stop reason, the watchdog's round, the
+/// workers' supervisor).
+pub fn pid1_is_systemd_shutdown() -> bool {
+    crate::state_read::read_state("/proc/1/comm").is_ok_and(|c| c.trim_end() == "systemd-shutdow")
+}
+
+impl StopExit {
+    /// An exit `clean` or not, with the host's state now and the agent's
+    /// `facts` (`None`: not handed over yet — no window, no stop known).
+    pub fn now(clean: bool, facts: Option<&StopFacts>) -> Self {
+        let (window_open, agent_stopping) = facts.map_or((false, false), |f| f());
+        Self {
+            clean,
+            host_shutdown: pid1_is_systemd_shutdown(),
+            window_open,
+            agent_stopping,
+        }
+    }
+
     /// Why the watchdog's exit is the host's or the operator's stop, not a
     /// death: a clean stop of its own in the host's shutdown, inside a
     /// signed window, or during the agent's own stop. `None`: a death — a

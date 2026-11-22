@@ -179,10 +179,13 @@ const KNOWN: &[(&str, usize, &str)] = &[
         "agent/src/pipeline/mod.rs",
         // lot 353 (re-check 2 of #563, R2-5): 6 → 7, no new I/O — the
         // question split in two (`systemd_state_with(…).await`, one in flight)
-        7,
+        // lot 388: 7 → 5, `pid1_is_systemd_shutdown`'s read of `/proc/1/comm`
+        // moved to nn-linux's one reader (`self_integrity`), shared with the
+        // workers' supervisor and the watchdog's round
+        5,
         "the systemd watch's (a task): its question to systemd off the runtime's worker, awaited \
-         with a bound; `pid1_is_systemd_shutdown` reads `/proc/1/comm` at a SIGTERM (the event \
-         loop's task) — the decision reads the watch's snapshot",
+         with a bound; `pid1_is_systemd_shutdown` asks nn-linux's reader of `/proc/1/comm` at a \
+         SIGTERM (the event loop's task) — the decision reads the watch's snapshot",
     ),
     (
         "agent/src/cow/mod.rs",
