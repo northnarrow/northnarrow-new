@@ -2320,6 +2320,72 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 389 (pre-alpha Phase 2h on rc14, Ubuntu 22.04 with systemd 249:
+  F2h-1, F2h-2 and the two P3s; `UPGRADE_NOTES_WAVE4.md` §74).
+  - **A boot without the agent is told on systemd 249.** systemd 249's
+    `journalctl --list-boots` walks the journal from its oldest boot and
+    stops, without a word, at the first boot it meets twice: on rc14's
+    Ubuntu 22.04 guest (a persistent journal of 422 boots) the list ended 39
+    boots before the current one, so every start signed only the advisory
+    `boot_continuity_unknown`, and a boot with the agent's units masked was
+    never signed `boots_without_agent` (never "clean" either; the verifier's
+    `NOT_BACK` told it). The start now asks the journal first for the boots
+    before this one, one at a time and newest first (`journalctl -b -<k>`,
+    once `-b 0` is this very boot; 249 walks back from the journal's tail:
+    15 to 230 ms each on that journal), until one is the last run's — the
+    boots met before it are the boots without the agent, judged by lot
+    387's rules; the list is asked only when the walk does not reach the
+    last run's boot (17 boots, 6 s), and a list that puts the last run's
+    boot right before this one while the walk names another there is
+    `unknown`, never clean (`nn_evidence::boot_gap::judge_walking`). The
+    form `-b <id>-<k>` was tried first: systemd 255 answers it with the boot
+    `<id>` itself (the lab's ubuntu2404), so an answer that is this very
+    boot stops the walk and the list judges. Tests
+    `the_boot_right_before_this_one_being_the_last_runs_is_the_next_boot`,
+    `a_boot_without_the_agent_is_found_walking_back_when_the_list_stops_short`,
+    `a_walk_that_does_not_reach_the_last_run_leaves_the_list_to_judge`,
+    `a_list_that_contradicts_the_walk_is_unknown_never_clean`,
+    `the_walk_keeps_the_list_rules`,
+    `a_boot_list_that_stops_short_is_walked_past_from_this_boot`,
+    `the_walk_counts_from_this_boot_only`,
+    `the_walk_reaches_past_every_boot_a_row_lists`,
+    `the_journals_boot_before_this_one_is_read_from_its_json_line`.
+  - **finalrd's remount of `/run` at the host's shutdown is a note.**
+    Ubuntu's packaged `finalrd.service` makes `/run` executable (`mount -o
+    remount,exec /run`) as the shutdown begins, seconds before
+    `systemd-shutdown` ends the agent; an integrity round landing in
+    between signed `mount_attrs_changed` and `mount_over_protected` (High),
+    the stop beat carried them, and the off-host verifier said `DEGRADED`
+    after one normal reboot in six. When `/run` in PID 1's table lost
+    `noexec` and nothing else, systemd says `stopping` with a start job of
+    `reboot.target`, `poweroff.target`, `halt.target`, `kexec.target` or
+    `soft-reboot.target` pending, and systemd's record shows the packaged
+    unit's one `ExecStop=` (`/usr/bin/finalrd`, its vendor fragment, no
+    drop-in, both files root's) started since the last round that read
+    `/run` unchanged (the monotonic clock), the change is signed once as
+    `run_exec_at_shutdown` (`recorded`, never held) — at most 120 s after
+    the run's first such note, and only once that note is signed. The same
+    change while the host runs, any other change, a change already signed,
+    or a "shutdown" that does not take the host down stays the High
+    `mount_attrs_changed`. A remount is no longer also read as a mount laid
+    over (`mount_over_protected` "hides …"): the mounts a watched path
+    crosses are compared by their identity, their attributes being
+    `mount_attrs_changed`'s. Tests
+    `finalrds_remount_at_the_host_s_shutdown_is_a_note_and_otherwise_a_degradation`,
+    `finalrds_remount_is_the_shutdowns_only_with_every_fact`,
+    `only_run_losing_noexec_alone_is_finalrds_shape`,
+    `a_remount_of_run_is_its_attributes_change_never_a_mount_over`,
+    `the_exec_stop_records_and_jobs_are_read_from_systemds_properties`.
+  - **The two P3s.** The verifier's `DEGRADED` once at the upgrade from
+    rc13 was the stopping rc13 agent's parse worker (fixed by lot 388): an
+    upgrade from rc14 signs no `worker_parse` (this lot's lab; the one
+    `DEGRADED` there named the manifest's change across the upgrade). The
+    verifier's `DEGRADED` once after an acknowledgement is truthful, not a
+    stale state: the acknowledgement ends the held finding, the capability
+    manifest's next revision differs (back to the hash before the gap, in
+    the lab), and the verifier tells every change of the manifest's hash
+    once (R13: it compares hashes, not directions); the check after it is
+    `OK`. HEARTBEAT.md and the tester guide say so.
 - Lot 388 (the review of #595: its triage (a) and (b), P3-1 to P3-3;
   `UPGRADE_NOTES_WAVE4.md` §73).
   - **No watchdog "death" at the host's own shutdown.** At a normal reboot

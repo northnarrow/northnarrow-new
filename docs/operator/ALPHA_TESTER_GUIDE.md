@@ -737,7 +737,10 @@ after an uninstall that kept the records — as is the off-host verifier's
 `NOT_BACK` while the agent was away. Read the row, then acknowledge it with
 the command `nn-admin status` prints beside it
 (`sudo nn-admin integrity acknowledge --through <row> --key /root/northnarrow-admin.key`).
-The system journal keeps
+After the acknowledgement the off-host verifier says `DEGRADED` once more,
+"the capability manifest changed": the degradation ended, so the manifest
+changed too, and it tells each change once; its next check is `OK`
+(HEARTBEAT.md). The system journal keeps
 systemd's lines about the units, as it does for any service. Exit codes:
 
 - **0**: removed, clean;

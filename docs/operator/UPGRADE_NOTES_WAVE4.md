@@ -6265,3 +6265,39 @@ fires.
 - **Docs**: an uninstall that kept the records followed by a reinstall,
   with a whole boot in between, leaves a signed gap — expected (the tester
   guide, INSTALL_UPGRADE_UNINSTALL.md).
+
+## 74. The boot gap on systemd 249; finalrd's remount of /run at the host's shutdown is a note (lot 389)
+
+- **The start asks the journal for the boots before this one, one at a
+  time** (`journalctl -b -<k> -n 1 -o json --output-fields=_BOOT_ID`,
+  newest first, once `-b 0` names this very boot; at most 17, each killed
+  past 2 s, the walk past 6 s), and runs `journalctl --list-boots` (§72) only
+  when that walk does not reach the last run's boot. On systemd 249 (Ubuntu
+  22.04), whose list stops at the first boot it meets twice, a host with a
+  long persistent journal signed `boot_continuity_unknown` at every start
+  and never `boots_without_agent`; it now signs `next_boot` after a normal
+  reboot and `boots_without_agent` (High, held until acknowledged) after a
+  boot without the agent. Expect, on such a host after the upgrade: the
+  advisory gone, and a gap row where a boot passed without the agent. The
+  rows' `sources` name both questions. A list that disagrees with the walk
+  is `unknown`, never `clean`.
+- **A new `integrity_drift` kind, `run_exec_at_shutdown`** (result
+  `recorded`, never held, no degradation): Ubuntu's packaged `finalrd`
+  made `/run` executable as the host went down (systemd `stopping` with a
+  reboot, power-off, halt or kexec job pending; the packaged unit's own
+  `ExecStop=` run since the round before). Before, one normal reboot in six
+  left a High `mount_attrs_changed` (and a `mount_over_protected` "/run
+  hides /run/northnarrow") in the run's stop beat, and the off-host
+  verifier said `DEGRADED` at the next start. A monitor that counted
+  `mount_attrs_changed` per reboot on Ubuntu: count the note beside it, or
+  expect fewer. The same change while the host runs, or in a "shutdown"
+  that does not take the host down within 120 s, is still the High
+  `mount_attrs_changed`.
+- **A remount is no longer also signed `mount_over_protected`**: an
+  attribute change of a mount a watched path crosses (its options, its
+  super block's, its propagation) is `mount_attrs_changed` alone, as lot
+  357 meant; a mount laid over, or one gone, is `mount_over_protected` /
+  `protected_mount_gone` as before.
+- **Docs**: after `nn-admin integrity acknowledge` the verifier says
+  `DEGRADED` once for the capability manifest's change (the held finding
+  ended), then `OK` — HEARTBEAT.md, the tester guide.

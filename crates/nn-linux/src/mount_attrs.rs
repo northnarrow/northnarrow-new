@@ -66,11 +66,79 @@ pub struct AttrWatch {
     base: BTreeMap<u64, Attrs>,
 }
 
+/// Lot 389 (pre-alpha Phase 2h, F2h-2): one watched mount whose attributes
+/// differ from the first seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttrChange {
+    pub mount_point: String,
+    pub before: Attrs,
+    pub after: Attrs,
+}
+
+impl AttrChange {
+    /// What changed, in words.
+    pub fn what(&self) -> String {
+        let (b, a) = (&self.before, &self.after);
+        let mut what = Vec::new();
+        if b.options != a.options {
+            what.push(format!("options {} → {}", b.options, a.options));
+        }
+        if b.super_options != a.super_options {
+            what.push(format!(
+                "super block options {} → {}",
+                b.super_options, a.super_options
+            ));
+        }
+        if b.propagation != a.propagation {
+            let shown = |p: &str| {
+                if p.is_empty() {
+                    "private".to_string()
+                } else {
+                    p.to_string()
+                }
+            };
+            what.push(format!(
+                "propagation {} → {}",
+                shown(&b.propagation),
+                shown(&a.propagation)
+            ));
+        }
+        what.join(", ")
+    }
+
+    /// Lot 389 (F2h-2): the change of Ubuntu's `finalrd` at the host's
+    /// shutdown (`mount -o remount,exec /run`, its packaged script's first
+    /// step): `/run`'s per-mount options lost `noexec` and nothing else —
+    /// no option added or dropped besides it, the same propagation, the same
+    /// super block options.
+    pub fn is_run_made_exec(&self) -> bool {
+        let opts = |o: &str| -> BTreeSet<String> { o.split(',').map(str::to_string).collect() };
+        let (b, a) = (opts(&self.before.options), opts(&self.after.options));
+        self.mount_point == "/run"
+            && self.before.propagation == self.after.propagation
+            && self.before.super_options == self.after.super_options
+            && a.is_subset(&b)
+            && b.difference(&a).map(String::as_str).eq(["noexec"])
+    }
+}
+
 impl AttrWatch {
     /// The watched mounts (`ids`) of this round's table whose attributes
     /// differ from the first seen: `(mount point, what changed)`. A mount
     /// seen for the first time is its own baseline; one gone is dropped.
     pub fn round(&mut self, text: &[u8], ids: &BTreeSet<u64>) -> Vec<(String, String)> {
+        self.round_changes(text, ids)
+            .into_iter()
+            .map(|c| {
+                let what = c.what();
+                (c.mount_point, what)
+            })
+            .collect()
+    }
+
+    /// Lot 389 (F2h-2): [`Self::round`]'s changes, each with the
+    /// attributes on both sides.
+    pub fn round_changes(&mut self, text: &[u8], ids: &BTreeSet<u64>) -> Vec<AttrChange> {
         let now = attrs_of(text);
         self.base.retain(|id, _| now.contains_key(id));
         let mut out = Vec::new();
@@ -83,33 +151,11 @@ impl AttrWatch {
                     self.base.insert(*id, a.clone());
                 }
                 Some(b) if b == a => {}
-                Some(b) => {
-                    let mut what = Vec::new();
-                    if b.options != a.options {
-                        what.push(format!("options {} → {}", b.options, a.options));
-                    }
-                    if b.super_options != a.super_options {
-                        what.push(format!(
-                            "super block options {} → {}",
-                            b.super_options, a.super_options
-                        ));
-                    }
-                    if b.propagation != a.propagation {
-                        let shown = |p: &str| {
-                            if p.is_empty() {
-                                "private".to_string()
-                            } else {
-                                p.to_string()
-                            }
-                        };
-                        what.push(format!(
-                            "propagation {} → {}",
-                            shown(&b.propagation),
-                            shown(&a.propagation)
-                        ));
-                    }
-                    out.push((mp.clone(), what.join(", ")));
-                }
+                Some(b) => out.push(AttrChange {
+                    mount_point: mp.clone(),
+                    before: b.clone(),
+                    after: a.clone(),
+                }),
             }
         }
         out
@@ -192,6 +238,72 @@ mod tests {
         let f = w.round(ro.as_bytes(), &ids);
         assert_eq!(f[0].0, "/");
         assert!(f[0].1.contains("super block options rw → ro"), "{f:?}");
+    }
+
+    /// Lot 389 (F2h-2): finalrd's `remount,exec /run` (rc14's ubuntu2204,
+    /// reboot 4: `rw,nosuid,nodev,noexec,relatime → rw,nosuid,nodev,relatime`)
+    /// is told from every other change of `/run` or of another mount — a
+    /// second option, a propagation or super block change beside it, an
+    /// option added, another mount point.
+    #[test]
+    fn only_run_losing_noexec_alone_is_finalrds_shape() {
+        let ids: BTreeSet<u64> = [1, 25, 26].into_iter().collect();
+        let shape = |table: &str| -> Vec<bool> {
+            let mut w = AttrWatch::default();
+            assert!(w.round_changes(TABLE.as_bytes(), &ids).is_empty());
+            w.round_changes(table.as_bytes(), &ids)
+                .iter()
+                .map(AttrChange::is_run_made_exec)
+                .collect()
+        };
+        let exec = TABLE.replace(
+            "/run rw,nosuid,nodev,noexec,relatime",
+            "/run rw,nosuid,nodev,relatime",
+        );
+        assert_eq!(shape(&exec), vec![true]);
+        // the words of the finding stay lot 357's
+        let mut w = AttrWatch::default();
+        w.round(TABLE.as_bytes(), &ids);
+        assert_eq!(
+            w.round(exec.as_bytes(), &ids),
+            vec![(
+                "/run".to_string(),
+                "options rw,nosuid,nodev,noexec,relatime → rw,nosuid,nodev,relatime".to_string()
+            )]
+        );
+        for other in [
+            // more than exec: suid back, read-only, an option added
+            TABLE.replace(
+                "/run rw,nosuid,nodev,noexec,relatime",
+                "/run rw,nodev,relatime",
+            ),
+            TABLE.replace(
+                "/run rw,nosuid,nodev,noexec,relatime",
+                "/run ro,nosuid,nodev,relatime",
+            ),
+            TABLE.replace(
+                "/run rw,nosuid,nodev,noexec,relatime",
+                "/run rw,nosuid,nodev,relatime,noatime",
+            ),
+            // exec and a propagation change, or a super block reconfigured
+            exec.replace(" shared:5 -", " -"),
+            exec.replace("tmpfs rw,mode=755", "tmpfs rw,mode=777"),
+            // noexec added, not dropped
+            TABLE.replace(
+                "/run rw,nosuid,nodev,noexec,relatime",
+                "/run rw,nosuid,nodev,noexec,relatime,nosymfollow",
+            ),
+            // another mount losing noexec
+            TABLE.replace(
+                "/proc rw,nosuid,nodev,noexec,relatime",
+                "/proc rw,nosuid,nodev,relatime",
+            ),
+        ] {
+            assert!(shape(&other).iter().all(|s| !s), "{other}");
+        }
+        // /run's mount point under another name is not /run
+        let moved = exec.replace(" / /run ", " / /run/x ");
+        assert!(shape(&moved).iter().all(|s| !s));
     }
 
     #[test]

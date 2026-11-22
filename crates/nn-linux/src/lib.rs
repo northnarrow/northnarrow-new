@@ -410,6 +410,9 @@ pub mod worker;
 // byte, of the start's mount check and the self-integrity watcher.
 pub mod mount_attrs;
 pub mod mountinfo;
+/// Lot 389 (F2h-2): Ubuntu's finalrd at the host's shutdown — its remount
+/// of /run a note, not a degradation.
+pub mod shutdown_remount;
 
 // Lot 311 (third bug hunt, F4 and N6): the kernel's state files read as
 // text that never fails on its encoding — a process sets its own `comm`.

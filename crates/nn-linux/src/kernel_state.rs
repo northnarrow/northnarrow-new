@@ -506,7 +506,7 @@ impl Watch {
 }
 
 /// `CLOCK_MONOTONIC` now, in ns (the kernel records' clock).
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

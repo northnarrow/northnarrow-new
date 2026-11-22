@@ -237,3 +237,264 @@ fn the_judgement_signs_its_state_and_facts() {
     assert_eq!(s.as_array().unwrap().len(), SOURCES.len());
     assert!(s[2]["rewritable"].as_str().unwrap().contains("volatile"));
 }
+
+/// Lot 389 (F2h-1): the boots before this one as a list `v` (oldest first,
+/// this boot last) gives them to the walk, one at a time — and what it was
+/// asked, in order.
+fn walk_of(
+    v: Vec<String>,
+    asked: &std::cell::RefCell<Vec<(String, usize)>>,
+) -> impl FnMut(&str, usize) -> BootBefore + '_ {
+    move |current, k| {
+        asked.borrow_mut().push((current.to_string(), k));
+        match v.len().checked_sub(k + 1) {
+            Some(i) => BootBefore::Boot(v[i].clone()),
+            None => BootBefore::NoSuchBoot,
+        }
+    }
+}
+
+/// systemd 249's `--list-boots`: the journal's boots from the oldest,
+/// stopped at the first one met twice — 383 of rc14's 422, never this boot.
+fn list_249(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("{:032x}", 0xd00d_0000_u64 + i as u64))
+        .collect()
+}
+
+/// Lot 389 (F2h-1, rc14's ubuntu2204): the boot right before this one is
+/// asked first, by this boot's id, and is the last run's — the next boot,
+/// at the first question; the list (which on systemd 249 stops short of
+/// this boot) is not asked.
+#[test]
+fn the_boot_right_before_this_one_being_the_last_runs_is_the_next_boot() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        walk_of(vec![j(D), j(A), j(C)], &asked),
+        || panic!("the walk reached the last run's boot"),
+    );
+    assert_eq!(got, BootContinuity::NextBoot);
+    assert_eq!(asked.into_inner(), vec![(j(C), 1)]);
+}
+
+/// Lot 389 (F2h-1): a boot without the agent (rc14's masked boot) found
+/// walking back from this boot while the list stops 39 boots short of it:
+/// `boots_without_agent`, counted and named, never `unknown`.
+#[test]
+fn a_boot_without_the_agent_is_found_walking_back_when_the_list_stops_short() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        walk_of(vec![j(A), j(B), j(C)], &asked),
+        || Ok(list_249(383)),
+    );
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: 1,
+            boot_ids: vec![j(B)]
+        }
+    );
+    assert_eq!(asked.into_inner(), vec![(j(C), 1), (j(C), 2)]);
+    // the old rule on the same list: unknown — what rc14 signed at every start
+    assert!(matches!(
+        judge(facts(Some(A), Some(C)), || Ok(list_249(383))),
+        BootContinuity::Unknown { .. }
+    ));
+}
+
+/// Lot 389 (F2h-1): a walk that does not reach the last run's boot (the
+/// journal ends, does not answer) leaves the judgement to the list — on
+/// systemd 249's short list `unknown`, its why naming both answers; on a
+/// list that reaches this boot, the list's judgement (a long gap counted
+/// whole past the walk's bound).
+#[test]
+fn a_walk_that_does_not_reach_the_last_run_leaves_the_list_to_judge() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    // a volatile journal: no boot before this one, and a short list
+    let got = judge_walking(facts(Some(A), Some(C)), walk_of(vec![j(C)], &asked), || {
+        Ok(list_249(383))
+    });
+    let BootContinuity::Unknown { why } = &got else {
+        panic!("{got:?}")
+    };
+    assert!(why.contains("not in the journal's boot list (383"), "{why}");
+    assert!(
+        why.contains("named 0 boot(s)") && why.contains("no boot -1)"),
+        "{why}"
+    );
+    assert_eq!(
+        asked.borrow().len(),
+        1,
+        "a journal without the boot is not asked further"
+    );
+    // the journal does not answer: asked once, the list judges
+    let mut n = 0;
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |_: &str, _: usize| {
+            n += 1;
+            BootBefore::NoAnswer("killed past 2 s".into())
+        },
+        || Ok(vec![j(A), j(B), j(C)]),
+    );
+    assert_eq!(n, 1);
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: 1,
+            boot_ids: vec![j(B)]
+        }
+    );
+    // past the walk's bound: never asked further, the whole list counts
+    let gap: Vec<String> = (0..WALK_MAX + 3)
+        .map(|i| format!("{:032x}", i + 1))
+        .collect();
+    let mut list = vec![j(A)];
+    list.extend(gap.iter().cloned());
+    list.push(j(C));
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        walk_of(list.clone(), &asked),
+        || Ok(list.clone()),
+    );
+    assert_eq!(asked.borrow().len(), WALK_MAX);
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: gap.len() as u64,
+            boot_ids: gap[..LISTED_BOOT_IDS_MAX].to_vec()
+        }
+    );
+}
+
+/// Lot 389 (F2h-1): the journal's two answers disagree — the walk names
+/// another boot right before this one, the list puts the last run's there:
+/// `unknown`, never the clean "next boot".
+#[test]
+fn a_list_that_contradicts_the_walk_is_unknown_never_clean() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let mut walk = walk_of(vec![j(B), j(C)], &asked);
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |c: &str, k: usize| match k {
+            1 => walk(c, k),
+            _ => BootBefore::NoAnswer("killed past 2 s".into()),
+        },
+        || Ok(vec![j(A), j(C)]),
+    );
+    let BootContinuity::Unknown { why } = &got else {
+        panic!("{got:?}")
+    };
+    assert!(why.contains(&j(B)), "{why}");
+    assert!(!got.continuous());
+}
+
+/// Lot 389 (F2h-1): the walk keeps lot 387's rules — a restart or a first
+/// run asks nothing, an unreadable fact is unknown, the walk's ids are one
+/// form, and a boot met twice (its entries split by another's) counts
+/// once; this very boot named as a boot before it stops the walk.
+#[test]
+fn the_walk_keeps_the_list_rules() {
+    let never_walk = |_: &str, _: usize| -> BootBefore { panic!("nothing asked") };
+    assert_eq!(
+        judge_walking(facts(Some(C), Some(C)), never_walk, never),
+        BootContinuity::SameBoot
+    );
+    let first = BootFacts {
+        previous_run: false,
+        previous_boot: None,
+        current_boot: Some(C),
+    };
+    assert_eq!(
+        judge_walking(first, never_walk, never),
+        BootContinuity::FirstRun
+    );
+    assert!(matches!(
+        judge_walking(facts(None, Some(C)), never_walk, never),
+        BootContinuity::Unknown { .. }
+    ));
+    assert!(matches!(
+        judge_walking(facts(Some(A), None), never_walk, never),
+        BootContinuity::Unknown { .. }
+    ));
+    // the kernel's form and capitals: one boot
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |_: &str, k: usize| match k {
+            1 => BootBefore::Boot(B.to_uppercase()),
+            _ => BootBefore::Boot(A.into()),
+        },
+        never,
+    );
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: 1,
+            boot_ids: vec![j(B)]
+        }
+    );
+    // a boot met twice before the last run's (its entries split by
+    // another's): counted once
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        walk_of(vec![j(A), j(B), j(D), j(B), j(C)], &asked),
+        never,
+    );
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: 2,
+            boot_ids: vec![j(B), j(D)]
+        }
+    );
+    // this very boot named as a boot before it (systemd 255 ignoring the
+    // offset of `-b <id>-<k>`, lot 389's lab): the walk stops, not counting
+    // it, and the list judges — its next boot stands, no contradiction
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |c: &str, k: usize| {
+            asked.borrow_mut().push(k);
+            BootBefore::Boot(c.to_string())
+        },
+        || Ok(vec![j(A), j(C)]),
+    );
+    assert_eq!(got, BootContinuity::NextBoot);
+    assert_eq!(asked.into_inner(), vec![1]);
+    // an answer that names no boot ends the walk; the list judges
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |_: &str, _: usize| BootBefore::Boot("no id".into()),
+        || Ok(vec![j(A), j(C)]),
+    );
+    assert!(matches!(got, BootContinuity::NextBoot), "{got:?}");
+}
+
+/// Lot 389 (F2h-1): the walk reaches the last run's boot past as many boots
+/// without the agent as a row lists ([`LISTED_BOOT_IDS_MAX`]) — on systemd
+/// 249, whose list stops short, the walk alone names them all.
+#[test]
+fn the_walk_reaches_past_every_boot_a_row_lists() {
+    let gap: Vec<String> = (0..LISTED_BOOT_IDS_MAX)
+        .map(|i| format!("{:032x}", i + 1))
+        .collect();
+    let mut list = vec![j(A)];
+    list.extend(gap.iter().cloned());
+    list.push(j(C));
+    let asked = std::cell::RefCell::new(Vec::new());
+    let got = judge_walking(facts(Some(A), Some(C)), walk_of(list, &asked), || {
+        panic!("the walk reached the last run's boot: the list is not asked")
+    });
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: LISTED_BOOT_IDS_MAX as u64,
+            boot_ids: gap
+        }
+    );
+    assert_eq!(asked.borrow().len(), LISTED_BOOT_IDS_MAX + 1);
+}

@@ -515,7 +515,9 @@ each open (a restart reads the chain again: it clears nothing):
   that are no finding (a note,
   a repair, an end) — a torn tail's repair among them
   (`chain_tail_repaired`, below: a crash's normal end, its cut signed and
-  verifiable).
+  verifiable), and lot 389's `run_exec_at_shutdown` (Ubuntu's `finalrd`
+  making `/run` executable while the host goes down, `recorded`; the same
+  change otherwise is the held `mount_attrs_changed`).
 - A row that ends a hold — an acknowledgement, a `cleared`, a start's
   `agent_boot` — counts only when its signature verifies with the agent's
   key: a line written into the file by hand ends nothing.

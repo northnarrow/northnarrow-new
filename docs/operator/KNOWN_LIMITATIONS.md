@@ -323,13 +323,19 @@ not cause as an incident.
     with no beat back while the host still answers, it says `NOT_BACK`
     (exit 18), no longer `STOPPED` ([HEARTBEAT.md](HEARTBEAT.md)).
   - The agent's next start. It compares the boot of its last run (the
-    `boot_id` of its signed `agent_boot`) with the journal's boot list
-    (`journalctl --list-boots`): each boot in between had no run of the
-    agent. It signs `boots_without_agent` (High: the count and the boot
-    ids), held in `nn-admin status` until you acknowledge it, and its
-    `previous_run` is then not `clean`. When the journal cannot tell (a
-    volatile journal keeps only this boot; the older boots rotated or
-    removed), it says `unknown` (an advisory), never `clean`.
+    `boot_id` of its signed `agent_boot`) with the journal's boots before
+    this one, asked one at a time from this boot backwards (`journalctl -b
+    -<k>`, once `-b 0` is this boot; lot 389: systemd 249's `--list-boots`
+    stops at the first boot it meets twice, short of this boot on a long
+    journal), then
+    with its boot list (`journalctl --list-boots`) when that walk does not
+    reach it: each boot in between had no run of the agent. It signs
+    `boots_without_agent` (High: the count and the boot ids), held in
+    `nn-admin status` until you acknowledge it, and its `previous_run` is
+    then not `clean`. When the journal cannot tell (a volatile journal
+    keeps only this boot; the older boots rotated or removed; more than 16
+    boots without the agent on systemd 249), it says `unknown` (an
+    advisory), never `clean`.
 
   Every source of that judgement but this boot's id can be rewritten by
   root before the agent starts: the audit chain (with the signing key, see
@@ -344,7 +350,24 @@ not cause as an incident.
   reboots, acknowledge the record (`nn-admin integrity acknowledge`).
   *Evidence:*
   `a_boot_without_the_agent_is_signed_at_the_next_start_never_clean`,
-  `a_stop_that_never_comes_back_is_not_back_past_the_grace`; lot 387.
+  `a_stop_that_never_comes_back_is_not_back_past_the_grace`; lot 387;
+  `a_boot_without_the_agent_is_found_walking_back_when_the_list_stops_short`;
+  lot 389.
+- **`/run` made executable while the host goes down is a note.** Ubuntu's
+  packaged `finalrd` makes `/run` executable as every shutdown begins. When
+  `/run` lost `noexec` and nothing else, systemd (PID 1, over its private
+  socket) says `stopping` with a reboot, power-off, halt or kexec job
+  pending, and systemd's record shows the packaged unit's own stop run
+  since the round before, the change is signed as `run_exec_at_shutdown`
+  (a note, no degradation), for at most 120 s from the run's first such
+  note. The mount table names no actor: a root process that makes the same
+  change in that very moment of a real shutdown is noted the same, and the
+  facts are what PID 1's private socket answers. Any other change, the
+  same change while the host runs, or a "shutdown" that does not take the
+  host down, is the High `mount_attrs_changed`. *For you:* on Ubuntu,
+  expect the note after some reboots. *Evidence:*
+  `finalrds_remount_at_the_host_s_shutdown_is_a_note_and_otherwise_a_degradation`,
+  `finalrds_remount_is_the_shutdowns_only_with_every_fact`; lot 389.
 - **Some BPF paths are not judged.** Some network program attachments and
   some map contents are not judged; their load is still recorded.
   *Evidence:* internal check Phase 3 §7.1 (residuals R002, R132); lot 356.

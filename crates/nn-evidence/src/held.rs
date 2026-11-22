@@ -325,6 +325,11 @@ pub const NOT_HELD_KINDS: &[(&str, &str)] = &[
         "an NN_ setting of a kept drop-in of ours, signed `recorded`: no drift",
     ),
     (
+        "run_exec_at_shutdown",
+        "lot 389: Ubuntu's packaged finalrd making /run executable at the host's shutdown \
+         (systemd stopping, its unit's own ExecStop), signed `recorded`: no drift",
+    ),
+    (
         "legacy_isolation_removed",
         "a repair at the start, signed `repaired`",
     ),
