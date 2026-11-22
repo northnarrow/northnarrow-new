@@ -112,9 +112,77 @@ pub fn journal_boots() -> Result<Vec<String>, String> {
     )))
 }
 
+/// Lot 388 (the review of #595, P3-1): the boots without the agent the
+/// start looks at in the journal at most, and how long each may take.
+pub const RESCUE_CHECK_MAX: usize = 4;
+pub const RESCUE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Lot 388 (the review of #595, P3-1): which of `boot_ids` (the boots
+/// without the agent, oldest first) the journal shows as a rescue or an
+/// emergency boot — PID 1's records of `rescue.target` or
+/// `emergency.target` in that boot. The first [`RESCUE_CHECK_MAX`] only,
+/// each bounded; a boot the journal does not answer for is not named (its
+/// cause stays one of the list the row gives). A fact for the row's
+/// wording: the gap is signed High all the same.
+pub fn rescue_boots(boot_ids: &[String]) -> Vec<String> {
+    rescue_boots_with(boot_ids, journal_shows_rescue)
+}
+
+/// [`rescue_boots`] with the journal's answer given (tests).
+pub fn rescue_boots_with(boot_ids: &[String], shows_rescue: impl Fn(&str) -> bool) -> Vec<String> {
+    boot_ids
+        .iter()
+        .take(RESCUE_CHECK_MAX)
+        .filter_map(|b| boot_gap::normalize(b))
+        .filter(|b| shows_rescue(b))
+        .collect()
+}
+
+/// Whether the journal holds PID 1's record of the rescue or emergency
+/// target in boot `id` (32 hex digits).
+fn journal_shows_rescue(id: &str) -> bool {
+    let Ok(bin) = crate::trusted_bin::resolve("journalctl") else {
+        return false;
+    };
+    let mut cmd = bin.command();
+    cmd.args([
+        "-b",
+        id,
+        "--no-pager",
+        "--quiet",
+        "-o",
+        "cat",
+        "-n",
+        "1",
+        "_PID=1",
+        "UNIT=rescue.target",
+        "UNIT=emergency.target",
+    ]);
+    crate::bounded_cmd::run_bounded(cmd, None, RESCUE_CHECK_TIMEOUT, "journalctl -b <id>")
+        .is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 388 (the review of #595, P3-1): the journal is asked about the
+    /// first boots without the agent only, by their normalized id; a boot
+    /// it shows in rescue is named, the others are not.
+    #[test]
+    fn the_rescue_boots_are_the_journal_s_among_the_first_boots_without_the_agent() {
+        let ids: Vec<String> = (0..6).map(|i| format!("{i:032x}")).collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let got = rescue_boots_with(&ids, |b| {
+            asked.borrow_mut().push(b.to_string());
+            b.ends_with('1') || b.ends_with('5')
+        });
+        assert_eq!(got, vec![ids[1].clone()], "the sixth boot is past the cap");
+        assert_eq!(asked.into_inner(), ids[..RESCUE_CHECK_MAX].to_vec());
+        // the kernel's form (dashes) is asked in the journal's
+        let got = rescue_boots_with(&[B.to_string(), "not a boot".into()], |_| true);
+        assert_eq!(got, vec![boot_gap::normalize(B).unwrap()]);
+    }
 
     const A: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
     const B: &str = "1111aaaa-2222-3333-4444-555566667777";

@@ -15,7 +15,7 @@ use northnarrow_agent::detection_report;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
 use northnarrow_agent::sensors::SensorMultiplexer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::cli::Cli;
 use super::posture::audit_combat_reconcile;
@@ -177,6 +177,17 @@ pub(crate) fn attest(
                     std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
                 );
                 log.set_boot(since.boot_id.clone(), since.continuity.clone());
+                // Lot 388 (the review of #595, P3-1): the journal's rescue
+                // or emergency boots among those without the agent — the
+                // gap's row names the causes the facts show
+                if let nn_evidence::boot_gap::BootContinuity::BootsWithoutAgent {
+                    boot_ids, ..
+                } = &since.continuity
+                {
+                    log.set_rescue_boots(northnarrow_agent::boot::boots_since::rescue_boots(
+                        boot_ids,
+                    ));
+                }
                 match log.boot_probe_profiled(
                     detect_only_source.as_deref(),
                     // lot 345: the profile signed, for the next start's
@@ -345,13 +356,17 @@ fn attest_boots_since(
 ) {
     use nn_evidence::boot_gap::BootContinuity;
     match &since.continuity {
+        // Lot 388 (the review of #595, P3-1): the causes such a boot can
+        // have, never one alone; the row names those the facts show
         BootContinuity::BootsWithoutAgent { count, boot_ids } => error!(
             count,
             boot_ids = ?boot_ids,
             previous_source = ?since.previous_source,
-            "BOOTS WITHOUT THE AGENT since its last run — its units were kept from starting \
-             (masked, not wanted by the default target, or disabled); signed High, held in \
-             `nn-admin status` until acknowledged"
+            refused_starts = log.refused_since_run().len(),
+            "BOOTS WITHOUT THE AGENT since its last run — its units kept from starting \
+             (masked, not wanted by the default target, disabled), a start refused, a rescue \
+             boot or a boot interrupted before the agent's start (look at each with \
+             `journalctl -b <id>`); signed High, held in `nn-admin status` until acknowledged"
         ),
         BootContinuity::Unknown { why } => warn!(
             why = %why,
@@ -361,9 +376,60 @@ fn attest_boots_since(
         ),
         _ => {}
     }
-    if let Err(e) = log.attest_boot_continuity() {
-        warn!(error = %format!("{e:#}"), "boots since the last run NOT recorded");
+    // Lot 388 (the review of #595, P3-3): the row carries the hold — the
+    // next start judges from this boot — so a failed write is tried again
+    // at once, then while the agent runs (`spawn_boot_continuity_retry`)
+    if let Err(e) = log
+        .attest_boot_continuity()
+        .or_else(|_| log.retry_boot_continuity())
+    {
+        warn!(
+            error = %format!("{e:#}"),
+            "boots since the last run NOT recorded yet — tried again every {} s",
+            BOOT_CONTINUITY_RETRY.as_secs()
+        );
     }
+}
+
+/// Lot 388 (the review of #595, P3-3): how often a boot gap's row whose
+/// write failed at the start is tried again.
+pub(crate) const BOOT_CONTINUITY_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Lot 388 (P3-3): while the boot gap's row is due
+/// ([`northnarrow_agent::audit::AuditLog::boot_continuity_due`]), try it
+/// again every [`BOOT_CONTINUITY_RETRY`], off the runtime's worker, until
+/// it is signed.
+pub(crate) fn spawn_boot_continuity_retry(
+    audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+) {
+    let Some(log) = audit_log else { return };
+    if !log.lock().boot_continuity_due() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BOOT_CONTINUITY_RETRY);
+        tick.tick().await; // the start just tried
+        loop {
+            tick.tick().await;
+            let l = Arc::clone(&log);
+            let r = tokio::task::spawn_blocking(move || {
+                let mut log = l.lock();
+                (log.retry_boot_continuity(), log.boot_continuity_due())
+            })
+            .await;
+            match r {
+                Ok((Ok(Some(_)), _)) => {
+                    info!("boots since the last run recorded (tried again)");
+                    return;
+                }
+                Ok((_, false)) => return,
+                Ok((Err(e), true)) => {
+                    debug!(error = %format!("{e:#}"), "boots since the last run: still not recorded")
+                }
+                Ok((Ok(None), true)) | Err(_) => {}
+            }
+        }
+    });
 }
 
 /// The audit log's open after the attach, when the integrity phase could
@@ -468,6 +534,9 @@ pub(crate) fn wire(
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     sensor.bpf_guard().spawn_link_self_check(audit_log.clone());
+    // Lot 388 (the review of #595, P3-3): a boot gap's row the start could
+    // not write is tried again while the agent runs
+    spawn_boot_continuity_retry(audit_log.clone());
     // Lab PR 216: the watchdog refresh has the log from its spawn
     // (`posture::machine`, fix round 5 of #582), not from here.
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin

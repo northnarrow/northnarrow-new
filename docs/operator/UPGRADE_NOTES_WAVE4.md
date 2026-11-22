@@ -6216,3 +6216,46 @@ fires.
   with writes the host does not record, and the signing key is readable by
   root code that runs before the agent at every boot (KNOWN_LIMITATIONS.md,
   the trust model).
+
+## 73. No watchdog death at the host's own shutdown; the verifier's start-up stage 5 is late, not lost (lot 388)
+
+- **`watchdog_gone` is no longer signed for the watchdog's own clean stop**
+  (its pidfile removed) in the host's shutdown (PID 1 is
+  `systemd-shutdown`), inside a signed trusted-installer window, or during
+  the agent's own stop. That is a new note, `watchdog_stopped` (op
+  `witness`, result `recorded`, never held), naming which. Before, a normal
+  reboot left a held `watchdog_gone` now and then (the agent's 30 s round
+  landing between the watchdog's quick stop and the agent's own), and
+  `nn-admin status` said `DEGRADED` until acknowledged. A kill, an OOM or a
+  crash of the watchdog (its pidfile left, or a successor's pidfile) is
+  still `watchdog_gone`, held until acknowledged, a window included. A
+  monitor that counted `watchdog_gone` rows per reboot: count
+  `watchdog_stopped` notes beside them, or expect fewer.
+- **`nn-admin heartbeat watch` no longer says `LOSS` (exit 14) for stage 5**
+  (`decision delay`): counted in a run's first 120 s it is a `NOTICE` line
+  (no exit code), after them `DEGRADED` (exit 16). After a reboot or a
+  restart the check that read `LOSS … stage 5 (decision delay) +N` now
+  prints `NOTICE stage 5 (decision delay) +N in the run's first 120 s` and
+  exits 0 when nothing else is wrong. The other stages are `LOSS` as
+  before.
+- **The stop beat is the run's last**: no periodic beat follows it any more
+  (one could, written during the agent's stop, and the verifier then said
+  "restarted without a clean stop" after a normal reboot).
+- **The agent's `telemetry_loss` row is `detected` only for a stage that
+  drops events**; stage 5 alone leaves it `success` (its counts in the row
+  as before) with an INFO line instead of the `telemetry loss` WARN.
+- **The `boots_without_agent` row** (§72) names the causes the facts show:
+  `refused_starts` (a start refused in one of those boots: its gate, its
+  row and its boot), `refused_starts_unplaced` (refused starts of an agent
+  before this release, their boot not recorded) and `rescue_boots` (the
+  journal shows PID 1 reaching `rescue.target` or `emergency.target` in
+  that boot; the first four boots without the agent are looked at, 2 s
+  each). Its `detail` no longer names one cause alone. The refused start's
+  `agent_boot` row (`result: refused`) carries `boot_id`. Still High and
+  held until acknowledged.
+- **A boot gap's row the start could not write** (a full disk) is tried
+  again every 30 s while the agent runs, until it is signed once; before,
+  the hold was lost at the next start.
+- **Docs**: an uninstall that kept the records followed by a reinstall,
+  with a whole boot in between, leaves a signed gap — expected (the tester
+  guide, INSTALL_UPGRADE_UNINSTALL.md).

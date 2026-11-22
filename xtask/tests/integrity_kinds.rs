@@ -71,6 +71,9 @@ const OTHER_ROWS: &[(&str, &str)] = &[
     ("witness_note", "signed under op witness, a note"),
     ("watchdog_succession", "signed under op witness, a note"),
     ("roles_released", "signed under op witness, a note"),
+    // lot 388: the watchdog's clean stop in the host's shutdown, a window or
+    // the agent's own stop (`self_integrity::watchdog_exit_finding`)
+    ("watchdog_stopped", "signed under op witness, a note"),
 ];
 
 /// Where the kinds of a kind position that is no literal and no constant

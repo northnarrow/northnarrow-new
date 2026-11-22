@@ -1906,7 +1906,9 @@ pub fn take_stuck_marker(path: &Path, pid: u32, now: u64) -> Option<String> {
 /// all the agent left. A crash, a kill or a stop: the watchdog's own record
 /// (`watchdog_exit`, or systemd's `watchdog_failed`) says why, when one
 /// could be written. `now` is what the agent's refresh finds in its place.
-pub fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution) -> Finding {
+/// Lot 388: signed only through [`watchdog_exit_finding`], which tells the
+/// host's or the operator's stop from a death.
+fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution) -> Finding {
     use crate::posture::exempt::WatchdogResolution as R;
     let now = match now {
         R::Verified { pid, .. } => format!("a new watchdog (pid {pid}) is verified"),
@@ -1918,6 +1920,85 @@ pub fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution
     Finding {
         kind: "watchdog_gone",
         detail: format!("the verified watchdog (pid {prev}) no longer runs; {now}"),
+    }
+}
+
+/// Lot 388 (the triage of #595, a): what the agent's watchdog round knows
+/// when it finds the verified watchdog gone. At a normal reboot
+/// `systemd-shutdown` signals the agent and the watchdog at the same moment
+/// (the only time PID 1 may outside a signed window, EBPF-001): the
+/// watchdog's stop is quick, the agent's takes longer, and a round that
+/// landed in between signed the watchdog's "death" — held until
+/// acknowledged (lot 379, F7-6), so `nn-admin status` said `DEGRADED` after
+/// a normal reboot, now and then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WatchdogExit {
+    /// The watchdog's own stop ran: its pidfile is gone (removed by its
+    /// teardown; a kill, an OOM or a crash leaves it naming the dead pid,
+    /// and a successor's names the successor).
+    pub clean: bool,
+    /// PID 1 is `systemd-shutdown`, the last stage of the host's shutdown
+    /// (its comm, which no other process can write).
+    pub host_shutdown: bool,
+    /// A signed trusted-installer window is open (an upgrade's or an
+    /// uninstall's stop).
+    pub window_open: bool,
+    /// The agent's own stop has begun (its event loop ended).
+    pub agent_stopping: bool,
+}
+
+impl WatchdogExit {
+    /// Why the watchdog's exit is the host's or the operator's stop, not a
+    /// death: a clean stop of its own in the host's shutdown, inside a
+    /// signed window, or during the agent's own stop. `None`: a death — a
+    /// kill, an OOM or a crash (its pidfile left), or any exit while the host
+    /// runs normally, no window open and the agent not stopping. Inside a
+    /// window only a clean stop is the operator's, as the watchdog's own
+    /// rule for the agent's role (`vacancy_kind`, the re-check of #582, N8).
+    pub fn stop_not_death(&self) -> Option<&'static str> {
+        if !self.clean {
+            return None;
+        }
+        if self.host_shutdown {
+            Some("in the host's shutdown (PID 1 is systemd-shutdown)")
+        } else if self.window_open {
+            Some("inside a signed trusted-installer window (the operator's stop)")
+        } else if self.agent_stopping {
+            Some("during the agent's own stop")
+        } else {
+            None
+        }
+    }
+}
+
+/// Lot 388: whether the watchdog's exit `e` is a death (held until
+/// acknowledged, `watchdog_gone`) — every exit but a clean stop in the
+/// host's shutdown, a signed window or the agent's own stop.
+pub fn watchdog_exit_is_a_death(e: &WatchdogExit) -> bool {
+    e.stop_not_death().is_none()
+}
+
+/// Lot 388: the finding of the verified watchdog `prev` gone, `now` what
+/// the round finds in its place, `e` what it knows of the exit
+/// ([`WatchdogExit`], its `clean` from `now`): a death (`watchdog_gone`,
+/// held until acknowledged) or, for the host's or the operator's stop, a
+/// note (`witness::WATCHDOG_STOPPED`, never held) — signed either way
+/// ([`report_or_note`]).
+pub fn watchdog_exit_finding(
+    prev: u32,
+    now: &crate::posture::exempt::WatchdogResolution,
+    mut e: WatchdogExit,
+) -> Finding {
+    e.clean = matches!(now, crate::posture::exempt::WatchdogResolution::NotPresent);
+    match e.stop_not_death() {
+        None => watchdog_gone(prev, now),
+        Some(why) => Finding {
+            kind: crate::witness::WATCHDOG_STOPPED,
+            detail: format!(
+                "the verified watchdog (pid {prev}) stopped {why}: its own stop removed its \
+                 pidfile; no watchdog runs now"
+            ),
+        },
     }
 }
 
@@ -3083,6 +3164,157 @@ mod tests {
             },
         );
         assert!(f.detail.contains("no watchdog is verified"), "{}", f.detail);
+    }
+
+    /// Lot 388 (the triage of #595, a): the watchdog's exit is a death but
+    /// for a clean stop of its own in the host's shutdown, inside a signed
+    /// window or during the agent's own stop — each condition alone, every
+    /// combination, both sides.
+    #[test]
+    fn watchdog_exit_is_a_death_unless_a_clean_stop_in_the_host_s_or_the_operator_s_stop() {
+        for bits in 0u8..16 {
+            let e = WatchdogExit {
+                clean: bits & 1 != 0,
+                host_shutdown: bits & 2 != 0,
+                window_open: bits & 4 != 0,
+                agent_stopping: bits & 8 != 0,
+            };
+            let stop = e.clean && (e.host_shutdown || e.window_open || e.agent_stopping);
+            assert_eq!(watchdog_exit_is_a_death(&e), !stop, "{e:?}");
+        }
+        // a host that runs normally: every exit a death, clean or not
+        assert!(watchdog_exit_is_a_death(&WatchdogExit {
+            clean: true,
+            ..WatchdogExit::default()
+        }));
+        // a kill, an OOM, a crash (its pidfile left) inside a window, in the
+        // host's shutdown or the agent's stop: a death
+        assert!(watchdog_exit_is_a_death(&WatchdogExit {
+            clean: false,
+            host_shutdown: true,
+            window_open: true,
+            agent_stopping: true,
+        }));
+        let why = |e: WatchdogExit| e.stop_not_death().unwrap_or("a death");
+        let clean = WatchdogExit {
+            clean: true,
+            ..WatchdogExit::default()
+        };
+        assert!(why(WatchdogExit {
+            host_shutdown: true,
+            ..clean
+        })
+        .contains("systemd-shutdown"));
+        assert!(why(WatchdogExit {
+            window_open: true,
+            ..clean
+        })
+        .contains("window"));
+        assert!(why(WatchdogExit {
+            agent_stopping: true,
+            ..clean
+        })
+        .contains("the agent's own stop"));
+    }
+
+    /// Lot 388 (the triage of #595, a): what the round signs — the death
+    /// (`watchdog_gone`, held until acknowledged) for a watchdog killed while
+    /// the host runs normally, or whose pidfile stayed (a kill, an OOM, a
+    /// crash; a successor's) whatever the moment; the note
+    /// (`watchdog_stopped`, op witness, never held) for its own clean stop in
+    /// the host's shutdown, a window or the agent's stop.
+    #[test]
+    fn a_watchdog_stopped_with_the_host_is_a_note_and_one_killed_is_a_held_death() {
+        use crate::posture::exempt::WatchdogResolution as R;
+        use nn_evidence::held::{hold_of, Hold};
+        let shutdown = WatchdogExit {
+            host_shutdown: true,
+            ..WatchdogExit::default()
+        };
+        // the normal reboot of the lab (lot 387, r1): pidfile absent, PID 1
+        // systemd-shutdown
+        let f = watchdog_exit_finding(3700, &R::NotPresent, shutdown);
+        assert_eq!(f.kind, crate::witness::WATCHDOG_STOPPED);
+        assert!(crate::witness::is_note(f.kind));
+        assert_ne!(hold_of(f.kind, "detected"), Hold::UntilAcknowledged);
+        assert!(
+            f.detail.contains("pid 3700") && f.detail.contains("systemd-shutdown"),
+            "{}",
+            f.detail
+        );
+        for e in [
+            WatchdogExit {
+                window_open: true,
+                ..WatchdogExit::default()
+            },
+            WatchdogExit {
+                agent_stopping: true,
+                ..WatchdogExit::default()
+            },
+        ] {
+            assert_eq!(
+                watchdog_exit_finding(3700, &R::NotPresent, e).kind,
+                crate::witness::WATCHDOG_STOPPED,
+                "{e:?}"
+            );
+        }
+        // the host running normally: a death, its pidfile gone or not
+        for now in [
+            R::NotPresent,
+            R::Unverifiable {
+                pid: 3700,
+                reason: String::new(),
+            },
+        ] {
+            let f = watchdog_exit_finding(3700, &now, WatchdogExit::default());
+            assert_eq!(f.kind, "watchdog_gone", "{now:?}");
+            assert!(!crate::witness::is_note(f.kind));
+            assert_eq!(hold_of(f.kind, "detected"), Hold::UntilAcknowledged);
+        }
+        // its pidfile left (a SIGKILL in the window, an OOM) or a successor's,
+        // in every stop: a death
+        let all = WatchdogExit {
+            clean: false,
+            host_shutdown: true,
+            window_open: true,
+            agent_stopping: true,
+        };
+        for now in [
+            R::Unverifiable {
+                pid: 3700,
+                reason: String::new(),
+            },
+            R::InvalidPidfile {
+                reason: String::new(),
+            },
+            R::ExeMismatch {
+                pid: 3700,
+                resolved: std::path::PathBuf::from("/usr/bin/sleep"),
+            },
+            R::Verified {
+                pid: 3800,
+                start_ticks: 1,
+            },
+        ] {
+            assert_eq!(
+                watchdog_exit_finding(3700, &now, all).kind,
+                "watchdog_gone",
+                "{now:?}"
+            );
+        }
+        // `clean` is the round's own reading of `now`, never the caller's
+        let f = watchdog_exit_finding(
+            3700,
+            &R::Verified {
+                pid: 3800,
+                start_ticks: 1,
+            },
+            WatchdogExit {
+                clean: true,
+                ..shutdown
+            },
+        );
+        assert_eq!(f.kind, "watchdog_gone");
     }
 
     /// Lot 353 (named, pre-alpha Phase 3 X6): the watchdog's stuck recovery

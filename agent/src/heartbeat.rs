@@ -140,6 +140,9 @@ struct Writer {
     /// The actions chain's head the last beat named (at the start: the
     /// last run's last beat's), read back at each beat (`kept`).
     actions_head: Option<Head>,
+    /// Lot 388 (the triage of #595, its mini-hunt): the stop beat is
+    /// written — the run's last: no periodic beat after it.
+    stopped: bool,
 }
 
 /// The heartbeat (see the module's doc). Cheap to clone.
@@ -195,6 +198,7 @@ impl Heartbeat {
                 unwritten: 0,
                 loss_row: None,
                 actions_head,
+                stopped: false,
             })),
             sources: Arc::new(sources),
             interval: interval_from_env(),
@@ -244,6 +248,20 @@ impl Heartbeat {
 
     /// Write one beat (and the loss row when due).
     pub fn beat(&self, kind: BeatKind, stop_reason: Option<&str>) {
+        self.beat_with(kind, stop_reason, || {});
+    }
+
+    /// [`Self::beat`], `between` run after the beat is built and before it
+    /// is written (the tests' stop beat, written in between).
+    fn beat_with(&self, kind: BeatKind, stop_reason: Option<&str>, between: impl FnOnce()) {
+        // Lot 388 (the triage of #595, its mini-hunt): the periodic beats'
+        // task runs on through the agent's stop — a beat it wrote after the
+        // stop beat made the run end on a plain beat, and the verifier said
+        // "restarted without a clean stop" after a normal reboot (lab
+        // debian13: stop beat 9, beat 10 0.8 s later)
+        if kind != BeatKind::Stop && self.inner.lock().stopped {
+            return;
+        }
         let s = &self.sources;
         let loss = loss_now(s);
         let j = s.journal.counts();
@@ -297,7 +315,15 @@ impl Heartbeat {
             None => crate::boot::degradation::snapshot(),
         };
         degradations.truncate(MAX_DEGRADATIONS);
+        between();
         let mut w = self.inner.lock();
+        // the stop beat may have been written while this one was built
+        if kind != BeatKind::Stop && w.stopped {
+            return;
+        }
+        if kind == BeatKind::Stop {
+            w.stopped = true;
+        }
         if now_head.is_some() {
             w.actions_head = now_head;
         }
@@ -382,6 +408,11 @@ fn sign_loss(
 ) {
     let names = nn_evidence::heartbeat::STAGE_NAMES;
     let mut any = false;
+    // Lot 388 (the triage of #595, b, its mini-hunt): stage 5 counts events
+    // judged later than their budget, none lost — at every start the boot's
+    // backlog made this row `detected` and a "telemetry loss" WARN. Its
+    // counts stay in the row; only a stage that drops events makes it a loss.
+    let mut late = 0u64;
     let stages: Vec<serde_json::Value> = loss
         .iter()
         .enumerate()
@@ -391,7 +422,9 @@ fn sign_loss(
                 .and_then(|(p, _)| p.get(i).copied().flatten())
                 .unwrap_or(0);
             let since = total.map(|t| t.saturating_sub(before));
-            if since.is_some_and(|d| d > 0) {
+            if i == nn_evidence::heartbeat::DECISION_DELAY_STAGE {
+                late = since.unwrap_or(0);
+            } else if since.is_some_and(|d| d > 0) {
                 any = true;
             }
             serde_json::json!({
@@ -406,6 +439,12 @@ fn sign_loss(
         warn!(
             stages = %serde_json::Value::from(stages.clone()),
             "telemetry loss since the last signed row (signed telemetry_loss)"
+        );
+    } else if late > 0 {
+        info!(
+            decided_late = late,
+            "events judged later than their decision budget since the last signed row (stage 5, \
+             none lost; signed telemetry_loss)"
         );
     }
     let Some(log) = audit else {
@@ -686,6 +725,100 @@ mod tests {
             .heads
             .iter()
             .any(|h| h.chain == "audit" && h.seq.is_some()));
+    }
+
+    /// Lot 388 (the triage of #595, its mini-hunt): the stop beat is the
+    /// run's last — a periodic beat after it (the beats' task runs on
+    /// through the agent's stop) is not written, and signs no loss row.
+    #[test]
+    fn no_beat_follows_the_stop_beat() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("agent.sig.key");
+        let key = || crate::keys::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let path = dir.path().join("heartbeat.jsonl");
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        hb.beat(BeatKind::Beat, None);
+        hb.stop("system_shutdown");
+        assert_eq!(hb.counts(), (3, 0));
+        hb.beat(BeatKind::Beat, None);
+        hb.beat(BeatKind::Beat, None);
+        assert_eq!(hb.counts(), (3, 0), "no beat after the stop beat");
+        let lines = export_lines(&path, 10).unwrap();
+        let last: crate::chainlog::ChainLine<HeartbeatRecord> =
+            serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last.payload.kind, BeatKind::Stop);
+        assert_eq!(last.payload.stop_reason.as_deref(), Some("system_shutdown"));
+        assert_eq!(lines.len(), 3);
+        // the race of the lab: a periodic beat built before the stop beat,
+        // written after it — not written
+        let path = dir.path().join("heartbeat-2.jsonl");
+        let hb = Heartbeat::open(
+            &path,
+            key(),
+            Arc::new(crate::chainlog::NoProtection),
+            false,
+            sources(),
+        );
+        hb.beat_with(BeatKind::Beat, None, || hb.stop("system_shutdown"));
+        assert_eq!(hb.counts(), (2, 0), "the start and the stop beat only");
+        let lines = export_lines(&path, 10).unwrap();
+        let last: crate::chainlog::ChainLine<HeartbeatRecord> =
+            serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last.payload.kind, BeatKind::Stop);
+    }
+
+    /// Lot 388 (the triage of #595, b, its mini-hunt): the `telemetry_loss`
+    /// row is `detected` for a stage that drops events, never for stage 5
+    /// alone (late decisions, every one judged — the start's backlog): its
+    /// count is in the row all the same.
+    #[test]
+    fn a_telemetry_loss_row_is_detected_for_lost_events_never_for_late_decisions_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::keys::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let audit_path = dir.path().join("audit.log");
+        let audit = Arc::new(Mutex::new(
+            crate::audit::AuditLog::open(&audit_path, key, [1; 16]).unwrap(),
+        ));
+        let stage5 = nn_evidence::heartbeat::DECISION_DELAY_STAGE;
+        let zero = vec![Some(0); 8];
+        let mut late = zero.clone();
+        late[stage5] = Some(1432);
+        sign_loss(
+            Some(&audit),
+            "r",
+            &late,
+            Some((zero.clone(), Duration::from_secs(30))),
+            BeatKind::Beat,
+        );
+        let mut lost = late.clone();
+        lost[0] = Some(2);
+        sign_loss(
+            Some(&audit),
+            "r",
+            &lost,
+            Some((late.clone(), Duration::from_secs(60))),
+            BeatKind::Beat,
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &serde_json::Value| r["op"] == TELEMETRY_LOSS_OP)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["result"], "success", "stage 5 alone is no loss");
+        assert_eq!(rows[0]["extra"]["stages"][stage5]["since_last_row"], 1432);
+        assert_eq!(
+            rows[1]["result"], "detected",
+            "a stage that drops events is"
+        );
+        assert_eq!(rows[1]["extra"]["stages"][0]["since_last_row"], 2);
     }
 
     /// The last beat's head of the actions chain.

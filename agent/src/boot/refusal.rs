@@ -386,6 +386,9 @@ fn write_refusal(
     if let Some(source) = refusal.degraded {
         northnarrow_agent::boot::degradation::sign_into(log, source, &refusal.detail, true);
     }
+    // Lot 388 (the review of #595, P3-1): the refused start's boot — the
+    // next start's boot gap names this refusal as that boot's cause
+    log.set_boot_id(nn_linux::fim::honeypot::current_boot_id());
     log.boot_refused_by(
         refusal.gate,
         integrity,

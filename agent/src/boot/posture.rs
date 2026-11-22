@@ -55,6 +55,7 @@ pub(crate) fn machine(
     defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
     rule_policy: &northnarrow_agent::decision::rule_policy::PolicyHandle,
     audit_log: &AuditHandle,
+    stop_begun: crate::stop_deadline::StopBegun,
 ) -> Posture {
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat
@@ -299,6 +300,8 @@ pub(crate) fn machine(
             watchdog_audit,
             Arc::clone(&mount_refresh),
             cli.witness_dir.clone(),
+            Arc::clone(installer_override),
+            stop_begun,
         );
     }
     // External audit EBPF-001: PID 1 may signal the agent at the very end

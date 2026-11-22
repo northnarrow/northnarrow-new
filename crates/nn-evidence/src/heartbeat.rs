@@ -354,6 +354,35 @@ pub const STAGE_NAMES: [&str; 8] = [
     "export",
 ];
 
+/// Lot 388 (the triage of #595, b): the index in a beat's `loss` of stage 5,
+/// "decision delay" — events decided later than their class's budget, every
+/// one of them judged: no event lost. At a start the sensors attach before
+/// the decision loop runs, and the boot's records wait their turn: the
+/// verifier said `LOSS` (exit 14) after every reboot and restart. Counted in
+/// a run's first [`START_SETTLE_SECS`] it is a `NOTICE` (no exit code);
+/// after them, `DEGRADED` (the decision kept falling behind); never `LOSS`.
+pub const DECISION_DELAY_STAGE: usize = 4;
+
+/// Lot 388: a run's start, for [`DECISION_DELAY_STAGE`] — its first 120 s,
+/// the capability manifest's settle window ([`MANIFEST_SETTLE_SECS`]): a
+/// count a beat of the run carries at an uptime within it was counted in
+/// it.
+pub const START_SETTLE_SECS: u64 = MANIFEST_SETTLE_SECS;
+
+/// Lot 388: what `run`'s late decisions ([`DECISION_DELAY_STAGE`]) counted
+/// in its first [`START_SETTLE_SECS`] came to — the count of its newest
+/// beat within them among `beats` (they only grow within a run), 0 when
+/// none is.
+fn late_at_start(beats: &[(usize, &HeartbeatRecord)], run: &str) -> u64 {
+    beats
+        .iter()
+        .map(|(_, b)| *b)
+        .filter(|b| b.run == run && b.uptime_ms <= START_SETTLE_SECS * 1000)
+        .filter_map(|b| b.loss.get(DECISION_DELAY_STAGE).copied().flatten())
+        .max()
+        .unwrap_or(0)
+}
+
 /// What the verifier remembers of the last beat it verified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchState {
@@ -893,7 +922,29 @@ pub fn check(
         for (i, n) in end.loss.iter().enumerate() {
             let before = prev_loss.get(i).copied().flatten().unwrap_or(0);
             if let Some(n) = n {
-                if *n > before {
+                if *n > before && i == DECISION_DELAY_STAGE {
+                    // Lot 388 (the triage of #595, b): late decisions, every
+                    // event judged — the start's backlog a NOTICE, what came
+                    // after the run's first 120 s DEGRADED; never LOSS
+                    let at_start = late_at_start(&beats, &end.run).clamp(before, *n);
+                    if at_start > before {
+                        out.notices.push(format!(
+                            "stage 5 (decision delay) +{} in the run's first {START_SETTLE_SECS} \
+                             s{of}: events of the start judged later than their budget (the \
+                             sensors attach before the decision runs) — every one judged, none \
+                             lost",
+                            at_start - before
+                        ));
+                    }
+                    if *n > at_start {
+                        health.push(format!(
+                            "stage 5 (decision delay) +{} after the run's first \
+                             {START_SETTLE_SECS} s{of}: events judged later than their budget \
+                             (none lost) — the decision falls behind",
+                            n - at_start
+                        ));
+                    }
+                } else if *n > before {
                     lost.push(format!(
                         "stage {} ({}) +{}{of}",
                         i + 1,

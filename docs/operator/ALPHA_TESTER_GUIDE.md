@@ -327,7 +327,10 @@ Further down, among many lines:
   line of `loss by stage` is not a loss: `decision delay` counts events
   judged later than their time budget, all of them judged. The agent's
   start, the scenarios and a slow VM add some; a count that keeps rising
-  on an idle host is worth a report.
+  on an idle host is worth a report. The off-host verifier says the same
+  (lot 388): what this line counts in a run's first 120 s is a `NOTICE`,
+  after them `DEGRADED`, never `LOSS`
+  ([HEARTBEAT.md](HEARTBEAT.md)).
 - `host hardening : <n> check(s), <m> warning(s)`, the last line: settings
   of the host that `sudo nn-admin host-check` lists one per row, with how
   to fix each. Run it with `sudo`: without root some files cannot be read
@@ -726,7 +729,15 @@ system accounts (`northnarrow-scan`, `northnarrow-worker`,
 removes the keys, the state and the records: `/etc/northnarrow`,
 `/var/lib/northnarrow`, the admin key `/root/northnarrow-admin.key`, the
 export directory under `/var/log/northnarrow` and the agent's own journal;
-without it they stay for a later reinstall. The system journal keeps
+without it they stay for a later reinstall. When a whole boot of the host
+passed without the agent between the uninstall and that reinstall, the
+reinstalled agent's first start signs those boots (`boots_without_agent`,
+High, held in `nn-admin status` until acknowledged): a signed gap, expected
+after an uninstall that kept the records — as is the off-host verifier's
+`NOT_BACK` while the agent was away. Read the row, then acknowledge it with
+the command `nn-admin status` prints beside it
+(`sudo nn-admin integrity acknowledge --through <row> --key /root/northnarrow-admin.key`).
+The system journal keeps
 systemd's lines about the units, as it does for any service. Exit codes:
 
 - **0**: removed, clean;

@@ -478,6 +478,7 @@ async fn run(
         &defense_detector,
         &rule_policy,
         &audit_log,
+        stop.begun_handle(),
     );
     let evidence::Wired { telemetry_probe } = evidence::wire(
         &cli,

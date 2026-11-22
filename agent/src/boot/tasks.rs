@@ -387,6 +387,7 @@ pub(crate) type MountGuardRefresh = Arc<parking_lot::Mutex<()>>;
 /// Logs only on a *change* of verified PID so a steady state doesn't
 /// flood the journal; any non-`Verified` outcome clears the exemption
 /// (fail toward over-triggering).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_watchdog_exempt_refresh(
     exempt: ExemptPids,
     pidfile: PathBuf,
@@ -394,6 +395,10 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
     audit: WatchdogAudit,
     mount_refresh: MountGuardRefresh,
     witness_dir: PathBuf,
+    installer_window: Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+    stop_begun: crate::stop_deadline::StopBegun,
 ) {
     tokio::spawn(async move {
         let mut tick =
@@ -497,11 +502,26 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
             // a deleted or rewritten pidfile alone does not unprotect the
             // watchdog that still runs.
             if let Some(prev) = last {
-                // Lab PR 216: a watchdog gone is signed, once per pid.
+                // Lab PR 216: a watchdog gone is signed, once per pid. Lot
+                // 388 (the triage of #595, a): its clean stop in the host's
+                // shutdown (systemd-shutdown signals both roles at once),
+                // inside a signed window or during the agent's own stop is a
+                // note; any other exit stays its death, held until
+                // acknowledged.
                 if !runs_watchdog_binary(prev, &expected_exe) {
-                    let f = northnarrow_agent::self_integrity::watchdog_gone(prev, &resolution);
+                    let exit = northnarrow_agent::self_integrity::WatchdogExit {
+                        clean: false, // read from the pidfile by the finding
+                        host_shutdown: crate::pipeline::pid1_is_systemd_shutdown(),
+                        window_open: installer_window.is_window_open(),
+                        agent_stopping: stop_begun.has_begun(),
+                    };
+                    let f = northnarrow_agent::self_integrity::watchdog_exit_finding(
+                        prev,
+                        &resolution,
+                        exit,
+                    );
                     let log = audit.as_ref();
-                    northnarrow_agent::self_integrity::report_event(log, &f);
+                    northnarrow_agent::self_integrity::report_or_note(log, &f);
                     succession_pending = true;
                 }
                 withdraw_watchdog_pid(bpffs_root, prev, &expected_exe);

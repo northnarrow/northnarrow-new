@@ -11699,6 +11699,58 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 388 — no watchdog death at the host's own shutdown; the verifier's
+  start-up stage 5 is late, not lost (the review of #595: its triage (a)
+  and (b), P3-1 to P3-3; `UPGRADE_NOTES_WAVE4.md` §73; no level change).**
+  - What was open: at a normal reboot `systemd-shutdown` signals the agent
+    and the watchdog at once; the agent's 30 s round, running on through
+    its own stop, could sign the watchdog's quick stop as `watchdog_gone`,
+    held until acknowledged since lot 379 (`nn-admin status` `DEGRADED`
+    after a normal reboot, now and then). The verifier said `LOSS` (exit
+    14) for stage 5 (`decision delay`, events judged late, none lost) at
+    every start. A boot gap's row named one cause for every gap, and its
+    hold was lost if its write failed.
+  - Done:
+    - **One writer of the watchdog's death**
+      (`self_integrity::watchdog_exit_finding`): the watchdog's own clean
+      stop (its pidfile removed) in the host's shutdown (PID 1 is
+      `systemd-shutdown`), inside a signed window or during the agent's own
+      stop is a `watchdog_stopped` note, never held; a kill, an OOM or a
+      crash stays the held death, a window included. Ratchet
+      `watchdog_death_writer.rs`.
+    - **Stage 5 at a start**: a `NOTICE` in a run's first 120 s, `DEGRADED`
+      after, never `LOSS`; the agent's `telemetry_loss` row `detected` only
+      for a stage that drops events.
+    - **The stop beat is the run's last** (the mini-hunt: the beats' task,
+      like the round, ran on through the stop).
+    - **A boot gap names its facts**: a start refused in that boot (its row
+      now carries `boot_id`), a rescue or emergency boot the journal shows;
+      otherwise every cause such a boot can have. A row not written is
+      tried again until signed, once.
+  - Mutation: 34 mutants of the new rules — 33 caught by a named test, one
+    equivalent (the beat's first stop check spares only the work of a beat
+    the check under the writer's lock refuses).
+  - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and debian13
+    (6.12, systemd 257) at the same time under two leases; the tree verified
+    by hash (1246 files), built in each guest, the verifier run on the host
+    from the same build; `alpha`; each guest uninstalled with `--purge` and
+    powered off. Ten normal reboots each (an in-guest power-off, then a
+    boot): `agent_stop` `system_shutdown` and `boots_since: next_boot` every
+    time (systemd 257 included), no gap row, no `watchdog_gone`, `nn-admin
+    status` `sensors: OK` after each; on debian13 one reboot of ten landed
+    the round in the stop — signed as the note ("stopped in the host's
+    shutdown (PID 1 is systemd-shutdown): its own stop removed its
+    pidfile"), not as a death. The verifier after each start: `NOTICE stage
+    5 (decision delay) +235 to +1445 in the run's first 120 s`, never
+    `LOSS`. The watchdog SIGKILLed inside a signed window while the host ran
+    (its unit restarted it, `NRestarts=1`): `watchdog_gone` held until
+    acknowledged, `sensors: DEGRADED`, the verifier `DEGRADED` naming it, on
+    both. Seen beside, not changed here: after every reboot the verifier
+    still said `DEGRADED` — the parse worker, killed by `systemd-shutdown`'s
+    SIGTERM before the agent's stop, signed as a degradation of the run and
+    a revision of its manifest in the stop beat (10 of 10 on both); and on
+    debian13 one run ended on a beat written after its stop beat (fixed
+    here, after that round).
 - **Lot 387 — a boot without the agent is signed at the next start, never
   clean; the verifier tells a stop that never came back (pre-alpha Phase
   3d, F3d-1, F3d-2, F3d-4; `UPGRADE_NOTES_WAVE4.md` §72; no level

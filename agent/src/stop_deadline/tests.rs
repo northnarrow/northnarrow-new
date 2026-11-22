@@ -75,6 +75,25 @@ fn a_stop_that_ends_in_time_is_never_cut() {
     assert!(notes.lock().is_empty());
 }
 
+/// Lot 388 (the triage of #595, a): the watchdog round's handle tells the
+/// agent's stop from the run — false until the event loop ends (the stop
+/// begun), true from then on, for every clone.
+#[test]
+fn the_stop_begun_handle_turns_at_the_stop_s_begin() {
+    let (_exits, exit) = recorder();
+    let stop = StopDeadline::start_with(SHORT, exit);
+    let begun = stop.begun_handle();
+    let clone = begun.clone();
+    assert!(!begun.has_begun() && !clone.has_begun());
+    stop.stage("loop");
+    assert!(!begun.has_begun());
+    let (_notes, note) = noted();
+    stop.begin("system_shutdown", note);
+    assert!(begun.has_begun() && clone.has_begun());
+    stop.finish();
+    assert!(begun.has_begun());
+}
+
 /// A deadline never begun is never cut either (a start that failed).
 #[test]
 fn a_deadline_never_begun_never_exits() {
