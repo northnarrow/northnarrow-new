@@ -454,7 +454,9 @@ each open (a restart reads the chain again: it clears nothing):
   crash (its pidfile left, or a successor's pidfile) stays the death in
   every case; a restart of the watchdog alone in a window that the round
   sees only once the successor runs is one too (acknowledge it then). A
-  worker's death (`worker_parse`) is a degradation of the run, as before.
+  worker's death (`worker_parse`) is a degradation of the run, as before —
+  but not its end by the stop's `SIGTERM` in the host's shutdown, a signed
+  window or the agent's own stop (lot 388, `WORKERS.md`).
 - **The witness rows of a key not certified yet** (the review of #586,
   P2-2). A restart of both units (`install.sh`'s upgrade, the documented
   restart) can let the agent read the new watchdog's first row before it

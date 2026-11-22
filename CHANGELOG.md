@@ -2352,6 +2352,21 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     `stage_5_at_a_start_is_a_notice_not_a_loss`,
     `stage_5_after_the_first_120_s_is_degraded_and_never_a_loss`,
     `a_telemetry_loss_row_is_detected_for_lost_events_never_for_late_decisions_alone`.
+  - **A worker ended by the host's or the operator's stop is no
+    degradation.** The parse worker survives the agent unit's stop job and
+    is ended by `systemd-shutdown`'s SIGTERM before the agent's stop: the
+    supervisor signed `worker_parse` and its state made a revision of the
+    capability manifest in the stop beat, so the off-host verifier said
+    `DEGRADED` after every normal reboot (lot 388's lab: 10 of 10 on two
+    guests). The rule of the watchdog's exit, shared (`StopExit`): a worker
+    ended by the stop's SIGTERM in the host's shutdown, a signed window or
+    the agent's own stop is the stop's own — no failure, no report, its
+    status kept (held 5 s, then started again if the agent still runs); a
+    crash, an OOM, a kill, a violation or a hang stays a failure. One reader
+    of `/proc/1/comm` (nn-linux). Tests
+    `a_worker_the_stop_s_sigterm_ends_in_a_stop_is_no_degradation`,
+    `a_worker_ended_while_the_host_runs_or_killed_in_a_stop_is_a_degradation`,
+    ratchet `a_worker_s_failure_is_judged_against_the_stop_before_its_report`.
   - **No beat after the stop beat.** The periodic beats' task ran on through
     the agent's stop, like the watchdog's round: a beat it wrote after the
     stop beat made the run end on a plain beat, and the verifier said "the

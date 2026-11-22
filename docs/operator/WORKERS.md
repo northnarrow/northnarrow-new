@@ -175,7 +175,15 @@ sends one),
 and starts another after a backoff (at once, then 1, 2, 4… s, at most
 60 s). Each failure is a signed degradation (`worker_parse: …`; at once
 for a protocol violation, a seccomp kill or a sandbox not entered,
-otherwise at most one a minute, the others counted into it).
+otherwise at most one a minute, the others counted into it). Lot 388: a
+worker ended by the stop's `SIGTERM` while a stop is under way — the
+host's shutdown (PID 1 is `systemd-shutdown`, which signals every process
+at once: the worker survives the agent unit's stop job), a signed
+trusted-installer window, the agent's own stop — is the stop's own: no
+failure and no degradation, an INFO line; its status is kept until the
+agent stops it (no revision of the capability manifest in the stop beat),
+and if the agent still runs 5 s later the worker is started again. A
+crash, an OOM, a kill or a violation in a stop stays a failure.
 
 After **five failures in a row** the worker's kind is **disabled**: the
 agent does without what it gives — and **never does that parsing in its own

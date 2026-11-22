@@ -6238,6 +6238,12 @@ fires.
   prints `NOTICE stage 5 (decision delay) +N in the run's first 120 s` and
   exits 0 when nothing else is wrong. The other stages are `LOSS` as
   before.
+- **A worker ended by the stop's SIGTERM in a stop under way** (the host's
+  shutdown, a signed window, the agent's own stop) is no longer a
+  `worker_parse` degradation nor a revision of the capability manifest: an
+  INFO line ("worker ended by the stop's SIGTERM …"). After a normal
+  reboot the verifier no longer says `DEGRADED` for it. A crash, an OOM, a
+  kill or a violation stays `worker_parse`.
 - **The stop beat is the run's last**: no periodic beat follows it any more
   (one could, written during the agent's stop, and the verifier then said
   "restarted without a clean stop" after a normal reboot).

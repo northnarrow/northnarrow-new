@@ -218,7 +218,8 @@ how.
   attack-class event (a refused shutdown marker, the admin socket removed)
   are held until acknowledged as well, across a host reboot. The
   watchdog's own clean stop in the host's shutdown, inside a signed window
-  or during the agent's stop is a note, not a death (lot 388); a restart of
+  or during the agent's stop is a note, not a death, and a worker ended by
+  the stop's SIGTERM then is no degradation (lot 388); a restart of
   the watchdog alone inside a window that the agent's 30 s round sees only
   once its successor runs is still held as one (the safe side: acknowledge
   it). A witness row
@@ -242,6 +243,7 @@ how.
   them. *Evidence:*
   `f3c_1_the_acknowledgement_through_the_named_row_ends_the_rows_counted_past_the_cap`;
   `a_watchdog_stopped_with_the_host_is_a_note_and_one_killed_is_a_held_death`;
+  `a_worker_the_stop_s_sigterm_ends_in_a_stop_is_no_degradation`;
   `past_max_counted_the_oldest_entries_merge_under_the_newer_row`;
   `sock.status-key.integrity-counted-only`;
   `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
