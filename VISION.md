@@ -1,80 +1,81 @@
-# NorthNarrow — Visione
+# NorthNarrow — Vision
 
-> Nota del 20 ottobre 2026 (decisione del founder, Wave 4, lab PR 214): l'LLM
-> non gira più dentro l'agente. La detection on-host è deterministica (regole,
-> correlazione, posture, COMBAT); un assistente AI, se ci sarà, starà fuori dal
-> percorso di enforcement (per esempio sul backend, per l'analista). I paragrafi
-> qui sotto sull'LLM interno descrivono la visione di partenza.
+> Note of 20 October 2026 (founder's decision, Wave 4, lab PR 214): the LLM
+> no longer runs inside the agent. On-host detection is deterministic
+> (rules, correlation, posture, COMBAT); an AI assistant, if there is one,
+> will stay outside the enforcement path (for example on the backend, for
+> the analyst). The paragraphs below about the built-in LLM describe the
+> original vision.
 
-NorthNarrow è un XDR ipercompetitivo e superiore a CrowdStrike, scritto in 
-linguaggio Rust nativo. È una fortezza con un LLM al suo interno che sa 
-quando un file è un virus o legit. Ha una grafica accattivante. È preparato 
-a TUTTI gli attacchi.
+NorthNarrow is a hyper-competitive XDR, superior to CrowdStrike, written in
+native Rust. It is a fortress with an LLM inside that knows when a file is
+a virus or legit. It has an attractive interface. It is prepared for ALL
+attacks.
 
-È proattivo davvero, non per marketing: nel momento in cui viene installato 
-su una macchina, la studia, capisce dove stanno i punti deboli, e trova 
-soluzioni per chiudere le falle prima che vengano sfruttate.
+It is truly proactive, not as a marketing word: the moment it is
+installed on a machine, it studies it, understands where its weak points
+are, and finds ways to close the gaps before they are exploited.
 
-L'LLM nativo che gira al suo interno è autoconsapevole: conosce i propri 
-punti deboli come difensore e conosce i punti deboli della macchina che 
-protegge. Non spara verdetti ciechi. Quando non è sicuro, escalation. 
-Quando vede una falla, la chiude. Quando vede un attacco, reagisce e 
-neutralizza.
+The native LLM that runs inside it is self-aware: it knows its own weak
+points as a defender, and it knows the weak points of the machine it
+protects. It does not give blind verdicts. When it is not sure, it
+escalates. When it sees a gap, it closes it. When it sees an attack, it
+reacts and neutralises it.
 
-## Autonomia di difesa
+## Defence autonomy
 
-Sul fattore difesa, NorthNarrow prescinde dalla volontà umana. Quando 
-identifica una minaccia grave, agisce. Fa tutto il possibile per salvare 
-la macchina, anche al costo di isolarla completamente dalla rete per 
-impedire che l'infezione si propaghi ad altri server.
+When it comes to defence, NorthNarrow does not depend on human will. When
+it identifies a serious threat, it acts. It does everything it can to save
+the machine, even at the cost of isolating it completely from the network
+to stop the infection from spreading to other servers.
 
-L'umano viene informato di ciò che NorthNarrow ha fatto. Non viene chiesto 
-permesso prima di agire quando il pericolo è chiaro. La velocità di 
-risposta è parte della difesa.
+The human is told what NorthNarrow did. Permission is not asked before
+acting when the danger is clear. Speed of response is part of the defence.
 
-### Livelli di autonomia (default: livello B)
+### Autonomy levels (default: level B)
 
-- **Minacce gravi confermate** (ransomware attivo, exfiltration in corso, 
-  exploit kernel, lateral movement): NorthNarrow agisce in autonomia 
-  immediata. Kill, isola, quarantena. Notifica dopo.
+- **Confirmed serious threats** (active ransomware, exfiltration in
+  progress, kernel exploit, lateral movement): NorthNarrow acts on its own,
+  at once. Kill, isolate, quarantine. Notify afterwards.
 
-- **Minacce ambigue o di basso livello**: NorthNarrow alza alert all'admin 
-  con suggerimento di azione. Aspetta input umano.
+- **Ambiguous or low-level threats**: NorthNarrow raises an alert to the
+  admin with a suggested action. It waits for human input.
 
-- **Override configurabile dal cliente**: l'organizzazione può scegliere 
-  un livello più aggressivo o più conservativo. Default = B.
+- **Override set by the customer**: the organisation can choose a more
+  aggressive or a more conservative level. Default = B.
 
-## Riattivazione supervisionata
+## Supervised reactivation
 
-Quando NorthNarrow isola una macchina dalla rete in risposta a una minaccia 
-grave, la riattivazione **non è automatica e non è banale**.
+When NorthNarrow isolates a machine from the network in response to a
+serious threat, reactivation is **not automatic and not trivial**.
 
-La rete torna online solo quando:
+The network comes back online only when:
 
-1. L'admin è fisicamente presente o in sessione supervisionata all'avvio 
-   della macchina.
-2. L'admin inserisce una chiave crittografica in suo possesso esclusivo.
-3. Senza quella chiave, la macchina resta offline anche dopo riavvii 
-   ripetuti.
+1. The admin is physically present, or in a supervised session, when the
+   machine starts.
+2. The admin enters a cryptographic key that only they hold.
+3. Without that key, the machine stays offline, even after repeated
+   reboots.
 
-Questo modello impedisce che credenziali admin compromesse riattivino una 
-macchina ancora infetta. La chiave ha un sistema di recovery aziendale 
-gestito da un key vault dedicato (dettagli in ROADMAP.md).
+This model stops compromised admin credentials from reactivating a machine
+that is still infected. The key has a company recovery system, managed by
+a dedicated key vault (details in ROADMAP.md).
 
-## Difesa suprema
+## Supreme defence
 
-NorthNarrow è la difesa suprema di ogni cosa esista su Windows e Linux.
+NorthNarrow is the supreme defence of everything that exists on Windows and
+Linux.
 
-NorthNarrow è il futuro. CrowdStrike è il passato.
+NorthNarrow is the future. CrowdStrike is the past.
 
 ---
 
-## Regola d'oro
+## Golden rule
 
-Questo file è il contratto. Ogni futura sessione di lavoro (con qualsiasi 
-Claude o qualsiasi tool) parte leggendo questo file per primo. Se uno 
-strumento contraddice questa visione, ha torto lo strumento.
+This file is the contract. Every future work session (with any Claude or
+any tool) starts by reading this file first. If a tool contradicts this
+vision, the tool is wrong.
 
-La visione non si ridimensiona. Si costruisce a tappe in ordine fisso 
-(vedi ROADMAP.md). Una tappa alla volta. Non si salta. Non si torna 
-indietro. Mai.
+The vision is not scaled down. It is built in Tappe (stages), in a fixed
+order (see ROADMAP.md). One Tappa at a time. None is skipped. There is no
+going back. Ever.

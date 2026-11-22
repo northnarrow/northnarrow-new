@@ -235,7 +235,7 @@ This needs Podman installed on the lab guests (Q6).
 ## 8. Decisions
 
 Accepted on 2026-10-12, as proposed. The owner delegated the choice
-("hai libertà di prendere decisioni"); the reasons are below each question.
+("you are free to make decisions"); the reasons are below each question.
 
 - **Q1 — Container runtime APIs.** None (proposed: the id and the pod uid
   come from the cgroup path), or read-only lookups of image and names over

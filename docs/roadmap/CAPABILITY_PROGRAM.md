@@ -1181,8 +1181,8 @@ number in parentheses is a lab PR.
     answer to a stream, not what acts on the answers. The posture state
     machine and the COMBAT ladder had unit tests and no replay of a stream,
     and R08 moves posture, lineage, correlation and decision into nn-core
-    (the lot-239 agent: "posture e scala COMBAT non sono ancora
-    rigiocate"). They could not be replayed the same way twice: the
+    (the lot-239 agent: "posture and the COMBAT ladder are not replayed
+    yet"). They could not be replayed the same way twice: the
     posture read `Instant::now` and `SystemTime::now` where it needed them,
     the trusted-installer window `Instant::now` and `Utc::now` (its end is
     named in the sanction of an own-unit stop), and the ladder's actuator

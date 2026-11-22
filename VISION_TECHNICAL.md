@@ -1,100 +1,102 @@
-# NorthNarrow — Visione tecnica di lungo termine
+# NorthNarrow — Long-term technical vision
 
-> Questo documento NON è una roadmap eseguibile. È la stella polare.
-> Descrive il prodotto finale completamente maturo: la fortezza assoluta.
-> Le feature qui dentro vengono integrate nella ROADMAP.md tappa per
-> tappa, quando le condizioni tecniche e di risorse lo permettono.
+> This document is NOT a roadmap to execute. It is the north star.
+> It describes the final, fully mature product: the absolute fortress.
+> Its features are brought into ROADMAP.md one Tappa (stage) at a time,
+> when the technical conditions and the resources allow it.
 
-Le 7 milestone della v3 architetturale, conservate come riferimento
-e ambizione.
+The 7 milestones of the architectural v3, kept as a reference and an
+ambition.
 
 ---
 
-## Milestone 1: La Fortezza (Ring -1, Hardware Isolation, Telemetria)
+## Milestone 1: The Fortress (Ring -1, Hardware Isolation, Telemetry)
 
-- Rust Micro-Hypervisor (Ring -1): hypervisor Type-1.5 in Rust puro.
-  Bypass EDR e rootkit avanzati anche con privilegi SYSTEM/root via EPT.
-- Windows Kernel Driver + BYOVD Annihilation: blocklist driver
-  vulnerabili, integrazione ELAM.
-- Linux Kernel Sensor + Anti-DMA: IOMMU enforcement contro PCILeech,
+- Rust Micro-Hypervisor (Ring -1): a Type-1.5 hypervisor in pure Rust.
+  Against EDR bypasses and advanced rootkits, even with SYSTEM/root
+  privileges, through EPT.
+- Windows Kernel Driver + BYOVD Annihilation: a blocklist of vulnerable
+  drivers, ELAM integration.
+- Linux Kernel Sensor + Anti-DMA: IOMMU enforcement against PCILeech and
   Thunderbolt attacks.
-- Network Interception WFP/XDP + eBPF Uprobes: lettura traffico
-  cifrato pre-encryption (libssl, bcrypt).
-- Crittografia Post-Quantistica: Kyber/Dilithium contro
+- Network Interception WFP/XDP + eBPF Uprobes: reading encrypted traffic
+  before encryption (libssl, bcrypt).
+- Post-Quantum Cryptography: Kyber/Dilithium against
   "Harvest Now, Decrypt Later".
 
-## Milestone 2: Sistema Nervoso + Hardware CFI
+## Milestone 2: Nervous System + Hardware CFI
 
-- Tokio + crossbeam lock-free.
+- Tokio + lock-free crossbeam.
 - Hardware-Assisted Control Flow Integrity: Intel CET, ARM BTI,
-  Shadow Stacks. Blocca ROP/JOP zero-day a livello CPU.
+  Shadow Stacks. Blocks zero-day ROP/JOP at the CPU level.
 - Aho-Corasick O(1) anti-worm matching.
-- JA4 fingerprinting: identifica client malevoli dall'handshake TLS.
+- JA4 fingerprinting: identifies malicious clients from the TLS handshake.
 
-## Milestone 3: Corteccia Cerebrale + Anti-Steganografia
+## Milestone 3: Cerebral Cortex + Anti-Steganography
 
 > Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214
-> (le tre voci sull'LLM qui sotto; resta il rilevamento di steganografia e
-> covert channel).
+> (the three LLM items below; the detection of steganography and covert
+> channels remains).
 
-- Candle nativo Rust per inferenza LLM.
-- LLM quantizzato anti-distillation.
-- Prompting contestuale anti-PromptFlux.
-- Rilevamento steganografia/covert channels: ICMP tunneling,
+- Native Rust Candle for LLM inference.
+- Quantised anti-distillation LLM.
+- Contextual anti-PromptFlux prompting.
+- Detection of steganography/covert channels: ICMP tunneling,
   DNS TXT exfiltration, LSB image steganography.
 
-## Milestone 4: Carnefice + Micro-Segmentazione
+## Milestone 4: Executioner + Micro-Segmentation
 
-- Kill chain Ring -1/Ring 0.
-- Micro-segmentazione dinamica: isolamento process-to-process via
-  WFP/eBPF, anche su localhost/IPC.
-- Quarantena AES-256-GCM.
+- Ring -1/Ring 0 kill chain.
+- Dynamic micro-segmentation: process-to-process isolation through
+  WFP/eBPF, also on localhost/IPC.
+- AES-256-GCM quarantine.
 
-## Milestone 5: Sigillo Crittografico + UEFI Integrity
+## Milestone 5: Cryptographic Seal + UEFI Integrity
 
 - Ed25519 challenge-response.
-- TPM PCR measurements + UEFI bootkit detection (es. BlackLotus).
-- Initramfs hardened per isolamento at-boot.
+- TPM PCR measurements + UEFI bootkit detection (for example BlackLotus).
+- Hardened initramfs for isolation at boot.
 
-## Milestone 6: Scout Proattivo + Deception
+## Milestone 6: Proactive Scout + Deception
 
-- Edge monitoring continuo.
-- Patching virtuale anti-supply-chain: regole eBPF/WFP iniettate
-  al volo per CVE non patchate.
-- Honeypot locali: finte credenziali LSASS, finte chiavi registro.
-  Lateral movement detection invisibile.
+- Continuous edge monitoring.
+- Anti-supply-chain virtual patching: eBPF/WFP rules injected on the fly
+  for unpatched CVEs.
+- Local honeypots: fake LSASS credentials, fake registry keys.
+  Invisible lateral movement detection.
 
-## Milestone 7: Centro di Comando
+## Milestone 7: Command Centre
 
-- Iced/Slint/Yew UI nativa Rust.
-- mTLS post-quantistico (rustls + Kyber).
-- Console centrale Axum + flotta + Key Vault.
-
----
-
-## Regole architetturali assolute
-
-1. No C/C++ in produzione. Ogni dipendenza con backend C va
-   sostituita con alternativa Rust pura quando possibile.
-2. Isolamento unsafe. Blocchi unsafe minimali, documentati,
-   incapsulati in API safe.
-3. Zero allocazioni dinamiche nei kernel hot paths.
-4. Verifica formale dei moduli Ring 0 (long-term goal).
-5. Paranoia di grado militare: assumi root/SYSTEM compromesso.
-   La difesa si basa su isolamento Kernel/Hypervisor + firme
-   crittografiche, non su permessi OS.
+- Iced/Slint/Yew native Rust UI.
+- Post-quantum mTLS (rustls + Kyber).
+- Axum central console + fleet + Key Vault.
 
 ---
 
-## Quando integrare queste feature?
+## Absolute architectural rules
 
-Le feature di questo documento entrano nella ROADMAP.md quando:
+1. No C/C++ in production. Every dependency with a C backend is replaced
+   with a pure Rust alternative when possible.
+2. `unsafe` isolation. Minimal `unsafe` blocks, documented, wrapped in a
+   safe API.
+3. Zero dynamic allocations in kernel hot paths.
+4. Formal verification of the Ring 0 modules (long-term goal).
+5. Military-grade paranoia: assume root/SYSTEM is compromised.
+   The defence relies on Kernel/Hypervisor isolation + cryptographic
+   signatures, not on OS permissions.
 
-- La tecnologia di base è production-ready (es. windows-drivers-rs
-  esce da preview)
-- Il founder ha le risorse (tempo, eventualmente team) per affrontarle
-- Il threat landscape lo richiede commercialmente
-- Beta tester chiedono la feature specifica
+---
 
-Mai vengono promesse a clienti finché non sono in roadmap eseguibile.
-Mai vengono iniziate prima delle tappe di ROADMAP.md che le precedono.
+## When to bring these features in?
+
+The features in this document enter ROADMAP.md when:
+
+- The base technology is production-ready (for example, windows-drivers-rs
+  leaves preview)
+- The founder has the resources (time, maybe a team) to take them on
+- The threat landscape requires it commercially
+- Beta testers ask for the specific feature
+
+They are never promised to customers until they are in the roadmap to
+execute.
+They are never started before the ROADMAP.md Tappe that come before them.

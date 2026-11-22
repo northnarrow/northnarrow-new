@@ -1,32 +1,31 @@
-# Contribuire a NorthNarrow
+# Contributing to NorthNarrow
 
-## Regola d'oro
+## Golden rule
 
-Prima di qualunque cosa, leggi:
+Before anything else, read:
 
-1. [VISION.md](VISION.md) — il contratto. Definisce cos'è NorthNarrow,
-   cos'è la sua autonomia di difesa, e cos'è la riattivazione
-   supervisionata. Non si negozia.
-2. [ROADMAP.md](ROADMAP.md) — la marcia operativa. Tappe in ordine
-   fisso, una alla volta. Non si salta. Non si torna indietro. Mai.
-3. [VISION_TECHNICAL.md](VISION_TECHNICAL.md) — la stella polare
-   tecnica di lungo termine. Le feature qui dentro entrano in roadmap
-   solo quando le condizioni lo permettono.
+1. [VISION.md](VISION.md) — the contract. It defines what NorthNarrow is,
+   what its defence autonomy is, and what supervised reactivation is. It
+   is not negotiable.
+2. [ROADMAP.md](ROADMAP.md) — the working plan. Tappe (stages) in a fixed
+   order, one at a time. None is skipped. There is no going back. Ever.
+3. [VISION_TECHNICAL.md](VISION_TECHNICAL.md) — the long-term technical
+   north star. Its features enter the roadmap only when conditions allow
+   it.
 
-## Una tappa alla volta
+## One Tappa at a time
 
-Ogni PR appartiene alla tappa corrente di ROADMAP.md. PR che provano a
-correre avanti (es. iniziare Tappa 4 mentre la 3 non è chiusa) vengono
-rifiutate. Eccezioni richiedono una modifica esplicita di ROADMAP.md
-firmata dal founder.
+Every PR belongs to the current Tappa of ROADMAP.md. PRs that try to run
+ahead (for example, starting Tappa 4 while Tappa 3 is not closed) are
+refused. An exception needs an explicit change to ROADMAP.md, signed off
+by the founder.
 
-Se uno strumento (Claude, Copilot, qualsiasi tool) suggerisce di
-saltare una tappa o di ridimensionare la visione, ha torto lo
-strumento.
+If a tool (Claude, Copilot, any tool) suggests skipping a Tappa or scaling
+down the vision, the tool is wrong.
 
-## Quality gates locali
+## Local quality gates
 
-Prima di aprire una PR, sul tuo branch:
+Before you open a PR, on your branch:
 
 ```sh
 cargo fmt --all --check
@@ -35,94 +34,92 @@ cargo build --workspace --locked
 cargo test --workspace --locked
 ```
 
-La CI esegue gli stessi controlli su Linux x86_64. Una PR rossa non si
-fonde.
+The CI runs the same checks on Linux x86_64. A red PR is not merged.
 
-- `--locked` (audit esterno SUP-016): ogni build della CI e della release
-  usa il `Cargo.lock` così com'è committato. Una PR che cambia un
-  `Cargo.toml` committa anche il lockfile aggiornato — `Cargo.lock`,
-  `fuzz/Cargo.lock` (il fuzz harness compila l'agente) e
-  `agent-ebpf/Cargo.lock` se tocca quel crate — altrimenti la CI fallisce
-  con "cannot update the lock file … because --locked was passed".
-  `cargo xtask` si lancia come `cargo --locked xtask build --release
-  --locked`: il secondo `--locked` arriva alle build annidate.
-- Toolchain (SUP-015): `rust-toolchain.toml` fissa una release di Rust
-  (rustup la installa al primo `cargo`); Dependabot propone la successiva
-  in una PR a sé. `rust-version` in `Cargo.toml` è la MSRV reale (oggi
-  1.89, imposta da `uuid`): il job `msrv` compila con quella versione e
-  `xtask/tests/supply_chain.rs` fallisce se una dipendenza del lockfile ne
-  chiede una più alta. Chi aggiorna una dipendenza così alza `rust-version`
-  nella stessa PR.
-- Advisory RustSEC (SUP-007): il job `audit` fallisce anche sugli advisory
-  `unsound` e `unmaintained`, non solo sulle vulnerabilità;
-  `cargo audit --file Cargo.lock` lanciato dalla radice del repository dà
-  lo stesso esito (legge `.cargo/audit.toml`). Un advisory si corregge
-  (bump del lockfile) oppure si registra come eccezione in
-  `.cargo/audit.toml`, con il blocco di commento descritto in testa al
-  file: motivo, responsabile, evento di riesame, data e scadenza (al
-  massimo 184 giorni). Mai `--ignore` sulla riga di comando. Dal giorno
-  dopo la scadenza il job è rosso finché l'eccezione non viene
-  riesaminata e registrata di nuovo, o tolta. Il bump di una crate di
-  sicurezza (elenco in `xtask/tests/supply_chain.rs`,
-  `security_crates_are_locked_alike_for_the_fuzzer`) va applicato sia a
-  `Cargo.lock` sia a `fuzz/Cargo.lock`, e il job fuzz deve compilare.
+- `--locked` (external audit SUP-016): every CI and release build uses
+  `Cargo.lock` as it is committed. A PR that changes a `Cargo.toml` also
+  commits the updated lockfile — `Cargo.lock`, `fuzz/Cargo.lock` (the fuzz
+  harness compiles the agent) and `agent-ebpf/Cargo.lock` if it touches
+  that crate — otherwise the CI fails with "cannot update the lock file …
+  because --locked was passed". `cargo xtask` is run as `cargo --locked
+  xtask build --release --locked`: the second `--locked` reaches the
+  nested builds.
+- Toolchain (SUP-015): `rust-toolchain.toml` pins one Rust release (rustup
+  installs it on the first `cargo`); Dependabot proposes the next one in a
+  PR of its own. `rust-version` in `Cargo.toml` is the real MSRV (today
+  1.89, set by `uuid`): the `msrv` job compiles with that version, and
+  `xtask/tests/supply_chain.rs` fails if a dependency in the lockfile asks
+  for a higher one. Whoever updates such a dependency raises
+  `rust-version` in the same PR.
+- RustSEC advisories (SUP-007): the `audit` job also fails on `unsound`
+  and `unmaintained` advisories, not only on vulnerabilities;
+  `cargo audit --file Cargo.lock`, run from the repository root, gives the
+  same result (it reads `.cargo/audit.toml`). An advisory is fixed (a
+  lockfile bump) or recorded as an exception in `.cargo/audit.toml`, with
+  the comment block described at the top of that file: reason, owner,
+  review event, date and expiry (at most 184 days). Never `--ignore` on
+  the command line. From the day after the expiry, the job is red until
+  the exception is reviewed and recorded again, or removed. The bump of a
+  security crate (listed in `xtask/tests/supply_chain.rs`,
+  `security_crates_are_locked_alike_for_the_fuzzer`) is applied to both
+  `Cargo.lock` and `fuzz/Cargo.lock`, and the fuzz job must compile.
 
-## Rilasci (audit esterno SUP-024)
+## Releases (external audit SUP-024)
 
-- Un rilascio parte solo da un tag `v*` annotato e firmato con una chiave
-  SSH elencata in `.github/allowed_signers` (formato "allowed signers" di
-  `ssh-keygen`, `namespaces="git"`). Il job `verify-tag` di `release.yml`
-  lo controlla prima di qualsiasi build
-  (`.github/scripts/verify-release-tag.sh`): un tag leggero, non firmato,
-  firmato con OpenPGP o con una chiave non elencata, rinominato o che non
-  punta al commit compilato si ferma lì, e non viene compilato, firmato,
-  attestato né pubblicato nulla. Finché il file non elenca nessuna chiave,
-  ogni tag si ferma lì: aggiungere la propria chiave pubblica è il primo
-  passo del maintainer.
-- Firmare e controllare un tag prima del push (con `.pub` la chiave privata
-  sta nell'ssh-agent; in alternativa il percorso della chiave privata):
+- A release starts only from an annotated `v*` tag, signed with an SSH key
+  listed in `.github/allowed_signers` (the `ssh-keygen` "allowed signers"
+  format, `namespaces="git"`). The `verify-tag` job of `release.yml`
+  checks it before any build (`.github/scripts/verify-release-tag.sh`): a
+  tag that is lightweight, unsigned, signed with OpenPGP or with a key not
+  in the list, renamed, or not pointing at the commit being built stops
+  there, and nothing is built, signed, attested or published. While the
+  file lists no key, every tag stops there: adding their own public key
+  is the maintainer's first step.
+- Signing and checking a tag before the push (with `.pub`, the private key
+  is in the ssh-agent; otherwise, give the path of the private key):
 
   ```sh
-  git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/<chiave>.pub" tag -s vX.Y.Z -m "vX.Y.Z"
+  git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/<key>.pub" tag -s vX.Y.Z -m "vX.Y.Z"
   git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag vX.Y.Z
   .github/scripts/verify-release-tag.sh verify vX.Y.Z "$(git rev-parse 'vX.Y.Z^{commit}')"
   ```
 
-- La versione (lotto 383): il tag è `v` più la versione del workspace
-  (`[workspace.package] version` di `Cargo.toml`: `v0.1.0-alpha` per
-  `0.1.0-alpha`), e `CHANGELOG.md` si apre con la sezione di quella
-  versione, datata. Fino al tag la sezione dice `- unreleased`;
-  nell'ultimo commit prima del tag si scrive al suo posto il giorno del tag
-  (UTC): `## [0.1.0-alpha] - AAAA-MM-GG`. Il job `verify-tag` lo controlla
-  (`verify-release-tag.sh version`): un tag di un'altra versione, un
-  `[Unreleased]` sopra la versione o una sezione senza data si fermano lì.
-  Prima del push: `.github/scripts/verify-release-tag.sh version vX.Y.Z`.
-- Aggiungere, ruotare o revocare una chiave è una PR su
-  `.github/allowed_signers`; conta la lista committata nel commit taggato.
-  Ruotando, la vecchia chiave resta con `valid-before="AAAAMMGG"`, così i
-  tag precedenti si verificano ancora; una chiave compromessa si toglie.
-  Le firme dei commit non sono richieste.
-- La pubblicazione (job `publish`, l'unico con `contents: write`) non
-  sostituisce mai un asset già pubblicato: se la release ha già degli
-  asset il job fallisce. Per ripubblicare, il maintainer cancella prima la
-  release (`gh release delete vX.Y.Z`, il tag resta) e rilancia il job.
-- Revisione obbligatoria da una seconda persona (CODEOWNERS): rinviata
-  finché c'è un solo maintainer, perché GitHub non permette di approvare
-  le proprie PR e bloccherebbe ogni merge.
+- The version (lot 383): the tag is `v` plus the workspace version
+  (`[workspace.package] version` in `Cargo.toml`: `v0.1.0-alpha` for
+  `0.1.0-alpha`), and `CHANGELOG.md` opens with that version's section,
+  dated. Until the tag, the section says `- unreleased`; in the last
+  commit before the tag, the day of the tag (UTC) is written in its place:
+  `## [0.1.0-alpha] - YYYY-MM-DD`. The `verify-tag` job checks it
+  (`verify-release-tag.sh version`): a tag of another version, an
+  `[Unreleased]` above the version, or a section with no date stops there.
+  Before the push: `.github/scripts/verify-release-tag.sh version vX.Y.Z`.
+- Adding, rotating or revoking a key is a PR on
+  `.github/allowed_signers`; the list committed in the tagged commit is
+  the one that counts. When rotating, the old key stays with
+  `valid-before="YYYYMMDD"`, so earlier tags still verify; a compromised
+  key is removed. Commit signatures are not required.
+- Publishing (the `publish` job, the only one with `contents: write`)
+  never replaces an asset that is already published: if the release
+  already has assets, the job fails. To publish again, the maintainer
+  first deletes the release (`gh release delete vX.Y.Z`; the tag stays)
+  and runs the job again.
+- Mandatory review by a second person (CODEOWNERS): postponed while there
+  is only one maintainer, because GitHub does not allow approving your own
+  PRs and it would block every merge.
 
-## Stile
+## Style
 
-- 100% Rust. No C/C++ in produzione (vedi VISION_TECHNICAL.md, regola 1).
-  La CI fallisce se `onig_sys` o `zstd-sys` entrano nel grafo delle
-  dipendenze dell'agente (vi entravano con tokenizers e tantivy, usciti con
-  il consulente LLM on-host nella Wave 4, lab PR 214).
-- Niente modelli generativi nell'agente: la detection on-host resta
-  deterministica (regole, correlazione, posture, COMBAT).
-- `unsafe` solo dove indispensabile, isolato dietro API safe, motivato
-  con un commento.
-- Niente dipendenze gratuite. Ogni nuova crate va giustificata.
+- 100% Rust. No C/C++ in production (see VISION_TECHNICAL.md, rule 1).
+  The CI fails if `onig_sys` or `zstd-sys` enter the agent's dependency
+  graph (they came in with tokenizers and tantivy, and left with the
+  on-host LLM advisor in Wave 4, lab PR 214).
+- No generative models in the agent: on-host detection stays
+  deterministic (rules, correlation, posture, COMBAT).
+- `unsafe` only where it cannot be avoided, isolated behind a safe API,
+  with a comment that says why.
+- No needless dependencies. Every new crate must be justified.
 
-## Sicurezza
+## Security
 
-NorthNarrow è un prodotto di difesa. Le issue di sicurezza interne al
-codice si segnalano in privato al founder, non in issue pubbliche.
+NorthNarrow is a defence product. Security issues in the code are
+reported privately to the founder, not in public issues.
