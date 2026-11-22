@@ -469,6 +469,24 @@ module, the disk read from another OS). A key that never leaves a TPM or the
 kernel keyring, and chain heads anchored off-host, are the follow-up
 (at-authz-2).
 
+Not closed either, and by the same nature (lot 387, pre-alpha F3d-2): the
+read refusal exists only while the agent's hooks are attached. **At every
+boot**, not only at the install, the key is an ordinary root-readable file
+until the agent's start attaches them: any root code that runs before it —
+a systemd generator, an `ExecStartPre=` of a drop-in, an initramfs hook, a
+unit ordered before the agent — can read it (residual R016 of the internal
+check). A drop-in or a unit file of the agent placed by a generator is
+signed at the start (`unit_dropin`, `unit_shadowed`); a generator that only
+reads the key, or that keeps the agent from starting, leaves nothing on the
+host. The same window lets root keep the agent from starting at boot (a
+generator that masks its units, `systemd.mask=` on the kernel command line,
+a default target without it): those writes are not recorded by the host.
+The witnesses are off the host or after the fact — the external heartbeat
+verifier (`NOT_BACK` past the grace of a maintenance stop) and the next
+start's signed `boots_without_agent` (`KNOWN_LIMITATIONS.md`, "Root can keep
+the agent from starting at boot"). With the key, root can also write beats
+that verify: only a key sealed off the host's files closes that.
+
 ## EBPF-015 — no new entry in the agent's directories
 
 **Goal.** Only the agent's family, or a signed trusted-installer window,

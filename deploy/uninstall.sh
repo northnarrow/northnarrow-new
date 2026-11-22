@@ -806,6 +806,29 @@ kept_report() {
     return 0
 }
 # <<< kept_report
+# >>> dpkg_leftovers (run by xtask/tests/install_scripts.rs)
+# Lot 387 (pre-alpha F3d-4): a package that tried to replace one of our files
+# and was refused (the agent's protection) leaves dpkg's temporaries beside
+# it: `<path>.dpkg-new` (the new file it could not rename over ours) and
+# `<path>.dpkg-tmp` (a hard link to our file it could not remove). They
+# survived the purge. Removed here — the siblings of our own paths only,
+# by their exact names, never a pattern over the directory; a directory of
+# that name is left.
+dpkg_leftovers() {
+    local p s
+    for p in "$BIN_DIR/northnarrow-agent" "$BIN_DIR/northnarrow-watchdog" "$BIN_DIR/nn-admin" \
+        "$BIN_DIR/northnarrow-scan" "$UNIT_DIR/northnarrow-agent.service" \
+        "$UNIT_DIR/northnarrow-watchdog.service" "$UNIT_DIR/northnarrow-watchdog-failed.service" \
+        "$UNIT_DIR/northnarrow.slice" "$JOURNALD_NS_CONF"; do
+        for s in dpkg-new dpkg-tmp; do
+            if [[ -L "$p.$s" || -f "$p.$s" ]]; then
+                log "PURGE: removing $p.$s (left by a refused package)"
+                rm -f -- "$p.$s"
+            fi
+        done
+    done
+}
+# <<< dpkg_leftovers
 if (( PURGE )); then
     if [[ -f "$LEGACY_KEY" ]]; then
         log "PURGE: removing the admin private key $LEGACY_KEY (an install before external audit DEP-001)"
@@ -828,6 +851,7 @@ if (( PURGE )); then
     for j in /var/log/journal/*.northnarrow /run/log/journal/*.northnarrow; do
         [[ -e "$j" ]] && { log "PURGE: removing namespace journal $j"; rm_tree "$j"; }
     done
+    dpkg_leftovers
 else
     kept_report
 fi

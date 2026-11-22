@@ -353,7 +353,9 @@ after this version has written is not supported.
    the finding, for a `trusted_installer_grant`, an `agent_boot` whose
    `previous_run` says `abrupt` (a start refused by a gate is not a run: it
    neither ends the run before it nor makes the next one say `abrupt`; lot
-   298, BUG16), other `integrity_drift` entries, and for
+   298, BUG16) or `boots_without_agent` (lot 387: whole boots without the
+   agent before this start — a window with no hook at all), other
+   `integrity_drift` entries, and for
    the time the rows went missing (the anchored head's `seq` and the
    `chain.head` journal lines say what was there).
 5. **Treat it as an incident.** Missing evidence means someone with root

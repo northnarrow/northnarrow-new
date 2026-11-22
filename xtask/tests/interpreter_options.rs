@@ -365,6 +365,12 @@ const KNOWN: &[(&str, usize, &str)] = &[
          Environment --value`, the agent's own question to systemd",
     ),
     (
+        "crates/nn-linux/src/boot/boots_since.rs",
+        3,
+        "lot 387: the options the agent passes (never reads) to `journalctl` for the boot list \
+         (`--list-boots`, `--no-pager`, `--quiet`): no interpreter's",
+    ),
+    (
         "crates/nn-linux/src/host_hardening.rs",
         5,
         "install.sh's own flag read from the agent's install record (`--without-nftables`), \

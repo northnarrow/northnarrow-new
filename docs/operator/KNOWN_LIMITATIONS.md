@@ -183,9 +183,14 @@ how.
   Forward-secure signing is future work. *Evidence:*
   `a_history_rewritten_with_the_agent_key_verifies_only_a_kept_head_tells`.
 - **A signature proves the key, not the host.** The agent keeps its
-  signing key from readers while it runs. A root who obtains it anyway can
+  signing key from readers while it runs. Before it runs, the key is a
+  file root can read — at every boot, not only at the install: any root
+  code that starts before the agent (a systemd generator, an
+  `ExecStartPre=` of a drop-in, an initramfs hook) can read it, and a
+  generator that only reads it leaves no record. A root who obtains it can
   write lines that verify, and forge the heartbeat. Hardware attestation
-  is future work
+  or a key sealed off the host's files (a TPM, the kernel keyring) is
+  future work
   ([HEARTBEAT.md](HEARTBEAT.md#what-it-does-not-prove)). *Evidence:* the
   same test; internal check Phase 3 §7.2 (residual R016, of the design).
 - **The evidence lives on the host.** A root who stops the agent inside a
@@ -299,6 +304,39 @@ not cause as an incident.
   later use is not judged. *For you:* install on a fresh VM. *Evidence:*
   `the_start_is_the_baseline_and_a_later_unseen_program_is_signed_once`;
   internal check Phase 3 §7.1 (residual R002).
+- **Root can keep the agent from starting at boot.** Before the agent
+  starts, root can keep it from starting: a systemd generator that masks
+  its units, `systemd.mask=` on the kernel command line, a default target
+  that does not pull it in. The host records none of these writes
+  (`systemctl disable` is: NN-L-EVA-001). Two witnesses tell it:
+  - The off-host heartbeat verifier — the witness of a host where the agent
+    does not start. The last beat is the stop at shutdown; past the grace
+    of a maintenance stop (`--max-stopped-secs`, 15 minutes by default)
+    with no beat back while the host still answers, it says `NOT_BACK`
+    (exit 18), no longer `STOPPED` ([HEARTBEAT.md](HEARTBEAT.md)).
+  - The agent's next start. It compares the boot of its last run (the
+    `boot_id` of its signed `agent_boot`) with the journal's boot list
+    (`journalctl --list-boots`): each boot in between had no run of the
+    agent. It signs `boots_without_agent` (High: the count and the boot
+    ids), held in `nn-admin status` until you acknowledge it, and its
+    `previous_run` is then not `clean`. When the journal cannot tell (a
+    volatile journal keeps only this boot; the older boots rotated or
+    removed), it says `unknown` (an advisory), never `clean`.
+
+  Every source of that judgement but this boot's id can be rewritten by
+  root before the agent starts: the audit chain (with the signing key, see
+  "A signature proves the key, not the host"), the state file
+  `last_boot_id`, the journal (removed, vacuumed or made volatile; a boot
+  that runs no journald leaves no entry, and the list's order is the
+  journal's). The record states what the agent could read, not proof.
+  A start that runs at boot and stops again leaves a run in that boot:
+  the verifier's `NOT_BACK` tells it, the next start does not. *For you:*
+  run the heartbeat verifier off the host
+  ([HEARTBEAT.md](HEARTBEAT.md)); after a planned stop of the agent over
+  reboots, acknowledge the record (`nn-admin integrity acknowledge`).
+  *Evidence:*
+  `a_boot_without_the_agent_is_signed_at_the_next_start_never_clean`,
+  `a_stop_that_never_comes_back_is_not_back_past_the_grace`; lot 387.
 - **Some BPF paths are not judged.** Some network program attachments and
   some map contents are not judged; their load is still recorded.
   *Evidence:* internal check Phase 3 §7.1 (residuals R002, R132); lot 356.
@@ -756,7 +794,12 @@ not cause as an incident.
 - **Not watched by file integrity.** udev rule directories and initramfs
   hook directories are not watched: a new file there leaves no file
   integrity record. What such a file runs later is judged by the process
-  rules. *Evidence:* internal check Phase 0, residuals R039, R040.
+  rules. Nor are systemd's generator directories, `default.target`, or the
+  boot loader's configuration and the kernel command line it gives
+  (`/etc/default/grub`, `grub.d`, `grub.cfg`): what they change takes
+  effect at the next boot, before the agent starts ("Root can keep the
+  agent from starting at boot"). *Evidence:* internal check Phase 0,
+  residuals R039, R040; pre-alpha Phase 3d.
 - **Some exemptions are wider than they should be.** A few exemptions for
   package managers and developer tools (npm under a system prefix, go,
   database initialisation) trust the tool by identity. They are listed in

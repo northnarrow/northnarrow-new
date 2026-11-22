@@ -139,7 +139,7 @@ which of them it uses.
 | 8 | evidence missing or altered: `audit verify`, `chain verify` (a `BROKEN` chain), `audit read` (lines that are not rows were skipped) — [`EVIDENCE_CHAINS.md`](EVIDENCE_CHAINS.md#exit-codes-of-the-verifiers) |
 | 9 | the agent verified the request and did nothing: no such canary (`canary burn` / `refresh`), nothing to release or restore (`response`), the isolation could not be released (`unlock`, `force-posture` out of COMBAT: the posture stays COMBAT), nothing held at or before the row, or a row not signed yet (`integrity acknowledge`) — the reason is printed |
 | 10 | `detection-set-status`: the change was not recorded (the agent could not append its chain: disk full?) |
-| 17 | the host refused this user the agent's admin socket, a key, the agent id or (`chain verify`) a chain (permission denied): run it with `sudo`. It says nothing about whether the agent runs, nor about the chains. 11 to 16 are left to the alerts of `heartbeat watch` and `export verify` |
+| 17 | the host refused this user the agent's admin socket, a key, the agent id or (`chain verify`) a chain (permission denied): run it with `sudo`. It says nothing about whether the agent runs, nor about the chains. 11 to 16 and 18 are left to the alerts of `heartbeat watch` and `export verify` |
 | 141 | the output was closed before everything was written (`nn-admin status \| head -1`) |
 
 `heartbeat watch` and `export verify` have their own codes, one per alert:

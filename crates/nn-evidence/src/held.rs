@@ -166,6 +166,10 @@ pub const DEATH_KINDS: &[&str] = &[
     "watchdog_successor_foreign",
     "watchdog_successor_unconfirmed",
     "watchdog_gone",
+    // lot 387 (pre-alpha F3d-1): whole boots of the host without a run of
+    // the agent since its last run (its units kept from starting) — the
+    // role vacant for those boots, found at the next start
+    "boots_without_agent",
 ];
 
 /// The review of #586 (P3-2): the attack-class events of the run — nothing
@@ -275,6 +279,12 @@ pub const ADVISORY_KINDS: &[(&str, &str)] = &[
     (
         "quarantine_index_rebuilt",
         "a repair note: the quarantine's index rebuilt from its files",
+    ),
+    (
+        "boot_continuity_unknown",
+        "lot 387: whether boots passed without the agent since its last run is not knowable at \
+         this start (a volatile or rotated journal): no sensor is degraded, and no clean \
+         succession is told",
     ),
 ];
 

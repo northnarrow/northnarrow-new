@@ -417,8 +417,15 @@ pub enum Alert {
     /// No newer beat within `max_silence` (the host, the agent or the
     /// channel silent), or the source could not be read past it.
     Silent(String),
-    /// The agent stopped (its signed stop beat).
+    /// The agent stopped (its signed stop beat), within the grace of a
+    /// maintenance stop ([`WatchConfig::max_stopped_secs`]).
     Stopped(String),
+    /// Lot 387 (pre-alpha F3d-1): the agent stopped and no beat came back
+    /// past the grace of a maintenance stop, while the export still answers
+    /// — the host is up and the agent did not start again (a boot without
+    /// it, its units masked or disabled, or a maintenance longer than the
+    /// grace).
+    NotBack(String),
     /// The counters show loss since the last beat seen.
     Loss(String),
     /// The agent's health degraded (a stalled decision, a probe gap, a new
@@ -436,6 +443,7 @@ impl Alert {
             Alert::Broken(_) => "BROKEN",
             Alert::Silent(_) => "SILENT",
             Alert::Stopped(_) => "STOPPED",
+            Alert::NotBack(_) => "NOT_BACK",
             Alert::Loss(_) => "LOSS",
             Alert::Degraded(_) => "DEGRADED",
         }
@@ -448,12 +456,15 @@ impl Alert {
             | Alert::Broken(d)
             | Alert::Silent(d)
             | Alert::Stopped(d)
+            | Alert::NotBack(d)
             | Alert::Loss(d)
             | Alert::Degraded(d) => d,
         }
     }
 
     /// The verifier's exit code for it (the most severe alert's wins).
+    /// Lot 387: 10 to 16 and 18 — never 17, nn-admin's permission refused
+    /// in every table (`NN_ADMIN.md`).
     pub fn exit_code(&self) -> i32 {
         match self {
             Alert::Tampered(_) => 13,
@@ -461,6 +472,7 @@ impl Alert {
             Alert::Broken(_) => 11,
             Alert::Silent(_) => 10,
             Alert::Stopped(_) => 15,
+            Alert::NotBack(_) => 18,
             Alert::Loss(_) => 14,
             Alert::Degraded(_) => 16,
         }
@@ -473,12 +485,17 @@ impl Alert {
             Alert::Replay(_) => 1,
             Alert::Broken(_) => 2,
             Alert::Silent(_) => 3,
-            Alert::Stopped(_) => 4,
-            Alert::Loss(_) => 5,
-            Alert::Degraded(_) => 6,
+            Alert::NotBack(_) => 4,
+            Alert::Stopped(_) => 5,
+            Alert::Loss(_) => 6,
+            Alert::Degraded(_) => 7,
         }
     }
 }
+
+/// Lot 387: every alert's exit code, one per kind (the verifier's table in
+/// HEARTBEAT.md; 17 is nn-admin's permission refused, never an alert's).
+pub const ALERT_EXIT_CODES: [i32; 8] = [13, 12, 11, 10, 18, 15, 14, 16];
 
 /// A beat this much later than its interval after the one before it (in
 /// one run) is late: the agent stood still (DEGRADED).
@@ -494,7 +511,16 @@ pub struct WatchConfig {
     pub max_skew_secs: u64,
     /// A decision whose last round is this many intervals old is stalled.
     pub stall_intervals: u64,
+    /// Lot 387 (pre-alpha F3d-1): the grace of a maintenance stop — a stop
+    /// beat with no newer beat for longer than this (on the verifier's
+    /// clock, since it first saw the stop) is [`Alert::NotBack`], no longer
+    /// [`Alert::Stopped`].
+    pub max_stopped_secs: u64,
 }
+
+/// Lot 387: the default grace of a maintenance stop (15 minutes: an
+/// upgrade, a reboot of a slow server).
+pub const DEFAULT_MAX_STOPPED_SECS: u64 = 900;
 
 impl Default for WatchConfig {
     fn default() -> Self {
@@ -502,6 +528,7 @@ impl Default for WatchConfig {
             max_silence_secs: None,
             max_skew_secs: 30,
             stall_intervals: 2,
+            max_stopped_secs: DEFAULT_MAX_STOPPED_SECS,
         }
     }
 }
@@ -810,6 +837,20 @@ pub fn check(
                 newest.seq,
                 newest.ts,
                 newest.stop_reason.as_deref().unwrap_or("no reason given")
+            )));
+        } else if past(age, cfg.max_stopped_secs) {
+            // Lot 387 (pre-alpha F3d-1): the export answers, so the host
+            // is up; the stop was not followed by a start within the grace
+            // of a maintenance — the label of a maintenance no longer fits
+            out.alerts.push(Alert::NotBack(format!(
+                "the agent stopped at seq {} ({}: {}) and has not come back for {age} s (grace \
+                 {} s) while its host still answers — it did not start again: a boot without \
+                 it (its units masked, disabled or not wanted by the default target), or a \
+                 maintenance longer than the grace",
+                newest.seq,
+                newest.ts,
+                newest.stop_reason.as_deref().unwrap_or("no reason given"),
+                cfg.max_stopped_secs
             )));
         } else {
             out.alerts.push(Alert::Stopped(format!(

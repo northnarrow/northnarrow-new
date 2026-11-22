@@ -266,6 +266,8 @@ pub struct AgentIdentity {
 /// open for the lifetime of the agent — the underlying file is
 /// `O_APPEND`, so a concurrent reader (auditor) sees consistent
 /// records without taking a lock.
+use crate::boot_gap::BootContinuity;
+
 /// How the previous agent run ended, read from the audit chain at open.
 ///
 /// Every run writes `agent_boot` when it starts and `agent_stop` when it
@@ -289,7 +291,36 @@ pub enum PreviousRun {
     },
 }
 
+/// Lot 387 (F3d-1): what [`AuditLog::set_boot`] keeps for the start's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootStamp {
+    boot_id: Option<String>,
+    continuity: BootContinuity,
+}
+
 impl PreviousRun {
+    /// Lot 387 (pre-alpha F3d-1): [`Self::to_json`] with the boots since
+    /// that run (`boots_since`). A clean end followed by boots without the
+    /// agent, or by boots not knowable, is no longer `ended: clean`: `ended`
+    /// is the judgement's word (`boots_without_agent`, `unknown`) and
+    /// `run_ended: clean` keeps how the run itself ended. An abrupt end stays
+    /// `abrupt`. `since`: no judgement made, the row as before.
+    pub fn to_json_since(&self, since: Option<&BootContinuity>) -> serde_json::Value {
+        let mut v = self.to_json();
+        let Some(since) = since else {
+            return v;
+        };
+        if matches!(self, PreviousRun::None) {
+            return v;
+        }
+        if matches!(self, PreviousRun::Clean { .. }) && !since.continuous() {
+            v["run_ended"] = "clean".into();
+            v["ended"] = since.label().into();
+        }
+        v["boots_since"] = since.to_json();
+        v
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             PreviousRun::None => serde_json::json!({ "ended": "none" }),
@@ -364,6 +395,12 @@ pub struct AuditLog<K> {
     /// run that booted ran (its `agent_boot`'s `profile`; for a row written
     /// before the field, `enforcing` when it ran its responses).
     previous_boot_profile: Option<String>,
+    /// Lot 387 (F3d-1): the boot id the last run's `agent_boot` signed
+    /// (`None`: no such run, or a row of an agent before the field).
+    previous_run_boot: Option<String>,
+    /// Lot 387 (F3d-1): this start's boot and the boots since the last run
+    /// ([`Self::set_boot`]), signed in its `agent_boot` row.
+    boot: Option<BootStamp>,
     /// The review of #553 (F2): when the chain's unacknowledged
     /// `profile_downgraded` was signed ([`Self::profile_downgrade_pending`]).
     profile_downgrade_pending: Option<String>,
@@ -457,6 +494,8 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_run: tail.previous_run,
             previous_boot_enforced: tail.previous_boot_enforced,
             previous_boot_profile: tail.previous_boot_profile,
+            previous_run_boot: tail.previous_run_boot,
+            boot: None,
             profile_downgrade_pending: tail.profile_downgrade_pending,
             held: tail.held,
             second_key_added: tail.second_key_added,
@@ -497,6 +536,8 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_run: PreviousRun::None,
             previous_boot_enforced: None,
             previous_boot_profile: None,
+            previous_run_boot: None,
+            boot: None,
             profile_downgrade_pending: None,
             held: crate::held::Held::default(),
             second_key_added: false,
@@ -618,6 +659,87 @@ impl<K: ChainSigner> AuditLog<K> {
     /// earlier boot in this chain.
     pub fn previous_boot_profile(&self) -> Option<&str> {
         self.previous_boot_profile.as_deref()
+    }
+
+    /// Lot 387 (F3d-1): the boot id the last run's `agent_boot` signed;
+    /// `None` without such a run, or for a row of an agent before the field.
+    pub fn previous_run_boot(&self) -> Option<&str> {
+        self.previous_run_boot.as_deref()
+    }
+
+    /// Lot 387 (F3d-1): this start's boot id and its judgement of the boots
+    /// since the last run ([`crate::boot_gap::judge`]), signed in the next
+    /// `agent_boot` row ([`Self::boot_probe_profiled`]: `boot_id`, and
+    /// `previous_run` never `clean` across a gap or an unknown) and by
+    /// [`Self::attest_boot_continuity`].
+    pub fn set_boot(&mut self, boot_id: Option<String>, continuity: BootContinuity) {
+        self.boot = Some(BootStamp {
+            boot_id,
+            continuity,
+        });
+    }
+
+    /// Lot 387 (F3d-1): the judgement given to [`Self::set_boot`].
+    pub fn boot_continuity(&self) -> Option<&BootContinuity> {
+        self.boot.as_ref().map(|b| &b.continuity)
+    }
+
+    /// Lot 387 (F3d-1): after the `agent_boot` row, the boots without the
+    /// agent since its last run (`boots_without_agent`, High, held until an
+    /// acknowledgement covers it) or a start that cannot tell
+    /// (`boot_continuity_unknown`, an advisory): an `integrity_drift` row
+    /// naming the boots, the sources it read and who can rewrite them.
+    /// `None`: nothing to sign (no judgement given, a first run, the same
+    /// boot or the next one).
+    pub fn attest_boot_continuity(&mut self) -> Result<Option<AuditEntry>> {
+        let Some(stamp) = &self.boot else {
+            return Ok(None);
+        };
+        let previous = self.previous_run_boot.clone();
+        let this_boot = stamp.boot_id.clone();
+        let mut extra = match &stamp.continuity {
+            BootContinuity::BootsWithoutAgent { count, boot_ids } => serde_json::json!({
+                "kind": crate::boot_gap::BOOTS_WITHOUT_AGENT_KIND,
+                "severity": "high",
+                "detail": format!(
+                    "{count} boot(s) of this host since the agent's last run had no run of the \
+                     agent (its units kept from starting: masked, not wanted by the default \
+                     target, or disabled); the last run's boot {}, this boot {}",
+                    previous.as_deref().unwrap_or("not recorded"),
+                    this_boot.as_deref().unwrap_or("unreadable"),
+                ),
+                "count": count,
+                "boot_ids": boot_ids,
+            }),
+            BootContinuity::Unknown { why } => serde_json::json!({
+                "kind": crate::boot_gap::BOOT_CONTINUITY_UNKNOWN_KIND,
+                "detail": format!(
+                    "whether boots passed without the agent since its last run is not known: \
+                     {why} — this start does not tell a clean succession"
+                ),
+                "why": why,
+            }),
+            _ => return Ok(None),
+        };
+        let kind = extra["kind"].as_str().unwrap_or_default().to_string();
+        extra["at_boot"] = true.into();
+        extra["previous_boot"] = previous.into();
+        extra["this_boot"] = this_boot.into();
+        extra["sources"] = crate::boot_gap::sources_json();
+        let pid = self.stamps.self_pid;
+        self.append(AuditEntryDraft {
+            op: INTEGRITY_DRIFT_OP.to_string(),
+            extra,
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: pid,
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        })
+        .map(Some)
+        .with_context(|| format!("audit log: {kind} entry"))
     }
 
     /// The review of #553 (F2): the time of the chain's first
@@ -1064,7 +1186,11 @@ impl<K: ChainSigner> AuditLog<K> {
             "detect_only_source": detect_only,
             "binary_integrity": integrity,
             "install_provenance": provenance,
-            "previous_run": self.previous_run.to_json(),
+            // Lot 387 (F3d-1): never `clean` across boots without the agent
+            // or boots not knowable
+            "previous_run": self
+                .previous_run
+                .to_json_since(self.boot.as_ref().map(|b| &b.continuity)),
             // External audit ATP-009: what the build is and how the BPF
             // guard runs — a debug-trigger build only observes.
             "build_features": build.features,
@@ -1077,6 +1203,11 @@ impl<K: ChainSigner> AuditLog<K> {
         if let Some((name, source)) = profile {
             extra["profile"] = serde_json::Value::String(name.to_string());
             extra["profile_source"] = serde_json::Value::String(source.to_string());
+        }
+        // Lot 387 (F3d-1): the boot this run starts in — the next start's
+        // judgement of the boots in between reads it
+        if let Some(id) = self.boot.as_ref().and_then(|b| b.boot_id.as_deref()) {
+            extra["boot_id"] = serde_json::Value::String(id.to_string());
         }
         self.append(AuditEntryDraft {
             op: "agent_boot".to_string(),
@@ -1272,6 +1403,8 @@ struct TailState {
     previous_boot_enforced: Option<bool>,
     /// Lot 345: the last run's `agent_boot`'s profile.
     previous_boot_profile: Option<String>,
+    /// Lot 387: the last run's `agent_boot`'s `boot_id`.
+    previous_run_boot: Option<String>,
     /// The review of #553 (F2): [`AuditLog::profile_downgrade_pending`].
     profile_downgrade_pending: Option<String>,
     /// Lot 379: [`AuditLog::held`] (the rows that end a hold counted only
@@ -1310,6 +1443,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
                 last_agent_id: None,
                 previous_boot_enforced: None,
                 previous_boot_profile: None,
+                previous_run_boot: None,
                 profile_downgrade_pending: None,
                 held: crate::held::Held::default(),
             });
@@ -1331,6 +1465,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
     let mut previous_boot_enforced = None;
     let mut profile_downgrade_pending: Option<String> = None;
     let mut previous_boot_profile = None;
+    let mut previous_run_boot = None;
     let mut held = crate::held::Held::default();
     let genuine = |e: &AuditEntry| pk.is_some_and(|pk| verify_entry(0, e, pk).is_ok());
     let mut row = 0u64;
@@ -1396,6 +1531,14 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
                 {
                     profile_downgrade_pending = None;
                 }
+                // Lot 387 (F3d-1): the run's boot; a row without it (an
+                // agent before the field) leaves it unknown, never the
+                // boot of an older run
+                previous_run_boot = entry
+                    .extra
+                    .get("boot_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 previous = PreviousRun::Abrupt {
                     booted_at: entry.ts.clone(),
                     last_entry_at: entry.ts.clone(),
@@ -1449,6 +1592,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
         last_agent_id,
         previous_boot_enforced,
         previous_boot_profile,
+        previous_run_boot,
         profile_downgrade_pending,
         held,
     })
@@ -2092,6 +2236,215 @@ mod tests {
             other => panic!("expected Clean, got {other:?}"),
         }
         assert!(verify_chain_ok(&log_path));
+    }
+
+    const BOOT_A: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    const BOOT_C: &str = "9f8e7d6c-5b4a-3928-1706-f5e4d3c2b1a0";
+
+    /// Lot 387 (pre-alpha F3d-1, B5/B9): a clean stop, then a boot without
+    /// the agent, then a start: its `agent_boot` no longer says `clean`, and
+    /// a High `boots_without_agent` row names the boot, held until an
+    /// acknowledgement.
+    #[test]
+    fn a_boot_without_the_agent_is_signed_at_the_next_start_never_clean() {
+        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(log.previous_run_boot(), None);
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        let first = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert_eq!(first.extra["boot_id"], BOOT_A);
+        assert_eq!(first.extra["previous_run"]["ended"], "none");
+        assert!(log.attest_boot_continuity().unwrap().is_none());
+        log.stop_entry("system_shutdown", 42).unwrap();
+        // the start after the masked boot
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(log.previous_run_boot(), Some(BOOT_A));
+        let gap = BootContinuity::BootsWithoutAgent {
+            count: 1,
+            boot_ids: vec!["1111aaaa222233334444555566667777".into()],
+        };
+        log.set_boot(Some(BOOT_C.into()), gap.clone());
+        assert_eq!(log.boot_continuity(), Some(&gap));
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        let prev = &boot.extra["previous_run"];
+        assert_eq!(prev["ended"], BOOTS_WITHOUT_AGENT_KIND, "{prev}");
+        assert_ne!(prev["ended"], "clean");
+        assert_eq!(prev["run_ended"], "clean");
+        assert_eq!(prev["reason"], "system_shutdown");
+        assert_eq!(prev["boots_since"]["count"], 1);
+        assert_eq!(boot.extra["boot_id"], BOOT_C);
+        let row = log.attest_boot_continuity().unwrap().unwrap();
+        assert_eq!(row.op, INTEGRITY_DRIFT_OP);
+        assert_eq!(row.result, "detected");
+        assert_eq!(row.extra["kind"], BOOTS_WITHOUT_AGENT_KIND);
+        assert_eq!(row.extra["severity"], "high");
+        assert_eq!(row.extra["count"], 1);
+        assert_eq!(row.extra["boot_ids"][0], "1111aaaa222233334444555566667777");
+        assert_eq!(row.extra["previous_boot"], BOOT_A);
+        assert_eq!(row.extra["this_boot"], BOOT_C);
+        assert_eq!(row.extra["at_boot"], true);
+        assert!(row.extra["detail"].as_str().unwrap().contains("1 boot(s)"));
+        assert_eq!(
+            row.extra["sources"].as_array().unwrap().len(),
+            crate::boot_gap::SOURCES.len()
+        );
+        // held as a death of the role: until an acknowledgement, a restart
+        // included
+        let held = |log: &AuditLog<TestKey>| {
+            log.held()
+                .findings()
+                .iter()
+                .filter(|f| f.kind == BOOTS_WITHOUT_AGENT_KIND)
+                .map(|f| f.hold)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held(&log), vec![crate::held::Hold::UntilAcknowledged]);
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_C.into()), BootContinuity::SameBoot);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert_eq!(held(&log), vec![crate::held::Hold::UntilAcknowledged]);
+        assert!(verify_chain_ok(&log_path));
+    }
+
+    /// Lot 387 (F3d-1): boots not knowable (a volatile journal) are
+    /// `unknown` — never `clean` — and an advisory row says why.
+    #[test]
+    fn boots_not_knowable_are_unknown_never_clean() {
+        use crate::boot_gap::{BootContinuity, BOOT_CONTINUITY_UNKNOWN_KIND};
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("system_shutdown", 42).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(
+            Some(BOOT_C.into()),
+            BootContinuity::Unknown {
+                why: "a volatile journal".into(),
+            },
+        );
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert_eq!(boot.extra["previous_run"]["ended"], "unknown");
+        assert_eq!(boot.extra["previous_run"]["run_ended"], "clean");
+        let row = log.attest_boot_continuity().unwrap().unwrap();
+        assert_eq!(row.extra["kind"], BOOT_CONTINUITY_UNKNOWN_KIND);
+        assert_eq!(row.extra.get("severity"), None);
+        assert_eq!(row.extra["why"], "a volatile journal");
+        assert!(row.extra["detail"]
+            .as_str()
+            .unwrap()
+            .contains("does not tell a clean succession"));
+        let holds: Vec<_> = log
+            .held()
+            .findings()
+            .iter()
+            .filter(|f| f.kind == BOOT_CONTINUITY_UNKNOWN_KIND)
+            .map(|f| f.hold)
+            .collect();
+        assert_eq!(holds, vec![crate::held::Hold::Advisory]);
+    }
+
+    /// Lot 387: a restart in the same boot and the next boot after a clean
+    /// stop stay `clean` (with what was judged), and sign no row; an abrupt
+    /// end stays `abrupt` whatever came after; no judgement, the row as
+    /// before.
+    #[test]
+    fn a_restart_and_a_normal_reboot_stay_clean_and_sign_nothing() {
+        use crate::boot_gap::BootContinuity;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("sigterm", 42).unwrap();
+        for (since, word) in [
+            (BootContinuity::SameBoot, "same_boot"),
+            (BootContinuity::NextBoot, "next_boot"),
+        ] {
+            let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+            log.set_boot(Some(BOOT_A.into()), since);
+            let boot = log
+                .boot_probe(None, "verified", "source-tree", &test_build())
+                .unwrap();
+            assert_eq!(boot.extra["previous_run"]["ended"], "clean");
+            assert_eq!(boot.extra["previous_run"].get("run_ended"), None);
+            assert_eq!(boot.extra["previous_run"]["boots_since"]["state"], word);
+            assert!(log.attest_boot_continuity().unwrap().is_none());
+            log.stop_entry("sigterm", 42).unwrap();
+        }
+        // abrupt (no stop), then a gap: still abrupt, the gap told beside
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        let p = PreviousRun::Abrupt {
+            booted_at: "t".into(),
+            last_entry_at: "t".into(),
+        };
+        let gap = BootContinuity::BootsWithoutAgent {
+            count: 2,
+            boot_ids: vec![],
+        };
+        let v = p.to_json_since(Some(&gap));
+        assert_eq!(v["ended"], "abrupt");
+        assert_eq!(v["boots_since"]["count"], 2);
+        // none: nothing to judge, the row as before
+        assert_eq!(
+            PreviousRun::None.to_json_since(Some(&gap)),
+            PreviousRun::None.to_json()
+        );
+        let clean = PreviousRun::Clean {
+            stopped_at: "t".into(),
+            reason: "sigterm".into(),
+        };
+        assert_eq!(clean.to_json_since(None), clean.to_json());
+        // no boot given: no boot id signed
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert_eq!(boot.extra.get("boot_id"), None);
+        assert!(log.attest_boot_continuity().unwrap().is_none());
+    }
+
+    /// Lot 387: the last run's boot is the last RUN's — a refused start
+    /// after it is no run, and a run of an agent before the field leaves it
+    /// unknown, never an older run's boot.
+    #[test]
+    fn the_last_runs_boot_is_read_from_the_last_run_only() {
+        use crate::boot_gap::BootContinuity;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("sigterm", 42).unwrap();
+        log.boot_refused_by(
+            "bpf_lsm",
+            "verified",
+            "source-tree",
+            "no bpf",
+            &test_build(),
+        )
+        .unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(log.previous_run_boot(), Some(BOOT_A));
+        // a run that signed no boot id (an agent before the field)
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        let log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(log.previous_run_boot(), None);
     }
 
     /// Lot 298 (external bug hunt, BUG16): a refused start (no

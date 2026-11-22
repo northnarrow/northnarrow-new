@@ -553,6 +553,8 @@ fn benign_states_are_advisories_not_degradations() {
         "sysctl_opted_out",
         "agent_stalled",
         "quarantine_index_rebuilt",
+        // lot 387: boots since the last run not knowable (no sensor degraded)
+        "boot_continuity_unknown",
     ];
     for k in advisories {
         assert_eq!(hold_of(k, "detected"), Hold::Advisory, "{k}");

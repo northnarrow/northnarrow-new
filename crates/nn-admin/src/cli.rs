@@ -1034,7 +1034,8 @@ enum HeartbeatCmd {
     /// and freshness against the last check (`--state`), print `OK …` or
     /// one `ALERT <KIND> …` line per alert. Once: exit 0, or the most
     /// severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered,
-    /// 14 loss, 15 stopped, 16 degraded); with `--every` until stopped.
+    /// 14 loss, 15 stopped, 16 degraded, 18 not back); with `--every` until
+    /// stopped.
     Watch {
         /// The agent's public key, 64 hex characters (its `agent.sig.pub`).
         #[arg(long = "agent-pubkey", conflicts_with = "agent_pubkey_file")]
@@ -1064,6 +1065,13 @@ enum HeartbeatCmd {
         /// (the agent's clock ahead).
         #[arg(long = "max-skew-secs", default_value_t = 30)]
         max_skew_secs: u64,
+        /// The grace of a maintenance stop: a stop beat with no newer beat
+        /// for longer is NOT_BACK (18), no longer STOPPED (15).
+        #[arg(
+            long = "max-stopped-secs",
+            default_value_t = nn_evidence::heartbeat::DEFAULT_MAX_STOPPED_SECS
+        )]
+        max_stopped_secs: u64,
         /// Start again from the newest beat when the state file cannot be
         /// read (without it, an unreadable state is an error: exit 3).
         #[arg(long = "reanchor")]
@@ -2037,6 +2045,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     every,
                     max_silence_secs,
                     max_skew_secs,
+                    max_stopped_secs,
                     reanchor,
                 },
         } => {
@@ -2067,6 +2076,7 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                         cfg: nn_evidence::heartbeat::WatchConfig {
                             max_silence_secs,
                             max_skew_secs,
+                            max_stopped_secs,
                             ..nn_evidence::heartbeat::WatchConfig::default()
                         },
                         reanchor,
@@ -7663,14 +7673,18 @@ mod permission_tests {
     }
 
     /// 17 means one thing in every table: neither a general code (0 to 10,
-    /// 141) nor an alert of `heartbeat watch` (10 to 16) or `export verify`
-    /// (xtask/tests/operator_docs.rs holds NN_ADMIN.md's table to it).
+    /// 141) nor an alert of `heartbeat watch` (10 to 16, and lot 387's 18)
+    /// or `export verify` (xtask/tests/operator_docs.rs holds NN_ADMIN.md's
+    /// table to it).
     #[test]
     fn exit_17_is_free_in_every_table() {
         assert_eq!(EXIT_PERMISSION_DENIED, 17);
-        // the alerts end at 16 (`heartbeat watch`'s help; `export verify`
-        // uses 2, 11 and 13)
-        assert!(include_str!("cli.rs").contains("15 stopped, 16 degraded)"));
+        // the alerts: 10 to 16, then 18 — `heartbeat watch`'s help, and
+        // every alert's own code (`export verify` uses 2, 11 and 13)
+        assert!(include_str!("cli.rs").contains("15 stopped, 16 degraded, 18 not back)"));
+        for code in nn_evidence::heartbeat::ALERT_EXIT_CODES {
+            assert_ne!(code, i32::from(EXIT_PERMISSION_DENIED));
+        }
     }
 }
 

@@ -165,6 +165,18 @@ pub(crate) fn attest(
                         );
                     }
                 }
+                // Lot 387 (pre-alpha F3d-1): the boots since the last run,
+                // judged before the row that tells how it ended — a boot
+                // without the agent is never told as a clean succession
+                let since = northnarrow_agent::boot::boots_since::judge(
+                    !matches!(
+                        log.previous_run(),
+                        northnarrow_agent::audit::PreviousRun::None
+                    ),
+                    log.previous_run_boot(),
+                    std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
+                );
+                log.set_boot(since.boot_id.clone(), since.continuity.clone());
                 match log.boot_probe_profiled(
                     detect_only_source.as_deref(),
                     // lot 345: the profile signed, for the next start's
@@ -180,6 +192,7 @@ pub(crate) fn attest(
                             entry_hash = %entry.entry_hash,
                             "audit log writable — agent_boot entry appended"
                         );
+                        attest_boots_since(&mut log, &since);
                         if let northnarrow_agent::audit::PreviousRun::Abrupt {
                             booted_at,
                             last_entry_at,
@@ -320,6 +333,37 @@ pub(crate) fn attest(
         chain_anchor,
         audit_log,
     })
+}
+
+/// Lot 387 (pre-alpha F3d-1): sign the boots since the last run that the
+/// start judged ([`northnarrow_agent::audit::AuditLog::attest_boot_continuity`]):
+/// boots without the agent (High, held until acknowledged) or boots not
+/// knowable (an advisory) — and say it in the journal.
+fn attest_boots_since(
+    log: &mut northnarrow_agent::audit::AuditLog,
+    since: &northnarrow_agent::boot::boots_since::BootsSince,
+) {
+    use nn_evidence::boot_gap::BootContinuity;
+    match &since.continuity {
+        BootContinuity::BootsWithoutAgent { count, boot_ids } => error!(
+            count,
+            boot_ids = ?boot_ids,
+            previous_source = ?since.previous_source,
+            "BOOTS WITHOUT THE AGENT since its last run — its units were kept from starting \
+             (masked, not wanted by the default target, or disabled); signed High, held in \
+             `nn-admin status` until acknowledged"
+        ),
+        BootContinuity::Unknown { why } => warn!(
+            why = %why,
+            previous_source = ?since.previous_source,
+            "whether boots passed without the agent since its last run is not known — not \
+             told as a clean succession"
+        ),
+        _ => {}
+    }
+    if let Err(e) = log.attest_boot_continuity() {
+        warn!(error = %format!("{e:#}"), "boots since the last run NOT recorded");
+    }
 }
 
 /// The audit log's open after the attach, when the integrity phase could
