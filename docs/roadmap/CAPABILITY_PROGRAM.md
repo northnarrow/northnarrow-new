@@ -11812,6 +11812,20 @@ number in parentheses is a lab PR.
       KNOWN_LIMITATIONS; a follow-up could take PID 1's `systemd-shutdown`
       as that stage's fact). Then `uninstall.sh --purge` and a cold boot
       with nothing of ours, powered off.
+  - **Fix round 2 (the CI of #597).** `test (ubuntu-latest)` failed three
+    times running in
+    `witness::tests::the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`
+    ("published no witness key"; `main` green). Cause: the test read the
+    key file from the test process's own descriptor table, where the
+    binary's earlier tests leave one descriptor per directory
+    `anchored::anchor` anchored (kept for the process's life, by design):
+    254 at four test threads, this lot's two remount tests adding 11 (one
+    temporary directory per round), so the key file landed past the 256
+    entries `published_key` reads. Not a race, not the product (the
+    watchdog publishes its key at its start, among its first descriptors).
+    The test's watchdog is now a stand-in child holding the key file on
+    descriptor 3; reproduced locally 3 of 3 at `--test-threads=4` before,
+    green after (the whole `nn-linux` binary, repeated).
 - **Lot 388 — no watchdog death at the host's own shutdown; the verifier's
   start-up stage 5 is late, not lost (the review of #595: its triage (a)
   and (b), P3-1 to P3-3; `UPGRADE_NOTES_WAVE4.md` §73; no level change).**
