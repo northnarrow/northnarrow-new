@@ -4812,8 +4812,8 @@ mod tests {
         let kinds =
             |audit: &Path| -> Vec<String> { rows(audit).into_iter().map(|r| r.0).collect() };
         // one round at `now` (s): systemd's `state` (None: no answer), the
-        // facts of a shutdown when it says `stopping`; finalrd's stop at
-        // 1 029 s
+        // facts of a shutdown when it says `stopping`, finalrd's stop then
+        // run a second before the round (by hand, or in the held reboot)
         let round = |c: &mut Checker, table: &str, now: u64, state: Option<&str>| {
             let down = state == Some("stopping");
             let mut f = mount_round(Ok(table.to_string()), not_readable, &own, &mut c.mounts);
@@ -4832,7 +4832,7 @@ mod tests {
                             path: crate::shutdown_remount::BINARY.into(),
                             argv: vec![crate::shutdown_remount::BINARY.into()],
                             start_realtime_us: 1_795_000_000_000_000,
-                            start_monotonic_us: 1_029_000_000,
+                            start_monotonic_us: (now - 1) * 1_000_000,
                             pid: 3637,
                         }],
                     }),
