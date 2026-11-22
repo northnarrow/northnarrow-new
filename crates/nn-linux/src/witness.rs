@@ -913,11 +913,10 @@ mod tests {
         assert!(!reader(true).ends_with_signed_release());
     }
 
-    /// A memory file named as the watchdog's key file, holding `body`,
-    /// sealed or not, in this process's descriptor table.
-    fn key_file(body: &str, sealed: bool) -> std::os::fd::OwnedFd {
-        use std::io::Write;
-        use std::os::fd::{AsRawFd, FromRawFd};
+    /// A memory file named as the watchdog's key file, empty, unsealed:
+    /// [`fill_key_file`] writes its body once its holder's pid is known.
+    fn key_file() -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
         let name = std::ffi::CString::new(KEY_MEMFD_NAME).unwrap();
         // SAFETY: a NUL-terminated name.
         let fd = unsafe {
@@ -925,7 +924,14 @@ mod tests {
         };
         assert!(fd >= 0);
         // SAFETY: a new descriptor this test owns.
-        let mut f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// `body` written to the key file `fd`, then sealed or not.
+    fn fill_key_file(fd: &std::os::fd::OwnedFd, body: &str, sealed: bool) {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::from(fd.try_clone().unwrap());
         f.write_all(body.as_bytes()).unwrap();
         if sealed {
             let s =
@@ -936,52 +942,108 @@ mod tests {
                 0
             );
         }
-        f.into()
+    }
+
+    /// The fix round 2 of #597: a stand-in watchdog — a child (`sleep`)
+    /// whose descriptor table is its own: its three standard streams on
+    /// `/dev/null` and, given, the key file on descriptor 3. Never this
+    /// test process's table: the other tests of this binary fill it with
+    /// descriptors kept for the life of the process (one per directory
+    /// [`crate::anchored::anchor`] anchors, by design), and past the 256
+    /// entries [`published_key`] reads, a key file there is not among
+    /// them — "published no witness key" in CI, by the order the tests
+    /// ran in.
+    struct StandIn(std::process::Child);
+
+    impl StandIn {
+        fn spawn(key: Option<&std::os::fd::OwnedFd>) -> StandIn {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            use std::process::Stdio;
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(fd) = key {
+                let raw = fd.as_raw_fd();
+                // SAFETY: only dup2/fcntl, async-signal-safe, in the child
+                // between fork and exec.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        let r = if raw == 3 {
+                            libc::fcntl(3, libc::F_SETFD, 0)
+                        } else {
+                            libc::dup2(raw, 3)
+                        };
+                        if r < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            StandIn(cmd.spawn().expect("sleep"))
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// The record of a key file naming this stand-in (or `pid`
+        /// instead) and its start (moved by `start_moved`).
+        fn record(&self, pid: Option<u32>, start_moved: u64, key: &str) -> String {
+            let start = antitamper_bpf::start_check::start_ticks(self.pid()).unwrap();
+            nn_proto::witness::key_record(pid.unwrap_or(self.pid()), start + start_moved, key)
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// Lot 374: the watchdog's key is taken only from a sealed memory file
     /// in the watchdog's own descriptor table that names that process and
     /// its start — never from a file another process could write — and
-    /// certified once.
+    /// certified once. The fix round 2 of #597: the watchdog is a stand-in
+    /// child ([`StandIn`]), its table read, never this test process's.
     #[test]
     fn the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file() {
-        let me = std::process::id();
-        let start = antitamper_bpf::start_check::start_ticks(me).unwrap();
         let key = WitnessKey::from_seed([6; 32]).public_hex();
-        let err = published_key(me).unwrap_err();
+        let none = StandIn::spawn(None);
+        let err = published_key(none.pid()).unwrap_err();
         assert!(err.contains("published no witness key"), "{err}");
-        let record = nn_proto::witness::key_record(me, start, &key);
-        for (body, sealed, why) in [
-            (record.clone(), false, "not sealed"),
-            (
-                nn_proto::witness::key_record(me + 1, start, &key),
-                true,
-                "names pid",
-            ),
-            (
-                nn_proto::witness::key_record(me, start + 1, &key),
-                true,
-                "names pid",
-            ),
-            ("nothing\n".to_string(), true, "holds no key record"),
+        drop(none);
+        for (pid_moved, start_moved, body, sealed, why) in [
+            (false, 0, None, false, "not sealed"),
+            (true, 0, None, true, "names pid"),
+            (false, 1, None, true, "names pid"),
+            (false, 0, Some("nothing\n"), true, "holds no key record"),
         ] {
-            let fd = key_file(&body, sealed);
-            let err = published_key(me).unwrap_err();
+            let fd = key_file();
+            let w = StandIn::spawn(Some(&fd));
+            let pid = pid_moved.then(|| w.pid() + 1);
+            let body = body.map_or_else(|| w.record(pid, start_moved, &key), str::to_string);
+            fill_key_file(&fd, &body, sealed);
+            let err = published_key(w.pid()).unwrap_err();
             assert!(err.contains(why), "{why}: {err}");
-            drop(fd);
         }
-        let fd = key_file(&record, true);
-        assert_eq!(published_key(me), Ok(key.clone()));
+        let fd = key_file();
+        let w = StandIn::spawn(Some(&fd));
+        fill_key_file(&fd, &w.record(None, 0, &key), true);
+        assert_eq!(published_key(w.pid()), Ok(key.clone()));
         // certified once, kept for the next reader
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
         let mut r = WitnessReader::new(dir.path());
-        let f = r.certify(me).expect("certified");
+        let f = r.certify(w.pid()).expect("certified");
         assert_eq!(f.kind, WITNESS_KEY);
         assert!(f.detail.contains(&key), "the certification names the key");
-        assert!(r.certify(me).is_none(), "once");
+        assert!(r.certify(w.pid()).is_none(), "once");
         assert!(WitnessReader::new(dir.path()).position().certified(&key));
-        drop(fd);
     }
 
     fn write_chain(dir: &Path, k: &WitnessKey, kinds: &[&str]) -> Vec<String> {

@@ -2404,6 +2404,16 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     the lab), and the verifier tells every change of the manifest's hash
     once (R13: it compares hashes, not directions); the check after it is
     `OK`. HEARTBEAT.md and the tester guide say so.
+  - **The witness key test reads a watchdog of its own** (the CI of #597;
+    tests only). `the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`
+    put the key file in the test process's own descriptor table, which the
+    binary's other tests fill with descriptors kept for the process's life
+    (one per directory `anchored::anchor` anchors, by design: 254 by the
+    time it ran, this lot's two remount tests adding 11); past the 256
+    entries `published_key` reads, the key file was not among them, and CI
+    failed three times running with "published no witness key". The
+    watchdog is now a stand-in child (`sleep`) holding the key file on
+    descriptor 3 and nothing else of the test's; every case is unchanged.
 - Lot 388 (the review of #595: its triage (a) and (b), P3-1 to P3-3;
   `UPGRADE_NOTES_WAVE4.md` §73).
   - **No watchdog "death" at the host's own shutdown.** At a normal reboot
