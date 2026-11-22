@@ -1008,7 +1008,11 @@ lists the known false positives of each rule.
     `/etc/login.defs` and `/etc/passwd` as the user, told by the kernel's
     record of its fork and the lineage of PID 1's launch of
     `user@<uid>.service`, or, for a manager older than the agent, by the
-    start's scan and its cgroup (no ALERTED posture). On every systemd the
+    start's scan and its cgroup (no ALERTED posture). Lot 385: that cgroup
+    is the manager's scope by the id the start's scan read — systemd
+    removes the scope a few milliseconds after `(sd-pam)` reads, and a
+    judgement that came later found no scope and raised ALERTED (a login
+    made before the install, then idle: seen by the external tester). On every systemd the
     alpha supports: 255 and later (`(sd-pam)` forked by the executor,
     Debian 13, Ubuntu 24.04 and 26.04) and before 255 (Ubuntu 22.04's 249,
     Debian 12's 252: no executor, `(sd-pam)` a fork of PID 1's own fork
@@ -1038,7 +1042,8 @@ lists the known false positives of each rule.
     by the agent's start's scan (`(sd-pam)` running the packaged executor
     as the user — before systemd 255, the packaged systemd —, its parent
     the packaged systemd as the user, PID 1's child) and by its cgroup at
-    the open, the manager's own `user@<uid>.service/init.scope`. A process
+    the open, the manager's own `user@<uid>.service/init.scope` (its id as
+    the scan read it, lot 385). A process
     of the user's running that packaged program since before the agent's
     start, moved by the user into that scope, reading `/etc/login.defs` or
     `/etc/passwd` is not told from it. A manager the agent saw launched whose fork record the

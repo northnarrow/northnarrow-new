@@ -94,7 +94,7 @@ const DEFAULT_RULES_V6: &str = "/etc/northnarrow/combat-rules.v6";
 
 /// Name of the chain that `combat-rules.v4` / `combat-rules.v6` create.
 /// The SAME chain name is used on both the v4 and v6 `filter` tables.
-const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
+const COMBAT_CHAIN: &str = combat_allow::COMBAT_CHAIN;
 
 /// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
 /// replaces with the management carve-out ACCEPT rules (Beta Step 4b).

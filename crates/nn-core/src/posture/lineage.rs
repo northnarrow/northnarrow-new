@@ -1228,7 +1228,17 @@ struct InnerState {
     /// oldest dropped first.
     go_links: HashMap<u64, GoLink>,
     go_link_order: VecDeque<u64>,
+    /// Lot 385 (the external tester's F9b-5): the scopes of the user
+    /// managers the start's scan found running — the cgroup v2 id of each
+    /// `user@<uid>.service/init.scope` → its uid, read while the scope is
+    /// there ([`AuthSessionTracker::seed_manager_scopes`]), at most
+    /// [`MANAGER_SCOPES_CAP`]. A cgroup's id is never given to another
+    /// cgroup during a boot.
+    manager_scopes: HashMap<u64, u32>,
 }
+
+/// Lot 385: the user managers' scopes the start's scan records at most.
+const MANAGER_SCOPES_CAP: usize = 4096;
 
 /// Lot 369 (the review of #576, F1): an exec of the packaged Go toolchain's
 /// linker (`<GOROOT>/pkg/tool/<os>_<arch>/link`, its image in a root-only
@@ -1481,6 +1491,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     kernel_fork_order: VecDeque::new(),
                     go_links: HashMap::new(),
                     go_link_order: VecDeque::new(),
+                    manager_scopes: HashMap::new(),
                 }),
                 proc_root,
                 cgroup_root: PathBuf::from(CGROUP_ROOT),
@@ -2075,7 +2086,54 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             );
             seeded += 1;
         }
+        self.seed_manager_scopes();
         seeded
+    }
+
+    /// Lot 385 (the external tester's F9b-5: ALERTED on an idle host from
+    /// the `(sd-pam)` of a login made before the install): the scope of
+    /// each user manager running at the start, `user@<uid>.service/init.scope`
+    /// (under the hierarchy's mount, or its `unified/`), by its cgroup id,
+    /// read now while it is there. The open of `/etc/login.defs` by a
+    /// manager's `(sd-pam)` comes as the manager stops, a few milliseconds
+    /// before systemd removes the scope's directory (the lab measured 2 ms
+    /// between the judgement and the unit's end): looked up at the
+    /// judgement, a judgement a few milliseconds late found no directory,
+    /// and the manager older than the agent raised ALERTED.
+    /// [`Self::is_user_manager_scope`] reads these ids too — the same
+    /// membership, at the open, of the same scope; nothing wider.
+    fn seed_manager_scopes(&self) {
+        let root = &self.inner.cgroup_root;
+        let mut found = Vec::new();
+        for base in [root.join("user.slice"), root.join("unified/user.slice")] {
+            let Ok(slices) = H::read_dir(&base) else {
+                continue;
+            };
+            for slice in slices {
+                let Some(uid) = slice
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("user-"))
+                    .and_then(|n| n.strip_suffix(".slice"))
+                    .and_then(|n| n.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                let scope = base
+                    .join(format!("user-{uid}.slice"))
+                    .join(format!("user@{uid}.service"))
+                    .join("init.scope");
+                if let Some(id) = H::dir_ino(&scope) {
+                    found.push((id, uid));
+                }
+            }
+        }
+        let mut s = self.inner.state.write();
+        for (id, uid) in found {
+            if s.manager_scopes.len() >= MANAGER_SCOPES_CAP {
+                break;
+            }
+            s.manager_scopes.insert(id, uid);
+        }
     }
 
     /// Lot 310: the identity of the image `pid` runs (`/proc/<pid>/exe`,
@@ -3415,7 +3473,15 @@ impl<H: PostureHost> AuthSessionTracker<H> {
     /// directory) is `uid`'s service manager's own scope,
     /// `/user.slice/user-<uid>.slice/user@<uid>.service/init.scope` (under
     /// the hierarchy's mount, or its `unified/` on a hybrid layout).
+    ///
+    /// Lot 385 (F9b-5): or the id the start's scan read for that scope
+    /// ([`Self::seed_manager_scopes`]) — the scope is gone a few
+    /// milliseconds after the manager's `(sd-pam)` reads, before a late
+    /// judgement looks.
     pub fn is_user_manager_scope(&self, id: u64, uid: u32) -> bool {
+        if self.inner.state.read().manager_scopes.get(&id) == Some(&uid) {
+            return true;
+        }
         let scope = format!("user.slice/user-{uid}.slice/user@{uid}.service/init.scope");
         let root = &self.inner.cgroup_root;
         [root.join(&scope), root.join("unified").join(&scope)]
@@ -11775,6 +11841,98 @@ mod tests {
     /// unit), another image at the open, a copy of the executor, a parent
     /// that is not the user's manager (another uid, not PID 1's child, a
     /// copy of systemd), another uid, root, a later exec of its own.
+    /// Lot 385 (the external tester's F9b-5: ALERTED on an idle Ubuntu
+    /// 24.04, 34 s after the install, from the `(sd-pam)` of a login made
+    /// before it; the lab measured 2 ms between the judgement of that open
+    /// and systemd's removal of the scope): the manager's scope, read by the
+    /// start's scan, still names the reader's cgroup once systemd has
+    /// removed its directory — a judgement a few milliseconds late. Its id
+    /// stands for that scope and that uid only: another user's scope, a
+    /// user's unit's cgroup, an id the scan did not read: not.
+    #[test]
+    fn an_older_manager_s_sd_pam_judged_after_its_scope_is_gone() {
+        use crate::posture::host::testing::IdTestHost;
+        const STAT_DEV: u64 = 64769;
+        const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
+        let (executor, systemd) = (
+            "/usr/lib/systemd/systemd-executor",
+            "/usr/lib/systemd/systemd",
+        );
+        IdTestHost::set_file_id(executor, Some((STAT_DEV, 21)));
+        IdTestHost::set_file_id(systemd, Some((STAT_DEV, 11)));
+        IdTestHost::set_dir_root_only("/usr/lib/systemd", true);
+        let packaged = (KDEV, 21);
+        let proc = TempDir::new().unwrap();
+        let cg = TempDir::new().unwrap();
+        let scope_dir = |uid: u32, unit: &str| {
+            cg.path().join(format!(
+                "user.slice/user-{uid}.slice/user@{uid}.service/{unit}"
+            ))
+        };
+        let scope = |uid: u32, unit: &str| {
+            let d = scope_dir(uid, unit);
+            fs::create_dir_all(&d).unwrap();
+            IdTestHost::dir_ino(&d).unwrap()
+        };
+        let (init, app) = (scope(1000, "init.scope"), scope(1000, "app.slice"));
+        let other_init = scope(1001, "init.scope");
+        let t =
+            super::AuthSessionTracker::<IdTestHost>::new(proc.path()).with_cgroup_root(cg.path());
+        let running = |pid: u32, exe: &str, ppid: u32, uid: u32, ticks: u64| {
+            write_exe(proc.path(), pid, exe);
+            write_status_uid(proc.path(), pid, ppid, uid);
+            write_started(proc.path(), &pid.to_string(), ppid, ticks);
+            let ns = proc.path().join(pid.to_string()).join("ns");
+            fs::create_dir_all(&ns).unwrap();
+            let _ = fs::remove_file(ns.join("mnt"));
+            symlink("mnt:[4026531841]", ns.join("mnt")).unwrap();
+            let view = proc
+                .path()
+                .join(pid.to_string())
+                .join("root")
+                .join(Path::new(exe).parent().unwrap().strip_prefix("/").unwrap());
+            IdTestHost::set_dir_root_only(&view, true);
+            let id = if exe == executor {
+                (STAT_DEV, 21)
+            } else {
+                (STAT_DEV, 11)
+            };
+            IdTestHost::set_file_id(proc.path().join(pid.to_string()).join("exe"), Some(id));
+        };
+        fs::create_dir_all(proc.path().join("1/ns")).unwrap();
+        symlink("mnt:[4026531841]", proc.path().join("1/ns/mnt")).unwrap();
+        // a login before the agent: the manager 500 and its (sd-pam) 501;
+        // another user's manager 510 and its (sd-pam) 511
+        running(500, systemd, 1, 1000, 100);
+        running(501, executor, 500, 1000, 101);
+        running(510, systemd, 1, 1001, 100);
+        running(511, executor, 510, 1001, 101);
+        assert_eq!(t.seed_from_proc(), 4);
+        let at = AsOf::Judged(20 * S);
+        let keeper = |pid: u32, uid: u32, cgroup: u64| {
+            t.is_user_manager_pam_keeper(pid, uid, at, (packaged, cgroup))
+        };
+        assert!(keeper(501, 1000, init), "the scope still there");
+        // the manager stops: (sd-pam) reads, exits, systemd removes the
+        // scope — and only then is the open judged
+        fs::remove_dir_all(scope_dir(1000, "")).unwrap();
+        fs::remove_dir_all(scope_dir(1001, "")).unwrap();
+        assert!(
+            keeper(501, 1000, init),
+            "the scope gone before the judgement"
+        );
+        assert!(keeper(511, 1001, other_init), "another user's, gone too");
+        assert!(!keeper(501, 1000, other_init), "another user's scope");
+        assert!(!keeper(511, 1001, init), "another user's scope");
+        assert!(!keeper(501, 1000, app), "a user's unit's cgroup");
+        assert!(!keeper(501, 1000, 0), "no cgroup read");
+        assert!(
+            !keeper(501, 1000, init + 1_000_000),
+            "an id the scan never read"
+        );
+        assert!(!t.is_user_manager_scope(1, 1000), "the hierarchy's root");
+    }
+
     #[test]
     fn the_user_manager_s_sd_pam_is_known_from_the_sweep_and_the_start_s_scan() {
         use crate::posture::host::testing::IdTestHost;

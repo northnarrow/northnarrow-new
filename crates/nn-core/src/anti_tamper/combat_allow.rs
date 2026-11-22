@@ -33,6 +33,12 @@
 //! ACCEPT rules and [`generate_accept_rules_v6`] the IPv6 ones, each
 //! spliced into its family's chain.
 
+/// The chain the COMBAT ruleset (`combat-rules.v4`, `combat-rules.v6`)
+/// creates in the `filter` table of both families, and that the release
+/// flushes and removes. Lot 385: named once — the isolator's, and the
+/// switch-off detector's for the agent's own release (NN-L-EVA-002).
+pub const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 

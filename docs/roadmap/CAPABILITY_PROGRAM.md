@@ -11699,6 +11699,56 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 385 — the external tester's findings on rc13 (pre-alpha Phase 9b):
+  `audit verify`'s default, `host-check` without root, the guide's COMBAT,
+  the agent's own release, an earlier login's `(sd-pam)`, a long link pin
+  name (no level change).**
+  - What was open: the guide's and the README's `sudo nn-admin audit
+    verify` exited 2 (`--from` required); `nn-admin host-check` without
+    root said `OK` for the admin key it could not see and "IMA not
+    present"; the guide promised a COMBAT that ends by itself after 6.8
+    (it is locked by design); `nn-admin unlock` left two High
+    `NN-L-EVA-002` for the agent's own `iptables -F NORTHNARROW_COMBAT`;
+    an idle host went ALERTED from the `(sd-pam)` of a login made before
+    the install; the link pin `link_cgroup_subtree_control_write` (33
+    bytes) was not registered in `OWN_PIN_NAMES`.
+  - Done:
+    - **Commands as documented.** `audit verify --from` defaults to the
+      audit log (which must exist); `xtask/tests/documented_commands.rs`
+      checks every `nn-admin` command of the README and the operator
+      guides against the binary's own help (the golden matrix).
+    - **A check that cannot read says so.** `host_hardening::Unread`:
+      denied is `n/a` `cannot check: run as root`, never `OK`; a preload
+      library this user cannot look at too (`preload::Verdict::Unseen`).
+    - **The agent's own helper by identity** (`run_by_the_agent`): root,
+      parent and forker the agent (the kernel's fork record), the
+      lineage's parent the agent's image, a packaged system binary, the
+      agent's chain only.
+    - **The scope read while it exists.** Lot 378's older-manager path
+      looked the manager's `init.scope` up at the judgement; systemd
+      removes it a few milliseconds after `(sd-pam)` reads. The start's
+      scan now records the running managers' scope ids.
+    - **Every link pin registered** by what the kernel's 32-byte window
+      holds of it; ratchet over every hook and program of the eBPF
+      sources, in nine path spellings, against a host model of the
+      window (nn-adversarial: the id, detach/update and inode layers held
+      for that link; the name layer was missing).
+  - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and
+    ubuntu2604 (7.0, systemd 259), the `alpha` profile, a login's manager
+    older than the agent stopping during an idle wait under a CPU burn.
+    On `main` (2404): `audit verify` exit 2; `host-check` without root
+    `OK … none at the bootstrap paths` and `IMA not present`; `unlock` two
+    High `NN-L-EVA-002`; the `too long for OWN_PIN_NAMES` WARN. On the
+    branch (both): `audit verify` 0; without root the two rows `n/a cannot
+    check: run as root` and the count line, as root `WARN` on the key;
+    6.8 a locked COMBAT, `unlock` 0 → ALERTED with no `NN-L-EVA-002`; a
+    root `systemd-run iptables -F NORTHNARROW_COMBAT` still one High
+    `NN-L-EVA-002`; no `(sd-pam)` transition, no unregistered pin. A build
+    of `main` with diagnostic lines (three rounds) judged the older
+    manager's `(sd-pam)` 2 ms and 0.36 ms before `user@1000.service`'s end:
+    the race itself was not lost in the lab. A relative `OBJ_GET` of the
+    long-named link and of `link_task_kill` (bpftool) drew two High
+    `NN-L-BPF-002` before and after: not discriminating.
 - **Lot 384 — an acknowledgement ends every held finding through its row;
   the status always names the row and the command; Phase 3c's doc truths
   (C23; `UPGRADE_NOTES_WAVE4.md` §69; no level change).**

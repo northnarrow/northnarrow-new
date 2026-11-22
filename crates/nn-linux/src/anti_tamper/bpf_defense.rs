@@ -71,7 +71,9 @@ pub(crate) fn own_key(kind: u8, id: u32) -> u64 {
 }
 const PIN_NAMES_MAP: &str = "OWN_PIN_NAMES";
 /// The window the kernel reads a pin's final component from (mirrors
-/// `PIN_NAME_LEN` in the eBPF crate): a longer name is never matched.
+/// `PIN_NAME_LEN` in the eBPF crate, held equal by a test): the last bytes of
+/// the `OBJ_GET` path. Lot 385: a longer name is matched by what the window
+/// holds of it ([`pin_name_key`]).
 const PIN_NAME_LEN: usize = 32;
 /// Prefix of the LSM link pins written by `antitamper_bpf::lsm_pin_paths`
 /// (lot 300: and the self-test's consistency test reads it; lot 301: the
@@ -1928,9 +1930,10 @@ fn pinned_owner(
 }
 
 /// The walk's entries split by owner ([`pinned_owner`]): the agent's
-/// links, with their pins' names (a name that does not fit the key is
-/// skipped with a WARN — none of ours is that long), and every entry that
-/// is not the agent's. A walk cut short says so among the foreign.
+/// links, with their pins' names (lot 385: every name the kernel's window
+/// can read is registered, a long one by what the window holds of it), and
+/// every entry that is not the agent's. A walk cut short says so among the
+/// foreign.
 fn split_pins(walk: &PinWalk, maps: &HashSet<u32>, progs: &HashSet<u32>) -> PinSplit {
     let mut out = PinSplit::default();
     for p in &walk.entries {
@@ -1947,7 +1950,8 @@ fn split_pins(walk: &PinWalk, maps: &HashSet<u32>, progs: &HashSet<u32>) -> PinS
             Some(k) => out.names.push(k),
             None => warn!(
                 pin = %p.path.display(),
-                "BPF self-defence: link pin name too long for OWN_PIN_NAMES — not registered"
+                "BPF self-defence: link pin name not registered in OWN_PIN_NAMES (not a name \
+                 the kernel's check can read)"
             ),
         }
     }
@@ -2010,13 +2014,51 @@ impl BpfGuard {
 
 /// The key the kernel computes for the final path component (external
 /// audit EBPF-010: its hash, `common::wire::pin_name_hash`), or `None` for
-/// a name the kernel's window cannot hold.
+/// what is no final component (empty, or with a `/`).
+///
+/// Lot 385 (the external tester's F9b-6): the kernel hashes the last
+/// [`PIN_NAME_LEN`] bytes of the `OBJ_GET` path, restarting after each `/`.
+/// A name shorter than the window is hashed whole (the `/` before it, or
+/// the path's start, is in the window); a longer one fills the window, and
+/// the kernel hashes its last [`PIN_NAME_LEN`] bytes, in every spelling of
+/// the path. `link_cgroup_subtree_control_write` (33 bytes, lot 348's
+/// subtree mark) was skipped as "too long": an `OBJ_GET` of that link by
+/// any path was not seen as one of the agent's links by name (its id, the
+/// detach and update deny and its inode still were). It is registered by
+/// those last bytes now. A third party's final component that ends with
+/// the same [`PIN_NAME_LEN`] bytes would be taken for ours: a refusal too
+/// many, never one too few ([`kernel_window_key`], the test of every own
+/// name in every spelling).
 fn pin_name_key(name: &str) -> Option<u64> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() >= PIN_NAME_LEN {
+    if bytes.is_empty() || bytes.contains(&b'/') {
         return None;
     }
-    Some(common::wire::pin_name_hash(bytes))
+    let seen = &bytes[bytes.len().saturating_sub(PIN_NAME_LEN)..];
+    Some(common::wire::pin_name_hash(seen))
+}
+
+/// Lot 385: what the eBPF `obj_get_names_own_link` computes for the
+/// `OBJ_GET` path `path` that fits its buffer — the hash of the final
+/// component within the last [`PIN_NAME_LEN`] bytes (restarted at each `/`),
+/// `None` for an empty path or an empty final component. The host's model
+/// of the kernel's check, which [`pin_name_key`] must meet for every own
+/// name, whatever the path's spelling.
+#[cfg(test)]
+fn kernel_window_key(path: &[u8]) -> Option<u64> {
+    if path.is_empty() {
+        return None;
+    }
+    let window = &path[path.len().saturating_sub(PIN_NAME_LEN)..];
+    let mut h = common::wire::PIN_NAME_HASH_SEED;
+    for &c in window {
+        if c == b'/' {
+            h = common::wire::PIN_NAME_HASH_SEED;
+        } else {
+            h = (h ^ u64::from(c)).wrapping_mul(common::wire::PIN_NAME_HASH_PRIME);
+        }
+    }
+    (h != common::wire::PIN_NAME_HASH_SEED).then_some(h)
 }
 
 impl BpfGuard {
@@ -2564,8 +2606,120 @@ mod tests {
         assert_eq!(k, common::wire::pin_name_hash(b"link_task_kill"));
         assert_ne!(k, pin_name_key("link_task_kil").unwrap());
         assert!(pin_name_key("").is_none());
-        assert!(pin_name_key(&"x".repeat(PIN_NAME_LEN)).is_none());
+        // lot 385: what is no final component has no key (a long name has
+        // one now: the window's, `every_own_link_pin_name_is_matched_in_every_spelling`)
+        assert!(pin_name_key("x/y").is_none());
         assert!(pin_name_key(&"x".repeat(PIN_NAME_LEN - 1)).is_some());
+    }
+
+    /// Every name the agent may pin a link under: `link_` and each hook
+    /// and each program of the eBPF object (`#[lsm(hook = …)]`,
+    /// `#[fentry/fexit/btf_tracepoint(function = …)]`,
+    /// `#[raw_tracepoint(tracepoint = …)]` and the program's function: the
+    /// pins are named by one or the other), read from its sources — a new
+    /// program cannot be missed.
+    fn own_link_pin_names() -> Vec<String> {
+        let dir = Path::new(env!("NN_REPO_ROOT")).join("agent-ebpf/src");
+        let mut names = std::collections::BTreeSet::new();
+        let mut files = vec![dir.clone()];
+        while let Some(d) = files.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    files.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let mut pending = false;
+                for line in text.lines() {
+                    let l = line.trim();
+                    if l.starts_with("#[lsm(")
+                        || l.starts_with("#[fentry(")
+                        || l.starts_with("#[fexit(")
+                        || l.starts_with("#[btf_tracepoint(")
+                        || l.starts_with("#[raw_tracepoint(")
+                    {
+                        for key in ["hook = \"", "function = \"", "tracepoint = \""] {
+                            if let Some(v) = l.split(key).nth(1).and_then(|r| r.split('"').next()) {
+                                names.insert(format!("{LINK_PIN_PREFIX}{v}"));
+                            }
+                        }
+                        pending = true;
+                    } else if pending {
+                        if let Some(f) = l
+                            .split("fn ")
+                            .nth(1)
+                            .and_then(|r| r.split('(').next())
+                            .filter(|_| l.starts_with("pub fn ") || l.starts_with("fn "))
+                        {
+                            names.insert(format!("{LINK_PIN_PREFIX}{f}"));
+                            pending = false;
+                        }
+                    }
+                }
+            }
+        }
+        names.insert(ROLE_EXIT_LINK_PIN.to_string());
+        names.into_iter().collect()
+    }
+
+    /// Lot 385 (the external tester's F9b-6): every link pin name of the
+    /// agent is registered as the kernel's `OBJ_GET` check reads it, in every
+    /// spelling of a path that fits its buffer — absolute, relative, through
+    /// `.`, `..`, `//` or a descriptor's `/proc/self/fd/N` — and no two of
+    /// them share a key. `link_cgroup_subtree_control_write` (33 bytes) was
+    /// "too long" and not registered at all; the eBPF window and the host's
+    /// are one length.
+    #[test]
+    fn every_own_link_pin_name_is_matched_in_every_spelling() {
+        let names = own_link_pin_names();
+        assert!(names.len() >= 40, "only {} names read", names.len());
+        assert!(names
+            .iter()
+            .any(|n| n == "link_cgroup_subtree_control_write"));
+        assert!(names.iter().any(|n| n.len() > PIN_NAME_LEN));
+        let mut keys = std::collections::HashMap::new();
+        for name in &names {
+            let key = pin_name_key(name).unwrap_or_else(|| panic!("{name}: no key"));
+            if let Some(other) = keys.insert(key, name) {
+                panic!("{name} and {other} share a key");
+            }
+            let forms = [
+                format!("/sys/fs/bpf/northnarrow/{name}"),
+                name.clone(),
+                format!("./{name}"),
+                format!("/sys/fs/bpf//northnarrow//{name}"),
+                format!("/sys/fs/bpf/./northnarrow/./{name}"),
+                format!("/sys/fs/bpf/../bpf/northnarrow/{name}"),
+                format!("../northnarrow/{name}"),
+                format!("/proc/self/fd/7/{name}"),
+                format!("{}{name}", "./".repeat(100)),
+            ];
+            for path in forms.iter().filter(|p| p.len() < 255) {
+                assert_eq!(
+                    kernel_window_key(path.as_bytes()),
+                    Some(key),
+                    "{path}: the kernel's check does not read the registered name"
+                );
+            }
+        }
+        // a name of another directory's that only begins like ours is not
+        // ours; the window's length is the eBPF's
+        assert_ne!(
+            kernel_window_key(b"/sys/fs/bpf/x/link_task_kill_x"),
+            pin_name_key("link_task_kill")
+        );
+        let ebpf = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent-ebpf/src/bpf_defense.rs"
+        ));
+        assert!(
+            ebpf.contains(&format!("pub const PIN_NAME_LEN: usize = {PIN_NAME_LEN};")),
+            "the eBPF window and the host's differ"
+        );
     }
 
     /// External audit EBPF-010: the hook restarts the hash after every '/'

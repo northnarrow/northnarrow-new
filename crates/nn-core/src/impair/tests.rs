@@ -2583,3 +2583,194 @@ fn an_appimage_program_is_no_staged_lineage() {
         assert_eq!(f.suspicious.is_some(), flags & USER_IMAGE == 0, "{f:?}");
     }
 }
+
+/// Lot 385 (the external tester's F9b-4): `nn-admin unlock` left two High
+/// NN-L-EVA-002 records on `/usr/sbin/xtables-nft-multi`, its parent the
+/// agent — the agent's own release flushing its own COMBAT chain
+/// (`iptables -F NORTHNARROW_COMBAT`, `ip6tables -F …`). The agent's own
+/// helper is told by identity: its parent at the exec and its forker by the
+/// kernel's fork record are the agent, the lineage names the agent's image
+/// as its parent, it runs as root a packaged program of a system directory,
+/// and it flushes the agent's own chain. Any other chain, the same flush by
+/// a shell, by a `CLONE_PARENT` sibling (forker not the agent), by an
+/// unpackaged copy, as another user, with the fork record lost, on a host
+/// with no package database or before the agent is known: still a
+/// switch-off.
+#[test]
+fn the_agent_s_own_release_flushing_its_own_chain_is_no_switch_off() {
+    let h = host();
+    let root = TempDir::new().unwrap();
+    let info = root.path().join("var/lib/dpkg/info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(root.path().join("var/lib/dpkg/status"), "Package: x\n").unwrap();
+    std::fs::write(
+        info.join("iptables.list"),
+        "/usr/sbin/xtables-nft-multi\n/usr/sbin/iptables\n",
+    )
+    .unwrap();
+    // a packaged program outside the directories the agent runs its helpers
+    // from
+    std::fs::write(
+        info.join("other.list"),
+        "/usr/libexec/other/xtables-nft-multi\n",
+    )
+    .unwrap();
+    let detector = |owners: &std::path::Path, own: bool| {
+        let d = DefenseDetector::with_proc_root(
+            Arc::new(SecurityTools::builtin()),
+            h.lineage.clone(),
+            None,
+            h._proc.path(),
+        )
+        .with_program_owners(crate::impact::trust::ProgramOwners::new(owners));
+        if own {
+            d.set_own_spawns(OwnSpawns {
+                agent_pid: 900,
+                agent_exe: "/usr/local/bin/northnarrow-agent".into(),
+            });
+        }
+        d
+    };
+    let det = detector(root.path(), true);
+    let l = &h.lineage;
+    // the agent (900), a child of it that is not its helper (950), and a
+    // process running a copy of the agent's name elsewhere (960)
+    l.ingest_exec(
+        900,
+        1,
+        "/usr/local/bin/northnarrow-agent",
+        &["northnarrow-agent".into()],
+        3 * S,
+        3 * S,
+        0,
+    );
+    l.ingest_exec(950, 900, "/usr/sbin/nft", &["nft".into()], 4 * S, 4 * S, 0);
+    l.ingest_exec(
+        960,
+        1,
+        "/tmp/northnarrow-agent",
+        &["northnarrow-agent".into()],
+        4 * S,
+        4 * S,
+        0,
+    );
+    let run_with = |det: &DefenseDetector,
+                    pid: u32,
+                    (ppid, fork_parent, uid): (u32, u32, u32),
+                    exe: &str,
+                    argv: &[&str]| {
+        let argv_s: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let at = 100 * S + pid as u64;
+        l.ingest_exec(pid, ppid, exe, &argv_s, at, at, 0);
+        let mut e = spawn(pid, ppid, exe, argv);
+        if let Event::ProcessSpawn {
+            timestamp_ns,
+            exe: id,
+            uid: u,
+            ..
+        } = &mut e
+        {
+            *timestamp_ns = at;
+            id.fork_parent = fork_parent;
+            *u = uid;
+        }
+        det.assess(&e)
+    };
+    let ipt = "/usr/sbin/xtables-nft-multi";
+    let run = |pid: u32, who: (u32, u32, u32), argv: &[&str]| run_with(&det, pid, who, ipt, argv);
+    let agent = (900, 900, 0);
+    // the agent's release: no switch-off, either family, either spelling
+    assert!(run(5001, agent, &["iptables", "-F", "NORTHNARROW_COMBAT"]).is_none());
+    assert!(run(5002, agent, &["ip6tables", "-F", "NORTHNARROW_COMBAT"]).is_none());
+    assert!(run(5003, agent, &["iptables", "--flush", "NORTHNARROW_COMBAT"]).is_none());
+    assert!(run(5004, agent, &["iptables", "-w", "-F", "NORTHNARROW_COMBAT"]).is_none());
+    // another chain, or every chain, flushed by the agent's spawn
+    assert!(
+        run(5011, agent, &["iptables", "-F"]).is_some(),
+        "every chain"
+    );
+    assert!(
+        run(5012, agent, &["iptables", "-F", "INPUT"]).is_some(),
+        "a built-in chain"
+    );
+    assert!(
+        run(5013, agent, &["iptables", "-F", "NORTHNARROW_COMBATX"]).is_some(),
+        "a chain named like it"
+    );
+    // the agent's chain flushed by anyone else
+    let chain = ["iptables", "-F", "NORTHNARROW_COMBAT"];
+    assert!(run(5021, (200, 200, 0), &chain).is_some(), "by a shell");
+    assert!(
+        run(5022, (900, 950, 0), &chain).is_some(),
+        "a CLONE_PARENT sibling: forked by the agent's child"
+    );
+    assert!(
+        run(5023, (900, 0, 0), &chain).is_some(),
+        "the fork record lost"
+    );
+    assert!(run(5024, (900, 900, 1000), &chain).is_some(), "not as root");
+    assert!(
+        run(5025, (960, 960, 0), &chain).is_some(),
+        "a process not the agent (another pid)"
+    );
+    assert!(
+        run_with(&det, 5026, agent, "/tmp/xtables-nft-multi", &chain).is_some(),
+        "a copy outside the system directories"
+    );
+    assert!(
+        run_with(
+            &det,
+            5027,
+            agent,
+            "/usr/local/sbin/xtables-nft-multi",
+            &chain
+        )
+        .is_some(),
+        "an unpackaged program"
+    );
+    assert!(
+        run_with(&det, 5028, agent, "/usr/sbin/xtables-legacy-multi", &chain).is_some(),
+        "an unpackaged program of a system directory"
+    );
+    assert!(
+        run_with(
+            &det,
+            5029,
+            agent,
+            "/usr/libexec/other/xtables-nft-multi",
+            &chain
+        )
+        .is_some(),
+        "a packaged program outside the system directories"
+    );
+    assert!(
+        run(5030, (1, 900, 0), &chain).is_some(),
+        "forked by the agent, its parent at the exec another"
+    );
+    // the event's parent is not the agent, whatever the lineage held of
+    // the pid before
+    let argv_s: Vec<String> = chain.iter().map(|a| a.to_string()).collect();
+    l.ingest_exec(5031, 900, ipt, &argv_s, 100 * S, 100 * S, 0);
+    let mut e = spawn(5031, 1, ipt, &chain);
+    if let Event::ProcessSpawn {
+        timestamp_ns,
+        exe: id,
+        ..
+    } = &mut e
+    {
+        *timestamp_ns = 100 * S + 5031;
+        id.fork_parent = 900;
+    }
+    assert!(det.assess(&e).is_some(), "the event's parent another");
+    // a host with no package database, or the agent not known yet
+    let bare = TempDir::new().unwrap();
+    assert!(run_with(&detector(bare.path(), true), 5031, agent, ipt, &chain).is_some());
+    assert!(run_with(&detector(root.path(), false), 5032, agent, ipt, &chain).is_some());
+    // the agent's lineage changed under the pid: its exec is the agent's
+    // image no more (a pid the lineage holds for another program)
+    l.ingest_exec(900, 1, "/usr/bin/bash", &["bash".into()], 99 * S, 99 * S, 0);
+    assert!(
+        run(5041, agent, &chain).is_some(),
+        "the parent runs another image"
+    );
+}

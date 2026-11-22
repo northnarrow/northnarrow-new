@@ -591,9 +591,9 @@ nn-admin response status --key <audit-read key>
 nn-admin response release --pid 4242 --key <response-manage key>
 
 # a quarantined file, back where it was taken from ...
-nn-admin response restore --vault-id 3f2a…(32 hex) --key <response-manage key>
+nn-admin response restore --vault-id <vault id, 32 hex> --key <response-manage key>
 # ... or somewhere else, to inspect it first
-nn-admin response restore --vault-id 3f2a… --to /root/inspect/sample.bin \
+nn-admin response restore --vault-id <vault id> --to /root/inspect/sample.bin \
     --key <response-manage key>
 ```
 
