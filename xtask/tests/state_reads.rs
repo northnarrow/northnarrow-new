@@ -479,11 +479,6 @@ const KNOWN: &[(&str, &str, &str)] = &[
         OWN,
     ),
     (
-        "crates/nn-linux/src/host_hardening.rs",
-        "read_state(p)",
-        KNOB,
-    ),
-    (
         "crates/nn-linux/src/kernel_state.rs",
         "read_to_string(p.join(f))",
         KNOB,

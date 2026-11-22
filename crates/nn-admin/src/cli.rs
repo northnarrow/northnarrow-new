@@ -973,7 +973,8 @@ enum AuditCmd {
     },
 
     // Through `northnarrow_agent::audit::verify_chain_file`.
-    /// Verify the chain in `--from <path>`: every row's hash link and
+    /// Verify the chain in `--from <path>` (default: the agent's audit log,
+    /// /etc/northnarrow/audit.log): every row's hash link and
     /// signature. Loads the verifying key either from `--agent-pubkey <hex>` (off-host
     /// verification with the pubkey conveyed out-of-band) or from
     /// the local `--agent-sig-key <path>` (default
@@ -985,9 +986,12 @@ enum AuditCmd {
     /// verified before it; one pass, one line in memory at a time.
     Verify {
         /// Path to a JSONL chain file (export from `audit read
-        /// --json` or the on-disk log itself).
+        /// --json` or the on-disk log itself). Without it, the agent's
+        /// audit log, /etc/northnarrow/audit.log, which must then exist
+        /// (the agent writes it at every start): a missing one is exit 1,
+        /// never "0 entries".
         #[arg(long)]
-        from: PathBuf,
+        from: Option<PathBuf>,
         /// Explicit 64-hex-char Ed25519 pubkey of the agent's
         /// audit signing key. Set this when running off-host
         /// (the auditor doesn't have access to the agent's
@@ -1924,8 +1928,13 @@ pub fn run<H: AdminHost>(host: &H) -> ExitCode {
                     expect_head,
                     min_seq,
                 },
-        } => match load_audit_pubkey(host, agent_pubkey.as_deref(), &agent_sig_key) {
-            Ok(pubkey) => match run_audit_verify_expecting(
+        } => match audit_verify_source(from).and_then(|from| {
+            Ok((
+                from,
+                load_audit_pubkey(host, agent_pubkey.as_deref(), &agent_sig_key)?,
+            ))
+        }) {
+            Ok((from, pubkey)) => match run_audit_verify_expecting(
                 &from,
                 &pubkey,
                 &ExpectedHead {
@@ -4829,6 +4838,35 @@ fn permission_denied(e: &anyhow::Error) -> Option<String> {
 /// "evidence missing or altered", a false alarm. Without root, a chain this
 /// user may not open is a permission ([`EXIT_PERMISSION_DENIED`]). As root a
 /// refused read stays `BROKEN`: no mode refuses root, so it is evidence.
+/// Lot 385 (the external tester's F9b-1): the chain `audit verify` reads —
+/// `--from`, or the agent's audit log ([`DEFAULT_AUDIT_LOG_PATH`]) when it
+/// is not given, as `audit read` and `chain verify` default to it. The
+/// default must exist: the agent writes it at every start, so a host where
+/// it is missing is said so (exit 1), never verified as "0 entries, hash
+/// chain intact" (a file given with `--from` keeps its contract: missing is
+/// an empty chain).
+fn audit_verify_source(from: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    audit_verify_source_in(from, std::path::Path::new(DEFAULT_AUDIT_LOG_PATH))
+}
+
+/// [`audit_verify_source`] with the default `default` (tests).
+fn audit_verify_source_in(
+    from: Option<PathBuf>,
+    default: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(from) = from {
+        return Ok(from);
+    }
+    match std::fs::symlink_metadata(default) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "no audit log at {} (the agent writes it at every start: is it installed?); \
+             pass --from <file> to verify another chain",
+            default.display()
+        ),
+        _ => Ok(default.to_path_buf()),
+    }
+}
+
 fn refused_without_root<C: crate::host::Chains>(
     paths: &C,
     only: &[String],
@@ -7538,5 +7576,34 @@ mod permission_tests {
         // the alerts end at 16 (`heartbeat watch`'s help; `export verify`
         // uses 2, 11 and 13)
         assert!(include_str!("cli.rs").contains("15 stopped, 16 degraded)"));
+    }
+}
+
+/// Lot 385 (the external tester's F9b-1): `audit verify` as the guides give
+/// it (the commands of every guide are checked against nn-admin's help in
+/// `xtask/tests/documented_commands.rs`).
+#[cfg(test)]
+mod audit_verify_source_tests {
+    use super::{audit_verify_source_in, Cli};
+    use clap::Parser as _;
+
+    /// `audit verify` without `--from` reads the agent's audit log; a
+    /// missing one is said, never verified as an empty chain.
+    #[test]
+    fn audit_verify_defaults_to_the_audit_log_which_must_exist() {
+        let cli = Cli::try_parse_from(["nn-admin", "audit", "verify"]).expect("parses");
+        assert!(format!("{cli:?}").contains("from: None"), "{cli:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        let e = audit_verify_source_in(None, &log).unwrap_err().to_string();
+        assert!(e.contains("no audit log at") && e.contains("--from"), "{e}");
+        std::fs::write(&log, b"").unwrap();
+        assert_eq!(audit_verify_source_in(None, &log).unwrap(), log);
+        // a file given keeps its contract (a missing one is an empty chain)
+        let given = dir.path().join("export.jsonl");
+        assert_eq!(
+            audit_verify_source_in(Some(given.clone()), &log).unwrap(),
+            given
+        );
     }
 }

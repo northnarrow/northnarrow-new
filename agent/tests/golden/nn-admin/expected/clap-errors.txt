@@ -1073,32 +1073,7 @@ exit: 2
 --- stderr
 | error: unexpected argument '--no-such-flag' found
 |
-| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
-|
-| For more information, try '--help'.
-
-### clap.audit.verify.missing-required
-$ nn-admin audit verify
-exit: 2
---- stdout
-(empty)
---- stderr
-| error: the following required arguments were not provided:
-|   --from <FROM>
-|
-| Usage: nn-admin audit verify --from <FROM>
-|
-| For more information, try '--help'.
-
-### clap.audit.verify.stray-positional
-$ nn-admin audit verify stray-argument
-exit: 2
---- stdout
-(empty)
---- stderr
-| error: unexpected argument 'stray-argument' found
-|
-| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
+| Usage: nn-admin audit verify [OPTIONS]
 |
 | For more information, try '--help'.
 

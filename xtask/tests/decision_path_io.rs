@@ -303,8 +303,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     (
         "crates/nn-core/src/posture/lineage.rs",
         // lot 376 (the review of #583, F3): 35 → 36, `pid1_descriptor_file`;
-        // lot 378: 36 → 37, `is_user_manager_scope`
-        37,
+        // lot 378: 36 → 37, `is_user_manager_scope`; lot 385: 37 → 39,
+        // `seed_manager_scopes` (the boot-time scan's read of the user
+        // managers' scopes, off the decision path)
+        39,
         "lot 373: a package's dpkg list (`is_package_file`: R012's maintainer-script setcap \
          on the package's own files, read only for a setcap a maintainer script of a live \
          transaction runs, of a narrow capability — and, for a path no line spells, the \

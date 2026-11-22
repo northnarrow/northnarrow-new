@@ -134,6 +134,7 @@ Download the tarball, `SHA256SUMS` and its signature `SHA256SUMS.asc`
 into one directory:
 
 ```sh
+# a build from before the tag (no release page yet)? Skip to "Before the release exists" below
 ver=<ver>                            # the release you test, e.g. 0.1.0-alpha
 base=https://github.com/northnarrow/northnarrow-new/releases/download/v$ver
 curl -fLO "$base/northnarrow-$ver-x86_64-linux.tar.gz"
@@ -223,12 +224,20 @@ sudo nn-admin status --key "$KEY"
 The first summary line must say `OBSERVE-ONLY — profile alpha`.
 
 With the key left on the host, the summary adds `advisories : 1` and the
-details list `integrity: admin_key_on_host` under `advisories`: the agent
+details list `integrity: admin_key_on_host` under `advisories` — not at
+once: the advisory appears after the agent's first integrity round, within
+about 30 s of its start. The agent
 signs the key it finds there (a credential for whoever is root on the
 host) and shows it while it is found. It is an advisory, not a
 degradation: `sensors` stays `OK`. On a throwaway VM that is expected; on
 any other machine, move the key off the host — the next start no longer
 finds it (lot 379, [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#what-nn-admin-status-holds)).
+
+The installer also writes ten inert decoy files (`/etc/northnarrow/kill_switch.conf`,
+`maintenance.mode`, `/run/northnarrow/pause.flag`, … — "writing
+control-surface file" in its output). They switch nothing: opening or
+changing one is recorded as Critical, on purpose. Leave them alone unless
+you mean to test that.
 
 Run `nn-admin` with `sudo`: the agent's socket and the key are root's.
 Without `sudo`, a command that talks to the agent is refused with exit 17
@@ -260,7 +269,7 @@ source) cannot be proven to be the release:
   ```
 
   For a CI build the installer prints `tarball matches SHA256SUMS` (not
-  "signed"), and `nn-admin host-check` shows `release verified at
+  "signed"), and `sudo nn-admin host-check` shows `release verified at
   install` as a WARN naming the flag. Both are expected for such a build.
   Its version reads `0.1.0-alpha`, as the release's: the `Build:` line of
   its tree's `README-RELEASE.md` names the commit it was built from (and
@@ -304,7 +313,9 @@ Further down, among many lines:
 
 - `trust level`: how much of the agent's protection is measured
   ([BOOT_INTEGRITY.md](BOOT_INTEGRITY.md) §5). Expect **L2** under
-  `alpha` (for example `L2 (enforcing and verified, degraded)`); L3 needs
+  `alpha` (for example `L2 (enforcing and verified, degraded)`): there
+  "degraded" means detect-only (no response action runs), not a lost
+  sensor — `degradations : none` beside it is the normal pair. L3 needs
   responses that run. **L1** (a kernel deny hook missing, or the
   self-test inconclusive) or **L0** (no enforcement) is worth a report.
 - `degradations`: each one of this run, one line each, also signed in the
@@ -318,8 +329,10 @@ Further down, among many lines:
   start, the scenarios and a slow VM add some; a count that keeps rising
   on an idle host is worth a report.
 - `host hardening : <n> check(s), <m> warning(s)`, the last line: settings
-  of the host that `nn-admin host-check` lists one per row, with how to
-  fix each. They are the host's, not faults of the agent. On a throwaway
+  of the host that `sudo nn-admin host-check` lists one per row, with how
+  to fix each. Run it with `sudo`: without root some files cannot be read
+  (the admin key under `/root`, IMA's), and those rows say `cannot check:
+  run as root` instead of a verdict. They are the host's, not faults of the agent. On a throwaway
   cloud VM expect WARN rows for kernel lockdown, module signatures, Secure
   Boot, IMA, kexec and the cgroup v1 controllers, and for the admin key
   left on the host (section 4 tells you to leave it there); before the
@@ -337,7 +350,9 @@ Further down, among many lines:
 up ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md)). Without new signals the
 posture comes down by itself: ALERTED after an hour, ENGAGED after a day,
 an unlocked COMBAT 30 minutes after its last signal. A COMBAT shown as
-`locked` has no automatic exit; release it with
+`locked` has no automatic exit, by design: it is entered on evidence an
+unprivileged user cannot produce (a refusal by the kernel's anti-tamper
+hooks, such as scenario 6.8). Release it with
 `sudo nn-admin unlock --key "$KEY"`
 ([COMBAT_RECOVERY.md](COMBAT_RECOVERY.md) §3). Under `alpha`, COMBAT is
 entered and recorded but never isolates the host.
@@ -386,7 +401,9 @@ How to run them:
   Without `jq`, drop the last line and read the JSON lines as they are.
 - What each rule means, its known false positives and its own test are in
   the
-  [rule catalogue](https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CATALOGUE.md).
+  [rule catalogue](https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CATALOGUE.md)
+  (online only, not in the release tarball; for the release you test,
+  replace `main` in the link with its tag, `v<ver>`).
 - The **record to expect** is the rule and severity listed. Other records
   can appear beside it (the posture's own, or a second rule on the same
   event): that is normal. A scenario whose expected record does not
@@ -394,7 +411,9 @@ How to run them:
   diagnostics of section 8 first).
 - A few scenarios in a row raise the posture, up to COMBAT (all eight in
   a row did, in our lab). Under `alpha` nothing follows from it but
-  records, and it comes down by itself (section 5).
+  records. It comes down by itself (section 5) — except after scenario
+  6.8: a refusal by the kernel's anti-tamper hooks locks COMBAT, which then
+  waits for a signed release (its clean-up step).
 
 ### 6.1 A program run from a temporary directory
 
@@ -404,9 +423,9 @@ cp /bin/true /var/tmp/nn-demo-vartmp && /var/tmp/nn-demo-vartmp
 ```
 
 Record to expect: `R001_ExecFromTmp` (High) and `R003_ExecFromVarTmp`
-(High). Their `response` reads `none` on a calm host and `would have:
-KillProcessTree` once the posture has risen: the rule's kill depends on
-the posture. Malware often unpacks itself into a world-writable directory
+(High). Run by you, their `response` reads `none` below COMBAT and
+`would have: KillProcessTree` in COMBAT: for a person's program the rule's
+kill waits for COMBAT (ALERTED and ENGAGED still read `none`). Malware often unpacks itself into a world-writable directory
 and runs from there.
 
 Clean up: `rm -f /tmp/nn-demo-tmp /var/tmp/nn-demo-vartmp`
@@ -505,19 +524,34 @@ systemctl is-active northnarrow-agent
 The `kill` fails with `Operation not permitted`, and the agent stays
 `active`. Record to expect: `NN-L-AT-001_AntiTamperDenial` (High) with
 `"operation": "signal"` and the response `denied in kernel (anti-tamper
-LSM hook)`: this refusal is not held back by the profile. Nothing to
-clean up.
+LSM hook)`: this refusal is not held back by the profile.
+
+It also puts the posture in COMBAT, **locked** (`posture : Combat`,
+`combat stage : INVESTIGATE (locked: nn-admin unlock to release)` in
+`sudo nn-admin status`): a stop of the agent refused by the kernel is
+evidence no unprivileged user can produce, so this COMBAT does not end by
+itself. Under `alpha` it isolates nothing.
+
+Clean up: `sudo nn-admin unlock --key "$KEY"` (exit 0, `success`). The
+posture goes to ALERTED, which decays by itself after an hour. The release
+is a signed admin action in the audit log (`sudo nn-admin audit read`) and a
+`POSTURE TRANSITION` line in the agent's journal; it adds no record to
+`nn-admin detections`. (An earlier build recorded two High
+`NN-L-EVA-002_SecurityToolSwitchedOff` for the agent's own `iptables` and
+`ip6tables` removing its COMBAT chain; if you still see them on a release,
+report it.)
 
 ## 7. Read the records
 
 ```sh
 sudo nn-admin detections --key "$KEY"                        # the last 50, newest first
 sudo nn-admin detections --key "$KEY" --min-severity high --limit 20
-sudo nn-admin detections --key "$KEY" --path /tmp/           # by executable, file or process name
+sudo nn-admin detections --key "$KEY" --path /tmp/           # a part of the executable, file or process name
 ```
 
 The records come as JSON lines on standard output, a summary on standard
-error. Other filters: `--since` and `--until` (UNIX seconds), `--sensor`
+error. `--path` matches a part of the name: `--path /tmp/` also lists
+`/var/tmp/` records. Other filters: `--since` and `--until` (UNIX seconds), `--sensor`
 (`exec`, `file`, `module-load`, `network`, `anti-tamper`, `canary`). A
 row whose signature does not verify is left out, and the agent logs an
 error.
@@ -543,15 +577,17 @@ archives. Each line is a link of a signed hash chain: read it through
 
 ```sh
 sudo nn-admin chain verify          # OK or BROKEN per chain; exit 8 on any problem
-sudo nn-admin audit verify          # the signed audit log, /etc/northnarrow/audit.log
+sudo nn-admin audit verify          # the signed audit log (/etc/northnarrow/audit.log; --from for another file)
 ```
 
 [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md) says what a failed check means.
 
 **On a quiet host** you will still see a few Low records: one
-`NN-L-BPF-002` at each start of the agent or the watchdog, records at boot
-for systemd's own kernel programs, logrotate's daily run, and on cloud
-images cloud-init's netcat at each boot. Other known false positives are
+`NN-L-BPF-002` at each start of the agent or the watchdog, at the agent's
+start `NN-L-AT-001` with `"operation": "bpf_baseline"` for the kernel's
+and systemd's own BPF programs it finds already loaded (found, not
+refused), logrotate's daily run, and on cloud images cloud-init's netcat at
+each boot. Other known false positives are
 in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md#false-positives-you-may-see).
 
 ## 8. Collect diagnostics without personal data
@@ -570,7 +606,7 @@ since=$(( $(date +%s) - 3600 ))
 d=$(mktemp -d /tmp/nn-diag.XXXXXX)
 { nn-admin --version; grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release; uname -r; } > "$d/system.txt" 2>&1
 sudo nn-admin status --key "$KEY" > "$d/status.txt" 2>&1
-nn-admin host-check > "$d/host-check.txt" 2>&1
+sudo nn-admin host-check > "$d/host-check.txt" 2>&1
 sudo nn-admin chain verify > "$d/chain-verify.txt" 2>&1
 sudo nn-admin detections --key "$KEY" --since "$since" --limit 200 > "$d/records.jsonl" 2> "$d/records-summary.txt"
 sudo journalctl --namespace=northnarrow --since "@$since" --no-pager > "$d/agent-journal.txt" 2>&1
@@ -615,10 +651,20 @@ attach the admin key, any file from `/etc/northnarrow`, or a real
 credential. The journal can be long; `grep` helps:
 
 ```sh
-grep -rlF -e "$(hostname)" -e "$(cat /etc/machine-id)" "$d"   # must print nothing
+grep -rlF -e "$(hostname)" -e "$(hostname -f)" -e "$(cat /etc/machine-id)" "$d"   # must print nothing
 U=$(id -un); [ "$U" = root ] || grep -rnP "(?<![\w/.-])\Q$U\E(?![\w.-])" "$d"   # must print nothing
 grep -nE ' (WARN|ERROR) ' "$d/agent-journal.txt"              # the lines to read first
 ```
+
+A clean install already gives many of those lines; these are expected and
+not worth a report on their own: `fim recompute: compute_baseline failed
+… not a regular file` (directories of the shipped FIM list), `skip
+register_etc_files entry — file missing` (the optional `*.local` and `.sig`
+files you did not create), `ERROR INTEGRITY DRIFT … admin_key_on_host`
+(the admin key left on the host: the advisory of section 4),
+`RLIMIT_MEMLOCK`, `tracefs root not used`, and the `VERDICT` and `POSTURE
+TRANSITION` lines of the scenarios you ran. Anything else is worth a look
+in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) first.
 
 Paste short files into the form's fields. Attach long ones, such as the
 journal, as files: drag them into a text box of the form (GitHub takes
@@ -640,10 +686,17 @@ What counts, for example: a way to stop, blind or get around the agent's
 self-protection without a record, a way to make it sign something false,
 or a crash caused by an unprivileged user.
 
+Not sure whether something touches the self-protection (a journal line
+naming the agent's own BPF objects, pins or hooks, for example)? Report it
+privately: it is moved to a public issue if it is not.
+
 **Anything else: open an issue** on
 https://github.com/northnarrow/northnarrow-new/issues/new/choose, after a
-look at [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md). Pick the form that
-fits; each asks for what the diagnostics of section 8 gather:
+look at [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md): it is long, so search
+it for the rule id or the journal message you saw. Pick the form that
+fits; each asks for what the diagnostics of section 8 gather (the
+release, the distribution and kernel, what you ran and what you saw, the
+record or the `status`, and the journal lines):
 
 | Form | Use it for |
 |---|---|

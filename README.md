@@ -340,8 +340,10 @@ Then:
 
 ```sh
 sudo ./deploy/install.sh --source-tree     # bootstraps an admin key at /root/northnarrow-admin.key: move it off-host
-sudo systemctl enable --now northnarrow-agent northnarrow-watchdog
 ```
+
+`install.sh` starts both units and enables them at boot (`--no-enable` leaves them stopped; then
+`sudo systemctl enable --now northnarrow-agent northnarrow-watchdog` when you are ready).
 
 **From a release (once one is published).** The first is `v0.1.0-alpha`: `<ver>` below is
 `0.1.0-alpha`, and the packages are `northnarrow_0.1.0-alpha-1_amd64.deb` and
@@ -356,17 +358,17 @@ gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/n
   --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
   --deny-self-hosted-runners
 
-# 2. Install (does NOT start anything; bootstraps an admin key at /root/northnarrow-admin.key
-#    that you must move off-host). install.sh checks the tree's MANIFEST.sha256, the tarball
-#    against SHA256SUMS (both found in ..) and the attestation (gh, or cosign with --attestation).
+# 2. Install: starts both units and enables them at boot (--no-enable leaves them stopped), and
+#    bootstraps an admin key at /root/northnarrow-admin.key that you must move off-host.
+#    install.sh checks the tree's MANIFEST.sha256, the tarball against SHA256SUMS (both found
+#    in ..) and the attestation (gh, or cosign with --attestation).
 tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux
 sudo ./deploy/install.sh
-sudo systemctl enable --now northnarrow-agent northnarrow-watchdog
 
 # 3. Look around
 sudo nn-admin status
 sudo nn-admin detections --key <offline-admin.key> --limit 20   # signed read (telemetry-read role)
-sudo nn-admin audit verify                                      # walks the signed hash chain
+sudo nn-admin audit verify                                      # the signed audit log's hash chain
 sudo nn-admin host-check                                        # the host's own hardening
 
 # Later (both need a key with the trusted-installer role)

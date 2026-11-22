@@ -350,7 +350,10 @@ fn kernel_fixes(root: &Path) -> Check {
             id: "kernel_fixes",
             name: "Kernel fixes the sandbox relies on",
             status: Status::Unknown,
-            value: "osrelease unreadable".to_string(),
+            value: match read_as(root, "/proc/sys/kernel/osrelease") {
+                Err(u) => u.said("osrelease absent"),
+                Ok(_) => "osrelease unparsable".to_string(),
+            },
             fix,
         };
     };
@@ -415,9 +418,9 @@ fn cgroup_v1(root: &Path) -> Check {
         .flat_map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
         .collect();
     let all = disabled.iter().any(|d| d == "all");
-    let (status, value) = match read(root, "/proc/cgroups") {
-        None => (Status::Unknown, "/proc/cgroups unreadable".to_string()),
-        Some(table) => {
+    let (status, value) = match read_as(root, "/proc/cgroups") {
+        Err(u) => (Status::Unknown, u.said("/proc/cgroups absent")),
+        Ok(table) => {
             let enabled: Vec<&str> = table
                 .lines()
                 .filter(|l| !l.starts_with('#'))
@@ -576,15 +579,26 @@ pub const ADMIN_KEY_PATHS: &[&str] = &["etc/northnarrow/admin.key", "root/northn
 /// The admin private keys found at [`ADMIN_KEY_PATHS`] under `root`
 /// (non-empty regular files), as absolute host paths.
 pub fn admin_keys_on_host(root: &Path) -> Vec<String> {
-    ADMIN_KEY_PATHS
-        .iter()
-        .filter(|rel| {
-            antitamper_bpf::kernel_roots::metadata(root.join(rel))
-                .map(|m| m.is_file() && m.len() > 0)
-                .unwrap_or(false)
-        })
-        .map(|rel| format!("/{rel}"))
-        .collect()
+    admin_key_probe(root).0
+}
+
+/// Lot 385 (the external tester's F9b-2): [`admin_keys_on_host`], and the
+/// bootstrap paths this user could not look at (`/root` is root's: run
+/// without root, the key there was "none" and the check said `OK`).
+pub fn admin_key_probe(root: &Path) -> (Vec<String>, Vec<Unread>) {
+    let mut found = Vec::new();
+    let mut unread = Vec::new();
+    for rel in ADMIN_KEY_PATHS {
+        match antitamper_bpf::kernel_roots::metadata(root.join(rel)) {
+            Ok(m) if m.is_file() && m.len() > 0 => found.push(format!("/{rel}")),
+            Ok(_) => {}
+            Err(e) => match Unread::of(&e, rel) {
+                Unread::Absent => {}
+                u => unread.push(u),
+            },
+        }
+    }
+    (found, unread)
 }
 
 /// Number of `Warn` checks in `checks`.
@@ -623,6 +637,17 @@ pub fn render_table(checks: &[Check]) -> String {
             ""
         }
     ));
+    // Lot 385 (F9b-2): checks this user could not read, said apart — the
+    // count above holds no verdict about them
+    let unread = checks
+        .iter()
+        .filter(|c| c.value.starts_with(CANNOT_CHECK))
+        .count();
+    if unread > 0 {
+        out.push_str(&format!(
+            "{unread} check(s) could not be read as this user — run it as root: `sudo nn-admin host-check`\n"
+        ));
+    }
     // Lot 377: a host the agent cannot run on, said apart from the hardening
     let fails = fail_count(checks);
     if fails > 0 {
@@ -634,17 +659,61 @@ pub fn render_table(checks: &[Check]) -> String {
 }
 
 fn read(root: &Path, rel: &str) -> Option<String> {
+    read_as(root, rel).ok()
+}
+
+/// Lot 385 (the external tester's F9b-2): why a host file gave no value.
+/// `nn-admin host-check` run without root cannot read some of them (the
+/// admin key under `/root`, IMA's securityfs files): a check that could not
+/// look says so, never `OK` nor "not present".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unread {
+    /// The file is not there.
+    Absent,
+    /// The file is there and this user may not read it (`EACCES`, `EPERM`).
+    Denied(String),
+    /// Another error.
+    Failed(String),
+}
+
+/// The value of a check that could not read its file as this user.
+pub const CANNOT_CHECK: &str = "cannot check: run as root";
+
+impl Unread {
+    fn of(e: &std::io::Error, rel: &str) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => Unread::Absent,
+            std::io::ErrorKind::PermissionDenied => {
+                Unread::Denied(format!("/{}", rel.trim_start_matches('/')))
+            }
+            _ => Unread::Failed(format!("/{}: {e}", rel.trim_start_matches('/'))),
+        }
+    }
+
+    /// What the check shows: `absent` when the file is not there, else why
+    /// it could not be read.
+    pub fn said(&self, absent: &str) -> String {
+        match self {
+            Unread::Absent => absent.to_string(),
+            Unread::Denied(path) => format!("{CANNOT_CHECK} ({path} is not readable as this user)"),
+            Unread::Failed(why) => format!("cannot check: {why}"),
+        }
+    }
+}
+
+/// The trimmed text of `rel` under `root`, or why there is none.
+fn read_as(root: &Path, rel: &str) -> Result<String, Unread> {
     let p: PathBuf = root.join(rel.trim_start_matches('/'));
     crate::state_read::read_state(p)
-        .ok()
         .map(|s| s.trim().to_string())
+        .map_err(|e| Unread::of(&e, rel))
 }
 
 fn bpf_lsm(root: &Path) -> Check {
-    let (status, value) = match read(root, "/sys/kernel/security/lsm") {
-        Some(list) if list.split(',').any(|l| l == "bpf") => (Status::Ok, list),
-        Some(list) => (Status::Warn, list),
-        None => (Status::Unknown, "securityfs not readable".to_string()),
+    let (status, value) = match read_as(root, "/sys/kernel/security/lsm") {
+        Ok(list) if list.split(',').any(|l| l == "bpf") => (Status::Ok, list),
+        Ok(list) => (Status::Warn, list),
+        Err(u) => (Status::Unknown, u.said("securityfs not readable")),
     };
     Check {
         id: "bpf_lsm",
@@ -662,16 +731,14 @@ const LOCKDOWN_FIX: &str = "boot with `lockdown=integrity` (Secure Boot enables 
 const LOCKDOWN_CONFIDENTIALITY_FIX: &str = "boot with `lockdown=integrity` instead of `confidentiality`: confidentiality takes from every BPF program loaded after it the helpers that read kernel memory (bpf_probe_read_kernel and its kin) and refuses new kprobes, so the agent's next start (an upgrade, a restart) loads without the sensors and deny hooks that use them (docs/operator/KERNEL_COMPATIBILITY.md, \"Lockdown\"); integrity keeps every protection against rewriting the kernel";
 
 fn lockdown(root: &Path) -> Check {
-    let (status, value, fix) = match read(root, "/sys/kernel/security/lockdown") {
+    let (status, value, fix) = match read_as(root, "/sys/kernel/security/lockdown") {
         // Lot 280b: confidentiality blinds the agent's next start
-        Some(s) if s.contains("[confidentiality]") => {
-            (Status::Warn, s, LOCKDOWN_CONFIDENTIALITY_FIX)
-        }
-        Some(s) if s.contains("[integrity]") => (Status::Ok, s, LOCKDOWN_FIX),
-        Some(s) => (Status::Warn, s, LOCKDOWN_FIX),
-        None => (
+        Ok(s) if s.contains("[confidentiality]") => (Status::Warn, s, LOCKDOWN_CONFIDENTIALITY_FIX),
+        Ok(s) if s.contains("[integrity]") => (Status::Ok, s, LOCKDOWN_FIX),
+        Ok(s) => (Status::Warn, s, LOCKDOWN_FIX),
+        Err(u) => (
             Status::Unknown,
-            "lockdown LSM not present".to_string(),
+            u.said("lockdown LSM not present"),
             LOCKDOWN_FIX,
         ),
     };
@@ -685,10 +752,10 @@ fn lockdown(root: &Path) -> Check {
 }
 
 fn unprivileged_bpf(root: &Path) -> Check {
-    let (status, value) = match read(root, "/proc/sys/kernel/unprivileged_bpf_disabled") {
-        Some(v) if v == "1" || v == "2" => (Status::Ok, v),
-        Some(v) => (Status::Warn, v),
-        None => (Status::Unknown, "sysctl absent".to_string()),
+    let (status, value) = match read_as(root, "/proc/sys/kernel/unprivileged_bpf_disabled") {
+        Ok(v) if v == "1" || v == "2" => (Status::Ok, v),
+        Ok(v) => (Status::Warn, v),
+        Err(u) => (Status::Unknown, u.said("sysctl absent")),
     };
     Check {
         id: "unprivileged_bpf",
@@ -716,22 +783,22 @@ fn module_sig_enforce(root: &Path) -> Check {
     // Lot 277: `kernel.modules_disabled=1` (one-way until reboot) refuses
     // every module load, signed or not.
     let modules_off = read(root, "/proc/sys/kernel/modules_disabled").as_deref() == Some("1");
-    let (status, value) = match read(root, "/sys/module/module/parameters/sig_enforce") {
-        Some(v) if v == "Y" => (Status::Ok, v),
-        Some(v) if modules_off => (
+    let (status, value) = match read_as(root, "/sys/module/module/parameters/sig_enforce") {
+        Ok(v) if v == "Y" => (Status::Ok, v),
+        Ok(v) if modules_off => (
             Status::Ok,
             format!("{v} (every module load refused: modules_disabled=1)"),
         ),
-        Some(v) => match lockdown_mode {
+        Ok(v) => match lockdown_mode {
             Some(mode) => (
                 Status::Ok,
                 format!("{v} (unsigned modules refused by lockdown={mode})"),
             ),
             None => (Status::Warn, v),
         },
-        None => (
+        Err(u) => (
             Status::Unknown,
-            "parameter absent (CONFIG_MODULE_SIG off?)".to_string(),
+            u.said("parameter absent (CONFIG_MODULE_SIG off?)"),
         ),
     };
     Check {
@@ -749,9 +816,13 @@ fn secure_boot(root: &Path) -> Check {
         Ok(bytes) if bytes.len() >= 5 && bytes[4] == 1 => (Status::Ok, "enabled".to_string()),
         Ok(bytes) if bytes.len() >= 5 => (Status::Warn, "disabled".to_string()),
         Ok(_) => (Status::Unknown, "efivar unreadable".to_string()),
-        Err(_) => (
+        Err(e) => (
             Status::Unknown,
-            "no EFI variable (legacy BIOS or VM without UEFI)".to_string(),
+            Unread::of(
+                &e,
+                "sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+            )
+            .said("no EFI variable (legacy BIOS or VM without UEFI)"),
         ),
     };
     Check {
@@ -764,21 +835,28 @@ fn secure_boot(root: &Path) -> Check {
 }
 
 fn ima(root: &Path) -> Check {
-    let count = read(root, "/sys/kernel/security/ima/runtime_measurements_count").or_else(|| {
-        read(
-            root,
-            "/sys/kernel/security/integrity/ima/runtime_measurements_count",
-        )
-    });
+    // either place; a file that is there but not readable is said, never
+    // "not present" (lot 385: securityfs's ima/ is root's)
+    let count =
+        read_as(root, "/sys/kernel/security/ima/runtime_measurements_count").or_else(|first| {
+            read_as(
+                root,
+                "/sys/kernel/security/integrity/ima/runtime_measurements_count",
+            )
+            .map_err(|second| {
+                if first == Unread::Absent {
+                    second
+                } else {
+                    first
+                }
+            })
+        });
     let (status, value) = match count {
-        Some(v) => match v.parse::<u64>() {
+        Ok(v) => match v.parse::<u64>() {
             Ok(n) if n > 0 => (Status::Ok, format!("{n} measurements")),
             _ => (Status::Warn, format!("{v} measurements (no policy loaded)")),
         },
-        None => (
-            Status::Unknown,
-            "IMA not present in this kernel".to_string(),
-        ),
+        Err(u) => (Status::Unknown, u.said("IMA not present in this kernel")),
     };
     Check {
         id: "ima",
@@ -797,24 +875,21 @@ fn kexec_load_disabled(root: &Path) -> Check {
         && limit("/proc/sys/kernel/kexec_load_limit_panic").as_deref() == Some("0");
     let lockdown_on = read(root, "/sys/kernel/security/lockdown")
         .is_some_and(|s| s.contains("[integrity]") || s.contains("[confidentiality]"));
-    let (status, value) = match read(root, "/proc/sys/kernel/kexec_load_disabled") {
-        Some(v) if v == "1" => (Status::Ok, v),
-        Some(v) if limits_zero => (
+    let (status, value) = match read_as(root, "/proc/sys/kernel/kexec_load_disabled") {
+        Ok(v) if v == "1" => (Status::Ok, v),
+        Ok(v) if limits_zero => (
             Status::Ok,
             format!("{v} (kexec_load_limit_reboot and _panic 0: no load left)"),
         ),
-        Some(v) if lockdown_on => (
+        Ok(v) if lockdown_on => (
             Status::Warn,
             format!(
                 "{v} (lockdown refuses an unsigned image; a signed kernel still boots with \
                  another command line)"
             ),
         ),
-        Some(v) => (Status::Warn, v),
-        None => (
-            Status::Unknown,
-            "sysctl absent (CONFIG_KEXEC off)".to_string(),
-        ),
+        Ok(v) => (Status::Warn, v),
+        Err(u) => (Status::Unknown, u.said("sysctl absent (CONFIG_KEXEC off)")),
     };
     Check {
         id: "kexec_load_disabled",
@@ -933,11 +1008,12 @@ fn bpffs_mounts(root: &Path) -> Check {
 /// for whoever is root on it — COMBAT release, trusted-installer windows
 /// (the anti-tamper suspended), overlay signatures.
 fn admin_key(root: &Path) -> Check {
-    let found = admin_keys_on_host(root);
-    let (status, value) = if found.is_empty() {
-        (Status::Ok, "none at the bootstrap paths".to_string())
-    } else {
-        (Status::Warn, found.join(", "))
+    let (found, unread) = admin_key_probe(root);
+    let (status, value) = match unread.first() {
+        _ if !found.is_empty() => (Status::Warn, found.join(", ")),
+        // lot 385: a path not looked at is no key absent
+        Some(u) => (Status::Unknown, u.said("")),
+        None => (Status::Ok, "none at the bootstrap paths".to_string()),
     };
     Check {
         id: "admin_key",
@@ -951,6 +1027,101 @@ fn admin_key(root: &Path) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lot 385 (the external tester's F9b-2): `nn-admin host-check` run
+    /// without root said `OK admin private key off the host — none at the
+    /// bootstrap paths` with the key in `/root`, and `IMA not present` with
+    /// IMA on. Every file the checks read is here, with a value that would
+    /// pass, and none can be read by this user: no check says `OK`, and each
+    /// one that could not look says so. (As root every file is read: the
+    /// test needs another user.)
+    #[test]
+    fn a_check_that_cannot_read_never_says_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads every file");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let files: &[(&str, &[u8])] = &[
+            ("sys/kernel/security/lsm", b"lockdown,capability,bpf"),
+            (
+                "sys/kernel/security/lockdown",
+                b"none [integrity] confidentiality",
+            ),
+            ("sys/kernel/security/ima/runtime_measurements_count", b"12"),
+            ("proc/sys/kernel/unprivileged_bpf_disabled", b"2"),
+            ("sys/module/module/parameters/sig_enforce", b"Y"),
+            (
+                "sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                &[7, 0, 0, 0, 1],
+            ),
+            ("proc/sys/kernel/kexec_load_disabled", b"1"),
+            ("proc/cmdline", b"cgroup_no_v1=all"),
+            (
+                "proc/cgroups",
+                b"#subsys_name hierarchy num_cgroups enabled\nfreezer 0 1 1\n",
+            ),
+            ("proc/sys/kernel/osrelease", b"6.20.0"),
+            ("root/northnarrow-admin.key", b"secret"),
+            ("etc/ld.so.preload", b""),
+        ];
+        for (rel, body) in files {
+            w(root, rel, body);
+            std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        // `/root` itself is root's
+        std::fs::set_permissions(root.join("root"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let checks = run_in(root);
+        let (found, unread) = admin_key_probe(root);
+        std::fs::set_permissions(root.join("root"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            found.is_empty() && unread.len() == 1,
+            "{found:?} {unread:?}"
+        );
+        let ok: Vec<String> = checks
+            .iter()
+            .filter(|c| c.status == Status::Ok)
+            .map(|c| format!("{}: {}", c.id, c.value))
+            .collect();
+        assert!(ok.is_empty(), "OK without reading: {ok:?}");
+        for id in [
+            "bpf_lsm",
+            "lockdown",
+            "unprivileged_bpf",
+            "module_sig_enforce",
+            "secure_boot",
+            "ima",
+            "kexec_load_disabled",
+            "admin_key",
+            "cgroup_v1",
+            "kernel_fixes",
+        ] {
+            let c = checks.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(c.status, Status::Unknown, "{id}: {}", c.value);
+            assert!(c.value.starts_with(CANNOT_CHECK), "{id}: {}", c.value);
+        }
+        let table = render_table(&checks);
+        assert!(
+            table.contains("10 check(s) could not be read as this user — run it as root"),
+            "{table}"
+        );
+        // the key readable: a WARN, and an absent file is said as absent
+        let c = run_in(root)
+            .into_iter()
+            .find(|c| c.id == "admin_key")
+            .unwrap();
+        assert_eq!(
+            (c.status, c.value.as_str()),
+            (Status::Warn, "/root/northnarrow-admin.key")
+        );
+        assert_eq!(Unread::Absent.said("IMA not present"), "IMA not present");
+    }
 
     fn w(root: &Path, rel: &str, body: &[u8]) {
         let p = root.join(rel);

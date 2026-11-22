@@ -2282,6 +2282,60 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 385 (pre-alpha Phase 9b, the external tester's findings on rc13;
+  `UPGRADE_NOTES_WAVE4.md` §70).
+  - **`nn-admin audit verify` takes the agent's audit log by default.**
+    The tester's guide (§7), the README's Quickstart and
+    `INSTALL_UPGRADE_UNINSTALL.md` gave `sudo nn-admin audit verify`, which
+    exited 2 for a missing `--from`. `--from` now defaults to
+    `/etc/northnarrow/audit.log`, as `audit read` and `chain verify` do; the
+    default must exist (a missing audit log is exit 1, never "0 entries,
+    hash chain intact"). A ratchet parses every `nn-admin` command of the
+    README and the operator guides with `nn-admin`'s own command line (one
+    more doc fixed: `COMBAT_RECOVERY.md`'s `response restore` example).
+    Tests `every_documented_nn_admin_command_parses`,
+    `audit_verify_defaults_to_the_audit_log_which_must_exist`,
+    `the_checker_reads_commands_and_refuses_a_wrong_one`. The README's
+    Quickstart no longer says the install "does NOT start anything":
+    `install.sh` starts and enables both units (`--no-enable` does not).
+  - **`nn-admin host-check` never says `OK` where it could not look.** Run
+    without root (as the guide's §8 did), it said `OK admin private key off
+    the host — none at the bootstrap paths` with the key in `/root`, and
+    `IMA not present` with IMA on. A file this user cannot read now makes
+    its row `n/a` with `cannot check: run as root (…)`, and the table counts
+    those rows ("run it as root"). Test
+    `a_check_that_cannot_read_never_says_ok`. The guide runs it with `sudo`.
+  - **The agent's own release is no security tool switched off.**
+    `nn-admin unlock` left two High `NN-L-EVA-002_SecurityToolSwitchedOff`
+    on `/usr/sbin/xtables-nft-multi`, the agent removing its own
+    `NORTHNARROW_COMBAT` chain. That flush is told by identity: run as root
+    by the agent's own fork (its parent at the exec and its forker by the
+    kernel's fork record), its parent in the lineage the agent's image, a
+    packaged program of a system directory, and only the agent's chain.
+    Any other chain, or the same flush by any other process, a
+    `CLONE_PARENT` sibling, an unpackaged copy: still recorded. Test
+    `the_agent_s_own_release_flushing_its_own_chain_is_no_switch_off`.
+  - **A login made before the install no longer raises ALERTED.** The
+    `(sd-pam)` of a user manager older than the agent reads
+    `/etc/login.defs` as the manager stops; lot 378 knew it by its
+    manager's scope, looked up when the open was judged — and systemd
+    removes the scope a few milliseconds after that read (the lab measured
+    2 ms between the judgement and the unit's end): a judgement a little
+    late (a busy first start, a slow VM) raised ALERTED on an idle host.
+    The scope's id is now read by the agent's start's scan, while the
+    manager runs; the same membership is asked, of the same scope. Test
+    `an_older_manager_s_sd_pam_judged_after_its_scope_is_gone`.
+  - **The tester's guide says what happens.** Scenario 6.8 leaves a
+    **locked** COMBAT by design (a stop refused by the kernel is evidence no
+    user can produce): its clean-up is `sudo nn-admin unlock`, and §6 no
+    longer says the posture always comes down by itself. Also: the advisory
+    appears after the first integrity round (within about 30 s), the ten
+    decoy files, "degraded" under `alpha` means detect-only, when R001's
+    response turns into `would have: KillProcessTree` (COMBAT), `--path`
+    matches a part of the name, `NN-L-AT-001` `bpf_baseline` at the start,
+    the expected WARN/ERROR lines of a clean install, `hostname -f` in the
+    privacy check, and when in doubt, report privately.
+
 - Lot 360 (pre-alpha Phase 4b, F4b-1, P2): **an AppImage's fork-only child
   is judged like its AppImage, and an image named with 31 bytes or more is
   tied** (`UPGRADE_NOTES_WAVE4.md` §53). A type-2 AppImage's zygote child
