@@ -6157,8 +6157,8 @@ fires.
   itself restarted while networkd ran without its monitor, or after an
   upgrade that changed the monitor's program, the re-attach stays High
   until the next boot.
-- **Docs.** "A stall of more than 15 s" is now "a long stall"
-  (KNOWN_LIMITATIONS.md) and the `agent_stalled` row of
+- **Docs.** KNOWN_LIMITATIONS.md speaks of a long stall and no longer
+  gives the stall's bound; the `agent_stalled` row of
   INSTALL_UPGRADE_UNINSTALL.md says "for a long time". The Debian 13
   `mount` item says what was measured: a propagation change of the pin
   directory's lock, `/`, `/sys` or `/sys/fs/bpf`, or a read-only bind

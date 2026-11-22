@@ -11711,7 +11711,13 @@ number in parentheses is a lab PR.
   - Done:
     - **The refusal is unchanged.** The `bpf` hook's record now carries the
       attached program's tag (`nn_prog_tag_of_fd`, a global BPF function;
-      0 when not read, the refusal independent of it).
+      0 when not read, the refusal independent of it). The review of #594
+      (P2-1): the tag is read inside the record's call, and
+      `blinding_switches` pins the root branch literally again (no
+      condition, no return between the branch and the refusal) and the
+      whole judged block; a planted `if tag == <the monitor's> { return 0;
+      }`, before the record or before the branch, fails it. The object's
+      code is unchanged by the move (its disassembly, every section).
     - **The proof** (`known_system_prog::known_reattach`, marked past the
       bus's lineage barrier: `mark_known_reattach_on_host`): the tag is the
       one of the program lot 304 proved attached by networkd before the
@@ -11726,7 +11732,8 @@ number in parentheses is a lab PR.
       response, the proof, the reference, the mark at the bus, the rule, the
       posture, the hook's writer), 36 caught by a named test (two after a
       test each: the PID 1 entry's facts, another refusal of the same
-      target).
+      target). The tag is compared before any `/proc` read (the review of
+      #594, P3-2).
     - Docs: KNOWN_LIMITATIONS (networkd's monitor: the systemd versions,
       what networkd loses, until when, when it stays High; "a long stall";
       F3c-2 as measured), INSTALL_UPGRADE_UNINSTALL (`agent_stalled`), the

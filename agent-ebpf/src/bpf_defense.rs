@@ -1899,20 +1899,13 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
             None => ROOT_UNREADABLE,
         };
+        // Lot 386: the record carries the attached program's tag (user
+        // space tells networkd's monitor re-attaching by it), read inside
+        // the call for the record alone. Nothing sits between the branch
+        // and the refusal — no condition, no return (the review of #594:
+        // xtask's blinding_switches pins the block literally).
         if root != ROOT_NO {
-            // lot 386: with the attached program's tag, for the record
-            // alone (`target_dev`; 0: not read) — told networkd's monitor
-            // re-attaching by user space, refused all the same
-            let tag = match prog_fd_offset(cmd) {
-                Some(off) if !attr.is_null() => {
-                    match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
-                        Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),
-                        Err(_) => 0,
-                    }
-                }
-                _ => 0,
-            };
-            emit_root_attach(tag, arg);
+            emit_root_attach(attached_prog_tag(cmd, attr), arg);
             return -EPERM;
         }
     }
@@ -2013,6 +2006,23 @@ fn emit_syscall(cmd: u32, arg: u32) {
 #[inline(always)]
 fn emit_denial(operation: u8, object_id: u32) {
     emit_denial_kind(operation, 0, object_id)
+}
+
+/// Lot 386: the tag of the program a `cgroup/sysctl` attach names
+/// ([`nn_prog_tag_of_fd`]), for the record of its refusal alone — 0 when
+/// the attribute or the descriptor cannot be read. A value, never a
+/// decision: the refusal is the caller's, unconditional.
+#[inline(always)]
+unsafe fn attached_prog_tag(cmd: u32, attr: *const c_void) -> u64 {
+    match prog_fd_offset(cmd) {
+        Some(off) if !attr.is_null() => {
+            match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+                Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),
+                Err(_) => 0,
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// Lot 386: a refused root `cgroup/sysctl` attach's record — the attached

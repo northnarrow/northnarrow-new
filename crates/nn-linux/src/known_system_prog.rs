@@ -684,24 +684,7 @@ pub fn known_reattach(
     account_uid: &dyn Fn(&str) -> Option<u32>,
 ) -> Result<usize, String> {
     use common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS;
-    if f.tag == 0 {
-        return Err("the hook read no program from the attach".to_string());
-    }
-    let entry = references
-        .iter()
-        .find(|(e, tag)| {
-            *tag == f.tag
-                && KNOWN_SYSTEM_PROGRAMS
-                    .get(*e)
-                    .is_some_and(|k| k.link == KnownLink::RootCgroupSysctl)
-        })
-        .map(|(e, _)| *e)
-        .ok_or_else(|| {
-            format!(
-                "its tag {} is no tag of a known program attached to the root before the agent                  started",
-                common::bpf_prog_class::tag_hex(f.tag)
-            )
-        })?;
+    let entry = reattach_reference(f.tag, references)?;
     let k = KNOWN_SYSTEM_PROGRAMS[entry];
     if f.exe.as_deref() != Some(k.loader) {
         return Err(format!("it did not execute {}", k.loader));
@@ -721,6 +704,32 @@ pub fn known_reattach(
         return Err(format!("not in {}'s cgroup", k.unit));
     }
     Ok(entry)
+}
+
+/// The entry of `references` whose program has tag `tag` and is attached
+/// to the root's `cgroup/sysctl` slot — the first test of
+/// [`known_reattach`], made from memory alone.
+fn reattach_reference(tag: u64, references: &[(usize, u64)]) -> Result<usize, String> {
+    use common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS;
+    if tag == 0 {
+        return Err("the hook read no program from the attach".to_string());
+    }
+    references
+        .iter()
+        .find(|(e, t)| {
+            *t == tag
+                && KNOWN_SYSTEM_PROGRAMS
+                    .get(*e)
+                    .is_some_and(|k| k.link == KnownLink::RootCgroupSysctl)
+        })
+        .map(|(e, _)| *e)
+        .ok_or_else(|| {
+            format!(
+                "its tag {} is no tag of a known program attached to the root before the \
+                 agent started",
+                common::bpf_prog_class::tag_hex(tag)
+            )
+        })
 }
 
 /// [`known_reattach`] on this host: [`known_reattach_by`] with the
@@ -748,7 +757,9 @@ pub fn known_reattach_on_host(
 /// a program of tag `tag` refused at `at_ns` (`CLOCK_MONOTONIC`), as
 /// `lineage` recorded it as of the refusal — its exec's file, image, uid and
 /// fork record, its service read for the start that exec recorded, the
-/// account from the host's `/etc/passwd`.
+/// account from the host's `/etc/passwd`. The tag is compared first: a
+/// program that is no reference costs no `/proc` read on the decision
+/// thread (the review of #594, P3-2).
 pub fn known_reattach_by(
     lineage: &AuthSessionTracker,
     references: &[(usize, u64)],
@@ -757,6 +768,7 @@ pub fn known_reattach_by(
     tag: u64,
     at_ns: u64,
 ) -> Result<usize, String> {
+    reattach_reference(tag, references)?;
     let as_of = AsOf::judged(at_ns);
     let exe = lineage
         .exec_identity(pid, as_of)
@@ -1190,6 +1202,47 @@ mod tests {
             "root at the attach"
         );
         assert!(prove(4040, MONITOR_TAG, 7 * s).is_err(), "no exec recorded");
+    }
+
+    /// Lot 386 (the review of #594, P3-2): the tag is compared before any
+    /// fact is read — a refused attach of a program that is no reference
+    /// (root's own, flooding) costs no `/proc` read on the decision thread;
+    /// its refusal names the tag, in words.
+    #[test]
+    fn a_reattach_s_tag_is_compared_before_any_proc_read() {
+        let src = include_str!("known_system_prog.rs");
+        let by = &src[src.find("\npub fn known_reattach_by(").unwrap()..];
+        let by = &by[..by.find("\n}\n").unwrap()];
+        let tag = by
+            .find("reattach_reference(tag, references)?;")
+            .expect("the tag compared in known_reattach_by");
+        for read in [
+            "exec_identity(",
+            "lineage_starts(",
+            "exec_file(",
+            "fork_parent(",
+            "system_service_started(",
+            "account_uid(",
+        ] {
+            assert!(
+                by.find(read).is_some_and(|i| i > tag),
+                "{read} before the tag"
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        let lineage = AuthSessionTracker::new(&t.path().join("proc")).with_host_root(t.path());
+        let none = |_: &str| None;
+        let e = known_reattach_by(&lineage, &[(0, MONITOR_TAG)], &none, (1204, 998), 0x7f3a, 1)
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "its tag 0000000000007f3a is no tag of a known program attached to the root \
+             before the agent started"
+        );
+        assert_eq!(
+            known_reattach_by(&lineage, &[(0, MONITOR_TAG)], &none, (1204, 998), 0, 1),
+            Err("the hook read no program from the attach".to_string())
+        );
     }
 
     /// Lot 386 (named): the reference of a re-attach is the tag of a root

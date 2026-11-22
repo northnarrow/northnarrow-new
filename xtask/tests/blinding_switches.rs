@@ -129,6 +129,43 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
     .unwrap();
 }
 
+/// The bpf hook's root `cgroup/sysctl` branch, and the whole of it: the
+/// record (the program's tag, read inside the call) and the refusal.
+const ROOT_BRANCH: &str = "if root != ROOT_NO {";
+const ROOT_REFUSAL: &str = "if root != ROOT_NO {\n            emit_root_attach(attached_prog_tag(cmd, attr), arg);\n            return -EPERM;\n        }";
+
+/// The bpf hook's judged `cgroup/sysctl` attach, whole: the target read,
+/// the root asked, the branch.
+const JUDGED_ROOT_ATTACH: &str = "
+    if judges_attach_target(cmd, arg)
+        && !crate::inode_protect::override_active()
+        && !fresh_instance_may_load()
+    {
+        let target = match attach_target_offset(cmd) {
+            Some(off) if !attr.is_null() => {
+                bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32).ok()
+            }
+            _ => None,
+        };
+        let root = match target {
+            Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
+            None => ROOT_UNREADABLE,
+        };
+        if root != ROOT_NO {
+            emit_root_attach(attached_prog_tag(cmd, attr), arg);
+            return -EPERM;
+        }
+    }";
+
+/// `word` in `hay` as a whole identifier.
+fn has_word(hay: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    hay.match_indices(word).any(|(i, _)| {
+        !hay[..i].chars().next_back().is_some_and(ident)
+            && !hay[i + word.len()..].chars().next().is_some_and(ident)
+    })
+}
+
 /// Named (item 5): the bpf hook refuses a cgroup/sysctl attach whose target
 /// is the cgroup v2 root — outside a window, past the family and a fresh
 /// instance, a target it cannot read refused too — signed, before the
@@ -138,6 +175,37 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
 fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     let c = code("agent-ebpf/src/bpf_defense.rs");
     let h = body(&c, "try_bpf_syscall_observe");
+    // Lot 386 (the review of #594, P2-1): the refusal is unconditional —
+    // the one root branch is the record and the refusal, literally: no
+    // condition and no return between the branch and `emit_root_attach`
+    // (the record's tag is a value read inside the call), so nothing read
+    // for the record (the tag of "the known monitor", say) can let an
+    // attach through.
+    assert_eq!(h.matches(ROOT_BRANCH).count(), 1, "one root branch");
+    let branch = &h[h.find(ROOT_BRANCH).unwrap()..];
+    let record = branch
+        .find("emit_root_attach(")
+        .expect("the record in the branch");
+    let between = &branch[ROOT_BRANCH.len()..record];
+    for word in ["return", "if", "match", "else"] {
+        assert!(
+            !has_word(between, word),
+            "`{word}` between `{ROOT_BRANCH}` and the refusal: {between}"
+        );
+    }
+    assert!(
+        branch.starts_with(ROOT_REFUSAL),
+        "the root branch is not the record and the refusal alone: {}",
+        &branch[..branch.len().min(ROOT_REFUSAL.len() + 120)]
+    );
+    // the mini-hunt (the same plant one step earlier): nothing between the
+    // target's reading and the branch either — the judged block is pinned
+    // whole, its comments and spacing aside
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat(h).contains(&flat(JUDGED_ROOT_ATTACH)),
+        "the judged root attach is not the target's reading, the root's and the refusal alone"
+    );
     in_order(
         h,
         &[
@@ -147,15 +215,23 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
             "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
             "Some(off) if !attr.is_null() => {",
             "None => ROOT_UNREADABLE,",
-            // lot 386: the record carries the attached program's tag; the
-            // refusal depends on nothing read for it
-            "if root != ROOT_NO {",
-            "Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),",
-            "emit_root_attach(tag, arg);\n            return -EPERM;\n        }",
+            ROOT_REFUSAL,
             "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
         ],
     )
     .unwrap();
+    // the tag, for the record alone: a value of the attach's program fd
+    in_order(
+        body(&c, "attached_prog_tag"),
+        &[
+            "match prog_fd_offset(cmd) {",
+            "Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),",
+            "Err(_) => 0,",
+            "_ => 0,",
+        ],
+    )
+    .unwrap();
+    assert!(c.contains("unsafe fn attached_prog_tag(cmd: u32, attr: *const c_void) -> u64 {"));
     in_order(
         body(&c, "fd_is_root_cgroup"),
         &[

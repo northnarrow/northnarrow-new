@@ -8,7 +8,7 @@ it reads `unreleased`); release.yml's `verify-tag` refuses a tag that is
 not `v` and the workspace version, or whose section is not the first one
 here, dated (CONTRIBUTING.md, "Rilasci").
 
-## [0.1.0-alpha] - unreleased
+## [0.1.0-alpha] - 2026-11-22
 
 Tag `v0.1.0-alpha`: the first alpha, everything since `0.0.1` (Wave 4 and
 the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
@@ -2349,9 +2349,14 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     `a_refused_root_attach_is_marked_a_known_reattach_only_when_proven`,
     `a_proven_networkd_monitor_reattach_is_low_and_any_other_high`,
     `a_proven_monitor_reattach_raises_nothing_and_any_other_impairs`,
-    `a_known_root_reattach_s_record_round_trips`; the ratchets
-    `the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root` and
-    `a_known_probe_is_marked_after_the_lineage_barrier` extended.
+    `a_known_root_reattach_s_record_round_trips`,
+    `a_reattach_s_tag_is_compared_before_any_proc_read` (the tag first: a
+    program that is no reference costs no `/proc` read); the ratchet
+    `a_known_probe_is_marked_after_the_lineage_barrier` extended. The
+    ratchet `the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root` pins
+    the root branch literally again — the record (the tag read inside its
+    call) and the refusal, no condition and no return between them — and
+    now the whole judged block, from the target's reading to the refusal.
   - **Docs.** KNOWN_LIMITATIONS.md: networkd's monitor (systemd 257 and
     later), what networkd loses and until when, and when the re-attach
     stays High; "a long stall" instead of a bound (also the
