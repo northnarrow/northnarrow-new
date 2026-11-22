@@ -6270,9 +6270,11 @@ fires.
 
 - **The start asks the journal for the boots before this one, one at a
   time** (`journalctl -b -<k> -n 1 -o json --output-fields=_BOOT_ID`,
-  newest first, once `-b 0` names this very boot; at most 17, each killed
-  past 2 s, the walk past 6 s), and runs `journalctl --list-boots` (§72) only
-  when that walk does not reach the last run's boot. On systemd 249 (Ubuntu
+  newest first, once the journal's newest entry — `journalctl -n 1`, no
+  `-b` — is of this very boot, the kernel's id; at most 17, each killed
+  past 2 s, none begun past 6 s: the walk ends within 8 s), and runs
+  `journalctl --list-boots` (§72) only when that walk does not reach the
+  last run's boot. On systemd 249 (Ubuntu
   22.04), whose list stops at the first boot it meets twice, a host with a
   long persistent journal signed `boot_continuity_unknown` at every start
   and never `boots_without_agent`; it now signs `next_boot` after a normal
@@ -6280,19 +6282,34 @@ fires.
   boot without the agent. Expect, on such a host after the upgrade: the
   advisory gone, and a gap row where a boot passed without the agent. The
   rows' `sources` name both questions. A list that disagrees with the walk
-  is `unknown`, never `clean`.
+  is `unknown`, never `clean` — a list that puts the last run's boot right
+  before this one while the walk named another boot there, or answered that
+  there is none (no boot before this one, or this very boot).
 - **A new `integrity_drift` kind, `run_exec_at_shutdown`** (result
   `recorded`, never held, no degradation): Ubuntu's packaged `finalrd`
   made `/run` executable as the host went down (systemd `stopping` with a
-  reboot, power-off, halt or kexec job pending; the packaged unit's own
-  `ExecStop=` run since the round before). Before, one normal reboot in six
+  job of `reboot`, `poweroff`, `halt` or `kexec.target` pending — not
+  `soft-reboot.target`, which keeps the agent; the unit's own `ExecStop=`,
+  its files root's and writable by no one else, run since the start of the
+  round before). Before, one normal reboot in six
   left a High `mount_attrs_changed` (and a `mount_over_protected` "/run
   hides /run/northnarrow") in the run's stop beat, and the off-host
   verifier said `DEGRADED` at the next start. A monitor that counted
   `mount_attrs_changed` per reboot on Ubuntu: count the note beside it, or
-  expect fewer. The same change while the host runs, or in a "shutdown"
-  that does not take the host down within 120 s, is still the High
-  `mount_attrs_changed`.
+  expect fewer. The same change while the host runs, or past 120 s from the
+  run's first note, is still the High `mount_attrs_changed`.
+- **A new `integrity_drift` kind, `run_exec_without_shutdown`** (High,
+  held until acknowledged, as the run's attack-class events are): the
+  shutdown a `run_exec_at_shutdown` note was signed for did not come — a
+  later round found systemd running again (a reboot cancelled), or the
+  agent still running 120 s after the run's first note (a reboot held, or
+  systemd silent) — "a remount noted as the host's shutdown, but the host
+  did not shut down", whatever `/run` looks like then; the run notes no
+  more. Before, root could make the note's facts true without the host
+  going down and put `noexec` back before the next round: the note was
+  then the only trace. A real shutdown that keeps the agent running more
+  than 120 s after the note signs it too; acknowledge it once you know
+  what held the reboot.
 - **A remount is no longer also signed `mount_over_protected`**: an
   attribute change of a mount a watched path crosses (its options, its
   super block's, its propagation) is `mount_attrs_changed` alone, as lot

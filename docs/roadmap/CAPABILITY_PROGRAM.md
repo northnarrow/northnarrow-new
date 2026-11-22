@@ -11712,8 +11712,8 @@ number in parentheses is a lab PR.
     the shutdown begins, seconds before the agent is ended.
   - Done:
     - **The walk from this boot** (`nn_evidence::boot_gap::judge_walking`;
-      `journalctl -b -<k>` once `-b 0` is this very boot, at most 17
-      questions, 6 s): the boots before this one, newest first, until the
+      `journalctl -b -<k>` once the journal's tail is of this very boot —
+      fix round 1 —, at most 17 questions, none begun past 6 s): the boots before this one, newest first, until the
       last run's; lot 387's list rules on what the walk met; `--list-boots`
       only when the walk does not reach it; a disagreement is `unknown`,
       never clean; an answer that is this very boot stops the walk.
@@ -11771,6 +11771,48 @@ number in parentheses is a lab PR.
       (five rounds): `sensors: OK`; the verifier `DEGRADED` once ("the
       capability manifest changed …", back to the hash before the gap),
       then `OK`.
+  - **Fix round 1 (the review of #597).**
+    - P2-1: a note awaits its shutdown — systemd in any state but
+      `stopping` at a later round, or the agent still running 120 s after
+      the run's first note, is the High `run_exec_without_shutdown` (an
+      event held until acknowledged), `/run` given back `noexec` or not;
+      the run notes no more.
+    - P3-2: the walk's first answer "no boot before this one" or "this very
+      boot", against the list's `next_boot`, is `unknown`.
+    - P3-3: the anchor is the journal's tail (`journalctl -n 1`, no `-b`)
+      against the kernel's boot id; `-b 0` is journalctl's shortcut to the
+      kernel's current boot.
+    - P3-4/5: `soft-reboot.target` dropped from the going-down targets;
+      "packaged" written as owner and mode; the job's type, the window, the
+      8 s bound and the one budget a run stated.
+    - Mutation: 28 mutants, 28 caught by a named test (two after the named
+      test's finalrd stop was made fresh at each round).
+    - Lab (as measured, ubuntu2204, 5.15.0-204, systemd 249.11, under its
+      lease; the tree verified by hash, 1247 files, built in the guest, the
+      branch installed fresh with the alpha profile): a cold boot and three
+      reboots — `next_boot` each, no `boot_continuity_unknown`, no mount
+      High, `sensors: OK`, the verifier `OK`; one boot with both units
+      masked, then the restore — `boots_without_agent` High naming the
+      masked boot, `sensors: DEGRADED`, the verifier `DEGRADED`; a round
+      landed in the reboot into the masked boot and signed the finalrd
+      note, and no `run_exec_without_shutdown` followed (the shutdown
+      came). A reboot
+      held (a unit whose stop sleeps) then cancelled, `/run` made
+      `noexec` again one second after the cancel: the note 11 s after the
+      reboot was queued (systemd `stopping`, `reboot.target` pending,
+      finalrd's stop with its pid), systemd `running` after the cancel,
+      then `run_exec_without_shutdown` High at the next round ("… but the
+      host did not shut down: systemd says running 28 s after the note"),
+      held, `sensors: DEGRADED`, the verifier `DEGRADED`. The held
+      transaction had stopped `systemd-user-sessions` (`/run/nologin`), so
+      the lab's ssh was refused: the guest was powered off from the host
+      and booted again (`previous_run.ended: abrupt`). In the reboot after
+      it, a round at 17:58:49.844 — after PID 1 became `systemd-shutdown`
+      (17:58:49.76) — signed `mount_attrs_changed` for finalrd's remount:
+      the last stage, where systemd answers no more (stated in
+      KNOWN_LIMITATIONS; a follow-up could take PID 1's `systemd-shutdown`
+      as that stage's fact). Then `uninstall.sh --purge` and a cold boot
+      with nothing of ours, powered off.
 - **Lot 388 — no watchdog death at the host's own shutdown; the verifier's
   start-up stage 5 is late, not lost (the review of #595: its triage (a)
   and (b), P3-1 to P3-3; `UPGRADE_NOTES_WAVE4.md` §73; no level change).**

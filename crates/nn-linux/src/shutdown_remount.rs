@@ -18,28 +18,44 @@
 //!   and nothing else (`mount_attrs::AttrChange::is_run_made_exec`);
 //! - the host goes down: systemd (PID 1, over its private socket — the
 //!   source of lot 388's rule and of the active response's stand-down,
-//!   EBPF-001) says `stopping`, and a start job of `reboot.target`,
-//!   `poweroff.target`, `halt.target`, `kexec.target` or
-//!   `soft-reboot.target` is pending (`shutdown.target` alone can be pulled
-//!   into a transaction that ends nothing);
+//!   EBPF-001) says `stopping`, and a job of `reboot.target`,
+//!   `poweroff.target`, `halt.target` or `kexec.target` is pending (its id;
+//!   its type is not read). `shutdown.target` alone can be pulled into a
+//!   transaction that ends nothing, and a soft-reboot (the review of #597,
+//!   P3-4) does not take the host down — the agent survives it;
 //! - the unit is the packaged one, as systemd holds it: its fragment in the
 //!   vendor directory, no drop-in, its one `ExecStop=` the packaged
-//!   `/usr/bin/finalrd`, both files root's and writable by no one else;
-//! - that `ExecStop=` ran — systemd's record of it, a child of PID 1 with
-//!   its pid — since the last round that read `/run` unchanged, on the
-//!   monotonic clock (the wall clock is root's to set);
+//!   `/usr/bin/finalrd` — "packaged" meaning both files root's and
+//!   writable by no one else (their owner and mode, links followed; not
+//!   their content);
+//! - that `ExecStop=` ran — systemd's record of it, with its pid — since
+//!   the start of the last round that read `/run` unchanged (about one
+//!   round interval before), on the monotonic clock (the wall clock is
+//!   root's to set);
 //! - the change was not signed as a degradation earlier in the run (a later
 //!   shutdown never ends it), and less than [`NOTE_MAX_SECS`] passed since
 //!   the run's first such note — one budget a run, on the monotonic clock:
 //!   past it, or once the host no longer goes down, the round signs the
 //!   change as before.
 //!
+//! The review of #597 (P2-1): root can make those facts true without the
+//! host going down — a reboot held or cancelled, finalrd stopped in it or
+//! by hand — and put `noexec` back before the next round: the note would
+//! then be the only trace. A note therefore awaits its shutdown: at each
+//! later round of the run, systemd answering a state other than `stopping`
+//! (the shutdown ended, the host runs on), or the agent still running past
+//! [`NOTE_MAX_SECS`] after the run's first note, is the High
+//! [`NO_SHUTDOWN_KIND`] — a remount noted as the host's shutdown, but the
+//! host did not shut down ([`shutdown_not_come`]) — whatever `/run` looks
+//! like then, and the run notes no more. A real shutdown ends the agent
+//! within seconds of finalrd's stop.
+//!
 //! The note says what the facts show — the change finalrd makes, made while
 //! finalrd's stop ran in the host's shutdown — not that finalrd's process
 //! made it: the kernel's mount table names no actor, and a root process's
-//! identical remount in that very moment reads the same. In the last stage
-//! (PID 1 is `systemd-shutdown`) systemd no longer answers: the change is
-//! judged as before.
+//! identical remount within that window reads the same. In the last stage
+//! (PID 1 is `systemd-shutdown`) systemd no longer answers: a change seen
+//! then is judged as before.
 
 use std::path::Path;
 use std::time::Duration;
@@ -49,6 +65,10 @@ use antitamper_bpf::systemd_bus::{self, Value};
 /// The note's kind (an `integrity_drift` row signed `recorded`).
 pub const RUN_EXEC_KIND: &str = "run_exec_at_shutdown";
 
+/// The review of #597 (P2-1): the High a round signs when the shutdown a
+/// note was signed for did not come ([`shutdown_not_come`]).
+pub const NO_SHUTDOWN_KIND: &str = "run_exec_without_shutdown";
+
 /// The packaged unit, its script and where the package puts the unit.
 pub const UNIT: &str = "finalrd.service";
 pub const BINARY: &str = "/usr/bin/finalrd";
@@ -57,18 +77,19 @@ pub const FRAGMENTS: &[&str] = &[
     "/usr/lib/systemd/system/finalrd.service",
 ];
 
-/// The targets whose pending start job is the host going down.
+/// The targets whose pending job is the host going down (not
+/// `soft-reboot.target`: the review of #597, P3-4 — a soft-reboot keeps the
+/// kernel and the agent).
 pub const GOING_DOWN_TARGETS: &[&str] = &[
     "reboot.target",
     "poweroff.target",
     "halt.target",
     "kexec.target",
-    "soft-reboot.target",
 ];
 
-/// How long after the run's first note the change may still be noted (a
-/// real shutdown ends the agent within seconds of finalrd's stop; a
-/// "shutdown" that does not come is not one).
+/// How long after the run's first note the change may still be noted, and
+/// the agent may still run before the note's shutdown is one that did not
+/// come (a real shutdown ends the agent within seconds of finalrd's stop).
 pub const NOTE_MAX_SECS: u64 = 120;
 
 /// How long each question to systemd may take.
@@ -99,7 +120,7 @@ pub struct FinalrdUnit {
 pub struct RunExecFacts {
     /// systemd says `stopping` (PID 1, its private socket).
     pub host_stopping: bool,
-    /// The pending start job's target ([`GOING_DOWN_TARGETS`]); `None`: none.
+    /// The target with a pending job ([`GOING_DOWN_TARGETS`]); `None`: none.
     pub going_down: Option<String>,
     /// The unit as systemd holds it (`None`: not asked, or no answer).
     pub unit: Option<FinalrdUnit>,
@@ -144,15 +165,43 @@ impl RunExecFacts {
         }
         Some(format!(
             "made while the host goes down (systemd: stopping, {target} pending) and the stop of \
-             the packaged {UNIT} ran ({}, no drop-in; {BINARY}, pid {}, PID 1's child, started at \
+             {UNIT} ran ({}, no drop-in, root's; systemd's record: {BINARY}, pid {}, started at \
              unix {}), whose first step is this very change (mount -o remount,exec /run) for the \
-             shutdown's final runtime directory — the shutdown's own change, not a drift (signed \
-             as one if the host does not go down within {NOTE_MAX_SECS} s)",
+             shutdown's final runtime directory — the shutdown's own change, not a drift (if the \
+             host does not shut down — systemd running again, or the agent still running \
+             {NOTE_MAX_SECS} s after the run's first note — the High {NO_SHUTDOWN_KIND} follows)",
             u.fragment,
             e.pid,
             e.start_realtime_us / 1_000_000
         ))
     }
+}
+
+/// The review of #597 (P2-1): why the shutdown a note was signed for did
+/// not come, `noted_for` seconds after the run's first note — the agent
+/// still running past [`NOTE_MAX_SECS`], or systemd's `state` (asked only
+/// within it) other than `stopping`: the shutdown ended, the host runs on —
+/// or `None`: it may still come (systemd says `stopping`, or no longer
+/// answers, as in the last stage).
+pub fn shutdown_not_come(noted_for: u64, state: impl FnOnce() -> Option<String>) -> Option<String> {
+    if noted_for > NOTE_MAX_SECS {
+        return Some(format!(
+            "the agent still runs {noted_for} s after the note, past the {NOTE_MAX_SECS} s a \
+             shutdown takes to end it"
+        ));
+    }
+    match state() {
+        Some(s) if s != "stopping" => Some(format!(
+            "systemd says {s} {noted_for} s after the note: the shutdown ended without the host \
+             going down"
+        )),
+        _ => None,
+    }
+}
+
+/// systemd's state now (PID 1, its private socket); `None`: no answer.
+pub fn system_state() -> Option<String> {
+    systemd_bus::system_state(Path::new(systemd_bus::PRIVATE_SOCKET), ASK_TIMEOUT).ok()
 }
 
 /// The `ExecStop=` records of a property value (`a(sasbttttuii)`); `None`
@@ -415,6 +464,64 @@ mod tests {
         assert!(exec(&|e| e.start_realtime_us = 1)
             .shutdown_not_drift()
             .is_some());
+    }
+
+    /// The review of #597 (P2-1): the shutdown a note was signed for did not
+    /// come — systemd answers a state other than `stopping` (a reboot
+    /// cancelled: the host runs on), or the agent still runs past the bound
+    /// (a reboot held, systemd silent or not); while systemd says
+    /// `stopping`, or does not answer (the last stage), within the bound it
+    /// may still come. Past the bound systemd is not asked.
+    #[test]
+    fn a_noted_shutdown_that_does_not_come_is_told() {
+        for s in ["running", "degraded", "starting", "maintenance"] {
+            let why = shutdown_not_come(30, || Some(s.into())).expect(s);
+            assert!(why.contains(s) && why.contains("30 s"), "{why}");
+        }
+        assert_eq!(shutdown_not_come(30, || Some("stopping".into())), None);
+        assert_eq!(shutdown_not_come(30, || None), None);
+        assert_eq!(
+            shutdown_not_come(NOTE_MAX_SECS, || Some("stopping".into())),
+            None
+        );
+        for state in [Some("stopping".to_string()), None] {
+            let why = shutdown_not_come(NOTE_MAX_SECS + 1, || -> Option<String> {
+                panic!("not asked past the bound: {state:?}")
+            })
+            .expect("past the bound");
+            assert!(why.contains(&format!("{} s", NOTE_MAX_SECS + 1)), "{why}");
+        }
+        // the note itself names the High that follows
+        let why = shutdown().shutdown_not_drift().unwrap();
+        assert!(why.contains(NO_SHUTDOWN_KIND), "{why}");
+        assert!(
+            !why.contains("PID 1's child"),
+            "systemd records a pid, no more"
+        );
+        let code = include_str!("shutdown_remount.rs");
+        let ask = &code[code.find("pub fn system_state(").unwrap()..];
+        assert!(
+            ask[..ask.find('}').unwrap()]
+                .contains("systemd_bus::system_state(Path::new(systemd_bus::PRIVATE_SOCKET)"),
+            "PID 1's private socket"
+        );
+    }
+
+    /// The review of #597 (P3-4): a soft-reboot keeps the kernel and the
+    /// agent — no shutdown of the host: its pending job is none of the
+    /// facts, so finalrd's remount in it stays the High.
+    #[test]
+    fn a_soft_reboot_is_no_shutdown_of_the_host() {
+        assert!(!GOING_DOWN_TARGETS.contains(&"soft-reboot.target"));
+        assert_eq!(
+            GOING_DOWN_TARGETS,
+            [
+                "reboot.target",
+                "poweroff.target",
+                "halt.target",
+                "kexec.target"
+            ]
+        );
     }
 
     /// The facts as read: systemd asked about the jobs only while it says

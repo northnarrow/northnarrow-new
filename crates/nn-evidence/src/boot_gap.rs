@@ -25,8 +25,8 @@
 //! boots, 1.5 GB) the list ended 39 boots before this one, and every start
 //! signed only `boot_continuity_unknown`: a boot without the agent was never
 //! told. The start now asks the journal first for the boots before this one,
-//! one at a time and newest first (`journalctl -b -<k>` once `-b 0` is this
-//! boot, which 249 walks from the journal's tail backwards —
+//! one at a time and newest first (`journalctl -b -<k>`, which 249 walks
+//! from the journal's tail backwards, once that tail is of this boot —
 //! [`judge_walking`]); the list is
 //! asked only when that walk does not reach the last run's boot, and two
 //! answers that disagree are `unknown`, never clean.
@@ -64,8 +64,9 @@ pub const SOURCES: &[(&str, &str)] = &[
         "root can rewrite both before the agent starts (the signing key is readable then, R016)",
     ),
     (
-        "the journal's boots before this one, asked one at a time (journalctl -b -<k>, once -b 0 \
-         is this boot), then its boot list (journalctl --list-boots) when they do not reach the last run's boot",
+        "the journal's boots before this one, asked one at a time (journalctl -b -<k>, once the \
+         journal's newest entry is of this boot), then its boot list (journalctl --list-boots) \
+         when they do not reach the last run's boot",
         "root can remove, vacuum or rotate it, or make the journal volatile",
     ),
 ];
@@ -234,8 +235,10 @@ pub fn judge(
 /// rules). When the walk does not reach the last run's boot (the journal
 /// ends, does not answer, or the walk's bound), `list_boots` judges as
 /// [`judge`] does — and a list that says "the next boot" while the walk
-/// found another boot right before this one is `unknown`, never clean.
-/// Nothing is asked within the same boot.
+/// found another boot right before this one, or answered that there is
+/// none (the journal holds no boot before this one, or names this very
+/// boot as the one before it: the review of #597, P3-2), is `unknown`,
+/// never clean. Nothing is asked within the same boot.
 pub fn judge_walking(
     facts: BootFacts<'_>,
     mut boot_before: impl FnMut(&str, usize) -> BootBefore,
@@ -248,6 +251,9 @@ pub fn judge_walking(
     // newest first: walked[0] is the boot right before this one
     let mut walked: Vec<String> = Vec::new();
     let mut stopped = format!("the walk's bound ({WALK_MAX} boots)");
+    // the review of #597 (P3-2): the walk's own answer that there is no
+    // boot right before this one — none, or this very boot named there
+    let mut none_before: Option<String> = None;
     for k in 1..=WALK_MAX {
         match boot_before(&current, k) {
             BootBefore::Boot(id) => {
@@ -257,9 +263,13 @@ pub fn judge_walking(
                 };
                 // this very boot is no boot before it: a journal that
                 // answers so does not walk (systemd 255 ignored the offset
-                // of `-b <id>-<k>`); the list judges
+                // of `-b <id>-<k>`); the list judges, never clean when it
+                // puts the last run's boot right before this one
                 if id == current {
                     stopped = format!("the journal named this boot as boot -{k}");
+                    if walked.is_empty() {
+                        none_before = Some(format!("names this very boot as boot -{k}"));
+                    }
                     break;
                 }
                 let reached = id == previous;
@@ -276,6 +286,9 @@ pub fn judge_walking(
             }
             BootBefore::NoSuchBoot => {
                 stopped = format!("the journal holds no boot -{k}");
+                if walked.is_empty() {
+                    none_before = Some(format!("holds no boot -{k}"));
+                }
                 break;
             }
             BootBefore::NoAnswer(why) => {
@@ -289,18 +302,23 @@ pub fn judge_walking(
          ({stopped})",
         walked.len()
     );
-    match judge(facts, list_boots) {
-        BootContinuity::Unknown { why } => BootContinuity::Unknown {
+    // what the walk itself put right before this one, when it answered:
+    // another boot than the last run's, or none
+    let right_before = walked
+        .first()
+        .map(|b| format!("names {b} there"))
+        .or(none_before);
+    match (judge(facts, list_boots), right_before) {
+        (BootContinuity::Unknown { why }, _) => BootContinuity::Unknown {
             why: format!("{why}; {walk}"),
         },
-        BootContinuity::NextBoot if !walked.is_empty() => BootContinuity::Unknown {
+        (BootContinuity::NextBoot, Some(said)) => BootContinuity::Unknown {
             why: format!(
                 "the journal's boot list puts the last run's boot {previous} right before this \
-                 one, but asked boot by boot it names {} there; {walk}",
-                walked[0]
+                 one, but asked boot by boot it {said}; {walk}"
             ),
         },
-        judged => judged,
+        (judged, _) => judged,
     }
 }
 

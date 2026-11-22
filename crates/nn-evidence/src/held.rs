@@ -184,6 +184,10 @@ pub const EVENT_KINDS: &[&str] = &[
     "admin_socket_removed",
     // External audit ASK-012: a peer the admin socket refused
     "admin_socket_foreign_peer",
+    // the review of #597 (P2-1): a remount of /run noted as the host's
+    // shutdown (`run_exec_at_shutdown`) whose shutdown did not come — the
+    // host ran on; `/run` may be back by then, nothing checks it again
+    "run_exec_without_shutdown",
 ];
 
 /// The degradations held while found ([`Hold::WhileFound`]): a state of the

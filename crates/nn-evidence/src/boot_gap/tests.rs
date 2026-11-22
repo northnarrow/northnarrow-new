@@ -453,7 +453,9 @@ fn the_walk_keeps_the_list_rules() {
     );
     // this very boot named as a boot before it (systemd 255 ignoring the
     // offset of `-b <id>-<k>`, lot 389's lab): the walk stops, not counting
-    // it, and the list judges — its next boot stands, no contradiction
+    // it, and the list judges — a boot without the agent it lists stands
+    // (the list's next boot against it: unknown, the review of #597, P3-2,
+    // `a_walk_that_names_no_boot_before_this_one_and_a_list_s_next_boot_are_unknown`)
     let asked = std::cell::RefCell::new(Vec::new());
     let got = judge_walking(
         facts(Some(A), Some(C)),
@@ -461,9 +463,15 @@ fn the_walk_keeps_the_list_rules() {
             asked.borrow_mut().push(k);
             BootBefore::Boot(c.to_string())
         },
-        || Ok(vec![j(A), j(C)]),
+        || Ok(vec![j(A), j(B), j(C)]),
     );
-    assert_eq!(got, BootContinuity::NextBoot);
+    assert_eq!(
+        got,
+        BootContinuity::BootsWithoutAgent {
+            count: 1,
+            boot_ids: vec![j(B)]
+        }
+    );
     assert_eq!(asked.into_inner(), vec![1]);
     // an answer that names no boot ends the walk; the list judges
     let got = judge_walking(
@@ -497,4 +505,58 @@ fn the_walk_reaches_past_every_boot_a_row_lists() {
         }
     );
     assert_eq!(asked.borrow().len(), LISTED_BOOT_IDS_MAX + 1);
+}
+
+/// The review of #597 (P3-2): the walk answers at its first question that
+/// there is no boot right before this one — the journal holds none, or
+/// names this very boot there — while the list puts the last run's boot
+/// right before this one: the two disagree, `unknown`, never the clean
+/// "next boot". A walk that did not answer (no answer, a line without a
+/// boot id) leaves the list's judgement as it is.
+#[test]
+fn a_walk_that_names_no_boot_before_this_one_and_a_list_s_next_boot_are_unknown() {
+    for (what, first) in [
+        ("no boot -1", BootBefore::NoSuchBoot),
+        ("this boot as boot -1", BootBefore::Boot(C.to_uppercase())),
+    ] {
+        let got = judge_walking(
+            facts(Some(A), Some(C)),
+            |_: &str, k: usize| {
+                assert_eq!(k, 1, "{what}: the walk stops at its first answer");
+                first.clone()
+            },
+            || Ok(vec![j(A), j(C)]),
+        );
+        let BootContinuity::Unknown { why } = &got else {
+            panic!("{what}: {got:?}")
+        };
+        assert!(
+            why.contains(&j(A)) && why.contains("boot -1"),
+            "{what}: {why}"
+        );
+        assert!(!got.continuous(), "{what}");
+    }
+    // the walk past one boot without the agent, then no boot: the list's
+    // next boot disagrees as before
+    let got = judge_walking(
+        facts(Some(A), Some(C)),
+        |_: &str, k: usize| match k {
+            1 => BootBefore::Boot(j(B)),
+            _ => BootBefore::NoSuchBoot,
+        },
+        || Ok(vec![j(A), j(C)]),
+    );
+    assert!(matches!(got, BootContinuity::Unknown { .. }), "{got:?}");
+    // a walk that did not answer: the list judges alone
+    for silent in [
+        BootBefore::NoAnswer("killed past 2 s".into()),
+        BootBefore::Boot("no id".into()),
+    ] {
+        let got = judge_walking(
+            facts(Some(A), Some(C)),
+            |_: &str, _: usize| silent.clone(),
+            || Ok(vec![j(A), j(C)]),
+        );
+        assert_eq!(got, BootContinuity::NextBoot, "{silent:?}");
+    }
 }
