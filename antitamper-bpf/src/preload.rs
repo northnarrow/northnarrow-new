@@ -138,6 +138,12 @@ pub enum Verdict {
     /// The files that exist at the paths its names resolve to (each
     /// absolute, as the daemons' start resolves it from `/`).
     Loads(Vec<String>),
+    /// Lot 385 (the review of #593): no file this caller saw, and a path a
+    /// name resolves to whose `stat(2)` failed for another reason than its
+    /// absence — `EACCES` in a directory this user cannot search
+    /// (`nn-admin host-check` without root): what the list loads is not
+    /// known to this caller. Each such path, with its error's kind.
+    Unseen(Vec<(String, std::io::ErrorKind)>),
     /// A list that cannot be read as one (a FIFO, a device, too large, a
     /// read error): every start reads it, and nothing says what it loads.
     Unjudged(String),
@@ -146,7 +152,12 @@ pub enum Verdict {
 /// [`Verdict`] of the list at `list` (an absolute path), its names
 /// resolved below `root` (`/` on a host; a test's tree). A name's
 /// candidate exists when `stat(2)` of it succeeds (symbolic links
-/// followed) — present, whether or not the loader would accept the file.
+/// followed) — present, whether or not the loader would accept the file;
+/// it is absent only when the path walk ends at no entry (`ENOENT`) or at a
+/// file where a directory should be (`ENOTDIR`), which ends it the same way
+/// for every caller. Any other failure (`EACCES`: a directory this user
+/// cannot search) is no absence: [`Verdict::Unseen`] unless a file was
+/// found.
 pub fn judge_in(root: &Path, list: &Path) -> Verdict {
     let at = |p: &str| root.join(p.trim_start_matches('/'));
     let text = match read_list(&at(&list.to_string_lossy())) {
@@ -156,6 +167,7 @@ pub fn judge_in(root: &Path, list: &Path) -> Verdict {
     };
     let names = preload_names(&text);
     let mut found: Vec<String> = Vec::new();
+    let mut unseen: Vec<(String, std::io::ErrorKind)> = Vec::new();
     for n in &names {
         for c in candidates(n) {
             let c = if c.starts_with('/') {
@@ -163,15 +175,26 @@ pub fn judge_in(root: &Path, list: &Path) -> Verdict {
             } else {
                 format!("/{c}")
             };
-            if std::fs::metadata(at(&c)).is_ok() && !found.contains(&c) {
-                found.push(c);
+            if found.contains(&c) || unseen.iter().any(|(u, _)| *u == c) {
+                continue;
+            }
+            match std::fs::metadata(at(&c)) {
+                Ok(_) => found.push(c),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(e) => unseen.push((c, e.kind())),
             }
         }
     }
-    if found.is_empty() {
-        Verdict::Inert { names: names.len() }
-    } else {
+    if !found.is_empty() {
         Verdict::Loads(found)
+    } else if !unseen.is_empty() {
+        Verdict::Unseen(unseen)
+    } else {
+        Verdict::Inert { names: names.len() }
     }
 }
 
@@ -277,6 +300,77 @@ mod tests {
         assert!(
             matches!(judge(&tree(&libs, Some(&big))), Verdict::Unjudged(w) if w.contains("larger")),
             "too large"
+        );
+    }
+
+    /// Lot 385 (the review of #593, named): a name whose file sits in a
+    /// directory this user cannot search is no absent file. `nn-admin
+    /// host-check` without root read such a list as loading nothing (`OK`)
+    /// where root sees the library. By path, through `$LIB`, by a bare name
+    /// in a system library directory, through a symbolic link: `Unseen`,
+    /// never `Inert`; a file found by another name still `Loads`; a path
+    /// through a regular file (`ENOTDIR`) is absent for every caller. (As
+    /// root every directory is searched: the test needs another user.)
+    #[test]
+    fn a_name_this_user_cannot_look_at_is_unseen_not_absent() {
+        use std::io::ErrorKind::PermissionDenied;
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root searches every directory");
+            return;
+        }
+        let libs = [
+            "/secret/libhook.so",
+            "/secret/lib64/libhook.so",
+            "/usr/lib64/libhook2.so",
+            "/usr/lib/x86_64-linux-gnu/libnnlog.so",
+            "/opt/v/file",
+        ];
+        let d = tree(&libs, None);
+        std::os::unix::fs::symlink(
+            d.path().join("secret/libhook.so"),
+            d.path().join("opt/v/link.so"),
+        )
+        .unwrap();
+        let list = |text: &[u8]| {
+            std::fs::create_dir_all(d.path().join("etc")).unwrap();
+            std::fs::write(d.path().join("etc/ld.so.preload"), text).unwrap();
+            judge(&d)
+        };
+        let shut = |mode: u32| {
+            for dir in ["secret", "usr/lib64"] {
+                std::fs::set_permissions(d.path().join(dir), std::fs::Permissions::from_mode(mode))
+                    .unwrap();
+            }
+        };
+        shut(0o000);
+        let by_path = list(b"/secret/libhook.so\n");
+        let by_lib = list(b"/secret/$LIB/libhook.so\n");
+        let bare = list(b"libhook2.so\n");
+        let linked = list(b"/opt/v/link.so\n");
+        let also_found = list(b"/secret/libhook.so libnnlog.so\n");
+        let not_a_dir = list(b"/opt/v/file/x.so\n");
+        shut(0o755);
+        let unseen = |p: &str| Verdict::Unseen(vec![(p.to_string(), PermissionDenied)]);
+        assert_eq!(by_path, unseen("/secret/libhook.so"), "by path");
+        assert!(
+            matches!(&by_lib, Verdict::Unseen(p) if p.len() == 5
+                && p.iter().all(|(c, k)| c.starts_with("/secret/") && *k == PermissionDenied)),
+            "through $LIB: {by_lib:?}"
+        );
+        assert_eq!(bare, unseen("/usr/lib64/libhook2.so"), "a bare name");
+        assert_eq!(linked, unseen("/opt/v/link.so"), "through a link");
+        assert_eq!(
+            also_found,
+            Verdict::Loads(vec!["/usr/lib/x86_64-linux-gnu/libnnlog.so".to_string()]),
+            "a file found by another name"
+        );
+        assert_eq!(not_a_dir, Verdict::Inert { names: 1 }, "ENOTDIR");
+        // searchable again: what root sees
+        assert_eq!(
+            list(b"/secret/libhook.so\n"),
+            Verdict::Loads(vec!["/secret/libhook.so".to_string()])
         );
     }
 

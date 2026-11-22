@@ -96,7 +96,9 @@ pub const PRELOAD_FIX: &str = "remove the entry that names a library (or the fil
 /// run on (its start check, and the watchdog's, refuse it): `fail`, named;
 /// one absent, empty or naming no file that exists is `ok`, and said. Read
 /// as the loader reads it, by the rule the watchdog's respawn gate and
-/// `install.sh`'s preflight share (`antitamper_bpf::preload`).
+/// `install.sh`'s preflight share (`antitamper_bpf::preload`). Lot 385:
+/// one naming a path this user could not look at (a directory it cannot
+/// search) is `n/a`, `cannot check: run as root`.
 fn preload(root: &Path) -> Check {
     use antitamper_bpf::preload::{judge_in, Verdict, PRELOAD_PATH};
     let (status, value) = match judge_in(root, Path::new(PRELOAD_PATH)) {
@@ -113,6 +115,27 @@ fn preload(root: &Path) -> Check {
                 files.join(", ")
             ),
         ),
+        // lot 385 (the review of #593): a library this user could not look
+        // at is no library absent — said like every check that could not
+        // read, never `OK` (a denied one first: as root it is looked at)
+        Verdict::Unseen(paths) => {
+            let unread: Vec<Unread> = paths
+                .iter()
+                .map(|(p, kind)| Unread::of(&std::io::Error::from(*kind), p))
+                .collect();
+            let first = unread
+                .iter()
+                .find(|u| matches!(u, Unread::Denied(_)))
+                .or(unread.first());
+            let mut value = first.map(|u| u.said("")).unwrap_or_default();
+            if unread.len() > 1 {
+                value.push_str(&format!(
+                    "; {} more path(s) the list names not looked at",
+                    unread.len() - 1
+                ));
+            }
+            (Status::Unknown, value)
+        }
         Verdict::Unjudged(why) => (
             Status::Fail,
             format!("cannot be judged ({why}); every program reads it at its start"),
@@ -1121,6 +1144,76 @@ mod tests {
             (Status::Warn, "/root/northnarrow-admin.key")
         );
         assert_eq!(Unread::Absent.said("IMA not present"), "IMA not present");
+    }
+
+    /// Lot 385 (the review of #593, named): `nn-admin host-check` without
+    /// root read a preload list naming a library in a directory this user
+    /// cannot search as `OK present, loads nothing`, where root's run says
+    /// `FAIL loads … into every program`. The row says it could not look,
+    /// like every check that could not read, and names a path root would
+    /// see before one nobody can (a link loop). (As root every directory is
+    /// searched: the test needs another user.)
+    #[test]
+    fn host_check_without_root_never_says_ok_of_a_preload_library_it_could_not_see() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root searches every directory");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        w(
+            root,
+            "etc/ld.so.preload",
+            b"/opt/loop.so /secret/libhook.so /secret/$LIB/libhook.so\n",
+        );
+        w(root, "secret/libhook.so", b"x");
+        // a link to itself (ELOOP for every caller): not looked at either,
+        // but a denied path is the one the row names (root would see it)
+        std::fs::create_dir_all(root.join("opt")).unwrap();
+        std::os::unix::fs::symlink("loop.so", root.join("opt/loop.so")).unwrap();
+        let preload = || {
+            run_in(root)
+                .into_iter()
+                .find(|c| c.id == "preload")
+                .unwrap()
+        };
+        let mode = |m: u32| {
+            std::fs::set_permissions(root.join("secret"), std::fs::Permissions::from_mode(m))
+                .unwrap()
+        };
+        mode(0o000);
+        let unseen = preload();
+        let table = render_table(&run_in(root));
+        mode(0o755);
+        assert_ne!(
+            unseen.status,
+            Status::Ok,
+            "OK without looking: {}",
+            unseen.value
+        );
+        assert_eq!(unseen.status, Status::Unknown, "{}", unseen.value);
+        assert_eq!(
+            unseen.value,
+            format!(
+                "{CANNOT_CHECK} (/secret/libhook.so is not readable as this user); \
+                 6 more path(s) the list names not looked at"
+            )
+        );
+        assert!(
+            table.contains("1 check(s) could not be read as this user"),
+            "{table}"
+        );
+        // searchable: what root sees
+        let seen = preload();
+        assert_eq!(
+            (seen.status, seen.value.as_str()),
+            (
+                Status::Fail,
+                "loads /secret/libhook.so into every program: the agent and its watchdog refuse to start"
+            )
+        );
     }
 
     fn w(root: &Path, rel: &str, body: &[u8]) {
