@@ -296,16 +296,14 @@ impl Fixture {
 
 /// The `integrity:` lines of a status, with the newest audit row each
 /// names (the review of #586: an overlay the start refused names the
-/// round's row of the same file too).
+/// round's row of the same file too; lot 384: read by the rule that
+/// writes it, the line counting the findings past the cap included).
 fn held_lines(status: &str) -> Vec<(String, u64)> {
     status
         .lines()
         .filter_map(|l| l.trim_start().strip_prefix("- integrity: "))
         .map(|l| {
-            let row = l
-                .split("(audit row ")
-                .skip(1)
-                .filter_map(|r| r.split(')').next()?.parse::<u64>().ok())
+            let row = nn_evidence::held::rows_named(l)
                 .max()
                 .unwrap_or_else(|| panic!("no audit row in {l:?}"));
             (l.to_string(), row)

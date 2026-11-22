@@ -1277,7 +1277,13 @@ is one boolean with early returns.
 **`mount_setattr(2)`.** No LSM hook, and `do_mount_setattr` (the one
 function with the resolved path) is inlined on 5.15.0-203 and 6.18 (absent
 from their BTF and kallsyms): no `fentry` either. The integrity round
-signs its effect instead (`mount_attrs_changed`).
+signs its effect instead (`mount_attrs_changed`). Lot 384 (pre-alpha
+Phase 3c): on Debian 13 the system's `mount` (util-linux 2.41,
+`fd-based-mount`) changes propagation and bind flags through
+`mount_setattr(2)` every time, so those changes are signed there, never
+refused; on Ubuntu 22.04 and 26.04 the same command uses `mount(2)` and is
+refused (KNOWN_LIMITATIONS.md, "On Debian 13 the system's `mount` changes
+mount flags without a refusal").
 
 **As measured, the fix round of #567** (the same guests and setup): the
 six programs (the five hooks and the `reconfigure_super` fentry) pass the
