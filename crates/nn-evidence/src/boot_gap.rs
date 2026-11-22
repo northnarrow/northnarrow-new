@@ -25,8 +25,8 @@
 //! boots, 1.5 GB) the list ended 39 boots before this one, and every start
 //! signed only `boot_continuity_unknown`: a boot without the agent was never
 //! told. The start now asks the journal first for the boots before this one,
-//! one at a time and newest first (`journalctl -b -<k>` once `-b 0` is this
-//! boot, which 249 walks from the journal's tail backwards —
+//! one at a time and newest first (`journalctl -b -<k>`, which 249 walks
+//! from the journal's tail backwards, once that tail is of this boot —
 //! [`judge_walking`]); the list is
 //! asked only when that walk does not reach the last run's boot, and two
 //! answers that disagree are `unknown`, never clean.
@@ -64,8 +64,9 @@ pub const SOURCES: &[(&str, &str)] = &[
         "root can rewrite both before the agent starts (the signing key is readable then, R016)",
     ),
     (
-        "the journal's boots before this one, asked one at a time (journalctl -b -<k>, once -b 0 \
-         is this boot), then its boot list (journalctl --list-boots) when they do not reach the last run's boot",
+        "the journal's boots before this one, asked one at a time (journalctl -b -<k>, once the \
+         journal's newest entry is of this boot), then its boot list (journalctl --list-boots) \
+         when they do not reach the last run's boot",
         "root can remove, vacuum or rotate it, or make the journal volatile",
     ),
 ];

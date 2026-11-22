@@ -530,7 +530,10 @@ fn a_walk_that_names_no_boot_before_this_one_and_a_list_s_next_boot_are_unknown(
         let BootContinuity::Unknown { why } = &got else {
             panic!("{what}: {got:?}")
         };
-        assert!(why.contains(&j(A)) && why.contains("boot -1"), "{what}: {why}");
+        assert!(
+            why.contains(&j(A)) && why.contains("boot -1"),
+            "{what}: {why}"
+        );
         assert!(!got.continuous(), "{what}");
     }
     // the walk past one boot without the agent, then no boot: the list's

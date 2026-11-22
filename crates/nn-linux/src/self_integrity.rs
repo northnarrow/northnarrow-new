@@ -4757,7 +4757,10 @@ mod tests {
             true,
             1_029,
         );
-        assert_eq!(rows(&audit), vec![note.clone(), not_come.clone(), high.clone()]);
+        assert_eq!(
+            rows(&audit),
+            vec![note.clone(), not_come.clone(), high.clone()]
+        );
 
         // a note that could not be signed (no audit log): the High stays in
         // the round
@@ -4782,8 +4785,7 @@ mod tests {
     #[test]
     fn a_remount_noted_as_the_shutdown_whose_host_did_not_shut_down_is_the_high() {
         use crate::shutdown_remount::{
-            ExecRecord, FinalrdUnit, RunExecFacts, NOTE_MAX_SECS, NO_SHUTDOWN_KIND,
-            RUN_EXEC_KIND,
+            ExecRecord, FinalrdUnit, RunExecFacts, NOTE_MAX_SECS, NO_SHUTDOWN_KIND, RUN_EXEC_KIND,
         };
         let own = ["/run/northnarrow/agent.pid".to_string()];
         let exec = HOST_MI.replace(
@@ -4807,7 +4809,8 @@ mod tests {
                 })
                 .collect()
         };
-        let kinds = |audit: &Path| -> Vec<String> { rows(audit).into_iter().map(|r| r.0).collect() };
+        let kinds =
+            |audit: &Path| -> Vec<String> { rows(audit).into_iter().map(|r| r.0).collect() };
         // one round at `now` (s): systemd's `state` (None: no answer), the
         // facts of a shutdown when it says `stopping`; finalrd's stop at
         // 1 029 s
@@ -4858,8 +4861,14 @@ mod tests {
             detail.starts_with("/run: options") && detail.contains("did not shut down"),
             "{detail}"
         );
-        assert!(detail.contains("systemd says running 30 s after the note"), "{detail}");
-        assert!(checker.active.active.is_empty(), "a one-shot event, no state");
+        assert!(
+            detail.contains("systemd says running 30 s after the note"),
+            "{detail}"
+        );
+        assert!(
+            checker.active.active.is_empty(),
+            "a one-shot event, no state"
+        );
         // signed once; a later "shutdown" in the run is noted no more
         round(&mut checker, HOST_MI, 1_090, Some("degraded"));
         round(&mut checker, &exec, 1_120, stopping);
@@ -4904,6 +4913,17 @@ mod tests {
         checker.audit_log = log;
         round(&mut checker, HOST_MI, 1_090, Some("running"));
         assert_eq!(kinds(&audit), [RUN_EXEC_KIND, NO_SHUTDOWN_KIND]);
+
+        // the round asks systemd itself (its state, over PID 1's private
+        // socket) and the host's facts
+        let code = include_str!("self_integrity.rs");
+        let judge = &code[code.find("fn judge_run_exec(").unwrap()
+            ..code.find("fn judge_run_exec_with(").unwrap()];
+        assert!(
+            judge.contains("crate::shutdown_remount::system_state,")
+                && judge.contains("crate::shutdown_remount::read_facts,"),
+            "{judge}"
+        );
     }
 
     /// External audit EVD-014: neither mountinfo readable is a finding,

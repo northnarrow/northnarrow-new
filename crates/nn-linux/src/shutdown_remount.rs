@@ -120,7 +120,7 @@ pub struct FinalrdUnit {
 pub struct RunExecFacts {
     /// systemd says `stopping` (PID 1, its private socket).
     pub host_stopping: bool,
-    /// The pending start job's target ([`GOING_DOWN_TARGETS`]); `None`: none.
+    /// The target with a pending job ([`GOING_DOWN_TARGETS`]); `None`: none.
     pub going_down: Option<String>,
     /// The unit as systemd holds it (`None`: not asked, or no answer).
     pub unit: Option<FinalrdUnit>,
@@ -183,10 +183,7 @@ impl RunExecFacts {
 /// within it) other than `stopping`: the shutdown ended, the host runs on —
 /// or `None`: it may still come (systemd says `stopping`, or no longer
 /// answers, as in the last stage).
-pub fn shutdown_not_come(
-    noted_for: u64,
-    state: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+pub fn shutdown_not_come(noted_for: u64, state: impl FnOnce() -> Option<String>) -> Option<String> {
     if noted_for > NOTE_MAX_SECS {
         return Some(format!(
             "the agent still runs {noted_for} s after the note, past the {NOTE_MAX_SECS} s a \
@@ -497,7 +494,17 @@ mod tests {
         // the note itself names the High that follows
         let why = shutdown().shutdown_not_drift().unwrap();
         assert!(why.contains(NO_SHUTDOWN_KIND), "{why}");
-        assert!(!why.contains("PID 1's child"), "systemd records a pid, no more");
+        assert!(
+            !why.contains("PID 1's child"),
+            "systemd records a pid, no more"
+        );
+        let code = include_str!("shutdown_remount.rs");
+        let ask = &code[code.find("pub fn system_state(").unwrap()..];
+        assert!(
+            ask[..ask.find('}').unwrap()]
+                .contains("systemd_bus::system_state(Path::new(systemd_bus::PRIVATE_SOCKET)"),
+            "PID 1's private socket"
+        );
     }
 
     /// The review of #597 (P3-4): a soft-reboot keeps the kernel and the
@@ -508,7 +515,12 @@ mod tests {
         assert!(!GOING_DOWN_TARGETS.contains(&"soft-reboot.target"));
         assert_eq!(
             GOING_DOWN_TARGETS,
-            ["reboot.target", "poweroff.target", "halt.target", "kexec.target"]
+            [
+                "reboot.target",
+                "poweroff.target",
+                "halt.target",
+                "kexec.target"
+            ]
         );
     }
 
