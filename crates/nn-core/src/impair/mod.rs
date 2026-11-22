@@ -50,6 +50,7 @@ use nn_model::telemetry::FimOp;
 use nn_model::Event;
 use parking_lot::Mutex;
 
+use crate::anti_tamper::combat_allow::COMBAT_CHAIN;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::content_host::ContentHost;
@@ -554,7 +555,37 @@ pub struct DefenseDetector<H: DecisionHost> {
     /// production; a fixture's in the replays and tests
     /// ([`Self::with_program_owners`]).
     owners: crate::impact::trust::ProgramOwners<H>,
+    /// Lot 385 (F9b-4): the agent itself, for its own response helpers
+    /// ([`Self::set_own_spawns`], `main.rs` once; unset: none is its own).
+    own: std::sync::OnceLock<OwnSpawns>,
 }
+
+/// Lot 385 (the external tester's F9b-4): what tells the agent's own
+/// response helper from any other process — the agent's pid (fixed for its
+/// life: only its own forks have it as their parent) and the image the
+/// kernel executed for it (`/proc/self/exe` at its start).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSpawns {
+    pub agent_pid: u32,
+    pub agent_exe: PathBuf,
+}
+
+/// Lot 385: what a spawn's event says of its process and its parent.
+#[derive(Debug, Clone, Copy)]
+struct Spawn {
+    pid: u32,
+    /// The parent at the exec (`real_parent`).
+    ppid: u32,
+    uid: u32,
+    /// Who forked it, by the kernel's record of the fork (`sched_process_fork`;
+    /// 0: not known) — not `real_parent`, which `CLONE_PARENT` sets to the
+    /// caller's own parent.
+    fork_parent: u32,
+}
+
+/// Lot 385: the system directories the agent runs its helpers from (its
+/// `trusted_bin` lookup: `iptables`, `ip6tables`, `nft`).
+const AGENT_HELPER_DIRS: &[&str] = &["/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/"];
 
 /// Lot 282 (Tappa Prove P0; the coordinator's review of the design): the
 /// chains of the container runtimes and orchestrators — CNI's (`CNI-…`),
@@ -695,7 +726,50 @@ impl<H: DecisionHost> DefenseDetector<H> {
             coalesce: Mutex::new(HashMap::new()),
             installer: std::sync::OnceLock::new(),
             owners: crate::impact::trust::ProgramOwners::default(),
+            own: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Lot 385 (F9b-4): the agent itself (`main.rs`, once), so that its own
+    /// release's flush of its own chain is not a switch-off.
+    pub fn set_own_spawns(&self, own: OwnSpawns) {
+        let _ = self.own.set(own);
+    }
+
+    /// Lot 385 (the external tester's F9b-4): the process of `spawn` is the
+    /// agent's own response helper — every fact the kernel's or the
+    /// lineage's, never a name:
+    /// - run as root, its parent at the exec the agent (`ppid`: only the
+    ///   agent's own forks have its pid as their parent while it runs), and
+    ///   forked by the agent itself by the kernel's record of the fork (a
+    ///   `CLONE_PARENT` clone of one of its children names the agent as
+    ///   `real_parent`, never as its forker; a record not known vouches for
+    ///   nothing);
+    /// - its parent in the lineage, as of the event, runs the agent's own
+    ///   image;
+    /// - the program the kernel executed is in a system directory
+    ///   ([`AGENT_HELPER_DIRS`], where the agent looks its helpers up) and
+    ///   installed by a package (a copy, an unpackaged file: not).
+    fn run_by_the_agent(&self, spawn: Spawn, id: &ExecIdentity, as_of: AsOf) -> bool {
+        let Some(own) = self.own.get() else {
+            return false;
+        };
+        if own.agent_pid <= 1
+            || spawn.uid != 0
+            || spawn.ppid != own.agent_pid
+            || spawn.fork_parent != own.agent_pid
+        {
+            return false;
+        }
+        let exe = id.exe.to_string_lossy();
+        if !AGENT_HELPER_DIRS.iter().any(|d| exe.starts_with(d)) || exe.contains("/../") {
+            return false;
+        }
+        let parent_is_agent = self
+            .lineage
+            .parent_identity(spawn.pid, as_of)
+            .is_some_and(|p| p.exe == own.agent_exe);
+        parent_is_agent && self.owners.owned(&id.exe) == Some(true)
     }
 
     /// With a cgroup tree of its own (tests).
@@ -904,6 +978,8 @@ impl<H: DecisionHost> DefenseDetector<H> {
         let (rule, tool, what, pid, filename, ts) = match event {
             Event::ProcessSpawn {
                 pid,
+                ppid,
+                uid,
                 filename,
                 argv,
                 exe,
@@ -920,7 +996,13 @@ impl<H: DecisionHost> DefenseDetector<H> {
                     self.schedule_rescan(Instant::now());
                     return None;
                 }
-                let asked = self.spawn_finding(*pid, &id, argv, as_of, GetoptEnv::of(exe))?;
+                let spawn = Spawn {
+                    pid: *pid,
+                    ppid: *ppid,
+                    uid: *uid,
+                    fork_parent: exe.fork_parent,
+                };
+                let asked = self.spawn_finding(spawn, &id, argv, as_of, GetoptEnv::of(exe))?;
                 stopped = asked.stopped;
                 reload = asked.reload;
                 (
@@ -1067,7 +1149,7 @@ impl<H: DecisionHost> DefenseDetector<H> {
 
     fn spawn_finding(
         &self,
-        pid: u32,
+        spawn: Spawn,
         id: &ExecIdentity,
         argv: &[String],
         as_of: AsOf,
@@ -1098,10 +1180,12 @@ impl<H: DecisionHost> DefenseDetector<H> {
             let understood = match SystemTool::named(&c.program) {
                 Some(tool) => {
                     let listed = read_listed(tool, &c.args);
-                    let by_its_runtime = || self.flushed_by_its_runtime(pid, as_of);
+                    let by_its_runtime = || self.flushed_by_its_runtime(spawn.pid, as_of);
+                    // lot 385 (F9b-4): the agent's own release
+                    let by_the_agent = || self.run_by_the_agent(spawn, id, as_of);
                     tool.read(argv, prog.args_from)
                         .iter()
-                        .find(|r| holds(tool, r, &listed, &by_its_runtime))
+                        .find(|r| holds(tool, r, &listed, &by_its_runtime, &by_the_agent))
                         .map(|r| r.understood)
                 }
                 None => switches_off(&args, &c.args).then_some(true),
@@ -1646,11 +1730,21 @@ fn switches_off(args: &[&str], run: &[String]) -> bool {
 /// process, and any other chain — the host firewall's (ufw, fail2ban,
 /// firewalld), a built-in one, every chain of a table (no chain named) — is
 /// still the firewall switched off.
+///
+/// Lot 385 (the external tester's F9b-4): nor is the agent's own COMBAT
+/// chain ([`COMBAT_CHAIN`]) flushed by the agent's own release — a signed
+/// `nn-admin unlock` (and a stale chain reconciled at its start) runs
+/// `iptables -F NORTHNARROW_COMBAT` and `ip6tables -F …`, and NN-L-EVA-002
+/// recorded two High "security tool switched off" for the agent undoing
+/// its own rules. Told by identity ([`DefenseDetector::run_by_the_agent`]);
+/// the same flush by any other process, and any other chain flushed by the
+/// agent's spawn, is still the firewall switched off.
 fn holds(
     tool: SystemTool,
     r: &Parsed<'_>,
     listed: &Parsed<'_>,
     by_its_runtime: &dyn Fn() -> bool,
+    by_the_agent: &dyn Fn() -> bool,
 ) -> bool {
     let flush = |name: &str| tool == SystemTool::Iptables && name == tool_options::IPTABLES_FLUSH;
     let options = listed.options.iter().all(|(name, values)| {
@@ -1660,6 +1754,12 @@ fn holds(
                     && values.is_empty()
                     && v.first().is_some_and(|chain| is_runtime_chain(chain))
                     && by_its_runtime())
+                // lot 385 (F9b-4): the agent's own chain, flushed by the
+                // agent's own release ([`DefenseDetector::run_by_the_agent`])
+                && !(flush(name)
+                    && values.is_empty()
+                    && v.first().copied() == Some(COMBAT_CHAIN)
+                    && by_the_agent())
         })
     });
     let operands = listed.operands.is_empty()

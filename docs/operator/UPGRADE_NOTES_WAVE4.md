@@ -6070,6 +6070,64 @@ fires.
   command: after the upgrade the status names the row; acknowledge through
   it.
 
+## 70. The external tester's findings: `audit verify`'s default, `host-check` without root, the agent's own release, an earlier login's `(sd-pam)`, a long link pin name (lot 385)
+
+- **`nn-admin audit verify` without `--from`** verifies the agent's audit
+  log, `/etc/northnarrow/audit.log` (it exited 2, "required arguments were
+  not provided"), as `audit read` and `chain verify` default to it. The
+  default must exist: on a host without it the command exits 1 and says
+  so — never "0 entries, hash chain intact". A file given with `--from`
+  keeps its contract (a missing one is an empty chain). Scripts that pass
+  `--from` see no change.
+- **`nn-admin host-check` run without root** no longer says `OK` for what
+  it could not read. The admin key under `/root` read as "none at the
+  bootstrap paths" (`OK`), IMA's securityfs file as "IMA not present", and
+  a library `/etc/ld.so.preload` names in a directory this user cannot
+  search as absent (`OK present, loads nothing`, where root's run says
+  `FAIL`): such a row is now `n/a` with `cannot check: run as root (<file>
+  is not readable as this user)`, and the table ends with the number of those rows
+  and `run it as root: sudo nn-admin host-check`. The exit status is
+  unchanged (`n/a` is no warning): a script that ran `host-check` without
+  root and read exit 0 as "hardened" was reading checks that never looked;
+  run it as root. As root nothing changes.
+- **`nn-admin unlock` no longer records two High
+  `NN-L-EVA-002_SecurityToolSwitchedOff`.** The agent's release removes its
+  own `NORTHNARROW_COMBAT` chain (`iptables -F`, `ip6tables -F`); that
+  flush is no security tool switched off when the kernel's facts and the
+  lineage say it is the agent's own: run as root, the agent its parent at
+  the exec and its forker by the kernel's fork record, the agent's image
+  its parent's in the lineage, a packaged program of `/usr/sbin`,
+  `/usr/bin`, `/sbin` or `/bin`, and the agent's chain only. The same
+  flush by any other process (a root shell, a `CLONE_PARENT` sibling of
+  an agent's child, an unpackaged copy), or another chain flushed by the
+  agent's child, is recorded as before. The chain's name is one constant
+  (`nn_core::anti_tamper::combat_allow::COMBAT_CHAIN`).
+- **A login made before the agent started, then idle, no longer raises
+  ALERTED** when its user manager stops (`(sd-pam)` reading
+  `/etc/login.defs`, some seconds after the last session ends). Lot 378
+  told that `(sd-pam)` by its manager's scope (`user@<uid>.service/init.scope`),
+  looked up when the open was judged; systemd removes the scope a few
+  milliseconds after the read (the lab measured the judgement 2 ms and
+  0.4 ms before the unit's end), and a judgement later than that — a busy
+  first start, a slow VM — raised ALERTED. The agent's start now reads
+  the id of every running user manager's scope, and the open's cgroup is
+  compared with it: the same membership, of the same scope (a cgroup's id
+  is never another cgroup's during a boot). The residuals of §64 stand.
+- **Every link pin of the agent is registered by name.** The WARN `BPF
+  self-defence: link pin name too long for OWN_PIN_NAMES — not registered
+  pin=/sys/fs/bpf/northnarrow/link_cgroup_subtree_control_write` at every
+  start is gone. The kernel's `OBJ_GET` check reads the last 32 bytes of
+  the path; that 33-byte name (lot 348's subtree mark) was skipped, so an
+  `OBJ_GET` of that link by a path other than the pin directory's literal
+  absolute one (a relative path from inside it, for example) was not seen
+  as one of the agent's links by name. Its id was registered, so the
+  detach and update of the link were still refused, and its pin inode was
+  still protected. A name longer than the window is now registered by what
+  the window holds of it, its last 32 bytes, so it is matched in every
+  spelling of the path that the agent's other links are matched in. A pin of another program whose name ends with those same 32
+  bytes would also be taken for the agent's: one more refusal, never one
+  less. No pin is renamed and nothing on disk changes.
+
 ## 71. systemd-networkd's sysctl monitor re-attach is told truthfully, still refused; the last doc truths (lot 386)
 
 - **What changed (the rc12 soak, Debian 13, systemd 257).** When

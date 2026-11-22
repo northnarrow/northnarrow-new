@@ -335,6 +335,20 @@ pub(crate) fn load(
                 .with_identity(lineage.clone()),
         )),
     ));
+    // Lot 385 (F9b-4): the agent itself, by its pid and the image the kernel
+    // executed for it — its own release's flush of its own COMBAT chain is
+    // no security tool switched off (NN-L-EVA-002)
+    match antitamper_bpf::kernel_roots::current_exe() {
+        Ok(agent_exe) => defense_detector.set_own_spawns(northnarrow_agent::impair::OwnSpawns {
+            agent_pid: std::process::id(),
+            agent_exe,
+        }),
+        Err(e) => warn!(
+            error = %e,
+            "NN-L-EVA-002: the agent's own image could not be read — its release's flush of its \
+             own COMBAT chain is judged as any other process's"
+        ),
+    }
     // Lab PR 236: the signed per-rule response policy, read once through the
     // overlay gate (absent or refused: the built-in defaults — every held
     // kill held). A signed file that does not parse leaves the defaults in

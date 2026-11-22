@@ -683,7 +683,11 @@ per missing setting at boot; `nn-admin status` shows the count and
 `nn-admin host-check [--json]` the full table (exit 2 when something is
 missing, 3 when the agent cannot run on this host: a row that is `FAIL`,
 `fail` in `--json`). A check that cannot be determined (no EFI, IMA not compiled in)
-is reported as `n/a`, not as a warning. The lab guests show the expected
+is reported as `n/a`, not as a warning. Run it as root (`sudo nn-admin
+host-check`): a file this user cannot read (the admin key under `/root`,
+IMA's securityfs files, a library the preload list names in a directory
+this user cannot search) makes its row `n/a` with `cannot check: run as
+root`, never `OK` or "not present", and the table ends by counting them. The lab guests show the expected
 gaps of a cloud image (no Secure Boot, lockdown off, kexec allowed); a
 production host should clear them — the Scout Tappa will automate the
 fixes, this is the measurement.
