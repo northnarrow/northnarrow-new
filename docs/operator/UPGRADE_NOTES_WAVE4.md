@@ -6025,9 +6025,11 @@ fires.
   `--from` see no change.
 - **`nn-admin host-check` run without root** no longer says `OK` for what
   it could not read. The admin key under `/root` read as "none at the
-  bootstrap paths" (`OK`) and IMA's securityfs file as "IMA not present":
-  such a row is now `n/a` with `cannot check: run as root (<file> is not
-  readable as this user)`, and the table ends with the number of those rows
+  bootstrap paths" (`OK`), IMA's securityfs file as "IMA not present", and
+  a library `/etc/ld.so.preload` names in a directory this user cannot
+  search as absent (`OK present, loads nothing`, where root's run says
+  `FAIL`): such a row is now `n/a` with `cannot check: run as root (<file>
+  is not readable as this user)`, and the table ends with the number of those rows
   and `run it as root: sudo nn-admin host-check`. The exit status is
   unchanged (`n/a` is no warning): a script that ran `host-check` without
   root and read exit 0 as "hardened" was reading checks that never looked;

@@ -331,8 +331,9 @@ Further down, among many lines:
 - `host hardening : <n> check(s), <m> warning(s)`, the last line: settings
   of the host that `sudo nn-admin host-check` lists one per row, with how
   to fix each. Run it with `sudo`: without root some files cannot be read
-  (the admin key under `/root`, IMA's), and those rows say `cannot check:
-  run as root` instead of a verdict. They are the host's, not faults of the agent. On a throwaway
+  (the admin key under `/root`, IMA's, a preloaded library in a directory
+  only root may search), and those rows say `cannot check: run as root`
+  instead of a verdict. They are the host's, not faults of the agent. On a throwaway
   cloud VM expect WARN rows for kernel lockdown, module signatures, Secure
   Boot, IMA, kexec and the cgroup v1 controllers, and for the admin key
   left on the host (section 4 tells you to leave it there); before the

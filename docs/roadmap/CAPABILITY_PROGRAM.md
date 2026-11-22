@@ -11718,7 +11718,8 @@ number in parentheses is a lab PR.
       checks every `nn-admin` command of the README and the operator
       guides against the binary's own help (the golden matrix).
     - **A check that cannot read says so.** `host_hardening::Unread`:
-      denied is `n/a` `cannot check: run as root`, never `OK`.
+      denied is `n/a` `cannot check: run as root`, never `OK`; a preload
+      library this user cannot look at too (`preload::Verdict::Unseen`).
     - **The agent's own helper by identity** (`run_by_the_agent`): root,
       parent and forker the agent (the kernel's fork record), the
       lineage's parent the agent's image, a packaged system binary, the
@@ -11729,7 +11730,7 @@ number in parentheses is a lab PR.
       scan now records the running managers' scope ids.
     - **Every link pin registered** by what the kernel's 32-byte window
       holds of it; ratchet over every hook and program of the eBPF
-      sources, in eight path spellings, against a host model of the
+      sources, in nine path spellings, against a host model of the
       window (nn-adversarial: the id, detach/update and inode layers held
       for that link; the name layer was missing).
   - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and

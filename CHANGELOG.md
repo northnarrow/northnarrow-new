@@ -2290,12 +2290,13 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     exited 2 for a missing `--from`. `--from` now defaults to
     `/etc/northnarrow/audit.log`, as `audit read` and `chain verify` do; the
     default must exist (a missing audit log is exit 1, never "0 entries,
-    hash chain intact"). A ratchet parses every `nn-admin` command of the
-    README and the operator guides with `nn-admin`'s own command line (one
-    more doc fixed: `COMBAT_RECOVERY.md`'s `response restore` example).
-    Tests `every_documented_nn_admin_command_parses`,
+    hash chain intact"). A ratchet checks the `nn-admin` commands of the
+    README's and the operator guides' fenced command lines against
+    `nn-admin`'s help as the golden matrix records it (one more doc fixed:
+    `COMBAT_RECOVERY.md`'s `response restore` example). Tests
+    `every_documented_nn_admin_command_is_one_nn_admin_takes`,
     `audit_verify_defaults_to_the_audit_log_which_must_exist`,
-    `the_checker_reads_commands_and_refuses_a_wrong_one`. The README's
+    `the_checker_reads_commands_and_refuses_wrong_ones`. The README's
     Quickstart no longer says the install "does NOT start anything":
     `install.sh` starts and enables both units (`--no-enable` does not).
   - **`nn-admin host-check` never says `OK` where it could not look.** Run
@@ -2303,8 +2304,13 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     the host — none at the bootstrap paths` with the key in `/root`, and
     `IMA not present` with IMA on. A file this user cannot read now makes
     its row `n/a` with `cannot check: run as root (…)`, and the table counts
-    those rows ("run it as root"). Test
-    `a_check_that_cannot_read_never_says_ok`. The guide runs it with `sudo`.
+    those rows ("run it as root"). The same for a library the preload list
+    names in a directory this user cannot search, which read as absent
+    (`OK present, loads nothing`). Tests
+    `a_check_that_cannot_read_never_says_ok`,
+    `host_check_without_root_never_says_ok_of_a_preload_library_it_could_not_see`,
+    `a_name_this_user_cannot_look_at_is_unseen_not_absent`. The guide runs
+    it with `sudo`.
   - **The agent's own release is no security tool switched off.**
     `nn-admin unlock` left two High `NN-L-EVA-002_SecurityToolSwitchedOff`
     on `/usr/sbin/xtables-nft-multi`, the agent removing its own
@@ -2325,6 +2331,14 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     The scope's id is now read by the agent's start's scan, while the
     manager runs; the same membership is asked, of the same scope. Test
     `an_older_manager_s_sd_pam_judged_after_its_scope_is_gone`.
+  - **Every link pin of the agent is registered by name.** The start
+    warned `link pin name too long for OWN_PIN_NAMES — not registered` for
+    `link_cgroup_subtree_control_write` (33 bytes): the kernel's `OBJ_GET`
+    check reads the last 32 bytes of the path, and that name had no entry.
+    Its id and pin inode were protected, its detach and update refused; a
+    name longer than the window is now registered by its last 32 bytes,
+    matched in every spelling of the path the agent's other names are. Test
+    `every_own_link_pin_name_is_matched_in_every_spelling`.
   - **The tester's guide says what happens.** Scenario 6.8 leaves a
     **locked** COMBAT by design (a stop refused by the kernel is evidence no
     user can produce): its clean-up is `sudo nn-admin unlock`, and §6 no
