@@ -1230,7 +1230,7 @@ mod tests {
             );
         }
         let t = tempfile::tempdir().unwrap();
-        let lineage = AuthSessionTracker::new(&t.path().join("proc")).with_host_root(t.path());
+        let lineage = AuthSessionTracker::new(t.path().join("proc")).with_host_root(t.path());
         let none = |_: &str| None;
         let e = known_reattach_by(&lineage, &[(0, MONITOR_TAG)], &none, (1204, 998), 0x7f3a, 1)
             .unwrap_err();
