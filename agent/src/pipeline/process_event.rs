@@ -796,8 +796,9 @@ pub(crate) fn process_event(
                             "denied in kernel (the BPF guard: a handle on the agent's own object)"
                                 .to_string()
                         } else if *operation == nn_model::FsProtectOperation::SysctlRootAttach {
-                            "denied in kernel (the bpf LSM hook: an attach to the root cgroup)"
-                                .to_string()
+                            // lot 386: a proven re-attach names the
+                            // coexistence policy and what it costs
+                            common::bpf_prog_class::root_attach_response(*target_ino)
                         } else if *operation == nn_model::FsProtectOperation::Sigio {
                             "denied in kernel (file_send_sigiotask: a signal through a file's \
                              owner, F_SETOWN / O_ASYNC; the pid raised the I/O, not necessarily \

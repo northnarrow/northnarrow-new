@@ -2639,8 +2639,57 @@ PID 1 included.
   into it), is not told apart here.
 - networkd restarted outside a window (an upgrade of systemd, an operator's
   `systemctl restart systemd-networkd`) has its root attach refused
-  (`sysctl_root_attach`, High, ENGAGED): it runs without its sysctl monitor
-  until it is restarted inside a window, or at the next boot.
+  (`sysctl_root_attach`): it runs without its sysctl monitor until it is
+  restarted inside a window, or at the next boot. Lot 386 (below): the
+  refusal stays, the record is Low when the re-attach is proven.
+
+## Lot 386 — networkd's sysctl monitor re-attached: still refused, told by its identity and its program
+
+**Goal.** The rc12 soak (Debian 13, systemd 257): an upgrade restarted
+systemd-networkd while the agent ran; its `sysctl_monitor`'s new attach to
+the root's `cgroup/sysctl` slot was refused, as it must be (a program after
+the agent's sysctl judge could rewrite what it judged), and signed
+NN-L-AT-001 High, "an attempt on the sensor itself", raising ENGAGED. The
+refusal is the coexistence policy, not an attack.
+
+**The criterion** (`known_system_prog::known_reattach`, marked at the bus
+as lot 340's probes: `sensors::multiplexer::mark_known_reattach_on_host`).
+The `bpf` hook reads the attached program's tag (the kernel's digest of its
+instructions) into the record, the refusal depending on nothing read for
+it. The record is the re-attach of a known root program only when all of
+this holds:
+- the tag is the tag of the program lot 304 proved attached by that
+  entry's packaged loader BEFORE the agent started
+  (`known_system_prog::REATTACH_REFERENCE`, noted by the kernel-state
+  round, in memory for the agent's life): the same instructions — another
+  object, a program of the attacker's, a changed one is not;
+- the attacher executed the packaged `/usr/lib/systemd/systemd-networkd`
+  (its exec's device and inode, as of the attach, are the file's at that
+  path now, root's in a root directory, writable by no one else; no
+  interpreter);
+- as the entry's account (`systemd-network`), at the exec and at the
+  attach;
+- PID 1 forked it to run that program (the kernel's fork record, through a
+  verified `systemd-executor`): an orphan PID 1 adopted, a wrapper's exec
+  before it, a process another forked is not;
+- its cgroup is the entry's unit's (`systemd-networkd.service`), read for
+  the start its exec recorded.
+
+Then NN-L-AT-001 is Low, its response `refused by the coexistence policy:
+systemd-networkd's sysctl monitor re-attached after the agent started;
+networkd runs without it until the next boot`, and the posture raises
+nothing. Anything else is High as before.
+
+**What stays open.**
+- The tag binds the instructions, not the maps: a program of the same tag
+  given other maps is still the monitor (it never changes a sysctl write).
+  Code an attacker runs inside the packaged networkd (a preload, a
+  debugger) that re-attaches the genuine monitor is recorded Low: what it
+  attaches is networkd's own program, refused all the same.
+- With no reference — an agent started while networkd ran without its
+  monitor (after an earlier refusal), or an upgrade that changed the
+  monitor's instructions — the re-attach is High (a false High, kept until
+  the next boot).
 
 
 ## Lot 340 — the known system probes: refused, recorded Low by their loader
@@ -3143,9 +3192,11 @@ where it starts.
     Ubuntu 22.04 and 26.04 (`mount(2)`), never apply to the system's tool
     there. Measured on Debian 13 (6.12): the lock's propagation changed,
     signed and made again within one round (9 to 28 s); the read-only
-    remount signed within 4 s and still read-only a minute later; the
-    same changes of `/`, `/sys` and `/sys/fs/bpf` signed
-    `mount_attrs_changed`, not undone. Any host whose `mount` is built
+    remount signed within 4 s and still read-only a minute later; a
+    propagation change of `/`, `/sys` and `/sys/fs/bpf` signed
+    `mount_attrs_changed`, not undone (lot 386: a read-only remount of
+    `/` is refused there too; one of `/sys` or `/sys/fs/bpf` was not
+    measured). Any host whose `mount` is built
     the same way behaves alike (KNOWN_LIMITATIONS.md);
   - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
     copies unbindable mounts): a root user who deliberately

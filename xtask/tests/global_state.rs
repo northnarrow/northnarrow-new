@@ -518,6 +518,15 @@ const STATICS: &[Kept] = &[
          integrity round keeps a lock the start found",
     ),
     kept(
+        "crates/nn-linux/src/known_system_prog.rs",
+        "REATTACH_REFERENCE",
+        HostFact,
+        "lot 386: the tags of the root cgroup/sysctl programs this agent's kernel-state round \
+         proved attached by a known loader before the agent started (networkd's monitor at \
+         boot) — a fact of the host's boot, noted by the one round, read by the decision \
+         thread to tell that program's re-attach; at most 8",
+    ),
+    kept(
         "crates/nn-linux/src/systemd_executor.rs",
         "KERNEL",
         Kernel,

@@ -857,7 +857,12 @@ impl<H: DecisionHost> TriggerDetector<H> {
                 // and signed Low (the bench's `bpftool prog show` raised
                 // ENGAGED at every boot)
                 || (*operation == nn_model::FsProtectOperation::BpfHandle
-                    && common::bpf_prog_class::bpf_listing_kind(*target_dev).is_some());
+                    && common::bpf_prog_class::bpf_listing_kind(*target_dev).is_some())
+                // lot 386: nor networkd's sysctl monitor re-attached at a
+                // restart, proven: refused by the coexistence policy, signed
+                // Low (the rc12 soak's upgrade raised ENGAGED with it)
+                || (*operation == nn_model::FsProtectOperation::SysctlRootAttach
+                    && common::bpf_prog_class::root_reattach_known_of(*target_ino).is_some());
             // Lot 280a: nor a write the signed per-sysctl opt-out let
             // through (`SysctlOptOut`): recorded, the operator's tuning.
             // Lot 280b: nor what the kernel-state round found (a new
@@ -5428,6 +5433,56 @@ mod tests {
                 "{op}"
             );
         }
+    }
+
+    /// Lot 386 (named, the rc12 soak's R18): networkd's sysctl monitor
+    /// re-attached at a restart, proven at the bus (the record's mark), raises
+    /// no trigger — refused and signed Low; the same refusal unproven (the
+    /// kernel's attach type alone, with or without a tag), or a mark naming
+    /// no root entry, impairs as before (ENGAGED).
+    #[test]
+    fn a_proven_monitor_reattach_raises_nothing_and_any_other_impairs() {
+        use common::bpf_prog_class::{root_reattach_known_ino, ROOT_REATTACH_KNOWN_BIT};
+        let det = TriggerDetector::new();
+        let ev = |pid, tag, ino| Event::FsProtectDenial {
+            pid,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: tag,
+            target_ino: ino,
+            operation: nn_model::FsProtectOperation::SysctlRootAttach,
+            timestamp_ns: 1,
+        };
+        assert!(det
+            .detect(&ev(1204, 0x7f3a, root_reattach_known_ino(0)), &[])
+            .is_empty());
+        for (tag, ino) in [
+            (0x7f3a, 18),
+            (0, 18),
+            (0x7f3a, root_reattach_known_ino(1)),
+            (0x7f3a, ROOT_REATTACH_KNOWN_BIT | 17),
+        ] {
+            assert_eq!(
+                det.detect(&ev(1204, tag, ino), &[]),
+                vec![TriggerType::DefenseImpairment],
+                "{tag:#x} {ino:#x}"
+            );
+        }
+        // the mark is a root attach's only: another refusal whose target
+        // reads the same keeps its trigger
+        let kprobes = Event::FsProtectDenial {
+            pid: 1204,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: 0x7f3a,
+            target_ino: root_reattach_known_ino(0),
+            operation: nn_model::FsProtectOperation::Kprobes,
+            timestamp_ns: 1,
+        };
+        assert_eq!(
+            det.detect(&kprobes, &[]),
+            vec![TriggerType::DefenseImpairment]
+        );
     }
 
     /// Lot 290 (named): a refused load of a refused program type and a

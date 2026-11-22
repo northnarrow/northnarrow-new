@@ -8,7 +8,7 @@ it reads `unreleased`); release.yml's `verify-tag` refuses a tag that is
 not `v` and the workspace version, or whose section is not the first one
 here, dated (CONTRIBUTING.md, "Rilasci").
 
-## [0.1.0-alpha] - unreleased
+## [0.1.0-alpha] - 2026-11-22
 
 Tag `v0.1.0-alpha`: the first alpha, everything since `0.0.1` (Wave 4 and
 the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
@@ -2320,6 +2320,51 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 386 (the rc12 soak's R18, Debian 13, systemd 257; the last doc
+  truths; `UPGRADE_NOTES_WAVE4.md` §71).
+  - **systemd-networkd's sysctl monitor re-attach is told truthfully, still
+    refused.** An upgrade restarted networkd while the agent ran; its
+    `sysctl_monitor`'s new attach to the root cgroup's `cgroup/sysctl`
+    slot was refused (as it must be: after the agent's sysctl judge it
+    could rewrite what it judged) and signed `NN-L-AT-001` High, "an
+    attempt on the sensor itself", raising ENGAGED. The `bpf` hook now puts
+    the attached program's tag in the record (the refusal depends on
+    nothing read for it), and the decision thread, past the bus's lineage
+    barrier, proves the re-attach a known root program's
+    (`known_system_prog::known_reattach`): the tag is the one of the
+    program the packaged networkd attached before the agent started (lot
+    304's proof, kept in memory by the kernel-state round), and the
+    attacher executed the packaged `/usr/lib/systemd/systemd-networkd`
+    (device and inode as of the attach), as `systemd-network`, forked by
+    PID 1 to run it (the kernel's fork record), in
+    `systemd-networkd.service`'s cgroup. Then the record is Low, `refused
+    by the coexistence policy: systemd-networkd's sysctl monitor
+    re-attached after the agent started; networkd runs without it until
+    the next boot`, and raises no posture; anything else stays High, now
+    with the program's tag. One packaged-file view shared with lot 373's
+    bpftool proof. Tests
+    `a_networkd_monitor_reattach_is_proven_by_its_identity_and_its_tag`,
+    `a_reattach_s_facts_are_the_lineage_s_as_of_the_refusal`,
+    `a_reattach_s_reference_is_a_program_loaded_before_the_start`,
+    `a_refused_root_attach_is_marked_a_known_reattach_only_when_proven`,
+    `a_proven_networkd_monitor_reattach_is_low_and_any_other_high`,
+    `a_proven_monitor_reattach_raises_nothing_and_any_other_impairs`,
+    `a_known_root_reattach_s_record_round_trips`,
+    `a_reattach_s_tag_is_compared_before_any_proc_read` (the tag first: a
+    program that is no reference costs no `/proc` read); the ratchet
+    `a_known_probe_is_marked_after_the_lineage_barrier` extended. The
+    ratchet `the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root` pins
+    the root branch literally again — the record (the tag read inside its
+    call) and the refusal, no condition and no return between them — and
+    now the whole judged block, from the target's reading to the refusal.
+  - **Docs.** KNOWN_LIMITATIONS.md: networkd's monitor (systemd 257 and
+    later), what networkd loses and until when, and when the re-attach
+    stays High; "a long stall" instead of a bound (also the
+    `agent_stalled` row of INSTALL_UPGRADE_UNINSTALL.md); the Debian 13
+    `mount` item says what was measured (a read-only remount of `/`
+    refused there too, of `/sys` and `/sys/fs/bpf` not measured) and that
+    `pin_lock_changed` is no `integrity:` line. The trust model has the
+    criterion and what stays open.
 - Lot 385 (pre-alpha Phase 9b, the external tester's findings on rc13;
   `UPGRADE_NOTES_WAVE4.md` §70).
   - **`nn-admin audit verify` takes the agent's audit log by default.**

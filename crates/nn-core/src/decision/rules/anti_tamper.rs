@@ -244,10 +244,32 @@ impl Rule for NnLAt001AntiTamperDenial {
                  read kernel memory from every BPF program loaded after it, the agent's next \
                  start among them"
             ),
+            // Lot 386: a known root program's packaged loader re-attaching
+            // that same program after the agent started (networkd's sysctl
+            // monitor, at a restart), proven at the bus: refused all the
+            // same, Low.
+            FsProtectOperation::SysctlRootAttach
+                if common::bpf_prog_class::root_reattach_known_of(*target_ino).is_some() =>
+            {
+                return Some(known_reattach_verdict(
+                    self,
+                    event,
+                    *pid,
+                    comm,
+                    *target_dev,
+                    *target_ino,
+                ));
+            }
             FsProtectOperation::SysctlRootAttach => format!(
-                "to attach a cgroup/sysctl program to the root cgroup (attach type \
+                "to attach a cgroup/sysctl program{} to the root cgroup (attach type \
                  {target_ino}) outside a trusted-installer window — attached after the agent's \
-                 sysctl judge, it would run after it and could rewrite the value it judged"
+                 sysctl judge, it would run after it and could rewrite the value it judged",
+                // lot 386: the program by its tag, as the hook read it
+                if *target_dev == 0 {
+                    String::new()
+                } else {
+                    format!(" (tag {})", common::bpf_prog_class::tag_hex(*target_dev))
+                }
             ),
             // Lot 280b: not refused — the kernel-state round's finding.
             FsProtectOperation::KernelTaint => {
@@ -861,6 +883,40 @@ fn known_probe_verdict(
         prog_type_name(u32::try_from(prog_type).unwrap_or(u32::MAX)),
         k.what,
         k.loader
+    );
+    build_verdict(rule, event, ResponseAction::Log, Severity::Low, &reasoning)
+}
+
+/// Lot 386: a refused attach to the root cgroup's `cgroup/sysctl` slot that
+/// the bus proved a known root program's packaged loader re-attaching that
+/// same program (`root_reattach_known_of`) — Low, refused by the coexistence
+/// policy, with the proof and what the refusal costs; raises no posture.
+fn known_reattach_verdict(
+    rule: &NnLAt001AntiTamperDenial,
+    event: &Event,
+    pid: u32,
+    comm: &str,
+    tag: u64,
+    target_ino: u64,
+) -> Verdict {
+    use common::bpf_prog_class::{root_reattach_known_of, tag_hex, KNOWN_SYSTEM_PROGRAMS};
+    let entry = root_reattach_known_of(target_ino).unwrap_or(0);
+    let k = KNOWN_SYSTEM_PROGRAMS[entry];
+    let reasoning = format!(
+        "Refused by the coexistence policy: {}. `{comm}` (pid {pid}) attempted to attach `{}` \
+         (tag {}), {}, to the root cgroup's cgroup/sysctl slot — the program its packaged \
+         loader attached before the agent started (the same tag). The attacher proven: it runs \
+         the packaged {} (its device and inode, as it executed it), as `{}`, forked by PID 1, \
+         in its own unit's cgroup ({}). The refusal stands — a cgroup/sysctl program after the \
+         agent's sysctl judge could rewrite what it judged; recorded Low, and raises no posture \
+         (lot 386). The same attach by any other process, or of any other program, stays High.",
+        k.reattach,
+        k.name,
+        tag_hex(tag),
+        k.what,
+        k.loader,
+        k.user,
+        k.unit
     );
     build_verdict(rule, event, ResponseAction::Log, Severity::Low, &reasoning)
 }
@@ -1842,6 +1898,74 @@ mod tests {
         let p = r(FsProtectOperation::SysctlRootProg);
         assert!(p.contains("(id 709)") && p.contains("Not refused"), "{p}");
         assert!(!p.contains("refused it"), "{p}");
+    }
+
+    /// Lot 386 (named, the rc12 soak's R18: networkd's monitor re-attached
+    /// at a restart while the agent ran, signed High "an attempt on the
+    /// sensor itself"): the re-attach the bus proved a known root program's
+    /// is Low, refused by the coexistence policy, naming the program, its
+    /// tag, the proof and what networkd loses until the next boot; the same
+    /// refusal unproven (the kernel's attach type alone), or a mark naming
+    /// no root entry, stays High with the tag the hook read.
+    #[test]
+    fn a_proven_networkd_monitor_reattach_is_low_and_any_other_high() {
+        use common::bpf_prog_class::{root_reattach_known_ino, ROOT_REATTACH_KNOWN_BIT};
+        let ev_tag = |tag, ino| Event::FsProtectDenial {
+            pid: 1204,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: tag,
+            target_ino: ino,
+            operation: FsProtectOperation::SysctlRootAttach,
+            timestamp_ns: 1,
+        };
+        let ev = |ino| ev_tag(0x342f_e7f3_4749_0662, ino);
+        let v = NnLAt001AntiTamperDenial
+            .evaluate(&ev(root_reattach_known_ino(0)))
+            .expect("verdict");
+        assert_eq!(v.severity, Severity::Low);
+        assert!(matches!(v.action, ResponseAction::Log));
+        for part in [
+            "Refused by the coexistence policy: systemd-networkd's sysctl monitor re-attached \
+             after the agent started; networkd runs without it until the next boot",
+            "`systemd-network` (pid 1204)",
+            "`sysctl_monitor` (tag 342fe7f347490662)",
+            "the packaged /usr/lib/systemd/systemd-networkd",
+            "as `systemd-network`, forked by PID 1",
+            "(systemd-networkd.service)",
+            "The refusal stands",
+            "raises no posture",
+            "stays High",
+        ] {
+            assert!(v.reasoning.contains(part), "{part}: {}", v.reasoning);
+        }
+        for ino in [18, root_reattach_known_ino(1), ROOT_REATTACH_KNOWN_BIT | 17] {
+            let v = NnLAt001AntiTamperDenial
+                .evaluate(&ev(ino))
+                .expect("verdict");
+            assert_eq!(v.severity, Severity::High, "{ino:#x}");
+            assert!(
+                v.reasoning.contains(
+                    "attempted to attach a cgroup/sysctl program (tag 342fe7f347490662) to the \
+                     root cgroup"
+                ),
+                "{}",
+                v.reasoning
+            );
+            assert!(
+                v.reasoning.contains("clearest intent signal"),
+                "{}",
+                v.reasoning
+            );
+        }
+        // no tag read: named as before
+        let v = NnLAt001AntiTamperDenial.evaluate(&ev_tag(0, 18)).unwrap();
+        assert!(
+            v.reasoning
+                .contains("attach a cgroup/sysctl program to the root cgroup (attach type 18)"),
+            "{}",
+            v.reasoning
+        );
     }
 
     /// Lot 304 (named): a root program the kernel-state round proved a

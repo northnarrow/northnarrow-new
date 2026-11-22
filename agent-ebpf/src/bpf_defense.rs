@@ -88,7 +88,7 @@ use northnarrow_common::bpf_prog_class::{
     CALIB_MAX_INSNS, CALIB_NONE, CALL_TARGETS, CONTENT_CALL, CONTENT_CONF_SLOTS,
     CONTENT_EVERY_TYPE_SLOT, CONTENT_FMOD_RET, CONTENT_LOCKDOWN_SLOT, CONTENT_MAX_INSNS,
     CONTENT_STAGE_HANDLE, CONTENT_STAGE_LOAD, CONTENT_STAGE_OFF, CONTENT_UNJUDGED, INSN_CALL,
-    PROG_LOAD_ATTACH_TYPE_OFFSET,
+    PROG_LOAD_ATTACH_TYPE_OFFSET, tag_word,
 };
 use northnarrow_common::cgroup_limits::{special_fs, SpecialFs};
 use northnarrow_common::fail_open::hook as fail_open_hook;
@@ -104,7 +104,7 @@ use northnarrow_common::wire::{
 
 use crate::btf_offsets::{
     BPF_LINK_ID_OFFSET, BPF_MAP_ID_OFFSET, BPF_MAP_MAP_TYPE_OFFSET, BPF_PROG_AUX_ID_OFFSET, BPF_PROG_AUX_OFFSET,
-    BPF_PROG_INSNSI_OFFSET, BPF_PROG_LEN_OFFSET, BPF_PROG_TYPE_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
+    BPF_PROG_INSNSI_OFFSET, BPF_PROG_TAG_OFFSET, BPF_PROG_LEN_OFFSET, BPF_PROG_TYPE_OFFSET, FDTABLE_FD_OFFSET, FDTABLE_MAX_FDS_OFFSET,
     FILES_STRUCT_FDT_OFFSET, FILE_F_INODE_OFFSET, FILE_PRIVATE_DATA_OFFSET, INODE_I_INO_OFFSET,
     INODE_I_SB_OFFSET, MM_STRUCT_EXE_FILE_OFFSET, SUPER_BLOCK_S_DEV_OFFSET, SUPER_BLOCK_S_MAGIC_OFFSET,
     TASK_STRUCT_FILES_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
@@ -445,6 +445,32 @@ unsafe fn prog_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
         return Ok(None);
     };
     prog_id_of(prog as *const c_void).map(Some).ok_or(())
+}
+
+/// Lot 386: [`prog_tag_of_fd`] as a global BPF function (exported, never
+/// inlined, scalar argument), as [`nn_link_id_of_fd`]: the tag of the
+/// program `fd` names in the caller's file table (`tag_word`, as the
+/// cross-view's records carry it), 0 when there is none or it cannot be
+/// read. Only for the record of a refused root `cgroup/sysctl` attach: the
+/// refusal never depends on it.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_prog_tag_of_fd(fd: u64) -> u64 {
+    unsafe { prog_tag_of_fd(fd as u32) }.unwrap_or(0)
+}
+
+/// Lot 386: the tag (`prog->tag`, the kernel's digest of the program's
+/// instructions, its maps' descriptors left out) of the BPF program `fd`
+/// names in the caller's file table. As [`prog_id_of_fd`]: the file is not
+/// checked to be a program — what another file's data reads as is a tag no
+/// known program has.
+#[inline(always)]
+unsafe fn prog_tag_of_fd(fd: u32) -> Option<u64> {
+    let o_tag = off_opt!(BPF_PROG_TAG_OFFSET)?;
+    let prog = private_of_fd(fd).ok()??;
+    bpf_probe_read_kernel::<[u8; 8]>((prog as *const u8).add(o_tag) as *const [u8; 8])
+        .ok()
+        .map(tag_word)
 }
 
 /// Lot 349 (the review of #558, F1): the id of the BPF map `fd` names and
@@ -1873,8 +1899,13 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
             Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
             None => ROOT_UNREADABLE,
         };
+        // Lot 386: the record carries the attached program's tag (user
+        // space tells networkd's monitor re-attaching by it), read inside
+        // the call for the record alone. Nothing sits between the branch
+        // and the refusal — no condition, no return (the review of #594:
+        // xtask's blinding_switches pins the block literally).
         if root != ROOT_NO {
-            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);
+            emit_root_attach(attached_prog_tag(cmd, attr), arg);
             return -EPERM;
         }
     }
@@ -1975,6 +2006,37 @@ fn emit_syscall(cmd: u32, arg: u32) {
 #[inline(always)]
 fn emit_denial(operation: u8, object_id: u32) {
     emit_denial_kind(operation, 0, object_id)
+}
+
+/// Lot 386: the tag of the program a `cgroup/sysctl` attach names
+/// ([`nn_prog_tag_of_fd`]), for the record of its refusal alone — 0 when
+/// the attribute or the descriptor cannot be read. A value, never a
+/// decision: the refusal is the caller's, unconditional.
+#[inline(always)]
+unsafe fn attached_prog_tag(cmd: u32, attr: *const c_void) -> u64 {
+    match prog_fd_offset(cmd) {
+        Some(off) if !attr.is_null() => {
+            match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+                Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),
+                Err(_) => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Lot 386: a refused root `cgroup/sysctl` attach's record — the attached
+/// program's tag in `target_dev` (0: not read), the attach type in
+/// `target_ino` — through the same budget as [`emit_denial`].
+#[inline(always)]
+fn emit_root_attach(tag: u64, attach_type: u32) {
+    crate::inode_protect::emit_attempt(
+        FS_OP_SYSCTL_ROOT_ATTACH,
+        InodeKey {
+            dev: tag,
+            ino: attach_type as u64,
+        },
+    );
 }
 
 /// [`emit_denial`] with the object's kind in `target_dev` (lot 290:

@@ -59,6 +59,8 @@ pub struct Program {
     pub attach: String,
     /// Boot-clock ns (`bpf_prog_info.load_time`).
     pub load_time: u64,
+    /// Lot 386: its tag (`common::bpf_prog_class::tag_word`; 0: not read).
+    pub tag: u64,
 }
 
 /// A process holding a link of the program.
@@ -89,6 +91,9 @@ pub struct Known {
     /// Seen loading by the agent's `bpf` hook (else loaded before the
     /// agent's start).
     pub seen: bool,
+    /// Lot 386: the program's tag (0: not read) — a re-attach's reference
+    /// ([`ReattachReference`]).
+    pub tag: u64,
 }
 
 /// Program `id`, held by a link of kind `link`: known, or why not. `prog`
@@ -154,6 +159,7 @@ pub fn judge(
             uid: h.uid,
             comm: h.comm.clone(),
             seen: seen_by_it,
+            tag: p.tag,
         });
     }
     Err(why.join("; "))
@@ -552,20 +558,239 @@ pub fn bpftool_listing_on_host(
         lineage.exec_file(pid, as_of),
         lineage.exec_uid(pid, as_of),
         &|argv| lineage.exec_argv_is(pid, as_of, argv),
-        &|path| {
-            let dir_ok = Path::new(path).parent().is_some_and(|d| {
-                antitamper_bpf::kernel_roots::metadata(d).is_ok_and(|m| {
-                    m.is_dir() && m.uid() == 0 && m.permissions().mode() & 0o022 == 0
-                })
-            });
-            if dir_ok {
-                packaged(Path::new("/"), path, 0)
-            } else {
-                None
-            }
-        },
+        &packaged_in_root_dir,
         kind_id,
     )
+}
+
+/// Lot 386: the packaged file at `path` on this host ([`packaged`] under
+/// `/`, owned by root), its directory root's and writable by no one else —
+/// `None` otherwise. [`bpftool_listing_on_host`]'s and
+/// [`known_reattach_on_host`]'s view of a packaged executable.
+fn packaged_in_root_dir(path: &str) -> Option<(u64, u64)> {
+    let dir_ok = Path::new(path).parent().is_some_and(|d| {
+        antitamper_bpf::kernel_roots::metadata(d)
+            .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.permissions().mode() & 0o022 == 0)
+    });
+    if dir_ok {
+        packaged(Path::new("/"), path, 0)
+    } else {
+        None
+    }
+}
+
+/// Lot 386: the tags a re-attach of a known root program is proven by
+/// ([`known_reattach`]) — each the tag of the program a known system
+/// program's packaged loader attached to the root's `cgroup/sysctl` slot
+/// BEFORE the agent started, as the kernel-state round proved it (lot 304,
+/// [`Known::seen`] false), by its entry. Kept for the agent's life, in
+/// memory only: an agent started after the monitor's re-attach was refused
+/// has none (the re-attach is High; `KNOWN_LIMITATIONS.md`). At most
+/// [`ReattachReference::CAP`] (a boot attaches one).
+#[derive(Debug, Default)]
+pub struct ReattachReference(std::sync::Mutex<Vec<(usize, u64)>>);
+
+impl ReattachReference {
+    /// The tags kept at most.
+    pub const CAP: usize = 8;
+
+    /// An empty reference (no program proven yet).
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Keep `k`'s tag when the round proved it loaded before the agent
+    /// started by an entry of the root's slot; a program the hook saw
+    /// loading (a window's), an unread tag, an LSM entry, one more past the
+    /// cap: nothing kept.
+    pub fn note(&self, k: &Known) {
+        let root = common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS
+            .get(k.entry)
+            .is_some_and(|e| e.link == KnownLink::RootCgroupSysctl);
+        if k.seen || k.tag == 0 || !root {
+            return;
+        }
+        let mut tags = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !tags.contains(&(k.entry, k.tag)) && tags.len() < Self::CAP {
+            tags.push((k.entry, k.tag));
+        }
+    }
+
+    /// The tags kept, with their entries.
+    pub fn tags(&self) -> Vec<(usize, u64)> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// Lot 386: this agent's [`ReattachReference`] (the kernel-state round
+/// notes, the decision thread reads).
+pub static REATTACH_REFERENCE: ReattachReference = ReattachReference::new();
+
+/// Lot 386: what the agent knows of a refused root `cgroup/sysctl` attach
+/// and of its attacher, as of the attach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReattachFacts {
+    /// The attached program's tag as the `bpf` hook read it (0: not read).
+    pub tag: u64,
+    /// The file the attacher executed (its exec as of the attach; `None`
+    /// for an interpreter's script, or no exec recorded).
+    pub exe: Option<String>,
+    /// That file's device (the kernel's form) and inode, as its exec
+    /// recorded it.
+    pub image: Option<(u64, u64)>,
+    /// The uid it executed it as, and the record's uid (at the attach).
+    pub exec_uid: Option<u32>,
+    pub uid: u32,
+    /// The process that forked it, by the kernel's fork record, when that
+    /// exec was the program the fork ran (through a verified
+    /// `systemd-executor`).
+    pub fork_parent: Option<u32>,
+    /// The systemd service whose cgroup places it, read for its start.
+    pub unit: Option<String>,
+}
+
+/// Lot 386 (the rc12 soak, R18: networkd restarted by an upgrade while the
+/// agent ran; its sysctl monitor's re-attach refused and signed High, "an
+/// attempt on the sensor itself"): a refused attach of a `cgroup/sysctl`
+/// program to the root cgroup is the packaged loader of a known root program
+/// re-attaching that program — its entry, or why not. Every fact holds:
+///
+/// * the program's tag (`f.tag`, read by the hook from the descriptor
+///   attached) is one of `references` ([`ReattachReference`]): the same
+///   instructions as the program that entry's loader attached before the
+///   agent started — another object, a program of the attacher's own, a
+///   changed one is not;
+/// * the attacher executed the entry's packaged loader (`f.exe`, not an
+///   interpreter's script) and its exec's image is that file now
+///   (`packaged`: device and inode, a regular file owned by root and
+///   writable by no one else, in such a directory) — a copy, another mount
+///   namespace's file, one replaced since the exec is not;
+/// * it executed it as the entry's account (`account_uid`), and attached as
+///   that account;
+/// * PID 1 forked it, and that exec was the program the fork ran (the
+///   kernel's fork record) — a process another forked, an orphan PID 1
+///   adopted, a wrapper's exec before it is not;
+/// * the systemd service whose cgroup places it is the entry's unit.
+///
+/// Refused all the same: NN-L-AT-001 signs it Low and the posture raises
+/// nothing. What this trusts: lot 304's proof of the program attached before
+/// the agent started, and a program of the same tag doing what that one did
+/// (the tag binds its instructions, not its maps: the monitor's
+/// instructions never change a sysctl write, whatever maps it is given).
+pub fn known_reattach(
+    f: &ReattachFacts,
+    references: &[(usize, u64)],
+    packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
+    account_uid: &dyn Fn(&str) -> Option<u32>,
+) -> Result<usize, String> {
+    use common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS;
+    let entry = reattach_reference(f.tag, references)?;
+    let k = KNOWN_SYSTEM_PROGRAMS[entry];
+    if f.exe.as_deref() != Some(k.loader) {
+        return Err(format!("it did not execute {}", k.loader));
+    }
+    let file = packaged(k.loader).map(|(dev, ino)| (common::wire::exe::kernel_dev(dev), ino));
+    if f.image.is_none() || f.image != file {
+        return Err(format!("it did not run the packaged {}", k.loader));
+    }
+    let account = account_uid(k.user).ok_or_else(|| format!("no account {}", k.user))?;
+    if f.exec_uid != Some(account) || f.uid != account {
+        return Err(format!("not run as {}", k.user));
+    }
+    if f.fork_parent != Some(1) {
+        return Err("not the program a fork of PID 1 ran".to_string());
+    }
+    if f.unit.as_deref() != Some(k.unit) {
+        return Err(format!("not in {}'s cgroup", k.unit));
+    }
+    Ok(entry)
+}
+
+/// The entry of `references` whose program has tag `tag` and is attached
+/// to the root's `cgroup/sysctl` slot — the first test of
+/// [`known_reattach`], made from memory alone.
+fn reattach_reference(tag: u64, references: &[(usize, u64)]) -> Result<usize, String> {
+    use common::bpf_prog_class::KNOWN_SYSTEM_PROGRAMS;
+    if tag == 0 {
+        return Err("the hook read no program from the attach".to_string());
+    }
+    references
+        .iter()
+        .find(|(e, t)| {
+            *t == tag
+                && KNOWN_SYSTEM_PROGRAMS
+                    .get(*e)
+                    .is_some_and(|k| k.link == KnownLink::RootCgroupSysctl)
+        })
+        .map(|(e, _)| *e)
+        .ok_or_else(|| {
+            format!(
+                "its tag {} is no tag of a known program attached to the root before the \
+                 agent started",
+                common::bpf_prog_class::tag_hex(tag)
+            )
+        })
+}
+
+/// [`known_reattach`] on this host: [`known_reattach_by`] with the
+/// references [`REATTACH_REFERENCE`] kept and the packaged loader under `/`
+/// in a directory root's ([`packaged_in_root_dir`]). Called once the bus
+/// taught the lineage every exec that reached it before the record.
+pub fn known_reattach_on_host(
+    lineage: &AuthSessionTracker,
+    pid: u32,
+    uid: u32,
+    tag: u64,
+    at_ns: u64,
+) -> Result<usize, String> {
+    known_reattach_by(
+        lineage,
+        &REATTACH_REFERENCE.tags(),
+        &packaged_in_root_dir,
+        (pid, uid),
+        tag,
+        at_ns,
+    )
+}
+
+/// [`known_reattach`] of the attacher `pid` (uid `uid` at the attach) of
+/// a program of tag `tag` refused at `at_ns` (`CLOCK_MONOTONIC`), as
+/// `lineage` recorded it as of the refusal — its exec's file, image, uid and
+/// fork record, its service read for the start that exec recorded, the
+/// account from the host's `/etc/passwd`. The tag is compared first: a
+/// program that is no reference costs no `/proc` read on the decision
+/// thread (the review of #594, P3-2).
+pub fn known_reattach_by(
+    lineage: &AuthSessionTracker,
+    references: &[(usize, u64)],
+    packaged: &dyn Fn(&str) -> Option<(u64, u64)>,
+    (pid, uid): (u32, u32),
+    tag: u64,
+    at_ns: u64,
+) -> Result<usize, String> {
+    reattach_reference(tag, references)?;
+    let as_of = AsOf::judged(at_ns);
+    let exe = lineage
+        .exec_identity(pid, as_of)
+        .filter(|i| !i.interprets())
+        .map(|i| i.exe.to_string_lossy().into_owned());
+    let start = lineage
+        .lineage_starts(pid, as_of)
+        .first()
+        .filter(|(p, s)| *p == pid && *s != 0)
+        .map(|(_, s)| *s);
+    let facts = ReattachFacts {
+        tag,
+        exe,
+        image: lineage.exec_file(pid, as_of),
+        exec_uid: lineage.exec_uid(pid, as_of),
+        uid,
+        fork_parent: lineage.fork_parent(pid, as_of),
+        unit: start.and_then(|s| lineage.system_service_started(pid, s)),
+    };
+    known_reattach(&facts, references, packaged, &|name| {
+        lineage.account_uid(name)
+    })
 }
 
 /// The host's clock ticks a second.
@@ -640,6 +865,424 @@ impl Host<'_> {
 mod tests {
     use super::*;
     use common::bpf_prog_class::{PROG_TYPE_CGROUP_SYSCTL, PROG_TYPE_LSM};
+
+    /// The networkd monitor's tag in these tests (the debian13 guest's link
+    /// fdinfo: `prog_tag 342fe7f347490662`).
+    const MONITOR_TAG: u64 = 0x342f_e7f3_4749_0662;
+
+    /// Lot 386 (named, the rc12 soak's R18: networkd restarted by an upgrade
+    /// while the agent ran, its monitor's re-attach signed High): the
+    /// packaged networkd re-attaching the program it attached before the
+    /// agent started is proven — every fact at once; each fact alone
+    /// missing or wrong (another program, no tag read, no reference, a copy
+    /// or a replaced binary, an interpreter, another account at the exec or
+    /// at the attach, a process PID 1 did not fork as that program, another
+    /// unit's cgroup, an entry with no unit) keeps it High.
+    #[test]
+    fn a_networkd_monitor_reattach_is_proven_by_its_identity_and_its_tag() {
+        const IMG: (u64, u64) = (common::wire::exe::kernel_dev(0x801), 386_001);
+        let loader = "/usr/lib/systemd/systemd-networkd";
+        let packaged = |p: &str| (p == loader).then_some((0x801, 386_001));
+        let accounts = |n: &str| match n {
+            "systemd-network" => Some(998),
+            "root" => Some(0),
+            _ => None,
+        };
+        let refs = [(1usize, 0x1111), (0usize, MONITOR_TAG)];
+        let good = ReattachFacts {
+            tag: MONITOR_TAG,
+            exe: Some(loader.into()),
+            image: Some(IMG),
+            exec_uid: Some(998),
+            uid: 998,
+            fork_parent: Some(1),
+            unit: Some("systemd-networkd.service".into()),
+        };
+        assert_eq!(known_reattach(&good, &refs, &packaged, &accounts), Ok(0));
+        type Case<'a> = (&'a str, ReattachFacts, &'a [(usize, u64)]);
+        let cases: Vec<Case> = vec![
+            (
+                "no tag read",
+                ReattachFacts {
+                    tag: 0,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "another program",
+                ReattachFacts {
+                    tag: 0x7f3a,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            ("no reference (an agent started after)", good.clone(), &[]),
+            (
+                "the LSM entry's tag",
+                ReattachFacts {
+                    tag: 0x1111,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "an interpreter",
+                ReattachFacts {
+                    exe: None,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "a copy",
+                ReattachFacts {
+                    exe: Some("/tmp/systemd-networkd".into()),
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "a replaced binary",
+                ReattachFacts {
+                    image: Some((IMG.0, 9)),
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "no image recorded",
+                ReattachFacts {
+                    image: None,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "root at the exec",
+                ReattachFacts {
+                    exec_uid: Some(0),
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "no exec uid",
+                ReattachFacts {
+                    exec_uid: None,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "root at the attach",
+                ReattachFacts {
+                    uid: 0,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "another forker",
+                ReattachFacts {
+                    fork_parent: Some(4242),
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "no fork record",
+                ReattachFacts {
+                    fork_parent: None,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "another unit",
+                ReattachFacts {
+                    unit: Some("run-u7.service".into()),
+                    ..good.clone()
+                },
+                &refs,
+            ),
+            (
+                "no unit",
+                ReattachFacts {
+                    unit: None,
+                    ..good.clone()
+                },
+                &refs,
+            ),
+        ];
+        for (why, f, refs) in cases {
+            assert!(
+                known_reattach(&f, refs, &packaged, &accounts).is_err(),
+                "{why}"
+            );
+        }
+        // the packaged loader not there, the account not there
+        assert!(known_reattach(&good, &refs, &|_: &str| None, &accounts).is_err());
+        assert!(known_reattach(&good, &refs, &packaged, &|_: &str| None).is_err());
+        // no image recorded and no packaged file: never equal
+        assert!(known_reattach(
+            &ReattachFacts {
+                image: None,
+                ..good.clone()
+            },
+            &refs,
+            &|_: &str| None,
+            &accounts
+        )
+        .is_err());
+        // a reference of tag 0 (none is kept) proves no unread program
+        assert!(known_reattach(
+            &ReattachFacts {
+                tag: 0,
+                ..good.clone()
+            },
+            &[(0, 0)],
+            &packaged,
+            &accounts
+        )
+        .is_err());
+        // a reference naming an entry not of the root's slot (PID 1's) proves
+        // nothing
+        assert!(known_reattach(
+            &ReattachFacts {
+                tag: 0x1111,
+                ..good.clone()
+            },
+            &[(1, 0x1111)],
+            &packaged,
+            &accounts
+        )
+        .is_err());
+        // PID 1's entry is no root program's, whatever facts match it (its
+        // loader, its account, an empty unit)
+        let pid1 = ReattachFacts {
+            tag: 0x1111,
+            exe: Some("/usr/lib/systemd/systemd".into()),
+            image: Some(IMG),
+            exec_uid: Some(0),
+            uid: 0,
+            fork_parent: Some(1),
+            unit: Some(String::new()),
+        };
+        let both =
+            |p: &str| (p == loader || p == "/usr/lib/systemd/systemd").then_some((0x801, 386_001));
+        assert!(known_reattach(&pid1, &[(1, 0x1111)], &both, &accounts).is_err());
+        let e = known_reattach(
+            &ReattachFacts {
+                tag: 0x7f3a,
+                ..good
+            },
+            &refs,
+            &packaged,
+            &accounts,
+        )
+        .unwrap_err();
+        assert!(e.contains("0000000000007f3a"), "{e}");
+    }
+
+    /// Lot 386 (named): the re-attach's facts are the lineage's as of the
+    /// refusal — networkd as PID 1's unit ran it through systemd-executor
+    /// (the kernel's fork record carried), as `systemd-network`, its cgroup
+    /// read for the start its exec recorded: proven. The same refusal before
+    /// its exec of networkd (its executor's, as of then), a root process
+    /// that executed the packaged networkd itself (no fork record of PID 1),
+    /// a process in another unit, a pid whose `/proc` shows another start,
+    /// another tag: not proven.
+    #[test]
+    fn a_reattach_s_facts_are_the_lineage_s_as_of_the_refusal() {
+        use common::wire::exe::exe_flags::{KNOWN, ROOT_DIR};
+        let t = tempfile::tempdir().unwrap();
+        let s = 1_000_000_000u64;
+        let loader = "/usr/lib/systemd/systemd-networkd";
+        const IMG: (u64, u64) = (common::wire::exe::kernel_dev(0x801), 386_001);
+        let packaged = |p: &str| (p == loader).then_some((0x801, 386_001));
+        let exec = |pid: u32, path: &str, uid: u32, forker: u32, at: u64, image: (u64, u64)| {
+            nn_model::Event::ProcessSpawn {
+                pid,
+                ppid: 1,
+                uid,
+                gid: uid,
+                comm: "x".into(),
+                filename: path.into(),
+                timestamp_ns: at,
+                argv: vec![path.into()],
+                parent_comm: String::new(),
+                parent_start_ns: 0,
+                start_ns: s,
+                parent_is_kthread: false,
+                exe: nn_model::ExeIdentity {
+                    path: path.into(),
+                    dev: image.0,
+                    ino: image.1,
+                    flags: KNOWN | ROOT_DIR,
+                    fork_parent: forker,
+                    ..Default::default()
+                },
+                argv_truncated: false,
+                filename_truncated: false,
+                stdio: Default::default(),
+            }
+        };
+        let proc = t.path().join("proc");
+        let entry = |pid: u32, ticks: u64, cgroup: &str| {
+            let d = proc.join(pid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("stat"),
+                format!(
+                    "{pid} (systemd-network) S 1 {pid} {pid} 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 \
+                     1 0 {ticks} 1 1\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+        };
+        std::fs::create_dir_all(t.path().join("etc")).unwrap();
+        std::fs::write(
+            t.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\n\
+             systemd-network:x:998:998:systemd Network Management:/:/usr/sbin/nologin\n",
+        )
+        .unwrap();
+        let unit = "/system.slice/systemd-networkd.service";
+        let lineage = AuthSessionTracker::new(&proc).with_host_root(t.path());
+        let executor = "/usr/lib/systemd/systemd-executor";
+        // networkd at its restart: PID 1's fork, the executor, networkd
+        assert!(lineage.ingest_spawn_event(&exec(1204, executor, 0, 1, 5 * s, (IMG.0, 7))));
+        assert!(lineage.ingest_spawn_event(&exec(1204, loader, 998, 1, 6 * s, IMG)));
+        entry(1204, 100, unit);
+        // root executing the packaged networkd from its shell (pid 4242's fork)
+        assert!(lineage.ingest_spawn_event(&exec(3000, loader, 998, 4242, 6 * s, IMG)));
+        entry(3000, 100, unit);
+        // networkd's image in another unit's cgroup
+        assert!(lineage.ingest_spawn_event(&exec(3001, loader, 998, 1, 6 * s, IMG)));
+        entry(3001, 100, "/system.slice/run-u7.service");
+        // the pid shows another start now
+        assert!(lineage.ingest_spawn_event(&exec(3002, loader, 998, 1, 6 * s, IMG)));
+        entry(3002, 900, unit);
+        // networkd executed as root (a drop-in's `User=`), attaching as
+        // `systemd-network` once it dropped its privileges
+        assert!(lineage.ingest_spawn_event(&exec(3003, loader, 0, 1, 6 * s, IMG)));
+        entry(3003, 100, unit);
+        // the mini-hunt: networkd in its unit's own mount namespace
+        // (`ProtectSystem=`, Ubuntu 26.04: no `ROOT_DIR`), by the LSM identity
+        let mut own_ns = exec(3004, loader, 998, 1, 6 * s, IMG);
+        if let nn_model::Event::ProcessSpawn { exe, .. } = &mut own_ns {
+            exe.flags = KNOWN;
+        }
+        assert!(lineage.ingest_spawn_event(&exec(3004, executor, 0, 1, 5 * s, (IMG.0, 7))));
+        assert!(lineage.ingest_spawn_event(&own_ns));
+        entry(3004, 100, unit);
+        let refs = [(0usize, MONITOR_TAG)];
+        let prove = |pid: u32, tag: u64, at: u64| {
+            known_reattach_by(&lineage, &refs, &packaged, (pid, 998), tag, at)
+        };
+        assert_eq!(prove(1204, MONITOR_TAG, 7 * s), Ok(0));
+        assert_eq!(
+            prove(3004, MONITOR_TAG, 7 * s),
+            Ok(0),
+            "its own mount namespace"
+        );
+        assert!(
+            prove(1204, MONITOR_TAG, 5 * s + s / 2).is_err(),
+            "the executor's"
+        );
+        assert!(prove(1204, 0x7f3a, 7 * s).is_err(), "another program");
+        assert!(prove(3000, MONITOR_TAG, 7 * s).is_err(), "not PID 1's fork");
+        assert!(prove(3001, MONITOR_TAG, 7 * s).is_err(), "another unit");
+        assert!(prove(3002, MONITOR_TAG, 7 * s).is_err(), "another start");
+        assert!(prove(3003, MONITOR_TAG, 7 * s).is_err(), "root at the exec");
+        assert!(
+            known_reattach_by(&lineage, &refs, &packaged, (1204, 0), MONITOR_TAG, 7 * s).is_err(),
+            "root at the attach"
+        );
+        assert!(prove(4040, MONITOR_TAG, 7 * s).is_err(), "no exec recorded");
+    }
+
+    /// Lot 386 (the review of #594, P3-2): the tag is compared before any
+    /// fact is read — a refused attach of a program that is no reference
+    /// (root's own, flooding) costs no `/proc` read on the decision thread;
+    /// its refusal names the tag, in words.
+    #[test]
+    fn a_reattach_s_tag_is_compared_before_any_proc_read() {
+        let src = include_str!("known_system_prog.rs");
+        let by = &src[src.find("\npub fn known_reattach_by(").unwrap()..];
+        let by = &by[..by.find("\n}\n").unwrap()];
+        let tag = by
+            .find("reattach_reference(tag, references)?;")
+            .expect("the tag compared in known_reattach_by");
+        for read in [
+            "exec_identity(",
+            "lineage_starts(",
+            "exec_file(",
+            "fork_parent(",
+            "system_service_started(",
+            "account_uid(",
+        ] {
+            assert!(
+                by.find(read).is_some_and(|i| i > tag),
+                "{read} before the tag"
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        let lineage = AuthSessionTracker::new(t.path().join("proc")).with_host_root(t.path());
+        let none = |_: &str| None;
+        let e = known_reattach_by(&lineage, &[(0, MONITOR_TAG)], &none, (1204, 998), 0x7f3a, 1)
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "its tag 0000000000007f3a is no tag of a known program attached to the root \
+             before the agent started"
+        );
+        assert_eq!(
+            known_reattach_by(&lineage, &[(0, MONITOR_TAG)], &none, (1204, 998), 0, 1),
+            Err("the hook read no program from the attach".to_string())
+        );
+    }
+
+    /// Lot 386 (named): the reference of a re-attach is the tag of a root
+    /// program the round proved loaded BEFORE the agent started — not one
+    /// the hook saw loading (a window's), not an unread tag, not the LSM
+    /// entry's; each once, at most `CAP`.
+    #[test]
+    fn a_reattach_s_reference_is_a_program_loaded_before_the_start() {
+        let r = ReattachReference::new();
+        let k = |entry, seen, tag| Known {
+            id: 35,
+            entry,
+            link_id: 3,
+            pid: 631,
+            uid: 998,
+            comm: "systemd-network".into(),
+            seen,
+            tag,
+        };
+        r.note(&k(0, true, MONITOR_TAG));
+        r.note(&k(0, false, 0));
+        r.note(&k(1, false, 0xe893));
+        r.note(&k(7, false, 0xe893));
+        assert!(r.tags().is_empty());
+        r.note(&k(0, false, MONITOR_TAG));
+        r.note(&k(0, false, MONITOR_TAG));
+        assert_eq!(r.tags(), vec![(0, MONITOR_TAG)]);
+        for t in 1..=20u64 {
+            r.note(&k(0, false, t));
+        }
+        assert_eq!(r.tags().len(), ReattachReference::CAP);
+        // the round notes each known root program it proves
+        let src = include_str!("kernel_state.rs");
+        let round = &src[src.find("\npub fn round(").unwrap()..];
+        let round = &round[..round.find("\n}\n").unwrap()];
+        assert!(
+            round.contains("crate::known_system_prog::REATTACH_REFERENCE.note(k);"),
+            "{round}"
+        );
+    }
 
     /// Lot 373 (the rc7 soak's `sudo bpftool prog show`): the packaged
     /// bpftool, run by root, listing or showing programs or maps, is a
@@ -788,6 +1431,7 @@ mod tests {
             name: "sysctl_monitor".into(),
             attach: String::new(),
             load_time,
+            tag: MONITOR_TAG,
         }
     }
 
@@ -797,6 +1441,7 @@ mod tests {
             name: "restrict_filesy".into(),
             attach: "bpf_lsm_file_open".into(),
             load_time,
+            tag: 0xe893_2b6b_ae2b_9745,
         }
     }
 
@@ -870,6 +1515,7 @@ mod tests {
                 uid: 998,
                 comm: "systemd-network".into(),
                 seen: false,
+                tag: MONITOR_TAG,
             }
         );
         // networkd restarted inside a window: the hook saw it load
