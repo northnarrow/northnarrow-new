@@ -614,10 +614,15 @@ pub fn round(
     let (found, degradation) = w.root(crate::sysctl_cgroup::root_report(), known);
     for f in &found {
         match f {
-            Finding::KnownRootProgram(k) => info!(
-                finding = ?k,
-                "kernel state: a known system program on the root cgroup's cgroup/sysctl slot, its loader proven"
-            ),
+            Finding::KnownRootProgram(k) => {
+                // lot 386: loaded before the start, its tag proves a
+                // re-attach of the same program after it
+                crate::known_system_prog::REATTACH_REFERENCE.note(k);
+                info!(
+                    finding = ?k,
+                    "kernel state: a known system program on the root cgroup's cgroup/sysctl slot, its loader proven"
+                )
+            }
             _ => {
                 warn!(finding = ?f, "kernel state: a cgroup/sysctl program not the agent's on the root cgroup")
             }
@@ -995,6 +1000,7 @@ mod tests {
             uid: 998,
             comm: "systemd-network".into(),
             seen: false,
+            tag: 0x7f3a,
         }
     }
 
@@ -1206,6 +1212,7 @@ mod tests {
                     uid: if id == 21 { 0 } else { 998 },
                     comm: "systemd".into(),
                     seen: false,
+                    tag: 0,
                 })
             } else {
                 Err("not proven".into())

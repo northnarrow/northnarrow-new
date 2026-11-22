@@ -1082,6 +1082,8 @@ fn teach(mut r: Received, lineage: Option<&AuthSessionTracker>) -> Received {
         crate::sensors::multiplexer::mark_known_probe_on_host(&mut r.envelope.event, l);
         // lot 373: and a refused handle proven the packaged bpftool's listing
         crate::sensors::multiplexer::mark_bpf_listing_on_host(&mut r.envelope.event, l);
+        // lot 386: and a refused root attach proven a known program's re-attach
+        crate::sensors::multiplexer::mark_known_reattach_on_host(&mut r.envelope.event, l);
     }
     r
 }
@@ -2134,6 +2136,11 @@ mod tests {
             .find("mark_known_probe_on_host(&mut r.envelope.event, l)")
             .expect("the mark");
         assert!(taught < marked, "{body}");
+        // lot 386: a known program's re-attach, past the same barrier
+        let reattach = body
+            .find("mark_known_reattach_on_host(&mut r.envelope.event, l)")
+            .expect("the re-attach's mark");
+        assert!(taught < reattach, "{body}");
         let mux = include_str!("multiplexer.rs");
         let pump = &mux[mux.find("\"fs_protect\",\n").unwrap()..];
         let pump = &pump[..pump.find(")?),").unwrap()];

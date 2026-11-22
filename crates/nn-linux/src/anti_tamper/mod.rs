@@ -1716,6 +1716,7 @@ mod tests {
                     uid: 998,
                     comm: "systemd-network".into(),
                     seen: false,
+                    tag: 0,
                 })
             } else {
                 Err("not proven".to_string())

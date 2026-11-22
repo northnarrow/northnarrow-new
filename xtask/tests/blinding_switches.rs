@@ -147,7 +147,11 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
             "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
             "Some(off) if !attr.is_null() => {",
             "None => ROOT_UNREADABLE,",
-            "if root != ROOT_NO {\n            emit_denial(FS_OP_SYSCTL_ROOT_ATTACH, arg);\n            return -EPERM;\n        }",
+            // lot 386: the record carries the attached program's tag; the
+            // refusal depends on nothing read for it
+            "if root != ROOT_NO {",
+            "Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),",
+            "emit_root_attach(tag, arg);\n            return -EPERM;\n        }",
             "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
         ],
     )
@@ -166,6 +170,20 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     )
     .unwrap();
     assert!(c.contains("const ROOT_CGROUP_INO: u64 = 1;"));
+    // lot 386: the record's response, the host-tested words
+    assert!(code("agent/src/pipeline/process_event.rs")
+        .contains("common::bpf_prog_class::root_attach_response(*target_ino)"));
+    // lot 386: the record's writer, behind the BPF guard's budget
+    in_order(
+        body(&c, "emit_root_attach"),
+        &[
+            "crate::inode_protect::emit_attempt(",
+            "FS_OP_SYSCTL_ROOT_ATTACH,",
+            "dev: tag,",
+            "ino: attach_type as u64,",
+        ],
+    )
+    .unwrap();
     // the kernel-state round asks the root again and signs what it finds,
     // through the bus as the fs_protect source
     let k = code("crates/nn-linux/src/kernel_state.rs");

@@ -11699,6 +11699,61 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 386 — systemd-networkd's sysctl monitor re-attach told truthfully,
+  still refused; the last doc truths (C23; `UPGRADE_NOTES_WAVE4.md` §71; no
+  level change).**
+  - What was open (the rc12 soak, R18, Debian 13, systemd 257): an upgrade
+    restarted networkd while the agent ran; its `sysctl_monitor`'s re-attach
+    to the root cgroup's `cgroup/sysctl` slot was refused (as it must be)
+    and signed NN-L-AT-001 High, "an attempt on the sensor itself", raising
+    ENGAGED. Docs: a stall bound in KNOWN_LIMITATIONS (the review of #590);
+    F3c-2 said more than was measured (the review of #592, P3-4).
+  - Done:
+    - **The refusal is unchanged.** The `bpf` hook's record now carries the
+      attached program's tag (`nn_prog_tag_of_fd`, a global BPF function;
+      0 when not read, the refusal independent of it).
+    - **The proof** (`known_system_prog::known_reattach`, marked past the
+      bus's lineage barrier: `mark_known_reattach_on_host`): the tag is the
+      one of the program lot 304 proved attached by networkd before the
+      agent started (`REATTACH_REFERENCE`, noted by the kernel-state round);
+      the attacher executed the packaged networkd (its exec's device and
+      inode, the file's now, in a root directory), as `systemd-network`,
+      forked by PID 1 to run it (the kernel's fork record through a
+      verified `systemd-executor`), in `systemd-networkd.service`'s cgroup.
+      Then NN-L-AT-001 Low, `refused by the coexistence policy: …`, and no
+      posture trigger; anything else High, with the tag.
+    - Mutation on the new code: 36 mutants (the record's encoding and
+      response, the proof, the reference, the mark at the bus, the rule, the
+      posture, the hook's writer), 36 caught by a named test (two after a
+      test each: the PID 1 entry's facts, another refusal of the same
+      target).
+    - Docs: KNOWN_LIMITATIONS (networkd's monitor: the systemd versions,
+      what networkd loses, until when, when it stays High; "a long stall";
+      F3c-2 as measured), INSTALL_UPGRADE_UNINSTALL (`agent_stalled`), the
+      trust model (lot 386's criterion and what stays open), UPGRADE_NOTES
+      §71.
+  - Lab (as measured, our own guest, debian13, 6.12.117, systemd 257.13;
+    the lot's tree verified by hash on the guest; two rounds, the second
+    without the probe's own `bpftool` listing, whose handles on the agent's
+    objects are a record of their own in the lab's observe-mode build):
+    - At boot, before the agent: `sysctl_monitor` id 35, tag
+      342fe7f347490662, held by networkd (uid 998): NN-L-AT-001 Low
+      (`sysctl_root_prog`, and the cross-view's `bpf_baseline`).
+    - `systemctl restart systemd-networkd`, twice: each re-attach refused
+      (networkd: "Unable to attach sysctl monitor BPF program to cgroup,
+      ignoring: Operation not permitted", networkd active), NN-L-AT-001 Low
+      `sysctl_root_attach` "refused by the coexistence policy: …" with
+      networkd as the principal; the posture Observing before and after.
+      The only other record of each restart: networkd's libbpf probe,
+      NN-L-AT-001 Low (lot 340).
+    - A foreign `cgroup/sysctl` program attached to the root by root
+      (`deploy/lab/adversarial/sysctl-child-probe.c`): `EPERM`, NN-L-AT-001
+      High `sysctl_root_attach`, the posture to ENGAGED.
+    - Uninstalled with `--purge` (no unit active, no pin, no `.local`), the
+      guest powered off.
+    - Not exercised in the lab: an upgrade that changes networkd's binary
+      (the soak's case; the identity reads the file at the path now, the
+      tag the program); a hostile networkd (the unit and lineage tests).
 - **Lot 384 — an acknowledgement ends every held finding through its row;
   the status always names the row and the command; Phase 3c's doc truths
   (C23; `UPGRADE_NOTES_WAVE4.md` §69; no level change).**

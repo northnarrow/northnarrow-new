@@ -6069,3 +6069,47 @@ fires.
   A host left `DEGRADED` with `… and N more held integrity row(s)` and no
   command: after the upgrade the status names the row; acknowledge through
   it.
+
+## 71. systemd-networkd's sysctl monitor re-attach is told truthfully, still refused; the last doc truths (lot 386)
+
+- **What changed (the rc12 soak, Debian 13, systemd 257).** When
+  systemd-networkd restarts while the agent runs (an upgrade of systemd,
+  `systemctl restart systemd-networkd`), its sysctl monitor's new attach
+  to the root cgroup's `cgroup/sysctl` slot is refused, as before: a
+  program after the agent's sysctl check could rewrite what it checked.
+  It was signed `NN-L-AT-001` High ("an attempt on the sensor itself")
+  and raised ENGAGED. Now the record carries the attached program's tag,
+  and when the agent proves the attach is the packaged networkd's —
+  `/usr/lib/systemd/systemd-networkd` by device and inode as it executed
+  it, run as `systemd-network`, started by PID 1 in
+  `systemd-networkd.service`, attaching the same program (its tag) that
+  networkd attached at boot before the agent started — it is Low, its
+  response `refused by the coexistence policy: systemd-networkd's sysctl
+  monitor re-attached after the agent started; networkd runs without it
+  until the next boot`, and it raises no posture. Any other process
+  attaching a `cgroup/sysctl` program to the root, or networkd attaching
+  another program, stays High; a refused attach whose program could not be
+  read names no tag, as before.
+- **What networkd loses.** Only its monitor (systemd 257 and later): its
+  log no longer names another process's change of a sysctl it manages,
+  until the next boot or a restart of networkd inside a trusted-installer
+  window. networkd keeps managing the network.
+- **Still High (KNOWN_LIMITATIONS.md).** The agent compares the program
+  with the one networkd attached at boot, in memory: after the agent
+  itself restarted while networkd ran without its monitor, or after an
+  upgrade that changed the monitor's program, the re-attach stays High
+  until the next boot.
+- **Docs.** "A stall of more than 15 s" is now "a long stall"
+  (KNOWN_LIMITATIONS.md) and the `agent_stalled` row of
+  INSTALL_UPGRADE_UNINSTALL.md says "for a long time". The Debian 13
+  `mount` item says what was measured: a propagation change of the pin
+  directory's lock, `/`, `/sys` or `/sys/fs/bpf`, or a read-only bind
+  remount of the lock, succeeds and is signed; a read-only remount of `/`
+  is refused there too, and one of `/sys` or `/sys/fs/bpf` was not
+  measured; `pin_lock_changed` is a signed record, not an `integrity:`
+  line (only `mount_attrs_changed` is).
+- **Upgrade.** No configuration, no protocol change. The record's
+  `target_dev` of a refused root attach now carries the program's tag (0
+  when it was not read), and its `target_ino` the attach type, marked when
+  the re-attach is proven; a reader of the raw record that took
+  `target_dev` as 0 reads the tag.

@@ -339,6 +339,7 @@ pub fn program_of(p: &ProgRecord) -> crate::known_system_prog::Program {
             String::new()
         },
         load_time: p.load_time,
+        tag: tag_word(p.tag),
     }
 }
 
@@ -884,6 +885,8 @@ mod tests {
                 name: "restrict_filesy".into(),
                 attach: "bpf_lsm_file_open".into(),
                 load_time: 9_000_000_000,
+                // lot 386: its tag, a re-attach's reference
+                tag: 0xab00_0000_0000_0015,
             })
         );
         // an attach function not read: none named, whatever the bytes

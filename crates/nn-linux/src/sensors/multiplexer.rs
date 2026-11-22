@@ -1506,6 +1506,56 @@ pub(crate) fn mark_bpf_listing_on_host(e: &mut Event, lineage: &AuthSessionTrack
     });
 }
 
+/// Lot 386 (the rc12 soak, R18: networkd restarted by an upgrade while the
+/// agent ran, its sysctl monitor's re-attach NN-L-AT-001 High): a refused
+/// attach of a `cgroup/sysctl` program to the root cgroup
+/// (`sysctl_root_attach`, the program's tag in `target_dev`) whose attacher
+/// the agent proves the packaged loader of a known root program
+/// re-attaching that same program
+/// ([`crate::known_system_prog::known_reattach_on_host`]) is marked in its
+/// `target_ino` (`common::bpf_prog_class::root_reattach_known_ino`) before
+/// the posture or the rule reads it: NN-L-AT-001 signs it Low and the
+/// posture raises nothing. Still refused. The proof is the attacher's exec
+/// as of the refusal, from the lineage, past the bus's barrier — as
+/// [`mark_known_probe_on_host`]'s.
+pub(crate) fn mark_known_reattach_on_host(e: &mut Event, lineage: &AuthSessionTracker) {
+    mark_known_reattach(e, &|pid, uid, tag, at| {
+        crate::known_system_prog::known_reattach_on_host(lineage, pid, uid, tag, at)
+    });
+}
+
+/// [`mark_known_reattach_on_host`]'s decision, the proof read by `prove`:
+/// only the kernel's own record (the attach type alone in `target_ino`, a
+/// tag read) is proven; any other passes unchanged.
+fn mark_known_reattach(e: &mut Event, prove: &dyn Fn(u32, u32, u64, u64) -> Result<usize, String>) {
+    let Event::FsProtectDenial {
+        pid,
+        uid,
+        operation: nn_model::FsProtectOperation::SysctlRootAttach,
+        target_dev,
+        target_ino,
+        timestamp_ns,
+        ..
+    } = e
+    else {
+        return;
+    };
+    if *target_ino != u64::from(common::bpf_cmd::ATTACH_CGROUP_SYSCTL) || *target_dev == 0 {
+        return;
+    }
+    match prove(*pid, *uid, *target_dev, *timestamp_ns) {
+        Ok(entry) => {
+            *target_ino = common::bpf_prog_class::root_reattach_known_ino(entry as u16);
+        }
+        Err(why) => tracing::debug!(
+            pid = *pid,
+            tag = %common::bpf_prog_class::tag_hex(*target_dev),
+            why,
+            "sysctl_root_attach: no known program's re-attach"
+        ),
+    }
+}
+
 /// [`mark_bpf_listing_on_host`]'s decision, the proof read by `prove`.
 ///
 /// The lab of lot 373 (observe mode: the kernel lets the handles through and
@@ -2850,6 +2900,57 @@ mod tests {
             let before = format!("{e:?}");
             let mut e = e;
             mark_bpf_listing(&mut e, prove);
+            assert_eq!(format!("{e:?}"), before);
+        }
+    }
+
+    /// Lot 386 (named, the rc12 soak's R18): a refused root `cgroup/sysctl`
+    /// attach is marked a known program's re-attach only when proven, with
+    /// the attacher's pid, uid, the tag and the time given to the proof; one
+    /// not proven, one with no tag read, one already marked, another
+    /// operation pass unchanged.
+    #[test]
+    fn a_refused_root_attach_is_marked_a_known_reattach_only_when_proven() {
+        use common::bpf_prog_class::{root_reattach_known_ino, root_reattach_known_of};
+        let denial = |op, dev, ino| Event::FsProtectDenial {
+            pid: 1204,
+            uid: 998,
+            comm: "systemd-network".into(),
+            target_dev: dev,
+            target_ino: ino,
+            operation: op,
+            timestamp_ns: 5,
+        };
+        type Prove = dyn Fn(u32, u32, u64, u64) -> Result<usize, String>;
+        let seen = std::cell::RefCell::new(Vec::new());
+        let proven = |pid: u32, uid: u32, tag: u64, at: u64| -> Result<usize, String> {
+            seen.borrow_mut().push((pid, uid, tag, at));
+            Ok(0)
+        };
+        let not = |_: u32, _: u32, _: u64, _: u64| -> Result<usize, String> { Err("no".into()) };
+        let attach = nn_model::FsProtectOperation::SysctlRootAttach;
+        let mut marked = denial(attach, 0x7f3a, 18);
+        mark_known_reattach(&mut marked, &proven);
+        assert!(
+            matches!(marked, Event::FsProtectDenial { target_dev: 0x7f3a, target_ino, .. }
+                if target_ino == root_reattach_known_ino(0)
+                    && root_reattach_known_of(target_ino) == Some(0)),
+            "{marked:?}"
+        );
+        assert_eq!(*seen.borrow(), vec![(1204, 998, 0x7f3a, 5)]);
+        for (e, prove) in [
+            (denial(attach, 0x7f3a, 18), &not as &Prove),
+            (denial(attach, 0, 18), &proven),
+            (denial(attach, 0x7f3a, 17), &proven),
+            (denial(attach, 0x7f3a, root_reattach_known_ino(0)), &proven),
+            (
+                denial(nn_model::FsProtectOperation::SysctlRootProg, 0x7f3a, 18),
+                &proven,
+            ),
+        ] {
+            let before = format!("{e:?}");
+            let mut e = e;
+            mark_known_reattach(&mut e, prove);
             assert_eq!(format!("{e:?}"), before);
         }
     }

@@ -652,6 +652,15 @@ pub struct KnownSystemProgram {
     pub loader: &'static str,
     /// What it is, for the record.
     pub what: &'static str,
+    /// Lot 386: the packaged unit whose main process the loader is (its
+    /// cgroup's), for a re-attach of the program after the agent started
+    /// ([`root_reattach_known_ino`]); empty for PID 1's, which never
+    /// re-attaches to the root's `cgroup/sysctl` slot.
+    pub unit: &'static str,
+    /// Lot 386: the account the packaged unit runs the loader as.
+    pub user: &'static str,
+    /// Lot 386: what the refusal of its re-attach costs, for the record.
+    pub reattach: &'static str,
 }
 
 /// Lot 304: the known system programs (measured on Debian 13, systemd
@@ -672,6 +681,10 @@ pub const KNOWN_SYSTEM_PROGRAMS: [KnownSystemProgram; 2] = [
         loader: "/usr/lib/systemd/systemd-networkd",
         what: "systemd-networkd's sysctl monitor (systemd 257+: it logs a write by another \
                process to a sysctl networkd manages, and refuses nothing)",
+        unit: "systemd-networkd.service",
+        user: "systemd-network",
+        reattach: "systemd-networkd's sysctl monitor re-attached after the agent started; \
+                   networkd runs without it until the next boot",
     },
     KnownSystemProgram {
         name: "restrict_filesy",
@@ -681,6 +694,9 @@ pub const KNOWN_SYSTEM_PROGRAMS: [KnownSystemProgram; 2] = [
         loader: "/usr/lib/systemd/systemd",
         what: "systemd's RestrictFileSystems= (PID 1: it refuses a unit's process the opening \
                of a file on a filesystem type its unit does not allow)",
+        unit: "",
+        user: "root",
+        reattach: "",
     },
 ];
 
@@ -740,6 +756,60 @@ pub const fn root_prog_known_of(target_dev: u64) -> Option<(usize, bool, u32)> {
         target_dev & ROOT_PROG_SEEN_BIT != 0,
         target_dev as u32,
     ))
+}
+
+/// Lot 386 (the rc12 soak, Debian 13, systemd 257: networkd restarted by an
+/// upgrade while the agent ran, its monitor's re-attach refused and signed
+/// NN-L-AT-001 High, "an attempt on the sensor itself"): `target_ino` bit of
+/// a `sysctl_root_attach` record whose attacher the agent proved the
+/// packaged loader of a known root program re-attaching that program — the
+/// same instructions (its tag, the record's `target_dev`) as the one that
+/// loader attached before the agent started. Still refused; the kernel's
+/// record carries the attach type alone there.
+pub const ROOT_REATTACH_KNOWN_BIT: u64 = 1 << 63;
+
+/// Lot 386: the `target_ino` of a proven re-attach's record: the bit, the
+/// entry of [`KNOWN_SYSTEM_PROGRAMS`] (bits 32–47) and the attach type
+/// (bits 0–31, `BPF_CGROUP_SYSCTL`).
+#[inline(always)]
+pub const fn root_reattach_known_ino(entry: u16) -> u64 {
+    ROOT_REATTACH_KNOWN_BIT | ((entry as u64) << 32) | crate::bpf_cmd::ATTACH_CGROUP_SYSCTL as u64
+}
+
+/// Lot 386: the entry of [`KNOWN_SYSTEM_PROGRAMS`] a `sysctl_root_attach`
+/// record's `target_ino` names ([`root_reattach_known_ino`]); `None` for the
+/// kernel's own value, any other bit set, another attach type, an entry not
+/// in the table or not one of the root's `cgroup/sysctl` slot.
+#[inline(always)]
+pub const fn root_reattach_known_of(target_ino: u64) -> Option<usize> {
+    let entry = ((target_ino >> 32) & 0xffff) as usize;
+    if target_ino & ROOT_REATTACH_KNOWN_BIT == 0
+        || target_ino & !(ROOT_REATTACH_KNOWN_BIT | (0xffff << 32) | 0xffff_ffff) != 0
+        || target_ino as u32 != crate::bpf_cmd::ATTACH_CGROUP_SYSCTL
+        || entry >= KNOWN_SYSTEM_PROGRAMS.len()
+        || !matches!(
+            KNOWN_SYSTEM_PROGRAMS[entry].link,
+            KnownLink::RootCgroupSysctl
+        )
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Lot 386: the signed record's `response` of a refused attach to the root
+/// cgroup's `cgroup/sysctl` slot — the coexistence policy and what its
+/// refusal costs when the record is a proven re-attach
+/// ([`root_reattach_known_of`]), the kernel's refusal otherwise.
+#[cfg(feature = "std")]
+pub fn root_attach_response(target_ino: u64) -> String {
+    match root_reattach_known_of(target_ino) {
+        Some(entry) => format!(
+            "refused by the coexistence policy: {}",
+            KNOWN_SYSTEM_PROGRAMS[entry].reattach
+        ),
+        None => "denied in kernel (the bpf LSM hook: an attach to the root cgroup)".to_string(),
+    }
 }
 
 /// Lot 340 (the alpha's daily false positives): a BPF load a packaged
@@ -1351,6 +1421,59 @@ mod tests {
             crossview_ino(false, false, PROG_TYPE_LSM, 21) & CROSSVIEW_KNOWN_BIT,
             0
         );
+    }
+
+    /// Lot 386 (named): a proven re-attach's record carries its entry and
+    /// the attach type, and nothing else is read as one — the kernel's own
+    /// value (the attach type alone), another bit, another attach type, an
+    /// entry past the table, the LSM entry (no root program's).
+    #[test]
+    fn a_known_root_reattach_s_record_round_trips() {
+        use crate::bpf_cmd::ATTACH_CGROUP_SYSCTL;
+        let ino = root_reattach_known_ino(0);
+        assert_eq!(root_reattach_known_of(ino), Some(0));
+        assert_eq!(
+            ino,
+            ROOT_REATTACH_KNOWN_BIT | u64::from(ATTACH_CGROUP_SYSCTL)
+        );
+        assert_eq!(
+            root_reattach_known_of(u64::from(ATTACH_CGROUP_SYSCTL)),
+            None
+        );
+        assert_eq!(root_reattach_known_of(0), None);
+        assert_eq!(root_reattach_known_of(ino | (1 << 62)), None);
+        assert_eq!(root_reattach_known_of(ino | (1 << 48)), None);
+        assert_eq!(root_reattach_known_of(ROOT_REATTACH_KNOWN_BIT | 17), None);
+        assert_eq!(
+            root_reattach_known_of(root_reattach_known_ino(KNOWN_SYSTEM_PROGRAMS.len() as u16)),
+            None
+        );
+        assert_eq!(root_reattach_known_of(root_reattach_known_ino(1)), None);
+        // the root entry names its unit, account and what its refusal costs
+        let k = KNOWN_SYSTEM_PROGRAMS[0];
+        assert_eq!(
+            (k.unit, k.user),
+            ("systemd-networkd.service", "systemd-network")
+        );
+        assert!(k.reattach.contains("until the next boot"), "{k:?}");
+        // a unit and a re-attach's words for every root entry, none for another
+        for k in KNOWN_SYSTEM_PROGRAMS {
+            let root = k.link == KnownLink::RootCgroupSysctl;
+            assert_eq!(!k.unit.is_empty(), root, "{k:?}");
+            assert_eq!(!k.reattach.is_empty(), root, "{k:?}");
+        }
+        // the record's response: the policy and its cost, or the refusal
+        assert_eq!(
+            root_attach_response(ino),
+            "refused by the coexistence policy: systemd-networkd's sysctl monitor re-attached \
+             after the agent started; networkd runs without it until the next boot"
+        );
+        for other in [u64::from(ATTACH_CGROUP_SYSCTL), root_reattach_known_ino(1)] {
+            assert_eq!(
+                root_attach_response(other),
+                "denied in kernel (the bpf LSM hook: an attach to the root cgroup)"
+            );
+        }
     }
 
     /// Lot 290: the iterators' records, as userland reads them.

@@ -412,15 +412,19 @@ not cause as an incident.
   `mount --version` lists `fd-based-mount`) changes a mount's propagation
   and a bind mount's flags through `mount_setattr(2)`, which has no kernel
   hook. So on Debian 13 the everyday tool takes the path the guard cannot
-  refuse: a propagation change or a read-only bind remount of the pin
-  directory's lock, of `/`, `/sys` or `/sys/fs/bpf` returns success where
-  Ubuntu 22.04 and 26.04 (whose `mount` uses `mount(2)`) refuse it and
-  record `NN-L-AT-001` High. What Debian 13 records instead is the
-  integrity round's: `mount_attrs_changed` (High) and, for the lock,
-  `pin_lock_changed`, within one round (about 30 s; 4 to 28 s measured);
-  each is an `integrity:` degradation of `nn-admin status`. The lock's
-  propagation is made again within that round; a read-only remount of the
-  lock is signed and stays until you act, as in the item above; the
+  refuse: a propagation change of the pin directory's lock, of `/`, `/sys`
+  or `/sys/fs/bpf`, or a read-only bind remount of the lock, returns
+  success where Ubuntu 22.04 and 26.04 (whose `mount` uses `mount(2)`)
+  refuse it and record `NN-L-AT-001` High. A read-only remount of `/` is
+  refused on Debian 13 too; one of `/sys` or `/sys/fs/bpf` was not
+  measured. What Debian 13 records instead is the integrity round's:
+  `mount_attrs_changed` (High) and, for the lock, `pin_lock_changed`,
+  within one round (about 30 s; 4 to 28 s measured). `mount_attrs_changed`
+  is an `integrity:` degradation of `nn-admin status`; `pin_lock_changed`
+  is a signed record, not an `integrity:` line (`nn-admin status` shows the
+  `pin_lock` degradation only while the lock is not in place). The
+  lock's propagation is made again within that round; a read-only remount
+  of the lock is signed and stays until you act, as in the item above; the
   other mounts' changes are signed, not undone. Another distribution
   whose `mount` is built the same way behaves like Debian 13. *For you:*
   on such a host, treat a `mount_attrs_changed` or `pin_lock_changed` you
@@ -627,7 +631,7 @@ not cause as an incident.
   *Evidence:* `a_weakening_variable_from_the_service_manager_is_ignored`;
   lot 370.
 - **The agent's CPU time.** Heavy CPU load from root processes can slow the
-  agent. A stall of more than 15 s is a signed `agent_stalled` record. A
+  agent. A long stall is a signed `agent_stalled` record. A
   confinement of the agent to fewer CPUs is not refused: it is detected
   and signed (`cpu_confined`, High), shown in `nn-admin status` (the
   `own_cpus` degradation), and withdrawn when it ends. Some limits on the
@@ -1178,6 +1182,31 @@ lists the known false positives of each rule.
   (a privileged suite of the CI's KVM guests);
   `a_build_without_the_test_feature_injects_nothing`;
   `the_guard_is_not_attached_without_the_offsets_it_reads`; lot 379.
+- **systemd-networkd's sysctl monitor (systemd 257 and later).** On a
+  host that runs systemd-networkd from systemd 257 on (Debian 13, Ubuntu
+  26.04), networkd attaches a small BPF program to the root cgroup at its
+  start: a monitor that logs another process's write to a sysctl networkd
+  manages, and refuses nothing. At boot it attaches before the agent
+  starts and keeps running (recorded once, Low). When networkd restarts
+  while the agent runs (an upgrade of systemd, a `systemctl restart
+  systemd-networkd`), the agent refuses its new attach, like any program
+  attached after the agent's own sysctl check. networkd keeps managing
+  the network; only its monitor is missing, so its log no longer names
+  another process's change of those sysctls, until the next boot. The
+  record is `NN-L-AT-001` Low, `refused by the coexistence policy`, and
+  raises no posture, when the agent proves it is the packaged networkd
+  started by systemd in its own unit re-attaching the same program it
+  attached at boot. Any other process attaching such a program, or
+  networkd attaching another one, stays High. It is also High when the
+  agent cannot compare the program with the one of the boot: after the
+  agent itself restarted while networkd ran without its monitor, or
+  after an upgrade that changed the monitor's program. *For you:* reboot,
+  or restart networkd inside a trusted-installer window, to give networkd
+  its monitor back. *Evidence:*
+  `a_networkd_monitor_reattach_is_proven_by_its_identity_and_its_tag`;
+  `a_proven_networkd_monitor_reattach_is_low_and_any_other_high`;
+  `a_proven_monitor_reattach_raises_nothing_and_any_other_impairs`;
+  lot 386.
 - **RHEL family not re-verified.** AlmaLinux 9 was verified on an older
   build and not since many recent changes; the `.rpm` is untested (above).
   *Evidence:* internal check Phase 8 §7 (residual R066).

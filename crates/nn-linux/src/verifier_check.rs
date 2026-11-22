@@ -1295,6 +1295,8 @@ mod tests {
         );
         for sub in [
             "nn_link_id_of_fd",
+            // lot 386: a refused root attach's program tag
+            "nn_prog_tag_of_fd",
             "nn_obj_get_own_link",
             "nn_loader_opted_out",
             // lot 345: the content judge's scan
