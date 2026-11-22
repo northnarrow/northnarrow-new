@@ -113,6 +113,14 @@ const DYNAMIC: &[(&str, &str, Source)] = &[
     (
         "crates/nn-linux/src/self_integrity.rs",
         "f.kind",
+        Source::PassThrough(
+            "note_once (lot 389): a `Finding`'s kind, read at its construction \
+             (`shutdown_remount::RUN_EXEC_KIND`)",
+        ),
+    ),
+    (
+        "crates/nn-linux/src/self_integrity.rs",
+        "f.kind",
         Source::PassThrough("report_event: a `Finding`'s kind, read at its construction"),
     ),
     (

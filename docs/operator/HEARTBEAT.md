@@ -226,12 +226,24 @@ at every run until a beat comes back — never `OK`, and no longer the
 maintenance label `STOPPED` for good.
 
 When the agent starts again, its start compares the boot of its last run
-with the journal's boot list and signs `boots_without_agent` (High), held
+with the journal's boots before this one (asked one at a time, then its
+boot list; lot 389) and signs `boots_without_agent` (High), held
 in `nn-admin status` until acknowledged; the held finding is one of the
 degradations the new run's beats carry, so this verifier says `DEGRADED`
 at that start, even when the masked boot was shorter than the grace. Both
 records are statements of what the host let the agent read: a root who
 holds the agent's key can also write beats that verify (below).
+
+Once you acknowledge the held finding (`nn-admin integrity acknowledge`),
+`nn-admin status` says `OK`, and the next check of this verifier says
+`DEGRADED` once more: "the capability manifest changed … (revision N of
+run …)". That is true — the acknowledgement ended a degradation, so the
+manifest's next revision has another hash — and the verifier tells every
+change of that hash once (it compares hashes, not directions; `nn-admin
+capabilities --key` names the change). The check after it is `OK`. The
+same holds at the start after a run that ended degraded: its manifest
+differs from that run's last one ("changed across a restart"), once
+(lot 389's lab).
 
 ## What it does not prove
 

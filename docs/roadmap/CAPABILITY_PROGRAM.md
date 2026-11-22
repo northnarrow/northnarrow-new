@@ -11699,6 +11699,133 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 389 — the boot gap on systemd 249; finalrd's remount of `/run` at
+  the host's shutdown a note (pre-alpha Phase 2h on rc14, F2h-1, F2h-2 and
+  two P3s; `UPGRADE_NOTES_WAVE4.md` §74; no level change).**
+  - What was open: on Ubuntu 22.04 (systemd 249) `journalctl --list-boots`
+    stops at the first boot it meets twice — 383 of the guest's 422 boots —
+    so every start signed `boot_continuity_unknown` and a boot with the
+    agent's units masked was never `boots_without_agent` (only the
+    verifier's `NOT_BACK` told it); and one normal reboot in six left a
+    High `mount_attrs_changed` (and a `mount_over_protected` "hides") in
+    the stop beat: Ubuntu's packaged `finalrd` makes `/run` executable as
+    the shutdown begins, seconds before the agent is ended.
+  - Done:
+    - **The walk from this boot** (`nn_evidence::boot_gap::judge_walking`;
+      `journalctl -b -<k>` once the journal's tail is of this very boot —
+      fix round 1 —, at most 17 questions, none begun past 6 s): the boots before this one, newest first, until the
+      last run's; lot 387's list rules on what the walk met; `--list-boots`
+      only when the walk does not reach it; a disagreement is `unknown`,
+      never clean; an answer that is this very boot stops the walk.
+    - **finalrd's remount a note** (`run_exec_at_shutdown`, not held) only
+      with every fact: `/run` lost `noexec` alone, systemd `stopping` with a
+      reboot, power-off, halt or kexec job pending, the packaged unit's own
+      `ExecStop=` run since the last round (monotonic clock), the note
+      signed, within 120 s of the run's first; otherwise the High as before.
+      Hardened after a brainstorm by another model (the pending job, the
+      monotonic clock, one budget a run, the High kept until the note is
+      signed).
+    - **A remount is not a mount laid over** (`same_mount`).
+    - **The P3s**: the upgrade's `worker_parse` was lot 388's; the
+      acknowledgement's one `DEGRADED` is the manifest's true change
+      (docs).
+  - Mutation: 54 mutants (the walk 11, the host's questions 10, the shape
+    5, the round 8, the rule and its facts 20) — 54 caught by a named test,
+    two after `the_walk_reaches_past_every_boot_a_row_lists` and the "never
+    ran" case.
+  - Lab (as measured, our own guests, each round under its lease): the tree
+    verified by hash (1247 files), built in the guest, the verifier run on
+    the host from the same build; each round: rc14 from its tarball (the
+    tester's way, `--allow-unverified`), upgraded to the branch with the
+    operator's grant, a cold boot, normal reboots (`systemctl reboot`), one
+    boot with both units masked on the kernel command line and the
+    restore, the acknowledgement, then `uninstall.sh --purge` and a final
+    cold boot with nothing of ours, powered off.
+    - ubuntu2204 (5.15.0-204, systemd 249.11, the persistent journal of
+      rc14's round, ~430 boots), round 1 (the walk then asked `-b <this
+      boot>-<k>`, which 249 answers as `-b -<k>`): a cold boot and ten
+      reboots, `boots_since: next_boot` every time (none was before on this
+      host), no `boot_continuity_unknown`, no `mount_attrs_changed` or
+      `mount_over_protected`, no `watchdog_gone`, `sensors: OK`, the
+      verifier `OK` (stage 5 a `NOTICE`) after each; at the first reboot a
+      round landed in the shutdown and signed the note ("made while the
+      host goes down (systemd: stopping, reboot.target pending) and the stop
+      of the packaged finalrd.service ran …"). Rounds 2 and 3, the final
+      code: a cold boot and four reboots, then a cold boot and six reboots
+      — the same each time (no round landed in a shutdown: no note).
+      The masked boot (every round): `boots_without_agent` High, count 1,
+      naming the masked boot's id, `previous_run.ended:
+      boots_without_agent`, `sensors: DEGRADED`, the verifier `DEGRADED`
+      naming it.
+    - ubuntu2404 (6.8.0-149, systemd 255.4), round 1 (as above): every
+      reboot `unknown` — systemd 255 answers `-b <id>-<k>` with `<id>`
+      itself, and the guard on a disagreement with the list said `unknown`
+      (never clean). Fixed: `-b -<k>` once `-b 0` is this boot, and an
+      answer that is this very boot stops the walk; 249, 255 and debian13's
+      257 answer `-b -<k>` alike (read-only probes). Round 2: a cold boot
+      and three reboots `next_boot`, the verifier `OK`; the masked boot
+      signed as on ubuntu2204.
+    - The upgrade from rc14 (five rounds): no `worker_parse` row; the
+      verifier's one `DEGRADED` named the manifest's change across the
+      upgrade (the release build to the lab's build). The acknowledgement
+      (five rounds): `sensors: OK`; the verifier `DEGRADED` once ("the
+      capability manifest changed …", back to the hash before the gap),
+      then `OK`.
+  - **Fix round 1 (the review of #597).**
+    - P2-1: a note awaits its shutdown — systemd in any state but
+      `stopping` at a later round, or the agent still running 120 s after
+      the run's first note, is the High `run_exec_without_shutdown` (an
+      event held until acknowledged), `/run` given back `noexec` or not;
+      the run notes no more.
+    - P3-2: the walk's first answer "no boot before this one" or "this very
+      boot", against the list's `next_boot`, is `unknown`.
+    - P3-3: the anchor is the journal's tail (`journalctl -n 1`, no `-b`)
+      against the kernel's boot id; `-b 0` is journalctl's shortcut to the
+      kernel's current boot.
+    - P3-4/5: `soft-reboot.target` dropped from the going-down targets;
+      "packaged" written as owner and mode; the job's type, the window, the
+      8 s bound and the one budget a run stated.
+    - Mutation: 28 mutants, 28 caught by a named test (two after the named
+      test's finalrd stop was made fresh at each round).
+    - Lab (as measured, ubuntu2204, 5.15.0-204, systemd 249.11, under its
+      lease; the tree verified by hash, 1247 files, built in the guest, the
+      branch installed fresh with the alpha profile): a cold boot and three
+      reboots — `next_boot` each, no `boot_continuity_unknown`, no mount
+      High, `sensors: OK`, the verifier `OK`; one boot with both units
+      masked, then the restore — `boots_without_agent` High naming the
+      masked boot, `sensors: DEGRADED`, the verifier `DEGRADED`; a round
+      landed in the reboot into the masked boot and signed the finalrd
+      note, and no `run_exec_without_shutdown` followed (the shutdown
+      came). A reboot held, then cancelled, `/run` made `noexec` again
+      one second after the cancel: the note 11 s after the
+      reboot was queued (systemd `stopping`, `reboot.target` pending,
+      finalrd's stop with its pid), systemd `running` after the cancel,
+      then `run_exec_without_shutdown` High at the next round ("… but the
+      host did not shut down: systemd says running 28 s after the note"),
+      held, `sensors: DEGRADED`, the verifier `DEGRADED`. The held
+      transaction had stopped `systemd-user-sessions` (`/run/nologin`), so
+      the lab's ssh was refused: the guest was powered off from the host
+      and booted again (`previous_run.ended: abrupt`). In the reboot after
+      it, a round at 17:58:49.844 — after PID 1 became `systemd-shutdown`
+      (17:58:49.76) — signed `mount_attrs_changed` for finalrd's remount:
+      the last stage, where systemd answers no more (stated in
+      KNOWN_LIMITATIONS; a follow-up could take PID 1's `systemd-shutdown`
+      as that stage's fact). Then `uninstall.sh --purge` and a cold boot
+      with nothing of ours, powered off.
+  - **Fix round 2 (the CI of #597).** `test (ubuntu-latest)` failed three
+    times running in
+    `witness::tests::the_witness_key_is_read_only_from_the_watchdog_s_own_sealed_file`
+    ("published no witness key"; `main` green). Cause: the test read the
+    key file from the test process's own descriptor table, where the
+    binary's earlier tests leave one descriptor per directory
+    `anchored::anchor` anchored (kept for the process's life, by design):
+    254 at four test threads, this lot's two remount tests adding 11 (one
+    temporary directory per round), so the key file landed past the 256
+    entries `published_key` reads. Not a race, not the product (the
+    watchdog publishes its key at its start, among its first descriptors).
+    The test's watchdog is now a stand-in child holding the key file on
+    descriptor 3; reproduced locally 3 of 3 at `--test-threads=4` before,
+    green after (the whole `nn-linux` binary, repeated).
 - **Lot 388 — no watchdog death at the host's own shutdown; the verifier's
   start-up stage 5 is late, not lost (the review of #595: its triage (a)
   and (b), P3-1 to P3-3; `UPGRADE_NOTES_WAVE4.md` §73; no level change).**

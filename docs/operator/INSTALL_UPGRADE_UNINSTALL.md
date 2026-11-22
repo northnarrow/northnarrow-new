@@ -980,9 +980,11 @@ An abrupt end is also a `PREVIOUS RUN ENDED ABRUPTLY` WARN at boot.
 
 **Boots without the agent** (lot 387). Every `agent_boot` carries its
 `boot_id`, and `previous_run.boots_since` says what passed between the last
-run and this start: `same_boot` (a restart), `next_boot` (the journal's
-boot list has nothing in between), `boots_without_agent` (boots listed in
-between, with no run of the agent) or
+run and this start: `same_boot` (a restart), `next_boot` (the journal has
+no boot in between: the boot right before this one is the last run's —
+lot 389: asked one at a time from this boot backwards, then the journal's
+boot list), `boots_without_agent` (boots in between, with no run of the
+agent) or
 `unknown` (the journal does not keep the last run's boot — volatile,
 rotated — or did not answer). Only the first two keep `"ended":"clean"`
 after a clean stop; otherwise `ended` is the judgement's word and

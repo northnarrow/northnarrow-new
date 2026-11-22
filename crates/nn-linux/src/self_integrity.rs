@@ -1081,6 +1081,8 @@ fn high_kind(kind: &str) -> bool {
             | crate::witness::WITNESS_UNCERTIFIED
             | crate::witness::WITNESS_BROKEN
             | crate::witness::ROLES_VACATED_GAP
+            // the review of #597 (P2-1)
+            | crate::shutdown_remount::NO_SHUTDOWN_KIND
     )
 }
 
@@ -1265,6 +1267,12 @@ pub struct MountWatch {
     /// protected points, against which the mounts already there at the
     /// first read are judged (`mount_not_canonical`); `None`: not judged.
     audit_points: Option<Vec<(String, u8)>>,
+    /// Lot 389 (F2h-2): this round's `mount_attrs_changed` detail when it
+    /// is finalrd's shape in PID 1's table — `/run` lost `noexec` alone
+    /// ([`crate::mount_attrs::AttrChange::is_run_made_exec`]) — for the
+    /// round to judge against the host's shutdown
+    /// ([`crate::shutdown_remount`]).
+    run_made_exec: Option<String>,
 }
 
 impl MountWatch {
@@ -1425,20 +1433,25 @@ fn mount_round_on(
         .iter()
         .flat_map(|p| mount_chain(&mounts, p).into_iter().map(|m| m.id))
         .collect();
-    out.extend(
-        watch
-            .attrs
-            .round(text, &ids)
-            .into_iter()
-            .map(|(mp, what)| Finding {
-                kind: "mount_attrs_changed",
-                detail: format!(
-                    "{mp}: {what} since the agent started — a mount that holds the agent's \
-                     paths (read-only: its writes there fail; propagation: what lets a mount made \
-                     in another namespace reach the host's view, which the mount guard follows)"
-                ),
-            }),
-    );
+    watch.run_made_exec = None;
+    for c in watch.attrs.round_changes(text, &ids) {
+        let f = Finding {
+            kind: "mount_attrs_changed",
+            detail: format!(
+                "{}: {} since the agent started — a mount that holds the agent's paths \
+                 (read-only: its writes there fail; propagation: what lets a mount made in \
+                 another namespace reach the host's view, which the mount guard follows)",
+                c.mount_point,
+                c.what()
+            ),
+        };
+        // lot 389 (F2h-2): finalrd's shape, in PID 1's table only (its
+        // remount changes the host's mount, never a unit's copy)
+        if source == MountSource::Host && c.is_run_made_exec() {
+            watch.run_made_exec = Some(f.detail.clone());
+        }
+        out.push(f);
+    }
     out.extend(hidden_by_mounts(
         &mounts,
         &watched,
@@ -1450,6 +1463,26 @@ fn mount_round_on(
         f.detail = format!("{prefix}{}", f.detail);
     }
     out
+}
+
+/// Lot 389 (F2h-2): the same mount — its id, its parent, its place, its
+/// file system and source — whatever its attributes: a remount changes
+/// those (`mount_attrs_changed`, the attributes' own finding), and rc14 read
+/// finalrd's `remount,exec /run` as "/run hides /run/northnarrow: mounted
+/// over a directory above them" besides.
+fn same_mount(a: &Mount, b: &Mount) -> bool {
+    let bare = |m: &Mount| crate::mountinfo::MountEntry {
+        options: Default::default(),
+        super_options: Default::default(),
+        ..m.entry.clone()
+    };
+    a.id == b.id
+        && a.parent == b.parent
+        && a.dev == b.dev
+        && a.root == b.root
+        && a.mount_point == b.mount_point
+        && a.fstype == b.fstype
+        && bare(a) == bare(b)
 }
 
 /// The watched paths whose resolution differs from the baseline, grouped
@@ -1471,7 +1504,7 @@ fn hidden_by_mounts(
         let same = now
             .iter()
             .zip(before.iter())
-            .take_while(|(a, b)| ***a == **b)
+            .take_while(|(a, b)| same_mount(a, b))
             .count();
         if same == now.len() && same == before.len() {
             continue;
@@ -2444,6 +2477,27 @@ struct Checker {
     /// The review of #497 (D4): our units' drop-ins judged again at every
     /// round outside a window (a kept one stays writable by root).
     own_guard: Option<OwnDropinGuard>,
+    /// Lot 389 (F2h-2): finalrd's remount of `/run` at the host's
+    /// shutdown, as the rounds follow it.
+    run_exec: RunExecWatch,
+}
+
+/// Lot 389 (F2h-2): what the rounds keep of finalrd's remount of `/run` at
+/// the host's shutdown ([`crate::shutdown_remount`]; `CLOCK_MONOTONIC`, µs).
+#[derive(Debug, Default)]
+struct RunExecWatch {
+    /// The start of the last round that read PID 1's `/run` without the
+    /// change.
+    unchanged_at: u64,
+    /// The run's first note of it as the host's shutdown's (one budget a
+    /// run).
+    first_note_at: Option<u64>,
+    /// The review of #597 (P2-1): the change a note excused, while the
+    /// shutdown it was noted for has not come — until the agent ends in
+    /// it, or the High [`crate::shutdown_remount::NO_SHUTDOWN_KIND`].
+    awaiting: Option<String>,
+    /// The review of #597 (P2-1): that High signed — the run notes no more.
+    not_come: bool,
 }
 
 /// The review of #497 (D4): what the round needs to judge our units' own
@@ -2860,6 +2914,107 @@ impl Checker {
         c
     }
 
+    /// Lot 389 (F2h-2): finalrd's `remount,exec /run` at the host's
+    /// shutdown ([`crate::shutdown_remount`]) — the round's
+    /// `mount_attrs_changed` of it signed once as a note
+    /// ([`crate::shutdown_remount::RUN_EXEC_KIND`], `recorded`) and, once
+    /// that note is signed, taken out of the round's findings, when every
+    /// fact of the rule holds; otherwise it stays this round's finding,
+    /// judged as before. The review of #597 (P2-1): a note awaits its
+    /// shutdown — the High [`crate::shutdown_remount::NO_SHUTDOWN_KIND`]
+    /// when a later round finds it did not come, whatever `/run` is then.
+    /// `started`: when this round began (`CLOCK_MONOTONIC`, µs).
+    fn judge_run_exec(&mut self, findings: &mut Vec<Finding>, started: u64, at_boot: bool) {
+        self.judge_run_exec_with(
+            findings,
+            started,
+            at_boot,
+            crate::shutdown_remount::system_state,
+            crate::shutdown_remount::read_facts,
+        );
+    }
+
+    /// [`Self::judge_run_exec`] with systemd's state given by `state`
+    /// (asked only while a note awaits its shutdown) and the host's facts
+    /// read by `read` (`unchanged_at_us`, `already_signed`, `noted_for`;
+    /// tests).
+    fn judge_run_exec_with(
+        &mut self,
+        findings: &mut Vec<Finding>,
+        started: u64,
+        at_boot: bool,
+        state: impl FnOnce() -> Option<String>,
+        read: impl FnOnce(u64, bool, Option<u64>) -> crate::shutdown_remount::RunExecFacts,
+    ) {
+        let noted_for = self
+            .run_exec
+            .first_note_at
+            .map(|t| started.saturating_sub(t) / 1_000_000);
+        // the review of #597 (P2-1): the shutdown a note was signed for, not
+        // come — signed High once, `/run` put back or not
+        if let (Some(noted), Some(secs)) = (self.run_exec.awaiting.clone(), noted_for) {
+            if let Some(why) = crate::shutdown_remount::shutdown_not_come(secs, state) {
+                let high = Finding {
+                    kind: crate::shutdown_remount::NO_SHUTDOWN_KIND,
+                    detail: format!(
+                        "{noted} — a remount noted as the host's shutdown ({}), but the host did \
+                         not shut down: {why}",
+                        crate::shutdown_remount::RUN_EXEC_KIND
+                    ),
+                };
+                if self.report_once(high, at_boot) {
+                    self.run_exec.awaiting = None;
+                    self.run_exec.not_come = true;
+                }
+            }
+        }
+        let Some(detail) = self.mounts.run_made_exec.clone() else {
+            self.run_exec.unchanged_at = started;
+            return;
+        };
+        let f = Finding {
+            kind: "mount_attrs_changed",
+            detail,
+        };
+        // a run whose noted shutdown did not come notes no more
+        if self.run_exec.not_come {
+            return;
+        }
+        let already_signed = self.active.history.get(&f).is_some_and(|h| h.reported);
+        let facts = read(self.run_exec.unchanged_at, already_signed, noted_for);
+        let Some(why) = facts.shutdown_not_drift() else {
+            return;
+        };
+        let note = Finding {
+            kind: crate::shutdown_remount::RUN_EXEC_KIND,
+            detail: format!("{} — {why}", f.detail),
+        };
+        // the degradation leaves the round only once its note is signed
+        if self.note_once(note, at_boot) {
+            findings.retain(|x| *x != f);
+            self.run_exec.first_note_at.get_or_insert(started);
+            self.run_exec.awaiting.get_or_insert(f.detail);
+        }
+    }
+
+    /// Lot 389: a one-shot note signed `recorded`, as [`Self::record_once`],
+    /// remembered only once signed: whether it is (now or before).
+    fn note_once(&mut self, f: Finding, at_boot: bool) -> bool {
+        if self.once.contains(&f) {
+            return true;
+        }
+        info!(kind = f.kind, detail = %f.detail, at_boot, "integrity: recorded, no drift");
+        let extra = serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": at_boot });
+        if !self.append(AUDIT_OP, extra, "recorded") {
+            return false;
+        }
+        if self.once.len() >= MAX_ONCE {
+            self.once.clear();
+        }
+        self.once.insert(f);
+        true
+    }
+
     /// Diff this round's state findings against the last round's and
     /// record what appeared and what went away.
     fn apply(&mut self, findings: Vec<Finding>, now: u64, at_boot: bool) {
@@ -2874,7 +3029,9 @@ impl Checker {
     }
 
     fn round(&mut self, at_boot: bool) {
-        let findings = self.collect_round();
+        let started = crate::kernel_state::monotonic_ns() / 1000;
+        let mut findings = self.collect_round();
+        self.judge_run_exec(&mut findings, started, at_boot);
         self.apply(findings, unix_now(), at_boot);
         self.own_dropins_round(at_boot);
         // Lot 273c (the review of #490): resource values the registration
@@ -3023,6 +3180,10 @@ pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
         own_files,
         audit_log,
         own_guard,
+        run_exec: RunExecWatch {
+            unchanged_at: crate::kernel_state::monotonic_ns() / 1000,
+            ..RunExecWatch::default()
+        },
     };
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
@@ -4381,6 +4542,390 @@ mod tests {
             .collect()
     }
 
+    /// Lot 389 (F2h-2): finalrd's `remount,exec /run` (rc14's ubuntu2204,
+    /// reboot 4) is one finding, the attributes' own — never also "/run
+    /// hides /run/northnarrow: mounted over" (the same mount, its options
+    /// changed) — and is flagged as finalrd's shape for the round's
+    /// judgement in PID 1's table only; a real mount over /run still is
+    /// `mount_over_protected`, its attributes changed or not.
+    #[test]
+    fn a_remount_of_run_is_its_attributes_change_never_a_mount_over() {
+        let own = ["/run/northnarrow/agent.pid".to_string()];
+        let exec = HOST_MI.replace(
+            "/run rw,nosuid,nodev,noexec,relatime",
+            "/run rw,nosuid,nodev,relatime",
+        );
+        let mut w = MountWatch::default();
+        assert!(mount_round(Ok(HOST_MI.to_string()), not_readable, &own, &mut w).is_empty());
+        assert_eq!(w.run_made_exec, None);
+        let f = mount_round(Ok(exec.clone()), not_readable, &own, &mut w);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_attrs_changed");
+        assert!(
+            f[0].detail.starts_with(
+                "/run: options rw,nosuid,nodev,noexec,relatime → rw,nosuid,nodev,relatime"
+            ),
+            "{f:?}"
+        );
+        assert_eq!(w.run_made_exec.as_deref(), Some(f[0].detail.as_str()));
+        // the next round without the change: the flag goes
+        let _ = mount_round(Ok(HOST_MI.to_string()), not_readable, &own, &mut w);
+        assert_eq!(w.run_made_exec, None);
+        // more than exec: a finding, not finalrd's shape
+        let suid = HOST_MI.replace(
+            "/run rw,nosuid,nodev,noexec,relatime",
+            "/run rw,nodev,relatime",
+        );
+        let f = mount_round(Ok(suid), not_readable, &own, &mut w);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(w.run_made_exec, None);
+        // a tmpfs laid over /run: a mount over, whatever its options
+        let mut w = MountWatch::default();
+        let _ = mount_round(Ok(HOST_MI.to_string()), not_readable, &own, &mut w);
+        let over = format!(
+            "{exec}99 26 0:77 / /run rw,nosuid,nodev,relatime shared:50 - tmpfs tmpfs rw\n"
+        );
+        let f = mount_round(Ok(over), not_readable, &own, &mut w);
+        assert!(
+            f.iter()
+                .any(|f| f.kind == "mount_over_protected"
+                    && f.detail.contains("hides /run/northnarrow")),
+            "{f:?}"
+        );
+        // the agent's own namespace: the same change is never finalrd's
+        let mut w = MountWatch::default();
+        let _ = mount_round_in(HOST_MI.as_bytes(), "agent", &own, &mut w, b"");
+        let f = mount_round_in(exec.as_bytes(), "agent", &own, &mut w, b"");
+        assert!(f.iter().any(|f| f.kind == "mount_attrs_changed"), "{f:?}");
+        assert!(!f.iter().any(|f| f.kind == "mount_over_protected"), "{f:?}");
+        assert_eq!(w.run_made_exec, None);
+    }
+
+    /// Lot 389 (F2h-2): the round signs finalrd's remount at the host's
+    /// shutdown once as a note (`run_exec_at_shutdown`, `recorded`: never
+    /// held) and takes it out of the round's degradations; the same change
+    /// while the host runs — or a "shutdown" that ends without the host
+    /// going down (then also the High `run_exec_without_shutdown`, the
+    /// review of #597, P2-1), or one past the run's budget — is the High
+    /// `mount_attrs_changed`, once signed never taken back by a later
+    /// shutdown, and a second episode in the same shutdown (noexec back,
+    /// then lost again) is judged against the run's first note's budget; a
+    /// note that could not be signed leaves the High in the round.
+    #[test]
+    fn finalrds_remount_at_the_host_s_shutdown_is_a_note_and_otherwise_a_degradation() {
+        use crate::shutdown_remount::{
+            ExecRecord, FinalrdUnit, RunExecFacts, RUN_EXEC_KIND as KIND,
+        };
+        let own = ["/run/northnarrow/agent.pid".to_string()];
+        let exec = HOST_MI.replace(
+            "/run rw,nosuid,nodev,noexec,relatime",
+            "/run rw,nosuid,nodev,relatime",
+        );
+        let rows = |audit: &Path| -> Vec<(String, String, String)> {
+            std::fs::read_to_string(audit)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["op"] == AUDIT_OP)
+                .map(|v| {
+                    (
+                        v["extra"]["kind"].as_str().unwrap_or("").to_string(),
+                        v["result"].as_str().unwrap_or("").to_string(),
+                        v["extra"]["severity"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        };
+        let note = (KIND.to_string(), "recorded".to_string(), String::new());
+        let high = (
+            "mount_attrs_changed".to_string(),
+            "detected".to_string(),
+            "high".to_string(),
+        );
+        let not_come = (
+            crate::shutdown_remount::NO_SHUTDOWN_KIND.to_string(),
+            "detected".to_string(),
+            "high".to_string(),
+        );
+        // one round at `now` (s, both clocks), the host going down or not
+        // (systemd says `stopping`, or `running`); finalrd's stop started
+        // at `stop` (s)
+        let round =
+            |c: &mut Checker, table: &str, now: u64, down: bool, stop: u64| -> Vec<Finding> {
+                let mut f = mount_round(Ok(table.to_string()), not_readable, &own, &mut c.mounts);
+                c.judge_run_exec_with(
+                    &mut f,
+                    now * 1_000_000,
+                    false,
+                    || Some(if down { "stopping" } else { "running" }.to_string()),
+                    |unchanged_at_us, already_signed, noted_for| RunExecFacts {
+                        host_stopping: down,
+                        going_down: down.then(|| "reboot.target".to_string()),
+                        unit: Some(FinalrdUnit {
+                            fragment: crate::shutdown_remount::FRAGMENTS[0].into(),
+                            dropins: Vec::new(),
+                            exec_stop: vec![ExecRecord {
+                                path: crate::shutdown_remount::BINARY.into(),
+                                argv: vec![crate::shutdown_remount::BINARY.into()],
+                                start_realtime_us: 1_795_000_000_000_000 + stop * 1_000_000,
+                                start_monotonic_us: stop * 1_000_000,
+                                pid: 3637,
+                            }],
+                        }),
+                        files_packaged: true,
+                        unchanged_at_us,
+                        already_signed,
+                        noted_for,
+                    },
+                );
+                c.apply(f.clone(), now, false);
+                f
+            };
+        // the baseline, then finalrd's remount in the host's shutdown
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        let f = round(&mut checker, &exec, 1_030, true, 1_029);
+        assert!(f.is_empty(), "{f:?}");
+        assert_eq!(rows(&audit), vec![note.clone()]);
+        assert!(checker.active.active.is_empty(), "no degradation held");
+        // a round later in the same shutdown: nothing more
+        round(&mut checker, &exec, 1_060, true, 1_029);
+        assert_eq!(rows(&audit).len(), 1);
+        // the "shutdown" did not come (the host runs on): the note's High
+        // and the change's, then never a note again
+        round(&mut checker, &exec, 1_090, false, 1_029);
+        assert_eq!(
+            rows(&audit),
+            vec![note.clone(), not_come.clone(), high.clone()]
+        );
+        round(&mut checker, &exec, 1_120, true, 1_029);
+        assert_eq!(rows(&audit).len(), 3, "still held, no note, no end");
+        assert_eq!(checker.active.active.len(), 1);
+
+        // the same change while the host runs: the High at once
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        round(&mut checker, &exec, 1_030, false, 1_029);
+        assert_eq!(rows(&audit), vec![high.clone()]);
+
+        // a stop of finalrd from before the last round that read /run
+        // unchanged: the High
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        round(&mut checker, &exec, 1_030, true, 990);
+        assert_eq!(rows(&audit), vec![high.clone()]);
+
+        // a second episode in the same shutdown (noexec put back, then lost
+        // again): within the run's budget a note, past it the High — the
+        // budget is the run's first note's, and the note's shutdown not
+        // come by then is its own High
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        round(&mut checker, &exec, 1_030, true, 1_029);
+        round(&mut checker, HOST_MI, 1_060, true, 1_029);
+        round(&mut checker, &exec, 1_090, true, 1_089);
+        assert_eq!(rows(&audit).iter().filter(|r| **r == note).count(), 2);
+        round(&mut checker, HOST_MI, 1_120, true, 1_089);
+        assert_eq!(rows(&audit).len(), 2, "still going down, within the bound");
+        round(
+            &mut checker,
+            &exec,
+            1_030 + crate::shutdown_remount::NOTE_MAX_SECS + 1,
+            true,
+            1_030 + crate::shutdown_remount::NOTE_MAX_SECS,
+        );
+        assert_eq!(
+            rows(&audit)[2..],
+            [not_come.clone(), high.clone()],
+            "{:?}",
+            rows(&audit)
+        );
+
+        // a shutdown that lasts past the budget: the High (and the note's)
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        round(&mut checker, &exec, 1_030, true, 1_029);
+        round(
+            &mut checker,
+            &exec,
+            1_030 + crate::shutdown_remount::NOTE_MAX_SECS + 1,
+            true,
+            1_029,
+        );
+        assert_eq!(
+            rows(&audit),
+            vec![note.clone(), not_come.clone(), high.clone()]
+        );
+
+        // a note that could not be signed (no audit log): the High stays in
+        // the round
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, _) = checker_with_log(dir.path());
+        checker.audit_log = None;
+        round(&mut checker, HOST_MI, 1_000, false, 0);
+        let f = round(&mut checker, &exec, 1_030, true, 1_029);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "mount_attrs_changed");
+    }
+
+    /// The review of #597 (P2-1): root makes the note's facts true without
+    /// the host going down — a reboot cancelled or held, finalrd's stop in
+    /// it — and puts `noexec` back on `/run` before the next round: the
+    /// note is not the only trace. A later round where systemd says the
+    /// host runs again, or past the bound while it still says `stopping`
+    /// or does not answer, signs the High `run_exec_without_shutdown` once,
+    /// naming the noted change; the run notes no more. A shutdown that
+    /// comes (the agent ends) leaves the note alone; one not signed is
+    /// tried again at the next round.
+    #[test]
+    fn a_remount_noted_as_the_shutdown_whose_host_did_not_shut_down_is_the_high() {
+        use crate::shutdown_remount::{
+            ExecRecord, FinalrdUnit, RunExecFacts, NOTE_MAX_SECS, NO_SHUTDOWN_KIND, RUN_EXEC_KIND,
+        };
+        let own = ["/run/northnarrow/agent.pid".to_string()];
+        let exec = HOST_MI.replace(
+            "/run rw,nosuid,nodev,noexec,relatime",
+            "/run rw,nosuid,nodev,relatime",
+        );
+        let rows = |audit: &Path| -> Vec<(String, String, String, String)> {
+            std::fs::read_to_string(audit)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["op"] == AUDIT_OP)
+                .map(|v| {
+                    let x = |k: &str| v["extra"][k].as_str().unwrap_or("").to_string();
+                    (
+                        x("kind"),
+                        v["result"].as_str().unwrap_or("").to_string(),
+                        x("severity"),
+                        x("detail"),
+                    )
+                })
+                .collect()
+        };
+        let kinds =
+            |audit: &Path| -> Vec<String> { rows(audit).into_iter().map(|r| r.0).collect() };
+        // one round at `now` (s): systemd's `state` (None: no answer), the
+        // facts of a shutdown when it says `stopping`, finalrd's stop then
+        // run a second before the round (by hand, or in the held reboot)
+        let round = |c: &mut Checker, table: &str, now: u64, state: Option<&str>| {
+            let down = state == Some("stopping");
+            let mut f = mount_round(Ok(table.to_string()), not_readable, &own, &mut c.mounts);
+            c.judge_run_exec_with(
+                &mut f,
+                now * 1_000_000,
+                false,
+                || state.map(String::from),
+                |unchanged_at_us, already_signed, noted_for| RunExecFacts {
+                    host_stopping: down,
+                    going_down: down.then(|| "reboot.target".to_string()),
+                    unit: Some(FinalrdUnit {
+                        fragment: crate::shutdown_remount::FRAGMENTS[0].into(),
+                        dropins: Vec::new(),
+                        exec_stop: vec![ExecRecord {
+                            path: crate::shutdown_remount::BINARY.into(),
+                            argv: vec![crate::shutdown_remount::BINARY.into()],
+                            start_realtime_us: 1_795_000_000_000_000,
+                            start_monotonic_us: (now - 1) * 1_000_000,
+                            pid: 3637,
+                        }],
+                    }),
+                    files_packaged: true,
+                    unchanged_at_us,
+                    already_signed,
+                    noted_for,
+                },
+            );
+            c.apply(f, now, false);
+        };
+        let stopping = Some("stopping");
+        // the reboot cancelled, /run put back before the next round: the
+        // host runs again — the High, at once
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, Some("running"));
+        round(&mut checker, &exec, 1_030, stopping);
+        assert_eq!(kinds(&audit), [RUN_EXEC_KIND]);
+        round(&mut checker, HOST_MI, 1_060, Some("running"));
+        let r = rows(&audit);
+        assert_eq!(kinds(&audit), [RUN_EXEC_KIND, NO_SHUTDOWN_KIND], "{r:?}");
+        let (_, result, severity, detail) = &r[1];
+        assert_eq!((result.as_str(), severity.as_str()), ("detected", "high"));
+        assert!(
+            detail.starts_with("/run: options") && detail.contains("did not shut down"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("systemd says running 30 s after the note"),
+            "{detail}"
+        );
+        assert!(
+            checker.active.active.is_empty(),
+            "a one-shot event, no state"
+        );
+        // signed once; a later "shutdown" in the run is noted no more
+        round(&mut checker, HOST_MI, 1_090, Some("degraded"));
+        round(&mut checker, &exec, 1_120, stopping);
+        assert_eq!(
+            kinds(&audit),
+            [RUN_EXEC_KIND, NO_SHUTDOWN_KIND, "mount_attrs_changed"]
+        );
+
+        // the reboot held (systemd still says stopping) or systemd silent:
+        // within the bound nothing, past it the High
+        for held in [stopping, None] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut checker, audit) = checker_with_log(dir.path());
+            round(&mut checker, HOST_MI, 1_000, Some("running"));
+            round(&mut checker, &exec, 1_030, stopping);
+            round(&mut checker, HOST_MI, 1_060, held);
+            round(&mut checker, HOST_MI, 1_030 + NOTE_MAX_SECS, held);
+            assert_eq!(kinds(&audit), [RUN_EXEC_KIND], "{held:?}");
+            round(&mut checker, HOST_MI, 1_030 + NOTE_MAX_SECS + 1, held);
+            let r = rows(&audit);
+            assert_eq!(kinds(&audit), [RUN_EXEC_KIND, NO_SHUTDOWN_KIND], "{held:?}");
+            assert!(r[1].3.contains("still runs 121 s after the note"), "{r:?}");
+        }
+
+        // a shutdown that comes: a round still in it, then the agent ends
+        // in it — the note alone
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, Some("running"));
+        round(&mut checker, &exec, 1_030, stopping);
+        round(&mut checker, &exec, 1_045, stopping);
+        assert_eq!(kinds(&audit), [RUN_EXEC_KIND]);
+
+        // the High not signed (the audit log gone): tried again
+        let dir = tempfile::tempdir().unwrap();
+        let (mut checker, audit) = checker_with_log(dir.path());
+        round(&mut checker, HOST_MI, 1_000, Some("running"));
+        round(&mut checker, &exec, 1_030, stopping);
+        let log = checker.audit_log.take();
+        round(&mut checker, HOST_MI, 1_060, Some("running"));
+        assert!(checker.run_exec.awaiting.is_some() && !checker.run_exec.not_come);
+        checker.audit_log = log;
+        round(&mut checker, HOST_MI, 1_090, Some("running"));
+        assert_eq!(kinds(&audit), [RUN_EXEC_KIND, NO_SHUTDOWN_KIND]);
+
+        // the round asks systemd itself (its state, over PID 1's private
+        // socket) and the host's facts
+        let code = include_str!("self_integrity.rs");
+        let judge = &code[code.find("fn judge_run_exec(").unwrap()
+            ..code.find("fn judge_run_exec_with(").unwrap()];
+        assert!(
+            judge.contains("crate::shutdown_remount::system_state,")
+                && judge.contains("crate::shutdown_remount::read_facts,"),
+            "{judge}"
+        );
+    }
+
     /// External audit EVD-014: neither mountinfo readable is a finding,
     /// not a round that silently checks no mount.
     #[test]
@@ -5079,6 +5624,7 @@ mod tests {
             own_files: Vec::new(),
             audit_log: Some(Arc::new(Mutex::new(log))),
             own_guard: None,
+            run_exec: RunExecWatch::default(),
         };
         (checker, path)
     }
