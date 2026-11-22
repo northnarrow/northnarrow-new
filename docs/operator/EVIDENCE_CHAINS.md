@@ -177,9 +177,14 @@ memory file of the watchdog's, never on disk.
   (`watchdog_successor_foreign`) — has no key certified: each of its rows
   is `witness_row_uncertified`.
 - Only the watchdog writes the chain: the kernel refuses the agent, a
-  worker and every other process a write, truncation, rename, link or
-  removal of it outside a trusted-installer window (`ROLE_WRITE_INODES`,
-  the watchdog's role). The watchdog checks that it still ends at its last
+  worker and every other process a write, truncation, rename or removal
+  of it outside a trusted-installer window, through any of its names
+  (`ROLE_WRITE_INODES`, the watchdog's role: the refusals follow the
+  file), and a new name for it in the witness directory. A hard link to
+  it made outside the agent's directories is neither refused nor recorded
+  (the source of a hard link is not checked); writing, truncating,
+  renaming or removing through it is refused and signed, and the extra
+  name stays until it is removed inside a window (lot 384). The watchdog checks that it still ends at its last
   row before each row and at a regular interval.
   Its position is `witness.imported`, beside the chain. A row changed or
   removed, a line that is not a row, or a chain that no longer holds the
@@ -510,12 +515,30 @@ each open (a restart reads the chain again: it clears nothing):
   findings whose newest row is at or before `<row>`, advisories included;
   a row not signed yet is refused (exit 9), and a finding
   signed after it — the same chain found broken at the next start — is
-  held again. The status prints the command with the newest held row.
+  held again. The status prints the command with the newest held row,
+  listed or counted, advisories included: that one acknowledgement covers
+  everything the status shows.
 - At most 16 findings are listed; the rows of the others are counted (`…
-  and N more held integrity row(s)`, `… and N more advisory row(s)`) and
-  acknowledged the same way. A finding held until acknowledged is listed
+  and N more held integrity row(s) in the signed audit log, the newest
+  (audit row M)`, `… and N more advisory row(s) …, the newest (audit row
+  M)`) and acknowledged the same way: an acknowledgement through a row
+  ends every finding at or before it, listed or counted, and none after
+  it. Lot 384 (pre-alpha Phase 3c, F3c-1): the counted rows were one
+  counter that kept only its newest row, and the status named the newest
+  *listed* row — when the counted ones were newer (deaths and cuts signed
+  past the cap, or a reimport after a cut chain), the acknowledgement the
+  status printed left them all held, and the status then showed `… and 2
+  more held integrity row(s)` with no row and no command. Each counted
+  row now keeps its own row (up to 1024 entries a class; past that the two
+  oldest are kept as one under the newer row, which only an
+  acknowledgement through that row ends), and the line that counts them
+  names the newest. A degradation counted (not listed) keeps no kind:
+  its check's `cleared` row does not end it; the next start or an
+  acknowledgement does. A finding held until acknowledged is listed
   before one a start ends: past the cap, the newest of those is counted in
-  its stead, so its kind, row and command stay shown.
+  its stead, so its kind, row and command stay shown. With an agent older
+  than lot 384, whose counting line names no row, `nn-admin status` still
+  prints the command and asks for the audit log's newest row.
 - Residual: the integrity round reports a finding that ended and came back
   within 10 minutes only at the end of its back-off (external audit
   NN-AUD-114); until then it is not held. The `cleared` row and the

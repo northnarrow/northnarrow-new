@@ -230,4 +230,31 @@ mod tests {
         let long = judge(log.held(), log.rows(), second, INTEGRITY_ACK_NOTE_MAX + 1).unwrap_err();
         assert!(long.contains("note is longer"), "{long}");
     }
+
+    /// Lot 384 (pre-alpha Phase 3c, F3c-1): past the 16 findings listed, an
+    /// acknowledgement covers every row counted at or before its own, and
+    /// says so — on main one through the second of three counted rows
+    /// covered none of them ("16 acknowledged, 3 still held").
+    #[test]
+    fn an_acknowledgement_past_the_cap_covers_the_counted_rows_before_it() {
+        use nn_evidence::held::MAX_HELD;
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let mut log = AuditLog::open(&dir.path().join("audit.log"), key, [1; 16]).unwrap();
+        let rows: Vec<u64> = (0..MAX_HELD + 3)
+            .map(|i| drift(&mut log, "witness_row", &format!("role_vacated {i}")))
+            .collect();
+        let counted = &rows[MAX_HELD..];
+        let total = MAX_HELD as u64 + 3;
+        assert_eq!(
+            judge(log.held(), log.rows(), rows[MAX_HELD - 1], 0),
+            Ok((MAX_HELD as u64, 3))
+        );
+        assert_eq!(
+            judge(log.held(), log.rows(), counted[1], 0),
+            Ok((total - 1, 1))
+        );
+        assert_eq!(judge(log.held(), log.rows(), counted[2], 0), Ok((total, 0)));
+        assert_eq!(log.held().newest_row(), Some(counted[2]));
+    }
 }

@@ -223,7 +223,16 @@ how.
   holder of such a key can clear the status, not the evidence (the rows,
   its own signed row, `chain verify`). A drift of the integrity round that
   ends and comes back is signed again with its count; until that next
-  signed row, `status` may show it as ended. *Evidence:*
+  signed row, `status` may show it as ended. Past 16 findings the others
+  are counted, each with its row; the status names the newest held row
+  and the command, and an acknowledgement through a row ends every finding
+  at or before it (lot 384). Past 1024 counted entries of one class, the
+  two oldest are kept as one under the newer row: an acknowledgement
+  through an earlier row leaves both held; the one the status names covers
+  them. *Evidence:*
+  `f3c_1_the_acknowledgement_through_the_named_row_ends_the_rows_counted_past_the_cap`;
+  `past_max_counted_the_oldest_entries_merge_under_the_newer_row`;
+  `sock.status-key.integrity-counted-only`;
   `a_cut_chain_is_held_across_a_restart_until_a_signed_acknowledgement`;
   `a_row_not_signed_by_the_log_s_key_ends_no_hold`;
   `an_agent_or_watchdog_death_is_held_until_acknowledged`;
@@ -366,8 +375,13 @@ not cause as an incident.
   integrity round, about 30 seconds apart, signs what happened (High); a
   loss that comes back soon after one already signed is reported again
   later, as every drift finding is:
-  - a change of the lock's own settings is not refused: the next round
-    signs it (`pin_lock_changed`) and makes the lock again;
+  - a change of the lock's own settings through `mount_setattr(2)`, which
+    has no kernel hook, is not refused. A change of its propagation: the
+    next round signs it (`pin_lock_changed`, `mount_attrs_changed`) and
+    makes the lock again. A read-only bind remount: signed
+    (`mount_attrs_changed`), not undone — the lock stays read-only, and
+    the agent's writes of pins there fail (each a signed degradation),
+    until you act (below);
   - another mount namespace's own copy of the lock is not judged as the
     host's lock: the host's bpffs view and the pins can be lost through
     it. Signed `protected_mount_gone` and `pin_lock_missing`;
@@ -384,12 +398,37 @@ not cause as an incident.
   and the round makes it. *For you:* if a `protected_mount_gone`,
   `pin_lock_missing`, `pin_lock_changed` or `bpf_pin_vanished` appears that
   you did not cause, do not restart the agent before a reboot: its
-  descriptors keep its hooks while it runs. *Evidence:*
+  descriptors keep its hooks while it runs. A lock left read-only stays so
+  across the agent's restarts (a lock in place is reused); remount it
+  read-write inside a trusted-installer window, or reboot (the lock is
+  made again at the first start). *Evidence:*
   `a_lost_or_changed_lock_is_a_finding_and_made_again`;
   `a_start_without_the_lock_is_a_degradation`;
   `a_removed_held_pin_is_a_high_pinned_again`;
   `a_mount_gone_from_under_the_agents_paths_is_reported`; lot 359;
   internal check Phase 2c §7; internal check Phase 8b §4.2.
+- **On Debian 13 the system's `mount` changes mount flags without a
+  refusal.** Its `mount` (util-linux 2.41, built with the new mount API:
+  `mount --version` lists `fd-based-mount`) changes a mount's propagation
+  and a bind mount's flags through `mount_setattr(2)`, which has no kernel
+  hook. So on Debian 13 the everyday tool takes the path the guard cannot
+  refuse: a propagation change or a read-only bind remount of the pin
+  directory's lock, of `/`, `/sys` or `/sys/fs/bpf` returns success where
+  Ubuntu 22.04 and 26.04 (whose `mount` uses `mount(2)`) refuse it and
+  record `NN-L-AT-001` High. What Debian 13 records instead is the
+  integrity round's: `mount_attrs_changed` (High) and, for the lock,
+  `pin_lock_changed`, within one round (about 30 s; 4 to 28 s measured);
+  each is an `integrity:` degradation of `nn-admin status`. The lock's
+  propagation is made again within that round; a read-only remount of the
+  lock is signed and stays until you act, as in the item above; the
+  other mounts' changes are signed, not undone. Another distribution
+  whose `mount` is built the same way behaves like Debian 13. *For you:*
+  on such a host, treat a `mount_attrs_changed` or `pin_lock_changed` you
+  did not cause as an incident, read the mount it names, and put it back
+  inside a trusted-installer window. *Evidence:*
+  `a_lost_or_changed_lock_is_a_finding_and_made_again`;
+  `a_protected_mounts_attributes_changed_are_reported`; lot 384; internal
+  check Phase 3c §4.3.
 - **The unmount guard reads a bounded part of the mount tree.** An
   unmount is judged on the part of the mount tree the guard reads. Outside
   the host's namespace some unmounts that take a host mount the agent

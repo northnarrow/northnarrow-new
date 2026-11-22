@@ -16,6 +16,44 @@ the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
 the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
 
 ### Added
+- Lot 384 (pre-alpha Phase 3c, F3c-1 to F3c-3; `UPGRADE_NOTES_WAVE4.md`
+  §69).
+  - **An acknowledgement ends every held finding through its row.** Past
+    the 16 findings `nn-admin status` lists, the others were one counter
+    per class with only its newest row, and the status's command named
+    the newest *listed* row: when the counted rows were newer, the
+    acknowledgement it printed left them held ("16 acknowledged, 3 still
+    held"), and the status stayed `DEGRADED` with `… and 2 more held
+    integrity row(s)`, no row and no command, across cold boots (3 lab
+    guests of 3). Each counted row now keeps its own row
+    (`nn_evidence::held`, up to 1024 entries a class, the oldest two then
+    kept as one under the newer row); an acknowledgement through row N
+    ends every finding at or before N, listed or counted, none after it;
+    the counting line names its newest row, and the status's command the
+    newest of every held line, advisories included (with an older agent,
+    the command all the same). One tag, written and read by the same
+    helper (`held::row_tag`, `held::rows_named`), also in the guard's e2e
+    reader. Tests
+    `f3c_1_the_acknowledgement_through_the_named_row_ends_the_rows_counted_past_the_cap`,
+    `an_acknowledgement_ends_every_counted_row_at_or_before_it_and_none_after`,
+    `exactly_sixteen_held_are_listed_and_the_seventeenth_is_counted_with_its_row`,
+    `the_counted_line_names_the_newest_row_of_either_class`,
+    `past_the_cap_a_row_not_genuine_ends_no_counted_hold`,
+    `past_max_counted_the_oldest_entries_merge_under_the_newer_row`,
+    `the_row_tag_reads_back`,
+    `an_acknowledgement_past_the_cap_covers_the_counted_rows_before_it`,
+    `the_acknowledgement_hint_names_the_newest_row_counted_past_the_cap`;
+    golden cases `sock.status-key.integrity-past-cap`,
+    `sock.status-key.integrity-counted-only`,
+    `sock.status-key.integrity-counted-older-agent` (and their `--json`).
+  - **Docs.** Debian 13's `mount` changes propagation and bind flags
+    through `mount_setattr(2)` (no kernel hook): signed within a round,
+    the lock's propagation made again, a read-only remount of the lock
+    kept until the operator acts (KNOWN_LIMITATIONS.md, the trust model,
+    KERNEL_COMPATIBILITY.md; F3c-2). §61 and EVIDENCE_CHAINS.md no longer
+    say a link of the witness chain is refused everywhere: a hard link
+    made outside the agent's directories is neither refused nor recorded,
+    and what is done through it is refused and signed (F3c-3).
 - Lot 383 (the alpha's version; `UPGRADE_NOTES_WAVE4.md` §68).
   - **0.1.0-alpha everywhere.** The workspace said `0.0.1`: a
     `v0.1.0-alpha` tag would have published 0.0.1 artefacts. The workspace
