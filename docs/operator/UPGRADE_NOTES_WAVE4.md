@@ -6171,3 +6171,48 @@ fires.
   when it was not read), and its `target_ino` the attach type, marked when
   the re-attach is proven; a reader of the raw record that took
   `target_dev` as 0 reads the tag.
+
+## 72. A boot without the agent is signed at the next start, never clean; the verifier tells a stop that never came back (lot 387)
+
+- **The `agent_boot` row carries `boot_id`**, the kernel's id of the boot
+  it starts in, and **`previous_run` gains `boots_since`**: `same_boot`
+  (a restart), `next_boot` (the journal's boot list has nothing between
+  the last run's boot and this one), `boots_without_agent` (`count`,
+  `boot_ids`) or `unknown` (`why`). After a clean stop, `ended` stays
+  `clean` only for the first two; otherwise `ended` is the judgement's word
+  and `run_ended: clean` keeps how the run itself ended. A script that
+  read `"ended":"clean"` as "nothing happened since" now sees
+  `boots_without_agent` or `unknown` where that was not true or not known.
+  An abrupt end stays `abrupt`.
+- **A new High row**, `integrity_drift` kind `boots_without_agent`
+  (`count`, `boot_ids`, `previous_boot`, `this_boot`, `sources`), is held
+  in `nn-admin status` (`sensors: DEGRADED`, the trust level at most L2)
+  until a signed acknowledgement covers it, like a death of the agent's
+  role. A planned stop of the agent across one or more reboots is such a
+  gap: check it, then `nn-admin integrity acknowledge --through <row>`. An
+  advisory `boot_continuity_unknown` (shown on its own, no degradation)
+  says the start could not tell — on a host whose journal is volatile,
+  after every reboot.
+- **The first start of this release**: the last run's row has no
+  `boot_id`; the start reads the state directory's `last_boot_id` (the
+  agent's file-integrity record of its last boot) instead. Without it, the
+  judgement is `unknown` once.
+- **The start runs `journalctl --list-boots` once after a reboot** (never
+  for a restart within a boot): the binary from `/usr/sbin`, `/usr/bin`,
+  `/sbin` or `/bin` only, root-owned and verified, a fixed environment,
+  killed past 10 s (then `unknown`).
+- **`nn-admin heartbeat watch` has a new alert, `NOT_BACK` (exit 18)**: a
+  stop beat still the newest past `--max-stopped-secs` (new, default 900 s)
+  on the verifier's clock, while the export answers. Before, that state
+  was `STOPPED` (exit 15) forever. A timer or a monitor that maps the
+  verifier's codes: add 18 ("the agent did not come back: go and look");
+  17 stays nn-admin's permission refused. A planned maintenance longer
+  than 15 minutes: stop the verifier's timer, or give it a longer
+  `--max-stopped-secs`.
+- **`uninstall.sh --purge`** also removes the `.dpkg-new` and `.dpkg-tmp`
+  files dpkg leaves beside our own paths after a refused package.
+- **Docs**: the verifier is the witness of a host where the agent does
+  not start (HEARTBEAT.md); root can keep the agent from starting at boot
+  with writes the host does not record, and the signing key is readable by
+  root code that runs before the agent at every boot (KNOWN_LIMITATIONS.md,
+  the trust model).

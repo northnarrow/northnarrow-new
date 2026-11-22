@@ -88,8 +88,8 @@ pub(crate) mod workers;
 /// LSM gate among them; lab PR 265: the start's continuity — its
 /// directories not mounted over, its signing identity kept.
 pub use nn_linux::boot::{
-    checks, continuity, degradation, lsm, BootOrderError, BootPhase, BootSequence, BootStep,
-    IntegrityVerified,
+    boots_since, checks, continuity, degradation, lsm, BootOrderError, BootPhase, BootSequence,
+    BootStep, IntegrityVerified,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command

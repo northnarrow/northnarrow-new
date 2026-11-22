@@ -8,7 +8,7 @@ it reads `unreleased`); release.yml's `verify-tag` refuses a tag that is
 not `v` and the workspace version, or whose section is not the first one
 here, dated (CONTRIBUTING.md, "Rilasci").
 
-## [0.1.0-alpha] - 2026-11-22
+## [0.1.0-alpha] - 2026-11-23
 
 Tag `v0.1.0-alpha`: the first alpha, everything since `0.0.1` (Wave 4 and
 the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
@@ -2320,6 +2320,63 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 387 (pre-alpha Phase 3d, F3d-1, F3d-2 and F3d-4;
+  `UPGRADE_NOTES_WAVE4.md` §72).
+  - **A boot without the agent is signed at the next start, never
+    `clean`.** Root can keep the agent from starting at boot (a generator
+    that masks its units, `systemd.mask=` on the kernel command line, a
+    default target without it), and the host records none of these
+    writes; after the restore the first start signed `previous_run:
+    {ended: clean, reason: system_shutdown}`. Every `agent_boot` now
+    carries its `boot_id`; the next start compares the last run's boot
+    with this one and, when they differ, with the journal's boot list
+    (`journalctl --list-boots`, resolved in the system directories only,
+    a fixed environment, killed past 10 s). Boots listed in between had no
+    run of the agent: a High `integrity_drift` row `boots_without_agent`
+    (the count, the boot ids, the sources read and who can rewrite them),
+    held in `nn-admin status` until acknowledged (a death of the role), and
+    `previous_run.ended` is `boots_without_agent` (`run_ended: clean`
+    keeps how the run itself ended). When the facts cannot be read — a
+    volatile journal, the last run's boot rotated out, the list not
+    answering, boots listed after this one — it is `unknown` and an
+    advisory `boot_continuity_unknown`, never `clean`. A restart in the
+    same boot asks no journal. The judgement is pure
+    (`nn_evidence::boot_gap`), the host's facts in
+    `nn_linux::boot::boots_since`. Tests
+    `a_boot_between_the_last_run_and_this_start_is_a_boot_without_the_agent`,
+    `a_journal_that_lost_the_last_runs_boot_is_unknown_never_clean`,
+    `every_unreadable_fact_is_unknown`,
+    `a_restart_in_the_same_boot_is_no_gap_and_asks_no_journal`,
+    `the_next_boot_in_the_list_is_no_gap`,
+    `a_boot_without_the_agent_is_signed_at_the_next_start_never_clean`,
+    `boots_not_knowable_are_unknown_never_clean`,
+    `a_restart_and_a_normal_reboot_stay_clean_and_sign_nothing`,
+    `the_last_runs_boot_is_read_from_the_last_run_only`,
+    `the_last_runs_boot_is_the_chains_then_the_state_files`.
+  - **The heartbeat verifier tells a stop that never came back.** After a
+    clean stop beat it said `STOPPED` ("expected only during
+    maintenance", exit 15) at every check, forever, even while the export
+    answered and the agent never started again. Past the grace of a
+    maintenance stop (`--max-stopped-secs`, default 900 s, on the
+    verifier's clock since it first saw the stop) it now says `NOT_BACK`
+    (exit 18; 17 stays nn-admin's permission refused); a source that
+    cannot be read stays `SILENT`. Tests
+    `a_stop_that_never_comes_back_is_not_back_past_the_grace`,
+    `a_stop_with_the_source_gone_is_silent_not_not_back`,
+    `every_alert_has_its_own_exit_code_never_17`.
+  - **`uninstall.sh --purge` removes a refused package's leftovers**: the
+    `.dpkg-new` and `.dpkg-tmp` dpkg leaves beside one of our own paths
+    (our binaries, units, slice and journald configuration) when the
+    agent refused its rename — by their exact names, never a pattern over
+    the directory. Test
+    `purge_removes_the_dpkg_leftovers_of_our_own_paths_only`.
+  - **Docs.** HEARTBEAT.md: the verifier is the witness of a host where the
+    agent does not start. KNOWN_LIMITATIONS.md and the trust model: root
+    can keep the agent from starting at boot with writes the host does not
+    record; the signing key is readable by root code that runs before the
+    agent at every boot, not only at the install (residual R016); the
+    generator directories, `default.target` and the boot loader's
+    configuration are not watched by file integrity.
 - Lot 386 (the rc12 soak's R18, Debian 13, systemd 257; the last doc
   truths; `UPGRADE_NOTES_WAVE4.md` §71).
   - **systemd-networkd's sysctl monitor re-attach is told truthfully, still

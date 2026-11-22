@@ -24,9 +24,9 @@ const FORMS: &str = ".github/ISSUE_TEMPLATE";
 /// The pre-alpha phases a limitation may cite as an internal check.
 /// Lot 379: Phase 6 (resources and performance, rc10); Phase 6b (its
 /// per-operation figures, rc11). Lot 384: Phase 3c (self-protection on
-/// rc12).
-const PHASES: [&str; 14] = [
-    "0", "1", "2", "2b", "2c", "3", "3b", "3c", "4", "4b", "6", "6b", "8", "8b",
+/// rc12). Lot 387: Phase 3d (the free red team on the self-protection).
+const PHASES: [&str; 15] = [
+    "0", "1", "2", "2b", "2c", "3", "3b", "3c", "3d", "4", "4b", "6", "6b", "8", "8b",
 ];
 const EVIDENCE: &str = "*Evidence:*";
 

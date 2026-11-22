@@ -26,6 +26,9 @@
 //! choosing. So the one proof of a process says that its start ran every
 //! check against this host and was refused by none.
 
+// Lot 387 (pre-alpha F3d-1): the host's facts for the judgement of the
+// boots since the agent's last run.
+pub mod boots_since;
 pub mod checks;
 pub mod continuity;
 pub mod degradation;

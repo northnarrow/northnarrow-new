@@ -319,6 +319,141 @@ fn a_stop_beat_alerts() {
     assert_eq!(kinds(&r), ["STOPPED"], "still stopped, not silent");
 }
 
+/// Lot 387 (pre-alpha F3d-1, B5/B9): a stop followed by no beat past the
+/// grace of a maintenance stop, while the export still answers, is
+/// `NOT_BACK` (exit 18) — no longer `STOPPED` forever; within the grace,
+/// and at the first sight of the stop, it stays `STOPPED` (15).
+#[test]
+fn a_stop_that_never_comes_back_is_not_back_past_the_grace() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(1), &cfg())
+        .state
+        .unwrap();
+    let mut b = beat(2, 10);
+    b.kind = BeatKind::Stop;
+    b.stop_reason = Some("system_shutdown".into());
+    c.push(b);
+    // first seen at 11
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(11), &cfg());
+    assert_eq!(kinds(&r), ["STOPPED"]);
+    let s = r.state.unwrap();
+    // HEARTBEAT.md and `--max-stopped-secs`'s help: 15 minutes
+    assert_eq!(DEFAULT_MAX_STOPPED_SECS, 900);
+    assert_eq!(cfg().max_stopped_secs, DEFAULT_MAX_STOPPED_SECS);
+    let grace = DEFAULT_MAX_STOPPED_SECS as i64;
+    // within the grace (the bound itself included): a maintenance
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(11 + grace), &cfg());
+    assert_eq!(kinds(&r), ["STOPPED"], "{r:?}");
+    assert_eq!(r.exit_code(), 15);
+    // past it: not back, with its own code
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(12 + grace), &cfg());
+    assert_eq!(kinds(&r), ["NOT_BACK"], "{r:?}");
+    assert_eq!(r.exit_code(), 18);
+    let d = r.alerts[0].detail();
+    assert!(d.contains("seq 2") && d.contains("system_shutdown"), "{d}");
+    assert!(d.contains(&format!("{} s", grace + 1)), "{d}");
+    assert!(d.contains("still answers"), "{d}");
+    // and stays so at every later check (the state keeps the first sight)
+    let s2 = r.state.unwrap();
+    assert_eq!(s2.seen_at, s.seen_at);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s2), at(86_400), &cfg());
+    assert_eq!(kinds(&r), ["NOT_BACK"]);
+    // the operator's grace
+    let short = WatchConfig {
+        max_stopped_secs: 60,
+        ..cfg()
+    };
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(71), &short);
+    assert_eq!(kinds(&r), ["STOPPED"]);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(72), &short);
+    assert_eq!(kinds(&r), ["NOT_BACK"]);
+    // a grace past i64 is never reached
+    let huge = WatchConfig {
+        max_stopped_secs: u64::MAX,
+        ..cfg()
+    };
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(86_400), &huge);
+    assert_eq!(kinds(&r), ["STOPPED"]);
+    // the agent comes back: its start after the stop, no alert at all
+    let mut b = beat(3, 2000);
+    b.kind = BeatKind::Start;
+    b.run = "bbbbbbbbbbbbbbbb".into();
+    b.uptime_ms = 1000;
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s2), at(2001), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+}
+
+/// Lot 387: the source unreadable after a stop is still `SILENT` past the
+/// silence bound (the host or the channel gone), never `NOT_BACK` — that
+/// one says the host answers.
+#[test]
+fn a_stop_with_the_source_gone_is_silent_not_not_back() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let mut b = beat(2, 10);
+    b.kind = BeatKind::Stop;
+    b.stop_reason = Some("system_shutdown".into());
+    c.push(b);
+    let s = check(Ok(&c.lines()), &c.pk, None, at(11), &cfg())
+        .state
+        .unwrap();
+    let r = check(
+        Err("ssh: no route to host"),
+        &c.pk,
+        Some(&s),
+        at(5000),
+        &cfg(),
+    );
+    assert_eq!(kinds(&r), ["SILENT"], "{r:?}");
+    assert_eq!(r.exit_code(), 10);
+}
+
+/// Lot 387: every alert has its own exit code, each in
+/// [`ALERT_EXIT_CODES`], none of nn-admin's general codes (0 to 9) nor its
+/// permission refused (17).
+#[test]
+fn every_alert_has_its_own_exit_code_never_17() {
+    let d = String::new;
+    let every = [
+        Alert::Tampered(d()),
+        Alert::Replay(d()),
+        Alert::Broken(d()),
+        Alert::Silent(d()),
+        Alert::NotBack(d()),
+        Alert::Stopped(d()),
+        Alert::Loss(d()),
+        Alert::Degraded(d()),
+    ];
+    // a new kind must be listed above (this match fails to compile)
+    for a in &every {
+        match a {
+            Alert::Tampered(_)
+            | Alert::Replay(_)
+            | Alert::Broken(_)
+            | Alert::Silent(_)
+            | Alert::NotBack(_)
+            | Alert::Stopped(_)
+            | Alert::Loss(_)
+            | Alert::Degraded(_) => {}
+        }
+    }
+    let codes: Vec<i32> = every.iter().map(Alert::exit_code).collect();
+    assert_eq!(codes, ALERT_EXIT_CODES);
+    let mut sorted = codes.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), every.len(), "one code per alert");
+    assert!(codes.iter().all(|c| (10..=18).contains(c) && *c != 17));
+    let ranks: std::collections::BTreeSet<u8> = every.iter().map(Alert::rank).collect();
+    assert_eq!(ranks.len(), every.len(), "one rank per alert");
+    // NOT_BACK outranks STOPPED, SILENT outranks NOT_BACK
+    assert!(Alert::NotBack(d()).rank() < Alert::Stopped(d()).rank());
+    assert!(Alert::Silent(d()).rank() < Alert::NotBack(d()).rank());
+    assert_eq!(Alert::NotBack(d()).kind(), "NOT_BACK");
+}
+
 /// Loss since the last beat seen; a new run's counters from zero; the
 /// first check (an anchor) says nothing of what the run counted before it.
 #[test]

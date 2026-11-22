@@ -1372,6 +1372,16 @@ exit: 2
 |
 | For more information, try '--help'.
 
+### clap.heartbeat.watch.max-stopped-secs.missing-value
+$ nn-admin heartbeat watch --max-stopped-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--max-stopped-secs <MAX_STOPPED_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
 ### clap.heartbeat.watch.reanchor.given-twice
 $ nn-admin heartbeat watch --reanchor --reanchor
 exit: 2

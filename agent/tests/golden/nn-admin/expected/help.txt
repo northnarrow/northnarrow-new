@@ -991,7 +991,7 @@ exit: 0
 |
 | Commands:
 |   export  Print the newest lines of the heartbeat chain, exactly as on disk (the verifier's input)
-|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded, 18 not back); with `--every` until stopped
 |   help    Print this message or the help of the given subcommand(s)
 |
 | Options:
@@ -1027,7 +1027,7 @@ exit: 2
 |
 | Commands:
 |   export  Print the newest lines of the heartbeat chain, exactly as on disk (the verifier's input)
-|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+|   watch   Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded, 18 not back); with `--every` until stopped
 |   help    Print this message or the help of the given subcommand(s)
 |
 | Options:
@@ -1068,7 +1068,7 @@ exit: 0
 $ nn-admin heartbeat watch --help
 exit: 0
 --- stdout
-| Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded); with `--every` until stopped
+| Verify the agent's heartbeat from another host: fetch the newest lines (`--from-cmd`, run with `sh -c`, e.g. an SSH pull through a forced command; or `--from-file`), check signatures, chain, numbers and freshness against the last check (`--state`), print `OK …` or one `ALERT <KIND> …` line per alert. Once: exit 0, or the most severe alert's code (10 silent, 11 broken, 12 replay, 13 tampered, 14 loss, 15 stopped, 16 degraded, 18 not back); with `--every` until stopped
 |
 | Usage: nn-admin heartbeat watch [OPTIONS]
 |
@@ -1089,6 +1089,8 @@ exit: 0
 |           No newer beat for this long is silence (default: two of the beats' intervals plus 15 s)
 |       --max-skew-secs <MAX_SKEW_SECS>
 |           A beat stamped further ahead of this host's clock is DEGRADED (the agent's clock ahead) [default: 30]
+|       --max-stopped-secs <MAX_STOPPED_SECS>
+|           The grace of a maintenance stop: a stop beat with no newer beat for longer is NOT_BACK (18), no longer STOPPED (15) [default: 900]
 |       --reanchor
 |           Start again from the newest beat when the state file cannot be read (without it, an unreadable state is an error: exit 3)
 |   -h, --help

@@ -11699,6 +11699,57 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 387 — a boot without the agent is signed at the next start, never
+  clean; the verifier tells a stop that never came back (pre-alpha Phase
+  3d, F3d-1, F3d-2, F3d-4; `UPGRADE_NOTES_WAVE4.md` §72; no level
+  change).**
+  - What was open: root could keep the agent from starting at boot (its
+    units masked at boot, a default target without them) with writes the
+    host does not record; after the restore the first start signed
+    `previous_run: {ended: clean}`, and the external verifier said
+    `STOPPED` (the maintenance label, exit 15) for as long as the agent
+    stayed away. KNOWN_LIMITATIONS and the trust model said the key is
+    closed "while it runs", not that the window reopens at every boot.
+    `uninstall.sh --purge` kept a refused package's `.dpkg-*` files.
+  - Done:
+    - **The boots between two runs judged** (`nn_evidence::boot_gap`, pure;
+      `nn_linux::boot::boots_since`, the host's facts): every `agent_boot`
+      signs its `boot_id`; the next start compares the last run's boot with
+      this one and, when they differ, with `journalctl --list-boots`
+      (trusted binary, fixed environment, 10 s). Boots in between: a High
+      `boots_without_agent` (count, ids, sources and who can rewrite
+      them), held until acknowledged; facts not readable: `unknown` and an
+      advisory, never `clean`. No counter of our own (it would be masked
+      with the agent and say "next boot").
+    - **`NOT_BACK`** (exit 18) past `--max-stopped-secs` (900 s) after a
+      stop while the export answers; `ALERT_EXIT_CODES`, one per alert,
+      never 17.
+    - **Docs as behaviour**: the verifier is the witness of a host where
+      the agent does not start; the key readable by root code before the
+      agent at every boot (residual R016); the boot paths not watched.
+    - `dpkg_leftovers`: exact names beside our own paths, on `--purge`.
+  - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255, persistent
+    journal), the branch built in the guest, the verifier run on the host
+    from the same build. First start: `agent_boot` with `boot_id`,
+    `previous_run` `none`. A normal reboot: `ended: clean`, `boots_since:
+    next_boot`, no row. The units masked on the kernel command line for one
+    boot: agent and watchdog `inactive` (`masked`); the verifier `STOPPED`
+    (15) at first sight, `NOT_BACK` (18) past a 60 s grace ("has not come
+    back for 65 s … while its host still answers"), `STOPPED` with the
+    default grace. Restored: the first start signed `ended:
+    boots_without_agent`, `run_ended: clean`, `count: 1` with the masked
+    boot's id, and a High row naming the previous and this boot; `nn-admin
+    status` `DEGRADED`, the row held until acknowledged; the journal's
+    ERROR; the verifier `DEGRADED` at that start (the held finding among
+    the new run's degradations). `--purge` removed a `.dpkg-new` and a
+    `.dpkg-tmp` (a hard link to the watchdog's binary) beside our binary;
+    the guest left with its boot settings restored, purged, powered off.
+    A second round (the same guest and build): a maintenance stop (a signed
+    window, SIGTERM to both units) and a start in the same boot —
+    `ended: clean`, `reason: sigterm`, `boots_since: same_boot`, no row;
+    the verifier `STOPPED` during the stop. Seen beside, not this lot's:
+    every start's `LOSS` of stage 5 (decision delay) and a held
+    `watchdog_gone` signed during a normal reboot's shutdown.
 - **Lot 386 — systemd-networkd's sysctl monitor re-attach told truthfully,
   still refused; the last doc truths (C23; `UPGRADE_NOTES_WAVE4.md` §71; no
   level change).**

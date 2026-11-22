@@ -253,8 +253,18 @@ pub fn current_boot_id() -> Option<String> {
 /// (first run, an unreadable one) counts as a reboot: the `/run` baits are
 /// then missing as after one.
 pub fn boot_changed(state_dir: &Path, now: &str) -> bool {
+    last_boot_id(state_dir).is_none_or(|last| last != now)
+}
+
+/// The boot id recorded in `state_dir` (the boot the agent last ran its
+/// file-integrity setup under); `None` without a readable, non-empty
+/// record. Lot 387: also the fallback for the last run's boot of a chain
+/// written before `agent_boot` carried it (`boot::boots_since`).
+pub fn last_boot_id(state_dir: &Path) -> Option<String> {
     antitamper_bpf::kernel_roots::read_to_string(state_dir.join(BOOT_ID_FILE))
-        .map_or(true, |last| last.trim() != now)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Record `now` in `state_dir`: a temporary created exclusively, then

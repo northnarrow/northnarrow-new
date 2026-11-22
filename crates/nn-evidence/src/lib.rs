@@ -23,6 +23,9 @@
 pub mod action_payload;
 /// The tamper-evident audit chain (was the agent's `audit`).
 pub mod audit;
+/// Lot 387 (pre-alpha F3d-1): the boots between the agent's last run and
+/// this start — a boot without the agent is never told as a clean succession.
+pub mod boot_gap;
 /// Completeness of the chains: row numbers, file heads, the head anchor, the
 /// boot check (was the agent's `chain_anchor`).
 pub mod chain_anchor;

@@ -590,7 +590,11 @@ a refused start) is removed once the units are gone.
 
 Every uninstall also stops the journal namespace's varlink socket and
 removes its runtime directory (`/run/systemd/journal.northnarrow`);
-`--purge` removes `/var/log/northnarrow` when nothing else is in it.
+`--purge` removes `/var/log/northnarrow` when nothing else is in it, and
+(lot 387) the `.dpkg-new` and `.dpkg-tmp` files dpkg leaves beside one of
+our own paths (the binaries, the units, the slice, the journald
+configuration) when the agent refused a package's rename over it — by
+their exact names, nothing else in those directories.
 
 **A wedged agent** (lot 341): its unit active but `nn-admin status` not
 answered within 10 s (`ANSWER_TIMEOUT`), or, with stale protected pins, an
@@ -973,6 +977,26 @@ sudo grep '"op":"agent_boot"' /etc/northnarrow/audit.log | tail -1 | grep -o '"p
 ```
 
 An abrupt end is also a `PREVIOUS RUN ENDED ABRUPTLY` WARN at boot.
+
+**Boots without the agent** (lot 387). Every `agent_boot` carries its
+`boot_id`, and `previous_run.boots_since` says what passed between the last
+run and this start: `same_boot` (a restart), `next_boot` (the journal's
+boot list has nothing in between), `boots_without_agent` (boots listed in
+between, with no run of the agent: its units were kept from starting) or
+`unknown` (the journal does not keep the last run's boot — volatile,
+rotated — or did not answer). Only the first two keep `"ended":"clean"`
+after a clean stop; otherwise `ended` is the judgement's word and
+`run_ended` says how the run itself ended. A gap is also a High
+`integrity_drift` row `boots_without_agent` (the count, the boot ids, the
+sources read and who can rewrite them), held in `nn-admin status` until
+acknowledged; `unknown` is an advisory `boot_continuity_unknown`:
+
+```sh
+sudo grep '"kind":"boots_without_agent"' /etc/northnarrow/audit.log | tail -1
+```
+
+A planned stop of the agent across reboots is such a gap too: acknowledge
+it after checking (`nn-admin integrity acknowledge --through <row>`).
 
 Refused attempts — signals to the agent or the watchdog, a ptrace attach,
 writes to protected files and pins, BPF map writes and link handles — are

@@ -5994,6 +5994,79 @@ fn uninstall_removes_the_journal_runtime_dir_and_the_export_parent() {
     }
 }
 
+/// Lot 387 (pre-alpha F3d-4, named): a package refused while it replaced
+/// our watchdog left `northnarrow-watchdog.dpkg-new` (its file) and
+/// `.dpkg-tmp` (a hard link to our binary) in the binaries' directory, and
+/// `--purge` kept both. The purge now removes dpkg's temporaries beside our
+/// own paths — by their exact names: another program's, another suffix and
+/// a directory of that name stay.
+#[test]
+fn purge_removes_the_dpkg_leftovers_of_our_own_paths_only() {
+    let text = read("deploy/uninstall.sh");
+    let purge = text
+        .find("if (( PURGE )); then\n    if [[ -f \"$LEGACY_KEY\" ]]")
+        .unwrap();
+    let call = text[purge..]
+        .find("    dpkg_leftovers\nelse\n    kept_report")
+        .expect("the purge calls it");
+    assert!(call > 0);
+    let dir = case_dir("dpkg-leftovers");
+    let (bin, units) = (dir.join("bin"), dir.join("units"));
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&units).unwrap();
+    fs::write(bin.join("northnarrow-watchdog"), "ours").unwrap();
+    fs::write(bin.join("northnarrow-watchdog.dpkg-new"), "theirs").unwrap();
+    fs::hard_link(
+        bin.join("northnarrow-watchdog"),
+        bin.join("northnarrow-watchdog.dpkg-tmp"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/bin/sh", bin.join("northnarrow-agent.dpkg-new")).unwrap();
+    fs::write(units.join("northnarrow-agent.service.dpkg-tmp"), "x").unwrap();
+    fs::write(dir.join("journald@northnarrow.conf.dpkg-new"), "x").unwrap();
+    // not ours, or not dpkg's temporaries, or not a file: kept
+    fs::write(bin.join("other-tool.dpkg-new"), "x").unwrap();
+    fs::write(bin.join("northnarrow-agent.dpkg-old"), "x").unwrap();
+    fs::create_dir_all(bin.join("nn-admin.dpkg-new")).unwrap();
+    let script = format!(
+        "set -euo pipefail\nlog() {{ echo \"uninstall.sh: $*\"; }}\nBIN_DIR=$1/bin\nUNIT_DIR=$1/units\nJOURNALD_NS_CONF=$1/journald@northnarrow.conf\n{}\ndpkg_leftovers\necho done\n",
+        block("deploy/uninstall.sh", "dpkg_leftovers")
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(&dir)
+        .output()
+        .expect("bash runs");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for gone in [
+        bin.join("northnarrow-watchdog.dpkg-new"),
+        bin.join("northnarrow-watchdog.dpkg-tmp"),
+        bin.join("northnarrow-agent.dpkg-new"),
+        units.join("northnarrow-agent.service.dpkg-tmp"),
+        dir.join("journald@northnarrow.conf.dpkg-new"),
+    ] {
+        assert!(
+            fs::symlink_metadata(&gone).is_err(),
+            "{} kept",
+            gone.display()
+        );
+        assert!(stdout.contains(&gone.display().to_string()), "{stdout}");
+    }
+    for kept in [
+        bin.join("northnarrow-watchdog"),
+        bin.join("other-tool.dpkg-new"),
+        bin.join("northnarrow-agent.dpkg-old"),
+        bin.join("nn-admin.dpkg-new"),
+    ] {
+        assert!(kept.exists(), "{} removed", kept.display());
+    }
+    // the symlink's target is untouched
+    assert!(Path::new("/bin/sh").exists());
+}
+
 /// `preload_check` from install.sh on the list `text` (none: `None`) with
 /// the libraries `libs` (empty files) under the case's root: (status,
 /// stdout, stderr).

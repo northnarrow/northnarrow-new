@@ -63,7 +63,8 @@ most severe alert's:
 | 12 | `REPLAY` | a beat older than one already seen, a fork of one, or a chain's head went back (the audit log's row, the actions chain's position: a tail cut, a rotation undone, a rewrite) or is gone from the beat (the chain did not open on the host: said once, then compared when it comes back — lower is a rollback), or the agent no longer finds in its actions chain the head its previous beat named (`kept: false`: cut or rewritten) — in any new beat of the fetch, each against the one before it, not only the newest, once per head a run of beats names (lot 295) | the chain was rolled back or an old export replayed: the host or the channel is lying |
 | 11 | `BROKEN` | the chain does not link, or beats are missing | beats were removed — or the export was short of them: on the host, `sudo nn-admin heartbeat export --count 500` shows more (the forced command always exports the default 64) |
 | 10 | `SILENT` | no new beat for two intervals plus 15 s (75 s by default; the beat's interval taken within the agent's own bounds, 5 to 300 s; `--max-silence-secs`) on the **verifier's** clock — since it first saw the newest beat — or the source could not be read past that | the agent stopped, froze or was killed, the host is down, or the network is cut — go and look |
-| 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped | expected only during maintenance |
+| 15 | `STOPPED` | the agent's signed `stop` beat (an admin shutdown, a host shutdown), and every check while it stays stopped within the grace of a maintenance stop (`--max-stopped-secs`, 900 s by default, on the verifier's clock since it first saw the stop) | expected only during maintenance |
+| 18 | `NOT_BACK` | lot 387: the stop beat is still the newest past that grace, while the export still answers — the host is up and the agent did not start again (17 is not an alert's: nn-admin's permission refused) | the agent was kept from starting — a boot without it (its units masked by a generator or by `systemd.mask=` on the kernel command line, a default target without it, the units disabled) — or a maintenance outlasted the grace: go and look; the next start signs `boots_without_agent` |
 | 14 | `LOSS` | a stage's loss grew since the last beat seen — each run of the new beats read up to its last beat against its own count: a run that ended between two checks too, a whole run between them from zero (lot 295) | `nn-admin status --key` on the host: which stage, which queue |
 | 16 | `DEGRADED` | the agent's clock gone back, or ahead of the verifier's past `--max-skew-secs`; a new run whose start beat follows no stop beat (the agent killed, crashed, or frozen and restarted by the watchdog — however soon it came back), or a stop beat whose reason is not a clean stop's (`admin_shutdown`, `system_shutdown`, `sigterm`, `sigint`, `sighup`) followed by the next run's start (lot 295: a pump that exited, a thread lost; lot 353: `stuck_unresponsive`, the watchdog's stuck recovery, named so in the alert), a beat late after the one before it in one run (more than its interval + 15 s: the agent stood still — frozen, starved — for less than the silence bound), the decision thread stood still for two intervals, a telemetry gap, an action row not in its chain, an action interrupted between intent and outcome, a new degradation (each run's own, as `LOSS`); R13: the capability manifest changed — a settled `capabilities.hash` other than the last one seen, within a run or across a restart (`bpf` gone from `lsm=`, a sensor partial or on a fallback, a probe's gap or its word stale) — or not settled 120 s after the start, or gone from the beats; the sensor contract changed backwards (`capabilities.contract` with an older agent `version`, `contract_version` or `kernel` than the last seen, or one not known to be newer); an upgrade alone is a `NOTICE`, not this | `nn-admin status --key`, `nn-admin capabilities --key` (what changed), the audit log's rows |
 
@@ -95,10 +96,12 @@ after the last beat seen is still `LOSS` (lot 295).
 
 - **Planned maintenance** (an upgrade, a reboot): the agent's `stop` beat
   is `STOPPED` at every check while it is stopped — a page every 30 s
-  with `OnFailure=`. Stop the verifier's timer for the window
+  with `OnFailure=` — and `NOT_BACK` once the stop outlasts
+  `--max-stopped-secs`. Stop the verifier's timer for the window
   (`systemctl stop nn-heartbeat-web01.timer`) and start it after; the
   first check then sees the new run's `start` beat after the `stop`: no
-  alert.
+  alert. A maintenance planned longer than 15 minutes: give the verifier
+  a longer `--max-stopped-secs` for it, or stop its timer.
 - **A key change** (the agent's signing key replaced): every check is
   `TAMPERED` until the verifier has the new public key, and the lines of
   the export signed before the change keep failing until they leave it
@@ -194,6 +197,27 @@ as a whole answer — the newest beats cut off.
   only from the management networks (`combat-allow.cidrs`): a verifier
   there keeps reading the beats; one elsewhere sees the silence, which is
   what an isolated host is.
+
+## A host where the agent does not start
+
+Root on the host can keep the agent from starting at the next boot — a
+systemd generator that masks its units, `systemd.mask=` on the kernel
+command line, a default target that does not pull it in — and the host
+records none of those writes ([`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md),
+"Root can keep the agent from starting at boot"). **This verifier is the
+witness for such a host**: the last beat is the `stop` of the shutdown,
+the export still answers (journald and SSH run, the agent does not), and
+past the grace of a maintenance stop the check says `NOT_BACK` (exit 18)
+at every run until a beat comes back — never `OK`, and no longer the
+maintenance label `STOPPED` for good.
+
+When the agent starts again, its start compares the boot of its last run
+with the journal's boot list and signs `boots_without_agent` (High), held
+in `nn-admin status` until acknowledged; the held finding is one of the
+degradations the new run's beats carry, so this verifier says `DEGRADED`
+at that start, even when the masked boot was shorter than the grace. Both
+records are statements of what the host let the agent read: a root who
+holds the agent's key can also write beats that verify (below).
 
 ## What it does not prove
 
