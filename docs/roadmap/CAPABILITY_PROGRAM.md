@@ -11699,6 +11699,59 @@ number in parentheses is a lab PR.
     bpffs left in any namespace: 7 and 8 before), the three refusals held,
     the same agent; 446 and 454 descriptors open (soft limit 65,536); clean
     cold boots.
+- **Lot 384 — an acknowledgement ends every held finding through its row;
+  the status always names the row and the command; Phase 3c's doc truths
+  (C23; `UPGRADE_NOTES_WAVE4.md` §69; no level change).**
+  - What was open (pre-alpha Phase 3c on rc12, F3c-1, P2): past the 16
+    findings the status lists, the counted ones kept only one newest row
+    per class, and the status's command named the newest listed row. When
+    the counted rows were newer, the acknowledgement it printed left them
+    held, and the status stayed `DEGRADED` with no row and no command,
+    across cold boots (3 lab guests of 3). F3c-2 and F3c-3: two documents
+    said less, or more, than the kernel does (Debian 13's `mount` and
+    `mount_setattr(2)`; a hard link of the witness chain).
+  - Done:
+    - **Counted rows keep their rows** (`nn_evidence::held::Counted`, up to
+      1024 entries a class, the two oldest then kept as one under the newer
+      row). An acknowledgement through row N ends every held finding at or
+      before N, listed or counted, none after it. Lot 379's rule is kept:
+      only a genuine acknowledgement ends a hold.
+    - **The counting lines name their newest row**, and the status's
+      command names the newest row of every held line, advisories
+      included (with an older agent: the command all the same). The tag
+      has one writer and one reader (`held::row_tag`, `held::rows_named`;
+      ratchet `xtask/tests/held_row_tag.rs`).
+    - Mutation on the new code: 23 mutants, 22 caught by a named test, 1
+      argued equivalent (the insertion point of a counted entry, `<=`
+      against `<`: one entry per chain row).
+    - Docs: KNOWN_LIMITATIONS (Debian 13's `mount`; the pin lock's
+      read-only remount kept until the operator acts; the cap's bound),
+      the trust model, KERNEL_COMPATIBILITY, EVIDENCE_CHAINS,
+      UPGRADE_NOTES §61 and §69.
+  - Lab (as measured, our own guest, debian13, 6.12.117, util-linux
+    2.41.5 with `fd-based-mount`; the lot's tree verified by hash on the
+    guest, 1242 files; installed with the alpha profile):
+    - 20 bpffs mounts outside `/sys/fs/bpf` signed `bpffs_mount` (audit
+      rows 21–40). The status listed the advisory and 15 of them, and
+      counted 5: `… and 5 more held integrity row(s) in the signed audit
+      log, the newest (audit row 40)`. Its command named row 40, the
+      newest held. Before this lot it would have named row 35, the newest
+      listed.
+    - `integrity acknowledge --through 40`: "21 held integrity finding(s)
+      acknowledged through audit row 40; 0 still held". The status was
+      then `sensors: OK`, and still OK after the mounts were removed.
+    - Cold boot: agent and watchdog active at once and 30 s later, 103
+      pins, 11 of our LSM programs; `sensors: OK`, the advisory signed
+      again (row 104).
+    - A new bpffs mount: held at row 111, its line and the command naming
+      row 111. The acknowledgement through it ("2 … acknowledged; 0 still
+      held", the advisory included) gave `sensors: OK` again.
+    - Uninstalled with `--purge`: no unit active, no pin, no `.local`, no
+      probe file left; the guest powered off.
+    - Not exercised in the lab: a death held until acknowledged. The
+      watchdog's manual stop is refused by its unit (`RefuseManualStop=`,
+      rc 4), so the probe's death case did not run. The class is covered by
+      `f3c_1_the_acknowledgement_through_the_named_row_ends_the_rows_counted_past_the_cap`.
 - **Lot 383 — the alpha's version, 0.1.0-alpha everywhere; the guard e2e
   teardown waits for our LSM programs only (release engineering and test
   fixtures; no level change).**

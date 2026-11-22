@@ -59,6 +59,8 @@
 //! whatever its signature (holding more is the safe side; a forged row
 //! breaks the chain, which is a finding of its own).
 
+use std::collections::VecDeque;
+
 use crate::audit::{AuditEntry, INTEGRITY_CLEARED_OP, INTEGRITY_DRIFT_OP};
 
 /// The op of a signed operator acknowledgement of the held findings
@@ -71,6 +73,32 @@ pub const SOURCE: &str = "integrity";
 
 /// Findings listed at most; past it they are counted ([`Held::more`]).
 pub const MAX_HELD: usize = 16;
+
+/// Lot 384 (pre-alpha Phase 3c, F3c-1): the counted entries of one class
+/// kept apart, each with its newest row, at most. Past it the two oldest
+/// are kept as one under the newer row: an acknowledgement before that row
+/// covers neither (holding more is the safe side), one through it — the
+/// row `nn-admin status` names is the newest of all — covers both.
+pub const MAX_COUNTED: usize = 1024;
+
+/// Lot 384 (F3c-1): how a held line names an audit row, `(audit row N)` —
+/// what [`rows_named`] reads back (`nn-admin status`'s acknowledgement hint).
+pub const ROW_TAG: &str = "(audit row ";
+
+/// `(audit row N)`.
+pub fn row_tag(row: u64) -> String {
+    format!("{ROW_TAG}{row})")
+}
+
+/// Lot 384 (F3c-1): every audit row a held line names ([`row_tag`]). The
+/// line that counts the findings past [`MAX_HELD`] names the newest of
+/// them, so the newest row the lines of a [`Held`] name is its
+/// [`Held::newest_row`] — what an acknowledgement of them all names.
+pub fn rows_named(line: &str) -> impl Iterator<Item = u64> + '_ {
+    line.split(ROW_TAG)
+        .skip(1)
+        .filter_map(|r| r.split(')').next()?.parse::<u64>().ok())
+}
 
 /// The longest detail a held line carries (characters).
 pub const DETAIL_CHARS: usize = 160;
@@ -339,13 +367,14 @@ impl HeldFinding {
         } else {
             format!(" ({})", self.subject)
         };
+        let row = row_tag(self.last_row);
         let times = if self.rows > 1 {
             format!(
-                "signed {} times since {}, last {} (audit row {})",
-                self.rows, self.first_ts, self.last_ts, self.last_row
+                "signed {} times since {}, last {} {row}",
+                self.rows, self.first_ts, self.last_ts
             )
         } else {
-            format!("signed {} (audit row {})", self.last_ts, self.last_row)
+            format!("signed {} {row}", self.last_ts)
         };
         let until = match self.hold {
             Hold::UntilAcknowledged => {
@@ -358,13 +387,78 @@ impl HeldFinding {
     }
 }
 
+/// Lot 384 (pre-alpha Phase 3c, F3c-1): the rows of one class's findings
+/// past [`MAX_HELD`], counted, not listed — each entry with its newest row,
+/// so that an acknowledgement through a row covers exactly the entries at
+/// or before it. On main one counter kept only the newest row of them all:
+/// an acknowledgement through an earlier row (the newest *listed* one,
+/// which `nn-admin status` named) covered none, and the rows past it stayed
+/// held with no row named and no command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Counted {
+    /// `(newest row, rows)`, by row, at most [`MAX_COUNTED`].
+    entries: VecDeque<(u64, u64)>,
+    /// The rows of all the entries.
+    rows: u64,
+}
+
+impl Counted {
+    fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    fn newest(&self) -> Option<u64> {
+        self.entries.back().map(|e| e.0)
+    }
+
+    /// `rows` rows whose newest is `row`: one row past the cap, or a
+    /// listed finding counted in another's stead.
+    fn add(&mut self, row: u64, rows: u64) {
+        let at = self.entries.partition_point(|e| e.0 <= row);
+        self.entries.insert(at, (row, rows));
+        self.rows += rows;
+        if self.entries.len() > MAX_COUNTED {
+            // the two oldest as one, under the newer row: never covered
+            // by an acknowledgement before it
+            if let (Some(a), Some(b)) = (self.entries.pop_front(), self.entries.pop_front()) {
+                self.entries.push_front((a.0.max(b.0), a.1 + b.1));
+            }
+        }
+    }
+
+    /// The rows an acknowledgement through `through` covers.
+    fn covered_by(&self, through: u64) -> u64 {
+        self.entries
+            .iter()
+            .take_while(|e| e.0 <= through)
+            .map(|e| e.1)
+            .sum()
+    }
+
+    /// What an acknowledgement through `through` ends: every entry at or
+    /// before it, none after.
+    fn acknowledge(&mut self, through: u64) {
+        while let Some(&(row, rows)) = self.entries.front() {
+            if row > through {
+                break;
+            }
+            self.entries.pop_front();
+            self.rows -= rows;
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// The held findings of one chain, as its rows say.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     findings: Vec<HeldFinding>,
-    /// Rows of findings past [`MAX_HELD`] (counted, and the newest row) of
-    /// each class ([`class`]).
-    more: [(u64, u64); 3],
+    /// Rows of findings past [`MAX_HELD`], counted, of each class
+    /// ([`class`]).
+    more: [Counted; 3],
 }
 
 /// The text of `extra[key]`, if a string.
@@ -414,18 +508,18 @@ impl Held {
 
     /// Rows of degradations held past [`MAX_HELD`], not listed.
     pub fn more(&self) -> u64 {
-        self.more[0].0 + self.more[1].0
+        self.more[0].rows() + self.more[1].rows()
     }
 
     /// Every finding held, listed or counted, advisories included (what an
     /// acknowledgement can cover).
     pub fn count(&self) -> u64 {
-        self.findings.len() as u64 + self.more.iter().map(|m| m.0).sum::<u64>()
+        self.findings.len() as u64 + self.more.iter().map(Counted::rows).sum::<u64>()
     }
 
     /// Nothing held, advisories included.
     pub fn is_empty(&self) -> bool {
-        self.findings.is_empty() && self.more() == 0 && self.more[2].0 == 0
+        self.findings.is_empty() && self.more() == 0 && self.more[2].rows() == 0
     }
 
     /// The degradations `nn-admin status` lists: one a finding, then one
@@ -456,18 +550,22 @@ impl Held {
             .map(
                 |f| match twin(f).filter(|_| f.kind == "unauthorized_overlay") {
                     Some(g) => format!(
-                    "{} — the integrity round signs the same file as config_overlay (audit row {})",
-                    f.line(),
-                    g.last_row
-                ),
+                        "{} — the integrity round signs the same file as config_overlay {}",
+                        f.line(),
+                        row_tag(g.last_row)
+                    ),
                     None => f.line(),
                 },
             )
             .collect();
-        if self.more() > 0 {
+        // lot 384 (F3c-1): the line of the rows counted names the newest
+        // of them — the row `nn-admin status` acknowledges through, when
+        // they are the newest held, or the only ones left
+        if let Some(newest) = self.more[0].newest().max(self.more[1].newest()) {
             out.push(format!(
-                "… and {} more held integrity row(s) (in the signed audit log)",
-                self.more()
+                "… and {} more held integrity row(s) in the signed audit log, the newest {}",
+                self.more(),
+                row_tag(newest)
             ));
         }
         out
@@ -483,10 +581,11 @@ impl Held {
             .filter(|f| f.hold == Hold::Advisory)
             .map(HeldFinding::line)
             .collect();
-        if self.more[2].0 > 0 {
+        if let Some(newest) = self.more[2].newest() {
             out.push(format!(
-                "… and {} more advisory row(s) (in the signed audit log)",
-                self.more[2].0
+                "… and {} more advisory row(s) in the signed audit log, the newest {}",
+                self.more[2].rows(),
+                row_tag(newest)
             ));
         }
         out
@@ -496,29 +595,19 @@ impl Held {
     /// all names), `None` when nothing is held.
     pub fn newest_row(&self) -> Option<u64> {
         let listed = self.findings.iter().map(|f| f.last_row).max();
-        let counted = self
-            .more
-            .iter()
-            .filter(|(n, _)| *n > 0)
-            .map(|(_, row)| *row)
-            .max();
+        let counted = self.more.iter().filter_map(Counted::newest).max();
         listed.max(counted)
     }
 
     /// How many held findings an acknowledgement through `through` covers
-    /// (their newest row at or before it).
+    /// (their newest row at or before it), listed or counted.
     pub fn covered_by(&self, through: u64) -> u64 {
         let listed = self
             .findings
             .iter()
             .filter(|f| f.last_row <= through)
             .count() as u64;
-        let counted: u64 = self
-            .more
-            .iter()
-            .filter(|(n, row)| *n > 0 && *row <= through)
-            .map(|(n, _)| *n)
-            .sum();
+        let counted: u64 = self.more.iter().map(|m| m.covered_by(through)).sum();
         listed + counted
     }
 
@@ -555,14 +644,14 @@ impl Held {
                     .findings
                     .iter()
                     .any(|f| f.hold != Hold::UntilAcknowledged)
-                    || self.more[1].0 > 0
-                    || self.more[2].0 > 0;
+                    || self.more[1].rows() > 0
+                    || self.more[2].rows() > 0;
                 if !found || !genuine(entry) {
                     return false;
                 }
                 self.findings.retain(|f| f.hold == Hold::UntilAcknowledged);
-                self.more[1] = (0, 0);
-                self.more[2] = (0, 0);
+                self.more[1].clear();
+                self.more[2].clear();
                 true
             }
             ACK_OP if entry.result == "success" => {
@@ -573,11 +662,11 @@ impl Held {
                 if self.covered_by(through) == 0 || !genuine(entry) {
                     return false;
                 }
+                // lot 384 (F3c-1): every finding at or before it, listed
+                // or counted; none after it
                 self.findings.retain(|f| f.last_row > through);
                 for m in &mut self.more {
-                    if m.0 > 0 && m.1 <= through {
-                        *m = (0, 0);
-                    }
+                    m.acknowledge(through);
                 }
                 true
             }
@@ -624,15 +713,11 @@ impl Held {
                 })
                 .flatten();
             let Some(i) = demoted else {
-                let m = &mut self.more[class(hold)];
-                m.0 += 1;
-                m.1 = row;
+                self.more[class(hold)].add(row, 1);
                 return true;
             };
             let f = self.findings.remove(i);
-            let m = &mut self.more[class(f.hold)];
-            m.0 += f.rows;
-            m.1 = m.1.max(f.last_row);
+            self.more[class(f.hold)].add(f.last_row, f.rows);
         }
         self.findings.push(HeldFinding {
             kind: kind.to_string(),

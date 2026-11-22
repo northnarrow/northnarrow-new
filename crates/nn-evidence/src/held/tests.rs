@@ -873,3 +873,270 @@ fn a_finding_counted_past_the_cap_brings_its_rows() {
     assert_eq!(log.held().count(), MAX_HELD as u64 + 2);
     assert!(log.held().lines()[MAX_HELD].contains("2 more held integrity row(s)"));
 }
+
+/// Lot 384: the newest row the held lines name — what `nn-admin status`
+/// names in its acknowledgement command (its degradations' `integrity:`
+/// lines and its advisories').
+fn named(held: &Held) -> Option<u64> {
+    let lines: Vec<String> = held.lines().into_iter().chain(held.advisories()).collect();
+    lines.iter().flat_map(|l| rows_named(l)).max()
+}
+
+/// A death the witness signs (held until acknowledged), one per detail.
+fn death(i: usize) -> AuditEntryDraft {
+    drift(
+        "witness_row",
+        &format!("watchdog 812: role_vacated: the agent (pid {i})"),
+    )
+}
+
+/// Lot 384 (pre-alpha Phase 3c, F3c-1, as the lab saw it on 3 guests out of
+/// 3): 16 findings held until acknowledged are listed, the newer ones past
+/// the cap counted — 2 deaths and an advisory. On main the status named the
+/// newest *listed* row, the acknowledgement through it said "16
+/// acknowledged, 3 still held", and the status stayed DEGRADED with only
+/// "… and 2 more held integrity row(s)": no row, no command, across
+/// restarts. Now the lines name the newest held row, and the
+/// acknowledgement through it ends every one, listed or counted.
+#[test]
+fn f3c_1_the_acknowledgement_through_the_named_row_ends_the_rows_counted_past_the_cap() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 2 {
+        log.append(death(i)).unwrap();
+    }
+    log.append(drift("admin_key_on_host", "/root/northnarrow-admin.key"))
+        .unwrap();
+    let newest = log.rows() - 1;
+    let held = log.held();
+    assert_eq!(held.findings().len(), MAX_HELD);
+    assert_eq!(held.more(), 2, "the two newest deaths, counted");
+    assert_eq!(held.count(), MAX_HELD as u64 + 3, "and the advisory");
+    assert_eq!(held.newest_row(), Some(newest));
+    assert_eq!(named(held), Some(newest), "{:?}", held.lines());
+    assert_eq!(held.covered_by(newest), MAX_HELD as u64 + 3);
+    log.append(ack(named(log.held()).unwrap())).unwrap();
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    assert!(log.held().lines().is_empty() && log.held().advisories().is_empty());
+    // a restart, and a start: still nothing held (the acknowledgement is
+    // the chain's row, read again at the open)
+    drop(log);
+    let mut log = open(&key, &path);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    boot(&mut log);
+    assert!(log.held().is_empty(), "{:?}", log.held());
+    // a new finding: held, listed, named with its row and the command
+    log.append(cut("detections", &path)).unwrap();
+    let row = log.rows() - 1;
+    let lines = log.held().lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(&row_tag(row)), "{lines:?}");
+    assert!(
+        lines[0].contains("acknowledge --through <row>"),
+        "{lines:?}"
+    );
+    assert_eq!(named(log.held()), Some(row));
+}
+
+/// Lot 384 (F3c-1): an acknowledgement through row N ends every held
+/// finding at or before N — listed or counted past the cap — and none
+/// after it; once only counted rows are left, their line still names the
+/// newest of them. On main the counter kept only its newest row: an
+/// acknowledgement before it covered none of its rows, and its line named
+/// no row.
+#[test]
+fn an_acknowledgement_ends_every_counted_row_at_or_before_it_and_none_after() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 3 {
+        log.append(death(i)).unwrap();
+    }
+    let listed_newest = MAX_HELD as u64 - 1;
+    let counted = [MAX_HELD as u64, MAX_HELD as u64 + 1, MAX_HELD as u64 + 2];
+    assert_eq!(log.held().more(), 3);
+    assert_eq!(log.held().covered_by(listed_newest), MAX_HELD as u64);
+    assert_eq!(log.held().covered_by(counted[1]), MAX_HELD as u64 + 2);
+    // through the newest listed row: the counted rows, all newer, stay
+    log.append(ack(listed_newest)).unwrap();
+    assert!(log.held().findings().is_empty());
+    assert_eq!(log.held().more(), 3);
+    let lines = log.held().lines();
+    assert_eq!(
+        lines,
+        [format!(
+            "… and 3 more held integrity row(s) in the signed audit log, the newest {}",
+            row_tag(counted[2])
+        )]
+    );
+    assert_eq!(named(log.held()), Some(counted[2]));
+    // through the second counted row: the first two end, the third stays
+    log.append(ack(counted[1])).unwrap();
+    assert_eq!(log.held().more(), 1, "{:?}", log.held());
+    assert_eq!(log.held().count(), 1);
+    assert_eq!(named(log.held()), Some(counted[2]));
+    // the same at the next open (the rows read again)
+    drop(log);
+    let mut log = open(&key, &path);
+    assert_eq!(log.held().more(), 1, "{:?}", log.held());
+    // a start ends no finding held until acknowledged, counted or not
+    boot(&mut log);
+    assert_eq!(log.held().more(), 1, "{:?}", log.held());
+    log.append(ack(counted[2])).unwrap();
+    assert!(log.held().is_empty(), "{:?}", log.held());
+}
+
+/// Lot 384: the boundaries of the cap. Exactly [`MAX_HELD`] findings are
+/// all listed, no line counts any; the 17th is counted, and its line names
+/// its row. Either way the acknowledgement through the row the lines name
+/// ends them all.
+#[test]
+fn exactly_sixteen_held_are_listed_and_the_seventeenth_is_counted_with_its_row() {
+    for (n, counted) in [(MAX_HELD, 0), (MAX_HELD + 1, 1)] {
+        let (_d, key, path) = paths();
+        let mut log = open(&key, &path);
+        for i in 0..n {
+            log.append(death(i)).unwrap();
+        }
+        let newest = log.rows() - 1;
+        let lines = log.held().lines();
+        assert_eq!(lines.len(), MAX_HELD + counted, "{n}: {lines:?}");
+        assert_eq!(log.held().more(), counted as u64, "{n}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("more held integrity row(s)"))
+                .count(),
+            counted,
+            "{n}: {lines:?}"
+        );
+        if counted == 1 {
+            assert_eq!(
+                lines[MAX_HELD],
+                format!(
+                    "… and 1 more held integrity row(s) in the signed audit log, the newest {}",
+                    row_tag(newest)
+                )
+            );
+        }
+        assert_eq!(named(log.held()), Some(newest), "{n}: {lines:?}");
+        log.append(ack(newest)).unwrap();
+        assert!(log.held().is_empty(), "{n}: {:?}", log.held());
+    }
+}
+
+/// Lot 384: the line of the counted rows names the newest of either class
+/// counted — a finding held until acknowledged or one held while found —
+/// whichever was signed last.
+#[test]
+fn the_counted_line_names_the_newest_row_of_either_class() {
+    for until_acknowledged_last in [false, true] {
+        let (_d, key, path) = paths();
+        let mut log = open(&key, &path);
+        for i in 0..MAX_HELD {
+            log.append(death(i)).unwrap();
+        }
+        let found = drift("mount_not_canonical", "/var/lib/northnarrow/witness");
+        if until_acknowledged_last {
+            log.append(found).unwrap();
+            log.append(death(MAX_HELD)).unwrap();
+        } else {
+            log.append(death(MAX_HELD)).unwrap();
+            log.append(found).unwrap();
+        }
+        let newest = log.rows() - 1;
+        assert_eq!(log.held().more(), 2, "{:?}", log.held());
+        assert_eq!(named(log.held()), Some(newest), "{:?}", log.held().lines());
+        // a start ends the one held while found; the other keeps its row
+        boot(&mut log);
+        assert_eq!(log.held().more(), 1, "{:?}", log.held());
+        let left = if until_acknowledged_last {
+            newest
+        } else {
+            newest - 1
+        };
+        assert_eq!(named(log.held()), Some(left), "{:?}", log.held().lines());
+    }
+}
+
+/// Lot 384 (keeps lot 379's rule): past the cap too, only a genuine
+/// acknowledgement ends a hold. The same rows read again with the
+/// acknowledgement's signature not verifying end nothing; with it, all.
+#[test]
+fn past_the_cap_a_row_not_genuine_ends_no_counted_hold() {
+    let (_d, key, path) = paths();
+    let mut log = open(&key, &path);
+    for i in 0..MAX_HELD + 3 {
+        log.append(death(i)).unwrap();
+    }
+    log.append(ack(log.rows() - 1)).unwrap();
+    assert!(log.held().is_empty());
+    drop(log);
+    let entries: Vec<AuditEntry> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let replay = |genuine: &dyn Fn(&AuditEntry) -> bool| {
+        let mut held = Held::default();
+        for (row, e) in entries.iter().enumerate() {
+            held.observe(row as u64, e, genuine);
+        }
+        held
+    };
+    let forged = replay(&|e| e.op != ACK_OP);
+    assert_eq!(forged.count(), MAX_HELD as u64 + 3, "{forged:?}");
+    assert_eq!(forged.more(), 3);
+    assert!(replay(&|_| true).is_empty());
+}
+
+/// Lot 384: the rows counted past the cap are kept apart, each with its
+/// newest row, up to [`MAX_COUNTED`] entries; past it the two oldest are
+/// one under the newer row — every row still counted, and an
+/// acknowledgement before that row covers neither (the safe side); one
+/// through it, or through the newest row, covers them.
+#[test]
+fn past_max_counted_the_oldest_entries_merge_under_the_newer_row() {
+    let mut c = Counted::default();
+    let n = MAX_COUNTED as u64 + 10;
+    for row in 0..n {
+        c.add(row, 1);
+    }
+    assert_eq!(c.entries.len(), MAX_COUNTED);
+    assert_eq!(c.rows(), n);
+    assert_eq!(c.newest(), Some(n - 1));
+    // rows 0..=10 are one entry under row 10
+    assert_eq!(c.entries.front(), Some(&(10, 11)));
+    assert_eq!(c.covered_by(9), 0, "an earlier row covers none of them");
+    assert_eq!(c.covered_by(10), 11);
+    assert_eq!(c.covered_by(11), 12);
+    c.acknowledge(9);
+    assert_eq!(c.rows(), n);
+    c.acknowledge(11);
+    assert_eq!(c.rows(), n - 12);
+    assert_eq!(c.entries.front(), Some(&(12, 1)));
+    // a finding counted in another's stead: in its row's place
+    c.add(5, 3);
+    assert_eq!(c.entries.front(), Some(&(5, 3)));
+    assert_eq!(c.covered_by(5), 3);
+    assert_eq!(c.rows(), n - 9);
+    c.acknowledge(n - 1);
+    assert_eq!((c.rows(), c.newest(), c.entries.len()), (0, None, 0));
+}
+
+/// Lot 384: the tag a held line names its row with is the one
+/// [`rows_named`] reads (`nn-admin status` reads the lines with it),
+/// whatever surrounds it; a malformed one names nothing.
+#[test]
+fn the_row_tag_reads_back() {
+    assert_eq!(row_tag(412), "(audit row 412)");
+    let line = format!(
+        "a {} b {} c (audit row x) {}",
+        row_tag(7),
+        row_tag(25),
+        ROW_TAG
+    );
+    assert_eq!(rows_named(&line).collect::<Vec<_>>(), [7, 25]);
+    assert_eq!(rows_named("no row").count(), 0);
+    // what comes before the first tag is never read as a row
+    assert_eq!(rows_named("3) x").count(), 0);
+}

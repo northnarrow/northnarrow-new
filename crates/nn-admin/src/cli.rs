@@ -3348,12 +3348,27 @@ fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
                 d.len()
             )];
             lines.extend(d.iter().map(|l| format!("  - {}", clean(l))));
-            if let Some(row) = newest_held_row(d) {
-                lines.push(format!(
+            if !d.iter().any(|l| l.starts_with(HELD_PREFIX)) {
+                return lines;
+            }
+            // lot 384 (F3c-1): the newest row of every held line — the
+            // advisories' too, so one acknowledgement covers all it shows
+            let advisories = out.advisories.as_deref().unwrap_or_default();
+            match newest_held_row(d.iter().chain(advisories)) {
+                Some(row) => lines.push(format!(
                     "  integrity findings are held until their rule ends them; once \
                      investigated: nn-admin integrity acknowledge --through {row} --key <key \
                      with triage or config-manage>"
-                ));
+                )),
+                // an agent older than lot 384 names no row for the findings
+                // it only counts: the command all the same
+                None => lines.push(
+                    "  integrity findings are held until their rule ends them; once \
+                     investigated: nn-admin integrity acknowledge --through <the audit log's \
+                     newest row: this agent does not name it> --key <key with triage or \
+                     config-manage>"
+                        .to_string(),
+                ),
             }
             lines
         }
@@ -3380,16 +3395,22 @@ fn advisory_lines(out: &StatusOutcome) -> Vec<String> {
     }
 }
 
+/// The prefix of the lines of the held integrity findings
+/// (`nn_evidence::held::SOURCE`, as the degradation registry shows it).
+const HELD_PREFIX: &str = "integrity: ";
+
 /// Lot 379: the newest audit row a held integrity finding names (`(audit
 /// row N)` in its `integrity:` line — every one a line names: an overlay
 /// the start refused names the round's row of the same file too), if any
-/// is held.
-fn newest_held_row(degradations: &[String]) -> Option<u64> {
-    degradations
-        .iter()
-        .filter(|l| l.starts_with("integrity: "))
-        .flat_map(|l| l.split("(audit row ").skip(1))
-        .filter_map(|r| r.split(')').next()?.parse::<u64>().ok())
+/// is held. Lot 384 (pre-alpha Phase 3c, F3c-1): the line that counts the
+/// findings past the cap names the newest of them, read by the same rule
+/// that writes it (`nn_evidence::held::rows_named`): on main this read only
+/// the listed lines, and the counted rows newer than them were never
+/// covered by the command it printed.
+fn newest_held_row<'a>(lines: impl Iterator<Item = &'a String>) -> Option<u64> {
+    lines
+        .filter(|l| l.starts_with(HELD_PREFIX))
+        .flat_map(|l| nn_evidence::held::rows_named(l))
         .max()
 }
 
@@ -6717,6 +6738,80 @@ mod flow_sock_line_tests {
             d.last()
                 .unwrap()
                 .contains("nn-admin integrity acknowledge --through 25 --key"),
+            "{d:?}"
+        );
+    }
+
+    /// Lot 384 (pre-alpha Phase 3c, F3c-1): past the 16 findings listed,
+    /// the line that counts the others names the newest of them, and the
+    /// hint acknowledges through it — also when only counted rows are left
+    /// (on main: no row, so no command), and through an advisory's row when
+    /// that is the newest held. An agent older than the lot names no row for
+    /// the counted ones: the command all the same.
+    #[test]
+    fn the_acknowledgement_hint_names_the_newest_row_counted_past_the_cap() {
+        let hint = |d: &[String]| d.last().unwrap().clone();
+        let mut o = outcome(None, None, None);
+        o.degradations = Some(vec![
+            "integrity: witness_row — signed t (audit row 15) — held until acknowledged \
+             (`nn-admin integrity acknowledge --through <row>`): role_vacated"
+                .to_string(),
+            "integrity: … and 2 more held integrity row(s) in the signed audit log, the \
+             newest (audit row 17)"
+                .to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert!(
+            hint(&d).contains("nn-admin integrity acknowledge --through 17 --key"),
+            "{d:?}"
+        );
+        // only the counted rows left (the listed ones acknowledged)
+        o.degradations = Some(vec![
+            "integrity: … and 2 more held integrity row(s) in the signed audit log, the \
+             newest (audit row 17)"
+                .to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(
+            hint(&d).contains("nn-admin integrity acknowledge --through 17 --key"),
+            "{d:?}"
+        );
+        // an advisory counted after them: one acknowledgement covers all
+        o.advisories = Some(vec![
+            "integrity: … and 1 more advisory row(s) in the signed audit log, the newest \
+             (audit row 18)"
+                .to_string(),
+            "net_drain: a reader said (audit row 999)".to_string(),
+        ]);
+        assert!(
+            hint(&degradation_lines(&o)).contains("--through 18 --key"),
+            "{:?}",
+            degradation_lines(&o)
+        );
+        // a degradation of another source beside an advisory: no command
+        // (only a held integrity line asks for one)
+        o.degradations = Some(vec!["net_drain: a reader said (audit row 999)".to_string()]);
+        assert_eq!(
+            degradation_lines(&o).len(),
+            2,
+            "{:?}",
+            degradation_lines(&o)
+        );
+        // an advisory alone: no degradation, no command
+        o.degradations = Some(Vec::new());
+        assert_eq!(degradation_lines(&o), ["degradations      : none"]);
+        // an agent older than lot 384: the counted line names no row
+        o.advisories = None;
+        o.degradations = Some(vec![
+            "integrity: … and 2 more held integrity row(s) (in the signed audit log)".to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert!(
+            hint(&d).contains(
+                "nn-admin integrity acknowledge --through <the audit log's newest row: this \
+                 agent does not name it> --key"
+            ),
             "{d:?}"
         );
     }
