@@ -9,8 +9,9 @@
 //!   `last_boot_id` (FIMR-008: written by the agent's file-integrity setup,
 //!   after this judgement).
 //! - The journal's boots before this one, asked one at a time, newest first
-//!   (lot 389, F2h-1: `journalctl -b -<k>`, [`journal_boot_at`], once `-b 0`
-//!   is this boot, [`anchored_walk`]
+//!   (lot 389, F2h-1: `journalctl -b -<k>`, [`journal_boot_at`], once the
+//!   journal's newest entry, its tail — which `-b -<k>` counts from — is of
+//!   this boot, the kernel's id: [`journal_tail_boot`], [`anchored_walk`]
 //!   — systemd 249's `--list-boots` stops at the first boot it meets twice,
 //!   and on a long journal never reached this boot), then, when that walk
 //!   does not reach the last run's boot, the journal's boot list
@@ -38,7 +39,10 @@ pub const JOURNAL_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Lot 389 (F2h-1): how long one question of the walk may take (systemd
 /// 249 answered each in 15–230 ms on a 1.5 GB journal of 430 boots), and
-/// the whole walk; past either the list judges.
+/// past when no question is begun (the review of #597, P3-5: one begun
+/// just before it may take its own bound, so the walk ends within
+/// [`WALK_TIMEOUT`] + [`WALK_STEP_TIMEOUT`], 8 s); past either the list
+/// judges.
 pub const WALK_STEP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WALK_TIMEOUT: Duration = Duration::from_secs(6);
 
@@ -73,13 +77,13 @@ pub fn judge(previous_run: bool, chain_boot: Option<&str>, state_dir: &Path) -> 
         crate::fim::honeypot::current_boot_id(),
         bounded_walk(
             std::time::Instant::now() + WALK_TIMEOUT,
-            anchored_walk(journal_boot_at),
+            anchored_walk(journal_tail_boot, journal_boot_at),
         ),
         journal_boots,
     )
 }
 
-/// Lot 389 (F2h-1): the walk's questions `ask`, none asked past
+/// Lot 389 (F2h-1): the walk's questions `ask`, none begun past
 /// `deadline` (the answer then: no answer).
 pub fn bounded_walk(
     deadline: std::time::Instant,
@@ -96,28 +100,34 @@ pub fn bounded_walk(
     }
 }
 
-/// Lot 389 (F2h-1): the `k`-th boot before this one as the journal's
-/// newest boot counts them (`ask(k)`: `journalctl -b -<k>`), once the
-/// journal's newest boot (`ask(0)`) is this very boot — asked at the first
-/// question; otherwise no answer at all (a journal whose newest boot is
-/// another: a clock set back, a journal not flushed). systemd 255 answers
-/// `-b <id>-<k>` with the boot `<id>` itself, the offset ignored (lot 389's
-/// lab, ubuntu2404); `-b -<k>` is answered alike by 249, 255 and 257.
+/// Lot 389 (F2h-1): the `k`-th boot before this one as the journal counts
+/// them back from its tail (`ask(k)`: `journalctl -b -<k>`), once the boot
+/// of the journal's newest entry (`tail()`: `journalctl -n 1`, no `-b`) is
+/// this very boot — the kernel's id, which the walk is given — asked at the
+/// first question; otherwise no answer at all (a journal whose newest entry
+/// is another boot's: a clock set back, a journal not flushed). The review
+/// of #597 (P3-3): `-b 0` is no such check — systemd 249, 255 and 257
+/// answer it with the kernel's current boot (`sd_id128_get_boot`), not the
+/// tail's, so it proved only that this boot has entries. systemd 255
+/// answers `-b <id>-<k>` with the boot `<id>` itself, the offset ignored
+/// (lot 389's lab, ubuntu2404); `-b -<k>` is answered alike by 249, 255
+/// and 257.
 pub fn anchored_walk(
+    mut tail: impl FnMut() -> BootBefore,
     mut ask: impl FnMut(usize) -> BootBefore,
 ) -> impl FnMut(&str, usize) -> BootBefore {
     let mut anchor: Option<Result<(), String>> = None;
     move |current, k| {
-        let anchored = anchor.get_or_insert_with(|| match ask(0) {
+        let anchored = anchor.get_or_insert_with(|| match tail() {
             BootBefore::Boot(newest)
                 if boot_gap::normalize(&newest) == boot_gap::normalize(current) =>
             {
                 Ok(())
             }
             BootBefore::Boot(newest) => Err(format!(
-                "the journal's newest boot is {newest}, not this one"
+                "the journal's newest entry is of boot {newest}, not this one"
             )),
-            BootBefore::NoSuchBoot => Err("the journal holds no entry of this boot".into()),
+            BootBefore::NoSuchBoot => Err("the journal holds no entry".into()),
             BootBefore::NoAnswer(why) => Err(why),
         });
         match anchored {
@@ -180,29 +190,58 @@ pub fn journal_boots() -> Result<Vec<String>, String> {
     )))
 }
 
-/// Lot 389 (F2h-1): the journal's `k`-th boot before its newest one (0:
-/// the newest): `journalctl -b -<k> -n 1 -o json --output-fields=_BOOT_ID`
-/// — the boot of the newest entry it shows. systemd 249 walks back from the
-/// journal's tail, boot by boot, without the list's stop at a boot met
-/// twice.
+/// Lot 389 (F2h-1): the journal's `k`-th boot before its newest one:
+/// `journalctl -b -<k> -n 1 -o json --output-fields=_BOOT_ID` — the boot of
+/// the newest entry it shows ([`journal_boot_args`]). systemd 249 walks
+/// back from the journal's tail, boot by boot, without the list's stop at
+/// a boot met twice.
 pub fn journal_boot_at(k: usize) -> BootBefore {
+    journal_boot(Some(k))
+}
+
+/// The review of #597 (P3-3): the boot of the journal's newest entry, its
+/// tail — the boot `-b -<k>` counts from: `journalctl -n 1 -o json
+/// --output-fields=_BOOT_ID`, no `-b` ([`journal_boot_args`]).
+pub fn journal_tail_boot() -> BootBefore {
+    journal_boot(None)
+}
+
+/// The arguments of the walk's question: the boot of the newest entry of
+/// the `k`-th boot back from the journal's tail (`Some(k)`, `-b -<k>`), or
+/// of the journal itself (`None`: no `-b`).
+pub fn journal_boot_args(k: Option<usize>) -> Vec<String> {
+    let mut args: Vec<String> = match k {
+        Some(k) => vec!["-b".into(), format!("-{k}")],
+        None => Vec::new(),
+    };
+    args.extend(
+        [
+            "-n",
+            "1",
+            "-o",
+            "json",
+            "--output-fields=_BOOT_ID",
+            "--no-pager",
+            "--quiet",
+        ]
+        .map(String::from),
+    );
+    args
+}
+
+fn journal_boot(k: Option<usize>) -> BootBefore {
     let bin = match crate::trusted_bin::resolve("journalctl") {
         Ok(b) => b,
         Err(e) => return BootBefore::NoAnswer(e.to_string()),
     };
     let mut cmd = bin.command();
-    cmd.args([
-        "-b",
-        &format!("-{k}"),
-        "-n",
-        "1",
-        "-o",
-        "json",
-        "--output-fields=_BOOT_ID",
-        "--no-pager",
-        "--quiet",
-    ]);
-    match crate::bounded_cmd::run_bounded(cmd, None, WALK_STEP_TIMEOUT, "journalctl -b -<k>") {
+    cmd.args(journal_boot_args(k));
+    let what = if k.is_some() {
+        "journalctl -b -<k>"
+    } else {
+        "journalctl -n 1"
+    };
+    match crate::bounded_cmd::run_bounded(cmd, None, WALK_STEP_TIMEOUT, what) {
         Ok(out) => boot_before_of(
             out.status.success(),
             &String::from_utf8_lossy(&out.stdout),
@@ -489,55 +528,103 @@ mod tests {
         let judge =
             &code[code.find("pub fn judge(").unwrap()..code.find("pub fn bounded_walk(").unwrap()];
         assert!(
-            judge.contains("anchored_walk(journal_boot_at)") && judge.contains("journal_boots,"),
+            judge.contains("anchored_walk(journal_tail_boot, journal_boot_at)")
+                && judge.contains("journal_boots,"),
             "{judge}"
         );
-        let ask = &code[code.find("pub fn journal_boot_at(").unwrap()
+        let asks = &code[code.find("pub fn journal_boot_at(").unwrap()
             ..code.find("pub fn boot_before_of(").unwrap()];
-        for arg in [
-            r#""-b","#,
-            r#"&format!("-{k}"),"#,
-            r#""-n","#,
-            r#""1","#,
-            r#""json","#,
-            r#""--output-fields=_BOOT_ID","#,
-        ] {
-            assert!(ask.contains(arg), "{arg}");
+        assert!(
+            asks.contains("journal_boot(Some(k))")
+                && asks.contains("journal_boot(None)")
+                && asks.contains("cmd.args(journal_boot_args(k));"),
+            "{asks}"
+        );
+        let args = journal_boot_args(Some(3));
+        assert_eq!(&args[..2], ["-b", "-3"]);
+        for arg in ["-n", "1", "-o", "json", "--output-fields=_BOOT_ID"] {
+            assert!(args.iter().any(|a| a == arg), "{arg}");
         }
     }
 
-    /// Lot 389 (F2h-1): the walk counts from the journal's newest boot only
-    /// once that boot is this one (asked once, at the first question, in
-    /// either form of the id); a journal whose newest boot is another, holds
-    /// none of this boot or does not answer gives no answer to any question.
+    /// The review of #597 (P3-3): the walk's anchor is the boot of the
+    /// journal's tail — the newest entry, asked with no `-b` — against the
+    /// kernel's id of this boot, never `-b 0`, which systemd 249, 255 and
+    /// 257 answer with the kernel's current boot whatever the tail is; the
+    /// walk's questions count back from that tail (`-b -<k>`).
+    #[test]
+    fn the_walk_s_anchor_is_the_journal_s_tail_never_b_0() {
+        let tail = journal_boot_args(None);
+        assert!(
+            !tail.iter().any(|a| a == "-b" || a.starts_with("--boot")),
+            "{tail:?}"
+        );
+        assert_eq!(
+            tail,
+            journal_boot_args(Some(0))[2..].to_vec(),
+            "the tail's question is the walk's without its -b"
+        );
+        // the tail is another boot's (a clock set back, separate seqnum
+        // chains): no question is asked, the walk has no answer — though
+        // `-b -<k>` would answer
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut w = anchored_walk(
+            || BootBefore::Boot(A.into()),
+            |k| {
+                asked.borrow_mut().push(k);
+                BootBefore::Boot(B.into())
+            },
+        );
+        assert!(matches!(w(C, 1), BootBefore::NoAnswer(why) if why.contains(A)));
+        drop(w);
+        assert!(asked.take().is_empty());
+        // the tail is this boot's: the walk counts back from it
+        let mut w = anchored_walk(
+            || BootBefore::Boot(C.into()),
+            |k| {
+                asked.borrow_mut().push(k);
+                BootBefore::Boot(B.into())
+            },
+        );
+        assert_eq!(w(C, 1), BootBefore::Boot(B.into()));
+        drop(w);
+        assert_eq!(asked.take(), vec![1]);
+    }
+
+    /// Lot 389 (F2h-1): the walk counts from the journal's tail only once
+    /// the tail's boot is this one (asked once, at the first question, in
+    /// either form of the id; `usize::MAX` below marks the tail's question);
+    /// a journal whose tail is another boot's, that holds no entry or does
+    /// not answer gives no answer to any question.
     #[test]
     fn the_walk_counts_from_this_boot_only() {
         let asked = std::cell::RefCell::new(Vec::new());
-        let journal = |newest: BootBefore| {
+        let tail = |newest: BootBefore| {
             let asked = &asked;
-            move |k: usize| {
-                asked.borrow_mut().push(k);
-                match k {
-                    0 => newest.clone(),
-                    k => BootBefore::Boot(format!("{k:032x}")),
-                }
+            move || {
+                asked.borrow_mut().push(usize::MAX);
+                newest.clone()
             }
         };
-        let mut w = anchored_walk(journal(BootBefore::Boot(C.to_uppercase())));
+        let back = |k: usize| {
+            asked.borrow_mut().push(k);
+            BootBefore::Boot(format!("{k:032x}"))
+        };
+        let mut w = anchored_walk(tail(BootBefore::Boot(C.to_uppercase())), back);
         assert_eq!(w(C, 1), BootBefore::Boot(format!("{:032x}", 1)));
         assert_eq!(w(C, 2), BootBefore::Boot(format!("{:032x}", 2)));
         drop(w);
-        assert_eq!(asked.take(), vec![0, 1, 2]);
+        assert_eq!(asked.take(), vec![usize::MAX, 1, 2]);
         for newest in [
             BootBefore::Boot(A.into()),
             BootBefore::NoSuchBoot,
             BootBefore::NoAnswer("killed past 2 s".into()),
         ] {
-            let mut w = anchored_walk(journal(newest.clone()));
+            let mut w = anchored_walk(tail(newest.clone()), back);
             assert!(matches!(w(C, 1), BootBefore::NoAnswer(_)), "{newest:?}");
             assert!(matches!(w(C, 2), BootBefore::NoAnswer(_)), "{newest:?}");
             drop(w);
-            assert_eq!(asked.take(), vec![0], "{newest:?}");
+            assert_eq!(asked.take(), vec![usize::MAX], "{newest:?}");
         }
     }
 

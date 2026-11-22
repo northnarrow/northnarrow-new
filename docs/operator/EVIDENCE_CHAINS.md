@@ -476,8 +476,10 @@ each open (a restart reads the chain again: it clears nothing):
 - **The attack-class events of the run** (the review of #586, P3-2) — a
   shutdown marker the watchdog refused (`shutdown_marker_rejected`), the
   admin socket removed (`admin_socket_removed`) or reached by a peer it
-  refused (`admin_socket_foreign_peer`) — are held until acknowledged:
-  nothing checks an event again at a start, and a host reboot is a start.
+  refused (`admin_socket_foreign_peer`), a remount of `/run` noted as the
+  host's shutdown whose shutdown did not come (`run_exec_without_shutdown`,
+  the review of #597) — are held until acknowledged: nothing checks an
+  event again at a start, and a host reboot is a start.
 - **The degradations** — an unauthorized overlay, a modified or
   unavailable default list, the integrity round's drifts (a drop-in, a
   mount over the agent's paths, a foreign pin…), the watchdog's holds —
@@ -517,7 +519,8 @@ each open (a restart reads the chain again: it clears nothing):
   (`chain_tail_repaired`, below: a crash's normal end, its cut signed and
   verifiable), and lot 389's `run_exec_at_shutdown` (Ubuntu's `finalrd`
   making `/run` executable while the host goes down, `recorded`; the same
-  change otherwise is the held `mount_attrs_changed`).
+  change otherwise is the held `mount_attrs_changed`, and a note whose
+  shutdown did not come is the held event `run_exec_without_shutdown`).
 - A row that ends a hold — an acknowledgement, a `cleared`, a start's
   `agent_boot` — counts only when its signature verifies with the agent's
   key: a line written into the file by hand ends nothing.
