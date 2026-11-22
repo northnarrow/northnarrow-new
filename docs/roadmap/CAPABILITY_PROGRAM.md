@@ -11723,11 +11723,14 @@ number in parentheses is a lab PR.
       for a stage that drops events.
     - **The stop beat is the run's last** (the mini-hunt: the beats' task,
       like the round, ran on through the stop).
+    - **A worker ended by the stop's SIGTERM in a stop under way** is the
+      stop's own: no `worker_parse`, no revision of the manifest; a crash,
+      an OOM, a kill stays a failure.
     - **A boot gap names its facts**: a start refused in that boot (its row
       now carries `boot_id`), a rescue or emergency boot the journal shows;
       otherwise every cause such a boot can have. A row not written is
       tried again until signed, once.
-  - Mutation: 34 mutants of the new rules — 33 caught by a named test, one
+  - Mutation: 42 mutants of the new rules — 41 caught by a named test, one
     equivalent (the beat's first stop check spares only the work of a beat
     the check under the writer's lock refuses).
   - Lab (as measured): ubuntu2404 (6.8.0-149, systemd 255) and debian13
@@ -11745,12 +11748,19 @@ number in parentheses is a lab PR.
     `LOSS`. The watchdog SIGKILLed inside a signed window while the host ran
     (its unit restarted it, `NRestarts=1`): `watchdog_gone` held until
     acknowledged, `sensors: DEGRADED`, the verifier `DEGRADED` naming it, on
-    both. Seen beside, not changed here: after every reboot the verifier
-    still said `DEGRADED` — the parse worker, killed by `systemd-shutdown`'s
-    SIGTERM before the agent's stop, signed as a degradation of the run and
-    a revision of its manifest in the stop beat (10 of 10 on both); and on
-    debian13 one run ended on a beat written after its stop beat (fixed
-    here, after that round).
+    both. That round also showed, after every reboot (10 of 10 on both),
+    the verifier still `DEGRADED`: the parse worker, ended by
+    `systemd-shutdown`'s SIGTERM before the agent's stop, signed as a
+    degradation and a revision of the manifest in the stop beat; and on
+    debian13 one run ended on a beat written after its stop beat. Both fixed
+    after it (the coordinator's follow-up): a worker ended by the stop's
+    SIGTERM in the host's shutdown, a signed window or the agent's stop is
+    the stop's own (`StopExit`, shared with the watchdog: no degradation,
+    its status kept); the stop beat is the run's last. Mutation of that
+    rule: 8 of 8 caught. A second round, ubuntu2404, the same build steps:
+    five normal reboots, the verifier `OK` with `NOTICE stage 5 … +1068 to
+    +1431` after each, never `DEGRADED`; `sensors: OK`, no `watchdog_gone`,
+    `next_boot` each; the watchdog SIGKILLed in a window: held, `DEGRADED`.
 - **Lot 387 — a boot without the agent is signed at the next start, never
   clean; the verifier tells a stop that never came back (pre-alpha Phase
   3d, F3d-1, F3d-2, F3d-4; `UPGRADE_NOTES_WAVE4.md` §72; no level
