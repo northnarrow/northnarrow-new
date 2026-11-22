@@ -11796,9 +11796,8 @@ number in parentheses is a lab PR.
       masked boot, `sensors: DEGRADED`, the verifier `DEGRADED`; a round
       landed in the reboot into the masked boot and signed the finalrd
       note, and no `run_exec_without_shutdown` followed (the shutdown
-      came). A reboot
-      held (a unit whose stop sleeps) then cancelled, `/run` made
-      `noexec` again one second after the cancel: the note 11 s after the
+      came). A reboot held, then cancelled, `/run` made `noexec` again
+      one second after the cancel: the note 11 s after the
       reboot was queued (systemd `stopping`, `reboot.target` pending,
       finalrd's stop with its pid), systemd `running` after the cancel,
       then `run_exec_without_shutdown` High at the next round ("… but the
