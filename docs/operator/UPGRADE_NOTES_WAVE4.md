@@ -6200,7 +6200,7 @@ fires.
 - **The start runs `journalctl --list-boots` once after a reboot** (never
   for a restart within a boot): the binary from `/usr/sbin`, `/usr/bin`,
   `/sbin` or `/bin` only, root-owned and verified, a fixed environment,
-  killed past 10 s (then `unknown`).
+  and bounded (an answer it does not get is `unknown`).
 - **`nn-admin heartbeat watch` has a new alert, `NOT_BACK` (exit 18)**: a
   stop beat still the newest past `--max-stopped-secs` (new, default 900 s)
   on the verifier's clock, while the export answers. Before, that state
@@ -6255,8 +6255,8 @@ fires.
   row and its boot), `refused_starts_unplaced` (refused starts of an agent
   before this release, their boot not recorded) and `rescue_boots` (the
   journal shows PID 1 reaching `rescue.target` or `emergency.target` in
-  that boot; the first four boots without the agent are looked at, 2 s
-  each). Its `detail` no longer names one cause alone. The refused start's
+  that boot; only the first few boots without the agent are looked at).
+  Its `detail` no longer names one cause alone. The refused start's
   `agent_boot` row (`result: refused`) carries `boot_id`. Still High and
   held until acknowledged.
 - **A boot gap's row the start could not write** (a full disk) is tried
@@ -6271,8 +6271,8 @@ fires.
 - **The start asks the journal for the boots before this one, one at a
   time** (`journalctl -b -<k> -n 1 -o json --output-fields=_BOOT_ID`,
   newest first, once the journal's newest entry — `journalctl -n 1`, no
-  `-b` — is of this very boot, the kernel's id; at most 17, each killed
-  past 2 s, none begun past 6 s: the walk ends within 8 s), and runs
+  `-b` — is of this very boot, the kernel's id; a bounded walk, each question
+  killed when it hangs), and runs
   `journalctl --list-boots` (§72) only when that walk does not reach the
   last run's boot. On systemd 249 (Ubuntu
   22.04), whose list stops at the first boot it meets twice, a host with a
@@ -6291,24 +6291,24 @@ fires.
   job of `reboot`, `poweroff`, `halt` or `kexec.target` pending — not
   `soft-reboot.target`, which keeps the agent; the unit's own `ExecStop=`,
   its files root's and writable by no one else, run since the start of the
-  round before). Before, one normal reboot in six
+  round before). Before, a normal reboot now and then
   left a High `mount_attrs_changed` (and a `mount_over_protected` "/run
   hides /run/northnarrow") in the run's stop beat, and the off-host
   verifier said `DEGRADED` at the next start. A monitor that counted
   `mount_attrs_changed` per reboot on Ubuntu: count the note beside it, or
-  expect fewer. The same change while the host runs, or past 120 s from the
+  expect fewer. The same change while the host runs, or well after the
   run's first note, is still the High `mount_attrs_changed`.
 - **A new `integrity_drift` kind, `run_exec_without_shutdown`** (High,
   held until acknowledged, as the run's attack-class events are): the
   shutdown a `run_exec_at_shutdown` note was signed for did not come — a
   later round found systemd running again (a reboot cancelled), or the
-  agent still running 120 s after the run's first note (a reboot held, or
+  agent still running well after the run's first note (a reboot held, or
   systemd silent) — "a remount noted as the host's shutdown, but the host
   did not shut down", whatever `/run` looks like then; the run notes no
   more. Before, root could make the note's facts true without the host
   going down and put `noexec` back before the next round: the note was
-  then the only trace. A real shutdown that keeps the agent running more
-  than 120 s after the note signs it too; acknowledge it once you know
+  then the only trace. A real shutdown that keeps the agent running long
+  after the note signs it too; acknowledge it once you know
   what held the reboot.
 - **A remount is no longer also signed `mount_over_protected`**: an
   attribute change of a mount a watched path crosses (its options, its

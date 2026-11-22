@@ -2337,8 +2337,7 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     kernel's current boot whatever the tail is), until one is the last
     run's — the boots met before it are the boots without the agent, judged
     by lot 387's rules; the list is asked only when the walk does not reach
-    the last run's boot (17 boots; no question begun past 6 s, each at most
-    2 s), and a list that puts the last run's boot right before this one
+    the last run's boot (the walk is bounded, each question killed when it hangs), and a list that puts the last run's boot right before this one
     while the walk names another there, or answers that there is none (no
     boot before this one, or this very boot), is `unknown`, never clean
     (`nn_evidence::boot_gap::judge_walking`). The
@@ -2362,7 +2361,7 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     `systemd-shutdown` ends the agent; an integrity round landing in
     between signed `mount_attrs_changed` and `mount_over_protected` (High),
     the stop beat carried them, and the off-host verifier said `DEGRADED`
-    after one normal reboot in six. When `/run` in PID 1's table lost
+    after a normal reboot now and then. When `/run` in PID 1's table lost
     `noexec` and nothing else, systemd says `stopping` with a job of
     `reboot.target`, `poweroff.target`, `halt.target` or `kexec.target`
     pending (not `soft-reboot.target`: a soft-reboot keeps the agent), and
@@ -2371,12 +2370,12 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     one else — their owner and mode, not their content) started since the
     start of the last round that read `/run` unchanged (the monotonic
     clock), the change is signed once as `run_exec_at_shutdown`
-    (`recorded`, never held) — at most 120 s after the run's first such
-    note, and only once that note is signed. The same change while the host
+    (`recorded`, never held) — only while the run's first such note
+    is still awaiting its shutdown. The same change while the host
     runs, any other change, or a change already signed stays the High
     `mount_attrs_changed`. A note awaits its shutdown: a later round that
     finds systemd running again (a reboot cancelled) or the agent still
-    running 120 s after the run's first note (a reboot held) signs the High
+    running well after the run's first note (a reboot held) signs the High
     `run_exec_without_shutdown` — a remount noted as the host's shutdown,
     but the host did not shut down — held until acknowledged, even with
     `noexec` back on `/run`, and the run notes no more (the review of #597:
