@@ -497,6 +497,135 @@ fn loss_alerts_against_the_last_beat_seen() {
     );
 }
 
+/// Lot 388 (the triage of #595, b): stage 5 (decision delay) counts events
+/// judged late, none lost. The start's backlog — a reboot's +1432 in the
+/// lab, a restart's +17 — is a NOTICE (exit 0), never `LOSS`; at a reboot,
+/// after the clean stop's beat, nothing else is said.
+#[test]
+fn stage_5_at_a_start_is_a_notice_not_a_loss() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    c.push(beat(2, 30));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg())
+        .state
+        .unwrap();
+    // the same run, within its first 120 s
+    let mut b = beat(3, 60);
+    b.loss[DECISION_DELAY_STAGE] = Some(17);
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(61), &cfg());
+    assert!(r.alerts.is_empty(), "{r:?}");
+    assert_eq!(r.exit_code(), 0);
+    assert_eq!(r.notices.len(), 1, "{r:?}");
+    assert!(
+        r.notices[0].starts_with("stage 5 (decision delay) +17 in the run's first 120 s")
+            && r.notices[0].contains("none lost"),
+        "{r:?}"
+    );
+    // a normal reboot: the clean stop's beat, the next run's start and beat
+    let s = r.state.unwrap();
+    let mut stop = beat(4, 70);
+    stop.kind = BeatKind::Stop;
+    stop.stop_reason = Some("system_shutdown".into());
+    stop.loss[DECISION_DELAY_STAGE] = Some(17);
+    c.push(stop);
+    let mut start = beat(5, 100);
+    start.kind = BeatKind::Start;
+    start.run = "bbbbbbbbbbbbbbbb".into();
+    start.uptime_ms = 3_000;
+    c.push(start);
+    let mut b = beat(6, 130);
+    b.run = "bbbbbbbbbbbbbbbb".into();
+    b.uptime_ms = 33_000;
+    b.loss[DECISION_DELAY_STAGE] = Some(1432);
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(131), &cfg());
+    assert!(r.alerts.is_empty(), "no LOSS, nothing else: {r:?}");
+    assert_eq!(r.exit_code(), 0);
+    assert!(
+        r.notices.len() == 1 && r.notices[0].contains("+1432 in the run's first 120 s"),
+        "{r:?}"
+    );
+}
+
+/// Lot 388 (the triage of #595, b): late decisions after a run's first
+/// 120 s are DEGRADED (exit 16: the decision falls behind), never `LOSS`;
+/// a check that spans the boundary tells the start's part (NOTICE) from
+/// the rest (DEGRADED); a stage that drops events beside it is still LOSS.
+#[test]
+fn stage_5_after_the_first_120_s_is_degraded_and_never_a_loss() {
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    c.push(beat(2, 30));
+    let s = check(Ok(&c.lines()), &c.pk, None, at(31), &cfg())
+        .state
+        .unwrap();
+    // beats at 60 s (100 late) and 150 s (130 late): +100 at the start,
+    // +30 after it
+    let mut b = beat(3, 60);
+    b.loss[DECISION_DELAY_STAGE] = Some(100);
+    c.push(b);
+    let mut b = beat(4, 90);
+    b.loss[DECISION_DELAY_STAGE] = Some(100);
+    c.push(b);
+    let mut b = beat(5, 120);
+    b.loss[DECISION_DELAY_STAGE] = Some(110);
+    c.push(b);
+    let mut b = beat(6, 150);
+    b.loss[DECISION_DELAY_STAGE] = Some(130);
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(151), &cfg());
+    assert_eq!(kinds(&r), ["DEGRADED"], "{r:?}");
+    assert_eq!(r.exit_code(), 16);
+    assert!(
+        r.alerts[0]
+            .detail()
+            .contains("stage 5 (decision delay) +20 after the run's first 120 s"),
+        "{r:?}"
+    );
+    assert!(
+        r.notices.len() == 1 && r.notices[0].contains("+110 in the run's first 120 s"),
+        "{r:?}"
+    );
+    // later in the run: all of it DEGRADED, and a dropping stage beside it
+    // is LOSS that names only itself
+    let s = r.state.unwrap();
+    let mut b = beat(7, 180);
+    b.loss[DECISION_DELAY_STAGE] = Some(131);
+    b.loss[0] = Some(2);
+    c.push(b);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(181), &cfg());
+    assert_eq!(kinds(&r), ["LOSS", "DEGRADED"], "{r:?}");
+    assert_eq!(
+        r.alerts[0].detail(),
+        "events lost since the last beat seen: stage 1 (kernel ring) +2"
+    );
+    assert!(
+        r.alerts[1]
+            .detail()
+            .contains("stage 5 (decision delay) +1 after"),
+        "{r:?}"
+    );
+    assert!(r.notices.is_empty(), "{r:?}");
+    // a run whose beats in its first 120 s the verifier never saw (the
+    // check's window): what it counts is DEGRADED, the safe side
+    let s = r.state.unwrap();
+    let mut start = beat(8, 190);
+    start.kind = BeatKind::Start;
+    start.run = "dddddddddddddddd".into();
+    start.uptime_ms = 200_000;
+    start.loss[DECISION_DELAY_STAGE] = Some(9);
+    c.push(start);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(191), &cfg());
+    assert!(
+        r.alerts
+            .iter()
+            .any(|a| a.kind() == "DEGRADED" && a.detail().contains("+9 after")),
+        "{r:?}"
+    );
+    assert!(!kinds(&r).contains(&"LOSS"), "{r:?}");
+}
+
 /// Health: a decision that stands still, a probe gap, an action row not
 /// written, an interrupted action, a new degradation.
 #[test]

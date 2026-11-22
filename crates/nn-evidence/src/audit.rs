@@ -298,6 +298,20 @@ struct BootStamp {
     continuity: BootContinuity,
 }
 
+/// Lot 388 (the review of #595, P3-1): a start refused since the last run —
+/// its `agent_boot` row with `result: refused`: the row's position (the
+/// `(audit row N)` of `nn-admin status`), the gate that refused it, and its
+/// boot (`None`: a row of an agent before the field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedStart {
+    pub row: u64,
+    pub gate: String,
+    pub boot_id: Option<String>,
+}
+
+/// Lot 388: the refused starts since the last run kept at most (the newest).
+pub const REFUSED_STARTS_MAX: usize = 16;
+
 impl PreviousRun {
     /// Lot 387 (pre-alpha F3d-1): [`Self::to_json`] with the boots since
     /// that run (`boots_since`). A clean end followed by boots without the
@@ -401,6 +415,19 @@ pub struct AuditLog<K> {
     /// Lot 387 (F3d-1): this start's boot and the boots since the last run
     /// ([`Self::set_boot`]), signed in its `agent_boot` row.
     boot: Option<BootStamp>,
+    /// Lot 388 (the review of #595, P3-1): this start's boot id before its
+    /// judgement ([`Self::set_boot_id`]): a refused start's row names it.
+    this_boot_id: Option<String>,
+    /// Lot 388 (P3-1): the starts refused since the last run, from the
+    /// chain ([`Self::refused_since_run`]).
+    refused_since_run: Vec<RefusedStart>,
+    /// Lot 388 (P3-1): the boots without the agent the journal shows as a
+    /// rescue or emergency boot ([`Self::set_rescue_boots`]).
+    rescue_boots: Vec<String>,
+    /// Lot 388 (the review of #595, P3-3): the boot gap's row is due and not
+    /// signed yet ([`Self::attest_boot_continuity`] failed): retried by
+    /// [`Self::retry_boot_continuity`].
+    boot_continuity_due: bool,
     /// The review of #553 (F2): when the chain's unacknowledged
     /// `profile_downgraded` was signed ([`Self::profile_downgrade_pending`]).
     profile_downgrade_pending: Option<String>,
@@ -496,6 +523,10 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_boot_profile: tail.previous_boot_profile,
             previous_run_boot: tail.previous_run_boot,
             boot: None,
+            this_boot_id: None,
+            refused_since_run: tail.refused_since_run,
+            rescue_boots: Vec::new(),
+            boot_continuity_due: false,
             profile_downgrade_pending: tail.profile_downgrade_pending,
             held: tail.held,
             second_key_added: tail.second_key_added,
@@ -538,6 +569,10 @@ impl<K: ChainSigner> AuditLog<K> {
             previous_boot_profile: None,
             previous_run_boot: None,
             boot: None,
+            this_boot_id: None,
+            refused_since_run: Vec::new(),
+            rescue_boots: Vec::new(),
+            boot_continuity_due: false,
             profile_downgrade_pending: None,
             held: crate::held::Held::default(),
             second_key_added: false,
@@ -673,10 +708,111 @@ impl<K: ChainSigner> AuditLog<K> {
     /// `previous_run` never `clean` across a gap or an unknown) and by
     /// [`Self::attest_boot_continuity`].
     pub fn set_boot(&mut self, boot_id: Option<String>, continuity: BootContinuity) {
+        self.this_boot_id = boot_id.clone();
         self.boot = Some(BootStamp {
             boot_id,
             continuity,
         });
+    }
+
+    /// Lot 388 (the review of #595, P3-1): this start's boot id, before the
+    /// judgement of the boots since the last run: a refused start's
+    /// `agent_boot` row names it ([`Self::boot_refused_by`]), so that the
+    /// next start can tell a boot whose start was refused from one whose
+    /// units were kept from starting.
+    pub fn set_boot_id(&mut self, boot_id: Option<String>) {
+        self.this_boot_id = boot_id;
+    }
+
+    /// Lot 388 (P3-1): the starts refused since the last run (`agent_boot`
+    /// with `result: refused` after the last run's own, at most
+    /// [`REFUSED_STARTS_MAX`], oldest first), from the chain at its open.
+    pub fn refused_since_run(&self) -> &[RefusedStart] {
+        &self.refused_since_run
+    }
+
+    /// Lot 388 (P3-1): the boots without the agent that the journal shows as
+    /// a rescue or an emergency boot (the host's own facts, read by the
+    /// start), named by [`Self::attest_boot_continuity`].
+    pub fn set_rescue_boots(&mut self, boot_ids: Vec<String>) {
+        self.rescue_boots = boot_ids;
+    }
+
+    /// Lot 388 (the review of #595, P3-3): the boot gap's row is due and not
+    /// signed yet — [`Self::attest_boot_continuity`] failed; the hold it
+    /// carries would be lost at the next start, which judges from this boot.
+    pub fn boot_continuity_due(&self) -> bool {
+        self.boot_continuity_due
+    }
+
+    /// Lot 388 (P3-3): sign the boot gap's row if it is still due (`None`:
+    /// nothing due, or signed before).
+    pub fn retry_boot_continuity(&mut self) -> Result<Option<AuditEntry>> {
+        if !self.boot_continuity_due {
+            return Ok(None);
+        }
+        self.attest_boot_continuity()
+    }
+
+    /// Lot 388 (the review of #595, P3-1): why the boots without the agent
+    /// had no run of it, from the facts this start holds — a start refused
+    /// in that boot (its signed row), a rescue or emergency boot (the
+    /// journal) — and otherwise the causes such a boot can have, never one
+    /// cause alone: `(text, refused starts named, refused starts of no
+    /// recorded boot)`.
+    fn gap_causes(&self, boot_ids: &[String]) -> (String, Vec<&RefusedStart>, Vec<&RefusedStart>) {
+        use crate::boot_gap::normalize;
+        let in_gap = |id: &Option<String>| {
+            id.as_deref()
+                .and_then(normalize)
+                .is_some_and(|n| boot_ids.contains(&n))
+        };
+        let refused: Vec<&RefusedStart> = self
+            .refused_since_run
+            .iter()
+            .filter(|r| in_gap(&r.boot_id))
+            .collect();
+        let unplaced: Vec<&RefusedStart> = self
+            .refused_since_run
+            .iter()
+            .filter(|r| r.boot_id.is_none())
+            .collect();
+        let rescue: Vec<&String> = self
+            .rescue_boots
+            .iter()
+            .filter(|b| normalize(b).is_some_and(|n| boot_ids.contains(&n)))
+            .collect();
+        let mut facts: Vec<String> = Vec::new();
+        for r in &refused {
+            facts.push(format!(
+                "boot {}: its start refused by `{}` {}",
+                r.boot_id.as_deref().unwrap_or_default(),
+                r.gate,
+                crate::held::row_tag(r.row)
+            ));
+        }
+        for b in &rescue {
+            facts.push(format!(
+                "boot {b}: a rescue or emergency boot (the journal)"
+            ));
+        }
+        if !unplaced.is_empty() {
+            let rows: Vec<String> = unplaced.iter().map(|r| r.row.to_string()).collect();
+            facts.push(format!(
+                "{} start(s) refused since the last run, their boot not recorded (audit rows {})",
+                unplaced.len(),
+                rows.join(", ")
+            ));
+        }
+        const CAUSES: &str = "its units kept from starting (masked, not wanted by the default \
+                              target, disabled), a start refused, a rescue boot, or a boot \
+                              interrupted before the agent's start";
+        let text = if facts.is_empty() {
+            format!("no run of the agent in them: {CAUSES}")
+        } else {
+            format!("{}; any other: {CAUSES}", facts.join("; "))
+        };
+        (text, refused, unplaced)
     }
 
     /// Lot 387 (F3d-1): the judgement given to [`Self::set_boot`].
@@ -698,19 +834,36 @@ impl<K: ChainSigner> AuditLog<K> {
         let previous = self.previous_run_boot.clone();
         let this_boot = stamp.boot_id.clone();
         let mut extra = match &stamp.continuity {
-            BootContinuity::BootsWithoutAgent { count, boot_ids } => serde_json::json!({
-                "kind": crate::boot_gap::BOOTS_WITHOUT_AGENT_KIND,
-                "severity": "high",
-                "detail": format!(
-                    "{count} boot(s) of this host since the agent's last run had no run of the \
-                     agent (its units kept from starting: masked, not wanted by the default \
-                     target, or disabled); the last run's boot {}, this boot {}",
-                    previous.as_deref().unwrap_or("not recorded"),
-                    this_boot.as_deref().unwrap_or("unreadable"),
-                ),
-                "count": count,
-                "boot_ids": boot_ids,
-            }),
+            // Lot 388 (the review of #595, P3-1): the causes the facts show
+            // (a refused start, a rescue boot), never an attack cause alone
+            BootContinuity::BootsWithoutAgent { count, boot_ids } => {
+                let (causes, refused, unplaced) = self.gap_causes(boot_ids);
+                let named = |v: &[&RefusedStart]| -> Vec<serde_json::Value> {
+                    v.iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "row": r.row, "gate": r.gate, "boot_id": r.boot_id
+                            })
+                        })
+                        .collect()
+                };
+                serde_json::json!({
+                    "kind": crate::boot_gap::BOOTS_WITHOUT_AGENT_KIND,
+                    "severity": "high",
+                    "detail": format!(
+                        "{count} boot(s) of this host since the agent's last run had no run of \
+                         the agent — {causes}; the last run's boot {}, this boot {} (look at \
+                         each with `journalctl -b <id>`)",
+                        previous.as_deref().unwrap_or("not recorded"),
+                        this_boot.as_deref().unwrap_or("unreadable"),
+                    ),
+                    "count": count,
+                    "boot_ids": boot_ids,
+                    "refused_starts": named(&refused),
+                    "refused_starts_unplaced": named(&unplaced),
+                    "rescue_boots": self.rescue_boots,
+                })
+            }
             BootContinuity::Unknown { why } => serde_json::json!({
                 "kind": crate::boot_gap::BOOT_CONTINUITY_UNKNOWN_KIND,
                 "detail": format!(
@@ -727,19 +880,51 @@ impl<K: ChainSigner> AuditLog<K> {
         extra["this_boot"] = this_boot.into();
         extra["sources"] = crate::boot_gap::sources_json();
         let pid = self.stamps.self_pid;
-        self.append(AuditEntryDraft {
-            op: INTEGRITY_DRIFT_OP.to_string(),
-            extra,
-            key_fp: "agent-self".to_string(),
-            cosigner_fps: Vec::new(),
-            result: "detected".to_string(),
-            client_pid: pid,
-            client_uid: 0,
-            client_comm: "northnarrow-agent".to_string(),
-            client_exe: None,
-        })
-        .map(Some)
-        .with_context(|| format!("audit log: {kind} entry"))
+        let from = self.rows;
+        let this_boot = extra["this_boot"].as_str().map(str::to_string);
+        let signed = self
+            .append(AuditEntryDraft {
+                op: INTEGRITY_DRIFT_OP.to_string(),
+                extra,
+                key_fp: "agent-self".to_string(),
+                cosigner_fps: Vec::new(),
+                result: "detected".to_string(),
+                client_pid: pid,
+                client_uid: 0,
+                client_comm: "northnarrow-agent".to_string(),
+                client_exe: None,
+            })
+            .map(Some)
+            .with_context(|| format!("audit log: {kind} entry"));
+        // Lot 388 (the review of #595, P3-3): due until it is signed — a
+        // row that reached the file whole (only its fsync failed) is signed:
+        // never twice
+        self.boot_continuity_due =
+            signed.is_err() && !self.gap_row_written(from, &kind, this_boot.as_deref());
+        signed
+    }
+
+    /// Lot 388 (P3-3): whether a row of the boot gap's `kind` for
+    /// `this_boot`, signed by this process, is in the log's file at position
+    /// `from` or after (a failed append whose row reached the file whole). A
+    /// file that cannot be read says no: tried again (a second row of the
+    /// same fact at worst).
+    fn gap_row_written(&self, from: u64, kind: &str, this_boot: Option<&str>) -> bool {
+        let pid = self.stamps.self_pid;
+        let mut found = false;
+        let _ = self.scan_rows(|i, e| {
+            if i >= from
+                && e.op == INTEGRITY_DRIFT_OP
+                && e.client_pid == pid
+                && e.extra.get("kind").and_then(|v| v.as_str()) == Some(kind)
+                && e.extra.get("this_boot").and_then(|v| v.as_str()) == this_boot
+            {
+                found = true;
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        found
     }
 
     /// The review of #553 (F2): the time of the chain's first
@@ -1127,15 +1312,21 @@ impl<K: ChainSigner> AuditLog<K> {
         detail: &str,
         build: &AgentBuild,
     ) -> Result<AuditEntry> {
+        let mut extra = serde_json::json!({
+            "version": build.version,
+            "refused_by": gate,
+            "binary_integrity": integrity,
+            "install_provenance": provenance,
+            "detail": detail,
+        });
+        // Lot 388 (the review of #595, P3-1): the boot of the refused start —
+        // the next start's boot gap names it
+        if let Some(id) = &self.this_boot_id {
+            extra["boot_id"] = serde_json::Value::String(id.clone());
+        }
         self.append(AuditEntryDraft {
             op: "agent_boot".to_string(),
-            extra: serde_json::json!({
-                "version": build.version,
-                "refused_by": gate,
-                "binary_integrity": integrity,
-                "install_provenance": provenance,
-                "detail": detail,
-            }),
+            extra,
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "refused".to_string(),
@@ -1405,6 +1596,8 @@ struct TailState {
     previous_boot_profile: Option<String>,
     /// Lot 387: the last run's `agent_boot`'s `boot_id`.
     previous_run_boot: Option<String>,
+    /// Lot 388: [`AuditLog::refused_since_run`].
+    refused_since_run: Vec<RefusedStart>,
     /// The review of #553 (F2): [`AuditLog::profile_downgrade_pending`].
     profile_downgrade_pending: Option<String>,
     /// Lot 379: [`AuditLog::held`] (the rows that end a hold counted only
@@ -1444,6 +1637,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
                 previous_boot_enforced: None,
                 previous_boot_profile: None,
                 previous_run_boot: None,
+                refused_since_run: Vec::new(),
                 profile_downgrade_pending: None,
                 held: crate::held::Held::default(),
             });
@@ -1466,6 +1660,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
     let mut profile_downgrade_pending: Option<String> = None;
     let mut previous_boot_profile = None;
     let mut previous_run_boot = None;
+    let mut refused_since_run: Vec<RefusedStart> = Vec::new();
     let mut held = crate::held::Held::default();
     let genuine = |e: &AuditEntry| pk.is_some_and(|pk| verify_entry(0, e, pk).is_ok());
     let mut row = 0u64;
@@ -1497,9 +1692,31 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
             // ends the run before it nor starts one. It made the next boot
             // sign `previous_run` "abrupt" (the SIGKILL/OOM warning) after a
             // clean stop.
-            "agent_boot" if entry.result == "refused" => in_run = false,
+            "agent_boot" if entry.result == "refused" => {
+                in_run = false;
+                // Lot 388 (the review of #595, P3-1): the starts refused
+                // since the last run, named by the next start's boot gap
+                refused_since_run.push(RefusedStart {
+                    row: row - 1,
+                    gate: entry
+                        .extra
+                        .get("refused_by")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("not named")
+                        .to_string(),
+                    boot_id: entry
+                        .extra
+                        .get("boot_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+                if refused_since_run.len() > REFUSED_STARTS_MAX {
+                    refused_since_run.remove(0);
+                }
+            }
             "agent_boot" => {
                 in_run = true;
+                refused_since_run.clear();
                 if entry.result == "success"
                     && entry.extra.get("binary_integrity").and_then(|v| v.as_str())
                         == Some("verified")
@@ -1593,6 +1810,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
         previous_boot_enforced,
         previous_boot_profile,
         previous_run_boot,
+        refused_since_run,
         profile_downgrade_pending,
         held,
     })
@@ -2240,6 +2458,241 @@ mod tests {
 
     const BOOT_A: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
     const BOOT_C: &str = "9f8e7d6c-5b4a-3928-1706-f5e4d3c2b1a0";
+
+    /// Lot 388 (the review of #595, P3-1): a gap's row names the causes the
+    /// facts show — a start refused in that boot (its signed row, which now
+    /// carries the boot), a rescue boot the journal shows — and otherwise
+    /// the causes such a boot can have, never an attack cause alone. Still
+    /// High, held until acknowledged.
+    #[test]
+    fn a_gap_names_a_refused_start_or_a_rescue_boot_when_the_facts_show_them() {
+        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        const BOOT_B: &str = "1111aaaa-2222-3333-4444-555566667777";
+        const BOOT_D: &str = "2222bbbb-3333-4444-5555-666677778888";
+        let n = |b: &str| crate::boot_gap::normalize(b).unwrap();
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("system_shutdown", 42).unwrap();
+        // boot B: a gate refused the start (the kernel lost lsm=bpf)
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot_id(Some(BOOT_B.into()));
+        let refused = log
+            .boot_refused_by(
+                "bpf_lsm",
+                "verified",
+                "source-tree",
+                "no bpf in lsm=",
+                &test_build(),
+            )
+            .unwrap();
+        assert_eq!(
+            refused.extra["boot_id"], BOOT_B,
+            "a refused start names its boot"
+        );
+        let refused_row = refused.seq.unwrap();
+        // boot C: a start refused in this boot too (not a boot without the
+        // agent: never named as one's cause), then the start after B and a
+        // rescue boot D
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot_id(Some(BOOT_C.into()));
+        let in_this_boot = log
+            .boot_refused_by("audit_log", "verified", "source-tree", "x", &test_build())
+            .unwrap()
+            .seq
+            .unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert_eq!(
+            log.refused_since_run(),
+            [
+                RefusedStart {
+                    row: refused_row,
+                    gate: "bpf_lsm".into(),
+                    boot_id: Some(BOOT_B.into())
+                },
+                RefusedStart {
+                    row: in_this_boot,
+                    gate: "audit_log".into(),
+                    boot_id: Some(BOOT_C.into())
+                }
+            ]
+        );
+        log.set_boot(
+            Some(BOOT_C.into()),
+            BootContinuity::BootsWithoutAgent {
+                count: 3,
+                boot_ids: vec![n(BOOT_B), n(BOOT_D), "3".repeat(32)],
+            },
+        );
+        log.set_rescue_boots(vec![n(BOOT_D)]);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        let row = log.attest_boot_continuity().unwrap().unwrap();
+        assert_eq!(row.extra["kind"], BOOTS_WITHOUT_AGENT_KIND);
+        assert_eq!(row.extra["severity"], "high");
+        let d = row.extra["detail"].as_str().unwrap();
+        assert!(
+            d.contains(&format!(
+                "boot {BOOT_B}: its start refused by `bpf_lsm` (audit row {refused_row})"
+            )),
+            "{d}"
+        );
+        assert!(
+            d.contains(&format!("boot {}: a rescue or emergency boot", n(BOOT_D))),
+            "{d}"
+        );
+        assert!(d.contains("journalctl -b <id>"), "{d}");
+        assert_eq!(row.extra["refused_starts"][0]["gate"], "bpf_lsm");
+        assert_eq!(
+            row.extra["refused_starts"].as_array().unwrap().len(),
+            1,
+            "the refusal in this boot is no gap boot's cause"
+        );
+        assert!(!d.contains("`audit_log`"), "{d}");
+        assert_eq!(row.extra["rescue_boots"][0], n(BOOT_D));
+        // a gap the facts do not explain: every cause such a boot can have,
+        // never the units' alone
+        let (_d2, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("system_shutdown", 42).unwrap();
+        // a refused start of an agent before the field: counted, no boot
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.boot_refused_by("bpf_lsm", "verified", "source-tree", "x", &test_build())
+            .unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.set_boot(
+            Some(BOOT_C.into()),
+            BootContinuity::BootsWithoutAgent {
+                count: 1,
+                boot_ids: vec![n(BOOT_B)],
+            },
+        );
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        let row = log.attest_boot_continuity().unwrap().unwrap();
+        let d = row.extra["detail"].as_str().unwrap();
+        for cause in [
+            "its units kept from starting",
+            "a start refused",
+            "a rescue boot",
+            "interrupted before the agent's start",
+            "1 start(s) refused since the last run, their boot not recorded",
+        ] {
+            assert!(d.contains(cause), "{cause}: {d}");
+        }
+        assert_eq!(row.extra["severity"], "high");
+        // a successful run since clears the refused starts
+        log.stop_entry("system_shutdown", 1).unwrap();
+        let log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        assert!(log.refused_since_run().is_empty());
+    }
+
+    /// Lot 388 (the review of #595, P3-3): the gap's row carries the hold —
+    /// the next start judges from this boot — so a write that failed is due
+    /// and tried again until it is signed, once.
+    #[test]
+    fn a_gap_row_whose_write_failed_is_tried_again_until_signed() {
+        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        let (_d, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("system_shutdown", 42).unwrap();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.set_boot(
+            Some(BOOT_C.into()),
+            BootContinuity::BootsWithoutAgent {
+                count: 1,
+                boot_ids: vec!["1111aaaa222233334444555566667777".into()],
+            },
+        );
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        assert!(!log.boot_continuity_due());
+        assert!(
+            log.retry_boot_continuity().unwrap().is_none(),
+            "nothing due yet"
+        );
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 40,
+        });
+        assert!(
+            log.attest_boot_continuity().is_err(),
+            "premise: the disk is full"
+        );
+        assert!(log.boot_continuity_due());
+        host::inject(Fault::ShortWrite {
+            prefix: b"{",
+            keep: 40,
+        });
+        assert!(log.retry_boot_continuity().is_err(), "premise: still full");
+        assert!(log.boot_continuity_due());
+        let row = log
+            .retry_boot_continuity()
+            .unwrap()
+            .expect("signed when tried again");
+        assert_eq!(row.extra["kind"], BOOTS_WITHOUT_AGENT_KIND);
+        assert!(!log.boot_continuity_due());
+        assert!(
+            log.retry_boot_continuity().unwrap().is_none(),
+            "signed once"
+        );
+        assert!(log
+            .held()
+            .findings()
+            .iter()
+            .any(|f| f.kind == BOOTS_WITHOUT_AGENT_KIND
+                && f.hold == crate::held::Hold::UntilAcknowledged));
+        drop(log);
+        let gap_rows = |p: &Path| {
+            every_line_a_row(p)
+                .iter()
+                .filter(|r| r.extra["kind"] == BOOTS_WITHOUT_AGENT_KIND)
+                .count()
+        };
+        assert_eq!(gap_rows(&log_path), 1);
+        whole_chain_verifies(&log_path, &TestKey::load_or_bootstrap(&key_path).unwrap());
+        // a row written whole whose fsync failed is signed: not due, never
+        // signed twice
+        let (_d2, key_path, log_path) = fresh_paths();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        log.stop_entry("system_shutdown", 42).unwrap();
+        let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
+        log.set_boot(
+            Some(BOOT_C.into()),
+            BootContinuity::Unknown {
+                why: "a volatile journal".into(),
+            },
+        );
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
+        host::inject(Fault::SyncFails { prefix: b"{" });
+        assert!(
+            log.attest_boot_continuity().is_err(),
+            "premise: the fsync fails"
+        );
+        assert!(!log.boot_continuity_due(), "the row is in the file");
+        assert!(log.retry_boot_continuity().unwrap().is_none());
+        log.append(sample_draft(9)).unwrap();
+        drop(log);
+        let unknown_rows = every_line_a_row(&log_path)
+            .iter()
+            .filter(|r| r.extra["kind"] == crate::boot_gap::BOOT_CONTINUITY_UNKNOWN_KIND)
+            .count();
+        assert_eq!(unknown_rows, 1);
+    }
 
     /// Lot 387 (pre-alpha F3d-1, B5/B9): a clean stop, then a boot without
     /// the agent, then a start: its `agent_boot` no longer says `clean`, and

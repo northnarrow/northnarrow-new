@@ -930,7 +930,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004). Since lab PR 216 also each bounded retry of a hold (`hold_retry`) and its end, with its length (`hold_ended`) |
 | `watchdog_exit` | the watchdog exited on a failure, with its exit status and reason (§3.9); systemd restarts it, as often as it fails (one record per run). Written by the watchdog just before it exits (lab PR 216) |
 | `watchdog_failed` | systemd put `northnarrow-watchdog.service` in the failed state — a start or stop job of the unit failed (a death of the process is restarted, without limit) — and no longer restarts it: the agent runs without a supervisor until the unit is started. Written by the unit's `OnFailure=` handler with systemd's `service_result`, `exit_code` and `exit_status` (lab PR 216, §3.9) |
-| `watchdog_gone` | the watchdog the agent had verified no longer runs (a crash, a kill, a stop), and what the agent finds in its place. Signed by the agent itself, within 30 s (lab PR 216) |
+| `watchdog_gone` | the watchdog the agent had verified no longer runs (a crash, a kill, a stop), and what the agent finds in its place. Signed by the agent itself, within 30 s (lab PR 216); a death, held in `nn-admin status` until acknowledged (lot 379). Lot 388: not for the watchdog's own clean stop (its pidfile removed) in the host's shutdown (PID 1 is `systemd-shutdown`, which signals both roles at once at every reboot), inside a signed trusted-installer window, or during the agent's own stop — that is a `watchdog_stopped` note (op `witness`, not held). A kill, an OOM or a crash (its pidfile left) stays a death in every case |
 | `stuck_recovery_failed` | the agent stopped answering (or its event loop stood still) and the watchdog's SIGINT then SIGKILL could not end it: the agent kept its `PROTECTED_PIDS` entry and its pidfile and stays supervised (lab PR 216). Signed High (lot 353) |
 | `event_loop_stalled` | the agent's admin socket answered three STATUS pings in a row while its event loop made no round (90 s or more); the watchdog recovers it like a hang (lab PR 216) |
 | `stuck_unresponsive` | the watchdog's stuck recovery stopped the agent: which ping failed, how many in a row and for how long (lot 353). The stop the recovery's SIGINT starts is `stuck_unresponsive` too — its `agent_stop` row and its heartbeat stop beat — never a clean `sigint` |
@@ -982,21 +982,33 @@ An abrupt end is also a `PREVIOUS RUN ENDED ABRUPTLY` WARN at boot.
 `boot_id`, and `previous_run.boots_since` says what passed between the last
 run and this start: `same_boot` (a restart), `next_boot` (the journal's
 boot list has nothing in between), `boots_without_agent` (boots listed in
-between, with no run of the agent: its units were kept from starting) or
+between, with no run of the agent) or
 `unknown` (the journal does not keep the last run's boot — volatile,
 rotated — or did not answer). Only the first two keep `"ended":"clean"`
 after a clean stop; otherwise `ended` is the judgement's word and
 `run_ended` says how the run itself ended. A gap is also a High
 `integrity_drift` row `boots_without_agent` (the count, the boot ids, the
 sources read and who can rewrite them), held in `nn-admin status` until
-acknowledged; `unknown` is an advisory `boot_continuity_unknown`:
+acknowledged; `unknown` is an advisory `boot_continuity_unknown`. Lot 388:
+the row names the causes the facts show — a start refused in that boot
+(`refused_starts`: its gate and its own `agent_boot` row, which names its
+boot since lot 388), a rescue or emergency boot (`rescue_boots`, PID 1's
+records of those targets in the journal, the first four boots looked at) —
+and otherwise every cause such a boot can have: its units kept from
+starting (masked, not wanted by the default target, disabled), a start
+refused, a rescue boot, or a boot interrupted before the agent's start.
+Look at each boot with `journalctl -b <id>`. A row the start could not
+write (a full disk) is tried again every 30 s while the agent runs, until
+it is signed (once):
 
 ```sh
 sudo grep '"kind":"boots_without_agent"' /etc/northnarrow/audit.log | tail -1
 ```
 
-A planned stop of the agent across reboots is such a gap too: acknowledge
-it after checking (`nn-admin integrity acknowledge --through <row>`).
+A planned stop of the agent across reboots is such a gap too, and so is an
+uninstall that kept the records followed by a reinstall, when a whole boot
+passed in between: acknowledge it after checking (`nn-admin integrity
+acknowledge --through <row>`).
 
 Refused attempts — signals to the agent or the watchdog, a ptrace attach,
 writes to protected files and pins, BPF map writes and link handles — are

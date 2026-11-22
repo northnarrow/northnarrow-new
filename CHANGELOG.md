@@ -2320,6 +2320,75 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   write of the ids timed inside it was no anomaly.
 
 ### Fixed
+- Lot 388 (the review of #595: its triage (a) and (b), P3-1 to P3-3;
+  `UPGRADE_NOTES_WAVE4.md` §73).
+  - **No watchdog "death" at the host's own shutdown.** At a normal reboot
+    `systemd-shutdown` signals the agent and the watchdog at once (the
+    only time PID 1 may, outside a signed window); the watchdog's stop is
+    quick, the agent's takes longer, and the agent's 30 s round that landed
+    in between signed `watchdog_gone` — held until acknowledged since lot
+    379, so `nn-admin status` said `DEGRADED` after a normal reboot now and
+    then. The watchdog's own clean stop (its pidfile removed) in the
+    host's shutdown (PID 1 is `systemd-shutdown`), inside a signed
+    trusted-installer window or during the agent's own stop is now a
+    `watchdog_stopped` note (op `witness`, never held); a kill, an OOM or a
+    crash (its pidfile left, or a successor's) stays the held death in
+    every case, a window included. One writer of the death
+    (`self_integrity::watchdog_exit_finding`; `watchdog_gone` private),
+    pinned by the ratchet `xtask/tests/watchdog_death_writer.rs`. Tests
+    `watchdog_exit_is_a_death_unless_a_clean_stop_in_the_host_s_or_the_operator_s_stop`,
+    `a_watchdog_stopped_with_the_host_is_a_note_and_one_killed_is_a_held_death`,
+    `the_stop_begun_handle_turns_at_the_stop_s_begin`,
+    `the_watchdog_s_death_has_one_writer_that_tells_a_stop_from_a_death`.
+  - **The verifier's stage 5 at a start is late, not lost.** Stage 5
+    (`decision delay`) counts events judged later than their budget, every
+    one of them judged; at each start the boot's records wait for the
+    decision, and `heartbeat watch` said `LOSS` (exit 14, above
+    `DEGRADED`) after every reboot and restart. Counted in a run's first
+    120 s it is a `NOTICE` (no exit code), after them `DEGRADED`, never
+    `LOSS`; the other stages are `LOSS` as before. The agent's own
+    `telemetry_loss` row is `detected` only for a stage that drops events
+    (stage 5 alone: `success`, an INFO line). Tests
+    `stage_5_at_a_start_is_a_notice_not_a_loss`,
+    `stage_5_after_the_first_120_s_is_degraded_and_never_a_loss`,
+    `a_telemetry_loss_row_is_detected_for_lost_events_never_for_late_decisions_alone`.
+  - **A worker ended by the host's or the operator's stop is no
+    degradation.** The parse worker survives the agent unit's stop job and
+    is ended by `systemd-shutdown`'s SIGTERM before the agent's stop: the
+    supervisor signed `worker_parse` and its state made a revision of the
+    capability manifest in the stop beat, so the off-host verifier said
+    `DEGRADED` after every normal reboot (lot 388's lab: 10 of 10 on two
+    guests). The rule of the watchdog's exit, shared (`StopExit`): a worker
+    ended by the stop's SIGTERM in the host's shutdown, a signed window or
+    the agent's own stop is the stop's own — no failure, no report, its
+    status kept (held 5 s, then started again if the agent still runs); a
+    crash, an OOM, a kill, a violation or a hang stays a failure. One reader
+    of `/proc/1/comm` (nn-linux). Tests
+    `a_worker_the_stop_s_sigterm_ends_in_a_stop_is_no_degradation`,
+    `a_worker_ended_while_the_host_runs_or_killed_in_a_stop_is_a_degradation`,
+    ratchet `a_worker_s_failure_is_judged_against_the_stop_before_its_report`.
+  - **No beat after the stop beat.** The periodic beats' task ran on through
+    the agent's stop, like the watchdog's round: a beat it wrote after the
+    stop beat made the run end on a plain beat, and the verifier said "the
+    agent restarted without a clean stop" (`DEGRADED`) after a normal reboot
+    now and then (lot 388's lab, debian13: the stop beat, then a beat 0.8 s
+    later). The stop beat is the run's last. Test
+    `no_beat_follows_the_stop_beat`.
+  - **A boot gap names the causes the facts show.** The
+    `boots_without_agent` row said "its units kept from starting: masked,
+    not wanted by the default target, or disabled" for every gap. It now
+    names a start refused in that boot (a refused start's `agent_boot` row
+    carries its `boot_id`; `refused_starts`) and a rescue or emergency boot
+    the journal shows (`rescue_boots`, the first four boots looked at),
+    and otherwise every cause such a boot can have, with `journalctl -b
+    <id>` to look; still High, held until acknowledged. A row the start
+    could not write is tried again every 30 s until it is signed, once (a
+    row that reached the file whole is not signed twice). The tester guide
+    says that an uninstall that kept the records, then a reinstall after a
+    whole boot, leaves a signed gap (expected). Tests
+    `a_gap_names_a_refused_start_or_a_rescue_boot_when_the_facts_show_them`,
+    `a_gap_row_whose_write_failed_is_tried_again_until_signed`,
+    `the_rescue_boots_are_the_journal_s_among_the_first_boots_without_the_agent`.
 - Lot 387 (pre-alpha Phase 3d, F3d-1, F3d-2 and F3d-4;
   `UPGRADE_NOTES_WAVE4.md` §72).
   - **A boot without the agent is signed at the next start, never

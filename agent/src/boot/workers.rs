@@ -103,6 +103,22 @@ pub(crate) fn start(cli: &Cli, image: std::io::Result<SelfImage>, export_on: boo
     workers
 }
 
+/// Lot 388 (the triage of #595, its follow-up): the supervisor is told of
+/// a stop under way — a signed trusted-installer window open, the agent's
+/// own stop begun — so that a worker the stop's SIGTERM ends then is the
+/// stop's own, not a degradation (with the host's shutdown, which the
+/// supervisor reads itself).
+pub(crate) fn stop_facts(
+    workers: &Workers,
+    window: &Arc<northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    stop_begun: crate::stop_deadline::StopBegun,
+) {
+    let window = Arc::clone(window);
+    workers.set_stop_facts(Arc::new(move || {
+        (window.is_window_open(), stop_begun.has_begun())
+    }));
+}
+
 /// R14b: this boot's deny hooks are attached and `PROTECTED_PIDS` pinned:
 /// the workers' pids from now on (the running one at once) go there,
 /// protected and not exempt.

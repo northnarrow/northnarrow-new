@@ -158,6 +158,13 @@ impl StopDeadline {
         Self { shared }
     }
 
+    /// Lot 388 (the triage of #595, a): a handle that tells whether the stop
+    /// has begun — the watchdog round's: a watchdog that stops cleanly during
+    /// the agent's own stop is no death.
+    pub(crate) fn begun_handle(&self) -> StopBegun {
+        StopBegun(Arc::clone(&self.shared))
+    }
+
     /// The stop begins (the first call; a later one changes nothing):
     /// `reason` is the way out of the loop, `note` what the deadline signs
     /// if it expires.
@@ -239,6 +246,17 @@ impl StopDeadline {
         while !st.exited && Instant::now() < until {
             self.shared.wake.wait_until(&mut st, until);
         }
+    }
+}
+
+/// Lot 388: whether the agent's stop has begun ([`StopDeadline::begun_handle`]).
+#[derive(Clone)]
+pub(crate) struct StopBegun(Arc<Shared>);
+
+impl StopBegun {
+    /// The event loop ended and the stop began.
+    pub(crate) fn has_begun(&self) -> bool {
+        self.0.state.lock().begun.is_some()
     }
 }
 

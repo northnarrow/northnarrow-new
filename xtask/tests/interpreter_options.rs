@@ -366,9 +366,10 @@ const KNOWN: &[(&str, usize, &str)] = &[
     ),
     (
         "crates/nn-linux/src/boot/boots_since.rs",
-        3,
+        8,
         "lot 387: the options the agent passes (never reads) to `journalctl` for the boot list \
-         (`--list-boots`, `--no-pager`, `--quiet`): no interpreter's",
+         (`--list-boots`, `--no-pager`, `--quiet`); lot 388: and for a boot's rescue or \
+         emergency target (`-b`, `--no-pager`, `--quiet`, `-o`, `-n`): no interpreter's",
     ),
     (
         "crates/nn-linux/src/host_hardening.rs",

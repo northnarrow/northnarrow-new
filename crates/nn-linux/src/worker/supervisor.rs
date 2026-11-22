@@ -90,6 +90,12 @@ pub const STOP_WAIT: Duration = Duration::from_secs(2);
 /// Lot 276: the longest a supervisor pass waits for a slot a request
 /// holds before it passes over it.
 pub const TICK_LOCK_WAIT: Duration = Duration::from_millis(10);
+/// Lot 388 (the triage of #595, its follow-up): how long a worker that
+/// ended with a stop under way (the host's shutdown, a signed window, the
+/// agent's own stop) is held — not restarted, its status as it was — before
+/// the supervisor starts it again, if the agent still runs: the agent's own
+/// stop ends its workers well within it.
+pub const STOP_HOLD: Duration = Duration::from_secs(5);
 
 /// The wait before the next start after `failures` in a row: at once
 /// after the first, then 1, 2, 4… seconds, at most [`MAX_BACKOFF`].
@@ -413,6 +419,12 @@ struct SlotState {
     /// by then (pings aside).
     cpu_mark: Option<(Instant, u64, u64)>,
     served: u64,
+    /// Lot 388: the last worker ended by a signal, and which (`None`: it
+    /// exited, or its end was not seen).
+    end_signal: Option<i32>,
+    /// Lot 388: a worker that ended with a stop under way is held until
+    /// then ([`STOP_HOLD`]): not started again, its status not published.
+    held_until: Option<Instant>,
 }
 
 /// A killed worker awaiting its eviction and its reap.
@@ -455,6 +467,8 @@ impl SlotState {
             err_lines: 0,
             err_dropped: 0,
             cpu_mark: None,
+            end_signal: None,
+            held_until: None,
             served: 0,
         }
     }
@@ -480,6 +494,8 @@ struct Shared {
     report: Report,
     slots: Vec<Slot>,
     stop: AtomicBool,
+    /// Lot 388: the agent's facts of a stop under way ([`Workers::set_stop_facts`]).
+    stop_facts: Mutex<Option<crate::self_integrity::StopFacts>>,
     #[cfg_attr(not(feature = "debug-trigger"), allow(dead_code))]
     debug_dir: Option<PathBuf>,
 }
@@ -538,6 +554,7 @@ impl Workers {
             report: cfg.report,
             slots,
             stop: AtomicBool::new(false),
+            stop_facts: Mutex::new(None),
             debug_dir: cfg.debug_dir,
         }));
         let why = me.unavailable_why();
@@ -554,7 +571,18 @@ impl Workers {
 
     /// F2: the slot's status for [`Workers::status`].
     fn publish(&self, slot: &Slot, s: &SlotState) {
+        // lot 388: a worker held by a stop under way keeps the status it had
+        if s.held_until.is_some() {
+            return;
+        }
         *slot.snap.lock() = self.status_of(slot.kind, s);
+    }
+
+    /// Lot 388 (the triage of #595, its follow-up): the agent's facts of a
+    /// stop under way — a signed trusted-installer window open, its own
+    /// stop begun — for a worker's end ([`crate::self_integrity::StopExit`]).
+    pub fn set_stop_facts(&self, facts: crate::self_integrity::StopFacts) {
+        *self.0.stop_facts.lock() = Some(facts);
     }
 
     fn unavailable_why(&self) -> Option<String> {
@@ -631,6 +659,12 @@ impl Workers {
 
     fn watch(&self, kind: WorkerKind, s: &mut SlotState, now: Instant) {
         self.bury(kind, s);
+        // lot 388: held by a stop under way; past the hold, started again
+        match s.held_until {
+            Some(until) if now < until => return,
+            Some(_) => s.held_until = None,
+            None => {}
+        }
         if self.unavailable_why().is_some() {
             return;
         }
@@ -1013,6 +1047,28 @@ impl Workers {
         let status = self.end_child(kind, s);
         s.pid = 0;
         s.deaths += 1;
+        // Lot 388 (the triage of #595, its follow-up): a worker the stop's
+        // SIGTERM ended while a stop is under way — the host's shutdown
+        // (systemd-shutdown signals every process at once), a signed
+        // window, the agent's own stop — is the stop's own: no failure, no
+        // degradation, its status kept until the agent stops it (no
+        // revision of the capability manifest in the stop beat); held, then
+        // started again if the agent still runs. A crash, an OOM, a kill, a
+        // violation or a hang stays a failure, reported.
+        let exit = crate::self_integrity::StopExit::now(
+            fault == Fault::Died && s.end_signal == Some(libc::SIGTERM),
+            self.0.stop_facts.lock().as_ref(),
+        );
+        if let Some(why) = exit.stop_not_death() {
+            s.last_exit = status.clone();
+            s.held_until = Some(Instant::now() + STOP_HOLD);
+            info!(
+                worker = kind.name(),
+                status = %status,
+                "worker ended by the stop's SIGTERM {why}: the stop's own end, no degradation"
+            );
+            return;
+        }
         if fault == Fault::Hang {
             s.hangs += 1;
         }
@@ -1048,15 +1104,16 @@ impl Workers {
         // a SIGKILL to our own child, not reaped: the pid is still ours
         let _ = c.kill();
         let deadline = Instant::now() + Duration::from_millis(500);
-        let end = loop {
-            if let Some(end) = ended(pid) {
+        let (end, signal) = loop {
+            if let Some(end) = ended_raw(pid) {
                 break end;
             }
             if Instant::now() >= deadline {
-                break "killed, its end not seen yet".to_string();
+                break ("killed, its end not seen yet".to_string(), None);
             }
             std::thread::sleep(Duration::from_millis(2));
         };
+        s.end_signal = signal;
         s.graveyard.push(Grave {
             child: c,
             pid,
@@ -1263,6 +1320,7 @@ impl Workers {
                 continue;
             };
             s.stopped = true;
+            s.held_until = None;
             s.sock = None;
             s.ready_at = None;
             s.stderr = None;
@@ -1374,6 +1432,11 @@ fn fault_name(f: Fault) -> &'static str {
 /// F3: the child `pid` ended (not reaped: `WNOWAIT`): its end in words;
 /// `None` while it runs (or when it is no child of ours).
 fn ended(pid: u32) -> Option<String> {
+    ended_raw(pid).map(|(end, _)| end)
+}
+
+/// [`ended`], and the signal that ended it (`None`: it exited).
+fn ended_raw(pid: u32) -> Option<(String, Option<i32>)> {
     if pid == 0 {
         return None;
     }
@@ -1394,8 +1457,8 @@ fn ended(pid: u32) -> Option<String> {
         return None;
     }
     Some(match info.si_code {
-        libc::CLD_EXITED => describe(Some(status), None),
-        _ => describe(None, Some(status)),
+        libc::CLD_EXITED => (describe(Some(status), None), None),
+        _ => (describe(None, Some(status)), Some(status)),
     })
 }
 

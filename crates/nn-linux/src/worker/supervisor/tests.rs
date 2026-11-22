@@ -651,6 +651,101 @@ fn a_worker_that_dies_with_a_request_is_reaped() {
     assert_eq!(f.workers.status()[0].deaths, 1);
 }
 
+/// The fixture's ready worker, ended by `signal` (the test's own child).
+fn end_ready_worker(f: &Fixture, signal: libc::c_int) -> u32 {
+    assert!(tick_until(&f.workers, Health::Ready));
+    let pid = f.workers.status()[0].pid.unwrap();
+    // SAFETY: a signal to the fixture's own child (`sleep`), not reaped
+    unsafe { libc::kill(pid as libc::pid_t, signal) };
+    pid
+}
+
+/// Tick for `d`, the clock as given (`at` added to now).
+fn tick_for(w: &Workers, d: Duration, at: Duration) {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        w.tick(Instant::now() + at);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Lot 388 (the triage of #595, its follow-up): a worker the stop's SIGTERM
+/// ends while a stop is under way — a signed window, the agent's own stop
+/// (the host's shutdown, PID 1 `systemd-shutdown`, is the same rule's third
+/// fact) — is the stop's own: no degradation reported, its status kept as
+/// it was (no revision of the capability manifest), not started again
+/// within the hold; the agent's stop then stops it. Past the hold, with the
+/// agent still running, it is started again.
+#[test]
+fn a_worker_the_stop_s_sigterm_ends_in_a_stop_is_no_degradation() {
+    for (window, stopping) in [(true, false), (false, true)] {
+        let f = fixture(Script::Honest);
+        f.workers
+            .set_stop_facts(Arc::new(move || (window, stopping)));
+        end_ready_worker(&f, libc::SIGTERM);
+        tick_for(&f.workers, Duration::from_millis(300), Duration::ZERO);
+        assert!(f.reports.lock().is_empty(), "{:?}", f.reports.lock());
+        let st = f.workers.status()[0].clone();
+        assert_eq!(st.health, Health::Ready, "its status kept: {st:?}");
+        assert_eq!(st.deaths, 0, "not published while held");
+        assert_eq!(
+            f.launcher.launches.load(Ordering::SeqCst),
+            1,
+            "held, not restarted"
+        );
+        // the agent's stop: stopped, nothing reported
+        f.workers.stop();
+        assert_eq!(health(&f.workers), Health::Stopped);
+        assert!(f.reports.lock().is_empty());
+    }
+    // past the hold, the agent still running: started again, still no
+    // degradation
+    let f = fixture(Script::Honest);
+    f.workers.set_stop_facts(Arc::new(|| (true, false)));
+    end_ready_worker(&f, libc::SIGTERM);
+    tick_for(&f.workers, Duration::from_millis(200), Duration::ZERO);
+    assert_eq!(f.launcher.launches.load(Ordering::SeqCst), 1);
+    tick_for(&f.workers, Duration::from_millis(300), STOP_HOLD);
+    assert!(
+        f.launcher.launches.load(Ordering::SeqCst) >= 2,
+        "started again past the hold"
+    );
+    assert!(f.reports.lock().is_empty(), "{:?}", f.reports.lock());
+}
+
+/// Lot 388 (the other side): a worker ended while the host runs normally —
+/// no window, the agent not stopping — or ended otherwise than by the
+/// stop's SIGTERM (a kill, an OOM) even in a stop, stays a degradation,
+/// reported and started again at once.
+#[test]
+fn a_worker_ended_while_the_host_runs_or_killed_in_a_stop_is_a_degradation() {
+    for (facts, signal) in [
+        (None, libc::SIGTERM),
+        (Some((false, false)), libc::SIGTERM),
+        (Some((true, true)), libc::SIGKILL),
+    ] {
+        let f = fixture(Script::Honest);
+        if let Some((window, stopping)) = facts {
+            f.workers
+                .set_stop_facts(Arc::new(move || (window, stopping)));
+        }
+        end_ready_worker(&f, signal);
+        tick_for(&f.workers, Duration::from_millis(300), Duration::ZERO);
+        let reports = f.reports.lock().clone();
+        assert!(
+            reports
+                .iter()
+                .any(|(source, detail)| source == "worker_parse" && detail.contains("died")),
+            "{facts:?} {signal}: {reports:?}"
+        );
+        assert!(f.workers.status()[0].deaths >= 1, "{facts:?} {signal}");
+        assert!(
+            f.launcher.launches.load(Ordering::SeqCst) >= 2,
+            "{facts:?} {signal}: started again"
+        );
+    }
+}
+
 /// Lot 379 (pre-alpha Phase 7b, F7-6): a worker's death (an OOM kill, a
 /// crash) is reported to the degradation registry — signed, in `nn-admin
 /// status` for the rest of the run, never withdrawn when the worker is back.

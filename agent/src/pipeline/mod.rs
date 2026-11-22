@@ -287,10 +287,10 @@ where
 }
 
 /// PID 1 is `systemd-shutdown` (its comm, truncated to 15 bytes): the
-/// machine is in the last stage of a shutdown.
+/// machine is in the last stage of a shutdown. Lot 388: nn-linux's one
+/// reader, shared with the workers' supervisor.
 pub(crate) fn pid1_is_systemd_shutdown() -> bool {
-    nn_linux::state_read::read_state("/proc/1/comm")
-        .is_ok_and(|c| c.trim_end() == "systemd-shutdow")
+    nn_linux::self_integrity::pid1_is_systemd_shutdown()
 }
 
 #[cfg(test)]

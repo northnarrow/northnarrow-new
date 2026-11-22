@@ -34,7 +34,7 @@ use nn_proto::witness::{
 pub fn is_note(kind: &str) -> bool {
     matches!(
         kind,
-        WITNESS_KEY | WITNESS_NOTE | WATCHDOG_SUCCESSION | ROLES_RELEASED
+        WITNESS_KEY | WITNESS_NOTE | WATCHDOG_SUCCESSION | ROLES_RELEASED | WATCHDOG_STOPPED
     )
 }
 
@@ -104,6 +104,11 @@ pub const WITNESS_BROKEN: &str = "witness_chain_broken";
 /// The watchdog's vacated role taken by its unit's clean restart (a note:
 /// its death is `watchdog_gone`).
 pub const WATCHDOG_SUCCESSION: &str = "watchdog_succession";
+/// Lot 388 (the triage of #595, a): the verified watchdog stopped cleanly
+/// in the host's shutdown, inside a signed window or during the agent's own
+/// stop (`self_integrity::watchdog_exit_finding`) — a note, never its death
+/// (`watchdog_gone`).
+pub const WATCHDOG_STOPPED: &str = "watchdog_stopped";
 /// The re-check of #582 (N4): the watchdog's vacated role taken by its
 /// unit's clean restart, but a library it maps was replaced on disk since
 /// and is not the agent's own copy — its identity not confirmed (High). The
@@ -634,9 +639,10 @@ mod tests {
     #[test]
     fn the_held_deaths_are_the_witness_s_and_the_round_s_kinds() {
         use nn_evidence::held::{hold_of, Hold, DEATH_KINDS};
-        let gone = crate::self_integrity::watchdog_gone(
+        let gone = crate::self_integrity::watchdog_exit_finding(
             812,
             &crate::posture::exempt::WatchdogResolution::NotPresent,
+            crate::self_integrity::WatchdogExit::default(),
         );
         for kind in [
             WITNESS_ROW,
@@ -658,6 +664,7 @@ mod tests {
             WITNESS_NOTE,
             WATCHDOG_SUCCESSION,
             ROLES_RELEASED,
+            WATCHDOG_STOPPED,
         ] {
             assert!(is_note(note), "{note}");
             assert!(!DEATH_KINDS.contains(&note), "{note}");
