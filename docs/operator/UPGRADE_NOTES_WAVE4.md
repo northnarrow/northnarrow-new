@@ -5034,9 +5034,16 @@ signs it, and the successor must be its unit's own restart.
   watchdog that cannot open its witness records it, and the agent signs
   `witness_unavailable` (High). See `EVIDENCE_CHAINS.md`.
 - **The chain is the watchdog's alone.** The kernel refuses the agent, a
-  worker and every other process a write, truncation, rename, link or
-  removal of it outside a trusted-installer window; the agent reads it and
-  writes only its import position beside it. The watchdog checks that the
+  worker and every other process a write, truncation, rename or removal
+  of it outside a trusted-installer window, through any of its names (the
+  refusals follow the file, not its path), and a new name for it in the
+  witness directory; the agent reads it and writes only its import
+  position beside it. A hard link to it made outside the agent's
+  directories is neither refused nor recorded (lot 384, pre-alpha Phase
+  3c, F3c-3: the source of a hard link is not checked, for every protected
+  file, as the trust model says): a write, truncation, rename or
+  removal through that name is refused and signed like the others, and
+  the extra name stays until it is removed inside a window. The watchdog checks that the
   chain still ends at its last row before each row it signs and at a
   regular interval, and moves it aside (`witness.chain.1`) before it grows
   past what is read, within a life as at its start; the agent's import
@@ -6013,6 +6020,55 @@ fires.
   since lot 381) stalls its loop too, not only a pause of the whole
   machine. The signed row's detail says so as well ("…, starvation or
   memory throttling (its MemoryHigh)").
+
+## 69. An acknowledgement ends every held finding through its row; the status always names the row and the command; Phase 3c's doc truths (lot 384)
+
+- **What changed (pre-alpha Phase 3c, F3c-1).** `nn-admin status --key`
+  lists at most 16 held integrity findings and counts the others. The
+  counted rows were one counter per class that kept only its newest row,
+  and the status's command named the newest *listed* row. When the
+  counted rows were the newer ones — deaths or cuts signed past the cap,
+  a chain reimported after a cut (7 to 14 rows at once) — the
+  acknowledgement the status printed left them all held ("16
+  acknowledged …; 3 still held"), and from then on the status said
+  `DEGRADED` with only `… and 2 more held integrity row(s)`: no row, no
+  command, across cold boots. Now:
+  - each counted row keeps its own row, and an acknowledgement through
+    row N ends every held finding at or before N, listed or counted, and
+    none after it (the agent's reply counts them the same way);
+  - the line that counts them names the newest: `… and N more held
+    integrity row(s) in the signed audit log, the newest (audit row M)`
+    (`… and N more advisory row(s) …` likewise);
+  - the status's command names the newest row of every `integrity:` line,
+    the advisories' included, so the acknowledgement it prints ends all it
+    shows. With an agent older than this lot, whose counting line names no
+    row, the status still prints the command and asks for the audit log's
+    newest row.
+  Up to 1024 counted entries a class are kept apart; past that the two
+  oldest are kept as one under the newer row (an acknowledgement through
+  an earlier row leaves both held; the one the status names covers them).
+  Nothing else ends a hold: an acknowledgement counts only when its row is
+  signed by the agent's key, as before.
+- **Docs (Phase 3c, F3c-2).** On Debian 13 the system's `mount`
+  (util-linux 2.41, `fd-based-mount`) changes propagation and bind flags
+  through `mount_setattr(2)`, which has no kernel hook: there the guard's
+  refusals of those changes never apply to the system's tool. A change of
+  the pin directory lock's propagation is signed (`pin_lock_changed`,
+  `mount_attrs_changed`, High) and the lock made again within one
+  integrity round; a read-only bind remount of the lock is signed and
+  stays until the operator remounts it read-write inside a window, or a
+  reboot. KNOWN_LIMITATIONS.md, the trust model and KERNEL_COMPATIBILITY.md
+  say so.
+- **Docs (Phase 3c, F3c-3).** §61 said the kernel refuses a "link" of the
+  witness chain. A new name for it in the witness directory is refused; a
+  hard link made outside the agent's directories is neither refused nor
+  recorded (the source of a hard link is not checked, for every protected
+  file), and a write, truncation, rename or removal through that name is
+  refused and signed. §61 and EVIDENCE_CHAINS.md now say that.
+- **Upgrade.** No configuration, no protocol change (the lines are text).
+  A host left `DEGRADED` with `… and N more held integrity row(s)` and no
+  command: after the upgrade the status names the row; acknowledge through
+  it.
 
 ## 70. The external tester's findings: `audit verify`'s default, `host-check` without root, the agent's own release, an earlier login's `(sd-pam)`, a long link pin name (lot 385)
 

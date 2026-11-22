@@ -3127,9 +3127,26 @@ where it starts.
   is a peer of a held mount, and signals `mount_setattr(2)` at once). Each
   is signed at the next integrity round (about 30 s):
   - `mount_setattr(2)` has no LSM hook: a root user who deliberately
-    changes the lock's flags can remove the pins' protection until the
-    round makes the lock again; the agent signs it (`pin_lock_changed`) and
-    keeps its programs;
+    changes the lock's propagation can remove the pins' protection until
+    the round makes the lock again; the agent signs it (`pin_lock_changed`,
+    `mount_attrs_changed`) and keeps its programs. A read-only bind
+    remount of the lock is signed (`mount_attrs_changed`, High) and not
+    undone: the round checks the lock's place and propagation, not its
+    per-mount flags, and a start reuses a lock in place. The lock stays
+    read-only — the agent's pin writes there fail, each a signed
+    degradation — until the operator remounts it read-write inside a
+    window, or a reboot makes it again. Lot 384 (pre-alpha Phase 3c,
+    F3c-2): on Debian 13 this is the everyday path, not a deliberate one
+    — its `mount` (util-linux 2.41, `fd-based-mount`) makes every
+    propagation and bind-flag change through `mount_setattr(2)`, so the
+    guard's refusals of those changes, which hold for the same command on
+    Ubuntu 22.04 and 26.04 (`mount(2)`), never apply to the system's tool
+    there. Measured on Debian 13 (6.12): the lock's propagation changed,
+    signed and made again within one round (9 to 28 s); the read-only
+    remount signed within 4 s and still read-only a minute later; the
+    same changes of `/`, `/sys` and `/sys/fs/bpf` signed
+    `mount_attrs_changed`, not undone. Any host whose `mount` is built
+    the same way behaves alike (KNOWN_LIMITATIONS.md);
   - a raw namespace holds its own copy of the lock (`copy_mnt_ns()`
     copies unbindable mounts): a root user who deliberately
     changes its propagation in a namespace of their own can leave the host's bpffs and pins with the guard's
@@ -3166,7 +3183,10 @@ where it starts.
   group against the held mounts' places).
 - `mount_setattr(2)` is observed (≤ one integrity round), not refused —
   of the pin directory's lock too (the pins are less protected until the
-  round).
+  round, which makes the lock's propagation again; a read-only remount of
+  the lock stays until the operator acts). On Debian 13 the system's
+  `mount` takes this path for every propagation and bind-flag change
+  (lot 384, above).
 - A held file system's writable reconfigure passes (its options are the
   operator's: `size=` of `/run`, finalrd's `exec`); only read-only is
   refused there.

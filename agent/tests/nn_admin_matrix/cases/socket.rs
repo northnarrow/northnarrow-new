@@ -698,6 +698,50 @@ pub fn verbs() -> Vec<Verb> {
                     .to_string(),
             ]);
             success.push(("advisories".to_string(), telemetry(Some(adv))));
+            // lot 384 (pre-alpha Phase 3c, F3c-1): past the 16 findings
+            // listed, the agent counts the others in one line that names
+            // the newest of them; the advisory counted past the cap names
+            // its own, the newest held: the command acknowledges through it
+            let mut past = full_status();
+            past.degradations = Some(vec![
+                "integrity: witness_row — signed 2026-11-22T02:10:04.000000Z (audit row 340) — \
+                 held until acknowledged (`nn-admin integrity acknowledge --through <row>`): \
+                 watchdog 812 at 1795312000: role_vacated: the agent (pid 4410) left its role \
+                 (row hash 0a1b2c3d4e5f6a7b)"
+                    .to_string(),
+                "integrity: … and 2 more held integrity row(s) in the signed audit log, the \
+                 newest (audit row 356)"
+                    .to_string(),
+            ]);
+            past.advisories = Some(vec![
+                "integrity: … and 1 more advisory row(s) in the signed audit log, the newest \
+                 (audit row 357)"
+                    .to_string(),
+            ]);
+            success.push(("integrity-past-cap".to_string(), telemetry(Some(past))));
+            // the listed ones acknowledged, the counted ones left: still
+            // the row and the command (on main: neither)
+            let mut counted = full_status();
+            counted.degradations = Some(vec![
+                "integrity: … and 2 more held integrity row(s) in the signed audit log, the \
+                 newest (audit row 356)"
+                    .to_string(),
+            ]);
+            success.push((
+                "integrity-counted-only".to_string(),
+                telemetry(Some(counted)),
+            ));
+            // an agent older than lot 384 names no row for what it counts:
+            // the command all the same, the row to find
+            let mut older = full_status();
+            older.degradations = Some(vec![
+                "integrity: … and 2 more held integrity row(s) (in the signed audit log)"
+                    .to_string(),
+            ]);
+            success.push((
+                "integrity-counted-older-agent".to_string(),
+                telemetry(Some(older)),
+            ));
         }
         // R13 (lab PR 271): a revision of the sensor contract's manifest
         if !name.starts_with("net-") && !name.starts_with("export-") {
