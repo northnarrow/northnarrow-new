@@ -352,20 +352,24 @@ NOT DDACD Phase 2.)*
 
 ## 5. Marketing positioning differential
 
-### 5.1 Competitive analysis
+### 5.1 Positioning
 
-| Capability | CrowdStrike / SentinelOne / MS Defender | Wazuh | **NorthNarrow Active Defender** |
-|---|---|---|---|
-| Telemetry residency | US-hosted cloud processing | self-host (DIY) | **EU-sovereign; customer data never egresses** |
-| Threat-intel updates | vendor cloud push (data flows both ways) | manual ruleset | **autonomous inbound pull, zero outbound** |
-| Environment awareness | cloud-correlated | none | **local host-intimate model, in-tenant** |
-| Deception | add-on / none | none | **adaptive, env-aware, zero-FP-by-design** |
-| Forensic dossier | cloud-stored | logs | **in-tenant, Ed25519-signed, Art-13** |
-| Air-gapped parity | limited/none | partial | **first-class signed-bundle path** |
+> Lot 392: this section's table used to describe named commercial products
+> (CrowdStrike, SentinelOne, Microsoft Defender, Wazuh) with no source. It now
+> states only the Active Defender's own intended properties.
 
-The structural point: competitors achieve "intelligence" by *moving
-your data to their cloud*. The Active Defender achieves it by *moving
-public knowledge into your tenant* — the inverse data-flow direction.
+| Capability | **NorthNarrow Active Defender** (intended) |
+|---|---|
+| Telemetry residency | **EU-sovereign; customer data never egresses** |
+| Threat-intel updates | **autonomous inbound pull, zero outbound** |
+| Environment awareness | **local host-intimate model, in-tenant** |
+| Deception | **adaptive, env-aware, zero-FP-by-design** |
+| Forensic dossier | **in-tenant, Ed25519-signed, Art-13** |
+| Air-gapped parity | **first-class signed-bundle path** |
+
+The structural point: the Active Defender aims to gain its intelligence by
+*moving public knowledge into your tenant*, never by moving your data out of
+it.
 
 ### 5.2 Tagline
 

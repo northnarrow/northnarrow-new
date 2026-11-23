@@ -107,7 +107,7 @@ Documentation and customer onboarding materials: 1 week.
 
 **One-liner**: "Adaptive defense generation under attack, with EU AI Act compliant forensic chain on every rule."
 
-**Differentiation**: no commercial EDR in 2026 has dynamic rule synthesis during active defense. Competitors require either operator approval for new rules (slow) or rely on pre-built signature updates (lagging). Battle-Time Synthesis closes the gap between attack and adaptive response — within strict guardrails that satisfy EU regulatory requirements.
+**Differentiation (a goal)**: Battle-Time Synthesis aims to close the gap between an attack and the adaptive response, with dynamic rule synthesis during an active defence, within strict guardrails that satisfy EU regulatory requirements. (Lot 392: this line used to claim, with no source, that no commercial EDR has it.)
 
 **Beta caution**: position this as V1.0 commercial capability, not beta. Customers in the beta program will see the doctrine framework but the synthesis subsystem is gated behind V1.0 release.
 

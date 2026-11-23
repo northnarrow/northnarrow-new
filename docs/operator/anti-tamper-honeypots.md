@@ -88,6 +88,9 @@ Any unauthorized **create / modify / delete / rename** of a bait fires:
   (the `NORTHNARROW_COMBAT` chain, loopback-only, the management
   interface preserved) only if that fails. Only a signed release ends
   it (§7).
+- **Under the `alpha` profile** (every fresh install): the kill is
+  recorded as `would have: KillProcessTree` and not carried out, and the
+  COMBAT is entered and recorded without isolation ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1).
 
 There is no debounce: a single tamper detonates (no benign access
 exists to wait out).

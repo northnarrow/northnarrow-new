@@ -29,7 +29,7 @@ number in parentheses is a lab PR.
 
 | ID | Capability | Level (2026-11-03) | Evidence | Target |
 |---|---|---|---|---|
-| C01 | Linux sensor | 2 | verified on Ubuntu 22.04, 24.04, 26.04, Debian 12, 13 and AlmaLinux 9 (last verified on 10/10, before Wave 4) (`docs/operator/KERNEL_COMPATIBILITY.md`); the 13-source sensor contract, the signed capability manifest (218, 271); verifier 77 of 77 programs on 6.8 and 6.12 (238); privileged suites in KVM guests, 2 on a pull request, 5 every night (227): green 6 nights of 12 from 22/10 to 02/11, the red ones a lab harness race and a test fixture (lot 274), not the sensor | 3 |
+| C01 | Linux sensor | 2 | verified on Ubuntu 22.04, 24.04, 26.04, Debian 12, 13 and AlmaLinux 9 (last verified on 10/10, before Wave 4) (`docs/operator/KERNEL_COMPATIBILITY.md`); the sensor contract (13 sources at 271, 16 since lot 275), the signed capability manifest (218, 271); verifier 77 of 77 programs on 6.8 and 6.12 (238); privileged suites in KVM guests, 2 on a pull request, 5 every night (227): green 6 nights of 12 from 22/10 to 02/11, the red ones a lab harness race and a test fixture (lot 274), not the sensor | 3 |
 | C02 | Windows sensor | 0 | no sensor code; `ci.yml` checks the portable crates for Windows targets, which is preparation, not support | 3 (user-mode first; a kernel driver needs WHCP signing) |
 | C03 | macOS sensor | 0 | no sensor code (as C02) | 3 (needs Apple's Endpoint Security entitlement) |
 | C04 | ARM64 support | 0 | aarch64: the portable crates' check only (`ci.yml`); the agent and the eBPF object are built for x86_64 only | 3 |
@@ -42,9 +42,9 @@ number in parentheses is a lab PR.
 | C11 | Containers and Kubernetes | 1 | the agent on a container host (`docs/operator/CONTAINER_HOST_DEPLOY.md`); R013 and EPG-002 detect an escape to the host; no container or pod id in the records | 3 |
 | C12 | Synchronous inline blocking | 2 | the exec policy at `bprm_check_security`: `-EACCES` per file class and lineage, LD_PRELOAD and LD_AUDIT, `mmap_file`; armed on 4 kernels, MS-01/02/03/32 refused (226); the `socket_connect` deny of the blocklist (224); EPG enforce, SIGKILL in the kernel (219); exec quarantine (223). All EXPERIMENTAL and off by default (`docs/design/EXEC_POLICY.md`); the behaviour proofs on one kernel | 3 |
 | C13 | Malware prevention | 1 | exec quarantine with a confined scanner (223), its signed hash list shipped empty (`docs/design/EXEC_QUARANTINE.md`), the default ELF heuristics resume the process; the exec policy refuses execs from memfd, deleted files and `/dev/shm` (226); EXPERIMENTAL, off by default | 3 |
-| C14 | Behavioural detection and correlation | 2 (lot B2, 11/11) | 95 rules (`docs/detection/RULE_CATALOGUE.md`); the multi-match engine (236); chains with late execs (235, 244, 294); the posture and the COMBAT ladder, no COMBAT and no ladder kill on the benign corpus (282, 283a–c: `docs/validation/BENIGN_CORPUS.md`); R009 in COMBAT only (278), R011 by the command line (279, 287); golden replay of 29 decision and 12 posture cases (228, 243); the priority bus (267). Not 3: no detection rate measured (the V2 matrix empty, 0 `campaign` rows), no rule for T1003.007 (#119); lots 278, 283b, 283c, 287, 291, 292, 294 and 299 measured on 6.8 only, 282 on 5.15 only; the nightly on Ubuntu 26.04 (7.0) fails the R011/R018 and NN-L-NET-028 e2e every night since 05/11 and in the dispatch of 11/11 (#530 open), AlmaLinux 9 not in Wave 4; no third party | 3 |
+| C14 | Behavioural detection and correlation | 2 (lot B2, 11/11) | 95 rules (`docs/detection/RULE_CATALOGUE.md`); the multi-match engine (236); chains with late execs (235, 244, 294); the posture and the COMBAT ladder, no COMBAT and no ladder kill on the benign corpus (282, 283a–c: `docs/validation/BENIGN_CORPUS.md`); R009 in COMBAT only (278), R011 by the command line (279, 287); golden replay of 35 decision and 15 posture cases (228, 243 and the lots since); the priority bus (267). Not 3: no detection rate measured (the V2 matrix empty, 0 `campaign` rows), no rule for T1003.007 (#119); lots 278, 283b, 283c, 287, 291, 292, 294 and 299 measured on 6.8 only, 282 on 5.15 only; the nightly on Ubuntu 26.04 (7.0) fails the R011/R018 and NN-L-NET-028 e2e every night since 05/11 and in the dispatch of 11/11 (fixed by #530, merged 11/11), AlmaLinux 9 not in Wave 4; no third party | 3 |
 | C15 | Custom rules, declarative format | 1 | the rules are compiled Rust; the operator has signed overlays only: per-rule off/audit/alert/enforce with exemptions (`docs/operator/RULE_POLICY.md`, 236), the lists, the exec policy's cells | 3 |
-| C16 | Structured ATT&CK mapping | 2 | `Rule::attack()` is mandatory: 93 of 93 rules on 66 techniques and 12 tactics of ATT&CK 20.0, pinned by the STIX bundle's commit and sha256 (`docs/detection/ATTACK_COVERAGE.md`); `mitre` and `mitre_version` in every record, a revoked or unlisted id fails the tests; the records of 44 rules carried their typed ids on 4 guests (221). The coverage is not measured: 0 `campaign` rows, the V2 campaign not run | 3 |
+| C16 | Structured ATT&CK mapping | 2 | `Rule::attack()` is mandatory: 95 of 95 rules on 66 techniques and 12 tactics of ATT&CK 20.0, pinned by the STIX bundle's commit and sha256 (`docs/detection/ATTACK_COVERAGE.md`); `mitre` and `mitre_version` in every record, a revoked or unlisted id fails the tests; the records of 44 rules carried their typed ids on 4 guests (221). The coverage is not measured: 0 `campaign` rows, the V2 campaign not run | 3 |
 | C17 | Response on processes and files | 2 | NEUTRALIZE on every offender, a signed outcome and unlock (217); intent and outcome signed per action, the actions in parallel: 400 kills' longest wait 19 s → 1.6 s (270); the quarantine vault v2 with restore (238) | 3 |
 | C18 | Host network isolation | 1 | ISOLATE per family, IPv4 and IPv6, with read-back, retry and a signed outcome, in the lab on 24.04 only (217); the signed management carve-out (`configs/combat-allow.cidrs`) and unlock; only inside an engaged COMBAT (`docs/operator/COMBAT_RECOVERY.md`) | 3 |
 | C19 | Rollback and remediation | 1 | copy on first write (222; EXPERIMENTAL, off by default): a signed restore of 51 of 51 files on XFS, 50 of 51 on ext4 (over the 16 MiB cap); in-place rewrites only: `x.enc` then an unlink or rename over `x`, and `truncate` by path, are not covered (`docs/design/COPY_ON_FIRST_WRITE.md`); no remediation of persistences | 3 |
@@ -55,7 +55,7 @@ number in parentheses is a lab PR.
 | C24 | Offline and air-gapped operation | 2 | the agent's only traffic of its own is the DNS probe to 127.0.0.1:53 (`crates/nn-linux/src/telemetry_probe.rs`); updates are an operator's action; the attestation is verified offline with a bundle (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) | 3 |
 | C25 | Data sovereignty | 2 | the telemetry stays on the host unless the operator signs an export overlay (lot 276: off by default; the detections and the responses by default, the flows, file drift and canary reads only each named; the exact fields that leave, `docs/operator/EXPORT.md` §1a); no model in the root process (214); the README's compliance table states design properties, not certifications (its NIS2, GDPR, DORA and CRA badges were removed on 2026-11-03) | 3 |
 | C26 | Open code, licence, inspectability | 2 | Apache-2.0 (`Cargo.toml`), the eBPF object Dual MIT/GPL, a public repository, the module map | 3 |
-| C27 | Product supply-chain security | 1 | SLSA provenance, a CycloneDX SBOM and a signed RPM in `release.yml`; install takes attested trees only (220); dependency audit, Dependabot. No release with assets since 09/10, `release-check` not run in Wave 4, SHA256SUMS and the RPM key not attested | 3 |
+| C27 | Product supply-chain security | 1 | SLSA provenance, a CycloneDX SBOM and a signed RPM in `release.yml`; install takes attested trees only (220); dependency audit, Dependabot. No release with assets from 09/10 to `v0.1.0-alpha` (23/11), `release-check` not run in Wave 4, SHA256SUMS and the RPM key not attested | 3 |
 | C28 | Safe content release | 1 | a transactional upgrade with a byte-for-byte rollback (220); signed overlays with an anti-rollback floor; the content is in the binary: no channel, canary or ring | 3 |
 | C29 | Independent public validation | 0 | the public CI runs are "a step towards, not, an independent validation" (227); the V2 matrix is empty (`docs/validation/matrix.md`) | 3 (needs third parties) |
 | C30 | Generative AI and data governance | 0: absent by design, no AI on the host | the on-host LLM advisor and its RAG removed (214); the README's EU AI Act row: "no AI system on the host"; the governance of data is C25's | 3 (off the host only: 214) |
@@ -14757,4 +14757,24 @@ number in parentheses is a lab PR.
     `witness_note_uncertified`, no certified `witness_note`. Three test
     messages that printed an admin reply whole (CodeQL
     rust/cleartext-logging) are fixed messages now.
-
+- **Lot 392 — the public documents say what NorthNarrow is today (docs
+  only; no level change).**
+  - What was open: an audit of every public document against `main` found
+    statements no longer true — "Pre-Beta" and "no release" where the
+    release is `v0.1.0-alpha`; the README's Phase 3 list with three done
+    items unchecked (the sensor self-test, lot 280c; the exemptions by
+    cgroup or unit, lot 277; the lockdown checks, lot 280b); response guides
+    that described kills and isolation with no word of the observe-only
+    `alpha` profile; the removed advisor in the agent's start; the
+    `[Unreleased]` section in two upgrade notes; this table's evidence
+    figures (13 sources, 29 and 12 golden cases, 93 rules); design and
+    strategy documents claiming an unmeasured superiority over named
+    companies; three Italian quotes.
+  - What changed: the README as the alpha's front page (status, what it
+    does and does not do, the tester guide, how to report, sourced figures:
+    the nightly 7 of 16 green from 7 to 22 Nov 2026, the soaks of
+    `KNOWN_LIMITATIONS.md`); SECURITY.md, CONTRIBUTING.md, ROADMAP.md, the
+    CHANGELOG's release candidates (rc1 to rc15), the operator guides and
+    the documents above. Levels unchanged: only the evidence column moved
+    (the figures of C01, C14 and C16; C27's release).
+  - Lab: none (docs only). Host: the full gates.

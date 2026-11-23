@@ -14,6 +14,10 @@ stays held, and no event gets a stronger response than the agent gave it
 before lab PR 236 (the legacy ceiling, §1). What changes is what it
 *records*: every rule that matches an event is named.
 
+Under the `alpha` profile (every fresh install) no response touches a user
+program: the policy is applied the same way, and a kill it would run is
+recorded as `would have: <action>`, not carried out ([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1).
+
 ## 1. What a decision is
 
 Since lab PR 236 every rule judges every event. When several rules match, the

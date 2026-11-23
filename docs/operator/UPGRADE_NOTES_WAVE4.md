@@ -4,7 +4,7 @@ What changes for an operator who upgrades to a build of Wave 4 (the
 capability program, tracker in the source repository:
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/roadmap/CAPABILITY_PROGRAM.md>).
 The changes of the external audit of `16f7563` that came before are in
-`UPGRADE_NOTES_AUDIT_16f7563.md`; `CHANGELOG.md` `[Unreleased]` (at the
+`UPGRADE_NOTES_AUDIT_16f7563.md`; `CHANGELOG.md` `[0.1.0-alpha]` (at the
 root of the release tree, in `/usr/share/doc/northnarrow/` from a package)
 has the details of each change below.
 

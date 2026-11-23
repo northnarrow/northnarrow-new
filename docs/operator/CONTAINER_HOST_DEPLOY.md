@@ -10,6 +10,11 @@ weakens a real detection (see below). On a host that legitimately runs
 containers (Docker, Kubernetes, podman, containerd, CRI-O) you may need
 to opt in.
 
+Under the `alpha` profile (every fresh install) nothing on this page is
+killed: a kill is recorded as `would have: <action>`
+([`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1). The records, and the false positives this page
+tunes, are the same under both profiles.
+
 ## When to enable the container-runtime overlay
 
 Enable it only if you observe **R013** false positives —

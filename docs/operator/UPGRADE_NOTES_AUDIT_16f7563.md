@@ -6,7 +6,7 @@ of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 lots as they land; tracker
 in the source repository:
 <https://github.com/northnarrow/northnarrow-new/blob/main/docs/audit/EXTERNAL_AUDIT_16f7563.md>).
 Every item below is a change of behaviour or a regression that
-`CHANGELOG.md` `[Unreleased]` declares (at the root of the release tree,
+`CHANGELOG.md` `[0.1.0-alpha]` declares (at the root of the release tree,
 in `/usr/share/doc/northnarrow/` from a package), grouped by
 what the operator touches. Each names the finding (`NN-AUD-xxx`, with the
 audit's own reference) and the lab PR that fixed it; the CHANGELOG entry

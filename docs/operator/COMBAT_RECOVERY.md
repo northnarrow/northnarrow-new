@@ -17,6 +17,12 @@ locked COMBAT has **no automatic exit** — that is by design (a confirmed
 compromise should stay contained). This page covers how to get a host
 back, and the safety nets that keep you from being locked out.
 
+> **Under the `alpha` profile** (every fresh install, [`ALPHA_PROFILE.md`](ALPHA_PROFILE.md) §1)
+> COMBAT is entered and recorded, and no step of the ladder is carried out:
+> nothing is killed, quarantined or isolated, and each `combat_outcome` reads
+> `would_have: …` (§3.3). What this page says about kills, quarantine and
+> isolation is the `enforcing` profile's.
+
 "Quiet" (lot 314, BUG-94 of the third external bug hunt): an unlocked COMBAT
 decays to ENGAGED 30 minutes after the **last escalation signal** recorded
 (an ENGAGED-tier or stronger trigger: an offensive tool, an exfiltration

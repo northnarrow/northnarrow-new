@@ -512,9 +512,9 @@ deny list. Compile-time check + runtime fuzz on the uplink path.
 ### 7.3 Sovereignty + legal boundary
 
 - The broker is hosted in **EU-sovereign infrastructure** (specific
-  jurisdiction TBD in Tappa 14.3). This is a positioning differentiator
-  vs US-hosted EDR competitors (CrowdStrike, SentinelOne) for EU
-  customers under GDPR + NIS2 + the upcoming Cyber Resilience Act.
+  jurisdiction TBD in Tappa 14.3). This is a positioning point for EU
+  customers under GDPR + NIS2 + the upcoming Cyber Resilience Act: the
+  broker stays under EU jurisdiction.
 - **Threat Intelligence Collection** (collecting IoCs/signals from the
   field for defensive purposes) is legal in IT/EU/US.
 - **Hack-back** (probing/exploiting the attacker's infrastructure from
@@ -571,9 +571,9 @@ In V1, network isolation is per-host and reflexive. In V2 with broker:
 
 This is the architectural step that delivers "block the threat from
 the first machine onward" — the V1 model couldn't do this because each
-edge made decisions in isolation. V2 + broker matches the
-CrowdStrike/SentinelOne capability bar while keeping customer data on
-the edge.
+edge made decisions in isolation. V2 + broker aims at the fleet-wide
+blocking the major commercial EDRs offer, while keeping customer data
+on the edge.
 
 ---
 
