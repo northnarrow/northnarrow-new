@@ -1446,6 +1446,15 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
     installs as an operator would.
 
 ### Security
+- Lot 394 (config and docs): the release tag-signing key was rotated
+  before the first tag; the new key's fingerprint is
+  `SHA256:1CZOQqqS5UoG/DpkH/tj5q4Gq6kYhFLxh2gCBaegaxQ` (ED25519, principal
+  `northnarrow-release`, `namespaces="git"`, `.github/allowed_signers`).
+  The key of 2026-11-04 (listed under Changed below), whose passphrase was
+  lost, is removed, so revoked: no tag was signed with it. xtask's
+  `allowed_signers_header_names_the_listed_keys_fingerprints` checks that
+  the file's header names the fingerprint of each listed key and of no
+  other.
 - Lot 366 (pre-alpha): **the exec pumps never wait on a process's files**
   (`UPGRADE_NOTES_WAVE4.md` §55). Every exec's reads (its file, its
   directory, an AppImage's image and daemon, a module tool's script and
