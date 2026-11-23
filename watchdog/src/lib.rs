@@ -1,4 +1,4 @@
-//! NorthNarrow XDR watchdog — testable library surface (Watchdog
+//! NorthNarrow EDR watchdog — testable library surface (Watchdog
 //! W2 + forward sprint commits).
 //!
 //! The binary entry point at `src/main.rs` is a thin wrapper that

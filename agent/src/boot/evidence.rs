@@ -795,7 +795,7 @@ pub(crate) fn stores(
     // Degrade-not-fail (BUG-026 ②): if protection is unavailable, keep
     // telemetry flowing — open the writers with NoProtection + rotation
     // DISABLED (append-only) rather than dropping FIM-drift + netflow, the two
-    // core telemetry streams. Losing them is the worse failure for an XDR; the
+    // core telemetry streams. Losing them is the worse failure for an EDR; the
     // disk grows (the original vector) only until a restart recovers
     // anti-tamper. An effectively-infinite cap means the writer never invokes
     // the chattr dance (which would EPERM under `+i` and stall logging).

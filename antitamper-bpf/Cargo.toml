@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared aya-handling primitives for the NorthNarrow XDR anti-tamper layer (bpffs pin paths, LSM hook attach/reuse, PROTECTED_PIDS handle). Consumed by `northnarrow-agent` and the forthcoming watchdog binary so both share one canonical pin contract."
+description = "Shared aya-handling primitives for the NorthNarrow EDR anti-tamper layer (bpffs pin paths, LSM hook attach/reuse, PROTECTED_PIDS handle). Consumed by `northnarrow-agent` and the forthcoming watchdog binary so both share one canonical pin contract."
 
 [lib]
 name = "northnarrow_antitamper_bpf"
