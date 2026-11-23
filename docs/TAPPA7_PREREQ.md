@@ -1,4 +1,4 @@
-# Tappa 7 — Prerequisiti tecnici
+# Tappa 7 — Technical prerequisites
 
 > **Historical record (May 2026), not an operator guide.** Updated on
 > 2026-10-20 (lab PR 209, external audit DEP-013 NN-AUD-385, DEP-021
@@ -23,54 +23,53 @@
 >   `kill -9`, gets `Operation not permitted`. How the agent is stopped
 >   today: `docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §3.7.
 
-> Stato: PREP — da consultare prima di iniziare Tappa 7
-> implementazione (BPF-LSM anti-tamper). Documento creato durante
-> sessione 12 maggio 2026 dopo verifica stato server Hetzner.
+> Status: PREP — to read before starting the Tappa 7
+> implementation (BPF-LSM anti-tamper). Document written during the
+> 12 May 2026 session, after checking the state of the Hetzner server.
 
-## Contesto
+## Context
 
-Tappa 7 (ROADMAP.md) richiede BPF-LSM hooks reali per
-anti-tamper Linux. I commit attuali (9 maggio 2026) usano
-tracepoint come workaround a causa di limitazioni bpf-linker
-BTF emission. La ricerca del 12 maggio 2026 ha identificato che
-queste limitazioni sono risolvibili adesso con configurazione
-appropriata.
+Tappa 7 (ROADMAP.md) needs real BPF-LSM hooks for Linux
+anti-tamper. The current commits (9 May 2026) use tracepoints
+as a workaround, because of bpf-linker BTF emission limits.
+The research of 12 May 2026 found that these limits can be
+solved now with the right configuration.
 
-## Stato verificato (12 maggio 2026)
+## Verified state (12 May 2026)
 
 Server: `northnarrow-dev-01` (Hetzner Helsinki CCX23)
 Kernel: Linux 6.8.0-111-generic Ubuntu 24.04.4 LTS
 
-**Kernel config (positivo):**
+**Kernel config (positive):**
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_LSM=y
 CONFIG_LSM_MMAP_MIN_ADDR=0
 CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor"
 
-**BTF kernel (positivo):**
+**Kernel BTF (positive):**
 $ ls /sys/kernel/btf/vmlinux
 /sys/kernel/btf/vmlinux  ✓
 
-**LSM attivi runtime (negativo):**
+**Active LSMs at runtime (negative):**
 $ cat /sys/kernel/security/lsm
 lockdown,capability,landlock,yama,apparmor
-Manca "bpf". BPF-LSM hooks falliranno al load.
+"bpf" is missing. BPF-LSM hooks will fail at load.
 
-**Ecosystem Aya (positivo):**
+**Aya ecosystem (positive):**
 agent/Cargo.toml:        aya = "0.13"  aya-log = "0.2"
 agent-ebpf/Cargo.toml:   aya-ebpf = "0.1"
 agent-ebpf/rust-toolchain.toml:
 channel = "nightly"
 components = ["rust-src", "rustfmt", "clippy"]
 
-Aya 0.13 supporta BTF + LSM hooks. Setup nightly + rust-src già
-in posto. Build infrastruttura pronta.
+Aya 0.13 supports BTF + LSM hooks. The nightly + rust-src setup is
+already in place. The build infrastructure is ready.
 
-## Blocker 1 — Kernel runtime LSM non include "bpf"
+## Blocker 1 — The kernel's runtime LSM list does not include "bpf"
 
-**Fix (lunedì 19 maggio o successivo):**
+**Fix (Monday 19 May or later):**
 
-1. Backup GRUB config:
+1. Back up the GRUB config:
 sudo cp /etc/default/grub /etc/default/grub.bak
 
 2. Edit `/etc/default/grub`: on that host (Ubuntu 24.04, AppArmor) the
@@ -85,34 +84,34 @@ sudo update-grub
 4. Reboot:
 sudo reboot
 
-5. Verifica post-reboot:
+5. Check after the reboot:
 cat /sys/kernel/security/lsm
-   Output atteso: `lockdown,capability,landlock,yama,apparmor,bpf`
+   Expected output: `lockdown,capability,landlock,yama,apparmor,bpf`
 
-**Rischio:** errore sintassi GRUB → server inavviabile. Per
-Hetzner recovery via console web sempre disponibile. Server
-senza dati production: rischio accettabile.
+**Risk:** a GRUB syntax error → the server does not boot. For
+Hetzner, recovery through the web console is always available. The
+server holds no production data: the risk is acceptable.
 
-**Quando eseguire:** lunedì 19 maggio 2026 o successivo. NON
-durante viaggi/produzione.
+**When to run it:** Monday 19 May 2026 or later. NOT
+while travelling or in production.
 
-## Blocker 2 — bpf-linker BTF emission non attivata
+## Blocker 2 — bpf-linker BTF emission not turned on
 
-**Contesto:** commit precedenti (`exec_check.rs`, `file_open.rs`)
-contengono nota esplicita:
+**Context:** earlier commits (`exec_check.rs`, `file_open.rs`)
+carry an explicit note:
 
 > "bpf-linker 0.10 doesn't emit BTF, so LSM CO-RE reloc would
 >  fail at load time. The tracepoint gives userland every field
 >  listed in the spec. When eBPF BTF lands properly, we'll
 >  switch the hook for Tappa 7 enforcement."
 
-**Soluzione (verificata da docs ufficiali aya-rs + bpf-linker
-2026):**
+**Solution (checked against the official aya-rs + bpf-linker
+docs, 2026):**
 
-Aggiungere flag `--btf` al linker via `RUSTFLAGS` nel build
-agent-ebpf. Due opzioni:
+Add the `--btf` flag to the linker through `RUSTFLAGS` in the
+agent-ebpf build. Two options:
 
-**Opzione A — via .cargo/config.toml (raccomandato):**
+**Option A — through .cargo/config.toml (recommended):**
 
 In `agent-ebpf/.cargo/config.toml`:
 ```toml
@@ -124,98 +123,98 @@ rustflags = "-C debuginfo=2 -C link-arg=--btf"
 build-std = ["core"]
 ```
 
-**Opzione B — via env variable (ad-hoc):**
+**Option B — through an environment variable (ad hoc):**
 RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf" 
 cargo +nightly build --target=bpfel-unknown-none 
 -Z build-std=core --release
 
-**Effetto:** binario ELF in
+**Effect:** the ELF binary at
 `target/bpfel-unknown-none/release/northnarrow-agent-ebpf`
-conterrà sezione BTF. Aya LSM loader può fare CO-RE relocations
-contro kernel structs (`struct task_struct`, `struct file`,
-ecc.).
+will contain a BTF section. The Aya LSM loader can do CO-RE relocations
+against kernel structs (`struct task_struct`, `struct file`,
+etc.).
 
-**Verifica BTF presente nell'ELF:**
+**Check that BTF is in the ELF:**
 llvm-objdump -h target/bpfel-unknown-none/release/northnarrow-agent-ebpf 
 | grep -i btf
 
-## Side effect — Migrazione Tappe 1-4 a LSM (opzionale)
+## Side effect — Moving Tappe 1-4 to LSM (optional)
 
-Dopo risoluzione blocker 1+2, codice esistente può migrare da
-tracepoint a LSM hooks veri:
+Once blockers 1+2 are solved, the existing code can move from
+tracepoints to real LSM hooks:
 
 - `exec_check.rs`: `sys_enter_execve` tracepoint →
   `bprm_check_security` LSM hook
 - `file_open.rs`: `sys_enter_openat` tracepoint →
   `file_open` LSM hook
 
-Beneficio: possibilità di `-EPERM` enforcement (denial), non
-solo telemetria.
+Benefit: `-EPERM` enforcement (denial) becomes possible, not
+only telemetry.
 
-Decisione di migrare: dopo Tappa 7 chiusa, valutare se conviene
-backport-are LSM ai sensori esistenti o lasciare tracepoint.
+Decision to move: after Tappa 7 is closed, weigh whether to
+backport LSM to the existing sensors or keep the tracepoints.
 
-## Tappa 7 effettiva (post-fix blocker 1+2)
+## Tappa 7 proper (after the fix of blockers 1+2)
 
-Specifica originale (ROADMAP.md):
+Original specification (ROADMAP.md):
 
 1. **BPF-LSM hook task_kill** — `agent-ebpf/src/task_kill.rs`
-   - Negare SIGKILL/SIGTERM verso PID dell'agent
-   - Eccezione: canale firmato Ed25519 (Tappa 8 dependency)
+   - Deny SIGKILL/SIGTERM to the agent's PID
+   - Exception: Ed25519-signed channel (Tappa 8 dependency)
 
 2. **BPF-LSM hook ptrace_access_check** —
    `agent-ebpf/src/ptrace_check.rs`
-   - Negare ptrace al daemon NorthNarrow
+   - Deny ptrace to the NorthNarrow daemon
 
-3. **Protezione filesystem `/var/lib/northnarrow/`:**
-   - `chattr +i` (immutable bit) su file critici
-   - LSM inode hooks per impedire modifiche
+3. **Protection of the `/var/lib/northnarrow/` filesystem:**
+   - `chattr +i` (immutable bit) on critical files
+   - LSM inode hooks to prevent changes
 
-4. **Watchdog secondario:**
-   - Daemon separato, Rust standard (non eBPF)
-   - Monitora agent principale
-   - Riavvia se cade
+4. **Secondary watchdog:**
+   - Separate daemon, standard Rust (not eBPF)
+   - Watches the main agent
+   - Restarts it if it goes down
 
-## Demo verifica finale Tappa 7
+## Final Tappa 7 check demo
 $ sudo kill -9 $(pidof northnarrow-agent)
 kill: (12345) - Operation not permitted
 
-Anche root non può uccidere l'agent.
+Even root cannot kill the agent.
 
-## Sequenza operativa lunedì 19 maggio 2026
+## Steps for Monday 19 May 2026
 
-1. SSH al server, verifica Phase A Reasoning LoRA OK (PC fisso)
-2. Backup GRUB config: `sudo cp /etc/default/grub /etc/default/grub.bak`
-3. Edit `/etc/default/grub`: aggiungere `bpf` alla lista `lsm=` (historical;
+1. SSH to the server, check that Phase A Reasoning LoRA is OK (desktop PC)
+2. Back up the GRUB config: `sudo cp /etc/default/grub /etc/default/grub.bak`
+3. Edit `/etc/default/grub`: add `bpf` to the `lsm=` list (historical;
    today: `docs/operator/KERNEL_COMPATIBILITY.md`, "Enabling the `bpf` LSM")
 4. `sudo update-grub`
 5. `sudo reboot`
-6. Verifica: `cat /sys/kernel/security/lsm` contiene `bpf`
-7. Edit `agent-ebpf/.cargo/config.toml`: aggiungere rustflags BTF
-8. Verifica bpf-linker installato:
+6. Check: `cat /sys/kernel/security/lsm` contains `bpf`
+7. Edit `agent-ebpf/.cargo/config.toml`: add the BTF rustflags
+8. Check that bpf-linker is installed:
    `cargo install --list | grep bpf-linker`
-   Se mancante: `cargo install bpf-linker`
+   If it is missing: `cargo install bpf-linker`
 9. Test build:
    `cd ~/dev/northnarrow-new/ && cargo xtask build`
-10. Verifica ELF contiene BTF:
+10. Check that the ELF contains BTF:
     `llvm-objdump -h target/bpfel-unknown-none/release/* | grep -i btf`
-11. Solo allora: iniziare implementazione `task_kill.rs` LSM hook
+11. Only then: start implementing the `task_kill.rs` LSM hook
 
-Tempo stimato setup: 1-2 ore.
-Tempo stimato Tappa 7 sviluppo: 2-3 settimane (da ROADMAP.md).
+Estimated setup time: 1-2 hours.
+Estimated Tappa 7 development time: 2-3 weeks (from ROADMAP.md).
 
-## Note critiche
+## Critical notes
 
-- Server `northnarrow-dev-01` è ambiente DEV, non production.
-  Reboot per GRUB fix è accettabile.
-- WSL2 (sviluppo PC fisso founder) NON ha BPF-LSM funzionante.
-  Sviluppo e test Tappa 7 = su server Hetzner o VM KVM locale.
-- Phase A Reasoning training in corso su PC fisso non
-  interferisce con lavoro server (hardware separato).
+- The `northnarrow-dev-01` server is a DEV environment, not production.
+  A reboot for the GRUB fix is acceptable.
+- WSL2 (development on the founder's desktop PC) has NO working BPF-LSM.
+  Tappa 7 development and tests = on the Hetzner server or a local KVM VM.
+- The Phase A Reasoning training running on the desktop PC does not
+  interfere with the server work (separate hardware).
 
 ---
 
-## UPDATE 12 maggio 2026 — 15:15 UTC — IMPLEMENTATION + LIVE TEST
+## UPDATE 12 May 2026 — 15:15 UTC — IMPLEMENTATION + LIVE TEST
 
 ### Implementation (via Claude Code, autopilot mode)
 
@@ -281,11 +280,11 @@ is VERIFIED FUNCTIONAL on production-grade kernel:
 - Optional: migrate Tappe 1-4 from tracepoint to LSM hooks
   now that BTF emission works.
 
-Target completion: settimana lunedì 19 maggio 2026.
+Target completion: the week of Monday 19 May 2026.
 
 ---
 
-## UPDATE 19 maggio 2026 — Task 7 ENI ✅ SHIPPED
+## UPDATE 19 May 2026 — Task 7 ENI ✅ SHIPPED
 
 ### Status
 

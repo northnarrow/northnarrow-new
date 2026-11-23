@@ -22,6 +22,6 @@
 #   valid-before="YYYYMMDD" (namespaces="git",valid-before="20271231")
 #   rather than deleting it, so older tags still verify; a compromised key
 #   is deleted.
-# Signing and checking a tag: CONTRIBUTING.md, "Rilasci".
+# Signing and checking a tag: CONTRIBUTING.md, "Releases".
 
 northnarrow-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP2LtgOZ4vM7cq3+9G8QYP/W9CU6LbB73LQhlq4uwhfS

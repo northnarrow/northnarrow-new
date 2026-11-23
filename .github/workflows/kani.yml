@@ -1,4 +1,4 @@
-# Kani model checking (Tappa 10.8, "verifica formale dopo il fuzzing").
+# Kani model checking (Tappa 10.8, "formal verification after fuzzing").
 #
 # The fuzz job samples the input space of the parsers that read
 # attacker-written bytes; these proofs cover all of it for the

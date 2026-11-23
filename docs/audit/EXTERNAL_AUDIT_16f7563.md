@@ -9944,7 +9944,7 @@ group, the ones an unprivileged user or a local attacker could use first.
     `publish` (tags only, `release-signing`, `contents: write` alone, no
     checkout) checks `SHA256SUMS`, fails on a release that already has
     assets, creates a draft with `--verify-tag`, uploads without
-    `--clobber`, then publishes the draft. CONTRIBUTING.md "Rilasci":
+    `--clobber`, then publishes the draft. CONTRIBUTING.md "Releases":
     signing, checking, rotation (`valid-before`), re-publishing.
     `.github/allowed_signers` holds the format and instructions and **no
     key**: none was in the repository, none was made up. Declined as in

@@ -35,7 +35,7 @@
 #     heading is `## [<version>] - YYYY-MM-DD`, a real date. Not
 #     `[Unreleased]` above it, not `- unreleased` for the date: the date is
 #     written in the last commit before the tag (CONTRIBUTING.md,
-#     "Rilasci"), the day of the tag.
+#     "Releases"), the day of the tag.
 # release.yml's `verify-tag` job runs it after `verify`.
 #
 # selftest runs the same checks on a scratch repository with throwaway keys
@@ -60,7 +60,7 @@ verify() { # <tag> <commit> [allowed_signers]
     [ -f "$signers" ] || refuse "no allowed-signers file at $signers"
     signers="$(cd "$(dirname "$signers")" && pwd)/$(basename "$signers")"
     keys="$(grep -cvE '^[[:space:]]*(#|$)' "$signers" || true)"
-    [ "$keys" -gt 0 ] || refuse "$signers lists no key, so no tag can be verified: the maintainer adds the public half of the tag-signing key (CONTRIBUTING.md, \"Rilasci\")"
+    [ "$keys" -gt 0 ] || refuse "$signers lists no key, so no tag can be verified: the maintainer adds the public half of the tag-signing key (CONTRIBUTING.md, \"Releases\")"
     type="$(git cat-file -t "refs/tags/$tag" 2>/dev/null)" || refuse "no tag $tag in this clone"
     [ "$type" = tag ] || refuse "$tag is a lightweight tag (a $type): a release tag is annotated and signed (git tag -s)"
     name="$(git cat-file tag "refs/tags/$tag" | sed -n '/^$/q; s/^tag //p')"

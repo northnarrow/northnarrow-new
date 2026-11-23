@@ -1204,7 +1204,7 @@ not exist yet. Before the next `v*` tag:
    with deployments limited to `v*` tags.
 3. Protect the creation of `v*` tags with a ruleset.
 4. Add the public half of a tag-signing SSH key to `.github/allowed_signers`
-   (one line, `namespaces="git"`; "Rilasci" in
+   (one line, `namespaces="git"`; "Releases" in
    <https://github.com/northnarrow/northnarrow-new/blob/main/CONTRIBUTING.md>)
    and sign
    every `v*` tag with it (NN-AUD-408 SUP-024, lab PR 210).
