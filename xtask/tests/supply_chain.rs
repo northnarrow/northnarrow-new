@@ -3,7 +3,7 @@
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
 //! SUP-005, SUP-006, SUP-007 to SUP-018, SUP-021 to SUP-024, DEP-008 and
 //! PROC-015; and the CodeQL code scanning (lot codeql). The tests read
-//! committed files; eight run a local tool and none touches the network:
+//! committed files; nine run a local tool and none touches the network:
 //! `codeql_scans_every_language_of_the_tree` lists the tracked files
 //! (`git ls-files`) and the members (`cargo metadata --offline`),
 //! `prune_script_fails_closed` runs the CI prune
@@ -15,6 +15,8 @@
 //! `deploy/btf-matrix/run-test.sh` (bash, tar, xz, sha256sum; stub curl, gh
 //! and agent), `release_tag_check_accepts_only_listed_signers` runs the
 //! tag check's selftest (git and ssh-keygen, throwaway keys),
+//! `allowed_signers_header_names_the_listed_keys_fingerprints` runs
+//! `ssh-keygen -l` on the listed public keys,
 //! `the_release_scripts_refuse_a_lab_build` runs the tarball's and the
 //! packages' scripts under bash with stub binaries, and
 //! `glibc_baseline_check_refuses_a_binary_that_needs_above_2_34` runs the glibc
@@ -2760,6 +2762,70 @@ fn allowed_signers_lists_only_git_namespaced_ssh_keys() {
         text.contains("NO KEY IS LISTED YET"),
         ".github/allowed_signers: the `NO KEY IS LISTED YET` note must match the file ({keys} key(s))"
     );
+}
+
+/// SUP-024 (lot 394): the header of .github/allowed_signers publishes the
+/// SHA256 fingerprint of each listed key, and of no other key: after a
+/// rotation it names the new key, never the one removed.
+#[cfg(unix)]
+#[test]
+fn allowed_signers_header_names_the_listed_keys_fingerprints() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let text = read(&repo_root().join(".github/allowed_signers"));
+    let mut listed = Vec::new();
+    for t in text
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+    {
+        let key: Vec<&str> = t.split_whitespace().skip(2).take(2).collect();
+        let mut child = Command::new("ssh-keygen")
+            .args(["-l", "-E", "sha256", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ssh-keygen runs");
+        child
+            .stdin
+            .take()
+            .expect("ssh-keygen's stdin")
+            .write_all(format!("{}\n", key.join(" ")).as_bytes())
+            .expect("the key is written to ssh-keygen");
+        let out = child.wait_with_output().expect("ssh-keygen ends");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "ssh-keygen -l refused a listed key: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let fp = stdout
+            .split_whitespace()
+            .nth(1)
+            .filter(|f| f.starts_with("SHA256:"))
+            .unwrap_or_else(|| panic!("no SHA256 fingerprint in: {stdout}"));
+        listed.push(fp.to_string());
+    }
+    let named: Vec<&str> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .filter_map(|w| w.find("SHA256:").map(|i| &w[i..]))
+        .map(|w| w.trim_end_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/')))
+        .collect();
+    for fp in &listed {
+        assert!(
+            named.contains(&fp.as_str()),
+            ".github/allowed_signers: the header does not name the listed key {fp}"
+        );
+    }
+    for fp in &named {
+        assert!(
+            listed.iter().any(|l| l == fp),
+            ".github/allowed_signers: the header names {fp}, which no listed key has"
+        );
+    }
 }
 
 /// SUP-024: the tag check itself, on a scratch repository with throwaway

@@ -14798,3 +14798,15 @@ number in parentheses is a lab PR.
     job checks the description the built `.deb` and `.rpm` carry.
   - Lab: none (descriptions only). Host: the full gates; a `.deb` built by
     mk-packages.sh from stub binaries carried the new synopsis and units.
+- **Lot 394 — the release tag-signing key rotated before
+  `v0.1.0-alpha` (config and docs; no level change).**
+  - What was open: the key listed in `.github/allowed_signers` since
+    2026-11-04 could no longer sign: its passphrase was lost. No tag was
+    signed with it.
+  - What changed: the file lists the new key (2026-11-23, ED25519,
+    `SHA256:1CZOQqqS5UoG/DpkH/tj5q4Gq6kYhFLxh2gCBaegaxQ`, the same
+    principal and `namespaces="git"`); the old line is removed, which
+    revokes it. A new xtask test checks that the header names the
+    fingerprint of each listed key and of no other.
+  - Lab: none (config only). Host: the full gates;
+    `verify-release-tag.sh version v0.1.0-alpha` passes.

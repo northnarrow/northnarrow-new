@@ -4,11 +4,13 @@
 # .github/scripts/verify-release-tag.sh (`git verify-tag` with
 # gpg.ssh.allowedSignersFile); `package` and every later job wait for it.
 #
-# Only the maintainer's tag-signing key is listed (added 2026-11-04,
-# ED25519, SHA256:uTnR1UsJWH1wlE2muj5W21Y7L1rxysvcR2jZcO1B5d8). A tag signed
-# by any other key is refused at verify-tag: nothing is built, signed,
-# attested or published from it (fail closed). Nobody else's key belongs
-# here; adding, rotating or revoking one is a reviewed PR.
+# Only the maintainer's tag-signing key is listed (added 2026-11-23,
+# ED25519, SHA256:1CZOQqqS5UoG/DpkH/tj5q4Gq6kYhFLxh2gCBaegaxQ).
+# It replaced the key of 2026-11-04, whose passphrase was lost: removed, so
+# revoked, before any tag was signed with it. A tag signed by any other key
+# is refused at verify-tag: nothing is built, signed, attested or published
+# from it (fail closed). Nobody else's key belongs here; adding, rotating
+# or revoking one is a reviewed PR.
 #
 # Format: ssh-keygen(1) "ALLOWED SIGNERS", one key per line:
 #   <principal> namespaces="git" <key type> <base64 public key>
@@ -24,4 +26,4 @@
 #   is deleted.
 # Signing and checking a tag: CONTRIBUTING.md, "Releases".
 
-northnarrow-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP2LtgOZ4vM7cq3+9G8QYP/W9CU6LbB73LQhlq4uwhfS
+northnarrow-release namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwLHfFGWu/T6qkt0/WkTglYs9pTeBVpkyri+JfxFORL
