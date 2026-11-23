@@ -1430,6 +1430,14 @@ kernel.
   *Evidence:* lot 273b (the git status figure, on Ubuntu 24.04);
   internal check Phase 6 (rc10); internal check Phase 6b (rc11: the
   per-operation figures).
+- **Exec storm, FIM scale, memory.** Measured in the lab (internal check
+  Phase 6b, rc11). The agent took up to 3.8k exec/s with no event lost; at
+  2.6k exec/s on 4 vCPU it uses about 1.4 cores and process decisions
+  arrive late (p99 0.72 s, counted and signed). The FIM watches about 4,000
+  configured paths per overlay and 8,192 inodes in all; beyond that,
+  watches are evicted or the overlay is refused, with a signed error. The
+  agent's RSS reaches up to 113 MiB after a storm. *Evidence:*
+  internal check Phase 6b (rc11); `deploy/lab/overhead/prog-cost.sh`.
 - **Network.** UDP receives are about 20 % slower, TCP sends about 10 %
   (the TLS fingerprint sensor), connects about 6 %
   ([NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) §6). *Evidence:*

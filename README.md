@@ -38,9 +38,9 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 > - **Linux x86_64 only**, verified in our lab on five kernels, which the nightly CI also runs:
 >   5.15, 6.1, 6.8, 6.12 and 7.0 (Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13).
 > - **Built with AI assistance, under the founder's direction.** A single-founder project from
->   the EU, written with an AI coding assistant (Anthropic's Claude). The founder sets the design
->   and the priorities and decides what ships; every change passes the CI and a separate review
->   before it merges.
+>   the EU. The founder sets the direction, decides and reviews. The code, and much of the
+>   design, were written with Claude Code (Anthropic's AI coding assistant). Reviews and
+>   red-team rounds were run by separate AI agents, and the lab tests can be rerun by anyone.
 > - **Self-assessed.** Nothing here has been validated by a third party. Every number below
 >   points to the file or the CI run it comes from, and
 >   [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md) lists what does not work yet.
@@ -62,8 +62,8 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
   and the foreign BPF programs that could blind it;
 - keeps its evidence on the host: no telemetry to the vendor, no phone-home; an export to your
   own SIEM only when you sign an overlay for it ([`EXPORT.md`](docs/operator/EXPORT.md));
-- installs, upgrades with rollback and uninstalls cleanly, from a tarball, a `.deb` or an
-  `.rpm`, checked against the release's signed checksums and build provenance.
+- installs, upgrades with rollback and uninstalls cleanly, from a tarball or a `.deb`
+  (the `.rpm` is built and signed, but not yet tested in our lab), checked against the release's signed checksums and build provenance.
 
 **What it does not do today:**
 
@@ -90,7 +90,7 @@ telemetry goes and who decides on it are part of the risk. NorthNarrow keeps bot
 |---|---|
 | Where telemetry goes | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` — unless the operator signs an export overlay, which sends exactly the fields [`EXPORT.md`](docs/operator/EXPORT.md) lists to the operator's own SIEM |
 | Who decides | **deterministic rules**, correlation and an adaptive posture, on the host; no AI model on the host |
-| Who responds | **the host itself**, on a graduated ladder that only a signed human command releases; under the `alpha` profile a response against a user program is recorded, not carried out |
+| Who responds | **the host itself**, on a graduated ladder whose containment only a signed human command lifts; under the `alpha` profile a response against a user program is recorded, not carried out |
 | Can root switch it off? | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, and BPF programs that could signal the agent, root included, outside a signed maintenance window, under every profile. Not absolute: see [the limits](#limits-said-plainly) |
 | Air-gapped hosts | **first-class**: no update channel, offline attestation |
 | Trust | **signed hash chains**, a signed heartbeat verified off the host, open code, a lab and a CI gate anyone can rerun |
@@ -244,7 +244,7 @@ against it on every `cargo test` by
 | Response | 400 kill trees at once: the longest queue wait went from 19 s to **1.6 s** | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) §2e |
 | Heartbeat | the off-host verifier flagged a stopped agent in 6.5 s, a replayed export in 5.0 s, a frozen agent in 55.7 s and a cut network in 66.7 s | [`HEARTBEAT.md`](docs/operator/HEARTBEAT.md) |
 | Determinism | **35** golden replay cases of the decision path and **15** of the posture and COMBAT ladder, checked byte for byte on every `cargo test`; **15** fuzz targets; **4** Kani proofs, run every week and on the pull requests that touch them | [`GOLDEN_REPLAY.md`](docs/validation/GOLDEN_REPLAY.md) |
-| Resources | lab, QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and 6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB, the watchdog's about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest, 14–25 % under exec-heavy work (a kernel build, container starts); an event recorded in about 0.5 ms (p50) and 3–5 ms (p99) | [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md#performance) |
+| Resources | lab, QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and 6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB (up to 113 MiB after an exec storm), the watchdog's about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest, 14–25 % under exec-heavy work (a kernel build, container starts); an event recorded in about 0.5 ms (p50) and 3–5 ms (p99) | [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md#performance) |
 | Cost | lab, QEMU guests (a guest is noisier than a real host). Per operation, rc11 on QEMU under Windows (WHPX), Ubuntu 24.04, kernel 6.8, 2 vCPU, three complete runs (A/A at most 7 %), **lower bounds** (the reference with the agent off still ran three of its LSM programs): an `open` + `read` + `close` about **+2.1–2.2 µs** (+55…+64 %), a `fork` + `exec` + `wait` about **+0.08 ms** (+9…+16 %). On real work: a kernel build 4 to 17 % slower with the agent on; package installs, container runs, `fio` and `pgbench` within the lab's noise (about 5–25 %). The older committed baseline (Ubuntu 24.04, a lab build): `git status` +24 % from the cgroup move guard | [`PERF_BASELINE.md`](docs/validation/PERF_BASELINE.md) |
 | Long runs | lab soaks: 48 hours on release candidate rc5, then confirmation soaks of 4 and 12 hours up to rc11, with no regression of stability | [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md#performance) |
 | Benign hosts | records a plain host's own work made, now Low or gone, the attack beside each judged as before: a container runtime's start (runc's sealed copy of itself, containerd's module probes, a cgroup controller enabled), a package's system account and initramfs build, a kernel or DKMS package's modules, cloud-init's boot, sudo-rs, `go test`, npm in its own directories, logrotate and rsyslog, and a desktop AppImage (judged by the image file the user ran, not by its mount under `/tmp`; what the program then does is judged as for any other). `sudo ./deploy/uninstall.sh`: 0 High in 15 runs | [`UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md) §34–§49 |
@@ -496,10 +496,10 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 - [x] Privilege separation: unprivileged workers in Landlock and seccomp, parsers out of the root process, one `KeyStore`, capabilities per thread
 - [x] Key continuity: the signing key decided once at boot
 
-**Done: Phase 3, the first alpha.** `v0.1.0-alpha` (23 November 2026) came after phased checks
+**Phase 3, first part done: the first alpha.** `v0.1.0-alpha` (23 November 2026) came after phased checks
 of release candidates rc1 to rc15 in our own lab: install, upgrade and uninstall on five
 distributions, self-protection, detection, false-positive soaks of up to 48 hours, a final
-review, and a run of the tester guide by an outside tester. These are our own checks, not an
+review, and a run of the tester guide by a fresh AI agent that had only the guide and this README. These are our own checks, not an
 independent validation.
 
 - [x] The observe-only `alpha` profile for testers, with the self-protection enforced
@@ -545,7 +545,7 @@ independent validation.
 <summary><b>Release pipeline, packages, CI and dependencies</b></summary>
 
 - **Signed releases.** A `v*` tag builds with a locked lockfile and pinned toolchains. It
-  publishes the tarball, the `.deb` and `.rpm` packages, two CycloneDX SBOMs, `SHA256SUMS` and
+  publishes the tarball, the `.deb` and `.rpm` packages, three CycloneDX SBOMs, `SHA256SUMS` and
   a SLSA build-provenance attestation bound to the exact commit and workflow. The attestation
   checks in `install.sh`, the operator guide and this README require the release workflow at a
   `v*` tag (`--cert-identity-regex '…release\.yml@refs/tags/v'`, `--deny-self-hosted-runners`),
@@ -615,8 +615,8 @@ feedback and co-authored incident retrospectives. *Issue title: "Design partner 
 
 **Investors.** Pre-revenue, at the first alpha, building toward first paid deployments in
 regulated EU markets. Three bets: EU sovereignty as a hard procurement requirement; on-host,
-deterministic detection with no trade-off on where telemetry goes; and active defence that only
-a signed human command releases.
+deterministic detection with no trade-off on where telemetry goes; and active defence, a
+containment that only a signed human command lifts.
 *Issue title: "Investor inquiry", for diligence materials.*
 
 **Engineers.** Not hiring yet: the project is single-founder by design during the alpha. If you
