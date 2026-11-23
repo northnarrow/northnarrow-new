@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="NorthNarrow" width="140" />
+<img src="assets/logo.png" alt="NorthNarrow" width="240" />
 
 # NorthNarrow
 
