@@ -31,7 +31,7 @@ That is the north star. This is the working plan.
 | 8 | closed | COMBAT unlock with an Ed25519 signature, signed audit log |
 | 9 (FIM) + 9.0.a/b/c | closed | File Integrity Monitoring, detections on a signed chainlog, triage |
 | 9.5 + 9.5.1 | closed | canary tokens and anti-tamper honeypots |
-| 10 (network) + 10.5 + 10.6 | closed | network observability, 69 rules at closing (76 today), detection depth |
+| 10 (network) + 10.5 + 10.6 | closed | network observability, 69 rules at closing (76 on 16 October, 95 at the alpha), detection depth |
 | 10.7 | in progress | adversarial validation through Kali (design closed, automated range) |
 | **10.8** | **in progress** | reliability: hardening 8–10 Oct, upgrade/uninstall, signed release, multi-kernel (4 kernels), 24 h soak, fuzzing, io_uring (first part), BPF self-defence, anti-tamper adversarial, overhead on 6.8, `.deb`/`.rpm` packages; still open: the 72 h soak, the overhead on the other guests, the `.rpm` signing key (a maintainer action) and the lab check of kernels from 6.9 (`inode_setattr`, handled by lab PR 164; Debian 13 / 6.12 checked on 16/10: chmod, chown and touch of a protected file refused; 81 privileged tests out of 82, the failed one — DNS attribution — also fails on main because of the guest's resolver) |
 | 10.9 | in progress | evasion coverage: cgroup/container context, runtime injection, encrypted DNS/tunnels (decided on 10 October after an external review); sensor attach point: design accepted, step 0 passed on 6.8, 6.1 and 5.15, steps 1 (file opens on LSM), 2 (exec on LSM) and 3 (DNS read from the socket buffer, IPv6 too) done on 12 October |
@@ -39,8 +39,9 @@ That is the north star. This is the working plan.
 | Local UI, proactive Scout | not started | moved after 10.9, numbering to be confirmed by the founder |
 | 11 – 17 | not started | Windows, EU backend, console, advanced hardening, beta, launch |
 
-Tagged release: `v0.0.1-tappa9.0` (9 October 2026) — everything up to Tappa 9.0 plus the
-hardening round. Defect registers: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
+Tagged releases: `v0.0.1-tappa9.0` (9 October 2026) — everything up to Tappa 9.0 plus the
+hardening round; `v0.1.0-alpha` (23 November 2026), the first alpha (`CHANGELOG.md`).
+Defect registers: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
 `docs/audit/NN_REVIEW_2026-10-08.md` (High and Medium all closed by 9 October),
 `docs/audit/EXTERNAL_AUDIT_16f7563.md` (external audit of 12 October: Critical, High and
 Medium closed by 16 October, with the follow-ups found in the lab).
@@ -751,6 +752,14 @@ of `main` 1777e6f: the demo holds on the four distributions.
 
 ## Tappa 10.9 — Evasion coverage (in progress)
 
+> At the alpha (23 November 2026) several items below exist in a first form, and their
+> "today" describes 10 October: the TLS fingerprint (JA3 and JA4) is captured and
+> NN-L-NET-003 records it (lot 275); foreign BPF programs and the signal, override and
+> write helpers are refused at load; untrusted module loads (an `init_module` buffer
+> included) and kexec images are refused; the experimental exec policy checks
+> `LD_PRELOAD` and `LD_AUDIT` and `mmap_file` (off by default). What each one covers is in
+> `docs/roadmap/CAPABILITY_PROGRAM.md`.
+
 Goal: the rules stop depending on the binary's path alone,
 and the sensor sees the channels that escape it today. Decided on 10 October
 2026 after an external review of the inventory (a comparison with Falcon,
@@ -867,8 +876,8 @@ not change the order of the later Tappe.
   `nn-admin net status` says so; the capture is needed first)
 - Inline enforcement (LSM `-EPERM`) for a deterministic subset
   of the rules: exec from tmpfs/memfd, reading credentials from binaries
-  outside the allowlist, connect to the blocklist; the LLM and the posture ladder
-  stay in userland
+  outside the allowlist, connect to the blocklist; the posture ladder stays in
+  userland (the LLM this plan named was removed in Wave 4: there is no model on the host)
 - Namespace operations seen from the syscall (`unshare`, `setns`,
   `clone` with `CLONE_NEW*`), not from the tool's name (R013 today looks at
   `nsenter`/`unshare` by comm)
@@ -920,7 +929,8 @@ Goal: at install, NorthNarrow closes the gaps.
   reached (Minimal → High) in the report; an optional "appliance" profile with
   IPE + dm-verity (6.12+), where the agent's binary cannot be replaced,
   not even by root offline
-- The LLM reasons about priorities + proposes fixes
+- ~~The LLM reasons about priorities + proposes fixes~~ (the LLM was removed in Wave 4:
+  there is no model on the host)
 - Auto-fix mode (with admin confirmation the first time)
   vs report-only
 
@@ -936,7 +946,8 @@ Goal: Linux→Windows parity without taking on a kernel driver yet.
 - Sensors based on Event Tracing for Windows through the ferrisetw crate
 - Capture: process creation, network connections, file operations,
   registry writes
-- Reuse of the whole decision engine, executor and LLM from Tappe 1-6
+- Reuse of the whole decision engine and executor from Tappe 1-6 (the LLM this plan named
+  was removed in Wave 4)
 - Windows executors: OpenProcess + TerminateProcess,
   the Windows Filtering Platform user-mode API to block the network
 

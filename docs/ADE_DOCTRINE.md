@@ -149,27 +149,30 @@ The five phases map to what the customer sees and pays for:
 |---|---|---|
 | 1 — Knowledge Superiority | Your defender knows what's out there better than the attacker does | AI-native, EU sovereign threat intelligence |
 | 2 — Strategic Positioning | Sensors and traps placed where they catch the most | Deception layer with zero false positives by design |
-| 3 — Pre-built Fortifications | Defenses built to survive contact, including the most sophisticated tampering | Hardest-to-kill agent on the market |
+| 3 — Pre-built Fortifications | Defenses built to survive contact, including the most sophisticated tampering | An agent built to be hard to kill, even by root (a goal, measured in our own lab, never against another product) |
 | 4 — Battle-Time Synthesis | Adaptive rule generation during attack, with safety guardrails compliant with EU AI Act | Court-admissible forensic chain for every adaptive decision |
 | 5 — Recovery and Evolution | Cryptographic recovery, continuous improvement, no silent state changes | Ed25519 admin protocol — your agent only listens to you |
 
 ---
 
-## Differentiation vs. Competitors
+## Design choices, not a comparison
 
-NorthNarrow's doctrine produces structural differences from CrowdStrike, SentinelOne, Microsoft Defender for Endpoint, and Sophos.
+> Lot 392: this section used to claim differences from named commercial EDRs
+> that were never measured or sourced. It now states NorthNarrow's own design
+> choices. A comparison with another product belongs in a sourced,
+> reproducible test, which has not been made.
 
-**Stateful escalation**: competitors operate per-event; NorthNarrow operates per-state (Phase 3 posture machine). No commercial EDR in 2026 has dynamic stateful posture.
+**Stateful escalation**: NorthNarrow judges a host's state over time, not only each event (Phase 3 posture machine).
 
-**Autonomous COMBAT**: competitors require operator approval for network isolation; NorthNarrow's COMBAT state autonomously drops network traffic with cryptographically-signed audit trail (Phase 3 + 5).
+**Response behind a signed policy**: COMBAT can drop the host's network traffic, with a cryptographically signed audit trail (Phase 3 + 5). Under the alpha's observe-only profile it records what it would have done instead.
 
-**Anti-tamper survivability**: competitors rely on userland protection; NorthNarrow uses kernel-level LSM with link pinning that survives agent process death (Phase 3 + 5).
+**Anti-tamper in the kernel**: BPF-LSM hooks with link pinning that survives the agent process's death (Phase 3 + 5).
 
-**AI Act compliance**: competitors face regulatory exposure in EU markets; NorthNarrow's XAI saliency mapping and forensic evidence chain are designed against Article 13 from the start (Phase 4 + 5).
+**AI Act**: since Wave 4 there is no AI system on the host; the forensic evidence chain records every decision (Phase 4 + 5). The XAI saliency mapping this section named was removed with the advisor.
 
-**EU sovereign data residency**: competitors process telemetry in US-hosted cloud; NorthNarrow's backend is EU-sovereign by design (Tappa 13 Backend SaaS).
+**EU data residency**: the telemetry stays on the host; a backend, when there is one, is planned as EU-sovereign (Tappa 13 Backend SaaS).
 
-The marketing position is **not** "we are better than CrowdStrike at the same game." It is **"we play a structurally different game — doctrine-driven instead of stimulus-response."**
+The position is a different approach — doctrine-driven, stateful — not a claim of being better than anyone at the same game.
 
 ---
 

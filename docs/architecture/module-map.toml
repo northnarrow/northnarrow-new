@@ -184,7 +184,7 @@ planned = false
 # the admin socket's), the payload of each rotating log, the canary chains'
 # full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
 # nn-admin's `chain verify` reads the list: two nn-admin references until
-# the payloads have a crate below it (plan R04a/R05 "i payload"; R10). R10
+# the payloads have a crate below it (plan R04a/R05 "the payloads"; R10). R10
 # (lab PR 259): it reads it through its host (`admin_host`, nn-admin's
 # `host::Chains` on `ChainPaths`), and the layout under the state
 # directory it named is the agent's implementation's
@@ -243,8 +243,8 @@ planned = false
 # binds nn-core's table here
 "decision::catalogue::render" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the detection log's records and their
-# parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
-# file propri"; the payloads are nn-evidence's). R08b (lab PR 251): the
+# parts, from `detection_store` (plan R04a: "the payload types go in files of
+# their own"; the payloads are nn-evidence's). R08b (lab PR 251): the
 # parts the engine names (`Sensor`, `MitreAttack`, `Principal`) are cut to
 # nn-evidence's `detection_payload` and re-exported here; the records stay
 # while their constructors take the engine's decisions (`detection_store`)

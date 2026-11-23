@@ -16,7 +16,9 @@ Before anything else, read:
 
 ## One Tappa at a time
 
-Every PR belongs to the current Tappa of ROADMAP.md. PRs that try to run
+Every PR belongs to the current step: up to Tappa 10.9 a Tappa of
+ROADMAP.md, and since Wave 4 (October 2026) the capability program's order
+(`docs/roadmap/CAPABILITY_PROGRAM.md`, "Order"). PRs that try to run
 ahead (for example, starting Tappa 4 while Tappa 3 is not closed) are
 refused. An exception needs an explicit change to ROADMAP.md, signed off
 by the founder.
@@ -123,4 +125,5 @@ The CI runs the same checks on Linux x86_64. A red PR is not merged.
 ## Security
 
 NorthNarrow is a defence product. Security issues in the code are
-reported privately to the founder, not in public issues.
+reported privately, through GitHub's private vulnerability reporting as
+[SECURITY.md](SECURITY.md) says, not in public issues.

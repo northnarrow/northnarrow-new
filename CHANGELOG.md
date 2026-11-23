@@ -11,11 +11,30 @@ here, dated (CONTRIBUTING.md, "Releases").
 ## [0.1.0-alpha] - 2026-11-23
 
 Tag `v0.1.0-alpha`: the first alpha, everything since `0.0.1` (Wave 4 and
-the pre-alpha's checks, release candidates rc1 to rc12). The workspace,
+the pre-alpha's checks, release candidates rc1 to rc15). The workspace,
 `--version`, the tarball and the packages say `0.1.0-alpha`; the `.deb` and
 the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
 
 ### Added
+- Lot 392 (docs only): the public documents say what NorthNarrow is today.
+  README.md is the alpha's front page: the status (`v0.1.0-alpha`, the
+  observe-only `alpha` profile, Linux x86_64, the five kernels verified,
+  built with AI assistance under the founder's direction), what it does and
+  does not do (`KNOWN_LIMITATIONS.md`), the quickstart through the alpha
+  tester guide, and how to report (the issue templates, SECURITY.md). Its
+  Phase 3 list follows the facts (the sensor self-test, the exemptions by
+  cgroup or unit and the lockdown checks are done), the nightly and soak
+  figures are current, and no table compares it with other vendors.
+  SECURITY.md covers the `0.x` tags. The guides on responses
+  (`COMBAT_RECOVERY.md`, `RULE_POLICY.md`, `anti-tamper-honeypots.md`,
+  `CONTAINER_HOST_DEPLOY.md`) say that `alpha` records a kill or an
+  isolation and does not carry it out; `INSTALL_UPGRADE_UNINSTALL.md` no
+  longer names the removed advisor, and both upgrade notes name the
+  `[0.1.0-alpha]` section. ROADMAP.md says which Tappa 10.9 items exist
+  now and drops the LLM from its plans; CAPABILITY_PROGRAM.md's evidence
+  figures are current (no level changed). Design and strategy documents
+  that claimed an unmeasured superiority over named companies state goals
+  or our own design choices; three Italian quotes are translated.
 - Lot 391 (docs only): every public document is in English — CONTRIBUTING.md
   (its "Rilasci" section is now "Releases"), ROADMAP.md (a note at the top
   names `docs/roadmap/CAPABILITY_PROGRAM.md` as the current state), VISION.md,

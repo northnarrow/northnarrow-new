@@ -1364,7 +1364,7 @@ and the units set `LimitCORE=0`: a crash writes no memory to disk, and
 `CAP_SYS_PTRACE`. `/run/northnarrow` is 0700 whoever creates it (both units
 and the handler declare `RuntimeDirectoryMode=0700`; `install.sh` and the
 watchdog create it 0700). Each unit bounds its start: `TimeoutStartSec=180s`
-for the agent (its `READY=1` follows the eBPF attach and the ADE load),
+for the agent (its `READY=1` follows the eBPF attach),
 `60s` for the watchdog (its own 30-s deadline for a verified agent fires
 first).
 

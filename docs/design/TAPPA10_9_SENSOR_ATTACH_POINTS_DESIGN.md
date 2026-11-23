@@ -6,7 +6,7 @@ Q5 is restated after step 0 (§9), which refused `fexit` below 6.5, and
 revised in step 3 (§12). Done: step 0 (§9), step 1 — file opens (§10),
 step 2 — exec (§11). Step 3 — DNS is §12.
 **Author:** Claude Code (architecture), 2026-10-11.
-**Scope:** the first item of Tappa 10.9 ("Punto di aggancio dei sensori").
+**Scope:** the first item of Tappa 10.9 ("Sensor attach point").
 The other 10.9 items (workload identity, runtime injection, persistence
 chains, new LSM hooks, …) are out of scope here, except where this change
 prepares them (§6).

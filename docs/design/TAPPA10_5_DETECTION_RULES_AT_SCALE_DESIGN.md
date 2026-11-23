@@ -46,7 +46,7 @@ ships 37 production rules today. EU-regulated prospects run
 acceptance suites with thousands of detection-coverage checkboxes
 and benchmark against Wazuh (which advertises "thousands of rules").
 37 rules is not a defensible Beta number in that conversation — not
-because 37 good rules detect less than 3000 noisy ones, but because
+because 37 curated rules detect less than 3000 signature entries, but because
 the *breadth-of-coverage story* (which MITRE ATT&CK tactics can this
 product see at all?) has visible holes a procurement checklist will
 find.

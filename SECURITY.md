@@ -6,10 +6,11 @@ and are handled as a priority.
 
 ## Supported versions
 
-The project is pre-release (`0.0.x`). Security fixes land on the `main`
-branch and ship in the next tag; there are no backports.
+The project is pre-release (`0.x`: the current tag is `v0.1.0-alpha`, the
+first alpha). Security fixes land on the `main` branch and ship in the
+next tag; there are no backports.
 
-**Support period.** A `0.0.x` tag is supported until the next tag is
+**Support period.** A `0.x` tag is supported until the next tag is
 published: on that day its support period ends, and the fix for a
 vulnerability found in it is the newer tag. The pre-release tags are not
 meant for production. The support period of the first stable release

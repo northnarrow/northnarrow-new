@@ -14,12 +14,13 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.89-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
-[Why](#why-northnarrow) ·
+[Today](#what-it-does-today-and-what-it-does-not) ·
 [Architecture](#architecture) ·
 [Defence in depth](#defence-in-depth) ·
 [Verified today](#verified-today) ·
 [Limits](#limits-said-plainly) ·
 [Quickstart](#quickstart) ·
+[Report](#report-what-you-find) ·
 [Roadmap](#roadmap) ·
 [Supply chain](#security-and-supply-chain) ·
 [Contact](#work-with-us)
@@ -27,30 +28,72 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 </div>
 
 > [!IMPORTANT]
-> **Pre-Beta.** A single-founder project, built in the EU. Linux x86_64 only. No release with
-> assets has been published yet: build from source. A fresh install runs the observe-only
-> [`alpha` profile](docs/operator/ALPHA_PROFILE.md): it records what it would have done to a user
-> program and does not do it, while its self-protection stays enforced. Nothing here has been
-> validated by a third party. Every number below points to the file or the CI run it comes from,
-> and [Limits, said plainly](#limits-said-plainly) lists what is still open.
+> **Alpha: `v0.1.0-alpha`, 23 November 2026.** For testing on machines you can throw away, not
+> yet for protecting real ones.
+>
+> - **Observe-only.** A fresh install runs the [`alpha` profile](docs/operator/ALPHA_PROFILE.md):
+>   the agent detects, judges and records as it would in production, and does not act on a user
+>   program: each verdict is recorded as what it *would have* done. Its self-protection and the
+>   host-integrity refusals (untrusted kernel modules, kexec, foreign BPF programs) stay enforced.
+> - **Linux x86_64 only**, verified in our lab on five kernels, which the nightly CI also runs:
+>   5.15, 6.1, 6.8, 6.12 and 7.0 (Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13).
+> - **Built with AI assistance, under the founder's direction.** A single-founder project from
+>   the EU, written with an AI coding assistant (Anthropic's Claude). The founder sets the design
+>   and the priorities and decides what ships; every change passes the CI and a separate review
+>   before it merges.
+> - **Self-assessed.** Nothing here has been validated by a third party. Every number below
+>   points to the file or the CI run it comes from, and
+>   [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md) lists what does not work yet.
+
+---
+
+## What it does today, and what it does not
+
+**Today, on each Linux host it runs on, NorthNarrow:**
+
+- watches what runs, the files it touches and the connections it makes, through eBPF sensors
+  in the kernel, and judges every event with deterministic rules, chain correlation and an
+  adaptive posture, on the host;
+- signs every record into hash chains you can verify offline (`nn-admin chain verify`), and
+  writes a signed heartbeat every 30 s that a verifier on another host checks
+  ([`HEARTBEAT.md`](docs/operator/HEARTBEAT.md));
+- defends itself against root outside a signed maintenance window: BPF-LSM hooks refuse
+  signals, ptrace, changes to its files, maps, links and cgroups, untrusted module loads, kexec
+  and the foreign BPF programs that could blind it;
+- keeps its evidence on the host: no telemetry to the vendor, no phone-home; an export to your
+  own SIEM only when you sign an overlay for it ([`EXPORT.md`](docs/operator/EXPORT.md));
+- installs, upgrades with rollback and uninstalls cleanly, from a tarball, a `.deb` or an
+  `.rpm`, checked against the release's signed checksums and build provenance.
+
+**What it does not do today:**
+
+- act on user programs under the `alpha` profile: that is the alpha's design, and `enforcing`
+  is a signed profile switch ([`ALPHA_PROFILE.md`](docs/operator/ALPHA_PROFILE.md));
+- record forks, exits or credential changes as events (exec only), or DNS over TCP, DoT or DoH;
+- prove its detection coverage: no adversarial campaign has run, and no third party has
+  validated it;
+- give a backend or a fleet console, or run on ARM64, Windows or macOS;
+- prevent by default: the exec policy, the exec quarantine and copy on first write are
+  experimental and off.
+
+The full list, with what each item means for you and the workaround when there is one:
+[`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md).
 
 ---
 
 ## Why NorthNarrow
 
-Most endpoint products are a sensor that streams your telemetry to someone else's cloud, where
-a model you cannot inspect decides and an operator you do not employ reacts later. For a
-European bank, hospital, utility or public body under NIS2 and DORA, that architecture is a
-liability before it is a product. NorthNarrow inverts it:
+For a European bank, hospital, utility or public body under NIS2 and DORA, where endpoint
+telemetry goes and who decides on it are part of the risk. NorthNarrow keeps both on the host:
 
-| | Cloud-first EDR/XDR | **NorthNarrow** |
-|---|---|---|
-| Where telemetry goes | the vendor's cloud | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` — unless the operator signs an export overlay, which sends exactly the fields [`EXPORT.md`](docs/operator/EXPORT.md) lists to the operator's own SIEM |
-| Who decides | remote models and a SOC | **deterministic rules**, correlation and an adaptive posture, on the host; no AI model on the host |
-| Who responds | a human, later | **the host itself**, on a graduated ladder that only a signed human command releases; under the `alpha` profile a response against a user program is recorded, not carried out |
-| Can root switch it off? | varies | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, and BPF programs that could signal the agent, root included, outside a signed maintenance window, under every profile. Not absolute: see [the limits](#limits-said-plainly) |
-| Air-gapped hosts | degraded | **first-class**: no update channel, offline attestation |
-| Trust | "trust us" | **signed hash chains**, a signed heartbeat verified off the host, open code, a lab and a CI gate anyone can rerun |
+| | **NorthNarrow** |
+|---|---|
+| Where telemetry goes | **stays on the host**: the agent's only traffic of its own is a DNS probe to `127.0.0.1:53` — unless the operator signs an export overlay, which sends exactly the fields [`EXPORT.md`](docs/operator/EXPORT.md) lists to the operator's own SIEM |
+| Who decides | **deterministic rules**, correlation and an adaptive posture, on the host; no AI model on the host |
+| Who responds | **the host itself**, on a graduated ladder that only a signed human command releases; under the `alpha` profile a response against a user program is recorded, not carried out |
+| Can root switch it off? | **hardened against root**: BPF-LSM refuses signals, ptrace, file tampering, cgroup kills, freezes, moves and resource limits, and BPF programs that could signal the agent, root included, outside a signed maintenance window, under every profile. Not absolute: see [the limits](#limits-said-plainly) |
+| Air-gapped hosts | **first-class**: no update channel, offline attestation |
+| Trust | **signed hash chains**, a signed heartbeat verified off the host, open code, a lab and a CI gate anyone can rerun |
 
 ---
 
@@ -101,7 +144,7 @@ flowchart LR
 | **Sense** | Sixteen sources on tracepoints, kprobes, uprobes, fentry/fexit and BPF-LSM hooks. Each source's attach point, fallbacks, failure mode, budgets, truncations and loss counters are a contract in code, and the agent signs a capability manifest of what really attached, at boot and at every change ([sensor contract](docs/operator/SENSOR_CONTRACT.md)). |
 | **Prioritise** | Every event class has its own queue. Tamper (P0) is taken first, so a flood of file opens no longer pushes denials out. A full queue follows its class's policy, and every drop is counted and signed, never silent ([event bus](docs/architecture/EVENT_BUS.md)). |
 | **Decide** | One OS thread with no `await` judges every event against the engine's 87 rules, chain correlation and the posture; most of the blocking I/O it used to do now runs elsewhere. There is no AI model on the host: the on-host LLM advisor was removed in Wave 4 ([upgrade notes](docs/operator/UPGRADE_NOTES_WAVE4.md)). |
-| **Act** | Responses go to a dispatcher: eight workers by default, Critical first, one process's responses in order. Each action is a signed intent before it runs and a signed outcome after it. The posture rises from OBSERVING through ALERTED and ENGAGED to COMBAT only on corroborated evidence. COMBAT climbs from INVESTIGATE to NEUTRALIZE to ISOLATE, and only an Ed25519-signed command releases it. |
+| **Act** | Responses go to a dispatcher: eight workers by default, Critical first, one process's responses in order. Each action is a signed intent before it runs and a signed outcome after it. The posture rises from OBSERVING through ALERTED and ENGAGED to COMBAT only on corroborated evidence. COMBAT climbs from INVESTIGATE to NEUTRALIZE to ISOLATE, and only an Ed25519-signed command releases it. Under the `alpha` profile every step is recorded as what it would have done, and none is carried out. |
 | **Isolate** | Hostile bytes (DNS names today) are parsed by an unprivileged worker: the `northnarrow-worker` account, no capabilities, a seccomp allowlist and Landlock. A source test checks that the root core calls no parser. Each core thread keeps only the capabilities its role needs. The keys live in one `KeyStore`, locked in memory and kept out of core dumps, and the signing key is decided once at boot ([process model](docs/architecture/PROCESS_MODEL.md)). |
 | **Hold** | BPF-LSM deny hooks protect the agent, the watchdog and their files, maps, links and cgroups from root outside a signed trusted-installer window ([trust model](docs/design/ANTITAMPER_TRUST_MODEL.md)). A watchdog respawns the agent, and ten inert decoy files that look like kill switches trip a Critical rule when someone tampers with one. |
 | **Prove** | Every admin operation, posture change, detection and action lands in a signed, hash-chained log with numbered rows and anchored heads (`nn-admin chain verify`). Every 30 s a signed heartbeat carries the loss counters, the chain heads and the manifest's hash to a verifier on another host ([heartbeat](docs/operator/HEARTBEAT.md)). |
@@ -195,7 +238,7 @@ against it on every `cargo test` by
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
 | Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2). The eBPF object holds **124** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 124 of the latest pre-alpha release candidate (November 2026), the mount guard's six included, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
 | Host tests | more than **6,300** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
-| Privileged suites | run as root in 5 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 20 Nov 2026: 6 of 14 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
+| Privileged suites | run as root in 5 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 22 Nov 2026: 7 of 16 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
 | Event bus | in the lab's file-open flood (EXP-13), anti-tamper denials lost: 3,699 before the priority bus, **0** after | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) |
 | Response | 400 kill trees at once: the longest queue wait went from 19 s to **1.6 s** | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) §2e |
@@ -203,6 +246,7 @@ against it on every `cargo test` by
 | Determinism | **35** golden replay cases of the decision path and **15** of the posture and COMBAT ladder, checked byte for byte on every `cargo test`; **15** fuzz targets; **4** Kani proofs, run every week and on the pull requests that touch them | [`GOLDEN_REPLAY.md`](docs/validation/GOLDEN_REPLAY.md) |
 | Resources | lab, QEMU guests (Ubuntu 24.04 and Debian 13, kernels 6.8 and 6.12, 2 and 4 vCPU): the agent's RSS about 65–95 MiB, the watchdog's about 5 MiB, a worker's about 5.5 MiB; about 3 % of one core at rest, 14–25 % under exec-heavy work (a kernel build, container starts); an event recorded in about 0.5 ms (p50) and 3–5 ms (p99) | [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md#performance) |
 | Cost | lab, QEMU guests (a guest is noisier than a real host). Per operation, rc11 on QEMU under Windows (WHPX), Ubuntu 24.04, kernel 6.8, 2 vCPU, three complete runs (A/A at most 7 %), **lower bounds** (the reference with the agent off still ran three of its LSM programs): an `open` + `read` + `close` about **+2.1–2.2 µs** (+55…+64 %), a `fork` + `exec` + `wait` about **+0.08 ms** (+9…+16 %). On real work: a kernel build 4 to 17 % slower with the agent on; package installs, container runs, `fio` and `pgbench` within the lab's noise (about 5–25 %). The older committed baseline (Ubuntu 24.04, a lab build): `git status` +24 % from the cgroup move guard | [`PERF_BASELINE.md`](docs/validation/PERF_BASELINE.md) |
+| Long runs | lab soaks: 48 hours on release candidate rc5, then confirmation soaks of 4 and 12 hours up to rc11, with no regression of stability | [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md#performance) |
 | Benign hosts | records a plain host's own work made, now Low or gone, the attack beside each judged as before: a container runtime's start (runc's sealed copy of itself, containerd's module probes, a cgroup controller enabled), a package's system account and initramfs build, a kernel or DKMS package's modules, cloud-init's boot, sudo-rs, `go test`, npm in its own directories, logrotate and rsyslog, and a desktop AppImage (judged by the image file the user ran, not by its mount under `/tmp`; what the program then does is judged as for any other). `sudo ./deploy/uninstall.sh`: 0 High in 15 runs | [`UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md) §34–§49 |
 | Detection fixes | a hard link of a watched setuid binary into a user-writable directory (NN-L-FIM-002); a write anywhere below a kernel's module directory (NN-L-FIM-008); the cross-process chains through descendants that only forked (NN-L-CHAIN-004/005/006/008); a reverse shell known by the shell's file, not its name (R020); an administrator's session vouched for only by the host's own sudo or su, run by a user who is not root, for what it ran as root after authenticating | [`CHANGELOG.md`](CHANGELOG.md) |
 | Lifecycle | fresh install, in-place upgrade with rollback, clean uninstall (`upgrade-check`, `uninstall-check`); `.deb` / `.rpm` by `pkg-check`. `install.sh` refuses a host it cannot run on before any change (among them a host whose `/etc/ld.so.preload` loads a library into every program); after `uninstall.sh --purge` only what the guide lists remains (a state diff on five distributions); the uninstall exits 3 when the removal ends at the next boot, 4 when it left processes the agent had contained thawed and listed; a release verifies with its signed `SHA256SUMS` where no `gh` attestation is available | [operator guide](docs/operator/INSTALL_UPGRADE_UNINSTALL.md) |
@@ -233,7 +277,8 @@ Thirty capabilities, each with a level that changes only together with its evide
 **0** absent, **1** partial, **2** present and tested in the lab, **3** mature and verified on every
 supported kernel. The table in
 [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md) was re-assessed on 2026-11-03
-against `main`, separately from the lab PRs. It is a self-assessment, not a third party's.
+against `main`, separately from the lab PRs, and C14 and C23 again on 2026-11-11. It is a
+self-assessment, not a third party's.
 **No capability is at level 3.** Eleven are at 2, ten at 1 and nine at 0.
 
 <details>
@@ -308,7 +353,6 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   names) go as signed OCSF records to the operator's own files or syslog receiver; the heartbeat
   leaves by pull (C21, C22; [`docs/operator/EXPORT.md`](docs/operator/EXPORT.md)).
 - **Linux x86_64 only.** No ARM64, no Windows, no macOS (C02 to C04).
-- **No published release with assets.** The signed pipeline exists, but the one tag has no assets.
 - **Partial telemetry.** Exec events only: forks reach the lineage through a kernel record, not
   as events, and there are no exit or credential events (C05). DNS is read
   over UDP only: no DNS over TCP, DoT or DoH, and no `recvmmsg` (C07).
@@ -316,8 +360,8 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
   list as Medium and never acts on it; `enforce` is refused until it has a second predicate.
 - **Narrow measurements.** The cost of one `exec` or `open` of this release is measured on one
   QEMU guest only (Ubuntu 24.04, kernel 6.8, 2 vCPU), as lower bounds. Its resources and its
-  cost on real work were measured on QEMU guests only (Ubuntu 24.04 and Debian 13). One
-  24-hour soak passed, on AlmaLinux 9, before Wave 4.
+  cost on real work were measured on QEMU guests only (Ubuntu 24.04 and Debian 13), and the
+  long-run soaks ran in the same lab.
 - **The alpha does not block user programs.** Under a fresh install's `alpha` profile, a
   verdict against a user program is recorded as `would have: <action>`, not carried out; the
   self-protection and the host-integrity refusals (modules, kexec, foreign BPF) stay enforced.
@@ -329,26 +373,22 @@ but a defence inside the kernel is only as strong as the kernel's integrity:
 
 ## Quickstart
 
+**Testing the alpha? Start with the
+[alpha tester guide](docs/operator/ALPHA_TESTER_GUIDE.md).** It takes about an hour on a
+throwaway virtual machine and assumes no knowledge of the project: install and verify the
+release, make it record a few harmless things, read what it recorded, collect diagnostics
+without personal data, report, and uninstall.
+
 Requirements: Linux x86_64, a kernel with BTF (`/sys/kernel/btf/vmlinux`), the `bpf` LSM added
 to the kernel's running list rather than a fixed list
 ([Enabling the `bpf` LSM](docs/operator/KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line)),
 bpffs at `/sys/fs/bpf`, systemd, and `nft`.
 
-**From source (today).** In a checkout, `cargo xtask build --release` compiles the eBPF object with a pinned
-nightly toolchain and embeds it in the agent, stamped with its source hash and its own SHA-256.
-Then:
-
-```sh
-sudo ./deploy/install.sh --source-tree     # bootstraps an admin key at /root/northnarrow-admin.key: move it off-host
-```
-
-`install.sh` starts both units and enables them at boot (`--no-enable` leaves them stopped; then
-`sudo systemctl enable --now northnarrow-agent northnarrow-watchdog` when you are ready).
-
-**From a release (once one is published).** The first is `v0.1.0-alpha`: `<ver>` below is
-`0.1.0-alpha`, and the packages are `northnarrow_0.1.0-alpha-1_amd64.deb` and
-`northnarrow-0.1.0-alpha-1.x86_64.rpm` (versioned `0.1.0~alpha-1` inside: dpkg's and rpm's form of a
-pre-release). A release is verified and installed like this:
+**From the release.** `<ver>` below is `0.1.0-alpha`, and the packages are
+`northnarrow_0.1.0-alpha-1_amd64.deb` and `northnarrow-0.1.0-alpha-1.x86_64.rpm` (versioned
+`0.1.0~alpha-1` inside: dpkg's and rpm's form of a pre-release). Without `gh` 2.49 or newer, the
+guide's [§4](docs/operator/ALPHA_TESTER_GUIDE.md#4-install-and-verify) verifies the release with its
+signed `SHA256SUMS.asc` and `gpgv` instead. With `gh`, a release is verified and installed like this:
 
 ```sh
 # 1. Download the release tarball + checksums from the Releases page, then verify
@@ -375,6 +415,17 @@ sudo nn-admin host-check                                        # the host's own
 sudo ./deploy/install.sh --upgrade --grant-key <admin.key>     # in place, keys and chains preserved
 sudo ./deploy/uninstall.sh [--purge] --grant-key <admin.key>   # the only order the anti-tamper layer allows
 ```
+
+**From source.** In a checkout, `cargo xtask build --release` compiles the eBPF object with a pinned
+nightly toolchain and embeds it in the agent, stamped with its source hash and its own SHA-256.
+Then:
+
+```sh
+sudo ./deploy/install.sh --source-tree     # bootstraps an admin key at /root/northnarrow-admin.key: move it off-host
+```
+
+`install.sh` starts both units and enables them at boot (`--no-enable` leaves them stopped; then
+`sudo systemctl enable --now northnarrow-agent northnarrow-watchdog` when you are ready).
 
 <details>
 <summary><b>What the installer checks, and where to read next</b></summary>
@@ -405,12 +456,29 @@ binaries and its eBPF object with the manifest, and refuses to start on a mismat
 
 ---
 
+## Report what you find
+
+- **A bug, a false positive or a detection gap:** open an issue with its template
+  ([new issue](https://github.com/northnarrow/northnarrow-new/issues/new/choose)): *Bug report*,
+  *False positive* or *Detection gap*. Read
+  [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md) first: some limits are known. The
+  guide's [§8](docs/operator/ALPHA_TESTER_GUIDE.md#8-collect-diagnostics-without-personal-data)
+  collects diagnostics without personal data, and
+  [§9](docs/operator/ALPHA_TESTER_GUIDE.md#9-report-what-you-found) says what a report needs.
+  Never attach the admin key, a file from `/etc/northnarrow` or a real credential.
+- **A vulnerability** — a way to stop, blind or get around the agent's self-protection, or to
+  make it sign something false: report it privately, as [`SECURITY.md`](SECURITY.md) says
+  (Security → Report a vulnerability), never in a public issue.
+
+---
+
 ## Roadmap
 
 The tracker is [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md): one note per
 lab PR, with what moved, what the lab measured and what is still open. The history of the
-earlier stages is in [`ROADMAP.md`](ROADMAP.md), and the long-term vision is in
-[`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are published: milestones ship in order.
+earlier stages is in [`ROADMAP.md`](ROADMAP.md), the goals are in [`VISION.md`](VISION.md), and
+the long-term technical vision is in [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are
+published: milestones ship in order.
 
 **Done: the foundations.** eBPF sensors, the rule engine, the response engine, the adaptive
 posture, anti-tamper, the signed COMBAT release, FIM, deception, network observability and
@@ -428,24 +496,29 @@ on-host LLM advisor removed, which also took about 150 crates out of `Cargo.lock
 - [x] Privilege separation: unprivileged workers in Landlock and seccomp, parsers out of the root process, one `KeyStore`, capabilities per thread
 - [x] Key continuity: the signing key decided once at boot
 
-**Phase 3, under way.** The first tag release, v0.1.0-alpha, follows a phased pre-release
-verification: an install matrix on 5 distributions, self-protection, detection coverage, a
-multi-day false-positive soak and an independent review.
+**Done: Phase 3, the first alpha.** `v0.1.0-alpha` (23 November 2026) came after phased checks
+of release candidates rc1 to rc15 in our own lab: install, upgrade and uninstall on five
+distributions, self-protection, detection, false-positive soaks of up to 48 hours, a final
+review, and a run of the tester guide by an outside tester. These are our own checks, not an
+independent validation.
 
+- [x] The observe-only `alpha` profile for testers, with the self-protection enforced
+- [x] The first tag release, with its build provenance and a signed `SHA256SUMS` that `install.sh` checks with or without `gh`
+- [x] The pre-release soaks, false positives first: a benign host's daily records judged by identity, the attack beside each judged as before
+- [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (the rule records, its kill refused until measured wider)
+- [x] Foreign BPF loads and rootkit helpers refused (with a signed per-loader opt-out for tracing tools); the signalling kfuncs refused in every program type; a window's forbidden load held and signed
+- [x] A self-test of every sensor, every round, each miss signed
+- [x] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
+- [x] Kernel lockdown checked by `nn-admin host-check`, and its switch refused outside a window
+- [x] The agent's own CPUs watched: a confinement is signed
 - [x] `prlimit` / `RLIMIT_CPU`, scheduler, nice and I/O-priority starvation refused outside a window
-- [ ] **Wave 1**
-  - [x] Network telemetry (inbound connections, DNS answers, TLS fingerprints) and "no DNS, no connect": a connection to an address no DNS answer gave (the rule records, its kill refused until measured wider)
-  - [ ] Process telemetry: fork, exit and credential changes
-  - [ ] Deception that trips when a decoy is used
-  - [ ] A self-test of every sensor, not three of sixteen
-  - [x] Foreign BPF loads and rootkit helpers refused (with a signed per-loader opt-out for tracing tools); the signalling kfuncs refused in every program type; a window's forbidden load held and signed
-  - [x] The agent's own CPUs watched: a confinement is signed
-  - [x] The observe-only `alpha` profile for testers, with the self-protection enforced
-  - [ ] Per-rule exemptions by cgroup or unit that hold only for processes started there: a process moved into an exempt cgroup loses the exemption, and the move is signed
-  - [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
-  - [ ] Kernel lockdown checks
-  - [ ] A tag release, verified end to end (its signed `SHA256SUMS`, checked by `install.sh` without `gh`, is in place)
 - [x] A minimal signed export of detections in OCSF (off by default, `docs/operator/EXPORT.md`)
+
+**Next: the rest of Phase 3.**
+
+- [ ] Process telemetry: fork, exit and credential changes
+- [ ] Deception that trips when a decoy is used
+- [ ] `isolate --ttl`: a signed isolation outside the COMBAT ladder, with an expiry
 - [ ] A free, public self-assessment against MITRE's open emulation plans
 - [ ] **Waves 2 and 3**: the remaining Linux capabilities, in the program's order (telemetry, prevention, detection, integration)
 
@@ -478,7 +551,7 @@ multi-day false-positive soak and an independent review.
   `v*` tag (`--cert-identity-regex '…release\.yml@refs/tags/v'`, `--deny-self-hosted-runners`),
   so the artefacts of a run on a branch do not verify as a release. Building and signing are
   separate jobs, and the job that compiles the dependency tree cannot request the signing token.
-  No tag has published assets yet: the first verified tag release is part of Phase 3.
+  `v0.1.0-alpha` is the first tag released this way.
 - **Packages.** The `.rpm` is signed on tag builds, in its own job. Check it with `rpm -K` or
   dnf's `localpkg_gpgcheck` against
   [`deploy/release/RPM-GPG-KEY-northnarrow.asc`](deploy/release/RPM-GPG-KEY-northnarrow.asc),
@@ -535,18 +608,18 @@ Open an issue with the title given below.
 **Design partners.** NorthNarrow is looking for design partners: regulated EU institutions
 (banking, insurance, healthcare, public administration, energy, telecommunications), critical
 infrastructure operators with sovereignty constraints, Linux-heavy production environments
-interested in autonomous defence, and security research labs who want to attack the pipeline.
+interested in on-host response, and security research labs who want to test the agent's defences.
 You get early access, deep technical briefings, direct input on detection coverage and response
 semantics, and acknowledgment at GA. We ask for real workload exposure, structured detection
 feedback and co-authored incident retrospectives. *Issue title: "Design partner inquiry".*
 
-**Investors.** Pre-revenue and pre-Beta, building toward first paid deployments in regulated EU
-markets. Three asymmetric bets: EU sovereignty as a hard procurement requirement; on-host,
-deterministic detection that removes the cloud-telemetry trade-off behind the incumbents' moat;
-and active defence as the next category after fifteen years of alert generation.
+**Investors.** Pre-revenue, at the first alpha, building toward first paid deployments in
+regulated EU markets. Three bets: EU sovereignty as a hard procurement requirement; on-host,
+deterministic detection with no trade-off on where telemetry goes; and active defence that only
+a signed human command releases.
 *Issue title: "Investor inquiry", for diligence materials.*
 
-**Engineers.** Not hiring yet: the project is single-founder by design during Pre-Beta. If you
+**Engineers.** Not hiring yet: the project is single-founder by design during the alpha. If you
 work on systems Rust, eBPF or kernel security and want to be on the early list, open an issue
 with a short note. *Issue title: "General inquiry".* Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -561,7 +634,7 @@ requests within the working day. *Issue title: "Press / media inquiry".*
 
 ## Disclaimer
 
-Pre-Beta software under active development. The detection rules are mapped to ATT&CK and
+Alpha software under active development, observe-only by default. The detection rules are mapped to ATT&CK and
 most are tested, but none has campaign proof yet, and no detection system covers every
 unknown threat. Pair NorthNarrow with defence in depth, and read [Kernels](#kernels) before
 you deploy on a kernel we have not tested.
