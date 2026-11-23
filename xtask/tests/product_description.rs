@@ -146,6 +146,7 @@ fn the_word_is_found_only_as_a_word() {
         "docs/XDR_ROADMAP_TAPPE_NEW.md",
         "XDRs",
         "maxdrops",
+        "rpc_xdr",
         "NorthNarrow EDR agent",
         "endpoint detection and response",
     ] {
