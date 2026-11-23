@@ -1,81 +1,86 @@
 # NorthNarrow — Vision
 
-> Note of 20 October 2026 (founder's decision, Wave 4, lab PR 214): the LLM
-> no longer runs inside the agent. On-host detection is deterministic
-> (rules, correlation, posture, COMBAT); an AI assistant, if there is one,
-> will stay outside the enforcement path (for example on the backend, for
-> the analyst). The paragraphs below about the built-in LLM describe the
-> original vision.
+> This document describes where NorthNarrow is going. For what it does
+> today, see [README.md](README.md) and
+> [docs/operator/KNOWN_LIMITATIONS.md](docs/operator/KNOWN_LIMITATIONS.md).
 
-NorthNarrow is a hyper-competitive XDR, superior to CrowdStrike, written in
-native Rust. It is a fortress with an LLM inside that knows when a file is
-a virus or legit. It has an attractive interface. It is prepared for ALL
-attacks.
+NorthNarrow is an endpoint defence written in Rust, built in the open. We
+aim to match and then surpass the major commercial EDRs, with code anyone
+can read and a lab anyone can rerun. It runs on Linux today; Windows and
+macOS are later goals.
 
-It is truly proactive, not as a marketing word: the moment it is
-installed on a machine, it studies it, understands where its weak points
-are, and finds ways to close the gaps before they are exploited.
+## Proactive
 
-The native LLM that runs inside it is self-aware: it knows its own weak
-points as a defender, and it knows the weak points of the machine it
-protects. It does not give blind verdicts. When it is not sure, it
-escalates. When it sees a gap, it closes it. When it sees an attack, it
-reacts and neutralises it.
+We want NorthNarrow to be truly proactive, not as a marketing word: once
+installed, it studies the machine, finds where it is weak, and helps close
+those gaps before anyone can use them.
+
+Our goal is broad coverage of the attacks real machines face, stated
+honestly: what we say it covers is backed by a test or a lab run, and what
+it does not cover yet is listed as a limit, not hidden. It does not give
+blind verdicts. When it is not sure, it escalates.
+
+## Deterministic on the host
+
+Since October 2026 there is no AI model on the host. Detection there is
+deterministic: rules, correlation, posture and COMBAT, so every decision
+can be read, tested and explained. An AI assistant, if there is one, stays
+outside the enforcement path, for example on a backend that helps the
+analyst.
 
 ## Defence autonomy
 
-When it comes to defence, NorthNarrow does not depend on human will. When
-it identifies a serious threat, it acts. It does everything it can to save
-the machine, even at the cost of isolating it completely from the network
-to stop the infection from spreading to other servers.
+The alpha is observe-only. It detects, judges and records what it would
+have done, and it does not touch a user's program
+([ALPHA_PROFILE.md](docs/operator/ALPHA_PROFILE.md)); its protection of
+itself stays on.
 
-The human is told what NorthNarrow did. Permission is not asked before
-acting when the danger is clear. Speed of response is part of the defence.
+Autonomous response is the goal, behind a signed policy. The response
+ladder exists in the code and is tested in our lab; the aim is that, on a
+confirmed serious threat, NorthNarrow acts at once and tells the human
+afterwards, because speed of response is part of the defence. At the far
+end, that means isolating the machine from the network so an infection
+does not spread to other servers.
 
-### Autonomy levels (default: level B)
+The intended levels (default: level B):
 
 - **Confirmed serious threats** (active ransomware, exfiltration in
-  progress, kernel exploit, lateral movement): NorthNarrow acts on its own,
-  at once. Kill, isolate, quarantine. Notify afterwards.
-
-- **Ambiguous or low-level threats**: NorthNarrow raises an alert to the
-  admin with a suggested action. It waits for human input.
-
-- **Override set by the customer**: the organisation can choose a more
-  aggressive or a more conservative level. Default = B.
+  progress, a kernel exploit, lateral movement): act at once (kill,
+  isolate, quarantine) and notify afterwards.
+- **Ambiguous or low-level threats**: alert the administrator with a
+  suggested action, and wait for a human.
+- **The organisation's choice**: a more aggressive or a more conservative
+  level, set in its signed policy.
 
 ## Supervised reactivation
 
-When NorthNarrow isolates a machine from the network in response to a
-serious threat, reactivation is **not automatic and not trivial**.
+When NorthNarrow isolates a machine, coming back online should be neither
+automatic nor trivial, so that stolen administrator credentials cannot put
+a machine that is still infected back on the network.
 
-The network comes back online only when:
+What exists today ([COMBAT_RECOVERY.md](docs/operator/COMBAT_RECOVERY.md)):
+a confirmed (locked) COMBAT has no automatic exit while the agent runs. It
+is released with `nn-admin unlock`, signed with an Ed25519 administrator
+key that belongs off the host and is bound to that install, and the
+release reports success only once the firewall reads back clear. A
+management carve-out keeps the administrators' own network reachable, so
+they are not locked out. In the alpha, isolation is recorded, not applied.
 
-1. The admin is physically present, or in a supervised session, when the
+The goal goes further:
+
+1. The administrator is present, or in a supervised session, when the
    machine starts.
-2. The admin enters a cryptographic key that only they hold.
-3. Without that key, the machine stays offline, even after repeated
-   reboots.
+2. The isolation holds across restarts and reboots until the
+   administrator's key releases it.
+3. The key can be recovered through a company key vault (ROADMAP.md).
 
-This model stops compromised admin credentials from reactivating a machine
-that is still infected. The key has a company recovery system, managed by
-a dedicated key vault (details in ROADMAP.md).
+## How we build it
 
-## Supreme defence
+This vision guides the roadmap. We do not scale it down to fit today;
+we build it in stages, one at a time and in order
+([ROADMAP.md](ROADMAP.md), and
+[CAPABILITY_PROGRAM.md](docs/roadmap/CAPABILITY_PROGRAM.md) for the
+current state), and a goal counts as reached only when a test or a lab run
+shows it.
 
-NorthNarrow is the supreme defence of everything that exists on Windows and
-Linux.
-
-NorthNarrow is the future. CrowdStrike is the past.
-
----
-
-## Golden rule
-
-This file is the contract. Every future work session (with any Claude or
-any tool) starts by reading this file first. If a tool contradicts this
-vision, the tool is wrong.
-
-The vision is not scaled down. It is built in Tappe (stages), in a fixed
-order (see ROADMAP.md). One Tappa at a time. None is skipped. There is no
-going back. Ever.
+We are building the defence we would want on our own machines.

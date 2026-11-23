@@ -4,9 +4,10 @@
 
 Before anything else, read:
 
-1. [VISION.md](VISION.md) — the contract. It defines what NorthNarrow is,
-   what its defence autonomy is, and what supervised reactivation is. It
-   is not negotiable.
+1. [VISION.md](VISION.md) — where NorthNarrow is going: its goals for
+   defence autonomy and supervised reactivation. It guides the roadmap;
+   what the agent does today is in README.md and
+   docs/operator/KNOWN_LIMITATIONS.md.
 2. [ROADMAP.md](ROADMAP.md) — the working plan. Tappe (stages) in a fixed
    order, one at a time. None is skipped. There is no going back. Ever.
 3. [VISION_TECHNICAL.md](VISION_TECHNICAL.md) — the long-term technical

@@ -409,7 +409,7 @@ binaries and its eBPF object with the manifest, and refuses to start on a mismat
 
 The tracker is [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md): one note per
 lab PR, with what moved, what the lab measured and what is still open. The history of the
-earlier stages is in [`ROADMAP.md`](ROADMAP.md) (in Italian), and the long-term vision is in
+earlier stages is in [`ROADMAP.md`](ROADMAP.md), and the long-term vision is in
 [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are published: milestones ship in order.
 
 **Done: the foundations.** eBPF sensors, the rule engine, the response engine, the adaptive

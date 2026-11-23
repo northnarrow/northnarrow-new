@@ -21,6 +21,8 @@ the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
   names `docs/roadmap/CAPABILITY_PROGRAM.md` as the current state), VISION.md,
   VISION_TECHNICAL.md, `docs/TAPPA7_PREREQ.md`,
   `docs/design/RESEARCH_TRIAGE_2026-10-11.md` and three quotes elsewhere.
+  VISION.md and VISION_TECHNICAL.md are rewritten as goals, never as the
+  current state, and point to README.md and `KNOWN_LIMITATIONS.md` for it.
 - Lot 384 (pre-alpha Phase 3c, F3c-1 to F3c-3; `UPGRADE_NOTES_WAVE4.md`
   §69).
   - **An acknowledgement ends every held finding through its row.** Past
