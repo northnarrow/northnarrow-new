@@ -1,5 +1,5 @@
 [Unit]
-Description=NorthNarrow XDR agent
+Description=NorthNarrow EDR agent
 Documentation=https://github.com/northnarrow/northnarrow-new
 # Network online so the agent's outbound posture-engaged behaviour
 # has a fully-up interface.

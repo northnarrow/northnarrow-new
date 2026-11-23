@@ -55,7 +55,7 @@ FORMATS=${NN_PKG_FORMATS:-"deb rpm"}
 REL=${NN_PKG_RELEASE:-1}
 MAINTAINER="NorthNarrow <279109805+northnarrow@users.noreply.github.com>"
 HOMEPAGE="https://github.com/northnarrow/northnarrow-new"
-SUMMARY="NorthNarrow XDR: eBPF endpoint detection and response for Linux"
+SUMMARY="NorthNarrow — endpoint detection and response for Linux"
 cd "$REPO_ROOT"
 ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 # Lot 383 (the alpha's version): the workspace version is SemVer, with at

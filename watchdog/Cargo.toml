@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow XDR anti-tamper supervisor — observes the agent's liveness via pidfd_open(2), closes the recycled-PID race on agent death via bpf_map_delete_elem on PROTECTED_PIDS, and respawns the agent under a bounded backoff policy. Per docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md."
+description = "NorthNarrow EDR anti-tamper supervisor — observes the agent's liveness via pidfd_open(2), closes the recycled-PID race on agent death via bpf_map_delete_elem on PROTECTED_PIDS, and respawns the agent under a bounded backoff policy. Per docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md."
 
 [[bin]]
 name = "northnarrow-watchdog"

@@ -1,4 +1,4 @@
-NorthNarrow XDR agent daemon (Linux).
+NorthNarrow — endpoint detection and response for Linux: the agent daemon.
 
 Usage: northnarrow-agent [OPTIONS]
 

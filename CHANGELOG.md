@@ -15,6 +15,18 @@ the pre-alpha's checks, release candidates rc1 to rc15). The workspace,
 `--version`, the tarball and the packages say `0.1.0-alpha`; the `.deb` and
 the `.rpm` carry it as `0.1.0~alpha`, which sorts before `0.1.0`.
 
+### Changed
+- Lot 393: NorthNarrow is an EDR in the alpha, "NorthNarrow — endpoint
+  detection and response for Linux", not an XDR (what an XDR adds, the
+  backend, identity, cloud and network detection, is at level 0 in
+  `docs/roadmap/CAPABILITY_PROGRAM.md`). The `.deb`'s description and the
+  `.rpm`'s summary, `northnarrow-agent --help`, `uninstall.sh --help`, the
+  units' and the slice's `Description=` (`NorthNarrow EDR agent`, …) and the
+  crates' descriptions say so; no name, path, unit file, package name or
+  behaviour changed. `xtask/tests/product_description.rs` keeps "XDR" out
+  of what describes the product as it is, and the release workflow checks
+  the built packages' description.
+
 ### Added
 - Lot 392 (docs only): the public documents say what NorthNarrow is today.
   README.md is the alpha's front page: the status (`v0.1.0-alpha`, the

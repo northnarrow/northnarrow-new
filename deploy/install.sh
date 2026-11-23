@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# NorthNarrow XDR install skeleton (Tappa 7 task 6 Watchdog W7).
+# NorthNarrow — endpoint detection and response for Linux: install (born as
+# the Tappa 7 task 6 Watchdog W7 skeleton).
 #
 # Copies the release-mode agent + watchdog binaries to
 # /usr/local/bin/ and the two systemd unit files to

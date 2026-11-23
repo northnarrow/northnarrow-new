@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# NorthNarrow XDR uninstall.
+# NorthNarrow — endpoint detection and response for Linux: uninstall.
 #
 # Removes everything deploy/install.sh put on the host, in the order the
 # anti-tamper layer requires:

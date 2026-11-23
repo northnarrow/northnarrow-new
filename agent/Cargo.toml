@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow agent daemon (Linux-first, 100% Rust XDR sensor + responder)."
+description = "NorthNarrow agent daemon (Linux-first, 100% Rust EDR sensor + responder)."
 
 [[bin]]
 name = "northnarrow-agent"
