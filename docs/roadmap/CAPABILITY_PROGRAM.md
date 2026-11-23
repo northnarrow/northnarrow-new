@@ -14778,6 +14778,26 @@ number in parentheses is a lab PR.
     the documents above. Levels unchanged: only the evidence column moved
     (the figures of C01, C14 and C16; C27's release).
   - Lab: none (docs only). Host: the full gates.
+- **Lot 393 — NorthNarrow is an EDR in the alpha: the product's
+  description everywhere (no level change).**
+  - What was open: the packages' summary ("NorthNarrow XDR: eBPF endpoint
+    detection and response for Linux"), the units' and the slice's
+    `Description=`, `northnarrow-agent --help`, `uninstall.sh --help` and
+    four crates' descriptions and root docs called the product an XDR,
+    while what an XDR adds is at level 0: C08 (identity), C09 (cloud), C10
+    (NDR) and C22 (backend).
+  - What changed (the founder's decision of 23 Nov 2026): the one-line
+    description "NorthNarrow — endpoint detection and response for Linux"
+    is the `.deb`'s synopsis, the `.rpm`'s Summary and the first line of
+    the agent's and of uninstall.sh's help; the units, the slice and the
+    crates say "NorthNarrow EDR". Unchanged: the unit and package names,
+    the paths, the protocols, the behaviour; the history (the CHANGELOG's
+    earlier entries, the design, strategy and audit records, a comment
+    that quotes an earlier release's canary templates) and the XDR goal.
+    Ratchet `xtask/tests/product_description.rs`; release.yml's package
+    job checks the description the built `.deb` and `.rpm` carry.
+  - Lab: none (descriptions only). Host: the full gates; a `.deb` built by
+    mk-packages.sh from stub binaries carried the new synopsis and units.
 - **Lot 394 — the release tag-signing key rotated before
   `v0.1.0-alpha` (config and docs; no level change).**
   - What was open: the key listed in `.github/allowed_signers` since

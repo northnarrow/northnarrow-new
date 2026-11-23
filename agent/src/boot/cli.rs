@@ -15,7 +15,7 @@ use northnarrow_agent::net::blocklist::{
 #[command(
     name = "northnarrow-agent",
     version,
-    about = "NorthNarrow XDR agent daemon (Linux)."
+    about = "NorthNarrow — endpoint detection and response for Linux: the agent daemon."
 )]
 pub(crate) struct Cli {
     // BUG-033.

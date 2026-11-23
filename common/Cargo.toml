@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The kernel↔userland ABI of the NorthNarrow XDR (raw wire layouts, BTF offsets, uapi constants, ring-drop slots) and the exec quarantine's scanner protocol."
+description = "The kernel↔userland ABI of the NorthNarrow EDR (raw wire layouts, BTF offsets, uapi constants, ring-drop slots) and the exec quarantine's scanner protocol."
 
 [lib]
 name = "northnarrow_common"

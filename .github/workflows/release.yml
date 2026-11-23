@@ -231,6 +231,14 @@ jobs:
           # %pre, %post, %preun, %postun and the %posttrans health check (lab PR 220)
           test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 5
           rpm -qp --scripts "$rpm" | grep -q -- '--package-verify'
+          # lot 393: both describe the product as mk-packages.sh's SUMMARY (an EDR), never an XDR
+          summary=$(sed -n 's/^SUMMARY="\(.*\)"$/\1/p' deploy/release/mk-packages.sh)
+          test -n "$summary"
+          test "$(dpkg-deb -f "$deb" Description | head -1)" = "$summary"
+          test "$(rpm -qp --qf '%{SUMMARY}' "$rpm")" = "$summary"
+          if { dpkg-deb -f "$deb" Description; rpm -qp --qf '%{SUMMARY}\n%{DESCRIPTION}\n' "$rpm"; } | grep -qiw xdr; then
+            echo "::error::a package describes the product as an XDR"; exit 1
+          fi
           "$tmp/usr/bin/northnarrow-agent" --version
 
       # Lot 383: every artefact carries the workspace version — the file

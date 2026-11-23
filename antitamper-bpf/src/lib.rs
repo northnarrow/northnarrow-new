@@ -1,4 +1,4 @@
-//! Shared aya-handling primitives for the NorthNarrow XDR anti-tamper
+//! Shared aya-handling primitives for the NorthNarrow EDR anti-tamper
 //! layer (ISSUE_002 extraction from `agent/src/anti_tamper/mod.rs`).
 //!
 //! This crate exists so the forthcoming **watchdog binary**

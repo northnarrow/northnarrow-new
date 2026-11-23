@@ -1,4 +1,4 @@
-//! Shared types for the NorthNarrow XDR.
+//! Shared types for the NorthNarrow EDR.
 //!
 //! Two layers live here:
 //!
