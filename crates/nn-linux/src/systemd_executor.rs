@@ -186,7 +186,7 @@ fn publish(map: &mut Option<KernelIds>, ids: &[(u64, u64)]) {
             dev: *dev,
             ino: *ino,
         });
-        if let Err(e) = map.insert(key, 1, 0) {
+        if let Err(e) = map.insert(&key, &1, 0) {
             tracing::warn!(error = %e, dev, ino, "EXECUTOR_IDS: an executor identity not written to the kernel");
         }
     }

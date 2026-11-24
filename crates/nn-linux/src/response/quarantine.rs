@@ -1618,7 +1618,7 @@ fn remove_verified(
 /// the exec quarantine share: the same notes, recorded at the same
 /// quarantine as before.
 static INDEX_NOTES: parking_lot::Mutex<BTreeMap<PathBuf, Vec<String>>> =
-    parking_lot::const_mutex(BTreeMap::new());
+    parking_lot::Mutex::new(BTreeMap::new());
 
 /// The repairs of the index of the vault `quarantine_dir` since the last
 /// call (external audit CMB-017).

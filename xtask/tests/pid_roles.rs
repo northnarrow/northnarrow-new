@@ -130,15 +130,15 @@ fn every_userland_write_of_protected_pids_names_a_role() {
     let lib = fs::read_to_string(repo_root().join("antitamper-bpf/src/lib.rs")).unwrap();
     let code = strip_comments(&lib);
     // the one raw insert is insert_role's, with a refused unknown role
-    assert_eq!(code.matches(".insert(pid, role, 0)").count(), 1);
+    assert_eq!(code.matches(".insert(&pid, &role, 0)").count(), 1);
     assert!(code.contains("if role != pid_role::AGENT && role != pid_role::WORKER {"));
     // a raw 1 is PROTECTED_OBSERVERS's (another map, presence only)
     let observers = &code[code
         .find("impl<T> ProtectedObserversHandle<T>")
         .unwrap_or(0)..];
     assert_eq!(
-        code.matches(".insert(pid, 1u8, 0)").count(),
-        observers.matches(".insert(pid, 1u8, 0)").count()
+        code.matches(".insert(&pid, &1u8, 0)").count(),
+        observers.matches(".insert(&pid, &1u8, 0)").count()
     );
     // nowhere else in userland is the map written with a value
     let mut bad = Vec::new();

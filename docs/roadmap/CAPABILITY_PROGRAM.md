@@ -15036,3 +15036,92 @@ number in parentheses is a lab PR.
     `verify-release-tag.sh version v0.1.0-alpha` passes. No lab round:
     no privileged code changed (the PR CI's privileged suites on 5.15 and
     6.8 run the worker harness).
+- **Lot 400a — aya 0.16 and aya-obj 0.6 for user space, MSRV 1.98,
+  parking_lot 0.13 (dependencies; the eBPF object unchanged, no level
+  change).**
+  - What was open: Dependabot's aya 0.14 → 0.16 (#485 at the root, #486
+    in the fuzzer) and aya-obj 0.3 → 0.6 (#484), held because both declare
+    rustc 1.98 and the MSRV was 1.89. parking_lot 0.13 (#445, #446, closed)
+    needs 1.95. Lot 400 took the eBPF crate's aya-ebpf 0.3 too, but LLVM
+    22's codegen pushed programs past the verifier. That half (lot 400b)
+    follows lot 361, and #515 stays open.
+  - What changed: aya 0.16 and aya-obj 0.6 in the workspace, `fuzz/` and
+    xtask, with parking_lot 0.13 (tokio keeps its 0.12.5). `rust-version`
+    is now 1.98, and the pinned toolchain stays 1.100. The fuzz job alone
+    moves to nightly-2026-08-05 (rustc 1.99): its harness builds the agent.
+    The ebpf-build, release and lab VM jobs keep the eBPF crate's
+    nightly-2025-12-01, and `every_dated_nightly_is_its_jobs_channel`
+    checks the two channels. `common/` declares its own `rust-version`
+    (1.93, the eBPF nightly's), because that nightly builds it too and
+    refuses a crate whose floor is above it. The eBPF object is
+    byte-identical to main's: sha256 `b3987c67…` from both trees, built
+    at the same path. The aya 0.16 API changes are:
+    - map writes take borrows;
+    - `nr_cpus()` is a `NonZeroU32`;
+    - uprobes attach by `[sym]`;
+    - `btf(None)` is gone. Every load starts from
+      `sensors::ebpf_object::object_loader()`, whose target-BTF source
+      refuses. It is the load `btf(None)` made, because the object has no
+      CO-RE relocation and no typed ksym (`the_object_needs_no_target_btf`).
+      The xtask ratchet `object_loader.rs` keeps every other `EbpfLoader`
+      out of the product.
+  - Fixed before it could ship: aya 0.16 reuses a pinned map only when it
+    is the object's map, `max_entries` included, and otherwise fails the
+    whole load. aya 0.14 took any pin. The start-in-cgroup tracker adopts
+    its registered pins, and its marks map is sized from `kernel.pid_max`
+    and `kernel.threads-max` when it is made. On 0.16, the first start
+    after either sysctl changed would therefore have refused the whole
+    object. An adoption now loads `CGROUP_JOINED` at its registered size
+    (`Plan::entries`, R2-a: a sysctl is no reset). The tests:
+    - `an_adoption_loads_the_marks_at_their_pinned_size` (unit);
+    - `a_start_adopts_the_marks_at_their_pinned_size_after_a_sysctl_change`
+      (privileged e2e);
+    - the adoption layouts of the tracker and of `module_writes`, checked
+      against the embedded object (`the_layout_an_adoption_*_is_the_object_s`).
+  - Mutations of the new code, each caught by a named test:
+    - the adoption's size dropped (`entries: None`), the sizing call
+      removed, or the sizing never taken: `an_adoption_loads_the_marks_at_their_pinned_size`
+      (its gap check made stricter for the last one);
+    - the loader's refusing BTF source removed: `object_loader_refuses_a_target_btf`;
+    - the nightly ratchet's job reader or either channel's side mutated:
+      `every_dated_nightly_is_its_jobs_channel`.
+  - Host: the full gates (6,198 workspace tests passed, golden ×5 with
+    the 66 files byte-identical, MSRV 1.98, the fuzz replay of the 15
+    targets on nightly-2026-08-05, 5 portable targets, lockfiles
+    unchanged by the build); `cargo audit --deny unsound --deny
+    unmaintained` passes on the three lockfiles;
+    `verify-release-tag.sh version v0.1.0-alpha` passes.
+  - Lab (measured, QEMU/WHPX guests, 6 GiB):
+    - **verifier-check** on 5.15 (ubuntu2204) and 6.8 (ubuntu2404): all
+      124 programs OK, every row identical to lot 396's reports (total
+      processed 5,228,657 and 2,643,251).
+    - **Privileged suites**:
+      - ubuntu2204: every suite passes but the new e2e. Its first start
+        had adopted the 32768-entry generation that the earlier tests of
+        its binary leave. It now makes its own at the host's size, and
+        `test-one cgroup_join_privileged_e2e` passes 17/17.
+      - ubuntu2404: the five runs pass (158 suites, 180 tests, the new
+        e2e among them). The workspace run's rustc was OOM-killed in the
+        6 GiB guest at 4 and at 2 jobs, so it ran with 1 job, thin LTO and
+        16 codegen units through a temporary cargo config in the guest,
+        removed afterwards.
+      - Both guests need `/etc/northnarrow` present before the first test
+        agent starts: without it, every later start is refused at
+        `agent_mounts`, the behaviour lot 356 reported.
+    - **Install, self-protection and restart**: install, `own-pins-check`
+      and `foreign-bpf-check` (F1, F2, F4, F5, F6: all pass). A restart in
+      a window (SIGTERM, and the watchdog starts the agent) gives a new
+      pid with the same census: 99 pins and 53 LSM programs on 5.15, 103
+      and 55 on 6.8. After the uninstall: no pin, no `.local`.
+    - **Upgrade in place (ubuntu2404)**: the released v0.1.0-alpha `.deb`,
+      running with the pins aya 0.14 made, upgraded to this branch's
+      `.deb` (`0.1.0~alpha-2`). The agent and the watchdog are active, no
+      unit failed, no pinned map was refused, the audit chain is intact
+      (11 → 25 rows), and the tracker's `CGROUP_JOINED` (id 10250, 47,094
+      entries) is adopted, same id. With `kernel.threads-max` and
+      `kernel.pid_max` lowered first (the host asks for 43,094), the
+      upgrade and a restart keep the same map (id 10615, 47,094 entries),
+      and so does a restart after both were raised (67,094). A cold boot
+      then starts clean (a new generation, 55 LSM programs), and the
+      package purge leaves nothing. No operator action is needed, so
+      there is no UPGRADE note.

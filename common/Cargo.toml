@@ -2,7 +2,13 @@
 name = "northnarrow-common"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Lot 400a: not the workspace's 1.98. Two compilers build this crate: the
+# workspace's (its `rust-version`, checked by the `msrv` CI job) and the
+# eBPF crate's nightly (agent-ebpf/rust-toolchain.toml, rustc
+# 1.93.0-nightly), which refuses a crate whose `rust-version` is above it.
+# The floor is the lower of the two, checked by every eBPF build; it moves
+# with the eBPF nightly (lot 400b).
+rust-version = "1.93"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

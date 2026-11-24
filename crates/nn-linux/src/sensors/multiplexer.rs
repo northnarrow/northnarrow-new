@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use aya::{
-    Btf, Ebpf, EbpfLoader,
+    Btf, Ebpf,
     maps::{MapData, ring_buf::RingBuf},
     programs::{BtfTracePoint, FExit, KProbe, TracePoint},
 };
@@ -317,8 +317,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
         // `filesystem::attach`), bound to this boot's ring, so no
         // program of an earlier boot writes into a ring nobody reads.
         let pin_root = crate::anti_tamper::prepare_pin_root();
-        let mut loader = EbpfLoader::new();
-        loader.btf(None);
+        let mut loader = crate::sensors::ebpf_object::object_loader();
         // Lab PR 219: the exploit guard's task maps. Strict's sized from
         // pid_max (or --exploit-guard-tasks), not preallocated; lite's (an
         // LRU map, always preallocated) bounded, one entry unless lite runs.
@@ -1277,7 +1276,7 @@ fn attach_fork_parent(ebpf: &mut Ebpf) {
         let mut since: aya::maps::Array<_, u64> =
             aya::maps::Array::try_from(map).map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
         since
-            .set(0, monotonic_ns(), 0)
+            .set(0, &monotonic_ns(), 0)
             .map_err(|e| format!("FORK_PARENT_SINCE: {e}"))?;
         Ok(())
     })();

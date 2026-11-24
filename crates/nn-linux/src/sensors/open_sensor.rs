@@ -63,7 +63,7 @@ pub fn set_tracepoint_emitting(ebpf: &mut Ebpf, on: bool) -> Result<()> {
         .map_mut(FILE_OPEN_TP_ON_MAP)
         .ok_or_else(|| anyhow!("{FILE_OPEN_TP_ON_MAP} missing from the eBPF object"))?;
     let mut switch: Array<&mut MapData, u32> = Array::try_from(map)?;
-    switch.set(0, u32::from(on), 0)?;
+    switch.set(0, &u32::from(on), 0)?;
     Ok(())
 }
 
@@ -726,7 +726,7 @@ impl GenerationSlot for Array<MapData, u32> {
         Ok(self.get(&0, 0)?)
     }
     fn write_generation(&mut self, value: u32) -> Result<()> {
-        Ok(self.set(0, value, 0)?)
+        Ok(self.set(0, &value, 0)?)
     }
 }
 
@@ -842,7 +842,7 @@ impl OpenSensorMaps {
             (common::wire::execq::OVERFLOW_ROW, overflow),
             (common::wire::execq::TOTAL_ROW, total),
         ] {
-            if self.task_overflow.set(row, n, 0).is_err() {
+            if self.task_overflow.set(row, &n, 0).is_err() {
                 r.failed += 1;
             }
         }
@@ -858,7 +858,7 @@ impl OpenSensorMaps {
     /// `file_open` observer classifies every open.
     pub fn arm(&mut self, on: bool) -> Result<()> {
         self.armed
-            .set(0, if on { OPEN_SENSOR_ARMED } else { 0 }, 0)?;
+            .set(0, if on { &OPEN_SENSOR_ARMED } else { &0 }, 0)?;
         Ok(())
     }
 }
@@ -888,25 +888,25 @@ fn removed(r: std::result::Result<(), aya::maps::MapError>) -> Result<()> {
 
 impl RuleMaps for OpenSensorMaps {
     fn insert_inode(&mut self, k: InodeKey, v: u32) -> Result<()> {
-        Ok(self.rules.insert(AyaInodeKey(k), v, 0)?)
+        Ok(self.rules.insert(&AyaInodeKey(k), &v, 0)?)
     }
     fn remove_inode(&mut self, k: InodeKey) -> Result<()> {
         removed(self.rules.remove(&AyaInodeKey(k)))
     }
     fn insert_child(&mut self, k: ChildRuleKey, v: u32) -> Result<()> {
-        Ok(self.children.insert(AyaChildKey(k), v, 0)?)
+        Ok(self.children.insert(&AyaChildKey(k), &v, 0)?)
     }
     fn remove_child(&mut self, k: ChildRuleKey) -> Result<()> {
         removed(self.children.remove(&AyaChildKey(k)))
     }
     fn insert_name(&mut self, k: [u8; 2 * OPEN_NAME_LEN], v: u32) -> Result<()> {
-        Ok(self.names.insert(k, v, 0)?)
+        Ok(self.names.insert(&k, &v, 0)?)
     }
     fn remove_name(&mut self, k: [u8; 2 * OPEN_NAME_LEN]) -> Result<()> {
         removed(self.names.remove(&k))
     }
     fn insert_runtime(&mut self, k: InodeKey, uid: u32) -> Result<()> {
-        Ok(self.runtime.insert(AyaInodeKey(k), uid, 0)?)
+        Ok(self.runtime.insert(&AyaInodeKey(k), &uid, 0)?)
     }
     fn remove_runtime(&mut self, k: InodeKey) -> Result<()> {
         removed(self.runtime.remove(&AyaInodeKey(k)))

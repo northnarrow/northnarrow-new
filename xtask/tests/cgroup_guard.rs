@@ -401,7 +401,7 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
         &[
             "V1Policy::Refused { .. } => CGROUP_POLICY_V1_REFUSE,",
             "V1Policy::NotRefused { .. } => 0,",
-            "arr.set(0, bits, 0)",
+            "arr.set(0, &bits, 0)",
             "for name in [CGROUP_POLICY_MAP_NAME, LIMIT_VALUES_MAP_NAME] {",
         ],
     )
@@ -420,7 +420,7 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
     in_order(
         body(&ab, "protect_unit_cgroup"),
         &[
-            "map.insert(Key(e.key), e.flags, 0)",
+            "map.insert(&Key(e.key), &e.flags, 0)",
             "write_values(bpffs_root, unit.values())?;",
         ],
     )
@@ -1337,5 +1337,5 @@ fn the_units_own_slice_is_a_service_tier() {
     .unwrap();
     let k = code("agent/src/execpol/kernel.rs");
     assert!(body(&k, "slice_ids").contains("id(\"northnarrow.slice\")"));
-    assert!(body(&k, "set_slices").contains("self.slices.set(slice_slot::OURS, ours, 0);"));
+    assert!(body(&k, "set_slices").contains("self.slices.set(slice_slot::OURS, &ours, 0);"));
 }

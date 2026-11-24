@@ -37,7 +37,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::{FExit, KProbe, Lsm, ProgramError, ProgramInfo};
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::{Btf, Ebpf};
 use common::wire::InodeKey;
 use common::wire::sensor_probe::{
     PROBE_DETAIL_LEN, PROBE_KIND_ANCESTOR, PROBE_KIND_DIR, PROBE_KIND_DNS4, PROBE_KIND_DNS6,
@@ -286,8 +286,7 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
 
     let btf = antitamper_bpf::kernel_roots::vmlinux_btf().context("loading the vmlinux BTF")?;
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
-    let mut ebpf = EbpfLoader::new()
-        .btf(None)
+    let mut ebpf = crate::sensors::ebpf_object::object_loader()
         .default_map_pin_directory(PIN_DIR)
         .load(EBPF_BYTES)
         .context("loading the eBPF object (is the installed agent still running? stop it first)")?;
@@ -298,12 +297,12 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
                 .context("PROBE_OFFSETS missing")?,
         )?;
         for slot in 1..probe_slot::COUNT {
-            arr.set(slot, u32::MAX, 0)?;
+            arr.set(slot, &u32::MAX, 0)?;
         }
         for (slot, off) in &probe_offsets {
-            arr.set(*slot, *off, 0)?;
+            arr.set(*slot, off, 0)?;
         }
-        arr.set(probe_slot::MAGIC, PROBE_OFFSETS_MAGIC, 0)?;
+        arr.set(probe_slot::MAGIC, &PROBE_OFFSETS_MAGIC, 0)?;
     }
 
     let file_open = load_lsm(&mut ebpf, rep, "probe_file_open", "file_open", &btf);
@@ -687,11 +686,11 @@ impl Probes {
                 .context("PROBE_DIRS missing")?,
         )?;
         dirs.insert(
-            AyaInodeKey(InodeKey {
+            &AyaInodeKey(InodeKey {
                 dev: stat_dev_to_kernel_dev(watched.dev()),
                 ino: watched.ino(),
             }),
-            1,
+            &1,
             0,
         )?;
         let mut names: HashMap<_, [u8; 2 * NAME_LEN], u8> = HashMap::try_from(
@@ -699,14 +698,14 @@ impl Probes {
                 .map_mut("PROBE_NAMES")
                 .context("PROBE_NAMES missing")?,
         )?;
-        names.insert(name_key("credentials", Some(".aws")), 1, 0)?;
-        names.insert(name_key("key4.db", None), 1, 0)?;
+        names.insert(&name_key("credentials", Some(".aws")), &1, 0)?;
+        names.insert(&name_key("key4.db", None), &1, 0)?;
         let mut anc: HashMap<_, [u8; NAME_LEN], u8> = HashMap::try_from(
             self.ebpf
                 .map_mut("PROBE_ANCESTORS")
                 .context("PROBE_ANCESTORS missing")?,
         )?;
-        anc.insert(name32(".gnupg"), 1, 0)?;
+        anc.insert(&name32(".gnupg"), &1, 0)?;
         Ok(())
     }
 
@@ -716,7 +715,7 @@ impl Probes {
                 .map_mut("PROBE_TARGET")
                 .context("PROBE_TARGET missing")?,
         )?;
-        t.set(0, tgid, 0)?;
+        t.set(0, &tgid, 0)?;
         Ok(())
     }
 
@@ -734,7 +733,7 @@ impl Probes {
                 .map_mut("PROBE_MODE")
                 .context("PROBE_MODE missing")?,
         )?;
-        m.set(0, mode, 0)?;
+        m.set(0, &mode, 0)?;
         Ok(())
     }
 
@@ -747,11 +746,11 @@ impl Probes {
                 .context("PROBE_DIR_CACHE missing")?,
         )?;
         c.insert(
-            AyaInodeKey(InodeKey {
+            &AyaInodeKey(InodeKey {
                 dev: stat_dev_to_kernel_dev(m.dev()),
                 ino: m.ino(),
             }),
-            0,
+            &0,
             0,
         )?;
         Ok(())

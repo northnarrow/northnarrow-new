@@ -31,9 +31,9 @@ libc = "0.2"
 [features]
 # Reserved for the YARA engine (docs/design/EXEC_QUARANTINE.md §6): no
 # engine is acceptable in this release (yara: C library, against the
-# charter; yara-x: rustc 1.95 over the workspace's 1.89 and a wasmtime JIT
-# that needs executable mappings the seccomp filter refuses). Building with
-# it fails with the reason.
+# charter; yara-x: a wasmtime JIT that needs executable mappings the
+# seccomp filter refuses — its rustc 1.95, over the workspace's 1.89 then,
+# is under lot 400a's 1.98). Building with it fails with the reason.
 yara = []
 
 [dev-dependencies]

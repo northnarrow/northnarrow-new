@@ -446,7 +446,7 @@ unsafe impl aya::Pod for ValueKey {}
 /// stale-key prune).
 fn register_value(ebpf: &mut Ebpf, key: &InodeKey, value: &LimitValue) -> Result<()> {
     values_map(ebpf)?
-        .insert(ValueKey(*key), *value, 0)
+        .insert(&ValueKey(*key), value, 0)
         .with_context(|| {
             format!(
                 "inserting the value of (dev={}, ino={}) into {LIMIT_VALUES_MAP_NAME}",
@@ -523,7 +523,7 @@ pub(crate) fn arm_v1_policy(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> Result<
             .ok_or_else(|| anyhow!("map {CGROUP_POLICY_MAP_NAME} missing from eBPF object"))?;
         let mut arr: AyaArray<&mut MapData, u32> = AyaArray::try_from(map)
             .with_context(|| format!("{CGROUP_POLICY_MAP_NAME} is not an Array<u32>"))?;
-        arr.set(0, bits, 0)
+        arr.set(0, &bits, 0)
             .with_context(|| format!("writing {CGROUP_POLICY_MAP_NAME}[0]"))?;
     }
     if let Some(root) = pin_root {

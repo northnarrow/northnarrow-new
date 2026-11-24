@@ -348,12 +348,15 @@ jobs:
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h / | tail -1
 
-      # libFuzzer needs nightly (-Zsanitizer); the same channel as the eBPF
-      # build so one toolchain download serves both. External audit
-      # SUP-005: cargo-fuzz pinned (the version runs resolved on 2026-10-15).
+      # libFuzzer needs nightly (-Zsanitizer). Lot 400a: the harness builds
+      # the agent, whose aya 0.16 and aya-obj 0.6 need rustc 1.98, so this
+      # job's nightly is its own (a 1.99 one), no longer the eBPF crate's
+      # (agent-ebpf/rust-toolchain.toml, 1.93); every line of this job names
+      # it (xtask/tests/supply_chain.rs). External audit SUP-005: cargo-fuzz
+      # pinned (the version runs resolved on 2026-10-15).
       - name: Install nightly toolchain + cargo-fuzz (pinned)
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal
+          rustup toolchain install nightly-2026-08-05 --profile minimal
           rustup toolchain install   # the pinned release builds cargo-fuzz (rust-toolchain.toml)
           cargo install cargo-fuzz --version 0.13.2 --locked
 
@@ -377,7 +380,7 @@ jobs:
       # harness's manifest (and the agent's, which it builds) first, and
       # must be unchanged after the build (external audit SUP-016).
       - name: fuzz/Cargo.lock is authoritative
-        run: cd fuzz && cargo +nightly-2025-12-01 fetch --locked
+        run: cd fuzz && cargo +nightly-2026-08-05 fetch --locked
 
       # External audit SUP-018: the working corpus carries over between
       # runs, saved under this run's id and restored from the latest one.
@@ -402,12 +405,12 @@ jobs:
       - name: Build, replay the committed inputs, smoke every fuzz target
         run: |
           set -euo pipefail
-          cargo +nightly-2025-12-01 fuzz build
+          cargo +nightly-2026-08-05 fuzz build
           # Run the built binaries directly: `cargo fuzz run` re-invokes
           # cargo for every run.
           bin=fuzz/target/x86_64-unknown-linux-gnu/release
           failed=""
-          for t in $(cargo +nightly-2025-12-01 fuzz list); do
+          for t in $(cargo +nightly-2026-08-05 fuzz list); do
             echo "::group::$t"
             mkdir -p "fuzz/corpus/$t" "fuzz/artifacts/$t"
             if [ ! -d "fuzz/seeds/$t" ]; then
@@ -438,8 +441,10 @@ jobs:
   msrv:
     # External audit SUP-015: `rust-version` in Cargo.toml is a claim this
     # job checks. It was 1.83 while uuid 1.28.0 needed 1.89, and nothing
-    # built with it. The version is read from Cargo.toml, so raising it
-    # needs no edit here. No cache (a check of the workspace takes minutes,
+    # built with it; lot 400a's aya 0.16 and aya-obj 0.6 raised it to 1.98.
+    # The version is read from Cargo.toml, so raising it needs no edit here
+    # (common/ declares the eBPF nightly's own lower floor, which every
+    # eBPF build checks). No cache (a check of the workspace takes minutes,
     # and nothing restored can mark a crate fresh), and no -D warnings: the
     # claim is that this rustc builds the tree; the lints are the pinned
     # toolchain's job (clippy above).

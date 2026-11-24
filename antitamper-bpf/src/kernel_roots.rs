@@ -2730,7 +2730,10 @@ mod tests {
         assert_eq!(cpu_count("x"), None);
         let text = std::fs::read_to_string("/sys/devices/system/cpu/possible").unwrap();
         assert_eq!(possible_cpus(), Ok(cpu_count(text.trim()).unwrap()));
-        assert_eq!(possible_cpus().unwrap(), aya::util::nr_cpus().unwrap());
+        assert_eq!(
+            possible_cpus().unwrap(),
+            aya::util::nr_cpus().unwrap().get() as usize
+        );
     }
 
     /// Lot 353 (fix round 5, the KVM suites of #563; named): a path below
