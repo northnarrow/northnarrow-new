@@ -73,9 +73,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-btf-matrix-v2-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          # Lot 397: keyed on the toolchain too (a target/ is of no use to
+          # another compiler; xtask/tests/supply_chain.rs checks it).
+          key: ${{ runner.os }}-cargo-btf-matrix-v2-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-btf-matrix-v2-
+            ${{ runner.os }}-cargo-btf-matrix-v2-${{ hashFiles('rust-toolchain.toml') }}-
 
       # SUP-013, SUP-014, SUP-021: run.sh's own cases, offline (stub curl,
       # gh and agent, a local directory as the archive), before it is trusted

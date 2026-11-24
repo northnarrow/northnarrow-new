@@ -504,9 +504,9 @@ mod tests {
         }
         assert_eq!(cell(&t, T::SESSION, class::HOME), Cell::Allow);
         assert_eq!(cell(&t, T::SERVICE, class::HOME), Cell::Quarantine);
-        for c in 0..CLASSES {
-            assert_ne!(t.exec[T::ADMIN as usize][c], Cell::Deny);
-            assert_ne!(t.exec[T::ADMIN as usize][c], Cell::Quarantine);
+        for (c, cell) in t.exec[T::ADMIN as usize].iter().enumerate() {
+            assert_ne!(*cell, Cell::Deny, "class {c}");
+            assert_ne!(*cell, Cell::Quarantine, "class {c}");
         }
         assert_eq!(cell(&t, T::ADMIN, class::MEMFD), Cell::Audit);
         assert_eq!(t.env[T::SERVICE as usize], EnvRule::Deny);

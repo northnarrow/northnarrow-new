@@ -14865,3 +14865,38 @@ number in parentheses is a lab PR.
   - Host: the full gates (6,185 workspace tests passed, golden ×5, MSRV 1.89, 15 fuzz targets, 5 portable targets, lockfiles unchanged); `verify-release-tag.sh version
     v0.1.0-alpha` passes; the CHANGELOG's 0.1.0-alpha section untouched
     (`verify-release-tag.sh` refuses an `[Unreleased]` on top).
+- **Lot 397 — Rust toolchain 1.100.0 (no behaviour change, no level
+  change).**
+  - What was open: `rust-toolchain.toml` pinned 1.99.1 while 1.100.0 was
+    the stable (2026-11-12); a pin left behind gets no fixes, and its
+    lints would meet code written under them later.
+  - What changed: `channel = "1.100.0"`; `rust-version` stays 1.89, the
+    eBPF crate's nightly-2025-12-01 and bpf-linker 0.10.3 stay (lot 400),
+    no dependency or lockfile moved. Its clippy found two sites under
+    `-D warnings`, both fixed in code, no `allow`: `needless_bool`'s
+    early-return guard in nn-linux's `cgroup_join::debug_reset` (a
+    `#[cfg]` block per configuration; a release still compiles `false`
+    only) and `needless_range_loop` in the execpol `the_server_profile`
+    test (the same cells, each assert now naming its class). Cargo's new
+    `unused_dependencies` (a warning, outside `-D warnings`) names `procfs`
+    among nn-linux's dependencies, read only by `response::kill`'s tests;
+    making it a dev-dependency drops one line of `fuzz/Cargo.lock`, so it
+    is left to a lot that may move a lockfile. Cargo 1.100
+    lays the build dir out anew (`<profile>/build/<package>/<hash>/`): CI's
+    `target/` caches were keyed on the lockfiles and manifests only, so a
+    toolchain bump hit them exactly, restored the old compiler's tree and
+    never saved; they are now keyed on their `rust-toolchain.toml` too
+    (`supply_chain.rs::a_cached_target_is_keyed_on_its_toolchain`, which
+    fails on main), and `prune-workspace-cache.sh` names the new layout,
+    its test covering both. What else of 1.100 touches the tree (the
+    `ENOTSUP` → `ErrorKind::Unsupported` mapping, the never type, Unicode
+    18, `cargo::unused_dependencies`, `cargo install`'s lockfile) is
+    listed in the PR: none changes a result.
+  - Lab: none (the eBPF toolchain and object are unchanged). Host:
+    the full gates (6,186 workspace tests passed, golden ×5 with the 66
+    files byte-identical, MSRV 1.89, 15 fuzz targets, 5 portable targets,
+    lockfiles unchanged); `verify-release-tag.sh version v0.1.0-alpha`
+    passes, the CHANGELOG's 0.1.0-alpha section untouched. The release
+    binaries against 1.99.1 (same tree, fat LTO): the agent +0.05 %
+    (31,371,928 bytes), the watchdog −0.05 %, nn-admin and `northnarrow`
+    +0.00 %, the scanner −0.11 %.
