@@ -4,11 +4,11 @@
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
+use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 use common::wire::execq::{
-    conf_slot, counter, root_kind, ExecqCandRaw, ExecqKey, ExecqKnown, ExecqStopped,
+    ExecqCandRaw, ExecqKey, ExecqKnown, ExecqStopped, conf_slot, counter, root_kind,
 };
 
 /// `ExecqKey` for aya (its own `Pod` marker; the orphan rule forbids
@@ -1011,10 +1011,11 @@ mod tests {
             "the later system root is in"
         );
         let tmp = std::fs::metadata("/tmp").unwrap();
-        assert!(map
-            .held
-            .iter()
-            .any(|(k, _)| k.ino == tmp.ino() && k.ino != FUSE_BY_DEVICE));
+        assert!(
+            map.held
+                .iter()
+                .any(|(k, _)| k.ino == tmp.ino() && k.ino != FUSE_BY_DEVICE)
+        );
         // a map with room for the system roots only: every FUSE root left out
         map.cap = 2;
         map.held.clear();

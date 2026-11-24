@@ -1,0 +1,6 @@
+# Lot 396 (#605): the code is edition 2024, and so is its style. `cargo fmt`
+# takes both from Cargo.toml; these lines say the same to a `rustfmt` run
+# on a file by itself (an editor), which would otherwise parse it as
+# edition 2015. agent-ebpf/ and fuzz/ are not formatted by the gates.
+edition = "2024"
+style_edition = "2024"

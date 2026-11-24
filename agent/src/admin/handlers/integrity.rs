@@ -22,8 +22,8 @@ use nn_proto::admin_protocol::{
 };
 use nn_proto::admin_signed_payload::INTEGRITY_ACK_NOTE_MAX;
 
-use crate::admin::verify::{signed, Verified};
 use crate::admin::AuditClient;
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::audit::AuditLog;
 

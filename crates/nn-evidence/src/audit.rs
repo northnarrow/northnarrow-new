@@ -80,9 +80,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -2406,16 +2406,20 @@ mod tests {
         refused.op = "rotate_keys_add".to_string();
         refused.result = "quorum_not_met".to_string();
         log.append(refused).unwrap();
-        assert!(!AuditLog::open(&log_path, key(), [0u8; 16])
-            .unwrap()
-            .second_key_added());
+        assert!(
+            !AuditLog::open(&log_path, key(), [0u8; 16])
+                .unwrap()
+                .second_key_added()
+        );
         let mut added = sample_draft(2);
         added.op = "rotate_keys_add".to_string();
         added.result = "success".to_string();
         log.append(added).unwrap();
-        assert!(AuditLog::open(&log_path, key(), [0u8; 16])
-            .unwrap()
-            .second_key_added());
+        assert!(
+            AuditLog::open(&log_path, key(), [0u8; 16])
+                .unwrap()
+                .second_key_added()
+        );
     }
 
     #[test]
@@ -2466,7 +2470,7 @@ mod tests {
     /// High, held until acknowledged.
     #[test]
     fn a_gap_names_a_refused_start_or_a_rescue_boot_when_the_facts_show_them() {
-        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        use crate::boot_gap::{BOOTS_WITHOUT_AGENT_KIND, BootContinuity};
         const BOOT_B: &str = "1111aaaa-2222-3333-4444-555566667777";
         const BOOT_D: &str = "2222bbbb-3333-4444-5555-666677778888";
         let n = |b: &str| crate::boot_gap::normalize(b).unwrap();
@@ -2599,7 +2603,7 @@ mod tests {
     /// and tried again until it is signed, once.
     #[test]
     fn a_gap_row_whose_write_failed_is_tried_again_until_signed() {
-        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        use crate::boot_gap::{BOOTS_WITHOUT_AGENT_KIND, BootContinuity};
         let (_d, key_path, log_path) = fresh_paths();
         let mut log = AuditLog::open(&log_path, faulty(&key_path), [0u8; 16]).unwrap();
         log.set_boot(Some(BOOT_A.into()), BootContinuity::FirstRun);
@@ -2646,12 +2650,13 @@ mod tests {
             log.retry_boot_continuity().unwrap().is_none(),
             "signed once"
         );
-        assert!(log
-            .held()
-            .findings()
-            .iter()
-            .any(|f| f.kind == BOOTS_WITHOUT_AGENT_KIND
-                && f.hold == crate::held::Hold::UntilAcknowledged));
+        assert!(
+            log.held()
+                .findings()
+                .iter()
+                .any(|f| f.kind == BOOTS_WITHOUT_AGENT_KIND
+                    && f.hold == crate::held::Hold::UntilAcknowledged)
+        );
         drop(log);
         let gap_rows = |p: &Path| {
             every_line_a_row(p)
@@ -2700,7 +2705,7 @@ mod tests {
     /// acknowledgement.
     #[test]
     fn a_boot_without_the_agent_is_signed_at_the_next_start_never_clean() {
-        use crate::boot_gap::{BootContinuity, BOOTS_WITHOUT_AGENT_KIND};
+        use crate::boot_gap::{BOOTS_WITHOUT_AGENT_KIND, BootContinuity};
         let (_d, key_path, log_path) = fresh_paths();
         let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
@@ -2770,7 +2775,7 @@ mod tests {
     /// `unknown` — never `clean` — and an advisory row says why.
     #[test]
     fn boots_not_knowable_are_unknown_never_clean() {
-        use crate::boot_gap::{BootContinuity, BOOT_CONTINUITY_UNKNOWN_KIND};
+        use crate::boot_gap::{BOOT_CONTINUITY_UNKNOWN_KIND, BootContinuity};
         let (_d, key_path, log_path) = fresh_paths();
         let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
@@ -2794,10 +2799,12 @@ mod tests {
         assert_eq!(row.extra["kind"], BOOT_CONTINUITY_UNKNOWN_KIND);
         assert_eq!(row.extra.get("severity"), None);
         assert_eq!(row.extra["why"], "a volatile journal");
-        assert!(row.extra["detail"]
-            .as_str()
-            .unwrap()
-            .contains("does not tell a clean succession"));
+        assert!(
+            row.extra["detail"]
+                .as_str()
+                .unwrap()
+                .contains("does not tell a clean succession")
+        );
         let holds: Vec<_> = log
             .held()
             .findings()
@@ -3287,9 +3294,10 @@ mod tests {
             Ok(l) => l,
             Err(_) => return, // open itself refusing is the same signal
         };
-        assert!(log
-            .boot_probe(None, "verified", "attested", &test_build())
-            .is_err());
+        assert!(
+            log.boot_probe(None, "verified", "attested", &test_build())
+                .is_err()
+        );
     }
 
     #[test]
@@ -3644,14 +3652,16 @@ mod tests {
             all.iter().map(|r| r.seq).collect::<Vec<_>>(),
             [None, None, None, Some(3), Some(4)]
         );
-        assert!(AuditLog::open(
-            &log_path,
-            TestKey::load_or_bootstrap(&key_path).unwrap(),
-            [0u8; 16]
-        )
-        .unwrap()
-        .take_open_findings(&log_path)
-        .is_empty());
+        assert!(
+            AuditLog::open(
+                &log_path,
+                TestKey::load_or_bootstrap(&key_path).unwrap(),
+                [0u8; 16]
+            )
+            .unwrap()
+            .take_open_findings(&log_path)
+            .is_empty()
+        );
     }
 
     /// External audit ASK-013 (NN-AUD-239, lab PR 179): an admin peer's
@@ -3958,10 +3968,12 @@ mod tests {
         let changed = drifts(&all, AGENT_ID_CHANGED_KIND);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].extra["source"], "minted");
-        assert!(changed[0].extra["detail"]
-            .as_str()
-            .unwrap()
-            .contains("removed and minted again"));
+        assert!(
+            changed[0].extra["detail"]
+                .as_str()
+                .unwrap()
+                .contains("removed and minted again")
+        );
         whole_chain_verifies(&log_path, &key());
     }
 
@@ -4547,12 +4559,14 @@ mod tests {
             "nothing cut, nothing attested"
         );
         assert_eq!(rows[2].seq, Some(2));
-        assert!(AuditLog::open(
-            &log_path,
-            TestKey::load_or_bootstrap(&key_path).unwrap(),
-            [0u8; 16]
-        )
-        .is_ok());
+        assert!(
+            AuditLog::open(
+                &log_path,
+                TestKey::load_or_bootstrap(&key_path).unwrap(),
+                [0u8; 16]
+            )
+            .is_ok()
+        );
     }
 
     /// Lot 379: an integrity finding whose row reached the file whole though

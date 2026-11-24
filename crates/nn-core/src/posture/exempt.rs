@@ -40,8 +40,8 @@
 
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::host::PostureHost;
 
@@ -241,7 +241,7 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
         Err(e) => {
             return WatchdogResolution::InvalidPidfile {
                 reason: format!("{e}"),
-            }
+            };
         }
     };
     // External audit POS-009, lot 315 (external bug hunt 1.4, BUG-113): the
@@ -258,7 +258,7 @@ pub(crate) fn resolve_with_proc_root<H: PostureHost>(
             return WatchdogResolution::Unverifiable {
                 pid,
                 reason: format!("readlink {}: {e}", exe_link.display()),
-            }
+            };
         }
     };
     // `/proc/<pid>/exe` carries a " (deleted)" suffix if the binary was
@@ -291,7 +291,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
 
-    use crate::posture::host::testing::{symlink, TestHost as H};
+    use crate::posture::host::testing::{TestHost as H, symlink};
 
     /// R08a (lab PR 250): the exemption and its readers on the portable
     /// test host.
@@ -319,7 +319,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("stat"),
-            format!("{pid} (northnarrow-wa) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+            format!(
+                "{pid} (northnarrow-wa) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+            ),
         )
         .unwrap();
     }

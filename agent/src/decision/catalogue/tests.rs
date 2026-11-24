@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 
 use nn_model::Severity;
 
-use super::render::{self, parse_pinned, parse_tsv, Pinned, PinnedRow, ShippedRule};
-use super::{docs, RuleDoc};
-use crate::decision::attack::{AttackRef, Tactic, ATTACK_IDS_FILE, ATTACK_VERSION};
+use super::render::{self, Pinned, PinnedRow, ShippedRule, parse_pinned, parse_tsv};
+use super::{RuleDoc, docs};
+use crate::decision::attack::{ATTACK_IDS_FILE, ATTACK_VERSION, AttackRef, Tactic};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("NN_REPO_ROOT"))

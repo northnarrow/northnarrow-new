@@ -22,26 +22,27 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
+use anyhow::{Result, anyhow};
 use aya::Ebpf;
+use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
+use common::wire::InodeKey;
 use common::wire::open_sensor::{
+    CHILD_RULES_MAX, ChildRuleKey, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX,
+    OPEN_PATH_SLOT_LEN, OPEN_PATH_SLOTS, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, OpenRecordRaw,
+    OpenTaskRaw, RUNTIME_UIDS_MAX,
     open_class::{
-        CHILDREN_PROBE, CHILD_FILES, DIR_HAS_FILES, FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE,
+        CHILD_FILES, CHILDREN_PROBE, DIR_HAS_FILES, FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE,
         LEAF_CRED, LEAVES_CRED, SUBTREE, TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME,
         TREE_PERSIST, TREE_RUNTIME, TREE_SHM, TREE_SVC_DATA, TREE_UNIT_DATA, TREE_USER_CACHE,
         UNIT_TAG_SHIFT,
     },
-    open_reason, ChildRuleKey, OpenRecordRaw, OpenTaskRaw, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH,
-    OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX,
-    OPEN_SENSOR_ARMED, RUNTIME_UIDS_MAX,
+    open_reason,
 };
-use common::wire::InodeKey;
-use nn_model::telemetry::{FileCapability, FimEvent, FimOp};
 use nn_model::Event;
+use nn_model::telemetry::{FileCapability, FimEvent, FimOp};
 use tracing::{info, warn};
 
-use crate::anti_tamper::filesystem::{stat_dev_to_kernel_dev, AyaInodeKey};
+use crate::anti_tamper::filesystem::{AyaInodeKey, stat_dev_to_kernel_dev};
 use crate::sensors::reject::RejectThrottle;
 
 /// The ring of interesting opens.
@@ -236,7 +237,7 @@ pub type OwnedDir = (PathBuf, u32);
 /// absolute. [`RuleSet::build`] keeps the directories that exist, are no
 /// symbolic link and belong to their account.
 pub fn account_dirs(passwd: &str, uid_min: u32) -> (Vec<OwnedDir>, Vec<OwnedDir>) {
-    use nn_core::decision::host::{classify_account, AccountKind};
+    use nn_core::decision::host::{AccountKind, classify_account};
     let mut svc = Vec::new();
     let mut caches = Vec::new();
     for line in passwd.lines() {
@@ -1496,7 +1497,7 @@ pub fn mount_points(mountinfo: &str) -> Vec<String> {
 pub use crate::path_text::unescape_octal;
 /// The text of the paths this sensor renders, shared with their readers:
 /// `crate::path_text`'s since R04b (lab PR 241), named here as before.
-pub use crate::path_text::{path_is_exact, CUT_MARK, UNREAD_COMPONENT};
+pub use crate::path_text::{CUT_MARK, UNREAD_COMPONENT, path_is_exact};
 
 /// The record's path components, leaf → root. External audit SNS-006: a
 /// name of `OPEN_PATH_SLOT_LEN - 1` bytes may have been cut (a longer name
@@ -2740,9 +2741,11 @@ mod tests {
         let f = std::fs::File::open(&info).unwrap();
         assert!(!mounts_changed(&f));
         assert!(MountTable::load_from(&info).watch.is_some());
-        assert!(MountTable::load_from(&t.path().join("none"))
-            .watch
-            .is_none());
+        assert!(
+            MountTable::load_from(&t.path().join("none"))
+                .watch
+                .is_none()
+        );
     }
 
     /// A generation slot that can fail its read.
@@ -2790,10 +2793,11 @@ mod tests {
         maps.slot.fail_read = true;
         let a = apply_rules(&mut maps, &busy_set(), None);
         assert!(a.generation_failed && a.degraded());
-        assert!(a
-            .first_error
-            .as_deref()
-            .is_some_and(|e| e.contains("DIR_CLASS_GEN")));
+        assert!(
+            a.first_error
+                .as_deref()
+                .is_some_and(|e| e.contains("DIR_CLASS_GEN"))
+        );
     }
 
     /// External audit SNS-011: the generation moves forward from the later
@@ -4016,10 +4020,11 @@ mod tests {
         );
         assert_eq!(a.failed, 3);
         assert!(a.degraded());
-        assert!(a
-            .first_error
-            .as_deref()
-            .is_some_and(|e| e.contains("E2BIG")));
+        assert!(
+            a.first_error
+                .as_deref()
+                .is_some_and(|e| e.contains("E2BIG"))
+        );
         // the other maps were written past the refused inode rules
         assert_eq!(maps.children.len(), 1);
         assert_eq!(maps.names.len(), 1);
@@ -4080,11 +4085,11 @@ mod tests {
         assert_eq!(h.note(&bad(3)), RuleHealthChange::Same);
         assert_eq!(h.note(&bad(5)), RuleHealthChange::Changed);
         assert_eq!(h.note(&ok), RuleHealthChange::Recovered);
-        let gen = Applied {
+        let generation_failed = Applied {
             generation_failed: true,
             ..Applied::default()
         };
-        assert_eq!(h.note(&gen), RuleHealthChange::Degraded);
+        assert_eq!(h.note(&generation_failed), RuleHealthChange::Degraded);
     }
 
     /// External audit SNS-007: the kernel maps hold the sizes this side

@@ -26,12 +26,12 @@ pub mod policy;
 pub mod record;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{anyhow, Context, Result};
-use aya::programs::Lsm;
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
+use aya::programs::Lsm;
 use common::wire::execpol::{counter, mode};
 use parking_lot::Mutex;
 use tracing::{info, warn};

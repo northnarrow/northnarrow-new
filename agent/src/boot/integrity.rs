@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use northnarrow_agent::agent_id;
-use northnarrow_agent::boot::{checks, BootSequence, BootStep};
+use northnarrow_agent::boot::{BootSequence, BootStep, checks};
 use northnarrow_agent::response::ExecutorConfig;
 use tracing::{debug, error, info, warn};
 
@@ -170,7 +170,7 @@ pub(crate) fn check(
     // lab PR 218 (external review G-09 / Q11-03), before anything attaches.
     let integrity = {
         use northnarrow_agent::install_manifest::{
-            BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
+            ALLOW_UNVERIFIED_ENV, BootHistory, IntegrityOutcome,
         };
         // External audit DEP-009: a missing manifest is a removal once a
         // boot of this install verified against it — the signed chain is
@@ -545,7 +545,7 @@ pub(crate) fn resolve_gate_with(
     use nn_core::response::profile::{self as prof, Profile};
     use nn_proto::admin_signed_payload::OverlayKind;
     use northnarrow_agent::config::overlay_auth::Verified;
-    use northnarrow_agent::install_manifest::{install_profile, InstallProfile};
+    use northnarrow_agent::install_manifest::{InstallProfile, install_profile};
     let overlay = match overlay_gate.verified(OverlayKind::Profile, &cli.profile_local) {
         Verified::Content { path, text } => match Profile::parse(&text) {
             Ok(p) => Some(p),
@@ -644,8 +644,8 @@ mod tests {
     /// key for agent `[3; 16]`, and the gate that trusts that key.
     fn signed_profile(dir: &std::path::Path, body: &str) -> OverlayGate {
         use ed25519_dalek::SigningKey;
-        use nn_proto::admin_signed_payload::{sign, OverlayKind, SignedPayload};
-        use northnarrow_agent::config::overlay_auth::{content_sha256, sig_path, OverlaySignature};
+        use nn_proto::admin_signed_payload::{OverlayKind, SignedPayload, sign};
+        use northnarrow_agent::config::overlay_auth::{OverlaySignature, content_sha256, sig_path};
         let key = SigningKey::generate(&mut northnarrow_agent::os_rng::OsRng);
         let admin_pub = dir.join("admin.pub");
         std::fs::write(

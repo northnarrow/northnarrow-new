@@ -286,9 +286,10 @@ mod tests {
         // the buckets spent, a Critical drift still goes through
         while rl.try_consume(DriftSeverity::Medium).is_ok() {}
         while rl.try_consume(DriftSeverity::High).is_ok() {}
-        assert!(rl
-            .try_consume(c.classify(FimOp::Modified, "/usr/sbin/sshd"))
-            .is_ok());
+        assert!(
+            rl.try_consume(c.classify(FimOp::Modified, "/usr/sbin/sshd"))
+                .is_ok()
+        );
         assert_eq!(
             c.classify(FimOp::Opened, "/usr/sbin/sshd"),
             DriftSeverity::Medium

@@ -418,9 +418,10 @@ mod tests {
         );
         let dot = resolver_dns_over_tls_under(r).expect("on");
         assert_eq!(dot.mode, DotMode::Yes);
-        assert!(dot
-            .source
-            .ends_with("etc/systemd/resolved.conf.d/50-dot.conf"));
+        assert!(
+            dot.source
+                .ends_with("etc/systemd/resolved.conf.d/50-dot.conf")
+        );
 
         // A later name wins whatever its directory; an empty value resets.
         write(
@@ -580,7 +581,7 @@ mod tests {
     /// entry; off, nothing is added.
     #[test]
     fn a_resolver_on_dns_over_tls_lists_the_blind_dns_rules() {
-        use crate::net::blind_spots::{resolver_dns_over_tls_under, DotMode, ResolverDot};
+        use crate::net::blind_spots::{DotMode, ResolverDot, resolver_dns_over_tls_under};
         let dot = ResolverDot {
             mode: DotMode::Yes,
             source: std::path::PathBuf::from("/etc/systemd/resolved.conf.d/50-dot.conf"),

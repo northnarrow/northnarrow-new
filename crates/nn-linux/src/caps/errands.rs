@@ -13,8 +13,8 @@
 //! The thread must be started by a thread that holds the core's sets (it
 //! inherits its creator's): the start's, before the decision thread runs.
 
-use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use parking_lot::Mutex;

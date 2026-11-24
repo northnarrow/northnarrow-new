@@ -40,32 +40,35 @@ const EPERM: c_int = 1;
 /// through and counted in `hook`'s fail-open slot.
 #[inline(always)]
 pub(crate) unsafe fn refuse_task_change(task: *const c_void, op: u8, detail: u64, hook: u32) -> bool {
-    if task.is_null() {
-        return false;
-    }
-    let tgid = match bpf_probe_read_kernel::<u32>(
-        (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            crate::fail_open::bump(hook);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if task.is_null() {
             return false;
         }
-    };
-    if !crate::task_kill::is_protected_pid(tgid)
-        && !crate::bpf_defense::task_runs_own_binary(task as *const u8)
-    {
-        return false;
+        let tgid = match bpf_probe_read_kernel::<u32>(
+            (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                crate::fail_open::bump(hook);
+                return false;
+            }
+        };
+        if !crate::task_kill::is_protected_pid(tgid)
+            && !crate::bpf_defense::task_runs_own_binary(task as *const u8)
+        {
+            return false;
+        }
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if caller == tgid
+            || crate::task_kill::is_exempt_pid(caller)
+            || crate::inode_protect::override_active()
+        {
+            return false;
+        }
+        crate::inode_protect::emit_task_denial(op, detail, tgid);
+        true
     }
-    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if caller == tgid
-        || crate::task_kill::is_exempt_pid(caller)
-        || crate::inode_protect::override_active()
-    {
-        return false;
-    }
-    crate::inode_protect::emit_task_denial(op, detail, tgid);
-    true
 }
 
 /// `int task_setrlimit(struct task_struct *p, unsigned int resource,

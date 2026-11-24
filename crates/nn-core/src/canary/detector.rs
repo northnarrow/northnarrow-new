@@ -97,7 +97,7 @@ use parking_lot::Mutex;
 use tracing::{error, warn};
 
 use crate::canary::host::{CanaryAccessDraft, CanaryHost};
-use crate::canary::network::{connect_destination, CanaryAddr, PortCanaries};
+use crate::canary::network::{CanaryAddr, PortCanaries, connect_destination};
 
 // ── hot-path indexes ────────────────────────────────────────────────
 

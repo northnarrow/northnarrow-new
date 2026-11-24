@@ -86,8 +86,8 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -98,8 +98,8 @@ use nn_model::posture_types::TriggerType;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::CombatCause;
 
-use super::offender::OffenderId;
 use super::CombatStage;
+use super::offender::OffenderId;
 
 /// One ladder stage transition — the payload of a signed audit entry.
 #[derive(Debug, Clone)]

@@ -332,8 +332,11 @@ pub struct DirClass {
     /// Owner of a runtime directory (`TREE_RUNTIME`) or, lot 283c, of a
     /// person's cache directory (`TREE_USER_CACHE`).
     pub uid: u32,
-    /// `DIR_CLASS_GEN[0]` when computed; any other value is stale.
-    pub gen: u32,
+    /// `DIR_CLASS_GEN[0]` when computed; any other value is stale. Lot
+    /// 396: a raw identifier, edition 2024 reserving `gen`; the field keeps
+    /// its name (lab PR 233), so the object's BTF and `Debug` still say
+    /// `gen`.
+    pub r#gen: u32,
     pub _pad: u32,
 }
 

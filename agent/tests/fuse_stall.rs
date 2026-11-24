@@ -33,8 +33,8 @@
 //! allocator's, a registry's) left the child waiting on it for ever.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long the loops run under the mounts: past the admin socket's first
@@ -358,6 +358,9 @@ fn the_critical_loops_keep_going_under_a_fuse_that_answers_one_lookup() {
     // under CI a run that cannot happen here fails (`fuse_testing::ran`)
     let rc = nn_linux::fuse_testing::in_userns(move || run_loops(&path));
     if let Some(rc) = nn_linux::fuse_testing::ran(rc) {
-        assert_eq!(rc, 0, "loops stalled (bits, in order: runtime, status, decision, signing, refresh, entropy): {rc:#b}");
+        assert_eq!(
+            rc, 0,
+            "loops stalled (bits, in order: runtime, status, decision, signing, refresh, entropy): {rc:#b}"
+        );
     }
 }

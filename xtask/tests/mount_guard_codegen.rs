@@ -54,7 +54,7 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
         .find("if guard != 0 && !q.held {")
         .expect("the top's own check");
     assert!(walk < top, "the walk is folded in before the top");
-    assert!(hook.contains("if below {\n        q.held = true;"));
+    assert!(hook.contains("if below {\n            q.held = true;"));
     for (f, sig) in [
         (
             "subtree_takes",
@@ -70,8 +70,10 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
         assert_eq!(attr.trim(), "#[inline(never)]", "{f} must stay out of line");
     }
     let walker = &e[e.find("fn subtree_takes(").unwrap()..];
-    assert!(walker[..walker.find("\n}\n").unwrap()]
-        .contains("below_takes_held(umount_below(&Subtree { o, by_id }, real), by_id != 0)"));
+    assert!(
+        walker[..walker.find("\n}\n").unwrap()]
+            .contains("below_takes_held(umount_below(&Subtree { o, by_id }, real), by_id != 0)")
+    );
     // the tree read is the kernel's: the children and the siblings' links
     let tree = &e[e.find("impl Tree for Subtree").expect("the kernel's tree")..];
     for f in ["o.mnt_mounts", "o.mnt_child", "o.mnt_parent", "below_of("] {

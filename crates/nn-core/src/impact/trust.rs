@@ -63,7 +63,7 @@ use std::time::SystemTime;
 use parking_lot::Mutex;
 
 use crate::decision::host::DecisionHost;
-use crate::posture::lineage::{in_system_tree, is_interpreter, ExecIdentity, Runs};
+use crate::posture::lineage::{ExecIdentity, Runs, in_system_tree, is_interpreter};
 
 /// Why a writer's bursts do not count.
 #[derive(Debug, Clone, PartialEq, Eq)]

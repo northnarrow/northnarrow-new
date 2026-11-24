@@ -66,7 +66,7 @@ use northnarrow_agent::audit::{
 use northnarrow_agent::chain_host_linux::LinuxHost;
 use northnarrow_agent::config::overlay_auth::OverlayGate;
 use northnarrow_agent::keys::KeyStore;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use super::cli::Cli;
@@ -272,7 +272,7 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
                 Err(e) => Err(format!("{e:#}")),
             },
             Err(e) => {
-                return Signed::Unsigned(format!("the agent's signing key cannot be loaded: {e}"))
+                return Signed::Unsigned(format!("the agent's signing key cannot be loaded: {e}"));
             }
         },
     };
@@ -293,7 +293,7 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
             return Signed::Unsigned(format!(
                 "the audit log cannot take it ({audit_log}); the agent's signing key cannot be \
                  loaded: {e}"
-            ))
+            ));
         }
     };
     // the head the chain names: the open log's, else the file's, read
@@ -312,7 +312,7 @@ pub(crate) fn sign(ctx: &Context<'_>, audit: Option<&mut AuditLog>, refusal: &Re
             return Signed::Unsigned(format!(
                 "the audit log cannot take it ({audit_log}); the fallback chain could not be \
                  signed: {why}"
-            ))
+            ));
         }
     };
     match FallbackDir::open(&dir, true).and_then(|d| d.create(&chain.into_bytes())) {
@@ -552,7 +552,7 @@ impl FallbackDir {
                         )
                     }
                     _ => format!("{}: {e}", path.display()),
-                })
+                });
             }
         };
         let meta = dir
@@ -749,7 +749,7 @@ pub(crate) fn record_fallback(
                 log,
                 dir,
                 json!({ "verified": false, "why": why }),
-            )]
+            )];
         }
     };
     let names = match fallback.names(MAX_FALLBACK_FILES) {
@@ -759,7 +759,7 @@ pub(crate) fn record_fallback(
                 log,
                 dir,
                 json!({ "verified": false, "why": why }),
-            )]
+            )];
         }
     };
     let mut recorded = Vec::new();

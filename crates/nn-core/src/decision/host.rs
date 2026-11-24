@@ -292,7 +292,7 @@ mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_account, AccountKind::*, DEFAULT_UID_MIN};
+    use super::{AccountKind::*, DEFAULT_UID_MIN, classify_account};
 
     /// Lot 283b: root; below `UID_MIN` a system account whatever its
     /// shell; from `UID_MIN` up a person's, unless its shell refuses a

@@ -48,8 +48,8 @@
 //! actuator is given no capability for it.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::{Mutex, MutexGuard};
@@ -57,8 +57,8 @@ use rand::Rng;
 use tracing::{error, warn};
 
 pub use nn_evidence::action_payload::{
-    unanswered_intents, ActionIntent, ActionOutcome, ActionOverflow, ActionRecord, ActionResult,
-    ActionRow, OVERFLOW_SAMPLES,
+    ActionIntent, ActionOutcome, ActionOverflow, ActionRecord, ActionResult, ActionRow,
+    OVERFLOW_SAMPLES, unanswered_intents,
 };
 use nn_evidence::clock::{Clock, SystemClock};
 use nn_model::log_escape::Escaped;
@@ -1606,8 +1606,7 @@ mod tests {
                 .with_ansi(false)
                 .finish();
             tracing::subscriber::with_default(sub, f);
-            let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-            text
+            String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
         };
         let burst = |j: &ActionJournal, from: u32| {
             for n in 0..40 {

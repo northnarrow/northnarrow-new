@@ -332,8 +332,7 @@ fn the_checker_refuses_missing_or_dead_evidence() {
     assert_eq!(lots("lots 357 and 359; lot 273b."), ["357", "359", "273b"]);
     assert_eq!(lots("Lot 359. Lots 1 and 2."), ["359", "1", "2"]);
     // a test named by its path is found by its last segment
-    let by_path =
-        "## A\n\n- **One.** *Evidence:* `xtask::known_limitations::the_checker_refuses_missing_or_dead_evidence`.\n";
+    let by_path = "## A\n\n- **One.** *Evidence:* `xtask::known_limitations::the_checker_refuses_missing_or_dead_evidence`.\n";
     assert!(
         problems(by_path, &t).is_empty(),
         "{:?}",
@@ -451,9 +450,9 @@ fn the_issue_forms_are_the_ones_the_guide_names() {
         let body = form["body"].as_sequence().expect("a form body");
         assert!(
             body.iter().any(|b| b["type"] == "checkboxes"
-                && b["attributes"]["options"].as_sequence().is_some_and(|o| o
-                    .iter()
-                    .any(|x| x["label"]
+                && b["attributes"]["options"]
+                    .as_sequence()
+                    .is_some_and(|o| o.iter().any(|x| x["label"]
                         .as_str()
                         .is_some_and(|l| l.contains("personal data"))))),
             "{file}: a required check that personal data was removed"

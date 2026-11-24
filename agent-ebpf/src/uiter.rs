@@ -29,44 +29,47 @@ const ITER_IOVEC: u8 = 1;
 /// The user address of the buffer `msg`'s iterator reads or fills.
 #[inline(always)]
 pub(crate) unsafe fn user_base(msg_ptr: *const u8) -> Option<*const u8> {
-    if msg_ptr.is_null() {
-        return None;
-    }
-    let iter_type_off = off_opt!(IOV_ITER_ITER_TYPE_OFFSET)?;
-    let iter = msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET));
-    let iter_type: u8 = bpf_probe_read_kernel::<u8>(iter.add(iter_type_off) as *const u8).ok()?;
-    let iter_ubuf = crate::btf_offsets::rt_opt(
-        northnarrow_common::btf_offsets::ITER_UBUF_VALUE_SLOT,
-        ITER_UBUF as usize,
-    )
-    .map(|v| v as u8);
-    let iter_iovec = crate::btf_offsets::rt_opt(
-        northnarrow_common::btf_offsets::ITER_IOVEC_VALUE_SLOT,
-        ITER_IOVEC as usize,
-    )
-    .map(|v| v as u8);
-    let base: *const u8 = if iter_ubuf == Some(iter_type) {
-        let ubuf_off = off_opt!(IOV_ITER_UBUF_BASE_OFFSET)?;
-        bpf_probe_read_kernel::<*const u8>(iter.add(ubuf_off) as *const *const u8).ok()?
-    } else if iter_iovec == Some(iter_type) {
-        let nr_segs_off = off_opt!(IOV_ITER_NR_SEGS_OFFSET)?;
-        let iov_off = off_opt!(IOV_ITER_IOV_OFFSET)?;
-        let nr_segs: usize = bpf_probe_read_kernel::<usize>(iter.add(nr_segs_off) as *const usize).ok()?;
-        if nr_segs != 1 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if msg_ptr.is_null() {
             return None;
         }
-        let iov: *const u8 = bpf_probe_read_kernel::<*const u8>(iter.add(iov_off) as *const *const u8).ok()?;
-        if iov.is_null() {
+        let iter_type_off = off_opt!(IOV_ITER_ITER_TYPE_OFFSET)?;
+        let iter = msg_ptr.add(off!(MSGHDR_MSG_ITER_OFFSET));
+        let iter_type: u8 = bpf_probe_read_kernel::<u8>(iter.add(iter_type_off) as *const u8).ok()?;
+        let iter_ubuf = crate::btf_offsets::rt_opt(
+            northnarrow_common::btf_offsets::ITER_UBUF_VALUE_SLOT,
+            ITER_UBUF as usize,
+        )
+        .map(|v| v as u8);
+        let iter_iovec = crate::btf_offsets::rt_opt(
+            northnarrow_common::btf_offsets::ITER_IOVEC_VALUE_SLOT,
+            ITER_IOVEC as usize,
+        )
+        .map(|v| v as u8);
+        let base: *const u8 = if iter_ubuf == Some(iter_type) {
+            let ubuf_off = off_opt!(IOV_ITER_UBUF_BASE_OFFSET)?;
+            bpf_probe_read_kernel::<*const u8>(iter.add(ubuf_off) as *const *const u8).ok()?
+        } else if iter_iovec == Some(iter_type) {
+            let nr_segs_off = off_opt!(IOV_ITER_NR_SEGS_OFFSET)?;
+            let iov_off = off_opt!(IOV_ITER_IOV_OFFSET)?;
+            let nr_segs: usize = bpf_probe_read_kernel::<usize>(iter.add(nr_segs_off) as *const usize).ok()?;
+            if nr_segs != 1 {
+                return None;
+            }
+            let iov: *const u8 = bpf_probe_read_kernel::<*const u8>(iter.add(iov_off) as *const *const u8).ok()?;
+            if iov.is_null() {
+                return None;
+            }
+            bpf_probe_read_kernel::<*const u8>(iov.add(off!(IOVEC_IOV_BASE_OFFSET)) as *const *const u8)
+                .ok()?
+        } else {
             return None;
+        };
+        if base.is_null() {
+            None
+        } else {
+            Some(base)
         }
-        bpf_probe_read_kernel::<*const u8>(iov.add(off!(IOVEC_IOV_BASE_OFFSET)) as *const *const u8)
-            .ok()?
-    } else {
-        return None;
-    };
-    if base.is_null() {
-        None
-    } else {
-        Some(base)
     }
 }

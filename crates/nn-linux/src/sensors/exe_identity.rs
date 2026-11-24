@@ -9,10 +9,10 @@
 //!   absolute one with the mount table, before any consumer reads the
 //!   event (review 61: the exec rules read `exe.path_or(filename)`).
 
-use anyhow::{anyhow, Context, Result};
-use aya::programs::Lsm;
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
-use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
+use aya::programs::Lsm;
+use common::btf_offsets::{BTF_OFFSETS_ABSENT, slot};
 use nn_model::Event;
 use tracing::{info, warn};
 

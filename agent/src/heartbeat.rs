@@ -40,7 +40,7 @@ pub const DEFAULT_HEARTBEAT_LOG_PATH: &str = "/var/lib/northnarrow/heartbeat.jso
 /// The beats' period (nn-linux's: the self-integrity check reports a
 /// weakening value).
 pub use nn_linux::heartbeat_config::{
-    interval_from_env, interval_weakens, DEFAULT_INTERVAL_SECS, INTERVAL_ENV,
+    DEFAULT_INTERVAL_SECS, INTERVAL_ENV, interval_from_env, interval_weakens,
 };
 /// The chain's rotation: 4 MiB × 4 archives (a beat ≈ 1 KiB: days of
 /// beats at 30 s).
@@ -590,11 +590,13 @@ mod tests {
             false,
             sources(),
         );
-        assert!(!export_lines(&path, 10)
-            .unwrap()
-            .last()
-            .unwrap()
-            .contains("nodns"));
+        assert!(
+            !export_lines(&path, 10)
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("nodns")
+        );
     }
 
     /// Lot 276: stage 8 is the export's loss — `None` without an export,
@@ -720,11 +722,12 @@ mod tests {
         let lines = export_lines(&dir.path().join("heartbeat.jsonl"), 10).unwrap();
         let last: crate::chainlog::ChainLine<HeartbeatRecord> =
             serde_json::from_str(lines.last().unwrap()).unwrap();
-        assert!(last
-            .payload
-            .heads
-            .iter()
-            .any(|h| h.chain == "audit" && h.seq.is_some()));
+        assert!(
+            last.payload
+                .heads
+                .iter()
+                .any(|h| h.chain == "audit" && h.seq.is_some())
+        );
     }
 
     /// Lot 388 (the triage of #595, its mini-hunt): the stop beat is the

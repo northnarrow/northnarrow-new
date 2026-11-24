@@ -330,15 +330,21 @@ fn the_checker_reads_commands_and_refuses_wrong_ones() {
     let say = |s: &[&str]| problem(&cmds, &w(s));
     assert_eq!(say(&["audit", "verify"]), None);
     assert_eq!(say(&["detections", "--key", "k", "--limit", "20"]), None);
-    assert!(say(&["detections", "--limit", "20"])
-        .unwrap()
-        .contains("requires `--key`"));
-    assert!(say(&["detections", "--key"])
-        .unwrap()
-        .contains("without its value"));
-    assert!(say(&["audit", "verify", "--form", "x"])
-        .unwrap()
-        .contains("no option"));
+    assert!(
+        say(&["detections", "--limit", "20"])
+            .unwrap()
+            .contains("requires `--key`")
+    );
+    assert!(
+        say(&["detections", "--key"])
+            .unwrap()
+            .contains("without its value")
+    );
+    assert!(
+        say(&["audit", "verify", "--form", "x"])
+            .unwrap()
+            .contains("no option")
+    );
     assert!(say(&["audit", "verfy"]).unwrap().contains("names a group"));
     assert!(say(&["nosuch"]).unwrap().contains("no command"));
     // a usage's required option, as the matrix gave it before lot 385
@@ -358,7 +364,9 @@ fn the_checker_reads_commands_and_refuses_wrong_ones() {
             ..Command::default()
         },
     );
-    assert!(problem(&old, &w(&["audit", "verify"]))
-        .unwrap()
-        .contains("requires `--from`"));
+    assert!(
+        problem(&old, &w(&["audit", "verify"]))
+            .unwrap()
+            .contains("requires `--from`")
+    );
 }

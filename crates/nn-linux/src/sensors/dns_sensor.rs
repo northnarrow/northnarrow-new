@@ -15,8 +15,8 @@
 
 use anyhow::Result;
 use aya::Ebpf;
-use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
-use common::wire::{dns_flags, DnsQueryRaw};
+use common::btf_offsets::{BTF_OFFSETS_ABSENT, slot};
+use common::wire::{DnsQueryRaw, dns_flags};
 use nn_model::Event;
 use nn_proto::ipc::{QnameForm, QnameIn, QnameOut};
 use tracing::{info, warn};

@@ -221,9 +221,18 @@ fn each_rule_fails_on_the_shape_it_forbids() {
         ("            p.ends_with (want.as_str())", "2"),
         ("            || p.contains(sub.as_str())", "3"),
         ("            || p.contains( &format!(\"/{rel}/\") )", "3"),
-        ("            || p.rsplitn(3, '/').nth(1) == Some(\"blocked.scope\")", "4"),
-        ("    let path = text.lines().find_map(|l| l.strip_prefix( \"0::\" ));", "5"),
-        ("        if exe.to_string_lossy().ends_with (\" (deleted)\") {", "1"),
+        (
+            "            || p.rsplitn(3, '/').nth(1) == Some(\"blocked.scope\")",
+            "4",
+        ),
+        (
+            "    let path = text.lines().find_map(|l| l.strip_prefix( \"0::\" ));",
+            "5",
+        ),
+        (
+            "        if exe.to_string_lossy().ends_with (\" (deleted)\") {",
+            "1",
+        ),
         // re-check of #543: the spellings that still passed
         ("            str::ends_with(p, want.as_str())", "2"),
         ("            || p.find(sub.as_str()).is_some()", "3"),

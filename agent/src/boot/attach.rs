@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nn_proto::admin_signed_payload::OverlayKind;
-use northnarrow_agent::boot::{checks, BootPhase, BootSequence, BootStep};
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep, checks};
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::AuthSessionTracker;
@@ -244,8 +244,7 @@ pub(crate) async fn load(
     // forks of cached processes that run their image entered.
     spawn_lineage_sweep(lineage.clone(), sensor.ring_drops().clone());
     info!(
-        sensors =
-            "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
+        sensors = "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
                    inet_csk_listen_start, tcp_close, udp_sendmsg_outbound",
         "sensor multiplexer attached (including Tappa 10 N2 net observation programs)"
     );

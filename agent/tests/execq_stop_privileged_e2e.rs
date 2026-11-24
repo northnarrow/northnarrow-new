@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_bin_at, install_to_priv_bin, InstalledBin};
+use common::{InstalledBin, install_bin_at, install_to_priv_bin};
 
 /// The guard's budget: a held exec waits this long for a verdict that never
 /// comes, then the default policy resumes it.

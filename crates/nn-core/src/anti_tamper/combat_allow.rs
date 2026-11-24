@@ -289,10 +289,12 @@ mod tests {
         ] {
             assert!(validate_entry(bad).is_err(), "{bad}");
         }
-        assert!(parse_allow_text("0.0.0.0/0\n::/0\n10.0.0.0/8\n")
-            .entries
-            .iter()
-            .all(|e| e.raw == "10.0.0.0/8"));
+        assert!(
+            parse_allow_text("0.0.0.0/0\n::/0\n10.0.0.0/8\n")
+                .entries
+                .iter()
+                .all(|e| e.raw == "10.0.0.0/8")
+        );
     }
 
     #[test]

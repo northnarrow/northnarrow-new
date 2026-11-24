@@ -397,7 +397,7 @@ mod tests {
         name(&mut p, "nope.example");
         p.extend_from_slice(&[0, 28, 0, 1]);
         rr(&mut p, &[0xC0, 12], 16, 5, b"\x03txt"); // TXT: stepped over
-                                                    // CH class A: stepped over
+        // CH class A: stepped over
         p.extend_from_slice(&[0xC0, 12, 0, 1, 0, 3, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
         rr(&mut p, &[0xC0, 12], TYPE_A, 9, &[1, 2, 3]); // a 3-byte A: stepped over
         let r = parse_response(&p).unwrap();

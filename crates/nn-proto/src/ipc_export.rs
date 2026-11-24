@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::{Violation, MAX_FRAME};
+use crate::ipc::{MAX_FRAME, Violation};
 
 /// Most rows one [`ExportRows`] request carries.
 pub const MAX_EXPORT_ROWS: usize = 256;
@@ -502,10 +502,12 @@ mod tests {
         }
         assert_eq!(ExportChain::from_name("audit"), None);
         assert!(!ExportChain::CanaryAccess.rotates());
-        assert!(ExportChain::ALL
-            .iter()
-            .filter(|c| **c != ExportChain::CanaryAccess)
-            .all(|c| c.rotates()));
+        assert!(
+            ExportChain::ALL
+                .iter()
+                .filter(|c| **c != ExportChain::CanaryAccess)
+                .all(|c| c.rotates())
+        );
         assert_eq!(ExportSink::File.name(), "file");
         assert_eq!(ExportSink::Syslog.name(), "syslog");
         assert_eq!(SinkState::Connecting.name(), "connecting");

@@ -20,8 +20,8 @@
 use std::time::{Duration, Instant};
 
 use nn_proto::ipc::{
-    worst_answer, Answer, DnsAnswersOut, QnameIn, QnameOut, Request, TlsOut, WorkerKind,
-    FRAME_MARGIN, MAX_BATCH, MAX_FRAME,
+    Answer, DnsAnswersOut, FRAME_MARGIN, MAX_BATCH, MAX_FRAME, QnameIn, QnameOut, Request, TlsOut,
+    WorkerKind, worst_answer,
 };
 use tracing::warn;
 
@@ -207,7 +207,7 @@ pub fn batches(inputs: Vec<QnameIn>) -> Vec<Vec<QnameIn>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nn_proto::ipc::{QnameForm, MAX_QNAME_IN};
+    use nn_proto::ipc::{MAX_QNAME_IN, QnameForm};
 
     fn q(n: usize) -> QnameIn {
         QnameIn {

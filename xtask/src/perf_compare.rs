@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 /// The schema `perf_lib.py` writes.
@@ -911,16 +911,20 @@ mod tests {
     fn parse_refuses_another_schema_and_bad_samples() {
         assert!(parse_run(r#"{"schema":"other","metrics":{}}"#, "x").is_err());
         assert!(parse_run(r#"{"metrics":{}}"#, "x").is_err());
-        assert!(parse_run(
-            r#"{"schema":"northnarrow-perf/1","metrics":{"m":{"samples":[1,"x"]}}}"#,
-            "x"
-        )
-        .is_err());
-        assert!(parse_run(
-            r#"{"schema":"northnarrow-perf/1","metrics":{"m":{"better":"up","samples":[1]}}}"#,
-            "x"
-        )
-        .is_err());
+        assert!(
+            parse_run(
+                r#"{"schema":"northnarrow-perf/1","metrics":{"m":{"samples":[1,"x"]}}}"#,
+                "x"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_run(
+                r#"{"schema":"northnarrow-perf/1","metrics":{"m":{"better":"up","samples":[1]}}}"#,
+                "x"
+            )
+            .is_err()
+        );
         let r = parse_run(
             r#"{"schema":"northnarrow-perf/1","metrics":{"m":{"samples":[1,2],"gate":false}}}"#,
             "x",
@@ -1002,9 +1006,10 @@ mod tests {
             "{:?}",
             r.notes
         );
-        assert!(r
-            .render()
-            .contains("note: host: mem_total_kib 8131764 → 8131760"));
+        assert!(
+            r.render()
+                .contains("note: host: mem_total_kib 8131764 → 8131760")
+        );
         // 0.1 % of the base (8,131.8 KiB here), at least 1 MiB
         assert!((mem_total_tolerance_kib(8_131_764.0) - 8_131.764).abs() < 1e-9);
         assert_eq!(mem_total_tolerance_kib(524_288.0), 1024.0);

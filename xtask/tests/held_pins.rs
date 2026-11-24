@@ -121,7 +121,10 @@ fn the_pin_rule_catches_planted_violations() {
         "map_data(ebpf, name)?\n                    .pin(dir.join(name))\n                    .map_err(|e| format!(\"pinning {name}: {e}\"))?;",
         "Some(Map::HashMap(d)) => d\n                        .pin(&path)",
     ] {
-        assert!(link_or_prog_pins(map).is_empty(), "a map's pin flagged: {map}");
+        assert!(
+            link_or_prog_pins(map).is_empty(),
+            "a map's pin flagged: {map}"
+        );
     }
 }
 

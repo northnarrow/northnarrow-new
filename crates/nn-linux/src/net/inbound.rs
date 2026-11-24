@@ -20,14 +20,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aya::maps::{ring_buf::RingBuf, MapData};
-use common::wire::{held_flags, inbound_kind, NetInboundRaw};
+use aya::maps::{MapData, ring_buf::RingBuf};
+use common::wire::{NetInboundRaw, held_flags, inbound_kind};
 use nn_model::telemetry::NetFlowEvent;
 use nn_model::{Event, FloodSource};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::net::drain::{NetFlowDb, NETFLOW_SYNC_INTERVAL};
+use crate::net::drain::{NETFLOW_SYNC_INTERVAL, NetFlowDb};
 use crate::net::flow_tracker::{FlowTracker, TcpCloseInfo, TcpConnectInfo};
 use crate::posture::lineage::AuthSessionTracker;
 

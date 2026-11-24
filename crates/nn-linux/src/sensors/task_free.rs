@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use aya::maps::{Array, MapData};
 use aya::{Btf, Ebpf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// The program (`#[lsm(hook = "task_free")]`).
 pub const PROGRAM: &str = "nn_task_free";

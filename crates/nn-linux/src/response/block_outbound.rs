@@ -33,7 +33,7 @@ use std::path::Path;
 use nn_core::response::cgroup::{cgroup_at, cgroup_at_or_under, unified_path};
 use tracing::{debug, info, warn};
 
-use super::{config::ExecutorConfig, ExecutionOutcome};
+use super::{ExecutionOutcome, config::ExecutorConfig};
 
 /// External audit CMB-011: the drop ruleset goes in once per COMBAT
 /// episode, not once per blocked process — a fork storm by an offender
@@ -557,9 +557,10 @@ mod tests {
         assert_eq!(runs.get(), 2, "a new episode applies it again");
         // a failed apply is retried at the next block
         let once = RulesetOnce::new();
-        assert!(once
-            .ensure(77, || Err(std::io::Error::other("no nft")))
-            .is_err());
+        assert!(
+            once.ensure(77, || Err(std::io::Error::other("no nft")))
+                .is_err()
+        );
         once.ensure(77, || Ok(())).unwrap();
         let mut again = false;
         once.ensure(77, || {
@@ -863,8 +864,7 @@ mod bug91 {
             out,
             ExecutionOutcome::NotInEffect {
                 pid: me,
-                reason:
-                    "moved, but /proc/<pid>/cgroup does not place it in the agent's blocked scope"
+                reason: "moved, but /proc/<pid>/cgroup does not place it in the agent's blocked scope"
             }
         );
         assert_eq!(
@@ -1044,7 +1044,9 @@ mod review_f2 {
         std::os::unix::fs::symlink("/dev/null", p.join("fd/0")).unwrap();
         let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
         let row = |ino: u64| {
-            format!("   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {ino} 1 0000000000000000 100 0 0 10 0\n")
+            format!(
+                "   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {ino} 1 0000000000000000 100 0 0 10 0\n"
+            )
         };
         fs::write(
             p.join("net/tcp"),

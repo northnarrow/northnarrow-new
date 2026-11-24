@@ -207,14 +207,18 @@ fn killall_reads_its_options_as_psmisc() {
         Some(argv(&["KILL"]))
     );
     // `-i` is a letter (interactive), `-ig` a prefix of `--ignore-case`
-    assert!(read(k, &["killall", "-i", "x"])[0]
-        .0
-        .iter()
-        .any(|(n, _)| n == "i"));
-    assert!(read(k, &["killall", "-ig", "x"])[0]
-        .0
-        .iter()
-        .any(|(n, _)| n == "I"));
+    assert!(
+        read(k, &["killall", "-i", "x"])[0]
+            .0
+            .iter()
+            .any(|(n, _)| n == "i")
+    );
+    assert!(
+        read(k, &["killall", "-ig", "x"])[0]
+            .0
+            .iter()
+            .any(|(n, _)| n == "I")
+    );
 }
 
 /// N4: iptables' policy with its long name, a prefix of it, the chain
@@ -358,10 +362,12 @@ fn kill_reads_its_options_as_procps() {
         option(k, &["kill", "--signal=KILL", "77"], "s"),
         Some(argv(&["KILL"]))
     );
-    assert!(read(k, &["kill", "-9", "77", "-l"])[0]
-        .0
-        .iter()
-        .any(|(n, _)| n == "l"));
+    assert!(
+        read(k, &["kill", "-9", "77", "-l"])[0]
+            .0
+            .iter()
+            .any(|(n, _)| n == "l")
+    );
 }
 
 /// Every switch-off command of the shipped list for a tool with a table is

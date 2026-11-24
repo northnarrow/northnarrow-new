@@ -166,7 +166,9 @@ pub fn cloud_init_check<H: PostureHost>(
     // a unix socket of cloud-init's, nothing else on the line or the streams:
     // one of the phase units' argvs exactly
     let Some((phase, socket)) = phase_of_argv(argv) else {
-        return no("its argv is none of cloud-init's phase units' (`nc -U <socket>`, `nc -Uu -W1 <socket> -s <return socket>`)");
+        return no(
+            "its argv is none of cloud-init's phase units' (`nc -U <socket>`, `nc -Uu -W1 <socket> -s <return socket>`)",
+        );
     };
     let no_inet = |s: &nn_model::StdioSocket| s.read && s.inet_fds == 0;
     if !no_inet(&stdio.own) || !no_inet(&stdio.parent) {

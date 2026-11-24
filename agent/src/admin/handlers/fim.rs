@@ -11,7 +11,7 @@ use nn_proto::admin_protocol::{
 };
 
 use super::read::{extract_ts_field, read_tail_jsonl};
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::admin::{AdminReadPaths, FimAdminState};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::fim::recompute::{RecomputeReason, Triggered};

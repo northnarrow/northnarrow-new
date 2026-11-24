@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::host_dropins::{breaks, directives, effective, harms, HostLimits, Kind, Reach};
+use crate::host_dropins::{HostLimits, Kind, Reach, breaks, directives, effective, harms};
 use crate::state_read::Config;
 
 /// Where a quarantined drop-in goes.
@@ -797,7 +797,7 @@ impl<'a, M: InodeMap> Protector<'a, M> {
 
     /// `path` is a regular file with one name, now write-protected.
     pub fn protect(&mut self, path: &Path) -> bool {
-        use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+        use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE, InodeKey};
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = antitamper_bpf::kernel_roots::symlink_metadata(path) else {
             return false;
@@ -901,9 +901,10 @@ mod tests {
             &mut |_| true,
         );
         assert_eq!(r.len(), 1, "{r:?}");
-        assert!(r[0]
-            .detail()
-            .contains("50-MemoryMax.conf: made inside the window, sets MemoryMax=4K"));
+        assert!(
+            r[0].detail()
+                .contains("50-MemoryMax.conf: made inside the window, sets MemoryMax=4K")
+        );
         assert!(!ag.join("50-MemoryMax.conf").exists());
         assert!(wd.join("50-MemoryMax.conf").exists());
         assert!(ag.join("10-known.conf").exists());
@@ -911,16 +912,18 @@ mod tests {
         // a drop-in changed before the window is not judged here
         std::fs::write(ag.join("60-old.conf"), "[Service]\nMemoryMax=4K\n").unwrap();
         let later = SystemTime::now() + std::time::Duration::from_secs(60);
-        assert!(quarantine(
-            &[root.path()],
-            &host(),
-            close(later),
-            q.path(),
-            1,
-            |_, _| false,
-            &mut |_| true
-        )
-        .is_empty());
+        assert!(
+            quarantine(
+                &[root.path()],
+                &host(),
+                close(later),
+                q.path(),
+                1,
+                |_, _| false,
+                &mut |_| true
+            )
+            .is_empty()
+        );
     }
 
     /// The review of #497 (D4): an mtime set back (`touch -d`) does not

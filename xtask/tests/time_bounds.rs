@@ -253,8 +253,10 @@ fn the_rule_finds_a_planted_cast() {
     assert!(time_casts("fn k(x: u32) -> i64 { f(x.counts) as i64 }").is_empty());
     assert!(time_casts("fn k(p: P) -> i64 { p.parts as i64 }").is_empty());
     assert!(time_casts("// skew_secs as i64\nfn x() {}").is_empty());
-    assert!(time_casts(
-        "fn x() {}\n#[cfg(test)]\nmod tests { fn t(secs: u64) { let _ = secs as i64; } }"
-    )
-    .is_empty());
+    assert!(
+        time_casts(
+            "fn x() {}\n#[cfg(test)]\nmod tests { fn t(secs: u64) { let _ = secs as i64; } }"
+        )
+        .is_empty()
+    );
 }

@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use crate::late_audit::{AuditHandle, LateAudit};
 
-use aya::maps::{MapData, PerCpuArray};
 use aya::Ebpf;
-use common::ring_drops::{ring_slot, RING_DROP_NAMES, RING_DROP_SLOTS};
+use aya::maps::{MapData, PerCpuArray};
+use common::ring_drops::{RING_DROP_NAMES, RING_DROP_SLOTS, ring_slot};
 use tracing::{debug, info, warn};
 
 /// Sampling period.

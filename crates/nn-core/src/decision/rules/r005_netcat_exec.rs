@@ -3,7 +3,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
 
@@ -114,17 +114,21 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_comms() {
-        assert!(R005::default()
-            .evaluate(&spawn("ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            R005::default()
+                .evaluate(&spawn("ls", "/usr/bin/ls"))
+                .is_none()
+        );
     }
 
     #[test]
     fn does_not_match_substrings() {
         // "ncurses-tool" contains "nc" as a substring but is not nc.
-        assert!(R005::default()
-            .evaluate(&spawn("ncurses-tool", "/usr/bin/ncurses-tool"))
-            .is_none());
+        assert!(
+            R005::default()
+                .evaluate(&spawn("ncurses-tool", "/usr/bin/ncurses-tool"))
+                .is_none()
+        );
     }
 
     /// Lot 350 (named, F2-3): with the lineage, cloud-init's own netcat

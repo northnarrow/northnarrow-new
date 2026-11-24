@@ -65,15 +65,15 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use aya::programs::{Program, ProgramError};
 use aya::{Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel};
 use sha2::{Digest, Sha256};
 
-use crate::anti_tamper::btf_revalidate::{self, RefuseReason, ResolveOutcome};
 use crate::anti_tamper::OPTIONAL_DENY_HOOKS;
+use crate::anti_tamper::btf_revalidate::{self, RefuseReason, ResolveOutcome};
 use crate::sensors::ebpf_object::EBPF_BYTES;
-use crate::verifier_headroom::{self, Measured, ProbeOffsets, BUDGET_ENV};
+use crate::verifier_headroom::{self, BUDGET_ENV, Measured, ProbeOffsets};
 
 /// Maps the object pins by name land here, away from the agent's pin root.
 const PIN_DIR: &str = "/sys/fs/bpf/nn-verifier-check";
@@ -491,7 +491,7 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
             return Outcome::Error(format!(
                 "program type {:?} is not one the agent loads",
                 other.prog_type()
-            ))
+            ));
         }
     };
     match r {

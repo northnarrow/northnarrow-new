@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::wire::execpol::{counter, ExecPolRaw};
+use common::wire::execpol::{ExecPolRaw, counter};
 use common::wire::execq::ExecqKey;
 use tracing::{debug, warn};
 
-use super::kernel;
-use super::record::{event_of, records_of, Recorder, Repeats};
 use super::COUNTERS;
+use super::kernel;
+use super::record::{Recorder, Repeats, event_of, records_of};
 use crate::execq::kernel::RootsRefused;
 
 /// How often the slices, the images and the roots are read again.
@@ -592,9 +592,10 @@ mod tests {
         c.step(Instant::now());
         let got = rec.0.lock();
         assert_eq!(got.len(), 2, "two denies, each recorded");
-        assert!(got
-            .iter()
-            .all(|r| r.verdict.rule_id == crate::execpol::RULE_EXEC));
+        assert!(
+            got.iter()
+                .all(|r| r.verdict.rule_id == crate::execpol::RULE_EXEC)
+        );
         assert_eq!(got[0].evidence.policy, "server profile (built in)");
         drop(got);
         assert!(crate::execpol::snapshot().denied >= 2);

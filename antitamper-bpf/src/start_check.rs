@@ -928,9 +928,10 @@ mod tests {
         // a user's file
         let user = |p: &str| sys(p).map(|f| FileFacts { uid: 1000, ..f });
         let f = foreign_mappings(&genuine(), EXE, Libs::Start, user);
-        assert!(f
-            .iter()
-            .all(|x| x.why == "not root's, or writable by another user"));
+        assert!(
+            f.iter()
+                .all(|x| x.why == "not root's, or writable by another user")
+        );
         assert_eq!(f.len(), 4);
         // group-writable
         let gw = |p: &str| {
@@ -1014,11 +1015,13 @@ mod tests {
             };
             assert!(!id.in_unit(AGENT_UNIT), "{id:?}");
         }
-        assert!(!Identity {
-            ppid: Some(1),
-            cgroup: None
-        }
-        .in_unit(AGENT_UNIT));
+        assert!(
+            !Identity {
+                ppid: Some(1),
+                cgroup: None
+            }
+            .in_unit(AGENT_UNIT)
+        );
     }
 
     #[test]
@@ -1108,9 +1111,11 @@ mod tests {
                 "/usr/lib/x86_64-linux-gnu/libevil.so (deleted)"
             ]
         );
-        assert!(foreign
-            .iter()
-            .all(|f| f.why == "a file deleted since it was mapped"));
+        assert!(
+            foreign
+                .iter()
+                .all(|f| f.why == "a file deleted since it was mapped")
+        );
         // a start: every deleted file foreign, as before
         let (foreign, replaced) = judge_mappings(maps, ("/x", 1), Libs::Start, none, &own);
         assert_eq!(foreign.len(), 5);

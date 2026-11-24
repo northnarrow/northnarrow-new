@@ -42,7 +42,7 @@ use ed25519_dalek::VerifyingKey;
 use nn_proto::admin_signed_payload::OverlayKind;
 use serde::{Deserialize, Serialize};
 
-use super::overlay_auth::{drift_entry, entry, AUDIT_OP_ACCEPTED, AUDIT_OP_SET};
+use super::overlay_auth::{AUDIT_OP_ACCEPTED, AUDIT_OP_SET, drift_entry, entry};
 use crate::audit::{AuditEntry, AuditEntryDraft, GENESIS_PREV_HASH};
 
 /// Audit op of a floor anchor.
@@ -121,7 +121,7 @@ impl RollbackFloor {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                return Self::default().reset_at(now, format!("the audit log is unreadable: {e}"))
+                return Self::default().reset_at(now, format!("the audit log is unreadable: {e}"));
             }
         };
         let lines = chain_lines(&bytes);
@@ -648,10 +648,11 @@ mod tests {
         let mut lines = c.lines();
         lines.remove(1);
         c.write_lines(&lines);
-        assert!(c
-            .scan()
-            .reset()
-            .is_some_and(|r| r.contains("does not chain")));
+        assert!(
+            c.scan()
+                .reset()
+                .is_some_and(|r| r.contains("does not chain"))
+        );
     }
 
     /// Hashes recomputed after removing a floor entry keep the chain linked

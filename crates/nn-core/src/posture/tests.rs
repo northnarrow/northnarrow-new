@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::thread;
 
-use nn_model::posture_types::PostureKind;
 use nn_model::Event;
+use nn_model::posture_types::PostureKind;
 
+use super::AdminReleaseError;
 use super::host::testing::TestHost;
 use super::triggers::testutil::{fs_protect_denial, spawn, tcp_v4};
-use super::AdminReleaseError;
 
 /// The machine on the portable test host.
 type PostureMachine = super::PostureMachine<TestHost>;
@@ -265,9 +265,9 @@ mod bug84 {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use crate::posture::ForceOutcome;
     use crate::posture::clock::{Clock, TestClock};
     use crate::posture::state::PostureState;
-    use crate::posture::ForceOutcome;
 
     const MIN: Duration = Duration::from_secs(60);
 
@@ -520,7 +520,7 @@ fn bpf_load_then_mass_write(
 /// judged — it raises the posture, and the mass write after it is COMBAT.
 #[test]
 fn a_known_system_program_s_bpf_load_never_corroborates_combat() {
-    use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_TRACEPOINT};
+    use common::bpf_prog_class::{PROG_TYPE_TRACEPOINT, known_probe_dev};
     // one workload, the test's own process: the two signals share a scope
     let pid = std::process::id();
     let (load, write) =

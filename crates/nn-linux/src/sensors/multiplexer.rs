@@ -27,23 +27,23 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
-    maps::{ring_buf::RingBuf, MapData},
-    programs::{BtfTracePoint, FExit, KProbe, TracePoint},
     Btf, Ebpf, EbpfLoader,
+    maps::{MapData, ring_buf::RingBuf},
+    programs::{BtfTracePoint, FExit, KProbe, TracePoint},
 };
 use bytemuck::Pod;
 use common::wire::{
-    dns_flags, BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw,
-    IoUringRaw, ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw,
+    BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, IoUringRaw,
+    ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw, dns_flags,
 };
 use nn_model::Event;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::sensors::pump::{run_ring, Pump, PumpThread, RingSource, PASS_MAX, POLL_MS};
+use crate::sensors::pump::{PASS_MAX, POLL_MS, Pump, PumpThread, RingSource, run_ring};
 
 use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
@@ -541,7 +541,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
                     );
                 }
                 Err(e) => {
-                    warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed");
+                    warn!(
+                        error = format!("{e:#}"),
+                        "io_uring submit tracepoint not attached — ring creations are still observed"
+                    );
                     attach_points.note(
                         "io_uring",
                         crate::sensors::contract::attach::IO_URING_CREATE,
@@ -647,7 +650,9 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
             let close_rb = take_ringbuf(&mut ebpf, "NET_FLOW_CLOSE_EVENTS")?;
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
             let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
-            info!("net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)");
+            info!(
+                "net: N2 BPF programs attached (inet_csk_listen_start kprobe + tcp_close fexit + udp_sendmsg_outbound kprobes on udp_sendmsg and udpv6_sendmsg)"
+            );
             // Lot 275 (C07): the inbound connections, the DNS responses and
             // the TLS ClientHellos (soft: each one missing is signed).
             net_attached = crate::sensors::net_telemetry::attach(&mut ebpf, &btf, &attach_points);
@@ -2820,7 +2825,7 @@ mod tests {
     /// `target_dev` pass unchanged.
     #[test]
     fn a_refused_load_is_marked_a_known_probe_only_when_proven() {
-        use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_KPROBE};
+        use common::bpf_prog_class::{PROG_TYPE_KPROBE, known_probe_dev};
         let denial = |op, dev, ino| Event::FsProtectDenial {
             pid: 868,
             uid: 998,
@@ -2864,7 +2869,7 @@ mod tests {
     /// 0), another operation pass unchanged.
     #[test]
     fn a_refused_handle_is_marked_a_bpftool_listing_only_when_proven() {
-        use common::bpf_prog_class::{bpf_listing_kind, BPF_LISTING_BIT};
+        use common::bpf_prog_class::{BPF_LISTING_BIT, bpf_listing_kind};
         let denial = |op, dev, ino| Event::FsProtectDenial {
             pid: 1613,
             uid: 0,
@@ -3993,8 +3998,8 @@ mod tests {
     mod fork_only_connects {
         use super::*;
         use common::wire::exe::exe_flags::USER_IMAGE;
-        use nn_core::decision::rules::net::NnLNet008OutboundFromTmpExec;
         use nn_core::decision::Rule;
+        use nn_core::decision::rules::net::NnLNet008OutboundFromTmpExec;
         use nn_model::ResponseAction;
         use std::path::Path;
 

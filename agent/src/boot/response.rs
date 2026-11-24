@@ -10,7 +10,7 @@ use northnarrow_agent::response::{Executor, ExecutorConfig};
 use tracing::{debug, error, info, warn};
 
 use super::cli::{Cli, ExploitGuard};
-use super::evidence::{attest_degraded, AuditHandle};
+use super::evidence::{AuditHandle, attest_degraded};
 
 /// What [`build`] built.
 pub(crate) struct Response {
@@ -69,7 +69,7 @@ pub(crate) fn build(
     // detect-only (the one no-enforcement switch wins). R11c (lab PR 264):
     // the guard the attach gave, no longer a process-wide control.
     if cli.exploit_guard != ExploitGuard::Off {
-        use northnarrow_agent::sensors::epg::{effective_response, set_response, Response};
+        use northnarrow_agent::sensors::epg::{Response, effective_response, set_response};
         let requested = cli.exploit_guard_response.response();
         match effective_response(requested, detect_only) {
             Response::Enforce => match set_response(exploit_guard.as_ref(), Response::Enforce) {

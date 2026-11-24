@@ -10,8 +10,8 @@ use crate::tls::tests::{CA_PEM, OTHER_CA_PEM, SRV_KEY, SRV_PEM};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -306,9 +306,11 @@ fn a_dropped_connection_loses_nothing() {
         "{:?}",
         s.stats
     );
-    assert!(answers
-        .iter()
-        .any(|a| matches!(a.fault, Some(SinkFault::Closed) | Some(SinkFault::Io(_)))));
+    assert!(
+        answers
+            .iter()
+            .any(|a| matches!(a.fault, Some(SinkFault::Closed) | Some(SinkFault::Io(_))))
+    );
 }
 
 /// The settle: a receiver that closes with bytes its kernel acknowledged
@@ -446,10 +448,11 @@ fn a_large_record_is_delivered() {
     std::thread::sleep(Duration::from_millis(100));
     let got = r.got.lock().unwrap();
     assert_eq!(got.len(), 6);
-    assert!(got
-        .iter()
-        .enumerate()
-        .all(|(i, m)| m.len() == 200 * 1024 + i + 1));
+    assert!(
+        got.iter()
+            .enumerate()
+            .all(|(i, m)| m.len() == 200 * 1024 + i + 1)
+    );
 }
 
 /// A row is delivered once the receiver's kernel acknowledged its last
@@ -538,17 +541,21 @@ fn the_receiver_is_authenticated() {
     let mut s = sink(r.addr, OTHER_CA_PEM, "receiver.lab");
     let (done, answers) = run_core(&mut s, &rows(2), Duration::from_millis(500), 3);
     assert_eq!(done, 0);
-    assert!(answers
-        .iter()
-        .any(|a| a.fault == Some(SinkFault::Tls(nn_proto::ipc::TlsFault::Certificate))));
+    assert!(
+        answers
+            .iter()
+            .any(|a| a.fault == Some(SinkFault::Tls(nn_proto::ipc::TlsFault::Certificate)))
+    );
     assert_eq!(s.stats.sessions, 0);
     // another name
     let mut s = sink(r.addr, CA_PEM, "other.lab");
     let (done, answers) = run_core(&mut s, &rows(2), Duration::from_millis(500), 3);
     assert_eq!(done, 0);
-    assert!(answers
-        .iter()
-        .any(|a| a.fault == Some(SinkFault::Tls(nn_proto::ipc::TlsFault::Certificate))));
+    assert!(
+        answers
+            .iter()
+            .any(|a| a.fault == Some(SinkFault::Tls(nn_proto::ipc::TlsFault::Certificate)))
+    );
     assert!(r.got.lock().unwrap().is_empty(), "nothing sent to it");
 }
 

@@ -1032,7 +1032,7 @@ impl Cli {
     /// Lab PR 223: the guard's configuration for this boot; a detect-only
     /// agent observes.
     pub(crate) fn execq_config(&self, detect_only: bool) -> northnarrow_agent::execq::Config {
-        use northnarrow_agent::execq::{policy, Config, Mode, Policy};
+        use northnarrow_agent::execq::{Config, Mode, Policy, policy};
         let mode = match self.exec_quarantine {
             Mode::Enforce if detect_only => Mode::Observe,
             m => m,
@@ -1342,9 +1342,10 @@ mod tests {
             link.as_os_str(),
         ])
         .expect("a test's command line");
-        assert!(cli
-            .refuse_one_binary_in_both_roles(&cli.own_exes())
-            .is_err());
+        assert!(
+            cli.refuse_one_binary_in_both_roles(&cli.own_exes())
+                .is_err()
+        );
         // CONTROL: another file
         let wd = dir.path().join("northnarrow-watchdog-elsewhere");
         std::fs::write(&wd, b"a watchdog").unwrap();
@@ -1414,7 +1415,9 @@ mod tests {
         }
         let clear = || {
             for (env, _) in SWITCHES {
-                std::env::remove_var(env);
+                // SAFETY: every test that parses a command line or touches these
+                // switches holds TEST_ENV (taken above); none reads them otherwise.
+                unsafe { std::env::remove_var(env) };
             }
         };
         clear();
@@ -1435,17 +1438,21 @@ mod tests {
             ("off", false),
         ] {
             for (env, flag) in SWITCHES {
-                std::env::set_var(env, value);
+                // SAFETY: as above (TEST_ENV held).
+                unsafe { std::env::set_var(env, value) };
                 let cli = Cli::try_parse_from(["northnarrow-agent"]);
-                std::env::remove_var(env);
+                // SAFETY: as above (TEST_ENV held).
+                unsafe { std::env::remove_var(env) };
                 let cli = cli.unwrap_or_else(|e| panic!("{env}={value}: {e}"));
                 assert_eq!(get(&cli, flag), on, "{env}={value}");
             }
         }
         for (env, _) in SWITCHES {
-            std::env::set_var(env, "maybe");
+            // SAFETY: as above (TEST_ENV held).
+            unsafe { std::env::set_var(env, "maybe") };
             let r = Cli::try_parse_from(["northnarrow-agent"]);
-            std::env::remove_var(env);
+            // SAFETY: as above (TEST_ENV held).
+            unsafe { std::env::remove_var(env) };
             assert!(r.is_err(), "{env}=maybe is refused, not read as on");
         }
         clear();

@@ -23,11 +23,11 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::config::overlay_auth::Verified;
 use crate::posture::host::PostureHost;
-use crate::posture::lineage::{in_system_tree, AuthSessionTracker};
+use crate::posture::lineage::{AuthSessionTracker, in_system_tree};
 
 /// Programs that read whole trees by design: an entry is a program name
 /// (the exe's basename for a binary, the script's for an interpreter) or a

@@ -101,91 +101,94 @@ fn sat16(n: u64) -> u16 {
 
 #[inline(always)]
 unsafe fn try_hello(ctx: &FEntryContext) {
-    let sk: u64 = ctx.arg(0);
-    if TLS_PENDING.get(&sk).is_none() {
-        return;
-    }
-    // the first send: whatever it is, the socket is no candidate after it
-    let _ = TLS_PENDING.remove(&sk);
-    let msg_ptr: *const u8 = ctx.arg(1);
-    let size: u64 = ctx.arg(2);
-    if size < HELLO_PEEK as u64 {
-        return;
-    }
-    let base = match crate::uiter::user_base(msg_ptr) {
-        Some(b) => b,
-        None => return,
-    };
-    let head: [u8; HELLO_PEEK] = match bpf_probe_read_user::<[u8; HELLO_PEEK]>(base as *const [u8; HELLO_PEEK]) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    if head[0] != CONTENT_HANDSHAKE || head[1] != 3 || head[5] != HANDSHAKE_CLIENT_HELLO {
-        return;
-    }
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let uid_gid = bpf_get_current_uid_gid();
-    let now = bpf_ktime_get_ns();
-    let held = match admit(
-        &TLS_TASK_BUDGET,
-        &TLS_UID_BUDGET,
-        (pid_tgid >> 32) as u32,
-        (uid_gid & 0xFFFF_FFFF) as u32,
-        now,
-        TLS_LIMITS,
-        northnarrow_common::ring_drops::ring_slot::TLS_RATE,
-    ) {
-        Some(h) => h,
-        None => return,
-    };
-    let mut entry = match TLS_HELLO_EVENTS.reserve::<TlsHelloRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TLS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let sk: u64 = ctx.arg(0);
+        if TLS_PENDING.get(&sk).is_none() {
             return;
         }
-    };
-    let raw: *mut TlsHelloRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).timestamp_ns = now;
-    (*raw).pid = (pid_tgid >> 32) as u32;
-    (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
-    }
-    if let Some(corr) = crate::tcp_connect::FLOW_SOCK_MAP.get(&sk) {
-        (*raw).flow_id = *corr;
-    }
-    if let Ok(Some(d)) = crate::dns_query::dest_from_sock(sk as *const u8) {
-        (*raw).family = d.family;
-        (*raw).dst_port = u16::from_be(d.port_be);
-        (*raw).dst_addr = d.addr;
-    }
-    (*raw).send_len = if size > 0xFFFF_FFFF { 0xFFFF_FFFF } else { size as u32 };
-    (*raw).held = sat16(held.task);
-    (*raw).held_uid = sat16(held.user);
-    let mut flags = 0u8;
-    if held.task != 0 {
-        flags |= held_flags::TASK;
-    }
-    if held.user != 0 {
-        flags |= held_flags::UID;
-    }
-    let dst = (*raw).data.as_mut_ptr() as *mut c_void;
-    if size >= TLS_HELLO_CAP as u64 {
-        if size > TLS_HELLO_CAP as u64 {
-            flags |= tls_flags::TRUNCATED;
+        // the first send: whatever it is, the socket is no candidate after it
+        let _ = TLS_PENDING.remove(&sk);
+        let msg_ptr: *const u8 = ctx.arg(1);
+        let size: u64 = ctx.arg(2);
+        if size < HELLO_PEEK as u64 {
+            return;
         }
-        if generated::bpf_probe_read_user(dst, TLS_HELLO_CAP as u32, base as *const c_void) == 0 {
-            (*raw).captured = TLS_HELLO_CAP as u16;
+        let base = match crate::uiter::user_base(msg_ptr) {
+            Some(b) => b,
+            None => return,
+        };
+        let head: [u8; HELLO_PEEK] = match bpf_probe_read_user::<[u8; HELLO_PEEK]>(base as *const [u8; HELLO_PEEK]) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        if head[0] != CONTENT_HANDSHAKE || head[1] != 3 || head[5] != HANDSHAKE_CLIENT_HELLO {
+            return;
         }
-    } else {
-        // A variable size the verifier bounds: below the cap.
-        let n = (size as u32) & (TLS_HELLO_CAP as u32 - 1);
-        if generated::bpf_probe_read_user(dst, n, base as *const c_void) == 0 {
-            (*raw).captured = n as u16;
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let uid_gid = bpf_get_current_uid_gid();
+        let now = bpf_ktime_get_ns();
+        let held = match admit(
+            &TLS_TASK_BUDGET,
+            &TLS_UID_BUDGET,
+            (pid_tgid >> 32) as u32,
+            (uid_gid & 0xFFFF_FFFF) as u32,
+            now,
+            TLS_LIMITS,
+            northnarrow_common::ring_drops::ring_slot::TLS_RATE,
+        ) {
+            Some(h) => h,
+            None => return,
+        };
+        let mut entry = match TLS_HELLO_EVENTS.reserve::<TlsHelloRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TLS);
+                return;
+            }
+        };
+        let raw: *mut TlsHelloRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).timestamp_ns = now;
+        (*raw).pid = (pid_tgid >> 32) as u32;
+        (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).comm = comm;
         }
+        if let Some(corr) = crate::tcp_connect::FLOW_SOCK_MAP.get(&sk) {
+            (*raw).flow_id = *corr;
+        }
+        if let Ok(Some(d)) = crate::dns_query::dest_from_sock(sk as *const u8) {
+            (*raw).family = d.family;
+            (*raw).dst_port = u16::from_be(d.port_be);
+            (*raw).dst_addr = d.addr;
+        }
+        (*raw).send_len = if size > 0xFFFF_FFFF { 0xFFFF_FFFF } else { size as u32 };
+        (*raw).held = sat16(held.task);
+        (*raw).held_uid = sat16(held.user);
+        let mut flags = 0u8;
+        if held.task != 0 {
+            flags |= held_flags::TASK;
+        }
+        if held.user != 0 {
+            flags |= held_flags::UID;
+        }
+        let dst = (*raw).data.as_mut_ptr() as *mut c_void;
+        if size >= TLS_HELLO_CAP as u64 {
+            if size > TLS_HELLO_CAP as u64 {
+                flags |= tls_flags::TRUNCATED;
+            }
+            if generated::bpf_probe_read_user(dst, TLS_HELLO_CAP as u32, base as *const c_void) == 0 {
+                (*raw).captured = TLS_HELLO_CAP as u16;
+            }
+        } else {
+            // A variable size the verifier bounds: below the cap.
+            let n = (size as u32) & (TLS_HELLO_CAP as u32 - 1);
+            if generated::bpf_probe_read_user(dst, n, base as *const c_void) == 0 {
+                (*raw).captured = n as u16;
+            }
+        }
+        (*raw).flags = flags;
+        entry.submit(0);
     }
-    (*raw).flags = flags;
-    entry.submit(0);
 }

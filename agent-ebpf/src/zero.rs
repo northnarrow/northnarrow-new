@@ -15,18 +15,21 @@
 /// compile-time constant, so the verifier sees fixed trip counts.
 #[inline(always)]
 pub unsafe fn zero<T>(p: *mut T) {
-    let bytes = core::mem::size_of::<T>();
-    let words = bytes / 8;
-    let p64 = p as *mut u64;
-    let mut i = 0usize;
-    while i < words {
-        core::ptr::write_volatile(p64.add(i), 0u64);
-        i += 1;
-    }
-    let p8 = p as *mut u8;
-    let mut j = words * 8;
-    while j < bytes {
-        core::ptr::write_volatile(p8.add(j), 0u8);
-        j += 1;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let bytes = core::mem::size_of::<T>();
+        let words = bytes / 8;
+        let p64 = p as *mut u64;
+        let mut i = 0usize;
+        while i < words {
+            core::ptr::write_volatile(p64.add(i), 0u64);
+            i += 1;
+        }
+        let p8 = p as *mut u8;
+        let mut j = words * 8;
+        while j < bytes {
+            core::ptr::write_volatile(p8.add(j), 0u8);
+            j += 1;
+        }
     }
 }

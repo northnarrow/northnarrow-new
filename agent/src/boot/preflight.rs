@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use northnarrow_agent::anti_tamper::btf_revalidate::{
-    publish_resolved, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
+    RefuseReason, ResolveOutcome, publish_resolved, resolve_tracepoint_fields,
 };
 use northnarrow_agent::boot::checks::{self, Verdict};
 use northnarrow_agent::boot::{BootSequence, BootStep};
@@ -453,7 +453,9 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
                 let effect = if m.struct_name.starts_with("bpf_lsm_") {
                     format!(
                         "not attached: {} (the agent starts only with NN_ANTI_TAMPER_ALLOW_DEGRADED=1)",
-                        northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
+                        northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(
+                            m.struct_name
+                        )
                     )
                 } else if m.struct_name == common::btf_offsets::CGROUP_MOVE_TARGET.func {
                     format!(
@@ -476,7 +478,9 @@ pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
                         "present — bpf_lsm_{hook} in the BTF: its deny program attaches and counts as an expected deny hook"
                     )
                 } else {
-                    format!("absent  — no bpf_lsm_{hook} in the BTF: no deny program on it, not expected")
+                    format!(
+                        "absent  — no bpf_lsm_{hook} in the BTF: no deny program on it, not expected"
+                    )
                 };
                 println!("  optional {hook:<33} {verdict}");
             }

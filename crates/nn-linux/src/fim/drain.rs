@@ -74,15 +74,15 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FimDriftRaw, FimLinkRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAMED_AWAY,
-    FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY,
-    FIM_WRITE_ONE_WRITER, FIM_WRITE_TRUNCATED_BY_ANOTHER,
+    FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED,
+    FIM_RENAMED_AWAY, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
+    FIM_WRITE_TRUNCATED_BY_ANOTHER, FimDriftRaw, FimLinkRaw, InodeKey,
 };
-use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use nn_model::Event;
+use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
 use serde::{Deserialize, Serialize};
 
 use crate::posture::lineage::AuthSessionTracker;
@@ -92,8 +92,8 @@ use crate::runtime::off_the_runtime;
 use tracing::{debug, info, warn};
 
 use crate::audit::AgentSigningKey;
-use crate::fim::attach::{key_for_path, WatchedPathsHandle};
-use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
+use crate::fim::attach::{WatchedPathsHandle, key_for_path};
+use crate::fim::baseline::{BaselineCache, BaselineEntry, compute_baseline};
 
 // BUG-026: production now uses the chainlog core; the legacy-v1
 // `build_signed_drift_entry` / `compute_entry_hash` (kept only so the
@@ -102,7 +102,7 @@ use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineEntry};
 #[cfg(test)]
 use crate::audit::GENESIS_PREV_HASH;
 #[cfg(test)]
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 
@@ -555,7 +555,7 @@ impl InodePathMap {
 // drift"), here under its names: the drain, the drift log's rows, the
 // admin socket and `main.rs` are unchanged.
 pub use nn_core::fim::drift::{
-    DriftClassifier, DriftRateLimiter, DriftSeverity, DEFAULT_HIGH_PER_MIN, DEFAULT_MEDIUM_PER_MIN,
+    DEFAULT_HIGH_PER_MIN, DEFAULT_MEDIUM_PER_MIN, DriftClassifier, DriftRateLimiter, DriftSeverity,
 };
 
 // ── on-disk drift entry (chained, signed) ──────────────────────────
@@ -4242,18 +4242,20 @@ mod tests {
         let rate_limiter = DriftRateLimiter::new();
         let mut run = |raw: &FimDriftRaw| {
             let mut out = Vec::new();
-            assert!(process_drift(
-                raw,
-                &path_map,
-                None,
-                &mut drift_db,
-                &classifier,
-                &rate_limiter,
-                None,
-                None,
-                Some(&mut out),
-            )
-            .unwrap());
+            assert!(
+                process_drift(
+                    raw,
+                    &path_map,
+                    None,
+                    &mut drift_db,
+                    &classifier,
+                    &rate_limiter,
+                    None,
+                    None,
+                    Some(&mut out),
+                )
+                .unwrap()
+            );
             match out.remove(0) {
                 Event::Fim(fe) => fe,
                 other => panic!("expected Event::Fim, got {other:?}"),
@@ -4641,7 +4643,7 @@ mod tests {
     /// `chainlog::verify_log_set::<FimDriftPayload>`.
     #[test]
     fn bug026_legacy_v1_drift_line_still_verifies() {
-        use crate::chainlog::{verify_log_set, ChainLine};
+        use crate::chainlog::{ChainLine, verify_log_set};
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
         let pk = key.verifying_key();
@@ -6185,12 +6187,14 @@ mod tests {
         assert_eq!(path_map.class_of(&etc_key), Some(WatchClass::AwaitParent));
         // control: another file created in /etc is no event, and not watched
         std::fs::write(etc.join("hostname.new"), b"h\n").unwrap();
-        assert!(drift_event(
-            &create_in(etc_key, b"hostname.new", 4100),
-            &path_map,
-            &mut db
-        )
-        .is_none());
+        assert!(
+            drift_event(
+                &create_in(etc_key, b"hostname.new", 4100),
+                &path_map,
+                &mut db
+            )
+            .is_none()
+        );
         let other = key_for_path(&etc.join("hostname.new")).unwrap();
         assert_eq!(
             path_map.lookup(&other),
@@ -7097,9 +7101,11 @@ mod tests {
             .unwrap();
             assert!(emitted, "writer {writer}: the drift must reach the rules");
         }
-        assert!(drift_rows(&dir)
-            .iter()
-            .all(|r| r["decision_engine_skipped"] == false));
+        assert!(
+            drift_rows(&dir)
+                .iter()
+                .all(|r| r["decision_engine_skipped"] == false)
+        );
     }
 
     /// External audit NN-AUD-285 (FIMR-011): each event names the file it
@@ -7827,9 +7833,11 @@ mod tests {
         assert!(!wp.lock().holds(&kids[2]) && !wp.lock().holds(&kids[3]));
         assert!(wp.lock().holds(&kids[4]) && wp.lock().holds(&kids[5]));
         // the sweep is for runtime children only
-        assert!(path_map
-            .lookup(&key_for_path(dir.path()).unwrap())
-            .is_none());
+        assert!(
+            path_map
+                .lookup(&key_for_path(dir.path()).unwrap())
+                .is_none()
+        );
         assert_eq!(path_map.len(), 3, "the configured path stays");
     }
 
@@ -7856,10 +7864,12 @@ mod tests {
         assert_eq!(draft.extra["reason"], "fim_watch_map_full");
         assert_eq!(draft.extra["evicted"], 60);
         assert_eq!(draft.extra["refused"], 2);
-        assert!(draft.extra["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("fim_watch_map_full"));
+        assert!(
+            draft.extra["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("fim_watch_map_full")
+        );
     }
 
     /// A regular, readable file a Critical rule guards (a system binary).
@@ -8488,7 +8498,7 @@ mod tests {
     #[test]
     fn a_shutdown_record_of_the_packaged_utmp_is_kept_by_the_kernel_s_facts() {
         use crate::decision::Rule;
-        use nn_core::fim::unit_writers::{unit_of, UTMP_RECORD_LEN};
+        use nn_core::fim::unit_writers::{UTMP_RECORD_LEN, unit_of};
         use std::os::unix::fs::MetadataExt;
         let t = TempDir::new().unwrap();
         let (root, cg) = (t.path().join("root"), t.path().join("cgroup"));

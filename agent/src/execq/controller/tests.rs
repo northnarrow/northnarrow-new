@@ -7,10 +7,10 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::wire::exe::{exe_path_slot, EXE_PATH_SLOT_LEN};
+use common::wire::exe::{EXE_PATH_SLOT_LEN, exe_path_slot};
 use common::wire::execq::class;
 use nn_proto::execq::{HashEntry, ScanConfig};
 use northnarrow_scan::engine::Engine;
@@ -891,10 +891,11 @@ fn a_refused_script_is_recorded_and_nothing_is_signalled() {
         "{}",
         r.response
     );
-    assert!(r
-        .verdict
-        .reasoning
-        .contains("interpreter reads by its path"));
+    assert!(
+        r.verdict
+            .reasoning
+            .contains("interpreter reads by its path")
+    );
     assert!(!r.evidence.held);
     assert_eq!(r.techniques(), ["T1204.002", "T1059"]);
     assert!(w.k.0.lock().unstopped.is_empty(), "nothing was held");

@@ -32,8 +32,8 @@
 //! are counted for `nn-admin net status`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nn_model::telemetry::NetFlowEvent;

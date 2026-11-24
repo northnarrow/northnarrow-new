@@ -24,7 +24,7 @@
 use nn_model::{Event, EventClass};
 use serde::{Deserialize, Serialize};
 
-use crate::bus::{LossStage, Priority, DECISION_BUDGET_NS, SPECS};
+use crate::bus::{DECISION_BUDGET_NS, LossStage, Priority, SPECS};
 
 pub mod manifest;
 

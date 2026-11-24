@@ -28,10 +28,10 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use aya::Ebpf;
 use aya::maps::{Array, Map, MapData};
 use aya::programs::CgroupSysctl;
-use aya::Ebpf;
-use common::sysctl_judge::{SysctlOptOut, SYSCTL_OPTOUT_SLOTS};
+use common::sysctl_judge::{SYSCTL_OPTOUT_SLOTS, SysctlOptOut};
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
@@ -153,8 +153,7 @@ pub fn judge() -> Option<&'static Judge> {
 }
 
 /// What the fallback costs (the manifest's note, the signed degradation).
-pub const FALLBACK_EFFECT: &str =
-    "the guarded sysctls are judged by the write deny alone, on the bytes it reads from the \
+pub const FALLBACK_EFFECT: &str = "the guarded sysctls are judged by the write deny alone, on the bytes it reads from the \
      writer before the kernel copies them: a second thread of the writer can change them in \
      between (the integrity round puts a harmful value back within 5 s, signed)";
 
@@ -614,7 +613,7 @@ mod tests {
     #[test]
     fn the_uapi_numbers_are_the_kernels() {
         use aya_obj::generated::{
-            bpf_attach_type, bpf_cmd, BPF_F_ALLOW_MULTI as M, BPF_F_ALLOW_OVERRIDE as O,
+            BPF_F_ALLOW_MULTI as M, BPF_F_ALLOW_OVERRIDE as O, bpf_attach_type, bpf_cmd,
         };
         assert_eq!(BPF_CGROUP_SYSCTL, bpf_attach_type::BPF_CGROUP_SYSCTL as u32);
         assert_eq!(BPF_PROG_QUERY, bpf_cmd::BPF_PROG_QUERY as u32);

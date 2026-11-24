@@ -63,60 +63,355 @@ const GATE_SWITCHES: &[(&str, &str)] = &[
 /// function, sites, route)`. A function may hold sites of two routes (one
 /// row each).
 const SITES: &[(&str, &str, usize, Route)] = &[
-    ("bpf_defense.rs", "try_bpf_map_guard", 2, Enforced("a read or write handle on one of the agent's MAPS (a program is loaded against a map, or a map written, only through one)")),
-    ("bpf_defense.rs", "try_bpf_prog_guard", 1, Enforced("a handle on one of the agent's PROGRAMS (an freplace of one of its functions needs it)")),
-    ("bpf_defense.rs", "try_bpf_prog_guard", 1, Enforced("before 6.9, a handle on a foreign program of a type refused by default (one a signed per-loader opt-out lets through) whose verified instructions call bpf_send_signal(_thread) or bpf_override_return: it kills the agent past task_kill or blinds it (lot 345)")),
-    ("bpf_defense.rs", "try_bpf_prog_guard", 1, Enforced("from 6.9, a handle after the window on a program a trusted-installer window let load whose instructions call what the content judge refuses outside one (bpf_send_signal(_thread), bpf_probe_write_user, bpf_override_return, the bpf_send_signal_task kfunc): taken by id or its pin and attached or run, it kills the agent past task_kill (lot 349)")),
-    ("bpf_defense.rs", "try_bpf_prog_guard", 2, Enforced("a window's load of a program the content judge refuses outside one, when the held set has no room for it (fail closed: kept nowhere, it could be run or attached after the window unrefused; the review of #558, F5)")),
-    ("bpf_defense.rs", "try_bpf_prog_load_guard", 1, Enforced("from 6.9, a foreign load of a type refused by default whose instructions call bpf_send_signal(_thread), bpf_probe_write_user, bpf_override_return or the bpf_send_signal_task kfunc, opted out or not (lot 345)")),
-    ("bpf_defense.rs", "try_bpf_write_user_guard", 1, Enforced("before 6.9, the verifier's lockdown question for bpf_probe_write_user asked by a foreign loader: it rewrites the memory of the process the probe fires in, the agent's (lot 345)")),
-    ("bpf_defense.rs", "nn_calib_signals", 1, Enforced("never attached: the content judge's calibration program, loaded, read by the bpf_prog hook and unloaded at the start (signal 0) (lot 345)")),
-    ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("a foreign load of the nine program types that signal a process (`bpf_send_signal` kills the agent past task_kill), rewrite its memory, override a kernel function's return or take a hook's place, outside a window and the signed per-loader opt-out (install.sh --allow-bpf-tools / --allow-bpf-loader)")),
-    ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("a cgroup/sysctl program on the root cgroup: it runs after the sysctl guard and rewrites the value the guard judged")),
-    ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("an fmod_ret (BPF_MODIFY_RETURN) load the signed per-loader opt-out lets through: it overrides any security_* function's return — security_file_open failing for the agent blinds it (lot 345)")),
-    ("bpf_defense.rs", "try_bpf_syscall_observe", 1, Enforced("a run or an attach, outside a window, of a program held at a window's load (BPF_PROG_RUN, BPF_PROG_ATTACH, BPF_RAW_TRACEPOINT_OPEN, BPF_LINK_CREATE, BPF_LINK_UPDATE, a prog array's update) through any descriptor: the loader's own kept from the window, one passed or taken with pidfd_getfd (the review of #558, F1)")),
-    ("bpf_defense.rs", "try_bpf_syscall_observe", 3, Enforced("a handle on one of the agent's links (by id or its pin), a handle by id on its maps or programs or one under its pin directories, a detach or update of one of its links")),
-    ("cgroup_files.rs", "refuse_switch", 1, Enforced("the kprobes and lockdown switches: kprobes/enabled=0 disarms every kprobe of the agent, lockdown takes the kernel-memory helpers from its programs (it blinds the agent)")),
-    ("cgroup_files.rs", "refuse_limit", 1, Enforced("a resource file of the agent's units' cgroups (kill, freeze, limits)")),
-    ("cgroup_files.rs", "refuse_v1", 1, Enforced("a cgroup v1 write (cgroup.procs, tasks, freezer.state under a controller): a v1 freezer moves and freezes the agent past the v2 move guard (lot 273b)")),
-    ("cgroup_files.rs", "refuse_sysctl", 1, Enforced("a guarded sysctl's file: kernel.ftrace_enabled=0 silences the BPF trampolines, the deny hooks' among them; the others abort or starve the agent")),
-    ("cgroup_files.rs", "refuse_oom_adj", 1, Enforced("the oom_score_adj of the agent, its watchdog or a worker")),
-    ("cgroup_files.rs", "refuse_memory_view", 1, Enforced("the open of a memory view of the agent, its watchdog or a worker (/proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, numa_maps, pagemap): from 6.16 the kernel lets a caller with CAP_PERFMON through the ptrace hook's read-mode refusal (lot 367)")),
-    ("cgroup_guard.rs", "try_cgroup_move_deny", 1, Enforced("a move of the agent's processes out of its cgroup")),
-    ("epg.rs", "respond", 1, Gated("the exploit guard's SIGKILL: detect mode under the gate (effective_response)")),
-    ("epg_lite.rs", "use_point_found", 3, Gated("the exploit guard's response (EPERM, SIGKILL): detect mode under the gate (effective_response)")),
-    ("execpol.rs", "env_commit", 1, Gated("the exec environment's SIGKILL: the exec policy's audit mode under the gate (execpol_mode)")),
-    ("execpol.rs", "on_pass", 1, Gated("the exec policy: audit mode under the gate (execpol_mode)")),
-    ("execpol.rs", "try_exec_env_lsm", 1, Gated("the exec policy: audit mode under the gate (execpol_mode)")),
-    ("execpol.rs", "try_execmap", 1, Gated("the exec policy: audit mode under the gate (execpol_mode)")),
-    ("execq.rs", "maybe_stop", 1, Gated("the exec quarantine's hold (SIGSTOP): observe mode under the gate (execq_config)")),
-    ("execq.rs", "note_pass", 1, Gated("the exec quarantine: observe mode under the gate (execq_config)")),
-    ("execq.rs", "refuse_script", 1, Gated("the exec quarantine: observe mode under the gate (execq_config)")),
-    ("inode_protect.rs", "try_inode_unlink", 2, Enforced(OWN_FILES)),
-    ("inode_protect.rs", "try_inode_rmdir", 2, Enforced(OWN_FILES)),
-    ("inode_protect.rs", "try_inode_rename", 4, Enforced(OWN_FILES)),
-    ("inode_protect.rs", "try_inode_setattr", 1, Enforced(OWN_FILES)),
+    (
+        "bpf_defense.rs",
+        "try_bpf_map_guard",
+        2,
+        Enforced(
+            "a read or write handle on one of the agent's MAPS (a program is loaded against a map, or a map written, only through one)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_prog_guard",
+        1,
+        Enforced(
+            "a handle on one of the agent's PROGRAMS (an freplace of one of its functions needs it)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_prog_guard",
+        1,
+        Enforced(
+            "before 6.9, a handle on a foreign program of a type refused by default (one a signed per-loader opt-out lets through) whose verified instructions call bpf_send_signal(_thread) or bpf_override_return: it kills the agent past task_kill or blinds it (lot 345)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_prog_guard",
+        1,
+        Enforced(
+            "from 6.9, a handle after the window on a program a trusted-installer window let load whose instructions call what the content judge refuses outside one (bpf_send_signal(_thread), bpf_probe_write_user, bpf_override_return, the bpf_send_signal_task kfunc): taken by id or its pin and attached or run, it kills the agent past task_kill (lot 349)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_prog_guard",
+        2,
+        Enforced(
+            "a window's load of a program the content judge refuses outside one, when the held set has no room for it (fail closed: kept nowhere, it could be run or attached after the window unrefused; the review of #558, F5)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_prog_load_guard",
+        1,
+        Enforced(
+            "from 6.9, a foreign load of a type refused by default whose instructions call bpf_send_signal(_thread), bpf_probe_write_user, bpf_override_return or the bpf_send_signal_task kfunc, opted out or not (lot 345)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_write_user_guard",
+        1,
+        Enforced(
+            "before 6.9, the verifier's lockdown question for bpf_probe_write_user asked by a foreign loader: it rewrites the memory of the process the probe fires in, the agent's (lot 345)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "nn_calib_signals",
+        1,
+        Enforced(
+            "never attached: the content judge's calibration program, loaded, read by the bpf_prog hook and unloaded at the start (signal 0) (lot 345)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        1,
+        Enforced(
+            "a foreign load of the nine program types that signal a process (`bpf_send_signal` kills the agent past task_kill), rewrite its memory, override a kernel function's return or take a hook's place, outside a window and the signed per-loader opt-out (install.sh --allow-bpf-tools / --allow-bpf-loader)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        1,
+        Enforced(
+            "a cgroup/sysctl program on the root cgroup: it runs after the sysctl guard and rewrites the value the guard judged",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        1,
+        Enforced(
+            "an fmod_ret (BPF_MODIFY_RETURN) load the signed per-loader opt-out lets through: it overrides any security_* function's return — security_file_open failing for the agent blinds it (lot 345)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        1,
+        Enforced(
+            "a run or an attach, outside a window, of a program held at a window's load (BPF_PROG_RUN, BPF_PROG_ATTACH, BPF_RAW_TRACEPOINT_OPEN, BPF_LINK_CREATE, BPF_LINK_UPDATE, a prog array's update) through any descriptor: the loader's own kept from the window, one passed or taken with pidfd_getfd (the review of #558, F1)",
+        ),
+    ),
+    (
+        "bpf_defense.rs",
+        "try_bpf_syscall_observe",
+        3,
+        Enforced(
+            "a handle on one of the agent's links (by id or its pin), a handle by id on its maps or programs or one under its pin directories, a detach or update of one of its links",
+        ),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_switch",
+        1,
+        Enforced(
+            "the kprobes and lockdown switches: kprobes/enabled=0 disarms every kprobe of the agent, lockdown takes the kernel-memory helpers from its programs (it blinds the agent)",
+        ),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_limit",
+        1,
+        Enforced("a resource file of the agent's units' cgroups (kill, freeze, limits)"),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_v1",
+        1,
+        Enforced(
+            "a cgroup v1 write (cgroup.procs, tasks, freezer.state under a controller): a v1 freezer moves and freezes the agent past the v2 move guard (lot 273b)",
+        ),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_sysctl",
+        1,
+        Enforced(
+            "a guarded sysctl's file: kernel.ftrace_enabled=0 silences the BPF trampolines, the deny hooks' among them; the others abort or starve the agent",
+        ),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_oom_adj",
+        1,
+        Enforced("the oom_score_adj of the agent, its watchdog or a worker"),
+    ),
+    (
+        "cgroup_files.rs",
+        "refuse_memory_view",
+        1,
+        Enforced(
+            "the open of a memory view of the agent, its watchdog or a worker (/proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, numa_maps, pagemap): from 6.16 the kernel lets a caller with CAP_PERFMON through the ptrace hook's read-mode refusal (lot 367)",
+        ),
+    ),
+    (
+        "cgroup_guard.rs",
+        "try_cgroup_move_deny",
+        1,
+        Enforced("a move of the agent's processes out of its cgroup"),
+    ),
+    (
+        "epg.rs",
+        "respond",
+        1,
+        Gated("the exploit guard's SIGKILL: detect mode under the gate (effective_response)"),
+    ),
+    (
+        "epg_lite.rs",
+        "use_point_found",
+        3,
+        Gated(
+            "the exploit guard's response (EPERM, SIGKILL): detect mode under the gate (effective_response)",
+        ),
+    ),
+    (
+        "execpol.rs",
+        "env_commit",
+        1,
+        Gated(
+            "the exec environment's SIGKILL: the exec policy's audit mode under the gate (execpol_mode)",
+        ),
+    ),
+    (
+        "execpol.rs",
+        "on_pass",
+        1,
+        Gated("the exec policy: audit mode under the gate (execpol_mode)"),
+    ),
+    (
+        "execpol.rs",
+        "try_exec_env_lsm",
+        1,
+        Gated("the exec policy: audit mode under the gate (execpol_mode)"),
+    ),
+    (
+        "execpol.rs",
+        "try_execmap",
+        1,
+        Gated("the exec policy: audit mode under the gate (execpol_mode)"),
+    ),
+    (
+        "execq.rs",
+        "maybe_stop",
+        1,
+        Gated("the exec quarantine's hold (SIGSTOP): observe mode under the gate (execq_config)"),
+    ),
+    (
+        "execq.rs",
+        "note_pass",
+        1,
+        Gated("the exec quarantine: observe mode under the gate (execq_config)"),
+    ),
+    (
+        "execq.rs",
+        "refuse_script",
+        1,
+        Gated("the exec quarantine: observe mode under the gate (execq_config)"),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_unlink",
+        2,
+        Enforced(OWN_FILES),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rmdir",
+        2,
+        Enforced(OWN_FILES),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_rename",
+        4,
+        Enforced(OWN_FILES),
+    ),
+    (
+        "inode_protect.rs",
+        "try_inode_setattr",
+        1,
+        Enforced(OWN_FILES),
+    ),
     ("inode_protect.rs", "try_file_ioctl", 1, Enforced(OWN_FILES)),
-    ("inode_protect.rs", "try_file_ioctl", 1, Enforced("a perf event's PERF_EVENT_IOC_SET_BPF, outside a window, of a program held at a window's load: a kprobe calling bpf_send_signal attached with no bpf(2) command (the review of #558, F1)")),
-    ("inode_protect.rs", "try_protected_open_deny", 2, Enforced("a read-open of the agent's key, a write-open of its protected files")),
-    ("inode_protect.rs", "try_protected_open_deny", 1, Delegated("refuse_write(")),
-    ("inode_protect.rs", "try_protected_open_deny", 1, Delegated("refuse_memory_view(")),
-    ("inode_protect.rs", "try_protected_write_deny", 1, Enforced("a write through a descriptor of the agent's protected files")),
-    ("inode_protect.rs", "try_protected_write_deny", 1, Delegated("refuse_write(")),
+    (
+        "inode_protect.rs",
+        "try_file_ioctl",
+        1,
+        Enforced(
+            "a perf event's PERF_EVENT_IOC_SET_BPF, outside a window, of a program held at a window's load: a kprobe calling bpf_send_signal attached with no bpf(2) command (the review of #558, F1)",
+        ),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        2,
+        Enforced("a read-open of the agent's key, a write-open of its protected files"),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Delegated("refuse_write("),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_open_deny",
+        1,
+        Delegated("refuse_memory_view("),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_write_deny",
+        1,
+        Enforced("a write through a descriptor of the agent's protected files"),
+    ),
+    (
+        "inode_protect.rs",
+        "try_protected_write_deny",
+        1,
+        Delegated("refuse_write("),
+    ),
     ("inode_protect.rs", "deny_new_entry", 1, Enforced(OWN_FILES)),
     ("inode_protect.rs", "deny_xattr", 1, Enforced(OWN_FILES)),
-    ("module_load.rs", "try_read_file", 1, Enforced("an untrusted kernel module: it can do anything to the agent; only the signed policy relaxes the judge (module_trust::kernel_mode takes no gate)")),
-    ("module_load.rs", "try_load_data", 1, Enforced("an untrusted kernel module: it can do anything to the agent; only the signed policy relaxes the judge (module_trust::kernel_mode takes no gate)")),
-    ("module_load.rs", "deny_kexec", 1, Enforced("a kexec image: a kernel booted without the agent's hooks (the host's integrity)")),
-    ("mount_guard.rs", "answer_parts", 1, Enforced("a mount on, over or below the paths the agent depends on in PID 1's mount namespace (the kernel views /proc, /sys, the cgroup root and the bpffs, its directories, binaries and units, the directories above them), an unmount or move of one of their mounts, an old-API move, a pivot: a FUSE or a tmpfs there stalls or blinds every by-path read (lot 357); lot 359: any change of the pin directory's lock but its maker's own steps (a racing or out-of-bound lazy unmount would take the host's bpffs and the pins)")),
-    ("ptrace_check.rs", "try_ptrace_access_check", 1, Enforced("a ptrace of the agent, its watchdog or a worker, and an attach of PID 1: its memory swapped between a deny hook's read of a write PID 1 may make (a unit's limit, a thaw) and the kernel's (lot 273c)")),
-    ("sigio_guard.rs", "try_file_send_sigiotask", 1, Enforced(AGENT)),
-    ("socket_connect.rs", "try_socket_connect", 1, Gated("the kernel connect deny (its EPERM a negative constant): not armed under the gate (policy::arming)")),
-    ("sysctl_guard.rs", "nn_sysctl_guard", 1, Delegated("try_sysctl_guard(")),
-    ("sysctl_guard.rs", "try_sysctl_guard", 1, Enforced("the sysctl guard's value judge: the values refuse_sysctl guards")),
+    (
+        "module_load.rs",
+        "try_read_file",
+        1,
+        Enforced(
+            "an untrusted kernel module: it can do anything to the agent; only the signed policy relaxes the judge (module_trust::kernel_mode takes no gate)",
+        ),
+    ),
+    (
+        "module_load.rs",
+        "try_load_data",
+        1,
+        Enforced(
+            "an untrusted kernel module: it can do anything to the agent; only the signed policy relaxes the judge (module_trust::kernel_mode takes no gate)",
+        ),
+    ),
+    (
+        "module_load.rs",
+        "deny_kexec",
+        1,
+        Enforced("a kexec image: a kernel booted without the agent's hooks (the host's integrity)"),
+    ),
+    (
+        "mount_guard.rs",
+        "answer_parts",
+        1,
+        Enforced(
+            "a mount on, over or below the paths the agent depends on in PID 1's mount namespace (the kernel views /proc, /sys, the cgroup root and the bpffs, its directories, binaries and units, the directories above them), an unmount or move of one of their mounts, an old-API move, a pivot: a FUSE or a tmpfs there stalls or blinds every by-path read (lot 357); lot 359: any change of the pin directory's lock but its maker's own steps (a racing or out-of-bound lazy unmount would take the host's bpffs and the pins)",
+        ),
+    ),
+    (
+        "ptrace_check.rs",
+        "try_ptrace_access_check",
+        1,
+        Enforced(
+            "a ptrace of the agent, its watchdog or a worker, and an attach of PID 1: its memory swapped between a deny hook's read of a write PID 1 may make (a unit's limit, a thaw) and the kernel's (lot 273c)",
+        ),
+    ),
+    (
+        "sigio_guard.rs",
+        "try_file_send_sigiotask",
+        1,
+        Enforced(AGENT),
+    ),
+    (
+        "socket_connect.rs",
+        "try_socket_connect",
+        1,
+        Gated(
+            "the kernel connect deny (its EPERM a negative constant): not armed under the gate (policy::arming)",
+        ),
+    ),
+    (
+        "sysctl_guard.rs",
+        "nn_sysctl_guard",
+        1,
+        Delegated("try_sysctl_guard("),
+    ),
+    (
+        "sysctl_guard.rs",
+        "try_sysctl_guard",
+        1,
+        Enforced("the sysctl guard's value judge: the values refuse_sysctl guards"),
+    ),
     ("task_kill.rs", "try_task_kill", 1, Enforced(AGENT)),
     ("task_limits.rs", "task_setrlimit_deny", 1, Enforced(AGENT)),
-    ("task_limits.rs", "task_setscheduler_deny", 1, Enforced(AGENT)),
+    (
+        "task_limits.rs",
+        "task_setscheduler_deny",
+        1,
+        Enforced(AGENT),
+    ),
     ("task_limits.rs", "task_setnice_deny", 1, Enforced(AGENT)),
     ("task_limits.rs", "task_setioprio_deny", 1, Enforced(AGENT)),
 ];
@@ -464,11 +759,7 @@ fn callees<'a>(
         Some(m) if !matches!(m, "crate" | "self" | "super") => pick(&format!("{m}.rs")),
         _ => pick(file),
     };
-    if own.is_empty() {
-        all
-    } else {
-        own
-    }
+    if own.is_empty() { all } else { own }
 }
 
 /// The gate's switches a self-protection site reaches: for each `Enforced`
@@ -884,15 +1175,47 @@ fn a_restricted_re_export_an_attributed_use_and_an_aliased_static_are_caught() {
     let lower = "\n    if relaxed() {\n        return 0;\n    }\n";
     let upper = "\n    if RELAXED() {\n        return 0;\n    }\n";
     let cases = [
-        ("pub(super) use", lower, "\npub(super) use crate::execq::is_relaxed_ptr as relaxed;\n"),
-        ("attr use", lower, "\n#[allow(unused_imports)] use crate::execq::is_relaxed_ptr as relaxed;\n"),
-        ("type alias static", upper, "\ntype RelaxFn = fn() -> bool;\nstatic RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
-        ("pub(super) static", upper, "\npub(super) static RELAXED: fn() -> bool = crate::execq::is_relaxed_ptr;\n"),
+        (
+            "pub(super) use",
+            lower,
+            "\npub(super) use crate::execq::is_relaxed_ptr as relaxed;\n",
+        ),
+        (
+            "attr use",
+            lower,
+            "\n#[allow(unused_imports)] use crate::execq::is_relaxed_ptr as relaxed;\n",
+        ),
+        (
+            "type alias static",
+            upper,
+            "\ntype RelaxFn = fn() -> bool;\nstatic RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n",
+        ),
+        (
+            "pub(super) static",
+            upper,
+            "\npub(super) static RELAXED: fn() -> bool = crate::execq::is_relaxed_ptr;\n",
+        ),
         // the mini-hunt
-        ("pub(in crate) use", lower, "\npub(in crate) use crate::execq::{is_relaxed_ptr as relaxed};\n"),
-        ("two attributes", lower, "\n#[allow(unused_imports)]\n#[cfg(not(test))]\nuse crate::execq::is_relaxed_ptr as relaxed;\n"),
-        ("const via alias", upper, "\ntype RelaxFn = fn() -> bool;\npub(crate) const RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n"),
-        ("static of a reference", upper, "\nstatic RELAXED: &RelaxFn = &crate::execq::is_relaxed_ptr;\n"),
+        (
+            "pub(in crate) use",
+            lower,
+            "\npub(in crate) use crate::execq::{is_relaxed_ptr as relaxed};\n",
+        ),
+        (
+            "two attributes",
+            lower,
+            "\n#[allow(unused_imports)]\n#[cfg(not(test))]\nuse crate::execq::is_relaxed_ptr as relaxed;\n",
+        ),
+        (
+            "const via alias",
+            upper,
+            "\ntype RelaxFn = fn() -> bool;\npub(crate) const RELAXED: RelaxFn = crate::execq::is_relaxed_ptr;\n",
+        ),
+        (
+            "static of a reference",
+            upper,
+            "\nstatic RELAXED: &RelaxFn = &crate::execq::is_relaxed_ptr;\n",
+        ),
     ];
     let mut green = Vec::new();
     for (what, call, helper) in cases {

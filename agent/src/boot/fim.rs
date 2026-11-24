@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use super::attach::record_own_prog_ids;
 use super::cli::{Cli, FileOpenSensor};
 use super::evidence::{
-    attest_degraded, attest_degraded_at, attest_open_findings, drain_ended, AuditHandle,
+    AuditHandle, attest_degraded, attest_degraded_at, attest_open_findings, drain_ended,
 };
 use super::policy::report_builtin_defaults;
 use super::response::attest_legacy_isolation_removed;
@@ -65,11 +65,13 @@ fn start_open_sensor(
     posture: &PostureMachine,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
-        build_bounded, refresh, spawn_pump, take_ringbuf, warn_refused_carveouts, DepthCapLog,
-        OpenSensorMaps, RuleHealth, RuleRefresh, BUILD_READER, REFRESH_EVERY, RULE_CAPACITY,
+        BUILD_READER, DepthCapLog, OpenSensorMaps, REFRESH_EVERY, RULE_CAPACITY, RuleHealth,
+        RuleRefresh, build_bounded, refresh, spawn_pump, take_ringbuf, warn_refused_carveouts,
     };
     if mode == FileOpenSensor::Tracepoint {
-        info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
+        info!(
+            "file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland"
+        );
         open_sensor_on_tracepoint(sensor, "chosen with --file-open-sensor tracepoint");
         return;
     }
@@ -439,7 +441,9 @@ pub(crate) fn start(
                         );
                         attest_degraded(
                             audit_log.as_ref(),
-                            &format!("fim baseline database unavailable ({e:#}): re-baselining off this boot"),
+                            &format!(
+                                "fim baseline database unavailable ({e:#}): re-baselining off this boot"
+                            ),
                         );
                         None
                     }
@@ -462,10 +466,10 @@ pub(crate) fn start(
                 };
                 use northnarrow_agent::fim::baseline::BaselineCache;
                 use northnarrow_agent::fim::drain::{
-                    drain_loop, DriftClassifier, DriftRateLimiter, FimDriftDb, InodePathMap,
+                    DriftClassifier, DriftRateLimiter, FimDriftDb, InodePathMap, drain_loop,
                 };
                 use northnarrow_agent::fim::recompute::{
-                    run_recompute_task, BaselineRecomputeChannel, RecomputeReason,
+                    BaselineRecomputeChannel, RecomputeReason, run_recompute_task,
                 };
 
                 let rate_limiter = Arc::new(DriftRateLimiter::new());

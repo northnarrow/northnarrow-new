@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Version of the JSON layout below.
@@ -588,11 +588,7 @@ pub fn evaluate(inputs: &Inputs, log: Option<&str>, expected: &[ExpectedEntry]) 
 /// A Markdown table cell: one line, no `|`.
 fn cell(s: &str) -> String {
     let s = s.replace(['\n', '\r'], " ").replace('|', "\\|");
-    if s.is_empty() {
-        "—".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "—".to_string() } else { s }
 }
 
 fn verdict_text(s: &Summary) -> String {

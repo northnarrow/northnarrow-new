@@ -28,7 +28,7 @@ use std::io::Write;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
-pub use nn_core::combat::reconcile::{attest, draft, StaleChain};
+pub use nn_core::combat::reconcile::{StaleChain, attest, draft};
 
 /// The unsigned compatibility log (docs/operator/COMBAT_RECOVERY.md).
 pub const LOG_PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";

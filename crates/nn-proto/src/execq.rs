@@ -281,7 +281,7 @@ pub fn parse_hash_list(text: &str) -> Result<HashList, String> {
             other => {
                 return Err(alloc::format!(
                     "line {lineno}: `{other}` (want `block` or `allow`)"
-                ))
+                ));
             }
         }
         if out.block.len() + out.allow.len() > MAX_HASH_ENTRIES {

@@ -507,9 +507,11 @@ fn a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert
         detail.starts_with("tcp_connect (tcp_connect): self-test step `a connect to the child's loopback listener` missed"),
         "{detail}"
     );
-    assert!(degradation::snapshot()
-        .iter()
-        .any(|l| l.starts_with("sensor_selftest: tcp_connect")));
+    assert!(
+        degradation::snapshot()
+            .iter()
+            .any(|l| l.starts_with("sensor_selftest: tcp_connect"))
+    );
     // round 2: the alert
     let notes = round(true);
     assert!(
@@ -552,9 +554,11 @@ fn a_sensor_whose_events_are_dropped_gives_the_signed_degradation_then_the_alert
         "{notes:?}"
     );
     assert_eq!(word(&probe), ProbeState::Seen);
-    assert!(rows(dir.path())
-        .iter()
-        .any(|r| r["op"] == AUDIT_OP_RESTORED && r["extra"]["rounds_missed"] == 3));
+    assert!(
+        rows(dir.path())
+            .iter()
+            .any(|r| r["op"] == AUDIT_OP_RESTORED && r["extra"]["rounds_missed"] == 3)
+    );
     assert!(
         !degradation::snapshot()
             .iter()
@@ -944,9 +948,10 @@ fn nonce_is_random_not_pid_or_clock() {
     assert_ne!(a, b);
     for n in [&a, &b] {
         assert_eq!(n.len(), 2 * NONCE_BYTES, "{n}");
-        assert!(n
-            .bytes()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            n.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
     // 64 random bits: two nonces sharing the pid's hex tail is a
     // 1-in-2^24 accident at most, a clock-and-pid nonce always does it
@@ -1009,14 +1014,19 @@ fn probe_datagram_stays_on_loopback_and_carries_the_name() {
 
 #[test]
 fn interval_env_zero_disables() {
-    std::env::set_var(INTERVAL_ENV, "0");
+    // SAFETY: no other test of nn-linux writes NN_TELEMETRY_PROBE_SECS;
+    // the crate reads the environment through std::env only, whose lock
+    // orders this write against those reads.
+    unsafe { std::env::set_var(INTERVAL_ENV, "0") };
     assert!(interval_from_env().is_none());
-    std::env::set_var(INTERVAL_ENV, "3");
+    // SAFETY: as above.
+    unsafe { std::env::set_var(INTERVAL_ENV, "3") };
     assert_eq!(
         interval_from_env(),
         Some(Duration::from_secs(DEADLINE_SECS + 1))
     );
-    std::env::remove_var(INTERVAL_ENV);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(INTERVAL_ENV) };
     assert_eq!(
         interval_from_env(),
         Some(Duration::from_secs(DEFAULT_INTERVAL_SECS))

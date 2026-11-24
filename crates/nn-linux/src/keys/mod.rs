@@ -26,10 +26,10 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
-use rand::rngs::SysRng;
+use anyhow::{Context, Result, anyhow};
+use ed25519_dalek::{SECRET_KEY_LENGTH, Signature, Signer as _, SigningKey, VerifyingKey};
 use rand::TryRng;
+use rand::rngs::SysRng;
 use tracing::{info, warn};
 
 use crate::audit::PARENT_DIR_MODE;
@@ -915,9 +915,11 @@ mod tests {
         assert!(d.contains("out of core dumps"), "{d}");
         assert!(!report_memory("nn-rc4-protected", true, true));
         assert!(report_memory("nn-rc4-key", false, true));
-        assert!(crate::boot::degradation::entries()
-            .iter()
-            .any(|e| e.source == "key_memory" && e.detail.contains("nn-rc4-key")));
+        assert!(
+            crate::boot::degradation::entries()
+                .iter()
+                .any(|e| e.source == "key_memory" && e.detail.contains("nn-rc4-key"))
+        );
     }
 
     /// External audit EVD-001: the agent publishes the public half next to
@@ -1154,9 +1156,11 @@ mod tests {
         let door = here
             .find("AgentSigningKey::load_or_bootstrap(path)?")
             .expect("the door");
-        assert!(here[..door]
-            .rfind("#[cfg(any(test, feature = \"test-util\"))]\n    pub fn loaded_for_tests(")
-            .is_some_and(|at| !here[at..door].contains("\n    }\n")));
+        assert!(
+            here[..door]
+                .rfind("#[cfg(any(test, feature = \"test-util\"))]\n    pub fn loaded_for_tests(")
+                .is_some_and(|at| !here[at..door].contains("\n    }\n"))
+        );
         // the one call of the mint is the start's key's
         let boot_key = &here[here.find("impl KeyStore {").unwrap()..];
         assert!(boot_key.contains("AgentSigningKey::mint_first(first)"));

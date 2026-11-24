@@ -337,9 +337,10 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         assert_eq!(v.severity, Severity::Critical);
         assert_eq!(v.event_pid, 4242);
-        assert!(v
-            .reasoning
-            .starts_with("why; kill the process tree [held back: "));
+        assert!(
+            v.reasoning
+                .starts_with("why; kill the process tree [held back: ")
+        );
         assert!(v.reasoning.contains("per-rule response policy"));
         let held = take_held().expect("held");
         assert_eq!(held.action, ResponseAction::KillProcessTree);

@@ -12,7 +12,7 @@ use tracing::warn;
 
 use super::controller::Recorder;
 use super::policy::{Action, Outcome};
-use super::{attack_refs, CATEGORY, RULE_ID, RULE_NAME};
+use super::{CATEGORY, RULE_ID, RULE_NAME, attack_refs};
 use crate::decision::attack::AttackRef;
 use crate::detection_payload::ExecqEvidence;
 use crate::detection_store::DetectionSink;
@@ -237,7 +237,7 @@ impl Recorder for SinkRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execq::policy::{decide, Basis, Policy};
+    use crate::execq::policy::{Basis, Policy, decide};
     use common::wire::execq::class;
     use nn_proto::execq::{Reason, ScanVerdict};
 

@@ -43,7 +43,7 @@ pub const MDWE_DEGRADATION: &str = "units_mdwe";
 /// without systemd's private socket. Blocking (2 s at most each exchange):
 /// at the start, before the runtime.
 pub fn note_units_mdwe() {
-    use antitamper_bpf::systemd_bus::{unit_property, Value, PRIVATE_SOCKET};
+    use antitamper_bpf::systemd_bus::{PRIVATE_SOCKET, Value, unit_property};
     let socket = std::path::Path::new(PRIVATE_SOCKET);
     if !socket.exists()
         || !antitamper_bpf::start_check::identity(std::process::id())

@@ -89,7 +89,7 @@ pub trait CanaryHost {
     /// Append an access row; its `entry_hash` (the agent:
     /// `CanaryAccessDb::append`, a signed row).
     fn append_access(log: &mut Self::AccessLog, draft: CanaryAccessDraft)
-        -> anyhow::Result<String>;
+    -> anyhow::Result<String>;
 
     /// Whether `addr` is one of this host's addresses (the agent:
     /// `LocalAddrs::contains`).

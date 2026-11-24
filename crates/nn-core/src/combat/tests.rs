@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use nn_model::posture_types::TriggerType;
 use nn_model::Event;
+use nn_model::posture_types::TriggerType;
 
 use super::actuator::{
     CombatActuator, Containment, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
@@ -569,10 +569,12 @@ fn a_corroborated_or_decisive_cause_is_neutralized() {
     );
     // a forced COMBAT is an administrator's word, not a heuristic
     assert!(!CombatCause::DebugForce.single_heuristic_arm());
-    assert!(!CombatCause::AdminForce {
-        signers: Vec::new()
-    }
-    .single_heuristic_arm());
+    assert!(
+        !CombatCause::AdminForce {
+            signers: Vec::new()
+        }
+        .single_heuristic_arm()
+    );
 }
 
 // ── Jump-ahead: active exfil pre-empts the INVESTIGATE deadline ──
@@ -1297,9 +1299,10 @@ fn spread_attribution_is_capped_and_escalates() {
         log.iter().any(|e| e == "audit:NEUTRALIZE->ISOLATE"),
         "{log:?}"
     );
-    assert!(!log
-        .iter()
-        .any(|e| e == "soft_block:103" || e == "soft_block:104"));
+    assert!(
+        !log.iter()
+            .any(|e| e == "soft_block:103" || e == "soft_block:104")
+    );
 }
 
 /// External audit CMB-014: a soft block that did not take effect is in
@@ -1594,9 +1597,11 @@ fn neutralize_signs_an_outcome_for_every_offender() {
     assert!(n.summary.contains("pid 100"), "{}", n.summary);
     // the uncontained offender escalates to ISOLATE, whose outcome follows
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
-    assert!(outcomes
-        .iter()
-        .any(|o| o.stage == CombatStage::Isolate && o.success()));
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.stage == CombatStage::Isolate && o.success())
+    );
 }
 
 /// A ladder whose isolations report `plan` in order (then success).

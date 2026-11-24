@@ -184,7 +184,7 @@ pub fn parse_role_keyword(s: &str) -> Result<Role, String> {
                  fim-manage, fim-read, canary-read, canary-manage, \
                  net-read, net-manage, trusted-installer, telemetry-read, \
                  triage, config-manage, response-manage, all"
-            ))
+            ));
         }
     })
 }

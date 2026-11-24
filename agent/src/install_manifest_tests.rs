@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::install_manifest::{sha256_file, IntegrityOutcome};
+use crate::install_manifest::{IntegrityOutcome, sha256_file};
 
 /// The manifest `install.sh` writes, with these hashes (a copy of the
 /// helper of `install_manifest`'s tests).
@@ -27,8 +27,8 @@ fn manifest_json(bin_dir: &Path, agent: &str, wd: &str, admin: &str, ebpf: &str)
 #[test]
 fn fuzz_fixture_reaches_hash_comparison() {
     use crate::fuzz_api::{
-        install_manifest_check_in_dir, write_install_manifest_fixture,
-        INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
+        INSTALL_MANIFEST_FIXTURE_EBPF_SHA, install_manifest_check_in_dir,
+        write_install_manifest_fixture,
     };
     let dir = tempfile::tempdir().unwrap();
     write_install_manifest_fixture(dir.path()).unwrap();

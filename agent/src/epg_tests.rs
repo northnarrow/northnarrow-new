@@ -9,10 +9,12 @@ use crate::sensors::epg::MODE_ENV;
 /// `integrity_drift`); `lite` and `strict` are not.
 #[test]
 fn the_off_value_is_a_weakening_variable() {
-    assert!(crate::self_integrity::WEAKENING_ENV
-        .iter()
-        .any(|(name, weakens)| *name == MODE_ENV
-            && weakens("off")
-            && !weakens("lite")
-            && !weakens("strict")));
+    assert!(
+        crate::self_integrity::WEAKENING_ENV
+            .iter()
+            .any(|(name, weakens)| *name == MODE_ENV
+                && weakens("off")
+                && !weakens("lite")
+                && !weakens("strict"))
+    );
 }

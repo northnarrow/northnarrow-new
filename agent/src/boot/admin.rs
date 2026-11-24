@@ -10,7 +10,7 @@ use northnarrow_agent::response::Executor;
 use tracing::error;
 
 use super::cli::Cli;
-use super::evidence::{attest_degraded, attest_degraded_at, AnchorHandle, AuditHandle};
+use super::evidence::{AnchorHandle, AuditHandle, attest_degraded, attest_degraded_at};
 
 /// The admin socket, started only with the network isolator (its ruleset):
 /// the admin key set (a skipped line signed, AUT-004; the one-key bootstrap

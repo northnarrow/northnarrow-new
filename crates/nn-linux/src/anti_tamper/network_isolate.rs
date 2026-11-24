@@ -27,12 +27,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nn_proto::admin_signed_payload::OverlayKind;
 use tracing::{error, info, warn};
 
 use super::combat_allow;
-use crate::bounded_cmd::{run_bounded, EXTERNAL_CMD_TIMEOUT};
+use crate::bounded_cmd::{EXTERNAL_CMD_TIMEOUT, run_bounded};
 use crate::trusted_bin::{self, SystemBin};
 
 /// `iptables-restore` lookup name. External audit ATP-014 (NN-AUD-262):
@@ -1481,9 +1481,10 @@ mod tests {
         let Some((iso, v4, v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso
-            .engage(&crate::response::journal::test_intent())
-            .complete());
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete()
+        );
         v4.fail("D");
         let report = iso.release(mint_unlock_token());
         assert!(!report.complete(), "{report:?}");
@@ -1512,9 +1513,10 @@ mod tests {
         assert!(!iso.is_engaged());
         assert!(!v4.has_chain());
         // and a v6 teardown failure is a failure too (it was a WARN)
-        assert!(iso
-            .engage(&crate::response::journal::test_intent())
-            .complete());
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete()
+        );
         v6.fail("D");
         let report = iso.release(mint_unlock_token());
         assert!(failure(&report.v6).contains("still isolated"), "{report:?}");
@@ -1618,9 +1620,10 @@ mod tests {
         let Some(iso) = mock_success_isolator() else {
             return;
         };
-        assert!(iso
-            .engage(&crate::response::journal::test_intent())
-            .complete());
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete()
+        );
         assert!(iso.is_engaged());
         let truebin = PathBuf::from("/bin/true");
         if !truebin.exists() {
@@ -1630,9 +1633,10 @@ mod tests {
             iptables_bin: Bin::Fixed(truebin),
             ..iso
         };
-        assert!(!iso
-            .engage(&crate::response::journal::test_intent())
-            .engaged());
+        assert!(
+            !iso.engage(&crate::response::journal::test_intent())
+                .engaged()
+        );
         assert!(
             !iso.is_isolated(Family::V4),
             "the host is no longer isolated"
@@ -1830,9 +1834,11 @@ mod tests {
             let failed =
                 NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
                     .unwrap();
-            assert!(!failed
-                .engage(&crate::response::journal::test_intent())
-                .engaged());
+            assert!(
+                !failed
+                    .engage(&crate::response::journal::test_intent())
+                    .engaged()
+            );
             assert!(!failed.is_engaged());
         }
     }
@@ -1912,9 +1918,10 @@ mod tests {
         let Some((iso, _v4, _v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso
-            .engage(&crate::response::journal::test_intent())
-            .complete());
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete()
+        );
         assert!(iso.is_engaged());
         assert!(iso.release(mint_unlock_token()).complete());
         assert!(!iso.is_engaged(), "release must clear the isolation state");
@@ -1927,9 +1934,10 @@ mod tests {
         let Some((iso, _v4, _v6)) = fake_isolator() else {
             return;
         };
-        assert!(iso
-            .engage(&crate::response::journal::test_intent())
-            .complete());
+        assert!(
+            iso.engage(&crate::response::journal::test_intent())
+                .complete()
+        );
         assert!(iso.release(mint_unlock_token()).complete(), "first release");
         assert!(
             iso.release(mint_unlock_token()).complete(),

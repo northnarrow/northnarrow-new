@@ -61,7 +61,7 @@ use northnarrow_agent::fim::rules::HONEYPOT_PATHS;
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+use common::{EniIptablesGuard, InstalledBin, install_to_priv_bin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const VERDICT_POLL_TIMEOUT: Duration = Duration::from_secs(20);

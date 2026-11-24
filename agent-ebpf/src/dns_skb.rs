@@ -50,23 +50,32 @@ const HEADER_UNSET: usize = 0xffff;
 /// (the helper always writes its destination).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
-    let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u16>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[kprobe]
@@ -83,121 +92,124 @@ pub fn dns_udp_v6_send_skb(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
-    // Kernel signatures: (skb, fl4, cork) and (skb, fl6, cork).
-    let skb: *const u8 = match ctx.arg(0) {
-        Some(p) => p,
-        None => return,
-    };
-    let fl: *const u8 = match ctx.arg(1) {
-        Some(p) => p,
-        None => return,
-    };
-    // One read per datagram: the destination port, the first field of
-    // `uli`. Optional offsets one at a time (5.15 rule 3); userland
-    // attaches these programs only when all of them resolved.
-    let o_uli = match if v6 {
-        off_opt!(FLOWI6_ULI_OFFSET)
-    } else {
-        off_opt!(FLOWI4_ULI_OFFSET)
-    } {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    if peek_u16(fl.add(o_uli)) != DNS_PORT_BE {
-        return;
-    }
-    let o_daddr = match if v6 {
-        off_opt!(FLOWI6_DADDR_OFFSET)
-    } else {
-        off_opt!(FLOWI4_DADDR_OFFSET)
-    } {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    let o_head = match off_opt!(SK_BUFF_HEAD_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    let o_tail = match off_opt!(SK_BUFF_TAIL_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    let o_th = match off_opt!(SK_BUFF_TRANSPORT_HEADER_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    let o_dlen = match off_opt!(SK_BUFF_DATA_LEN_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return,
-    };
-    // Review 78: the DNS record budgets.
-    let admitted = match crate::dns_query::dns_admit() {
-        Some(a) => a,
-        None => return,
-    };
-
-    let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signatures: (skb, fl4, cork) and (skb, fl6, cork).
+        let skb: *const u8 = match ctx.arg(0) {
+            Some(p) => p,
+            None => return,
+        };
+        let fl: *const u8 = match ctx.arg(1) {
+            Some(p) => p,
+            None => return,
+        };
+        // One read per datagram: the destination port, the first field of
+        // `uli`. Optional offsets one at a time (5.15 rule 3); userland
+        // attaches these programs only when all of them resolved.
+        let o_uli = match if v6 {
+            off_opt!(FLOWI6_ULI_OFFSET)
+        } else {
+            off_opt!(FLOWI4_ULI_OFFSET)
+        } {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        if peek_u16(fl.add(o_uli)) != DNS_PORT_BE {
             return;
         }
-    };
-    let raw: *mut DnsQueryRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
-    }
-    // The destination the datagram will use (after any cgroup/sendmsg
-    // rewrite): 4 or 16 bytes, network order, as the old sensor stored it.
-    let dst = (*raw).dns_server.as_mut_ptr() as *mut c_void;
-    if v6 {
-        (*raw).family = AF_INET6;
-        let _ = generated::bpf_probe_read_kernel(dst, 16, fl.add(o_daddr) as *const c_void);
-    } else {
-        (*raw).family = AF_INET;
-        let _ = generated::bpf_probe_read_kernel(dst, 4, fl.add(o_daddr) as *const c_void);
-    }
+        let o_daddr = match if v6 {
+            off_opt!(FLOWI6_DADDR_OFFSET)
+        } else {
+            off_opt!(FLOWI4_DADDR_OFFSET)
+        } {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        let o_head = match off_opt!(SK_BUFF_HEAD_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        let o_tail = match off_opt!(SK_BUFF_TAIL_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        let o_th = match off_opt!(SK_BUFF_TRANSPORT_HEADER_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        let o_dlen = match off_opt!(SK_BUFF_DATA_LEN_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return,
+        };
+        // Review 78: the DNS record budgets.
+        let admitted = match crate::dns_query::dns_admit() {
+            Some(a) => a,
+            None => return,
+        };
 
-    // The payload the kernel copied: `head + transport_header` is the UDP
-    // header (blank until this function fills it), the linear data ends at
-    // `head + tail`; both are offsets from `head` on 64-bit kernels.
-    let head = peek_u64(skb.add(o_head)) as *const u8;
-    let tail = peek_u32(skb.add(o_tail)) as usize;
-    let th = peek_u16(skb.add(o_th)) as usize;
-    let mut flags = dns_flags::SKB | admitted.flags;
-    if peek_u32(skb.add(o_dlen)) != 0 {
-        flags |= dns_flags::NONLINEAR;
-    }
-    (*raw).flags = flags;
-    (*raw).held = admitted.held;
-    if !head.is_null() && th != HEADER_UNSET {
-        let start = (th & 0xffff) + UDP_HDR_LEN + DNS_HDR_LEN;
-        let avail = if tail > start { tail - start } else { 0 };
-        let src = head.add(start);
-        // Constant-size pieces up to the end of the linear data. The last
-        // one may read up to 31 bytes past `tail`, still inside the
-        // buffer's allocation (tailroom, then `skb_shared_info`); userland
-        // reads only `qname_len` bytes.
-        let mut copied = 0usize;
-        let mut i = 0usize;
-        while i < CHUNKS {
-            let off = i * CHUNK;
-            if off >= avail {
-                break;
+        let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS);
+                return;
             }
-            let dst = (*raw).query_name.as_mut_ptr().add(off) as *mut c_void;
-            if generated::bpf_probe_read_kernel(dst, CHUNK as u32, src.add(off) as *const c_void) != 0 {
-                break;
-            }
-            copied = off + CHUNK;
-            i += 1;
+        };
+        let raw: *mut DnsQueryRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).comm = comm;
         }
-        let n = if copied < avail { copied } else { avail };
-        (*raw).qname_len = n as u16;
+        // The destination the datagram will use (after any cgroup/sendmsg
+        // rewrite): 4 or 16 bytes, network order, as the old sensor stored it.
+        let dst = (*raw).dns_server.as_mut_ptr() as *mut c_void;
+        if v6 {
+            (*raw).family = AF_INET6;
+            let _ = generated::bpf_probe_read_kernel(dst, 16, fl.add(o_daddr) as *const c_void);
+        } else {
+            (*raw).family = AF_INET;
+            let _ = generated::bpf_probe_read_kernel(dst, 4, fl.add(o_daddr) as *const c_void);
+        }
+
+        // The payload the kernel copied: `head + transport_header` is the UDP
+        // header (blank until this function fills it), the linear data ends at
+        // `head + tail`; both are offsets from `head` on 64-bit kernels.
+        let head = peek_u64(skb.add(o_head)) as *const u8;
+        let tail = peek_u32(skb.add(o_tail)) as usize;
+        let th = peek_u16(skb.add(o_th)) as usize;
+        let mut flags = dns_flags::SKB | admitted.flags;
+        if peek_u32(skb.add(o_dlen)) != 0 {
+            flags |= dns_flags::NONLINEAR;
+        }
+        (*raw).flags = flags;
+        (*raw).held = admitted.held;
+        if !head.is_null() && th != HEADER_UNSET {
+            let start = (th & 0xffff) + UDP_HDR_LEN + DNS_HDR_LEN;
+            let avail = if tail > start { tail - start } else { 0 };
+            let src = head.add(start);
+            // Constant-size pieces up to the end of the linear data. The last
+            // one may read up to 31 bytes past `tail`, still inside the
+            // buffer's allocation (tailroom, then `skb_shared_info`); userland
+            // reads only `qname_len` bytes.
+            let mut copied = 0usize;
+            let mut i = 0usize;
+            while i < CHUNKS {
+                let off = i * CHUNK;
+                if off >= avail {
+                    break;
+                }
+                let dst = (*raw).query_name.as_mut_ptr().add(off) as *mut c_void;
+                if generated::bpf_probe_read_kernel(dst, CHUNK as u32, src.add(off) as *const c_void) != 0 {
+                    break;
+                }
+                copied = off + CHUNK;
+                i += 1;
+            }
+            let n = if copied < avail { copied } else { avail };
+            (*raw).qname_len = n as u16;
+        }
+        entry.submit(0);
     }
-    entry.submit(0);
 }

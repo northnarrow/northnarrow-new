@@ -20,7 +20,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
-use nn_evidence::heartbeat::{check, CheckResult, WatchConfig, WatchState};
+use nn_evidence::heartbeat::{CheckResult, WatchConfig, WatchState, check};
 
 /// Lines `export` prints by default.
 pub const DEFAULT_EXPORT_LINES: usize = 64;
@@ -171,7 +171,7 @@ impl Pipe {
 /// Wait at most `wait` for bytes on the open pipes, then read once from
 /// each one that has some or closed. Whether one did.
 fn read_ready(out: &mut Pipe, err: &mut Pipe, wait: Duration) -> bool {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
     let ready: Vec<bool> = {
         let open: Vec<&std::fs::File> = [&out.fd, &err.fd].into_iter().flatten().collect();
         if open.is_empty() {

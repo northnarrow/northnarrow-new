@@ -26,8 +26,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use super::rules;
 use super::Rule;
+use super::rules;
 
 const RULES_TSV: &str = "docs/validation/v2-rules.tsv";
 const TECHNIQUES_TSV: &str = "docs/validation/v2-techniques.tsv";

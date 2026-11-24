@@ -52,7 +52,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::rules::program_identity;
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 const OFFSEC_COMMS: &[&str] = &["socat", "msfvenom", "meterpreter", "sliver", "havoc"];
@@ -429,9 +429,11 @@ mod tests {
 
     #[test]
     fn match_is_exact_not_prefix() {
-        assert!(rule()
-            .evaluate(&spawn("socat-helper", "/usr/bin/socat-helper"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("socat-helper", "/usr/bin/socat-helper"))
+                .is_none()
+        );
     }
 
     /// External audit PROC-010: the distribution's socat is recorded; a
@@ -552,9 +554,10 @@ mod tests {
         let r = R006ReverseShellTooling::new(Arc::new(CommAllowlist::from_iter_owned([
             "socat".to_string()
         ])));
-        assert!(r
-            .evaluate(&spawn_exe("socat", "socat", "/usr/bin/socat", 0))
-            .is_none());
+        assert!(
+            r.evaluate(&spawn_exe("socat", "socat", "/usr/bin/socat", 0))
+                .is_none()
+        );
         let v = r
             .evaluate(&spawn_exe("socat", "./socat", "/home/alice/socat", 0))
             .expect("a copy is not the allowlisted socat");

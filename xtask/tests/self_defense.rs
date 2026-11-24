@@ -195,11 +195,11 @@ fn the_sigio_hook_refuses_every_owner_signal_to_a_protected_process() {
         &[
             "let task: *const c_void = ctx.arg(0);",
             "off!(TASK_STRUCT_TGID_OFFSET)",
-            "crate::fail_open::bump(hook::FILE_SEND_SIGIOTASK);\n            return 0;",
-            "if !crate::task_kill::is_protected_pid(tgid) {\n        return 0;\n    }",
+            "crate::fail_open::bump(hook::FILE_SEND_SIGIOTASK);\n                return 0;",
+            "if !crate::task_kill::is_protected_pid(tgid) {\n            return 0;\n        }",
             "let sig: c_int = ctx.arg(2);",
             "let delivered = sigio_signal(sig);",
-            "if crate::task_kill::kill_grant_allows(delivered) {\n        return 0;\n    }",
+            "if crate::task_kill::kill_grant_allows(delivered) {\n            return 0;\n        }",
             "crate::inode_protect::emit_task_denial(FS_OP_SIGIO, delivered as u32 as u64, tgid);",
             "-EPERM",
         ],
@@ -283,8 +283,10 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
     .unwrap();
     assert!(!open.contains("emit_denial("));
     let c = code("agent-ebpf/src/cgroup_files.rs");
-    assert!(body(&c, "sign")
-        .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),"));
+    assert!(
+        body(&c, "sign")
+            .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),")
+    );
     // no other inode refusal writes the ring without a budget (lot 356:
     // but the sole traces' writer, `emit_sole_trace` — a window's held load
     // alone, which `kernel_halves.rs` keeps to `hold`; the re-check 2 of
@@ -548,7 +550,7 @@ fn every_watchdog_pin_handle_failure_is_signed() {
 fn the_memory_views_are_refused_whatever_the_opens_access_mode() {
     let i = code("agent-ebpf/src/inode_protect.rs");
     let open = body(&i, "try_protected_open_deny");
-    let call = "    if crate::cgroup_files::refuse_memory_view(file, inode) {\n        return -EPERM;\n    }";
+    let call = "    if crate::cgroup_files::refuse_memory_view(file, inode) {\n            return -EPERM;\n        }";
     let at = open
         .find(call)
         .expect("the view deny, at the body's own level");
@@ -582,10 +584,10 @@ fn the_memory_views_are_refused_at_their_open_with_the_hooks_decisions() {
     in_order(
         body(&c, "refuse_memory_view"),
         &[
-            "if !matches!(special_fs(magic), Some(SpecialFs::Proc)) {\n        return false;\n    }",
-            "if !northnarrow_common::ptrace_read::is_memory_view(len, words) {\n        return false;\n    }",
+            "if !matches!(special_fs(magic), Some(SpecialFs::Proc)) {\n            return false;\n        }",
+            "if !northnarrow_common::ptrace_read::is_memory_view(len, words) {\n            return false;\n        }",
             "proc_file_task(inode)",
-            "if caller == tgid {\n        return false;\n    }",
+            "if caller == tgid {\n            return false;\n        }",
             "if !crate::ptrace_check::target_is_protected(tgid, task) {",
             "if crate::ptrace_check::caller_may_access(caller, false) {",
             "northnarrow_common::ptrace_read::VIEW_OPEN | MODE_READ_FSCREDS",
@@ -600,7 +602,9 @@ fn the_memory_views_are_refused_at_their_open_with_the_hooks_decisions() {
     let p = code("agent-ebpf/src/ptrace_check.rs");
     let hook = body(&p, "try_ptrace_access_check");
     assert!(!hook.contains("VIEW_OPEN"));
-    assert!(hook.contains("crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);"));
+    assert!(
+        hook.contains("crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);")
+    );
     // the record's words: the shared module's, for every read-mode record
     let e = code("agent/src/pipeline/process_event.rs");
     in_order(

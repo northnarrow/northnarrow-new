@@ -37,38 +37,44 @@ pub fn dns_nss_resolve(ctx: ProbeContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_dns_nss_resolve(ctx: &ProbeContext) {
-    // `_nss_resolve_gethostbyname*_r(const char *name, …)`.
-    let name: *const u8 = match ctx.arg(0) {
-        Some(p) => p,
-        None => return,
-    };
-    if name.is_null() {
-        return;
-    }
-    let admitted = match crate::dns_query::dns_admit() {
-        Some(a) => a,
-        None => return,
-    };
-    let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // `_nss_resolve_gethostbyname*_r(const char *name, …)`.
+        let name: *const u8 = match ctx.arg(0) {
+            Some(p) => p,
+            None => return,
+        };
+        if name.is_null() {
             return;
         }
-    };
-    let raw: *mut DnsQueryRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
+        let admitted = match crate::dns_query::dns_admit() {
+            Some(a) => a,
+            None => return,
+        };
+        let mut entry = match DNS_QUERY_EVENTS.reserve::<DnsQueryRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS);
+                return;
+            }
+        };
+        let raw: *mut DnsQueryRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).comm = comm;
+        }
+        (*raw).flags = dns_flags::NSS | admitted.flags;
+        (*raw).held = admitted.held;
+        let dst = core::slice::from_raw_parts_mut((*raw).query_name.as_mut_ptr(), QNAME_WIRE_LEN);
+        match bpf_probe_read_user_str_bytes(name, dst) {
+            Ok(s) => {
+                (*raw).qname_len = s.len() as u16;
+            }
+            _ => {}
+        }
+        entry.submit(0);
     }
-    (*raw).flags = dns_flags::NSS | admitted.flags;
-    (*raw).held = admitted.held;
-    let dst = core::slice::from_raw_parts_mut((*raw).query_name.as_mut_ptr(), QNAME_WIRE_LEN);
-    if let Ok(s) = bpf_probe_read_user_str_bytes(name, dst) {
-        (*raw).qname_len = s.len() as u16;
-    }
-    entry.submit(0);
 }

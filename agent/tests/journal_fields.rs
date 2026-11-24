@@ -268,11 +268,13 @@ fn the_scan_finds_what_it_must() {
     );
     assert_eq!(violations(f, r#"info!("ran {comm}")"#).len(), 1);
     assert!(violations(f, r#"warn!(comm = %Escaped(comm), "x")"#).is_empty());
-    assert!(violations(
-        f,
-        r#"warn!(comm = %nn_model::log_escape::Escaped(&c), "x")"#
-    )
-    .is_empty());
+    assert!(
+        violations(
+            f,
+            r#"warn!(comm = %nn_model::log_escape::Escaped(&c), "x")"#
+        )
+        .is_empty()
+    );
     assert!(violations(f, r#"warn!(comm = ?comm, path = %p.display(), "x")"#).is_empty());
     assert!(violations(f, r#"info!("ran {comm:?} at {}", 5)"#).is_empty());
     assert!(violations(f, "// warn!(comm = %comm)\nlet x = 5 % 3;").is_empty());

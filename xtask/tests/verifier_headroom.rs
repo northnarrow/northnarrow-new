@@ -110,7 +110,7 @@ fn the_fim_sensor_past_the_watch_is_global_functions() {
     ] {
         assert!(
             f.contains(&format!(
-                "#[no_mangle] #[inline(never)] pub extern \"C\" fn {g}("
+                "#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn {g}("
             )),
             "{g} is a global function"
         );
@@ -138,8 +138,11 @@ fn the_fim_sensor_past_the_watch_is_global_functions() {
     // parent and its inode go to the last through the buffer, written
     // before they are read
     let class = body(&open, "nn_open_class");
-    assert!(class
-        .contains("let cls = dir_class(&pkey, parent as *const u8, parent_inode as *const u8);"));
+    assert!(
+        class.contains(
+            "let cls = dir_class(&pkey, parent as *const u8, parent_inode as *const u8);"
+        )
+    );
     assert!(
         !class.contains("buffer_of(") && !class.contains("OPEN_TASK"),
         "{class}"
@@ -218,8 +221,9 @@ fn the_share_key_walk_reads_without_a_branch() {
         !walk.contains("bpf_probe_read_kernel::<"),
         "a read with a branch on its result"
     );
-    assert!(flat(&ts)
-        .contains("#[no_mangle] #[inline(never)] pub extern \"C\" fn nn_share_key() -> u64 {"));
+    assert!(flat(&ts).contains(
+        "#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn nn_share_key() -> u64 {"
+    ));
 }
 
 /// 4. The write history's step in the eBPF program: plain values, no

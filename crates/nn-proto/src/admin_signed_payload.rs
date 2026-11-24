@@ -67,7 +67,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
@@ -2472,9 +2472,11 @@ mod tests {
             verifying.verify_strict(RAW_MSG, &stored).unwrap();
             let mut bad = sig_bytes(RAW_SIG);
             bad[0] ^= 1;
-            assert!(verifying
-                .verify_strict(RAW_MSG, &Signature::from_bytes(&bad))
-                .is_err());
+            assert!(
+                verifying
+                    .verify_strict(RAW_MSG, &Signature::from_bytes(&bad))
+                    .is_err()
+            );
         }
 
         /// Protects: a signed admin payload stored before the bump must verify after it.

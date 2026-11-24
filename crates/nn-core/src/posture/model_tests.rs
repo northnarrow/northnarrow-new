@@ -17,8 +17,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use nn_model::posture_types::PostureKind;
 use nn_model::Event;
+use nn_model::posture_types::PostureKind;
 
 use super::clock::{Clock, TestClock};
 use super::host::testing::TestHost;
@@ -26,7 +26,7 @@ use super::state::PostureState;
 use super::transitions::COMBAT_QUIET_WINDOW;
 use super::triggers::testutil::{fs_protect_denial, spawn, tcp_v4};
 use super::{AuthSessionTracker, ExemptPids};
-use crate::model_check::{check, Rng, SEQUENCES};
+use crate::model_check::{Rng, SEQUENCES, check};
 
 type PostureMachine = super::PostureMachine<TestHost>;
 

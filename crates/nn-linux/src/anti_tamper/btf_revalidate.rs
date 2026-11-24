@@ -37,10 +37,11 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, FexitTarget, HookArgCheck, HookArgSpec, JoinTarget, OffsetSpec, BTF_MODULE_STRUCTS,
-    BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_JOIN_OFFSETS, CGROUP_JOIN_TARGETS,
-    CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES, FEXIT_TARGETS, HOOK_ARGS,
-    HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE, NO_ARG_TARGETS, REVALIDATE, SLOT_TABLE,
+    BTF_MODULE_STRUCTS, BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, CGROUP_JOIN_OFFSETS,
+    CGROUP_JOIN_TARGETS, CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET, ENUM_SLOT_TABLE, ENUM_VALUES,
+    EnumSpec, FEXIT_TARGETS, FexitTarget, HOOK_ARG_CHECKS, HOOK_ARG_MAX, HOOK_ARG_SLOT_TABLE,
+    HOOK_ARGS, HookArgCheck, HookArgSpec, JoinTarget, NO_ARG_TARGETS, OffsetSpec, REVALIDATE,
+    SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -130,7 +131,7 @@ pub fn revalidate_offsets() -> RevalidateOutcome {
         Err(e) => {
             return RevalidateOutcome::SkippedNoBtf {
                 reason: format!("{VMLINUX_BTF}: {e}"),
-            }
+            };
         }
     };
     let btf = match Btf::parse(&data) {
@@ -396,7 +397,7 @@ pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
         Err(e) => {
             return ResolveOutcome::SkippedNoBtf {
                 reason: format!("{}: {e}", path.display()),
-            }
+            };
         }
     };
     let btf = match Btf::parse(&data) {
@@ -913,7 +914,7 @@ fn read_format_file(path: &str, fs_magic: u64) -> std::io::Result<String> {
         Some(m) => {
             return Err(std::io::Error::other(format!(
                 "filesystem type {m:#x}, not tracefs"
-            )))
+            )));
         }
         None => return Err(std::io::Error::last_os_error()),
     }
@@ -1605,7 +1606,7 @@ impl Btf {
                 return Err(ResolveError::Prototype(format!(
                     "{}: no function prototype",
                     t.func
-                )))
+                )));
             }
         };
         let shape = || self.describe_prototype(t.func, params);
@@ -1999,16 +2000,19 @@ mod tests {
         fs::create_dir_all(&sqe).unwrap();
         fs::write(sqe.join("format"), "format:\n\tfield:void * ctx;\toffset:8;\tsize:8;\tsigned:0;\n\tfield:void * req;\toffset:16;\tsize:8;\tsigned:0;\n\tfield:u8 opcode;\toffset:24;\tsize:1;\tsigned:0;\n\tfield:u64 user_data;\toffset:32;\tsize:8;\tsigned:0;\n\tfield:u32 flags;\toffset:40;\tsize:4;\tsigned:0;\n\tfield:bool force_nonblock;\toffset:44;\tsize:1;\tsigned:0;\n\tfield:bool sq_thread;\toffset:45;\tsize:1;\tsigned:0;\n").unwrap();
         let r = resolve_in(root);
-        assert!(r
-            .values
-            .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24)));
-        assert!(r
-            .values
-            .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45)));
-        assert!(r
-            .drifted
-            .iter()
-            .any(|(n, _, rt)| *n == "TP_IOURING_SUBMIT_OPCODE_OFFSET" && *rt == 24));
+        assert!(
+            r.values
+                .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24))
+        );
+        assert!(
+            r.values
+                .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45))
+        );
+        assert!(
+            r.drifted
+                .iter()
+                .any(|(n, _, rt)| *n == "TP_IOURING_SUBMIT_OPCODE_OFFSET" && *rt == 24)
+        );
     }
 
     /// A synthetic tracefs tree with the RHEL 9 layout: the exec filename
@@ -2016,7 +2020,7 @@ mod tests {
     /// event falls back to the compiled value and is reported.
     #[test]
     fn tracepoint_fields_resolve_from_tracefs_tree() {
-        use common::btf_offsets::{slot, TP_SCHED_EXEC_FILENAME_OFFSET};
+        use common::btf_offsets::{TP_SCHED_EXEC_FILENAME_OFFSET, slot};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let exec = root.join("events/sched/sched_process_exec");
@@ -2028,12 +2032,14 @@ mod tests {
         // sys_enter_execve deliberately absent
         let r = resolve_in(root);
         assert_eq!(r.values.len(), common::btf_offsets::TRACEPOINT_FIELDS.len());
-        assert!(r
-            .values
-            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12)));
-        assert!(r
-            .values
-            .contains(&(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 32)));
+        assert!(
+            r.values
+                .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12))
+        );
+        assert!(
+            r.values
+                .contains(&(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 32))
+        );
         assert_eq!(
             r.drifted,
             vec![(
@@ -2047,9 +2053,10 @@ mod tests {
         // 226 are no longer read)
         assert_eq!(r.unresolved.len(), 6);
         assert_eq!(r.unresolved[0].0, "TP_SYS_ENTER_EXECVE_FILENAME_OFFSET");
-        assert!(r
-            .values
-            .contains(&(slot::TP_SYS_ENTER_EXECVE_FILENAME_OFFSET, 16)));
+        assert!(
+            r.values
+                .contains(&(slot::TP_SYS_ENTER_EXECVE_FILENAME_OFFSET, 16))
+        );
         // no readable root at all: every slot keeps its compiled value
         let none = resolve_tracepoint_fields_from(
             &["/nonexistent/tracefs"],
@@ -2095,13 +2102,15 @@ mod tests {
                 .contains(&(slot::TP_IOURING_SUBMIT_OPCODE_OFFSET, 24)),
             "{r:?}"
         );
-        assert!(r
-            .values
-            .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45)));
-        assert!(!r
-            .unresolved
-            .iter()
-            .any(|(n, _)| n.starts_with("TP_IOURING_SUBMIT")));
+        assert!(
+            r.values
+                .contains(&(slot::TP_IOURING_SUBMIT_SQ_THREAD_OFFSET, 45))
+        );
+        assert!(
+            !r.unresolved
+                .iter()
+                .any(|(n, _)| n.starts_with("TP_IOURING_SUBMIT"))
+        );
     }
 
     /// External audit NN-AUD-098 (b, d): a root that is not tracefs (here a
@@ -2109,7 +2118,7 @@ mod tests {
     /// every field keeps its compiled value and the reason is attested.
     #[test]
     fn non_tracefs_root_is_skipped() {
-        use common::btf_offsets::{slot, TRACEPOINT_FIELDS};
+        use common::btf_offsets::{TRACEPOINT_FIELDS, slot};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_format(root, "sched", "sched_process_exec", RHEL9_EXEC_FORMAT);
@@ -2143,9 +2152,10 @@ mod tests {
         );
         // the same tree accepted as the expected type: resolved, nothing to attest
         let ok = resolve_in(root);
-        assert!(ok
-            .values
-            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12)));
+        assert!(
+            ok.values
+                .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 12))
+        );
         assert!(ok.skipped_roots.is_empty());
     }
 
@@ -2248,9 +2258,11 @@ mod tests {
                 "{header}\n\tfield:__data_loc char[] filename;\toffset:508;\tsize:4;\tsigned:1;\n"
             ),
         );
-        assert!(resolve_in(dir.path())
-            .values
-            .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 508)));
+        assert!(
+            resolve_in(dir.path())
+                .values
+                .contains(&(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 508))
+        );
     }
 
     /// Stock layouts pass the checks of NN-AUD-098 unchanged: upstream 6.8
@@ -2815,9 +2827,10 @@ mod tests {
             ResolveOutcome::Resolved(r) => {
                 let slot = |n: &str| SLOT_TABLE.iter().find(|(s, _)| *s == n).unwrap().1;
                 assert!(r.values.contains(&(slot("BTRFS_INODE_ROOT_OFFSET"), 0)));
-                assert!(r
-                    .values
-                    .contains(&(slot("BTRFS_INODE_VFS_INODE_OFFSET"), 16)));
+                assert!(
+                    r.values
+                        .contains(&(slot("BTRFS_INODE_VFS_INODE_OFFSET"), 16))
+                );
                 assert!(r.values.contains(&(slot("BTRFS_ROOT_ANON_DEV_OFFSET"), 8)));
                 assert!(r.absent.is_empty() && r.modules_not_loaded.is_empty());
             }
@@ -3086,9 +3099,11 @@ mod tests {
         }
         // the prototype is named in the reason
         let r = hooks_only(&hook_btf(Setattr::NoIattrAfter, Xattr::From512, 1));
-        assert!(r.absent[0]
-            .detail
-            .contains("bpf_lsm_inode_setattr(struct mnt_idmap *, struct dentry *, ?)"));
+        assert!(
+            r.absent[0]
+                .detail
+                .contains("bpf_lsm_inode_setattr(struct mnt_idmap *, struct dentry *, ?)")
+        );
     }
 
     /// No resolution published this boot (no BTF): the programs on a hook
@@ -3185,7 +3200,7 @@ mod tests {
     /// unchanged without it (the ACL hooks: 6.2 and later).
     #[test]
     fn file_ioctl_compat_is_selected_from_the_kernels_btf() {
-        use super::super::filesystem::{attach_optional, OptionalHook, OPTIONAL_LSM_PROGRAMS};
+        use super::super::filesystem::{OPTIONAL_LSM_PROGRAMS, OptionalHook, attach_optional};
         for (kernel, compat, acl, expected) in [
             // lot 293: 22 required deny hooks (file_send_sigiotask)
             ("6.8, 6.12", true, true, 22 + 3),

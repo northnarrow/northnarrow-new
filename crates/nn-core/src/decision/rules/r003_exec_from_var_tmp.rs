@@ -6,7 +6,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 #[derive(Debug, Default)]
 pub struct R003ExecFromVarTmp {
@@ -117,21 +117,29 @@ mod tests {
     #[test]
     fn ignores_plain_tmp_and_legit_paths() {
         // /tmp/ is R001's job; /usr/bin/ is fine.
-        assert!(R003ExecFromVarTmp::default()
-            .evaluate(&spawn("x", "/tmp/x"))
-            .is_none());
-        assert!(R003ExecFromVarTmp::default()
-            .evaluate(&spawn("ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            R003ExecFromVarTmp::default()
+                .evaluate(&spawn("x", "/tmp/x"))
+                .is_none()
+        );
+        assert!(
+            R003ExecFromVarTmp::default()
+                .evaluate(&spawn("ls", "/usr/bin/ls"))
+                .is_none()
+        );
     }
 
     #[test]
     fn does_not_match_var_root_or_lookalikes() {
-        assert!(R003ExecFromVarTmp::default()
-            .evaluate(&spawn("x", "/var/tmpfoo/x"))
-            .is_none());
-        assert!(R003ExecFromVarTmp::default()
-            .evaluate(&spawn("x", "/var/log/syslog"))
-            .is_none());
+        assert!(
+            R003ExecFromVarTmp::default()
+                .evaluate(&spawn("x", "/var/tmpfoo/x"))
+                .is_none()
+        );
+        assert!(
+            R003ExecFromVarTmp::default()
+                .evaluate(&spawn("x", "/var/log/syslog"))
+                .is_none()
+        );
     }
 }

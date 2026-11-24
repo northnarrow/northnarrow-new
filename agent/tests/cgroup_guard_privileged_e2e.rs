@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+use common::{EniIptablesGuard, InstalledBin, install_to_priv_bin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const LOG_POLL_TIMEOUT: Duration = Duration::from_secs(20);

@@ -115,44 +115,47 @@ pub fn cgroup_move_stash(ctx: FExitContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_cgroup_move_stash(ctx: &FExitContext) {
-    let args = ctx.as_ptr() as *const u64;
-    let task = match bpf_probe_read_kernel::<u64>(args.add(CGROUP_MOVE_RET_ARG)) {
-        Ok(t) => t,
-        Err(_) => {
-            crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let args = ctx.as_ptr() as *const u64;
+        let task = match bpf_probe_read_kernel::<u64>(args.add(CGROUP_MOVE_RET_ARG)) {
+            Ok(t) => t,
+            Err(_) => {
+                crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+                return;
+            }
+        };
+        // NULL or an ERR_PTR (a pid that names no task, a kernel thread): the
+        // write fails by itself.
+        if task == 0 || task >= 0u64.wrapping_sub(MAX_ERRNO) {
             return;
         }
-    };
-    // NULL or an ERR_PTR (a pid that names no task, a kernel thread): the
-    // write fails by itself.
-    if task == 0 || task >= 0u64.wrapping_sub(MAX_ERRNO) {
-        return;
-    }
-    let tgid_ptr = (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
-    let tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
-        Ok(v) => v,
-        Err(_) => {
-            // The task cannot be told: the move goes through undecided,
-            // and is counted (lab PR 215).
-            crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+        let tgid_ptr = (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
+        let tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
+            Ok(v) => v,
+            Err(_) => {
+                // The task cannot be told: the move goes through undecided,
+                // and is counted (lab PR 215).
+                crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+                return;
+            }
+        };
+        let pid_tgid = bpf_get_current_pid_tgid();
+        // Only a protected process moved by a caller outside the agent's
+        // family (a worker is protected, not exempt: R14a), outside a signed
+        // trusted-installer window, is recorded.
+        if !crate::task_kill::is_protected_pid(tgid)
+            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
+            || crate::inode_protect::override_active()
+        {
             return;
         }
-    };
-    let pid_tgid = bpf_get_current_pid_tgid();
-    // Only a protected process moved by a caller outside the agent's
-    // family (a worker is protected, not exempt: R14a), outside a signed
-    // trusted-installer window, is recorded.
-    if !crate::task_kill::is_protected_pid(tgid)
-        || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
-        || crate::inode_protect::override_active()
-    {
-        return;
-    }
-    let rec = [u64::from(tgid), bpf_ktime_get_ns()];
-    if CGROUP_MOVES.insert(&pid_tgid, &rec, 0).is_err() {
-        // Lot 273b: the map is full (it never evicts): counted, and the
-        // move goes through undecided.
-        crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+        let rec = [u64::from(tgid), bpf_ktime_get_ns()];
+        if CGROUP_MOVES.insert(&pid_tgid, &rec, 0).is_err() {
+            // Lot 273b: the map is full (it never evicts): counted, and the
+            // move goes through undecided.
+            crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);
+        }
     }
 }
 
@@ -185,64 +188,67 @@ pub fn cgroup_move_clear(_ctx: FExitContext) -> i32 {
 /// hierarchy. A read that fails is no such file.
 #[inline(always)]
 unsafe fn is_cgroup2_members_file(inode: *const c_void) -> bool {
-    if inode.is_null() {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if inode.is_null() {
+            return false;
+        }
+        let Ok(sb) = bpf_probe_read_kernel::<*const u8>(
+            (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const u8,
+        ) else {
+            return false;
+        };
+        if sb.is_null() {
+            return false;
+        }
+        let Ok(magic) = bpf_probe_read_kernel::<u64>(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
+        else {
+            return false;
+        };
+        if magic & 0xffff_ffff != CGROUP2_SUPER_MAGIC {
+            return false;
+        }
+        let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16)
+        else {
+            return false;
+        };
+        if mode & S_IFMT != S_IFREG {
+            return false;
+        }
+        let (Some(private), Some(name_off)) = (
+            off_opt!(INODE_I_PRIVATE_OFFSET),
+            off_opt!(KERNFS_NODE_NAME_OFFSET),
+        ) else {
+            return true;
+        };
+        let Ok(kn) = bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(private) as *const *const u8)
+        else {
+            return false;
+        };
+        if kn.is_null() {
+            return false;
+        }
+        let Ok(name) = bpf_probe_read_kernel::<*const u8>(kn.add(name_off) as *const *const u8) else {
+            return false;
+        };
+        if name.is_null() {
+            return false;
+        }
+        // "cgroup.procs" (12 bytes) or "cgroup.threads" (14): read up to its
+        // NUL into two zeroed words (never past the string), compared whole.
+        let mut w = [0u64; 2];
+        let n = generated::bpf_probe_read_kernel_str(
+            w.as_mut_ptr() as *mut c_void,
+            16,
+            name as *const c_void,
+        );
+        if n <= 0 {
+            return false;
+        }
+        const PROCS: [u64; 3] = name_words(b"cgroup.procs");
+        const THREADS: [u64; 3] = name_words(b"cgroup.threads");
+        (w[0] == PROCS[0] && w[1] == PROCS[1]) || (w[0] == THREADS[0] && w[1] == THREADS[1])
     }
-    let Ok(sb) = bpf_probe_read_kernel::<*const u8>(
-        (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const u8,
-    ) else {
-        return false;
-    };
-    if sb.is_null() {
-        return false;
-    }
-    let Ok(magic) = bpf_probe_read_kernel::<u64>(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
-    else {
-        return false;
-    };
-    if magic & 0xffff_ffff != CGROUP2_SUPER_MAGIC {
-        return false;
-    }
-    let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16)
-    else {
-        return false;
-    };
-    if mode & S_IFMT != S_IFREG {
-        return false;
-    }
-    let (Some(private), Some(name_off)) = (
-        off_opt!(INODE_I_PRIVATE_OFFSET),
-        off_opt!(KERNFS_NODE_NAME_OFFSET),
-    ) else {
-        return true;
-    };
-    let Ok(kn) = bpf_probe_read_kernel::<*const u8>((inode as *const u8).add(private) as *const *const u8)
-    else {
-        return false;
-    };
-    if kn.is_null() {
-        return false;
-    }
-    let Ok(name) = bpf_probe_read_kernel::<*const u8>(kn.add(name_off) as *const *const u8) else {
-        return false;
-    };
-    if name.is_null() {
-        return false;
-    }
-    // "cgroup.procs" (12 bytes) or "cgroup.threads" (14): read up to its
-    // NUL into two zeroed words (never past the string), compared whole.
-    let mut w = [0u64; 2];
-    let n = generated::bpf_probe_read_kernel_str(
-        w.as_mut_ptr() as *mut c_void,
-        16,
-        name as *const c_void,
-    );
-    if n <= 0 {
-        return false;
-    }
-    const PROCS: [u64; 3] = name_words(b"cgroup.procs");
-    const THREADS: [u64; 3] = name_words(b"cgroup.threads");
-    (w[0] == PROCS[0] && w[1] == PROCS[1]) || (w[0] == THREADS[0] && w[1] == THREADS[1])
 }
 
 /// `int inode_permission(struct inode *inode, int mask)`: the next write
@@ -256,31 +262,34 @@ pub fn cgroup_move_deny(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_cgroup_move_deny(ctx: &LsmContext) -> i32 {
-    // No prev-retval read, see task_kill.rs.
-    let mask: c_int = ctx.arg(1);
-    if mask & MAY_WRITE == 0 {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // No prev-retval read, see task_kill.rs.
+        let mask: c_int = ctx.arg(1);
+        if mask & MAY_WRITE == 0 {
+            return 0;
+        }
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let rec = match CGROUP_MOVES.get(&pid_tgid) {
+            Some(r) => *r,
+            None => return 0,
+        };
+        // Lot 273b: consumed only by the check a migration makes.
+        if !is_cgroup2_members_file(ctx.arg(0)) {
+            return 0;
+        }
+        let _ = CGROUP_MOVES.remove(&pid_tgid);
+        if bpf_ktime_get_ns().wrapping_sub(rec[1]) >= STASH_TTL_NS {
+            return 0;
+        }
+        // Checked again at the refusal: a window opened in between, or a
+        // process that joined the family, is let through.
+        if crate::inode_protect::override_active()
+            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
+        {
+            return 0;
+        }
+        crate::inode_protect::emit_task_denial(FS_OP_CGROUP_MOVE, 0, rec[0] as u32);
+        -EPERM
     }
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let rec = match CGROUP_MOVES.get(&pid_tgid) {
-        Some(r) => *r,
-        None => return 0,
-    };
-    // Lot 273b: consumed only by the check a migration makes.
-    if !is_cgroup2_members_file(ctx.arg(0)) {
-        return 0;
-    }
-    let _ = CGROUP_MOVES.remove(&pid_tgid);
-    if bpf_ktime_get_ns().wrapping_sub(rec[1]) >= STASH_TTL_NS {
-        return 0;
-    }
-    // Checked again at the refusal: a window opened in between, or a
-    // process that joined the family, is let through.
-    if crate::inode_protect::override_active()
-        || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)
-    {
-        return 0;
-    }
-    crate::inode_protect::emit_task_denial(FS_OP_CGROUP_MOVE, 0, rec[0] as u32);
-    -EPERM
 }

@@ -104,7 +104,7 @@ use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::rules::kmod_exec_facts::{self, Credentials, KMOD_TOOLS};
 use crate::decision::rules::kmod_invocation::{self, Syntax};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Lot 347: the modules a container runtime asks for at its start, by
@@ -267,7 +267,9 @@ impl<H: PostureHost> R011KernelModuleTooling<H> {
                 if kmod_invocation::tool_of(image, argv) == Ok(kmod_invocation::Tool::Modprobe)
                     && kmod_invocation::loads_nothing(argv, *argv_truncated) =>
             {
-                format!("{image}, the system's modprobe asked to load nothing (--show-depends or --dry-run)")
+                format!(
+                    "{image}, the system's modprobe asked to load nothing (--show-depends or --dry-run)"
+                )
             }
             // a hook: a `#!` script, the host's file at its path
             (Err(_), Some(interpreter))
@@ -1011,7 +1013,7 @@ mod tests {
     /// non-root exec, a copy of the tool, no fork record: R011's verdict.
     #[test]
     fn a_packaged_container_runtime_s_module_probe_is_recorded_low() {
-        use crate::decision::rules::program_identity::{record_installed, InstalledImage};
+        use crate::decision::rules::program_identity::{InstalledImage, record_installed};
         use common::wire::exe::exe_flags::ROOT_DIR;
         let (containerd, dockerd, shim, bash) = (
             (0x0fd0_0347, 347_101),
@@ -2671,9 +2673,11 @@ mod tests {
     fn ignores_non_kmod_tooling() {
         assert!(rule().evaluate(&spawn("ls", "/usr/bin/ls")).is_none());
         // A non-ProcessSpawn event never matches.
-        assert!(rule()
-            .evaluate(&spawn("modprobed-but-not-exact", "/usr/sbin/x"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("modprobed-but-not-exact", "/usr/sbin/x"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2681,9 +2685,10 @@ mod tests {
         let r = R011KernelModuleTooling::new(Arc::new(CommAllowlist::from_iter_owned([
             "modprobe".to_string(),
         ])));
-        assert!(r
-            .evaluate(&spawn("modprobe", "/usr/sbin/modprobe"))
-            .is_none());
+        assert!(
+            r.evaluate(&spawn("modprobe", "/usr/sbin/modprobe"))
+                .is_none()
+        );
         // A different kmod tool not on the allowlist still fires.
         assert!(r.evaluate(&spawn("insmod", "/usr/sbin/insmod")).is_some());
     }

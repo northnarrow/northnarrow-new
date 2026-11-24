@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::audit::{AgentBuild, AuditEntryDraft, AuditLog};
 use crate::chain_anchor::ChainFinding;
-use crate::chain_host::testing::{helds, TestKey};
+use crate::chain_host::testing::{TestKey, helds};
 
 fn paths() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();

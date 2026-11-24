@@ -61,8 +61,8 @@ pub mod audit {
     #[allow(unused_imports)]
     pub use crate::keys::test_doors::*;
     pub use crate::keys::{
-        public_half, read_verifying_key, verifying_key_path, AgentSigningKey,
-        DEFAULT_SIGNING_KEY_PATH,
+        AgentSigningKey, DEFAULT_SIGNING_KEY_PATH, public_half, read_verifying_key,
+        verifying_key_path,
     };
 
     /// [`nn_evidence::audit::AuditLog`], signed by the agent's key unless

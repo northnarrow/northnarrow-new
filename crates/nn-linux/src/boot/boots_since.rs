@@ -368,7 +368,7 @@ mod tests {
 
     /// The journal's boots before this one as a list `v` (oldest first,
     /// this boot last) gives them, one at a time.
-    fn walk(v: &[&str]) -> impl FnMut(&str, usize) -> BootBefore {
+    fn walk(v: &[&str]) -> impl FnMut(&str, usize) -> BootBefore + use<> {
         let v: Vec<String> = ids(v).unwrap();
         move |current, k| {
             assert_eq!(v.last().map(String::as_str), Some(current));

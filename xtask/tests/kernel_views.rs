@@ -1917,8 +1917,7 @@ fn the_re_check_s_planted_shapes_are_found() {
         !walks(&d_code["x.rs"], &d_consts).is_empty(),
         "D (a closure)"
     );
-    let d2 =
-        "fn g() {\n    for p in REV563_PREFIXES {\n        let _ = std::fs::metadata(p);\n    \
+    let d2 = "fn g() {\n    for p in REV563_PREFIXES {\n        let _ = std::fs::metadata(p);\n    \
               }\n}\n";
     assert!(!walks(d2, &d_consts).is_empty(), "D (a for loop)");
     // the items of a list that names no view are not
@@ -2131,8 +2130,7 @@ fn the_re_check_2_s_planted_shapes_are_found() {
         );
     }
     // the same closure reading through kernel_roots is clean
-    let clean =
-        "fn read(path: &str) -> String {\n    crate::response::on_host_path(Path::new(path), \
+    let clean = "fn read(path: &str) -> String {\n    crate::response::on_host_path(Path::new(path), \
                  |p| {\n        antitamper_bpf::kernel_roots::open(p, libc::O_RDONLY)\n    })\n}\n";
     assert!(
         walks_full(clean, &[], &BTreeMap::new(), &handing).is_empty(),

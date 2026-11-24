@@ -1086,7 +1086,7 @@ fn a_forged_shutdown_marker_is_refused_and_the_agent_respawned() {
 /// authorisation is recorded so it cannot be presented again.
 #[test]
 fn a_quorum_signed_shutdown_marker_stands_the_watchdog_down() {
-    use nn_proto::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::admin_signed_payload::{SignedPayload, sign};
     use nn_proto::shutdown_marker::ShutdownMarker;
 
     let mut fx = E2eFixture::setup();
@@ -1429,8 +1429,8 @@ fn heads(records: &[&String]) -> Vec<String> {
 #[test]
 fn the_watchdog_signs_the_agent_s_vacancy_and_its_successor() {
     use nn_proto::witness::{
-        judge_chain, Judged, AGENT_ROUND_SECS, CHAIN_FILE, KIND_OPENED, KIND_SUCCESSOR_FOREIGN,
-        KIND_VACATED, UNCERTIFIED_WAIT_ROUNDS,
+        AGENT_ROUND_SECS, CHAIN_FILE, Judged, KIND_OPENED, KIND_SUCCESSOR_FOREIGN, KIND_VACATED,
+        UNCERTIFIED_WAIT_ROUNDS, judge_chain,
     };
     let mut fx = E2eFixture::setup();
     let pid0 = fx.spawn_agent();

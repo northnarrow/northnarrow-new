@@ -24,7 +24,7 @@
 use nn_model::{EpgKind, Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 /// Credential post-condition (T1068).
 pub struct NnLEpg001CredentialPostcondition;

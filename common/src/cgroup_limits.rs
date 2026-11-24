@@ -21,7 +21,7 @@
 //! values and their comparison are tested once, here.
 
 use crate::wire::{
-    CGROUP2_SUPER_MAGIC, CGROUP_SUPER_MAGIC, DEBUGFS_MAGIC, PROC_SUPER_MAGIC, SECURITYFS_MAGIC,
+    CGROUP_SUPER_MAGIC, CGROUP2_SUPER_MAGIC, DEBUGFS_MAGIC, PROC_SUPER_MAGIC, SECURITYFS_MAGIC,
 };
 
 /// Not a protected resource file.

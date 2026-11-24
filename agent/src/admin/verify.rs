@@ -51,7 +51,7 @@ use nn_proto::admin_protocol::{
     ResponseStatusRequest, RotateKeysAddRequest, RotateKeysRevokeRequest, ShutdownRequest,
     SignedUnlockRequest, TelemetryStatusRequest, TrustedInstallerGrantRequest,
 };
-use nn_proto::admin_quorum::{role_keyword, AdminKey};
+use nn_proto::admin_quorum::{AdminKey, role_keyword};
 use nn_proto::admin_signed_payload::{
     CanaryBurnExtra, CanaryDeployExtra, CanaryListExtra, CanaryRefreshExtra, ConfigOverlaySetExtra,
     DetectionSetStatusExtra, DetectionsExtra, FimBaselineExtra, FimReportExtra, FimStatusExtra,

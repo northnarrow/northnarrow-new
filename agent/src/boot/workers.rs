@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use nn_linux::worker::supervisor::{Config, ImageLauncher, NoPidRoles, PidRoles, PinnedPidRoles};
-use nn_linux::worker::{SelfImage, WorkerAccount, Workers, EXPORT_USER, WORKER_USER};
+use nn_linux::worker::{EXPORT_USER, SelfImage, WORKER_USER, WorkerAccount, Workers};
 use nn_proto::ipc::WorkerKind;
 use tracing::{info, warn};
 

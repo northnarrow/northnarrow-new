@@ -91,7 +91,7 @@ pub mod templates {
 /// host since); these draw the agent's seeds.
 #[cfg(test)]
 mod tests {
-    use super::templates::{new_content_seed, render, render_file_body, CredFamily};
+    use super::templates::{CredFamily, new_content_seed, render, render_file_body};
 
     const FAMILIES: [CredFamily; 5] = [
         CredFamily::Aws,

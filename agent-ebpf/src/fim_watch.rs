@@ -253,13 +253,16 @@ pub static FIM_DIRTY_INODES: HashMap<InodeKey, DirtyMeta> =
 /// kernel pointer read.
 #[inline(always)]
 unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
-    if dentry.is_null() {
-        return None;
-    }
-    let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
-    match bpf_probe_read_kernel::<*const c_void>(slot) {
-        Ok(p) if !p.is_null() => Some(p),
-        _ => None,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if dentry.is_null() {
+            return None;
+        }
+        let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
+        match bpf_probe_read_kernel::<*const c_void>(slot) {
+            Ok(p) if !p.is_null() => Some(p),
+            _ => None,
+        }
     }
 }
 
@@ -271,29 +274,35 @@ unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
 /// — both sides agree on the `(dev, ino)` key bytes (review 55).
 #[inline(always)]
 unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
-    if inode.is_null() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if inode.is_null() {
+            return None;
+        }
+        let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
+        let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
+        if sb_ptr.is_null() {
+            return None;
+        }
+        let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
+        let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
+        let dev = crate::inode_dev::stat_dev(inode as *const u8, sb_ptr as *const u8, dev);
+        let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
+        let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
+        Some(InodeKey {
+            dev: dev as u64,
+            ino,
+        })
     }
-    let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
-    let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
-    if sb_ptr.is_null() {
-        return None;
-    }
-    let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
-    let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
-    let dev = crate::inode_dev::stat_dev(inode as *const u8, sb_ptr as *const u8, dev);
-    let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
-    let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
-    Some(InodeKey {
-        dev: dev as u64,
-        ino,
-    })
 }
 
 /// `true` if `key` is in [`WATCHED_PATHS`].
 #[inline(always)]
 unsafe fn is_watched(key: &InodeKey) -> bool {
-    WATCHED_PATHS.get(key).is_some()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        WATCHED_PATHS.get(key).is_some()
+    }
 }
 
 /// PHASE_D_002-symmetric caller exemption: `true` if the
@@ -336,14 +345,17 @@ pub(crate) fn emit_drift_opened(key: InodeKey) {
 /// since its fork ([`crate::fork_parent::unexecuted_forks`]) into `raw`.
 #[inline(always)]
 unsafe fn fill_forks(raw: *mut FimDriftRaw) {
-    let (own, forker) = crate::fork_parent::unexecuted_forks();
-    if let Some(f) = own {
-        (*raw).fork_ppid = f.ppid;
-        (*raw).fork_start = f.start;
-    }
-    if let Some(f) = forker {
-        (*raw).fork_pppid = f.ppid;
-        (*raw).fork_parent_start = f.start;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let (own, forker) = crate::fork_parent::unexecuted_forks();
+        if let Some(f) = own {
+            (*raw).fork_ppid = f.ppid;
+            (*raw).fork_start = f.start;
+        }
+        if let Some(f) = forker {
+            (*raw).fork_pppid = f.ppid;
+            (*raw).fork_parent_start = f.start;
+        }
     }
 }
 
@@ -535,14 +547,17 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
 /// `true` means "emit"; `false` means "skip silently".
 #[inline(always)]
 unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
-    let key = inode_key(target)?;
-    if !is_watched(&key) {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let key = inode_key(target)?;
+        if !is_watched(&key) {
+            return None;
+        }
+        if caller_is_in_family() {
+            return None;
+        }
+        Some(key)
     }
-    if caller_is_in_family() {
-        return None;
-    }
-    Some(key)
 }
 
 /// Dereference a `*file` and return its `f_inode` pointer (the
@@ -551,13 +566,16 @@ unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
 /// hooks. `None` on null / probe failure.
 #[inline(always)]
 unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
-    if file.is_null() {
-        return None;
-    }
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) if !p.is_null() => Some(p),
-        _ => None,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if file.is_null() {
+            return None;
+        }
+        let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+        match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+            Ok(p) if !p.is_null() => Some(p),
+            _ => None,
+        }
     }
 }
 
@@ -570,29 +588,32 @@ unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
 /// (userland keeps the bare-dir path) rather than emitting garbage.
 #[inline(always)]
 unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_NAME_LEN]) -> u8 {
-    if child_dentry.is_null() {
-        return 0;
-    }
-    let name_ptr_slot = (child_dentry as *const u8)
-        .add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))
-        as *const *const u8;
-    let name_ptr = match bpf_probe_read_kernel::<*const u8>(name_ptr_slot) {
-        Ok(p) if !p.is_null() => p,
-        _ => return 0,
-    };
-    // Best-effort NUL-terminated leaf copy, truncated to the buffer.
-    if bpf_probe_read_kernel_str_bytes(name_ptr, &mut dst[..]).is_err() {
-        return 0;
-    }
-    // Truncation: a leaf whose true length (excl. NUL) doesn't fit the
-    // buffer sets the flag so userland rules don't lose a suffix.
-    let len_slot =
-        (child_dentry as *const u8).add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32;
-    let true_len = bpf_probe_read_kernel::<u32>(len_slot).unwrap_or(0) as usize;
-    if true_len >= FIM_CHILD_NAME_LEN {
-        FIM_CHILD_TRUNCATED
-    } else {
-        0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if child_dentry.is_null() {
+            return 0;
+        }
+        let name_ptr_slot = (child_dentry as *const u8)
+            .add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))
+            as *const *const u8;
+        let name_ptr = match bpf_probe_read_kernel::<*const u8>(name_ptr_slot) {
+            Ok(p) if !p.is_null() => p,
+            _ => return 0,
+        };
+        // Best-effort NUL-terminated leaf copy, truncated to the buffer.
+        if bpf_probe_read_kernel_str_bytes(name_ptr, &mut dst[..]).is_err() {
+            return 0;
+        }
+        // Truncation: a leaf whose true length (excl. NUL) doesn't fit the
+        // buffer sets the flag so userland rules don't lose a suffix.
+        let len_slot =
+            (child_dentry as *const u8).add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32;
+        let true_len = bpf_probe_read_kernel::<u32>(len_slot).unwrap_or(0) as usize;
+        if true_len >= FIM_CHILD_NAME_LEN {
+            FIM_CHILD_TRUNCATED
+        } else {
+            0
+        }
     }
 }
 
@@ -613,33 +634,39 @@ pub fn fim_setattr_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
-    // `(dentry, iattr)` up to 6.8, `(idmap, dentry, iattr)` from 6.9: the
-    // dentry's position comes from the running kernel (lab PR 164), as
-    // for inode_protect.rs::try_inode_setattr.
-    let dentry = match crate::inode_protect::setattr_dentry(ctx) {
-        Some(d) => d,
-        None => return 0,
-    };
-    let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
-    if let Some(inode) = inode_from_dentry(dentry) {
-        if let Some(key) = should_emit(inode) {
-            // the review of #554 (F1): a size change (`ATTR_SIZE` in
-            // `ia_valid`, `struct iattr`'s first member) is said in the
-            // record, and in the marker of another process's pending writes
-            let sized = iattr != 0
-                && bpf_probe_read_kernel::<u32>(iattr as *const u32).is_ok_and(|v| v & ATTR_SIZE != 0);
-            if sized {
-                truncated_by_another(key);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // `(dentry, iattr)` up to 6.8, `(idmap, dentry, iattr)` from 6.9: the
+        // dentry's position comes from the running kernel (lab PR 164), as
+        // for inode_protect.rs::try_inode_setattr.
+        let dentry = match crate::inode_protect::setattr_dentry(ctx) {
+            Some(d) => d,
+            None => return 0,
+        };
+        let iattr = crate::inode_protect::setattr_iattr(ctx).map_or(0, |p| p as u64);
+        match inode_from_dentry(dentry) {
+            Some(inode) => {
+                if let Some(key) = should_emit(inode) {
+                    // the review of #554 (F1): a size change (`ATTR_SIZE` in
+                    // `ia_valid`, `struct iattr`'s first member) is said in the
+                    // record, and in the marker of another process's pending writes
+                    let sized = iattr != 0
+                        && bpf_probe_read_kernel::<u32>(iattr as *const u32).is_ok_and(|v| v & ATTR_SIZE != 0);
+                    if sized {
+                        truncated_by_another(key);
+                    }
+                    let flags = if sized { FIM_SETATTR_SIZE } else { 0 };
+                    emit_drift_with_dest(FIM_OP_MODIFIED, key, NO_DEST, flags);
+                }
             }
-            let flags = if sized { FIM_SETATTR_SIZE } else { 0 };
-            emit_drift_with_dest(FIM_OP_MODIFIED, key, NO_DEST, flags);
+            _ => {}
         }
+        // Lot 282 (the review of #500, C1): a file that holds data before a
+        // truncate empties it — its unlink then destroys an original (the
+        // re-review: a size change only, read from the `iattr`).
+        let _ = crate::open_sensor::nn_setattr_mark(dentry as u64, iattr);
+        0 // observe-only — NEVER return -EPERM
     }
-    // Lot 282 (the review of #500, C1): a file that holds data before a
-    // truncate empties it — its unlink then destroys an original (the
-    // re-review: a size change only, read from the `iattr`).
-    let _ = crate::open_sensor::nn_setattr_mark(dentry as u64, iattr);
-    0 // observe-only — NEVER return -EPERM
 }
 
 /// `ATTR_SIZE` in `struct iattr`'s `ia_valid` (`include/linux/fs.h`, the
@@ -680,17 +707,23 @@ pub fn fim_create_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_create_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (dir, dentry, mode). The DIR (arg 0)
-    // is the parent inode we watch; the dentry (arg 1) is the
-    // not-yet-created child whose leaf name BUG-022 carries to
-    // userland so the child-prefix rules (FIM-007/008/009/021/023)
-    // can match instead of seeing only the bare watched-dir path.
-    let dir: *const c_void = ctx.arg(0);
-    if let Some(key) = should_emit(dir) {
-        let child_dentry: *const c_void = ctx.arg(1);
-        emit_drift_with_child(FIM_OP_CREATED, key, child_dentry);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (dir, dentry, mode). The DIR (arg 0)
+        // is the parent inode we watch; the dentry (arg 1) is the
+        // not-yet-created child whose leaf name BUG-022 carries to
+        // userland so the child-prefix rules (FIM-007/008/009/021/023)
+        // can match instead of seeing only the bare watched-dir path.
+        let dir: *const c_void = ctx.arg(0);
+        match should_emit(dir) {
+            Some(key) => {
+                let child_dentry: *const c_void = ctx.arg(1);
+                emit_drift_with_child(FIM_OP_CREATED, key, child_dentry);
+            }
+            _ => {}
+        }
+        0
     }
-    0
 }
 
 /// `inode_unlink` observation — fires on `rm` of a watched
@@ -704,28 +737,37 @@ pub fn fim_unlink_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (parent dir, target dentry).
-    // Either the parent dir OR the target inode being in
-    // WATCHED_PATHS is a hit — `rm` of a watched file fires
-    // both if both are registered; the C4 drain dedups by
-    // (target_dev, target_ino, timestamp_ns) before chaining
-    // into fim_drift.jsonl.
-    let parent: *const c_void = ctx.arg(0);
-    if let Some(key) = should_emit(parent) {
-        emit_drift(FIM_OP_DELETED, key);
-    }
-    let dentry: *const c_void = ctx.arg(1);
-    if let Some(target_inode) = inode_from_dentry(dentry) {
-        if let Some(key) = should_emit(target_inode) {
-            emit_drift(FIM_OP_DELETED, key);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (parent dir, target dentry).
+        // Either the parent dir OR the target inode being in
+        // WATCHED_PATHS is a hit — `rm` of a watched file fires
+        // both if both are registered; the C4 drain dedups by
+        // (target_dev, target_ino, timestamp_ns) before chaining
+        // into fim_drift.jsonl.
+        let parent: *const c_void = ctx.arg(0);
+        match should_emit(parent) {
+            Some(key) => {
+                emit_drift(FIM_OP_DELETED, key);
+            }
+            _ => {}
         }
+        let dentry: *const c_void = ctx.arg(1);
+        if let Some(target_inode) = inode_from_dentry(dentry) {
+            match should_emit(target_inode) {
+                Some(key) => {
+                    emit_drift(FIM_OP_DELETED, key);
+                }
+                _ => {}
+            }
+        }
+        // Lab PR 225: every unlink counts toward its process's unlink burst
+        // (the deletion of originals after an encrypted copy was written).
+        let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 1));
+        // Lot 322: the walk's per-task buffers, if it made them.
+        crate::open_sensor::forget_task();
+        0
     }
-    // Lab PR 225: every unlink counts toward its process's unlink burst
-    // (the deletion of originals after an encrypted copy was written).
-    let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 1));
-    // Lot 322: the walk's per-task buffers, if it made them.
-    crate::open_sensor::forget_task();
-    0
 }
 
 /// `inode_rename` observation — fires on `mv` involving a
@@ -739,70 +781,82 @@ pub fn fim_rename_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (old_dir, old_dentry, new_dir,
-    // new_dentry). Four inodes to check — userland C4 dedups
-    // by (target_dev, target_ino, timestamp_ns) so duplicate
-    // emissions for the same rename don't flood the drift
-    // chain.
-    //
-    // Polish #3 — when the OLD dentry's inode is watched, emit
-    // a single combined event with `dest_dev` + `dest_ino` set
-    // to the NEW dir's inode key. Userland's drain resolves the
-    // dest key via InodePathMap so NN-L-FIM-010 can match the
-    // ransomware extension on the destination side. The OTHER
-    // three inode-checks (old_dir / new_dir / new_dentry) keep
-    // the C8 single-event emit path — dedup by
-    // (target_dev, target_ino, timestamp_ns) in userland.
-    let old_dentry: *const c_void = ctx.arg(1);
-    let new_dir: *const c_void = ctx.arg(2);
-    let new_dir_key = inode_key(new_dir).unwrap_or(NO_DEST);
-    let old_inode_opt = inode_from_dentry(old_dentry);
-    // Tappa 10.9 step 1: a moved directory invalidates the file-open
-    // sensor's directory-class cache.
-    if let Some(moved) = old_inode_opt {
-        crate::open_sensor::on_rename(moved as *const u8);
-    }
-    if let Some(old_inode) = old_inode_opt {
-        if let Some(key) = should_emit(old_inode) {
-            // Lab PR 225: with the new leaf, so userland names the file's
-            // new path, not the directory's.
-            let new_dentry_leaf: *const c_void = ctx.arg(3);
-            emit_drift_with_dest_leaf(FIM_OP_RENAMED, key, new_dir_key, new_dentry_leaf);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (old_dir, old_dentry, new_dir,
+        // new_dentry). Four inodes to check — userland C4 dedups
+        // by (target_dev, target_ino, timestamp_ns) so duplicate
+        // emissions for the same rename don't flood the drift
+        // chain.
+        //
+        // Polish #3 — when the OLD dentry's inode is watched, emit
+        // a single combined event with `dest_dev` + `dest_ino` set
+        // to the NEW dir's inode key. Userland's drain resolves the
+        // dest key via InodePathMap so NN-L-FIM-010 can match the
+        // ransomware extension on the destination side. The OTHER
+        // three inode-checks (old_dir / new_dir / new_dentry) keep
+        // the C8 single-event emit path — dedup by
+        // (target_dev, target_ino, timestamp_ns) in userland.
+        let old_dentry: *const c_void = ctx.arg(1);
+        let new_dir: *const c_void = ctx.arg(2);
+        let new_dir_key = inode_key(new_dir).unwrap_or(NO_DEST);
+        let old_inode_opt = inode_from_dentry(old_dentry);
+        // Tappa 10.9 step 1: a moved directory invalidates the file-open
+        // sensor's directory-class cache.
+        if let Some(moved) = old_inode_opt {
+            crate::open_sensor::on_rename(moved as *const u8);
         }
-    }
+        if let Some(old_inode) = old_inode_opt {
+            if let Some(key) = should_emit(old_inode) {
+                // Lab PR 225: with the new leaf, so userland names the file's
+                // new path, not the directory's.
+                let new_dentry_leaf: *const c_void = ctx.arg(3);
+                emit_drift_with_dest_leaf(FIM_OP_RENAMED, key, new_dir_key, new_dentry_leaf);
+            }
+        }
 
-    let old_dir: *const c_void = ctx.arg(0);
-    if let Some(key) = should_emit(old_dir) {
-        emit_drift(FIM_OP_RENAMED, key);
-    }
-    if let Some(key) = should_emit(new_dir) {
-        // BUG-022 — a rename INTO a watched dir is a drop; carry the
-        // dest leaf (new_dentry, arg 3) so userland reconstructs the
-        // child path and normalizes this to a Created against it.
-        let new_dentry_for_child: *const c_void = ctx.arg(3);
-        emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry_for_child);
-    }
-    let new_dentry: *const c_void = ctx.arg(3);
-    if let Some(new_inode) = inode_from_dentry(new_dentry) {
-        if let Some(key) = should_emit(new_inode) {
-            // External audit FIMR-004: another file is renamed over the
-            // watched one — its path's content replaced in one call.
-            emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
+        let old_dir: *const c_void = ctx.arg(0);
+        match should_emit(old_dir) {
+            Some(key) => {
+                emit_drift(FIM_OP_RENAMED, key);
+            }
+            _ => {}
         }
+        match should_emit(new_dir) {
+            Some(key) => {
+                // BUG-022 — a rename INTO a watched dir is a drop; carry the
+                // dest leaf (new_dentry, arg 3) so userland reconstructs the
+                // child path and normalizes this to a Created against it.
+                let new_dentry_for_child: *const c_void = ctx.arg(3);
+                emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry_for_child);
+            }
+            _ => {}
+        }
+        let new_dentry: *const c_void = ctx.arg(3);
+        if let Some(new_inode) = inode_from_dentry(new_dentry) {
+            match should_emit(new_inode) {
+                Some(key) => {
+                    // External audit FIMR-004: another file is renamed over the
+                    // watched one — its path's content replaced in one call.
+                    emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
+                }
+                _ => {}
+            }
+        }
+        // Lot 282: a rename onto the name of an existing regular file destroys
+        // that file — an original replaced, counted as its unlink is (a name
+        // that did not exist has a negative dentry, and counts nothing).
+        let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 3));
+        // Lab PR 225: every rename counts toward its process's burst of
+        // renames to a new extension, wherever the file is.
+        let _ = crate::open_sensor::nn_rename_burst(
+            crate::open_sensor::raw_arg(ctx, 1),
+            crate::open_sensor::raw_arg(ctx, 3),
+        );
+        // Lot 322: the walk's per-task buffers, if the unlink burst made them.
+        crate::open_sensor::forget_task();
+        0
     }
-    // Lot 282: a rename onto the name of an existing regular file destroys
-    // that file — an original replaced, counted as its unlink is (a name
-    // that did not exist has a negative dentry, and counts nothing).
-    let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 3));
-    // Lab PR 225: every rename counts toward its process's burst of
-    // renames to a new extension, wherever the file is.
-    let _ = crate::open_sensor::nn_rename_burst(
-        crate::open_sensor::raw_arg(ctx, 1),
-        crate::open_sensor::raw_arg(ctx, 3),
-    );
-    // Lot 322: the walk's per-task buffers, if the unlink burst made them.
-    crate::open_sensor::forget_task();
-    0
 }
 
 /// `inode_link` observation — fires on hardlink creation
@@ -820,32 +874,41 @@ pub fn fim_link_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (old_dentry, new_dir, new_dentry).
-    // The OLD dentry points at the source inode (the watched
-    // file). The NEW dir is the parent of where the link is
-    // being created — userland C4 resolves the new link's
-    // absolute path from /proc/<modifier_pid>/cwd + the call's
-    // path arg (best-effort; if path resolution fails, the
-    // event still fires with the source key — operators see
-    // "hardlink to /usr/bin/sudo created by uid=… pid=…").
-    let old_dentry: *const c_void = ctx.arg(0);
-    if let Some(src_inode) = inode_from_dentry(old_dentry) {
-        if let Some(key) = should_emit(src_inode) {
-            // Lot 352 (NN-L-FIM-002): with the NEW link's path — the drift
-            // record named the source only, and the link's directory is
-            // rarely watched
-            let new_dentry: *const c_void = ctx.arg(2);
-            emit_link(key, new_dentry as *const u8);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (old_dentry, new_dir, new_dentry).
+        // The OLD dentry points at the source inode (the watched
+        // file). The NEW dir is the parent of where the link is
+        // being created — userland C4 resolves the new link's
+        // absolute path from /proc/<modifier_pid>/cwd + the call's
+        // path arg (best-effort; if path resolution fails, the
+        // event still fires with the source key — operators see
+        // "hardlink to /usr/bin/sudo created by uid=… pid=…").
+        let old_dentry: *const c_void = ctx.arg(0);
+        match inode_from_dentry(old_dentry) {
+            Some(src_inode) => {
+                if let Some(key) = should_emit(src_inode) {
+                    // Lot 352 (NN-L-FIM-002): with the NEW link's path — the drift
+                    // record named the source only, and the link's directory is
+                    // rarely watched
+                    let new_dentry: *const c_void = ctx.arg(2);
+                    emit_link(key, new_dentry as *const u8);
+                }
+            }
+            _ => {}
         }
+        // Also check the NEW DIR — a hardlink created INTO a
+        // watched directory (e.g., `ln /etc/passwd /watched-dir/x`)
+        // is the symmetric case worth observing.
+        let new_dir: *const c_void = ctx.arg(1);
+        match should_emit(new_dir) {
+            Some(key) => {
+                emit_drift(FIM_OP_LINKED, key);
+            }
+            _ => {}
+        }
+        0
     }
-    // Also check the NEW DIR — a hardlink created INTO a
-    // watched directory (e.g., `ln /etc/passwd /watched-dir/x`)
-    // is the symmetric case worth observing.
-    let new_dir: *const c_void = ctx.arg(1);
-    if let Some(key) = should_emit(new_dir) {
-        emit_drift(FIM_OP_LINKED, key);
-    }
-    0
 }
 
 /// Lot 352: a link made to the watched inode `key` — its drift record
@@ -854,54 +917,57 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
 /// ring drops it, counted as the drift records are.
 #[inline(always)]
 unsafe fn emit_link(key: InodeKey, new_dentry: *const u8) {
-    let mut entry = match FS_FIM_EVENTS.reserve::<FimLinkRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match FS_FIM_EVENTS.reserve::<FimLinkRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+                return;
+            }
+        };
+        let raw: *mut FimLinkRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        let d: *mut FimDriftRaw = &mut (*raw).drift;
+        (*d).timestamp_ns = bpf_ktime_get_ns();
+        (*d).modifier_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*d).modifier_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        (*d).target_dev = key.dev;
+        (*d).target_ino = key.ino;
+        (*d).op = FIM_OP_LINKED;
+        crate::comm::comm_into(&mut (*d).modifier_comm);
+        fill_forks(d);
+        let dst = (*raw).path.as_mut_ptr();
+        let mut cur = new_dentry;
+        let mut n: usize = 0;
+        let mut top: *const u8 = core::ptr::null();
+        for i in 0..OPEN_PATH_SLOTS {
+            if cur.is_null() {
+                break;
+            }
+            let name = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+            if !name.is_null() {
+                let slot = core::slice::from_raw_parts_mut(dst.add(i * OPEN_PATH_SLOT_LEN), OPEN_PATH_SLOT_LEN);
+                let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+            }
+            n = i + 1;
+            let up = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_PARENT_OFFSET)));
+            if up == cur {
+                top = cur;
+                break;
+            }
+            cur = up;
         }
-    };
-    let raw: *mut FimLinkRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    let d: *mut FimDriftRaw = &mut (*raw).drift;
-    (*d).timestamp_ns = bpf_ktime_get_ns();
-    (*d).modifier_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    (*d).modifier_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    (*d).target_dev = key.dev;
-    (*d).target_ino = key.ino;
-    (*d).op = FIM_OP_LINKED;
-    crate::comm::comm_into(&mut (*d).modifier_comm);
-    fill_forks(d);
-    let dst = (*raw).path.as_mut_ptr();
-    let mut cur = new_dentry;
-    let mut n: usize = 0;
-    let mut top: *const u8 = core::ptr::null();
-    for i in 0..OPEN_PATH_SLOTS {
-        if cur.is_null() {
-            break;
+        (*raw).path_n = n as u16;
+        if top.is_null() {
+            (*raw).path_truncated = 1;
+        } else {
+            let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(top.add(off!(DENTRY_D_INODE_OFFSET))));
+            (*raw).root_dev = root.dev;
+            (*raw).root_ino = root.ino;
         }
-        let name = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-        if !name.is_null() {
-            let slot = core::slice::from_raw_parts_mut(dst.add(i * OPEN_PATH_SLOT_LEN), OPEN_PATH_SLOT_LEN);
-            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
-        }
-        n = i + 1;
-        let up = crate::open_sensor::read_ptr(cur.add(off!(DENTRY_D_PARENT_OFFSET)));
-        if up == cur {
-            top = cur;
-            break;
-        }
-        cur = up;
+        entry.submit(0);
     }
-    (*raw).path_n = n as u16;
-    if top.is_null() {
-        (*raw).path_truncated = 1;
-    } else {
-        let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(top.add(off!(DENTRY_D_INODE_OFFSET))));
-        (*raw).root_dev = root.dev;
-        (*raw).root_ino = root.ino;
-    }
-    entry.submit(0);
 }
 
 /// `file_open` observation — fires on EVERY open of a watched
@@ -942,10 +1008,13 @@ pub fn fim_file_open_sensor(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (file).
-    let file: *const u8 = ctx.arg(0);
-    observe_open_plain(file);
-    0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (file).
+        let file: *const u8 = ctx.arg(0);
+        observe_open_plain(file);
+        0
+    }
 }
 
 /// The plain observer's work on `file`: its inode key, the watch lookup
@@ -953,14 +1022,20 @@ unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
 /// falls back to it when it cannot read its windows.
 #[inline(always)]
 pub(crate) unsafe fn observe_open_plain(file: *const u8) {
-    if let Some(inode) = inode_from_file(file as *const c_void) {
-        if let Some(key) = should_emit(inode) {
-            // Review 75: a read-only repeat by the same task is dropped; an
-            // unreadable `f_mode` counts as a write and reports.
-            let mode = bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32)
-                .unwrap_or(FMODE_WRITE);
-            if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&FIM_READ_SEEN, &key) {
-                emit_drift_opened(key);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if let Some(inode) = inode_from_file(file as *const c_void) {
+            match should_emit(inode) {
+                Some(key) => {
+                    // Review 75: a read-only repeat by the same task is dropped; an
+                    // unreadable `f_mode` counts as a write and reports.
+                    let mode = bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32)
+                        .unwrap_or(FMODE_WRITE);
+                    if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&FIM_READ_SEEN, &key) {
+                        emit_drift_opened(key);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -982,82 +1057,91 @@ pub fn fim_write_intent_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (file, mask). Skip reads BEFORE any
-    // kernel-pointer work — file_permission is a hot path.
-    let mask = ctx.arg::<u64>(1) as i32;
-    if mask & MAY_WRITE == 0 {
-        return 0;
-    }
-    let file: *const c_void = ctx.arg(0);
-    if let Some(inode) = inode_from_file(file) {
-        if let Some(key) = should_emit(inode) {
-            let pid_tgid = bpf_get_current_pid_tgid();
-            let uid_gid = bpf_get_current_uid_gid();
-            let pid = (pid_tgid >> 32) as u32;
-            // Lot 344: an append (`O_APPEND`; an unreadable `f_flags` is
-            // not one) by the marker's process keeps each bit; any other
-            // write clears it for good — until the record at close.
-            let append = bpf_probe_read_kernel::<u32>((file as *const u8).add(off!(FILE_F_FLAGS_OFFSET)) as *const u32)
-                .is_ok_and(|f| f & O_APPEND != 0);
-            let mut flags = if append { u32::from(FIM_WRITE_APPEND_ONLY) } else { 0 };
-            flags |= u32::from(FIM_WRITE_ONE_WRITER);
-            // the review of #554 (F1): one writer is one process — a pid
-            // reused is another
-            let start = crate::fork_parent::current_start();
-            // lot 373: the writer's image at its write (the review of #580,
-            // F3: and one writer is one image — an exec keeps the pid and the
-            // start, so a rewrite before it, through a descriptor the new
-            // image inherits, is another writer's; an image not read is
-            // never the same)
-            let (exe_dev, exe_ino) = crate::bpf_defense::caller_exe_key().map_or((0, 0), |e| (e.dev, e.ino));
-            let mut prev_writer = None;
-            if let Some(prev) = FIM_DIRTY_INODES.get(&key) {
-                // another's truncation while pending stays said
-                flags = (flags & prev.flags) | (prev.flags & u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER));
-                prev_writer = Some((prev.pid, prev.start, prev.exe_dev, prev.exe_ino));
-            }
-            if !fim_one_writer_keeps(prev_writer, (pid, start, exe_dev, exe_ino)) {
-                flags &= !u32::from(FIM_WRITE_ONE_WRITER);
-            }
-            let mut meta = DirtyMeta {
-                pid,
-                uid: (uid_gid & 0xFFFF_FFFF) as u32,
-                comm: [0u8; TASK_COMM_LEN],
-                flags,
-                fork_ppid: 0,
-                fork_pppid: 0,
-                _pad: 0,
-                fork_start: 0,
-                fork_parent_start: 0,
-                start,
-                exe_dev,
-                exe_ino,
-                cgroup: 0,
-            };
-            if let Ok(comm) = bpf_get_current_comm() {
-                meta.comm = comm;
-            }
-            // lot 373: the writer's cgroup, at its write
-            meta.cgroup = aya_ebpf::helpers::generated::bpf_get_current_cgroup_id();
-            // lot 344: the writer's fork records, at its write
-            let (own, forker) = crate::fork_parent::unexecuted_forks();
-            if let Some(f) = own {
-                meta.fork_ppid = f.ppid;
-                meta.fork_start = f.start;
-            }
-            if let Some(f) = forker {
-                meta.fork_pppid = f.ppid;
-                meta.fork_parent_start = f.start;
-            }
-            // Last writer wins (an existing key is updated in place even
-            // when the map is full). External audit EBPF-009: a refused
-            // marker means no `Modified` at close, so it is counted.
-            if FIM_DIRTY_INODES.insert(&key, &meta, 0).is_err() {
-                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM_DIRTY_FULL);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (file, mask). Skip reads BEFORE any
+        // kernel-pointer work — file_permission is a hot path.
+        let mask = ctx.arg::<u64>(1) as i32;
+        if mask & MAY_WRITE == 0 {
+            return 0;
+        }
+        let file: *const c_void = ctx.arg(0);
+        if let Some(inode) = inode_from_file(file) {
+            match should_emit(inode) {
+                Some(key) => {
+                    let pid_tgid = bpf_get_current_pid_tgid();
+                    let uid_gid = bpf_get_current_uid_gid();
+                    let pid = (pid_tgid >> 32) as u32;
+                    // Lot 344: an append (`O_APPEND`; an unreadable `f_flags` is
+                    // not one) by the marker's process keeps each bit; any other
+                    // write clears it for good — until the record at close.
+                    let append = bpf_probe_read_kernel::<u32>((file as *const u8).add(off!(FILE_F_FLAGS_OFFSET)) as *const u32)
+                        .is_ok_and(|f| f & O_APPEND != 0);
+                    let mut flags = if append { u32::from(FIM_WRITE_APPEND_ONLY) } else { 0 };
+                    flags |= u32::from(FIM_WRITE_ONE_WRITER);
+                    // the review of #554 (F1): one writer is one process — a pid
+                    // reused is another
+                    let start = crate::fork_parent::current_start();
+                    // lot 373: the writer's image at its write (the review of #580,
+                    // F3: and one writer is one image — an exec keeps the pid and the
+                    // start, so a rewrite before it, through a descriptor the new
+                    // image inherits, is another writer's; an image not read is
+                    // never the same)
+                    let (exe_dev, exe_ino) = crate::bpf_defense::caller_exe_key().map_or((0, 0), |e| (e.dev, e.ino));
+                    let mut prev_writer = None;
+                    if let Some(prev) = FIM_DIRTY_INODES.get(&key) {
+                        // another's truncation while pending stays said
+                        flags = (flags & prev.flags) | (prev.flags & u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER));
+                        prev_writer = Some((prev.pid, prev.start, prev.exe_dev, prev.exe_ino));
+                    }
+                    if !fim_one_writer_keeps(prev_writer, (pid, start, exe_dev, exe_ino)) {
+                        flags &= !u32::from(FIM_WRITE_ONE_WRITER);
+                    }
+                    let mut meta = DirtyMeta {
+                        pid,
+                        uid: (uid_gid & 0xFFFF_FFFF) as u32,
+                        comm: [0u8; TASK_COMM_LEN],
+                        flags,
+                        fork_ppid: 0,
+                        fork_pppid: 0,
+                        _pad: 0,
+                        fork_start: 0,
+                        fork_parent_start: 0,
+                        start,
+                        exe_dev,
+                        exe_ino,
+                        cgroup: 0,
+                    };
+                    match bpf_get_current_comm() {
+                        Ok(comm) => {
+                            meta.comm = comm;
+                        }
+                        _ => {}
+                    }
+                    // lot 373: the writer's cgroup, at its write
+                    meta.cgroup = aya_ebpf::helpers::generated::bpf_get_current_cgroup_id();
+                    // lot 344: the writer's fork records, at its write
+                    let (own, forker) = crate::fork_parent::unexecuted_forks();
+                    if let Some(f) = own {
+                        meta.fork_ppid = f.ppid;
+                        meta.fork_start = f.start;
+                    }
+                    if let Some(f) = forker {
+                        meta.fork_pppid = f.ppid;
+                        meta.fork_parent_start = f.start;
+                    }
+                    // Last writer wins (an existing key is updated in place even
+                    // when the map is full). External audit EBPF-009: a refused
+                    // marker means no `Modified` at close, so it is counted.
+                    if FIM_DIRTY_INODES.insert(&key, &meta, 0).is_err() {
+                        crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM_DIRTY_FULL);
+                    }
+                }
+                _ => {}
             }
         }
+        0
     }
-    0
 }
 
 /// `file_free_security` (BUG-023 close-emit) — fires when a file
@@ -1081,17 +1165,20 @@ pub fn fim_close_emit_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_close_emit_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (file).
-    let file: *const c_void = ctx.arg(0);
-    if let Some(inode) = inode_from_file(file) {
-        if let Some(key) = inode_key(inode) {
-            if let Some(meta) = FIM_DIRTY_INODES.get(&key) {
-                // Copy out so the map borrow ends before remove().
-                let meta = *meta;
-                emit_drift_close(key, meta);
-                let _ = FIM_DIRTY_INODES.remove(&key);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (file).
+        let file: *const c_void = ctx.arg(0);
+        if let Some(inode) = inode_from_file(file) {
+            if let Some(key) = inode_key(inode) {
+                if let Some(meta) = FIM_DIRTY_INODES.get(&key) {
+                    // Copy out so the map borrow ends before remove().
+                    let meta = *meta;
+                    emit_drift_close(key, meta);
+                    let _ = FIM_DIRTY_INODES.remove(&key);
+                }
             }
         }
+        0
     }
-    0
 }

@@ -21,7 +21,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Debugger / tracer tool comms (design §7.1).
@@ -153,21 +153,27 @@ mod tests {
 
     #[test]
     fn ignores_root_or_human_uid() {
-        assert!(rule()
-            .evaluate(&spawn_as(0, "gdb", "/usr/bin/gdb"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn_as(0, "gdb", "/usr/bin/gdb"))
+                .is_none()
+        );
         // Human users and a rootless container's sub-uids (PROC-012).
-        for uid in [1000, 60_000, 100_000, 100_032] {
+        // the case's index, not its uid, in the message (CodeQL
+        // rust/cleartext-logging)
+        for (case, uid) in [1000, 60_000, 100_000, 100_032].into_iter().enumerate() {
             assert!(
                 rule()
                     .evaluate(&spawn_as(uid, "strace", "/usr/bin/strace"))
                     .is_none(),
-                "{uid}"
+                "case {case}"
             );
         }
-        assert!(rule()
-            .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -175,9 +181,10 @@ mod tests {
         let r = R016DebuggerServiceUid::new(Arc::new(CommAllowlist::from_iter_owned([
             "strace".to_string()
         ])));
-        assert!(r
-            .evaluate(&spawn_as(33, "strace", "/usr/bin/strace"))
-            .is_none());
+        assert!(
+            r.evaluate(&spawn_as(33, "strace", "/usr/bin/strace"))
+                .is_none()
+        );
         assert!(r.evaluate(&spawn_as(33, "gdb", "/usr/bin/gdb")).is_some());
     }
 }

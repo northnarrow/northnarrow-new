@@ -123,45 +123,54 @@ fn current_is_target() -> bool {
 
 #[inline(always)]
 unsafe fn read_ptr(p: *const u8) -> *const u8 {
-    match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
-        Ok(v) => v,
-        Err(_) => core::ptr::null(),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
+            Ok(v) => v,
+            Err(_) => core::ptr::null(),
+        }
     }
 }
 
 #[inline(always)]
 unsafe fn inode_key(inode: *const u8) -> InodeKey {
-    let mut key = InodeKey { dev: 0, ino: 0 };
-    if inode.is_null() {
-        return key;
-    }
-    let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
-    if !sb.is_null() {
-        if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-            key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut key = InodeKey { dev: 0, ino: 0 };
+        if inode.is_null() {
+            return key;
         }
+        let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
+        if !sb.is_null() {
+            if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
+                key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
+            }
+        }
+        if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+            key.ino = ino;
+        }
+        key
     }
-    if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-        key.ino = ino;
-    }
-    key
 }
 
 /// Read `dentry->d_name.name` (NUL-padded) into `dst[..32]`.
 #[inline(always)]
 unsafe fn read_name(dentry: *const u8, dst: *mut u8) {
-    let w = dst as *mut u64;
-    core::ptr::write_volatile(w, 0);
-    core::ptr::write_volatile(w.add(1), 0);
-    core::ptr::write_volatile(w.add(2), 0);
-    core::ptr::write_volatile(w.add(3), 0);
-    if dentry.is_null() {
-        return;
-    }
-    let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-    if !name.is_null() {
-        let slot = core::slice::from_raw_parts_mut(dst, NAME_LEN);
-        let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let w = dst as *mut u64;
+        core::ptr::write_volatile(w, 0);
+        core::ptr::write_volatile(w.add(1), 0);
+        core::ptr::write_volatile(w.add(2), 0);
+        core::ptr::write_volatile(w.add(3), 0);
+        if dentry.is_null() {
+            return;
+        }
+        let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+        if !name.is_null() {
+            let slot = core::slice::from_raw_parts_mut(dst, NAME_LEN);
+            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+        }
     }
 }
 
@@ -173,86 +182,89 @@ pub fn probe_file_open(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_probe_file_open(ctx: &LsmContext) {
-    if !current_is_target() {
-        return;
-    }
-    let file: *const u8 = ctx.arg(0);
-    if file.is_null() {
-        return;
-    }
-    let inode = read_ptr(file.add(off!(FILE_F_INODE_OFFSET)));
-    let mode = match PROBE_MODE.get(0) {
-        Some(m) => *m,
-        None => 0,
-    };
-    if mode == 1 {
-        let _ = PROBE_DIRS.get(&inode_key(inode));
-        return;
-    }
-    let dentry = read_ptr(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)));
-    if inode.is_null() || dentry.is_null() {
-        return;
-    }
-    if mode == 2 {
-        let _ = PROBE_DIRS.get(&inode_key(inode));
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !current_is_target() {
+            return;
+        }
+        let file: *const u8 = ctx.arg(0);
+        if file.is_null() {
+            return;
+        }
+        let inode = read_ptr(file.add(off!(FILE_F_INODE_OFFSET)));
+        let mode = match PROBE_MODE.get(0) {
+            Some(m) => *m,
+            None => 0,
+        };
+        if mode == 1 {
+            let _ = PROBE_DIRS.get(&inode_key(inode));
+            return;
+        }
+        let dentry = read_ptr(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)));
+        if inode.is_null() || dentry.is_null() {
+            return;
+        }
+        if mode == 2 {
+            let _ = PROBE_DIRS.get(&inode_key(inode));
+            let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+            if !parent.is_null() {
+                let pkey = inode_key(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
+                let _ = PROBE_DIR_CACHE.get(&pkey);
+            }
+            return;
+        }
+        let f_mode = match bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32) {
+            Ok(m) => m,
+            Err(_) => 0,
+        };
+        let mut kind: u8 = 0;
+        if f_mode & FMODE_WRITE != 0 && count_write() {
+            kind = PROBE_KIND_MASS_WRITE;
+        }
         let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-        if !parent.is_null() {
+        if kind == 0 && !parent.is_null() {
             let pkey = inode_key(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
-            let _ = PROBE_DIR_CACHE.get(&pkey);
+            if PROBE_DIRS.get(&pkey).is_some() {
+                kind = PROBE_KIND_DIR;
+            }
         }
-        return;
-    }
-    let f_mode = match bpf_probe_read_kernel::<u32>(file.add(off!(FILE_F_MODE_OFFSET)) as *const u32) {
-        Ok(m) => m,
-        Err(_) => 0,
-    };
-    let mut kind: u8 = 0;
-    if f_mode & FMODE_WRITE != 0 && count_write() {
-        kind = PROBE_KIND_MASS_WRITE;
-    }
-    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-    if kind == 0 && !parent.is_null() {
-        let pkey = inode_key(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
-        if PROBE_DIRS.get(&pkey).is_some() {
-            kind = PROBE_KIND_DIR;
-        }
-    }
-    let scratch = match PROBE_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p as *mut u8,
-        None => return,
-    };
-    if kind == 0 {
-        read_name(dentry, scratch);
-        read_name(parent, scratch.add(NAME_LEN));
-        if PROBE_NAMES.get(&*(scratch as *const [u8; 64])).is_some() {
-            kind = PROBE_KIND_NAME;
-        } else {
-            read_name(core::ptr::null(), scratch.add(NAME_LEN));
+        let scratch = match PROBE_SCRATCH.get_ptr_mut(0) {
+            Some(p) => p as *mut u8,
+            None => return,
+        };
+        if kind == 0 {
+            read_name(dentry, scratch);
+            read_name(parent, scratch.add(NAME_LEN));
             if PROBE_NAMES.get(&*(scratch as *const [u8; 64])).is_some() {
                 kind = PROBE_KIND_NAME;
+            } else {
+                read_name(core::ptr::null(), scratch.add(NAME_LEN));
+                if PROBE_NAMES.get(&*(scratch as *const [u8; 64])).is_some() {
+                    kind = PROBE_KIND_NAME;
+                }
             }
         }
-    }
-    if kind == 0 {
-        let mut d = parent;
-        for _ in 0..ANCESTOR_DEPTH {
-            if d.is_null() {
-                break;
+        if kind == 0 {
+            let mut d = parent;
+            for _ in 0..ANCESTOR_DEPTH {
+                if d.is_null() {
+                    break;
+                }
+                read_name(d, scratch);
+                if PROBE_ANCESTORS.get(&*(scratch as *const [u8; NAME_LEN])).is_some() {
+                    kind = PROBE_KIND_ANCESTOR;
+                    break;
+                }
+                let up = read_ptr(d.add(off!(DENTRY_D_PARENT_OFFSET)));
+                if up == d {
+                    break;
+                }
+                d = up;
             }
-            read_name(d, scratch);
-            if PROBE_ANCESTORS.get(&*(scratch as *const [u8; NAME_LEN])).is_some() {
-                kind = PROBE_KIND_ANCESTOR;
-                break;
-            }
-            let up = read_ptr(d.add(off!(DENTRY_D_PARENT_OFFSET)));
-            if up == d {
-                break;
-            }
-            d = up;
         }
-    }
-    if kind != 0 {
-        emit(kind, inode, dentry, f_mode, core::ptr::null(), 0);
+        if kind != 0 {
+            emit(kind, inode, dentry, f_mode, core::ptr::null(), 0);
+        }
     }
 }
 
@@ -260,33 +272,36 @@ unsafe fn try_probe_file_open(ctx: &LsmContext) {
 /// [`PROBE_MASS_WRITE_MIN`] within [`PROBE_MASS_WRITE_WINDOW_NS`].
 #[inline(always)]
 unsafe fn count_write() -> bool {
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    match PROBE_WRITES.get_ptr_mut(&tgid) {
-        Some(w) => {
-            if now.saturating_sub((*w).start_ns) > PROBE_MASS_WRITE_WINDOW_NS {
-                (*w).start_ns = now;
-                (*w).count = 1;
-                (*w).fired = 0;
-                false
-            } else {
-                (*w).count += 1;
-                if (*w).count >= PROBE_MASS_WRITE_MIN && (*w).fired == 0 {
-                    (*w).fired = 1;
-                    true
-                } else {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        match PROBE_WRITES.get_ptr_mut(&tgid) {
+            Some(w) => {
+                if now.saturating_sub((*w).start_ns) > PROBE_MASS_WRITE_WINDOW_NS {
+                    (*w).start_ns = now;
+                    (*w).count = 1;
+                    (*w).fired = 0;
                     false
+                } else {
+                    (*w).count += 1;
+                    if (*w).count >= PROBE_MASS_WRITE_MIN && (*w).fired == 0 {
+                        (*w).fired = 1;
+                        true
+                    } else {
+                        false
+                    }
                 }
             }
-        }
-        None => {
-            let w = ProbeWriteWindow {
-                start_ns: now,
-                count: 1,
-                fired: 0,
-            };
-            let _ = PROBE_WRITES.insert(&tgid, &w, 0);
-            false
+            None => {
+                let w = ProbeWriteWindow {
+                    start_ns: now,
+                    count: 1,
+                    fired: 0,
+                };
+                let _ = PROBE_WRITES.insert(&tgid, &w, 0);
+                false
+            }
         }
     }
 }
@@ -300,45 +315,51 @@ pub fn probe_bprm(ctx: LsmContext) -> i32 {
 /// `true` when the current task's real parent is the runner.
 #[inline(always)]
 unsafe fn parent_is_target() -> bool {
-    let t = target();
-    if t == 0 {
-        return false;
-    }
-    let task = bpf_get_current_task() as *const u8;
-    if task.is_null() {
-        return false;
-    }
-    let parent = read_ptr(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)));
-    if parent.is_null() {
-        return false;
-    }
-    match bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32) {
-        Ok(tgid) => tgid == t,
-        Err(_) => false,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let t = target();
+        if t == 0 {
+            return false;
+        }
+        let task = bpf_get_current_task() as *const u8;
+        if task.is_null() {
+            return false;
+        }
+        let parent = read_ptr(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)));
+        if parent.is_null() {
+            return false;
+        }
+        match bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32) {
+            Ok(tgid) => tgid == t,
+            Err(_) => false,
+        }
     }
 }
 
 #[inline(always)]
 unsafe fn try_probe_bprm(ctx: &LsmContext) {
-    if !parent_is_target() {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !parent_is_target() {
+            return;
+        }
+        let bprm: *const u8 = ctx.arg(0);
+        if bprm.is_null() {
+            return;
+        }
+        let (file_off, name_off) = match (poff(probe_slot::LINUX_BINPRM_FILE), poff(probe_slot::LINUX_BINPRM_FILENAME)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        };
+        let file = read_ptr(bprm.add(file_off));
+        if file.is_null() {
+            return;
+        }
+        let inode = read_ptr(file.add(off!(FILE_F_INODE_OFFSET)));
+        let dentry = read_ptr(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)));
+        let filename = read_ptr(bprm.add(name_off));
+        emit(PROBE_KIND_EXEC, inode, dentry, 0, filename, 0);
     }
-    let bprm: *const u8 = ctx.arg(0);
-    if bprm.is_null() {
-        return;
-    }
-    let (file_off, name_off) = match (poff(probe_slot::LINUX_BINPRM_FILE), poff(probe_slot::LINUX_BINPRM_FILENAME)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return,
-    };
-    let file = read_ptr(bprm.add(file_off));
-    if file.is_null() {
-        return;
-    }
-    let inode = read_ptr(file.add(off!(FILE_F_INODE_OFFSET)));
-    let dentry = read_ptr(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)));
-    let filename = read_ptr(bprm.add(name_off));
-    emit(PROBE_KIND_EXEC, inode, dentry, 0, filename, 0);
 }
 
 #[kretprobe]
@@ -379,41 +400,47 @@ pub fn probe_fexit_ip6_make_skb(_ctx: FExitContext) -> u32 {
 
 #[inline(always)]
 unsafe fn probe_skb_ret(ctx: &RetProbeContext, kind: u8) {
-    if !current_is_target() {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !current_is_target() {
+            return;
+        }
+        let skb: *const u8 = ctx.ret();
+        // ERR_PTR() values sit in the last page of the address space.
+        if skb.is_null() || (skb as u64) >= 0xffff_ffff_ffff_f000 {
+            return;
+        }
+        emit_skb(skb, kind);
     }
-    let skb: *const u8 = ctx.ret();
-    // ERR_PTR() values sit in the last page of the address space.
-    if skb.is_null() || (skb as u64) >= 0xffff_ffff_ffff_f000 {
-        return;
-    }
-    emit_skb(skb, kind);
 }
 
 #[inline(always)]
 unsafe fn emit_skb(skb: *const u8, kind: u8) {
-    let (head_off, th_off, len_off) = match (
-        poff(probe_slot::SK_BUFF_HEAD),
-        poff(probe_slot::SK_BUFF_TRANSPORT_HEADER),
-        poff(probe_slot::SK_BUFF_LEN),
-    ) {
-        (Some(a), Some(b), Some(c)) => (a, b, c),
-        _ => return,
-    };
-    let head = read_ptr(skb.add(head_off));
-    let th = match bpf_probe_read_kernel::<u16>(skb.add(th_off) as *const u16) {
-        Ok(v) => v as usize,
-        Err(_) => return,
-    };
-    let len = match bpf_probe_read_kernel::<u32>(skb.add(len_off) as *const u32) {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
-    if head.is_null() || th == 0xffff {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let (head_off, th_off, len_off) = match (
+            poff(probe_slot::SK_BUFF_HEAD),
+            poff(probe_slot::SK_BUFF_TRANSPORT_HEADER),
+            poff(probe_slot::SK_BUFF_LEN),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return,
+        };
+        let head = read_ptr(skb.add(head_off));
+        let th = match bpf_probe_read_kernel::<u16>(skb.add(th_off) as *const u16) {
+            Ok(v) => v as usize,
+            Err(_) => return,
+        };
+        let len = match bpf_probe_read_kernel::<u32>(skb.add(len_off) as *const u32) {
+            Ok(v) => v,
+            Err(_) => 0,
+        };
+        if head.is_null() || th == 0xffff {
+            return;
+        }
+        let payload = head.add((th & 0xffff) + UDP_HDR_LEN);
+        emit(kind, core::ptr::null(), core::ptr::null(), len, payload, skb as u64);
     }
-    let payload = head.add((th & 0xffff) + UDP_HDR_LEN);
-    emit(kind, core::ptr::null(), core::ptr::null(), len, payload, skb as u64);
 }
 
 /// The one emit site per program. `inode`/`dentry` fill the identity and
@@ -421,91 +448,97 @@ unsafe fn emit_skb(skb: *const u8, kind: u8) {
 /// a UDP payload (`aux` = skb pointer, fixed-size read).
 #[inline(always)]
 unsafe fn emit(kind: u8, inode: *const u8, dentry: *const u8, mode: u32, detail_src: *const u8, aux: u64) {
-    let mut entry = match PROBE_EVENTS.reserve::<SensorProbeRaw>(0) {
-        Some(e) => e,
-        None => return,
-    };
-    let raw: *mut SensorProbeRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
-    }
-    (*raw).kind = kind;
-    (*raw).mode = mode;
-    (*raw).aux = aux;
-    if !inode.is_null() {
-        let key = inode_key(inode);
-        (*raw).dev = key.dev;
-        (*raw).ino = key.ino;
-        if let Some(o) = poff(probe_slot::INODE_I_NLINK) {
-            if let Ok(n) = bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32) {
-                (*raw).nlink = n;
-            }
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match PROBE_EVENTS.reserve::<SensorProbeRaw>(0) {
+            Some(e) => e,
+            None => return,
+        };
+        let raw: *mut SensorProbeRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*raw).uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).comm = comm;
         }
-        if kind == PROBE_KIND_EXEC {
-            if let Some(o) = poff(probe_slot::INODE_I_MODE) {
-                if let Ok(m) = bpf_probe_read_kernel::<u16>(inode.add(o) as *const u16) {
-                    (*raw).mode = m as u32;
+        (*raw).kind = kind;
+        (*raw).mode = mode;
+        (*raw).aux = aux;
+        if !inode.is_null() {
+            let key = inode_key(inode);
+            (*raw).dev = key.dev;
+            (*raw).ino = key.ino;
+            if let Some(o) = poff(probe_slot::INODE_I_NLINK) {
+                if let Ok(n) = bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32) {
+                    (*raw).nlink = n;
+                }
+            }
+            if kind == PROBE_KIND_EXEC {
+                if let Some(o) = poff(probe_slot::INODE_I_MODE) {
+                    if let Ok(m) = bpf_probe_read_kernel::<u16>(inode.add(o) as *const u16) {
+                        (*raw).mode = m as u32;
+                    }
+                }
+            }
+            if let Some(o) = poff(probe_slot::SUPER_BLOCK_S_MAGIC) {
+                let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
+                if !sb.is_null() {
+                    if let Ok(m) = bpf_probe_read_kernel::<u64>(sb.add(o) as *const u64) {
+                        (*raw).s_magic = m;
+                    }
                 }
             }
         }
-        if let Some(o) = poff(probe_slot::SUPER_BLOCK_S_MAGIC) {
-            let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
-            if !sb.is_null() {
-                if let Ok(m) = bpf_probe_read_kernel::<u64>(sb.add(o) as *const u64) {
-                    (*raw).s_magic = m;
+        if !dentry.is_null() {
+            let (n, truncated) = walk_path(dentry, (*raw).path.as_mut_ptr());
+            (*raw).path_n = n as u16;
+            (*raw).path_truncated = truncated as u8;
+        }
+        if !detail_src.is_null() {
+            let dst = core::slice::from_raw_parts_mut((*raw).detail.as_mut_ptr(), PROBE_DETAIL_LEN);
+            if aux == 0 {
+                if let Ok(s) = bpf_probe_read_kernel_str_bytes(detail_src, dst) {
+                    (*raw).detail_len = s.len() as u16;
+                }
+            } else {
+                let part = core::slice::from_raw_parts_mut((*raw).detail.as_mut_ptr(), PAYLOAD_COPY);
+                if bpf_probe_read_kernel_buf(detail_src, part).is_ok() {
+                    (*raw).detail_len = PAYLOAD_COPY as u16;
                 }
             }
         }
+        entry.submit(0);
     }
-    if !dentry.is_null() {
-        let (n, truncated) = walk_path(dentry, (*raw).path.as_mut_ptr());
-        (*raw).path_n = n as u16;
-        (*raw).path_truncated = truncated as u8;
-    }
-    if !detail_src.is_null() {
-        let dst = core::slice::from_raw_parts_mut((*raw).detail.as_mut_ptr(), PROBE_DETAIL_LEN);
-        if aux == 0 {
-            if let Ok(s) = bpf_probe_read_kernel_str_bytes(detail_src, dst) {
-                (*raw).detail_len = s.len() as u16;
-            }
-        } else {
-            let part = core::slice::from_raw_parts_mut((*raw).detail.as_mut_ptr(), PAYLOAD_COPY);
-            if bpf_probe_read_kernel_buf(detail_src, part).is_ok() {
-                (*raw).detail_len = PAYLOAD_COPY as u16;
-            }
-        }
-    }
-    entry.submit(0);
 }
 
 /// `module_load.rs`'s fixed-slot walk: each component leaf → root into a
 /// constant 32-byte slot; `(slots, truncated)`.
 #[inline(always)]
 unsafe fn walk_path(leaf: *const u8, dst: *mut u8) -> (usize, bool) {
-    let mut dentry = leaf;
-    let mut n: usize = 0;
-    let mut reached_root = false;
-    for i in 0..PROBE_PATH_SLOTS {
-        if dentry.is_null() {
-            break;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut dentry = leaf;
+        let mut n: usize = 0;
+        let mut reached_root = false;
+        for i in 0..PROBE_PATH_SLOTS {
+            if dentry.is_null() {
+                break;
+            }
+            let off = i * PROBE_PATH_SLOT_LEN;
+            let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+            if !name.is_null() {
+                let slot = core::slice::from_raw_parts_mut(dst.add(off), PROBE_PATH_SLOT_LEN);
+                let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+            }
+            n = i + 1;
+            let up = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+            if up == dentry {
+                reached_root = true;
+                break;
+            }
+            dentry = up;
         }
-        let off = i * PROBE_PATH_SLOT_LEN;
-        let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-        if !name.is_null() {
-            let slot = core::slice::from_raw_parts_mut(dst.add(off), PROBE_PATH_SLOT_LEN);
-            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
-        }
-        n = i + 1;
-        let up = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-        if up == dentry {
-            reached_root = true;
-            break;
-        }
-        dentry = up;
+        (n, !reached_root)
     }
-    (n, !reached_root)
 }

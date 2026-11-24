@@ -118,8 +118,8 @@ mod stop_tests {
     use std::sync::Arc;
 
     use nn_core::canary::detector::{CanaryIndexes, Detector};
-    use nn_model::telemetry::{FimEvent, FimOp};
     use nn_model::Event;
+    use nn_model::telemetry::{FimEvent, FimOp};
     use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
     use parking_lot::Mutex;
     use tempfile::TempDir;
@@ -409,10 +409,12 @@ mod stop_tests {
         let (registry, access) = paths.stores();
         let found = registry.lock().unrecorded_trips(&paths.access()).unwrap();
         for trip in &found {
-            assert!(registry
-                .lock()
-                .mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
-                .unwrap());
+            assert!(
+                registry
+                    .lock()
+                    .mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
+                    .unwrap()
+            );
         }
         (registry, access, found)
     }

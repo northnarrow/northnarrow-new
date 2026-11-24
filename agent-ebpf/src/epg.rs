@@ -146,7 +146,10 @@ pub(crate) fn bump_root_epoch() {
 
 #[inline(always)]
 pub(crate) unsafe fn rd<T>(addr: u64) -> Option<T> {
-    bpf_probe_read_kernel::<T>(addr as *const T).ok()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        bpf_probe_read_kernel::<T>(addr as *const T).ok()
+    }
 }
 
 /// `T` at `addr`, zeroes when unreadable: the helper clears its
@@ -158,14 +161,17 @@ pub(crate) unsafe fn rd<T>(addr: u64) -> Option<T> {
 /// 10).
 #[inline(always)]
 pub(crate) unsafe fn peek<T>(addr: u64) -> T {
-    let mut v = core::mem::MaybeUninit::<T>::uninit();
-    let _ = generated::bpf_probe_read_kernel(
-        v.as_mut_ptr() as *mut aya_ebpf::cty::c_void,
-        core::mem::size_of::<T>() as u32,
-        addr as *const aya_ebpf::cty::c_void,
-    );
-    // SAFETY: the helper writes every byte (the value, or zeroes).
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<T>::uninit();
+        let _ = generated::bpf_probe_read_kernel(
+            v.as_mut_ptr() as *mut aya_ebpf::cty::c_void,
+            core::mem::size_of::<T>() as u32,
+            addr as *const aya_ebpf::cty::c_void,
+        );
+        // SAFETY: the helper writes every byte (the value, or zeroes).
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
@@ -178,107 +184,143 @@ pub(crate) fn o(v: u32) -> u64 {
 /// `task->cred`.
 #[inline(always)]
 pub(crate) unsafe fn task_cred(c: &GuardConfig, task: u64) -> Option<u64> {
-    rd::<u64>(task + o(c.task_cred))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        rd::<u64>(task + o(c.task_cred))
+    }
 }
 
 /// `[cap_permitted, cap_effective]`.
 #[inline(always)]
 pub(crate) unsafe fn cred_caps(c: &GuardConfig, cred: u64) -> Option<[u64; 2]> {
-    rd::<[u64; 2]>(cred + o(c.cred_caps))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        rd::<[u64; 2]>(cred + o(c.cred_caps))
+    }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn cred_identity(c: &GuardConfig, cred: u64, caps: [u64; 2]) -> Option<Identity> {
-    let ids = rd::<[u32; 8]>(cred + o(c.cred_uid))?;
-    let user_ns = rd::<u64>(cred + o(c.cred_user_ns))?;
-    Some(Identity {
-        ids,
-        cap_permitted: caps[0],
-        cap_effective: caps[1],
-        user_ns,
-    })
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let ids = rd::<[u32; 8]>(cred + o(c.cred_uid))?;
+        let user_ns = rd::<u64>(cred + o(c.cred_user_ns))?;
+        Some(Identity {
+            ids,
+            cap_permitted: caps[0],
+            cap_effective: caps[1],
+            user_ns,
+        })
+    }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn read_identity(c: &GuardConfig, cred: u64) -> Option<Identity> {
-    let caps = cred_caps(c, cred)?;
-    cred_identity(c, cred, caps)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let caps = cred_caps(c, cred)?;
+        cred_identity(c, cred, caps)
+    }
 }
 
 /// `task->fs` and `task->fs->root.dentry` (0 when unreadable; a null `fs`
 /// makes the second read fail, so its root is 0 too).
 #[inline(always)]
 pub(crate) unsafe fn fs_and_root(c: &GuardConfig, task: u64) -> (u64, u64) {
-    let fs = peek::<u64>(task + o(c.task_fs));
-    let root = peek::<u64>(fs + o(c.fs_root_dentry));
-    (fs, root)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let fs = peek::<u64>(task + o(c.task_fs));
+        let root = peek::<u64>(fs + o(c.fs_root_dentry));
+        (fs, root)
+    }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn nsproxy_of(c: &GuardConfig, task: u64) -> u64 {
-    peek::<u64>(task + o(c.task_nsproxy))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        peek::<u64>(task + o(c.task_nsproxy))
+    }
 }
 
 /// `ns.inum` of the namespace whose pointer is at `ptr_addr` (0 when
 /// unreadable: a null namespace makes the second read fail).
 #[inline(always)]
 unsafe fn inum_at(ptr_addr: u64, inum_off: u64) -> u32 {
-    peek::<u32>(peek::<u64>(ptr_addr) + inum_off)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        peek::<u32>(peek::<u64>(ptr_addr) + inum_off)
+    }
 }
 
 /// `ns.inum` of the mount, pid (for children) and network namespaces.
 #[inline(always)]
 pub(crate) unsafe fn ns_inums(c: &GuardConfig, nsproxy: u64) -> [u32; 3] {
-    // A null `nsproxy` makes every read fail: zeroes.
-    [
-        inum_at(nsproxy + o(c.nsproxy_mnt), o(c.mnt_inum)),
-        inum_at(nsproxy + o(c.nsproxy_pid), o(c.pid_inum)),
-        inum_at(nsproxy + o(c.nsproxy_net), o(c.net_inum)),
-    ]
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // A null `nsproxy` makes every read fail: zeroes.
+        [
+            inum_at(nsproxy + o(c.nsproxy_mnt), o(c.mnt_inum)),
+            inum_at(nsproxy + o(c.nsproxy_pid), o(c.pid_inum)),
+            inum_at(nsproxy + o(c.nsproxy_net), o(c.net_inum)),
+        ]
+    }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn user_inum(c: &GuardConfig, user_ns: u64) -> u32 {
-    peek::<u32>(user_ns + o(c.user_inum))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        peek::<u32>(user_ns + o(c.user_inum))
+    }
 }
 
 /// `TS_COMPAT` in `thread_info.status`: the current call is a 32-bit one
 /// (not when unreadable).
 #[inline(always)]
 pub(crate) unsafe fn compat(c: &GuardConfig, task: u64) -> bool {
-    peek::<u32>(task + o(c.task_ti_status)) & epg::TS_COMPAT != 0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        peek::<u32>(task + o(c.task_ti_status)) & epg::TS_COMPAT != 0
+    }
 }
 
 /// The current task holds every capability with host real uid 0.
 #[inline(always)]
 unsafe fn current_fully_privileged(c: &GuardConfig, task: u64) -> bool {
-    let ruid = bpf_get_current_uid_gid() as u32;
-    if ruid != 0 {
-        return false;
-    }
-    match task_cred(c, task).and_then(|cr| cred_caps(c, cr)) {
-        Some(caps) => epg::fully_privileged(ruid, caps[1], c.full_cap_mask),
-        None => false,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let ruid = bpf_get_current_uid_gid() as u32;
+        if ruid != 0 {
+            return false;
+        }
+        match task_cred(c, task).and_then(|cr| cred_caps(c, cr)) {
+            Some(caps) => epg::fully_privileged(ruid, caps[1], c.full_cap_mask),
+            None => false,
+        }
     }
 }
 
 /// The whole snapshot of `task` with credential `now`.
 #[inline(always)]
 unsafe fn baseline(c: &GuardConfig, s: *mut EpgState, task: u64, cred: u64, now: &Identity) {
-    (*s).id = *now;
-    (*s).cred = cred;
-    let nsproxy = nsproxy_of(c, task);
-    (*s).nsproxy = nsproxy;
-    let (fs, root) = fs_and_root(c, task);
-    (*s).fs = fs;
-    (*s).root = root;
-    (*s).root_epoch = root_epoch();
-    let n = ns_inums(c, nsproxy);
-    (*s).inum[INUM_MNT] = n[0];
-    (*s).inum[INUM_PID] = n[1];
-    (*s).inum[INUM_NET] = n[2];
-    (*s).inum[INUM_USER] = user_inum(c, now.user_ns);
-    (*s).mech = 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        (*s).id = *now;
+        (*s).cred = cred;
+        let nsproxy = nsproxy_of(c, task);
+        (*s).nsproxy = nsproxy;
+        let (fs, root) = fs_and_root(c, task);
+        (*s).fs = fs;
+        (*s).root = root;
+        (*s).root_epoch = root_epoch();
+        let n = ns_inums(c, nsproxy);
+        (*s).inum[INUM_MNT] = n[0];
+        (*s).inum[INUM_PID] = n[1];
+        (*s).inum[INUM_NET] = n[2];
+        (*s).inum[INUM_USER] = user_inum(c, now.user_ns);
+        (*s).mech = 0;
+    }
 }
 
 /// What one record carries.
@@ -303,16 +345,19 @@ pub(crate) struct Finding {
 /// (pending, so delivered before the task's next return to user mode).
 #[inline(always)]
 pub(crate) unsafe fn respond(c: &GuardConfig) -> u8 {
-    count(counter::ANOMALIES);
-    if c.mode == cfg::MODE_ENFORCE {
-        if generated::bpf_send_signal(SIGKILL) == 0 {
-            count(counter::KILLS);
-            action::KILLED
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        count(counter::ANOMALIES);
+        if c.mode == cfg::MODE_ENFORCE {
+            if generated::bpf_send_signal(SIGKILL) == 0 {
+                count(counter::KILLS);
+                action::KILLED
+            } else {
+                action::KILL_FAILED
+            }
         } else {
-            action::KILL_FAILED
+            action::RECORDED
         }
-    } else {
-        action::RECORDED
     }
 }
 
@@ -320,14 +365,17 @@ pub(crate) unsafe fn respond(c: &GuardConfig) -> u8 {
 /// The response never depends on the ring.
 #[inline(always)]
 unsafe fn report(c: &GuardConfig, s: *mut EpgState, f: &Finding) {
-    let act = respond(c);
-    (*s).flags |= REPORTED;
-    if (*s).reports >= epg::REPORTS_PER_TASK {
-        count(counter::REPORTS_HELD);
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let act = respond(c);
+        (*s).flags |= REPORTED;
+        if (*s).reports >= epg::REPORTS_PER_TASK {
+            count(counter::REPORTS_HELD);
+            return;
+        }
+        (*s).reports += 1;
+        emit(c, f, act);
     }
-    (*s).reports += 1;
-    emit(c, f, act);
 }
 
 /// A reserved, zeroed ring record with its header filled (time, task,
@@ -342,53 +390,59 @@ unsafe fn record(
     flags: u8,
     pt: u8,
 ) -> Option<RingBufEntry<EpgEventRaw>> {
-    let mut entry = match EPG_EVENTS.reserve::<EpgEventRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(ring_slot::EXPLOIT_GUARD);
-            return None;
-        }
-    };
-    let r: *mut EpgEventRaw = entry.as_mut_ptr();
-    crate::zero::zero(r);
-    let pid_tgid = bpf_get_current_pid_tgid();
-    (*r).timestamp_ns = bpf_ktime_get_ns();
-    (*r).pid = (pid_tgid >> 32) as u32;
-    (*r).tid = pid_tgid as u32;
-    (*r).kind = kind_;
-    (*r).action = act;
-    (*r).abi = abi_;
-    (*r).nr = nr_;
-    (*r).flags = flags;
-    (*r).point = pt;
-    (*r).variant = c.variant as u8;
-    crate::comm::comm_into(&mut (*r).comm);
-    Some(entry)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match EPG_EVENTS.reserve::<EpgEventRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(ring_slot::EXPLOIT_GUARD);
+                return None;
+            }
+        };
+        let r: *mut EpgEventRaw = entry.as_mut_ptr();
+        crate::zero::zero(r);
+        let pid_tgid = bpf_get_current_pid_tgid();
+        (*r).timestamp_ns = bpf_ktime_get_ns();
+        (*r).pid = (pid_tgid >> 32) as u32;
+        (*r).tid = pid_tgid as u32;
+        (*r).kind = kind_;
+        (*r).action = act;
+        (*r).abi = abi_;
+        (*r).nr = nr_;
+        (*r).flags = flags;
+        (*r).point = pt;
+        (*r).variant = c.variant as u8;
+        crate::comm::comm_into(&mut (*r).comm);
+        Some(entry)
+    }
 }
 
 /// One ring record (`EpgEventRaw`).
 #[inline(always)]
 pub(crate) unsafe fn emit(c: &GuardConfig, f: &Finding, act: u8) {
-    let Some(mut entry) = record(c, f.kind, act, (f.abi, f.nr), f.flags, f.point) else {
-        return;
-    };
-    let r: *mut EpgEventRaw = entry.as_mut_ptr();
-    (*r).mechanisms = f.mech;
-    (*r).before_ids = f.before.ids;
-    (*r).after_ids = f.after.ids;
-    (*r).before_cap_permitted = f.before.cap_permitted;
-    (*r).before_cap_effective = f.before.cap_effective;
-    (*r).after_cap_permitted = f.after.cap_permitted;
-    (*r).after_cap_effective = f.after.cap_effective;
-    (*r).before_user_ns = f.before_ns[3];
-    (*r).after_user_ns = f.after_user_inum;
-    (*r).before_mnt_ns = f.before_ns[0];
-    (*r).before_pid_ns = f.before_ns[1];
-    (*r).before_net_ns = f.before_ns[2];
-    (*r).after_mnt_ns = f.after_ns[0];
-    (*r).after_pid_ns = f.after_ns[1];
-    (*r).after_net_ns = f.after_ns[2];
-    entry.submit(0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(mut entry) = record(c, f.kind, act, (f.abi, f.nr), f.flags, f.point) else {
+            return;
+        };
+        let r: *mut EpgEventRaw = entry.as_mut_ptr();
+        (*r).mechanisms = f.mech;
+        (*r).before_ids = f.before.ids;
+        (*r).after_ids = f.after.ids;
+        (*r).before_cap_permitted = f.before.cap_permitted;
+        (*r).before_cap_effective = f.before.cap_effective;
+        (*r).after_cap_permitted = f.after.cap_permitted;
+        (*r).after_cap_effective = f.after.cap_effective;
+        (*r).before_user_ns = f.before_ns[3];
+        (*r).after_user_ns = f.after_user_inum;
+        (*r).before_mnt_ns = f.before_ns[0];
+        (*r).before_pid_ns = f.before_ns[1];
+        (*r).before_net_ns = f.before_ns[2];
+        (*r).after_mnt_ns = f.after_ns[0];
+        (*r).after_pid_ns = f.after_ns[1];
+        (*r).after_net_ns = f.after_ns[2];
+        entry.submit(0);
+    }
 }
 
 /// `ids` copied word by word into a ring record. An assignment between two
@@ -398,12 +452,15 @@ pub(crate) unsafe fn emit(c: &GuardConfig, f: &Finding, act: u8) {
 /// inline.
 #[inline(always)]
 unsafe fn copy_ids(dst: *mut [u32; 8], src: *const [u32; 8]) {
-    let d = dst as *mut u32;
-    let s = src as *const u32;
-    let mut i = 0;
-    while i < 8 {
-        core::ptr::write_volatile(d.add(i), *s.add(i));
-        i += 1;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let d = dst as *mut u32;
+        let s = src as *const u32;
+        let mut i = 0;
+        while i < 8 {
+            core::ptr::write_volatile(d.add(i), *s.add(i));
+            i += 1;
+        }
     }
 }
 
@@ -422,7 +479,10 @@ pub(crate) unsafe fn emit_held(
     id: &Identity,
     nsproxy: u64,
 ) {
-    emit_change(c, kind_, act, call, flags, pt, id, nsproxy, id, nsproxy);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        emit_change(c, kind_, act, call, flags, pt, id, nsproxy, id, nsproxy);
+    }
 }
 
 /// One ring record of a change: `before` and `before_nsproxy` what the
@@ -444,27 +504,30 @@ pub(crate) unsafe fn emit_change(
     after: &Identity,
     after_nsproxy: u64,
 ) {
-    let Some(mut entry) = record(c, kind_, act, call, flags, pt) else {
-        return;
-    };
-    let r: *mut EpgEventRaw = entry.as_mut_ptr();
-    copy_ids(&mut (*r).before_ids, core::ptr::addr_of!((*before).ids));
-    copy_ids(&mut (*r).after_ids, &after.ids);
-    (*r).before_cap_permitted = (*before).cap_permitted;
-    (*r).before_cap_effective = (*before).cap_effective;
-    (*r).after_cap_permitted = after.cap_permitted;
-    (*r).after_cap_effective = after.cap_effective;
-    (*r).before_user_ns = user_inum(c, (*before).user_ns);
-    (*r).after_user_ns = user_inum(c, after.user_ns);
-    let b = ns_inums(c, before_nsproxy);
-    (*r).before_mnt_ns = b[0];
-    (*r).before_pid_ns = b[1];
-    (*r).before_net_ns = b[2];
-    let a = ns_inums(c, after_nsproxy);
-    (*r).after_mnt_ns = a[0];
-    (*r).after_pid_ns = a[1];
-    (*r).after_net_ns = a[2];
-    entry.submit(0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(mut entry) = record(c, kind_, act, call, flags, pt) else {
+            return;
+        };
+        let r: *mut EpgEventRaw = entry.as_mut_ptr();
+        copy_ids(&mut (*r).before_ids, core::ptr::addr_of!((*before).ids));
+        copy_ids(&mut (*r).after_ids, &after.ids);
+        (*r).before_cap_permitted = (*before).cap_permitted;
+        (*r).before_cap_effective = (*before).cap_effective;
+        (*r).after_cap_permitted = after.cap_permitted;
+        (*r).after_cap_effective = after.cap_effective;
+        (*r).before_user_ns = user_inum(c, (*before).user_ns);
+        (*r).after_user_ns = user_inum(c, after.user_ns);
+        let b = ns_inums(c, before_nsproxy);
+        (*r).before_mnt_ns = b[0];
+        (*r).before_pid_ns = b[1];
+        (*r).before_net_ns = b[2];
+        let a = ns_inums(c, after_nsproxy);
+        (*r).after_mnt_ns = a[0];
+        (*r).after_pid_ns = a[1];
+        (*r).after_net_ns = a[2];
+        entry.submit(0);
+    }
 }
 
 /// A finding about credentials only (namespaces as in the snapshot).
@@ -479,23 +542,26 @@ unsafe fn cred_finding(
     flags: u8,
     pt: u8,
 ) -> Finding {
-    let after_user = if after.user_ns == (*s).id.user_ns {
-        (*s).inum[INUM_USER]
-    } else {
-        user_inum(c, after.user_ns)
-    };
-    Finding {
-        kind: kind_,
-        abi: abi_,
-        nr: nr_,
-        before: (*s).id,
-        after: *after,
-        before_ns: (*s).inum,
-        after_user_inum: after_user,
-        after_ns: [(*s).inum[INUM_MNT], (*s).inum[INUM_PID], (*s).inum[INUM_NET]],
-        flags,
-        point: pt,
-        mech: (*s).mech,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let after_user = if after.user_ns == (*s).id.user_ns {
+            (*s).inum[INUM_USER]
+        } else {
+            user_inum(c, after.user_ns)
+        };
+        Finding {
+            kind: kind_,
+            abi: abi_,
+            nr: nr_,
+            before: (*s).id,
+            after: *after,
+            before_ns: (*s).inum,
+            after_user_inum: after_user,
+            after_ns: [(*s).inum[INUM_MNT], (*s).inum[INUM_PID], (*s).inum[INUM_NET]],
+            flags,
+            point: pt,
+            mech: (*s).mech,
+        }
     }
 }
 
@@ -520,69 +586,72 @@ pub fn epg_sys_enter(ctx: RawTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sys_enter(c: &GuardConfig, ctx: &RawTracePointContext) {
-    // `sys_enter(struct pt_regs *regs, long id)`.
-    let nr = *(ctx.as_ptr() as *const u64).add(1) as u32;
-    let task = bpf_get_current_task();
-    let Some(cred) = task_cred(c, task) else {
-        return;
-    };
-    let Some(caps) = cred_caps(c, cred) else {
-        return;
-    };
-    let ruid = bpf_get_current_uid_gid() as u32;
-    if epg::fully_privileged(ruid, caps[1], c.full_cap_mask) {
-        count(counter::SKIPPED_PRIVILEGED);
-        return;
-    }
-    let Some(now) = cred_identity(c, cred, caps) else {
-        return;
-    };
-    match EPG_TASKS.get_ptr_mut(&task) {
-        Some(s) => {
-            if (*s).flags & REBASE != 0 {
-                baseline(c, s, task, cred, &now);
-                count(counter::REBASED);
-            } else {
-                let bypassed = (*s).flags & IN_SYSCALL != 0;
-                if bypassed {
-                    count(counter::EXIT_BYPASSED);
-                }
-                if let Some(k) = epg::judge_enter(&(*s).id, &now) {
-                    let (prev_abi, prev_nr) = if bypassed {
-                        epg::split_abi((*s).nr, false)
-                    } else {
-                        (abi::NONE, NO_SYSCALL)
-                    };
-                    let mut fl = if bypassed { evf::EXIT_BYPASSED } else { 0 };
-                    if cred != (*s).cred {
-                        fl |= evf::CRED_REPLACED;
-                    }
-                    let f = cred_finding(c, s, k, prev_abi, prev_nr, &now, fl, point::SYS_ENTER);
-                    report(c, s, &f);
-                }
-                if now.user_ns != (*s).id.user_ns {
-                    (*s).inum[INUM_USER] = user_inum(c, now.user_ns);
-                }
-                (*s).id = now;
-                (*s).cred = cred;
-            }
-            (*s).nr = nr;
-            (*s).mech = 0;
-            (*s).flags = ((*s).flags & !(REBASE | REPORTED)) | IN_SYSCALL;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // `sys_enter(struct pt_regs *regs, long id)`.
+        let nr = *(ctx.as_ptr() as *const u64).add(1) as u32;
+        let task = bpf_get_current_task();
+        let Some(cred) = task_cred(c, task) else {
+            return;
+        };
+        let Some(caps) = cred_caps(c, cred) else {
+            return;
+        };
+        let ruid = bpf_get_current_uid_gid() as u32;
+        if epg::fully_privileged(ruid, caps[1], c.full_cap_mask) {
+            count(counter::SKIPPED_PRIVILEGED);
+            return;
         }
-        None => {
-            // Zeroed with volatile stores: `mem::zeroed()` compiles to the
-            // `memset` subprogram (rule 9).
-            let mut slot = core::mem::MaybeUninit::<EpgState>::uninit();
-            crate::zero::zero(slot.as_mut_ptr());
-            let fresh = &mut *slot.as_mut_ptr();
-            baseline(c, fresh, task, cred, &now);
-            fresh.nr = nr;
-            fresh.flags = IN_SYSCALL;
-            if EPG_TASKS.insert(&task, fresh, 0).is_ok() {
-                count(counter::TRACKED);
-            } else {
-                count(counter::UNTRACKED);
+        let Some(now) = cred_identity(c, cred, caps) else {
+            return;
+        };
+        match EPG_TASKS.get_ptr_mut(&task) {
+            Some(s) => {
+                if (*s).flags & REBASE != 0 {
+                    baseline(c, s, task, cred, &now);
+                    count(counter::REBASED);
+                } else {
+                    let bypassed = (*s).flags & IN_SYSCALL != 0;
+                    if bypassed {
+                        count(counter::EXIT_BYPASSED);
+                    }
+                    if let Some(k) = epg::judge_enter(&(*s).id, &now) {
+                        let (prev_abi, prev_nr) = if bypassed {
+                            epg::split_abi((*s).nr, false)
+                        } else {
+                            (abi::NONE, NO_SYSCALL)
+                        };
+                        let mut fl = if bypassed { evf::EXIT_BYPASSED } else { 0 };
+                        if cred != (*s).cred {
+                            fl |= evf::CRED_REPLACED;
+                        }
+                        let f = cred_finding(c, s, k, prev_abi, prev_nr, &now, fl, point::SYS_ENTER);
+                        report(c, s, &f);
+                    }
+                    if now.user_ns != (*s).id.user_ns {
+                        (*s).inum[INUM_USER] = user_inum(c, now.user_ns);
+                    }
+                    (*s).id = now;
+                    (*s).cred = cred;
+                }
+                (*s).nr = nr;
+                (*s).mech = 0;
+                (*s).flags = ((*s).flags & !(REBASE | REPORTED)) | IN_SYSCALL;
+            }
+            None => {
+                // Zeroed with volatile stores: `mem::zeroed()` compiles to the
+                // `memset` subprogram (rule 9).
+                let mut slot = core::mem::MaybeUninit::<EpgState>::uninit();
+                crate::zero::zero(slot.as_mut_ptr());
+                let fresh = &mut *slot.as_mut_ptr();
+                baseline(c, fresh, task, cred, &now);
+                fresh.nr = nr;
+                fresh.flags = IN_SYSCALL;
+                if EPG_TASKS.insert(&task, fresh, 0).is_ok() {
+                    count(counter::TRACKED);
+                } else {
+                    count(counter::UNTRACKED);
+                }
             }
         }
     }
@@ -600,125 +669,131 @@ pub fn epg_sys_exit(ctx: RawTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sys_exit(c: &GuardConfig, ctx: &RawTracePointContext) {
-    let task = bpf_get_current_task();
-    let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
-        return;
-    };
-    if (*s).flags & IN_SYSCALL == 0 {
-        // A fully privileged task's call (no snapshot taken), or a call the
-        // kernel skipped before `sys_enter` (seccomp).
-        return;
-    }
-    (*s).flags &= !IN_SYSCALL;
-    count(counter::CHECKED);
-    // `sys_exit(struct pt_regs *regs, long ret)`.
-    let ret = *(ctx.as_ptr() as *const u64).add(1) as i64;
-    let Some(cred) = task_cred(c, task) else {
-        return;
-    };
-    let Some(after) = read_identity(c, cred) else {
-        return;
-    };
-    let nsproxy = nsproxy_of(c, task);
-    let (fs, root) = fs_and_root(c, task);
-    let epoch = root_epoch();
-    let gain = epg::cred_gain(&(*s).id, &after);
-    let ns_changed = nsproxy != (*s).nsproxy;
-    let fs_changed = fs != (*s).fs;
-    let root_changed = root != (*s).root;
-    let raw_nr = (*s).nr;
-    let mut after_ns = [(*s).inum[INUM_MNT], (*s).inum[INUM_PID], (*s).inum[INUM_NET]];
-    if ns_changed {
-        after_ns = ns_inums(c, nsproxy);
-    }
-    let mut after_user = (*s).inum[INUM_USER];
-    if after.user_ns != (*s).id.user_ns {
-        after_user = user_inum(c, after.user_ns);
-    }
-    if gain != 0 || ns_changed || fs_changed || root_changed {
-        // Slow path: something changed; read the ABI and judge.
-        let (abi_, nr_) = epg::split_abi(raw_nr, compat(c, task));
-        let obs = ExitObservation {
-            before: (*s).id,
-            after,
-            mechanisms: (*s).mech,
-            abi: abi_,
-            nr: nr_,
-            nsproxy_changed: ns_changed,
-            fs_changed,
-            root_changed,
-            root_epoch_advanced: epoch != (*s).root_epoch,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
+            return;
         };
-        if let Some(k) = epg::judge_exit(&obs) {
-            if (*s).flags & REPORTED == 0 {
-                let mut fl = 0u8;
-                if cred != (*s).cred {
-                    fl |= evf::CRED_REPLACED;
+        if (*s).flags & IN_SYSCALL == 0 {
+            // A fully privileged task's call (no snapshot taken), or a call the
+            // kernel skipped before `sys_enter` (seccomp).
+            return;
+        }
+        (*s).flags &= !IN_SYSCALL;
+        count(counter::CHECKED);
+        // `sys_exit(struct pt_regs *regs, long ret)`.
+        let ret = *(ctx.as_ptr() as *const u64).add(1) as i64;
+        let Some(cred) = task_cred(c, task) else {
+            return;
+        };
+        let Some(after) = read_identity(c, cred) else {
+            return;
+        };
+        let nsproxy = nsproxy_of(c, task);
+        let (fs, root) = fs_and_root(c, task);
+        let epoch = root_epoch();
+        let gain = epg::cred_gain(&(*s).id, &after);
+        let ns_changed = nsproxy != (*s).nsproxy;
+        let fs_changed = fs != (*s).fs;
+        let root_changed = root != (*s).root;
+        let raw_nr = (*s).nr;
+        let mut after_ns = [(*s).inum[INUM_MNT], (*s).inum[INUM_PID], (*s).inum[INUM_NET]];
+        if ns_changed {
+            after_ns = ns_inums(c, nsproxy);
+        }
+        let mut after_user = (*s).inum[INUM_USER];
+        if after.user_ns != (*s).id.user_ns {
+            after_user = user_inum(c, after.user_ns);
+        }
+        if gain != 0 || ns_changed || fs_changed || root_changed {
+            // Slow path: something changed; read the ABI and judge.
+            let (abi_, nr_) = epg::split_abi(raw_nr, compat(c, task));
+            let obs = ExitObservation {
+                before: (*s).id,
+                after,
+                mechanisms: (*s).mech,
+                abi: abi_,
+                nr: nr_,
+                nsproxy_changed: ns_changed,
+                fs_changed,
+                root_changed,
+                root_epoch_advanced: epoch != (*s).root_epoch,
+            };
+            match epg::judge_exit(&obs) {
+                Some(k) => {
+                    if (*s).flags & REPORTED == 0 {
+                        let mut fl = 0u8;
+                        if cred != (*s).cred {
+                            fl |= evf::CRED_REPLACED;
+                        }
+                        if ns_changed {
+                            fl |= evf::NS_CHANGED;
+                        }
+                        if fs_changed {
+                            fl |= evf::FS_CHANGED;
+                        }
+                        if root_changed {
+                            fl |= evf::ROOT_CHANGED;
+                        }
+                        let f = Finding {
+                            kind: k,
+                            abi: abi_,
+                            nr: nr_,
+                            before: (*s).id,
+                            after,
+                            before_ns: (*s).inum,
+                            after_user_inum: after_user,
+                            after_ns,
+                            flags: fl,
+                            point: point::SYS_EXIT,
+                            mech: (*s).mech,
+                        };
+                        report(c, s, &f);
+                    }
                 }
-                if ns_changed {
-                    fl |= evf::NS_CHANGED;
-                }
-                if fs_changed {
-                    fl |= evf::FS_CHANGED;
-                }
-                if root_changed {
-                    fl |= evf::ROOT_CHANGED;
-                }
-                let f = Finding {
-                    kind: k,
-                    abi: abi_,
-                    nr: nr_,
-                    before: (*s).id,
-                    after,
-                    before_ns: (*s).inum,
-                    after_user_inum: after_user,
-                    after_ns,
-                    flags: fl,
-                    point: point::SYS_EXIT,
-                    mech: (*s).mech,
-                };
-                report(c, s, &f);
+                _ => {}
+            }
+            // Fallback for kernels where `chroot_fs_refs` cannot be hooked: a
+            // successful `pivot_root` replaced the roots of the tasks of its
+            // mount namespace.
+            if epg::is_pivot_root(abi_, nr_) && ret == 0 {
+                bump_root_epoch();
             }
         }
-        // Fallback for kernels where `chroot_fs_refs` cannot be hooked: a
-        // successful `pivot_root` replaced the roots of the tasks of its
-        // mount namespace.
-        if epg::is_pivot_root(abi_, nr_) && ret == 0 {
-            bump_root_epoch();
+        // Lab fault injection: only when the agent (a `debug-trigger` build)
+        // set a comm; a `getppid` exit of that process is reported, marked
+        // injected, with nothing changed.
+        if c.inject_comm_lo != 0
+            && raw_nr == epg::nr::GETPPID
+            && (*s).flags & REPORTED == 0
+            && injected_comm(c)
+        {
+            let f = cred_finding(
+                c,
+                s,
+                kind::CRED_NO_MECHANISM,
+                abi::X64,
+                raw_nr,
+                &after,
+                evf::INJECTED,
+                point::SYS_EXIT,
+            );
+            report(c, s, &f);
         }
+        (*s).id = after;
+        (*s).cred = cred;
+        (*s).nsproxy = nsproxy;
+        (*s).fs = fs;
+        (*s).root = root;
+        (*s).root_epoch = root_epoch();
+        (*s).inum[INUM_MNT] = after_ns[0];
+        (*s).inum[INUM_PID] = after_ns[1];
+        (*s).inum[INUM_NET] = after_ns[2];
+        (*s).inum[INUM_USER] = after_user;
+        (*s).mech = 0;
+        (*s).flags &= !REPORTED;
     }
-    // Lab fault injection: only when the agent (a `debug-trigger` build)
-    // set a comm; a `getppid` exit of that process is reported, marked
-    // injected, with nothing changed.
-    if c.inject_comm_lo != 0
-        && raw_nr == epg::nr::GETPPID
-        && (*s).flags & REPORTED == 0
-        && injected_comm(c)
-    {
-        let f = cred_finding(
-            c,
-            s,
-            kind::CRED_NO_MECHANISM,
-            abi::X64,
-            raw_nr,
-            &after,
-            evf::INJECTED,
-            point::SYS_EXIT,
-        );
-        report(c, s, &f);
-    }
-    (*s).id = after;
-    (*s).cred = cred;
-    (*s).nsproxy = nsproxy;
-    (*s).fs = fs;
-    (*s).root = root;
-    (*s).root_epoch = root_epoch();
-    (*s).inum[INUM_MNT] = after_ns[0];
-    (*s).inum[INUM_PID] = after_ns[1];
-    (*s).inum[INUM_NET] = after_ns[2];
-    (*s).inum[INUM_USER] = after_user;
-    (*s).mech = 0;
-    (*s).flags &= !REPORTED;
 }
 
 // ── task exit ───────────────────────────────────────────────────────────
@@ -739,12 +814,15 @@ pub fn epg_task_exit(_ctx: RawTracePointContext) -> i32 {
 /// then re-snapshotted too.
 #[inline(always)]
 unsafe fn outside_call(c: &GuardConfig, s: *mut EpgState, task: u64, anomaly: Option<Finding>) {
-    if !current_fully_privileged(c, task) {
-        if let Some(f) = anomaly {
-            report(c, s, &f);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !current_fully_privileged(c, task) {
+            if let Some(f) = anomaly {
+                report(c, s, &f);
+            }
         }
+        (*s).flags |= REBASE;
     }
-    (*s).flags |= REBASE;
 }
 
 /// `int commit_creds(struct cred *new)` — always for `current`.
@@ -758,42 +836,45 @@ pub fn epg_commit_creds(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_commit_creds(c: &GuardConfig, ctx: &FEntryContext) {
-    let task = bpf_get_current_task();
-    let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
-        return;
-    };
-    count(counter::COMMITS);
-    let new = ctx.arg::<*const u8>(0) as u64;
-    let Some(after) = read_identity(c, new) else {
-        return;
-    };
-    if (*s).flags & IN_SYSCALL == 0 {
-        // Compare with the credential being replaced, not the snapshot.
-        let Some(old) = task_cred(c, task).and_then(|cr| read_identity(c, cr)) else {
-            (*s).flags |= REBASE;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
             return;
         };
-        let gain = epg::cred_gain(&old, &after);
-        let finding = match epg::judge_commit(gain, abi::NONE, NO_SYSCALL, false) {
-            Some(k) => {
-                let mut f = cred_finding(c, s, k, abi::NONE, NO_SYSCALL, &after, evf::CRED_REPLACED, point::COMMIT_CREDS);
-                f.before = old;
-                Some(f)
-            }
-            None => None,
+        count(counter::COMMITS);
+        let new = ctx.arg::<*const u8>(0) as u64;
+        let Some(after) = read_identity(c, new) else {
+            return;
         };
-        outside_call(c, s, task, finding);
-        return;
-    }
-    (*s).mech |= mech::COMMIT_CREDS;
-    let gain = epg::cred_gain(&(*s).id, &after);
-    if gain == 0 {
-        return;
-    }
-    let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
-    if let Some(k) = epg::judge_commit(gain, abi_, nr_, true) {
-        let f = cred_finding(c, s, k, abi_, nr_, &after, evf::CRED_REPLACED, point::COMMIT_CREDS);
-        report(c, s, &f);
+        if (*s).flags & IN_SYSCALL == 0 {
+            // Compare with the credential being replaced, not the snapshot.
+            let Some(old) = task_cred(c, task).and_then(|cr| read_identity(c, cr)) else {
+                (*s).flags |= REBASE;
+                return;
+            };
+            let gain = epg::cred_gain(&old, &after);
+            let finding = match epg::judge_commit(gain, abi::NONE, NO_SYSCALL, false) {
+                Some(k) => {
+                    let mut f = cred_finding(c, s, k, abi::NONE, NO_SYSCALL, &after, evf::CRED_REPLACED, point::COMMIT_CREDS);
+                    f.before = old;
+                    Some(f)
+                }
+                None => None,
+            };
+            outside_call(c, s, task, finding);
+            return;
+        }
+        (*s).mech |= mech::COMMIT_CREDS;
+        let gain = epg::cred_gain(&(*s).id, &after);
+        if gain == 0 {
+            return;
+        }
+        let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
+        if let Some(k) = epg::judge_commit(gain, abi_, nr_, true) {
+            let f = cred_finding(c, s, k, abi_, nr_, &after, evf::CRED_REPLACED, point::COMMIT_CREDS);
+            report(c, s, &f);
+        }
     }
 }
 
@@ -808,31 +889,34 @@ pub fn epg_switch_ns(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_switch_ns(c: &GuardConfig, ctx: &FEntryContext) {
-    let task = bpf_get_current_task();
-    let p = ctx.arg::<*const u8>(0) as u64;
-    let new = ctx.arg::<*const u8>(1) as u64;
-    // `exit_task_namespaces` passes NULL; another task's switch is not
-    // this task's mechanism.
-    if p != task || new == 0 {
-        return;
-    }
-    let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
-        return;
-    };
-    let ns_after = ns_inums(c, new);
-    let unchanged = (*s).id;
-    if (*s).flags & IN_SYSCALL == 0 {
-        let mut f = cred_finding(c, s, kind::NS_FROM_SYSCALL, abi::NONE, NO_SYSCALL, &unchanged, evf::NS_CHANGED, point::SWITCH_NS);
-        f.after_ns = ns_after;
-        outside_call(c, s, task, Some(f));
-        return;
-    }
-    (*s).mech |= mech::SWITCH_NS;
-    let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
-    if let Some(k) = epg::judge_switch_ns(abi_, nr_, true) {
-        let mut f = cred_finding(c, s, k, abi_, nr_, &unchanged, evf::NS_CHANGED, point::SWITCH_NS);
-        f.after_ns = ns_after;
-        report(c, s, &f);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let p = ctx.arg::<*const u8>(0) as u64;
+        let new = ctx.arg::<*const u8>(1) as u64;
+        // `exit_task_namespaces` passes NULL; another task's switch is not
+        // this task's mechanism.
+        if p != task || new == 0 {
+            return;
+        }
+        let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
+            return;
+        };
+        let ns_after = ns_inums(c, new);
+        let unchanged = (*s).id;
+        if (*s).flags & IN_SYSCALL == 0 {
+            let mut f = cred_finding(c, s, kind::NS_FROM_SYSCALL, abi::NONE, NO_SYSCALL, &unchanged, evf::NS_CHANGED, point::SWITCH_NS);
+            f.after_ns = ns_after;
+            outside_call(c, s, task, Some(f));
+            return;
+        }
+        (*s).mech |= mech::SWITCH_NS;
+        let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
+        if let Some(k) = epg::judge_switch_ns(abi_, nr_, true) {
+            let mut f = cred_finding(c, s, k, abi_, nr_, &unchanged, evf::NS_CHANGED, point::SWITCH_NS);
+            f.after_ns = ns_after;
+            report(c, s, &f);
+        }
     }
 }
 
@@ -847,28 +931,31 @@ pub fn epg_set_fs_root(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_set_fs_root(c: &GuardConfig, ctx: &FEntryContext) {
-    // Every root change on the host advances the epoch, whoever makes it.
-    bump_root_epoch();
-    let task = bpf_get_current_task();
-    let fs = ctx.arg::<*const u8>(0) as u64;
-    let (my_fs, _) = fs_and_root(c, task);
-    if fs == 0 || fs != my_fs {
-        return;
-    }
-    let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
-        return;
-    };
-    let unchanged = (*s).id;
-    if (*s).flags & IN_SYSCALL == 0 {
-        let f = cred_finding(c, s, kind::ROOT_FROM_SYSCALL, abi::NONE, NO_SYSCALL, &unchanged, evf::ROOT_CHANGED, point::SET_FS_ROOT);
-        outside_call(c, s, task, Some(f));
-        return;
-    }
-    (*s).mech |= mech::SET_FS_ROOT;
-    let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
-    if let Some(k) = epg::judge_set_fs_root(abi_, nr_, true) {
-        let f = cred_finding(c, s, k, abi_, nr_, &unchanged, evf::ROOT_CHANGED, point::SET_FS_ROOT);
-        report(c, s, &f);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Every root change on the host advances the epoch, whoever makes it.
+        bump_root_epoch();
+        let task = bpf_get_current_task();
+        let fs = ctx.arg::<*const u8>(0) as u64;
+        let (my_fs, _) = fs_and_root(c, task);
+        if fs == 0 || fs != my_fs {
+            return;
+        }
+        let Some(s) = EPG_TASKS.get_ptr_mut(&task) else {
+            return;
+        };
+        let unchanged = (*s).id;
+        if (*s).flags & IN_SYSCALL == 0 {
+            let f = cred_finding(c, s, kind::ROOT_FROM_SYSCALL, abi::NONE, NO_SYSCALL, &unchanged, evf::ROOT_CHANGED, point::SET_FS_ROOT);
+            outside_call(c, s, task, Some(f));
+            return;
+        }
+        (*s).mech |= mech::SET_FS_ROOT;
+        let (abi_, nr_) = epg::split_abi((*s).nr, compat(c, task));
+        if let Some(k) = epg::judge_set_fs_root(abi_, nr_, true) {
+            let f = cred_finding(c, s, k, abi_, nr_, &unchanged, evf::ROOT_CHANGED, point::SET_FS_ROOT);
+            report(c, s, &f);
+        }
     }
 }
 

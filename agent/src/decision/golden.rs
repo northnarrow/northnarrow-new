@@ -52,12 +52,12 @@ use std::time::Duration;
 use common::wire::execpol::{self as wpol, ExecPolRaw};
 use nn_model::{Event, ExeIdentity};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{replay, response_policy, rule_policy, RuleEngine};
+use super::{RuleEngine, replay, response_policy, rule_policy};
+use crate::impact::RansomTracker;
 use crate::impact::entropy::{Sample, Sampler};
 use crate::impact::trust::ProgramOwners;
-use crate::impact::RansomTracker;
 use crate::posture::lineage::AuthSessionTracker;
 
 /// The cases, the golden files and the fixture root.
@@ -1342,7 +1342,7 @@ fn the_event_loop_wires_the_bus_as_modelled() {
 /// on the agent): what the take prevents.
 #[test]
 fn self_test_events_never_trigger_rules_or_the_posture() {
-    use crate::telemetry_probe::{deny, round_events_for_tests, TelemetryProbe, Window};
+    use crate::telemetry_probe::{TelemetryProbe, Window, deny, round_events_for_tests};
     use nn_model::posture_types::PostureKind;
     let case: Case =
         serde_json::from_value(json!({"about": "lot 280c: the sensor self-test", "items": []}))

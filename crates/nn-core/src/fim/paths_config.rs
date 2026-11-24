@@ -32,7 +32,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::config::overlay_auth::Verified;
@@ -250,9 +250,10 @@ mod tests {
         assert!(out.added.contains(&PathBuf::from("/opt/myapp/bin/myapp")));
         assert!(out.added.contains(&PathBuf::from("/etc/myapp/config.toml")));
         assert!(out.disabled.contains(&PathBuf::from("/var/log/wtmp")));
-        assert!(out
-            .unknown_disable
-            .contains(&PathBuf::from("/etc/nonexistent")));
+        assert!(
+            out.unknown_disable
+                .contains(&PathBuf::from("/etc/nonexistent"))
+        );
     }
 
     /// External audit LLMR-016: with `fim-paths.v1` unreadable, FIM watches

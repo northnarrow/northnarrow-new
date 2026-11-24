@@ -882,9 +882,11 @@ fn the_scan_fails_on_a_planted_kind_without_class() {
     assert_ne!(text, code[file]);
     code.insert(file.to_string(), text);
     let (kinds, _) = inventory(&code);
-    assert!(unclassified(&kinds, &classified)
-        .iter()
-        .any(|m| m.starts_with("k379_planted_arm")));
+    assert!(
+        unclassified(&kinds, &classified)
+            .iter()
+            .any(|m| m.starts_with("k379_planted_arm"))
+    );
     // a kind position the scan cannot read
     code.insert(
         "k379-planted-d".to_string(),

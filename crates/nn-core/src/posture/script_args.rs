@@ -3100,7 +3100,7 @@ mod tests {
     /// judged by `mono-sgen`, which `family_of` did not know.
     #[test]
     fn bug104_mono_sgen_is_mono() {
-        use crate::posture::lineage::{is_interpreter, ExecIdentity};
+        use crate::posture::lineage::{ExecIdentity, is_interpreter};
         for exe in ["/usr/bin/mono-sgen", "/usr/bin/mono-boehm"] {
             let id = ExecIdentity::of_exec(exe, &argv(&["mono", "/tmp/evil.exe"]));
             assert_eq!(

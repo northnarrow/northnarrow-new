@@ -32,7 +32,7 @@ use std::process::{Child, Command, Stdio};
 
 use nn_proto::ipc::WorkerKind;
 
-use super::{transport, SelfImage, WorkerAccount};
+use super::{SelfImage, WorkerAccount, transport};
 
 /// The descriptor a worker finds its channel on.
 pub const IPC_FD: i32 = 3;

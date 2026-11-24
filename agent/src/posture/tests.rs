@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::thread;
 
-use nn_model::posture_types::{PostureKind, TriggerType};
 use nn_model::Event;
+use nn_model::posture_types::{PostureKind, TriggerType};
 
 use super::triggers::testutil::{
     file_open, fs_protect_denial, spawn, spawn_by, spawn_elevated, spawn_exe_flags, spawn_host,
@@ -194,9 +194,10 @@ fn telemetry_loss_targets_alerted_and_never_corroborates() {
     assert_eq!(last.trigger, Some(TriggerType::TelemetryLoss));
 
     // A second loss at the same level only re-arms the decay.
-    assert!(m
-        .raise_signal(TriggerType::TelemetryLoss, "again")
-        .is_none());
+    assert!(
+        m.raise_signal(TriggerType::TelemetryLoss, "again")
+            .is_none()
+    );
 
     let (ef, er) = exfil_burst(42);
     m.observe(&ef, &er);
@@ -208,9 +209,11 @@ fn telemetry_loss_targets_alerted_and_never_corroborates() {
 
     // Escalation without an event is refused.
     let fresh = PostureMachine::new();
-    assert!(fresh
-        .raise_signal(TriggerType::AntiTamperDenial, "forged")
-        .is_none());
+    assert!(
+        fresh
+            .raise_signal(TriggerType::AntiTamperDenial, "forged")
+            .is_none()
+    );
     assert_eq!(fresh.current_kind(), PostureKind::Observing);
 }
 
@@ -350,9 +353,10 @@ fn unlocked_combat_decays_once_quiet() {
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
     let now = Instant::now();
-    assert!(m
-        .tick_decay_at(now + COMBAT_QUIET_WINDOW - Duration::from_secs(60))
-        .is_none());
+    assert!(
+        m.tick_decay_at(now + COMBAT_QUIET_WINDOW - Duration::from_secs(60))
+            .is_none()
+    );
     assert_eq!(m.current_kind(), PostureKind::Combat);
     let next = m.tick_decay_at(now + COMBAT_QUIET_WINDOW + Duration::from_secs(1));
     assert_eq!(next.map(|s| s.kind()), Some(PostureKind::Engaged));
@@ -361,9 +365,10 @@ fn unlocked_combat_decays_once_quiet() {
 
     let m = PostureMachine::new();
     m.observe(&fs_protect_denial(42, 1), &[]);
-    assert!(m
-        .tick_decay_at(Instant::now() + COMBAT_QUIET_WINDOW * 4)
-        .is_none());
+    assert!(
+        m.tick_decay_at(Instant::now() + COMBAT_QUIET_WINDOW * 4)
+            .is_none()
+    );
     assert_eq!(m.current_kind(), PostureKind::Combat);
 }
 
@@ -1117,12 +1122,14 @@ fn agent_self_writes_still_exempt() {
 #[test]
 fn cron_job_shadow_read_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
-    assert!(m
-        .observe(&spawn(500, 1, "cron", "/usr/sbin/cron", 1), &[])
-        .is_none());
-    assert!(m
-        .observe(&spawn(501, 500, "sh", "/bin/sh", 2), &[])
-        .is_none());
+    assert!(
+        m.observe(&spawn(500, 1, "cron", "/usr/sbin/cron", 1), &[])
+            .is_none()
+    );
+    assert!(
+        m.observe(&spawn(501, 500, "sh", "/bin/sh", 2), &[])
+            .is_none()
+    );
     let shadow_read = file_open(501, 1000, "/etc/shadow", 0, 3);
     let r = m.observe(&shadow_read, &[]);
     assert!(
@@ -1137,11 +1144,12 @@ fn cron_job_shadow_read_e2e_stays_at_observing() {
 #[test]
 fn gdm_login_gshadow_read_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
-    assert!(m
-        .observe(&spawn(600, 1, "gdm3", "/usr/sbin/gdm3", 1), &[])
-        .is_none());
-    assert!(m
-        .observe(
+    assert!(
+        m.observe(&spawn(600, 1, "gdm3", "/usr/sbin/gdm3", 1), &[])
+            .is_none()
+    );
+    assert!(
+        m.observe(
             &spawn(
                 601,
                 600,
@@ -1151,7 +1159,8 @@ fn gdm_login_gshadow_read_e2e_stays_at_observing() {
             ),
             &[],
         )
-        .is_none());
+        .is_none()
+    );
     let gshadow_read = file_open(601, 1000, "/etc/gshadow", 0, 3);
     let r = m.observe(&gshadow_read, &[]);
     assert!(
@@ -1170,9 +1179,10 @@ fn gdm_login_gshadow_read_e2e_stays_at_observing() {
 fn unexpected_gshadow_read_e2e_reaches_alerted() {
     let m = machine_with_isolated_auth();
     // Non-auth lineage: a plain shell child.
-    assert!(m
-        .observe(&spawn(900, 1, "bash", "/usr/bin/bash", 1), &[])
-        .is_none());
+    assert!(
+        m.observe(&spawn(900, 1, "bash", "/usr/bin/bash", 1), &[])
+            .is_none()
+    );
     let r = m.observe(&file_open(900, 1000, "/etc/gshadow", 0, 2), &[]);
     assert!(r.is_some(), "unexpected /etc/gshadow read must transition");
     assert_eq!(
@@ -1189,8 +1199,8 @@ fn unexpected_gshadow_read_e2e_reaches_alerted() {
 #[test]
 fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
-    assert!(m
-        .observe(
+    assert!(
+        m.observe(
             &spawn(
                 700,
                 1,
@@ -1200,13 +1210,15 @@ fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
             ),
             &[],
         )
-        .is_none());
-    assert!(m
-        .observe(
+        .is_none()
+    );
+    assert!(
+        m.observe(
             &spawn(701, 700, "unix_chkpwd", "/usr/sbin/unix_chkpwd", 2),
             &[]
         )
-        .is_none());
+        .is_none()
+    );
     let shadow_read = file_open(701, 1000, "/etc/shadow", 0, 3);
     let r = m.observe(&shadow_read, &[]);
     assert!(
@@ -1229,12 +1241,13 @@ fn screen_unlock_unix_chkpwd_e2e_stays_at_observing() {
 fn snapd_refresh_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
     // snapd daemon spawned by systemd (pid 1).
-    assert!(m
-        .observe(
+    assert!(
+        m.observe(
             &spawn_by(0, 1096, 1, "snapd", "/usr/lib/snapd/snapd", 1),
             &[]
         )
-        .is_none());
+        .is_none()
+    );
 
     // 1. 25 atomic state.json rewrites in-window (mass-write arm).
     let recent: Vec<Event> = (0..25u64)
@@ -1983,7 +1996,7 @@ fn a_control_surface_tamper_reaches_locked_combat() {
 #[test]
 fn the_trigger_fires_exactly_where_fim024_does() {
     use crate::decision::Rule as _;
-    use crate::fim::rules::{NnLFim024AntiTamperHoneypotModified, HONEYPOT_PATHS};
+    use crate::fim::rules::{HONEYPOT_PATHS, NnLFim024AntiTamperHoneypotModified};
     use nn_model::telemetry::FimOp;
     let rule = NnLFim024AntiTamperHoneypotModified::new(1);
     let ops = [
@@ -2231,7 +2244,7 @@ fn ransomware_combination_needs_corroboration_until_the_policy() {
 /// the combination as the defaults say.
 #[test]
 fn the_ransomware_directive_is_the_machines_own() {
-    use crate::decision::rule_policy::{parse, PolicyHandle, RulePolicy};
+    use crate::decision::rule_policy::{PolicyHandle, RulePolicy, parse};
     let tmp = tempfile::TempDir::new().unwrap();
     let lineage = AuthSessionTracker::new(tmp.path());
     lineage.ingest_exec(
@@ -2360,10 +2373,11 @@ fn defense_impairment_engages_and_corroborates() {
     }
     let _ = m.observe(&stop, &[]);
     assert_eq!(m.current_kind(), PostureKind::Engaged);
-    assert!(m
-        .transition_log()
-        .iter()
-        .any(|t| t.trigger == Some(TriggerType::DefenseImpairment)));
+    assert!(
+        m.transition_log()
+            .iter()
+            .any(|t| t.trigger == Some(TriggerType::DefenseImpairment))
+    );
 }
 
 /// R08a (lab PR 250): the triggers' test of R020's shape (lab PR 224, CM-03),
@@ -2372,11 +2386,11 @@ fn defense_impairment_engages_and_corroborates() {
 /// host reads and nn-core's test host does not have. With the detector it
 /// ran on there.
 mod reverse_shell {
-    use nn_model::posture_types::TriggerType;
     use nn_model::Event;
+    use nn_model::posture_types::TriggerType;
 
-    use super::super::triggers::testutil::spawn_exe_flags;
     use super::super::triggers::TriggerDetector;
+    use super::super::triggers::testutil::spawn_exe_flags;
 
     /// Build a TriggerDetector whose AuthSessionTracker reads a
     /// nonexistent /proc (so the /proc fallback never reports an
@@ -2413,8 +2427,9 @@ mod reverse_shell {
             vec![TriggerType::ConfirmedIntrusion]
         );
         assert!(det.detect(&with(1, false), &[]).is_empty());
-        assert!(det
-            .detect(&spawn_exe_flags(45, 4000, "/usr/bin/bash", 0, 1), &[])
-            .is_empty());
+        assert!(
+            det.detect(&spawn_exe_flags(45, 4000, "/usr/bin/bash", 0, 1), &[])
+                .is_empty()
+        );
     }
 }

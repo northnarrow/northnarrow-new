@@ -63,8 +63,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aya::maps::{Array, MapData};
 use aya::Ebpf;
+use aya::maps::{Array, MapData};
 use nn_model::{Event, FsProtectOperation as Op};
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
@@ -1318,12 +1318,12 @@ pub fn plan_hooks(
                 Needs::Loaded if matches!(loaded, Some(None)) => {
                     return Err(
                         "its hook is not on this kernel (its program is not loaded)".to_string()
-                    )
+                    );
                 }
                 Needs::Enforce if !enforce => {
                     return Err("the BPF guard observes (a debug build, or \
                                 NN_BPF_DEFENSE_OBSERVE=1): it refuses no handle by design"
-                        .to_string())
+                        .to_string());
                 }
                 _ => {}
             }

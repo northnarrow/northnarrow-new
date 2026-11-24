@@ -485,10 +485,12 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["export.jsonl", "export.jsonl.1", "export.jsonl.9"]);
-        assert!(std::fs::symlink_metadata(d.path().join("export.jsonl.9"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(d.path().join("export.jsonl.9"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"kept\n");
         // the same count again: nothing to clear
         drop(s);

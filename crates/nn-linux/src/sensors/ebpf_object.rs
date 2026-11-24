@@ -20,7 +20,7 @@
 //! *absent* (placeholder) or *corrupted* one. Either way the agent
 //! never runs against a kernel half that does not match its userland.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use aya::include_bytes_aligned;
 use sha2::{Digest, Sha256};
 use tracing::info;

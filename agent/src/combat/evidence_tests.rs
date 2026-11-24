@@ -173,9 +173,10 @@ fn a_late_row_names_the_clocks_times_and_the_logs_pid() {
     });
     let ev = AuditEvidence::new(Some(Arc::clone(&lab.log))).with_clock(clock.clone());
     lab.fail();
-    assert!(ev
-        .record_stage(&transition(CombatStage::Investigate, "t1"))
-        .is_err());
+    assert!(
+        ev.record_stage(&transition(CombatStage::Investigate, "t1"))
+            .is_err()
+    );
     *clock.0.lock() = at("2026-01-01T00:05:40Z");
     lab.recover();
     ev.record_stage(&transition(CombatStage::Neutralize, "t2"))
@@ -195,9 +196,10 @@ fn retry_pending_writes_what_waits() {
     let lab = Lab::new();
     let ev = AuditEvidence::new(Some(Arc::clone(&lab.log)));
     lab.fail();
-    assert!(ev
-        .record_stage(&transition(CombatStage::Investigate, "t1"))
-        .is_err());
+    assert!(
+        ev.record_stage(&transition(CombatStage::Investigate, "t1"))
+            .is_err()
+    );
     ev.retry_pending();
     assert_eq!(ev.counts().pending, 1);
     lab.recover();

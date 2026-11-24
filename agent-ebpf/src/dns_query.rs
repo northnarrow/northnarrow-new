@@ -121,33 +121,36 @@ pub(crate) struct Admitted {
 /// process's or the user's budget.
 #[inline(always)]
 pub(crate) unsafe fn dns_admit() -> Option<Admitted> {
-    let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    if DNS_EXEMPT_UIDS.get(&uid).is_some() {
-        return Some(Admitted { held: 0, flags: 0 });
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        if DNS_EXEMPT_UIDS.get(&uid).is_some() {
+            return Some(Admitted { held: 0, flags: 0 });
+        }
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        let held = admit(
+            &DNS_TASK_BUDGET,
+            &DNS_UID_BUDGET,
+            tgid,
+            uid,
+            now,
+            DNS_LIMITS,
+            northnarrow_common::ring_drops::ring_slot::DNS_RATE,
+        )?;
+        let mut flags = 0u8;
+        if held.task != 0 {
+            flags |= dns_flags::RATE_HELD;
+        }
+        if held.user != 0 {
+            flags |= dns_flags::RATE_HELD_UID;
+        }
+        let total = held.task + held.user;
+        Some(Admitted {
+            held: if total > 0xFFFF { 0xFFFF } else { total as u16 },
+            flags,
+        })
     }
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    let held = admit(
-        &DNS_TASK_BUDGET,
-        &DNS_UID_BUDGET,
-        tgid,
-        uid,
-        now,
-        DNS_LIMITS,
-        northnarrow_common::ring_drops::ring_slot::DNS_RATE,
-    )?;
-    let mut flags = 0u8;
-    if held.task != 0 {
-        flags |= dns_flags::RATE_HELD;
-    }
-    if held.user != 0 {
-        flags |= dns_flags::RATE_HELD_UID;
-    }
-    let total = held.task + held.user;
-    Some(Admitted {
-        held: if total > 0xFFFF { 0xFFFF } else { total as u16 },
-        flags,
-    })
 }
 
 const DNS_PORT_BE: u16 = 0x3500; // 53 in network byte order

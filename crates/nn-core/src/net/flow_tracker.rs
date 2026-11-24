@@ -99,8 +99,8 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn_model::telemetry::{FlowPhase, NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
@@ -1376,9 +1376,10 @@ mod tests {
         }
         // The flooder kept its most recent connects.
         let newest = FlowTracker::corr_id(999, 999);
-        assert!(t
-            .on_tcp_close(&close_fixture(6_000, newest, 0, 0, 0))
-            .is_some());
+        assert!(
+            t.on_tcp_close(&close_fixture(6_000, newest, 0, 0, 0))
+                .is_some()
+        );
     }
 
     /// The same with one connect per process (a fork per connect): at
@@ -1414,22 +1415,26 @@ mod tests {
         t.on_tcp_connect(&a);
         t.on_tcp_connect(&b);
         let corr = |c: &TcpConnectInfo| FlowTracker::corr_id(c.start_ns, c.sk_ptr);
-        assert!(t
-            .on_tcp_close(&close_fixture(9, corr(&a), 0, 0, 0))
-            .is_some());
+        assert!(
+            t.on_tcp_close(&close_fixture(9, corr(&a), 0, 0, 0))
+                .is_some()
+        );
         t.on_tcp_connect(&c);
         assert_eq!(t.evictions(), 0);
         t.on_tcp_connect(&d); // over capacity: `a` is closed, `b` goes
         assert_eq!(t.evictions(), 1);
-        assert!(t
-            .on_tcp_close(&close_fixture(9, corr(&b), 0, 0, 0))
-            .is_none());
-        assert!(t
-            .on_tcp_close(&close_fixture(9, corr(&c), 0, 0, 0))
-            .is_some());
-        assert!(t
-            .on_tcp_close(&close_fixture(9, corr(&d), 0, 0, 0))
-            .is_some());
+        assert!(
+            t.on_tcp_close(&close_fixture(9, corr(&b), 0, 0, 0))
+                .is_none()
+        );
+        assert!(
+            t.on_tcp_close(&close_fixture(9, corr(&c), 0, 0, 0))
+                .is_some()
+        );
+        assert!(
+            t.on_tcp_close(&close_fixture(9, corr(&d), 0, 0, 0))
+                .is_some()
+        );
         assert!(t.by_pid.is_empty() && t.weight.is_empty());
 
         // Churn beside one long session: the queue holds the live entry
@@ -1439,9 +1444,10 @@ mod tests {
         for i in 2..50_000u64 {
             let c = connect_fixture(i, i, 7, v4(2, 2, 2, 2), 80);
             t.on_tcp_connect(&c);
-            assert!(t
-                .on_tcp_close(&close_fixture(i, corr(&c), 0, 0, 0))
-                .is_some());
+            assert!(
+                t.on_tcp_close(&close_fixture(i, corr(&c), 0, 0, 0))
+                    .is_some()
+            );
         }
         assert_eq!(t.pending_len(), 1);
         assert!(t.by_pid[&7].order.queue_len() <= 9);
@@ -1530,9 +1536,10 @@ mod tests {
             "late connect after a synthesised close must be ignored"
         );
         // Fixture closes without a destination still drop (no 5-tuple).
-        assert!(t
-            .on_tcp_close(&close_fixture(2, [0x55u8; 16], 0, 0, 0))
-            .is_none());
+        assert!(
+            t.on_tcp_close(&close_fixture(2, [0x55u8; 16], 0, 0, 0))
+                .is_none()
+        );
     }
 
     /// Lab PR 246, the KVM failure of 27/10/2026: a shell's connect to a

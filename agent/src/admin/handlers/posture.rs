@@ -8,7 +8,7 @@ use nn_proto::admin_protocol::{AdminResult, ForcePostureRequest};
 use nn_proto::admin_signed_payload::Role;
 
 use crate::admin::audit::DispatchNotes;
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::posture::{AdminReleaseError, PostureMachine};
 

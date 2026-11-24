@@ -8,8 +8,8 @@ use tracing::{info, warn};
 
 use nn_proto::admin_protocol::{AdminResult, ShutdownRequest};
 
-use crate::admin::verify::{signed, Verified};
 use crate::admin::ShutdownSignal;
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::shutdown_marker::{self, ShutdownMarker};
 

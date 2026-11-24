@@ -85,7 +85,7 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "before_epoch"),
         &[
-            "if epoch == 0 || ptgid == 1 || family(ptgid) {\n        return false;\n    }",
+            "if epoch == 0 || ptgid == 1 || family(ptgid) {\n            return false;\n        }",
             "leader_start(parent).unwrap_or(0) < epoch",
         ],
     )
@@ -101,7 +101,7 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "CGROUP_JOIN_EPOCH.get_ptr_mut(0)",
             "CGROUP_JOIN_EPOCH_RT.get(0)",
             "if epoch_promoted(*e, request) {",
-            "CGROUP_JOIN_EPOCH.get_ptr_mut(1),\n            CGROUP_JOIN_EPOCH_RT.get(1),",
+            "CGROUP_JOIN_EPOCH.get_ptr_mut(1),\n                CGROUP_JOIN_EPOCH_RT.get(1),",
             "*b = *rb;",
             "*e = request;",
         ],
@@ -143,8 +143,11 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     )
     .unwrap();
     assert!(body(&j, "found").contains("unsafe { core::ptr::write_volatile(b, 0) };"));
-    assert!(body(&j, "is_lost")
-        .contains("lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)"));
+    assert!(
+        body(&j, "is_lost").contains(
+            "lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)"
+        )
+    );
     // the source of a self-move, cleared for every write
     in_order(
         body(&j, "try_src"),
@@ -153,7 +156,7 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "args.add(CGROUP_MOVE_RET_ARG)",
             "task >= 0u64.wrapping_sub(MAX_ERRNO)",
             // the review of #494, B1: the writing thread itself
-            "if task == bpf_get_current_task() {\n        *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];",
+            "if task == bpf_get_current_task() {\n            *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];",
         ],
     )
     .unwrap();
@@ -165,24 +168,24 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         body(&j, "try_mark"),
         &[
             "let task: u64 = ctx.arg(2);",
-            "if family(writer) {\n        return;\n    }",
+            "if family(writer) {\n            return;\n        }",
             // the re-review of #494, N-b: the writer's own tgid unread is
             // not known; another task's is counted
             "let Some(moved) = tgid_of(task) else {",
-            "if task == bpf_get_current_task() {\n            lose(writer);\n        } else {\n            count(STAT_LOST);\n        }",
-            "let Some(start) = leader_start(task) else {\n        lose(moved);",
+            "if task == bpf_get_current_task() {\n                lose(writer);\n            } else {\n                count(STAT_LOST);\n            }",
+            "let Some(start) = leader_start(task) else {\n            lose(moved);",
             // the review of #494, B1: the shared `noop`, the moved task the
             // writing thread itself (its behaviour: common's
             // `a_noop_is_the_writing_thread_staying_where_it_is`, the
             // privileged `a_threaded_move_of_the_leader_is_marked`)
             "Some(src) => (src[0] == pid_tgid, src[1]),",
-            "let unchanged = noop(\n        task == bpf_get_current_task(),\n        src_this_write,\n        src_id,\n        generated::bpf_get_current_cgroup_id(),\n    );",
+            "let unchanged = noop(\n            task == bpf_get_current_task(),\n            src_this_write,\n            src_id,\n            generated::bpf_get_current_cgroup_id(),\n        );",
             "off!(TASK_STRUCT_REAL_PARENT_OFFSET)",
-            "let pre_exec = parent_tgid == 1\n        && match (exe_file(task), exe_file(parent)) {\n            (Some(a), Some(b)) => a == b,\n            _ => false,\n        };",
-            "match placement(writer, moved, parent_tgid, pre_exec, unchanged) {\n        Move::Placement | Move::NoOp => return,\n        Move::Mark => {}\n    }",
+            "let pre_exec = parent_tgid == 1\n            && match (exe_file(task), exe_file(parent)) {\n                (Some(a), Some(b)) => a == b,\n                _ => false,\n            };",
+            "match placement(writer, moved, parent_tgid, pre_exec, unchanged) {\n            Move::Placement | Move::NoOp => return,\n            Move::Mark => {}\n        }",
             "if mark(moved, start, HOW_MOVED, writer) {",
             "if let Some(hash) = exempt_destination(path) {",
-            "crate::inode_protect::emit_limited(\n            FS_OP_CGROUP_JOIN,",
+            "crate::inode_protect::emit_limited(\n                FS_OP_CGROUP_JOIN,",
             "ino: u64::from(moved),",
         ],
     )
@@ -196,13 +199,13 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         &[
             "CGROUP_EXEMPT_NAMES.get(&0).is_some()",
             "bpf_probe_read_kernel_str(",
-            "match path_read(n) {\n        PathRead::Unread | PathRead::Cut => return Some(0),\n        PathRead::Whole => {}\n    }",
+            "match path_read(n) {\n            PathRead::Unread | PathRead::Cut => return Some(0),\n            PathRead::Whole => {}\n        }",
             "for i in 0..PATH_READ {",
-            "if b == 0 {\n            break;\n        }",
+            "if b == 0 {\n                break;\n            }",
             "full = fnv_step(full, b);",
-            "if b == b'/' {\n            if is_name(comp, NAME_UNIT) {\n                hit = comp;\n            }\n            comp = FNV_OFFSET;\n        } else {\n            comp = fnv_step(comp, b);\n        }",
-            "if is_name(comp, NAME_UNIT) {\n        hit = comp;\n    }",
-            "if is_name(full, NAME_CGROUP) {\n        return Some(full);\n    }",
+            "if b == b'/' {\n                if is_name(comp, NAME_UNIT) {\n                    hit = comp;\n                }\n                comp = FNV_OFFSET;\n            } else {\n                comp = fnv_step(comp, b);\n            }",
+            "if is_name(comp, NAME_UNIT) {\n            hit = comp;\n        }",
+            "if is_name(full, NAME_CGROUP) {\n            return Some(full);\n        }",
             "(hit != 0).then_some(hit)",
         ],
     )
@@ -228,12 +231,12 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "try_born"),
         &[
-            "if tgid == forker {\n        return;\n    }",
-            "if CGROUP_JOINED.get(&tgid).is_some() {\n        let _ = CGROUP_JOINED.remove(&tgid);\n    }\n    found(tgid);",
-            "if kargs == 0 {\n        lose(tgid);\n        return;\n    }",
-            "off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {\n        lose(tgid);",
-            "if flags & CLONE_INTO_CGROUP == 0 {\n        return;\n    }",
-            "if forker == 1 || family(forker) {\n        return;\n    }",
+            "if tgid == forker {\n            return;\n        }",
+            "if CGROUP_JOINED.get(&tgid).is_some() {\n            let _ = CGROUP_JOINED.remove(&tgid);\n        }\n        found(tgid);",
+            "if kargs == 0 {\n            lose(tgid);\n            return;\n        }",
+            "off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {\n            lose(tgid);",
+            "if flags & CLONE_INTO_CGROUP == 0 {\n            return;\n        }",
+            "if forker == 1 || family(forker) {\n            return;\n        }",
             "if mark(tgid, start, HOW_BORN_INTO, forker) {",
         ],
     )
@@ -252,13 +255,13 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "let child: u64 = ctx.arg(1);",
             // lot 281: the reset asked for taken in first, by every fork
             "let epoch = epoch_now();",
-            "let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {\n        Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),\n        None => (false, 0),\n    };",
+            "let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {\n            Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),\n            None => (false, 0),\n        };",
             // the third review of #494, R2-a: a parent started before the
             // marks' last reset is not known, and passes that on
             "let lost = is_lost(ptgid) || before_epoch(epoch, parent, ptgid);",
-            "if !marked && !lost {\n        return;\n    }",
-            "if ctgid == ptgid {\n        return;\n    }",
-            "if lost {\n        lose(ctgid);\n        return;\n    }",
+            "if !marked && !lost {\n            return;\n        }",
+            "if ctgid == ptgid {\n            return;\n        }",
+            "if lost {\n            lose(ctgid);\n            return;\n        }",
             // lot 281: where it runs and the taint, passed on
             "if mark(ctgid, start, inherited(phow), ptgid) {",
         ],
@@ -270,10 +273,10 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "try_inject"),
         &[
-            "if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {\n        return;\n    }",
-            "if family(caller) {\n        return;\n    }",
+            "if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {\n            return;\n        }",
+            "if family(caller) {\n            return;\n        }",
             "let (syscall, flags) = current_call();",
-            "if !injection(mode, syscall, flags) {\n        return;\n    }",
+            "if !injection(mode, syscall, flags) {\n            return;\n        }",
             "taint(target, tgid, caller, inject_detail(mode, syscall), true);",
         ],
     )
@@ -284,7 +287,7 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         body(&j, "try_traceme"),
         &[
             "let Some(tracer) = tgid_of(parent) else {",
-            "if family(tracer) {\n        return;\n    }",
+            "if family(tracer) {\n            return;\n        }",
             "taint(bpf_get_current_task(), me, tracer, 0, false);",
         ],
     )
@@ -295,12 +298,12 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "taint"),
         &[
-            "if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {\n        return;\n    }",
-            "let Some(start) = leader_start(task) else {\n        lose(tgid);",
+            "if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {\n            return;\n        }",
+            "let Some(start) = leader_start(task) else {\n            lose(tgid);",
             "let old = how_now(tgid, start);",
-            "if old & HOW_TAINT != 0 {\n        return;\n    }",
+            "if old & HOW_TAINT != 0 {\n            return;\n        }",
             "let rec = [start, pack(injected(old), by)];",
-            "if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {\n        lose(tgid);\n    }",
+            "if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {\n            lose(tgid);\n        }",
             "count(STAT_INJECTED);",
             "if record {",
             "FS_OP_EXEMPT_INJECT,",
@@ -314,9 +317,9 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
         body(&j, "current_call"),
         &[
             "off_opt!(PT_REGS_ORIG_AX_OFFSET)",
-            "if !regs_are_the_writes(flags) {\n        return (None, None);\n    }",
+            "if !regs_are_the_writes(flags) {\n            return (None, None);\n        }",
             "generated::bpf_task_pt_regs(task)",
-            "let open_flags = if nr == SYS_OPEN {\n        rd_u64(regs + si as u64)\n    } else if nr == SYS_OPENAT {\n        rd_u64(regs + dx as u64)\n    } else if nr == SYS_OPENAT2 {",
+            "let open_flags = if nr == SYS_OPEN {\n            rd_u64(regs + si as u64)\n        } else if nr == SYS_OPENAT {\n            rd_u64(regs + dx as u64)\n        } else if nr == SYS_OPENAT2 {",
             "bpf_probe_read_user::<u64>(how as *const u64)",
         ],
     )
@@ -325,9 +328,9 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     in_order(
         body(&j, "try_exit"),
         &[
-            "if CGROUP_JOINED.get(&tgid).is_none() {\n        return;\n    }",
+            "if CGROUP_JOINED.get(&tgid).is_none() {\n            return;\n        }",
             "off!(TASK_STRUCT_SIGNAL_OFFSET)",
-            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n        let _ = CGROUP_JOINED.remove(&tgid);\n    }",
+            "if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {\n            let _ = CGROUP_JOINED.remove(&tgid);\n        }",
         ],
     )
     .unwrap();
@@ -597,8 +600,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
     assert!(
         code("agent/src/boot/policy.rs").contains("nn_linux::cgroup_join::sync_names(&policy);")
     );
-    assert!(code("agent/src/admin/handlers/config.rs")
-        .contains("nn_linux::cgroup_join::sync_names(&rule_policy.current());"));
+    assert!(
+        code("agent/src/admin/handlers/config.rs")
+            .contains("nn_linux::cgroup_join::sync_names(&rule_policy.current());")
+    );
     // a cgroup_join record raises no tamper trigger, and is signed as such
     let tr = code("crates/nn-core/src/posture/triggers.rs");
     // (lot 280a: nor a write the signed per-sysctl opt-out let through;

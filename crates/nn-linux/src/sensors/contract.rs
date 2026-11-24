@@ -13,11 +13,11 @@
 //! pumps, the drains and the attach notes (`boot::manifest`): a source or an
 //! attach point the code starts without an entry here fails them.
 
-use common::wire::{exe, open_sensor as wos};
 use common::wire::{
     ARGV_LEN, DNS_ANSWER_CAP, FILENAME_LEN, FIM_CHILD_NAME_LEN, QNAME_LEN, QNAME_WIRE_LEN,
     TASK_COMM_LEN, TLS_HELLO_CAP,
 };
+use common::wire::{exe, open_sensor as wos};
 use nn_core::contract::{
     EventKind as K, FailureMode, Fallback, KernelBudget, OptIn, Overhead, SourceContract,
     SyncVerdict, Truncation,
@@ -438,8 +438,7 @@ pub const SOURCES: [SourceContract; 16] = [
              for it and what it forks until its thread group ends",
         kernel_budgets: &[
             KernelBudget {
-                allows:
-                    "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
+                allows: "a refused signal, ptrace, kexec, cgroup move, oom_score_adj write or (lot \
                      273b) refused write through a descriptor: one record per caller and \
                      operation a second, 50 a second per CPU (every one is refused); lot 318 \
                      (the re-check of #545): the decisive ones only — a move into a cgroup an \
@@ -1029,9 +1028,11 @@ mod tests {
         let deny = source("fs_protect").unwrap().kernel_budgets[0].allows;
         assert!(deny.contains("50 a second per CPU"));
         assert_eq!(common::epg::REPORTS_PER_TASK, 4);
-        assert!(source("exploit_guard").unwrap().kernel_budgets[0]
-            .allows
-            .starts_with("4 reports"));
+        assert!(
+            source("exploit_guard").unwrap().kernel_budgets[0]
+                .allows
+                .starts_with("4 reports")
+        );
         // the fim drain's dirty-inode map
         has(
             "fim_watch.rs",

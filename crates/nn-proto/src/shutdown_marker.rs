@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_quorum::{self, AdminKey, QuorumDecision};
 use crate::wire::admin_signed_payload::{
-    decode_cbor, encode_cbor, signing_digest, OperationCode, OperationExtra, Role, SignedPayload,
-    SignedPayloadError,
+    OperationCode, OperationExtra, Role, SignedPayload, SignedPayloadError, decode_cbor,
+    encode_cbor, signing_digest,
 };
 
 /// Where the agent leaves the marker (`RuntimeDirectory=northnarrow`,
@@ -558,9 +558,11 @@ mod tests {
             verify(&garbage, &e, |_| false),
             Err(Rejection::TooManySignatures(1000))
         );
-        assert!(Rejection::TooManySignatures(17)
-            .to_string()
-            .contains("at most 8"));
+        assert!(
+            Rejection::TooManySignatures(17)
+                .to_string()
+                .contains("at most 8")
+        );
         let mismatched = SignedPayload {
             extra: OperationExtra::Unlock(UnlockExtra {}),
             ..payload

@@ -607,7 +607,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
     },
     RuleDoc {
         id: "NN-L-FIM-025_FileCapabilityGranted",
-        severities: &[Severity::Critical, Severity::High, Severity::Medium, Severity::Low],
+        severities: &[
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ],
         actions: &[ResponseAction::StripFileCapability, ResponseAction::Log],
         sensors: &[Sensor::File],
         data_components: &["DC0059"],

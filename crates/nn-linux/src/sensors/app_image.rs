@@ -113,7 +113,7 @@ use nn_core::posture::lineage::in_system_tree;
 use nn_model::Event;
 use parking_lot::Mutex;
 
-use crate::mountinfo::{is_fuse, MountEntry, MountTable};
+use crate::mountinfo::{MountEntry, MountTable, is_fuse};
 
 /// The execs of possible images kept, one per process (its latest).
 const RAN_MAX: usize = 4096;
@@ -862,7 +862,7 @@ mod tests {
 
     use super::*;
     use common::wire::exe::kernel_dev;
-    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     impl AppImages {
         /// `event` noted, read and marked at once, the processes under
@@ -1550,9 +1550,11 @@ mod tests {
             noted().take(&program).is_some(),
             "a FUSE file under /tmp: the tie"
         );
-        assert!(noted()
-            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
-            .is_some());
+        assert!(
+            noted()
+                .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+                .is_some()
+        );
         assert!(
             AppImages::default().take(&program).is_none(),
             "no image's exec before it, nothing tied: nothing to read"
@@ -1675,17 +1677,21 @@ mod tests {
         // another program's check since: the image's check is forgotten
         let mut images = AppImages::default();
         assert!(images.take(&image_check).is_none());
-        assert!(images
-            .take(&check(
-                RUNTIME,
-                "/usr/bin/true",
-                (8 << 20) | 1,
-                "/usr/bin/true"
-            ))
-            .is_none());
-        assert!(images
-            .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
-            .is_none());
+        assert!(
+            images
+                .take(&check(
+                    RUNTIME,
+                    "/usr/bin/true",
+                    (8 << 20) | 1,
+                    "/usr/bin/true"
+                ))
+                .is_none()
+        );
+        assert!(
+            images
+                .take(&check(RUNTIME, &apprun(), FUSE_DEV, &apprun()))
+                .is_none()
+        );
     }
 
     /// Lot 366, the review of #573 (F1): a FUSE device is handed out again
@@ -2369,7 +2375,7 @@ mod tests {
     /// each name of 31 bytes or more cut to its first 31 and marked.
     fn walk_of(path: &Path) -> String {
         use common::wire::exe::{
-            exe_path_slot, relative_path, ExeIdentityRaw, EXE_PATH_SLOTS, EXE_PATH_SLOT_LEN,
+            EXE_PATH_SLOT_LEN, EXE_PATH_SLOTS, ExeIdentityRaw, exe_path_slot, relative_path,
         };
         let names: Vec<&str> = path
             .to_str()

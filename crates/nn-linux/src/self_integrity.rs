@@ -433,9 +433,11 @@ pub fn ignore_manager_weakening(unit_name: &str) -> Vec<String> {
     };
     let names = from_the_manager(&own, &manager, &unit);
     for name in &names {
-        // SAFETY (edition 2021: safe): the start's one thread, before the
-        // command line is parsed or any thread exists.
-        std::env::remove_var(name);
+        // SAFETY: the start, before the command line is parsed and before
+        // any of the agent's threads: the only others are `run_bounded`'s
+        // pipe readers of the two systemctl calls above, which read their
+        // pipes and end, and never touch the environment.
+        unsafe { std::env::remove_var(name) };
         crate::boot::degradation::report(
             "weakening_env_ignored",
             &format!(
@@ -883,7 +885,7 @@ fn mounts_over_protected_in(
 /// finds it in place, with the start's own line of a lock it did not find.
 /// The High findings of its loss stay in the signed chain either way.
 fn show_pin_lock(line: crate::anti_tamper::pin_lock::StatusLine) {
-    use crate::anti_tamper::pin_lock::{StatusLine, DEGRADATION_SOURCE, START_DEGRADATION_PREFIX};
+    use crate::anti_tamper::pin_lock::{DEGRADATION_SOURCE, START_DEGRADATION_PREFIX, StatusLine};
     match line {
         StatusLine::NotInPlace(detail) => {
             crate::boot::degradation::report(DEGRADATION_SOURCE, &detail);
@@ -1312,7 +1314,7 @@ pub fn mount_round<T: AsRef<[u8]>>(
                         "{MOUNTINFO_HOST}: {host_err}; {MOUNTINFO_OWN}: {own_err} — mounts over \
                          the agent's directories are not checked"
                     ),
-                }]
+                }];
             }
         },
     };
@@ -3393,21 +3395,27 @@ mod tests {
             clean: true,
             ..WatchdogExit::default()
         };
-        assert!(why(WatchdogExit {
-            host_shutdown: true,
-            ..clean
-        })
-        .contains("systemd-shutdown"));
-        assert!(why(WatchdogExit {
-            window_open: true,
-            ..clean
-        })
-        .contains("window"));
-        assert!(why(WatchdogExit {
-            agent_stopping: true,
-            ..clean
-        })
-        .contains("the agent's own stop"));
+        assert!(
+            why(WatchdogExit {
+                host_shutdown: true,
+                ..clean
+            })
+            .contains("systemd-shutdown")
+        );
+        assert!(
+            why(WatchdogExit {
+                window_open: true,
+                ..clean
+            })
+            .contains("window")
+        );
+        assert!(
+            why(WatchdogExit {
+                agent_stopping: true,
+                ..clean
+            })
+            .contains("the agent's own stop")
+        );
     }
 
     /// Lot 388 (the triage of #595, a): what the round signs — the death
@@ -3419,7 +3427,7 @@ mod tests {
     #[test]
     fn a_watchdog_stopped_with_the_host_is_a_note_and_one_killed_is_a_held_death() {
         use crate::posture::exempt::WatchdogResolution as R;
-        use nn_evidence::held::{hold_of, Hold};
+        use nn_evidence::held::{Hold, hold_of};
         let shutdown = WatchdogExit {
             host_shutdown: true,
             ..WatchdogExit::default()
@@ -3567,10 +3575,12 @@ mod tests {
                 .clone()
         };
         assert_eq!(row("agent_restart_loop")["extra"]["severity"], "high");
-        assert!(row("stuck_unresponsive")["extra"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("STATUS pings"));
+        assert!(
+            row("stuck_unresponsive")["extra"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("STATUS pings")
+        );
         let now = crate::boot::degradation::snapshot();
         assert!(
             now.iter().any(
@@ -4073,14 +4083,18 @@ mod tests {
         let f = mount_findings(mi, &own);
         let kinds: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
         assert_eq!(kinds.len(), 4, "{kinds:?}");
-        assert!(kinds[0]
-            .1
-            .starts_with("/etc/northnarrow (ext4, source root /tmp/fake)"));
+        assert!(
+            kinds[0]
+                .1
+                .starts_with("/etc/northnarrow (ext4, source root /tmp/fake)")
+        );
         assert_eq!(kinds[1], ("bpffs_mount", "/mnt/nn-bpf2"));
         assert_eq!(kinds[2].0, "mount_over_protected");
-        assert!(kinds[3]
-            .1
-            .starts_with("/etc/systemd/system/northnarrow-agent.service"));
+        assert!(
+            kinds[3]
+                .1
+                .starts_with("/etc/systemd/system/northnarrow-agent.service")
+        );
     }
 
     /// Lot 353 (named, pre-alpha Phase 3 X6): a FUSE mounted over the
@@ -4147,8 +4161,14 @@ mod tests {
              /sys/fs/cgroup, which is cgroup2 or tmpfs: a reader of the host walks into it"
         );
         for (line, at) in [
-            ("901 26 0:92 / /proc rw - fuse.x x rw", "/proc (fuse.x, source x"),
-            ("902 24 8:1 /srv/sys /sys rw - ext4 /dev/sda1 rw", "/sys (ext4, source /dev/sda1"),
+            (
+                "901 26 0:92 / /proc rw - fuse.x x rw",
+                "/proc (fuse.x, source x",
+            ),
+            (
+                "902 24 8:1 /srv/sys /sys rw - ext4 /dev/sda1 rw",
+                "/sys (ext4, source /dev/sda1",
+            ),
             (
                 "903 26 0:93 / /proc/sys/kernel rw - tmpfs tmpfs rw",
                 "/proc/sys/kernel (tmpfs, source tmpfs, source root /) below the kernel's view /proc",
@@ -4342,8 +4362,11 @@ mod tests {
         let read = &read[..read.find("\n    }\n").unwrap()];
         assert!(read.contains("let in_unit = own_cgroup().as_deref() == Some(AGENT_UNIT_CGROUP);"));
         assert!(read.contains("if self.pin_lock.watches(in_unit) {"));
-        assert!(read
-            .contains("std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE"));
+        assert!(
+            read.contains(
+                "std::time::Instant::now() + crate::anti_tamper::pin_lock::REMAKE_DEADLINE"
+            )
+        );
         assert!(read.contains("crate::anti_tamper::pin_lock::remake(&root, until)"));
         assert!(read.contains("std::thread::sleep,"));
         assert!(
@@ -4614,7 +4637,7 @@ mod tests {
     #[test]
     fn finalrds_remount_at_the_host_s_shutdown_is_a_note_and_otherwise_a_degradation() {
         use crate::shutdown_remount::{
-            ExecRecord, FinalrdUnit, RunExecFacts, RUN_EXEC_KIND as KIND,
+            ExecRecord, FinalrdUnit, RUN_EXEC_KIND as KIND, RunExecFacts,
         };
         let own = ["/run/northnarrow/agent.pid".to_string()];
         let exec = HOST_MI.replace(
@@ -4785,7 +4808,7 @@ mod tests {
     #[test]
     fn a_remount_noted_as_the_shutdown_whose_host_did_not_shut_down_is_the_high() {
         use crate::shutdown_remount::{
-            ExecRecord, FinalrdUnit, RunExecFacts, NOTE_MAX_SECS, NO_SHUTDOWN_KIND, RUN_EXEC_KIND,
+            ExecRecord, FinalrdUnit, NO_SHUTDOWN_KIND, NOTE_MAX_SECS, RUN_EXEC_KIND, RunExecFacts,
         };
         let own = ["/run/northnarrow/agent.pid".to_string()];
         let exec = HOST_MI.replace(
@@ -5108,9 +5131,10 @@ mod tests {
             format!("{HOST_MI}92 27 8:3 /lib /var/lib rw shared:3 - ext4 /dev/sda3 rw\n");
         let f = round(&selfbind, &mut w);
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(f[0]
-            .1
-            .starts_with("/var/lib (ext4, source root /lib) hides /var/lib/northnarrow"));
+        assert!(
+            f[0].1
+                .starts_with("/var/lib (ext4, source root /lib) hides /var/lib/northnarrow")
+        );
     }
 
     /// A second bpffs stacked on /sys/fs/bpf hides the pins; the canonical
@@ -5127,9 +5151,10 @@ mod tests {
         let f = round(&stacked, &mut w);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].0, "mount_over_protected");
-        assert!(f[0]
-            .1
-            .starts_with("/sys/fs/bpf (bpf, source root /) hides /sys/fs/bpf/northnarrow"));
+        assert!(
+            f[0].1
+                .starts_with("/sys/fs/bpf (bpf, source root /) hides /sys/fs/bpf/northnarrow")
+        );
     }
 
     /// A mount the agent's paths resolved through at the start that is
@@ -5146,9 +5171,11 @@ mod tests {
         let f = round(&without_var, &mut w);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].0, "protected_mount_gone");
-        assert!(f[0]
-            .1
-            .starts_with("/var (ext4, source root /) is no longer mounted: /var/lib/northnarrow"));
+        assert!(
+            f[0].1.starts_with(
+                "/var (ext4, source root /) is no longer mounted: /var/lib/northnarrow"
+            )
+        );
     }
 
     /// The agent's binaries are watched too: a mount over their directory.
@@ -5324,9 +5351,10 @@ mod tests {
         std::fs::write(dir.path().join("process-comm-allowlist.v1"), "x").unwrap();
         let f = config_overlays(dir.path());
         assert_eq!(f.len(), 1);
-        assert!(f[0]
-            .detail
-            .contains("process-comm-allowlist.local (6 bytes, sha256 "));
+        assert!(
+            f[0].detail
+                .contains("process-comm-allowlist.local (6 bytes, sha256 ")
+        );
         std::fs::write(dir.path().join("process-comm-allowlist.local"), "+evil2\n").unwrap();
         assert_ne!(
             config_overlays(dir.path())[0],
@@ -5735,10 +5763,12 @@ mod tests {
         assert_eq!(row["op"], AUDIT_OP);
         assert_eq!(row["extra"]["kind"], "mount_over_protected");
         assert_eq!(row["extra"]["severity"], "high");
-        assert!(row["extra"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("source nnf03"));
+        assert!(
+            row["extra"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("source nnf03")
+        );
     }
 
     /// External audit NN-AUD-114: an environment variable is a property of
@@ -5792,12 +5822,16 @@ mod tests {
             )
         )));
         // the same ones are listed every round: the first by detail
-        assert!(capped
-            .iter()
-            .any(|f| f.detail.starts_with("/etc/northnarrow/f000.local")));
-        assert!(!capped
-            .iter()
-            .any(|f| f.detail.starts_with("/etc/northnarrow/f199.local")));
+        assert!(
+            capped
+                .iter()
+                .any(|f| f.detail.starts_with("/etc/northnarrow/f000.local"))
+        );
+        assert!(
+            !capped
+                .iter()
+                .any(|f| f.detail.starts_with("/etc/northnarrow/f199.local"))
+        );
         assert!(capped.contains(&finding("unit_dropin", "/a.conf (mtime 1)")));
     }
 
@@ -5981,9 +6015,10 @@ mod tests {
             f[0].detail,
             "watchdog oom_score_adj: expected -999 (unit), found 1000"
         );
-        assert!(w
-            .observe(&full(&[("watchdog oom_score_adj", "-999")]), &[])
-            .is_empty());
+        assert!(
+            w.observe(&full(&[("watchdog oom_score_adj", "-999")]), &[])
+                .is_empty()
+        );
         assert!(
             w.observe(&full(&[]), &[]).is_empty(),
             "a restarting watchdog is not drift"
@@ -6015,9 +6050,11 @@ mod tests {
         for unit in [AGENT_UNIT, WATCHDOG_UNIT] {
             assert_eq!(unit_directive(unit, "OOMScoreAdjust"), Some("-999"));
             // the cap a leak meets: kept
-            assert!(unit_directive(unit, "MemoryMax")
-                .and_then(systemd_bytes)
-                .is_some());
+            assert!(
+                unit_directive(unit, "MemoryMax")
+                    .and_then(systemd_bytes)
+                    .is_some()
+            );
         }
         let host = |oom: &str| {
             lim(&[
@@ -6145,9 +6182,10 @@ mod tests {
             ])
         };
         let mut w = LimitWatch::default();
-        assert!(w
-            .observe(&host("1", "2", "0"), &expected_limits())
-            .is_empty());
+        assert!(
+            w.observe(&host("1", "2", "0"), &expected_limits())
+                .is_empty()
+        );
         let mut w = LimitWatch::default();
         let f = w.observe(&host("0", "0", "unlimited"), &expected_limits());
         let got: Vec<&str> = f.iter().map(|x| x.detail.as_str()).collect();

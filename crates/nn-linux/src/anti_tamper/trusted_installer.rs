@@ -64,8 +64,8 @@
 //! rule layer.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -74,7 +74,7 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use super::{
-    AyaFsGrant, AyaKillGrant, AGENT_SESSION_MAP_NAME, FS_GRANT_MAP_NAME, KILL_GRANT_MAP_NAME,
+    AGENT_SESSION_MAP_NAME, AyaFsGrant, AyaKillGrant, FS_GRANT_MAP_NAME, KILL_GRANT_MAP_NAME,
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
@@ -87,7 +87,7 @@ use common::wire::{FsGrant, KillGrant};
 // ceiling too, which nn-admin clamps `--window-secs` to (it names no module
 // of nn-linux).
 pub use nn_core::anti_tamper::trusted_installer::{
-    WindowGrant, WindowGrantee, MAX_TRUSTED_INSTALLER_WINDOW_SECS, OWN_SYSTEMD_UNITS,
+    MAX_TRUSTED_INSTALLER_WINDOW_SECS, OWN_SYSTEMD_UNITS, WindowGrant, WindowGrantee,
 };
 
 /// Userland state of the trusted-installer override. Shared via `Arc`

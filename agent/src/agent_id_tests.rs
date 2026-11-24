@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use nn_admin::agent_id::load_existing;
 use tempfile::TempDir;
 
-use crate::agent_id::{load_or_bootstrap, resolve, IdentitySource, AGENT_ID_LEN};
+use crate::agent_id::{AGENT_ID_LEN, IdentitySource, load_or_bootstrap, resolve};
 
 /// Width of the on-disk hex encoding of one [`AGENT_ID_LEN`]-byte value.
 const HEX_LEN: usize = AGENT_ID_LEN * 2;

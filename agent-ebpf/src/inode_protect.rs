@@ -207,16 +207,19 @@ pub(crate) fn caller_is_self_test() -> bool {
 /// in `DENY_FAIL_OPEN`).
 #[inline(always)]
 unsafe fn inode_from_dentry(dentry: *const c_void, hook: u32) -> Option<*const c_void> {
-    if dentry.is_null() {
-        return None;
-    }
-    let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
-    match bpf_probe_read_kernel::<*const c_void>(slot) {
-        Ok(p) if !p.is_null() => Some(p),
-        Ok(_) => None,
-        Err(_) => {
-            crate::fail_open::bump(hook);
-            None
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if dentry.is_null() {
+            return None;
+        }
+        let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
+        match bpf_probe_read_kernel::<*const c_void>(slot) {
+            Ok(p) if !p.is_null() => Some(p),
+            Ok(_) => None,
+            Err(_) => {
+                crate::fail_open::bump(hook);
+                None
+            }
         }
     }
 }
@@ -227,36 +230,42 @@ unsafe fn inode_from_dentry(dentry: *const c_void, hook: u32) -> Option<*const c
 /// the operation through without knowing whether the inode is protected.
 #[inline(always)]
 unsafe fn inode_key(inode: *const c_void, hook: u32) -> Option<InodeKey> {
-    if inode.is_null() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if inode.is_null() {
+            return None;
+        }
+        let key = read_inode_key(inode);
+        if key.is_none() {
+            crate::fail_open::bump(hook);
+        }
+        key
     }
-    let key = read_inode_key(inode);
-    if key.is_none() {
-        crate::fail_open::bump(hook);
-    }
-    key
 }
 
 /// [`inode_key`]'s reads: `None` when one fails (or the inode has no
 /// superblock, which no live inode lacks).
 #[inline(always)]
 pub(crate) unsafe fn read_inode_key(inode: *const c_void) -> Option<InodeKey> {
-    let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
-    let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
-    if sb_ptr.is_null() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
+        let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
+        if sb_ptr.is_null() {
+            return None;
+        }
+        let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
+        let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
+        let dev = crate::inode_dev::stat_dev(inode as *const u8, sb_ptr as *const u8, dev);
+
+        let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
+        let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
+
+        Some(InodeKey {
+            dev: dev as u64,
+            ino,
+        })
     }
-    let dev_slot = (sb_ptr as *const u8).add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32;
-    let dev = bpf_probe_read_kernel::<u32>(dev_slot).ok()?;
-    let dev = crate::inode_dev::stat_dev(inode as *const u8, sb_ptr as *const u8, dev);
-
-    let ino_slot = (inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64;
-    let ino = bpf_probe_read_kernel::<u64>(ino_slot).ok()?;
-
-    Some(InodeKey {
-        dev: dev as u64,
-        ino,
-    })
 }
 
 /// FIM-009 self-upgrade (§15.1): the trusted-installer FS-pin override
@@ -699,12 +708,15 @@ fn emit_denial(operation: u8, key: InodeKey) -> bool {
 /// caller's `DENY_FAIL_OPEN` slot (lab PR 215).
 #[inline(always)]
 unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> bool {
-    match protected_verdict(operation, target, hook) {
-        Some((op, key)) => {
-            emit_attempt(op, key);
-            true
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match protected_verdict(operation, target, hook) {
+            Some((op, key)) => {
+                emit_attempt(op, key);
+                true
+            }
+            None => false,
         }
-        None => false,
     }
 }
 
@@ -712,63 +724,66 @@ unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> 
 /// sign and the inode when `operation` on `target` must be refused.
 #[inline(always)]
 unsafe fn protected_verdict(operation: u8, target: *const c_void, hook: u32) -> Option<(u8, InodeKey)> {
-    let key = match inode_key(target, hook) {
-        Some(k) => k,
-        None => {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let key = match inode_key(target, hook) {
+            Some(k) => k,
+            None => {
+                return None;
+            }
+        };
+        // at-authz-1: the map value is a flag-mask. An absent key is not
+        // protected; a present key is denied for THIS op only if the op's
+        // bit is set (`fs_protect_required`): `FS_PROTECT_WRITE` for a
+        // write-open, `FS_PROTECT_READ` for a read-open, `FS_PROTECT_NOCREATE`
+        // (the agent's own directories only) for a new entry, and
+        // `FS_PROTECT_MUTATE`, which the loader sets on every member, for
+        // every other op. `operation` is a constant at each call site, so the
+        // match folds away.
+        let flags = match PROTECTED_INODES.get(&key) {
+            Some(f) => *f,
+            None => {
+                return None;
+            }
+        };
+        let required = fs_protect_required(operation);
+        if flags & required == 0 {
             return None;
         }
-    };
-    // at-authz-1: the map value is a flag-mask. An absent key is not
-    // protected; a present key is denied for THIS op only if the op's
-    // bit is set (`fs_protect_required`): `FS_PROTECT_WRITE` for a
-    // write-open, `FS_PROTECT_READ` for a read-open, `FS_PROTECT_NOCREATE`
-    // (the agent's own directories only) for a new entry, and
-    // `FS_PROTECT_MUTATE`, which the loader sets on every member, for
-    // every other op. `operation` is a constant at each call site, so the
-    // match folds away.
-    let flags = match PROTECTED_INODES.get(&key) {
-        Some(f) => *f,
-        None => {
+        if override_active() {
             return None;
         }
-    };
-    let required = fs_protect_required(operation);
-    if flags & required == 0 {
-        return None;
-    }
-    if override_active() {
-        return None;
-    }
-    // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
-    // CALLER's tgid is in `task_kill::PROTECTED_PIDS`, allow the
-    // operation — same symmetric exemption PHASE_D_002 added to
-    // ptrace_access_check. The agent and watchdog are both
-    // inserted into PROTECTED_PIDS by W6, so this naturally
-    // exempts the agent's own A13 rotate-keys atomic rewrite +
-    // every other in-family FS-mutation path (audit log
-    // append, agent.sig.key rotation on re-install, etc.)
-    // while denying every unrelated root caller.
-    // R14a: exempt callers only (the agent and the watchdog); a worker is
-    // protected but not exempt, so it is denied the keys and the protected
-    // paths as any other process is (plan §3.3).
-    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if crate::task_kill::is_exempt_pid(caller_tgid) {
-        // The review of #582 (F2 c): an inode one role alone changes — the
-        // family's exemption is that role's binary's only.
-        match ROLE_WRITE_INODES.get(&key) {
-            Some(role) if *role != crate::bpf_defense::caller_role() => {}
-            _ => return None,
+        // Tappa 8 A14 (B4): caller-side mutual whitelist. If the
+        // CALLER's tgid is in `task_kill::PROTECTED_PIDS`, allow the
+        // operation — same symmetric exemption PHASE_D_002 added to
+        // ptrace_access_check. The agent and watchdog are both
+        // inserted into PROTECTED_PIDS by W6, so this naturally
+        // exempts the agent's own A13 rotate-keys atomic rewrite +
+        // every other in-family FS-mutation path (audit log
+        // append, agent.sig.key rotation on re-install, etc.)
+        // while denying every unrelated root caller.
+        // R14a: exempt callers only (the agent and the watchdog); a worker is
+        // protected but not exempt, so it is denied the keys and the protected
+        // paths as any other process is (plan §3.3).
+        let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if crate::task_kill::is_exempt_pid(caller_tgid) {
+            // The review of #582 (F2 c): an inode one role alone changes — the
+            // family's exemption is that role's binary's only.
+            match ROLE_WRITE_INODES.get(&key) {
+                Some(role) if *role != crate::bpf_defense::caller_role() => {}
+                _ => return None,
+            }
         }
+        // Lot 273: PID 1 removes a protected unit's cgroup directory once its
+        // processes are gone (the kernel refuses a populated one), and
+        // systemd-shutdown trims the tree; nothing else is let through here.
+        if fs_protect_init_may(operation, flags, caller_tgid) {
+            return None;
+        }
+        // Lot 273: a refused write-open of a protected `cgroup.kill` or
+        // `cgroup.freeze` is signed by what it would have done.
+        Some((fs_protect_denied_op(operation, flags), key))
     }
-    // Lot 273: PID 1 removes a protected unit's cgroup directory once its
-    // processes are gone (the kernel refuses a populated one), and
-    // systemd-shutdown trims the tree; nothing else is let through here.
-    if fs_protect_init_may(operation, flags, caller_tgid) {
-        return None;
-    }
-    // Lot 273: a refused write-open of a protected `cgroup.kill` or
-    // `cgroup.freeze` is signed by what it would have done.
-    Some((fs_protect_denied_op(operation, flags), key))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,25 +797,28 @@ pub fn inode_unlink(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
-    // No prev-retval read — see task_kill.rs for rationale (kernel
-    // call_int_hook short-circuits, aya 0.13's phony-retval slot is
-    // unreliable on Ubuntu 6.8 trampoline).
-    //
-    // arg(0) = parent dir inode, arg(1) = target dentry. Block if
-    // either the parent dir or the target inode itself is in the
-    // protected set — that covers both "rm somefile inside dir" and
-    // "rm /the/protected/file".
-    let parent: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_UNLINK, parent, hook::INODE_UNLINK) {
-        return -EPERM;
-    }
-    let dentry: *const c_void = ctx.arg(1);
-    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_UNLINK) {
-        if deny_if_protected(FS_OP_UNLINK, target_inode, hook::INODE_UNLINK) {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // No prev-retval read — see task_kill.rs for rationale (kernel
+        // call_int_hook short-circuits, aya 0.13's phony-retval slot is
+        // unreliable on Ubuntu 6.8 trampoline).
+        //
+        // arg(0) = parent dir inode, arg(1) = target dentry. Block if
+        // either the parent dir or the target inode itself is in the
+        // protected set — that covers both "rm somefile inside dir" and
+        // "rm /the/protected/file".
+        let parent: *const c_void = ctx.arg(0);
+        if deny_if_protected(FS_OP_UNLINK, parent, hook::INODE_UNLINK) {
             return -EPERM;
         }
+        let dentry: *const c_void = ctx.arg(1);
+        if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_UNLINK) {
+            if deny_if_protected(FS_OP_UNLINK, target_inode, hook::INODE_UNLINK) {
+                return -EPERM;
+            }
+        }
+        0
     }
-    0
 }
 
 #[lsm(hook = "inode_rmdir")]
@@ -810,18 +828,21 @@ pub fn inode_rmdir(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
-    // No prev-retval read — see task_kill.rs.
-    let parent: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_RMDIR, parent, hook::INODE_RMDIR) {
-        return -EPERM;
-    }
-    let dentry: *const c_void = ctx.arg(1);
-    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_RMDIR) {
-        if deny_if_protected(FS_OP_RMDIR, target_inode, hook::INODE_RMDIR) {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // No prev-retval read — see task_kill.rs.
+        let parent: *const c_void = ctx.arg(0);
+        if deny_if_protected(FS_OP_RMDIR, parent, hook::INODE_RMDIR) {
             return -EPERM;
         }
+        let dentry: *const c_void = ctx.arg(1);
+        if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_RMDIR) {
+            if deny_if_protected(FS_OP_RMDIR, target_inode, hook::INODE_RMDIR) {
+                return -EPERM;
+            }
+        }
+        0
     }
-    0
 }
 
 #[lsm(hook = "inode_rename")]
@@ -831,31 +852,34 @@ pub fn inode_rename(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (old_dir, old_dentry, new_dir, new_dentry).
-    // No prev-retval read — see task_kill.rs for rationale.
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (old_dir, old_dentry, new_dir, new_dentry).
+        // No prev-retval read — see task_kill.rs for rationale.
 
-    let old_dir: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_RENAME, old_dir, hook::INODE_RENAME) {
-        return -EPERM;
-    }
-    let new_dir: *const c_void = ctx.arg(2);
-    if deny_if_protected(FS_OP_RENAME, new_dir, hook::INODE_RENAME) {
-        return -EPERM;
-    }
-
-    let old_dentry: *const c_void = ctx.arg(1);
-    if let Some(old_inode) = inode_from_dentry(old_dentry, hook::INODE_RENAME) {
-        if deny_if_protected(FS_OP_RENAME, old_inode, hook::INODE_RENAME) {
+        let old_dir: *const c_void = ctx.arg(0);
+        if deny_if_protected(FS_OP_RENAME, old_dir, hook::INODE_RENAME) {
             return -EPERM;
         }
-    }
-    let new_dentry: *const c_void = ctx.arg(3);
-    if let Some(new_inode) = inode_from_dentry(new_dentry, hook::INODE_RENAME) {
-        if deny_if_protected(FS_OP_RENAME, new_inode, hook::INODE_RENAME) {
+        let new_dir: *const c_void = ctx.arg(2);
+        if deny_if_protected(FS_OP_RENAME, new_dir, hook::INODE_RENAME) {
             return -EPERM;
         }
+
+        let old_dentry: *const c_void = ctx.arg(1);
+        if let Some(old_inode) = inode_from_dentry(old_dentry, hook::INODE_RENAME) {
+            if deny_if_protected(FS_OP_RENAME, old_inode, hook::INODE_RENAME) {
+                return -EPERM;
+            }
+        }
+        let new_dentry: *const c_void = ctx.arg(3);
+        if let Some(new_inode) = inode_from_dentry(new_dentry, hook::INODE_RENAME) {
+            if deny_if_protected(FS_OP_RENAME, new_inode, hook::INODE_RENAME) {
+                return -EPERM;
+            }
+        }
+        0
     }
-    0
 }
 
 #[lsm(hook = "inode_setattr")]
@@ -867,25 +891,28 @@ pub fn inode_setattr(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
-    // The dentry is argument 0 up to 6.8, `(dentry, iattr)`, and argument
-    // 1 from 6.9, `(idmap, dentry, iattr)` (lab PR 164): its position
-    // comes from the running kernel's prototype. No prev-retval read, see
-    // task_kill.rs.
-    let dentry = match setattr_dentry(ctx) {
-        Some(d) => d,
-        None => {
-            // Lab PR 215: the dentry's position is not known here (the
-            // agent attaches the hook only once it is) or its read failed.
-            crate::fail_open::bump(hook::INODE_SETATTR);
-            return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // The dentry is argument 0 up to 6.8, `(dentry, iattr)`, and argument
+        // 1 from 6.9, `(idmap, dentry, iattr)` (lab PR 164): its position
+        // comes from the running kernel's prototype. No prev-retval read, see
+        // task_kill.rs.
+        let dentry = match setattr_dentry(ctx) {
+            Some(d) => d,
+            None => {
+                // Lab PR 215: the dentry's position is not known here (the
+                // agent attaches the hook only once it is) or its read failed.
+                crate::fail_open::bump(hook::INODE_SETATTR);
+                return 0;
+            }
+        };
+        if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_SETATTR) {
+            if deny_if_protected(FS_OP_SETATTR, target_inode, hook::INODE_SETATTR) {
+                return -EPERM;
+            }
         }
-    };
-    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_SETATTR) {
-        if deny_if_protected(FS_OP_SETATTR, target_inode, hook::INODE_SETATTR) {
-            return -EPERM;
-        }
+        0
     }
-    0
 }
 
 /// `inode_setattr`'s `struct dentry *`, read at the position the agent
@@ -898,12 +925,15 @@ unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
 /// bounded below `HOOK_ARG_MAX`.
 #[inline(always)]
 pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
-    let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
-    let dentry = raw_arg(ctx, i) as *const c_void;
-    if dentry.is_null() {
-        None
-    } else {
-        Some(dentry)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
+        let dentry = raw_arg(ctx, i) as *const c_void;
+        if dentry.is_null() {
+            None
+        } else {
+            Some(dentry)
+        }
     }
 }
 
@@ -914,12 +944,15 @@ pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
 /// `bpf_probe_read_kernel`). `None` when the position is not known.
 #[inline(always)]
 pub(crate) unsafe fn setattr_iattr(ctx: &LsmContext) -> Option<*const u8> {
-    let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
-    let iattr = raw_arg(ctx, i + 1) as *const u8;
-    if iattr.is_null() {
-        None
-    } else {
-        Some(iattr)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
+        let iattr = raw_arg(ctx, i + 1) as *const u8;
+        if iattr.is_null() {
+            None
+        } else {
+            Some(iattr)
+        }
     }
 }
 
@@ -948,52 +981,55 @@ pub fn protected_ioctl_compat_deny(ctx: LsmContext) -> i32 {
 /// the caller's `DENY_FAIL_OPEN` slot).
 #[inline(always)]
 unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
-    // Kernel signature of both hooks: (file, cmd, arg). No prev-retval
-    // read — see task_kill.rs.
-    //
-    // Fast path: this hook fires for EVERY ioctl on EVERY fd; anything
-    // but the chattr-family commands returns before any read.
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature of both hooks: (file, cmd, arg). No prev-retval
+        // read — see task_kill.rs.
+        //
+        // Fast path: this hook fires for EVERY ioctl on EVERY fd; anything
+        // but the chattr-family commands returns before any read.
 
-    let cmd: c_uint = ctx.arg(1);
+        let cmd: c_uint = ctx.arg(1);
 
-    // Lot 349 (the review of #558, F1): a perf event's
-    // `PERF_EVENT_IOC_SET_BPF` attaches the program whose descriptor is the
-    // argument (a kprobe calling `bpf_send_signal`, kept from a window) with
-    // no `bpf(2)` command — judged as the `bpf` hook judges an attach
-    if cmd == PERF_EVENT_IOC_SET_BPF {
-        let fd: u64 = ctx.arg(2);
-        let held = crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF));
-        // the lab on 7.0: LLVM knows the global function returns 0 or 1 and
-        // folded the branch into `-held`, which the verifier reads as an
-        // unknown return value (not in [-4095, 0]) and refuses the program;
-        // a volatile read keeps the two constant returns
-        if core::ptr::read_volatile(&held) == crate::bpf_defense::HELD_REFUSED {
-            return -EPERM;
-        }
-        return 0;
-    }
-
-    if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {
-        return 0;
-    }
-
-    let file: *const c_void = ctx.arg(0);
-    if file.is_null() {
-        return 0;
-    }
-
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) => p,
-        Err(_) => {
-            crate::fail_open::bump(hook);
+        // Lot 349 (the review of #558, F1): a perf event's
+        // `PERF_EVENT_IOC_SET_BPF` attaches the program whose descriptor is the
+        // argument (a kprobe calling `bpf_send_signal`, kept from a window) with
+        // no `bpf(2)` command — judged as the `bpf` hook judges an attach
+        if cmd == PERF_EVENT_IOC_SET_BPF {
+            let fd: u64 = ctx.arg(2);
+            let held = crate::bpf_defense::nn_held_use(fd, u64::from(BPF_HELD_SET_BPF));
+            // the lab on 7.0: LLVM knows the global function returns 0 or 1 and
+            // folded the branch into `-held`, which the verifier reads as an
+            // unknown return value (not in [-4095, 0]) and refuses the program;
+            // a volatile read keeps the two constant returns
+            if core::ptr::read_volatile(&held) == crate::bpf_defense::HELD_REFUSED {
+                return -EPERM;
+            }
             return 0;
         }
-    };
-    if deny_if_protected(FS_OP_IOCTL, inode, hook) {
-        return -EPERM;
+
+        if cmd != FS_IOC_SETFLAGS && cmd != FS_IOC32_SETFLAGS && cmd != FS_IOC_FSSETXATTR {
+            return 0;
+        }
+
+        let file: *const c_void = ctx.arg(0);
+        if file.is_null() {
+            return 0;
+        }
+
+        let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+        let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+            Ok(p) => p,
+            Err(_) => {
+                crate::fail_open::bump(hook);
+                return 0;
+            }
+        };
+        if deny_if_protected(FS_OP_IOCTL, inode, hook) {
+            return -EPERM;
+        }
+        0
     }
-    0
 }
 
 /// at-authz-1 — write-open deny. The sixth deny hook in the
@@ -1024,63 +1060,66 @@ pub fn protected_open_deny(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
-    // Kernel signature: `int file_open(struct file *file)` (vlen=1,
-    // verified on 6.8 — the observe-only `fim_file_open_observe` already
-    // attaches here). No prev-retval read.
-    let file: *const c_void = ctx.arg(0);
-    if file.is_null() {
-        return 0;
-    }
-
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) => p,
-        Err(_) => {
-            crate::fail_open::bump(hook::FILE_OPEN);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: `int file_open(struct file *file)` (vlen=1,
+        // verified on 6.8 — the observe-only `fim_file_open_observe` already
+        // attaches here). No prev-retval read.
+        let file: *const c_void = ctx.arg(0);
+        if file.is_null() {
             return 0;
         }
-    };
-    // Lot 367 (F3b-1): a protected process's memory views, refused at
-    // their open — the ptrace hook's read-mode refusal is let through by
-    // the kernel from 6.16 for a caller with CAP_PERFMON. Before the access
-    // mode is read (the review of #574, F1): a read-write, write-only or
-    // no-access open of a view takes the process's memory as a read-only
-    // one does, and reads it.
-    if crate::cgroup_files::refuse_memory_view(file, inode) {
-        return -EPERM;
-    }
 
-    // Only write-intent opens can mutate the file; a read-only open
-    // matters only for the few READ-protected inodes (external audit
-    // EVD-001), matched on the inode number before any map lookup.
-    let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
-    let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
-        Ok(m) => m,
-        Err(_) => {
-            crate::fail_open::bump(hook::FILE_OPEN);
+        let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+        let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+            Ok(p) => p,
+            Err(_) => {
+                crate::fail_open::bump(hook::FILE_OPEN);
+                return 0;
+            }
+        };
+        // Lot 367 (F3b-1): a protected process's memory views, refused at
+        // their open — the ptrace hook's read-mode refusal is let through by
+        // the kernel from 6.16 for a caller with CAP_PERFMON. Before the access
+        // mode is read (the review of #574, F1): a read-write, write-only or
+        // no-access open of a view takes the process's memory as a read-only
+        // one does, and reads it.
+        if crate::cgroup_files::refuse_memory_view(file, inode) {
+            return -EPERM;
+        }
+
+        // Only write-intent opens can mutate the file; a read-only open
+        // matters only for the few READ-protected inodes (external audit
+        // EVD-001), matched on the inode number before any map lookup.
+        let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
+        let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
+            Ok(m) => m,
+            Err(_) => {
+                crate::fail_open::bump(hook::FILE_OPEN);
+                return 0;
+            }
+        };
+        if f_mode & FMODE_WRITE == 0 {
+            if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode, hook::FILE_OPEN) {
+                return -EPERM;
+            }
             return 0;
         }
-    };
-    if f_mode & FMODE_WRITE == 0 {
-        if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode, hook::FILE_OPEN) {
+        if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_OPEN) {
+            // Lot 273b: PID 1's thaw (systemd 254/255 at every start and stop)
+            // is judged at its write, by its value.
+            if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {
+                emit_attempt(op, key);
+                return -EPERM;
+            }
+        }
+        // Lot 273b: a protected cgroup's resource file, a cgroup v1 hierarchy,
+        // a protected process's `oom_score_adj`.
+        if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {
             return -EPERM;
         }
-        return 0;
+        0
     }
-    if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_OPEN) {
-        // Lot 273b: PID 1's thaw (systemd 254/255 at every start and stop)
-        // is judged at its write, by its value.
-        if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {
-            emit_attempt(op, key);
-            return -EPERM;
-        }
-    }
-    // Lot 273b: a protected cgroup's resource file, a cgroup v1 hierarchy,
-    // a protected process's `oom_score_adj`.
-    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {
-        return -EPERM;
-    }
-    0
 }
 
 /// Lot 273b — the write deny. `file_open` refuses a write-open of a
@@ -1108,75 +1147,81 @@ const S_IFREG: u16 = 0o100000;
 
 #[inline(always)]
 unsafe fn try_protected_write_deny(ctx: &LsmContext) -> i32 {
-    // Kernel signature: `int file_permission(struct file *file, int mask)`.
-    let mask: c_int = ctx.arg(1);
-    if mask & MAY_WRITE == 0 {
-        return 0;
-    }
-    let file: *const c_void = ctx.arg(0);
-    if file.is_null() {
-        return 0;
-    }
-    let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
-    let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
-        Ok(p) => p,
-        Err(_) => {
-            crate::fail_open::bump(hook::FILE_PERMISSION);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: `int file_permission(struct file *file, int mask)`.
+        let mask: c_int = ctx.arg(1);
+        if mask & MAY_WRITE == 0 {
             return 0;
         }
-    };
-    // Lot 273c (the review of #490): a socket, a pipe, a tty — most writes
-    // of a busy host — is never protected (every protected file, cgroup
-    // file and proc file is a regular one): out before the map lookup. A
-    // mode that cannot be read goes on to the lookup.
-    if !inode.is_null() {
-        if let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
-            if mode & S_IFMT != S_IFREG {
+        let file: *const c_void = ctx.arg(0);
+        if file.is_null() {
+            return 0;
+        }
+        let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
+        let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
+            Ok(p) => p,
+            Err(_) => {
+                crate::fail_open::bump(hook::FILE_PERMISSION);
                 return 0;
             }
+        };
+        // Lot 273c (the review of #490): a socket, a pipe, a tty — most writes
+        // of a busy host — is never protected (every protected file, cgroup
+        // file and proc file is a regular one): out before the map lookup. A
+        // mode that cannot be read goes on to the lookup.
+        if !inode.is_null() {
+            if let Ok(mode) = bpf_probe_read_kernel::<u16>((inode as *const u8).add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
+                if mode & S_IFMT != S_IFREG {
+                    return 0;
+                }
+            }
         }
-    }
-    if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION) {
-        // Lot 273b: PID 1's write of `0` to a protected cgroup.freeze — a
-        // thaw — goes through; a freeze is refused here.
-        let thaw = fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32)
-            && matches!(crate::cgroup_files::written_value(), Some(v) if same_value(&v, &fs_protect_thaw_value()));
-        if !thaw {
-            emit_limited(op, key);
+        if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION) {
+            // Lot 273b: PID 1's write of `0` to a protected cgroup.freeze — a
+            // thaw — goes through; a freeze is refused here.
+            let thaw = fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32)
+                && matches!(crate::cgroup_files::written_value(), Some(v) if same_value(&v, &fs_protect_thaw_value()));
+            if !thaw {
+                emit_limited(op, key);
+                return -EPERM;
+            }
+        }
+        if crate::cgroup_files::refuse_write(file, inode, hook::FILE_PERMISSION, crate::cgroup_files::Phase::Write) {
             return -EPERM;
         }
+        0
     }
-    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_PERMISSION, crate::cgroup_files::Phase::Write) {
-        return -EPERM;
-    }
-    0
 }
 
 /// External audit EVD-001: `inode`'s number is one of
 /// [`READ_PROTECTED_INOS`] (the device is checked by the map lookup after).
 #[inline(always)]
 unsafe fn read_protected_ino(inode: *const c_void) -> bool {
-    if inode.is_null() {
-        return false;
-    }
-    let ino = match bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-        Ok(i) => i,
-        Err(_) => {
-            // Lab PR 215: a read-only open the key's deny could not judge.
-            crate::fail_open::bump(hook::FILE_OPEN);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if inode.is_null() {
             return false;
         }
-    };
-    let mut slot = 0u32;
-    while slot < READ_PROTECTED_SLOTS {
-        if let Some(v) = READ_PROTECTED_INOS.get(slot) {
-            if *v != 0 && *v == ino {
-                return true;
+        let ino = match bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+            Ok(i) => i,
+            Err(_) => {
+                // Lab PR 215: a read-only open the key's deny could not judge.
+                crate::fail_open::bump(hook::FILE_OPEN);
+                return false;
             }
+        };
+        let mut slot = 0u32;
+        while slot < READ_PROTECTED_SLOTS {
+            if let Some(v) = READ_PROTECTED_INOS.get(slot) {
+                if *v != 0 && *v == ino {
+                    return true;
+                }
+            }
+            slot += 1;
         }
-        slot += 1;
+        false
     }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,10 +1250,13 @@ unsafe fn read_protected_ino(inode: *const c_void) -> bool {
 /// window, for a caller outside the agent's family.
 #[inline(always)]
 unsafe fn deny_new_entry(operation: u8, dir: *const c_void, hook: u32) -> i32 {
-    if deny_if_protected(operation, dir, hook) {
-        -EPERM
-    } else {
-        0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if deny_if_protected(operation, dir, hook) {
+            -EPERM
+        } else {
+            0
+        }
     }
 }
 
@@ -1262,8 +1310,11 @@ const XATTR_SELINUX: [u64; 3] = [
 /// `open_sensor::raw_arg`).
 #[inline(always)]
 unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
-    let args = ctx.as_ptr() as *const u64;
-    bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let args = ctx.as_ptr() as *const u64;
+        bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+    }
 }
 
 /// Whether the attribute `name` is exactly `security.selinux` — the one
@@ -1273,15 +1324,18 @@ unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
 /// SELinux's.
 #[inline(always)]
 unsafe fn xattr_is_selinux(name: u64) -> bool {
-    if name == 0 {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if name == 0 {
+            return false;
+        }
+        let mut buf = [0u64; 3];
+        let bytes = core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, 24);
+        if bpf_probe_read_kernel_str_bytes(name as *const u8, bytes).is_err() {
+            return false;
+        }
+        buf[0] == XATTR_SELINUX[0] && buf[1] == XATTR_SELINUX[1] && buf[2] == XATTR_SELINUX[2]
     }
-    let mut buf = [0u64; 3];
-    let bytes = core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, 24);
-    if bpf_probe_read_kernel_str_bytes(name as *const u8, bytes).is_err() {
-        return false;
-    }
-    buf[0] == XATTR_SELINUX[0] && buf[1] == XATTR_SELINUX[1] && buf[2] == XATTR_SELINUX[2]
 }
 
 /// An extended attribute set, removed or (6.2+) an ACL changed on a
@@ -1292,29 +1346,32 @@ unsafe fn xattr_is_selinux(name: u64) -> bool {
 /// position is known, and these hooks always get a dentry).
 #[inline(always)]
 unsafe fn deny_xattr(ctx: &LsmContext, dentry_arg: Option<usize>, hook: u32) -> i32 {
-    let i = match dentry_arg {
-        Some(i) => i,
-        None => {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let i = match dentry_arg {
+            Some(i) => i,
+            None => {
+                crate::fail_open::bump(hook);
+                return 0;
+            }
+        };
+        let dentry = raw_arg(ctx, i) as *const c_void;
+        if dentry.is_null() {
             crate::fail_open::bump(hook);
             return 0;
         }
-    };
-    let dentry = raw_arg(ctx, i) as *const c_void;
-    if dentry.is_null() {
-        crate::fail_open::bump(hook);
-        return 0;
+        let inode = match inode_from_dentry(dentry, hook) {
+            Some(i) => i,
+            None => return 0,
+        };
+        if xattr_is_selinux(raw_arg(ctx, i + 1)) {
+            return 0;
+        }
+        if deny_if_protected(FS_OP_XATTR, inode, hook) {
+            return -EPERM;
+        }
+        0
     }
-    let inode = match inode_from_dentry(dentry, hook) {
-        Some(i) => i,
-        None => return 0,
-    };
-    if xattr_is_selinux(raw_arg(ctx, i + 1)) {
-        return 0;
-    }
-    if deny_if_protected(FS_OP_XATTR, inode, hook) {
-        return -EPERM;
-    }
-    0
 }
 
 /// Kernel signature: `(mnt_userns | idmap, dentry, name, value, size,

@@ -26,44 +26,47 @@ const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 /// three array lookups.
 #[inline(always)]
 pub unsafe fn stat_dev(inode: *const u8, sb: *const u8, s_dev: u32) -> u32 {
-    // Bounded to 16 bits (the real values are below 1 KiB): `inode` is a
-    // BTF-typed pointer in the hooks that receive one, and the verifier
-    // refuses arithmetic on it with an unbounded offset ("value -4294967295
-    // makes trusted_ptr_ pointer be out of bounds"). One offset at a time,
-    // each consumed at once: a tuple of three `Option`s was spilled and
-    // read back on a path that never wrote it, which the 5.15 verifier
-    // refuses ("invalid read from stack", 5.15 rule 3) once the caller is
-    // large enough (the file-open sensor of Tappa 10.9).
-    let root_off = match off_opt!(BTRFS_INODE_ROOT_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return s_dev,
-    };
-    let vfs_off = match off_opt!(BTRFS_INODE_VFS_INODE_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return s_dev,
-    };
-    let anon_off = match off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return s_dev,
-    };
-    let magic = match bpf_probe_read_kernel::<u64>(
-        sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64,
-    ) {
-        Ok(m) => m,
-        Err(_) => return s_dev,
-    };
-    if magic != BTRFS_SUPER_MAGIC {
-        return s_dev;
-    }
-    // container_of(inode, struct btrfs_inode, vfs_inode)
-    let bi = (inode as usize).wrapping_sub(vfs_off) as *const u8;
-    let root = match bpf_probe_read_kernel::<*const u8>(bi.add(root_off) as *const *const u8) {
-        Ok(p) if !p.is_null() => p,
-        _ => return s_dev,
-    };
-    match bpf_probe_read_kernel::<u32>(root.add(anon_off) as *const u32) {
-        Ok(d) if d != 0 => d,
-        _ => s_dev,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Bounded to 16 bits (the real values are below 1 KiB): `inode` is a
+        // BTF-typed pointer in the hooks that receive one, and the verifier
+        // refuses arithmetic on it with an unbounded offset ("value -4294967295
+        // makes trusted_ptr_ pointer be out of bounds"). One offset at a time,
+        // each consumed at once: a tuple of three `Option`s was spilled and
+        // read back on a path that never wrote it, which the 5.15 verifier
+        // refuses ("invalid read from stack", 5.15 rule 3) once the caller is
+        // large enough (the file-open sensor of Tappa 10.9).
+        let root_off = match off_opt!(BTRFS_INODE_ROOT_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return s_dev,
+        };
+        let vfs_off = match off_opt!(BTRFS_INODE_VFS_INODE_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return s_dev,
+        };
+        let anon_off = match off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return s_dev,
+        };
+        let magic = match bpf_probe_read_kernel::<u64>(
+            sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64,
+        ) {
+            Ok(m) => m,
+            Err(_) => return s_dev,
+        };
+        if magic != BTRFS_SUPER_MAGIC {
+            return s_dev;
+        }
+        // container_of(inode, struct btrfs_inode, vfs_inode)
+        let bi = (inode as usize).wrapping_sub(vfs_off) as *const u8;
+        let root = match bpf_probe_read_kernel::<*const u8>(bi.add(root_off) as *const *const u8) {
+            Ok(p) if !p.is_null() => p,
+            _ => return s_dev,
+        };
+        match bpf_probe_read_kernel::<u32>(root.add(anon_off) as *const u32) {
+            Ok(d) if d != 0 => d,
+            _ => s_dev,
+        }
     }
 }
 
@@ -88,54 +91,60 @@ impl SbDev {
     /// The facts of superblock `sb` (whose `s_dev` the caller read).
     #[inline(always)]
     pub unsafe fn of(sb: *const u8, s_dev: u32) -> Self {
-        let mut d = SbDev {
-            s_dev,
-            btrfs: 0,
-            vfs_off: 0,
-            root_off: 0,
-            anon_off: 0,
-        };
-        let magic = bpf_probe_read_kernel::<u64>(
-            sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64,
-        )
-        .unwrap_or(0);
-        if magic != BTRFS_SUPER_MAGIC {
-            return d;
+        // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+        unsafe {
+            let mut d = SbDev {
+                s_dev,
+                btrfs: 0,
+                vfs_off: 0,
+                root_off: 0,
+                anon_off: 0,
+            };
+            let magic = bpf_probe_read_kernel::<u64>(
+                sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64,
+            )
+            .unwrap_or(0);
+            if magic != BTRFS_SUPER_MAGIC {
+                return d;
+            }
+            let mut have = 0u32;
+            if let Some(o) = off_opt!(BTRFS_INODE_ROOT_OFFSET) {
+                d.root_off = o & 0xffff;
+                have += 1;
+            }
+            if let Some(o) = off_opt!(BTRFS_INODE_VFS_INODE_OFFSET) {
+                d.vfs_off = o & 0xffff;
+                have += 1;
+            }
+            if let Some(o) = off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET) {
+                d.anon_off = o & 0xffff;
+                have += 1;
+            }
+            if have == 3 {
+                d.btrfs = 1;
+            }
+            d
         }
-        let mut have = 0u32;
-        if let Some(o) = off_opt!(BTRFS_INODE_ROOT_OFFSET) {
-            d.root_off = o & 0xffff;
-            have += 1;
-        }
-        if let Some(o) = off_opt!(BTRFS_INODE_VFS_INODE_OFFSET) {
-            d.vfs_off = o & 0xffff;
-            have += 1;
-        }
-        if let Some(o) = off_opt!(BTRFS_ROOT_ANON_DEV_OFFSET) {
-            d.anon_off = o & 0xffff;
-            have += 1;
-        }
-        if have == 3 {
-            d.btrfs = 1;
-        }
-        d
     }
 
     /// `stat()`'s device of `inode`, an inode of this superblock.
     #[inline(always)]
     pub unsafe fn dev(&self, inode: *const u8) -> u32 {
-        if self.btrfs == 0 {
-            return self.s_dev;
-        }
-        // container_of(inode, struct btrfs_inode, vfs_inode)
-        let bi = (inode as usize).wrapping_sub(self.vfs_off) as *const u8;
-        let root = match bpf_probe_read_kernel::<*const u8>(bi.add(self.root_off) as *const *const u8) {
-            Ok(p) if !p.is_null() => p,
-            _ => return self.s_dev,
-        };
-        match bpf_probe_read_kernel::<u32>(root.add(self.anon_off) as *const u32) {
-            Ok(d) if d != 0 => d,
-            _ => self.s_dev,
+        // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+        unsafe {
+            if self.btrfs == 0 {
+                return self.s_dev;
+            }
+            // container_of(inode, struct btrfs_inode, vfs_inode)
+            let bi = (inode as usize).wrapping_sub(self.vfs_off) as *const u8;
+            let root = match bpf_probe_read_kernel::<*const u8>(bi.add(self.root_off) as *const *const u8) {
+                Ok(p) if !p.is_null() => p,
+                _ => return self.s_dev,
+            };
+            match bpf_probe_read_kernel::<u32>(root.add(self.anon_off) as *const u32) {
+                Ok(d) if d != 0 => d,
+                _ => self.s_dev,
+            }
         }
     }
 }

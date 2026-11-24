@@ -43,8 +43,8 @@ mod norm;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The variable the golden tests read (xtask's `golden::UPDATE_ENV`).
 const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";
@@ -93,23 +93,27 @@ fn run_all(cases: &[harness::Case]) -> Vec<String> {
         .clamp(2, 8);
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::SeqCst);
-                let Some(case) = cases.get(i) else {
-                    break;
-                };
-                let text = if (case.host_defaults && !defaults) || (case.needs_no_root() && as_root)
-                {
-                    None
-                } else {
-                    Some(harness::run(case, root.path()).text)
-                };
-                *out[i].lock().unwrap() = text;
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(case) = cases.get(i) else {
+                        break;
+                    };
+                    let text =
+                        if (case.host_defaults && !defaults) || (case.needs_no_root() && as_root) {
+                            None
+                        } else {
+                            Some(harness::run(case, root.path()).text)
+                        };
+                    *out[i].lock().unwrap() = text;
+                }
             });
         }
     });
     if as_root {
-        eprintln!("nn-admin matrix: run as root: the cases of a socket this user may not open were not run");
+        eprintln!(
+            "nn-admin matrix: run as root: the cases of a socket this user may not open were not run"
+        );
     }
     if !defaults {
         eprintln!(

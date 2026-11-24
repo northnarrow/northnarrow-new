@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// What `cargo xtask attack-coverage` asks of the example.
 pub struct Request<'a> {

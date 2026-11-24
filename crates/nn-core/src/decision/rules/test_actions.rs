@@ -13,7 +13,7 @@
 
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
-use crate::decision::{attack::AttackRef, rules::build_verdict, Rule};
+use crate::decision::{Rule, attack::AttackRef, rules::build_verdict};
 
 pub struct R901TestBlockOutbound;
 pub struct R902TestNetworkIsolation;

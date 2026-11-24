@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -45,13 +45,13 @@ use nn_proto::admin_protocol::{
 };
 use nn_proto::admin_quorum::role_keyword;
 use nn_proto::admin_signed_payload::{
-    sign, CanaryBurnExtra, CanaryDeployExtra, CanaryDeploymentWire, CanaryListExtra,
-    CanaryRefreshExtra, CanaryTypeWire, ConfigOverlaySetExtra, DetectionSetStatusExtra,
-    DetectionsExtra, FimBaselineExtra, FimReportExtra, FimStatusExtra, ForcePostureExtra,
-    IntegrityAcknowledgeExtra, NetFingerprintExtra, NetFlowsExtra, NetListenersExtra,
-    NetResolveExtra, OperationExtra, OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra,
-    ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra,
-    ShutdownExtra, SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
+    CanaryBurnExtra, CanaryDeployExtra, CanaryDeploymentWire, CanaryListExtra, CanaryRefreshExtra,
+    CanaryTypeWire, ConfigOverlaySetExtra, DetectionSetStatusExtra, DetectionsExtra,
+    FimBaselineExtra, FimReportExtra, FimStatusExtra, ForcePostureExtra, IntegrityAcknowledgeExtra,
+    NetFingerprintExtra, NetFlowsExtra, NetListenersExtra, NetResolveExtra, OperationExtra,
+    OverlayKind, RemediateRansomwareExtra, ResponseReleaseExtra, ResponseRestoreExtra,
+    ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra, ShutdownExtra,
+    SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra, sign,
 };
 use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 
@@ -59,7 +59,7 @@ use super::tests::{
     bare_context, build_test_audit_log, fake_client, read_audit_entries, rules_path,
 };
 use super::transport::serve_request;
-use super::verify::{now_unix_secs, Quorum, Signed, RULES};
+use super::verify::{Quorum, RULES, Signed, now_unix_secs};
 use super::{AdminHandles, AdminReadPaths, StatusPolls};
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;

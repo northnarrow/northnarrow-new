@@ -654,7 +654,9 @@ mod tests {
         let f = mounts_over(&parse_mountinfo(host_bind), &dirs());
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(
-            f[0].contains("another directory or file bound there, over the agent's directory /etc/northnarrow"),
+            f[0].contains(
+                "another directory or file bound there, over the agent's directory /etc/northnarrow"
+            ),
             "{}",
             f[0]
         );

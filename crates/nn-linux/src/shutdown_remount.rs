@@ -213,15 +213,23 @@ pub fn exec_records(v: &Value) -> Option<Vec<ExecRecord>> {
     cmds.iter()
         .map(|c| match c {
             Value::Struct(f) => match f.as_slice() {
-                [Value::Str(path), argv, Value::Bool(_), Value::U64(start_rt), Value::U64(start_mono), _, _, Value::U32(pid), ..] => {
-                    Some(ExecRecord {
-                        path: path.clone(),
-                        argv: argv.strings()?,
-                        start_realtime_us: *start_rt,
-                        start_monotonic_us: *start_mono,
-                        pid: *pid,
-                    })
-                }
+                [
+                    Value::Str(path),
+                    argv,
+                    Value::Bool(_),
+                    Value::U64(start_rt),
+                    Value::U64(start_mono),
+                    _,
+                    _,
+                    Value::U32(pid),
+                    ..,
+                ] => Some(ExecRecord {
+                    path: path.clone(),
+                    argv: argv.strings()?,
+                    start_realtime_us: *start_rt,
+                    start_monotonic_us: *start_mono,
+                    pid: *pid,
+                }),
                 _ => None,
             },
             _ => None,
@@ -363,12 +371,14 @@ mod tests {
             why.contains("pid 3637") && why.contains("reboot.target pending"),
             "{why}"
         );
-        assert!(RunExecFacts {
-            noted_for: Some(NOTE_MAX_SECS),
-            ..shutdown()
-        }
-        .shutdown_not_drift()
-        .is_some());
+        assert!(
+            RunExecFacts {
+                noted_for: Some(NOTE_MAX_SECS),
+                ..shutdown()
+            }
+            .shutdown_not_drift()
+            .is_some()
+        );
         let unit = |f: &dyn Fn(&mut FinalrdUnit)| {
             let mut s = shutdown();
             f(s.unit.as_mut().unwrap());
@@ -457,13 +467,17 @@ mod tests {
         };
         assert_eq!(never.shutdown_not_drift(), None);
         // a stop started within the second before the round's read
-        assert!(exec(&|e| e.start_monotonic_us = 354_100_000)
-            .shutdown_not_drift()
-            .is_some());
+        assert!(
+            exec(&|e| e.start_monotonic_us = 354_100_000)
+                .shutdown_not_drift()
+                .is_some()
+        );
         // the wall clock set anywhere: the monotonic one decides
-        assert!(exec(&|e| e.start_realtime_us = 1)
-            .shutdown_not_drift()
-            .is_some());
+        assert!(
+            exec(&|e| e.start_realtime_us = 1)
+                .shutdown_not_drift()
+                .is_some()
+        );
     }
 
     /// The review of #597 (P2-1): the shutdown a note was signed for did not

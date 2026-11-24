@@ -10,13 +10,13 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tempfile::TempDir;
 
 use crate::chain_host_linux::LinuxHost;
 
-use crate::canary::templates::{render, CredFamily, RenderError};
-use crate::config::overlay::{parse_default_text, DefaultsSource, Shipped};
+use crate::canary::templates::{CredFamily, RenderError, render};
+use crate::config::overlay::{DefaultsSource, Shipped, parse_default_text};
 use crate::config::overlay_auth::content_sha256;
 
 /// A validator that accepts any non-empty token (as `config::overlay`'s

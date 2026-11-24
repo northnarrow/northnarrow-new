@@ -37,7 +37,7 @@ const BAIT_DIR_MODE: u32 = 0o700;
 // R08b (lab PR 251): the bait table — each path with its template — is
 // nn-core's content (`nn_core::fim::baits`, cut verbatim), as NN-L-FIM-024
 // watches its paths; here under its names.
-pub use nn_core::fim::baits::{bait_content, BAITS, BAIT_PATHS};
+pub use nn_core::fim::baits::{BAIT_PATHS, BAITS, bait_content};
 
 /// Prefix of the line a bait's write fills.
 const LAST_MODIFIED: &str = "last_modified=";
@@ -379,10 +379,12 @@ mod tests {
         assert_eq!(rep.replaced, vec![bp.to_string()]);
         assert_eq!(rep.recreated, vec![bp.to_string()]);
         assert!(!rep.all_present());
-        assert!(std::fs::symlink_metadata(&bait)
-            .unwrap()
-            .file_type()
-            .is_file());
+        assert!(
+            std::fs::symlink_metadata(&bait)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
         assert_eq!(std::fs::read_to_string(&bait).unwrap(), "BAIT");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "THEIRS");
     }

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+use common::{EniIptablesGuard, InstalledBin, install_to_priv_bin};
 #[cfg(feature = "debug-trigger")]
 use northnarrow_agent::anti_tamper::bpf_defense::OWN_IDS_FILE_NAME;
 
@@ -1515,7 +1515,7 @@ fn wait_ready(run: &mut GuardRun) -> Result<u32, String> {
                     "the {} agent exited at boot ({st})\n{}",
                     run.name,
                     log_tail(&run.log)
-                ))
+                ));
             }
             Ok(None) => {}
             Err(e) => return Err(format!("try_wait on the {} agent: {e}", run.name)),
@@ -2247,7 +2247,9 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     );
     for id in &links {
         if let Err(e) = common::raw_bpf::link_next_id(*id) {
-            panic!("BPF_LINK_GET_NEXT_ID from the agent's link {id} failed with errno {e}: the enumeration gives no handle and must not be refused");
+            panic!(
+                "BPF_LINK_GET_NEXT_ID from the agent's link {id} failed with errno {e}: the enumeration gives no handle and must not be refused"
+            );
         }
     }
 
@@ -3315,11 +3317,7 @@ mod owner_signal {
             );
             let e = io::Error::last_os_error().raw_os_error().unwrap_or(0);
             libc::close(fd as libc::c_int);
-            if r < 0 {
-                Err(e)
-            } else {
-                Ok(())
-            }
+            if r < 0 { Err(e) } else { Ok(()) }
         }
     }
 }
@@ -3354,7 +3352,7 @@ fn sigio_denials(log: &Path, pid: u32, sig: i32) -> usize {
 #[cfg(feature = "debug-trigger")]
 #[test]
 fn signals_through_a_file_s_owner_are_refused_and_signed() {
-    use owner_signal::{fire, pidfd_signal, Owner};
+    use owner_signal::{Owner, fire, pidfd_signal};
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -3486,7 +3484,7 @@ fn signals_through_a_file_s_owner_are_refused_and_signed() {
 #[test]
 fn admin_socket_refuses_a_peer_of_another_uid() {
     use northnarrow_agent::admin_cli::run_status;
-    use northnarrow_agent::admin_socket::{serve_with_audit_log, FOREIGN_PEER_KIND};
+    use northnarrow_agent::admin_socket::{FOREIGN_PEER_KIND, serve_with_audit_log};
     use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
     use northnarrow_agent::anti_tamper::network_isolate::NetworkIsolator;
     use northnarrow_agent::audit::{AgentSigningKey, AuditLog};

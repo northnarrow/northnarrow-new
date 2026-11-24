@@ -76,7 +76,7 @@ pub fn read_marker(path: &Path, owner_uid: u32) -> Marker {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Marker::Absent,
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Marker::Refused("a symbolic link".to_string())
+            return Marker::Refused("a symbolic link".to_string());
         }
         Err(e) => return Marker::Refused(format!("unreadable: {e}")),
     };

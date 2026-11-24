@@ -7,10 +7,10 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::anti_tamper::trusted_installer::WindowGrant;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
+use crate::posture::AuthSessionTracker;
 use crate::posture::host::PostureAgent;
 use crate::posture::lineage::AsOf;
-use crate::posture::AuthSessionTracker;
 
 /// Path prefixes that are user-writable on a typical Linux system.
 const USER_WRITABLE_PREFIXES: &[&str] = &["/home/", "/tmp/", "/var/tmp/"];
@@ -225,25 +225,33 @@ mod tests {
     #[test]
     fn ignores_non_root_or_safe_path() {
         // Non-root exec from /tmp is R001's territory, not R009's.
-        assert!(R009RootExecFromUserPath::default()
-            .evaluate(&spawn_as(1000, "payload", "/tmp/payload"))
-            .is_none());
+        assert!(
+            R009RootExecFromUserPath::default()
+                .evaluate(&spawn_as(1000, "payload", "/tmp/payload"))
+                .is_none()
+        );
         // Root exec from /usr/bin is fine.
-        assert!(R009RootExecFromUserPath::default()
-            .evaluate(&spawn_as(0, "ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            R009RootExecFromUserPath::default()
+                .evaluate(&spawn_as(0, "ls", "/usr/bin/ls"))
+                .is_none()
+        );
     }
 
     #[test]
     fn does_not_match_lookalike_prefixes() {
         // /var/log is not user-writable in the spec.
-        assert!(R009RootExecFromUserPath::default()
-            .evaluate(&spawn_as(0, "x", "/var/log/syslog"))
-            .is_none());
+        assert!(
+            R009RootExecFromUserPath::default()
+                .evaluate(&spawn_as(0, "x", "/var/log/syslog"))
+                .is_none()
+        );
         // "/homefoo/..." is not /home/.
-        assert!(R009RootExecFromUserPath::default()
-            .evaluate(&spawn_as(0, "x", "/homefoo/x"))
-            .is_none());
+        assert!(
+            R009RootExecFromUserPath::default()
+                .evaluate(&spawn_as(0, "x", "/homefoo/x"))
+                .is_none()
+        );
     }
 
     /// External audit PROC-007: an administrator's sudo session at a

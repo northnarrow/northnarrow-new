@@ -11,8 +11,8 @@ use nn_proto::admin_protocol::{
 use sha2::{Digest, Sha256};
 
 use super::read::read_tail_jsonl;
-use crate::admin::verify::{signed, Verified};
 use crate::admin::CanaryAdminState;
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::canary::registry::{CanaryToken, CanaryTokenDraft, DecoyContent, RegistryError};
 
@@ -287,7 +287,7 @@ pub(in crate::admin) fn materialise_canary_file(
     deployment: &nn_proto::admin_signed_payload::CanaryDeploymentWire,
     state: &CanaryAdminState,
 ) -> Result<(Option<common::wire::InodeKey>, Option<DecoyContent>)> {
-    use crate::canary::templates::{new_content_seed, render, render_file_body, CredFamily};
+    use crate::canary::templates::{CredFamily, new_content_seed, render, render_file_body};
     use nn_proto::admin_signed_payload::CanaryDeploymentWire;
     let seed = new_content_seed();
     let (path, body) = match deployment {
@@ -304,7 +304,7 @@ pub(in crate::admin) fn materialise_canary_file(
         // binary; a Network canary opens no listener (lab PR 163,
         // `canary::network`).
         CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => {
-            return Ok((None, None))
+            return Ok((None, None));
         }
     };
     // canary-path-1 / external audit DEC-002: policy check, then a walk

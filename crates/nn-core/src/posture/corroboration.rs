@@ -605,14 +605,16 @@ mod tests {
         let session = Scope::Login(1000);
         let mut l = CorroborationLedger::new();
         let fs = EvidenceClass::FileSystem;
-        assert!(l
-            .corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
-            .is_empty());
+        assert!(
+            l.corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
+                .is_empty()
+        );
         l.record(TriggerType::CriticalFileModification, now, session.clone());
         // the same kind of evidence vouches for nothing
-        assert!(l
-            .corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
-            .is_empty());
+        assert!(
+            l.corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
+                .is_empty()
+        );
         l.record(TriggerType::ExploitAttempt, now, session.clone());
         l.record(TriggerType::ExploitAttempt, now, session.clone());
         l.record(TriggerType::LateralMovement, now, unit("other.service"));
@@ -623,9 +625,10 @@ mod tests {
             vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)],
             "another class, placed, in this scope, once"
         );
-        assert!(l
-            .corroborating(TriggerType::ConfirmedIntrusion, fs, &Scope::Unattributed)
-            .is_empty());
+        assert!(
+            l.corroborating(TriggerType::ConfirmedIntrusion, fs, &Scope::Unattributed)
+                .is_empty()
+        );
     }
 
     /// Review 52: a pending configuration change corroborates nothing
@@ -1114,7 +1117,7 @@ mod tests {
     /// the bounds hold.
     #[test]
     fn the_ledger_keeps_its_invariants() {
-        use crate::model_check::{check, SEQUENCES};
+        use crate::model_check::{SEQUENCES, check};
         let scopes: Vec<Scope> = (0..24)
             .map(|i| unit(&format!("u{i}.service")))
             .chain([Scope::Login(1000), Scope::Unattributed])

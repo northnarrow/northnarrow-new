@@ -94,7 +94,9 @@ fn hash_object(journal: &Path, n: u64) -> std::io::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let Some(dir) = arg(&args, "--dir").map(PathBuf::from) else {
-        eprintln!("usage: cow_bench --dir DIR [--files N] [--size BYTES] [--rounds R] [--simulate-copy JOURNAL_DIR]");
+        eprintln!(
+            "usage: cow_bench --dir DIR [--files N] [--size BYTES] [--rounds R] [--simulate-copy JOURNAL_DIR]"
+        );
         std::process::exit(2);
     };
     let files: usize = arg(&args, "--files")

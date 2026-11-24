@@ -74,7 +74,7 @@ use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::response_policy::{self, PolicySwitch};
 use crate::decision::rules::program_identity;
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
 

@@ -273,12 +273,16 @@ fn detector_returns_none_for_non_canary_events() {
     let dir = TempDir::new().unwrap();
     let (detector, _registry) = build_detector(&dir);
     // No canaries deployed → every event passes through.
-    assert!(detector
-        .process_event(&fim_event_on("/etc/passwd", 1234))
-        .is_none());
-    assert!(detector
-        .process_event(&process_spawn("/bin/ls", 5678))
-        .is_none());
+    assert!(
+        detector
+            .process_event(&fim_event_on("/etc/passwd", 1234))
+            .is_none()
+    );
+    assert!(
+        detector
+            .process_event(&process_spawn("/bin/ls", 5678))
+            .is_none()
+    );
     // Also: event variants the K3 V1.0 detector doesn't
     // intercept (TcpConnect / DnsQuery / FsProtectDenial)
     // always return None regardless of registry state.
@@ -438,9 +442,10 @@ fn hot_path_helpers_return_none_for_non_canary_keys() {
     let idx = detector.indexes().lock();
     assert!(idx.is_canary_inode(&InodeKey { dev: 1, ino: 2 }).is_none());
     assert!(idx.is_canary_exe(Path::new("/bin/ls")).is_none());
-    assert!(idx
-        .is_canary_destination("127.0.0.1".parse().unwrap(), 22, &|_| true)
-        .is_none());
+    assert!(
+        idx.is_canary_destination("127.0.0.1".parse().unwrap(), 22, &|_| true)
+            .is_none()
+    );
     assert_eq!(idx.len(), 0);
     assert!(idx.is_empty());
 }
@@ -479,9 +484,10 @@ fn rebuild_from_registry_populates_exe_and_port_indexes() {
     }
     let mut idx = detector.indexes().lock();
     idx.rebuild_from_registry(&registry.lock(), |_| None);
-    assert!(idx
-        .is_canary_exe(Path::new("/usr/local/bin/helper"))
-        .is_some());
+    assert!(
+        idx.is_canary_exe(Path::new("/usr/local/bin/helper"))
+            .is_some()
+    );
     let lo = "127.0.0.1".parse().unwrap();
     assert!(idx.is_canary_destination(lo, 4444, &|_| false).is_some());
     assert!(idx.is_canary_destination(lo, 22, &|_| false).is_none());
@@ -763,8 +769,8 @@ fn a_trip_carries_the_accessor_s_start_from_its_source_event() {
 /// the connecting process's tree killed.
 #[test]
 fn a_network_canary_trip_draws_canary_003_on_the_connector() {
-    use crate::decision::rules::canary::NnLCanary003NetworkConnect;
     use crate::decision::Rule as _;
+    use crate::decision::rules::canary::NnLCanary003NetworkConnect;
     let dir = TempDir::new().unwrap();
     let (detector, registry) = build_detector(&dir);
     deploy_network_canary(&registry, &detector, "127.0.0.1", 31337);
@@ -802,15 +808,21 @@ fn connects_a_network_canary_does_not_cover_do_not_trip_it() {
     assert!(access_rows(&dir).is_empty());
     // the IPv4 record of that dual-stack connect, and the wildcard
     // canary's port on this host
-    assert!(detector
-        .process_event(&connect_to("100.64.0.9", 4444, 1, 6))
-        .is_some());
-    assert!(detector
-        .process_event(&connect_to("127.0.0.1", 5555, 1, 7))
-        .is_some());
-    assert!(detector
-        .process_event(&connect_to("0.0.0.0", 5555, 1, 8))
-        .is_some());
+    assert!(
+        detector
+            .process_event(&connect_to("100.64.0.9", 4444, 1, 6))
+            .is_some()
+    );
+    assert!(
+        detector
+            .process_event(&connect_to("127.0.0.1", 5555, 1, 7))
+            .is_some()
+    );
+    assert!(
+        detector
+            .process_event(&connect_to("0.0.0.0", 5555, 1, 8))
+            .is_some()
+    );
     assert_eq!(access_rows(&dir).len(), 3);
 }
 
@@ -822,9 +834,11 @@ fn a_burned_network_canary_does_not_trip() {
     let id = deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
     registry.lock().burn(&id, "deadbeef").unwrap();
     detector.indexes().lock().rebuild_live(&registry.lock());
-    assert!(detector
-        .process_event(&connect_to("100.64.0.9", 4444, 1, 1))
-        .is_none());
+    assert!(
+        detector
+            .process_event(&connect_to("100.64.0.9", 4444, 1, 1))
+            .is_none()
+    );
 }
 
 /// A TCP row of `pid`'s connection connected at `start_ns`, in `phase`,
@@ -1157,9 +1171,11 @@ fn a_network_canary_with_no_ip_address_is_not_indexed() {
     let (detector, registry) = build_detector(&dir);
     deploy_network_canary(&registry, &detector, "db.internal", 4444);
     assert!(detector.indexes().lock().is_empty());
-    assert!(detector
-        .process_event(&connect_to("127.0.0.1", 4444, 1, 1))
-        .is_none());
+    assert!(
+        detector
+            .process_event(&connect_to("127.0.0.1", 4444, 1, 1))
+            .is_none()
+    );
 }
 
 /// R12b (lab PR 269): with a writer, a trip's access row and registry mark

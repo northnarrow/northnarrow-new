@@ -101,7 +101,7 @@ fn folded(path: &str) -> Option<Vec<&str>> {
 fn link_of(segs: &[&str]) -> Option<ProcLink> {
     let rest = match segs {
         ["dev", "fd", _, ..] | ["dev", "stdin" | "stdout" | "stderr", ..] => {
-            return Some(ProcLink::Descriptor)
+            return Some(ProcLink::Descriptor);
         }
         ["proc", _, "task", _, rest @ ..] | ["proc", _, rest @ ..] => rest,
         _ => return None,

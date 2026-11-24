@@ -187,9 +187,10 @@ fn every_rule_response_writes_its_intent_then_its_outcome() {
     for a in &actions {
         assert!(p.iter().any(|(_, r, _)| r == &format!("{a:?}")), "{a:?}");
     }
-    assert!(p
-        .iter()
-        .all(|(_, _, result)| *result == ActionResult::WouldExecute));
+    assert!(
+        p.iter()
+            .all(|(_, _, result)| *result == ActionResult::WouldExecute)
+    );
     // every intent before its own outcome, and each record written after
     let records: Vec<DetectionRecord> = sink.queued_for_test();
     assert_eq!(records.len(), actions.len());
@@ -967,10 +968,11 @@ fn a_kill_that_killed_takes_its_process_s_queued_throttle_out() {
             .any(|(r, _)| r == "ThrottleProcess"),
         "never run"
     );
-    assert!(sink
-        .queued_for_test()
-        .iter()
-        .any(|r| r.response.contains("superseded")));
+    assert!(
+        sink.queued_for_test()
+            .iter()
+            .any(|r| r.response.contains("superseded"))
+    );
     let st = d.status();
     assert_eq!((st.queue.superseded, st.queue.lost()), (1, 0));
 }
@@ -1044,10 +1046,12 @@ fn a_kill_that_did_not_kill_lets_its_process_s_block_run() {
         !block.reason.as_deref().unwrap_or("").contains("superseded"),
         "{block:?}"
     );
-    assert!(!sink
-        .queued_for_test()
-        .iter()
-        .any(|r| r.response.contains("superseded")));
+    assert!(
+        !sink
+            .queued_for_test()
+            .iter()
+            .any(|r| r.response.contains("superseded"))
+    );
     let st = d.status();
     assert_eq!(st.queue.superseded, 0);
 }

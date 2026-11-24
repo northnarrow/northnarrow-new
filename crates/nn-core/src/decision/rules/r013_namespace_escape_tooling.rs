@@ -31,7 +31,7 @@ use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::response_policy::R013_RUNC_KILL;
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Container/namespace escape tool comms (design §7.1).
@@ -281,9 +281,11 @@ mod tests {
     #[test]
     fn ignores_escape_tool_from_standard_path() {
         // Legit util-linux / runtime location → no fire.
-        assert!(rule()
-            .evaluate(&spawn("nsenter", "/usr/bin/nsenter"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("nsenter", "/usr/bin/nsenter"))
+                .is_none()
+        );
         assert!(rule().evaluate(&spawn("runc", "/usr/sbin/runc")).is_none());
         // Non-escape tool from a weird path is not R013's concern.
         assert!(rule().evaluate(&spawn("ls", "/tmp/ls")).is_none());

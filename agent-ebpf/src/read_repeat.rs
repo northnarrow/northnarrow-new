@@ -39,24 +39,30 @@ pub struct ReadSeenKey {
 /// `false`. An LRU eviction only makes a repeat report again.
 #[inline(always)]
 pub unsafe fn repeat(seen: &LruHashMap<ReadSeenKey, u64>, key: &InodeKey) -> bool {
-    let task = bpf_get_current_task() as *const u8;
-    let start_time = if task.is_null() {
-        0
-    } else {
-        bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64).unwrap_or(0)
-    };
-    let k = ReadSeenKey {
-        pid_tgid: bpf_get_current_pid_tgid(),
-        start_time,
-        dev: key.dev,
-        ino: key.ino,
-    };
-    let now = bpf_ktime_get_ns();
-    if let Some(last) = seen.get(&k) {
-        if now.wrapping_sub(*last) < READ_REPEAT_NS {
-            return true;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task() as *const u8;
+        let start_time = if task.is_null() {
+            0
+        } else {
+            bpf_probe_read_kernel::<u64>(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const u64).unwrap_or(0)
+        };
+        let k = ReadSeenKey {
+            pid_tgid: bpf_get_current_pid_tgid(),
+            start_time,
+            dev: key.dev,
+            ino: key.ino,
+        };
+        let now = bpf_ktime_get_ns();
+        match seen.get(&k) {
+            Some(last) => {
+                if now.wrapping_sub(*last) < READ_REPEAT_NS {
+                    return true;
+                }
+            }
+            _ => {}
         }
+        let _ = seen.insert(&k, &now, 0);
+        false
     }
-    let _ = seen.insert(&k, &now, 0);
-    false
 }

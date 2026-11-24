@@ -1071,10 +1071,12 @@ mod tests {
             .filter(|r| r["source"] == REPAIRS_DROPPED)
             .collect();
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0]["detail"]
-            .as_str()
-            .unwrap()
-            .starts_with("1 run-time repair(s)"));
+        assert!(
+            said[0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 run-time repair(s)")
+        );
         reset_for_tests();
     }
 

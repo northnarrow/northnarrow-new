@@ -260,7 +260,7 @@ pub fn reload_verified(socket: &Path, timeout: Duration) -> io::Result<&'static 
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                continue
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -315,7 +315,7 @@ fn reloading_signal(msg: &[u8]) -> io::Result<Option<bool>> {
             other_sig => {
                 return Err(other(format!(
                     "D-Bus: unexpected header field type {other_sig:?}"
-                )))
+                )));
             }
         }
     }
@@ -650,7 +650,7 @@ impl Cursor<'_> {
             _ => {
                 return Err(other(format!(
                     "D-Bus: a property of type {t:?} is not read here"
-                )))
+                )));
             }
         })
     }
@@ -697,7 +697,7 @@ fn parse_reply(msg: &[u8], serial: u32) -> io::Result<Option<Value>> {
             other_sig => {
                 return Err(other(format!(
                     "D-Bus: unexpected header field type {other_sig:?}"
-                )))
+                )));
             }
         }
     }

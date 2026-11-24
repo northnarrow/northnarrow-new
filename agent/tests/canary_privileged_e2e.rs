@@ -54,8 +54,8 @@
 
 #![cfg(feature = "test-privileged")]
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
+use common::{EniIptablesGuard, InstalledBin, install_to_priv_bin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -745,11 +745,13 @@ fn a_reader_daemon_older_than_the_agent_stays_spared_after_2100_execs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let decoy = tmp.path().join("decoy_backup_keys.txt");
     let go = tmp.path().join("go");
-    assert!(Command::new("mkfifo")
-        .arg(&go)
-        .status()
-        .expect("mkfifo")
-        .success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&go)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
     // the daemon: /usr/local/lib/<dir>/clamd, a copy of bash (removed at the end)
     let dir = PathBuf::from(format!(
         "/usr/local/lib/nn-e2e-clamd-{}",
@@ -848,11 +850,13 @@ fn a_type_forking_reader_daemon_started_after_the_agent_stays_spared() {
         "/run/nn-e2e-clamd-forking-{}.pid",
         std::process::id()
     ));
-    assert!(Command::new("mkfifo")
-        .arg(&go)
-        .status()
-        .expect("mkfifo")
-        .success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&go)
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
     let dir = PathBuf::from(format!(
         "/usr/local/lib/nn-e2e-clamd-forking-{}",
         std::process::id()

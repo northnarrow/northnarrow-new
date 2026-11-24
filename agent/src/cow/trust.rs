@@ -36,14 +36,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex;
 
 use crate::impact::trust::{
-    is_user_manager, started_by_pid1, topmost_same, vouches, HopFacts, ProgramOwners,
+    HopFacts, ProgramOwners, is_user_manager, started_by_pid1, topmost_same, vouches,
 };
 use crate::posture::lineage::{
-    in_system_tree, is_interpreter, AsOf, AuthSessionTracker, ExecIdentity,
+    AsOf, AuthSessionTracker, ExecIdentity, in_system_tree, is_interpreter,
 };
 
 /// Editors and the version-control client: programs a person runs to

@@ -7,8 +7,8 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::VerifyingKey;
 
 use super::*;
-use crate::chain_host::testing::TestKey;
 use crate::chain_host::ChainSigner;
+use crate::chain_host::testing::TestKey;
 use crate::chainlog::{NoProtection, RotatingChainLog, RotationConfig};
 
 const T0: &str = "2026-11-01T10:00:00.000000Z";

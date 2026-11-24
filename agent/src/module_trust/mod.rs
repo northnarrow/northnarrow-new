@@ -31,7 +31,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::module_judge::{
-    mode, trust_flag, ModuleTrust, MODULE_PKG_IMAGES_MAX, MODULE_TRUST_MAX,
+    MODULE_PKG_IMAGES_MAX, MODULE_TRUST_MAX, ModuleTrust, mode, trust_flag,
 };
 use common::wire::InodeKey;
 use parking_lot::Mutex;
@@ -151,7 +151,7 @@ pub fn mode_name(m: u64) -> &'static str {
 /// change time: without them it trusts no file, and the deny mode is never
 /// armed (the record mode instead, signed degraded).
 pub fn offsets_resolved() -> bool {
-    use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
+    use common::btf_offsets::{BTF_OFFSETS_ABSENT, slot};
     let Some(r) = crate::anti_tamper::btf_revalidate::resolved() else {
         return true; // unarmed: the compiled 6.8 offsets apply
     };
@@ -377,19 +377,19 @@ impl Controller {
             self.txns.sample();
         }
         let want = desired();
-        let gen = self.kernel.write_gen();
+        let write_gen = self.kernel.write_gen();
         let stamp = db_stamp();
         let due = match &self.last {
             None => true,
             Some((at, g, d, s)) => {
-                at.elapsed() >= FULL_EVERY || *g != gen || *d != want || *s != stamp
+                at.elapsed() >= FULL_EVERY || *g != write_gen || *d != want || *s != stamp
             }
         };
         if !due {
             return;
         }
         self.look(&want, stamp);
-        self.last = Some((Instant::now(), gen, want, stamp));
+        self.last = Some((Instant::now(), write_gen, want, stamp));
     }
 
     fn look(&mut self, want: &Desired, stamp: Option<SystemTime>) {
@@ -707,9 +707,11 @@ mod tests {
         let named = parse("module-allow zfs\n").unwrap();
         assert!(apply_policy(&named, true).is_none());
         let with = desired();
-        assert!(inputs_of(&with, "6.8.0", tree, 7, reg, None)
-            .opt_outs
-            .contains("zfs"));
+        assert!(
+            inputs_of(&with, "6.8.0", tree, 7, reg, None)
+                .opt_outs
+                .contains("zfs")
+        );
         assert!(apply_policy(&RulePolicy::builtin(), true).is_none());
         assert_eq!(mode_name(mode::DENY), "deny");
         assert_eq!(mode_name(mode::NOT_READY), "not armed");

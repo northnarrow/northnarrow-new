@@ -88,7 +88,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use northnarrow_agent::anti_tamper::{
-    lsm_pin_paths, DEFAULT_BPFFS_ROOT, DENY_HOOKS, OPTIONAL_DENY_HOOKS,
+    DEFAULT_BPFFS_ROOT, DENY_HOOKS, OPTIONAL_DENY_HOOKS, lsm_pin_paths,
 };
 
 mod common;

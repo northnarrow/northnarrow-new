@@ -191,17 +191,20 @@ pub(crate) mod tests {
             "no P-256/P-384 key exchange: crypto-bigint 0.5 computes on no secret"
         );
         assert!(!p.cipher_suites.is_empty());
-        assert!(p
-            .cipher_suites
-            .iter()
-            .all(|s| matches!(s, SupportedCipherSuite::Tls13(_))));
+        assert!(
+            p.cipher_suites
+                .iter()
+                .all(|s| matches!(s, SupportedCipherSuite::Tls13(_)))
+        );
         // built without its `tls12` feature, the provider itself has no
         // TLS 1.2 suite: the narrowing's retain removes none today, and is
         // there for a feature another crate would turn on
-        assert!(rustls_rustcrypto::provider()
-            .cipher_suites
-            .iter()
-            .all(|s| matches!(s, SupportedCipherSuite::Tls13(_))));
+        assert!(
+            rustls_rustcrypto::provider()
+                .cipher_suites
+                .iter()
+                .all(|s| matches!(s, SupportedCipherSuite::Tls13(_)))
+        );
         let cfg = client_config(CA_PEM.as_bytes()).unwrap();
         assert!(
             !cfg.client_auth_cert_resolver.has_certs(),
@@ -211,10 +214,12 @@ pub(crate) mod tests {
         // test key, the narrowed one refuses it
         use rustls::pki_types::PrivateKeyDer;
         let key = || PrivateKeyDer::from_pem_slice(SRV_KEY.as_bytes()).unwrap();
-        assert!(rustls_rustcrypto::provider()
-            .key_provider
-            .load_private_key(key())
-            .is_ok());
+        assert!(
+            rustls_rustcrypto::provider()
+                .key_provider
+                .load_private_key(key())
+                .is_ok()
+        );
         assert!(p.key_provider.load_private_key(key()).is_err());
         // the key exchange refuses a shared secret of all zeros (a peer's
         // key of small order: here the all-zero point), takes a real one

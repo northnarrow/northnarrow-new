@@ -62,10 +62,10 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
+use nn_model::Event;
 use nn_model::posture_types::{
     Confidence, EvidenceClass, PostureKind, PostureTransition, TriggerType,
 };
-use nn_model::Event;
 
 use crate::decision::host::DecisionHost;
 use clock::Clock;
@@ -74,10 +74,10 @@ use escalation_allow::EscalationAllowList;
 
 pub use entry::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 pub use exempt::{
-    resolve_verified_watchdog_pid, sibling_watchdog_exe, ExemptPids, WatchdogResolution,
-    DEFAULT_WATCHDOG_EXE, DEFAULT_WATCHDOG_PIDFILE,
+    DEFAULT_WATCHDOG_EXE, DEFAULT_WATCHDOG_PIDFILE, ExemptPids, WatchdogResolution,
+    resolve_verified_watchdog_pid, sibling_watchdog_exe,
 };
-pub use lineage::{AuthSessionTracker, AUTH_BINARY_EXES};
+pub use lineage::{AUTH_BINARY_EXES, AuthSessionTracker};
 pub use state::PostureState;
 pub use triggers::TriggerDetector;
 
@@ -764,11 +764,7 @@ impl<H: DecisionHost> PostureMachine<H> {
             format!("{trigger}: {reason}")
         });
         drop(guard);
-        if after != before {
-            Some(next)
-        } else {
-            None
-        }
+        if after != before { Some(next) } else { None }
     }
 
     /// Apply decay if the appropriate window has elapsed. Returns

@@ -29,7 +29,7 @@ use nn_model::EventClass;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{class_contracts, FailureMode, SourceContract};
+use super::{FailureMode, SourceContract, class_contracts};
 
 /// Bumped when a field changes meaning or goes. 2 (R13): the class and
 /// source entries, the revisions and their hashes.

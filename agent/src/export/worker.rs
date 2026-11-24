@@ -9,7 +9,7 @@ use std::path::Path;
 
 use nn_linux::sandbox;
 use nn_linux::worker::serve::{self, Args};
-use nn_proto::ipc::{Answer, Refusal, Request, EXPORT_DIR};
+use nn_proto::ipc::{Answer, EXPORT_DIR, Refusal, Request};
 
 /// The worker's whole life; its exit status.
 pub fn main(a: &Args) -> i32 {

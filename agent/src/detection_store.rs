@@ -46,8 +46,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -60,7 +60,7 @@ use tracing::{info, warn};
 
 use crate::audit::AgentSigningKey;
 use crate::chainlog::{ProtectionManager, RotatingChainLog, RotationConfig};
-use crate::decision::attack::{mitre_of, AttackRef, ATTACK_VERSION};
+use crate::decision::attack::{ATTACK_VERSION, AttackRef, mitre_of};
 use crate::response::{ExecutionOutcome, ExecutionReport};
 
 /// Default on-disk location of the detection chainlog. Lives under the
@@ -299,7 +299,7 @@ pub fn describe_response(report: &ExecutionReport) -> String {
     let root = match &report.primary {
         _ if report.action == ResponseAction::Log => return "none".to_string(),
         ExecutionOutcome::WouldExecute { .. } => {
-            return nn_core::response::profile::would_have(&format!("{:?}", report.action))
+            return nn_core::response::profile::would_have(&format!("{:?}", report.action));
         }
         ExecutionOutcome::Killed { .. }
         | ExecutionOutcome::Blocked { .. }
@@ -1644,7 +1644,7 @@ fn collect_latest_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainlog::{verify_log_set, NoProtection};
+    use crate::chainlog::{NoProtection, verify_log_set};
 
     /// Lot 281 (named): the record of a match whose exemption did not hold
     /// lists the match — built in alone too — and says which exemption and
@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn a_revoked_exemption_is_in_the_signed_record() {
         use crate::decision::combine::{apply_policy, combine};
-        use crate::decision::rule_policy::{parse, Exempt};
+        use crate::decision::rule_policy::{Exempt, parse};
         let v = Verdict {
             rule_id: "R020_ShellWithSocketStdio".to_string(),
             rule_name: "r".to_string(),
@@ -2615,9 +2615,11 @@ mod tests {
         );
         assert!(!r.acted());
         assert_eq!(r.operation, None);
-        assert!(!serde_json::to_string(&r)
-            .unwrap()
-            .contains(r#""operation":"#));
+        assert!(
+            !serde_json::to_string(&r)
+                .unwrap()
+                .contains(r#""operation":"#)
+        );
     }
 
     /// `suppressed_before` is absent unless something was held back, so

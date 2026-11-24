@@ -184,23 +184,32 @@ fn conf(slot: u32) -> u64 {
 
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
-    let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u16>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// What the judge reads of `inode`. An offset this kernel lacks leaves a
@@ -208,26 +217,29 @@ unsafe fn peek_u16(src: *const u8) -> u16 {
 /// fail closed — the agent never arms the deny mode then.
 #[inline(always)]
 unsafe fn facts_of(inode: *const u8) -> FileFacts {
-    let mut f = FileFacts {
-        uid: u32::MAX,
-        mode: 0,
-        ctime_sec: i64::MIN,
-        ctime_nsec: 0,
-        size: -1,
-    };
-    if inode.is_null() {
-        return f;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut f = FileFacts {
+            uid: u32::MAX,
+            mode: 0,
+            ctime_sec: i64::MIN,
+            ctime_nsec: 0,
+            size: -1,
+        };
+        if inode.is_null() {
+            return f;
+        }
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            f.uid = peek_u32(inode.add(o & 0xffff));
+        }
+        f.mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET) & 0xffff)));
+        f.size = peek_u64(inode.add(off!(INODE_I_SIZE_OFFSET) & 0xffff)) as i64;
+        if let (Some(a), Some(b)) = (off_opt!(INODE_I_CTIME_SEC_OFFSET), off_opt!(INODE_I_CTIME_NSEC_OFFSET)) {
+            f.ctime_sec = peek_u64(inode.add(a & 0xffff)) as i64;
+            f.ctime_nsec = peek_u32(inode.add(b & 0xffff));
+        }
+        f
     }
-    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-        f.uid = peek_u32(inode.add(o & 0xffff));
-    }
-    f.mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET) & 0xffff)));
-    f.size = peek_u64(inode.add(off!(INODE_I_SIZE_OFFSET) & 0xffff)) as i64;
-    if let (Some(a), Some(b)) = (off_opt!(INODE_I_CTIME_SEC_OFFSET), off_opt!(INODE_I_CTIME_NSEC_OFFSET)) {
-        f.ctime_sec = peek_u64(inode.add(a & 0xffff)) as i64;
-        f.ctime_nsec = peek_u32(inode.add(b & 0xffff));
-    }
-    f
 }
 
 /// The judged file of a `finit_module` load.
@@ -241,21 +253,24 @@ struct Judged {
 /// Lot 285: judge the file `file` a `finit_module` reads.
 #[inline(always)]
 unsafe fn judge_file(file: *const u8) -> Judged {
-    let m = conf(conf_slot::MODE);
-    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
-    let key = crate::open_sensor::key_of(inode);
-    let facts = facts_of(inode);
-    let entry = if inode.is_null() { None } else { MODULE_TRUST.get(&key) };
-    let trust_flags = match entry {
-        Some(e) => e.flags,
-        None => 0,
-    };
-    let window = m != mode::NOT_READY && crate::inode_protect::override_active();
-    Judged {
-        verdict: finit_verdict(entry, &facts, window, m),
-        key,
-        facts,
-        trust_flags,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let m = conf(conf_slot::MODE);
+        let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+        let key = crate::open_sensor::key_of(inode);
+        let facts = facts_of(inode);
+        let entry = if inode.is_null() { None } else { MODULE_TRUST.get(&key) };
+        let trust_flags = match entry {
+            Some(e) => e.flags,
+            None => 0,
+        };
+        let window = m != mode::NOT_READY && crate::inode_protect::override_active();
+        Judged {
+            verdict: finit_verdict(entry, &facts, window, m),
+            key,
+            facts,
+            trust_flags,
+        }
     }
 }
 
@@ -266,24 +281,27 @@ pub fn module_read_file_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_read_file(ctx: &LsmContext) -> i32 {
-    // kernel_read_file(struct file *file, enum kernel_read_file_id id, bool contents)
-    let id: c_int = ctx.arg(1);
-    if id == KEXEC_IMAGE {
-        return deny_kexec(id);
-    }
-    // Lot 303: `READING_MODULE`, or 7.0's `READING_MODULE_COMPRESSED` (a
-    // `finit_module` the kernel decompresses: every `.ko.zst` kmod loads on
-    // Ubuntu 26.04), judged by the file alike.
-    if !reads_module_file(id as u32) {
-        return 0;
-    }
-    let file: *const c_void = ctx.arg(0);
-    let j = judge_file(file as *const u8);
-    emit_module_load(MODULE_LOAD_FINIT, file, &j);
-    if refuses(j.verdict) {
-        -EPERM
-    } else {
-        0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // kernel_read_file(struct file *file, enum kernel_read_file_id id, bool contents)
+        let id: c_int = ctx.arg(1);
+        if id == KEXEC_IMAGE {
+            return deny_kexec(id);
+        }
+        // Lot 303: `READING_MODULE`, or 7.0's `READING_MODULE_COMPRESSED` (a
+        // `finit_module` the kernel decompresses: every `.ko.zst` kmod loads on
+        // Ubuntu 26.04), judged by the file alike.
+        if !reads_module_file(id as u32) {
+            return 0;
+        }
+        let file: *const c_void = ctx.arg(0);
+        let j = judge_file(file as *const u8);
+        emit_module_load(MODULE_LOAD_FINIT, file, &j);
+        if refuses(j.verdict) {
+            -EPERM
+        } else {
+            0
+        }
     }
 }
 
@@ -294,29 +312,32 @@ pub fn module_load_data_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_load_data(ctx: &LsmContext) -> i32 {
-    // kernel_load_data(enum kernel_load_data_id id, bool contents)
-    let id: c_int = ctx.arg(0);
-    if id == KEXEC_IMAGE {
-        return deny_kexec(id);
-    }
-    if id != LOADING_MODULE {
-        return 0;
-    }
-    // Legacy init_module buffer load — no file, so no path and nothing to
-    // trust: lot 285, refused outside a window in the deny mode.
-    let m = conf(conf_slot::MODE);
-    let window = m != mode::NOT_READY && crate::inode_protect::override_active();
-    let j = Judged {
-        verdict: init_verdict(window, m),
-        key: InodeKey { dev: 0, ino: 0 },
-        facts: FileFacts::default(),
-        trust_flags: 0,
-    };
-    emit_module_load(MODULE_LOAD_INIT, core::ptr::null(), &j);
-    if refuses(j.verdict) {
-        -EPERM
-    } else {
-        0
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // kernel_load_data(enum kernel_load_data_id id, bool contents)
+        let id: c_int = ctx.arg(0);
+        if id == KEXEC_IMAGE {
+            return deny_kexec(id);
+        }
+        if id != LOADING_MODULE {
+            return 0;
+        }
+        // Legacy init_module buffer load — no file, so no path and nothing to
+        // trust: lot 285, refused outside a window in the deny mode.
+        let m = conf(conf_slot::MODE);
+        let window = m != mode::NOT_READY && crate::inode_protect::override_active();
+        let j = Judged {
+            verdict: init_verdict(window, m),
+            key: InodeKey { dev: 0, ino: 0 },
+            facts: FileFacts::default(),
+            trust_flags: 0,
+        };
+        emit_module_load(MODULE_LOAD_INIT, core::ptr::null(), &j);
+        if refuses(j.verdict) {
+            -EPERM
+        } else {
+            0
+        }
     }
 }
 
@@ -341,57 +362,60 @@ unsafe fn deny_kexec(id: c_int) -> i32 {
 /// the ring is full: the verdict never depends on the record.
 #[inline(always)]
 unsafe fn emit_module_load(method: u8, file: *const c_void, j: &Judged) {
-    let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::MODULE_LOAD);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::MODULE_LOAD);
+                return;
+            }
+        };
+        let raw: *mut ModuleLoadRaw = entry.as_mut_ptr();
+        // Zero the whole slot first so `_pad` + any unwritten path slots
+        // stay deterministic (a `bytemuck::Pod` requirement userland-side).
+        crate::zero::zero(raw);
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        (*raw).loader_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*raw).loader_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        (*raw).method = method;
+        (*raw).verdict = j.verdict;
+        (*raw).file_dev = j.key.dev;
+        (*raw).file_ino = j.key.ino;
+        (*raw).ctime_sec = j.facts.ctime_sec;
+        (*raw).ctime_nsec = j.facts.ctime_nsec;
+        (*raw).file_uid = j.facts.uid;
+        (*raw).file_mode = j.facts.mode;
+        (*raw).file_size = j.facts.size;
+        (*raw).trust_flags = j.trust_flags;
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).loader_comm = comm;
         }
-    };
-    let raw: *mut ModuleLoadRaw = entry.as_mut_ptr();
-    // Zero the whole slot first so `_pad` + any unwritten path slots
-    // stay deterministic (a `bytemuck::Pod` requirement userland-side).
-    crate::zero::zero(raw);
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    (*raw).loader_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    (*raw).loader_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    (*raw).method = method;
-    (*raw).verdict = j.verdict;
-    (*raw).file_dev = j.key.dev;
-    (*raw).file_ino = j.key.ino;
-    (*raw).ctime_sec = j.facts.ctime_sec;
-    (*raw).ctime_nsec = j.facts.ctime_nsec;
-    (*raw).file_uid = j.facts.uid;
-    (*raw).file_mode = j.facts.mode;
-    (*raw).file_size = j.facts.size;
-    (*raw).trust_flags = j.trust_flags;
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).loader_comm = comm;
-    }
-    fill_parent(raw);
-    if method == MODULE_LOAD_FINIT && !file.is_null() {
-        // file → f_path.dentry (the source .ko's leaf dentry).
-        let dentry_slot = (file as *const u8)
-            .add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff)
-            as *const *const u8;
-        if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
-            if !leaf.is_null() {
-                let (n, truncated, top) = walk_components(leaf, (*raw).path.as_mut_ptr());
-                (*raw).path_len = n as u16;
-                (*raw).path_truncated = truncated;
-                // External audit PROC-005: the filesystem root the walk
-                // reached, which userland maps to its mount point.
-                if !top.is_null() {
-                    let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(
-                        top.add(off!(DENTRY_D_INODE_OFFSET)),
-                    ));
-                    (*raw).root_dev = root.dev;
-                    (*raw).root_ino = root.ino;
+        fill_parent(raw);
+        if method == MODULE_LOAD_FINIT && !file.is_null() {
+            // file → f_path.dentry (the source .ko's leaf dentry).
+            let dentry_slot = (file as *const u8)
+                .add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff)
+                as *const *const u8;
+            if let Ok(leaf) = bpf_probe_read_kernel::<*const u8>(dentry_slot) {
+                if !leaf.is_null() {
+                    let (n, truncated, top) = walk_components(leaf, (*raw).path.as_mut_ptr());
+                    (*raw).path_len = n as u16;
+                    (*raw).path_truncated = truncated;
+                    // External audit PROC-005: the filesystem root the walk
+                    // reached, which userland maps to its mount point.
+                    if !top.is_null() {
+                        let root = crate::open_sensor::key_of(crate::open_sensor::read_ptr(
+                            top.add(off!(DENTRY_D_INODE_OFFSET)),
+                        ));
+                        (*raw).root_dev = root.dev;
+                        (*raw).root_ino = root.ino;
+                    }
                 }
             }
         }
+        entry.submit(0);
     }
-    entry.submit(0);
 }
 
 /// Walk the `d_parent` chain from `leaf`, writing each component name
@@ -406,76 +430,79 @@ unsafe fn emit_module_load(method: u8, file: *const c_void, j: &Judged) {
 /// walk (short/empty path, never garbage).
 #[inline(always)]
 unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8, *const u8) {
-    let mut dentry = leaf;
-    let mut n: usize = 0;
-    let mut reached_root = false;
-    let mut top: *const u8 = core::ptr::null();
-    let mut failed = false;
-    for i in 0..MODULE_PATH_SLOTS {
-        if dentry.is_null() {
-            failed = true;
-            break;
-        }
-        let off = match i {
-            0 => 0,
-            1 => 32,
-            2 => 64,
-            3 => 96,
-            4 => 128,
-            5 => 160,
-            6 => 192,
-            7 => 224,
-            8 => 256,
-            9 => 288,
-            10 => 320,
-            11 => 352,
-            12 => 384,
-            13 => 416,
-            14 => 448,
-            15 => 480,
-            _ => break,
-        };
-        // dentry->d_name.name (struct qstr → const u8*).
-        let name_pp =
-            dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)) as *const *const u8;
-        match bpf_probe_read_kernel::<*const u8>(name_pp) {
-            Ok(name_ptr) if !name_ptr.is_null() => {
-                let slot = core::slice::from_raw_parts_mut(dst.add(off), MODULE_PATH_SLOT_LEN);
-                if bpf_probe_read_kernel_str_bytes(name_ptr, slot).is_err() {
-                    failed = true;
-                }
-            }
-            _ => failed = true,
-        }
-        n = i + 1;
-        // Step to the parent; stop at the root (d_parent == self) or a
-        // failed/null read. Only `d_parent == self` means "root reached";
-        // a failed read counts as truncated too (prefix unknown).
-        match bpf_probe_read_kernel::<*const u8>(dentry.add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const u8) {
-            Ok(p) if !p.is_null() && p != dentry => dentry = p,
-            Ok(p) if p == dentry => {
-                reached_root = true;
-                top = dentry;
-                break;
-            }
-            _ => {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut dentry = leaf;
+        let mut n: usize = 0;
+        let mut reached_root = false;
+        let mut top: *const u8 = core::ptr::null();
+        let mut failed = false;
+        for i in 0..MODULE_PATH_SLOTS {
+            if dentry.is_null() {
                 failed = true;
                 break;
             }
+            let off = match i {
+                0 => 0,
+                1 => 32,
+                2 => 64,
+                3 => 96,
+                4 => 128,
+                5 => 160,
+                6 => 192,
+                7 => 224,
+                8 => 256,
+                9 => 288,
+                10 => 320,
+                11 => 352,
+                12 => 384,
+                13 => 416,
+                14 => 448,
+                15 => 480,
+                _ => break,
+            };
+            // dentry->d_name.name (struct qstr → const u8*).
+            let name_pp =
+                dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)) as *const *const u8;
+            match bpf_probe_read_kernel::<*const u8>(name_pp) {
+                Ok(name_ptr) if !name_ptr.is_null() => {
+                    let slot = core::slice::from_raw_parts_mut(dst.add(off), MODULE_PATH_SLOT_LEN);
+                    if bpf_probe_read_kernel_str_bytes(name_ptr, slot).is_err() {
+                        failed = true;
+                    }
+                }
+                _ => failed = true,
+            }
+            n = i + 1;
+            // Step to the parent; stop at the root (d_parent == self) or a
+            // failed/null read. Only `d_parent == self` means "root reached";
+            // a failed read counts as truncated too (prefix unknown).
+            match bpf_probe_read_kernel::<*const u8>(dentry.add(off!(DENTRY_D_PARENT_OFFSET)) as *const *const u8) {
+                Ok(p) if !p.is_null() && p != dentry => dentry = p,
+                Ok(p) if p == dentry => {
+                    reached_root = true;
+                    top = dentry;
+                    break;
+                }
+                _ => {
+                    failed = true;
+                    break;
+                }
+            }
         }
+        // External audit PROC-004: the two causes are told apart. Every slot
+        // used without reaching the root is a path deeper than any module
+        // directory — the loader chose that depth, it cannot make the load
+        // unverifiable.
+        let code = if failed {
+            MODULE_PATH_UNREADABLE
+        } else if reached_root {
+            0
+        } else {
+            MODULE_PATH_TOO_DEEP
+        };
+        (n, code, if failed { core::ptr::null() } else { top })
     }
-    // External audit PROC-004: the two causes are told apart. Every slot
-    // used without reaching the root is a path deeper than any module
-    // directory — the loader chose that depth, it cannot make the load
-    // unverifiable.
-    let code = if failed {
-        MODULE_PATH_UNREADABLE
-    } else if reached_root {
-        0
-    } else {
-        MODULE_PATH_TOO_DEEP
-    };
-    (n, code, if failed { core::ptr::null() } else { top })
 }
 
 /// Read the loader's real-parent `comm` + `PF_KTHREAD` flag into `raw`.
@@ -486,23 +513,26 @@ unsafe fn walk_components(leaf: *const u8, dst: *mut u8) -> (usize, u8, *const u
 /// (fire path), never a silent exemption.
 #[inline(always)]
 unsafe fn fill_parent(raw: *mut ModuleLoadRaw) {
-    let task = bpf_get_current_task() as *const u8;
-    if task.is_null() {
-        return;
-    }
-    let parent = match bpf_probe_read_kernel::<*const u8>(
-        task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
-    ) {
-        Ok(p) if !p.is_null() => p,
-        _ => return,
-    };
-    let comm_slot = core::slice::from_raw_parts_mut((*raw).parent_comm.as_mut_ptr(), COMM_LEN);
-    let _ = bpf_probe_read_kernel_str_bytes(parent.add(off!(TASK_STRUCT_COMM_OFFSET)), comm_slot);
-    if let Ok(flags) =
-        bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32)
-    {
-        if flags & PF_KTHREAD != 0 {
-            (*raw).parent_is_kthread = 1;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task() as *const u8;
+        if task.is_null() {
+            return;
+        }
+        let parent = match bpf_probe_read_kernel::<*const u8>(
+            task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
+        ) {
+            Ok(p) if !p.is_null() => p,
+            _ => return,
+        };
+        let comm_slot = core::slice::from_raw_parts_mut((*raw).parent_comm.as_mut_ptr(), COMM_LEN);
+        let _ = bpf_probe_read_kernel_str_bytes(parent.add(off!(TASK_STRUCT_COMM_OFFSET)), comm_slot);
+        if let Ok(flags) =
+            bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32)
+        {
+            if flags & PF_KTHREAD != 0 {
+                (*raw).parent_is_kthread = 1;
+            }
         }
     }
 }
@@ -522,61 +552,64 @@ pub fn module_write_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_write_open(ctx: &LsmContext) {
-    let file: *const u8 = ctx.arg(0);
-    if file.is_null() {
-        return;
-    }
-    let fmode = peek_u32(file.add(off!(FILE_F_MODE_OFFSET) & 0xffff));
-    if fmode & FMODE_WRITE == 0 {
-        return;
-    }
-    if conf(conf_slot::TREE_DEV) == 0 {
-        return;
-    }
-    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
-    if inode.is_null() {
-        return;
-    }
-    let key = crate::open_sensor::key_of(inode);
-    if MODULE_TRUST.get(&key).is_none() {
-        let dentry = crate::open_sensor::read_ptr(
-            file.add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff),
-        );
-        if dentry.is_null() || !module_named(dentry) || nn_module_under_tree(dentry as u64) == 0 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let file: *const u8 = ctx.arg(0);
+        if file.is_null() {
             return;
         }
-    }
-    // Lot 370 (F10-2): the transaction the write belongs to — the nearest
-    // package manager of the lineage, not held, the writer's marks free of
-    // injected code — named by its thread group and start. In plain values
-    // on every path (`module_judge::history_step_raw`): an `Option`'s
-    // unwritten payload was a stack read 5.15's verifier refused
-    let hop = nn_module_pkg_lineage(bpf_get_current_task()) as *const u8;
-    let mut txn = if hop.is_null() || !crate::cgroup_join::caller_untainted() {
-        Txn::NONE
-    } else {
-        txn_of(hop)
-    };
-    // lot 370 (the lab): and holding its lock at this write
-    // ([`MODULE_PKG_LOCKERS`]), unless the agent says the locks' observer
-    // is not attached (it samples the locks then)
-    if txn.tgid != 0 && conf(conf_slot::LOCKS_UNOBSERVED) == 0 {
-        let (had, entry) = match MODULE_PKG_LOCKERS.get(&txn.tgid) {
-            Some(v) => (true, *v),
-            None => (false, PkgLocker::default()),
-        };
-        if !holds_lock(entry, had, txn.start) {
-            txn = Txn::NONE;
+        let fmode = peek_u32(file.add(off!(FILE_F_MODE_OFFSET) & 0xffff));
+        if fmode & FMODE_WRITE == 0 {
+            return;
         }
-    }
-    let (had, prev) = match MODULE_WRITES.get(&key) {
-        Some(v) => (true, *v),
-        None => (false, ModuleWrite::default()),
-    };
-    let next = history_step_raw(prev, had, fmode & FMODE_CREATED != 0, txn);
-    let _ = MODULE_WRITES.insert(&key, &next, 0);
-    if let Some(g) = MODULE_WRITE_GEN.get_ptr_mut(0) {
-        *g = (*g).wrapping_add(1);
+        if conf(conf_slot::TREE_DEV) == 0 {
+            return;
+        }
+        let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+        if inode.is_null() {
+            return;
+        }
+        let key = crate::open_sensor::key_of(inode);
+        if MODULE_TRUST.get(&key).is_none() {
+            let dentry = crate::open_sensor::read_ptr(
+                file.add((off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) & 0xffff),
+            );
+            if dentry.is_null() || !module_named(dentry) || nn_module_under_tree(dentry as u64) == 0 {
+                return;
+            }
+        }
+        // Lot 370 (F10-2): the transaction the write belongs to — the nearest
+        // package manager of the lineage, not held, the writer's marks free of
+        // injected code — named by its thread group and start. In plain values
+        // on every path (`module_judge::history_step_raw`): an `Option`'s
+        // unwritten payload was a stack read 5.15's verifier refused
+        let hop = nn_module_pkg_lineage(bpf_get_current_task()) as *const u8;
+        let mut txn = if hop.is_null() || !crate::cgroup_join::caller_untainted() {
+            Txn::NONE
+        } else {
+            txn_of(hop)
+        };
+        // lot 370 (the lab): and holding its lock at this write
+        // ([`MODULE_PKG_LOCKERS`]), unless the agent says the locks' observer
+        // is not attached (it samples the locks then)
+        if txn.tgid != 0 && conf(conf_slot::LOCKS_UNOBSERVED) == 0 {
+            let (had, entry) = match MODULE_PKG_LOCKERS.get(&txn.tgid) {
+                Some(v) => (true, *v),
+                None => (false, PkgLocker::default()),
+            };
+            if !holds_lock(entry, had, txn.start) {
+                txn = Txn::NONE;
+            }
+        }
+        let (had, prev) = match MODULE_WRITES.get(&key) {
+            Some(v) => (true, *v),
+            None => (false, ModuleWrite::default()),
+        };
+        let next = history_step_raw(prev, had, fmode & FMODE_CREATED != 0, txn);
+        let _ = MODULE_WRITES.insert(&key, &next, 0);
+        if let Some(g) = MODULE_WRITE_GEN.get_ptr_mut(0) {
+            *g = (*g).wrapping_add(1);
+        }
     }
 }
 
@@ -585,24 +618,27 @@ unsafe fn try_write_open(ctx: &LsmContext) {
 /// [`module_file_name`].
 #[inline(always)]
 unsafe fn module_named(dentry: *const u8) -> bool {
-    let qstr = dentry.add(off!(DENTRY_D_NAME_OFFSET));
-    let len = peek_u32(qstr.add(off!(QSTR_LEN_OFFSET))) as usize;
-    let name = crate::open_sensor::read_ptr(qstr.add(off!(QSTR_NAME_OFFSET)));
-    if name.is_null() {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let qstr = dentry.add(off!(DENTRY_D_NAME_OFFSET));
+        let len = peek_u32(qstr.add(off!(QSTR_LEN_OFFSET))) as usize;
+        let name = crate::open_sensor::read_ptr(qstr.add(off!(QSTR_NAME_OFFSET)));
+        if name.is_null() {
+            return false;
+        }
+        let start = if len > NAME_TAIL - 1 { (len - (NAME_TAIL - 1)) & 0xfff } else { 0 };
+        let mut tail = [0u8; NAME_TAIL];
+        if bpf_probe_read_kernel_str_bytes(name.add(start), &mut tail).is_err() {
+            return false;
+        }
+        module_file_name(&tail)
     }
-    let start = if len > NAME_TAIL - 1 { (len - (NAME_TAIL - 1)) & 0xfff } else { 0 };
-    let mut tail = [0u8; NAME_TAIL];
-    if bpf_probe_read_kernel_str_bytes(name.add(start), &mut tail).is_err() {
-        return false;
-    }
-    module_file_name(&tail)
 }
 
 /// Lot 285: 1 when the directory above `dentry` (within [`WALK_HOPS`]) is
 /// the running kernel's module tree ([`MODULE_CONF`]'s root). A global
 /// function: the verifier checks its loop once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_module_under_tree(dentry: u64) -> u64 {
     unsafe { u64::from(under_tree(dentry as *const u8)) }
@@ -610,27 +646,30 @@ pub extern "C" fn nn_module_under_tree(dentry: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn under_tree(leaf: *const u8) -> bool {
-    let dev = conf(conf_slot::TREE_DEV);
-    let ino = conf(conf_slot::TREE_INO);
-    if dev == 0 || leaf.is_null() {
-        return false;
-    }
-    let mut d = peek_u64(leaf.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
-    for _ in 0..WALK_HOPS {
-        if d.is_null() {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let dev = conf(conf_slot::TREE_DEV);
+        let ino = conf(conf_slot::TREE_INO);
+        if dev == 0 || leaf.is_null() {
             return false;
         }
-        let k = crate::open_sensor::key_of(peek_u64(d.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8);
-        if k.dev == dev && k.ino == ino {
-            return true;
+        let mut d = peek_u64(leaf.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
+        for _ in 0..WALK_HOPS {
+            if d.is_null() {
+                return false;
+            }
+            let k = crate::open_sensor::key_of(peek_u64(d.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8);
+            if k.dev == dev && k.ino == ino {
+                return true;
+            }
+            let up = peek_u64(d.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
+            if up.is_null() || up == d {
+                return false;
+            }
+            d = up;
         }
-        let up = peek_u64(d.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
-        if up.is_null() || up == d {
-            return false;
-        }
-        d = up;
+        false
     }
-    false
 }
 
 /// Lot 285: the current task runs as root and it, or an ancestor within
@@ -642,7 +681,7 @@ unsafe fn under_tree(leaf: *const u8) -> bool {
 /// by the system's freezer (`module_judge::state_may_vouch`; a cgroup-v2
 /// freezer's task waits as any other, and vouches; its state unreadable: none) — a held
 /// package manager vouched for its lineage's writes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_module_pkg_lineage(task: u64) -> u64 {
     unsafe { pkg_lineage(task as *const u8) as u64 }
@@ -650,43 +689,46 @@ pub extern "C" fn nn_module_pkg_lineage(task: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn pkg_lineage(task: *const u8) -> *const u8 {
-    if bpf_get_current_uid_gid() as u32 != 0 {
-        return core::ptr::null();
-    }
-    let mut t = task;
-    for _ in 0..WALK_HOPS {
-        if t.is_null() {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if bpf_get_current_uid_gid() as u32 != 0 {
             return core::ptr::null();
         }
-        let mm = peek_u64(t.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
-        if !mm.is_null() {
-            let mut found = false;
-            let exe = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
-            if !exe.is_null() {
-                let inode = peek_u64(exe.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-                if !inode.is_null() {
-                    let k = crate::open_sensor::key_of(inode);
-                    found = MODULE_PKG_IMAGES.get(&k).is_some();
+        let mut t = task;
+        for _ in 0..WALK_HOPS {
+            if t.is_null() {
+                return core::ptr::null();
+            }
+            let mm = peek_u64(t.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
+            if !mm.is_null() {
+                let mut found = false;
+                let exe = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+                if !exe.is_null() {
+                    let inode = peek_u64(exe.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+                    if !inode.is_null() {
+                        let k = crate::open_sensor::key_of(inode);
+                        found = MODULE_PKG_IMAGES.get(&k).is_some();
+                    }
+                }
+                // a package manager's `#!` script, its image the interpreter's
+                if !found {
+                    let tgid = peek_u32(t.add(off!(TASK_STRUCT_TGID_OFFSET)));
+                    if let Some(m) = MODULE_PKG_SCRIPTS.get(&tgid) {
+                        found = *m == mm as u64;
+                    }
+                }
+                if found {
+                    return if not_held(t) { t } else { core::ptr::null() };
                 }
             }
-            // a package manager's `#!` script, its image the interpreter's
-            if !found {
-                let tgid = peek_u32(t.add(off!(TASK_STRUCT_TGID_OFFSET)));
-                if let Some(m) = MODULE_PKG_SCRIPTS.get(&tgid) {
-                    found = *m == mm as u64;
-                }
+            let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+            if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
+                return core::ptr::null();
             }
-            if found {
-                return if not_held(t) { t } else { core::ptr::null() };
-            }
+            t = up;
         }
-        let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
-        if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
-            return core::ptr::null();
-        }
-        t = up;
+        core::ptr::null()
     }
-    core::ptr::null()
 }
 
 /// Lot 370 (F10-2): `task` is neither stopped, traced nor frozen by the
@@ -695,12 +737,15 @@ unsafe fn pkg_lineage(task: *const u8) -> *const u8 {
 /// (no offset): held, fail closed.
 #[inline(always)]
 unsafe fn not_held(task: *const u8) -> bool {
-    let Some(o) = off_opt!(TASK_STRUCT_STATE_OFFSET) else {
-        return false;
-    };
-    match bpf_probe_read_kernel(task.add(o & 0xffff) as *const u32) {
-        Ok(state) => state_may_vouch(state),
-        Err(_) => false,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(o) = off_opt!(TASK_STRUCT_STATE_OFFSET) else {
+            return false;
+        };
+        match bpf_probe_read_kernel(task.add(o & 0xffff) as *const u32) {
+            Ok(state) => state_may_vouch(state),
+            Err(_) => false,
+        }
     }
 }
 
@@ -711,12 +756,15 @@ unsafe fn not_held(task: *const u8) -> bool {
 /// `module_judge::history_step_raw`).
 #[inline(always)]
 unsafe fn txn_of(hop: *const u8) -> Txn {
-    let start = leader_start(hop);
-    let tgid = peek_u32(hop.add(off!(TASK_STRUCT_TGID_OFFSET)));
-    if tgid > 1 && start != 0 {
-        Txn { tgid, start }
-    } else {
-        Txn::NONE
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let start = leader_start(hop);
+        let tgid = peek_u32(hop.add(off!(TASK_STRUCT_TGID_OFFSET)));
+        if tgid > 1 && start != 0 {
+            Txn { tgid, start }
+        } else {
+            Txn::NONE
+        }
     }
 }
 
@@ -724,16 +772,19 @@ unsafe fn txn_of(hop: *const u8) -> Txn {
 /// unreadable.
 #[inline(always)]
 unsafe fn leader_start(task: *const u8) -> u64 {
-    let Some(o) = off_opt!(TASK_STRUCT_START_BOOTTIME_OFFSET) else {
-        return 0;
-    };
-    let leader = peek_u64(task.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET))) as *const u8;
-    if leader.is_null() {
-        return 0;
-    }
-    match bpf_probe_read_kernel(leader.add(o & 0xffff) as *const u64) {
-        Ok(v) => v,
-        Err(_) => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(o) = off_opt!(TASK_STRUCT_START_BOOTTIME_OFFSET) else {
+            return 0;
+        };
+        let leader = peek_u64(task.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET))) as *const u8;
+        if leader.is_null() {
+            return 0;
+        }
+        match bpf_probe_read_kernel(leader.add(o & 0xffff) as *const u64) {
+            Ok(v) => v,
+            Err(_) => 0,
+        }
     }
 }
 
@@ -750,34 +801,37 @@ pub fn module_lock_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_lock(ctx: &LsmContext) {
-    if bpf_get_current_uid_gid() as u32 != 0 {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if bpf_get_current_uid_gid() as u32 != 0 {
+            return;
+        }
+        let file: *const u8 = ctx.arg(0);
+        if file.is_null() {
+            return;
+        }
+        let kind: u64 = ctx.arg(1);
+        let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
+        if inode.is_null() {
+            return;
+        }
+        let key = crate::open_sensor::key_of(inode);
+        let bit = match MODULE_PKG_LOCKS.get(&key) {
+            Some(b) => *b,
+            None => return,
+        };
+        let start = leader_start(bpf_get_current_task() as *const u8);
+        if start == 0 {
+            return;
+        }
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let (had, prev) = match MODULE_PKG_LOCKERS.get(&tgid) {
+            Some(v) => (true, *v),
+            None => (false, PkgLocker::default()),
+        };
+        let next = locker_step(prev, had, start, kind as u32, bit);
+        let _ = MODULE_PKG_LOCKERS.insert(&tgid, &next, 0);
     }
-    let file: *const u8 = ctx.arg(0);
-    if file.is_null() {
-        return;
-    }
-    let kind: u64 = ctx.arg(1);
-    let inode = crate::open_sensor::read_ptr(file.add(off!(FILE_F_INODE_OFFSET) & 0xffff));
-    if inode.is_null() {
-        return;
-    }
-    let key = crate::open_sensor::key_of(inode);
-    let bit = match MODULE_PKG_LOCKS.get(&key) {
-        Some(b) => *b,
-        None => return,
-    };
-    let start = leader_start(bpf_get_current_task() as *const u8);
-    if start == 0 {
-        return;
-    }
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let (had, prev) = match MODULE_PKG_LOCKERS.get(&tgid) {
-        Some(v) => (true, *v),
-        None => (false, PkgLocker::default()),
-    };
-    let next = locker_step(prev, had, start, kind as u32, bit);
-    let _ = MODULE_PKG_LOCKERS.insert(&tgid, &next, 0);
 }
 
 /// Lot 285 (the coordinator's matrix): after a successful exec
@@ -788,7 +842,7 @@ unsafe fn try_lock(ctx: &LsmContext) {
 /// task's thread group is noted with its new `mm` ([`MODULE_PKG_SCRIPTS`]).
 /// A global function (scalars only): the verifier checks it once, on its
 /// own. 1 when noted.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_module_note_exec(task: u64, dev: u64, ino: u64) -> u64 {
     unsafe { note_exec(task as *const u8, dev, ino) }
@@ -796,17 +850,20 @@ pub extern "C" fn nn_module_note_exec(task: u64, dev: u64, ino: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn note_exec(task: *const u8, dev: u64, ino: u64) -> u64 {
-    if task.is_null() || (dev == 0 && ino == 0) {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if task.is_null() || (dev == 0 && ino == 0) {
+            return 0;
+        }
+        if MODULE_PKG_IMAGES.get(&InodeKey { dev, ino }).is_none() {
+            return 0;
+        }
+        let tgid = peek_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)));
+        let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET)));
+        if mm == 0 {
+            return 0;
+        }
+        let _ = MODULE_PKG_SCRIPTS.insert(&tgid, &mm, 0);
+        1
     }
-    if MODULE_PKG_IMAGES.get(&InodeKey { dev, ino }).is_none() {
-        return 0;
-    }
-    let tgid = peek_u32(task.add(off!(TASK_STRUCT_TGID_OFFSET)));
-    let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET)));
-    if mm == 0 {
-        return 0;
-    }
-    let _ = MODULE_PKG_SCRIPTS.insert(&tgid, &mm, 0);
-    1
 }

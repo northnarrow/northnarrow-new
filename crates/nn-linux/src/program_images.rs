@@ -58,8 +58,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -1354,7 +1354,7 @@ fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
                 file,
                 m,
                 through: false,
-            }
+            };
         }
         Err(true) => Copy::Replaced,
         // the review of #588 (F1): its `exe` (its leader's) not read — the
@@ -1365,7 +1365,7 @@ fn open_copy(proc_root: &Path, pid: u32, ppid: u32, exe: (u64, u64)) -> Copy {
                     file,
                     m,
                     through: false,
-                }
+                };
             }
             Group::Replaced => Copy::Replaced,
             Group::Running => Copy::Running,
@@ -2247,8 +2247,8 @@ mod tests {
         run(38_206, 38_290, &clone, Some(&fd(&clone)), 0); // under bash
         run(38_207, 38_200, &short, Some(&fd(&short)), 0); // no runtime's length
         run(38_208, 38_200, &unsealed, Some(&fd(&unsealed)), 0); // not sealed now
-                                                                 // the mini-hunt: its pid running another file now (executed again,
-                                                                 // or reused), and a zombie (its `/proc` entry, no `exe`)
+        // the mini-hunt: its pid running another file now (executed again,
+        // or reused), and a zombie (its `/proc` entry, no `exe`)
         run(38_210, 38_200, &clone, Some(&bash), 0);
         std::fs::create_dir_all(proc.0.join("38211/task/38211")).unwrap();
         std::fs::write(
@@ -2672,9 +2672,11 @@ mod tests {
         let checks = production_checks();
         // the user's own decoys spend its share (the review of #585, F2: the
         // whole of its burst)
-        assert!(checks
-            .bounds
-            .take(1000, RUNTIME_BURST_PER_UID, Instant::now()));
+        assert!(
+            checks
+                .bounds
+                .take(1000, RUNTIME_BURST_PER_UID, Instant::now())
+        );
         let link = |pid: u32, to: &Path| {
             std::fs::create_dir_all(proc.join(pid.to_string())).unwrap();
             symlink(to, proc.join(pid.to_string()).join("exe")).unwrap();
@@ -2702,9 +2704,11 @@ mod tests {
         );
         assert_eq!(checks.bounds.skipped.load(Ordering::Relaxed), 1);
         // lot 370 (F10-6): the budget spent is signed, naming the uid
-        assert!(crate::boot::degradation::entries()
-            .iter()
-            .any(|d| d.source == "runtime_copy_compare" && d.detail == budget_spent_line(1000)));
+        assert!(
+            crate::boot::degradation::entries()
+                .iter()
+                .any(|d| d.source == "runtime_copy_compare" && d.detail == budget_spent_line(1000))
+        );
         // the review of #578 (N3): the episode's first skip names who spent
         // the budget — the user itself, its decoys' share
         assert_eq!(
@@ -3592,9 +3596,11 @@ mod tests {
         )
         .unwrap();
         put(r, "/usr/bin/bash", &bash);
-        assert!(installed_under(r)
-            .iter()
-            .any(|i| i.kind == ProgramKind::Loader));
+        assert!(
+            installed_under(r)
+                .iter()
+                .any(|i| i.kind == ProgramKind::Loader)
+        );
         refresh_under(r);
         let proc_root = r.join("proc");
         let x = put(r, "/home/u/x", &loader);

@@ -2,10 +2,10 @@
 //! trust map, the package managers' images, the write history — taken from
 //! the loaded object for the controller ([`super::start`]).
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{Array, HashMap, MapData};
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
-use common::module_judge::{conf_slot, ModuleTrust, ModuleWrite};
+use aya::maps::{Array, HashMap, MapData};
+use common::module_judge::{ModuleTrust, ModuleWrite, conf_slot};
 use common::wire::InodeKey;
 
 /// `InodeKey` for aya (its own `Pod` marker; the orphan rule forbids
@@ -37,7 +37,7 @@ pub struct Kernel {
     /// Lot 370 (the lab): the package managers' lock files, by inode.
     pkg_locks: HashMap<MapData, AyaKey, u32>,
     writes: HashMap<MapData, AyaKey, AyaWrite>,
-    gen: Array<MapData, u64>,
+    write_gen: Array<MapData, u64>,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -59,7 +59,7 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
         pkg_images: HashMap::try_from(take("MODULE_PKG_IMAGES")?).context("MODULE_PKG_IMAGES")?,
         pkg_locks: HashMap::try_from(take("MODULE_PKG_LOCKS")?).context("MODULE_PKG_LOCKS")?,
         writes: HashMap::try_from(take("MODULE_WRITES")?).context("MODULE_WRITES")?,
-        gen: Array::try_from(take("MODULE_WRITE_GEN")?).context("MODULE_WRITE_GEN")?,
+        write_gen: Array::try_from(take("MODULE_WRITE_GEN")?).context("MODULE_WRITE_GEN")?,
     })
 }
 
@@ -133,6 +133,6 @@ impl Kernel {
 
     /// The write history's generation (bumped at each write recorded).
     pub fn write_gen(&self) -> u64 {
-        self.gen.get(&0, 0).unwrap_or(0)
+        self.write_gen.get(&0, 0).unwrap_or(0)
     }
 }

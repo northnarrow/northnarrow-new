@@ -80,16 +80,22 @@ pub(crate) static EXEC_SCRATCH: HashMap<TaskKey, ExeIdentityRaw> =
 /// (the helper always writes its destination).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// Lab PR 223/226 (verifier, KERNEL_COMPATIBILITY "Older verifiers", rule
@@ -105,126 +111,129 @@ pub fn exec_check_lsm(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (bprm).
-    let bprm: *const u8 = ctx.arg(0);
-    if bprm.is_null() {
-        return 0;
-    }
-    // Optional offsets, one at a time (5.15 rule 3); userland attaches
-    // this program only when all of them resolved.
-    let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    let file = peek_u64(bprm.add(o_file)) as *const u8;
-    let filename = peek_u64(bprm.add(o_filename)) as *const u8;
-    let interp = peek_u64(bprm.add(o_interp)) as *const u8;
-    let task = bpf_get_current_task() as *const u8;
-    let key = crate::task_scratch::key_of(task);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (bprm).
+        let bprm: *const u8 = ctx.arg(0);
+        if bprm.is_null() {
+            return 0;
+        }
+        // Optional offsets, one at a time (5.15 rule 3); userland attaches
+        // this program only when all of them resolved.
+        let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        let file = peek_u64(bprm.add(o_file)) as *const u8;
+        let filename = peek_u64(bprm.add(o_filename)) as *const u8;
+        let interp = peek_u64(bprm.add(o_interp)) as *const u8;
+        let task = bpf_get_current_task() as *const u8;
+        let key = crate::task_scratch::key_of(task);
 
-    // The file: identity, filesystem, memfd name, link count.
-    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-    let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
-    let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
-    let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
-    let dentry = peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-    let mut flags = exe_flags::KNOWN;
-    if magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC || magic == RAMFS_MAGIC {
-        flags |= exe_flags::TMPFS;
-    }
-    let name = peek_u64(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) as *const u8;
-    if peek_u64(name) & MEMFD_MASK == MEMFD_PREFIX {
-        flags |= exe_flags::MEMFD;
-        if magic == TMPFS_MAGIC && memfd_sealed(inode) {
-            flags |= exe_flags::MEMFD_SEALED;
+        // The file: identity, filesystem, memfd name, link count.
+        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+        let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+        let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+        let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
+        let dentry = peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+        let mut flags = exe_flags::KNOWN;
+        if magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC || magic == RAMFS_MAGIC {
+            flags |= exe_flags::TMPFS;
         }
-    }
-    if let Some(o) = off_opt!(INODE_I_NLINK_OFFSET) {
-        if peek_u32(inode.add(o & 0xffff)) == 0 {
-            flags |= exe_flags::DELETED;
+        let name = peek_u64(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) as *const u8;
+        if peek_u64(name) & MEMFD_MASK == MEMFD_PREFIX {
+            flags |= exe_flags::MEMFD;
+            if magic == TMPFS_MAGIC && memfd_sealed(inode) {
+                flags |= exe_flags::MEMFD_SEALED;
+            }
         }
-    }
-    let pass: u8 = if interp == filename { 0 } else { 1 };
-    let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
-        Some(p) => p,
-        // The review of #546 (F4, F5): the map full — counted. Lot 325
-        // (the re-check, R5): judged on what needs no walk; a protected
-        // target refused, the rest let through and recorded. It refused
-        // every exec in enforce mode: a flood of execs in flight (a fork
-        // bomb) stopped the host's.
-        // The verdict as a constant (a global function's result is a
-        // scalar the verifier cannot range: 6.12+ checks an LSM program's
-        // return value).
-        None => {
-            let refuse = crate::execpol::nn_exec_unwalked(
-                inode as u64,
+        if let Some(o) = off_opt!(INODE_I_NLINK_OFFSET) {
+            if peek_u32(inode.add(o & 0xffff)) == 0 {
+                flags |= exe_flags::DELETED;
+            }
+        }
+        let pass: u8 = if interp == filename { 0 } else { 1 };
+        let s = match crate::task_scratch::make(&EXEC_SCRATCH, &key) {
+            Some(p) => p,
+            // The review of #546 (F4, F5): the map full — counted. Lot 325
+            // (the re-check, R5): judged on what needs no walk; a protected
+            // target refused, the rest let through and recorded. It refused
+            // every exec in enforce mode: a flood of execs in flight (a fork
+            // bomb) stopped the host's.
+            // The verdict as a constant (a global function's result is a
+            // scalar the verifier cannot range: 6.12+ checks an LSM program's
+            // return value).
+            None => {
+                let refuse = crate::execpol::nn_exec_unwalked(
+                    inode as u64,
+                    dentry as u64,
+                    task as u64,
+                    u64::from(flags) | (u64::from(pass) << 32),
+                );
+                return if refuse != 0 { -13 } else { 0 };
+            }
+        };
+        // The task's root, where the walk stops.
+        let task_root = task_root_of(task);
+        (*s).dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
+        (*s).ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
+        (*s).pass = pass;
+        (*s)._pad = 0;
+        (*s).flags = flags
+            | (nn_exe_walk(
                 dentry as u64,
-                task as u64,
-                u64::from(flags) | (u64::from(pass) << 32),
-            );
-            return if refuse != 0 { -13 } else { 0 };
-        }
-    };
-    // The task's root, where the walk stops.
-    let task_root = task_root_of(task);
-    (*s).dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
-    (*s).ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
-    (*s).pass = pass;
-    (*s)._pad = 0;
-    (*s).flags = flags
-        | (nn_exe_walk(
-            dentry as u64,
-            task_root as u64,
-            u64::from(key.tid),
-            key.start_ns,
-        ) as u32);
+                task_root as u64,
+                u64::from(key.tid),
+                key.start_ns,
+            ) as u32);
 
-    // One record per pass.
-    match crate::exec_check::EXEC_CHECK_EVENTS.reserve::<ExecCheckRaw>(0) {
-        Some(mut entry) => {
-            let raw: *mut ExecCheckRaw = entry.as_mut_ptr();
-            crate::zero::zero(raw);
-            let pid_tgid = bpf_get_current_pid_tgid();
-            let uid_gid = bpf_get_current_uid_gid();
-            (*raw).pid = (pid_tgid >> 32) as u32;
-            (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
-            (*raw).gid = (uid_gid >> 32) as u32;
-            (*raw).timestamp_ns = bpf_ktime_get_ns();
-            let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
-            (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
-            crate::comm::comm_into(&mut (*raw).comm);
-            let _ = generated::bpf_probe_read_kernel_str(
-                (*raw).filename.as_mut_ptr() as *mut c_void,
-                FILENAME_LEN as u32,
-                filename as *const c_void,
-            );
-            let _ = generated::bpf_probe_read_kernel(
-                &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
-                core::mem::size_of::<ExeIdentityRaw>() as u32,
-                s as *const c_void,
-            );
-            entry.submit(0);
+        // One record per pass.
+        match crate::exec_check::EXEC_CHECK_EVENTS.reserve::<ExecCheckRaw>(0) {
+            Some(mut entry) => {
+                let raw: *mut ExecCheckRaw = entry.as_mut_ptr();
+                crate::zero::zero(raw);
+                let pid_tgid = bpf_get_current_pid_tgid();
+                let uid_gid = bpf_get_current_uid_gid();
+                (*raw).pid = (pid_tgid >> 32) as u32;
+                (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+                (*raw).gid = (uid_gid >> 32) as u32;
+                (*raw).timestamp_ns = bpf_ktime_get_ns();
+                let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+                (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
+                crate::comm::comm_into(&mut (*raw).comm);
+                let _ = generated::bpf_probe_read_kernel_str(
+                    (*raw).filename.as_mut_ptr() as *mut c_void,
+                    FILENAME_LEN as u32,
+                    filename as *const c_void,
+                );
+                let _ = generated::bpf_probe_read_kernel(
+                    &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
+                    core::mem::size_of::<ExeIdentityRaw>() as u32,
+                    s as *const c_void,
+                );
+                entry.submit(0);
+            }
+            None => crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXEC_CHECK),
         }
-        None => crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXEC_CHECK),
+        // Pass 0: the file the caller named, for the post-exec record.
+        if pass == 0 {
+            let _ = EXEC_HANDOFF.insert(&(task as u64), &*s, 0);
+        }
+        // Lab PR 226 (EXPERIMENTAL): the exec policy, then the exec
+        // quarantine's candidate (lab PR 223), stopped by `sched_process_exec`
+        // once the exec succeeded. Two array reads when both are off.
+        let rc = crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);
+        let _ = EXEC_SCRATCH.remove(&key);
+        rc
     }
-    // Pass 0: the file the caller named, for the post-exec record.
-    if pass == 0 {
-        let _ = EXEC_HANDOFF.insert(&(task as u64), &*s, 0);
-    }
-    // Lab PR 226 (EXPERIMENTAL): the exec policy, then the exec
-    // quarantine's candidate (lab PR 223), stopped by `sched_process_exec`
-    // once the exec succeeded. Two array reads when both are off.
-    let rc = crate::execpol::on_pass(s, inode, dentry, task as u64, pass, &key);
-    let _ = EXEC_SCRATCH.remove(&key);
-    rc
 }
 
 /// Lot 347 (the review of #556, F1): the memfd whose inode is `inode` (a
@@ -237,18 +246,21 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
 /// when either optional offset is absent or the read fails (no exemption).
 #[inline(always)]
 unsafe fn memfd_sealed(inode: *const u8) -> bool {
-    // one optional offset at a time (5.15 rule 3)
-    let seals_off = match off_opt!(SHMEM_INODE_INFO_SEALS_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return false,
-    };
-    let vfs_off = match off_opt!(SHMEM_INODE_INFO_VFS_INODE_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return false,
-    };
-    // container_of(inode, struct shmem_inode_info, vfs_inode)
-    let info = (inode as usize).wrapping_sub(vfs_off) as *const u8;
-    peek_u32(info.add(seals_off)) & MEMFD_SEALS == MEMFD_SEALS
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // one optional offset at a time (5.15 rule 3)
+        let seals_off = match off_opt!(SHMEM_INODE_INFO_SEALS_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return false,
+        };
+        let vfs_off = match off_opt!(SHMEM_INODE_INFO_VFS_INODE_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return false,
+        };
+        // container_of(inode, struct shmem_inode_info, vfs_inode)
+        let info = (inode as usize).wrapping_sub(vfs_off) as *const u8;
+        peek_u32(info.add(seals_off)) & MEMFD_SEALS == MEMFD_SEALS
+    }
 }
 
 /// The dentry of `task`'s root (`task->fs->root.dentry`): where the walk
@@ -256,16 +268,19 @@ unsafe fn memfd_sealed(inode: *const u8) -> bool {
 /// without the two optional offsets: neither stops then.
 #[inline(always)]
 pub(crate) unsafe fn task_root_of(task: *const u8) -> *const u8 {
-    if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
-        if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
-            let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
-            if fs.is_null() {
-                return core::ptr::null();
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if let Some(o_fs) = off_opt!(TASK_STRUCT_FS_OFFSET) {
+            if let Some(o_root) = off_opt!(FS_STRUCT_ROOT_OFFSET) {
+                let fs = peek_u64(task.add(o_fs & 0xffff)) as *const u8;
+                if fs.is_null() {
+                    return core::ptr::null();
+                }
+                return peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
             }
-            return peek_u64(fs.add((o_root & 0xffff) + off!(PATH_DENTRY_OFFSET))) as *const u8;
         }
+        core::ptr::null()
     }
-    core::ptr::null()
 }
 
 /// The dentry walk of [`exec_check_lsm`]: writes the path slots, the
@@ -276,7 +291,7 @@ pub(crate) unsafe fn task_root_of(task: *const u8) -> *const u8 {
 /// A global BPF function (exported, never inlined, integer arguments):
 /// the verifier checks its 64-level loop once, on its own
 /// (KERNEL_COMPATIBILITY, 5.15 rule 6).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_exe_walk(dentry: u64, task_root: u64, tid: u64, start: u64) -> u64 {
     unsafe {
@@ -291,50 +306,53 @@ pub extern "C" fn nn_exe_walk(dentry: u64, task_root: u64, tid: u64, start: u64)
 /// check's: `crate::execpol`).
 #[inline(always)]
 pub(crate) unsafe fn exe_walk(s: *mut ExeIdentityRaw, dentry: *const u8, task_root: *const u8) -> u64 {
-    let o_parent = off!(DENTRY_D_PARENT_OFFSET);
-    let o_inode = off!(DENTRY_D_INODE_OFFSET);
-    let o_name = off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET);
-    let path = (*s).path.as_mut_ptr();
-    let mut flags = exe_flags::UNRESOLVED;
-    let mut levels: u16 = 0;
-    // Volatile: two plain zero stores became a `memset` call (rule 9).
-    core::ptr::write_volatile(&mut (*s).root_dev, 0);
-    core::ptr::write_volatile(&mut (*s).root_ino, 0);
-    let mut d = dentry;
-    for level in 0..EXE_WALK_DEPTH {
-        if d.is_null() {
-            break;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_parent = off!(DENTRY_D_PARENT_OFFSET);
+        let o_inode = off!(DENTRY_D_INODE_OFFSET);
+        let o_name = off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET);
+        let path = (*s).path.as_mut_ptr();
+        let mut flags = exe_flags::UNRESOLVED;
+        let mut levels: u16 = 0;
+        // Volatile: two plain zero stores became a `memset` call (rule 9).
+        core::ptr::write_volatile(&mut (*s).root_dev, 0);
+        core::ptr::write_volatile(&mut (*s).root_ino, 0);
+        let mut d = dentry;
+        for level in 0..EXE_WALK_DEPTH {
+            if d.is_null() {
+                break;
+            }
+            // The task's root is where the task's own view starts: its name
+            // is not part of the path.
+            if level > 0 && d == task_root {
+                flags = exe_flags::TASK_ROOT;
+                break;
+            }
+            let slot = exe_path_slot(level);
+            let name = peek_u64(d.add(o_name)) as *const c_void;
+            let _ = generated::bpf_probe_read_kernel_str(
+                path.add(slot * EXE_PATH_SLOT_LEN) as *mut c_void,
+                EXE_PATH_SLOT_LEN as u32,
+                name,
+            );
+            levels = (level + 1) as u16;
+            let up = peek_u64(d.add(o_parent)) as *const u8;
+            if up == d {
+                // The filesystem's root: userland maps its key to a mount point.
+                let inode = peek_u64(d.add(o_inode)) as *const u8;
+                let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+                let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+                (*s).root_dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
+                (*s).root_ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
+                flags = 0;
+                break;
+            }
+            d = up;
         }
-        // The task's root is where the task's own view starts: its name
-        // is not part of the path.
-        if level > 0 && d == task_root {
-            flags = exe_flags::TASK_ROOT;
-            break;
+        (*s).levels = levels;
+        if levels as usize > EXE_PATH_SLOTS {
+            flags |= exe_flags::DEEP;
         }
-        let slot = exe_path_slot(level);
-        let name = peek_u64(d.add(o_name)) as *const c_void;
-        let _ = generated::bpf_probe_read_kernel_str(
-            path.add(slot * EXE_PATH_SLOT_LEN) as *mut c_void,
-            EXE_PATH_SLOT_LEN as u32,
-            name,
-        );
-        levels = (level + 1) as u16;
-        let up = peek_u64(d.add(o_parent)) as *const u8;
-        if up == d {
-            // The filesystem's root: userland maps its key to a mount point.
-            let inode = peek_u64(d.add(o_inode)) as *const u8;
-            let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
-            let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
-            (*s).root_dev = crate::inode_dev::stat_dev(inode, sb, s_dev) as u64;
-            (*s).root_ino = peek_u64(inode.add(off!(INODE_I_INO_OFFSET)));
-            flags = 0;
-            break;
-        }
-        d = up;
+        u64::from(flags)
     }
-    (*s).levels = levels;
-    if levels as usize > EXE_PATH_SLOTS {
-        flags |= exe_flags::DEEP;
-    }
-    u64::from(flags)
 }

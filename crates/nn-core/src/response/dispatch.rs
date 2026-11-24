@@ -723,9 +723,10 @@ mod tests {
                 taken.entry(t.job.pid).or_default().extend(&t.job.decisions);
             }
             // only throttles and blocks are superseded, each once
-            assert!(gone
-                .iter()
-                .all(|d| matches!(action_of[d], "throttle" | "block")));
+            assert!(
+                gone.iter()
+                    .all(|d| matches!(action_of[d], "throttle" | "block"))
+            );
             for (pid, ds) in &submitted {
                 let got = taken.get(pid).cloned().unwrap_or_default();
                 // every decision taken or superseded, once

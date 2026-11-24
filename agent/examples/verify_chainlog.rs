@@ -39,7 +39,10 @@ fn main() {
         Ok(rep) => {
             println!(
                 "VERIFY OK  active={active}  earliest_retained_seq={}  archives_verified={}  total_records={}  checkpoints_verified={}",
-                rep.earliest_retained_seq, rep.archives_verified, rep.total_records, rep.checkpoints_verified
+                rep.earliest_retained_seq,
+                rep.archives_verified,
+                rep.total_records,
+                rep.checkpoints_verified
             );
         }
         Err(e) => {

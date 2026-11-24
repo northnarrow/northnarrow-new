@@ -9,7 +9,7 @@
 //! The check reads the ELF64 section headers only (no dependency, no
 //! parse of the BTF itself): a section named `.BTF` with a non-zero size.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))

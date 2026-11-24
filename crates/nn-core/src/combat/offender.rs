@@ -11,7 +11,7 @@
 //! Data and its rendering only: `/proc` is read by the actuator
 //! (`actuator::read_proc_facts`, the Linux side).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The longest executable or cgroup path a row carries, in bytes. A longer
 /// one keeps its end (the file, the unit or container that names it) after

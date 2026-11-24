@@ -71,7 +71,7 @@ use common::wire::exe::exe_flags;
 use nn_core::decision::rules::kmod_exec_facts::{
     self, Credentials, Environment, ExecFacts, KMOD_TOOLS,
 };
-use nn_core::posture::lineage::{in_system_tree, PACKAGE_MANAGER_EXES};
+use nn_core::posture::lineage::{PACKAGE_MANAGER_EXES, in_system_tree};
 use nn_model::{Event, ExeIdentity};
 use parking_lot::Mutex;
 
@@ -838,7 +838,7 @@ fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Optio
             return (
                 Environment::Exited(format!("no process had its pid any more ({e})")),
                 None,
-            )
+            );
         }
         Err(e) => {
             return (
@@ -846,7 +846,7 @@ fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Optio
                     "its pidfd could not be opened ({e}): its environment was not read"
                 )),
                 None,
-            )
+            );
         }
     };
     // The pidfd holds the process: `/proc/<pid>` describes it while it runs
@@ -861,19 +861,19 @@ fn environment_read(proc: &Path, pid: u32, start_ns: u64) -> (Environment, Optio
                     "its pid names another process now (its start is not the exec's)".to_string(),
                 ),
                 None,
-            )
+            );
         }
         None if pidfd_exited(&fd) => {
             return (
                 Environment::Exited("it was reaped before its /proc entry was read".to_string()),
                 None,
-            )
+            );
         }
         None => {
             return (
                 Environment::Refused("its /proc entry could not be read".to_string()),
                 None,
-            )
+            );
         }
     }
     let mut env = Vec::new();
@@ -930,7 +930,7 @@ fn running_thread(proc: &Path, pid: u32, fd: &OwnedFd) -> Option<Environment> {
         Err(e) => {
             return Some(Environment::Refused(format!(
                 "its leader showed no memory and its threads could not be listed ({e})"
-            )))
+            )));
         }
     };
     let runs = |tid: &std::ffi::OsStr| {
@@ -1914,7 +1914,7 @@ mod tests {
     /// (fails on the lot's first head: any value was kept).
     #[test]
     fn an_opt_library_directory_a_user_can_write_is_not_kept() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("root");
         let lib = root.join("var/lib/containerd/opt/lib");

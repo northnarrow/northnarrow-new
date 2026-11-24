@@ -30,7 +30,7 @@ pub type CombatReleaseHook = nn_core::posture::CombatReleaseHook<
     <LinuxHost as nn_core::posture::host::PostureAgent>::UnlockToken,
 >;
 
-pub use exempt::{resolve_verified_watchdog_pid, sibling_watchdog_exe, ExemptPids};
+pub use exempt::{ExemptPids, resolve_verified_watchdog_pid, sibling_watchdog_exe};
 pub use lineage::AuthSessionTracker;
 pub use triggers::TriggerDetector;
 

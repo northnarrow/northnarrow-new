@@ -6,12 +6,12 @@
 use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity};
 
+use super::Rule;
 use super::rules::testutil::{spawn, spawn_as};
 use super::rules::{
     R001ExecFromTmp, R002ExecFromDevShm, R003ExecFromVarTmp, R008HiddenHomeBinary,
     R010BinaryInWebroot,
 };
-use super::Rule;
 use crate::decision::host::DecisionHost;
 use crate::posture::host::testing::TestHost as H;
 
@@ -654,7 +654,7 @@ fn io_uring_and_bpf_events_reach_their_rules_in_both_engines() {
 /// never held back.
 #[test]
 fn a_demo_build_enforces_only_with_the_operators_consent() {
-    use super::engine::{demo_rules_gate, ALLOW_DEMO_RULES_ENV};
+    use super::engine::{ALLOW_DEMO_RULES_ENV, demo_rules_gate};
     // demo build, enforcement: refused without the variable, or with any
     // value other than 1
     for allow in [
@@ -1097,9 +1097,11 @@ fn a_staging_listener_on_8080_is_recorded() {
     assert_eq!(v.rule_id, "NN-L-NET-019_WildcardListener");
     assert_eq!(v.action, ResponseAction::Log);
     assert_eq!(v.severity, Severity::Medium);
-    assert!(engine
-        .evaluate(&listen("/usr/sbin/lighttpd", "lighttpd"))
-        .is_none());
+    assert!(
+        engine
+            .evaluate(&listen("/usr/sbin/lighttpd", "lighttpd"))
+            .is_none()
+    );
 }
 
 /// Lab PR 221: the engine hands back the ATT&CK references of the rule
@@ -1114,9 +1116,11 @@ fn the_engine_returns_the_attack_references_of_the_rule_that_fired() {
     assert_eq!(v.rule_id, "R001_ExecFromTmp");
     assert_eq!(refs, R001ExecFromTmp::default().attack());
     assert!(!refs.is_empty());
-    assert!(engine
-        .evaluate_with_attack(&spawn("ls", "/usr/bin/ls"))
-        .is_none());
+    assert!(
+        engine
+            .evaluate_with_attack(&spawn("ls", "/usr/bin/ls"))
+            .is_none()
+    );
 }
 // ── Lab PR 224 (CM-02): a flow judged in its phases ─────────────────────
 
@@ -1347,16 +1351,18 @@ fn a_refused_connect_is_net_001s_record() {
         "{}",
         v.reasoning
     );
-    assert!(engine
-        .evaluate(&tcp_row(
-            4401,
-            "/tmp/x",
-            "198.51.100.7",
-            4444,
-            9,
-            FlowPhase::Denied
-        ))
-        .is_none());
+    assert!(
+        engine
+            .evaluate(&tcp_row(
+                4401,
+                "/tmp/x",
+                "198.51.100.7",
+                4444,
+                9,
+                FlowPhase::Denied
+            ))
+            .is_none()
+    );
 }
 
 /// Lab PR 224: the cost of judging a flow at its connect, in the production
@@ -1560,10 +1566,11 @@ fn shadow_fim023_fires_with_fim009_on_a_timer() {
     // Lot 283b: NN-L-FIM-009's kill of the writer is held (a record); the
     // timer's own rule kills it, and is the primary.
     assert_eq!(d.verdict.rule_id, "NN-L-FIM-023_SystemdTimerCreated");
-    assert!(d
-        .attack()
-        .iter()
-        .any(|a| a.technique.as_str() == "T1053.006"));
+    assert!(
+        d.attack()
+            .iter()
+            .any(|a| a.technique.as_str() == "T1053.006")
+    );
     assert_eq!(d.responses.len(), 1, "one kill of the writer");
     assert_eq!(d.responses[0].rule_id, "NN-L-FIM-023_SystemdTimerCreated");
 }
@@ -1598,10 +1605,11 @@ fn shadow_fim004_is_recorded_and_its_kill_waits_for_enforce() {
     let k = d.primary();
     assert_eq!(k.held, Some(super::combine::LEGACY_CEILING));
     assert_eq!(k.held_action, Some(ResponseAction::KillProcess));
-    assert!(d
-        .verdict
-        .reasoning
-        .contains("`enforce NN-L-FIM-004` in the signed per-rule policy lifts it"));
+    assert!(
+        d.verdict
+            .reasoning
+            .contains("`enforce NN-L-FIM-004` in the signed per-rule policy lifts it")
+    );
     let d = prod("enforce NN-L-FIM-004\n")
         .decide(&keys())
         .expect("a decision");
@@ -1663,10 +1671,11 @@ fn below_combat_r009_records_and_its_record_holds_the_staging_kill() {
             "{posture}"
         );
         assert_eq!(d.responses.len(), 1);
-        assert!(d
-            .verdict
-            .reasoning
-            .contains("enforced by the signed per-rule policy"));
+        assert!(
+            d.verdict
+                .reasoning
+                .contains("enforced by the signed per-rule policy")
+        );
     }
     let d = prod("enforce R001_ExecFromTmp\n")
         .decide_in(&exec, PostureKind::Observing)
@@ -2371,10 +2380,11 @@ fn a_person_s_exec_from_tmp_is_recorded_a_system_account_s_is_killed() {
             .decide_in(&spawn_as(1000, "calc.test", path), PostureKind::Observing)
             .expect("a decision");
         assert_eq!(d.verdict.action, ResponseAction::KillProcessTree, "{rule}");
-        assert!(d
-            .verdict
-            .reasoning
-            .contains("enforced by the signed per-rule policy"));
+        assert!(
+            d.verdict
+                .reasoning
+                .contains("enforced by the signed per-rule policy")
+        );
     }
 }
 
@@ -2946,9 +2956,10 @@ fn an_aged_chain_record_does_not_take_a_fresh_reads_kill() {
             ts,
         )
     };
-    assert!(p
-        .decide(&read(s0 + SEC))
-        .is_none_or(|d| d.verdict.action == ResponseAction::Log));
+    assert!(
+        p.decide(&read(s0 + SEC))
+            .is_none_or(|d| d.verdict.action == ResponseAction::Log)
+    );
     let connect = s0 + 401 * SEC;
     let row = |phase| tcp_row(4600, "/usr/bin/gpg", "93.184.216.34", 443, connect, phase);
     let at_connect = p.decide(&row(FlowPhase::Connect)).expect("the aged record");
@@ -2961,12 +2972,14 @@ fn an_aged_chain_record_does_not_take_a_fresh_reads_kill() {
         (ResponseAction::Log, Severity::High)
     );
     // no new read: the aged record is not repeated
-    assert!(p
-        .decide(&row(FlowPhase::Snapshot))
-        .is_none_or(|d| !ids(&d).iter().any(|id| id.starts_with("NN-L-CHAIN-"))));
-    assert!(p
-        .decide(&read(connect + 30 * SEC))
-        .is_none_or(|d| d.verdict.action == ResponseAction::Log));
+    assert!(
+        p.decide(&row(FlowPhase::Snapshot))
+            .is_none_or(|d| !ids(&d).iter().any(|id| id.starts_with("NN-L-CHAIN-")))
+    );
+    assert!(
+        p.decide(&read(connect + 30 * SEC))
+            .is_none_or(|d| d.verdict.action == ResponseAction::Log)
+    );
     let snap = p.decide(&row(FlowPhase::Snapshot));
     assert!(
         kills(&snap),

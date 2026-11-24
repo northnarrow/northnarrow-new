@@ -83,8 +83,11 @@ fn the_environment_is_read_to_its_end() {
         ],
     );
     // the rounds cover the cap, whatever the judged names took of them
-    assert!(flat(&pol)
-        .contains("const _: () = assert!(ENV_ROUNDS * ENV_STEPS_MID * ENV_STEP == ENV_SCAN_CAP);"));
+    assert!(
+        flat(&pol).contains(
+            "const _: () = assert!(ENV_ROUNDS * ENV_STEPS_MID * ENV_STEP == ENV_SCAN_CAP);"
+        )
+    );
     assert!(
         flat(&pol).contains("const ROUND_CALLS: usize = ENV_STEPS_MID + ENV_JUDGED_MAX as usize;")
     );
@@ -156,15 +159,17 @@ fn the_environment_is_read_to_its_end() {
     ] {
         assert!(
             flat(&pol).contains(&format!(
-                "#[no_mangle] #[inline(never)] pub extern \"C\" fn {f}("
+                "#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn {f}("
             )),
             "{f} is a global function"
         );
     }
     // the cap is above the kernel's own limit (the wire's test pins it)
     let wire = code("common/src/wire/execpol.rs");
-    assert!(flat(&wire)
-        .contains("pub const ENV_SCAN_CAP: usize = ENV_STEP * ENV_STEPS_MID * ENV_ROUNDS;"));
+    assert!(
+        flat(&wire)
+            .contains("pub const ENV_SCAN_CAP: usize = ENV_STEP * ENV_STEPS_MID * ENV_ROUNDS;")
+    );
     // an environment the scan could not finish: refused at a protected
     // target (the tier's rule refuses a staging preload) or a set-id one,
     // counted, recorded
@@ -388,10 +393,14 @@ fn every_occurrence_of_a_loader_variable_is_judged() {
         ],
     );
     // judged after each variable, by the first pass and the post-commit one
-    assert!(body(&pol, "nn_env_pending")
-        .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);"));
-    assert!(body(&pol, "nn_env_region_round")
-        .contains("nn_env_judge(nn_env_var(p, 0, 0, 1), p, 0, 0, 1);"));
+    assert!(
+        body(&pol, "nn_env_pending")
+            .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);")
+    );
+    assert!(
+        body(&pol, "nn_env_region_round")
+            .contains("nn_env_judge(nn_env_var(p, 0, 0, 1), p, 0, 0, 1);")
+    );
     assert!(body(&pol, "env_scan").contains("let f = nn_env_resolve(0, tid, start) as u32;"));
     assert!(body(&pol, "nn_env_region").contains("nn_env_resolve(1, 0, 0)"));
     assert!(body(&pol, "nn_env_resolve").contains("resolve_bare(e);"));
@@ -486,8 +495,11 @@ fn a_flood_of_execs_keeps_protected_targets_closed() {
     assert!(flat(&pol).contains(
         "static COMMIT_ENV: PerCpuArray<EnvScan> = PerCpuArray::with_max_entries(1, 0);"
     ));
-    assert!(body(&pol, "env_commit")
-        .contains("let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));"));
+    assert!(
+        body(&pol, "env_commit").contains(
+            "let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));"
+        )
+    );
     // the agent: counted, a signed degradation while the counts move
     let c = code("agent/src/execpol/controller.rs");
     in_order(
@@ -695,8 +707,10 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
     assert!(
         code("agent/src/exec_guards.rs").contains("nn_linux::sensors::share_subuid::ensure(ebpf)")
     );
-    assert!(code("crates/nn-linux/src/fim/attach.rs")
-        .contains("crate::sensors::share_subuid::ensure(ebpf)"));
+    assert!(
+        code("crates/nn-linux/src/fim/attach.rs")
+            .contains("crate::sensors::share_subuid::ensure(ebpf)")
+    );
     let pubr = code("crates/nn-linux/src/sensors/share_subuid.rs");
     assert!(pubr.contains("pub const MAP: &str = \"SHARE_SUBUID\";"));
     // the trie's key is the uid big-endian on both sides (an LPM trie
@@ -985,7 +999,10 @@ fn the_environment_has_its_own_program() {
     // recorded whenever the judgment acts (refuses, would, records)
     assert!(flat(body(&pol, "try_exec_env_lsm")).contains("if env_act != 0 { nn_env_report("));
     // the record, its path walked, checked once (a global function)
-    assert!(flat(&pol).contains("#[no_mangle] #[inline(never)] pub extern \"C\" fn nn_env_report("));
+    assert!(
+        flat(&pol)
+            .contains("#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn nn_env_report(")
+    );
     assert!(body(&pol, "nn_env_report").contains("report_env_pass("));
     let op = body(&pol, "on_pass");
     for not in ["nn_exec_env(", "env_deny_rule", "EXECPOL_ENV_SEEN"] {

@@ -204,33 +204,45 @@ fn slice(slot: u32) -> u64 {
 
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
-    let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u16>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// `(dev, ino)` of `inode`, as `stat()` reports them.
 #[inline(always)]
 unsafe fn inode_key(inode: *const u8) -> ExecqKey {
-    let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
-    let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
-    ExecqKey {
-        dev: crate::inode_dev::stat_dev(inode, sb, s_dev) as u64,
-        ino: peek_u64(inode.add(off!(INODE_I_INO_OFFSET))),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+        let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+        ExecqKey {
+            dev: crate::inode_dev::stat_dev(inode, sb, s_dev) as u64,
+            ino: peek_u64(inode.add(off!(INODE_I_INO_OFFSET))),
+        }
     }
 }
 
@@ -238,35 +250,41 @@ unsafe fn inode_key(inode: *const u8) -> ExecqKey {
 /// kernel thread.
 #[inline(always)]
 unsafe fn exe_inode(task: *const u8) -> *const u8 {
-    let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
-    if mm.is_null() {
-        return core::ptr::null();
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
+        if mm.is_null() {
+            return core::ptr::null();
+        }
+        let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+        if file.is_null() {
+            return core::ptr::null();
+        }
+        peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8
     }
-    let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
-    if file.is_null() {
-        return core::ptr::null();
-    }
-    peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8
 }
 
 /// The `EXECPOL_IMAGES` role of `task`'s executable (0: none).
 #[inline(always)]
 unsafe fn image_role_of(task: *const u8) -> u32 {
-    let inode = exe_inode(task);
-    if inode.is_null() {
-        return 0;
-    }
-    let key = inode_key(inode);
-    match EXECPOL_IMAGES.get(&key) {
-        Some(v) => *v,
-        None => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let inode = exe_inode(task);
+        if inode.is_null() {
+            return 0;
+        }
+        let key = inode_key(inode);
+        match EXECPOL_IMAGES.get(&key) {
+            Some(v) => *v,
+            None => 0,
+        }
     }
 }
 
 /// The caller's lineage tier ([`tier`]) and the signals it rests on
 /// ([`tier_sig`]). A global function (integer argument, never inlined):
 /// the verifier checks its lineage loop once, apart from the hooks.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_execpol_tier(task: u64) -> u64 {
     unsafe { u64::from(tier_of(task as *const u8)) }
@@ -274,77 +292,80 @@ pub extern "C" fn nn_execpol_tier(task: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn tier_of(task: *const u8) -> u32 {
-    let uid = bpf_get_current_uid_gid() as u32;
-    let mut sig = 0u32;
-    if uid == 0 {
-        sig |= tier_sig::ROOT;
-    }
-    let sys = slice(slice_slot::SYSTEM);
-    let user = slice(slice_slot::USER);
-    if sys == 0 && user == 0 {
-        return tier::UNKNOWN | sig | tier_sig::NO_SLICES;
-    }
-    // Level 1: the top-level slice the caller's cgroup is under. Lot 273d
-    // (the short re-check of #497, NB5): the units' own `northnarrow.slice`
-    // is a service slice, as `system.slice` was for them.
-    let ours = slice(slice_slot::OURS);
-    let cg1 = generated::bpf_get_current_ancestor_cgroup_id(1);
-    if cg1 != 0 && cg1 == sys {
-        return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;
-    }
-    // the last review of #497 (NC2): named as our slice
-    if cg1 != 0 && cg1 == ours {
-        return tier::SERVICE | sig | tier_sig::OUR_SLICE;
-    }
-    if cg1 == 0 || cg1 != user {
-        return tier::UNKNOWN | sig;
-    }
-    sig |= tier_sig::USER_SLICE;
-    let login = match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
-        Some(o) => peek_u32(task.add(o & 0xffff)),
-        None => u32::MAX,
-    };
-    if login == u32::MAX {
-        return tier::UNKNOWN | sig;
-    }
-    sig |= tier_sig::LOGIN;
-    if let Some(o_sig) = off_opt!(TASK_STRUCT_SIGNAL_OFFSET) {
-        if let Some(o_tty) = off_opt!(SIGNAL_STRUCT_TTY_OFFSET) {
-            let signal = peek_u64(task.add(o_sig & 0xffff)) as *const u8;
-            if !signal.is_null() && peek_u64(signal.add(o_tty & 0xffff)) != 0 {
-                sig |= tier_sig::TTY;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let uid = bpf_get_current_uid_gid() as u32;
+        let mut sig = 0u32;
+        if uid == 0 {
+            sig |= tier_sig::ROOT;
+        }
+        let sys = slice(slice_slot::SYSTEM);
+        let user = slice(slice_slot::USER);
+        if sys == 0 && user == 0 {
+            return tier::UNKNOWN | sig | tier_sig::NO_SLICES;
+        }
+        // Level 1: the top-level slice the caller's cgroup is under. Lot 273d
+        // (the short re-check of #497, NB5): the units' own `northnarrow.slice`
+        // is a service slice, as `system.slice` was for them.
+        let ours = slice(slice_slot::OURS);
+        let cg1 = generated::bpf_get_current_ancestor_cgroup_id(1);
+        if cg1 != 0 && cg1 == sys {
+            return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;
+        }
+        // the last review of #497 (NC2): named as our slice
+        if cg1 != 0 && cg1 == ours {
+            return tier::SERVICE | sig | tier_sig::OUR_SLICE;
+        }
+        if cg1 == 0 || cg1 != user {
+            return tier::UNKNOWN | sig;
+        }
+        sig |= tier_sig::USER_SLICE;
+        let login = match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
+            Some(o) => peek_u32(task.add(o & 0xffff)),
+            None => u32::MAX,
+        };
+        if login == u32::MAX {
+            return tier::UNKNOWN | sig;
+        }
+        sig |= tier_sig::LOGIN;
+        if let Some(o_sig) = off_opt!(TASK_STRUCT_SIGNAL_OFFSET) {
+            if let Some(o_tty) = off_opt!(SIGNAL_STRUCT_TTY_OFFSET) {
+                let signal = peek_u64(task.add(o_sig & 0xffff)) as *const u8;
+                if !signal.is_null() && peek_u64(signal.add(o_tty & 0xffff)) != 0 {
+                    sig |= tier_sig::TTY;
+                }
             }
         }
-    }
-    if uid != 0 || sig & tier_sig::TTY == 0 {
-        return tier::SESSION | sig;
-    }
-    // Root with a terminal in a login session: a root login, or an
-    // elevation binary up the lineage (the caller itself included: the
-    // child sudo forks has not exec'd yet).
-    let mut t = task;
-    let mut elevated = false;
-    for _ in 0..LINEAGE_HOPS {
-        if t.is_null() {
-            break;
+        if uid != 0 || sig & tier_sig::TTY == 0 {
+            return tier::SESSION | sig;
         }
-        if image_role_of(t) & image_role::ELEVATION != 0 {
-            elevated = true;
-            break;
+        // Root with a terminal in a login session: a root login, or an
+        // elevation binary up the lineage (the caller itself included: the
+        // child sudo forks has not exec'd yet).
+        let mut t = task;
+        let mut elevated = false;
+        for _ in 0..LINEAGE_HOPS {
+            if t.is_null() {
+                break;
+            }
+            if image_role_of(t) & image_role::ELEVATION != 0 {
+                elevated = true;
+                break;
+            }
+            let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+            if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
+                break;
+            }
+            t = up;
         }
-        let up = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
-        if up.is_null() || up == t || peek_u32(up.add(off!(TASK_STRUCT_TGID_OFFSET))) <= 1 {
-            break;
+        if elevated {
+            sig |= tier_sig::ELEVATED;
         }
-        t = up;
-    }
-    if elevated {
-        sig |= tier_sig::ELEVATED;
-    }
-    if login == 0 || elevated {
-        tier::ADMIN | sig
-    } else {
-        tier::SESSION | sig
+        if login == 0 || elevated {
+            tier::ADMIN | sig
+        } else {
+            tier::SESSION | sig
+        }
     }
 }
 
@@ -353,30 +374,33 @@ unsafe fn tier_of(task: *const u8) -> u32 {
 /// exec re-runs the caller's own image. `sig` gets the reason.
 #[inline(always)]
 unsafe fn exemptions(task: *const u8, inode: *const u8, sig: &mut u32) -> u32 {
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if tgid == 1 {
-        // init: never refused (systemd ≥ 255 executes its executor from a
-        // descriptor it pinned at start, deleted after an upgrade).
-        *sig |= tier_sig::EXEMPT_IMAGE;
-        return class::ALL;
-    }
-    let mut ex = 0u32;
-    let own = exe_inode(task);
-    if !own.is_null() {
-        if own == inode {
-            *sig |= tier_sig::SELF_REEXEC;
-            ex |= class::MEMFD | class::DELETED;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if tgid == 1 {
+            // init: never refused (systemd ≥ 255 executes its executor from a
+            // descriptor it pinned at start, deleted after an upgrade).
+            *sig |= tier_sig::EXEMPT_IMAGE;
+            return class::ALL;
         }
-        let key = inode_key(own);
-        if let Some(r) = EXECPOL_IMAGES.get(&key) {
-            let e = *r & image_role::EXEMPT_MASK;
-            if e != 0 {
-                *sig |= tier_sig::EXEMPT_IMAGE;
-                ex |= e;
+        let mut ex = 0u32;
+        let own = exe_inode(task);
+        if !own.is_null() {
+            if own == inode {
+                *sig |= tier_sig::SELF_REEXEC;
+                ex |= class::MEMFD | class::DELETED;
+            }
+            let key = inode_key(own);
+            if let Some(r) = EXECPOL_IMAGES.get(&key) {
+                let e = *r & image_role::EXEMPT_MASK;
+                if e != 0 {
+                    *sig |= tier_sig::EXEMPT_IMAGE;
+                    ex |= e;
+                }
             }
         }
+        ex
     }
-    ex
 }
 
 /// A binfmt pass of `bprm_check_security`, after `exec_lsm`'s walk filled
@@ -392,90 +416,93 @@ pub(crate) unsafe fn on_pass(
     pass: u8,
     wk: &TaskKey,
 ) -> i32 {
-    let m = conf(conf_slot::MODE);
-    let q = crate::execq::armed();
-    if m == mode::OFF && !q {
-        return 0;
-    }
-    let classes = crate::execq::nn_execq_classify(
-        dentry as u64,
-        (*s).flags as u64,
-        u64::from(wk.tid),
-        wk.start_ns,
-    ) as u32;
-    if m == mode::OFF {
-        // Lab PR 223 alone: every class the guard holds.
-        return crate::execq::note_pass(s, inode, task, pass, classes);
-    }
-    // The re-check of #547 (G6): the new environment is judged by its own
-    // program on this hook ([`exec_env_lsm`]), not here.
-    if classes == 0 {
-        if q {
-            return crate::execq::note_pass(s, inode, task, pass, 0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let m = conf(conf_slot::MODE);
+        let q = crate::execq::armed();
+        if m == mode::OFF && !q {
+            return 0;
         }
-        return 0;
-    }
-    let t_ptr = task as *const u8;
-    let tv = nn_execpol_tier(task) as u32;
-    let t = tv & 3;
-    let mut sig = tv & !tier::MASK;
-    let mut act = 0u32;
-    let mut cand = 0u32;
-    if classes != 0 {
-        let ex = exemptions(t_ptr, inode, &mut sig);
-        let cells = classes & conf(conf_slot::DENY + t) as u32;
-        let exempted = cells & ex;
-        let cells = cells & !ex;
-        let class_audit = conf(conf_slot::CLASS_AUDIT) as u32;
-        let mut deny = cells & !class_audit;
-        let mut would = (classes & conf(conf_slot::AUDIT + t) as u32 & !ex) | (cells & class_audit);
-        if m != mode::ENFORCE {
-            would |= deny;
-            deny = 0;
+        let classes = crate::execq::nn_execq_classify(
+            dentry as u64,
+            (*s).flags as u64,
+            u64::from(wk.tid),
+            wk.start_ns,
+        ) as u32;
+        if m == mode::OFF {
+            // Lab PR 223 alone: every class the guard holds.
+            return crate::execq::note_pass(s, inode, task, pass, classes);
         }
-        if exempted != 0 {
-            act |= action::EXEMPTED;
-            bump(counter::EXEMPTED);
-        }
-        if deny != 0 {
-            act |= action::DENY;
-            bump(counter::DENIED);
-        } else {
-            let quar = classes & conf(conf_slot::QUARANTINE + t) as u32;
-            if quar != 0 {
-                if q {
-                    act |= action::QUARANTINE;
-                    bump(counter::QUARANTINE);
-                } else {
-                    act |= action::QUARANTINE_INACTIVE;
-                    bump(counter::QUARANTINE_INACTIVE);
-                }
+        // The re-check of #547 (G6): the new environment is judged by its own
+        // program on this hook ([`exec_env_lsm`]), not here.
+        if classes == 0 {
+            if q {
+                return crate::execq::note_pass(s, inode, task, pass, 0);
             }
-            cand = if conf(conf_slot::FLAGS) & flags::QUARANTINE_BY_POLICY != 0 {
-                quar
+            return 0;
+        }
+        let t_ptr = task as *const u8;
+        let tv = nn_execpol_tier(task) as u32;
+        let t = tv & 3;
+        let mut sig = tv & !tier::MASK;
+        let mut act = 0u32;
+        let mut cand = 0u32;
+        if classes != 0 {
+            let ex = exemptions(t_ptr, inode, &mut sig);
+            let cells = classes & conf(conf_slot::DENY + t) as u32;
+            let exempted = cells & ex;
+            let cells = cells & !ex;
+            let class_audit = conf(conf_slot::CLASS_AUDIT) as u32;
+            let mut deny = cells & !class_audit;
+            let mut would = (classes & conf(conf_slot::AUDIT + t) as u32 & !ex) | (cells & class_audit);
+            if m != mode::ENFORCE {
+                would |= deny;
+                deny = 0;
+            }
+            if exempted != 0 {
+                act |= action::EXEMPTED;
+                bump(counter::EXEMPTED);
+            }
+            if deny != 0 {
+                act |= action::DENY;
+                bump(counter::DENIED);
             } else {
-                classes
-            };
+                let quar = classes & conf(conf_slot::QUARANTINE + t) as u32;
+                if quar != 0 {
+                    if q {
+                        act |= action::QUARANTINE;
+                        bump(counter::QUARANTINE);
+                    } else {
+                        act |= action::QUARANTINE_INACTIVE;
+                        bump(counter::QUARANTINE_INACTIVE);
+                    }
+                }
+                cand = if conf(conf_slot::FLAGS) & flags::QUARANTINE_BY_POLICY != 0 {
+                    quar
+                } else {
+                    classes
+                };
+            }
+            if would != 0 {
+                act |= action::WOULD_DENY;
+                bump(counter::WOULD_DENY);
+            }
         }
-        if would != 0 {
-            act |= action::WOULD_DENY;
-            bump(counter::WOULD_DENY);
+        if act & (action::DENY | action::WOULD_DENY) != 0 {
+            let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+            report_exec(s, inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits);
         }
-    }
-    if act & (action::DENY | action::WOULD_DENY) != 0 {
-        let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-        report_exec(s, inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits);
-    }
-    if act & action::DENY != 0 {
-        if pass == 0 {
-            crate::execq::forget(task);
+        if act & action::DENY != 0 {
+            if pass == 0 {
+                crate::execq::forget(task);
+            }
+            return -EACCES;
         }
-        return -EACCES;
+        if q {
+            return crate::execq::note_pass(s, inode, task, pass, cand);
+        }
+        0
     }
-    if q {
-        return crate::execq::note_pass(s, inode, task, pass, cand);
-    }
-    0
 }
 
 // ── the environment's check: a program of its own (the re-check of #547) ──
@@ -500,145 +527,148 @@ pub fn exec_env_lsm(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_exec_env_lsm(ctx: &LsmContext) -> i32 {
-    let m = conf(conf_slot::MODE);
-    if m == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {
-        return 0;
-    }
-    // Kernel signature: (bprm).
-    let bprm: *const u8 = ctx.arg(0);
-    if bprm.is_null() {
-        return 0;
-    }
-    let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
-        Some(o) => o & 0xffff,
-        None => return 0,
-    };
-    // Pass 0 only: the file the caller named (an interpreter's pass runs
-    // with the same environment).
-    if peek_u64(bprm.add(o_interp)) != peek_u64(bprm.add(o_filename)) {
-        return 0;
-    }
-    let file = peek_u64(bprm.add(o_file)) as *const u8;
-    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-    let dentry = peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-    let task = bpf_get_current_task();
-    let wk = crate::task_scratch::current_key();
-    // Lot 325: what an earlier, failed exec of this task left for the
-    // post-commit check is not this exec's.
-    let _ = EXECPOL_ENV_SEEN.remove(&task);
-    // Lot 322: the new environment, read now into the task's own entry
-    // (`ef` its findings, `stashed` whether the task's entry holds them:
-    // removed once judged).
-    let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);
-    let ef = er as u32;
-    if ef == 0 {
-        return 0;
-    }
-    let stashed = er & ENV_STASHED != 0;
-    let tv = nn_execpol_tier(task) as u32;
-    let t = tv & 3;
-    let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-    let mut env_act = 0u32;
-    {
-        let tb = 1u64 << t;
-        // The target's set-id bits: what `GLIBC_TUNABLES` is reported at.
-        let setid = mode_bits & 0o6000 != 0;
-        // Lot 318 (external bug hunt BUG101): a set-id target is judged as
-        // any other. It was let through on its mode bits ("the kernel sets
-        // `AT_SECURE` and the loader ignores the entry"), which the bits do
-        // not promise: root running a set-uid-root file changes no
-        // credential, and no set-id bit applies under `no_new_privs`, on a
-        // `nosuid` mount, to a `#!` script (its interpreter's bits decide)
-        // or for an owner the caller's user namespace does not map.
-        // `deny-root` was side-stepped with `su`, or with a set-gid copy of
-        // anything run under `setpriv --no-new-privs`. Telling those apart
-        // here would take four more kernel facts and could still miss one;
-        // a preload from a staging path refused at a set-id target whose
-        // loader would have ignored it costs nothing legitimate.
-        let root = tv & tier_sig::ROOT != 0;
-        let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0
-            || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
-        // Lot 325 (the re-check of #546, R2): an environment the scan could
-        // not finish — longer than any the kernel accepts, so its array grew
-        // after the kernel's count — is refused at a protected target (the
-        // tier's rule refuses a staging preload) or a set-id one, and
-        // recorded elsewhere. No legitimate environment reaches the cap
-        // (the largest measured, a CI runner's or a Kubernetes pod's, holds
-        // thousands of variables, the cap a million).
-        // The review of #547: a relative loader path is the same (F1); a
-        // loader value longer than the scan reads is not refused here (F7)
-        // — the post-commit check judges the kernel's copy of it.
-        let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);
-        if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {
-            if m == mode::ENFORCE {
-                env_act |= action::DENY;
-                bump(counter::ENV_DENIED);
-            } else {
-                env_act |= action::WOULD_DENY;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let m = conf(conf_slot::MODE);
+        if m == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {
+            return 0;
+        }
+        // Kernel signature: (bprm).
+        let bprm: *const u8 = ctx.arg(0);
+        if bprm.is_null() {
+            return 0;
+        }
+        let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
+            Some(o) => o & 0xffff,
+            None => return 0,
+        };
+        // Pass 0 only: the file the caller named (an interpreter's pass runs
+        // with the same environment).
+        if peek_u64(bprm.add(o_interp)) != peek_u64(bprm.add(o_filename)) {
+            return 0;
+        }
+        let file = peek_u64(bprm.add(o_file)) as *const u8;
+        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+        let dentry = peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+        let task = bpf_get_current_task();
+        let wk = crate::task_scratch::current_key();
+        // Lot 325: what an earlier, failed exec of this task left for the
+        // post-commit check is not this exec's.
+        let _ = EXECPOL_ENV_SEEN.remove(&task);
+        // Lot 322: the new environment, read now into the task's own entry
+        // (`ef` its findings, `stashed` whether the task's entry holds them:
+        // removed once judged).
+        let er = nn_exec_env(task, u64::from(wk.tid), wk.start_ns);
+        let ef = er as u32;
+        if ef == 0 {
+            return 0;
+        }
+        let stashed = er & ENV_STASHED != 0;
+        let tv = nn_execpol_tier(task) as u32;
+        let t = tv & 3;
+        let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        let mut env_act = 0u32;
+        {
+            let tb = 1u64 << t;
+            // The target's set-id bits: what `GLIBC_TUNABLES` is reported at.
+            let setid = mode_bits & 0o6000 != 0;
+            // Lot 318 (external bug hunt BUG101): a set-id target is judged as
+            // any other. It was let through on its mode bits ("the kernel sets
+            // `AT_SECURE` and the loader ignores the entry"), which the bits do
+            // not promise: root running a set-uid-root file changes no
+            // credential, and no set-id bit applies under `no_new_privs`, on a
+            // `nosuid` mount, to a `#!` script (its interpreter's bits decide)
+            // or for an owner the caller's user namespace does not map.
+            // `deny-root` was side-stepped with `su`, or with a set-gid copy of
+            // anything run under `setpriv --no-new-privs`. Telling those apart
+            // here would take four more kernel facts and could still miss one;
+            // a preload from a staging path refused at a set-id target whose
+            // loader would have ignored it costs nothing legitimate.
+            let root = tv & tier_sig::ROOT != 0;
+            let env_deny_rule = conf(conf_slot::ENV_DENY) & tb != 0
+                || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
+            // Lot 325 (the re-check of #546, R2): an environment the scan could
+            // not finish — longer than any the kernel accepts, so its array grew
+            // after the kernel's count — is refused at a protected target (the
+            // tier's rule refuses a staging preload) or a set-id one, and
+            // recorded elsewhere. No legitimate environment reaches the cap
+            // (the largest measured, a CI runner's or a Kubernetes pod's, holds
+            // thousands of variables, the cap a million).
+            // The review of #547: a relative loader path is the same (F1); a
+            // loader value longer than the scan reads is not refused here (F7)
+            // — the post-commit check judges the kernel's copy of it.
+            let unfinished = ef & env_flags::FIRST_PASS_FAIL_CLOSED != 0 && (env_deny_rule || setid);
+            if (ef & env_flags::DENYABLE != 0 && env_deny_rule) || unfinished {
+                if m == mode::ENFORCE {
+                    env_act |= action::DENY;
+                    bump(counter::ENV_DENIED);
+                } else {
+                    env_act |= action::WOULD_DENY;
+                }
+            }
+            // The review of #546 (F1, F2): an environment not read whole is
+            // counted and recorded, never refused (32-bit runtimes exec through
+            // the compat calls; a string can go unreadable after the kernel's
+            // copy).
+            if ef & env_flags::UNREADABLE != 0 {
+                bump(counter::ENV_UNREAD);
+            }
+            let reportable = ef
+                & (env_flags::DENYABLE
+                    | env_flags::LIBPATH_STAGING
+                    | env_flags::HISTORY
+                    | env_flags::UNREADABLE
+                    | env_flags::UNFINISHED
+                    | env_flags::PRELOAD_RELATIVE
+                    | env_flags::LOADER_IRREGULAR)
+                != 0
+                || (setid && ef & env_flags::GLIBC_TUNABLES != 0);
+            if conf(conf_slot::ENV_RECORD) & tb != 0 && reportable {
+                env_act |= action::RECORD;
+            }
+            if env_act != 0 {
+                bump(counter::ENV_RECORDED);
+            }
+            if ef & env_flags::UNFINISHED != 0 {
+                bump(counter::ENV_TRUNCATED);
             }
         }
-        // The review of #546 (F1, F2): an environment not read whole is
-        // counted and recorded, never refused (32-bit runtimes exec through
-        // the compat calls; a string can go unreadable after the kernel's
-        // copy).
-        if ef & env_flags::UNREADABLE != 0 {
-            bump(counter::ENV_UNREAD);
-        }
-        let reportable = ef
-            & (env_flags::DENYABLE
-                | env_flags::LIBPATH_STAGING
-                | env_flags::HISTORY
-                | env_flags::UNREADABLE
-                | env_flags::UNFINISHED
-                | env_flags::PRELOAD_RELATIVE
-                | env_flags::LOADER_IRREGULAR)
-            != 0
-            || (setid && ef & env_flags::GLIBC_TUNABLES != 0);
-        if conf(conf_slot::ENV_RECORD) & tb != 0 && reportable {
-            env_act |= action::RECORD;
-        }
         if env_act != 0 {
-            bump(counter::ENV_RECORDED);
+            // one call: the record (its path walked) is checked once, not for
+            // every state the judgment leaves
+            nn_env_report(
+                task,
+                inode as u64,
+                dentry as u64,
+                (u64::from(tv) << 32) | u64::from(ef),
+                (u64::from(env_act) << 32) | u64::from(mode_bits),
+            );
         }
-        if ef & env_flags::UNFINISHED != 0 {
-            bump(counter::ENV_TRUNCATED);
+        if stashed {
+            let _ = EXECPOL_ENV.remove(&wk);
         }
+        // Lot 325 (TOCTOU): what was judged here and let through (a tier that
+        // records it) is no news to the post-commit check — its record is
+        // made; it still kills a protected target on what it cannot clear.
+        if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
+            let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
+        }
+        if env_act & action::DENY != 0 {
+            // the exec quarantine's candidate of this pass, if `exec_check_lsm`
+            // made one: the exec fails
+            crate::execq::forget(task);
+            return -EACCES;
+        }
+        0
     }
-    if env_act != 0 {
-        // one call: the record (its path walked) is checked once, not for
-        // every state the judgment leaves
-        nn_env_report(
-            task,
-            inode as u64,
-            dentry as u64,
-            (u64::from(tv) << 32) | u64::from(ef),
-            (u64::from(env_act) << 32) | u64::from(mode_bits),
-        );
-    }
-    if stashed {
-        let _ = EXECPOL_ENV.remove(&wk);
-    }
-    // Lot 325 (TOCTOU): what was judged here and let through (a tier that
-    // records it) is no news to the post-commit check — its record is
-    // made; it still kills a protected target on what it cannot clear.
-    if ef & (env_flags::DENYABLE | env_flags::UNJUDGED) != 0 && env_act & action::DENY == 0 {
-        let _ = EXECPOL_ENV_SEEN.insert(&task, &ef, 0);
-    }
-    if env_act & action::DENY != 0 {
-        // the exec quarantine's candidate of this pass, if `exec_check_lsm`
-        // made one: the exec fails
-        crate::execq::forget(task);
-        return -EACCES;
-    }
-    0
 }
 
 /// The report of [`exec_env_lsm`]: the file by its identity and its path,
@@ -648,7 +678,7 @@ unsafe fn try_exec_env_lsm(ctx: &LsmContext) -> i32 {
 /// `act_mode`: the action above the file's mode bits. A global function:
 /// inline, its path walk was checked again for every state the judgment
 /// left, past the verifier's budget on 5.15.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_report(task: u64, inode: u64, dentry: u64, tv_ef: u64, act_mode: u64) -> u64 {
     // SAFETY: the task's own entry, kernel reads of the exec's file.
@@ -684,63 +714,69 @@ unsafe fn report_env_pass(
     env: Option<*const EnvStashRaw>,
     mode_bits: u32,
 ) {
-    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
-            bump(counter::RING_FULL);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+                bump(counter::RING_FULL);
+                return;
+            }
+        };
+        let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        fill_head(raw, task);
+        (*raw).kind = kind::EXEC;
+        (*raw).tier = tv;
+        (*raw).env_action = env_act;
+        (*raw).env_flags = ef;
+        if let Some(e) = env {
+            (*raw).env_count = (*e).count;
+            (*raw).tunables_len = (*e).tunables_len;
+            let _ = generated::bpf_probe_read_kernel(
+                (*raw).preload.as_mut_ptr() as *mut c_void,
+                (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
+                    as u32,
+                (*e).preload.as_ptr() as *const c_void,
+            );
         }
-    };
-    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    fill_head(raw, task);
-    (*raw).kind = kind::EXEC;
-    (*raw).tier = tv;
-    (*raw).env_action = env_act;
-    (*raw).env_flags = ef;
-    if let Some(e) = env {
-        (*raw).env_count = (*e).count;
-        (*raw).tunables_len = (*e).tunables_len;
-        let _ = generated::bpf_probe_read_kernel(
-            (*raw).preload.as_mut_ptr() as *mut c_void,
-            (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
-                as u32,
-            (*e).preload.as_ptr() as *const c_void,
-        );
+        (*raw).file_mode = mode_bits;
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+        }
+        let k = inode_key(inode);
+        let task_root = crate::exec_lsm::task_root_of(task);
+        let wf = crate::exec_lsm::exe_walk(&mut (*raw).exe, dentry, task_root) as u32;
+        (*raw).exe.dev = k.dev;
+        (*raw).exe.ino = k.ino;
+        (*raw).exe.flags = exe_flags::KNOWN | wf;
+        entry.submit(0);
     }
-    (*raw).file_mode = mode_bits;
-    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-        (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
-    }
-    let k = inode_key(inode);
-    let task_root = crate::exec_lsm::task_root_of(task);
-    let wf = crate::exec_lsm::exe_walk(&mut (*raw).exe, dentry, task_root) as u32;
-    (*raw).exe.dev = k.dev;
-    (*raw).exe.ino = k.ino;
-    (*raw).exe.flags = exe_flags::KNOWN | wf;
-    entry.submit(0);
 }
 
 /// The common fields of a report.
 #[inline(always)]
 unsafe fn fill_head(raw: *mut ExecPolRaw, task: *const u8) {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let uid_gid = bpf_get_current_uid_gid();
-    (*raw).pid = (pid_tgid >> 32) as u32;
-    (*raw).tid = pid_tgid as u32;
-    let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
-    (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
-    (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
-    (*raw).gid = (uid_gid >> 32) as u32;
-    (*raw).loginuid = match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
-        Some(o) => peek_u32(task.add(o & 0xffff)),
-        None => u32::MAX,
-    };
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    (*raw).start_ns = peek_u64(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)));
-    (*raw).cgroup_id = generated::bpf_get_current_cgroup_id();
-    crate::comm::comm_into(&mut (*raw).comm);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let uid_gid = bpf_get_current_uid_gid();
+        (*raw).pid = (pid_tgid >> 32) as u32;
+        (*raw).tid = pid_tgid as u32;
+        let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+        (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
+        (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw).gid = (uid_gid >> 32) as u32;
+        (*raw).loginuid = match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
+            Some(o) => peek_u32(task.add(o & 0xffff)),
+            None => u32::MAX,
+        };
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        (*raw).start_ns = peek_u64(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)));
+        (*raw).cgroup_id = generated::bpf_get_current_cgroup_id();
+        crate::comm::comm_into(&mut (*raw).comm);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -757,43 +793,46 @@ unsafe fn report_exec(
     env: Option<*const EnvStashRaw>,
     mode_bits: u32,
 ) {
-    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
-            bump(counter::RING_FULL);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+                bump(counter::RING_FULL);
+                return;
+            }
+        };
+        let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        fill_head(raw, task);
+        (*raw).kind = kind::EXEC;
+        (*raw).tier = tv;
+        (*raw).classes = classes;
+        (*raw).action = act;
+        (*raw).env_action = env_act;
+        (*raw).file_mode = mode_bits;
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
         }
-    };
-    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    fill_head(raw, task);
-    (*raw).kind = kind::EXEC;
-    (*raw).tier = tv;
-    (*raw).classes = classes;
-    (*raw).action = act;
-    (*raw).env_action = env_act;
-    (*raw).file_mode = mode_bits;
-    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-        (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
-    }
-    (*raw).env_flags = ef;
-    if let Some(e) = env {
-        (*raw).env_count = (*e).count;
-        (*raw).tunables_len = (*e).tunables_len;
+        (*raw).env_flags = ef;
+        if let Some(e) = env {
+            (*raw).env_count = (*e).count;
+            (*raw).tunables_len = (*e).tunables_len;
+            let _ = generated::bpf_probe_read_kernel(
+                (*raw).preload.as_mut_ptr() as *mut c_void,
+                (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
+                    as u32,
+                (*e).preload.as_ptr() as *const c_void,
+            );
+        }
         let _ = generated::bpf_probe_read_kernel(
-            (*raw).preload.as_mut_ptr() as *mut c_void,
-            (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
-                as u32,
-            (*e).preload.as_ptr() as *const c_void,
+            &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
+            core::mem::size_of::<ExeIdentityRaw>() as u32,
+            s as *const c_void,
         );
+        entry.submit(0);
     }
-    let _ = generated::bpf_probe_read_kernel(
-        &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
-        core::mem::size_of::<ExeIdentityRaw>() as u32,
-        s as *const c_void,
-    );
-    entry.submit(0);
 }
 
 // ── the new environment, at the exec's first pass ───────────────────
@@ -830,7 +869,7 @@ const ENV_STASHED: u64 = 1 << 32;
 /// own, apart from `exec_check_lsm`. Inlined there, 5.15's verifier
 /// refused the program: on the unknown-call path the compiler spilled a
 /// register that path never set ("R4 !read_ok").
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_exec_env(task: u64, tid: u64, start: u64) -> u64 {
     unsafe { exec_env(task as *const u8, &crate::task_scratch::key(tid, start)) }
@@ -845,27 +884,30 @@ pub extern "C" fn nn_exec_env(task: u64, tid: u64, start: u64) -> u64 {
 /// string the scan could not read.
 #[inline(always)]
 unsafe fn exec_env(task: *const u8, key: &TaskKey) -> u64 {
-    let raw = exec_envp(task);
-    if raw == ENVP_UNREAD {
-        return u64::from(env_flags::UNREADABLE);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let raw = exec_envp(task);
+        if raw == ENVP_UNREAD {
+            return u64::from(env_flags::UNREADABLE);
+        }
+        if raw == 0 {
+            return 0;
+        }
+        let compat = raw >> 63;
+        let envp = raw & !ENVP_COMPAT;
+        // Inline (not a global function of its own): lot 325's scan nests three
+        // calls deep under it, and the verifier sums the frames of a call chain
+        // (512 bytes): one frame less.
+        let r = env_scan(envp, u64::from(key.tid), key.start_ns, compat);
+        if r & SCAN_LOST != 0 {
+            return u64::from(env_flags::UNREADABLE);
+        }
+        let ef = r as u32;
+        if ef == 0 {
+            return 0;
+        }
+        u64::from(ef) | ENV_STASHED
     }
-    if raw == 0 {
-        return 0;
-    }
-    let compat = raw >> 63;
-    let envp = raw & !ENVP_COMPAT;
-    // Inline (not a global function of its own): lot 325's scan nests three
-    // calls deep under it, and the verifier sums the frames of a call chain
-    // (512 bytes): one frame less.
-    let r = env_scan(envp, u64::from(key.tid), key.start_ns, compat);
-    if r & SCAN_LOST != 0 {
-        return u64::from(env_flags::UNREADABLE);
-    }
-    let ef = r as u32;
-    if ef == 0 {
-        return 0;
-    }
-    u64::from(ef) | ENV_STASHED
 }
 
 /// `envp` of the exec in progress, from the registers it entered the
@@ -885,43 +927,46 @@ unsafe fn exec_env(task: *const u8, key: &TaskKey) -> u64 {
 /// [`ENVP_COMPAT`].
 #[inline(always)]
 unsafe fn exec_envp(task: *const u8) -> u64 {
-    // One value out, no tuple through the stack: on 5.15 an `Option<(u64,
-    // bool)>` left a stack slot unwritten on one path and the verifier
-    // refused the read ("invalid read from stack off -24").
-    let ax = match off_opt!(PT_REGS_ORIG_AX_OFFSET) {
-        Some(o) if o <= 0xff => o,
-        _ => return ENVP_UNREAD,
-    };
-    if peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) == 0 {
-        return 0;
-    }
-    let tflags = peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET)));
-    if !northnarrow_common::cgroup_limits::regs_are_the_writes(tflags) {
-        return 0;
-    }
-    let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
-    if regs == 0 {
-        return ENVP_UNREAD;
-    }
-    let nr = peek_u64((regs + ax as u64) as *const u8);
-    let (reg, abi) = match exec_envp_reg(nr) {
-        Some(v) => v,
-        None => return ENVP_UNREAD,
-    };
-    let off = match reg {
-        EnvpReg::Dx => off_opt!(PT_REGS_DX_OFFSET),
-        EnvpReg::R10 => off_opt!(PT_REGS_R10_OFFSET),
-        EnvpReg::Si => off_opt!(PT_REGS_SI_OFFSET),
-    };
-    let off = match off {
-        Some(o) if o <= 0xff => o,
-        _ => return ENVP_UNREAD,
-    };
-    let v = envp_value(peek_u64((regs + off as u64) as *const u8), abi);
-    if abi.compat_pointers() {
-        v | ENVP_COMPAT
-    } else {
-        v
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // One value out, no tuple through the stack: on 5.15 an `Option<(u64,
+        // bool)>` left a stack slot unwritten on one path and the verifier
+        // refused the read ("invalid read from stack off -24").
+        let ax = match off_opt!(PT_REGS_ORIG_AX_OFFSET) {
+            Some(o) if o <= 0xff => o,
+            _ => return ENVP_UNREAD,
+        };
+        if peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) == 0 {
+            return 0;
+        }
+        let tflags = peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET)));
+        if !northnarrow_common::cgroup_limits::regs_are_the_writes(tflags) {
+            return 0;
+        }
+        let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
+        if regs == 0 {
+            return ENVP_UNREAD;
+        }
+        let nr = peek_u64((regs + ax as u64) as *const u8);
+        let (reg, abi) = match exec_envp_reg(nr) {
+            Some(v) => v,
+            None => return ENVP_UNREAD,
+        };
+        let off = match reg {
+            EnvpReg::Dx => off_opt!(PT_REGS_DX_OFFSET),
+            EnvpReg::R10 => off_opt!(PT_REGS_R10_OFFSET),
+            EnvpReg::Si => off_opt!(PT_REGS_SI_OFFSET),
+        };
+        let off = match off {
+            Some(o) if o <= 0xff => o,
+            _ => return ENVP_UNREAD,
+        };
+        let v = envp_value(peek_u64((regs + off as u64) as *const u8), abi);
+        if abi.compat_pointers() {
+            v | ENVP_COMPAT
+        } else {
+            v
+        }
     }
 }
 
@@ -991,60 +1036,63 @@ const _: () = assert!(ENV_ROUNDS * ENV_STEPS_MID * ENV_STEP == ENV_SCAN_CAP);
 
 #[inline(always)]
 unsafe fn env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
-    let key = crate::task_scratch::key(tid, start);
-    let e = match crate::task_scratch::make(&EXECPOL_ENV, &key) {
-        Some(p) => p,
-        None => return SCAN_LOST,
-    };
-    let stride = envp_stride(compat);
-    let mut read = 0u64;
-    let mut more = true;
-    let mut round = 0usize;
-    // What a round found goes into the entry at once, not into locals: each
-    // way out of the loop is then one state for the verifier (5.15 refused
-    // `exec_check_lsm` past a million instructions with two more). A round
-    // reads ENV_STEPS_MID * ENV_STEP entries, unless the array ends or a
-    // step stops at a judged name, which is read whole here
-    // ([`nn_env_pending`]: past the judged names' cap, `STOP`); the rounds
-    // and the judged names' stops cover the cap.
-    while round < ENV_ROUNDS + ENV_JUDGED_MAX as usize {
-        let r = nn_env_round(envp, read, tid, start, compat);
-        read += r & COUNT_MASK;
-        if r & UNREAD != 0 {
-            (*e).stash.flags |= env_flags::UNREADABLE;
-        }
-        if r & JUDGE != 0 {
-            if nn_env_pending(tid, start) & STOP != 0 {
-                (*e).stash.flags |= env_flags::TRUNCATED;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let key = crate::task_scratch::key(tid, start);
+        let e = match crate::task_scratch::make(&EXECPOL_ENV, &key) {
+            Some(p) => p,
+            None => return SCAN_LOST,
+        };
+        let stride = envp_stride(compat);
+        let mut read = 0u64;
+        let mut more = true;
+        let mut round = 0usize;
+        // What a round found goes into the entry at once, not into locals: each
+        // way out of the loop is then one state for the verifier (5.15 refused
+        // `exec_check_lsm` past a million instructions with two more). A round
+        // reads ENV_STEPS_MID * ENV_STEP entries, unless the array ends or a
+        // step stops at a judged name, which is read whole here
+        // ([`nn_env_pending`]: past the judged names' cap, `STOP`); the rounds
+        // and the judged names' stops cover the cap.
+        while round < ENV_ROUNDS + ENV_JUDGED_MAX as usize {
+            let r = nn_env_round(envp, read, tid, start, compat);
+            read += r & COUNT_MASK;
+            if r & UNREAD != 0 {
+                (*e).stash.flags |= env_flags::UNREADABLE;
+            }
+            if r & JUDGE != 0 {
+                if nn_env_pending(tid, start) & STOP != 0 {
+                    (*e).stash.flags |= env_flags::TRUNCATED;
+                    more = false;
+                    break;
+                }
+            } else if r & MORE == 0 {
                 more = false;
                 break;
             }
-        } else if r & MORE == 0 {
-            more = false;
-            break;
+            round += 1;
         }
-        round += 1;
-    }
-    if more {
-        // Every round full: an array past the cap, longer than any the
-        // kernel accepts — it grew after the kernel's count. Not judged
-        // whole: refused where a staging preload is refused (on_pass).
-        let mut ptr = 0u64;
-        let rc = generated::bpf_probe_read_user(
-            &mut ptr as *mut u64 as *mut c_void,
-            stride as u32,
-            (envp + read * stride) as *const c_void,
-        );
-        if rc != 0 || ptr != 0 {
-            (*e).stash.flags |= env_flags::TRUNCATED;
+        if more {
+            // Every round full: an array past the cap, longer than any the
+            // kernel accepts — it grew after the kernel's count. Not judged
+            // whole: refused where a staging preload is refused (on_pass).
+            let mut ptr = 0u64;
+            let rc = generated::bpf_probe_read_user(
+                &mut ptr as *mut u64 as *mut c_void,
+                stride as u32,
+                (envp + read * stride) as *const c_void,
+            );
+            if rc != 0 || ptr != 0 {
+                (*e).stash.flags |= env_flags::TRUNCATED;
+            }
         }
+        (*e).stash.count = read as u32;
+        let f = nn_env_resolve(0, tid, start) as u32;
+        if f == 0 {
+            let _ = EXECPOL_ENV.remove(&key);
+        }
+        u64::from(f)
     }
-    (*e).stash.count = read as u32;
-    let f = nn_env_resolve(0, tid, start) as u32;
-    if f == 0 {
-        let _ = EXECPOL_ENV.remove(&key);
-    }
-    u64::from(f)
 }
 
 /// The review of #547 (F1): a bare name in `LD_PRELOAD` / `LD_AUDIT` is
@@ -1054,7 +1102,7 @@ unsafe fn env_scan(envp: u64, tid: u64, start: u64, compat: u64) -> u64 {
 /// (`LOADER_CUT`). The entry's findings then ([`env_entry`]: `sel`, `tid`,
 /// `start`; [`env_flags::UNREADABLE`] without it). A global function: its
 /// branches are checked once, not on every way out of a scan's loop.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_resolve(sel: u64, tid: u64, start: u64) -> u64 {
     unsafe {
@@ -1070,19 +1118,22 @@ pub extern "C" fn nn_env_resolve(sel: u64, tid: u64, start: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn resolve_bare(e: *mut EnvScan) {
-    let i = (*e).internal;
-    if i & INTERNAL_BARE_PRELOAD != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
-        (*e).stash.flags |= env_flags::PRELOAD_STAGING;
-    }
-    if i & INTERNAL_BARE_AUDIT != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
-        (*e).stash.flags |= env_flags::AUDIT_STAGING;
-    }
-    if i & (INTERNAL_BARE_PRELOAD | INTERNAL_BARE_AUDIT) != 0 {
-        if i & INTERNAL_LIBPATH_RELATIVE != 0 {
-            (*e).stash.flags |= env_flags::PRELOAD_RELATIVE;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let i = (*e).internal;
+        if i & INTERNAL_BARE_PRELOAD != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
+            (*e).stash.flags |= env_flags::PRELOAD_STAGING;
         }
-        if i & INTERNAL_LIBPATH_CUT != 0 {
-            (*e).stash.flags |= env_flags::LOADER_CUT;
+        if i & INTERNAL_BARE_AUDIT != 0 && i & INTERNAL_LIBPATH_STAGING != 0 {
+            (*e).stash.flags |= env_flags::AUDIT_STAGING;
+        }
+        if i & (INTERNAL_BARE_PRELOAD | INTERNAL_BARE_AUDIT) != 0 {
+            if i & INTERNAL_LIBPATH_RELATIVE != 0 {
+                (*e).stash.flags |= env_flags::PRELOAD_RELATIVE;
+            }
+            if i & INTERNAL_LIBPATH_CUT != 0 {
+                (*e).stash.flags |= env_flags::LOADER_CUT;
+            }
         }
     }
 }
@@ -1103,17 +1154,20 @@ unsafe fn env_entry(sel: u64, tid: u64, start: u64) -> Option<*mut EnvScan> {
 /// is then not finished: `TRUNCATED`).
 #[inline(always)]
 unsafe fn judged_one_more(sel: u64, tid: u64, start: u64) -> bool {
-    match env_entry(sel, tid, start) {
-        Some(e) => {
-            if (*e).judged >= ENV_JUDGED_MAX {
-                (*e).stash.flags |= env_flags::TRUNCATED;
-                false
-            } else {
-                (*e).judged += 1;
-                true
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match env_entry(sel, tid, start) {
+            Some(e) => {
+                if (*e).judged >= ENV_JUDGED_MAX {
+                    (*e).stash.flags |= env_flags::TRUNCATED;
+                    false
+                } else {
+                    (*e).judged += 1;
+                    true
+                }
             }
+            None => false,
         }
-        None => false,
     }
 }
 
@@ -1121,7 +1175,7 @@ unsafe fn judged_one_more(sel: u64, tid: u64, start: u64) -> bool {
 /// ([`nn_env_step`]), until the array ends or a step stops at a judged name
 /// (`JUDGE`, its string in [`EnvScan::pending`], for [`nn_env_pending`]).
 /// Returns the entries read and the flags. A global function: checked once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_round(envp: u64, idx: u64, tid: u64, start: u64, compat: u64) -> u64 {
     let mut n = 0u64;
@@ -1149,7 +1203,7 @@ pub extern "C" fn nn_env_round(envp: u64, idx: u64, tid: u64, start: u64, compat
 /// the scan itself, not by its round: the call chain under
 /// `exec_check_lsm` stays under 512 bytes of stack, and the round's loop
 /// stays small for the verifier. A global function: checked once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_pending(tid: u64, start: u64) -> u64 {
     unsafe {
@@ -1174,7 +1228,7 @@ pub extern "C" fn nn_env_pending(tid: u64, start: u64) -> u64 {
 /// ([`env_name_wanted`]), its string in [`EnvScan::pending`] (`JUDGE`), for
 /// its round to read whole. A global function that calls nothing: its loop
 /// is checked once, and the call chain stays short.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_step(envp: u64, idx: u64, tid: u64, start: u64, compat: u64) -> u64 {
     unsafe {
@@ -1224,7 +1278,7 @@ pub extern "C" fn nn_env_step(envp: u64, idx: u64, tid: u64, start: u64, compat:
 /// which loader variable it is (`VAR_*`: [`nn_env_judge`] judges its value
 /// whole). A global function: checked once, called for the few variables
 /// it judges.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_var(ptr: u64, tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
@@ -1278,7 +1332,7 @@ const VAR_LIBPATH: u64 = 3;
 /// checked once — inline in the round, its 16 reads multiplied the round's
 /// states past the verifier's million instructions (7.0 refused
 /// `exec_check_lsm`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_judge(var: u64, ptr: u64, tid: u64, start: u64, sel: u64) -> u64 {
     let (kind, off) = match var {
@@ -1318,7 +1372,7 @@ const CHUNK_CUT: u64 = 1 << 10;
 /// bytes read with the NUL (0: unreadable, flagged). With [`CHUNK_FINISH`]
 /// in `kind_flags`: no read — the value's end. A global function: its byte
 /// loop is checked once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_chunk(p: u64, kind_flags: u64, tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
@@ -1377,7 +1431,7 @@ pub extern "C" fn nn_env_chunk(p: u64, kind_flags: u64, tid: u64, start: u64, se
 /// `LD_LIBRARY_PATH` element) in the entry ([`env_entry`]: `sel`, `tid`,
 /// `start`). A global function: checked once, called from
 /// [`nn_env_chunk`]'s byte loop at each separator.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_value_end(kind: u64, tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
@@ -1389,7 +1443,7 @@ pub extern "C" fn nn_value_end(kind: u64, tid: u64, start: u64, sel: u64) -> u64
 }
 
 /// A `/` of a value's entry ([`value_parse::slash`]), as [`nn_value_end`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_value_slash(tid: u64, start: u64, sel: u64) -> u64 {
     unsafe {
@@ -1405,11 +1459,14 @@ pub extern "C" fn nn_value_slash(tid: u64, start: u64, sel: u64) -> u64 {
 /// to a `memset` call: rule 9).
 #[inline(always)]
 unsafe fn zero_parse(p: *mut ValueParse) {
-    let w = p as *mut u64;
-    let mut i = 0;
-    while i < core::mem::size_of::<ValueParse>() / 8 {
-        core::ptr::write_volatile(w.add(i), 0);
-        i += 1;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let w = p as *mut u64;
+        let mut i = 0;
+        while i < core::mem::size_of::<ValueParse>() / 8 {
+            core::ptr::write_volatile(w.add(i), 0);
+            i += 1;
+        }
     }
 }
 
@@ -1417,53 +1474,56 @@ unsafe fn zero_parse(p: *mut ValueParse) {
 /// the entry's findings; `cut`: the value went on past the reads.
 #[inline(always)]
 unsafe fn value_found(e: *mut EnvScan, kind: u32, cut: bool) {
-    value_parse::end_value(&mut (*e).parse, kind);
-    let found = (*e).parse.found;
-    // the re-check of #547 (G1–G4): whichever loader variable
-    if found & value_parse::IRREGULAR != 0 {
-        (*e).stash.flags |= env_flags::LOADER_IRREGULAR;
-    }
-    let staging = found & value_parse::STAGING != 0;
-    let relative = found & value_parse::RELATIVE != 0;
-    let bare = found & value_parse::BARE != 0;
-    let st = &mut (*e).stash;
-    if kind == value_parse::KIND_PRELOAD {
-        if staging {
-            st.flags |= env_flags::PRELOAD_STAGING;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        value_parse::end_value(&mut (*e).parse, kind);
+        let found = (*e).parse.found;
+        // the re-check of #547 (G1–G4): whichever loader variable
+        if found & value_parse::IRREGULAR != 0 {
+            (*e).stash.flags |= env_flags::LOADER_IRREGULAR;
         }
-        if relative {
-            st.flags |= env_flags::PRELOAD_RELATIVE;
-        }
-        if bare {
-            (*e).internal |= INTERNAL_BARE_PRELOAD;
-        }
-        if cut {
-            st.flags |= env_flags::LOADER_CUT;
-        }
-    } else if kind == value_parse::KIND_AUDIT {
-        if staging {
-            st.flags |= env_flags::AUDIT_STAGING;
-        }
-        if relative {
-            st.flags |= env_flags::PRELOAD_RELATIVE;
-        }
-        if bare {
-            (*e).internal |= INTERNAL_BARE_AUDIT;
-        }
-        if cut {
-            st.flags |= env_flags::LOADER_CUT;
-        }
-    } else {
-        if staging {
-            st.flags |= env_flags::LIBPATH_STAGING;
-            (*e).internal |= INTERNAL_LIBPATH_STAGING;
-        }
-        if relative {
-            st.flags |= env_flags::LIBPATH_STAGING;
-            (*e).internal |= INTERNAL_LIBPATH_RELATIVE;
-        }
-        if cut {
-            (*e).internal |= INTERNAL_LIBPATH_CUT;
+        let staging = found & value_parse::STAGING != 0;
+        let relative = found & value_parse::RELATIVE != 0;
+        let bare = found & value_parse::BARE != 0;
+        let st = &mut (*e).stash;
+        if kind == value_parse::KIND_PRELOAD {
+            if staging {
+                st.flags |= env_flags::PRELOAD_STAGING;
+            }
+            if relative {
+                st.flags |= env_flags::PRELOAD_RELATIVE;
+            }
+            if bare {
+                (*e).internal |= INTERNAL_BARE_PRELOAD;
+            }
+            if cut {
+                st.flags |= env_flags::LOADER_CUT;
+            }
+        } else if kind == value_parse::KIND_AUDIT {
+            if staging {
+                st.flags |= env_flags::AUDIT_STAGING;
+            }
+            if relative {
+                st.flags |= env_flags::PRELOAD_RELATIVE;
+            }
+            if bare {
+                (*e).internal |= INTERNAL_BARE_AUDIT;
+            }
+            if cut {
+                st.flags |= env_flags::LOADER_CUT;
+            }
+        } else {
+            if staging {
+                st.flags |= env_flags::LIBPATH_STAGING;
+                (*e).internal |= INTERNAL_LIBPATH_STAGING;
+            }
+            if relative {
+                st.flags |= env_flags::LIBPATH_STAGING;
+                (*e).internal |= INTERNAL_LIBPATH_RELATIVE;
+            }
+            if cut {
+                (*e).internal |= INTERNAL_LIBPATH_CUT;
+            }
         }
     }
 }
@@ -1475,16 +1535,19 @@ unsafe fn value_found(e: *mut EnvScan, kind: u32, cut: bool) {
 /// a value of exactly 127 bytes, or 63, was flagged).
 #[inline(always)]
 unsafe fn value_cut(len: i64, cap: usize, value: u64) -> bool {
-    if len < cap as i64 {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if len < cap as i64 {
+            return false;
+        }
+        let mut b = 0u8;
+        let _ = generated::bpf_probe_read_user(
+            &mut b as *mut u8 as *mut c_void,
+            1,
+            (value + cap as u64 - 1) as *const c_void,
+        );
+        b != 0
     }
-    let mut b = 0u8;
-    let _ = generated::bpf_probe_read_user(
-        &mut b as *mut u8 as *mut c_void,
-        1,
-        (value + cap as u64 - 1) as *const c_void,
-    );
-    b != 0
 }
 
 /// One variable (`ptr`, its first 24 bytes in `w0..w2`): a finding into the
@@ -1492,85 +1555,88 @@ unsafe fn value_cut(len: i64, cap: usize, value: u64) -> bool {
 /// which (`VAR_*`: [`nn_env_judge`] judges each occurrence).
 #[inline(always)]
 unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 {
-    let st = &mut (*e).stash;
-    if w0 == W_LD_PRELO && w1 & M3 == W_AD_EQ {
-        st.flags |= env_flags::LD_PRELOAD;
-        let len = generated::bpf_probe_read_user_str(
-            st.preload.as_mut_ptr() as *mut c_void,
-            ENV_PRELOAD_LEN as u32,
-            (ptr + 11) as *const c_void,
-        );
-        if len < 0 {
-            st.flags |= env_flags::UNREADABLE;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let st = &mut (*e).stash;
+        if w0 == W_LD_PRELO && w1 & M3 == W_AD_EQ {
+            st.flags |= env_flags::LD_PRELOAD;
+            let len = generated::bpf_probe_read_user_str(
+                st.preload.as_mut_ptr() as *mut c_void,
+                ENV_PRELOAD_LEN as u32,
+                (ptr + 11) as *const c_void,
+            );
+            if len < 0 {
+                st.flags |= env_flags::UNREADABLE;
+            }
+            if value_cut(len, ENV_PRELOAD_LEN, ptr + 11) {
+                st.flags |= env_flags::VALUE_CUT;
+            }
+            return VAR_PRELOAD;
+        } else if w0 == W_LD_AUDIT && w1 & M1 == u64::from(b'=') {
+            st.flags |= env_flags::LD_AUDIT;
+            let len = generated::bpf_probe_read_user_str(
+                st.audit.as_mut_ptr() as *mut c_void,
+                ENV_AUDIT_LEN as u32,
+                (ptr + 9) as *const c_void,
+            );
+            if len < 0 {
+                st.flags |= env_flags::UNREADABLE;
+            }
+            if value_cut(len, ENV_AUDIT_LEN, ptr + 9) {
+                st.flags |= env_flags::VALUE_CUT;
+            }
+            return VAR_AUDIT;
+        } else if w0 == W_LD_LIBRA && w1 == W_RY_PATH {
+            st.flags |= env_flags::LD_LIBRARY_PATH;
+            let len = generated::bpf_probe_read_user_str(
+                st.libpath.as_mut_ptr() as *mut c_void,
+                ENV_LIBPATH_LEN as u32,
+                (ptr + 16) as *const c_void,
+            );
+            if len < 0 {
+                st.flags |= env_flags::UNREADABLE;
+            }
+            if value_cut(len, ENV_LIBPATH_LEN, ptr + 16) {
+                st.flags |= env_flags::VALUE_CUT;
+            }
+            return VAR_LIBPATH;
+        } else if w0 == W_GLIBC_TU && w1 & M7 == W_NABLES {
+            st.flags |= env_flags::GLIBC_TUNABLES;
+            let len = generated::bpf_probe_read_user_str(
+                st.tunables.as_mut_ptr() as *mut c_void,
+                ENV_TUNABLES_LEN as u32,
+                (ptr + 15) as *const c_void,
+            );
+            if len < 0 {
+                st.flags |= env_flags::UNREADABLE;
+            }
+            st.tunables_len = if len > 0 { (len - 1) as u32 } else { 0 };
+        } else if w0 == W_HISTFILE && w1 & M1 == u64::from(b'=') {
+            st.flags |= env_flags::HISTFILE;
+            let hl = generated::bpf_probe_read_user_str(
+                st.hist.as_mut_ptr() as *mut c_void,
+                ENV_HIST_LEN as u32,
+                (ptr + 9) as *const c_void,
+            );
+            if hl < 0 {
+                st.flags |= env_flags::UNREADABLE;
+            }
+            // "HISTFILE=" then "/dev/null" or nothing.
+            let v = (w1 >> 8) | (w2 << 56);
+            if v & M1 == 0 || (v == W_DEV_NUL && (w2 >> 8) & 0xffff == 0x6c) {
+                st.flags |= env_flags::HISTFILE_NULL;
+            }
+        } else if w0 == W_HISTFILE && w1 & M5 == W_SIZE_EQ {
+            if (w1 >> 40) & 0xffff == 0x0030 {
+                st.flags |= env_flags::HISTFILESIZE_ZERO;
+            }
+        } else if w0 == W_HISTSIZE && w1 & M3 == W_EQ_ZERO {
+            st.flags |= env_flags::HISTSIZE_ZERO;
+        } else if w0 == W_HISTCONT && w1 == W_ROL_IGNO {
+            st.flags |= env_flags::HISTCONTROL_IGNORE;
         }
-        if value_cut(len, ENV_PRELOAD_LEN, ptr + 11) {
-            st.flags |= env_flags::VALUE_CUT;
-        }
-        return VAR_PRELOAD;
-    } else if w0 == W_LD_AUDIT && w1 & M1 == u64::from(b'=') {
-        st.flags |= env_flags::LD_AUDIT;
-        let len = generated::bpf_probe_read_user_str(
-            st.audit.as_mut_ptr() as *mut c_void,
-            ENV_AUDIT_LEN as u32,
-            (ptr + 9) as *const c_void,
-        );
-        if len < 0 {
-            st.flags |= env_flags::UNREADABLE;
-        }
-        if value_cut(len, ENV_AUDIT_LEN, ptr + 9) {
-            st.flags |= env_flags::VALUE_CUT;
-        }
-        return VAR_AUDIT;
-    } else if w0 == W_LD_LIBRA && w1 == W_RY_PATH {
-        st.flags |= env_flags::LD_LIBRARY_PATH;
-        let len = generated::bpf_probe_read_user_str(
-            st.libpath.as_mut_ptr() as *mut c_void,
-            ENV_LIBPATH_LEN as u32,
-            (ptr + 16) as *const c_void,
-        );
-        if len < 0 {
-            st.flags |= env_flags::UNREADABLE;
-        }
-        if value_cut(len, ENV_LIBPATH_LEN, ptr + 16) {
-            st.flags |= env_flags::VALUE_CUT;
-        }
-        return VAR_LIBPATH;
-    } else if w0 == W_GLIBC_TU && w1 & M7 == W_NABLES {
-        st.flags |= env_flags::GLIBC_TUNABLES;
-        let len = generated::bpf_probe_read_user_str(
-            st.tunables.as_mut_ptr() as *mut c_void,
-            ENV_TUNABLES_LEN as u32,
-            (ptr + 15) as *const c_void,
-        );
-        if len < 0 {
-            st.flags |= env_flags::UNREADABLE;
-        }
-        st.tunables_len = if len > 0 { (len - 1) as u32 } else { 0 };
-    } else if w0 == W_HISTFILE && w1 & M1 == u64::from(b'=') {
-        st.flags |= env_flags::HISTFILE;
-        let hl = generated::bpf_probe_read_user_str(
-            st.hist.as_mut_ptr() as *mut c_void,
-            ENV_HIST_LEN as u32,
-            (ptr + 9) as *const c_void,
-        );
-        if hl < 0 {
-            st.flags |= env_flags::UNREADABLE;
-        }
-        // "HISTFILE=" then "/dev/null" or nothing.
-        let v = (w1 >> 8) | (w2 << 56);
-        if v & M1 == 0 || (v == W_DEV_NUL && (w2 >> 8) & 0xffff == 0x6c) {
-            st.flags |= env_flags::HISTFILE_NULL;
-        }
-    } else if w0 == W_HISTFILE && w1 & M5 == W_SIZE_EQ {
-        if (w1 >> 40) & 0xffff == 0x0030 {
-            st.flags |= env_flags::HISTFILESIZE_ZERO;
-        }
-    } else if w0 == W_HISTSIZE && w1 & M3 == W_EQ_ZERO {
-        st.flags |= env_flags::HISTSIZE_ZERO;
-    } else if w0 == W_HISTCONT && w1 == W_ROL_IGNO {
-        st.flags |= env_flags::HISTCONTROL_IGNORE;
+        VAR_NONE
     }
-    VAR_NONE
 }
 
 // ── a flood of execs in flight: the ladder (lot 325, R5) ───────────
@@ -1593,7 +1659,7 @@ unsafe fn scan_one(e: *mut EnvScan, ptr: u64, w0: u64, w1: u64, w2: u64) -> u64 
 /// function: verified once, apart from `exec_check_lsm`.
 ///
 /// [`TASK_SCRATCH_CAP`]: crate::task_scratch::TASK_SCRATCH_CAP
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_exec_unwalked(inode: u64, dentry: u64, task: u64, flags_pass: u64) -> u64 {
     unsafe {
@@ -1615,61 +1681,64 @@ unsafe fn exec_unwalked(
     fl: u32,
     pass: u8,
 ) -> u64 {
-    let m = conf(conf_slot::MODE);
-    if m == mode::OFF {
-        // The exec quarantine alone: no candidate without the walk.
-        bump(counter::LOST_OPEN);
-        return 0;
-    }
-    let t_ptr = task as *const u8;
-    let tv = nn_execpol_tier(task) as u32;
-    let t = tv & 3;
-    let mut sig = tv & !tier::MASK;
-    // The classes that need no walk.
-    let mut classes = 0u32;
-    if fl & exe_flags::MEMFD != 0 {
-        classes |= class::MEMFD;
-    }
-    if fl & exe_flags::DELETED != 0 {
-        classes |= class::DELETED;
-    }
-    if fl & exe_flags::TMPFS != 0 {
-        classes |= class::TMPFS;
-    }
-    let parent = peek_u64(dentry.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
-    if !parent.is_null() && parent != dentry {
-        let pinode = peek_u64(parent.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8;
-        if !pinode.is_null() && peek_u16(pinode.add(off!(INODE_I_MODE_OFFSET))) & S_IWOTH != 0 {
-            classes |= class::WORLD_WRITABLE_DIR;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let m = conf(conf_slot::MODE);
+        if m == mode::OFF {
+            // The exec quarantine alone: no candidate without the walk.
+            bump(counter::LOST_OPEN);
+            return 0;
         }
-    }
-    let ex = exemptions(t_ptr, inode, &mut sig);
-    let deny_c = classes & conf(conf_slot::DENY + t) as u32 & !ex & !(conf(conf_slot::CLASS_AUDIT) as u32);
-    let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-    // The re-check of #547 (G6): the environment is judged by its own
-    // program ([`exec_env_lsm`]), which reads it into its own entry whether
-    // or not this walk could be made.
-    let mut act = action::UNWALKED | action::RECORD;
-    let refuse = m == mode::ENFORCE && deny_c != 0;
-    if refuse {
-        bump(counter::LOST);
-        act |= action::DENY;
-    } else {
-        bump(counter::LOST_OPEN);
-        if deny_c != 0 {
-            act |= action::WOULD_DENY;
+        let t_ptr = task as *const u8;
+        let tv = nn_execpol_tier(task) as u32;
+        let t = tv & 3;
+        let mut sig = tv & !tier::MASK;
+        // The classes that need no walk.
+        let mut classes = 0u32;
+        if fl & exe_flags::MEMFD != 0 {
+            classes |= class::MEMFD;
         }
+        if fl & exe_flags::DELETED != 0 {
+            classes |= class::DELETED;
+        }
+        if fl & exe_flags::TMPFS != 0 {
+            classes |= class::TMPFS;
+        }
+        let parent = peek_u64(dentry.add(off!(DENTRY_D_PARENT_OFFSET))) as *const u8;
+        if !parent.is_null() && parent != dentry {
+            let pinode = peek_u64(parent.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8;
+            if !pinode.is_null() && peek_u16(pinode.add(off!(INODE_I_MODE_OFFSET))) & S_IWOTH != 0 {
+                classes |= class::WORLD_WRITABLE_DIR;
+            }
+        }
+        let ex = exemptions(t_ptr, inode, &mut sig);
+        let deny_c = classes & conf(conf_slot::DENY + t) as u32 & !ex & !(conf(conf_slot::CLASS_AUDIT) as u32);
+        let mode_bits = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        // The re-check of #547 (G6): the environment is judged by its own
+        // program ([`exec_env_lsm`]), which reads it into its own entry whether
+        // or not this walk could be made.
+        let mut act = action::UNWALKED | action::RECORD;
+        let refuse = m == mode::ENFORCE && deny_c != 0;
+        if refuse {
+            bump(counter::LOST);
+            act |= action::DENY;
+        } else {
+            bump(counter::LOST_OPEN);
+            if deny_c != 0 {
+                act |= action::WOULD_DENY;
+            }
+        }
+        report_unwalked(inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits, fl, pass);
+        // The review of #547 (F4): an earlier, failed exec's candidate is not this
+        // exec's (no candidate is made here: the quarantine needs the walk).
+        if pass == 0 {
+            crate::execq::forget(task);
+        }
+        if refuse {
+            return 1;
+        }
+        0
     }
-    report_unwalked(inode, t_ptr, t | sig, classes, act, 0, 0, None, mode_bits, fl, pass);
-    // The review of #547 (F4): an earlier, failed exec's candidate is not this
-    // exec's (no candidate is made here: the quarantine needs the walk).
-    if pass == 0 {
-        crate::execq::forget(task);
-    }
-    if refuse {
-        return 1;
-    }
-    0
 }
 
 /// The report of an exec judged without its walk: the file by its
@@ -1689,43 +1758,46 @@ unsafe fn report_unwalked(
     fl: u32,
     pass: u8,
 ) {
-    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
-            bump(counter::RING_FULL);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+                bump(counter::RING_FULL);
+                return;
+            }
+        };
+        let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        fill_head(raw, task);
+        (*raw).kind = kind::EXEC;
+        (*raw).tier = tv;
+        (*raw).classes = classes;
+        (*raw).action = act;
+        (*raw).env_action = env_act;
+        (*raw).file_mode = mode_bits;
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
         }
-    };
-    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    fill_head(raw, task);
-    (*raw).kind = kind::EXEC;
-    (*raw).tier = tv;
-    (*raw).classes = classes;
-    (*raw).action = act;
-    (*raw).env_action = env_act;
-    (*raw).file_mode = mode_bits;
-    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-        (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+        (*raw).env_flags = ef;
+        if let Some(e) = env {
+            (*raw).env_count = (*e).count;
+            (*raw).tunables_len = (*e).tunables_len;
+            let _ = generated::bpf_probe_read_kernel(
+                (*raw).preload.as_mut_ptr() as *mut c_void,
+                (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
+                    as u32,
+                (*e).preload.as_ptr() as *const c_void,
+            );
+        }
+        let key = inode_key(inode);
+        (*raw).exe.dev = key.dev;
+        (*raw).exe.ino = key.ino;
+        (*raw).exe.flags = fl;
+        (*raw).exe.pass = pass;
+        entry.submit(0);
     }
-    (*raw).env_flags = ef;
-    if let Some(e) = env {
-        (*raw).env_count = (*e).count;
-        (*raw).tunables_len = (*e).tunables_len;
-        let _ = generated::bpf_probe_read_kernel(
-            (*raw).preload.as_mut_ptr() as *mut c_void,
-            (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
-                as u32,
-            (*e).preload.as_ptr() as *const c_void,
-        );
-    }
-    let key = inode_key(inode);
-    (*raw).exe.dev = key.dev;
-    (*raw).exe.ino = key.ino;
-    (*raw).exe.flags = fl;
-    (*raw).exe.pass = pass;
-    entry.submit(0);
 }
 
 // ── the kernel's own copy, past the point of no return (lot 325) ─────
@@ -1760,116 +1832,122 @@ pub fn execpol_env_commit(_ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 unsafe fn env_commit() {
-    if conf(conf_slot::MODE) == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {
-        return;
-    }
-    let task = bpf_get_current_task() as *const u8;
-    let tk = task as u64;
-    let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
-    if mm.is_null() {
-        return;
-    }
-    let (os, oe) = match (
-        off_opt!(MM_STRUCT_ENV_START_OFFSET),
-        off_opt!(MM_STRUCT_ENV_END_OFFSET),
-    ) {
-        (Some(a), Some(b)) => (a & 0xffff, b & 0xffff),
-        _ => return,
-    };
-    let start = peek_u64(mm.add(os));
-    let end = peek_u64(mm.add(oe));
-    let seen = match EXECPOL_ENV_SEEN.get(&tk) {
-        Some(v) => *v,
-        None => 0,
-    };
-    if seen != 0 {
-        let _ = EXECPOL_ENV_SEEN.remove(&tk);
-    }
-    // The CPU's entry (preemption is off here), zeroed.
-    let e = match COMMIT_ENV.get_ptr_mut(0) {
-        Some(p) => p,
-        None => {
-            bump(counter::ENV_UNREAD);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if conf(conf_slot::MODE) == mode::OFF || conf(conf_slot::FLAGS) & flags::ENV_SCAN == 0 {
             return;
         }
-    };
-    if let Some(z) = crate::task_scratch::TASK_SCRATCH_ZERO.get_ptr(0) {
-        let _ = generated::bpf_probe_read_kernel(
-            e as *mut c_void,
-            core::mem::size_of::<EnvScan>() as u32,
-            z as *const c_void,
-        );
-    }
-    let f = if end > start {
-        nn_env_region(start, end) as u32
-    } else {
-        0
-    };
-    // The review of #547 (F2): a staging entry the first pass did not see
-    // (the environment changed after the kernel's copy), and what this read
-    // of the kernel's own copy cannot clear — a value longer than the scan
-    // reads, past the bound of this read, a relative path, an unreadable
-    // string — are never silent: a protected target (the tier's rule
-    // refuses a staging preload) or a set-id one is killed, anything else
-    // recorded and counted. It acted on new staging entries only.
-    let staging_new = f & env_flags::DENYABLE & !seen;
-    let unjudged = f & env_flags::UNJUDGED;
-    if staging_new == 0 && unjudged == 0 {
-        return;
-    }
-    let tv = nn_execpol_tier(tk) as u32;
-    let t = tv & 3;
-    let tb = 1u64 << t;
-    let root = tv & tier_sig::ROOT != 0;
-    let rule = conf(conf_slot::ENV_DENY) & tb != 0
-        || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
-    let setid = exe_mode(mm) & 0o6000 != 0;
-    let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));
-    // what the first pass judged and recorded, let through: no news, unless
-    // it is to be killed now
-    if !kill && staging_new == 0 && unjudged & !seen == 0 {
-        return;
-    }
-    if staging_new != 0 {
-        bump(counter::ENV_CHANGED);
-    }
-    if unjudged & env_flags::UNFINISHED != 0 {
-        bump(counter::ENV_TRUNCATED);
-    }
-    if unjudged & env_flags::UNREADABLE != 0 {
-        bump(counter::ENV_UNREAD);
-    }
-    let mut env_act = action::RECORD;
-    if kill {
-        if conf(conf_slot::MODE) == mode::ENFORCE {
-            // the review of #547 (F9): killed only when the signal is sent
-            if generated::bpf_send_signal(SIGKILL) == 0 {
-                env_act |= action::DENY | action::KILLED;
-                bump(counter::ENV_DENIED);
+        let task = bpf_get_current_task() as *const u8;
+        let tk = task as u64;
+        let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
+        if mm.is_null() {
+            return;
+        }
+        let (os, oe) = match (
+            off_opt!(MM_STRUCT_ENV_START_OFFSET),
+            off_opt!(MM_STRUCT_ENV_END_OFFSET),
+        ) {
+            (Some(a), Some(b)) => (a & 0xffff, b & 0xffff),
+            _ => return,
+        };
+        let start = peek_u64(mm.add(os));
+        let end = peek_u64(mm.add(oe));
+        let seen = match EXECPOL_ENV_SEEN.get(&tk) {
+            Some(v) => *v,
+            None => 0,
+        };
+        if seen != 0 {
+            let _ = EXECPOL_ENV_SEEN.remove(&tk);
+        }
+        // The CPU's entry (preemption is off here), zeroed.
+        let e = match COMMIT_ENV.get_ptr_mut(0) {
+            Some(p) => p,
+            None => {
+                bump(counter::ENV_UNREAD);
+                return;
+            }
+        };
+        if let Some(z) = crate::task_scratch::TASK_SCRATCH_ZERO.get_ptr(0) {
+            let _ = generated::bpf_probe_read_kernel(
+                e as *mut c_void,
+                core::mem::size_of::<EnvScan>() as u32,
+                z as *const c_void,
+            );
+        }
+        let f = if end > start {
+            nn_env_region(start, end) as u32
+        } else {
+            0
+        };
+        // The review of #547 (F2): a staging entry the first pass did not see
+        // (the environment changed after the kernel's copy), and what this read
+        // of the kernel's own copy cannot clear — a value longer than the scan
+        // reads, past the bound of this read, a relative path, an unreadable
+        // string — are never silent: a protected target (the tier's rule
+        // refuses a staging preload) or a set-id one is killed, anything else
+        // recorded and counted. It acted on new staging entries only.
+        let staging_new = f & env_flags::DENYABLE & !seen;
+        let unjudged = f & env_flags::UNJUDGED;
+        if staging_new == 0 && unjudged == 0 {
+            return;
+        }
+        let tv = nn_execpol_tier(tk) as u32;
+        let t = tv & 3;
+        let tb = 1u64 << t;
+        let root = tv & tier_sig::ROOT != 0;
+        let rule = conf(conf_slot::ENV_DENY) & tb != 0
+            || (root && conf(conf_slot::ENV_DENY_ROOT) & tb != 0);
+        let setid = exe_mode(mm) & 0o6000 != 0;
+        let kill = (staging_new != 0 && rule) || (unjudged != 0 && (rule || setid));
+        // what the first pass judged and recorded, let through: no news, unless
+        // it is to be killed now
+        if !kill && staging_new == 0 && unjudged & !seen == 0 {
+            return;
+        }
+        if staging_new != 0 {
+            bump(counter::ENV_CHANGED);
+        }
+        if unjudged & env_flags::UNFINISHED != 0 {
+            bump(counter::ENV_TRUNCATED);
+        }
+        if unjudged & env_flags::UNREADABLE != 0 {
+            bump(counter::ENV_UNREAD);
+        }
+        let mut env_act = action::RECORD;
+        if kill {
+            if conf(conf_slot::MODE) == mode::ENFORCE {
+                // the review of #547 (F9): killed only when the signal is sent
+                if generated::bpf_send_signal(SIGKILL) == 0 {
+                    env_act |= action::DENY | action::KILLED;
+                    bump(counter::ENV_DENIED);
+                } else {
+                    env_act |= action::WOULD_DENY;
+                }
             } else {
                 env_act |= action::WOULD_DENY;
             }
-        } else {
-            env_act |= action::WOULD_DENY;
         }
+        bump(counter::ENV_RECORDED);
+        let changed = if staging_new != 0 { env_flags::CHANGED } else { 0 };
+        report_commit(task, mm, tv, f | changed, env_act, &(*e).stash);
     }
-    bump(counter::ENV_RECORDED);
-    let changed = if staging_new != 0 { env_flags::CHANGED } else { 0 };
-    report_commit(task, mm, tv, f | changed, env_act, &(*e).stash);
 }
 
 /// The mode bits of `mm`'s executable (0 when unreadable).
 #[inline(always)]
 unsafe fn exe_mode(mm: *const u8) -> u32 {
-    let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
-    if file.is_null() {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+        if file.is_null() {
+            return 0;
+        }
+        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+        if inode.is_null() {
+            return 0;
+        }
+        u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))))
     }
-    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-    if inode.is_null() {
-        return 0;
-    }
-    u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))))
 }
 
 /// The report of [`execpol_env_commit`]: the new image's file, its path
@@ -1883,47 +1961,50 @@ unsafe fn report_commit(
     env_act: u32,
     e: *const EnvStashRaw,
 ) {
-    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
-            bump(counter::RING_FULL);
-            return;
-        }
-    };
-    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    fill_head(raw, task);
-    (*raw).kind = kind::EXEC;
-    (*raw).tier = tv;
-    (*raw).env_action = env_act;
-    (*raw).env_flags = ef;
-    (*raw).env_count = (*e).count;
-    (*raw).tunables_len = (*e).tunables_len;
-    let _ = generated::bpf_probe_read_kernel(
-        (*raw).preload.as_mut_ptr() as *mut c_void,
-        (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN) as u32,
-        (*e).preload.as_ptr() as *const c_void,
-    );
-    let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
-    if !file.is_null() {
-        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-        if !inode.is_null() {
-            let k = inode_key(inode);
-            (*raw).file_mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-            if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-                (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+                bump(counter::RING_FULL);
+                return;
             }
-            let dentry =
-                peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-            let task_root = crate::exec_lsm::task_root_of(task);
-            let wf = crate::exec_lsm::exe_walk(&mut (*raw).exe, dentry, task_root) as u32;
-            (*raw).exe.dev = k.dev;
-            (*raw).exe.ino = k.ino;
-            (*raw).exe.flags = exe_flags::KNOWN | wf;
+        };
+        let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        fill_head(raw, task);
+        (*raw).kind = kind::EXEC;
+        (*raw).tier = tv;
+        (*raw).env_action = env_act;
+        (*raw).env_flags = ef;
+        (*raw).env_count = (*e).count;
+        (*raw).tunables_len = (*e).tunables_len;
+        let _ = generated::bpf_probe_read_kernel(
+            (*raw).preload.as_mut_ptr() as *mut c_void,
+            (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN) as u32,
+            (*e).preload.as_ptr() as *const c_void,
+        );
+        let file = peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8;
+        if !file.is_null() {
+            let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+            if !inode.is_null() {
+                let k = inode_key(inode);
+                (*raw).file_mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+                if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+                    (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+                }
+                let dentry =
+                    peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+                let task_root = crate::exec_lsm::task_root_of(task);
+                let wf = crate::exec_lsm::exe_walk(&mut (*raw).exe, dentry, task_root) as u32;
+                (*raw).exe.dev = k.dev;
+                (*raw).exe.ino = k.ino;
+                (*raw).exe.flags = exe_flags::KNOWN | wf;
+            }
         }
+        entry.submit(0);
     }
-    entry.submit(0);
 }
 
 /// The new image's environment `[start, end)`, string after string, into
@@ -1934,7 +2015,7 @@ unsafe fn report_commit(
 /// bytes compared and the judged names read whole, their values judged as
 /// the first pass judges them ([`nn_env_var`], [`nn_env_judge`]). Returns
 /// the findings. A global function: checked once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_region(start: u64, end: u64) -> u64 {
     unsafe {
@@ -1981,7 +2062,7 @@ const AT_MASK: u64 = AT_START | AT_SKIP;
 /// One round of [`nn_env_region`]: steps ([`nn_env_region_step`]); each
 /// judged name a step stops at is read whole here, its value judged, then
 /// its string skipped by the next step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_region_round(pos: u64, end: u64, at: u64) -> u64 {
     unsafe {
@@ -2017,7 +2098,7 @@ pub extern "C" fn nn_env_region_round(pos: u64, end: u64, at: u64) -> u64 {
 /// its round, which reads it whole and has the next step skip it
 /// ([`AT_SKIP`]) — and a string longer than a read takes the next one. A
 /// global function that calls nothing.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_env_region_step(pos: u64, end: u64, at: u64) -> u64 {
     unsafe {
@@ -2076,14 +2157,17 @@ pub extern "C" fn nn_env_region_step(pos: u64, end: u64, at: u64) -> u64 {
 /// BTF typing (a scalar).
 #[inline(always)]
 unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
-    let args = ctx.as_ptr() as *const u64;
-    let mut v = 0u64;
-    let _ = generated::bpf_probe_read_kernel(
-        &mut v as *mut u64 as *mut c_void,
-        8,
-        args.add(i) as *const c_void,
-    );
-    v
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let args = ctx.as_ptr() as *const u64;
+        let mut v = 0u64;
+        let _ = generated::bpf_probe_read_kernel(
+            &mut v as *mut u64 as *mut c_void,
+            8,
+            args.add(i) as *const c_void,
+        );
+        v
+    }
 }
 
 #[lsm(hook = "mmap_file")]
@@ -2102,141 +2186,144 @@ pub fn execmap_check(ctx: LsmContext) -> i32 {
 /// `walked`: set once the task's walk entry is made (the caller removes it).
 #[inline(always)]
 unsafe fn try_execmap(ctx: &LsmContext, task: *const u8, walked: &mut Option<TaskKey>) -> i32 {
-    // Kernel signature (5.15–6.18): (file, reqprot, prot, flags). `reqprot`
-    // is what the caller asked; PROT_EXEC in it is an executable mapping.
-    // The file is read through a helper, untyped: it is handed to a global
-    // function, which takes scalars only.
-    let file = raw_arg(ctx, 0) as *const u8;
-    let reqprot = raw_arg(ctx, 1);
-    if file.is_null() || reqprot & PROT_EXEC == 0 {
-        return 0;
-    }
-    let m = conf(conf_slot::MODE);
-    if m == mode::OFF || conf(conf_slot::FLAGS) & flags::MAP == 0 {
-        return 0;
-    }
-    // The image an exec is loading (`mm->exe_file`): judged at its exec.
-    let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
-    if mm.is_null() || peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8 == file {
-        return 0;
-    }
-    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-    if inode.is_null() {
-        return 0;
-    }
-    let key = inode_key(inode);
-    let (cs, cn) = match (off_opt!(INODE_I_CTIME_SEC_OFFSET), off_opt!(INODE_I_CTIME_NSEC_OFFSET)) {
-        (Some(a), Some(b)) => (
-            peek_u64(inode.add(a & 0xffff)) as i64,
-            peek_u32(inode.add(b & 0xffff)),
-        ),
-        _ => (0i64, 0u32),
-    };
-    let mut classes = 0u32;
-    let mut reported = 0u64;
-    let mut cached = false;
-    if let Some(v) = EXECMAP_SEEN.get(&key) {
-        if v.ctime_sec == cs && v.ctime_nsec == cn {
-            classes = v.classes;
-            reported = v.reported_ns;
-            cached = true;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature (5.15–6.18): (file, reqprot, prot, flags). `reqprot`
+        // is what the caller asked; PROT_EXEC in it is an executable mapping.
+        // The file is read through a helper, untyped: it is handed to a global
+        // function, which takes scalars only.
+        let file = raw_arg(ctx, 0) as *const u8;
+        let reqprot = raw_arg(ctx, 1);
+        if file.is_null() || reqprot & PROT_EXEC == 0 {
+            return 0;
         }
-    }
-    let wk = crate::task_scratch::key_of(task);
-    if !cached {
-        *walked = Some(wk);
-        let r = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns) as u32;
-        classes = r & !MAP_WALK_LOST;
-        // A classification without a walk (fail-closed) is not cached:
-        // the next mapping of the file is walked.
-        if r & MAP_WALK_LOST == 0 {
-            let v = MapSeen {
-                ctime_sec: cs,
-                ctime_nsec: cn,
-                classes,
-                reported_ns: 0,
-            };
-            let _ = EXECMAP_SEEN.insert(&key, &v, 0);
+        let m = conf(conf_slot::MODE);
+        if m == mode::OFF || conf(conf_slot::FLAGS) & flags::MAP == 0 {
+            return 0;
         }
-    }
-    if classes == 0 {
-        return 0;
-    }
-    let tv = nn_execpol_tier(task as u64) as u32;
-    let t = tv & 3;
-    let deny_c = classes & conf(conf_slot::MAP_DENY + t) as u32;
-    let rec_c = classes & conf(conf_slot::MAP_RECORD + t) as u32;
-    if deny_c == 0 && rec_c == 0 {
-        return 0;
-    }
-    let mut act = action::RECORD;
-    let mut rc = 0;
-    if deny_c != 0 {
-        if m == mode::ENFORCE && deny_c & !(conf(conf_slot::CLASS_AUDIT) as u32) != 0 {
-            act |= action::DENY;
-            rc = -EACCES;
-            bump(counter::MAP_DENIED);
-        } else {
-            act |= action::WOULD_DENY;
+        // The image an exec is loading (`mm->exe_file`): judged at its exec.
+        let mm = peek_u64(task.add(off!(TASK_STRUCT_MM_OFFSET))) as *const u8;
+        if mm.is_null() || peek_u64(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET))) as *const u8 == file {
+            return 0;
         }
-    }
-    bump(counter::MAP_RECORDED);
-    // One report per file per minute: a library mapped by every worker of
-    // a service is one finding (the counters keep the total).
-    let now = bpf_ktime_get_ns();
-    if reported != 0 && now.wrapping_sub(reported) < MAP_REPORT_EVERY_NS {
-        return rc;
-    }
-    let v = MapSeen {
-        ctime_sec: cs,
-        ctime_nsec: cn,
-        classes,
-        reported_ns: now,
-    };
-    let _ = EXECMAP_SEEN.insert(&key, &v, 0);
-    let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
-            bump(counter::RING_FULL);
+        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+        if inode.is_null() {
+            return 0;
+        }
+        let key = inode_key(inode);
+        let (cs, cn) = match (off_opt!(INODE_I_CTIME_SEC_OFFSET), off_opt!(INODE_I_CTIME_NSEC_OFFSET)) {
+            (Some(a), Some(b)) => (
+                peek_u64(inode.add(a & 0xffff)) as i64,
+                peek_u32(inode.add(b & 0xffff)),
+            ),
+            _ => (0i64, 0u32),
+        };
+        let mut classes = 0u32;
+        let mut reported = 0u64;
+        let mut cached = false;
+        if let Some(v) = EXECMAP_SEEN.get(&key) {
+            if v.ctime_sec == cs && v.ctime_nsec == cn {
+                classes = v.classes;
+                reported = v.reported_ns;
+                cached = true;
+            }
+        }
+        let wk = crate::task_scratch::key_of(task);
+        if !cached {
+            *walked = Some(wk);
+            let r = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns) as u32;
+            classes = r & !MAP_WALK_LOST;
+            // A classification without a walk (fail-closed) is not cached:
+            // the next mapping of the file is walked.
+            if r & MAP_WALK_LOST == 0 {
+                let v = MapSeen {
+                    ctime_sec: cs,
+                    ctime_nsec: cn,
+                    classes,
+                    reported_ns: 0,
+                };
+                let _ = EXECMAP_SEEN.insert(&key, &v, 0);
+            }
+        }
+        if classes == 0 {
+            return 0;
+        }
+        let tv = nn_execpol_tier(task as u64) as u32;
+        let t = tv & 3;
+        let deny_c = classes & conf(conf_slot::MAP_DENY + t) as u32;
+        let rec_c = classes & conf(conf_slot::MAP_RECORD + t) as u32;
+        if deny_c == 0 && rec_c == 0 {
+            return 0;
+        }
+        let mut act = action::RECORD;
+        let mut rc = 0;
+        if deny_c != 0 {
+            if m == mode::ENFORCE && deny_c & !(conf(conf_slot::CLASS_AUDIT) as u32) != 0 {
+                act |= action::DENY;
+                rc = -EACCES;
+                bump(counter::MAP_DENIED);
+            } else {
+                act |= action::WOULD_DENY;
+            }
+        }
+        bump(counter::MAP_RECORDED);
+        // One report per file per minute: a library mapped by every worker of
+        // a service is one finding (the counters keep the total).
+        let now = bpf_ktime_get_ns();
+        if reported != 0 && now.wrapping_sub(reported) < MAP_REPORT_EVERY_NS {
             return rc;
         }
-    };
-    let raw: *mut ExecPolRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    fill_head(raw, task);
-    (*raw).kind = kind::MAP;
-    (*raw).tier = tv;
-    (*raw).classes = classes;
-    (*raw).action = act;
-    (*raw).file_mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
-    if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
-        (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+        let v = MapSeen {
+            ctime_sec: cs,
+            ctime_nsec: cn,
+            classes,
+            reported_ns: now,
+        };
+        let _ = EXECMAP_SEEN.insert(&key, &v, 0);
+        let mut entry = match EXECPOL_EVENTS.reserve::<ExecPolRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECPOL);
+                bump(counter::RING_FULL);
+                return rc;
+            }
+        };
+        let raw: *mut ExecPolRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        fill_head(raw, task);
+        (*raw).kind = kind::MAP;
+        (*raw).tier = tv;
+        (*raw).classes = classes;
+        (*raw).action = act;
+        (*raw).file_mode = u32::from(peek_u16(inode.add(off!(INODE_I_MODE_OFFSET))));
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
+        }
+        // A report from the cache walks the file now (once a minute at most):
+        // the per-CPU buffer it was copied from held whatever this CPU walked
+        // last (lot 322).
+        if cached {
+            *walked = Some(wk);
+            let _ = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns);
+        }
+        if let Some(sc) = EXECMAP_SCRATCH.get_ptr(&wk) {
+            let _ = generated::bpf_probe_read_kernel(
+                &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
+                core::mem::size_of::<ExeIdentityRaw>() as u32,
+                sc as *const c_void,
+            );
+        }
+        (*raw).exe.dev = key.dev;
+        (*raw).exe.ino = key.ino;
+        entry.submit(0);
+        rc
     }
-    // A report from the cache walks the file now (once a minute at most):
-    // the per-CPU buffer it was copied from held whatever this CPU walked
-    // last (lot 322).
-    if cached {
-        *walked = Some(wk);
-        let _ = nn_map_classify(file as u64, u64::from(wk.tid), wk.start_ns);
-    }
-    if let Some(sc) = EXECMAP_SCRATCH.get_ptr(&wk) {
-        let _ = generated::bpf_probe_read_kernel(
-            &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
-            core::mem::size_of::<ExeIdentityRaw>() as u32,
-            sc as *const c_void,
-        );
-    }
-    (*raw).exe.dev = key.dev;
-    (*raw).exe.ino = key.ino;
-    entry.submit(0);
-    rc
 }
 
 /// The classes of a file mapped executable: its walk into the mapping
 /// task's own entry (`tid`, `start`; made here), then lab PR 223's
 /// classification. A global function (integer arguments): checked once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_map_classify(file: u64, tid: u64, start: u64) -> u64 {
     unsafe { u64::from(map_classify(file as *const u8, tid, start)) }
@@ -2248,39 +2335,42 @@ const MAP_WALK_LOST: u32 = 1 << 31;
 
 #[inline(always)]
 unsafe fn map_classify(file: *const u8, tid: u64, start: u64) -> u32 {
-    let s = match crate::task_scratch::make(&EXECMAP_SCRATCH, &crate::task_scratch::key(tid, start)) {
-        Some(p) => p,
-        // The review of #546 (F4, F5): counted, and classed as a file the
-        // walk cannot place (it was class 0: let through, uncounted).
-        None => {
-            bump(counter::LOST);
-            return MAP_WALK_LOST | class::TMP | class::VAR_TMP | class::HOME;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let s = match crate::task_scratch::make(&EXECMAP_SCRATCH, &crate::task_scratch::key(tid, start)) {
+            Some(p) => p,
+            // The review of #546 (F4, F5): counted, and classed as a file the
+            // walk cannot place (it was class 0: let through, uncounted).
+            None => {
+                bump(counter::LOST);
+                return MAP_WALK_LOST | class::TMP | class::VAR_TMP | class::HOME;
+            }
+        };
+        let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
+        let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+        let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
+        let dentry =
+            peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
+        let mut fl = exe_flags::KNOWN;
+        if magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC || magic == RAMFS_MAGIC {
+            fl |= exe_flags::TMPFS;
         }
-    };
-    let inode = peek_u64(file.add(off!(FILE_F_INODE_OFFSET))) as *const u8;
-    let sb = peek_u64(inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
-    let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
-    let dentry =
-        peek_u64(file.add(off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET))) as *const u8;
-    let mut fl = exe_flags::KNOWN;
-    if magic == TMPFS_MAGIC || magic == HUGETLBFS_MAGIC || magic == RAMFS_MAGIC {
-        fl |= exe_flags::TMPFS;
-    }
-    let name = peek_u64(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) as *const u8;
-    if peek_u64(name) & MEMFD_MASK == MEMFD_PREFIX {
-        fl |= exe_flags::MEMFD;
-    }
-    if let Some(o) = off_opt!(INODE_I_NLINK_OFFSET) {
-        if peek_u32(inode.add(o & 0xffff)) == 0 {
-            fl |= exe_flags::DELETED;
+        let name = peek_u64(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET))) as *const u8;
+        if peek_u64(name) & MEMFD_MASK == MEMFD_PREFIX {
+            fl |= exe_flags::MEMFD;
         }
+        if let Some(o) = off_opt!(INODE_I_NLINK_OFFSET) {
+            if peek_u32(inode.add(o & 0xffff)) == 0 {
+                fl |= exe_flags::DELETED;
+            }
+        }
+        let task_root = crate::exec_lsm::task_root_of(bpf_get_current_task() as *const u8);
+        let key = inode_key(inode);
+        (*s).dev = key.dev;
+        (*s).ino = key.ino;
+        (*s).pass = 0;
+        (*s)._pad = 0;
+        (*s).flags = fl | (crate::exec_lsm::exe_walk(s, dentry, task_root) as u32);
+        crate::execq::classify(s, dentry, (*s).flags)
     }
-    let task_root = crate::exec_lsm::task_root_of(bpf_get_current_task() as *const u8);
-    let key = inode_key(inode);
-    (*s).dev = key.dev;
-    (*s).ino = key.ino;
-    (*s).pass = 0;
-    (*s)._pad = 0;
-    (*s).flags = fl | (crate::exec_lsm::exe_walk(s, dentry, task_root) as u32);
-    crate::execq::classify(s, dentry, (*s).flags)
 }

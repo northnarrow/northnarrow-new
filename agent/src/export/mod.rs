@@ -11,11 +11,11 @@
 //!   checked, what it lost counted (stage 8) and signed.
 //! - [`ExportHandle`]: what the status, the manifest and the beats read.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn_core::config::overlay_auth::Verified;
-use nn_export::config::{ExportConfig, EXPORT_LOCAL};
+use nn_export::config::{EXPORT_LOCAL, ExportConfig};
 use nn_proto::admin_protocol::{ExportSinkStatus, ExportStatus};
 use nn_proto::admin_signed_payload::OverlayKind;
 use parking_lot::Mutex;
@@ -76,7 +76,7 @@ pub fn parse(text: &str) -> Loaded {
             return Loaded::Failed {
                 why: format!("{e:#}"),
                 sha256,
-            }
+            };
         }
     };
     let ca_pem = match &config.syslog {
@@ -86,7 +86,7 @@ pub fn parse(text: &str) -> Loaded {
                 return Loaded::Failed {
                     why: format!("{e:#}"),
                     sha256,
-                }
+                };
             }
         },
         _ => None,

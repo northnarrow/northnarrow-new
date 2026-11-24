@@ -1,7 +1,7 @@
 [package]
 name = "northnarrow-agent-ebpf"
 version = "0.1.0-alpha"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/northnarrow/northnarrow-new"
 authors = ["NorthNarrow"]
@@ -54,3 +54,6 @@ rpath = false
 [workspace]
 # Sub-workspace: explicitly empty. Prevents the parent Cargo.toml from
 # trying to share workspace settings (different toolchain + target).
+# Lot 396: edition 2024 would make its resolver "3"; it stays "2", as the
+# root workspace's, so no resolution changes.
+resolver = "2"

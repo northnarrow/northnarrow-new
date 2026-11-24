@@ -10,15 +10,15 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use nn_model::posture_types::TriggerType;
 use nn_model::Event;
+use nn_model::posture_types::TriggerType;
 
+use super::ProcRef;
 use super::actuator::{
     CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
 };
 use super::evidence::{ActionOutcome, LadderEvidence, OutcomeResult, StageTransition, Unrecorded};
 use super::offender::ProcFacts;
-use super::ProcRef;
 use super::{AuditEvidence, CombatLadder, CombatStage, LadderConfig, NoProtectedProcs};
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
 use crate::chain_host_linux::LinuxHost;

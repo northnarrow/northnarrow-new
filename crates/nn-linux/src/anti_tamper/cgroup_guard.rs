@@ -48,16 +48,16 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::btf_offsets::{CGROUP_MOVE_FINISH, CGROUP_MOVE_TARGET};
 use common::cgroup_limits::LimitValue;
-use common::wire::{InodeKey, CGROUP_POLICY_V1_REFUSE};
+use common::wire::{CGROUP_POLICY_V1_REFUSE, InodeKey};
 use tracing::{info, warn};
 
-pub use antitamper_bpf::cgroup_guard::{UnitCgroup, V1Policy};
 use antitamper_bpf::cgroup_guard::{CGROUP_POLICY_MAP_NAME, LIMIT_VALUES_MAP_NAME};
+pub use antitamper_bpf::cgroup_guard::{UnitCgroup, V1Policy};
 
 /// The move guard's lookup half and the kernel function it is attached to
 /// (its pins carry the function's name: `prog_cgroup_procs_write_start`,
@@ -90,8 +90,7 @@ pub const SUBTREE_MARK_HOOK: &str = "cgroup_subtree_control_write";
 
 /// What is lost when the subtree mark is not attached (an FP, never a
 /// protection).
-pub const SUBTREE_MARK_ABSENT_EFFECT: &str =
-    "the cgroup controller mark is not attached: on kernels before 6.5 a write of `+cpuset` to \
+pub const SUBTREE_MARK_ABSENT_EFFECT: &str = "the cgroup controller mark is not attached: on kernels before 6.5 a write of `+cpuset` to \
      a cgroup.subtree_control above the agent's unit is refused (the cpuset controller's \
      scheduling check of the agent, recorded NN-L-AT-001 `sched`)";
 
@@ -99,8 +98,7 @@ pub const SUBTREE_MARK_ABSENT_EFFECT: &str =
 pub const GUARD_HOOKS: [&str; 3] = [MOVE_DENY_HOOK, MOVE_STASH_HOOK, MOVE_CLEAR_HOOK];
 
 /// What is lost when the move guard is not attached.
-pub const MOVE_GUARD_ABSENT_EFFECT: &str =
-    "the cgroup move guard is not attached: a protected process can be moved out of its \
+pub const MOVE_GUARD_ABSENT_EFFECT: &str = "the cgroup move guard is not attached: a protected process can be moved out of its \
      unit's cgroup (and killed or frozen through the new one)";
 
 /// How the move guard counted this boot.
@@ -417,7 +415,10 @@ pub fn back_to_configured(bpffs_root: Option<&Path>, socket: &Path) -> Vec<Strin
     }
     if !moved.is_empty() {
         refresh_values(bpffs_root);
-        info!(files = moved.len(), "anti-tamper cgroup: files at their floors back at their configured values after a confirmed reload");
+        info!(
+            files = moved.len(),
+            "anti-tamper cgroup: files at their floors back at their configured values after a confirmed reload"
+        );
     }
     moved
 }
@@ -726,9 +727,11 @@ mod tests {
         remember_unit("/test.slice/remember-unit-other.service");
         let units = REGISTERED_UNITS.lock().clone();
         assert_eq!(units.iter().filter(|u| *u == unit).count(), 1);
-        assert!(units
-            .iter()
-            .any(|u| u == "/test.slice/remember-unit-other.service"));
+        assert!(
+            units
+                .iter()
+                .any(|u| u == "/test.slice/remember-unit-other.service")
+        );
         assert_eq!(refresh_values(None), 0);
     }
 

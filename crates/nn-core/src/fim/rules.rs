@@ -49,11 +49,11 @@ use nn_model::telemetry::{FimEvent, FimOp};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
-use crate::anti_tamper::trusted_installer::{is_own_unit_dropin, OWN_SYSTEMD_UNITS};
+use crate::anti_tamper::trusted_installer::{OWN_SYSTEMD_UNITS, is_own_unit_dropin};
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
-use crate::decision::response_policy::{PolicySwitch, FIM_007_KILL, FIM_009_KILL};
-use crate::decision::Rule;
+use crate::decision::response_policy::{FIM_007_KILL, FIM_009_KILL, PolicySwitch};
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
 
@@ -213,15 +213,16 @@ fn fim_verdict(
     };
     // Lot 373: a creation no kernel record reported says so — its writer is
     // not known, and no pid or name stands in for one.
-    let reasoning =
-        if super::unknown_writer::writer_unknown(fe) && !reasoning.contains("writer unknown") {
-            format!(
+    let reasoning = if super::unknown_writer::writer_unknown(fe)
+        && !reasoning.contains("writer unknown")
+    {
+        format!(
             "{reasoning} [writer unknown: no kernel record of this creation — the file was found \
              at a look]"
         )
-        } else {
-            reasoning
-        };
+    } else {
+        reasoning
+    };
     Verdict {
         rule_id: rule.id().to_string(),
         rule_name: rule.name().to_string(),
@@ -3972,9 +3973,11 @@ mod tests {
     #[test]
     fn bug022_created_kmod_and_truncated_suffix_rules_fire() {
         // FIM-008 on a Created module drop (was Modified-only → dead).
-        assert!(NnLFim008KernelModuleModified
-            .evaluate(&fim_event(FimOp::Created, "/lib/modules/6.8.0/evil.ko"))
-            .is_some());
+        assert!(
+            NnLFim008KernelModuleModified
+                .evaluate(&fim_event(FimOp::Created, "/lib/modules/6.8.0/evil.ko"))
+                .is_some()
+        );
 
         // A Created event in a watched dir whose leaf was truncated
         // (no verifiable suffix survives).
@@ -3988,31 +3991,39 @@ mod tests {
             }
         };
 
-        assert!(NnLFim021PamModuleModified
-            .evaluate(&truncated(
-                "/usr/lib/x86_64-linux-gnu/security/loooong-no-suffix"
-            ))
-            .is_some());
-        assert!(NnLFim023SystemdTimerCreated
-            .evaluate(&truncated("/etc/systemd/system/loooong-no-suffix"))
-            .is_some());
+        assert!(
+            NnLFim021PamModuleModified
+                .evaluate(&truncated(
+                    "/usr/lib/x86_64-linux-gnu/security/loooong-no-suffix"
+                ))
+                .is_some()
+        );
+        assert!(
+            NnLFim023SystemdTimerCreated
+                .evaluate(&truncated("/etc/systemd/system/loooong-no-suffix"))
+                .is_some()
+        );
 
         // Control: a NON-truncated leaf without the suffix must NOT
         // fire — truncation is the only suffix bypass.
-        assert!(NnLFim021PamModuleModified
-            .evaluate(&fim_event(
-                FimOp::Created,
-                "/usr/lib/x86_64-linux-gnu/security/readme.txt"
-            ))
-            .is_none());
+        assert!(
+            NnLFim021PamModuleModified
+                .evaluate(&fim_event(
+                    FimOp::Created,
+                    "/usr/lib/x86_64-linux-gnu/security/readme.txt"
+                ))
+                .is_none()
+        );
 
         // Control: a truncated leaf OUTSIDE the rule's dir gate must NOT
         // fire — `child_truncated` is AND-gated by the dir match
         // (`contains("/security/")`), never global. A long filename
         // anywhere else must not be a false positive.
-        assert!(NnLFim021PamModuleModified
-            .evaluate(&truncated("/tmp/loooong-attacker-name-no-dir-match"))
-            .is_none());
+        assert!(
+            NnLFim021PamModuleModified
+                .evaluate(&truncated("/tmp/loooong-attacker-name-no-dir-match"))
+                .is_none()
+        );
     }
 
     // ── universal: FIM rules return None for non-FIM events ─────
@@ -4057,12 +4068,15 @@ mod tests {
         let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         let tree = "/usr/lib/modules/6.8.0-1-generic/kernel/fs/x.ko";
         assert!(r.evaluate(&fim_event(FimOp::Modified, tree)).is_none());
-        assert!(NnLFim008KernelModuleModified
-            .evaluate(&fim_event(FimOp::Modified, tree))
-            .is_some());
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/usr/lib/systemd/systemd"))
-            .is_some());
+        assert!(
+            NnLFim008KernelModuleModified
+                .evaluate(&fim_event(FimOp::Modified, tree))
+                .is_some()
+        );
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/usr/lib/systemd/systemd"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -4082,13 +4096,15 @@ mod tests {
     fn fim001_does_not_fire_on_user_binary_modified() {
         let r = NnLFim001SystemBinaryModified::new(H::inert_installer_window());
         // /usr/local/bin/ is NN-L-FIM-006's territory; 001 must NOT fire.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/usr/local/bin/x"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/usr/local/bin/x"))
+                .is_none()
+        );
         // /home/ definitely not.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/home/u/bin/x"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/home/u/bin/x"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4097,12 +4113,14 @@ mod tests {
         // Deleted of a system binary is alarming but caught by
         // a different rule (or none in V1.0); 001 only handles
         // Modified.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Deleted, "/usr/bin/sshd"))
-            .is_none());
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/usr/bin/sshd"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Deleted, "/usr/bin/sshd"))
+                .is_none()
+        );
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/usr/bin/sshd"))
+                .is_none()
+        );
     }
 
     // ── NN-L-FIM-002 ────────────────────────────────────────────
@@ -4144,13 +4162,15 @@ mod tests {
         // Modified op never fires 002.
         assert!(r.evaluate(&fim_event(FimOp::Modified, "/tmp/.x")).is_none());
         // Created in system path NOT user-writable — 001 territory.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/usr/bin/y"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/usr/bin/y"))
+                .is_none()
+        );
         // Linked into /etc/ — possibly a different rule, NOT 002.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Linked, "/etc/cron.d/x"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Linked, "/etc/cron.d/x"))
+                .is_none()
+        );
     }
 
     /// Lot 352 (pre-alpha Phase 4, FIM-002): `ln /usr/bin/passwd
@@ -4177,9 +4197,10 @@ mod tests {
             v.reasoning.contains("/var/tmp/nn-link"),
             "the link is named"
         );
-        assert!(r
-            .evaluate(&link("/backup/daily.0/usr/bin/passwd"))
-            .is_none());
+        assert!(
+            r.evaluate(&link("/backup/daily.0/usr/bin/passwd"))
+                .is_none()
+        );
         assert!(r.evaluate(&link("mnt[8:1:2]/tmp/x")).is_some());
         assert!(r.evaluate(&link("mnt[8:1:2]/srv/x")).is_none());
         let cut = format!("{}/a/b/x", nn_model::path_text::CUT_MARK);
@@ -4188,9 +4209,10 @@ mod tests {
         // only a link's walk: a Created of a cut path is judged by its path
         assert!(r.evaluate(&fim_event(FimOp::Created, &cut)).is_none());
         // without the walk (an older record) the source is judged, as before
-        assert!(r
-            .evaluate(&fim_event(FimOp::Linked, "/usr/bin/passwd"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Linked, "/usr/bin/passwd"))
+                .is_none()
+        );
         // a Created keeps its path (the dest is a rename's)
         let mut created = fim_event(FimOp::Created, "/etc/x");
         if let Event::Fim(fe) = &mut created {
@@ -4224,16 +4246,18 @@ mod tests {
     fn fim003_does_not_fire_on_arbitrary_etc_file() {
         let r = NnLFim003SensitiveConfigModified;
         // /etc/hostname is on /etc/ but not in the exact list.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/etc/hostname"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/etc/hostname"))
+                .is_none()
+        );
         // /etc/shadow- (the backup file with trailing dash) is
         // an exact-match miss — operators may legitimately
         // rename shadow + shadow- during password ops; rule
         // 003 only fires on the exact /etc/shadow.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/etc/shadow-"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/etc/shadow-"))
+                .is_none()
+        );
     }
 
     // ── NN-L-FIM-004 ────────────────────────────────────────────
@@ -4310,23 +4334,27 @@ mod tests {
         assert_eq!(v.severity, Severity::Critical);
         assert!(v.reasoning.contains("set-uid added"), "{}", v.reasoning);
         // writable by others, or a new owner: the next rewrite is anyone's
-        assert!(r
-            .evaluate(&attr_event("/usr/bin/sudo", (0o755, 0, 0), (0o757, 0, 0)))
-            .is_some());
-        assert!(r
-            .evaluate(&attr_event(
+        assert!(
+            r.evaluate(&attr_event("/usr/bin/sudo", (0o755, 0, 0), (0o757, 0, 0)))
+                .is_some()
+        );
+        assert!(
+            r.evaluate(&attr_event(
                 "/usr/bin/sudo",
                 (0o755, 0, 0),
                 (0o755, 1000, 0)
             ))
-            .is_some());
+            .is_some()
+        );
         // hardening (`chmod u-s`) and a harmless read bit: recorded only
-        assert!(r
-            .evaluate(&attr_event("/usr/bin/chfn", (0o4755, 0, 0), (0o755, 0, 0)))
-            .is_none());
-        assert!(r
-            .evaluate(&attr_event("/usr/bin/x", (0o711, 0, 0), (0o755, 0, 0)))
-            .is_none());
+        assert!(
+            r.evaluate(&attr_event("/usr/bin/chfn", (0o4755, 0, 0), (0o755, 0, 0)))
+                .is_none()
+        );
+        assert!(
+            r.evaluate(&attr_event("/usr/bin/x", (0o711, 0, 0), (0o755, 0, 0)))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4336,43 +4364,48 @@ mod tests {
             .evaluate(&attr_event("/etc/shadow", (0o640, 0, 42), (0o644, 0, 42)))
             .expect("chmod o+r /etc/shadow");
         assert_eq!(v.severity, Severity::High);
+        // a fixed message: the reasoning names the modifier's uid (CodeQL
+        // rust/cleartext-logging)
         assert!(
             v.reasoning.contains("readable by group/others"),
-            "{}",
-            v.reasoning
+            "the reasoning says the file became readable by group/others"
         );
         // closing it again is not
-        assert!(r
-            .evaluate(&attr_event("/etc/shadow", (0o644, 0, 42), (0o640, 0, 42)))
-            .is_none());
+        assert!(
+            r.evaluate(&attr_event("/etc/shadow", (0o644, 0, 42), (0o640, 0, 42)))
+                .is_none()
+        );
     }
 
     #[test]
     fn an_authorized_keys_file_handed_to_another_owner_fires() {
         let r = NnLFim004AuthorizedKeysModified;
-        assert!(r
-            .evaluate(&attr_event(
+        assert!(
+            r.evaluate(&attr_event(
                 "/root/.ssh/authorized_keys",
                 (0o600, 0, 0),
                 (0o600, 1000, 1000)
             ))
-            .is_some());
-        assert!(r
-            .evaluate(&attr_event(
+            .is_some()
+        );
+        assert!(
+            r.evaluate(&attr_event(
                 "/root/.ssh/authorized_keys",
                 (0o644, 0, 0),
                 (0o600, 0, 0)
             ))
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]
     fn a_chmod_of_a_bait_is_a_touch() {
         let r = NnLFim024AntiTamperHoneypotModified::new(1);
         let bait = HONEYPOT_PATHS[0];
-        assert!(r
-            .evaluate(&attr_event(bait, (0o644, 0, 0), (0o600, 0, 0)))
-            .is_some());
+        assert!(
+            r.evaluate(&attr_event(bait, (0o644, 0, 0), (0o600, 0, 0)))
+                .is_some()
+        );
     }
 
     // ── NN-L-FIM-005 ────────────────────────────────────────────
@@ -4406,9 +4439,10 @@ mod tests {
     #[test]
     fn fim005_does_not_fire_on_non_log_paths() {
         let r = NnLFim005LogTruncated::new(Some(TEST_SYSLOG_UID));
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/etc/passwd"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/etc/passwd"))
+                .is_none()
+        );
         assert!(r.evaluate(&fim_event(FimOp::Modified, "/tmp/x")).is_none());
     }
 
@@ -4497,25 +4531,29 @@ mod tests {
             "rsyslogd's O_APPEND writes read after another's truncation"
         );
         // the same shrink without the kernel's record: a truncation
-        assert!(r
-            .evaluate(&shrunk(Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, false))
-            .is_some());
+        assert!(
+            r.evaluate(&shrunk(Some(RSYSLOGD_EXE), TEST_SYSLOG_UID, false))
+                .is_some()
+        );
         // the flag proves an append, not who wrote: another program fires
-        assert!(r
-            .evaluate(&shrunk(Some("/usr/bin/tee"), TEST_SYSLOG_UID, true))
-            .is_some());
+        assert!(
+            r.evaluate(&shrunk(Some("/usr/bin/tee"), TEST_SYSLOG_UID, true))
+                .is_some()
+        );
         assert!(r.evaluate(&shrunk(None, TEST_SYSLOG_UID, true)).is_some());
         // Debian's packaged rsyslogd runs as root: the kernel's proof is
         // enough; without it, root's rsyslogd is judged as before
         assert!(r.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, true)).is_none());
         assert!(r.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, false)).is_some());
         let none = NnLFim005LogTruncated::new(None);
-        assert!(none
-            .evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, true))
-            .is_none());
-        assert!(none
-            .evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, false))
-            .is_some());
+        assert!(
+            none.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, true))
+                .is_none()
+        );
+        assert!(
+            none.evaluate(&shrunk(Some(RSYSLOGD_EXE), 0, false))
+                .is_some()
+        );
     }
 
     /// Lot 350 (named, F2-1): rsyslogd's appends emitted by the drain's own
@@ -4538,9 +4576,10 @@ mod tests {
             Event::Fim(fe)
         };
         for uid in [0, TEST_SYSLOG_UID] {
-            assert!(r
-                .evaluate(&ev(RSYSLOGD_EXE, uid, 8_292, 8_292, true, true))
-                .is_none());
+            assert!(
+                r.evaluate(&ev(RSYSLOGD_EXE, uid, 8_292, 8_292, true, true))
+                    .is_none()
+            );
             for (exe, new, appends, read) in [
                 (RSYSLOGD_EXE, 8_292, true, false),
                 (RSYSLOGD_EXE, 8_292, false, true),
@@ -4807,12 +4846,14 @@ mod tests {
     #[test]
     fn fim007_does_not_fire_on_unrelated_paths() {
         let r = NnLFim007CronDropInCreated::with_fresh_window();
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/etc/passwd"))
-            .is_none());
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/etc/passwd"))
+                .is_none()
+        );
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/var/spool/lpd/x"))
+                .is_none()
+        );
     }
 
     /// FP-3 dedup helper: a cron-path event with a caller-chosen
@@ -5047,12 +5088,14 @@ mod tests {
             Some("/var/spool/cron")
         );
         let r = NnLFim007CronDropInCreated::with_fresh_window();
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/etc/crontab.bak"))
-            .is_none());
-        assert!(r
-            .evaluate(&fim_event(FimOp::Modified, "/etc/crontab"))
-            .is_some());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/etc/crontab.bak"))
+                .is_none()
+        );
+        assert!(
+            r.evaluate(&fim_event(FimOp::Modified, "/etc/crontab"))
+                .is_some()
+        );
     }
 
     /// Genuinely distinct persistence events are never swallowed: a
@@ -5161,9 +5204,10 @@ mod tests {
         // /run/systemd/system/ is runtime state, not a unit file
         // root. systemctl writes runtime overrides there; not
         // a persistence vector.
-        assert!(r
-            .evaluate(&fim_event(FimOp::Created, "/run/systemd/system/x.service"))
-            .is_none());
+        assert!(
+            r.evaluate(&fim_event(FimOp::Created, "/run/systemd/system/x.service"))
+                .is_none()
+        );
     }
 
     // ── NN-L-FIM-009 — FIM-009 self-upgrade downgrade (§15.1) ────
@@ -5673,22 +5717,24 @@ mod tests {
         let r = NnLFim011AwsCredsRead;
         // A delete reads nothing and swaps nothing in; NN-AUD-286: a
         // replacement, a truncate and a chmod do fire (below).
-        assert!(r
-            .evaluate(&fim_event_with_comm(
+        assert!(
+            r.evaluate(&fim_event_with_comm(
                 FimOp::Deleted,
                 "/root/.aws/credentials",
                 "evil"
             ))
-            .is_none());
+            .is_none()
+        );
         // Random path with "aws" in it — must NOT match the
         // /.aws/ fragment pattern.
-        assert!(r
-            .evaluate(&fim_event_with_comm(
+        assert!(
+            r.evaluate(&fim_event_with_comm(
                 FimOp::Opened,
                 "/etc/aws-cli/something",
                 "evil"
             ))
-            .is_none());
+            .is_none()
+        );
     }
 
     /// External audit NN-AUD-286 (FIMR-012): the credentials replaced by a
@@ -5763,9 +5809,10 @@ mod tests {
         let rules = rules_by_id(&lineage);
         let r = &rules["NN-L-FIM-011_AwsCredsRead"];
         for op in [FimOp::Modified, FimOp::AttrChanged] {
-            assert!(r
-                .evaluate(&written_by(op, "/root/.aws/credentials", 100, "aws"))
-                .is_none());
+            assert!(
+                r.evaluate(&written_by(op, "/root/.aws/credentials", 100, "aws"))
+                    .is_none()
+            );
             let v = r
                 .evaluate(&written_by(op, "/root/.aws/credentials", 101, "aws"))
                 .expect("python named aws fires");
@@ -5940,9 +5987,10 @@ mod tests {
             v.reasoning.contains("writer unknown") && v.reasoning.contains("no hostile content")
         );
         assert!(!is_decisive_bait_tamper(&own));
-        assert!(!det
-            .detect(&Event::Fim(own), &[])
-            .contains(&TriggerType::ControlSurfaceTamper));
+        assert!(
+            !det.detect(&Event::Fim(own), &[])
+                .contains(&TriggerType::ControlSurfaceTamper)
+        );
         // a hostile content, or one not read: Critical, the writer said unknown
         for (fe, why) in [
             (created(0, 373_002), "hostile"),
@@ -5972,9 +6020,10 @@ mod tests {
         let v = rule.evaluate(&Event::Fim(by_shell.clone())).expect("fires");
         assert_eq!(v.severity, Severity::Critical);
         assert!(!v.reasoning.contains("writer unknown"));
-        assert!(det
-            .detect(&Event::Fim(by_shell), &[])
-            .contains(&TriggerType::ControlSurfaceTamper));
+        assert!(
+            det.detect(&Event::Fim(by_shell), &[])
+                .contains(&TriggerType::ControlSurfaceTamper)
+        );
     }
 
     #[test]
@@ -6454,14 +6503,15 @@ mod tests {
                 "{other}"
             );
         }
-        assert!(r
-            .evaluate(&written_by(
+        assert!(
+            r.evaluate(&written_by(
                 FimOp::Opened,
                 "/etc/modprobe.d/x.conf",
                 600,
                 "cat"
             ))
-            .is_none());
+            .is_none()
+        );
         // the FIM paths shipped watch every directory
         let shipped = include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1"));
         for d in [
@@ -6816,9 +6866,10 @@ mod tests {
         };
         let v = read(1001, Some(1000));
         assert_eq!(v.action, ResponseAction::KillProcess);
-        assert!(v
-            .reasoning
-            .contains("uid 1001 read a file owned by uid 1000"));
+        assert!(
+            v.reasoning
+                .contains("uid 1001 read a file owned by uid 1000")
+        );
         assert_eq!(read(1000, Some(1000)).action, ResponseAction::Log);
         assert_eq!(read(0, Some(1000)).action, ResponseAction::Log);
         assert_eq!(read(1001, None).action, ResponseAction::Log);
@@ -7021,13 +7072,14 @@ mod tests {
             assert_ne!(v.severity, Severity::Low);
         }
         // past the window, the same process records again
-        assert!(r
-            .evaluate(&unit(
+        assert!(
+            r.evaluate(&unit(
                 "/usr/lib/systemd/system/d.service",
                 200,
                 10 * S + KMOD_TRANSACTION_COALESCE_NS
             ))
-            .is_some());
+            .is_some()
+        );
     }
 
     /// Lot 376 (mutation guard): [`TransactionCoalesced`] coalesces a Low
@@ -7383,9 +7435,10 @@ mod tests {
             }
             e
         };
-        assert!(rule
-            .evaluate(&opened("/root/.gnupg/private-keys-v1.d", true))
-            .is_none());
+        assert!(
+            rule.evaluate(&opened("/root/.gnupg/private-keys-v1.d", true))
+                .is_none()
+        );
         let v = rule
             .evaluate(&opened("/root/.gnupg/private-keys-v1.d/ABCD.key", false))
             .expect("a key read");
@@ -7822,8 +7875,8 @@ mod tests {
         /// inode, no image, another program (`truncate`, python named
         /// logrotate), root's configuration directories writable by others.
         #[test]
-        fn a_hand_rotation_by_the_packaged_logrotate_with_root_s_configuration_is_high_never_a_kill(
-        ) {
+        fn a_hand_rotation_by_the_packaged_logrotate_with_root_s_configuration_is_high_never_a_kill()
+         {
             let (_tmp, t) = tracker();
             IdTestHost::set_dir_root_only("/etc", true);
             IdTestHost::set_dir_root_only("/etc/logrotate.d", true);
@@ -8374,9 +8427,11 @@ mod tests {
                 30 * S,
             )));
             let [_, fim019] = log_rules(None, &t);
-            assert!(fim019
-                .evaluate(&write("/var/log/wtmp", 560, "login"))
-                .is_none());
+            assert!(
+                fim019
+                    .evaluate(&write("/var/log/wtmp", 560, "login"))
+                    .is_none()
+            );
         }
     }
 
@@ -9041,9 +9096,10 @@ mod tests {
             );
             for (i, leaf) in ["b.ko.dpkg-new", "c.ko.dpkg-new"].iter().enumerate() {
                 let ts = (11 + i as u64) * S;
-                assert!(rule
-                    .evaluate(&write_at(FimOp::Created, &format!("{dir}/{leaf}"), 200, ts))
-                    .is_none());
+                assert!(
+                    rule.evaluate(&write_at(FimOp::Created, &format!("{dir}/{leaf}"), 200, ts))
+                        .is_none()
+                );
             }
             let held: Vec<_> = crate::detection_budget::take_held()
                 .into_iter()
@@ -9053,14 +9109,15 @@ mod tests {
             assert_eq!(held[0].count, 2);
             assert!(held[0].samples.iter().any(|s| s.ends_with("c.ko.dpkg-new")));
             // the postinst's systemctl, another process of the transaction
-            assert!(rule
-                .evaluate(&write_at(
+            assert!(
+                rule.evaluate(&write_at(
                     FimOp::Created,
                     &format!("{dir}/d.ko"),
                     400,
                     12 * S
                 ))
-                .is_some());
+                .is_some()
+            );
             // not a package write: the kill
             let v = rule
                 .evaluate(&write_at(
@@ -9073,26 +9130,29 @@ mod tests {
             assert_eq!(v.action, ResponseAction::KillProcessTree);
             // past the window, a new record
             let later = 10 * S + KMOD_TRANSACTION_COALESCE_NS;
-            assert!(rule
-                .evaluate(&write_at(
+            assert!(
+                rule.evaluate(&write_at(
                     FimOp::Created,
                     &format!("{dir}/e.ko"),
                     200,
                     later
                 ))
-                .is_some());
-            assert!(rule
-                .evaluate(&write_at(
+                .is_some()
+            );
+            assert!(
+                rule.evaluate(&write_at(
                     FimOp::Created,
                     &format!("{dir}/f.ko"),
                     200,
                     later + S
                 ))
-                .is_none());
+                .is_none()
+            );
             // elsewhere: not the tree's
-            assert!(rule
-                .evaluate(&write_at(FimOp::Created, "/etc/x", 600, 12 * S))
-                .is_none());
+            assert!(
+                rule.evaluate(&write_at(FimOp::Created, "/etc/x", 600, 12 * S))
+                    .is_none()
+            );
         }
 
         /// Lot 352: the remembered processes are bounded, the oldest
@@ -9482,10 +9542,18 @@ mod tests {
         );
         // apt-get (100) still runs, but the nearest package manager is the
         // finished dpkg: no cover from it.
-        assert!(!lineage
-            .is_package_transaction_write(300, crate::posture::lineage::AsOf::live(t0 + 120 * s)));
-        assert!(lineage
-            .is_package_transaction_write(100, crate::posture::lineage::AsOf::live(t0 + 120 * s)));
+        assert!(
+            !lineage.is_package_transaction_write(
+                300,
+                crate::posture::lineage::AsOf::live(t0 + 120 * s)
+            )
+        );
+        assert!(
+            lineage.is_package_transaction_write(
+                100,
+                crate::posture::lineage::AsOf::live(t0 + 120 * s)
+            )
+        );
     }
 
     /// NN-AUD-284: a short `dpkg -i` that exited before any walk found it
@@ -9819,9 +9887,10 @@ mod tests {
             )]);
             let rules = rules_by_id(&lineage);
             let rule = rules.get("NN-L-FIM-011_AwsCredsRead").unwrap();
-            assert!(rule
-                .evaluate(&read_by("/root/.aws/credentials", 310, "aws"))
-                .is_none());
+            assert!(
+                rule.evaluate(&read_by("/root/.aws/credentials", 310, "aws"))
+                    .is_none()
+            );
         }
     }
 }

@@ -173,14 +173,14 @@ pub(crate) fn load_or_init_master_key(path: &Path) -> std::io::Result<Zeroizing<
                 "master key at {} has wrong length {}",
                 path.display(),
                 bytes.len()
-            )))
+            )));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(std::io::Error::new(
                 e.kind(),
                 format!("master key at {}: {e}", path.display()),
-            ))
+            ));
         }
     }
     if let Some(parent) = path.parent() {

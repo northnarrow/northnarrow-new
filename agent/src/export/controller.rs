@@ -15,8 +15,8 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
@@ -27,8 +27,8 @@ use nn_linux::worker::{Health, WorkerError, Workers};
 use nn_proto::admin_protocol::{ExportChainStatus, ExportSinkStatus};
 use nn_proto::ipc::{
     Answer, ExportAddr, ExportChain, ExportRow, ExportRows, ExportRowsOut, ExportSetup, ExportSink,
-    FileSetup, Request, RowPos, SinkFault, SinkState, SyslogSetup, WorkerKind, MAX_EXPORT_BYTES,
-    MAX_EXPORT_ROWS, MAX_RECORDS_PER_ROW,
+    FileSetup, MAX_EXPORT_BYTES, MAX_EXPORT_ROWS, MAX_RECORDS_PER_ROW, Request, RowPos, SinkFault,
+    SinkState, SyslogSetup, WorkerKind,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -1255,30 +1255,36 @@ mod tests {
     #[test]
     fn an_answer_beyond_what_was_sent_is_refused() {
         let mut c = chain();
-        assert!(apply(
-            &mut c,
-            (1..=2).map(sent).collect(),
-            &out(Some(3), Some(3), 0)
-        )
-        .is_err());
+        assert!(
+            apply(
+                &mut c,
+                (1..=2).map(sent).collect(),
+                &out(Some(3), Some(3), 0)
+            )
+            .is_err()
+        );
         assert!(c.window.is_empty(), "the window is dropped");
         let mut c = chain();
         assert!(apply(&mut c, (1..=2).map(sent).collect(), &out(None, Some(7), 0)).is_err());
         let mut c = chain();
-        assert!(apply(
-            &mut c,
-            (1..=2).map(sent).collect(),
-            &out(Some(1), Some(2), 3)
-        )
-        .is_err());
+        assert!(
+            apply(
+                &mut c,
+                (1..=2).map(sent).collect(),
+                &out(Some(1), Some(2), 3)
+            )
+            .is_err()
+        );
         // two records a row is the most
         let mut c = chain();
-        assert!(apply(
-            &mut c,
-            (1..=2).map(sent).collect(),
-            &out(Some(2), Some(2), 4)
-        )
-        .is_ok());
+        assert!(
+            apply(
+                &mut c,
+                (1..=2).map(sent).collect(),
+                &out(Some(2), Some(2), 4)
+            )
+            .is_ok()
+        );
         // a row at or before the cursor is no lie (an ack already applied)
         let mut c = chain();
         c.cursor = sent(5).cursor();
@@ -1335,9 +1341,11 @@ mod tests {
         assert_eq!(over_bound(d.path(), 3, 100), None);
         // one byte more
         std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 21]).unwrap();
-        assert!(over_bound(d.path(), 3, 100)
-            .unwrap()
-            .contains("past its bound"));
+        assert!(
+            over_bound(d.path(), 3, 100)
+                .unwrap()
+                .contains("past its bound")
+        );
         // a name the sink does not write, a number past its files
         std::fs::write(d.path().join("export.jsonl.2"), [b'a'; 1]).unwrap();
         for bad in [
@@ -1442,15 +1450,19 @@ mod tests {
             vec![b'y'; (bound + allowance.unwrap()) as usize],
         )
         .unwrap();
-        assert!(dir_verdict(d.path(), 3, bound, allowance)
-            .unwrap()
-            .contains("past its bound"));
+        assert!(
+            dir_verdict(d.path(), 3, bound, allowance)
+                .unwrap()
+                .contains("past its bound")
+        );
         // and a name the sink does not write, whatever the allowance
         std::fs::write(d.path().join("export.jsonl"), b"").unwrap();
         std::fs::write(d.path().join("filler"), b"x").unwrap();
-        assert!(dir_verdict(d.path(), 3, bound, Some(u64::MAX / 2))
-            .unwrap()
-            .contains("does not write"));
+        assert!(
+            dir_verdict(d.path(), 3, bound, Some(u64::MAX / 2))
+                .unwrap()
+                .contains("does not write")
+        );
     }
 
     /// The same configuration again (no larger file): no allowance, the

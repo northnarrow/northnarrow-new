@@ -171,9 +171,10 @@ fn the_agent_can_move_a_drop_in_out_of_our_own_directories() {
         .collect();
     // the review of #497 (N7): the persistent agent one made by the unit
     // too, not by install.sh alone
-    assert!(made
-        .iter()
-        .any(|m| m == "/etc/systemd/system/northnarrow-agent.service.d"));
+    assert!(
+        made.iter()
+            .any(|m| m == "/etc/systemd/system/northnarrow-agent.service.d")
+    );
     for dir in made.iter().map(String::as_str) {
         assert!(
             rw.iter().any(|p| p.strip_prefix('-') == Some(dir)),
@@ -462,7 +463,7 @@ fn all_set<'a>(d: &'a [(String, String)], key: &str) -> Vec<&'a str> {
 /// and 64M — this test fails there.
 #[test]
 fn the_memory_limits_are_sized_from_the_measured_peaks() {
-    use antitamper_bpf::cgroup_floors::{floor_of, FloorRole};
+    use antitamper_bpf::cgroup_floors::{FloorRole, floor_of};
     const MIB: u64 = 1 << 20;
     // the measures (docs/operator/KNOWN_LIMITATIONS.md quotes them): Phase
     // 6b's cold start and storms, lot 381's lab
@@ -655,9 +656,11 @@ fn the_watchdog_restarts_on_every_failure_but_not_after_a_stop() {
         "no burst without an interval"
     );
     assert_eq!(value(&u, "OnFailure"), Some(HANDLER));
-    assert!(section_directives(&body, "Service")
-        .iter()
-        .all(|(k, _)| k != "OnFailure" && !k.starts_with("StartLimit")));
+    assert!(
+        section_directives(&body, "Service")
+            .iter()
+            .all(|(k, _)| k != "OnFailure" && !k.starts_with("StartLimit"))
+    );
 }
 
 /// Static review C-43 / G-06: no core dump from any unit, and each start

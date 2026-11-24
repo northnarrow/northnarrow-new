@@ -124,12 +124,15 @@ mod tests {
         assert_eq!(buf.len(), 3);
         let snap = buf.snapshot();
         // pid=1 evicted
-        assert!(!snap
-            .iter()
-            .any(|e| matches!(e, Event::ProcessSpawn { pid: 1, .. })));
-        assert!(snap
-            .iter()
-            .any(|e| matches!(e, Event::ProcessSpawn { pid: 4, .. })));
+        assert!(
+            !snap
+                .iter()
+                .any(|e| matches!(e, Event::ProcessSpawn { pid: 1, .. }))
+        );
+        assert!(
+            snap.iter()
+                .any(|e| matches!(e, Event::ProcessSpawn { pid: 4, .. }))
+        );
     }
 
     /// External audit XAI-017: a capacity of 0 never evicted.

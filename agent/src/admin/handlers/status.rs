@@ -5,7 +5,7 @@ use nn_proto::admin_protocol::{
     AdminResult, StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse,
 };
 
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::admin::{AdminHandles, ResponseAdminState};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};

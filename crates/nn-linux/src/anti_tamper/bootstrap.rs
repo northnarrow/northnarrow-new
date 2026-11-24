@@ -432,8 +432,7 @@ mod tests {
     #[test]
     fn evaluate_refuses_armed_when_admin_pub_has_two_keys() {
         let dir = TempDir::new().unwrap();
-        let admin_pub_content =
-            "1111111111111111111111111111111111111111111111111111111111111111\n\
+        let admin_pub_content = "1111111111111111111111111111111111111111111111111111111111111111\n\
              2222222222222222222222222222222222222222222222222222222222222222\n";
         let (paths, nonce) = make_install(&dir, admin_pub_content, None);
         let expected = compute_sentinel_content(&nonce, admin_pub_content.as_bytes());
@@ -520,8 +519,7 @@ mod tests {
 
         // Step 2: dispatcher completes the 1-of-N add. admin.pub
         // gains a second key, sentinel is removed.
-        let admin_pub_two_keys =
-            "1111111111111111111111111111111111111111111111111111111111111111\n\
+        let admin_pub_two_keys = "1111111111111111111111111111111111111111111111111111111111111111\n\
              2222222222222222222222222222222222222222222222222222222222222222\n";
         fs::write(&paths.admin_pub, admin_pub_two_keys).unwrap();
         complete(&paths).unwrap();

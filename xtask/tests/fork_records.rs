@@ -165,12 +165,10 @@ fn a_fork_record_not_taught_fails_the_ratchet() {
     let no_ingest = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_exec(r.pid);\n}\n\
                      fn pump(r: &XRaw, l: &L) {\n    teach(r, l);\n}\n";
     assert!(!teaches(no_ingest, "teach"));
-    let never_called =
-        "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n\
+    let never_called = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n\
                         fn pump(r: &XRaw) {\n    send(r);\n}\n";
     assert!(!teaches(never_called, "teach"));
-    let no_start =
-        "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, 0), 3, 4);\n}\n\
+    let no_start = "fn teach(r: &XRaw, l: &L) {\n    l.ingest_kernel_fork(r.pid, 1, (2, 0), 3, 4);\n}\n\
                     fn pump(r: &XRaw, l: &L) {\n    teach(r, l);\n}\n";
     assert!(!teaches(no_start, "teach"));
     let named_only = "fn pump(r: &XRaw, l: &L) {\n    let teach = 1;\n    l.ingest_kernel_fork(r.pid, 1, (2, r.fork_parent_start), 3, 4);\n}\n";

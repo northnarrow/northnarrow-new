@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::wire::execpol::{action, env_flags, kind, tier, ExecPolRaw};
+use common::wire::execpol::{ExecPolRaw, action, env_flags, kind, tier};
 use common::wire::execq::class;
 use nn_model::{Event, ExeIdentity, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
@@ -16,7 +16,7 @@ use super::{
     CATEGORY, RULE_ENV, RULE_ENV_NAME, RULE_EXEC, RULE_EXEC_NAME, RULE_MAP, RULE_MAP_NAME,
     RULE_PRELOAD, RULE_PRELOAD_NAME,
 };
-use crate::decision::attack::{mitre_of, AttackRef, Tactic};
+use crate::decision::attack::{AttackRef, Tactic, mitre_of};
 use crate::decision::bounded::RepeatWindow;
 use crate::detection_payload::ExecPolEvidence;
 use crate::detection_store::DetectionSink;
@@ -949,10 +949,12 @@ mod tests {
             "{}",
             rs[0].response
         );
-        assert!(rs[0]
-            .verdict
-            .reasoning
-            .contains("grew after the kernel counted it"));
+        assert!(
+            rs[0]
+                .verdict
+                .reasoning
+                .contains("grew after the kernel counted it")
+        );
         assert_eq!(rs[0].evidence.decision, "deny");
         assert_eq!(rs[0].evidence.environment, ["truncated"]);
         // an admin's: recorded, the exec ran
@@ -980,19 +982,23 @@ mod tests {
         assert_eq!(rs.len(), 1, "{rs:?}");
         assert_eq!(rs[0].verdict.rule_id, RULE_ENV);
         assert_eq!(rs[0].verdict.severity, Severity::High);
-        assert!(rs[0]
-            .verdict
-            .reasoning
-            .contains("longer than the check reads"));
+        assert!(
+            rs[0]
+                .verdict
+                .reasoning
+                .contains("longer than the check reads")
+        );
         assert!(
             rs[0].response.starts_with("denied at exec"),
             "{}",
             rs[0].response
         );
-        assert!(rs[0]
-            .evidence
-            .environment
-            .contains(&"loader_value_cut".to_string()));
+        assert!(
+            rs[0]
+                .evidence
+                .environment
+                .contains(&"loader_value_cut".to_string())
+        );
     }
 
     /// Lot 325 (TOCTOU): a staging preload in the kernel's own copy that the
@@ -1013,14 +1019,18 @@ mod tests {
             "{}",
             rs[0].response
         );
-        assert!(rs[0]
-            .verdict
-            .reasoning
-            .contains("the environment changed after the kernel's copy"));
-        assert!(rs[0]
-            .evidence
-            .environment
-            .contains(&"changed_after_the_kernel_s_copy".to_string()));
+        assert!(
+            rs[0]
+                .verdict
+                .reasoning
+                .contains("the environment changed after the kernel's copy")
+        );
+        assert!(
+            rs[0]
+                .evidence
+                .environment
+                .contains(&"changed_after_the_kernel_s_copy".to_string())
+        );
         raw.env_action = action::RECORD | action::WOULD_DENY;
         let rs = records_of(&raw, &ev("/usr/bin/true"), "p");
         assert_eq!(rs[0].verdict.severity, Severity::High);
@@ -1096,19 +1106,23 @@ mod tests {
         assert_eq!(rs.len(), 1, "{rs:?}");
         assert_eq!(rs[0].verdict.rule_id, RULE_PRELOAD);
         assert_eq!(rs[0].verdict.severity, Severity::High);
-        assert!(rs[0]
-            .verdict
-            .reasoning
-            .contains("relative to the caller's directory"));
+        assert!(
+            rs[0]
+                .verdict
+                .reasoning
+                .contains("relative to the caller's directory")
+        );
         assert!(
             rs[0].response.starts_with("denied at exec"),
             "{}",
             rs[0].response
         );
-        assert!(rs[0]
-            .evidence
-            .environment
-            .contains(&"relative_loader_path".to_string()));
+        assert!(
+            rs[0]
+                .evidence
+                .environment
+                .contains(&"relative_loader_path".to_string())
+        );
         raw.env_action = action::RECORD;
         assert_eq!(
             records_of(&raw, &ev("/usr/bin/true"), "p")[0]
@@ -1163,10 +1177,12 @@ mod tests {
             "{}",
             rs[0].response
         );
-        assert!(rs[0]
-            .evidence
-            .environment
-            .contains(&"irregular_loader_value".to_string()));
+        assert!(
+            rs[0]
+                .evidence
+                .environment
+                .contains(&"irregular_loader_value".to_string())
+        );
         raw.env_action = action::RECORD;
         assert_eq!(
             records_of(&raw, &ev("/usr/bin/true"), "p")[0]
@@ -1214,10 +1230,11 @@ mod tests {
         put(&mut raw.libpath, "/tmp/lib");
         let r = &records_of(&raw, &ev("/usr/bin/id"), "p")[0];
         assert_eq!(r.verdict.severity, Severity::Medium);
-        assert!(r
-            .evidence
-            .values
-            .contains(&"LD_LIBRARY_PATH=/tmp/lib".to_string()));
+        assert!(
+            r.evidence
+                .values
+                .contains(&"LD_LIBRARY_PATH=/tmp/lib".to_string())
+        );
     }
 
     #[test]
@@ -1395,7 +1412,7 @@ mod bughunt3 {
     /// so, a deny always; the table within its cap.
     #[test]
     fn the_repeat_table_keeps_its_invariants() {
-        use nn_core::model_check::{check, Rng, SEQUENCES};
+        use nn_core::model_check::{Rng, SEQUENCES, check};
         use std::collections::HashMap;
         let prefix = "glibc.malloc.arena_max=1:".repeat(4);
         let tunables = [

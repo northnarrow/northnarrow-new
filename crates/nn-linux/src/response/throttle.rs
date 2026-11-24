@@ -19,9 +19,9 @@ use nn_core::response::cgroup::{cgroup_at, cgroup_at_or_under};
 use tracing::{info, warn};
 
 use super::{
+    ExecutionOutcome,
     block_outbound::{create_cgroup_dir, write_pid},
     config::ExecutorConfig,
-    ExecutionOutcome,
 };
 
 /// 10% of one core, 100ms period.
@@ -516,8 +516,7 @@ mod tests {
             out,
             ExecutionOutcome::NotInEffect {
                 pid: me,
-                reason:
-                    "moved, but /proc/<pid>/cgroup does not place it in the agent's throttle scope"
+                reason: "moved, but /proc/<pid>/cgroup does not place it in the agent's throttle scope"
             }
         );
         assert_eq!(

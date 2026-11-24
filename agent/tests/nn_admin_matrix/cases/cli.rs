@@ -4,7 +4,7 @@
 use std::process::{Command, Stdio};
 
 use crate::fixtures;
-use crate::harness::{Case, BIN};
+use crate::harness::{BIN, Case};
 
 /// One subcommand path, its `-h` text parsed.
 struct Node {

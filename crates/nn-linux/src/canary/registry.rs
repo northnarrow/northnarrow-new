@@ -91,9 +91,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use common::wire::InodeKey;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -1206,7 +1206,7 @@ pub fn check_decoy(path: &Path, expected_sha256: Option<&str>) -> DecoyCheck {
     let lmeta = match antitamper_bpf::kernel_roots::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return found(DecoyState::Missing, None, None)
+            return found(DecoyState::Missing, None, None);
         }
         Err(_) => return found(DecoyState::Unreadable, None, None),
     };
@@ -1220,7 +1220,7 @@ pub fn check_decoy(path: &Path, expected_sha256: Option<&str>) -> DecoyCheck {
     {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return found(DecoyState::Missing, None, None)
+            return found(DecoyState::Missing, None, None);
         }
         Err(_) => return found(DecoyState::Unreadable, None, None),
     };
@@ -1496,10 +1496,11 @@ mod tests {
         assert_eq!(reg.list().len(), 2, "both canaries still deployed");
         assert_eq!(reg.take_open_findings().1, 1);
         // a line put in between moves the rows after it: reported
-        assert!(reg
-            .take_chain_findings()
-            .iter()
-            .any(|f| f.kind == "chain_sequence_broken"));
+        assert!(
+            reg.take_chain_findings()
+                .iter()
+                .any(|f| f.kind == "chain_sequence_broken")
+        );
     }
 
     /// External audit DEC-012: the writer refuses a row the reader would
@@ -1575,9 +1576,10 @@ mod tests {
         let log_path = dir.path().join("canaries.jsonl");
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         let deploy = reg.deploy(sample_draft(2)).unwrap();
-        assert!(reg
-            .mark_tripped(&deploy.canary_id, Some("abc123".to_string()))
-            .unwrap());
+        assert!(
+            reg.mark_tripped(&deploy.canary_id, Some("abc123".to_string()))
+                .unwrap()
+        );
         let state_pre = reg.get(&deploy.canary_id).unwrap();
         assert!(state_pre.tripped);
         assert_eq!(state_pre.first_trip_access_hash.as_deref(), Some("abc123"));
@@ -1605,18 +1607,21 @@ mod tests {
         let log_path = dir.path().join("canaries.jsonl");
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         let deploy = reg.deploy(sample_draft(3)).unwrap();
-        assert!(reg
-            .mark_tripped(&deploy.canary_id, Some("first".to_string()))
-            .unwrap());
+        assert!(
+            reg.mark_tripped(&deploy.canary_id, Some("first".to_string()))
+                .unwrap()
+        );
         // Second + third calls: return false (single-trip
         // semantics — no re-fire). first_trip_access_hash stays
         // the ORIGINAL value.
-        assert!(!reg
-            .mark_tripped(&deploy.canary_id, Some("second".to_string()))
-            .unwrap());
-        assert!(!reg
-            .mark_tripped(&deploy.canary_id, Some("third".to_string()))
-            .unwrap());
+        assert!(
+            !reg.mark_tripped(&deploy.canary_id, Some("second".to_string()))
+                .unwrap()
+        );
+        assert!(
+            !reg.mark_tripped(&deploy.canary_id, Some("third".to_string()))
+                .unwrap()
+        );
         let state = reg.get(&deploy.canary_id).unwrap();
         assert!(state.tripped);
         assert_eq!(
@@ -2029,9 +2034,11 @@ mod tests {
             ]
         );
         assert_eq!(all[1].decoy_state, Some(DecoyState::Modified));
-        assert!(serde_json::to_string(&all[1])
-            .unwrap()
-            .contains("\"decoy_state\":\"modified\""));
+        assert!(
+            serde_json::to_string(&all[1])
+                .unwrap()
+                .contains("\"decoy_state\":\"modified\"")
+        );
         assert_eq!(all[2].decoy_state, Some(DecoyState::Intact));
         verify_chain(&all, &pubkey).unwrap();
         let reg = reopen(&dir, &log_path);
@@ -2198,10 +2205,11 @@ mod tests {
         let (key, _) = fresh_signing_key(&dir);
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         assert!(reg.get(&second.canary_id).is_none(), "not applied");
-        assert!(reg
-            .take_chain_findings()
-            .iter()
-            .any(|f| f.kind == "chain_lines_unverified"));
+        assert!(
+            reg.take_chain_findings()
+                .iter()
+                .any(|f| f.kind == "chain_lines_unverified")
+        );
     }
 
     // ── Lab PR 260: the trip the access log holds ──────────────────────
@@ -2239,9 +2247,10 @@ mod tests {
         drop(access_db(dir));
         let found = reg.unrecorded_trips(&dir.path().join(ACCESS_LOG)).unwrap();
         for trip in &found {
-            assert!(reg
-                .mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
-                .unwrap());
+            assert!(
+                reg.mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
+                    .unwrap()
+            );
         }
         (reg, found)
     }
@@ -2311,9 +2320,10 @@ mod tests {
         let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
         let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
         let trip = access_db(&dir).append(access(&id, true, 1)).unwrap();
-        assert!(reg
-            .mark_tripped(&id, Some(trip.entry_hash.clone()))
-            .unwrap());
+        assert!(
+            reg.mark_tripped(&id, Some(trip.entry_hash.clone()))
+                .unwrap()
+        );
         let refresh = reg.refresh(&id, "11111111", None).unwrap();
         assert_eq!(refresh.action, RegistryAction::Refresh);
         assert!(!refresh.tripped);
@@ -2394,9 +2404,10 @@ mod tests {
         // the registry cannot be appended to: a directory at its path
         std::fs::rename(&log_path, &aside).unwrap();
         std::fs::create_dir(&log_path).unwrap();
-        assert!(reg
-            .mark_tripped(&id, Some(trip.entry_hash.clone()))
-            .is_err());
+        assert!(
+            reg.mark_tripped(&id, Some(trip.entry_hash.clone()))
+                .is_err()
+        );
         assert!(!reg.is_armed(&id), "tripped for this run");
         std::fs::remove_dir(&log_path).unwrap();
         std::fs::rename(&aside, &log_path).unwrap();
@@ -2557,10 +2568,11 @@ mod tests {
         let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
         reg.mark_tripped(&id, None).unwrap();
         std::fs::create_dir(dir2.path().join(ACCESS_LOG)).unwrap();
-        assert!(reg
-            .unrecorded_trips(&dir2.path().join(ACCESS_LOG))
-            .unwrap()
-            .is_empty());
+        assert!(
+            reg.unrecorded_trips(&dir2.path().join(ACCESS_LOG))
+                .unwrap()
+                .is_empty()
+        );
         reg.refresh(&id, "11111111", None).unwrap();
         assert!(
             reg.unrecorded_trips(&dir2.path().join(ACCESS_LOG)).is_err(),

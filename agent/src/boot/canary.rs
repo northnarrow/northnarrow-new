@@ -6,7 +6,7 @@ use northnarrow_agent::admin_socket;
 use tracing::{error, info, warn};
 
 use super::cli::Cli;
-use super::evidence::{attest_chain_findings, attest_degraded, attest_open_findings, AuditHandle};
+use super::evidence::{AuditHandle, attest_chain_findings, attest_degraded, attest_open_findings};
 
 /// What [`start`] opened.
 pub(crate) struct Canary {
@@ -148,7 +148,7 @@ pub(crate) fn start(
                         // rebuild_from_registry directly).
                         let fim_watch = fim_admin_state.as_ref().map(|f| f.watch.clone());
                         {
-                            use northnarrow_agent::canary::registry::{check_decoy, DecoyState};
+                            use northnarrow_agent::canary::registry::{DecoyState, check_decoy};
                             let mut reg = registry.lock();
                             let mut idx = indexes.lock();
                             // External audit DEC-003: inodes resolved at

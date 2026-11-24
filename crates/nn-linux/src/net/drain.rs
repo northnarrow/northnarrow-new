@@ -41,14 +41,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{ring_buf::RingBuf, MapData};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
+use aya::maps::{MapData, ring_buf::RingBuf};
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use common::wire::{NetFlowCloseRaw, NetListenRaw};
-use nn_model::telemetry::{NetFlowEvent, NetListenerEvent};
 use nn_model::Event;
+use nn_model::telemetry::{NetFlowEvent, NetListenerEvent};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1251,7 +1251,7 @@ mod tests {
     /// signed legacy line).
     #[test]
     fn bug026_legacy_v1_netflow_line_still_verifies() {
-        use crate::chainlog::{verify_log_set, ChainLine};
+        use crate::chainlog::{ChainLine, verify_log_set};
         let dir = tempfile::tempdir().unwrap();
         let key = fresh_key();
         let pk = key.verifying_key();
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn netflow_db_append_writes_one_chained_row() {
         use crate::chainlog::{
-            verify_log_set, ChainLine, NoProtection, RotationConfig, CHAINLOG_FMT_V3,
+            CHAINLOG_FMT_V3, ChainLine, NoProtection, RotationConfig, verify_log_set,
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
@@ -1396,7 +1396,7 @@ mod tests {
     /// Same shape as the audit + drift chain tests.
     #[test]
     fn netflow_db_chains_prev_hash_into_next_entry_hash() {
-        use crate::chainlog::{verify_log_set, ChainLine, NoProtection, RotationConfig};
+        use crate::chainlog::{ChainLine, NoProtection, RotationConfig, verify_log_set};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key = fresh_key();
@@ -1442,7 +1442,7 @@ mod tests {
     /// the second db sees the same signing identity as the first.
     #[test]
     fn netflow_db_reopen_resumes_chain_from_tail() {
-        use crate::chainlog::{verify_log_set, ChainLine, NoProtection, RotationConfig};
+        use crate::chainlog::{ChainLine, NoProtection, RotationConfig, verify_log_set};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
         let key_path = dir.path().join("k.sig");
@@ -1979,9 +1979,10 @@ mod tests {
             .map(|r| r.payload.decision_engine_skipped)
             .collect();
         assert_eq!(skipped, [false, false, true, true, true, false]);
-        assert!(rows
-            .iter()
-            .all(|r| r.payload.exe.as_deref() == Some("/opt/nnx/nnflood")));
+        assert!(
+            rows.iter()
+                .all(|r| r.payload.exe.as_deref() == Some("/opt/nnx/nnflood"))
+        );
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.matches("\"decision_engine_skipped\":true").count(), 3);
         assert_eq!(body.matches("decision_engine_skipped").count(), 3);

@@ -31,10 +31,10 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
 
-use crate::config::overlay::{load_defaults, DefaultsSource, Shipped};
+use crate::config::overlay::{DefaultsSource, Shipped, load_defaults};
 use crate::config::overlay_auth::Verified;
 use crate::content_host::ContentHost;
 

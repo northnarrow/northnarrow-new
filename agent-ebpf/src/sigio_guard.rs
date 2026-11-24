@@ -61,28 +61,31 @@ pub fn file_send_sigiotask_deny(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_file_send_sigiotask(ctx: &LsmContext) -> i32 {
-    let task: *const c_void = ctx.arg(0);
-    if task.is_null() {
-        return 0;
-    }
-    let tgid = match bpf_probe_read_kernel::<u32>(
-        (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            // the target cannot be told: let through, counted
-            crate::fail_open::bump(hook::FILE_SEND_SIGIOTASK);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task: *const c_void = ctx.arg(0);
+        if task.is_null() {
             return 0;
         }
-    };
-    if !crate::task_kill::is_protected_pid(tgid) {
-        return 0;
+        let tgid = match bpf_probe_read_kernel::<u32>(
+            (task as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                // the target cannot be told: let through, counted
+                crate::fail_open::bump(hook::FILE_SEND_SIGIOTASK);
+                return 0;
+            }
+        };
+        if !crate::task_kill::is_protected_pid(tgid) {
+            return 0;
+        }
+        let sig: c_int = ctx.arg(2);
+        let delivered = sigio_signal(sig);
+        if crate::task_kill::kill_grant_allows(delivered) {
+            return 0;
+        }
+        crate::inode_protect::emit_task_denial(FS_OP_SIGIO, delivered as u32 as u64, tgid);
+        -EPERM
     }
-    let sig: c_int = ctx.arg(2);
-    let delivered = sigio_signal(sig);
-    if crate::task_kill::kill_grant_allows(delivered) {
-        return 0;
-    }
-    crate::inode_protect::emit_task_denial(FS_OP_SIGIO, delivered as u32 as u64, tgid);
-    -EPERM
 }

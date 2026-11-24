@@ -27,7 +27,11 @@ exclude = ["agent-ebpf", "fuzz"]
 
 [workspace.package]
 version = "0.1.0-alpha"
-edition = "2021"
+# Lot 396 (#605): edition 2024 (rustc 1.85 or later; `rust-version` below
+# stays 1.89). `resolver` above stays "2": edition 2024 would default to
+# "3", the rust-version-aware one, and this lot changes no dependency
+# resolution.
+edition = "2024"
 # External audit SUP-015: the oldest rustc that builds this workspace with
 # the committed Cargo.lock. It was "1.83", which no build could meet:
 # uuid 1.28.0 declares 1.89 (and time 0.3.47, 1.88, until it left with
@@ -83,6 +87,16 @@ aya = "0.14"
 # not the crates' metadata, not the binaries.
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# Lot 396 (#605): edition 2024 brings let chains (`if let … && …`, stable
+# since rustc 1.88), and clippy's `collapsible_if` now asks for one at each
+# `if let` nested in another `if`: 350 sites in the gates' clippy runs.
+# Rewriting them changes style, not behaviour, and is left to a lot of its
+# own (this one changes no behaviour); until then the lint is off. Nested
+# plain `if`s, which it also stops flagging, no member has today (main's
+# clippy ran with it on). The agent's own table says the same.
+[workspace.lints.clippy]
+collapsible_if = "allow"
 
 [profile.release]
 # Sub-tappa 6.8 bumped LTO from "thin" to "fat" for the on-host LLM

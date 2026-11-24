@@ -11,8 +11,8 @@
 //!
 //! Process-wide atomics: one event loop per agent process.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use nn_proto::admin_protocol::LoopProgressResponse;

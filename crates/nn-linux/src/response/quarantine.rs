@@ -52,8 +52,8 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use super::{config::ExecutorConfig, ExecutionOutcome};
-use crate::keys::vault::{bad_record, record_format, RECORD_V2};
+use super::{ExecutionOutcome, config::ExecutorConfig};
+use crate::keys::vault::{RECORD_V2, bad_record, record_format};
 
 /// R14c: the vault `cfg` seals and opens through — the key store's
 /// ([`ExecutorConfig::vault`]). Review of #482 (R14c-5): a configuration
@@ -1818,7 +1818,7 @@ mod tests {
     // R14c: the record crypto is the key store's vault's (its pinned
     // vectors still checked here, against what the quarantine writes)
     use crate::keys::vault::{
-        derive_file_key, derive_file_key_v2, open, open_v1, open_v2, seal, seal_v2, HEADER_LEN,
+        HEADER_LEN, derive_file_key, derive_file_key_v2, open, open_v1, open_v2, seal, seal_v2,
     };
     use tempfile::TempDir;
     use zeroize::Zeroizing;
@@ -1953,8 +1953,8 @@ mod tests {
     /// (`PathSwapped`) — never another file in its place.
     #[test]
     fn a_directory_flipped_in_a_loop_never_redirects_the_removal() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         for round in 0..20 {
             let tmp = TempDir::new().unwrap();
             let cfg = cfg_for(&tmp);
@@ -2773,10 +2773,12 @@ mod tests {
             let new_bin = fs::read(vault.join(format!("{id}.bin"))).unwrap();
             assert_eq!(record_format(&new_bin).unwrap(), 2);
             assert_eq!(vault_meta(&id, &cfg).unwrap()["format"], 2);
-            assert!(vault_meta(FIXTURE_ID, &cfg)
-                .unwrap()
-                .get("format")
-                .is_none());
+            assert!(
+                vault_meta(FIXTURE_ID, &cfg)
+                    .unwrap()
+                    .get("format")
+                    .is_none()
+            );
 
             let old_out = tmp.path().join("old-restored");
             restore(FIXTURE_ID, &old_out, &cfg).unwrap();
@@ -3579,15 +3581,19 @@ mod bug90 {
         let r = rows();
         assert_eq!(r.len(), 2, "{r:?}");
         assert_eq!(r[0]["result"], "partial");
-        assert!(r[0]["extra"]["in_place"]
-            .as_str()
-            .unwrap()
-            .contains("shared: 2 links"));
+        assert!(
+            r[0]["extra"]["in_place"]
+                .as_str()
+                .unwrap()
+                .contains("shared: 2 links")
+        );
         assert_eq!(r[1]["result"], "success");
-        assert!(r[1]["extra"]["in_place"]
-            .as_str()
-            .unwrap()
-            .starts_with("emptied in place"));
+        assert!(
+            r[1]["extra"]["in_place"]
+                .as_str()
+                .unwrap()
+                .starts_with("emptied in place")
+        );
         assert!(r[1]["extra"]["original_path"].is_null(), "no name invented");
     }
 

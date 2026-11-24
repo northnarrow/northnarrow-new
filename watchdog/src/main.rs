@@ -32,36 +32,37 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    abort_fuse, covering_fuse, fuse_aborted_record, fuse_waiting, leave_stuck_marker,
-    restart_loop_record, stuck_marker_path, stuck_unresponsive_record, unanswered_pings,
-    CoveringFuse, RestartLoop, FUSE_CONNECTIONS,
-};
-use northnarrow_watchdog::{
+    BackoffOutcome, Cli, DEFAULT_AGENT_BIN, HOLD_POLL, HoldOutcome, PIDFD_OPEN_RETRY_DEADLINE,
+    PingOutcome, RestartBackoff, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
+    STUCK_RECOVERY_HARDKILL_GRACE, ShutdownCheck, ShutdownVerdict, StatusPingTracker,
     anchor_run_dir, check_shutdown_marker_bounded, evict_dead_agent, harden_self,
     hold_until_agent_returns, log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited,
     pin_handle_failed, process_start_unix, register_own_cgroup, register_self_pid,
     reinsert_new_agent_pid, sd_notify_ready, sd_notify_status, stuck_recovery, unregister_self_pid,
-    wait_for_agent_death, write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome,
-    RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN,
-    HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
-    STUCK_RECOVERY_HARDKILL_GRACE,
+    wait_for_agent_death, write_pidfile_atomic,
 };
 use northnarrow_watchdog::{
+    CoveringFuse, FUSE_CONNECTIONS, RestartLoop, abort_fuse, covering_fuse, fuse_aborted_record,
+    fuse_waiting, leave_stuck_marker, restart_loop_record, stuck_marker_path,
+    stuck_unresponsive_record, unanswered_pings,
+};
+use northnarrow_watchdog::{
+    ExitAs, ExitReason, Failure, HOLD_REMIND_EVERY, HOLD_STATUS_EVERY, HoldRetry, LoopProgress,
+    StuckVerdict, event_loop_stalled_record, exit_record, hold_status_line, pidfd_wait_failed,
+    ping_agent, read_pid_from_file, stuck_recovery_failed_record, stuck_verdict,
+    unit_failure_record, unix_now,
+};
+use northnarrow_watchdog::{
+    PingFailure, Reaped, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
+    STATUS_PING_VANISHED_TAMPER_AFTER, SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
     classify_ping_error, exec_respawn_argv, hold_record_path, off_runtime, ping_ticker, reap_agent,
     record_hold, respawn_agent_off_runtime, select_backend, systemctl_unit_state,
-    systemd_is_booted, PingFailure, Reaped, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
-    STATUS_PING_VANISHED_TAMPER_AFTER, SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
-};
-use northnarrow_watchdog::{
-    event_loop_stalled_record, exit_record, hold_status_line, pidfd_wait_failed, ping_agent,
-    read_pid_from_file, stuck_recovery_failed_record, stuck_verdict, unit_failure_record, unix_now,
-    ExitAs, ExitReason, Failure, HoldRetry, LoopProgress, StuckVerdict, HOLD_REMIND_EVERY,
-    HOLD_STATUS_EVERY,
+    systemd_is_booted,
 };
 
 /// Deadline budget for the post-respawn pidfile-readiness wait.
@@ -1341,7 +1342,7 @@ fn judge_agent_at_start(
     witness: &mut Option<northnarrow_watchdog::witness::Witness>,
     pid: u32,
 ) {
-    use antitamper_bpf::{role_exit_ns, role_marks, ROLE_SLOT_AGENT, ROLE_SLOT_WATCHDOG};
+    use antitamper_bpf::{ROLE_SLOT_AGENT, ROLE_SLOT_WATCHDOG, role_exit_ns, role_marks};
     let root = &cli.bpffs_root;
     let mut unread = Vec::new();
     let mut known = |r: anyhow::Result<u64>| match r {

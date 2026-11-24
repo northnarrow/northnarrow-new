@@ -19,13 +19,13 @@
 //! writers': the rotating log's data lines and terminators, and the flat
 //! chains' numbered rows.
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::chain_anchor::{AUDIT_DOMAIN_V2, CANARY_ACCESS_DOMAIN_V2, CANARY_REGISTRY_DOMAIN_V2};
-use crate::chainlog::{chain_domain, LineRole, CHAINLOG_FMT_V2, CHAINLOG_FMT_V3};
+use crate::chainlog::{CHAINLOG_FMT_V2, CHAINLOG_FMT_V3, LineRole, chain_domain};
 
 /// A row's place in its chain's links, and which line it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,11 +251,11 @@ pub fn verify_row(raw: &[u8], chain: &str, pk: &VerifyingKey) -> Result<RowSeal,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_host::testing::TestKey;
     use crate::chain_host::ChainSigner;
+    use crate::chain_host::testing::TestKey;
     use crate::chainlog::{
-        archive_path_for, line_is_genuine, ChainPayload, NoProtection, RotatingChainLog,
-        RotationConfig,
+        ChainPayload, NoProtection, RotatingChainLog, RotationConfig, archive_path_for,
+        line_is_genuine,
     };
     use serde::{Deserialize, Serialize};
 

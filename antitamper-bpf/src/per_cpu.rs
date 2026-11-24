@@ -16,8 +16,8 @@
 use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 
-use aya::maps::{IterableMap, MapData, PerCpuArray};
 use aya::Pod;
+use aya::maps::{IterableMap, MapData, PerCpuArray};
 
 /// `bpf(2)`'s attribute of the element commands.
 #[repr(C)]

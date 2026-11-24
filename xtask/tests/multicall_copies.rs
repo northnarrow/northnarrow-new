@@ -426,17 +426,38 @@ fn no_test_runs_a_coreutils_copy_under_another_name() {
     // the review of #554 (F4): however the copy is then run, or made
     for (code, leaf) in [
         // run through another expression of the path
-        ("let mal = tmp.path().join(\"mal\");\nstd::fs::copy(\"/bin/sleep\", &mal).unwrap();\nCommand::new(mal.as_path()).spawn();", "mal"),
-        ("let mal = tmp.path().join(\"mal\");\nfs::copy(\"/bin/sleep\", &*mal).unwrap();\nCommand::new(&*mal).spawn();", "mal"),
-        ("let mal: PathBuf = PathBuf::from(\"/tmp/x/mal\");\nfs::copy(\"/bin/sleep\", mal.clone()).unwrap();", "mal"),
+        (
+            "let mal = tmp.path().join(\"mal\");\nstd::fs::copy(\"/bin/sleep\", &mal).unwrap();\nCommand::new(mal.as_path()).spawn();",
+            "mal",
+        ),
+        (
+            "let mal = tmp.path().join(\"mal\");\nfs::copy(\"/bin/sleep\", &*mal).unwrap();\nCommand::new(&*mal).spawn();",
+            "mal",
+        ),
+        (
+            "let mal: PathBuf = PathBuf::from(\"/tmp/x/mal\");\nfs::copy(\"/bin/sleep\", mal.clone()).unwrap();",
+            "mal",
+        ),
         // the destination inline
-        ("fs::copy(\"/usr/bin/sleep\", dir.path().join(\"mal\")).unwrap();", "mal"),
+        (
+            "fs::copy(\"/usr/bin/sleep\", dir.path().join(\"mal\")).unwrap();",
+            "mal",
+        ),
         // a path built where this test cannot read it
         ("fs::copy(\"/bin/sleep\", &helper_path()).unwrap();", "?"),
         // a copy that keeps the name, linked or renamed to another
-        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nstd::fs::hard_link(&s, d.join(\"mal\")).unwrap();", "mal"),
-        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nlet m = d.join(\"mal\");\nstd::os::unix::fs::symlink(s.as_path(), &m).unwrap();", "mal"),
-        ("let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nfs::rename(&s, d.join(\"x\").join(\"evil\")).unwrap();", "evil"),
+        (
+            "let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nstd::fs::hard_link(&s, d.join(\"mal\")).unwrap();",
+            "mal",
+        ),
+        (
+            "let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nlet m = d.join(\"mal\");\nstd::os::unix::fs::symlink(s.as_path(), &m).unwrap();",
+            "mal",
+        ),
+        (
+            "let s = d.join(\"sleep\");\nfs::copy(\"/bin/sleep\", &s).unwrap();\nfs::rename(&s, d.join(\"x\").join(\"evil\")).unwrap();",
+            "evil",
+        ),
     ] {
         let got = renamed_spawned_copies(code);
         assert_eq!(got.len(), 1, "{code}: {got:?}");

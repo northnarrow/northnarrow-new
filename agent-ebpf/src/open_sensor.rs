@@ -264,25 +264,28 @@ fn open_task_bump(slot: u32) {
 /// ([`OPEN_TASK_RUN`]). `None`: neither has room (counted).
 #[inline(always)]
 unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
-    if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
-        return Some((p, true));
-    }
-    if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {
-        return Some((p, false));
-    }
-    if crate::task_scratch::task_free_armed() {
-        if nn_open_task_make(task) != 0 {
-            if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
-                return Some((p, true));
-            }
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
+            return Some((p, true));
         }
-        open_task_bump(OPEN_TASK_PER_CALL);
-    }
-    match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {
-        Some(p) => Some((p, false)),
-        None => {
-            open_task_bump(OPEN_TASK_LOST);
-            None
+        if let Some(p) = OPEN_TASK_RUN.get_ptr_mut(&task) {
+            return Some((p, false));
+        }
+        if crate::task_scratch::task_free_armed() {
+            if nn_open_task_make(task) != 0 {
+                if let Some(p) = OPEN_TASK.get_ptr_mut(&task) {
+                    return Some((p, true));
+                }
+            }
+            open_task_bump(OPEN_TASK_PER_CALL);
+        }
+        match crate::task_scratch::make(&OPEN_TASK_RUN, &task) {
+            Some(p) => Some((p, false)),
+            None => {
+                open_task_bump(OPEN_TASK_LOST);
+                None
+            }
         }
     }
 }
@@ -291,7 +294,7 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
 /// counted in kept in the entry). 1: made; 0: the share taken or the map
 /// full. A global function: checked once, its share's branches not in the
 /// sensor's states.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_task_make(task: u64) -> u64 {
     let row = match crate::task_scratch::share_take(
@@ -353,9 +356,12 @@ pub fn armed() -> bool {
 
 #[inline(always)]
 pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
-    match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
-        Ok(v) => v,
-        Err(_) => core::ptr::null(),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match bpf_probe_read_kernel::<*const u8>(p as *const *const u8) {
+            Ok(v) => v,
+            Err(_) => core::ptr::null(),
+        }
     }
 }
 
@@ -366,25 +372,34 @@ pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
 /// rule has device 0, no name is empty).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// `dentry->d_name.name` into `dst[..32]`, NUL-padded, the same way
 /// (an unreadable name stays all zeros).
 #[inline(always)]
 unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
-    zero32(dst);
-    let name = peek_u64(dentry.add(name_off)) as *const c_void;
-    let _ = generated::bpf_probe_read_kernel_str(dst as *mut c_void, OPEN_NAME_LEN as u32, name);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        zero32(dst);
+        let name = peek_u64(dentry.add(name_off)) as *const c_void;
+        let _ = generated::bpf_probe_read_kernel_str(dst as *mut c_void, OPEN_NAME_LEN as u32, name);
+    }
 }
 
 /// `(dev, ino)` of `inode` as `stat()` reports it (review 55); dev 0 /
@@ -392,58 +407,70 @@ unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
 /// inlined calls (5.15 rule 3).
 #[inline(always)]
 pub(crate) unsafe fn key_of(inode: *const u8) -> InodeKey {
-    let mut key = InodeKey { dev: 0, ino: 0 };
-    if inode.is_null() {
-        return key;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut key = InodeKey { dev: 0, ino: 0 };
+        if inode.is_null() {
+            return key;
+        }
+        let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
+        if sb.is_null() {
+            return key;
+        }
+        if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
+            key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
+        }
+        if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+            key.ino = ino;
+        }
+        key
     }
-    let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
-    if sb.is_null() {
-        return key;
-    }
-    if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-        key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
-    }
-    if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-        key.ino = ino;
-    }
-    key
 }
 
 /// `dentry->d_name.name` into `dst[..32]`, NUL-padded.
 #[inline(always)]
 unsafe fn read_name(dentry: *const u8, dst: *mut u8) {
-    let w = dst as *mut u64;
-    core::ptr::write_volatile(w, 0);
-    core::ptr::write_volatile(w.add(1), 0);
-    core::ptr::write_volatile(w.add(2), 0);
-    core::ptr::write_volatile(w.add(3), 0);
-    if dentry.is_null() {
-        return;
-    }
-    let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-    if !name.is_null() {
-        let slot = core::slice::from_raw_parts_mut(dst, OPEN_NAME_LEN);
-        let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let w = dst as *mut u64;
+        core::ptr::write_volatile(w, 0);
+        core::ptr::write_volatile(w.add(1), 0);
+        core::ptr::write_volatile(w.add(2), 0);
+        core::ptr::write_volatile(w.add(3), 0);
+        if dentry.is_null() {
+            return;
+        }
+        let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+        if !name.is_null() {
+            let slot = core::slice::from_raw_parts_mut(dst, OPEN_NAME_LEN);
+            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+        }
     }
 }
 
 #[inline(always)]
 unsafe fn zero32(dst: *mut u8) {
-    let w = dst as *mut u64;
-    core::ptr::write_volatile(w, 0);
-    core::ptr::write_volatile(w.add(1), 0);
-    core::ptr::write_volatile(w.add(2), 0);
-    core::ptr::write_volatile(w.add(3), 0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let w = dst as *mut u64;
+        core::ptr::write_volatile(w, 0);
+        core::ptr::write_volatile(w.add(1), 0);
+        core::ptr::write_volatile(w.add(2), 0);
+        core::ptr::write_volatile(w.add(3), 0);
+    }
 }
 
 #[inline(always)]
 unsafe fn copy32(dst: *mut u8, src: *const u8) {
-    let d = dst as *mut u64;
-    let s = src as *const u64;
-    core::ptr::write_volatile(d, core::ptr::read_volatile(s));
-    core::ptr::write_volatile(d.add(1), core::ptr::read_volatile(s.add(1)));
-    core::ptr::write_volatile(d.add(2), core::ptr::read_volatile(s.add(2)));
-    core::ptr::write_volatile(d.add(3), core::ptr::read_volatile(s.add(3)));
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let d = dst as *mut u64;
+        let s = src as *const u64;
+        core::ptr::write_volatile(d, core::ptr::read_volatile(s));
+        core::ptr::write_volatile(d.add(1), core::ptr::read_volatile(s.add(1)));
+        core::ptr::write_volatile(d.add(2), core::ptr::read_volatile(s.add(2)));
+        core::ptr::write_volatile(d.add(3), core::ptr::read_volatile(s.add(3)));
+    }
 }
 
 #[inline(always)]
@@ -472,28 +499,34 @@ fn carveout_magic(magic: u64) -> bool {
 /// walking its ancestors ([`nn_open_walk`]).
 #[inline(always)]
 unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> DirClass {
-    let gen = match DIR_CLASS_GEN.get(0) {
-        Some(g) => *g,
-        None => 0,
-    };
-    if let Some(c) = DIR_CLASS.get(dkey) {
-        if c.gen == gen && c.bits & CLASSIFIED != 0 {
-            return *c;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let generation = match DIR_CLASS_GEN.get(0) {
+            Some(g) => *g,
+            None => 0,
+        };
+        match DIR_CLASS.get(dkey) {
+            Some(c) => {
+                if c.r#gen == generation && c.bits & CLASSIFIED != 0 {
+                    return *c;
+                }
+            }
+            _ => {}
         }
+        let r = nn_open_walk(dkey.dev, dkey.ino, dir as u64, dir_inode as u64);
+        let c = DirClass {
+            bits: r as u32 | CLASSIFIED,
+            uid: (r >> 32) as u32,
+            r#gen: generation,
+            _pad: 0,
+        };
+        // Lot 325 (R3): a walk that could not run is not the directory's
+        // class: not cached, the next open walks again.
+        if dir_class_cacheable(c.bits) {
+            let _ = DIR_CLASS.insert(dkey, &c, 0);
+        }
+        c
     }
-    let r = nn_open_walk(dkey.dev, dkey.ino, dir as u64, dir_inode as u64);
-    let c = DirClass {
-        bits: r as u32 | CLASSIFIED,
-        uid: (r >> 32) as u32,
-        gen,
-        _pad: 0,
-    };
-    // Lot 325 (R3): a walk that could not run is not the directory's
-    // class: not cached, the next open walks again.
-    if dir_class_cacheable(c.bits) {
-        let _ = DIR_CLASS.insert(dkey, &c, 0);
-    }
-    c
 }
 
 /// Lot 282 (the re-review of #500): the class of the directory of
@@ -502,30 +535,36 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
 /// 283c: the unlink counter reads its owner bits too ([`own_of`]).
 #[inline(always)]
 unsafe fn parent_class(key: &InodeKey, parent: *const u8) -> Option<DirClass> {
-    let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
-    if parent_inode.is_null() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
+        if parent_inode.is_null() {
+            return None;
+        }
+        let pkey = InodeKey {
+            dev: key.dev,
+            ino: match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+                Ok(i) => i,
+                Err(_) => return None,
+            },
+        };
+        Some(dir_class(&pkey, parent, parent_inode))
     }
-    let pkey = InodeKey {
-        dev: key.dev,
-        ino: match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-            Ok(i) => i,
-            Err(_) => return None,
-        },
-    };
-    Some(dir_class(&pkey, parent, parent_inode))
 }
 
 /// The owner (`i_uid`) of `inode`, or `u32::MAX` (no account's) when it
 /// cannot be read.
 #[inline(always)]
 unsafe fn inode_uid(inode: *const u8) -> u32 {
-    if inode.is_null() {
-        return u32::MAX;
-    }
-    match off_opt!(INODE_I_UID_OFFSET) {
-        Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(u32::MAX),
-        None => u32::MAX,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if inode.is_null() {
+            return u32::MAX;
+        }
+        match off_opt!(INODE_I_UID_OFFSET) {
+            Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(u32::MAX),
+            None => u32::MAX,
+        }
     }
 }
 
@@ -536,21 +575,24 @@ unsafe fn inode_uid(inode: *const u8) -> u32 {
 /// read outside a class [`own_code`] reads.
 #[inline(always)]
 unsafe fn own_of(bits: u32, owner: u32, dentry: *const u8) -> u32 {
-    if bits & OWN_DATA_BITS == 0 || dentry.is_null() {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if bits & OWN_DATA_BITS == 0 || dentry.is_null() {
+            return 0;
+        }
+        let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+        let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+        if inode.is_null() || parent.is_null() {
+            return 0;
+        }
+        let nlink = match off_opt!(INODE_I_NLINK_OFFSET) {
+            Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(0),
+            None => 0,
+        };
+        let dir_uid = inode_uid(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
+        let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        own_code(bits, owner, uid, dir_uid, inode_uid(inode), nlink)
     }
-    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
-    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-    if inode.is_null() || parent.is_null() {
-        return 0;
-    }
-    let nlink = match off_opt!(INODE_I_NLINK_OFFSET) {
-        Some(o) => bpf_probe_read_kernel::<u32>(inode.add(o) as *const u32).unwrap_or(0),
-        None => 0,
-    };
-    let dir_uid = inode_uid(read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET))));
-    let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    own_code(bits, owner, uid, dir_uid, inode_uid(inode), nlink)
 }
 
 /// The ancestor walk of [`dir_class`]: class bits in the low half, the
@@ -564,7 +606,7 @@ unsafe fn own_of(bits: u32, owner: u32, dentry: *const u8) -> u32 {
 /// EBPF-011) multiplied the states of the rest of the program past the
 /// 5.15 verifier's million-instruction budget. Every argument is a plain
 /// value, so any value is safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> u64 {
     unsafe { walk(InodeKey { dev, ino }, dir as *const u8, dir_inode as *const u8) }
@@ -572,109 +614,115 @@ pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> 
 
 #[inline(always)]
 unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
-    // The running task's buffers: [`on_open`]'s, or made here for an
-    // unlink or a rename (`forget_task` removes them).
-    let task = bpf_get_current_task();
-    let scratch = match task_buffer(task) {
-        Some((p, _)) => (*p).names.as_mut_ptr(),
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
-            // Lot 325 (R3): lost, never cached ([`dir_class`]).
-            return (u64::from(u32::MAX) << 32) | u64::from(WALK_LOST);
-        }
-    };
-    let mut bits = 0u32;
-    let mut uid = u32::MAX;
-    // The walk never leaves the directory's superblock: the layout, the
-    // magic and the device are read once. Only btrfs subvolumes change
-    // the device on the way up (review 55), and only there is it read per
-    // level. Every read inside the loop is branch-free (`peek_*`).
-    let o_parent = off!(DENTRY_D_PARENT_OFFSET);
-    let o_inode = off!(DENTRY_D_INODE_OFFSET);
-    let o_name = off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET);
-    let o_ino = off!(INODE_I_INO_OFFSET);
-    let sb = peek_u64(dir_inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
-    let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
-    if carveout_magic(magic) {
-        bits |= TREE_CARVEOUT;
-    }
-    let btrfs = magic == BTRFS_SUPER_MAGIC;
-    let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
-    let mut d = dir;
-    let mut key = start;
-    let mut capped = DEPTH_CAPPED;
-    for level in 0..OPEN_CLASSIFY_DEPTH {
-        // Level 0 is the directory itself (its children's rules apply);
-        // above it only what a directory passes to its whole subtree.
-        let keep = if level == 0 { DIRECT } else { SUBTREE };
-        let r = rule(&key);
-        bits |= r & keep;
-        // Lot 283c: a person's cache directory carries its owner the
-        // same way.
-        if r & (TREE_RUNTIME | TREE_USER_CACHE) != 0 {
-            if let Some(u) = RUNTIME_UIDS.get(&key) {
-                uid = *u;
-            }
-        }
-        let up = peek_u64(d.add(o_parent)) as *const u8;
-        if up.is_null() || up == d {
-            capped = 0;
-            break;
-        }
-        // (registered parent, this name): paths missing at registration.
-        peek_name(d, o_name, scratch);
-        let up_inode = peek_u64(up.add(o_inode)) as *const u8;
-        let up_key = InodeKey {
-            dev: if btrfs {
-                crate::inode_dev::stat_dev(up_inode, sb, s_dev) as u64
-            } else {
-                s_dev as u64
-            },
-            ino: peek_u64(up_inode.add(o_ino)),
-        };
-        let ck = scratch.add(64);
-        core::ptr::write_volatile(ck as *mut u64, up_key.dev);
-        core::ptr::write_volatile((ck as *mut u64).add(1), up_key.ino);
-        copy32(ck.add(16), scratch);
-        if let Some(cr) = CHILD_RULES.get(&*(ck as *const ChildRuleKey)) {
-            bits |= *cr & keep;
-        }
-        // Credential directory names: this name with its parent's name,
-        // then with any parent.
-        peek_name(up, o_name, scratch.add(OPEN_NAME_LEN));
-        let nr = match OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
-            Some(v) => *v,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // The running task's buffers: [`on_open`]'s, or made here for an
+        // unlink or a rename (`forget_task` removes them).
+        let task = bpf_get_current_task();
+        let scratch = match task_buffer(task) {
+            Some((p, _)) => (*p).names.as_mut_ptr(),
             None => {
-                zero32(scratch.add(OPEN_NAME_LEN));
-                match OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
-                    Some(v) => *v,
-                    None => 0,
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+                // Lot 325 (R3): lost, never cached ([`dir_class`]).
+                return (u64::from(u32::MAX) << 32) | u64::from(WALK_LOST);
+            }
+        };
+        let mut bits = 0u32;
+        let mut uid = u32::MAX;
+        // The walk never leaves the directory's superblock: the layout, the
+        // magic and the device are read once. Only btrfs subvolumes change
+        // the device on the way up (review 55), and only there is it read per
+        // level. Every read inside the loop is branch-free (`peek_*`).
+        let o_parent = off!(DENTRY_D_PARENT_OFFSET);
+        let o_inode = off!(DENTRY_D_INODE_OFFSET);
+        let o_name = off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET);
+        let o_ino = off!(INODE_I_INO_OFFSET);
+        let sb = peek_u64(dir_inode.add(off!(INODE_I_SB_OFFSET))) as *const u8;
+        let magic = peek_u64(sb.add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)));
+        if carveout_magic(magic) {
+            bits |= TREE_CARVEOUT;
+        }
+        let btrfs = magic == BTRFS_SUPER_MAGIC;
+        let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+        let mut d = dir;
+        let mut key = start;
+        let mut capped = DEPTH_CAPPED;
+        for level in 0..OPEN_CLASSIFY_DEPTH {
+            // Level 0 is the directory itself (its children's rules apply);
+            // above it only what a directory passes to its whole subtree.
+            let keep = if level == 0 { DIRECT } else { SUBTREE };
+            let r = rule(&key);
+            bits |= r & keep;
+            // Lot 283c: a person's cache directory carries its owner the
+            // same way.
+            if r & (TREE_RUNTIME | TREE_USER_CACHE) != 0 {
+                if let Some(u) = RUNTIME_UIDS.get(&key) {
+                    uid = *u;
                 }
             }
-        };
-        bits |= nr & (if level == 0 { TREE_CRED | LEAVES_CRED } else { TREE_CRED });
-        d = up;
-        key = up_key;
-    }
-    if capped != 0 {
-        if let Some(n) = OPEN_DEPTH_CAPPED.get_ptr_mut(0) {
-            *n += 1;
+            let up = peek_u64(d.add(o_parent)) as *const u8;
+            if up.is_null() || up == d {
+                capped = 0;
+                break;
+            }
+            // (registered parent, this name): paths missing at registration.
+            peek_name(d, o_name, scratch);
+            let up_inode = peek_u64(up.add(o_inode)) as *const u8;
+            let up_key = InodeKey {
+                dev: if btrfs {
+                    crate::inode_dev::stat_dev(up_inode, sb, s_dev) as u64
+                } else {
+                    s_dev as u64
+                },
+                ino: peek_u64(up_inode.add(o_ino)),
+            };
+            let ck = scratch.add(64);
+            core::ptr::write_volatile(ck as *mut u64, up_key.dev);
+            core::ptr::write_volatile((ck as *mut u64).add(1), up_key.ino);
+            copy32(ck.add(16), scratch);
+            if let Some(cr) = CHILD_RULES.get(&*(ck as *const ChildRuleKey)) {
+                bits |= *cr & keep;
+            }
+            // Credential directory names: this name with its parent's name,
+            // then with any parent.
+            peek_name(up, o_name, scratch.add(OPEN_NAME_LEN));
+            let nr = match OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
+                Some(v) => *v,
+                None => {
+                    zero32(scratch.add(OPEN_NAME_LEN));
+                    match OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
+                        Some(v) => *v,
+                        None => 0,
+                    }
+                }
+            };
+            bits |= nr & (if level == 0 { TREE_CRED | LEAVES_CRED } else { TREE_CRED });
+            d = up;
+            key = up_key;
         }
+        if capped != 0 {
+            if let Some(n) = OPEN_DEPTH_CAPPED.get_ptr_mut(0) {
+                *n += 1;
+            }
+        }
+        (u64::from(uid) << 32) | u64::from(bits | capped)
     }
-    (u64::from(uid) << 32) | u64::from(bits | capped)
 }
 
 /// The writer's login uid, or `u32::MAX` (never a runtime dir's owner)
 /// when the kernel has none.
 #[inline(always)]
 unsafe fn loginuid() -> u32 {
-    let task = bpf_get_current_task() as *const u8;
-    match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
-        Some(o) if !task.is_null() => match bpf_probe_read_kernel::<u32>(task.add(o) as *const u32) {
-            Ok(u) => u,
-            Err(_) => u32::MAX,
-        },
-        _ => u32::MAX,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task() as *const u8;
+        match off_opt!(TASK_STRUCT_LOGINUID_OFFSET) {
+            Some(o) if !task.is_null() => match bpf_probe_read_kernel::<u32>(task.add(o) as *const u32) {
+                Ok(u) => u,
+                Err(_) => u32::MAX,
+            },
+            _ => u32::MAX,
+        }
     }
 }
 
@@ -697,7 +745,7 @@ unsafe fn loginuid() -> u32 {
 /// count cost 80,000 to 110,000 more, and the count inline with the
 /// cgroup window went past the million. Here its windows and branches are
 /// verified once, on their own.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_count_write(cls: u64, dentry: u64, dev_over: u64, ino: u64, flags_mode: u64) -> u64 {
     unsafe {
@@ -752,67 +800,70 @@ unsafe fn count_write(
     key: &InodeKey,
     dentry: *const u8,
 ) -> u64 {
-    if carved_class(cls_bits, cls_uid, || loginuid()) {
-        return 0;
-    }
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    if created {
-        let made = OverwriteSeenKey {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if carved_class(cls_bits, cls_uid, || loginuid()) {
+            return 0;
+        }
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        if created {
+            let made = OverwriteSeenKey {
+                tgid,
+                _pad: 0,
+                dev: key.dev,
+                ino: key.ino,
+            };
+            let _ = OPEN_CREATED.insert(&made, &now, 0);
+        }
+        let window = OPEN_WRITES.get_ptr_mut(&tgid);
+        let start = match window {
+            Some(w) => (*w).start_for(now),
+            None => now,
+        };
+        let seen = OverwriteSeenKey {
             tgid,
             _pad: 0,
             dev: key.dev,
             ino: key.ino,
         };
-        let _ = OPEN_CREATED.insert(&made, &now, 0);
-    }
-    let window = OPEN_WRITES.get_ptr_mut(&tgid);
-    let start = match window {
-        Some(w) => (*w).start_for(now),
-        None => now,
-    };
-    let seen = OverwriteSeenKey {
-        tgid,
-        _pad: 0,
-        dev: key.dev,
-        ino: key.ino,
-    };
-    // The re-review of #500 (cost): a file the open created is new — its
-    // first write-open of the window, whatever an entry of a freed inode
-    // number says — so it is remembered without a lookup.
-    let first = first_write(created, || OPEN_OVERWRITE_SEEN.get(&seen).copied(), start);
-    if first {
-        let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
-    }
-    let kind = write_kind(created, data, big, first);
-    let counted = kind != WriteKind::Repeat;
-    let own = if counted { own_of(cls_bits, cls_uid, dentry) } else { 0 };
-    let (mut reason, mut count, cg_add, mut summary) = match window {
-        Some(w) => {
-            let (r, c, a) = write_step(&mut *w, kind, now);
-            // `write_step` starts a fresh window with one write-open.
-            (*w).own = own_after((*w).own, (*w).count == 1, counted, own);
-            (r, c, a, (*w).own)
+        // The re-review of #500 (cost): a file the open created is new — its
+        // first write-open of the window, whatever an entry of a freed inode
+        // number says — so it is remembered without a lookup.
+        let first = first_write(created, || OPEN_OVERWRITE_SEEN.get(&seen).copied(), start);
+        if first {
+            let _ = OPEN_OVERWRITE_SEEN.insert(&seen, &start, 0);
         }
-        None => {
-            let mut fresh = OpenWriteWindow::fresh(now, kind);
-            fresh.own = own;
-            let _ = OPEN_WRITES.insert(&tgid, &fresh, 0);
-            (0, 0, 0, own)
+        let kind = write_kind(created, data, big, first);
+        let counted = kind != WriteKind::Repeat;
+        let own = if counted { own_of(cls_bits, cls_uid, dentry) } else { 0 };
+        let (mut reason, mut count, cg_add, mut summary) = match window {
+            Some(w) => {
+                let (r, c, a) = write_step(&mut *w, kind, now);
+                // `write_step` starts a fresh window with one write-open.
+                (*w).own = own_after((*w).own, (*w).count == 1, counted, own);
+                (r, c, a, (*w).own)
+            }
+            None => {
+                let mut fresh = OpenWriteWindow::fresh(now, kind);
+                fresh.own = own;
+                let _ = OPEN_WRITES.insert(&tgid, &fresh, 0);
+                (0, 0, 0, own)
+            }
+        };
+        if cg_add != 0 {
+            let (n, cg_own) = count_cgroup(cg_add, summary, now);
+            if n != 0 {
+                reason |= open_reason::MASS_OVERWRITE_CGROUP;
+                count = n;
+                summary = cg_own;
+            }
         }
-    };
-    if cg_add != 0 {
-        let (n, cg_own) = count_cgroup(cg_add, summary, now);
-        if n != 0 {
-            reason |= open_reason::MASS_OVERWRITE_CGROUP;
-            count = n;
-            summary = cg_own;
+        if reason != 0 {
+            reason |= (summary & 0xFF) << open_reason::OWN_SHIFT;
         }
+        (u64::from(count) << 32) | u64::from(reason)
     }
-    if reason != 0 {
-        reason |= (summary & 0xFF) << open_reason::OWN_SHIFT;
-    }
-    (u64::from(count) << 32) | u64::from(reason)
 }
 
 /// `add` overwrites into the writer's cgroup window; the window's
@@ -824,37 +875,40 @@ unsafe fn count_write(
 /// a few files under the threshold in a window of their own.
 #[inline(always)]
 unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
-    let cgroup = bpf_get_current_cgroup_id();
-    let key = if cgroup > 1 {
-        OpenCgKey {
-            cgroup,
-            uid: 0,
-            loginuid: 0,
-        }
-    } else {
-        OpenCgKey {
-            cgroup: 0,
-            uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32,
-            loginuid: 0,
-        }
-    };
-    match OPEN_CG_WRITES.get_ptr_mut(&key) {
-        Some(w) => {
-            let n = cgroup_step(&mut *w, add, now);
-            // A fresh window holds this add alone (every add is one or more).
-            (*w).own = own_after((*w).own, (*w).overwrites == add, true, own);
-            (n, (*w).own)
-        }
-        None => {
-            let w = OpenCgWindow {
-                start_ns: now,
-                overwrites: add,
-                fired: 0,
-                own,
-                _pad: 0,
-            };
-            let _ = OPEN_CG_WRITES.insert(&key, &w, 0);
-            (0, own)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let cgroup = bpf_get_current_cgroup_id();
+        let key = if cgroup > 1 {
+            OpenCgKey {
+                cgroup,
+                uid: 0,
+                loginuid: 0,
+            }
+        } else {
+            OpenCgKey {
+                cgroup: 0,
+                uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32,
+                loginuid: 0,
+            }
+        };
+        match OPEN_CG_WRITES.get_ptr_mut(&key) {
+            Some(w) => {
+                let n = cgroup_step(&mut *w, add, now);
+                // A fresh window holds this add alone (every add is one or more).
+                (*w).own = own_after((*w).own, (*w).overwrites == add, true, own);
+                (n, (*w).own)
+            }
+            None => {
+                let w = OpenCgWindow {
+                    start_ns: now,
+                    overwrites: add,
+                    fired: 0,
+                    own,
+                    _pad: 0,
+                };
+                let _ = OPEN_CG_WRITES.insert(&key, &w, 0);
+                (0, own)
+            }
         }
     }
 }
@@ -865,24 +919,30 @@ unsafe fn count_cgroup(add: u32, own: u32, now: u64) -> (u32, u32) {
 /// `off + 8 <= len` into a comparison of `off` itself.
 #[inline(always)]
 unsafe fn win_u64(win: *const u8, len: usize, src: *const u8, off: usize) -> u64 {
-    if off + 8 <= len {
-        core::ptr::read_unaligned(win.add(off) as *const u64)
-    } else {
-        match bpf_probe_read_kernel::<u64>(src.add(off) as *const u64) {
-            Ok(v) => v,
-            Err(_) => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if off + 8 <= len {
+            core::ptr::read_unaligned(win.add(off) as *const u64)
+        } else {
+            match bpf_probe_read_kernel::<u64>(src.add(off) as *const u64) {
+                Ok(v) => v,
+                Err(_) => 0,
+            }
         }
     }
 }
 
 #[inline(always)]
 unsafe fn win_u32(win: *const u8, len: usize, src: *const u8, off: usize) -> u32 {
-    if off + 4 <= len {
-        core::ptr::read_unaligned(win.add(off) as *const u32)
-    } else {
-        match bpf_probe_read_kernel::<u32>(src.add(off) as *const u32) {
-            Ok(v) => v,
-            Err(_) => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if off + 4 <= len {
+            core::ptr::read_unaligned(win.add(off) as *const u32)
+        } else {
+            match bpf_probe_read_kernel::<u32>(src.add(off) as *const u32) {
+                Ok(v) => v,
+                Err(_) => 0,
+            }
         }
     }
 }
@@ -893,17 +953,20 @@ unsafe fn win_u32(win: *const u8, len: usize, src: *const u8, off: usize) -> u32
 /// after a small `struct file`).
 #[inline(always)]
 unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
-    if bpf_probe_read_kernel_buf(file, core::slice::from_raw_parts_mut(w, FILE_WIN)).is_err() {
-        return core::ptr::null();
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if bpf_probe_read_kernel_buf(file, core::slice::from_raw_parts_mut(w, FILE_WIN)).is_err() {
+            return core::ptr::null();
+        }
+        let inode = win_u64(w, FILE_WIN, file, off!(FILE_F_INODE_OFFSET)) as *const u8;
+        if inode.is_null()
+            || bpf_probe_read_kernel_buf(inode, core::slice::from_raw_parts_mut(w.add(FILE_WIN), INODE_WIN))
+                .is_err()
+        {
+            return core::ptr::null();
+        }
+        inode
     }
-    let inode = win_u64(w, FILE_WIN, file, off!(FILE_F_INODE_OFFSET)) as *const u8;
-    if inode.is_null()
-        || bpf_probe_read_kernel_buf(inode, core::slice::from_raw_parts_mut(w.add(FILE_WIN), INODE_WIN))
-            .is_err()
-    {
-        return core::ptr::null();
-    }
-    inode
 }
 
 /// The whole `file_open` work of the sensor variant of the FIM observer
@@ -912,117 +975,123 @@ unsafe fn read_windows(file: *const u8, w: *mut u8) -> *const u8 {
 /// own buffers ([`task_buffer`]: kept for the task's life, or this run's).
 #[inline(always)]
 pub unsafe fn on_open(file: *const u8) {
-    let task = bpf_get_current_task();
-    let (t, live) = match task_buffer(task) {
-        Some(x) => x,
-        None => {
-            // No room anywhere: FIM still sees the open (the plain observer,
-            // field by field, no shared buffer); the sensor's look is lost,
-            // counted.
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
-            crate::fim_watch::observe_open_plain(file);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let (t, live) = match task_buffer(task) {
+            Some(x) => x,
+            None => {
+                // No room anywhere: FIM still sees the open (the plain observer,
+                // field by field, no shared buffer); the sensor's look is lost,
+                // counted.
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+                crate::fim_watch::observe_open_plain(file);
+                return;
+            }
+        };
+        on_open_in(file, t, task, live);
+        // Lot 325: a task's entry stays for its next open, removed at
+        // `task_free`; a run's own, at the end of the run.
+        if !live {
+            let _ = OPEN_TASK_RUN.remove(&task);
         }
-    };
-    on_open_in(file, t, task, live);
-    // Lot 325: a task's entry stays for its next open, removed at
-    // `task_free`; a run's own, at the end of the run.
-    if !live {
-        let _ = OPEN_TASK_RUN.remove(&task);
     }
 }
 
 #[inline(always)]
 unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
-    let w = (*t).win.as_mut_ptr();
-    let inode = read_windows(file, w);
-    if inode.is_null() {
-        // No windows: FIM still sees the open, field by field as the
-        // plain observer reads it; only the sensor skips it.
-        crate::fim_watch::observe_open_plain(file);
-        return;
-    }
-    let iw = w.add(FILE_WIN);
-    let sb = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SB_OFFSET)) as *const u8;
-    if sb.is_null() {
-        return;
-    }
-    let ino = win_u64(iw, INODE_WIN, inode, off!(INODE_I_INO_OFFSET));
-    let s_dev = match bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let key = InodeKey {
-        dev: crate::inode_dev::stat_dev(inode, sb, s_dev) as u64,
-        ino,
-    };
-    let mode = win_u32(w, FILE_WIN, file, off!(FILE_F_MODE_OFFSET));
-    let watched = crate::fim_watch::WATCHED_PATHS.get(&key).is_some();
-    if watched {
-        // The agent's own opens: neither FIM nor the sensor reports them.
-        if crate::fim_watch::caller_is_in_family() {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let w = (*t).win.as_mut_ptr();
+        let inode = read_windows(file, w);
+        if inode.is_null() {
+            // No windows: FIM still sees the open, field by field as the
+            // plain observer reads it; only the sensor skips it.
+            crate::fim_watch::observe_open_plain(file);
             return;
         }
-        // Review 75: a read-only repeat by the same task is dropped.
-        if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
-            crate::fim_watch::emit_drift_opened(key);
+        let iw = w.add(FILE_WIN);
+        let sb = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SB_OFFSET)) as *const u8;
+        if sb.is_null() {
+            return;
         }
+        let ino = win_u64(iw, INODE_WIN, inode, off!(INODE_I_INO_OFFSET));
+        let s_dev = match bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let key = InodeKey {
+            dev: crate::inode_dev::stat_dev(inode, sb, s_dev) as u64,
+            ino,
+        };
+        let mode = win_u32(w, FILE_WIN, file, off!(FILE_F_MODE_OFFSET));
+        let watched = crate::fim_watch::WATCHED_PATHS.get(&key).is_some();
+        if watched {
+            // The agent's own opens: neither FIM nor the sensor reports them.
+            if crate::fim_watch::caller_is_in_family() {
+                return;
+            }
+            // Review 75: a read-only repeat by the same task is dropped.
+            if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
+                crate::fim_watch::emit_drift_opened(key);
+            }
+        }
+        if !armed() {
+            return;
+        }
+        let dentry = win_u64(w, FILE_WIN, file, off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const u8;
+        let flags = win_u32(w, FILE_WIN, file, off!(FILE_F_FLAGS_OFFSET));
+        // Mass write is the ransomware shape — data files. A device, FIFO or
+        // socket opened for writing (`> /dev/null` in a script loop, systemd
+        // writing `/dev/console` at shutdown) does not count.
+        let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
+        let size = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SIZE_OFFSET));
+        // Lot 332 (verifier headroom): the sensor proper in global functions,
+        // each checked once — the directory's class, the write count, the
+        // rest — not again for every state the FIM watch above leaves.
+        if dentry.is_null() {
+            return;
+        }
+        let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+        if parent.is_null() || parent == dentry {
+            return;
+        }
+        let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
+        if parent_inode.is_null() {
+            return;
+        }
+        // The parent is on the file's filesystem (and, on btrfs, in its
+        // subvolume): only its inode number is read.
+        let pino = match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        let cls = nn_open_class(key.dev, pino, parent as u64, parent_inode as u64);
+        // For [`nn_open_observe`]: the class, the parent and its inode number,
+        // in the task's own buffer (every field of the windows is out of it).
+        let stash = w as *mut u64;
+        core::ptr::write_volatile(stash.add(STASH_CLASS), cls);
+        core::ptr::write_volatile(stash.add(STASH_PARENT), parent as u64);
+        core::ptr::write_volatile(stash.add(STASH_PINO), pino);
+        // Write-opens are counted before the family lookup; a crossing is
+        // emitted by the count itself, as a record of its own, and the agent's
+        // own writes are dropped there (once per window).
+        if mode & FMODE_WRITE != 0 && regular {
+            let created = mode & FMODE_CREATED != 0;
+            let _ = nn_open_count_write(
+                cls,
+                dentry as u64,
+                key.dev
+                    | (u64::from(size != 0) << 63)
+                    | (u64::from(created) << 62)
+                    | (u64::from(size >= OVERWRITE_MIN_BYTES) << 61),
+                key.ino,
+                u64::from(flags) | (u64::from(mode) << 32),
+            );
+        }
+        let dev_bits = key.dev | (u64::from(watched) << OBS_WATCHED) | (u64::from(live) << OBS_LIVE);
+        let _ = nn_open_observe(task, dev_bits, key.ino, dentry as u64, u64::from(flags) | (u64::from(mode) << 32));
     }
-    if !armed() {
-        return;
-    }
-    let dentry = win_u64(w, FILE_WIN, file, off!(FILE_F_PATH_OFFSET) + off!(PATH_DENTRY_OFFSET)) as *const u8;
-    let flags = win_u32(w, FILE_WIN, file, off!(FILE_F_FLAGS_OFFSET));
-    // Mass write is the ransomware shape — data files. A device, FIFO or
-    // socket opened for writing (`> /dev/null` in a script loop, systemd
-    // writing `/dev/console` at shutdown) does not count.
-    let regular = (win_u32(iw, INODE_WIN, inode, off!(INODE_I_MODE_OFFSET)) as u16) & S_IFMT == S_IFREG;
-    let size = win_u64(iw, INODE_WIN, inode, off!(INODE_I_SIZE_OFFSET));
-    // Lot 332 (verifier headroom): the sensor proper in global functions,
-    // each checked once — the directory's class, the write count, the
-    // rest — not again for every state the FIM watch above leaves.
-    if dentry.is_null() {
-        return;
-    }
-    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-    if parent.is_null() || parent == dentry {
-        return;
-    }
-    let parent_inode = read_ptr(parent.add(off!(DENTRY_D_INODE_OFFSET)));
-    if parent_inode.is_null() {
-        return;
-    }
-    // The parent is on the file's filesystem (and, on btrfs, in its
-    // subvolume): only its inode number is read.
-    let pino = match bpf_probe_read_kernel::<u64>(parent_inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-        Ok(i) => i,
-        Err(_) => return,
-    };
-    let cls = nn_open_class(key.dev, pino, parent as u64, parent_inode as u64);
-    // For [`nn_open_observe`]: the class, the parent and its inode number,
-    // in the task's own buffer (every field of the windows is out of it).
-    let stash = w as *mut u64;
-    core::ptr::write_volatile(stash.add(STASH_CLASS), cls);
-    core::ptr::write_volatile(stash.add(STASH_PARENT), parent as u64);
-    core::ptr::write_volatile(stash.add(STASH_PINO), pino);
-    // Write-opens are counted before the family lookup; a crossing is
-    // emitted by the count itself, as a record of its own, and the agent's
-    // own writes are dropped there (once per window).
-    if mode & FMODE_WRITE != 0 && regular {
-        let created = mode & FMODE_CREATED != 0;
-        let _ = nn_open_count_write(
-            cls,
-            dentry as u64,
-            key.dev
-                | (u64::from(size != 0) << 63)
-                | (u64::from(created) << 62)
-                | (u64::from(size >= OVERWRITE_MIN_BYTES) << 61),
-            key.ino,
-            u64::from(flags) | (u64::from(mode) << 32),
-        );
-    }
-    let dev_bits = key.dev | (u64::from(watched) << OBS_WATCHED) | (u64::from(live) << OBS_LIVE);
-    let _ = nn_open_observe(task, dev_bits, key.ino, dentry as u64, u64::from(flags) | (u64::from(mode) << 32));
 }
 
 /// [`nn_open_observe`]'s flags, above the device (a `u32`, `stat_dev`): the
@@ -1058,7 +1127,7 @@ unsafe fn buffer_of(task: u64, dev_bits: u64) -> Option<*mut OpenTask> {
 /// instructions processed, 765k in the program's own body. A global
 /// function: checked once. Every argument is a plain value, as
 /// [`nn_open_walk`]'s.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_class(dev: u64, pino: u64, parent: u64, parent_inode: u64) -> u64 {
     // SAFETY: reads of the kernel's objects through helpers and this
@@ -1079,7 +1148,7 @@ pub extern "C" fn nn_open_class(dev: u64, pino: u64, parent: u64, parent_inode: 
 /// map lookup of its own: the names it reads are map keys, which 5.15 takes
 /// from a map value or the stack only). A global function: checked once.
 /// Returns 0.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_observe(task: u64, dev_bits: u64, ino: u64, dentry: u64, flags_mode: u64) -> u64 {
     // SAFETY: the running task's own buffer, then reads of the kernel's
@@ -1126,84 +1195,87 @@ unsafe fn observe(
     pino: u64,
     scratch: *mut u8,
 ) {
-    let write = mode & FMODE_WRITE != 0;
-    let pkey = InodeKey { dev: key.dev, ino: pino };
-    // A file's own rule only where userland put one (DIR_HAS_FILES).
-    let mut own = if cls_bits & DIR_HAS_FILES != 0 { rule(key) } else { 0 };
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let write = mode & FMODE_WRITE != 0;
+        let pkey = InodeKey { dev: key.dev, ino: pino };
+        // A file's own rule only where userland put one (DIR_HAS_FILES).
+        let mut own = if cls_bits & DIR_HAS_FILES != 0 { rule(key) } else { 0 };
 
-    // The leaf name, only where it matters: credential leaves (not for
-    // an inode the FIM path already reports) and missing-file rules.
-    let leaf_cred = !watched && cls_bits & (LEAVES_CRED | TREE_HOME) != 0;
-    let mut cred = !watched && cls_bits & TREE_CRED != 0;
-    if leaf_cred || cls_bits & CHILD_FILES != 0 {
-        read_name(dentry, scratch);
-        if cls_bits & CHILD_FILES != 0 {
-            let ck = scratch.add(64);
-            core::ptr::write_volatile(ck as *mut u64, pkey.dev);
-            core::ptr::write_volatile((ck as *mut u64).add(1), pkey.ino);
-            copy32(ck.add(16), scratch);
-            if let Some(cr) = CHILD_RULES.get(&*(ck as *const ChildRuleKey)) {
-                own |= *cr;
-            }
-        }
-        if leaf_cred && !cred {
-            // (leaf, parent name) where the parent's name decides
-            // (`.aws/credentials`), then (leaf, any) in home trees.
-            if cls_bits & LEAVES_CRED != 0 {
-                read_name(parent, scratch.add(OPEN_NAME_LEN));
-                if let Some(v) = OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
-                    cred = *v & LEAF_CRED != 0;
+        // The leaf name, only where it matters: credential leaves (not for
+        // an inode the FIM path already reports) and missing-file rules.
+        let leaf_cred = !watched && cls_bits & (LEAVES_CRED | TREE_HOME) != 0;
+        let mut cred = !watched && cls_bits & TREE_CRED != 0;
+        if leaf_cred || cls_bits & CHILD_FILES != 0 {
+            read_name(dentry, scratch);
+            if cls_bits & CHILD_FILES != 0 {
+                let ck = scratch.add(64);
+                core::ptr::write_volatile(ck as *mut u64, pkey.dev);
+                core::ptr::write_volatile((ck as *mut u64).add(1), pkey.ino);
+                copy32(ck.add(16), scratch);
+                if let Some(cr) = CHILD_RULES.get(&*(ck as *const ChildRuleKey)) {
+                    own |= *cr;
                 }
             }
-            if !cred {
-                zero32(scratch.add(OPEN_NAME_LEN));
-                if let Some(v) = OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
-                    cred = *v & LEAF_CRED != 0;
+            if leaf_cred && !cred {
+                // (leaf, parent name) where the parent's name decides
+                // (`.aws/credentials`), then (leaf, any) in home trees.
+                if cls_bits & LEAVES_CRED != 0 {
+                    read_name(parent, scratch.add(OPEN_NAME_LEN));
+                    if let Some(v) = OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
+                        cred = *v & LEAF_CRED != 0;
+                    }
+                }
+                if !cred {
+                    zero32(scratch.add(OPEN_NAME_LEN));
+                    if let Some(v) = OPEN_NAME_RULES.get(&*(scratch as *const [u8; 2 * OPEN_NAME_LEN])) {
+                        cred = *v & LEAF_CRED != 0;
+                    }
+                }
+                if !cred && cls_bits & TREE_HOME != 0 {
+                    cred = kdbx_suffix(&*(scratch as *const [u8; OPEN_NAME_LEN]));
                 }
             }
-            if !cred && cls_bits & TREE_HOME != 0 {
-                cred = kdbx_suffix(&*(scratch as *const [u8; OPEN_NAME_LEN]));
-            }
         }
-    }
 
-    let mut reason = 0u32;
-    if own & FILE_SENSITIVE != 0 {
-        reason |= open_reason::SENSITIVE;
+        let mut reason = 0u32;
+        if own & FILE_SENSITIVE != 0 {
+            reason |= open_reason::SENSITIVE;
+        }
+        if write && (own & FILE_CRITICAL != 0 || cls_bits & TREE_CRITICAL != 0) {
+            reason |= open_reason::CRITICAL;
+        }
+        if write && (own & FILE_PERSIST != 0 || cls_bits & TREE_PERSIST != 0) {
+            reason |= open_reason::PERSIST;
+        }
+        if cls_bits & CHILDREN_PROBE != 0 {
+            reason |= open_reason::PROBE;
+        }
+        if cred {
+            reason |= open_reason::CRED;
+        }
+        // The write-open was counted before ([`nn_open_count_write`], from
+        // `on_open_in`).
+        // Lab PR 137, 5.15 verifier budget: nothing of the count comes back
+        // here, and no value of `cls_bits` is folded into `reason` (the depth
+        // cap is counted in the walk). The branches below test `reason`: an
+        // unknown folded into it keeps alive the paths that report nothing,
+        // and a class bit folded into it is made precise back to the map read,
+        // so states stop merging. The second took `fim_file_open_sensor` past
+        // the million instructions.
+        if reason == 0 {
+            return;
+        }
+        if !family_checked && crate::fim_watch::caller_is_in_family() {
+            return;
+        }
+        // Review 75: a read-only repeat by the same task is dropped (the
+        // telemetry probe excepted: each of its opens is a check).
+        if !write && reason & open_reason::PROBE == 0 && crate::read_repeat::repeat(&OPEN_READ_SEEN, key) {
+            return;
+        }
+        emit(reason, key, dentry, flags, mode, 0);
     }
-    if write && (own & FILE_CRITICAL != 0 || cls_bits & TREE_CRITICAL != 0) {
-        reason |= open_reason::CRITICAL;
-    }
-    if write && (own & FILE_PERSIST != 0 || cls_bits & TREE_PERSIST != 0) {
-        reason |= open_reason::PERSIST;
-    }
-    if cls_bits & CHILDREN_PROBE != 0 {
-        reason |= open_reason::PROBE;
-    }
-    if cred {
-        reason |= open_reason::CRED;
-    }
-    // The write-open was counted before ([`nn_open_count_write`], from
-    // `on_open_in`).
-    // Lab PR 137, 5.15 verifier budget: nothing of the count comes back
-    // here, and no value of `cls_bits` is folded into `reason` (the depth
-    // cap is counted in the walk). The branches below test `reason`: an
-    // unknown folded into it keeps alive the paths that report nothing,
-    // and a class bit folded into it is made precise back to the map read,
-    // so states stop merging. The second took `fim_file_open_sensor` past
-    // the million instructions.
-    if reason == 0 {
-        return;
-    }
-    if !family_checked && crate::fim_watch::caller_is_in_family() {
-        return;
-    }
-    // Review 75: a read-only repeat by the same task is dropped (the
-    // telemetry probe excepted: each of its opens is a check).
-    if !write && reason & open_reason::PROBE == 0 && crate::read_repeat::repeat(&OPEN_READ_SEEN, key) {
-        return;
-    }
-    emit(reason, key, dentry, flags, mode, 0);
 }
 
 /// The one emit site: identity, reason and the mount-relative path, plus
@@ -1227,7 +1299,7 @@ unsafe fn emit(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32, mode:
 /// `fim_file_open_sensor` went from 834,000 processed instructions (main)
 /// to 463,000, `fim_file_cap_observe` from 55,000 to 8,000. The ring entry
 /// never leaves it (5.15 rule 1), and every argument is a plain value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_open_emit(reason_count: u64, dev: u64, ino: u64, dentry: u64, flags_mode: u64) -> u64 {
     unsafe {
@@ -1245,81 +1317,84 @@ pub extern "C" fn nn_open_emit(reason_count: u64, dev: u64, ino: u64, dentry: u6
 
 #[inline(always)]
 unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32, mode: u32, count: u32) {
-    let mut entry = match OPEN_SENSOR_EVENTS.reserve::<OpenRecordRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
-            return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut entry = match OPEN_SENSOR_EVENTS.reserve::<OpenRecordRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+                return;
+            }
+        };
+        let raw: *mut OpenRecordRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).timestamp_ns = bpf_ktime_get_ns();
+        (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let uid_gid = bpf_get_current_uid_gid();
+        (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw).gid = (uid_gid >> 32) as u32;
+        crate::comm::comm_into(&mut (*raw).comm);
+        (*raw).dev = key.dev;
+        (*raw).ino = key.ino;
+        (*raw).flags = flags;
+        (*raw).mode = mode;
+        // Lot 283c: a crossing's own-data summary rides in the reason's top
+        // byte.
+        (*raw).reason = reason & open_reason::REASON_BITS;
+        (*raw).own = (reason >> open_reason::OWN_SHIFT) as u8;
+        (*raw).count = count;
+        // Lot 282 (the review of #500, C1): the replacement's halves are
+        // paired per cgroup too.
+        (*raw).cgroup = bpf_get_current_cgroup_id();
+        // Lot 340: who forked a writer that executed nothing since (a backup's
+        // receiver): the lineage it has no exec record of.
+        let (own, forker) = crate::fork_parent::unexecuted_forks();
+        if let Some(f) = own {
+            (*raw).fork_ppid = f.ppid;
+            (*raw).fork_start = f.start;
         }
-    };
-    let raw: *mut OpenRecordRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).timestamp_ns = bpf_ktime_get_ns();
-    (*raw).pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let uid_gid = bpf_get_current_uid_gid();
-    (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
-    (*raw).gid = (uid_gid >> 32) as u32;
-    crate::comm::comm_into(&mut (*raw).comm);
-    (*raw).dev = key.dev;
-    (*raw).ino = key.ino;
-    (*raw).flags = flags;
-    (*raw).mode = mode;
-    // Lot 283c: a crossing's own-data summary rides in the reason's top
-    // byte.
-    (*raw).reason = reason & open_reason::REASON_BITS;
-    (*raw).own = (reason >> open_reason::OWN_SHIFT) as u8;
-    (*raw).count = count;
-    // Lot 282 (the review of #500, C1): the replacement's halves are
-    // paired per cgroup too.
-    (*raw).cgroup = bpf_get_current_cgroup_id();
-    // Lot 340: who forked a writer that executed nothing since (a backup's
-    // receiver): the lineage it has no exec record of.
-    let (own, forker) = crate::fork_parent::unexecuted_forks();
-    if let Some(f) = own {
-        (*raw).fork_ppid = f.ppid;
-        (*raw).fork_start = f.start;
-    }
-    if let Some(f) = forker {
-        (*raw).fork_pppid = f.ppid;
-        (*raw).fork_parent_start = f.start;
-    }
-    // Lot 376: the opener's executable at the open — `sudo`'s read of
-    // `/etc/sudoers` is the auth stack's by its image, when its exec is not
-    // in the lineage yet
-    if let Some(e) = crate::bpf_defense::caller_exe_key() {
-        (*raw).exe_dev = e.dev;
-        (*raw).exe_ino = e.ino;
-    }
-    let dst = (*raw).path.as_mut_ptr();
-    let mut d = dentry;
-    let mut n: usize = 0;
-    let mut top: *const u8 = core::ptr::null();
-    for i in 0..OPEN_PATH_SLOTS {
-        if d.is_null() {
-            break;
+        if let Some(f) = forker {
+            (*raw).fork_pppid = f.ppid;
+            (*raw).fork_parent_start = f.start;
         }
-        let name = read_ptr(d.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-        if !name.is_null() {
-            let slot = core::slice::from_raw_parts_mut(dst.add(i * OPEN_PATH_SLOT_LEN), OPEN_PATH_SLOT_LEN);
-            let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+        // Lot 376: the opener's executable at the open — `sudo`'s read of
+        // `/etc/sudoers` is the auth stack's by its image, when its exec is not
+        // in the lineage yet
+        if let Some(e) = crate::bpf_defense::caller_exe_key() {
+            (*raw).exe_dev = e.dev;
+            (*raw).exe_ino = e.ino;
         }
-        n = i + 1;
-        let up = read_ptr(d.add(off!(DENTRY_D_PARENT_OFFSET)));
-        if up == d {
-            top = d;
-            break;
+        let dst = (*raw).path.as_mut_ptr();
+        let mut d = dentry;
+        let mut n: usize = 0;
+        let mut top: *const u8 = core::ptr::null();
+        for i in 0..OPEN_PATH_SLOTS {
+            if d.is_null() {
+                break;
+            }
+            let name = read_ptr(d.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+            if !name.is_null() {
+                let slot = core::slice::from_raw_parts_mut(dst.add(i * OPEN_PATH_SLOT_LEN), OPEN_PATH_SLOT_LEN);
+                let _ = bpf_probe_read_kernel_str_bytes(name, slot);
+            }
+            n = i + 1;
+            let up = read_ptr(d.add(off!(DENTRY_D_PARENT_OFFSET)));
+            if up == d {
+                top = d;
+                break;
+            }
+            d = up;
         }
-        d = up;
+        (*raw).path_n = n as u16;
+        if top.is_null() {
+            (*raw).path_truncated = 1;
+        } else {
+            let root = key_of(read_ptr(top.add(off!(DENTRY_D_INODE_OFFSET))));
+            (*raw).root_dev = root.dev;
+            (*raw).root_ino = root.ino;
+        }
+        entry.submit(0);
     }
-    (*raw).path_n = n as u16;
-    if top.is_null() {
-        (*raw).path_truncated = 1;
-    } else {
-        let root = key_of(read_ptr(top.add(off!(DENTRY_D_INODE_OFFSET))));
-        (*raw).root_dev = root.dev;
-        (*raw).root_ino = root.ino;
-    }
-    entry.submit(0);
 }
 
 /// Bump the cache generation: every cached class is stale.
@@ -1334,12 +1409,15 @@ pub fn bump_generation() {
 /// the class of everything below it.
 #[inline(always)]
 pub unsafe fn on_rename(moved_inode: *const u8) {
-    if !armed() || moved_inode.is_null() {
-        return;
-    }
-    if let Ok(m) = bpf_probe_read_kernel::<u16>(moved_inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
-        if m & S_IFMT == S_IFDIR {
-            bump_generation();
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !armed() || moved_inode.is_null() {
+            return;
+        }
+        if let Ok(m) = bpf_probe_read_kernel::<u16>(moved_inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16) {
+            if m & S_IFMT == S_IFDIR {
+                bump_generation();
+            }
         }
     }
 }
@@ -1357,19 +1435,22 @@ pub fn open_sensor_rmdir(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (dir, dentry).
-    if !armed() {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Kernel signature: (dir, dentry).
+        if !armed() {
+            return 0;
+        }
+        let dentry: *const u8 = ctx.arg(1);
+        if dentry.is_null() {
+            return 0;
+        }
+        let key = key_of(read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET))));
+        if key.ino != 0 {
+            let _ = DIR_CLASS.remove(&key);
+        }
+        0
     }
-    let dentry: *const u8 = ctx.arg(1);
-    if dentry.is_null() {
-        return 0;
-    }
-    let key = key_of(read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET))));
-    if key.ino != 0 {
-        let _ = DIR_CLASS.remove(&key);
-    }
-    0
 }
 
 /// Lab PR 225: the name of `dentry` into `p` — its first
@@ -1378,49 +1459,55 @@ unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
 /// shape counts.
 #[inline(always)]
 unsafe fn read_parts(dentry: *const u8, p: *mut NameParts) {
-    let head = core::ptr::addr_of_mut!((*p).head) as *mut u8;
-    let tail = core::ptr::addr_of_mut!((*p).tail) as *mut u8;
-    let mut i = 0;
-    while i < NAME_HEAD_LEN {
-        core::ptr::write_volatile(head.add(i), 0);
-        i += 1;
-    }
-    (*p).len = 0;
-    (*p).tail_len = 0;
-    let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
-    if name.is_null() {
-        return;
-    }
-    let len = match bpf_probe_read_kernel::<u32>(
-        dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32,
-    ) {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-    let _ = bpf_probe_read_kernel_str_bytes(name, core::slice::from_raw_parts_mut(head, NAME_HEAD_LEN));
-    if len as usize > NAME_TAIL_LEN {
-        let dst = core::slice::from_raw_parts_mut(tail, NAME_TAIL_LEN);
-        if bpf_probe_read_kernel_buf(name.add(len as usize - NAME_TAIL_LEN), dst).is_err() {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let head = core::ptr::addr_of_mut!((*p).head) as *mut u8;
+        let tail = core::ptr::addr_of_mut!((*p).tail) as *mut u8;
+        let mut i = 0;
+        while i < NAME_HEAD_LEN {
+            core::ptr::write_volatile(head.add(i), 0);
+            i += 1;
+        }
+        (*p).len = 0;
+        (*p).tail_len = 0;
+        let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+        if name.is_null() {
             return;
         }
-        (*p).tail_len = NAME_TAIL_LEN as u32;
-    } else {
-        let mut j = 0;
-        while j < NAME_TAIL_LEN {
-            core::ptr::write_volatile(tail.add(j), core::ptr::read_volatile(head.add(j)));
-            j += 1;
+        let len = match bpf_probe_read_kernel::<u32>(
+            dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32,
+        ) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let _ = bpf_probe_read_kernel_str_bytes(name, core::slice::from_raw_parts_mut(head, NAME_HEAD_LEN));
+        if len as usize > NAME_TAIL_LEN {
+            let dst = core::slice::from_raw_parts_mut(tail, NAME_TAIL_LEN);
+            if bpf_probe_read_kernel_buf(name.add(len as usize - NAME_TAIL_LEN), dst).is_err() {
+                return;
+            }
+            (*p).tail_len = NAME_TAIL_LEN as u32;
+        } else {
+            let mut j = 0;
+            while j < NAME_TAIL_LEN {
+                core::ptr::write_volatile(tail.add(j), core::ptr::read_volatile(head.add(j)));
+                j += 1;
+            }
+            (*p).tail_len = len;
         }
-        (*p).tail_len = len;
+        (*p).len = len;
     }
-    (*p).len = len;
 }
 
 /// `(mode, size)` of `inode`, zeros when unreadable.
 #[inline(always)]
 unsafe fn mode_size(inode: *const u8) -> (u16, u64) {
-    let mode = bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16).unwrap_or(0);
-    let size = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_SIZE_OFFSET)) as *const u64).unwrap_or(0);
-    (mode, size)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mode = bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16).unwrap_or(0);
+        let size = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_SIZE_OFFSET)) as *const u64).unwrap_or(0);
+        (mode, size)
+    }
 }
 
 /// Lab PR 225, from `inode_rename` (`fim_watch::fim_rename_observe`): a
@@ -1435,7 +1522,7 @@ unsafe fn mode_size(inode: *const u8) -> (u16, u64) {
 /// A global BPF function, like [`nn_open_walk`]: verified once, on its own,
 /// with plain values for arguments (the dentries, read from the context
 /// array with [`raw_arg`]).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_rename_burst(old_dentry: u64, new_dentry: u64) -> u64 {
     unsafe {
@@ -1448,70 +1535,73 @@ pub extern "C" fn nn_rename_burst(old_dentry: u64, new_dentry: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn rename_burst(old: *const u8, new: *const u8, task: u64) {
-    if !armed() || old.is_null() || new.is_null() {
-        return;
-    }
-    let inode = read_ptr(old.add(off!(DENTRY_D_INODE_OFFSET)));
-    if inode.is_null() {
-        return;
-    }
-    let (mode, _) = mode_size(inode);
-    if mode & S_IFMT != S_IFREG {
-        return;
-    }
-    let rt = match crate::task_scratch::make(&RENAME_TASK, &task) {
-        Some(p) => p,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !armed() || old.is_null() || new.is_null() {
             return;
         }
-    };
-    let sc = &mut (*rt).names;
-    read_parts(old, &mut sc.old);
-    read_parts(new, &mut sc.new);
-    // Each extension scan, then the shape, in a global function of its
-    // own, the results in map memory: inlined here together, the scans'
-    // dot positions and the head comparisons multiplied the verifier's
-    // paths past the 1M-instruction limit of 5.15 and 6.1 (lab PR 225;
-    // KERNEL_COMPATIBILITY "Older verifiers", rule 11).
-    let _ = nn_rename_ext(EXT_NEW as u64);
-    let _ = nn_rename_ext(EXT_OLD as u64);
-    let shape = nn_rename_shape() as u32;
-    if shape == RENAME_OTHER {
-        return;
-    }
-    if crate::fim_watch::caller_is_in_family() {
-        return;
-    }
-    let (ext, src) = (
-        core::ptr::read_volatile(&(*rt).ext[EXT_NEW]),
-        core::ptr::read_volatile(&(*rt).ext[EXT_OLD]),
-    );
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    let appended = shape == RENAME_APPENDED;
-    let crossed = match OPEN_RENAMES.get_ptr_mut(&tgid) {
-        Some(w) => rename_step(&mut *w, ext, src, appended, now),
-        None => {
-            let _ = OPEN_RENAMES.insert(&tgid, &RenameWindow::fresh(now, ext, src, appended), 0);
-            false
+        let inode = read_ptr(old.add(off!(DENTRY_D_INODE_OFFSET)));
+        if inode.is_null() {
+            return;
         }
-    };
-    if !crossed {
-        return;
+        let (mode, _) = mode_size(inode);
+        if mode & S_IFMT != S_IFREG {
+            return;
+        }
+        let rt = match crate::task_scratch::make(&RENAME_TASK, &task) {
+            Some(p) => p,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
+                return;
+            }
+        };
+        let sc = &mut (*rt).names;
+        read_parts(old, &mut sc.old);
+        read_parts(new, &mut sc.new);
+        // Each extension scan, then the shape, in a global function of its
+        // own, the results in map memory: inlined here together, the scans'
+        // dot positions and the head comparisons multiplied the verifier's
+        // paths past the 1M-instruction limit of 5.15 and 6.1 (lab PR 225;
+        // KERNEL_COMPATIBILITY "Older verifiers", rule 11).
+        let _ = nn_rename_ext(EXT_NEW as u64);
+        let _ = nn_rename_ext(EXT_OLD as u64);
+        let shape = nn_rename_shape() as u32;
+        if shape == RENAME_OTHER {
+            return;
+        }
+        if crate::fim_watch::caller_is_in_family() {
+            return;
+        }
+        let (ext, src) = (
+            core::ptr::read_volatile(&(*rt).ext[EXT_NEW]),
+            core::ptr::read_volatile(&(*rt).ext[EXT_OLD]),
+        );
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        let appended = shape == RENAME_APPENDED;
+        let crossed = match OPEN_RENAMES.get_ptr_mut(&tgid) {
+            Some(w) => rename_step(&mut *w, ext, src, appended, now),
+            None => {
+                let _ = OPEN_RENAMES.insert(&tgid, &RenameWindow::fresh(now, ext, src, appended), 0);
+                false
+            }
+        };
+        if !crossed {
+            return;
+        }
+        let (count, appended, sources) = match OPEN_RENAMES.get(&tgid) {
+            Some(w) => (w.count, w.appended, w.sources),
+            None => return,
+        };
+        let key = key_of(inode);
+        emit(open_reason::MASS_RENAME, &key, new, appended, sources, count);
     }
-    let (count, appended, sources) = match OPEN_RENAMES.get(&tgid) {
-        Some(w) => (w.count, w.appended, w.sources),
-        None => return,
-    };
-    let key = key_of(inode);
-    emit(open_reason::MASS_RENAME, &key, new, appended, sources, count);
 }
 
 /// Lab PR 225: [`name_ext`] of the rename's new name (`slot`
 /// [`EXT_NEW`]) or old name ([`EXT_OLD`]) in [`RENAME_SCRATCH`], written
 /// to that slot of [`RENAME_EXT`]. A global function: verified once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_rename_ext(slot: u64) -> u64 {
     unsafe {
@@ -1537,7 +1627,7 @@ pub extern "C" fn nn_rename_ext(slot: u64) -> u64 {
 /// Lab PR 225: [`rename_shape_with`] of the names in [`RENAME_SCRATCH`]
 /// and the extensions [`nn_rename_ext`] left in [`RENAME_EXT`]. A global
 /// function: verified once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_rename_shape() -> u64 {
     unsafe {
@@ -1574,7 +1664,7 @@ pub extern "C" fn nn_rename_shape() -> u64 {
 /// negative dentry, a name that did not exist, counts nothing). Each name
 /// once per window ([`OPEN_DESTROY_SEEN`]: the parent dentry and the
 /// name's hash); a name whose hash cannot be read counts every time.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_unlink_burst(dentry: u64) -> u64 {
     unsafe { unlink_burst(dentry as *const u8) };
@@ -1583,106 +1673,109 @@ pub extern "C" fn nn_unlink_burst(dentry: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn unlink_burst(dentry: *const u8) {
-    if !armed() || dentry.is_null() {
-        return;
-    }
-    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
-    if inode.is_null() {
-        return;
-    }
-    let (mode, size) = mode_size(inode);
-    if mode & S_IFMT != S_IFREG {
-        return;
-    }
-    if crate::fim_watch::caller_is_in_family() {
-        return;
-    }
-    let key = key_of(inode);
-    let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
-    // Lot 282, the re-review of #500: what the writes' count leaves out,
-    // the destructions' does too — a pseudo-filesystem, `/run/systemd`,
-    // the journal, the operator's extras, the destroyer's own runtime
-    // directory ([`carved_class`]): a daemon's atomic replacements there are
-    // no originals, and cost no map work.
-    let cls = if parent.is_null() {
-        None
-    } else {
-        parent_class(&key, parent)
-    };
-    let (bits, owner) = match cls {
-        Some(c) => (c.bits, c.uid),
-        None => (0, u32::MAX),
-    };
-    if cls.is_some() && carved_class(bits, owner, || loginuid()) {
-        return;
-    }
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    // Lot 282, the review of #500 (C1): an empty file is an original only
-    // if it held data within the window (emptied by a truncate first).
-    if size == 0 && !destroys_an_original(0, OPEN_HAD_DATA.get(&key).copied(), now) {
-        return;
-    }
-    // Lot 282: a file this process created within the window is its own
-    // temporary file, no original.
-    let made = OverwriteSeenKey {
-        tgid,
-        _pad: 0,
-        dev: key.dev,
-        ino: key.ino,
-    };
-    if created_in_window(OPEN_CREATED.get(&made).copied(), now) {
-        return;
-    }
-    let hash_len =
-        bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_NAME_OFFSET)) as *const u64).unwrap_or(0);
-    if !parent.is_null() && hash_len != 0 {
-        let start = match OPEN_UNLINKS.get(&tgid) {
-            Some(w) => w.start_for(now),
-            None => now,
-        };
-        let seen = DestroySeenKey {
-            tgid,
-            _pad: 0,
-            parent: parent as u64,
-            hash_len,
-        };
-        if !first_in_window(OPEN_DESTROY_SEEN.get(&seen).copied(), start) {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !armed() || dentry.is_null() {
             return;
         }
-        let _ = OPEN_DESTROY_SEEN.insert(&seen, &start, 0);
-    }
-    // Lot 283c: whose own data the originals destroyed in the window were.
-    let own = own_of(bits, owner, dentry);
-    let (count, summary) = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
-        Some(w) => {
-            let c = unlink_step(&mut *w, now);
-            (*w).own = own_after((*w).own, (*w).count == 1, true, own);
-            (c, (*w).own)
+        let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+        if inode.is_null() {
+            return;
         }
-        None => {
-            let w = UnlinkWindow {
-                start_ns: now,
-                count: 1,
-                fired: 0,
-                own,
-                _pad: 0,
+        let (mode, size) = mode_size(inode);
+        if mode & S_IFMT != S_IFREG {
+            return;
+        }
+        if crate::fim_watch::caller_is_in_family() {
+            return;
+        }
+        let key = key_of(inode);
+        let parent = read_ptr(dentry.add(off!(DENTRY_D_PARENT_OFFSET)));
+        // Lot 282, the re-review of #500: what the writes' count leaves out,
+        // the destructions' does too — a pseudo-filesystem, `/run/systemd`,
+        // the journal, the operator's extras, the destroyer's own runtime
+        // directory ([`carved_class`]): a daemon's atomic replacements there are
+        // no originals, and cost no map work.
+        let cls = if parent.is_null() {
+            None
+        } else {
+            parent_class(&key, parent)
+        };
+        let (bits, owner) = match cls {
+            Some(c) => (c.bits, c.uid),
+            None => (0, u32::MAX),
+        };
+        if cls.is_some() && carved_class(bits, owner, || loginuid()) {
+            return;
+        }
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        // Lot 282, the review of #500 (C1): an empty file is an original only
+        // if it held data within the window (emptied by a truncate first).
+        if size == 0 && !destroys_an_original(0, OPEN_HAD_DATA.get(&key).copied(), now) {
+            return;
+        }
+        // Lot 282: a file this process created within the window is its own
+        // temporary file, no original.
+        let made = OverwriteSeenKey {
+            tgid,
+            _pad: 0,
+            dev: key.dev,
+            ino: key.ino,
+        };
+        if created_in_window(OPEN_CREATED.get(&made).copied(), now) {
+            return;
+        }
+        let hash_len =
+            bpf_probe_read_kernel::<u64>(dentry.add(off!(DENTRY_D_NAME_OFFSET)) as *const u64).unwrap_or(0);
+        if !parent.is_null() && hash_len != 0 {
+            let start = match OPEN_UNLINKS.get(&tgid) {
+                Some(w) => w.start_for(now),
+                None => now,
             };
-            let _ = OPEN_UNLINKS.insert(&tgid, &w, 0);
-            (0, own)
+            let seen = DestroySeenKey {
+                tgid,
+                _pad: 0,
+                parent: parent as u64,
+                hash_len,
+            };
+            if !first_in_window(OPEN_DESTROY_SEEN.get(&seen).copied(), start) {
+                return;
+            }
+            let _ = OPEN_DESTROY_SEEN.insert(&seen, &start, 0);
         }
-    };
-    if count == 0 {
-        return;
+        // Lot 283c: whose own data the originals destroyed in the window were.
+        let own = own_of(bits, owner, dentry);
+        let (count, summary) = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
+            Some(w) => {
+                let c = unlink_step(&mut *w, now);
+                (*w).own = own_after((*w).own, (*w).count == 1, true, own);
+                (c, (*w).own)
+            }
+            None => {
+                let w = UnlinkWindow {
+                    start_ns: now,
+                    count: 1,
+                    fired: 0,
+                    own,
+                    _pad: 0,
+                };
+                let _ = OPEN_UNLINKS.insert(&tgid, &w, 0);
+                (0, own)
+            }
+        };
+        if count == 0 {
+            return;
+        }
+        emit(
+            open_reason::MASS_UNLINK | ((summary & 0xFF) << open_reason::OWN_SHIFT),
+            &key,
+            dentry,
+            0,
+            0,
+            count,
+        );
     }
-    emit(
-        open_reason::MASS_UNLINK | ((summary & 0xFF) << open_reason::OWN_SHIFT),
-        &key,
-        dentry,
-        0,
-        0,
-        count,
-    );
 }
 
 /// Lot 282, the review of #500 (C1), from `inode_setattr`
@@ -1695,7 +1788,7 @@ unsafe fn unlink_burst(dentry: *const u8) {
 /// x` sets the times of every file) no longer pays a map insert, nor
 /// evicts a truncated file's entry. A global BPF function, as
 /// [`nn_unlink_burst`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_setattr_mark(dentry: u64, iattr: u64) -> u64 {
     unsafe { setattr_mark(dentry as *const u8, iattr as *const u8) };
@@ -1704,26 +1797,29 @@ pub extern "C" fn nn_setattr_mark(dentry: u64, iattr: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn setattr_mark(dentry: *const u8, iattr: *const u8) {
-    if !armed() || dentry.is_null() || iattr.is_null() {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !armed() || dentry.is_null() || iattr.is_null() {
+            return;
+        }
+        // `ia_valid` is `struct iattr`'s first member (an `unsigned int`) in
+        // every kernel the agent supports, as it has been since 2.6.
+        match bpf_probe_read_kernel::<u32>(iattr as *const u32) {
+            Ok(v) if marks_had_data(v) => {}
+            _ => return,
+        }
+        let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+        if inode.is_null() {
+            return;
+        }
+        let (mode, size) = mode_size(inode);
+        if mode & S_IFMT != S_IFREG || size == 0 {
+            return;
+        }
+        let key = key_of(inode);
+        let now = bpf_ktime_get_ns();
+        let _ = OPEN_HAD_DATA.insert(&key, &now, 0);
     }
-    // `ia_valid` is `struct iattr`'s first member (an `unsigned int`) in
-    // every kernel the agent supports, as it has been since 2.6.
-    match bpf_probe_read_kernel::<u32>(iattr as *const u32) {
-        Ok(v) if marks_had_data(v) => {}
-        _ => return,
-    }
-    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
-    if inode.is_null() {
-        return;
-    }
-    let (mode, size) = mode_size(inode);
-    if mode & S_IFMT != S_IFREG || size == 0 {
-        return;
-    }
-    let key = key_of(inode);
-    let now = bpf_ktime_get_ns();
-    let _ = OPEN_HAD_DATA.insert(&key, &now, 0);
 }
 
 /// Review 86: a file capability set by any route — `setcap`, a direct
@@ -1750,47 +1846,56 @@ const XATTR_NAME_CAPS: [u8; 20] = *b"security.capability\0";
 /// 9's 5.14), and `value` is one.
 #[inline(always)]
 pub(crate) unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
-    let args = ctx.as_ptr() as *const u64;
-    bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let args = ctx.as_ptr() as *const u64;
+        bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
+    }
 }
 
 #[inline(always)]
 unsafe fn try_file_cap(ctx: &LsmContext) {
-    let dentry: *const u8 = ctx.arg(0);
-    let name = raw_arg(ctx, 1) as *const u8;
-    let value = raw_arg(ctx, 2) as *const u8;
-    let size = raw_arg(ctx, 3) as usize;
-    if dentry.is_null() || name.is_null() || value.is_null() || size < 12 {
-        return;
-    }
-    let mut n = [0u8; 20];
-    if bpf_probe_read_kernel_str_bytes(name, &mut n).is_err() || n != XATTR_NAME_CAPS {
-        return;
-    }
-    // struct vfs_cap_data: magic_etc, then {permitted, inheritable} for
-    // the low and (revision >= 2) the high 32 capabilities.
-    let mut head = [0u32; 3];
-    if bpf_probe_read_kernel_buf(value, core::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut u8, 12))
-        .is_err()
-    {
-        return;
-    }
-    let mut high = 0u32;
-    if size >= 16 {
-        if let Ok(h) = bpf_probe_read_kernel::<u32>(value.add(12) as *const u32) {
-            high = h;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let dentry: *const u8 = ctx.arg(0);
+        let name = raw_arg(ctx, 1) as *const u8;
+        let value = raw_arg(ctx, 2) as *const u8;
+        let size = raw_arg(ctx, 3) as usize;
+        if dentry.is_null() || name.is_null() || value.is_null() || size < 12 {
+            return;
         }
+        let mut n = [0u8; 20];
+        if bpf_probe_read_kernel_str_bytes(name, &mut n).is_err() || n != XATTR_NAME_CAPS {
+            return;
+        }
+        // struct vfs_cap_data: magic_etc, then {permitted, inheritable} for
+        // the low and (revision >= 2) the high 32 capabilities.
+        let mut head = [0u32; 3];
+        if bpf_probe_read_kernel_buf(value, core::slice::from_raw_parts_mut(head.as_mut_ptr() as *mut u8, 12))
+            .is_err()
+        {
+            return;
+        }
+        let mut high = 0u32;
+        if size >= 16 {
+            match bpf_probe_read_kernel::<u32>(value.add(12) as *const u32) {
+                Ok(h) => {
+                    high = h;
+                }
+                _ => {}
+            }
+        }
+        let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+        if inode.is_null() {
+            return;
+        }
+        let key = key_of(inode);
+        // The dentry goes to the global `nn_open_emit` as a plain value: the
+        // hook's own argument is a BTF-typed pointer, which a global function
+        // does not take (5.15: "R4 is not a scalar").
+        let dentry_value = raw_arg(ctx, 0) as *const u8;
+        emit(open_reason::FILE_CAP, &key, dentry_value, high, head[0], head[1]);
     }
-    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
-    if inode.is_null() {
-        return;
-    }
-    let key = key_of(inode);
-    // The dentry goes to the global `nn_open_emit` as a plain value: the
-    // hook's own argument is a BTF-typed pointer, which a global function
-    // does not take (5.15: "R4 is not a scalar").
-    let dentry_value = raw_arg(ctx, 0) as *const u8;
-    emit(open_reason::FILE_CAP, &key, dentry_value, high, head[0], head[1]);
 }
 
 /// Lot 322 (the review of #546, F3): the walk's buffers an unlink or a

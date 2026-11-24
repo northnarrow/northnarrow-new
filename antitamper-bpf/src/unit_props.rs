@@ -14,8 +14,8 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cgroup_floors::{below_floor, floor_of, FloorRole};
-use crate::systemd_bus::{unit_properties, unit_property, Value};
+use crate::cgroup_floors::{FloorRole, below_floor, floor_of};
+use crate::systemd_bus::{Value, unit_properties, unit_property};
 use common::cgroup_limits::limit_kind_of;
 
 /// The service interface and the slice interface of systemd's units.
@@ -391,18 +391,22 @@ mod tests {
             ("MemoryMax", 1 << 30),
             ("TasksMax", 512),
         ];
-        assert!(below_with("a", FloorRole::Agent, get(shipped))
-            .unwrap()
-            .is_empty());
+        assert!(
+            below_with("a", FloorRole::Agent, get(shipped))
+                .unwrap()
+                .is_empty()
+        );
         // the watchdog's: 32M (lot 381), 10 %, 8 tasks
         let wd: &[(&str, u64)] = &[
             ("MemoryMax", 32 << 20),
             ("CPUQuotaPerSecUSec", 100_000),
             ("TasksMax", 8),
         ];
-        assert!(below_with("w", FloorRole::Watchdog, get(wd))
-            .unwrap()
-            .is_empty());
+        assert!(
+            below_with("w", FloorRole::Watchdog, get(wd))
+                .unwrap()
+                .is_empty()
+        );
         // a refused set-property's copy: MemoryMax 4K
         let hostile: &[(&str, u64)] = &[("MemoryMax", 4096), ("CPUWeight", 1)];
         let b = below_with("a", FloorRole::Agent, get(hostile)).unwrap();

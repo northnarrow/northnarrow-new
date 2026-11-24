@@ -26,7 +26,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::config::overlay::{self, DefaultsSource, OverlayLoad, Shipped};
 use crate::config::overlay_auth::Verified;

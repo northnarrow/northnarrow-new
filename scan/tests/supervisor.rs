@@ -7,8 +7,8 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use nn_proto::execq::{encode_config, HashEntry, ScanConfig, ScanRequest, ScanVerdict};
-use northnarrow_scan::supervisor::{lookup_user, ScanUser, ScannerEvent, Supervisor};
+use nn_proto::execq::{HashEntry, ScanConfig, ScanRequest, ScanVerdict, encode_config};
+use northnarrow_scan::supervisor::{ScanUser, ScannerEvent, Supervisor, lookup_user};
 use sha2::{Digest, Sha256};
 
 fn me() -> ScanUser {
@@ -107,7 +107,9 @@ fn a_missing_binary_backs_off() {
 #[test]
 fn root_and_unknown_users_are_refused() {
     assert!(lookup_user("root").unwrap_err().contains("root"));
-    assert!(lookup_user("nn-no-such-user-xyz")
-        .unwrap_err()
-        .contains("no user"));
+    assert!(
+        lookup_user("nn-no-such-user-xyz")
+            .unwrap_err()
+            .contains("no user")
+    );
 }

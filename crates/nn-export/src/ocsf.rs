@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use nn_proto::ipc::ExportChain;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The OCSF version every record names (`metadata.version`).
 pub const OCSF_VERSION: &str = "1.9.0";
@@ -539,10 +539,12 @@ fn detection(ctx: &Context, row: &Row<'_>, v: &Value) -> Vec<Value> {
     );
     fi.insert(
         "title".into(),
-        json!(rule_name
-            .clone()
-            .or_else(|| rule_id.clone())
-            .unwrap_or_else(|| "detection".into())),
+        json!(
+            rule_name
+                .clone()
+                .or_else(|| rule_id.clone())
+                .unwrap_or_else(|| "detection".into())
+        ),
     );
     if let Some(t) = text(v, "detection_type") {
         fi.insert("types".into(), json!([t]));

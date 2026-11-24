@@ -51,8 +51,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::EniIptablesGuard;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const RECORD_POLL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -825,8 +825,8 @@ int main(int argc, char **argv) {
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn a_staging_preload_is_refused_at_every_exec_on_every_cpu() {
     use std::os::unix::process::CommandExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     const N: usize = 24;
 
     let _eni = EniIptablesGuard::install();

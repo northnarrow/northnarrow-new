@@ -318,13 +318,17 @@ mod received {
         assert!(record_of("").is_none());
         assert!(record_of("   \n").is_none());
         assert!(record_of("<107>1 cut before the record").unwrap().is_err());
-        assert!(record_of("<107>1 - - - {\"class_uid\":20")
-            .unwrap()
-            .is_err());
+        assert!(
+            record_of("<107>1 - - - {\"class_uid\":20")
+                .unwrap()
+                .is_err()
+        );
         assert_eq!(problems_of(&serde_json::json!({})), ["no class_uid"]);
-        assert!(problems_of(&serde_json::json!({"class_uid": 1}))
-            .iter()
-            .any(|p| p.contains("not one the schema pins")));
+        assert!(
+            problems_of(&serde_json::json!({"class_uid": 1}))
+                .iter()
+                .any(|p| p.contains("not one the schema pins"))
+        );
     }
 
     /// `NN_OCSF_RECEIVED=<file>[:<file>…]`: every record of each file

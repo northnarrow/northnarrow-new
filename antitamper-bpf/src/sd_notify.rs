@@ -122,9 +122,11 @@ mod tests {
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{value}");
         }
         assert!(address(OsStr::new("@x")).unwrap().as_abstract_name() == Some(&b"x"[..]));
-        assert!(address(OsStr::new("/run/systemd/notify"))
-            .unwrap()
-            .as_pathname()
-            .is_some());
+        assert!(
+            address(OsStr::new("/run/systemd/notify"))
+                .unwrap()
+                .as_pathname()
+                .is_some()
+        );
     }
 }

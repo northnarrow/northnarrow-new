@@ -172,9 +172,11 @@ mod tests {
         assert_eq!(row.extra["window_secs"], 3600);
         assert_eq!(row.extra["peers_over_cap"], false);
         // Still inside the hour: counted.
-        assert!(polls
-            .note(&peer(4200, "nn-admin"), t0 + Duration::from_secs(3599))
-            .is_none());
+        assert!(
+            polls
+                .note(&peer(4200, "nn-admin"), t0 + Duration::from_secs(3599))
+                .is_none()
+        );
         let next = polls
             .note(&peer(4300, "nn-admin"), t0 + POLL_WINDOW)
             .expect("the next window opens with a row");
@@ -214,9 +216,11 @@ mod tests {
         let polls = StatusPolls::new(exempt);
         let t0 = Instant::now();
         for i in 0..10 {
-            assert!(polls
-                .note(&peer(me, "northnarrow-wat"), t0 + Duration::from_secs(i))
-                .is_none());
+            assert!(
+                polls
+                    .note(&peer(me, "northnarrow-wat"), t0 + Duration::from_secs(i))
+                    .is_none()
+            );
         }
         assert_eq!(polls.tracked(), 0);
         let namesake = polls

@@ -20,9 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use super::journal::Intent;
-use super::proc_ref::{is_gone, read_stat, ProcRef, ProcStat};
 use super::ExecutionOutcome;
+use super::journal::Intent;
+use super::proc_ref::{ProcRef, ProcStat, is_gone, read_stat};
 
 /// How long a SIGKILLed process may take to exit before the kill is
 /// reported `Failed` (`ETIMEDOUT`).

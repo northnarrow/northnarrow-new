@@ -17,13 +17,13 @@ use tokio::net::UnixStream;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-use nn_proto::admin_protocol::{decode_frame, encode_frame, AdminMessage, MAX_FRAME_BODY};
+use nn_proto::admin_protocol::{AdminMessage, MAX_FRAME_BODY, decode_frame, encode_frame};
 
-use super::audit::{emit_audit_for, AuditClient, DispatchNotes};
-use super::handlers::{dispatch, Wired};
+use super::audit::{AuditClient, DispatchNotes, emit_audit_for};
+use super::handlers::{Wired, dispatch};
 use super::{
-    socket_watch, status_polls, AdminHandles, AdminReadPaths, CanaryAdminState,
-    DetectionAdminState, FimAdminState, ResponseAdminState, ShutdownSignal, StatusPolls,
+    AdminHandles, AdminReadPaths, CanaryAdminState, DetectionAdminState, FimAdminState,
+    ResponseAdminState, ShutdownSignal, StatusPolls, socket_watch, status_polls,
 };
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;

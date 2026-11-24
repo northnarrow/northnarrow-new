@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::VerifyingKey;
 use nn_evidence::chain_host::ChainHost;
 use nn_evidence::chainlog::{self, ManifestEvent};
-use nn_proto::ipc::{ExportChain, ExportRow, ExportSink, RowPos, MAX_EXPORT_ROW};
+use nn_proto::ipc::{ExportChain, ExportRow, ExportSink, MAX_EXPORT_ROW, RowPos};
 use serde::{Deserialize, Serialize};
 
 /// The core's cursors' file's name, beside the detection log (the state

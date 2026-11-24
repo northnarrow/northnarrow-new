@@ -84,7 +84,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         _ => {
             return Err(format!(
                 "--pin-ids and --mirror go together, with --write\n{usage}"
-            ))
+            ));
         }
     }
     let mut stale = Vec::new();

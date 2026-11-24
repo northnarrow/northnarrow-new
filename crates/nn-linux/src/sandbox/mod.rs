@@ -44,8 +44,8 @@ use std::io;
 use std::os::fd::RawFd;
 
 use landlock::{
-    Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, NetPort, PathBeneath,
-    PathFd, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, NetPort,
+    PathBeneath, PathFd, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use nn_proto::ipc::{LandlockEnforced, SandboxLevel};
 

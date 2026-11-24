@@ -318,10 +318,11 @@ fn a_change_while_running_is_a_signed_revision() {
         .find(|s| s.source == "fim_drain")
         .unwrap();
     assert_eq!(fim.state, SourceState::AdapterTerminated);
-    assert!(now
-        .change
-        .iter()
-        .any(|c| c.starts_with("source fim_drain: ok on its attach point")));
+    assert!(
+        now.change
+            .iter()
+            .any(|c| c.starts_with("source fim_drain: ok on its attach point"))
+    );
     assert_eq!(m.adapters_terminated(&["fim_drain"]), None, "once");
     let rows = rows(dir.path());
     let changes: Vec<&crate::audit::AuditEntry> =
@@ -566,10 +567,11 @@ fn without_the_bpf_lsm_the_manifest_says_which_hooks_do_not_run() {
             assert_eq!(s.state, SourceState::Ok, "{s:?}");
         }
     }
-    assert!(cur
-        .missing
-        .iter()
-        .any(|l| l.starts_with("fs_protect: attached, not invoked")));
+    assert!(
+        cur.missing
+            .iter()
+            .any(|l| l.starts_with("fs_protect: attached, not invoked"))
+    );
     let m = SignedManifest::default();
     m.arm(None, inputs(active(), SelfTestOutcome::NotDenied));
     let cur = m.current().unwrap();
@@ -604,12 +606,14 @@ fn without_the_bpf_lsm_the_manifest_says_which_hooks_do_not_run() {
     i.base.deny_hooks.observe_missing = vec!["bpf_syscall_observe: refused".to_string()];
     m.arm(None, i);
     let cur = m.current().unwrap();
-    assert!(cur
-        .missing
-        .contains(&"deny hook: inode_link: no BTF".to_string()));
-    assert!(cur
-        .missing
-        .contains(&"observe hook: bpf_syscall_observe: refused".to_string()));
+    assert!(
+        cur.missing
+            .contains(&"deny hook: inode_link: no BTF".to_string())
+    );
+    assert!(
+        cur.missing
+            .contains(&"observe hook: bpf_syscall_observe: refused".to_string())
+    );
 }
 
 /// R13: a list given way to the copy built into the agent is the
@@ -655,10 +659,11 @@ fn a_default_list_in_force_is_the_manifest_s_content() {
     );
     m.flush().expect("a change");
     let cur = m.current().unwrap();
-    assert!(cur
-        .change
-        .iter()
-        .any(|c| c.starts_with("content + netflow-ja3-blocklist (/x.v1): no list")));
+    assert!(
+        cur.change
+            .iter()
+            .any(|c| c.starts_with("content + netflow-ja3-blocklist (/x.v1): no list"))
+    );
 }
 
 /// The source files of `rel` paths (from the repository's root), without
