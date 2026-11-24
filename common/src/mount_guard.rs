@@ -441,15 +441,23 @@ pub fn umount_below<T: Tree>(t: &T, top: T::M) -> Below {
     let mut at = top;
     // the peer groups of the parents read, OR-ed
     let mut groups: u64 = 0;
-    let mut i = 0;
-    while i <= SUBTREE_MAX {
+    // Lot 400: the bound's test closes the loop, the step after the last
+    // mount read is taken after it. With the test inside (`if i ==
+    // SUBTREE_MAX { break }` after the step), every exit of the loop was in
+    // its body: rustc 1.99's LLVM 22 laid the latch — the groups OR-ed and
+    // the count — above the header it fell through into, a back-edge 5.15's
+    // and 6.1's verifiers refuse (`no_function_has_a_back_edge_the_5_15_
+    // verifier_rejects`). The mounts read and the verdicts are the same.
+    let mut left = SUBTREE_MAX;
+    loop {
         match next_below(t, at, top) {
             Step::Done => return Below::Clear,
-            Step::Deep => break,
+            Step::Deep => {
+                return Below::Unread {
+                    reaches: groups != 0,
+                };
+            }
             Step::Next(n) => {
-                if i == SUBTREE_MAX {
-                    break;
-                }
                 at = n;
                 let v = t.below(n);
                 if v & BELOW_TAKES != 0 {
@@ -458,10 +466,17 @@ pub fn umount_below<T: Tree>(t: &T, top: T::M) -> Below {
                 groups |= v;
             }
         }
-        i += 1;
+        left -= 1;
+        if left == 0 {
+            break;
+        }
     }
-    Below::Unread {
-        reaches: groups != 0,
+    // SUBTREE_MAX mounts read: whether there is another
+    match next_below(t, at, top) {
+        Step::Done => Below::Clear,
+        Step::Deep | Step::Next(_) => Below::Unread {
+            reaches: groups != 0,
+        },
     }
 }
 
@@ -979,8 +994,17 @@ pub fn allowed_kernel_mount(fstype: &NameKey, point: &Point, src_root: bool) -> 
     if !src_root || fstype.len == NAME_UNREAD || fstype.len == NAME_ANY {
         return false;
     }
-    let mut i = 0;
-    while i < ALLOWED_KERNEL_MOUNTS.len() {
+    // Lot 400: the list is walked from its end, the count taken down at
+    // the top of each step and tested at its bottom, so the loop's latch is
+    // that test — a jump. `while i < len` (and a `loop` whose test closes
+    // it, the same code) became, with rustc 1.99's LLVM 22, a latch whose
+    // last instruction was the index's increment, laid out above the
+    // header it fell through into: a back-edge 5.15's and 6.1's verifiers
+    // refuse (`no_function_has_a_back_edge_the_5_15_verifier_rejects`).
+    // The verdict is the same in any order: any entry matching.
+    let mut i = ALLOWED_KERNEL_MOUNTS.len();
+    loop {
+        i -= 1;
         let a = &ALLOWED_KERNEL_MOUNTS[i];
         let stacked_ok = if a.covers == 0 {
             point.stack == 0
@@ -995,9 +1019,10 @@ pub fn allowed_kernel_mount(fstype: &NameKey, point: &Point, src_root: bool) -> 
         {
             return true;
         }
-        i += 1;
+        if i == 0 {
+            return false;
+        }
     }
-    false
 }
 
 fn names_match(want: &[NameKey; 3], got: &[NameKey; 3], depth: u8) -> bool {
