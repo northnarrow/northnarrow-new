@@ -14810,3 +14810,58 @@ number in parentheses is a lab PR.
     fingerprint of each listed key and of no other.
   - Lab: none (config only). Host: the full gates;
     `verify-release-tag.sh version v0.1.0-alpha` passes.
+- **Lot 396 — Rust edition 2024 for the workspace and agent-ebpf (#605;
+  no behaviour change, no level change).**
+  - What was open: every crate was on edition 2021, and the eBPF stages
+    after the alpha (P3 before Z1–Z8) would each have had to be migrated
+    again: `#[no_mangle]` and `#[link_section]` become `unsafe(…)`
+    attributes, an `unsafe fn`'s body is no longer an unsafe context.
+  - What changed: `edition = "2024"` for the workspace, `fuzz/` and
+    `agent-ebpf/`; `rust-version` stays 1.89 and the pinned toolchains
+    1.99.1 and nightly-2025-12-01; no dependency moved (`resolver` stays
+    "2" in the three workspaces, where 2024 would make it "3"). From
+    `cargo fix --edition` over every configuration the gates compile, by
+    hand: the eBPF object's 54 `#[unsafe(no_mangle)]` and 3
+    `#[unsafe(link_section)]` (aya-ebpf-macros 0.2.0 already emits the
+    `unsafe(…)` forms); its 340 `unsafe fn` bodies each one explicit
+    `unsafe {}` block with a `SAFETY` line, the argument once in
+    `agent-ebpf/src/main.rs` ("Unsafe code"); the dead crate-wide
+    `allow(static_mut_refs)` removed (no `static mut` anywhere); 16
+    `std::env::set_var`/`remove_var` calls (15 in tests) in `unsafe` with
+    their `SAFETY`; `gen` renamed where it was ours, the wire field
+    `DirClass::r#gen` keeps its name (lab PR 233); `use<…>` where 2021's
+    capture must stay (4 return types); cargo fix's 9 `if let` → `match`
+    rewrites and 2 `expr_2021` fragments reverted (their temporaries drop
+    nothing; one-arm macros). The 103 tail expressions whose temporaries
+    now drop before the block's locals were reviewed one by one (23 with
+    a lock guard): none drops a value another one's `Drop` needs; the
+    list is in the PR. Clippy's `collapsible_if` (let chains, 350 sites)
+    is off workspace-wide until a lot of its own; rustfmt's 2024 style is
+    a commit of its own; xtask's source-scanning tests quote the
+    re-indented eBPF bodies (141 snippets, 4 columns right), the
+    `unsafe(…)` attributes and one `match`.
+  - The eBPF object and the verifier: the migrated sources compiled under
+    2021 give main's instructions exactly. Under 2024, an `if let`'s
+    scrutinee temporaries end in each arm and a block's tail temporaries
+    before its locals; the code LLVM made of those scopes differed in 34
+    of the 124 programs, and `nn-lab.sh verifier-check` against rc15's
+    figures (fase 8h) found 8 small programs grown by more than 1 % on one
+    of the five kernels (`fim_file_open_observe` 884 → 1,043 on 5.15,
+    `dns_nss_resolve` +4.6 %, `epg_sys_exit` +2.7 % on 6.8, the
+    iterators, `bpf_prog_guard`, `fork_parent_record`, `fim_file_open_sensor`)
+    and others shrunk (`module_read_file_observe` 551,900 → 459,242 on
+    5.15). In their paths 22 `if let`s became `match`es (2021's one end,
+    after the arms) and two map keys are bound before their lookup (a
+    third lookup moved inside its `unsafe` block), each kept only where a
+    program's code needed it: 109 programs are main's instructions again,
+    the 15 others differ by a few.
+  - Lab: `nn-lab.sh verifier-check` on the five kernels (5.15, 6.1, 6.8,
+    6.12, 7.0), against rc15's figures. The final object: no program
+    fails or changes result, none grows by more than 1 % (the largest,
+    `module_read_file_observe` +0.74 % on 6.8 and 6.12, is 16.8 % smaller
+    on 5.15 and 6.1), no stack figure changes, `mount_guard_sb_mount`
+    830,908 on 5.15 as before; the total processed −1.77 % (5.15), −2.01 %
+    (6.1), +0.02 % (6.8, 6.12), −0.07 % (7.0).
+  - Host: the full gates (6,185 workspace tests passed, golden ×5, MSRV 1.89, 15 fuzz targets, 5 portable targets, lockfiles unchanged); `verify-release-tag.sh version
+    v0.1.0-alpha` passes; the CHANGELOG's 0.1.0-alpha section untouched
+    (`verify-release-tag.sh` refuses an `[Unreleased]` on top).
