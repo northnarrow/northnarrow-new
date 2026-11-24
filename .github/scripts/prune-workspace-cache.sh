@@ -38,13 +38,17 @@ for target in "$@"; do
     [ -d "$target" ] || continue
     for name in "${names[@]}"; do
         under=${name//-/_}
+        # Cargo up to 1.99 (and the nightly of agent-ebpf/ and fuzz/):
         # <profile>/.fingerprint/<name>-<hash>, <profile>/deps/{lib,}<name>-<hash>.*,
-        # <profile>/build/<name>-<hash> (build scripts), <profile>/<name> (bins),
-        # <profile>/incremental/<name>-<hash>, and the same under target triples.
+        # <profile>/build/<name>-<hash> (build scripts). Cargo 1.100's
+        # build-dir layout (lot 397): <profile>/build/<name>/<hash>/{fingerprint,out},
+        # every unit of the package under one directory. Both: <profile>/<name>
+        # (bins), <profile>/incremental/<name>-<hash>, and the same under
+        # target triples.
         find "$target" -mindepth 2 -maxdepth 4 \( \
             -path "*/.fingerprint/${name}-*" -o \
             -path "*/deps/${under}-*" -o -path "*/deps/lib${under}-*" -o \
-            -path "*/build/${name}-*" -o \
+            -path "*/build/${name}-*" -o -path "*/build/${name}" -o \
             -path "*/incremental/${under}-*" -o \
             -path "*/${name}" -o -path "*/${name}.d" \) \
             -prune -exec rm -rf {} + 2>/dev/null || true

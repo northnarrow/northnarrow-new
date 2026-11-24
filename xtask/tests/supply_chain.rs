@@ -631,6 +631,61 @@ fn cache_restore_keys_stay_within_their_own_key() {
     );
 }
 
+/// Lot 397 (Rust 1.100.0): a cached `target/` is only of use to the
+/// toolchain that built it, and the cache key named the lockfiles and
+/// manifests alone. A toolchain bump left them unchanged, so the key hit
+/// exactly: every run restored the old compiler's artifacts, rebuilt all
+/// of them, and never saved (an exact hit is not saved) until the next
+/// dependency change. With 1.100's new build-dir layout the restored tree
+/// also stayed beside the new one. A step that caches `<dir>/target` keys on
+/// `<dir>/rust-toolchain.toml` when there is one, before the trailing
+/// hashFiles(), so its restore key (the key without it) keys on it too.
+#[test]
+fn a_cached_target_is_keyed_on_its_toolchain() {
+    let mut seen = 0;
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            for step in steps(&body) {
+                if !str_of(&step, "uses").is_some_and(|u| u.starts_with("actions/cache@")) {
+                    continue;
+                }
+                let with = step.get("with");
+                let key = with.and_then(|w| str_of(w, "key")).unwrap_or("");
+                let own = key.rfind("${{ hashFiles(").map_or("", |i| &key[..i]);
+                let paths = with.and_then(|w| str_of(w, "path")).unwrap_or("");
+                for path in paths.lines().map(str::trim) {
+                    let Some(dir) = path
+                        .strip_suffix("target")
+                        .filter(|d| d.is_empty() || d.ends_with('/'))
+                    else {
+                        continue;
+                    };
+                    let toolchain = format!("{dir}rust-toolchain.toml");
+                    if !repo_root().join(&toolchain).is_file() {
+                        continue;
+                    }
+                    seen += 1;
+                    if !own.contains(&format!("'{toolchain}'")) {
+                        bad.push(format!(
+                            "{}: job {job}: caches {path}, key `{key}` does not hash \
+                             {toolchain} before its last hashFiles()",
+                            rel(&file)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no cached target/ found");
+    assert!(
+        bad.is_empty(),
+        "a cached target/ must be keyed on the toolchain that builds it:\n{}",
+        bad.join("\n")
+    );
+}
+
 /// Logical lines of a shell script: continuations joined, comments dropped.
 fn script_lines(script: &str) -> Vec<String> {
     let lines: Vec<&str> = script.lines().collect();
@@ -1067,7 +1122,9 @@ fn rust_version_covers_every_locked_dependency() {
 /// SUP-012: the prune step must not pass when it pruned nothing because
 /// cargo metadata failed: the restored workspace artifacts would stay and
 /// could be taken as fresh. Runs the script with a stub `cargo` first on
-/// PATH.
+/// PATH. Lot 397: the target dir holds both of Cargo's build-dir layouts
+/// (the workspace's 1.100 and the nightly of agent-ebpf/ and fuzz/), and the
+/// workspace crates go from each while the dependencies stay.
 #[cfg(unix)]
 #[test]
 fn prune_script_fails_closed() {
@@ -1079,10 +1136,11 @@ fn prune_script_fails_closed() {
         let dir = base.join(case);
         let bin = dir.join("bin");
         let target = dir.join("target");
-        for d in [
-            "debug/.fingerprint/northnarrow-agent-0123",
-            "debug/.fingerprint/serde-4567",
-        ] {
+        for d in OLD_LAYOUT
+            .iter()
+            .chain(&NEW_LAYOUT)
+            .flat_map(|(w, d)| [w, d])
+        {
             fs::create_dir_all(target.join(d)).unwrap();
         }
         fs::create_dir_all(&bin).unwrap();
@@ -1139,7 +1197,56 @@ fn prune_script_fails_closed() {
         target.join("debug/.fingerprint/serde-4567").exists(),
         "a dependency's fingerprint is kept"
     );
+    for (workspace, dependency) in OLD_LAYOUT.iter().chain(&NEW_LAYOUT) {
+        assert!(
+            !target.join(workspace).exists(),
+            "a workspace crate's {workspace} is removed"
+        );
+        assert!(
+            target.join(dependency).exists(),
+            "a dependency's {dependency} is kept"
+        );
+    }
 }
+
+/// (a workspace crate's artifact, a dependency's) in Cargo's build-dir
+/// layout up to 1.99, as the nightly of agent-ebpf/ and fuzz/ still lays it.
+const OLD_LAYOUT: [(&str, &str); 4] = [
+    (
+        "debug/.fingerprint/northnarrow-agent-0123",
+        "debug/.fingerprint/serde-4567",
+    ),
+    (
+        "debug/deps/libnorthnarrow_agent-0123.rlib",
+        "debug/deps/libserde-4567.rlib",
+    ),
+    (
+        "debug/build/northnarrow-agent-89ab",
+        "debug/build/serde-cdef",
+    ),
+    (
+        "debug/incremental/xtask-1abc",
+        "debug/incremental/serde-2def",
+    ),
+];
+
+/// The same in Cargo 1.100's layout (the workspace's `rust-toolchain.toml`,
+/// lot 397): `<profile>/build/<package>/<hash>/{fingerprint,out}`, also under
+/// a target triple.
+const NEW_LAYOUT: [(&str, &str); 3] = [
+    (
+        "debug/build/northnarrow-agent/0123456789abcdef/fingerprint",
+        "debug/build/serde/456789abcdef0123/fingerprint",
+    ),
+    (
+        "release/build/xtask/89abcdef01234567/out",
+        "release/build/serde_json/cdef0123456789ab/out",
+    ),
+    (
+        "x86_64-unknown-linux-gnu/release/build/northnarrow-agent/0123456789abcdef/out",
+        "x86_64-unknown-linux-gnu/release/build/serde/456789abcdef0123/out",
+    ),
+];
 
 /// SUP-006 (residual of Wave 2): an advisory published against an
 /// unchanged main must not wait for the next push. ci.yml runs on a
