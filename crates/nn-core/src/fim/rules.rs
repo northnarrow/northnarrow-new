@@ -4364,10 +4364,11 @@ mod tests {
             .evaluate(&attr_event("/etc/shadow", (0o640, 0, 42), (0o644, 0, 42)))
             .expect("chmod o+r /etc/shadow");
         assert_eq!(v.severity, Severity::High);
+        // a fixed message: the reasoning names the modifier's uid (CodeQL
+        // rust/cleartext-logging)
         assert!(
             v.reasoning.contains("readable by group/others"),
-            "{}",
-            v.reasoning
+            "the reasoning says the file became readable by group/others"
         );
         // closing it again is not
         assert!(

@@ -159,12 +159,14 @@ mod tests {
                 .is_none()
         );
         // Human users and a rootless container's sub-uids (PROC-012).
-        for uid in [1000, 60_000, 100_000, 100_032] {
+        // the case's index, not its uid, in the message (CodeQL
+        // rust/cleartext-logging)
+        for (case, uid) in [1000, 60_000, 100_000, 100_032].into_iter().enumerate() {
             assert!(
                 rule()
                     .evaluate(&spawn_as(uid, "strace", "/usr/bin/strace"))
                     .is_none(),
-                "{uid}"
+                "case {case}"
             );
         }
         assert!(

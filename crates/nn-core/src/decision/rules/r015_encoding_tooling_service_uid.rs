@@ -204,12 +204,14 @@ mod tests {
         );
         // Human user (uid >= 1000) likewise, and a rootless container's
         // sub-uid (PROC-012: the range's owner's standing).
-        for uid in [1000, 60_000, 100_000, 100_032] {
+        // the case's index, not its uid, in the message (CodeQL
+        // rust/cleartext-logging)
+        for (case, uid) in [1000, 60_000, 100_000, 100_032].into_iter().enumerate() {
             assert!(
                 rule()
                     .evaluate(&spawn_as(uid, "openssl", "/usr/bin/openssl"))
                     .is_none(),
-                "{uid}"
+                "case {case}"
             );
         }
         // Non-encoder by a service uid is not R015's concern.
