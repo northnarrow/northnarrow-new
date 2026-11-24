@@ -112,7 +112,8 @@ bytemuck = { workspace = true }
 aya = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process"] }
-procfs = { version = "0.18", default-features = false }
+# (procfs: removed by lot 398 — no code of the agent named it; Cargo
+# 1.100's `unused_dependencies`. nn-linux's tests keep it, a dev-dependency.)
 
 # Tappa 5: response executors
 # Lab PR 234: the RustCrypto generation (aes-gcm 0.11, hkdf/hmac 0.13,

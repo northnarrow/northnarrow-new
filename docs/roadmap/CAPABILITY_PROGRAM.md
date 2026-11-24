@@ -14900,3 +14900,99 @@ number in parentheses is a lab PR.
     binaries against 1.99.1 (same tree, fat LTO): the agent +0.05 %
     (31,371,928 bytes), the watchdog −0.05 %, nn-admin and `northnarrow`
     +0.00 %, the scanner −0.11 %.
+- **Lot 398 — rustls-rustcrypto 0.1.0-pre.0: rustls-webpki 0.102 and
+  seven advisory exceptions gone (dependencies; no behaviour change, no
+  level change).**
+  - What was open: lot 276's TLS provider, rustls-rustcrypto 0.0.2-alpha
+    (April 2024), brought the RustCrypto generation of its time, and with
+    it eight advisories recorded in `.cargo/audit.toml` as not reached:
+    five against its own copy of rustls-webpki 0.102.8, of which it took
+    the `alg_id` constants only (Dependabot showed them as 8 open alerts,
+    two "high", on `Cargo.lock` and `fuzz/Cargo.lock`), Marvin in rsa
+    0.9.10, RUSTSEC-2026-0387 in crypto-bigint 0.5.5, and paste
+    (unmaintained). Their "Re-check" was a provider release without
+    rustls-webpki 0.102: 0.1.0-pre.0 (2026-11-09; rust-version 1.87;
+    its changelog has no entry, its README still says "do not use in
+    production").
+  - What changed: the provider pinned `=0.1.0-pre.0` (workspace and fuzz);
+    our X25519 group (the all-zero check the provider still lacks) on
+    x25519-dalek 3.0.0 and getrandom 0.4.3's `SysRng`, the provider's own
+    crates, pinned to their locked versions (rand_core 0.6 and
+    x25519-dalek 2 left). The provider's API to rustls did not change:
+    no other line of code. Its cipher suites (TLS 1.3 AES-128-GCM,
+    AES-256-GCM, ChaCha20-Poly1305), groups (X25519, P-256, P-384) and
+    signature schemes (ECDSA P-256/P-384 with SHA-256/384, Ed25519, RSA
+    PKCS#1 v1.5 and PSS with SHA-256/384/512) are the same, none added or
+    dropped (`the_provider_offers_lot_276s_algorithms`); the worker's
+    narrowing is unchanged (TLS 1.3, X25519 ours, `NoKeys`). The
+    lockfiles: 36 packages fewer (267 → 231 in `Cargo.lock`): rustls-webpki
+    0.102.8 and the old generation's duplicates out (aead 0.5, sha2 0.10,
+    digest 0.10, ed25519-dalek 2, curve25519-dalek 4, rand 0.8,
+    rand_core 0.6, num-bigint-dig …), the provider's dependencies on the
+    workspace's own majors (p256/p384 0.14, ecdsa 0.17, rsa 0.10.0,
+    crypto-bigint 0.7.11, chacha20poly1305 0.11), 4 new (crypto-primes,
+    primefield, serdect, wnaf; MIT OR Apache-2.0). `.cargo/audit.toml`
+    drops seven exceptions: the five rustls-webpki 0.102 ones, Marvin
+    (rsa 0.10.0 is its patched release) and RUSTSEC-2026-0387
+    (crypto-bigint patched from 0.7.6); paste stays (still a procedural
+    macro of the provider's). `cargo audit --deny unsound --deny
+    unmaintained` passes on the three lockfiles. The test that read the
+    provider's sources for its use of webpki 0.102 is replaced by a
+    ratchet on both lockfiles, `one_rustls_webpki_and_only_rustls_own`
+    (one rustls-webpki, 0.103 or later, rustls' alone: fails on main).
+    `every_signature_family_completes_a_handshake`: the export's client
+    against an RSA-2048, a P-384 and an Ed25519 receiver as well as
+    P-256 (new test PKI in `crates/nn-export/tests/pki`), each refused
+    with its leaf's signature altered by one bit or under another CA.
+    On the side, Cargo 1.100's `unused_dependencies` (lot 397): `procfs`
+    is a dev-dependency of nn-linux (only `response::kill`'s tests read
+    it); once moved, Cargo named the agent's own `procfs`, which no code
+    of the agent uses: removed. procfs and procfs-core leave
+    `fuzz/Cargo.lock` (and the agent's graph; `Cargo.lock` keeps them for
+    nn-linux's tests), and leave the list of crates both lockfiles must
+    lock alike (`security_crates_are_locked_alike_for_the_fuzzer`).
+    `EXPORT.md` §7 and `KNOWN_LIMITATIONS.md` updated; the CHANGELOG's
+    0.1.0-alpha section untouched (`verify-release-tag.sh` refuses an
+    `[Unreleased]` on top).
+  - Seccomp: the worker's filter already allowed `getrandom`, which
+    getrandom 0.4 reaches through libc's `getrandom(3)` (0.2 made the
+    raw system call); x86_64's CPU feature detection is `cpuid`, no
+    system call. No filter change.
+  - Lab (our own QEMU guests under lease k398; the agent installed as an
+    operator does, enabled at boot, and purged at the end; the guests
+    off): Ubuntu 22.04 (kernel 5.15, Landlock ABI 1) and Debian 13
+    (kernel 6.12, Landlock ABI 6).
+    - Before the install, as root in the guest's tree: nn-export's tests
+      76 passed (3 ignored), nn-linux's `sandbox::` 19, the agent's
+      `export::` under `test-privileged` 17; none failed, on both.
+    - `export-guest.sh setup arrive outage hostile interop off` against
+      the lab's receiver of syslog over TLS: 44 of 44 checks on both. The
+      worker under its own account, no capability, `no_new_privs`,
+      seccomp mode 2. Arrive: 118 (22.04) and 138 (Debian 13) chain rows
+      in the capture and in the JSONL files, none missing, none other,
+      every record verified (`nn-admin export verify`). The receiver
+      killed while rows flowed: 293 and 313 rows, none lost (8 and 10
+      duplicate records). Silent, garbage and chatty receivers: each
+      burst detected, stage 5 unchanged (37 → 37, 46 → 46), the worker
+      ready, no row lost (582 and 602). OpenSSL's `s_server` (3.0.2 and
+      3.5.9, TLS 1.3, X25519) as the receiver that is not ours: 85 rows
+      written while it listened, 0 missing, every record verified.
+    - No seccomp kill, no Landlock denial: no seccomp audit record
+      (type 1326) and no Landlock line in the kernel's log during the
+      e2e, no worker death in the agent's journal. The 10 seccomp records
+      the suites leave on each guest are their own deliberate escapes
+      (`every_escape_kills_the_process`,
+      `under_the_export_filter_only_its_sinks_calls_run`).
+    - Round 1 on Debian 13 ran `interop` before `outage` and `hostile`:
+      their two no-loss and two verify checks failed on the 87 rows the
+      foreign receiver had taken (detections 1/66 … 1/71, netflow 1/83 …
+      1/163), which the lab receiver's capture cannot hold; the foreign
+      receiver had them all, verified. The harness compares that capture
+      with every chain row, so `interop` runs last (round 2 above). Round
+      1's install on 22.04 failed on a build tree the root-run suites had
+      left root-owned (the lab's, not the product's); round 2 installed.
+  - Host: the full gates (6,189 workspace tests passed, golden ×5 with
+    the 66 files byte-identical, MSRV 1.89, 15 fuzz targets, 5 portable
+    targets, lockfiles unchanged by the build); `cargo audit --deny
+    unsound --deny unmaintained` passes on the three lockfiles;
+    `verify-release-tag.sh version v0.1.0-alpha` passes.
