@@ -1491,9 +1491,11 @@ every record passed the OCSF 1.9.0 schema. Its limits are in
   `received_records_match_the_pinned_schema` (the lab's records, through
   OpenSSL 3.0's TLS 1.3 listener);
 - the TLS provider is a young library that marks itself as not for
-  production. The advisories in its dependencies are recorded with why
-  they are not reached ([EXPORT.md](EXPORT.md) §7). *Evidence:* internal
-  check Phase 1 §4.3;
+  production (rustls-rustcrypto 0.1.0-pre.0, a pre-release). Since lot
+  398 one advisory remains in its dependencies (paste, unmaintained, a
+  compile-time macro), recorded with why it is not reached
+  ([EXPORT.md](EXPORT.md) §7). *Evidence:* internal check Phase 1 §4.3;
+  `one_rustls_webpki_and_only_rustls_own`, `.cargo/audit.toml`;
 - the export's own connections are judged by the network rules: a
   receiver on your LAN draws `NN-L-NET-007` records, one at a public
   address `NN-L-NET-028` records unless you list it in the signed

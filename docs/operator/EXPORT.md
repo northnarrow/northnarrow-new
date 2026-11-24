@@ -425,17 +425,18 @@ rustls with the RustCrypto provider (`rustls-rustcrypto`) — the founder's
 decision: TLS in Rust only (aws-lc-rs is C; ring has C and assembly),
 accepting a younger provider, which its own README marks
 **"⚠️USE THIS AT YOUR OWN RISK! DO NOT USE THIS IN PRODUCTION⚠️"**
-(rustls-rustcrypto 0.0.2-alpha, the latest release on crates.io). What
-the export holds against that, below: TLS 1.3 only, X25519 only and our
-own group that refuses a shared secret of all zeros (the provider's does
-not: RFC 8446 §7.4.2), a key provider that loads no private key
-(`NoKeys`), the receiver's chain verified by rustls' own rustls-webpki
-0.103.16, the export off by default, the provider's advisories recorded
-with an expiry (2027-05-03). The provider is to be reviewed again in
-phase 4 of the plan. Both pinned exactly (`=0.23.46`,
-`=0.0.2-alpha` in `crates/nn-export/Cargo.toml`): they move only by a
-reviewed edit. rustls is built without its defaults (no aws-lc-rs, no TLS
-1.2, no logging), the provider without TLS 1.2.
+(rustls-rustcrypto 0.1.0-pre.0, a pre-release of 2026-11-09 and the
+latest release on crates.io; lot 276 shipped 0.0.2-alpha of April 2024,
+lot 398 moved to this one). What the export holds against that, below:
+TLS 1.3 only, X25519 only and our own group that refuses a shared secret
+of all zeros (the provider's still does not: RFC 8446 §7.4.2), a key
+provider that loads no private key (`NoKeys`), the receiver's chain
+verified by rustls' own rustls-webpki 0.103.16, the export off by
+default. The provider is to be reviewed again in phase 4 of the plan.
+Both pinned exactly (`=0.23.46`, `=0.1.0-pre.0` in
+`crates/nn-export/Cargo.toml`): they move only by a reviewed edit. rustls
+is built without its defaults (no aws-lc-rs, no TLS 1.2, no logging), the
+provider without TLS 1.2.
 
 The worker narrows the provider (`nn_export::tls::provider`): TLS 1.3, its
 three suites, **X25519 only** (our group: a shared secret of all zeros,
@@ -445,26 +446,43 @@ that loads no private key (`NoKeys`), the receiver's chain checked by
 rustls' own WebPKI verifier against the pinned CA bundle: rustls'
 `with_root_certificates` builds its `WebPkiServerVerifier`, on rustls'
 rustls-webpki 0.103.16 (`verify_for_usage`, then the name); the provider's
-only part in it is its signature algorithms. The
-provider's release (April 2024) is built on the RustCrypto generation of
-that time, which the workspace had moved past: it brings its own copies
-(sha2 0.10, p256 0.13, rsa 0.9, rustls-webpki 0.102 …). `cargo audit`
-reports eight advisories in them, each recorded in `.cargo/audit.toml`
-with why it is not reached here and a test that holds the narrowing:
+only part in it is its signature algorithms.
 
-| Advisory | Crate | Why not reached |
+What the provider offers did not change with 0.1.0-pre.0 (a test pins it,
+`nn_export::tls::tests::the_provider_offers_lot_276s_algorithms`): the
+TLS 1.3 suites AES-128-GCM-SHA256, AES-256-GCM-SHA384 and
+ChaCha20-Poly1305-SHA256; the groups X25519, P-256 and P-384 (the worker
+keeps X25519, its own); the signature schemes ECDSA P-256/SHA-256 and
+P-384/SHA-384 (each curve with either hash), Ed25519, RSA PKCS#1 v1.5 and
+RSA-PSS with SHA-256, SHA-384 and SHA-512. No suite, group or scheme was
+added or dropped. The provider's random bytes, and our group's, now come
+from getrandom 0.4's `SysRng` (the `getrandom` system call, allowed in
+the worker's seccomp filter, as before).
+
+0.1.0-pre.0 is built on the current RustCrypto generation, the
+workspace's own (aead 0.6, sha2 0.11, p256 and p384 0.14, ecdsa 0.17,
+rsa 0.10, crypto-bigint 0.7, x25519-dalek 3), and no longer depends on
+rustls-webpki: its `alg_id` constants come from rustls-pki-types. Seven
+of the eight advisories lot 276 recorded went with the old copies, and
+their exceptions left `.cargo/audit.toml` (lot 398):
+
+| Advisory | Crate (lot 276) | Now |
 |---|---|---|
-| RUSTSEC-2026-0049, -0098, -0099, -0104, -0382 | rustls-webpki 0.102.8 | the provider takes its `alg_id` constants only; certificates are verified by rustls' rustls-webpki 0.103.16 (patched) |
-| RUSTSEC-2023-0071 (Marvin) | rsa 0.9.10 | RSA private-key operations only; the worker holds no RSA key, it verifies signatures (public data) |
-| RUSTSEC-2026-0387 | crypto-bigint 0.5.5 | timing on secrets: P-256 and P-384 key exchange are removed (X25519 only, curve25519-dalek 4.1.3), no ECDSA key is held; ECDSA verification runs on public data |
-| RUSTSEC-2024-0436 | paste 1.0.15 (unmaintained) | a procedural macro of the provider's: compile time only |
+| RUSTSEC-2026-0049, -0098, -0099, -0104, -0382 | rustls-webpki 0.102.8 | gone: one rustls-webpki in the lockfiles, rustls' 0.103.16 (`xtask/tests/export_in_the_worker.rs` refuses a second) |
+| RUSTSEC-2023-0071 (Marvin) | rsa 0.9.10 | fixed: rsa 0.10.0 |
+| RUSTSEC-2026-0387 | crypto-bigint 0.5.5 | fixed: crypto-bigint 0.7.11 (patched from 0.7.6) |
+| RUSTSEC-2024-0436 | paste 1.0.15 (unmaintained) | still recorded: a procedural macro of the provider's, compile time only |
+
+The narrowing stays as it was: with the advisories fixed it is no longer
+what keeps them unreached, but it keeps the code that runs on a secret to
+X25519 alone and refuses every private key.
 
 Licences: rustls (Apache-2.0 OR ISC OR MIT), rustls-webpki (ISC),
 rustls-pki-types (MIT OR Apache-2.0), untrusted (ISC),
 rustls-rustcrypto and the RustCrypto crates (MIT OR Apache-2.0),
-num-bigint-dig (MIT/Apache-2.0); all permissive and compatible with the
+x25519-dalek (BSD-3-Clause); all permissive and compatible with the
 agent's Apache-2.0. The lockfiles change by the new crates (Cargo.lock,
-fuzz/Cargo.lock): the lot's note lists them.
+fuzz/Cargo.lock): the lots' notes list them.
 
 ## 8. Limits (what is open)
 

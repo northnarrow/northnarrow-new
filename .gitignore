@@ -12,6 +12,8 @@ Cargo.lock.bak
 # tests and the lab; its CA's key discarded, trusted by no build)
 !crates/nn-export/tests/pki/*.pem
 !crates/nn-export/tests/pki/srv.key
+# lot 398: one more test-only receiver per signature family (rsa, p384, ed25519)
+!crates/nn-export/tests/pki/*-srv.key
 
 # Editor / IDE
 *.swp

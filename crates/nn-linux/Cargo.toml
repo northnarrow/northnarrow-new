@@ -44,7 +44,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 libc = "0.2"
-procfs = { version = "0.18", default-features = false }
 parking_lot = "0.12"
 # the response vault (quarantine): AES-GCM, HKDF over SHA-256, the master
 # key zeroized, a vault's id.
@@ -127,6 +126,10 @@ nn-core = { workspace = true, features = ["test-util"] }
 # unit tests, with the parser aya 0.14.0 itself runs (lab PR 219: every map
 # of a type aya loads; the exploit guard's maps and programs).
 aya-obj = "=0.3.0"
+# Lot 398: a test's cross-check of the process walk (response::kill's
+# tests); no production code of this crate names procfs (Cargo 1.100
+# warned of a dependency that only tests use).
+procfs = { version = "0.18", default-features = false }
 
 [lints]
 workspace = true

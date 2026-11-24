@@ -1887,14 +1887,15 @@ fn security_crates_are_locked_alike_for_the_fuzzer() {
         "rand_core",
         "getrandom",
         "md-5",
-        // the kernel interface, /proc and the BTF/ELF parsing
+        // the kernel interface and the BTF/ELF parsing (procfs and
+        // procfs-core left the agent's graph with lot 398: no code of the
+        // agent named them, and nn-linux's tests alone read procfs, a
+        // dev-dependency the fuzz lockfile does not lock)
         "libc",
         "nix",
         "aya",
         "aya-obj",
         "object",
-        "procfs",
-        "procfs-core",
         // (tantivy, candle-core, tokenizers, safetensors and memmap2, the LLM
         // advisor's model and knowledge base and what they mapped from disk,
         // left the graph with the advisor in Wave 4, lab PR 214; so did lru

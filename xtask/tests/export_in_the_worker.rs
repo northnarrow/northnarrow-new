@@ -143,64 +143,113 @@ fn a_planted_call_in_the_core_fails() {
     assert!(reaches_the_worker(&production(&strip_comments(fine))).is_empty());
 }
 
-/// Lot 276 (`.cargo/audit.toml`, RUSTSEC-2026-0049/-0098/-0099/-0104/-0382):
-/// the five advisories against rustls-webpki 0.102 are recorded as not
-/// reached because rustls-rustcrypto takes nothing of that copy but its
-/// `alg_id` constants — this test reads the provider's locked sources and
-/// fails the day it takes more.
-#[test]
-fn the_provider_takes_only_alg_ids_of_its_webpki() {
-    // the version locked (the lockfile, not `cargo metadata`: offline, that
-    // wants every target's packages downloaded — CI's test job has only
-    // its own, #499's first run)
-    let lock = fs::read_to_string(repo_root().join("Cargo.lock")).unwrap();
-    let at = lock
-        .find("name = \"rustls-rustcrypto\"\nversion = \"")
-        .expect("rustls-rustcrypto is locked");
-    let version: String = lock[at..]
-        .lines()
-        .nth(1)
-        .unwrap()
-        .trim_start_matches("version = \"")
-        .trim_end_matches('"')
-        .to_string();
-    assert_eq!(
-        version, "0.0.2-alpha",
-        "re-check the advisories' entries for a new release"
-    );
-    // its sources, where cargo unpacked them (the build before the tests)
-    let home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cargo"));
-    let src = fs::read_dir(home.join("registry/src"))
-        .expect("cargo's registry")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join(format!("rustls-rustcrypto-{version}")))
-        .find(|p| p.is_dir())
-        .expect("rustls-rustcrypto's sources unpacked (build the workspace once)")
-        .join("src");
-    let mut uses = Vec::new();
-    for f in rs_files(&src) {
-        let code = strip_comments(&fs::read_to_string(&f).unwrap());
-        for (i, _) in code.match_indices("webpki") {
-            let rest = &code[i..];
-            let what: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+/// One `[[package]]` of a Cargo.lock: its name, its version and its
+/// `dependencies` entries (`"name"`, or `"name version"` when the lockfile
+/// holds two versions of it).
+struct LockedPackage {
+    name: String,
+    version: String,
+    deps: Vec<String>,
+}
+
+fn locked_packages(lock: &str) -> Vec<LockedPackage> {
+    let field = |block: &str, key: &str| {
+        block.lines().find_map(|l| {
+            l.strip_prefix(key)
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+    };
+    lock.split("[[package]]")
+        .skip(1)
+        .map(|block| {
+            let deps = block
+                .split_once("dependencies = [")
+                .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+                .unwrap_or("")
+                .lines()
+                .map(|l| l.trim().trim_end_matches(',').trim_matches('"').to_string())
+                .filter(|d| !d.is_empty())
                 .collect();
-            uses.push((f.display().to_string(), what));
-        }
+            LockedPackage {
+                name: field(block, "name = ").unwrap_or_default(),
+                version: field(block, "version = ").unwrap_or_default(),
+                deps,
+            }
+        })
+        .collect()
+}
+
+/// The packages of `lock` that depend on `name` (any version).
+fn dependents_of<'a>(lock: &'a [LockedPackage], name: &str) -> Vec<&'a str> {
+    lock.iter()
+        .filter(|p| {
+            p.deps
+                .iter()
+                .any(|d| d.split_whitespace().next() == Some(name))
+        })
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// The lockfiles the agent is built from (the workspace, the fuzz harness).
+const AGENT_LOCKS: [&str; 2] = ["Cargo.lock", "fuzz/Cargo.lock"];
+
+/// Lot 398: rustls-rustcrypto 0.1.0-pre.0 has no copy of rustls-webpki
+/// (0.0.2-alpha pinned 0.102 for its `alg_id` constants, now taken from
+/// rustls-pki-types), and the five advisories against that copy
+/// (RUSTSEC-2026-0049/-0098/-0099/-0104/-0382, lot 276's exceptions in
+/// `.cargo/audit.toml`) left with it. Each lockfile locks ONE
+/// rustls-webpki — rustls' own, which verifies the receiver's chain — at
+/// 0.103 or later, and nothing else depends on it: a second copy coming
+/// back (a provider release, another TLS crate) fails here, by name,
+/// before `cargo audit` meets its advisories.
+#[test]
+fn one_rustls_webpki_and_only_rustls_own() {
+    for lock in AGENT_LOCKS {
+        let text = fs::read_to_string(repo_root().join(lock)).unwrap();
+        let packages = locked_packages(&text);
+        let webpki: Vec<&str> = packages
+            .iter()
+            .filter(|p| p.name == "rustls-webpki")
+            .map(|p| p.version.as_str())
+            .collect();
+        assert_eq!(webpki.len(), 1, "{lock}: rustls-webpki locked {webpki:?}");
+        let mut v = webpki[0].split('.').map(|n| n.parse::<u64>().unwrap_or(0));
+        let (major, minor) = (v.next().unwrap_or(0), v.next().unwrap_or(0));
+        assert!(
+            (major, minor) >= (0, 103),
+            "{lock}: rustls-webpki {} (0.102 and older: the advisories of lot 276)",
+            webpki[0]
+        );
+        assert_eq!(
+            dependents_of(&packages, "rustls-webpki"),
+            vec!["rustls"],
+            "{lock}: rustls-webpki is rustls' own only"
+        );
+        let provider = packages
+            .iter()
+            .find(|p| p.name == "rustls-rustcrypto")
+            .unwrap_or_else(|| panic!("{lock}: rustls-rustcrypto is locked"));
+        assert!(
+            provider.deps.iter().any(|d| d == "rustls-pki-types"),
+            "{lock}: the provider's alg_id constants come from rustls-pki-types"
+        );
     }
-    assert!(!uses.is_empty(), "the provider names webpki");
-    let other: Vec<_> = uses
-        .iter()
-        .filter(|(_, w)| w != "webpki::alg_id" && w != "webpki")
-        .collect();
-    assert!(
-        other.is_empty(),
-        "rustls-rustcrypto uses more of rustls-webpki 0.102 than its alg_id constants: {other:?}"
+}
+
+#[test]
+fn a_second_rustls_webpki_is_seen() {
+    // the lockfile's shape on main before lot 398: two copies, the
+    // provider depending on the old one
+    let before = "[[package]]\nname = \"rustls\"\nversion = \"0.23.46\"\ndependencies = [\n \"rustls-webpki 0.103.16\",\n]\n\n\
+                  [[package]]\nname = \"rustls-rustcrypto\"\nversion = \"0.0.2-alpha\"\ndependencies = [\n \"rustls\",\n \"rustls-webpki 0.102.8\",\n]\n\n\
+                  [[package]]\nname = \"rustls-webpki\"\nversion = \"0.102.8\"\n\n\
+                  [[package]]\nname = \"rustls-webpki\"\nversion = \"0.103.16\"\n";
+    let p = locked_packages(before);
+    assert_eq!(p.iter().filter(|p| p.name == "rustls-webpki").count(), 2);
+    assert_eq!(
+        dependents_of(&p, "rustls-webpki"),
+        vec!["rustls", "rustls-rustcrypto"]
     );
-    // `webpki` alone: its Cargo.toml's dependency name, in a `use` path only
-    let bare = uses.iter().filter(|(_, w)| w == "webpki").count();
-    assert_eq!(bare, 0, "{uses:?}");
+    assert_eq!(p[1].deps, vec!["rustls", "rustls-webpki 0.102.8"]);
 }
