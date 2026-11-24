@@ -14996,3 +14996,43 @@ number in parentheses is a lab PR.
     targets, lockfiles unchanged by the build); `cargo audit --deny
     unsound --deny unmaintained` passes on the three lockfiles;
     `verify-release-tag.sh version v0.1.0-alpha` passes.
+- **Lot 399 — the minor dependency updates: clap 4.6.9, rand 0.10.4,
+  zeroize 1.9.2, uuid 1.29.3, landlock 0.4.8 (dependencies; no behaviour
+  change on any kernel of the lab, no level change).**
+  - What was open: Dependabot's rust-minor group (#591, closed by
+    Dependabot for #608, the same four updates and landlock 0.4.7 →
+    0.4.8), parking_lot 0.12.5 → 0.13.0 (#445 at the root, #446 in the
+    fuzzer) and nix 0.29.0 → 0.31.3 (#433).
+  - What changed: both `Cargo.lock` and `fuzz/Cargo.lock` move alike:
+    clap and clap_derive 4.6.9, rand 0.10.4, zeroize 1.9.2, uuid 1.29.3,
+    syn 3.0.10 (clap_derive's) and landlock `=0.4.8` (rust-versions 1.85,
+    1.85, 1.85, 1.89.0, 1.71 and 1.77: the MSRV stays 1.89). landlock
+    0.4.8 knows Landlock ABI 10 (UDP rights), so on a kernel with ABI 10
+    or above (Linux 7.2 and later, by its changelog; none in the lab) its
+    `effective_abi` is 10 where 0.4.7 said 9. The worker declared that
+    number as its ABI, while the core expects the kernel's capped at
+    `LANDLOCK_ABI_KNOWN` (9): every worker's hello would have been
+    refused there. The declaration is now capped at the rights asked
+    (`sandbox::declared_abi`), and a build-time assertion holds the ask
+    (`LANDLOCK_ASK`, ABI 9) equal to `LANDLOCK_ABI_KNOWN`;
+    `a_kernel_above_the_rights_asked_declares_the_rights_asked` fails
+    without the cap. The rights asked are unchanged: UDP is not asked for
+    (a change of the sandbox and of the core's check of its own).
+    `docs/operator/WORKERS.md` says what a kernel above ABI 9 declares.
+  - Left out: parking_lot 0.13.0, whose rust-version is 1.95 (lock_api
+    0.5.0 and parking_lot_core 0.10.0 too), above the MSRV; #445 and #446
+    stay open. nix 0.31.3 is on `main` since lab PR 237, which superseded
+    #433: nothing to change. Its one call site, the deny self-test's
+    child (`boot::deny_selftest::run_child`: `getppid`,
+    `Signal::try_from`, `kill`, the `EPERM` and `ESRCH` errnos), reads
+    the same on 0.31.3.
+  - Mutations on `declared_abi`: the cap removed, `min` made `max`, and
+    no Landlock declared as 1: each caught by the named test. The ask
+    moved to ABI 10 stops the build (the assertion).
+  - Host: the full gates (6,190 workspace tests passed, golden ×5 with
+    the 66 files byte-identical, MSRV 1.89, the fuzz replay, 5 portable
+    targets, lockfiles unchanged by the build); `cargo audit --deny
+    unsound --deny unmaintained` passes on the three lockfiles;
+    `verify-release-tag.sh version v0.1.0-alpha` passes. No lab round:
+    no privileged code changed (the PR CI's privileged suites on 5.15 and
+    6.8 run the worker harness).

@@ -47,7 +47,7 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, NetPort,
     PathBeneath, PathFd, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
-use nn_proto::ipc::{LandlockEnforced, SandboxLevel};
+use nn_proto::ipc::{LANDLOCK_ABI_KNOWN, LandlockEnforced, SandboxLevel};
 
 pub mod seccomp;
 
@@ -510,9 +510,30 @@ fn measure() -> Result<SandboxLevel, SandboxError> {
     })
 }
 
-/// The newest ABI this build knows: the rights asked for. The kernel's own
-/// decides what is enforced (best effort), and the level says which.
+/// The ABI whose rights the workers ask for. The kernel's own decides what
+/// is enforced (best effort), and the level says which. Lot 399: no longer
+/// the newest the `landlock` crate knows (0.4.8 knows 10, UDP: asking for
+/// it is a reviewed change of the sandbox and of the core's check of its
+/// own), so it is the core's [`LANDLOCK_ABI_KNOWN`], checked at build time.
 const LANDLOCK_ASK: ABI = ABI::V9;
+const _: () = assert!(
+    LANDLOCK_ASK as u8 == LANDLOCK_ABI_KNOWN,
+    "the workers ask for the ABI the core checks their hello against"
+);
+
+/// Lot 399: the ABI the level declares. The crate's `effective_abi` is the
+/// newest it knows below the kernel's, which is above [`LANDLOCK_ASK`] from
+/// `landlock` 0.4.8 on a kernel with ABI 10: declared as is, the core
+/// (which expects the kernel's ABI capped at `LANDLOCK_ABI_KNOWN`) would
+/// refuse every worker's hello there. The rights asked are the ceiling.
+fn declared_abi(status: LandlockStatus) -> u8 {
+    match status {
+        LandlockStatus::Available { effective_abi, .. } => {
+            (effective_abi as u8).min(LANDLOCK_ASK as u8)
+        }
+        _ => 0,
+    }
+}
 
 /// What Landlock refused once it bound the calling thread, measured (review
 /// of #480, F7: not derived from the ABI's number).
@@ -668,10 +689,7 @@ fn landlock_restrict(profile: &Profile, level: &mut SandboxLevel) -> Result<(), 
         }
     }
     let status = created.restrict_self().map_err(fail)?;
-    let abi = match status.landlock {
-        LandlockStatus::Available { effective_abi, .. } => effective_abi as u8,
-        _ => 0,
-    };
+    let abi = declared_abi(status.landlock);
     let enforced = match status.ruleset {
         RulesetStatus::FullyEnforced => LandlockEnforced::Full,
         RulesetStatus::PartiallyEnforced => LandlockEnforced::Partial,
