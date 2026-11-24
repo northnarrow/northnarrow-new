@@ -995,7 +995,7 @@ fn dated_nightlies(line: &str) -> Vec<&str> {
     let mut from = 0;
     while let Some(at) = line[from..].find("nightly-") {
         let start = from + at;
-        let date = line[start + "nightly-".len()..].as_bytes();
+        let date = &line.as_bytes()[start + "nightly-".len()..];
         let dated = date.len() >= 10
             && date[..10].iter().enumerate().all(|(i, b)| match i {
                 4 | 7 => *b == b'-',

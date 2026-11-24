@@ -289,6 +289,13 @@ pub struct Plan {
     pub reset: Option<String>,
     /// Signed, no reset: the marks' capacity below the host's (R2-a).
     pub note: Option<String>,
+    /// Lot 400: an adoption's marks capacity — the registered map's
+    /// `max_entries`, fixed when it was made. The load asks for the
+    /// marks map at that size: aya 0.16 reuses a pinned map only when it
+    /// is the map the object defines, `max_entries` included, and fails
+    /// the whole load otherwise; aya 0.14 took the pin as it was. `None`:
+    /// a new generation, sized from the host now.
+    pub entries: Option<u32>,
 }
 
 /// What `BPF_OBJ_GET_INFO_BY_FD` says of a pinned map.
@@ -401,6 +408,7 @@ pub fn plan(
         adopt: false,
         reset,
         note: None,
+        entries: None,
     };
     let Some(st) = state else {
         if dirs.is_empty() {
@@ -454,6 +462,7 @@ pub fn plan(
     Plan {
         dir: st.dir.clone(),
         adopt: true,
+        entries: Some(entries),
         reset: None,
         note: (entries < wanted).then(|| {
             format!(
@@ -599,6 +608,12 @@ pub fn prepare_pins(loader: &mut EbpfLoader<'_>, pin_root: Option<&Path>, entrie
     });
     if let Ok(p) = plan {
         if p.adopt {
+            // Lot 400: at the pinned map's size, whatever the host asks for
+            // now (R2-a: a sysctl is no reset) — or aya 0.16 refuses the pin
+            // and with it the whole object.
+            if let Some(n) = p.entries {
+                loader.map_max_entries(JOINED_MAP, n);
+            }
             for name in PINNED_MAPS {
                 loader.map_pin_path(name, p.dir.join(name));
             }
@@ -2385,6 +2400,51 @@ mod tests {
         // one is not adopted either: the registered one is
         let p = plan(root, "B", Some(&s0), &[d(0), d(7)], &ok(10), 10, None);
         assert!(p.adopt && p.dir == d(0));
+    }
+
+    /// Lot 400 (named): an adoption carries the registered marks map's
+    /// size, whatever the host asks for now, and `prepare_pins` loads the
+    /// map at it before naming the pins. aya 0.16 reuses a pinned map only
+    /// when its `max_entries` is the object's: at the host's size the
+    /// first start after a `kernel.threads-max` / `kernel.pid_max` change
+    /// failed the whole object's load (aya 0.14 took the pin as it was). A
+    /// new generation is sized from the host.
+    #[test]
+    fn an_adoption_loads_the_marks_at_their_pinned_size() {
+        let root = Path::new("/b/northnarrow");
+        let d = |g: u32| PathBuf::from(format!("/b/northnarrow-cgroup-join-v{PIN_SCHEMA}_{g}"));
+        let s0 = PinState {
+            boot: "B".to_string(),
+            dir: d(0),
+            maps: vec![],
+        };
+        let ok = |n: u32| move |_: &PinState| Ok::<u32, String>(n);
+        for wanted in [100_000, 63_222, 40_000] {
+            let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), wanted, None);
+            assert!(p.adopt, "{wanted}");
+            assert_eq!(p.entries, Some(63_222), "the host asks for {wanted}");
+        }
+        let p = plan(root, "B", None, &[], &ok(1), 63_222, None);
+        assert!(!p.adopt);
+        assert_eq!(p.entries, None, "a new generation: the host's size");
+        let p = plan(root, "B", Some(&s0), &[d(0)], &ok(63_222), 63_222, Some(64));
+        assert!(!p.adopt);
+        assert_eq!(p.entries, None, "a debug build's reset");
+        // and the load asks for that size, before the pins are named
+        let src = include_str!("cgroup_join.rs");
+        let body = &src[src.find("pub fn prepare_pins(").expect("prepare_pins")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let sized = body
+            .find("loader.map_max_entries(JOINED_MAP, n);")
+            .expect("an adoption sizes the marks map");
+        let named = body
+            .find("loader.map_pin_path(name, p.dir.join(name));")
+            .expect("an adoption names the pins");
+        assert!(sized < named, "the size is set before the pins are named");
+        assert!(
+            body[..sized].contains("if let Some(n) = p.entries"),
+            "the size is the adopted one"
+        );
     }
 
     /// Lot 281 (named, #494's N1/N2): the exemption check's answer from one

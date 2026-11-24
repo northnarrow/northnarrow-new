@@ -39,10 +39,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
         "Ebpf::load_file(",
         "Ebpf::load_file is EbpfLoader::new().load_file: use object_loader()",
     ),
-    (
-        ".btf_source(",
-        "the target BTF is object_loader's to set",
-    ),
+    (".btf_source(", "the target BTF is object_loader's to set"),
     (".btf(&", "the target BTF is object_loader's to set"),
 ];
 

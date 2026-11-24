@@ -265,8 +265,10 @@ pub mod impair {
         /// `pid` in the map (the errand's answer).
         pub fn insert(&self, pid: u32) -> Result<(), String> {
             let m = Arc::clone(&self.0);
-            crate::caps::errands::run(move || m.lock().insert(&pid, &1, 0).map_err(|e| e.to_string()))
-                .unwrap_or_else(|| Err("the errands thread did not answer".to_string()))
+            crate::caps::errands::run(move || {
+                m.lock().insert(&pid, &1, 0).map_err(|e| e.to_string())
+            })
+            .unwrap_or_else(|| Err("the errands thread did not answer".to_string()))
         }
 
         /// `pid` out of the map.

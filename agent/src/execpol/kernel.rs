@@ -141,11 +141,11 @@ pub(crate) mod debug_fill {
                 let k = key(i);
                 let mut made = false;
                 if let Some(m) = self.walk.as_mut() {
-                    made |= m.insert(k, [0u8; WALK_BYTES], 0).is_ok();
+                    made |= m.insert(&k, &[0u8; WALK_BYTES], 0).is_ok();
                 }
                 if env {
                     if let Some(m) = self.env.as_mut() {
-                        made |= m.insert(k, [0u8; ENV_ENTRY_BYTES], 0).is_ok();
+                        made |= m.insert(&k, &[0u8; ENV_ENTRY_BYTES], 0).is_ok();
                     }
                 }
                 if !made {
