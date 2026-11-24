@@ -77,35 +77,38 @@ pub fn nn_sysctl_guard(ctx: SysctlContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sysctl_guard(ctx: &SysctlContext) -> SysctlVerdict {
-    // a read is no change
-    if (*ctx.sysctl).write == 0 {
-        return SysctlVerdict::Allow;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // a read is no change
+        if (*ctx.sysctl).write == 0 {
+            return SysctlVerdict::Allow;
+        }
+        let kind = sysctl_of(ctx);
+        if kind == SYSCTL_NONE {
+            return SysctlVerdict::Allow;
+        }
+        let task = bpf_get_current_task() as *const u8;
+        let tgid = bpf_probe_read_kernel::<u32>(task.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32)
+            .unwrap_or(0);
+        // the identity every guarded write is let through by: the agent's
+        // family (its round's restore), a signed window; an unread tgid is no
+        // one's (0 is never an exempt pid)
+        let caller_may = (tgid != 0 && crate::task_kill::is_exempt_pid(tgid))
+            || crate::inode_protect::override_active();
+        if caller_may {
+            return SysctlVerdict::Allow;
+        }
+        // every value written (no `Option`: lot 280a's first lab round, `R2
+        // !read_ok` — `common::sysctl_judge::Range`)
+        let (read, v) = new_value(ctx);
+        let verdict = verdict_of(kind, false, read, v, opt_out(kind));
+        match verdict {
+            SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),
+            SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),
+            SysctlVerdict::Allow => {}
+        }
+        verdict
     }
-    let kind = sysctl_of(ctx);
-    if kind == SYSCTL_NONE {
-        return SysctlVerdict::Allow;
-    }
-    let task = bpf_get_current_task() as *const u8;
-    let tgid = bpf_probe_read_kernel::<u32>(task.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32)
-        .unwrap_or(0);
-    // the identity every guarded write is let through by: the agent's
-    // family (its round's restore), a signed window; an unread tgid is no
-    // one's (0 is never an exempt pid)
-    let caller_may = (tgid != 0 && crate::task_kill::is_exempt_pid(tgid))
-        || crate::inode_protect::override_active();
-    if caller_may {
-        return SysctlVerdict::Allow;
-    }
-    // every value written (no `Option`: lot 280a's first lab round, `R2
-    // !read_ok` — `common::sysctl_judge::Range`)
-    let (read, v) = new_value(ctx);
-    let verdict = verdict_of(kind, false, read, v, opt_out(kind));
-    match verdict {
-        SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),
-        SysctlVerdict::OptedOut => record(FS_OP_SYSCTL_OPT_OUT, kind, read, v, task, tgid, false),
-        SysctlVerdict::Allow => {}
-    }
-    verdict
 }
 
 /// The guarded sysctl the access names (its path under `/proc/sys`, read
@@ -114,17 +117,20 @@ unsafe fn try_sysctl_guard(ctx: &SysctlContext) -> SysctlVerdict {
 /// `-E2BIG`, never one of ours.
 #[inline(always)]
 unsafe fn sysctl_of(ctx: &SysctlContext) -> u8 {
-    let mut name = [0u64; 4];
-    let n = generated::bpf_sysctl_get_name(
-        ctx.sysctl,
-        name.as_mut_ptr() as *mut c_char,
-        SYSCTL_PATH_MAX as u64,
-        0,
-    );
-    if n <= 0 || n as usize >= SYSCTL_PATH_MAX {
-        return SYSCTL_NONE;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut name = [0u64; 4];
+        let n = generated::bpf_sysctl_get_name(
+            ctx.sysctl,
+            name.as_mut_ptr() as *mut c_char,
+            SYSCTL_PATH_MAX as u64,
+            0,
+        );
+        if n <= 0 || n as usize >= SYSCTL_PATH_MAX {
+            return SYSCTL_NONE;
+        }
+        sysctl_path_kind(n as usize, name)
     }
-    sysctl_path_kind(n as usize, name)
 }
 
 /// The kernel's copy of the write, read in base 0 as the kernel reads it:
@@ -132,17 +138,20 @@ unsafe fn sysctl_of(ctx: &SysctlContext) -> u8 {
 /// 1 bytes, not an integer, or past `i64` (refused).
 #[inline(always)]
 unsafe fn new_value(ctx: &SysctlContext) -> (bool, i64) {
-    let mut buf = core::mem::MaybeUninit::<[u8; VALUE_BUF]>::uninit();
-    let p = buf.as_mut_ptr() as *mut c_char;
-    // zero-filled past the value by the helper; -E2BIG when cut
-    if generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {
-        return (false, 0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut buf = core::mem::MaybeUninit::<[u8; VALUE_BUF]>::uninit();
+        let p = buf.as_mut_ptr() as *mut c_char;
+        // zero-filled past the value by the helper; -E2BIG when cut
+        if generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {
+            return (false, 0);
+        }
+        let mut res: c_long = 0;
+        if generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {
+            return (false, 0);
+        }
+        (true, res as i64)
     }
-    let mut res: c_long = 0;
-    if generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {
-        return (false, 0);
-    }
-    (true, res as i64)
 }
 
 /// The signed opt-out's range in force for `kind` (`Range::NONE`: none).
@@ -177,18 +186,21 @@ unsafe fn record(
     tgid: u32,
     limited: bool,
 ) {
-    let comm = bpf_probe_read_kernel::<[u8; TASK_COMM_LEN]>(
-        task.add(off!(TASK_STRUCT_COMM_OFFSET)) as *const [u8; TASK_COMM_LEN],
-    )
-    .unwrap_or([0u8; TASK_COMM_LEN]);
-    crate::inode_protect::emit_sysctl_record(
-        operation,
-        InodeKey {
-            dev: record_dev(kind, read),
-            ino: v as u64,
-        },
-        tgid,
-        comm,
-        limited,
-    );
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let comm = bpf_probe_read_kernel::<[u8; TASK_COMM_LEN]>(
+            task.add(off!(TASK_STRUCT_COMM_OFFSET)) as *const [u8; TASK_COMM_LEN],
+        )
+        .unwrap_or([0u8; TASK_COMM_LEN]);
+        crate::inode_protect::emit_sysctl_record(
+            operation,
+            InodeKey {
+                dev: record_dev(kind, read),
+                ino: v as u64,
+            },
+            tgid,
+            comm,
+            limited,
+        );
+    }
 }

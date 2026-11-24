@@ -1606,8 +1606,7 @@ mod tests {
                 .with_ansi(false)
                 .finish();
             tracing::subscriber::with_default(sub, f);
-            let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-            text
+            String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
         };
         let burst = |j: &ActionJournal, from: u32| {
             for n in 0..40 {

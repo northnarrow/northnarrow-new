@@ -55,8 +55,8 @@ fn the_read_hook_judges_a_compressed_module_s_read() {
         body(&m, "try_read_file"),
         &[
             "let id: c_int = ctx.arg(1);",
-            "if id == KEXEC_IMAGE {\n        return deny_kexec(id);\n    }",
-            "if !reads_module_file(id as u32) {\n        return 0;\n    }",
+            "if id == KEXEC_IMAGE {\n            return deny_kexec(id);\n        }",
+            "if !reads_module_file(id as u32) {\n            return 0;\n        }",
             "judge_file(file as *const u8)",
             "emit_module_load(MODULE_LOAD_FINIT, file, &j);",
         ],

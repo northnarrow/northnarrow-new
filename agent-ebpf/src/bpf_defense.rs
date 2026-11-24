@@ -406,7 +406,7 @@ const LINK_UNREADABLE: u64 = u64::MAX - 1;
 /// sees one unknown return value — the link id, [`LINK_NONE`] or
 /// [`LINK_UNREADABLE`]. Inlined, its six optional offsets multiplied the
 /// hook's states.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_link_id_of_fd(fd: u64) -> u64 {
     match unsafe { link_id_of_fd(fd as u32) } {
@@ -426,13 +426,16 @@ pub extern "C" fn nn_link_id_of_fd(fd: u64) -> u64 {
 /// the kernel whatever is read here.
 #[inline(always)]
 unsafe fn link_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
-    let o_id = off_opt!(BPF_LINK_ID_OFFSET).ok_or(())?;
-    let Some(link) = private_of_fd(fd)? else {
-        return Ok(None);
-    };
-    bpf_probe_read_kernel::<u32>((link as *const u8).add(o_id) as *const u32)
-        .map(Some)
-        .map_err(|_| ())
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_id = off_opt!(BPF_LINK_ID_OFFSET).ok_or(())?;
+        let Some(link) = private_of_fd(fd)? else {
+            return Ok(None);
+        };
+        bpf_probe_read_kernel::<u32>((link as *const u8).add(o_id) as *const u32)
+            .map(Some)
+            .map_err(|_| ())
+    }
 }
 
 /// Lot 349 (the review of #558, F1): the id of the BPF program `fd` names
@@ -441,10 +444,13 @@ unsafe fn link_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
 /// descriptor of anything else fails in the kernel whatever is read here.
 #[inline(always)]
 unsafe fn prog_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
-    let Some(prog) = private_of_fd(fd)? else {
-        return Ok(None);
-    };
-    prog_id_of(prog as *const c_void).map(Some).ok_or(())
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(prog) = private_of_fd(fd)? else {
+            return Ok(None);
+        };
+        prog_id_of(prog as *const c_void).map(Some).ok_or(())
+    }
 }
 
 /// Lot 386: [`prog_tag_of_fd`] as a global BPF function (exported, never
@@ -453,7 +459,7 @@ unsafe fn prog_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
 /// cross-view's records carry it), 0 when there is none or it cannot be
 /// read. Only for the record of a refused root `cgroup/sysctl` attach: the
 /// refusal never depends on it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_prog_tag_of_fd(fd: u64) -> u64 {
     unsafe { prog_tag_of_fd(fd as u32) }.unwrap_or(0)
@@ -466,24 +472,30 @@ pub extern "C" fn nn_prog_tag_of_fd(fd: u64) -> u64 {
 /// known program has.
 #[inline(always)]
 unsafe fn prog_tag_of_fd(fd: u32) -> Option<u64> {
-    let o_tag = off_opt!(BPF_PROG_TAG_OFFSET)?;
-    let prog = private_of_fd(fd).ok()??;
-    bpf_probe_read_kernel::<[u8; 8]>((prog as *const u8).add(o_tag) as *const [u8; 8])
-        .ok()
-        .map(tag_word)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_tag = off_opt!(BPF_PROG_TAG_OFFSET)?;
+        let prog = private_of_fd(fd).ok()??;
+        bpf_probe_read_kernel::<[u8; 8]>((prog as *const u8).add(o_tag) as *const [u8; 8])
+            .ok()
+            .map(tag_word)
+    }
 }
 
 /// Lot 349 (the review of #558, F1): the id of the BPF map `fd` names and
 /// its type (`private_data->id`, `->map_type`).
 #[inline(always)]
 unsafe fn map_of_fd(fd: u32) -> Result<Option<(u32, u32)>, ()> {
-    let Some(map) = private_of_fd(fd)? else {
-        return Ok(None);
-    };
-    let map = map as *const u8;
-    let id = bpf_probe_read_kernel::<u32>(map.add(off!(BPF_MAP_ID_OFFSET)) as *const u32).map_err(|_| ())?;
-    let ty = bpf_probe_read_kernel::<u32>(map.add(off!(BPF_MAP_MAP_TYPE_OFFSET)) as *const u32).map_err(|_| ())?;
-    Ok(Some((id, ty)))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(map) = private_of_fd(fd)? else {
+            return Ok(None);
+        };
+        let map = map as *const u8;
+        let id = bpf_probe_read_kernel::<u32>(map.add(off!(BPF_MAP_ID_OFFSET)) as *const u32).map_err(|_| ())?;
+        let ty = bpf_probe_read_kernel::<u32>(map.add(off!(BPF_MAP_MAP_TYPE_OFFSET)) as *const u32).map_err(|_| ())?;
+        Ok(Some((id, ty)))
+    }
 }
 
 /// External audit EBPF-010 (lot 349: shared by [`link_id_of_fd`],
@@ -492,41 +504,44 @@ unsafe fn map_of_fd(fd: u32) -> Result<Option<(u32, u32)>, ()> {
 /// `Ok(None)` for an fd out of range or closed, or a file with none.
 #[inline(always)]
 unsafe fn private_of_fd(fd: u32) -> Result<Option<u64>, ()> {
-    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
-    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
-    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
-    let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
-    let o_priv = off_opt!(FILE_PRIVATE_DATA_OFFSET).ok_or(())?;
-    let task = bpf_get_current_task() as *const u8;
-    if task.is_null() {
-        return Err(());
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
+        let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
+        let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
+        let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
+        let o_priv = off_opt!(FILE_PRIVATE_DATA_OFFSET).ok_or(())?;
+        let task = bpf_get_current_task() as *const u8;
+        if task.is_null() {
+            return Err(());
+        }
+        let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
+        if files == 0 {
+            return Ok(None);
+        }
+        let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
+            .map_err(|_| ())?;
+        if fdt == 0 {
+            return Err(());
+        }
+        let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
+            .map_err(|_| ())?;
+        if fd >= max {
+            return Ok(None);
+        }
+        let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
+            .map_err(|_| ())?;
+        if arr == 0 {
+            return Err(());
+        }
+        let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
+        if file == 0 {
+            return Ok(None);
+        }
+        let private = bpf_probe_read_kernel::<u64>((file as *const u8).add(o_priv) as *const u64)
+            .map_err(|_| ())?;
+        Ok((private != 0).then_some(private))
     }
-    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
-    if files == 0 {
-        return Ok(None);
-    }
-    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
-        .map_err(|_| ())?;
-    if fdt == 0 {
-        return Err(());
-    }
-    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
-        .map_err(|_| ())?;
-    if fd >= max {
-        return Ok(None);
-    }
-    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
-        .map_err(|_| ())?;
-    if arr == 0 {
-        return Err(());
-    }
-    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
-    if file == 0 {
-        return Ok(None);
-    }
-    let private = bpf_probe_read_kernel::<u64>((file as *const u8).add(o_priv) as *const u64)
-        .map_err(|_| ())?;
-    Ok((private != 0).then_some(private))
 }
 
 /// [`nn_held_use`]: let through.
@@ -544,7 +559,7 @@ pub const HELD_REFUSED: u64 = 1;
 /// [`HELD_PASS`]; an unreadable descriptor is a fail-open, counted. A
 /// global BPF function (exported, never inlined, scalar arguments): the
 /// `bpf` hook and the `file_ioctl` hooks call it, each verifies it once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_held_use(fd: u64, how: u64) -> u64 {
     if caller_is_exempt() || crate::inode_protect::override_active() {
@@ -582,7 +597,7 @@ pub extern "C" fn nn_held_use(fd: u64, how: u64) -> u64 {
 /// slot took a held program. Now the kernel path is tried next
 /// ([`slot_value`]), and a value neither reads is refused, signed
 /// ([`BPF_HELD_SLOT_UNREAD`], the prog array's id): fail closed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_held_slot(map_fd: u64, value: u64) -> u64 {
     if caller_is_exempt() || crate::inode_protect::override_active() {
@@ -678,10 +693,13 @@ unsafe fn hold(id: u32, verdict: u64) -> bool {
 /// window, for the family, a fresh instance of ours, a clean program.
 #[inline(always)]
 unsafe fn window_verdict(prog: *const c_void, every_type: bool) -> Option<u64> {
-    if !crate::inode_protect::override_active() || caller_is_exempt() || fresh_instance_may_load() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !crate::inode_protect::override_active() || caller_is_exempt() || fresh_instance_may_load() {
+            return None;
+        }
+        content_scan(prog, every_type).map(|(why, ty)| (u64::from(why) << 32) | u64::from(ty))
     }
-    content_scan(prog, every_type).map(|(why, ty)| (u64::from(why) << 32) | u64::from(ty))
 }
 
 /// [`nn_fd_is_root_cgroup`]: the descriptor names no cgroup v2 root (out
@@ -696,7 +714,7 @@ const ROOT_UNREADABLE: u64 = 2;
 /// Lot 280b: [`fd_is_root_cgroup`] as a global BPF function (exported,
 /// never inlined, scalar argument), as [`nn_link_id_of_fd`]: checked once,
 /// on its own. [`ROOT_NO`], [`ROOT_YES`], [`ROOT_UNREADABLE`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_fd_is_root_cgroup(fd: u64) -> u64 {
     match unsafe { fd_is_root_cgroup(fd as u32) } {
@@ -712,55 +730,58 @@ pub extern "C" fn nn_fd_is_root_cgroup(fd: u64) -> u64 {
 /// is another node). `Ok(false)`: out of range, closed, another file.
 #[inline(always)]
 unsafe fn fd_is_root_cgroup(fd: u32) -> Result<bool, ()> {
-    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
-    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
-    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
-    let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
-    let task = bpf_get_current_task() as *const u8;
-    if task.is_null() {
-        return Err(());
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
+        let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
+        let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
+        let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
+        let task = bpf_get_current_task() as *const u8;
+        if task.is_null() {
+            return Err(());
+        }
+        let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
+        if files == 0 {
+            return Ok(false);
+        }
+        let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
+            .map_err(|_| ())?;
+        if fdt == 0 {
+            return Err(());
+        }
+        let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
+            .map_err(|_| ())?;
+        if fd >= max {
+            return Ok(false);
+        }
+        let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
+            .map_err(|_| ())?;
+        if arr == 0 {
+            return Err(());
+        }
+        let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
+        if file == 0 {
+            return Ok(false);
+        }
+        let inode = bpf_probe_read_kernel::<u64>((file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if inode == 0 {
+            return Err(());
+        }
+        let sb = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if sb == 0 {
+            return Err(());
+        }
+        let magic = bpf_probe_read_kernel::<u64>((sb as *const u8).add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {
+            return Ok(false);
+        }
+        let ino = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64)
+            .map_err(|_| ())?;
+        Ok(ino == ROOT_CGROUP_INO)
     }
-    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
-    if files == 0 {
-        return Ok(false);
-    }
-    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
-        .map_err(|_| ())?;
-    if fdt == 0 {
-        return Err(());
-    }
-    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
-        .map_err(|_| ())?;
-    if fd >= max {
-        return Ok(false);
-    }
-    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
-        .map_err(|_| ())?;
-    if arr == 0 {
-        return Err(());
-    }
-    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
-    if file == 0 {
-        return Ok(false);
-    }
-    let inode = bpf_probe_read_kernel::<u64>((file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const u64)
-        .map_err(|_| ())?;
-    if inode == 0 {
-        return Err(());
-    }
-    let sb = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const u64)
-        .map_err(|_| ())?;
-    if sb == 0 {
-        return Err(());
-    }
-    let magic = bpf_probe_read_kernel::<u64>((sb as *const u8).add(off!(SUPER_BLOCK_S_MAGIC_OFFSET)) as *const u64)
-        .map_err(|_| ())?;
-    if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {
-        return Ok(false);
-    }
-    let ino = bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64)
-        .map_err(|_| ())?;
-    Ok(ino == ROOT_CGROUP_INO)
 }
 
 /// The kernel's inode number of the cgroup v2 hierarchy's root.
@@ -784,7 +805,7 @@ const PIN_UNDER_DIRS: u64 = 3;
 /// million-instruction budget once the detach/update deny was added (lab,
 /// 6.8: "BPF program is too large"). 0: not ours, [`PIN_OWN`],
 /// [`PIN_UNREADABLE`], [`PIN_UNDER_DIRS`] (lot 290).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
     unsafe {
@@ -819,94 +840,100 @@ pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
 /// verification), no stack array (memset subprogram).
 #[inline(always)]
 unsafe fn obj_get_names_own_link(user_ptr: u64, buf: *mut [u8; PATH_BUF_LEN]) -> Result<u64, ()> {
-    if user_ptr == 0 {
-        return Ok(0);
-    }
-    // pass 1: length only. A path that does not fit the buffer (truncated
-    // read: PATH_BUF_LEN - 1 bytes, the NUL takes the last slot) is not
-    // matched: scanning PATH_MAX in chunks blew the 5.15 state budget
-    // ("BPF program is too large"), and a link fd cannot detach or update
-    // an LSM link anyway — this check is defence in depth behind the pin
-    // protection (review entry 39).
-    let n = match bpf_probe_read_user_str_bytes(user_ptr as *const u8, &mut *buf) {
-        Ok(s) => s.len(),
-        Err(_) => return Err(()),
-    };
-    if n == 0 {
-        return Ok(0);
-    }
-    // Lot 290: the head against the pin directories' prefix, now (the
-    // second pass writes the head of the same buffer).
-    let mut under = n >= PIN_DIRS_PREFIX.len();
-    let mut k: usize = 0;
-    while k < PIN_DIRS_PREFIX.len() {
-        if (*buf)[k] != PIN_DIRS_PREFIX[k] {
-            under = false;
-            break;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if user_ptr == 0 {
+            return Ok(0);
         }
-        k += 1;
-    }
-    let other: u64 = if under { PIN_UNDER_DIRS } else { 0 };
-    // External audit EBPF-010: a path that does not fit the buffer is not
-    // let through when it starts at the agent's pin root — padding a pin's
-    // path past the buffer (`/sys/fs/bpf/northnarrow/./././…/link_task_kill`)
-    // took a link handle in enforce mode. Nothing of a third party lives
-    // under that root. (A symlink or a rewritten buffer still gets past a
-    // check on the caller's string: the guarantee is the detach/update deny
-    // in `try_bpf_syscall_observe`.)
-    if n >= PATH_BUF_LEN - 1 {
-        let mut i: usize = 0;
-        while i < PIN_ROOT.len() {
-            if (*buf)[i] != PIN_ROOT[i] {
-                return Ok(other);
+        // pass 1: length only. A path that does not fit the buffer (truncated
+        // read: PATH_BUF_LEN - 1 bytes, the NUL takes the last slot) is not
+        // matched: scanning PATH_MAX in chunks blew the 5.15 state budget
+        // ("BPF program is too large"), and a link fd cannot detach or update
+        // an LSM link anyway — this check is defence in depth behind the pin
+        // protection (review entry 39).
+        let n = match bpf_probe_read_user_str_bytes(user_ptr as *const u8, &mut *buf) {
+            Ok(s) => s.len(),
+            Err(_) => return Err(()),
+        };
+        if n == 0 {
+            return Ok(0);
+        }
+        // Lot 290: the head against the pin directories' prefix, now (the
+        // second pass writes the head of the same buffer).
+        let mut under = n >= PIN_DIRS_PREFIX.len();
+        let mut k: usize = 0;
+        while k < PIN_DIRS_PREFIX.len() {
+            if (*buf)[k] != PIN_DIRS_PREFIX[k] {
+                under = false;
+                break;
             }
-            i += 1;
+            k += 1;
         }
-        return Ok(PIN_OWN);
-    }
-    // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
-    // arithmetic is a plain scalar add for the verifier)
-    let win_ptr: u64 = if n > PIN_NAME_LEN {
-        user_ptr + (n - PIN_NAME_LEN) as u64
-    } else {
-        user_ptr
-    };
-    let win: &mut [u8] = core::slice::from_raw_parts_mut(buf as *mut u8, PIN_NAME_LEN + 1);
-    let m = match bpf_probe_read_user_str_bytes(win_ptr as *const u8, win) {
-        Ok(s) => s.len(),
-        Err(_) => return Err(()),
-    };
-    if m == 0 || m > PIN_NAME_LEN {
-        return Ok(other);
-    }
-    // External audit EBPF-010: the final component, hashed in one pass —
-    // the hash restarts after every '/'. An empty component (trailing '/')
-    // hashes to the seed and a window with no '/' to 32 bytes, neither of
-    // which is one of our names.
-    let mut h: u64 = PIN_NAME_HASH_SEED;
-    let mut j: usize = 0;
-    while j < PIN_NAME_LEN {
-        if j >= m {
-            break;
+        let other: u64 = if under { PIN_UNDER_DIRS } else { 0 };
+        // External audit EBPF-010: a path that does not fit the buffer is not
+        // let through when it starts at the agent's pin root — padding a pin's
+        // path past the buffer (`/sys/fs/bpf/northnarrow/./././…/link_task_kill`)
+        // took a link handle in enforce mode. Nothing of a third party lives
+        // under that root. (A symlink or a rewritten buffer still gets past a
+        // check on the caller's string: the guarantee is the detach/update deny
+        // in `try_bpf_syscall_observe`.)
+        if n >= PATH_BUF_LEN - 1 {
+            let mut i: usize = 0;
+            while i < PIN_ROOT.len() {
+                if (*buf)[i] != PIN_ROOT[i] {
+                    return Ok(other);
+                }
+                i += 1;
+            }
+            return Ok(PIN_OWN);
         }
-        let c = (*buf)[j];
-        if c == b'/' {
-            h = PIN_NAME_HASH_SEED;
+        // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
+        // arithmetic is a plain scalar add for the verifier)
+        let win_ptr: u64 = if n > PIN_NAME_LEN {
+            user_ptr + (n - PIN_NAME_LEN) as u64
         } else {
-            h = (h ^ c as u64).wrapping_mul(PIN_NAME_HASH_PRIME);
+            user_ptr
+        };
+        let win: &mut [u8] = core::slice::from_raw_parts_mut(buf as *mut u8, PIN_NAME_LEN + 1);
+        let m = match bpf_probe_read_user_str_bytes(win_ptr as *const u8, win) {
+            Ok(s) => s.len(),
+            Err(_) => return Err(()),
+        };
+        if m == 0 || m > PIN_NAME_LEN {
+            return Ok(other);
         }
-        j += 1;
+        // External audit EBPF-010: the final component, hashed in one pass —
+        // the hash restarts after every '/'. An empty component (trailing '/')
+        // hashes to the seed and a window with no '/' to 32 bytes, neither of
+        // which is one of our names.
+        let mut h: u64 = PIN_NAME_HASH_SEED;
+        let mut j: usize = 0;
+        while j < PIN_NAME_LEN {
+            if j >= m {
+                break;
+            }
+            let c = (*buf)[j];
+            if c == b'/' {
+                h = PIN_NAME_HASH_SEED;
+            } else {
+                h = (h ^ c as u64).wrapping_mul(PIN_NAME_HASH_PRIME);
+            }
+            j += 1;
+        }
+        Ok(match OWN_PIN_NAMES.get(&h) {
+            Some(kind) if *kind == OWN_KIND_LINK => PIN_OWN,
+            _ => other,
+        })
     }
-    Ok(match OWN_PIN_NAMES.get(&h) {
-        Some(kind) if *kind == OWN_KIND_LINK => PIN_OWN,
-        _ => other,
-    })
 }
 
 /// `(dev, ino)` of the calling task's executable (`mm->exe_file`).
 #[inline(always)]
 pub(crate) unsafe fn caller_exe_key() -> Option<InodeKey> {
-    task_exe_key(bpf_get_current_task() as *const u8)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        task_exe_key(bpf_get_current_task() as *const u8)
+    }
 }
 
 /// External audit EBPF-002: `task` runs the agent's or the watchdog's
@@ -914,9 +941,12 @@ pub(crate) unsafe fn caller_exe_key() -> Option<InodeKey> {
 /// freshly started instance cannot be injected into.
 #[inline(always)]
 pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
-    match task_exe_key(task) {
-        Some(k) => OWN_EXE_INODES.get(&k).is_some(),
-        None => false,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match task_exe_key(task) {
+            Some(k) => OWN_EXE_INODES.get(&k).is_some(),
+            None => false,
+        }
     }
 }
 
@@ -924,32 +954,35 @@ pub(crate) unsafe fn task_runs_own_binary(task: *const u8) -> bool {
 /// kernel thread (no `mm`).
 #[inline(always)]
 unsafe fn task_exe_key(task: *const u8) -> Option<InodeKey> {
-    if task.is_null() {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if task.is_null() {
+            return None;
+        }
+        let mm = bpf_probe_read_kernel::<*const u8>(task.add(off!(TASK_STRUCT_MM_OFFSET)) as *const *const u8).ok()?;
+        if mm.is_null() {
+            return None;
+        }
+        let file = bpf_probe_read_kernel::<*const u8>(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET)) as *const *const u8).ok()?;
+        if file.is_null() {
+            return None;
+        }
+        let inode = bpf_probe_read_kernel::<*const u8>(file.add(off!(FILE_F_INODE_OFFSET)) as *const *const u8).ok()?;
+        if inode.is_null() {
+            return None;
+        }
+        let sb = bpf_probe_read_kernel::<*const u8>(inode.add(off!(INODE_I_SB_OFFSET)) as *const *const u8).ok()?;
+        if sb.is_null() {
+            return None;
+        }
+        let dev = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32).ok()?;
+        let dev = crate::inode_dev::stat_dev(inode, sb, dev);
+        let ino = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64).ok()?;
+        Some(InodeKey {
+            dev: dev as u64,
+            ino,
+        })
     }
-    let mm = bpf_probe_read_kernel::<*const u8>(task.add(off!(TASK_STRUCT_MM_OFFSET)) as *const *const u8).ok()?;
-    if mm.is_null() {
-        return None;
-    }
-    let file = bpf_probe_read_kernel::<*const u8>(mm.add(off!(MM_STRUCT_EXE_FILE_OFFSET)) as *const *const u8).ok()?;
-    if file.is_null() {
-        return None;
-    }
-    let inode = bpf_probe_read_kernel::<*const u8>(file.add(off!(FILE_F_INODE_OFFSET)) as *const *const u8).ok()?;
-    if inode.is_null() {
-        return None;
-    }
-    let sb = bpf_probe_read_kernel::<*const u8>(inode.add(off!(INODE_I_SB_OFFSET)) as *const *const u8).ok()?;
-    if sb.is_null() {
-        return None;
-    }
-    let dev = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32).ok()?;
-    let dev = crate::inode_dev::stat_dev(inode, sb, dev);
-    let ino = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64).ok()?;
-    Some(InodeKey {
-        dev: dev as u64,
-        ino,
-    })
 }
 
 /// Role of the calling task's executable (0: not one of ours).
@@ -1021,21 +1054,24 @@ fn fresh_instance_may_load() -> bool {
 /// transient unit included, never takes a vacated role.
 #[inline(always)]
 unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
-    let parent = match bpf_probe_read_kernel::<*const u8>(
-        task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
-    ) {
-        Ok(p) if !p.is_null() => p,
-        _ => return false,
-    };
-    let ptgid = match bpf_probe_read_kernel::<u32>(
-        parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
-    ) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    ptgid == 1
-        && nn_in_role_unit(task as u64, u64::from(slot)) == 1
-        && crate::cgroup_join::caller_marks_clean()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let parent = match bpf_probe_read_kernel::<*const u8>(
+            task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const *const u8,
+        ) {
+            Ok(p) if !p.is_null() => p,
+            _ => return false,
+        };
+        let ptgid = match bpf_probe_read_kernel::<u32>(
+            parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32,
+        ) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        ptgid == 1
+            && nn_in_role_unit(task as u64, u64::from(slot)) == 1
+            && crate::cgroup_join::caller_marks_clean()
+    }
 }
 
 /// Lot 374: whether `task`'s cgroup of the default hierarchy is role slot
@@ -1045,7 +1081,7 @@ unsafe fn started_for_the_role(task: *const u8, slot: u32) -> bool {
 /// it is not or an offset or a read is missing (fail closed). A global
 /// BPF function (exported, never inlined, scalar arguments): the verifier
 /// checks it once, not in every hook that inlines the successor's right.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_in_role_unit(task: u64, slot: u64) -> u64 {
     u64::from(unsafe { in_role_unit(task as *const u8, slot as u32) })
@@ -1053,73 +1089,82 @@ pub extern "C" fn nn_in_role_unit(task: u64, slot: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn in_role_unit(task: *const u8, slot: u32) -> bool {
-    let (Some(o_cgroups), Some(o_dfl), Some(o_kn), Some(o_name), Some(o_parent)) = (
-        off_opt!(TASK_STRUCT_CGROUPS_OFFSET),
-        off_opt!(CSS_SET_DFL_CGRP_OFFSET),
-        off_opt!(CGROUP_KN_OFFSET),
-        off_opt!(KERNFS_NODE_NAME_OFFSET),
-        off_opt!(KERNFS_NODE_PARENT_OFFSET),
-    ) else {
-        return false;
-    };
-    if task.is_null() {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let (Some(o_cgroups), Some(o_dfl), Some(o_kn), Some(o_name), Some(o_parent)) = (
+            off_opt!(TASK_STRUCT_CGROUPS_OFFSET),
+            off_opt!(CSS_SET_DFL_CGRP_OFFSET),
+            off_opt!(CGROUP_KN_OFFSET),
+            off_opt!(KERNFS_NODE_NAME_OFFSET),
+            off_opt!(KERNFS_NODE_PARENT_OFFSET),
+        ) else {
+            return false;
+        };
+        if task.is_null() {
+            return false;
+        }
+        let Some(cset) = read_ptr(task, o_cgroups) else {
+            return false;
+        };
+        let Some(cgrp) = read_ptr(cset, o_dfl) else {
+            return false;
+        };
+        let Some(kn) = read_ptr(cgrp, o_kn) else {
+            return false;
+        };
+        let unit = if slot == 0 {
+            role_unit_words(0)
+        } else {
+            role_unit_words(1)
+        };
+        if !kn_named(kn, o_name, &unit) {
+            return false;
+        }
+        let Some(slice) = read_ptr(kn, o_parent) else {
+            return false;
+        };
+        const SLICE: [u64; 4] = kn_name_words(OUR_SLICE);
+        if !kn_named(slice, o_name, &SLICE) {
+            return false;
+        }
+        let Some(root) = read_ptr(slice, o_parent) else {
+            return false;
+        };
+        matches!(
+            bpf_probe_read_kernel::<*const u8>(root.add(o_parent) as *const *const u8),
+            Ok(p) if p.is_null()
+        )
     }
-    let Some(cset) = read_ptr(task, o_cgroups) else {
-        return false;
-    };
-    let Some(cgrp) = read_ptr(cset, o_dfl) else {
-        return false;
-    };
-    let Some(kn) = read_ptr(cgrp, o_kn) else {
-        return false;
-    };
-    let unit = if slot == 0 {
-        role_unit_words(0)
-    } else {
-        role_unit_words(1)
-    };
-    if !kn_named(kn, o_name, &unit) {
-        return false;
-    }
-    let Some(slice) = read_ptr(kn, o_parent) else {
-        return false;
-    };
-    const SLICE: [u64; 4] = kn_name_words(OUR_SLICE);
-    if !kn_named(slice, o_name, &SLICE) {
-        return false;
-    }
-    let Some(root) = read_ptr(slice, o_parent) else {
-        return false;
-    };
-    matches!(
-        bpf_probe_read_kernel::<*const u8>(root.add(o_parent) as *const *const u8),
-        Ok(p) if p.is_null()
-    )
 }
 
 /// The non-null pointer at `base + off`.
 #[inline(always)]
 unsafe fn read_ptr(base: *const u8, off: usize) -> Option<*const u8> {
-    match bpf_probe_read_kernel::<*const u8>(base.add(off) as *const *const u8) {
-        Ok(p) if !p.is_null() => Some(p),
-        _ => None,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match bpf_probe_read_kernel::<*const u8>(base.add(off) as *const *const u8) {
+            Ok(p) if !p.is_null() => Some(p),
+            _ => None,
+        }
     }
 }
 
 /// Kernfs node `kn`'s name is `want` (`common::wire::kn_name_words`).
 #[inline(always)]
 unsafe fn kn_named(kn: *const u8, o_name: usize, want: &[u64; 4]) -> bool {
-    let Some(name) = read_ptr(kn, o_name) else {
-        return false;
-    };
-    let mut w = [0u64; 4];
-    let n = aya_ebpf::helpers::generated::bpf_probe_read_kernel_str(
-        w.as_mut_ptr() as *mut c_void,
-        32,
-        name as *const c_void,
-    );
-    n > 1 && w[0] == want[0] && w[1] == want[1] && w[2] == want[2] && w[3] == want[3]
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(name) = read_ptr(kn, o_name) else {
+            return false;
+        };
+        let mut w = [0u64; 4];
+        let n = aya_ebpf::helpers::generated::bpf_probe_read_kernel_str(
+            w.as_mut_ptr() as *mut c_void,
+            32,
+            name as *const c_void,
+        );
+        n > 1 && w[0] == want[0] && w[1] == want[1] && w[2] == want[2] && w[3] == want[3]
+    }
 }
 
 /// Lot 370 (F10-4): the record of a fresh instance's handle — a first
@@ -1186,54 +1231,60 @@ pub fn bpf_map_guard(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
-    let map: *const c_void = ctx.arg(0);
-    if map.is_null() {
-        return 0;
-    }
-    let fmode: u32 = ctx.arg(1);
-    let write = fmode & FMODE_WRITE != 0;
-    // Lot 290: a read handle is judged too, but only in enforce mode and
-    // outside a window — the rest of the read path is left alone.
-    if !write && (!enforce() || crate::inode_protect::override_active()) {
-        return 0;
-    }
-    let id_slot = (map as *const u8).add(off!(BPF_MAP_ID_OFFSET)) as *const u32;
-    let id = match bpf_probe_read_kernel::<u32>(id_slot) {
-        Ok(v) => v,
-        Err(_) => {
-            // Lab PR 215: a handle the guard could not judge.
-            crate::fail_open::bump(fail_open_hook::BPF_MAP);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let map: *const c_void = ctx.arg(0);
+        if map.is_null() {
             return 0;
         }
-    };
-    if !is_own_kind(id, OWN_KIND_MAP) || caller_is_exempt() || fresh_instance_may_load() {
-        return 0;
+        let fmode: u32 = ctx.arg(1);
+        let write = fmode & FMODE_WRITE != 0;
+        // Lot 290: a read handle is judged too, but only in enforce mode and
+        // outside a window — the rest of the read path is left alone.
+        if !write && (!enforce() || crate::inode_protect::override_active()) {
+            return 0;
+        }
+        let id_slot = (map as *const u8).add(off!(BPF_MAP_ID_OFFSET)) as *const u32;
+        let id = match bpf_probe_read_kernel::<u32>(id_slot) {
+            Ok(v) => v,
+            Err(_) => {
+                // Lab PR 215: a handle the guard could not judge.
+                crate::fail_open::bump(fail_open_hook::BPF_MAP);
+                return 0;
+            }
+        };
+        if !is_own_kind(id, OWN_KIND_MAP) || caller_is_exempt() || fresh_instance_may_load() {
+            return 0;
+        }
+        if !write {
+            // Lot 290: a read handle on one of the agent's maps, through any
+            // path (a bind mount of the bpffs, a relative path, a symlink): a
+            // program is loaded against a map only through a descriptor of it
+            // (lot 281's residual).
+            emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_MAP, id);
+            return -EPERM;
+        }
+        if enforce() {
+            emit_denial(FS_OP_BPF_MAP, id);
+            return -EPERM;
+        }
+        emit_syscall(BPF_CMD_FOREIGN_MAP_WRITE, id);
+        0
     }
-    if !write {
-        // Lot 290: a read handle on one of the agent's maps, through any
-        // path (a bind mount of the bpffs, a relative path, a symlink): a
-        // program is loaded against a map only through a descriptor of it
-        // (lot 281's residual).
-        emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_MAP, id);
-        return -EPERM;
-    }
-    if enforce() {
-        emit_denial(FS_OP_BPF_MAP, id);
-        return -EPERM;
-    }
-    emit_syscall(BPF_CMD_FOREIGN_MAP_WRITE, id);
-    0
 }
 
 /// Lot 290: the id of program `prog` (`prog->aux->id`), `None` when a read
 /// fails.
 #[inline(always)]
 pub(crate) unsafe fn prog_id_of(prog: *const c_void) -> Option<u32> {
-    let aux = bpf_probe_read_kernel::<u64>((prog as *const u8).add(off!(BPF_PROG_AUX_OFFSET)) as *const u64).ok()?;
-    if aux == 0 {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let aux = bpf_probe_read_kernel::<u64>((prog as *const u8).add(off!(BPF_PROG_AUX_OFFSET)) as *const u64).ok()?;
+        if aux == 0 {
+            return None;
+        }
+        bpf_probe_read_kernel::<u32>((aux as *const u8).add(off!(BPF_PROG_AUX_ID_OFFSET)) as *const u32).ok()
     }
-    bpf_probe_read_kernel::<u32>((aux as *const u8).add(off!(BPF_PROG_AUX_ID_OFFSET)) as *const u32).ok()
 }
 
 /// Lot 290: `bpf_prog(struct bpf_prog *prog)` — every new program handle:
@@ -1250,83 +1301,86 @@ pub fn bpf_prog_guard(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_bpf_prog_guard(ctx: &LsmContext) -> i32 {
-    let prog: *const c_void = ctx.arg(0);
-    if prog.is_null() {
-        return 0;
-    }
-    let loading = crate::bpf_census::take_load_mark();
-    let id = match prog_id_of(prog) {
-        Some(id) => id,
-        None => {
-            crate::fail_open::bump(fail_open_hook::BPF);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let prog: *const c_void = ctx.arg(0);
+        if prog.is_null() {
             return 0;
         }
-    };
-    // Lot 345: before 6.9 the content is judged here, once verified, on
-    // every handle a foreign caller takes — the load's, and one by id or
-    // path (the load's program has an id before its descriptor: a second
-    // thread could take it by id in between). The agent's own programs
-    // (some signal) are the own-object guard's, below. No kfunc before 6.9:
-    // the types refused by default only.
-    if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {
-        if let Some((why, ty)) = content_refusal(prog, false) {
-            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
-            return -EPERM;
-        }
-        // Lot 349 (the review of #558, F1): before 6.9 too, a window's load
-        // that the judge refuses outside one is held and signed — its later
-        // handles are judged here again, its runs and attaches through the
-        // loader's own descriptor by [`nn_held_use`]
-        if loading {
-            if let Some(v) = window_verdict(prog, false) {
-                if !hold(id, v) {
-                    return -EPERM;
-                }
+        let loading = crate::bpf_census::take_load_mark();
+        let id = match prog_id_of(prog) {
+            Some(id) => id,
+            None => {
+                crate::fail_open::bump(fail_open_hook::BPF);
+                return 0;
             }
-        }
-    }
-    // Lot 349 (pre-alpha R002): from 6.9, a load inside a window that the
-    // judge would refuse outside one — kept at its load ([`PROG_CONTENT_HELD`])
-    // — and, on any later handle by id or path outside a window, refused to a
-    // caller outside the family, signed as at the load.
-    if content_stage() == CONTENT_STAGE_LOAD {
-        if loading {
-            let tid = bpf_get_current_pid_tgid() as u32;
-            if let Some(v) = PROG_CONTENT_HELD_INFLIGHT.get_ptr(&tid) {
-                let v = *v;
-                let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
-                // the review of #558 (F5): full, the load is refused
-                if !hold(id, v) {
-                    return -EPERM;
-                }
-            }
-        } else if let Some(v) = PROG_CONTENT_HELD.get_ptr(&id) {
-            let v = *v;
-            if !caller_is_exempt() && !crate::inode_protect::override_active() && !fresh_instance_may_load() {
-                emit_denial_kind(FS_OP_BPF_PROG_TYPE, (v >> 32) as u8, v as u32);
+        };
+        // Lot 345: before 6.9 the content is judged here, once verified, on
+        // every handle a foreign caller takes — the load's, and one by id or
+        // path (the load's program has an id before its descriptor: a second
+        // thread could take it by id in between). The agent's own programs
+        // (some signal) are the own-object guard's, below. No kfunc before 6.9:
+        // the types refused by default only.
+        if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {
+            if let Some((why, ty)) = content_refusal(prog, false) {
+                emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
                 return -EPERM;
             }
+            // Lot 349 (the review of #558, F1): before 6.9 too, a window's load
+            // that the judge refuses outside one is held and signed — its later
+            // handles are judged here again, its runs and attaches through the
+            // loader's own descriptor by [`nn_held_use`]
+            if loading {
+                if let Some(v) = window_verdict(prog, false) {
+                    if !hold(id, v) {
+                        return -EPERM;
+                    }
+                }
+            }
         }
-    }
-    // Lot 345: one of the agent's calibration programs, loaded while it
-    // asks for a calibration (before 6.9)
-    if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {
-        if let Some(addr) = ptr_scalar(prog) {
-            nn_calibrate(addr);
+        // Lot 349 (pre-alpha R002): from 6.9, a load inside a window that the
+        // judge would refuse outside one — kept at its load ([`PROG_CONTENT_HELD`])
+        // — and, on any later handle by id or path outside a window, refused to a
+        // caller outside the family, signed as at the load.
+        if content_stage() == CONTENT_STAGE_LOAD {
+            if loading {
+                let tid = bpf_get_current_pid_tgid() as u32;
+                if let Some(v) = PROG_CONTENT_HELD_INFLIGHT.get_ptr(&tid) {
+                    let v = *v;
+                    let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
+                    // the review of #558 (F5): full, the load is refused
+                    if !hold(id, v) {
+                        return -EPERM;
+                    }
+                }
+            } else if let Some(v) = PROG_CONTENT_HELD.get_ptr(&id) {
+                let v = *v;
+                if !caller_is_exempt() && !crate::inode_protect::override_active() && !fresh_instance_may_load() {
+                    emit_denial_kind(FS_OP_BPF_PROG_TYPE, (v >> 32) as u8, v as u32);
+                    return -EPERM;
+                }
+            }
         }
+        // Lot 345: one of the agent's calibration programs, loaded while it
+        // asks for a calibration (before 6.9)
+        if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {
+            if let Some(addr) = ptr_scalar(prog) {
+                nn_calibrate(addr);
+            }
+        }
+        if loading {
+            crate::bpf_census::mark_seen(id, prog);
+            return 0;
+        }
+        if !is_own_kind(id, OWN_KIND_PROG) || caller_is_exempt() || fresh_instance_may_load() {
+            return 0;
+        }
+        if enforce() && !crate::inode_protect::override_active() {
+            emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_PROG, id);
+            return -EPERM;
+        }
+        0
     }
-    if loading {
-        crate::bpf_census::mark_seen(id, prog);
-        return 0;
-    }
-    if !is_own_kind(id, OWN_KIND_PROG) || caller_is_exempt() || fresh_instance_may_load() {
-        return 0;
-    }
-    if enforce() && !crate::inode_protect::override_active() {
-        emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_PROG, id);
-        return -EPERM;
-    }
-    0
 }
 
 /// Lot 345 (the re-check of #550, point 1 (ii)): `bpf_prog_load(struct
@@ -1349,26 +1403,29 @@ pub fn bpf_prog_load_guard(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_bpf_prog_load_guard(ctx: &LsmContext) -> i32 {
-    if content_stage() != CONTENT_STAGE_LOAD {
-        return 0;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if content_stage() != CONTENT_STAGE_LOAD {
+            return 0;
+        }
+        let prog: *const c_void = ctx.arg(0);
+        if prog.is_null() {
+            return 0;
+        }
+        let tid = bpf_get_current_pid_tgid() as u32;
+        let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
+        if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {
+            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
+            return -EPERM;
+        }
+        // Lot 349 (pre-alpha R002): a window lets the load through; what it
+        // would refuse outside one is kept for the program's later handles,
+        // runs and attaches (the `bpf_prog` hook holds it once it has an id)
+        if let Some(v) = window_verdict(prog, every_type_armed()) {
+            let _ = PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &v, 0);
+        }
+        0
     }
-    let prog: *const c_void = ctx.arg(0);
-    if prog.is_null() {
-        return 0;
-    }
-    let tid = bpf_get_current_pid_tgid() as u32;
-    let _ = PROG_CONTENT_HELD_INFLIGHT.remove(&tid);
-    if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {
-        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);
-        return -EPERM;
-    }
-    // Lot 349 (pre-alpha R002): a window lets the load through; what it
-    // would refuse outside one is kept for the program's later handles,
-    // runs and attaches (the `bpf_prog` hook holds it once it has an id)
-    if let Some(v) = window_verdict(prog, every_type_armed()) {
-        let _ = PROG_CONTENT_HELD_INFLIGHT.insert(&tid, &v, 0);
-    }
-    0
 }
 
 /// The review of #553 (F1): this kernel has kfunc targets, read in a load
@@ -1396,7 +1453,7 @@ fn calibration_armed() -> bool {
 /// `kallsyms` — recorded by instruction in [`PROG_CONTENT_SEEN`] (0 for
 /// any other); the agent takes them in order. A global BPF function,
 /// verified once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_calibrate(prog: u64) -> u64 {
     let (Some(len_off), Some(insns_off)) = (off_opt!(BPF_PROG_LEN_OFFSET), off_opt!(BPF_PROG_INSNSI_OFFSET))
@@ -1418,8 +1475,11 @@ pub extern "C" fn nn_calibrate(prog: u64) -> u64 {
             Err(_) => return 0,
         };
         let call = insn as u8 == INSN_CALL && (insn >> 12) & 0xf == 0;
-        if let Some(p) = PROG_CONTENT_SEEN.get_ptr_mut(i) {
-            unsafe { *p = if call { (insn >> 32) as u32 } else { 0 } };
+        match PROG_CONTENT_SEEN.get_ptr_mut(i) {
+            Some(p) => {
+                unsafe { *p = if call { (insn >> 32) as u32 } else { 0 } };
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -1502,26 +1562,29 @@ fn content_stage() -> u32 {
 /// and for every other program.
 #[inline(always)]
 unsafe fn content_refusal(prog: *const c_void, every_type: bool) -> Option<(u8, u32)> {
-    let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
-        .ok()?;
-    let kfuncs_only = !denied_by_default(ty);
-    if (kfuncs_only && !every_type)
-        || caller_is_exempt()
-        || crate::inode_protect::override_active()
-        || fresh_instance_may_load()
-    {
-        return None;
-    }
-    // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
-    // BTF pointer to the verifier, which a global function does not take
-    // ("R1 is not a scalar") — its address is passed as a plain number
-    let Some(addr) = ptr_scalar(prog) else {
-        return Some((CONTENT_UNJUDGED, ty));
-    };
-    match nn_prog_forbidden_call(addr, kfuncs_only as u64) {
-        SCAN_CLEAN => None,
-        hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
-        _ => Some((CONTENT_UNJUDGED, ty)),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
+            .ok()?;
+        let kfuncs_only = !denied_by_default(ty);
+        if (kfuncs_only && !every_type)
+            || caller_is_exempt()
+            || crate::inode_protect::override_active()
+            || fresh_instance_may_load()
+        {
+            return None;
+        }
+        // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
+        // BTF pointer to the verifier, which a global function does not take
+        // ("R1 is not a scalar") — its address is passed as a plain number
+        let Some(addr) = ptr_scalar(prog) else {
+            return Some((CONTENT_UNJUDGED, ty));
+        };
+        match nn_prog_forbidden_call(addr, kfuncs_only as u64) {
+            SCAN_CLEAN => None,
+            hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
+            _ => Some((CONTENT_UNJUDGED, ty)),
+        }
     }
 }
 
@@ -1530,22 +1593,25 @@ unsafe fn content_refusal(prog: *const c_void, every_type: bool) -> Option<(u8, 
 /// verdict is kept for the program's later handles.
 #[inline(always)]
 unsafe fn content_scan(prog: *const c_void, every_type: bool) -> Option<(u8, u32)> {
-    let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
-        .ok()?;
-    let kfuncs_only = !denied_by_default(ty);
-    if kfuncs_only && !every_type {
-        return None;
-    }
-    // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
-    // BTF pointer to the verifier, which a global function does not take
-    // ("R1 is not a scalar") — its address is passed as a plain number
-    let Some(addr) = ptr_scalar(prog) else {
-        return Some((CONTENT_UNJUDGED, ty));
-    };
-    match nn_prog_forbidden_call(addr, kfuncs_only as u64) {
-        SCAN_CLEAN => None,
-        hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
-        _ => Some((CONTENT_UNJUDGED, ty)),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let ty = bpf_probe_read_kernel::<u32>((prog as *const u8).add(off!(BPF_PROG_TYPE_OFFSET)) as *const u32)
+            .ok()?;
+        let kfuncs_only = !denied_by_default(ty);
+        if kfuncs_only && !every_type {
+            return None;
+        }
+        // the lab's first round (6.8): the hook's `struct bpf_prog *` is a
+        // BTF pointer to the verifier, which a global function does not take
+        // ("R1 is not a scalar") — its address is passed as a plain number
+        let Some(addr) = ptr_scalar(prog) else {
+            return Some((CONTENT_UNJUDGED, ty));
+        };
+        match nn_prog_forbidden_call(addr, kfuncs_only as u64) {
+            SCAN_CLEAN => None,
+            hit if hit <= CALL_TARGETS as u64 => Some((CONTENT_CALL + (hit - 1) as u8, ty)),
+            _ => Some((CONTENT_UNJUDGED, ty)),
+        }
     }
 }
 
@@ -1555,8 +1621,11 @@ unsafe fn content_scan(prog: *const c_void, every_type: bool) -> Option<(u8, u32
 /// pointer to the verifier, `as u64` or not.
 #[inline(always)]
 unsafe fn ptr_scalar(p: *const c_void) -> Option<u64> {
-    let v: u64 = p as u64;
-    bpf_probe_read_kernel::<u64>(&v as *const u64).ok()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let v: u64 = p as u64;
+        bpf_probe_read_kernel::<u64>(&v as *const u64).ok()
+    }
 }
 
 /// Lot 345: [`nn_prog_forbidden_call`] found no forbidden call.
@@ -1576,7 +1645,7 @@ const SCAN_FAN: u64 = 32;
 /// scalar argument). The review of #553 (F1): `kfuncs_only` (not 0), a
 /// call of a kfunc target only ([`judged_for_every_type`]) — a type let
 /// through by default.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_prog_forbidden_call(prog: u64, kfuncs_only: u64) -> u64 {
     let (Some(len_off), Some(insns_off)) = (off_opt!(BPF_PROG_LEN_OFFSET), off_opt!(BPF_PROG_INSNSI_OFFSET))
@@ -1608,7 +1677,7 @@ pub extern "C" fn nn_prog_forbidden_call(prog: u64, kfuncs_only: u64) -> u64 {
 
 /// Lot 345: [`nn_prog_forbidden_call`] over the [`SCAN_FAN`] blocks from
 /// instruction `from`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_scan_span(insns: u64, from: u64, len: u64, kfuncs_only: u64) -> u64 {
     let mut k: u64 = 0;
@@ -1627,7 +1696,7 @@ pub extern "C" fn nn_scan_span(insns: u64, from: u64, len: u64, kfuncs_only: u64
 }
 
 /// Lot 345: … over the [`SCAN_FAN`] chunks from instruction `from`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_scan_block(insns: u64, from: u64, len: u64, kfuncs_only: u64) -> u64 {
     let mut k: u64 = 0;
@@ -1648,7 +1717,7 @@ pub extern "C" fn nn_scan_block(insns: u64, from: u64, len: u64, kfuncs_only: u6
 /// Lot 345: … over the [`SCAN_FAN`] instructions from `from` (to `len`):
 /// each one's call key looked up in [`PROG_CONTENT_KEYS`] (with
 /// `kfuncs_only`, a kfunc target's only).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64, kfuncs_only: u64) -> u64 {
     let mut j: u64 = 0;
@@ -1661,10 +1730,13 @@ pub extern "C" fn nn_scan_chunk(insns: u64, from: u64, len: u64, kfuncs_only: u6
             Ok(v) => v,
             Err(_) => return SCAN_UNJUDGED,
         };
-        if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {
-            if kfuncs_only == 0 || judged_for_every_type(*slot) {
-                return *slot as u64;
+        match unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {
+            Some(slot) => {
+                if kfuncs_only == 0 || judged_for_every_type(*slot) {
+                    return *slot as u64;
+                }
             }
+            _ => {}
         }
         j += 1;
     }
@@ -1692,7 +1764,7 @@ const OPT_OUT_REPORT: u32 = 0xFFFF_0100;
 /// off (its stage not armed: a failed calibration, a configuration not
 /// written) — fail closed: an opted-out loader would otherwise get back the
 /// signalling helpers, the return override and `bpf_probe_write_user`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_loader_opted_out(prog_type: u64) -> u64 {
     let bit = type_bit(prog_type as u32);
@@ -1710,239 +1782,242 @@ pub extern "C" fn nn_loader_opted_out(prog_type: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
-    let cmd = ctx.arg::<c_int>(0) as u32;
-    let attr: *const c_void = ctx.arg(1);
-    // Lot 349 (the review of #558, F1): a run or an attach of a program held
-    // at a window's load, through whatever descriptor — refused outside a
-    // window, signed ([`nn_held_use`]); before the `observed` filter, which
-    // leaves out `BPF_PROG_RUN` and the map updates
-    if !attr.is_null() && held_use_refused(cmd, attr) {
-        return -EPERM;
-    }
-    // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
-    // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
-    // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
-    if !observed(cmd) {
-        return 0;
-    }
-    if caller_is_exempt() {
-        // Lot 290: the family's loads are seen too — a program the agent
-        // loads after its registration of its own objects is never "unseen"
-        if cmd == BPF_PROG_LOAD {
-            crate::bpf_census::mark_load();
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let cmd = ctx.arg::<c_int>(0) as u32;
+        let attr: *const c_void = ctx.arg(1);
+        // Lot 349 (the review of #558, F1): a run or an attach of a program held
+        // at a window's load, through whatever descriptor — refused outside a
+        // window, signed ([`nn_held_use`]); before the `observed` filter, which
+        // leaves out `BPF_PROG_RUN` and the map updates
+        if !attr.is_null() && held_use_refused(cmd, attr) {
+            return -EPERM;
         }
-        return 0;
-    }
-    // bpf_attr is uapi-stable: the first u32 of the union is prog_type
-    // (PROG_LOAD), map_type (MAP_CREATE), target_fd (PROG_ATTACH /
-    // LINK_CREATE — attach_type sits at +8), start_id / prog_id / map_id /
-    // link_id (*_GET_FD_BY_ID).
-    // Lab PR 215: the commands whose argument decides a deny here (a link
-    // handle by id, a detach or update of one of our links); for them an
-    // unreadable argument is a fail-open, counted. Lot 290: and a load's
-    // type, a map's or a program's handle by id.
-    let decides = matches!(
-        cmd,
-        BPF_LINK_GET_FD_BY_ID
-            | BPF_LINK_DETACH
-            | BPF_LINK_UPDATE
-            | BPF_PROG_LOAD
-            | BPF_MAP_GET_FD_BY_ID
-            | BPF_PROG_GET_FD_BY_ID
-    );
-    let mut arg: u32 = 0;
-    if !attr.is_null() {
-        let off: usize = match cmd {
-            BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,
-            // Lot 293 (external bug hunt BUG05): `raw_tracepoint.prog_fd`
-            // after the name's pointer.
-            BPF_RAW_TRACEPOINT_OPEN => 8,
-            _ => 0,
-        };
-        match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
-            Ok(v) => arg = v,
-            Err(_) => {
-                if decides {
-                    crate::fail_open::bump(fail_open_hook::BPF);
+        // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
+        // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
+        // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
+        if !observed(cmd) {
+            return 0;
+        }
+        if caller_is_exempt() {
+            // Lot 290: the family's loads are seen too — a program the agent
+            // loads after its registration of its own objects is never "unseen"
+            if cmd == BPF_PROG_LOAD {
+                crate::bpf_census::mark_load();
+            }
+            return 0;
+        }
+        // bpf_attr is uapi-stable: the first u32 of the union is prog_type
+        // (PROG_LOAD), map_type (MAP_CREATE), target_fd (PROG_ATTACH /
+        // LINK_CREATE — attach_type sits at +8), start_id / prog_id / map_id /
+        // link_id (*_GET_FD_BY_ID).
+        // Lab PR 215: the commands whose argument decides a deny here (a link
+        // handle by id, a detach or update of one of our links); for them an
+        // unreadable argument is a fail-open, counted. Lot 290: and a load's
+        // type, a map's or a program's handle by id.
+        let decides = matches!(
+            cmd,
+            BPF_LINK_GET_FD_BY_ID
+                | BPF_LINK_DETACH
+                | BPF_LINK_UPDATE
+                | BPF_PROG_LOAD
+                | BPF_MAP_GET_FD_BY_ID
+                | BPF_PROG_GET_FD_BY_ID
+        );
+        let mut arg: u32 = 0;
+        if !attr.is_null() {
+            let off: usize = match cmd {
+                BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,
+                // Lot 293 (external bug hunt BUG05): `raw_tracepoint.prog_fd`
+                // after the name's pointer.
+                BPF_RAW_TRACEPOINT_OPEN => 8,
+                _ => 0,
+            };
+            match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+                Ok(v) => arg = v,
+                Err(_) => {
+                    if decides {
+                        crate::fail_open::bump(fail_open_hook::BPF);
+                    }
                 }
             }
         }
-    }
-    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // Lot 290: a program type that can rewrite user memory, override a
-    // kernel function's return, signal a process or take a hook's place
-    // (kprobe, tracepoint, perf_event, raw_tracepoint and its writable
-    // form, tracing, struct_ops, extension, LSM), loaded by a caller
-    // outside the family (returned above) outside a window — refused, in
-    // every mode, unless the signed per-loader opt-out names the caller's
-    // executable and the type (let through, recorded once a second). A
-    // fresh agent or watchdog before it is a protected pid loads its own.
-    // A load let through marks its thread: the `bpf_prog` hook records the
-    // program it makes as seen (the cross-view).
-    if cmd == BPF_PROG_LOAD {
-        if denied_by_default(arg)
-            && !crate::inode_protect::override_active()
-            && !fresh_instance_may_load()
-        {
-            if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {
-                emit_denial(FS_OP_BPF_PROG_TYPE, arg);
-                return -EPERM;
+        let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        // Lot 290: a program type that can rewrite user memory, override a
+        // kernel function's return, signal a process or take a hook's place
+        // (kprobe, tracepoint, perf_event, raw_tracepoint and its writable
+        // form, tracing, struct_ops, extension, LSM), loaded by a caller
+        // outside the family (returned above) outside a window — refused, in
+        // every mode, unless the signed per-loader opt-out names the caller's
+        // executable and the type (let through, recorded once a second). A
+        // fresh agent or watchdog before it is a protected pid loads its own.
+        // A load let through marks its thread: the `bpf_prog` hook records the
+        // program it makes as seen (the cross-view).
+        if cmd == BPF_PROG_LOAD {
+            if denied_by_default(arg)
+                && !crate::inode_protect::override_active()
+                && !fresh_instance_may_load()
+            {
+                if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {
+                    emit_denial(FS_OP_BPF_PROG_TYPE, arg);
+                    return -EPERM;
+                }
+                // Lot 345 (the re-check of #550, N2): the opt-out never covers
+                // an fmod_ret — it overrides the return of any `security_*`
+                // function, and an allowed loader made `security_file_open`
+                // fail for the agent (the kernel's copy of the attr: an
+                // unreadable attach type is refused too)
+                let refused_attach = match bpf_probe_read_kernel::<u32>(
+                    (attr as *const u8).add(PROG_LOAD_ATTACH_TYPE_OFFSET) as *const u32,
+                ) {
+                    Ok(eat) => opt_out_refuses_attach(eat),
+                    Err(_) => true,
+                };
+                if refused_attach {
+                    emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);
+                    return -EPERM;
+                }
+                if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {
+                    emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);
+                }
             }
-            // Lot 345 (the re-check of #550, N2): the opt-out never covers
-            // an fmod_ret — it overrides the return of any `security_*`
-            // function, and an allowed loader made `security_file_open`
-            // fail for the agent (the kernel's copy of the attr: an
-            // unreadable attach type is refused too)
-            let refused_attach = match bpf_probe_read_kernel::<u32>(
-                (attr as *const u8).add(PROG_LOAD_ATTACH_TYPE_OFFSET) as *const u32,
-            ) {
-                Ok(eat) => opt_out_refuses_attach(eat),
-                Err(_) => true,
-            };
-            if refused_attach {
-                emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);
-                return -EPERM;
-            }
-            if should_report(pid, OPT_OUT_REPORT | (arg & 0xff)) {
-                emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);
-            }
+            crate::bpf_census::mark_load();
+        } else if matches!(cmd, BPF_PROG_GET_FD_BY_ID | BPF_OBJ_GET) {
+            // a handle the `bpf_prog` hook may see: not a load
+            crate::bpf_census::clear_load_mark();
         }
-        crate::bpf_census::mark_load();
-    } else if matches!(cmd, BPF_PROG_GET_FD_BY_ID | BPF_OBJ_GET) {
-        // a handle the `bpf_prog` hook may see: not a load
-        crate::bpf_census::clear_load_mark();
-    }
-    // A handle to one of the agent's own MAPS or LINKS taken by id: the
-    // shape of `bpftool map update id N` / `bpftool link show id N` /
-    // `bpftool link detach id N` (and of each NorthNarrow entry `bpftool
-    // link list` reaches: it takes a handle by id on every link it prints).
-    // Lot 290: and its PROGRAMS (`bpftool prog show id N`; an `freplace`
-    // of one of its functions needs a handle on it).
-    let own_map_handle = cmd == BPF_MAP_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_MAP);
-    let own_prog_handle = cmd == BPF_PROG_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_PROG);
-    let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);
-    let pin = if cmd == BPF_OBJ_GET && !attr.is_null() {
-        match bpf_probe_read_kernel::<u64>(attr as *const u64) {
-            Ok(p) => nn_obj_get_own_link(p),
-            Err(_) => PIN_UNREADABLE,
-        }
-    } else {
-        0
-    };
-    if pin == PIN_UNREADABLE {
-        crate::fail_open::bump(fail_open_hook::BPF);
-    }
-    let own_link_pin = pin == PIN_OWN;
-    let own_dir_pin = pin == PIN_UNDER_DIRS;
-    // Second half of the self-defence: a link handle is the only thing
-    // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
-    // id N` / `… pinned <path>`), so in enforce mode a foreign process
-    // never gets one — by id or through the pin.
-    // External audit EBPF-002: no exemption by executable — a link handle
-    // is taken only once the agent is a protected pid.
-    if (own_link_handle || own_link_pin) && enforce() {
-        emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
-        return -EPERM;
-    }
-    // Lot 290: a handle on one of the agent's maps or programs by id, or
-    // anything under its pin directories, outside a window (enforce mode):
-    // a program cannot be loaded against a map it has no descriptor of,
-    // nor replace a function of a program it has none of. The `bpf_map`
-    // and `bpf_prog` hooks judge the object a path reaches otherwise.
-    if (own_map_handle || own_prog_handle || own_dir_pin)
-        && enforce()
-        && !crate::inode_protect::override_active()
-        && !fresh_instance_may_load()
-    {
-        let kind = if own_map_handle {
-            OWN_KIND_MAP
-        } else if own_prog_handle {
-            OWN_KIND_PROG
+        // A handle to one of the agent's own MAPS or LINKS taken by id: the
+        // shape of `bpftool map update id N` / `bpftool link show id N` /
+        // `bpftool link detach id N` (and of each NorthNarrow entry `bpftool
+        // link list` reaches: it takes a handle by id on every link it prints).
+        // Lot 290: and its PROGRAMS (`bpftool prog show id N`; an `freplace`
+        // of one of its functions needs a handle on it).
+        let own_map_handle = cmd == BPF_MAP_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_MAP);
+        let own_prog_handle = cmd == BPF_PROG_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_PROG);
+        let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);
+        let pin = if cmd == BPF_OBJ_GET && !attr.is_null() {
+            match bpf_probe_read_kernel::<u64>(attr as *const u64) {
+                Ok(p) => nn_obj_get_own_link(p),
+                Err(_) => PIN_UNREADABLE,
+            }
         } else {
             0
         };
-        emit_denial_kind(FS_OP_BPF_HANDLE, kind, if kind == 0 { 0 } else { arg });
-        return -EPERM;
-    }
-    // External audit EBPF-010: whatever gave the handle (a pin reached
-    // through a symlink, or a buffer rewritten after the name check), a
-    // foreign process neither detaches nor replaces one of the agent's
-    // links. The kernels the agent supports refuse both on its link types
-    // anyway (tracing, raw tracepoint and perf links have no .detach /
-    // .update_prog: EOPNOTSUPP / EINVAL in the lab); this keeps it so on a
-    // kernel that adds them. `arg` is the link fd for both commands.
-    if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {
-        let id = nn_link_id_of_fd(u64::from(arg));
-        if id == LINK_UNREADABLE {
+        if pin == PIN_UNREADABLE {
             crate::fail_open::bump(fail_open_hook::BPF);
-        } else if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
-            emit_denial(FS_OP_BPF_LINK, id as u32);
+        }
+        let own_link_pin = pin == PIN_OWN;
+        let own_dir_pin = pin == PIN_UNDER_DIRS;
+        // Second half of the self-defence: a link handle is the only thing
+        // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
+        // id N` / `… pinned <path>`), so in enforce mode a foreign process
+        // never gets one — by id or through the pin.
+        // External audit EBPF-002: no exemption by executable — a link handle
+        // is taken only once the agent is a protected pid.
+        if (own_link_handle || own_link_pin) && enforce() {
+            emit_denial(FS_OP_BPF_LINK, if own_link_handle { arg } else { 0 });
             return -EPERM;
         }
-    }
-    // Lot 280b: a cgroup/sysctl program attached to the root cgroup outside
-    // a window (the family returned above; a fresh agent before it is a
-    // protected pid may attach its judge) — refused, signed. `arg` is the
-    // attach type for both commands; the target is read only for them.
-    // Lot 290: in every mode (it held in enforce mode only).
-    if judges_attach_target(cmd, arg)
-        && !crate::inode_protect::override_active()
-        && !fresh_instance_may_load()
-    {
-        let target = match attach_target_offset(cmd) {
-            Some(off) if !attr.is_null() => {
-                bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32).ok()
+        // Lot 290: a handle on one of the agent's maps or programs by id, or
+        // anything under its pin directories, outside a window (enforce mode):
+        // a program cannot be loaded against a map it has no descriptor of,
+        // nor replace a function of a program it has none of. The `bpf_map`
+        // and `bpf_prog` hooks judge the object a path reaches otherwise.
+        if (own_map_handle || own_prog_handle || own_dir_pin)
+            && enforce()
+            && !crate::inode_protect::override_active()
+            && !fresh_instance_may_load()
+        {
+            let kind = if own_map_handle {
+                OWN_KIND_MAP
+            } else if own_prog_handle {
+                OWN_KIND_PROG
+            } else {
+                0
+            };
+            emit_denial_kind(FS_OP_BPF_HANDLE, kind, if kind == 0 { 0 } else { arg });
+            return -EPERM;
+        }
+        // External audit EBPF-010: whatever gave the handle (a pin reached
+        // through a symlink, or a buffer rewritten after the name check), a
+        // foreign process neither detaches nor replaces one of the agent's
+        // links. The kernels the agent supports refuse both on its link types
+        // anyway (tracing, raw tracepoint and perf links have no .detach /
+        // .update_prog: EOPNOTSUPP / EINVAL in the lab); this keeps it so on a
+        // kernel that adds them. `arg` is the link fd for both commands.
+        if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {
+            let id = nn_link_id_of_fd(u64::from(arg));
+            if id == LINK_UNREADABLE {
+                crate::fail_open::bump(fail_open_hook::BPF);
+            } else if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
+                emit_denial(FS_OP_BPF_LINK, id as u32);
+                return -EPERM;
             }
-            _ => None,
-        };
-        let root = match target {
-            Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
-            None => ROOT_UNREADABLE,
-        };
-        // Lot 386: the record carries the attached program's tag (user
-        // space tells networkd's monitor re-attaching by it), read inside
-        // the call for the record alone. Nothing sits between the branch
-        // and the refusal — no condition, no return (the review of #594:
-        // xtask's blinding_switches pins the block literally).
-        if root != ROOT_NO {
-            emit_root_attach(attached_prog_tag(cmd, attr), arg);
-            return -EPERM;
         }
+        // Lot 280b: a cgroup/sysctl program attached to the root cgroup outside
+        // a window (the family returned above; a fresh agent before it is a
+        // protected pid may attach its judge) — refused, signed. `arg` is the
+        // attach type for both commands; the target is read only for them.
+        // Lot 290: in every mode (it held in enforce mode only).
+        if judges_attach_target(cmd, arg)
+            && !crate::inode_protect::override_active()
+            && !fresh_instance_may_load()
+        {
+            let target = match attach_target_offset(cmd) {
+                Some(off) if !attr.is_null() => {
+                    bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32).ok()
+                }
+                _ => None,
+            };
+            let root = match target {
+                Some(fd) => nn_fd_is_root_cgroup(u64::from(fd)),
+                None => ROOT_UNREADABLE,
+            };
+            // Lot 386: the record carries the attached program's tag (user
+            // space tells networkd's monitor re-attaching by it), read inside
+            // the call for the record alone. Nothing sits between the branch
+            // and the refusal — no condition, no return (the review of #594:
+            // xtask's blinding_switches pins the block literally).
+            if root != ROOT_NO {
+                emit_root_attach(attached_prog_tag(cmd, attr), arg);
+                return -EPERM;
+            }
+        }
+        let foreign_handle =
+            own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
+        // Lot 344 (the alpha's false positives): a fresh agent or watchdog —
+        // its binary by device and inode, its role vacant, its main thread, its
+        // first minute — opening the agent's pins before it is a protected pid
+        // is the family's own start (the watchdog registers itself through
+        // `PROTECTED_PIDS`' pin), let through above for that reason: not a
+        // foreign handle (NN-L-BPF-002 High at every start). The review of #554
+        // (F2): recorded on its own (Low), not silenced — a foreign program made
+        // "the watchdog by device and inode" (`PR_SET_MM_EXE_FILE`) while the
+        // role is vacant takes this path too. A second instance beside the live
+        // one, or one past its first minute, is still a foreign handle; a handle
+        // on one of the agent's LINKS (by id, or its pin) is never exempt by
+        // executable (external audit EBPF-002), nor here.
+        let fresh_instance =
+            (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();
+        let report_cmd = if fresh_instance {
+            fresh_instance_cmd()
+        } else if foreign_handle {
+            BPF_CMD_FOREIGN_GET_FD
+        } else {
+            cmd
+        };
+        // Lot 290: one record a second per loader and program TYPE (a loader
+        // of several types records each).
+        let dedup = if cmd == BPF_PROG_LOAD {
+            cmd | ((arg & 0xff) << 8)
+        } else {
+            report_cmd
+        };
+        if should_report(pid, dedup) {
+            emit_syscall(report_cmd, arg);
+        }
+        0
     }
-    let foreign_handle =
-        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;
-    // Lot 344 (the alpha's false positives): a fresh agent or watchdog —
-    // its binary by device and inode, its role vacant, its main thread, its
-    // first minute — opening the agent's pins before it is a protected pid
-    // is the family's own start (the watchdog registers itself through
-    // `PROTECTED_PIDS`' pin), let through above for that reason: not a
-    // foreign handle (NN-L-BPF-002 High at every start). The review of #554
-    // (F2): recorded on its own (Low), not silenced — a foreign program made
-    // "the watchdog by device and inode" (`PR_SET_MM_EXE_FILE`) while the
-    // role is vacant takes this path too. A second instance beside the live
-    // one, or one past its first minute, is still a foreign handle; a handle
-    // on one of the agent's LINKS (by id, or its pin) is never exempt by
-    // executable (external audit EBPF-002), nor here.
-    let fresh_instance =
-        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();
-    let report_cmd = if fresh_instance {
-        fresh_instance_cmd()
-    } else if foreign_handle {
-        BPF_CMD_FOREIGN_GET_FD
-    } else {
-        cmd
-    };
-    // Lot 290: one record a second per loader and program TYPE (a loader
-    // of several types records each).
-    let dedup = if cmd == BPF_PROG_LOAD {
-        cmd | ((arg & 0xff) << 8)
-    } else {
-        report_cmd
-    };
-    if should_report(pid, dedup) {
-        emit_syscall(report_cmd, arg);
-    }
-    0
 }
 
 /// Lot 349 (the review of #558, F1): `cmd`, a run or an attach of a held
@@ -1952,25 +2027,28 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
 /// N1).
 #[inline(always)]
 unsafe fn held_use_refused(cmd: u32, attr: *const c_void) -> bool {
-    if cmd == BPF_MAP_UPDATE_ELEM {
-        let a = attr as *const u8;
-        let (Ok(map_fd), Ok(value)) = (
-            bpf_probe_read_kernel::<u32>(a as *const u32),
-            bpf_probe_read_kernel::<u64>(a.add(MAP_UPDATE_VALUE_OFFSET) as *const u64),
-        ) else {
-            crate::fail_open::bump(fail_open_hook::BPF);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if cmd == BPF_MAP_UPDATE_ELEM {
+            let a = attr as *const u8;
+            let (Ok(map_fd), Ok(value)) = (
+                bpf_probe_read_kernel::<u32>(a as *const u32),
+                bpf_probe_read_kernel::<u64>(a.add(MAP_UPDATE_VALUE_OFFSET) as *const u64),
+            ) else {
+                crate::fail_open::bump(fail_open_hook::BPF);
+                return false;
+            };
+            return nn_held_slot(u64::from(map_fd), value) == HELD_REFUSED;
+        }
+        let Some(off) = prog_fd_offset(cmd) else {
             return false;
         };
-        return nn_held_slot(u64::from(map_fd), value) == HELD_REFUSED;
-    }
-    let Some(off) = prog_fd_offset(cmd) else {
-        return false;
-    };
-    match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
-        Ok(fd) => nn_held_use(u64::from(fd), u64::from(cmd)) == HELD_REFUSED,
-        Err(_) => {
-            crate::fail_open::bump(fail_open_hook::BPF);
-            false
+        match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+            Ok(fd) => nn_held_use(u64::from(fd), u64::from(cmd)) == HELD_REFUSED,
+            Err(_) => {
+                crate::fail_open::bump(fail_open_hook::BPF);
+                false
+            }
         }
     }
 }
@@ -2014,14 +2092,17 @@ fn emit_denial(operation: u8, object_id: u32) {
 /// decision: the refusal is the caller's, unconditional.
 #[inline(always)]
 unsafe fn attached_prog_tag(cmd: u32, attr: *const c_void) -> u64 {
-    match prog_fd_offset(cmd) {
-        Some(off) if !attr.is_null() => {
-            match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
-                Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),
-                Err(_) => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match prog_fd_offset(cmd) {
+            Some(off) if !attr.is_null() => {
+                match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+                    Ok(fd) => nn_prog_tag_of_fd(u64::from(fd)),
+                    Err(_) => 0,
+                }
             }
+            _ => 0,
         }
-        _ => 0,
     }
 }
 

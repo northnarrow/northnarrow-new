@@ -4080,11 +4080,11 @@ mod tests {
         assert_eq!(h.note(&bad(3)), RuleHealthChange::Same);
         assert_eq!(h.note(&bad(5)), RuleHealthChange::Changed);
         assert_eq!(h.note(&ok), RuleHealthChange::Recovered);
-        let gen = Applied {
+        let generation_failed = Applied {
             generation_failed: true,
             ..Applied::default()
         };
-        assert_eq!(h.note(&gen), RuleHealthChange::Degraded);
+        assert_eq!(h.note(&generation_failed), RuleHealthChange::Degraded);
     }
 
     /// External audit SNS-007: the kernel maps hold the sizes this side

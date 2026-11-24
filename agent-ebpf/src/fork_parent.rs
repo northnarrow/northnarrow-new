@@ -121,7 +121,7 @@ pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
     let own = if leader.is_null() {
         None
     } else {
-        unsafe { FORK_PARENTS.get(&(leader as u64)) }.map(|r| (r.start, r.used != 0, r.anchor))
+        unsafe { FORK_PARENTS.get(&(leader as u64)).map(|r| (r.start, r.used != 0, r.anchor)) }
     };
     let rec = ForkParent {
         parent_tgid,
@@ -223,7 +223,8 @@ fn unexecuted_of(leader: *const u8) -> Option<Unexecuted> {
     }
     let start =
         unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }.ok()?;
-    match unsafe { FORK_PARENTS.get(&(leader as u64)) } {
+    let key = leader as u64;
+    match unsafe { FORK_PARENTS.get(&key) } {
         Some(rec) if rec.used == 0 && rec.start == start && rec.parent_tgid != 0 => Some(Unexecuted {
             ppid: rec.parent_tgid,
             start,
@@ -301,7 +302,8 @@ pub fn current_lineage() -> Option<Lineage> {
     }
     let start =
         unsafe { bpf_probe_read_kernel::<u64>(leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _) }.ok()?;
-    match unsafe { FORK_PARENTS.get(&(leader as u64)) } {
+    let key = leader as u64;
+    match unsafe { FORK_PARENTS.get(&key) } {
         Some(rec) if rec.used == 0 && rec.start == start && rec.parent_tgid != 0 => Some(Lineage {
             ppid: rec.parent_tgid,
             start,

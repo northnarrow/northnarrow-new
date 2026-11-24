@@ -204,14 +204,15 @@ const PROGRAM_ATTRS: [&str; 26] = [
 ];
 
 /// The programs of the eBPF object (`agent-ebpf/src`): one aya program
-/// attribute each, and the iterators placed by `link_section = "iter/…"`.
+/// attribute each, and the iterators placed by
+/// `#[unsafe(link_section = "iter/…")]`.
 fn ebpf_programs() -> usize {
     let mut n = 0;
     for file in rs_under("agent-ebpf/src") {
         let text = fs::read_to_string(&file).expect("readable");
         for line in text.lines() {
             let l = line.trim();
-            if l.starts_with("#[link_section = \"iter/") {
+            if l.starts_with("#[unsafe(link_section = \"iter/") {
                 n += 1;
                 continue;
             }

@@ -54,7 +54,7 @@ fn an_unmount_is_judged_by_the_subtree_it_takes() {
         .find("if guard != 0 && !q.held {")
         .expect("the top's own check");
     assert!(walk < top, "the walk is folded in before the top");
-    assert!(hook.contains("if below {\n        q.held = true;"));
+    assert!(hook.contains("if below {\n            q.held = true;"));
     for (f, sig) in [
         (
             "subtree_takes",

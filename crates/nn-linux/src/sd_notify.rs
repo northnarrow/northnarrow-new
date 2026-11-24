@@ -65,7 +65,9 @@ mod tests {
     #[test]
     fn ready_is_ok_when_notify_socket_unset() {
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("NOTIFY_SOCKET");
+        // SAFETY: the tests that touch NOTIFY_SOCKET hold ENV; no other test
+        // of the crate reads it.
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
         ready().expect("must be Ok when NOTIFY_SOCKET unset");
     }
 
@@ -81,7 +83,8 @@ mod tests {
         listener
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
-        std::env::set_var("NOTIFY_SOCKET", format!("@{name}"));
+        // SAFETY: as above (ENV held).
+        unsafe { std::env::set_var("NOTIFY_SOCKET", format!("@{name}")) };
         let sent = ready();
         let mut buf = [0u8; 64];
         let got = listener.recv(&mut buf).map(|n| buf[..n].to_vec());
@@ -92,7 +95,8 @@ mod tests {
         listener.shutdown(std::net::Shutdown::Both).unwrap();
         drop(listener);
         let refused = ready();
-        std::env::remove_var("NOTIFY_SOCKET");
+        // SAFETY: as above (ENV held).
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
         sent.expect("READY=1 sent");
         assert_eq!(got.expect("a datagram"), b"READY=1\n");
         assert!(refused.is_err(), "nobody listens any more");

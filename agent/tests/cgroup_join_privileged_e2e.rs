@@ -795,7 +795,7 @@ fn a_planted_tracker_directory_is_never_adopted() {
         let _fx = Fixture::setup();
         registered()
     };
-    let gen = before
+    let generation = before
         .dir
         .to_string_lossy()
         .rsplit_once('_')
@@ -806,7 +806,7 @@ fn a_planted_tracker_directory_is_never_adopted() {
         root().display(),
         ::common::cgroup_join::PIN_DIR_INFIX,
         ::common::cgroup_join::PIN_SCHEMA,
-        gen + 1
+        generation + 1
     );
     let out = Command::new("python3")
         .args(["-I", "-c", PLANT_LRU, &planted])

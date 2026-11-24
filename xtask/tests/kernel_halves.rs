@@ -821,10 +821,10 @@ fn a_guarded_mount_is_found_by_an_ancestor_s_identity() {
         "{c}"
     );
     assert!(q.contains(
-        "#[no_mangle]\n#[inline(never)]\npub extern \"C\" fn nn_guarded_root(dentry: u64, task_root: u64) -> u64 {"
+        "#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn nn_guarded_root(dentry: u64, task_root: u64) -> u64 {"
     ));
     assert!(c.contains(
-        "let task_root =\n        crate::exec_lsm::task_root_of(aya_ebpf::helpers::bpf_get_current_task() as *const u8);"
+        "let task_root =\n            crate::exec_lsm::task_root_of(aya_ebpf::helpers::bpf_get_current_task() as *const u8);"
     ));
     let g = body(&q, "guarded_root");
     in_order(

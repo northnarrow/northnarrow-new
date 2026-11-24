@@ -433,9 +433,11 @@ pub fn ignore_manager_weakening(unit_name: &str) -> Vec<String> {
     };
     let names = from_the_manager(&own, &manager, &unit);
     for name in &names {
-        // SAFETY (edition 2021: safe): the start's one thread, before the
-        // command line is parsed or any thread exists.
-        std::env::remove_var(name);
+        // SAFETY: the start, before the command line is parsed and before
+        // any of the agent's threads: the only others are `run_bounded`'s
+        // pipe readers of the two systemctl calls above, which read their
+        // pipes and end, and never touch the environment.
+        unsafe { std::env::remove_var(name) };
         crate::boot::degradation::report(
             "weakening_env_ignored",
             &format!(

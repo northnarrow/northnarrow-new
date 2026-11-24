@@ -103,66 +103,69 @@ pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
-    // No prev-retval read — see task_kill.rs comment for rationale.
-    // Short version: kernel call_int_hook short-circuits on the first
-    // non-zero LSM verdict, so we are only invoked when prev==0, and
-    // aya 0.13's arg(N) read of the phony retval is unreliable on
-    // Ubuntu 6.8's BPF-LSM trampoline.
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // No prev-retval read — see task_kill.rs comment for rationale.
+        // Short version: kernel call_int_hook short-circuits on the first
+        // non-zero LSM verdict, so we are only invoked when prev==0, and
+        // aya 0.13's arg(N) read of the phony retval is unreliable on
+        // Ubuntu 6.8's BPF-LSM trampoline.
 
-    let target: *const c_void = ctx.arg(0);
-    if target.is_null() {
-        return 0;
-    }
-
-    // Read `child->tgid` via the probe helper. With LSM + BTF the
-    // pointer is a kernel-trusted `PTR_TO_BTF_ID`, but we use the
-    // explicit helper so the verifier accepts the read without a
-    // CO-RE relocation we don't yet emit from Rust. Offset is
-    // shared with `task_kill` and validated by userland at boot
-    // against `/sys/kernel/btf/vmlinux`.
-    let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
-    let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
-        Ok(v) => v,
-        Err(_) => {
-            // Lab PR 215: the target cannot be told; the access goes
-            // through undecided, and is counted.
-            crate::fail_open::bump(northnarrow_common::fail_open::hook::PTRACE_ACCESS_CHECK);
+        let target: *const c_void = ctx.arg(0);
+        if target.is_null() {
             return 0;
         }
-    };
 
-    // The protected processes ([`target_is_protected`]); lot 273c (the
-    // review of #490): and PID 1, in attach mode only — a
-    // debugger, `/proc/1/mem`, `process_vm_writev`. The deny hooks let PID 1
-    // write back a unit's resource values and thaw a slice on the bytes
-    // its `write(2)` carries; a PID 1 whose memory root could write would
-    // swap them between the hook's read and the kernel's. Read-mode
-    // access (`ps`, `/proc/1/environ`) is untouched, and a window lets a
-    // debugger attach.
-    let mode: u32 = ctx.arg(1);
-    let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
-    if !init_attach && !target_is_protected(target_tgid, target as *const u8) {
-        return 0;
-    }
-    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if caller_may_access(caller_tgid, init_attach) {
-        return 0;
-    }
+        // Read `child->tgid` via the probe helper. With LSM + BTF the
+        // pointer is a kernel-trusted `PTR_TO_BTF_ID`, but we use the
+        // explicit helper so the verifier accepts the read without a
+        // CO-RE relocation we don't yet emit from Rust. Offset is
+        // shared with `task_kill` and validated by userland at boot
+        // against `/sys/kernel/btf/vmlinux`.
+        let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
+        let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
+            Ok(v) => v,
+            Err(_) => {
+                // Lab PR 215: the target cannot be told; the access goes
+                // through undecided, and is counted.
+                crate::fail_open::bump(northnarrow_common::fail_open::hook::PTRACE_ACCESS_CHECK);
+                return 0;
+            }
+        };
 
-    // Evidence: an ATTACH-mode access (debugger attach, /proc/<pid>/mem,
-    // process_vm_readv/writev) at each attempt (the per-caller dedup); the
-    // re-check of #567 (b): a READ-mode one (`nsenter` or `systemctl bind`
-    // opening /proc/<pid>/ns/mnt, `lsof`, journald's /proc/<pid>/exe) once a
-    // minute per caller and target. NOAUDIT asks LSMs explicitly not to
-    // report (`ps` reading /proc/<pid>/stat): a silent denial.
-    if mode & PTRACE_MODE_NOAUDIT == 0 {
-        if mode & PTRACE_MODE_ATTACH != 0 {
-            crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
-        } else {
-            crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);
+        // The protected processes ([`target_is_protected`]); lot 273c (the
+        // review of #490): and PID 1, in attach mode only — a
+        // debugger, `/proc/1/mem`, `process_vm_writev`. The deny hooks let PID 1
+        // write back a unit's resource values and thaw a slice on the bytes
+        // its `write(2)` carries; a PID 1 whose memory root could write would
+        // swap them between the hook's read and the kernel's. Read-mode
+        // access (`ps`, `/proc/1/environ`) is untouched, and a window lets a
+        // debugger attach.
+        let mode: u32 = ctx.arg(1);
+        let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;
+        if !init_attach && !target_is_protected(target_tgid, target as *const u8) {
+            return 0;
         }
+        let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if caller_may_access(caller_tgid, init_attach) {
+            return 0;
+        }
+
+        // Evidence: an ATTACH-mode access (debugger attach, /proc/<pid>/mem,
+        // process_vm_readv/writev) at each attempt (the per-caller dedup); the
+        // re-check of #567 (b): a READ-mode one (`nsenter` or `systemctl bind`
+        // opening /proc/<pid>/ns/mnt, `lsof`, journald's /proc/<pid>/exe) once a
+        // minute per caller and target. NOAUDIT asks LSMs explicitly not to
+        // report (`ps` reading /proc/<pid>/stat): a silent denial.
+        if mode & PTRACE_MODE_NOAUDIT == 0 {
+            if mode & PTRACE_MODE_ATTACH != 0 {
+                crate::inode_protect::emit_task_denial(FS_OP_PTRACE, mode as u64, target_tgid);
+            } else {
+                crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);
+            }
+        }
+        -EPERM
     }
-    -EPERM
 }
 
 /// Whether `target` (its tgid `target_tgid`) is one of the processes the
@@ -173,14 +176,17 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
 /// processes the hook does.
 #[inline(always)]
 pub(crate) unsafe fn target_is_protected(target_tgid: u32, target: *const u8) -> bool {
-    // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
-    // hash map (see task_kill.rs for the rationale on the Tappa 7
-    // task 6 single-PID → hash-set migration).
-    // External audit EBPF-002: a process running the agent's or the
-    // watchdog's binary is protected before it registers (its first moments
-    // are when it may still take the agent's maps).
-    // R14a: a worker is a protected target too (and runs the agent's binary).
-    crate::task_kill::is_protected_pid(target_tgid) || crate::bpf_defense::task_runs_own_binary(target)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
+        // hash map (see task_kill.rs for the rationale on the Tappa 7
+        // task 6 single-PID → hash-set migration).
+        // External audit EBPF-002: a process running the agent's or the
+        // watchdog's binary is protected before it registers (its first moments
+        // are when it may still take the agent's maps).
+        // R14a: a worker is a protected target too (and runs the agent's binary).
+        crate::task_kill::is_protected_pid(target_tgid) || crate::bpf_defense::task_runs_own_binary(target)
+    }
 }
 
 /// Whether the caller `caller_tgid` may access a protected process anyway

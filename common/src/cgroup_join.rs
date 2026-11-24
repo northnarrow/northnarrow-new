@@ -113,8 +113,8 @@ pub const fn epoch_promoted(epoch: u64, request: u64) -> bool {
 /// `/sys/fs/bpf/northnarrow-cgroup-join-v1_0`. A sibling of the root, so a
 /// purge of the root leaves it.
 #[cfg(feature = "std")]
-pub fn pin_dir(root: &str, gen: u32) -> String {
-    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}_{gen}")
+pub fn pin_dir(root: &str, generation: u32) -> String {
+    format!("{root}{PIN_DIR_INFIX}{PIN_SCHEMA}_{generation}")
 }
 
 /// `name` (a file name in the root's parent) as a tracker pin directory of
@@ -128,8 +128,8 @@ pub fn parse_pin_dir(root_name: &str, name: &str) -> Option<(u32, Option<u32>)> 
             .then(|| v.parse::<u32>().ok())
             .flatten()
     };
-    if let Some((schema, gen)) = rest.split_once('_') {
-        return Some((num(schema)?, Some(num(gen)?)));
+    if let Some((schema, generation)) = rest.split_once('_') {
+        return Some((num(schema)?, Some(num(generation)?)));
     }
     let (schema, size) = rest.split_once('-')?;
     num(size)?;

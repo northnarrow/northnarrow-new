@@ -50,13 +50,13 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
     in_order(
         h,
         &[
-            "if !observed(cmd) {\n        return 0;\n    }",
+            "if !observed(cmd) {\n            return 0;\n        }",
             "if caller_is_exempt() {",
-            "if cmd == BPF_PROG_LOAD {\n            crate::bpf_census::mark_load();\n        }\n        return 0;\n    }",
+            "if cmd == BPF_PROG_LOAD {\n                crate::bpf_census::mark_load();\n            }\n            return 0;\n        }",
             "| BPF_PROG_LOAD",
             "crate::fail_open::bump(fail_open_hook::BPF);",
-            "if cmd == BPF_PROG_LOAD {\n        if denied_by_default(arg)\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
-            "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {\n                emit_denial(FS_OP_BPF_PROG_TYPE, arg);\n                return -EPERM;\n            }",
+            "if cmd == BPF_PROG_LOAD {\n            if denied_by_default(arg)\n                && !crate::inode_protect::override_active()\n                && !fresh_instance_may_load()\n            {",
+            "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {\n                    emit_denial(FS_OP_BPF_PROG_TYPE, arg);\n                    return -EPERM;\n                }",
             "emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);",
             "crate::bpf_census::mark_load();",
             "should_report(pid, dedup)",
@@ -64,7 +64,7 @@ fn the_bpf_hook_refuses_the_rootkit_grade_types_in_every_mode() {
     )
     .unwrap();
     let start = h
-        .find("if cmd == BPF_PROG_LOAD {\n        if denied_by_default(arg)")
+        .find("if cmd == BPF_PROG_LOAD {\n            if denied_by_default(arg)")
         .expect("the load's refusal");
     let load = &h[start..start + h[start..].find("crate::bpf_census::mark_load();").unwrap()];
     assert!(
@@ -113,11 +113,11 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
             "let own_prog_handle = cmd == BPF_PROG_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_PROG);",
             "let own_link_handle = cmd == BPF_LINK_GET_FD_BY_ID && is_own_kind(arg, OWN_KIND_LINK);",
             "Ok(p) => nn_obj_get_own_link(p),",
-            "if pin == PIN_UNREADABLE {\n        crate::fail_open::bump(fail_open_hook::BPF);\n    }",
+            "if pin == PIN_UNREADABLE {\n            crate::fail_open::bump(fail_open_hook::BPF);\n        }",
             "let own_dir_pin = pin == PIN_UNDER_DIRS;",
-            "if (own_link_handle || own_link_pin) && enforce() {\n        emit_denial(FS_OP_BPF_LINK,",
-            "if (own_map_handle || own_prog_handle || own_dir_pin)\n        && enforce()\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
-            "emit_denial_kind(FS_OP_BPF_HANDLE, kind, if kind == 0 { 0 } else { arg });\n        return -EPERM;",
+            "if (own_link_handle || own_link_pin) && enforce() {\n            emit_denial(FS_OP_BPF_LINK,",
+            "if (own_map_handle || own_prog_handle || own_dir_pin)\n            && enforce()\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
+            "emit_denial_kind(FS_OP_BPF_HANDLE, kind, if kind == 0 { 0 } else { arg });\n            return -EPERM;",
         ],
     )
     .unwrap();
@@ -127,10 +127,10 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
         &[
             "let n = match bpf_probe_read_user_str_bytes(user_ptr as *const u8, &mut *buf) {",
             "let mut under = n >= PIN_DIRS_PREFIX.len();",
-            "if (*buf)[k] != PIN_DIRS_PREFIX[k] {\n            under = false;",
+            "if (*buf)[k] != PIN_DIRS_PREFIX[k] {\n                under = false;",
             "let other: u64 = if under { PIN_UNDER_DIRS } else { 0 };",
             "let m = match bpf_probe_read_user_str_bytes(win_ptr as *const u8, win) {",
-            "Some(kind) if *kind == OWN_KIND_LINK => PIN_OWN,\n        _ => other,",
+            "Some(kind) if *kind == OWN_KIND_LINK => PIN_OWN,\n            _ => other,",
         ],
     )
     .unwrap();
@@ -138,11 +138,11 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
         body(&c, "try_bpf_map_guard"),
         &[
             "let write = fmode & FMODE_WRITE != 0;",
-            "if !write && (!enforce() || crate::inode_protect::override_active()) {\n        return 0;\n    }",
+            "if !write && (!enforce() || crate::inode_protect::override_active()) {\n            return 0;\n        }",
             "if !is_own_kind(id, OWN_KIND_MAP) || caller_is_exempt() || fresh_instance_may_load() {",
             "if !write {",
-            "emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_MAP, id);\n        return -EPERM;",
-            "if enforce() {\n        emit_denial(FS_OP_BPF_MAP, id);\n        return -EPERM;\n    }",
+            "emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_MAP, id);\n            return -EPERM;",
+            "if enforce() {\n            emit_denial(FS_OP_BPF_MAP, id);\n            return -EPERM;\n        }",
         ],
     )
     .unwrap();
@@ -151,9 +151,9 @@ fn the_agent_s_maps_and_programs_are_off_limits_outside_a_window() {
         &[
             "let loading = crate::bpf_census::take_load_mark();",
             "let id = match prog_id_of(prog) {",
-            "if loading {\n        crate::bpf_census::mark_seen(id, prog);\n        return 0;\n    }",
+            "if loading {\n            crate::bpf_census::mark_seen(id, prog);\n            return 0;\n        }",
             "if !is_own_kind(id, OWN_KIND_PROG) || caller_is_exempt() || fresh_instance_may_load() {",
-            "if enforce() && !crate::inode_protect::override_active() {\n        emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_PROG, id);\n        return -EPERM;",
+            "if enforce() && !crate::inode_protect::override_active() {\n            emit_denial_kind(FS_OP_BPF_HANDLE, OWN_KIND_PROG, id);\n            return -EPERM;",
         ],
     )
     .unwrap();
@@ -292,21 +292,21 @@ fn a_seen_load_is_marked_and_the_iterators_write_whole_records() {
     )
     .unwrap();
     assert!(k.contains(
-        "#[link_section = \"iter/bpf_prog\"]\npub fn census_progs(ctx: *mut c_void) -> i32 {"
+        "#[unsafe(link_section = \"iter/bpf_prog\")]\npub fn census_progs(ctx: *mut c_void) -> i32 {"
     ));
     assert!(k.contains(
-        "#[link_section = \"iter/bpf_link\"]\npub fn census_links(ctx: *mut c_void) -> i32 {"
+        "#[unsafe(link_section = \"iter/bpf_link\")]\npub fn census_links(ctx: *mut c_void) -> i32 {"
     ));
     in_order(
         body(&k, "try_iter_progs"),
         &[
             "let meta = *(ctx as *const *const *mut c_void);",
             "let prog = *(ctx as *const u64).add(1);",
-            "if prog == 0 || meta.is_null() {\n        return;\n    }",
+            "if prog == 0 || meta.is_null() {\n            return;\n        }",
             "let seq = *meta;",
             "crate::zero::zero(rec);",
             "(*rec).id = id;",
-            "if let Some(o) = off_opt!(BPF_PROG_AUX_LOAD_TIME_OFFSET) {\n        (*rec).load_time = rd_u64(aux + o as u64).unwrap_or(0);",
+            "if let Some(o) = off_opt!(BPF_PROG_AUX_LOAD_TIME_OFFSET) {\n            (*rec).load_time = rd_u64(aux + o as u64).unwrap_or(0);",
             "core::mem::size_of::<ProgRecord>() as u32,",
         ],
     )
@@ -478,7 +478,7 @@ fn the_own_ids_map_holds_every_object_of_the_agent() {
                     "#[fexit",
                     "#[uprobe",
                     "#[cgroup_sysctl",
-                    "#[link_section = \"",
+                    "#[unsafe(link_section = \"",
                 ]
                 .iter()
                 .any(|p| l.starts_with(p))
@@ -521,13 +521,13 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
         h,
         &[
             "if (own_link_handle || own_link_pin) && enforce() {",
-            "&& !fresh_instance_may_load()\n    {\n        let kind",
+            "&& !fresh_instance_may_load()\n        {\n            let kind",
             "if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {",
-            "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
-            "let fresh_instance =\n        (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
+            "let foreign_handle =\n            own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
+            "let fresh_instance =\n            (own_map_handle || own_prog_handle || own_dir_pin) && fresh_instance_may_load();",
             // lot 370 (F10-4): the start's record, or a vacated role's
-            "let report_cmd = if fresh_instance {\n        fresh_instance_cmd()\n    } else if foreign_handle {\n        BPF_CMD_FOREIGN_GET_FD",
-            "if should_report(pid, dedup) {\n        emit_syscall(report_cmd, arg);",
+            "let report_cmd = if fresh_instance {\n            fresh_instance_cmd()\n        } else if foreign_handle {\n            BPF_CMD_FOREIGN_GET_FD",
+            "if should_report(pid, dedup) {\n            emit_syscall(report_cmd, arg);",
         ],
     )
     .unwrap();
@@ -563,7 +563,7 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
     in_order(
         sftr,
         &[
-            "ptgid == 1\n        && nn_in_role_unit(task as u64, u64::from(slot)) == 1\n        && crate::cgroup_join::caller_marks_clean()",
+            "ptgid == 1\n            && nn_in_role_unit(task as u64, u64::from(slot)) == 1\n            && crate::cgroup_join::caller_marks_clean()",
         ],
     )
     .unwrap();
@@ -581,16 +581,16 @@ fn a_fresh_instance_s_own_start_is_not_reported_as_a_foreign_handle() {
             "off_opt!(TASK_STRUCT_CGROUPS_OFFSET)",
             "off_opt!(CSS_SET_DFL_CGRP_OFFSET)",
             "off_opt!(CGROUP_KN_OFFSET)",
-            "else {\n        return false;\n    };",
+            "else {\n            return false;\n        };",
             "let Some(cset) = read_ptr(task, o_cgroups) else {",
             "let Some(cgrp) = read_ptr(cset, o_dfl) else {",
             "let Some(kn) = read_ptr(cgrp, o_kn) else {",
             "role_unit_words(0)",
             "role_unit_words(1)",
-            "if !kn_named(kn, o_name, &unit) {\n        return false;\n    }",
+            "if !kn_named(kn, o_name, &unit) {\n            return false;\n        }",
             "let Some(slice) = read_ptr(kn, o_parent) else {",
             "kn_name_words(OUR_SLICE)",
-            "if !kn_named(slice, o_name, &SLICE) {\n        return false;\n    }",
+            "if !kn_named(slice, o_name, &SLICE) {\n            return false;\n        }",
             "let Some(root) = read_ptr(slice, o_parent) else {",
             "Ok(p) if p.is_null()",
         ],
@@ -695,8 +695,8 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         &[
             "if nn_loader_opted_out(u64::from(arg)) != LOADER_OPTED_OUT {",
             "(attr as *const u8).add(PROG_LOAD_ATTACH_TYPE_OFFSET) as *const u32,",
-            "Ok(eat) => opt_out_refuses_attach(eat),\n                Err(_) => true,",
-            "if refused_attach {\n                emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);\n                return -EPERM;",
+            "Ok(eat) => opt_out_refuses_attach(eat),\n                    Err(_) => true,",
+            "if refused_attach {\n                    emit_denial_kind(FS_OP_BPF_PROG_TYPE, CONTENT_FMOD_RET, arg);\n                    return -EPERM;",
             "emit_denial(FS_OP_BPF_PROG_OPT_OUT, arg);",
         ],
     )
@@ -704,9 +704,9 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&c, "content_refusal"),
         &[
-            "let kfuncs_only = !denied_by_default(ty);\n    if (kfuncs_only && !every_type)\n        || caller_is_exempt()\n        || crate::inode_protect::override_active()\n        || fresh_instance_may_load()",
-            "let Some(addr) = ptr_scalar(prog) else {\n        return Some((CONTENT_UNJUDGED, ty));",
-            "match nn_prog_forbidden_call(addr, kfuncs_only as u64) {\n        SCAN_CLEAN => None,",
+            "let kfuncs_only = !denied_by_default(ty);\n        if (kfuncs_only && !every_type)\n            || caller_is_exempt()\n            || crate::inode_protect::override_active()\n            || fresh_instance_may_load()",
+            "let Some(addr) = ptr_scalar(prog) else {\n            return Some((CONTENT_UNJUDGED, ty));",
+            "match nn_prog_forbidden_call(addr, kfuncs_only as u64) {\n            SCAN_CLEAN => None,",
             "_ => Some((CONTENT_UNJUDGED, ty)),",
         ],
     )
@@ -716,7 +716,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "try_bpf_prog_load_guard"),
         &[
             "if content_stage() != CONTENT_STAGE_LOAD {",
-            "if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {\n        emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n        return -EPERM;",
+            "if let Some((why, ty)) = content_refusal(prog, every_type_armed()) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
         ],
     )
     .unwrap();
@@ -725,9 +725,9 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
     in_order(
         body(&c, "try_bpf_prog_guard"),
         &[
-            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n        if let Some((why, ty)) = content_refusal(prog, false) {\n            emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n            return -EPERM;",
-            "if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {\n        if let Some(addr) = ptr_scalar(prog) {\n            nn_calibrate(addr);",
-            "if loading {\n        crate::bpf_census::mark_seen(id, prog);",
+            "if content_stage() == CONTENT_STAGE_HANDLE && !is_own_kind(id, OWN_KIND_PROG) {\n            if let Some((why, ty)) = content_refusal(prog, false) {\n                emit_denial_kind(FS_OP_BPF_PROG_TYPE, why, ty);\n                return -EPERM;",
+            "if loading && calibration_armed() && (caller_is_exempt() || fresh_instance_may_load()) {\n            if let Some(addr) = ptr_scalar(prog) {\n                nn_calibrate(addr);",
+            "if loading {\n            crate::bpf_census::mark_seen(id, prog);",
         ],
     )
     .unwrap();
@@ -757,7 +757,7 @@ fn an_allowed_loader_cannot_load_what_kills_or_blinds_the_agent() {
         body(&c, "nn_scan_chunk"),
         &[
             "Err(_) => return SCAN_UNJUDGED,",
-            "if let Some(slot) = unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {\n            if kfuncs_only == 0 || judged_for_every_type(*slot) {\n                return *slot as u64;",
+            "match unsafe { PROG_CONTENT_KEYS.get(&call_key(insn)) } {\n            Some(slot) => {\n                if kfuncs_only == 0 || judged_for_every_type(*slot) {\n                    return *slot as u64;",
         ],
     )
     .unwrap();
@@ -1267,7 +1267,7 @@ fn an_inode_of_one_role_is_changed_by_that_role_alone() {
         v,
         &[
             "let flags = match PROTECTED_INODES.get(&key) {",
-            "if override_active() {\n        return None;\n    }",
+            "if override_active() {\n            return None;\n        }",
             "if crate::task_kill::is_exempt_pid(caller_tgid) {",
             "match ROLE_WRITE_INODES.get(&key) {",
             "Some(role) if *role != crate::bpf_defense::caller_role() => {}",

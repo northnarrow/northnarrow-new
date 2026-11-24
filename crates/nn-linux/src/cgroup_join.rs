@@ -1313,7 +1313,7 @@ fn next_dir(root: &Path, dir: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let gen = |p: &Path| {
+    let generation_of = |p: &Path| {
         p.file_name()
             .and_then(|n| parse_pin_dir(&root_name, &n.to_string_lossy()))
             .and_then(|(_, g)| g)
@@ -1322,7 +1322,7 @@ fn next_dir(root: &Path, dir: &Path) -> PathBuf {
         .iter()
         .map(PathBuf::as_path)
         .chain(std::iter::once(dir))
-        .filter_map(gen)
+        .filter_map(generation_of)
         .max()
         .unwrap_or(0);
     PathBuf::from(common::cgroup_join::pin_dir(

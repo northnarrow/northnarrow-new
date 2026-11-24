@@ -233,7 +233,7 @@ impl JournalIndex {
 
     /// The entries filed in `f`'s slot: `f`'s, and those of files that
     /// had its inode number before it.
-    fn in_slot(&self, f: &FileId) -> impl Iterator<Item = &Entry> {
+    fn in_slot(&self, f: &FileId) -> impl Iterator<Item = &Entry> + use<'_> {
         self.by_inode
             .get(&f.slot())
             .into_iter()

@@ -194,36 +194,51 @@ fn count(slot: u32) {
 
 #[inline(always)]
 unsafe fn rd_u64(addr: u64) -> Option<u64> {
-    bpf_probe_read_kernel::<u64>(addr as *const u64).ok()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        bpf_probe_read_kernel::<u64>(addr as *const u64).ok()
+    }
 }
 
 #[inline(always)]
 unsafe fn rd_u32(addr: u64) -> Option<u32> {
-    bpf_probe_read_kernel::<u32>(addr as *const u32).ok()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        bpf_probe_read_kernel::<u32>(addr as *const u32).ok()
+    }
 }
 
 #[inline(always)]
 unsafe fn tgid_of(task: u64) -> Option<u32> {
-    rd_u32(task + off!(TASK_STRUCT_TGID_OFFSET) as u64)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        rd_u32(task + off!(TASK_STRUCT_TGID_OFFSET) as u64)
+    }
 }
 
 /// The start time of `task`'s thread-group leader.
 #[inline(always)]
 unsafe fn leader_start(task: u64) -> Option<u64> {
-    let leader = rd_u64(task + off!(TASK_STRUCT_GROUP_LEADER_OFFSET) as u64)?;
-    if leader == 0 {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let leader = rd_u64(task + off!(TASK_STRUCT_GROUP_LEADER_OFFSET) as u64)?;
+        if leader == 0 {
+            return None;
+        }
+        rd_u64(leader + off!(TASK_STRUCT_START_TIME_OFFSET) as u64)
     }
-    rd_u64(leader + off!(TASK_STRUCT_START_TIME_OFFSET) as u64)
 }
 
 #[inline(always)]
 unsafe fn exe_file(task: u64) -> Option<u64> {
-    let mm = rd_u64(task + off!(TASK_STRUCT_MM_OFFSET) as u64)?;
-    if mm == 0 {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mm = rd_u64(task + off!(TASK_STRUCT_MM_OFFSET) as u64)?;
+        if mm == 0 {
+            return None;
+        }
+        rd_u64(mm + off!(MM_STRUCT_EXE_FILE_OFFSET) as u64).filter(|f| *f != 0)
     }
-    rd_u64(mm + off!(MM_STRUCT_EXE_FILE_OFFSET) as u64).filter(|f| *f != 0)
 }
 
 #[inline(always)]
@@ -313,13 +328,16 @@ fn found(tgid: u32) {
 /// unread is before (fail closed).
 #[inline(always)]
 unsafe fn before_epoch(epoch: u64, parent: u64, ptgid: u32) -> bool {
-    if epoch == 0 || ptgid == 1 || family(ptgid) {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if epoch == 0 || ptgid == 1 || family(ptgid) {
+            return false;
+        }
+        // A start unread is 0, before any epoch. Not a `match` on the Option:
+        // LLVM made it a compare of the start register on the unread path too,
+        // which the 5.15 verifier refused (`R1 !read_ok`: lot 277's lab).
+        leader_start(parent).unwrap_or(0) < epoch
     }
-    // A start unread is 0, before any epoch. Not a `match` on the Option:
-    // LLVM made it a compare of the start register on the unread path too,
-    // which the 5.15 verifier refused (`R1 !read_ok`: lot 277's lab).
-    leader_start(parent).unwrap_or(0) < epoch
 }
 
 /// Lot 281 (#494's N2): the marks' last reset — the agent's request
@@ -328,32 +346,38 @@ unsafe fn before_epoch(epoch: u64, parent: u64, ptgid: u32) -> bool {
 /// the monotonic slot never names an epoch the other does not). 0: none.
 #[inline(always)]
 unsafe fn epoch_now() -> u64 {
-    let Some(e) = CGROUP_JOIN_EPOCH.get_ptr_mut(0) else {
-        return 0;
-    };
-    let request = match CGROUP_JOIN_EPOCH_RT.get(0) {
-        Some(r) => *r,
-        None => 0,
-    };
-    if epoch_promoted(*e, request) {
-        if let (Some(b), Some(rb)) = (
-            CGROUP_JOIN_EPOCH.get_ptr_mut(1),
-            CGROUP_JOIN_EPOCH_RT.get(1),
-        ) {
-            *b = *rb;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(e) = CGROUP_JOIN_EPOCH.get_ptr_mut(0) else {
+            return 0;
+        };
+        let request = match CGROUP_JOIN_EPOCH_RT.get(0) {
+            Some(r) => *r,
+            None => 0,
+        };
+        if epoch_promoted(*e, request) {
+            if let (Some(b), Some(rb)) = (
+                CGROUP_JOIN_EPOCH.get_ptr_mut(1),
+                CGROUP_JOIN_EPOCH_RT.get(1),
+            ) {
+                *b = *rb;
+            }
+            *e = request;
         }
-        *e = request;
+        *e
     }
-    *e
 }
 
 /// The `how` of thread group `tgid`'s mark, when it is this process's
 /// (leader start `start`) — 0 for none.
 #[inline(always)]
 unsafe fn how_now(tgid: u32, start: u64) -> u8 {
-    match CGROUP_JOINED.get(&tgid) {
-        Some(rec) if rec[0] == start => unpack(rec[1]).0,
-        _ => 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        match CGROUP_JOINED.get(&tgid) {
+            Some(rec) if rec[0] == start => unpack(rec[1]).0,
+            _ => 0,
+        }
     }
 }
 
@@ -384,22 +408,25 @@ pub fn cgroup_join_src(ctx: FExitContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_src(ctx: &FExitContext) {
-    let Some(slot) = CGROUP_JOIN_SRC.get_ptr_mut(0) else {
-        return;
-    };
-    // SAFETY: the one slot, written under `cgroup_mutex`.
-    *slot = [0, 0];
-    let args = ctx.as_ptr() as *const u64;
-    let Ok(task) = bpf_probe_read_kernel::<u64>(args.add(CGROUP_MOVE_RET_ARG)) else {
-        return;
-    };
-    if task == 0 || task >= 0u64.wrapping_sub(MAX_ERRNO) {
-        return;
-    }
-    // The review of #494, B1: the writing thread itself, not another thread
-    // of its process (its own cgroup is not the moved task's then).
-    if task == bpf_get_current_task() {
-        *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(slot) = CGROUP_JOIN_SRC.get_ptr_mut(0) else {
+            return;
+        };
+        // SAFETY: the one slot, written under `cgroup_mutex`.
+        *slot = [0, 0];
+        let args = ctx.as_ptr() as *const u64;
+        let Ok(task) = bpf_probe_read_kernel::<u64>(args.add(CGROUP_MOVE_RET_ARG)) else {
+            return;
+        };
+        if task == 0 || task >= 0u64.wrapping_sub(MAX_ERRNO) {
+            return;
+        }
+        // The review of #494, B1: the writing thread itself, not another thread
+        // of its process (its own cgroup is not the moved task's then).
+        if task == bpf_get_current_task() {
+            *slot = [bpf_get_current_pid_tgid(), generated::bpf_get_current_cgroup_id()];
+        }
     }
 }
 
@@ -415,72 +442,75 @@ pub fn cgroup_join_mark(ctx: BtfTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_mark(ctx: &BtfTracePointContext) {
-    let path: u64 = ctx.arg(1);
-    let task: u64 = ctx.arg(2);
-    if task == 0 {
-        return;
-    }
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let writer = (pid_tgid >> 32) as u32;
-    if family(writer) {
-        return;
-    }
-    let Some(moved) = tgid_of(task) else {
-        // The re-review of #494, N-b: a tgid unread is known only for the
-        // writing thread itself, which is then not known; another task's
-        // is counted (a read of a live task's own field does not fail).
-        if task == bpf_get_current_task() {
-            lose(writer);
-        } else {
-            count(STAT_LOST);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let path: u64 = ctx.arg(1);
+        let task: u64 = ctx.arg(2);
+        if task == 0 {
+            return;
         }
-        return;
-    };
-    let Some(start) = leader_start(task) else {
-        lose(moved);
-        return;
-    };
-    // The review of #494, B1: no move only for the writing thread moving
-    // itself to where it was (`common::cgroup_join::noop`).
-    let (src_this_write, src_id) = match CGROUP_JOIN_SRC.get(0) {
-        Some(src) => (src[0] == pid_tgid, src[1]),
-        None => (false, 0),
-    };
-    let unchanged = noop(
-        task == bpf_get_current_task(),
-        src_this_write,
-        src_id,
-        generated::bpf_get_current_cgroup_id(),
-    );
-    let parent = rd_u64(task + off!(TASK_STRUCT_REAL_PARENT_OFFSET) as u64).unwrap_or(0);
-    let parent_tgid = if parent == 0 {
-        0
-    } else {
-        tgid_of(parent).unwrap_or(0)
-    };
-    // Still its parent's image: the same `struct file` in both `mm`s (a
-    // fork shares it; an exec, or PR_SET_MM_EXE_FILE, makes another).
-    let pre_exec = parent_tgid == 1
-        && match (exe_file(task), exe_file(parent)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let writer = (pid_tgid >> 32) as u32;
+        if family(writer) {
+            return;
+        }
+        let Some(moved) = tgid_of(task) else {
+            // The re-review of #494, N-b: a tgid unread is known only for the
+            // writing thread itself, which is then not known; another task's
+            // is counted (a read of a live task's own field does not fail).
+            if task == bpf_get_current_task() {
+                lose(writer);
+            } else {
+                count(STAT_LOST);
+            }
+            return;
         };
-    match placement(writer, moved, parent_tgid, pre_exec, unchanged) {
-        Move::Placement | Move::NoOp => return,
-        Move::Mark => {}
-    }
-    if mark(moved, start, HOW_MOVED, writer) {
-        count(STAT_ROOTS);
-    }
-    if let Some(hash) = exempt_destination(path) {
-        count(STAT_INTO_EXEMPT);
-        crate::inode_protect::emit_limited(
-            FS_OP_CGROUP_JOIN,
-            InodeKey {
-                dev: hash,
-                ino: u64::from(moved),
-            },
+        let Some(start) = leader_start(task) else {
+            lose(moved);
+            return;
+        };
+        // The review of #494, B1: no move only for the writing thread moving
+        // itself to where it was (`common::cgroup_join::noop`).
+        let (src_this_write, src_id) = match CGROUP_JOIN_SRC.get(0) {
+            Some(src) => (src[0] == pid_tgid, src[1]),
+            None => (false, 0),
+        };
+        let unchanged = noop(
+            task == bpf_get_current_task(),
+            src_this_write,
+            src_id,
+            generated::bpf_get_current_cgroup_id(),
         );
+        let parent = rd_u64(task + off!(TASK_STRUCT_REAL_PARENT_OFFSET) as u64).unwrap_or(0);
+        let parent_tgid = if parent == 0 {
+            0
+        } else {
+            tgid_of(parent).unwrap_or(0)
+        };
+        // Still its parent's image: the same `struct file` in both `mm`s (a
+        // fork shares it; an exec, or PR_SET_MM_EXE_FILE, makes another).
+        let pre_exec = parent_tgid == 1
+            && match (exe_file(task), exe_file(parent)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+        match placement(writer, moved, parent_tgid, pre_exec, unchanged) {
+            Move::Placement | Move::NoOp => return,
+            Move::Mark => {}
+        }
+        if mark(moved, start, HOW_MOVED, writer) {
+            count(STAT_ROOTS);
+        }
+        if let Some(hash) = exempt_destination(path) {
+            count(STAT_INTO_EXEMPT);
+            crate::inode_protect::emit_limited(
+                FS_OP_CGROUP_JOIN,
+                InodeKey {
+                    dev: hash,
+                    ino: u64::from(moved),
+                },
+            );
+        }
     }
 }
 
@@ -494,56 +524,62 @@ unsafe fn try_mark(ctx: &BtfTracePointContext) {
 /// took it past a million instructions).
 #[inline(always)]
 unsafe fn exempt_destination(path: u64) -> Option<u64> {
-    let any = CGROUP_EXEMPT_NAMES.get(&0).is_some();
-    if !any || path == 0 {
-        return None;
-    }
-    let buf = CGROUP_JOIN_PATH.get_ptr_mut(0)?;
-    let n = generated::bpf_probe_read_kernel_str(
-        buf as *mut _,
-        PATH_READ as u32,
-        path as *const _,
-    );
-    // The review of #494, D1: a full buffer is a cut path (the helper
-    // writes its NUL in the last byte).
-    match path_read(n) {
-        PathRead::Unread | PathRead::Cut => return Some(0),
-        PathRead::Whole => {}
-    }
-    let mut full = FNV_OFFSET;
-    let mut comp = FNV_OFFSET;
-    let mut hit = 0u64;
-    for i in 0..PATH_READ {
-        // SAFETY: `i` < PATH_READ, the buffer's length.
-        let b = (*buf)[i];
-        if b == 0 {
-            break;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let any = CGROUP_EXEMPT_NAMES.get(&0).is_some();
+        if !any || path == 0 {
+            return None;
         }
-        full = fnv_step(full, b);
-        if b == b'/' {
-            if is_name(comp, NAME_UNIT) {
-                hit = comp;
+        let buf = CGROUP_JOIN_PATH.get_ptr_mut(0)?;
+        let n = generated::bpf_probe_read_kernel_str(
+            buf as *mut _,
+            PATH_READ as u32,
+            path as *const _,
+        );
+        // The review of #494, D1: a full buffer is a cut path (the helper
+        // writes its NUL in the last byte).
+        match path_read(n) {
+            PathRead::Unread | PathRead::Cut => return Some(0),
+            PathRead::Whole => {}
+        }
+        let mut full = FNV_OFFSET;
+        let mut comp = FNV_OFFSET;
+        let mut hit = 0u64;
+        for i in 0..PATH_READ {
+            // SAFETY: `i` < PATH_READ, the buffer's length.
+            let b = (*buf)[i];
+            if b == 0 {
+                break;
             }
-            comp = FNV_OFFSET;
-        } else {
-            comp = fnv_step(comp, b);
+            full = fnv_step(full, b);
+            if b == b'/' {
+                if is_name(comp, NAME_UNIT) {
+                    hit = comp;
+                }
+                comp = FNV_OFFSET;
+            } else {
+                comp = fnv_step(comp, b);
+            }
         }
+        if is_name(comp, NAME_UNIT) {
+            hit = comp;
+        }
+        if is_name(full, NAME_CGROUP) {
+            return Some(full);
+        }
+        (hit != 0).then_some(hit)
     }
-    if is_name(comp, NAME_UNIT) {
-        hit = comp;
-    }
-    if is_name(full, NAME_CGROUP) {
-        return Some(full);
-    }
-    (hit != 0).then_some(hit)
 }
 
 /// `hash` is a name of the policy's of `kind`.
 #[inline(always)]
 unsafe fn is_name(hash: u64, kind: u8) -> bool {
-    CGROUP_EXEMPT_NAMES
-        .get(&hash)
-        .is_some_and(|k| *k & kind != 0)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        CGROUP_EXEMPT_NAMES
+            .get(&hash)
+            .is_some_and(|k| *k & kind != 0)
+    }
 }
 
 /// `void cgroup_post_fork(struct task_struct *child, struct
@@ -565,51 +601,54 @@ pub fn cgroup_join_born(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_born(ctx: &FEntryContext) {
-    let child: u64 = ctx.arg(0);
-    let kargs: u64 = ctx.arg(1);
-    if child == 0 {
-        return;
-    }
-    let forker = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let Some(tgid) = tgid_of(child) else {
-        count(STAT_LOST);
-        return;
-    };
-    // A thread (`CLONE_THREAD`, a threaded cgroup's too) is its process's:
-    // not a new thread group.
-    if tgid == forker {
-        return;
-    }
-    // Lot 280b: seen by the fentry — the fork's tracepoint checks it. An
-    // entry the map cannot take makes the tracepoint count this birth as
-    // unseen: more "not known", never less.
-    let _ = CGROUP_JOIN_BORN.insert(&tgid, &1, 0);
-    if CGROUP_JOINED.get(&tgid).is_some() {
-        let _ = CGROUP_JOINED.remove(&tgid);
-    }
-    found(tgid);
-    // Fail closed: a start whose flags cannot be read may be one into a
-    // cgroup.
-    if kargs == 0 {
-        lose(tgid);
-        return;
-    }
-    let Some(flags) = rd_u64(kargs + off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {
-        lose(tgid);
-        return;
-    };
-    if flags & CLONE_INTO_CGROUP == 0 {
-        return;
-    }
-    if forker == 1 || family(forker) {
-        return;
-    }
-    let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
-        lose(tgid);
-        return;
-    };
-    if mark(tgid, start, HOW_BORN_INTO, forker) {
-        count(STAT_ROOTS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let child: u64 = ctx.arg(0);
+        let kargs: u64 = ctx.arg(1);
+        if child == 0 {
+            return;
+        }
+        let forker = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let Some(tgid) = tgid_of(child) else {
+            count(STAT_LOST);
+            return;
+        };
+        // A thread (`CLONE_THREAD`, a threaded cgroup's too) is its process's:
+        // not a new thread group.
+        if tgid == forker {
+            return;
+        }
+        // Lot 280b: seen by the fentry — the fork's tracepoint checks it. An
+        // entry the map cannot take makes the tracepoint count this birth as
+        // unseen: more "not known", never less.
+        let _ = CGROUP_JOIN_BORN.insert(&tgid, &1, 0);
+        if CGROUP_JOINED.get(&tgid).is_some() {
+            let _ = CGROUP_JOINED.remove(&tgid);
+        }
+        found(tgid);
+        // Fail closed: a start whose flags cannot be read may be one into a
+        // cgroup.
+        if kargs == 0 {
+            lose(tgid);
+            return;
+        }
+        let Some(flags) = rd_u64(kargs + off!(KERNEL_CLONE_ARGS_FLAGS_OFFSET) as u64) else {
+            lose(tgid);
+            return;
+        };
+        if flags & CLONE_INTO_CGROUP == 0 {
+            return;
+        }
+        if forker == 1 || family(forker) {
+            return;
+        }
+        let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
+            lose(tgid);
+            return;
+        };
+        if mark(tgid, start, HOW_BORN_INTO, forker) {
+            count(STAT_ROOTS);
+        }
     }
 }
 
@@ -624,51 +663,54 @@ pub fn cgroup_join_fork(ctx: BtfTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fork(ctx: &BtfTracePointContext) {
-    let parent: u64 = ctx.arg(0);
-    let child: u64 = ctx.arg(1);
-    if parent == 0 || child == 0 {
-        return;
-    }
-    let Some(ptgid) = tgid_of(parent) else {
-        return;
-    };
-    // Lot 280b: a new thread group the fentry did not see — ftrace off
-    // (or the fentry gone): not known, counted.
-    if check_birth(ptgid, child) {
-        return;
-    }
-    // Lot 281: the reset asked for taken in first, whoever forks.
-    let epoch = epoch_now();
-    // The mark is this process's, not a dead one's at the same tgid; lot
-    // 281: its `how`, for the child's.
-    let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {
-        Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),
-        None => (false, 0),
-    };
-    // The review of #494, D2: a group not known passes that on too — and
-    // (the third review, R2-a) one that started before the last reset.
-    let lost = is_lost(ptgid) || before_epoch(epoch, parent, ptgid);
-    if !marked && !lost {
-        return;
-    }
-    let Some(ctgid) = tgid_of(child) else {
-        count(STAT_LOST);
-        return;
-    };
-    if ctgid == ptgid {
-        return;
-    }
-    if lost {
-        lose(ctgid);
-        return;
-    }
-    let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
-        lose(ctgid);
-        return;
-    };
-    // Lot 281: where it runs and the taint, passed on.
-    if mark(ctgid, start, inherited(phow), ptgid) {
-        count(STAT_INHERITED);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let parent: u64 = ctx.arg(0);
+        let child: u64 = ctx.arg(1);
+        if parent == 0 || child == 0 {
+            return;
+        }
+        let Some(ptgid) = tgid_of(parent) else {
+            return;
+        };
+        // Lot 280b: a new thread group the fentry did not see — ftrace off
+        // (or the fentry gone): not known, counted.
+        if check_birth(ptgid, child) {
+            return;
+        }
+        // Lot 281: the reset asked for taken in first, whoever forks.
+        let epoch = epoch_now();
+        // The mark is this process's, not a dead one's at the same tgid; lot
+        // 281: its `how`, for the child's.
+        let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {
+            Some(rec) => (leader_start(parent) == Some(rec[0]), unpack(rec[1]).0),
+            None => (false, 0),
+        };
+        // The review of #494, D2: a group not known passes that on too — and
+        // (the third review, R2-a) one that started before the last reset.
+        let lost = is_lost(ptgid) || before_epoch(epoch, parent, ptgid);
+        if !marked && !lost {
+            return;
+        }
+        let Some(ctgid) = tgid_of(child) else {
+            count(STAT_LOST);
+            return;
+        };
+        if ctgid == ptgid {
+            return;
+        }
+        if lost {
+            lose(ctgid);
+            return;
+        }
+        let Some(start) = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64) else {
+            lose(ctgid);
+            return;
+        };
+        // Lot 281: where it runs and the taint, passed on.
+        if mark(ctgid, start, inherited(phow), ptgid) {
+            count(STAT_INHERITED);
+        }
     }
 }
 
@@ -681,33 +723,36 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) {
 /// known here (nothing more to decide for it).
 #[inline(always)]
 unsafe fn check_birth(ptgid: u32, child: u64) -> bool {
-    let Some(ctgid) = tgid_of(child) else {
-        return false;
-    };
-    if ctgid == ptgid {
-        return false;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(ctgid) = tgid_of(child) else {
+            return false;
+        };
+        if ctgid == ptgid {
+            return false;
+        }
+        let seen = CGROUP_JOIN_BORN.get(&ctgid).is_some();
+        if seen {
+            let _ = CGROUP_JOIN_BORN.remove(&ctgid);
+        }
+        let armed = match CGROUP_JOIN_SILENT.get(SILENT_ARMED) {
+            Some(a) => *a,
+            None => 0,
+        };
+        // A start unread counts as after the arming (fail closed).
+        let start = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64).unwrap_or(u64::MAX);
+        if !unseen_birth(armed, start, seen) {
+            return false;
+        }
+        lose(ctgid);
+        if let Some(n) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_UNSEEN) {
+            *n += 1;
+        }
+        if let Some(t) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_LAST_NS) {
+            *t = bpf_ktime_get_ns();
+        }
+        true
     }
-    let seen = CGROUP_JOIN_BORN.get(&ctgid).is_some();
-    if seen {
-        let _ = CGROUP_JOIN_BORN.remove(&ctgid);
-    }
-    let armed = match CGROUP_JOIN_SILENT.get(SILENT_ARMED) {
-        Some(a) => *a,
-        None => 0,
-    };
-    // A start unread counts as after the arming (fail closed).
-    let start = rd_u64(child + off!(TASK_STRUCT_START_TIME_OFFSET) as u64).unwrap_or(u64::MAX);
-    if !unseen_birth(armed, start, seen) {
-        return false;
-    }
-    lose(ctgid);
-    if let Some(n) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_UNSEEN) {
-        *n += 1;
-    }
-    if let Some(t) = CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_LAST_NS) {
-        *t = bpf_ktime_get_ns();
-    }
-    true
 }
 
 /// `sched_process_exit(struct task_struct *p, …)`: the mark goes with the
@@ -723,28 +768,31 @@ pub fn cgroup_join_exit(ctx: BtfTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_exit(ctx: &BtfTracePointContext) {
-    let task: u64 = ctx.arg(0);
-    if task == 0 {
-        return;
-    }
-    let Some(tgid) = tgid_of(task) else {
-        return;
-    };
-    if CGROUP_JOINED.get(&tgid).is_none() {
-        return;
-    }
-    let Some(signal) = rd_u64(task + off!(TASK_STRUCT_SIGNAL_OFFSET) as u64) else {
-        return;
-    };
-    if signal == 0 {
-        return;
-    }
-    // Two threads exiting together may both read 0: a second remove finds
-    // nothing. The group's byte in `CGROUP_JOIN_LOST` stays — a dead
-    // tgid's, read by no one — until the pid's next thread group is forked
-    // (`cgroup_join_born`), which clears it before anything can reach it.
-    if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
-        let _ = CGROUP_JOINED.remove(&tgid);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task: u64 = ctx.arg(0);
+        if task == 0 {
+            return;
+        }
+        let Some(tgid) = tgid_of(task) else {
+            return;
+        };
+        if CGROUP_JOINED.get(&tgid).is_none() {
+            return;
+        }
+        let Some(signal) = rd_u64(task + off!(TASK_STRUCT_SIGNAL_OFFSET) as u64) else {
+            return;
+        };
+        if signal == 0 {
+            return;
+        }
+        // Two threads exiting together may both read 0: a second remove finds
+        // nothing. The group's byte in `CGROUP_JOIN_LOST` stays — a dead
+        // tgid's, read by no one — until the pid's next thread group is forked
+        // (`cgroup_join_born`), which clears it before anything can reach it.
+        if rd_u32(signal + off!(SIGNAL_STRUCT_LIVE_OFFSET) as u64) == Some(0) {
+            let _ = CGROUP_JOINED.remove(&tgid);
+        }
     }
 }
 
@@ -761,26 +809,29 @@ pub fn cgroup_join_inject(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inject(ctx: &LsmContext) {
-    let target: u64 = ctx.arg(0);
-    let mode: u32 = ctx.arg(1);
-    // Read mode (`ps`, `/proc/<pid>/environ`, `kcmp`): no injection.
-    if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let target: u64 = ctx.arg(0);
+        let mode: u32 = ctx.arg(1);
+        // Read mode (`ps`, `/proc/<pid>/environ`, `kcmp`): no injection.
+        if target == 0 || mode & PTRACE_MODE_ATTACH == 0 {
+            return;
+        }
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        // The agent and the watchdog: their accesses taint nothing.
+        if family(caller) {
+            return;
+        }
+        let Some(tgid) = tgid_of(target) else {
+            count(STAT_LOST);
+            return;
+        };
+        let (syscall, flags) = current_call();
+        if !injection(mode, syscall, flags) {
+            return;
+        }
+        taint(target, tgid, caller, inject_detail(mode, syscall), true);
     }
-    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // The agent and the watchdog: their accesses taint nothing.
-    if family(caller) {
-        return;
-    }
-    let Some(tgid) = tgid_of(target) else {
-        count(STAT_LOST);
-        return;
-    };
-    let (syscall, flags) = current_call();
-    if !injection(mode, syscall, flags) {
-        return;
-    }
-    taint(target, tgid, caller, inject_detail(mode, syscall), true);
 }
 
 /// Lot 281: `int ptrace_traceme(struct task_struct *parent)` — the current
@@ -796,19 +847,22 @@ pub fn cgroup_join_traceme(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_traceme(ctx: &LsmContext) {
-    let parent: u64 = ctx.arg(0);
-    if parent == 0 {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let parent: u64 = ctx.arg(0);
+        if parent == 0 {
+            return;
+        }
+        let Some(tracer) = tgid_of(parent) else {
+            count(STAT_LOST);
+            return;
+        };
+        if family(tracer) {
+            return;
+        }
+        let me = (bpf_get_current_pid_tgid() >> 32) as u32;
+        taint(bpf_get_current_task(), me, tracer, 0, false);
     }
-    let Some(tracer) = tgid_of(parent) else {
-        count(STAT_LOST);
-        return;
-    };
-    if family(tracer) {
-        return;
-    }
-    let me = (bpf_get_current_pid_tgid() >> 32) as u32;
-    taint(bpf_get_current_task(), me, tracer, 0, false);
 }
 
 /// Lot 281: thread group `tgid` (task `task`) tainted by `by` — its mark's
@@ -820,30 +874,33 @@ unsafe fn try_traceme(ctx: &LsmContext) {
 /// counted and, when `record`, recorded with `detail`.
 #[inline(always)]
 unsafe fn taint(task: u64, tgid: u32, by: u32, detail: u64, record: bool) {
-    if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {
-        return;
-    }
-    let Some(start) = leader_start(task) else {
-        lose(tgid);
-        return;
-    };
-    let old = how_now(tgid, start);
-    if old & HOW_TAINT != 0 {
-        return;
-    }
-    let rec = [start, pack(injected(old), by)];
-    if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {
-        lose(tgid);
-    }
-    count(STAT_INJECTED);
-    if record {
-        crate::inode_protect::emit_limited(
-            FS_OP_EXEMPT_INJECT,
-            InodeKey {
-                dev: detail,
-                ino: u64::from(tgid),
-            },
-        );
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if tgid == 1 || crate::task_kill::is_protected_pid(tgid) {
+            return;
+        }
+        let Some(start) = leader_start(task) else {
+            lose(tgid);
+            return;
+        };
+        let old = how_now(tgid, start);
+        if old & HOW_TAINT != 0 {
+            return;
+        }
+        let rec = [start, pack(injected(old), by)];
+        if CGROUP_JOINED.insert(&tgid, &rec, 0).is_err() {
+            lose(tgid);
+        }
+        count(STAT_INJECTED);
+        if record {
+            crate::inode_protect::emit_limited(
+                FS_OP_EXEMPT_INJECT,
+                InodeKey {
+                    dev: detail,
+                    ino: u64::from(tgid),
+                },
+            );
+        }
     }
 }
 
@@ -854,46 +911,49 @@ unsafe fn taint(task: u64, tgid: u32, by: u32, detail: u64, record: bool) {
 /// attach-mode access is then an injection (fail closed).
 #[inline(always)]
 unsafe fn current_call() -> (Option<u64>, Option<u64>) {
-    let (Some(ax), Some(si), Some(dx)) = (
-        off_opt!(PT_REGS_ORIG_AX_OFFSET),
-        off_opt!(PT_REGS_SI_OFFSET),
-        off_opt!(PT_REGS_DX_OFFSET),
-    ) else {
-        return (None, None);
-    };
-    if ax > 0xff || si > 0xff || dx > 0xff {
-        return (None, None);
-    }
-    let task = generated::bpf_get_current_task_btf();
-    let Ok(flags) = bpf_probe_read_kernel::<u32>(
-        (task as *const u8).add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32,
-    ) else {
-        return (None, None);
-    };
-    if !regs_are_the_writes(flags) {
-        return (None, None);
-    }
-    let regs = generated::bpf_task_pt_regs(task) as u64;
-    if regs == 0 {
-        return (None, None);
-    }
-    let Some(nr) = rd_u64(regs + ax as u64) else {
-        return (None, None);
-    };
-    let open_flags = if nr == SYS_OPEN {
-        rd_u64(regs + si as u64)
-    } else if nr == SYS_OPENAT {
-        rd_u64(regs + dx as u64)
-    } else if nr == SYS_OPENAT2 {
-        // `struct open_how *` (its `flags` the first u64), in user memory.
-        match rd_u64(regs + dx as u64) {
-            Some(how) if how != 0 => {
-                aya_ebpf::helpers::bpf_probe_read_user::<u64>(how as *const u64).ok()
-            }
-            _ => None,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let (Some(ax), Some(si), Some(dx)) = (
+            off_opt!(PT_REGS_ORIG_AX_OFFSET),
+            off_opt!(PT_REGS_SI_OFFSET),
+            off_opt!(PT_REGS_DX_OFFSET),
+        ) else {
+            return (None, None);
+        };
+        if ax > 0xff || si > 0xff || dx > 0xff {
+            return (None, None);
         }
-    } else {
-        None
-    };
-    (Some(nr), open_flags)
+        let task = generated::bpf_get_current_task_btf();
+        let Ok(flags) = bpf_probe_read_kernel::<u32>(
+            (task as *const u8).add(off!(TASK_STRUCT_FLAGS_OFFSET)) as *const u32,
+        ) else {
+            return (None, None);
+        };
+        if !regs_are_the_writes(flags) {
+            return (None, None);
+        }
+        let regs = generated::bpf_task_pt_regs(task) as u64;
+        if regs == 0 {
+            return (None, None);
+        }
+        let Some(nr) = rd_u64(regs + ax as u64) else {
+            return (None, None);
+        };
+        let open_flags = if nr == SYS_OPEN {
+            rd_u64(regs + si as u64)
+        } else if nr == SYS_OPENAT {
+            rd_u64(regs + dx as u64)
+        } else if nr == SYS_OPENAT2 {
+            // `struct open_how *` (its `flags` the first u64), in user memory.
+            match rd_u64(regs + dx as u64) {
+                Some(how) if how != 0 => {
+                    aya_ebpf::helpers::bpf_probe_read_user::<u64>(how as *const u64).ok()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        (Some(nr), open_flags)
+    }
 }

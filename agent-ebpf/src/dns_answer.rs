@@ -159,97 +159,103 @@ enum Src {
 /// place in the two families); the address only for port 53.
 #[inline(always)]
 unsafe fn source_from_name(msg_ptr: *const u8) -> Src {
-    let name: *const u8 =
-        match bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const *const u8) {
-            Ok(p) => p,
-            Err(_) => return Src::NoName,
-        };
-    if name.is_null() {
-        return Src::NoName;
-    }
-    let head: u32 = match bpf_probe_read_kernel::<u32>(name as *const u32) {
-        Ok(v) => v,
-        Err(_) => return Src::NoName,
-    };
-    let family = (head & 0xFFFF) as u16;
-    let port_be = (head >> 16) as u16;
-    if family != AF_INET && family != AF_INET6 {
-        return Src::NoName;
-    }
-    if port_be != DNS_PORT_BE {
-        return Src::NotDns;
-    }
-    let mut addr = [0u8; ADDR_LEN];
-    if family == AF_INET {
-        let a: [u8; 4] = match bpf_probe_read_kernel::<[u8; 4]>(name.add(4) as *const [u8; 4]) {
-            Ok(v) => v,
-            Err(_) => return Src::NoName,
-        };
-        let mut i = 0usize;
-        while i < 4 {
-            addr[i] = a[i];
-            i += 1;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let name: *const u8 =
+            match bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const *const u8) {
+                Ok(p) => p,
+                Err(_) => return Src::NoName,
+            };
+        if name.is_null() {
+            return Src::NoName;
         }
-    } else {
-        addr = match bpf_probe_read_kernel::<[u8; ADDR_LEN]>(name.add(8) as *const [u8; ADDR_LEN]) {
+        let head: u32 = match bpf_probe_read_kernel::<u32>(name as *const u32) {
             Ok(v) => v,
             Err(_) => return Src::NoName,
         };
+        let family = (head & 0xFFFF) as u16;
+        let port_be = (head >> 16) as u16;
+        if family != AF_INET && family != AF_INET6 {
+            return Src::NoName;
+        }
+        if port_be != DNS_PORT_BE {
+            return Src::NotDns;
+        }
+        let mut addr = [0u8; ADDR_LEN];
+        if family == AF_INET {
+            let a: [u8; 4] = match bpf_probe_read_kernel::<[u8; 4]>(name.add(4) as *const [u8; 4]) {
+                Ok(v) => v,
+                Err(_) => return Src::NoName,
+            };
+            let mut i = 0usize;
+            while i < 4 {
+                addr[i] = a[i];
+                i += 1;
+            }
+        } else {
+            addr = match bpf_probe_read_kernel::<[u8; ADDR_LEN]>(name.add(8) as *const [u8; ADDR_LEN]) {
+                Ok(v) => v,
+                Err(_) => return Src::NoName,
+            };
+        }
+        Src::Dns(Source {
+            family,
+            port_be,
+            addr,
+        })
     }
-    Src::Dns(Source {
-        family,
-        port_be,
-        addr,
-    })
 }
 
 /// The connected socket's peer (`recv()` on a connected socket: no
 /// `msg_name`): its family and port first, its address only for port 53.
 #[inline(always)]
 unsafe fn source_from_sock(sk_ptr: *const u8) -> Src {
-    if sk_ptr.is_null() {
-        return Src::NoName;
-    }
-    let port_be: u16 = match bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16) {
-        Ok(v) => v,
-        Err(_) => return Src::NoName,
-    };
-    if port_be != DNS_PORT_BE {
-        return Src::NotDns;
-    }
-    let family: u16 = match bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16) {
-        Ok(v) => v,
-        Err(_) => return Src::NoName,
-    };
-    let mut addr = [0u8; ADDR_LEN];
-    match family {
-        AF_INET => {
-            let a: [u8; 4] =
-                match bpf_probe_read_kernel::<[u8; 4]>(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const [u8; 4]) {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if sk_ptr.is_null() {
+            return Src::NoName;
+        }
+        let port_be: u16 = match bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16) {
+            Ok(v) => v,
+            Err(_) => return Src::NoName,
+        };
+        if port_be != DNS_PORT_BE {
+            return Src::NotDns;
+        }
+        let family: u16 = match bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16) {
+            Ok(v) => v,
+            Err(_) => return Src::NoName,
+        };
+        let mut addr = [0u8; ADDR_LEN];
+        match family {
+            AF_INET => {
+                let a: [u8; 4] =
+                    match bpf_probe_read_kernel::<[u8; 4]>(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const [u8; 4]) {
+                        Ok(v) => v,
+                        Err(_) => return Src::NoName,
+                    };
+                let mut i = 0usize;
+                while i < 4 {
+                    addr[i] = a[i];
+                    i += 1;
+                }
+            }
+            AF_INET6 => {
+                addr = match bpf_probe_read_kernel::<[u8; ADDR_LEN]>(
+                    sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN],
+                ) {
                     Ok(v) => v,
                     Err(_) => return Src::NoName,
                 };
-            let mut i = 0usize;
-            while i < 4 {
-                addr[i] = a[i];
-                i += 1;
             }
+            _ => return Src::NoName,
         }
-        AF_INET6 => {
-            addr = match bpf_probe_read_kernel::<[u8; ADDR_LEN]>(
-                sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN],
-            ) {
-                Ok(v) => v,
-                Err(_) => return Src::NoName,
-            };
-        }
-        _ => return Src::NoName,
+        Src::Dns(Source {
+            family,
+            port_be,
+            addr,
+        })
     }
-    Src::Dns(Source {
-        family,
-        port_be,
-        addr,
-    })
 }
 
 #[inline(always)]
@@ -263,120 +269,123 @@ fn sat16(n: u64) -> u16 {
 
 #[inline(always)]
 unsafe fn try_answer(ctx: &FExitContext, ret: i32) {
-    // A DNS message is at least its header; an error is negative. The
-    // function returns an `int`: only the slot's low 32 bits are its value.
-    if ret <= DNS_HDR_LEN {
-        return;
-    }
-    let sk_ptr: *const u8 = ctx.arg(0);
-    let msg_ptr: *const u8 = ctx.arg(1);
-    if msg_ptr.is_null() {
-        return;
-    }
-    let src = match source_from_name(msg_ptr) {
-        Src::Dns(s) => s,
-        Src::NotDns => return,
-        Src::NoName => match source_from_sock(sk_ptr) {
-            Src::Dns(s) => s,
-            _ => return,
-        },
-    };
-    // N1: the receiver's buffer's length, the third parameter in every
-    // arity (`MSG_TRUNC` returns the datagram's length, longer)
-    let buf_len: u64 = ctx.arg(2);
-    let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let now = bpf_ktime_get_ns();
-    // The local resolvers' users (`DNS_EXEMPT_UIDS`, written by the agent)
-    // have no budget: their upstream answers are what the others' names
-    // resolve to.
-    let held = if crate::dns_query::DNS_EXEMPT_UIDS.get(&uid).is_some() {
-        crate::budget::Held::NONE
-    } else {
-        match admit(
-            &ANSWER_TASK_BUDGET,
-            &ANSWER_UID_BUDGET,
-            tgid,
-            uid,
-            now,
-            ANSWER_LIMITS,
-            northnarrow_common::ring_drops::ring_slot::DNS_ANSWER_RATE,
-        ) {
-            Some(h) => h,
-            None => return,
-        }
-    };
-    let mut entry = match DNS_ANSWER_EVENTS.reserve::<DnsAnswerRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_ANSWER);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // A DNS message is at least its header; an error is negative. The
+        // function returns an `int`: only the slot's low 32 bits are its value.
+        if ret <= DNS_HDR_LEN {
             return;
         }
-    };
-    let raw: *mut DnsAnswerRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw);
-    (*raw).timestamp_ns = now;
-    (*raw).pid = tgid;
-    (*raw).uid = uid;
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
-    }
-    (*raw).family = src.family as u8;
-    (*raw).server = src.addr;
-    (*raw).server_port = u16::from_be(src.port_be);
-    // the datagram's length; what the receiver's buffer holds of it is at
-    // most the buffer's length (N1)
-    let dgram: u64 = ret as u64;
-    (*raw).datagram_len = if dgram > 0xFFFF_FFFF { 0xFFFF_FFFF } else { dgram as u32 };
-    let len: u64 = if buf_len < dgram { buf_len } else { dgram };
-    (*raw).held = sat16(held.task);
-    (*raw).held_uid = sat16(held.user);
-    let mut flags = 0u8;
-    if held.task != 0 {
-        flags |= held_flags::TASK;
-    }
-    if held.user != 0 {
-        flags |= held_flags::UID;
-    }
-    // The receiver's buffer, the datagram at its start.
-    let dst = (*raw).payload.as_mut_ptr() as *mut c_void;
-    let read = match crate::uiter::user_base(msg_ptr) {
-        None => -1,
-        Some(base) => {
-            // a datagram longer than what is read is cut
-            if dgram > len {
-                flags |= answer_flags::TRUNCATED;
+        let sk_ptr: *const u8 = ctx.arg(0);
+        let msg_ptr: *const u8 = ctx.arg(1);
+        if msg_ptr.is_null() {
+            return;
+        }
+        let src = match source_from_name(msg_ptr) {
+            Src::Dns(s) => s,
+            Src::NotDns => return,
+            Src::NoName => match source_from_sock(sk_ptr) {
+                Src::Dns(s) => s,
+                _ => return,
+            },
+        };
+        // N1: the receiver's buffer's length, the third parameter in every
+        // arity (`MSG_TRUNC` returns the datagram's length, longer)
+        let buf_len: u64 = ctx.arg(2);
+        let uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        let now = bpf_ktime_get_ns();
+        // The local resolvers' users (`DNS_EXEMPT_UIDS`, written by the agent)
+        // have no budget: their upstream answers are what the others' names
+        // resolve to.
+        let held = if crate::dns_query::DNS_EXEMPT_UIDS.get(&uid).is_some() {
+            crate::budget::Held::NONE
+        } else {
+            match admit(
+                &ANSWER_TASK_BUDGET,
+                &ANSWER_UID_BUDGET,
+                tgid,
+                uid,
+                now,
+                ANSWER_LIMITS,
+                northnarrow_common::ring_drops::ring_slot::DNS_ANSWER_RATE,
+            ) {
+                Some(h) => h,
+                None => return,
             }
-            if len >= DNS_ANSWER_CAP as u64 {
-                if len > DNS_ANSWER_CAP as u64 {
+        };
+        let mut entry = match DNS_ANSWER_EVENTS.reserve::<DnsAnswerRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::DNS_ANSWER);
+                return;
+            }
+        };
+        let raw: *mut DnsAnswerRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw);
+        (*raw).timestamp_ns = now;
+        (*raw).pid = tgid;
+        (*raw).uid = uid;
+        if let Ok(comm) = bpf_get_current_comm() {
+            (*raw).comm = comm;
+        }
+        (*raw).family = src.family as u8;
+        (*raw).server = src.addr;
+        (*raw).server_port = u16::from_be(src.port_be);
+        // the datagram's length; what the receiver's buffer holds of it is at
+        // most the buffer's length (N1)
+        let dgram: u64 = ret as u64;
+        (*raw).datagram_len = if dgram > 0xFFFF_FFFF { 0xFFFF_FFFF } else { dgram as u32 };
+        let len: u64 = if buf_len < dgram { buf_len } else { dgram };
+        (*raw).held = sat16(held.task);
+        (*raw).held_uid = sat16(held.user);
+        let mut flags = 0u8;
+        if held.task != 0 {
+            flags |= held_flags::TASK;
+        }
+        if held.user != 0 {
+            flags |= held_flags::UID;
+        }
+        // The receiver's buffer, the datagram at its start.
+        let dst = (*raw).payload.as_mut_ptr() as *mut c_void;
+        let read = match crate::uiter::user_base(msg_ptr) {
+            None => -1,
+            Some(base) => {
+                // a datagram longer than what is read is cut
+                if dgram > len {
                     flags |= answer_flags::TRUNCATED;
                 }
-                let r = generated::bpf_probe_read_user(dst, DNS_ANSWER_CAP as u32, base as *const c_void);
-                if r == 0 {
-                    (*raw).captured = DNS_ANSWER_CAP as u16;
+                if len >= DNS_ANSWER_CAP as u64 {
+                    if len > DNS_ANSWER_CAP as u64 {
+                        flags |= answer_flags::TRUNCATED;
+                    }
+                    let r = generated::bpf_probe_read_user(dst, DNS_ANSWER_CAP as u32, base as *const c_void);
+                    if r == 0 {
+                        (*raw).captured = DNS_ANSWER_CAP as u16;
+                    }
+                    r
+                } else {
+                    // A variable size the verifier bounds: below the cap. The
+                    // length goes through the stack first: LLVM knows it is
+                    // below the cap here and drops a plain mask, then hands the
+                    // helper the sign-extended return value, which the verifier
+                    // has no bound for (the 6.8 lab's refusal of lot 275's first
+                    // build: "R2 min value is negative"). The volatile read
+                    // keeps the mask next to the call.
+                    let len32: u32 = len as u32;
+                    let n = core::ptr::read_volatile(&len32) & (DNS_ANSWER_CAP as u32 - 1);
+                    let r = generated::bpf_probe_read_user(dst, n, base as *const c_void);
+                    if r == 0 {
+                        (*raw).captured = n as u16;
+                    }
+                    r
                 }
-                r
-            } else {
-                // A variable size the verifier bounds: below the cap. The
-                // length goes through the stack first: LLVM knows it is
-                // below the cap here and drops a plain mask, then hands the
-                // helper the sign-extended return value, which the verifier
-                // has no bound for (the 6.8 lab's refusal of lot 275's first
-                // build: "R2 min value is negative"). The volatile read
-                // keeps the mask next to the call.
-                let len32: u32 = len as u32;
-                let n = core::ptr::read_volatile(&len32) & (DNS_ANSWER_CAP as u32 - 1);
-                let r = generated::bpf_probe_read_user(dst, n, base as *const c_void);
-                if r == 0 {
-                    (*raw).captured = n as u16;
-                }
-                r
             }
+        };
+        if read != 0 {
+            flags |= answer_flags::UNREAD;
         }
-    };
-    if read != 0 {
-        flags |= answer_flags::UNREAD;
+        (*raw).flags = flags;
+        entry.submit(0);
     }
-    (*raw).flags = flags;
-    entry.submit(0);
 }

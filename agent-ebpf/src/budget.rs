@@ -50,16 +50,19 @@ impl Held {
 
 #[inline(always)]
 unsafe fn refill(b: *mut Budget, now: u64, burst: u64, refill_ns: u64) {
-    let steps = now.wrapping_sub((*b).last_ns) / refill_ns;
-    if steps == 0 {
-        return;
-    }
-    if (*b).tokens + steps >= burst {
-        (*b).tokens = burst;
-        (*b).last_ns = now;
-    } else {
-        (*b).tokens += steps;
-        (*b).last_ns += steps * refill_ns;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let steps = now.wrapping_sub((*b).last_ns) / refill_ns;
+        if steps == 0 {
+            return;
+        }
+        if (*b).tokens + steps >= burst {
+            (*b).tokens = burst;
+            (*b).last_ns = now;
+        } else {
+            (*b).tokens += steps;
+            (*b).last_ns += steps * refill_ns;
+        }
     }
 }
 
@@ -98,35 +101,38 @@ pub(crate) unsafe fn admit(
     limits: Limits,
     slot: u32,
 ) -> Option<Held> {
-    let task = match budget(task_map, tgid, now, limits.task_burst) {
-        Some(b) => b,
-        None => return Some(Held::NONE),
-    };
-    let user = match budget(uid_map, uid, now, limits.uid_burst) {
-        Some(b) => b,
-        None => return Some(Held::NONE),
-    };
-    refill(task, now, limits.task_burst, limits.task_refill_ns);
-    refill(user, now, limits.uid_burst, limits.uid_refill_ns);
-    if (*task).tokens == 0 {
-        (*task).held += 1;
-        crate::drops::bump(slot);
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = match budget(task_map, tgid, now, limits.task_burst) {
+            Some(b) => b,
+            None => return Some(Held::NONE),
+        };
+        let user = match budget(uid_map, uid, now, limits.uid_burst) {
+            Some(b) => b,
+            None => return Some(Held::NONE),
+        };
+        refill(task, now, limits.task_burst, limits.task_refill_ns);
+        refill(user, now, limits.uid_burst, limits.uid_refill_ns);
+        if (*task).tokens == 0 {
+            (*task).held += 1;
+            crate::drops::bump(slot);
+            return None;
+        }
+        if (*user).tokens == 0 {
+            (*user).held += 1;
+            crate::drops::bump(slot);
+            return None;
+        }
+        (*task).tokens -= 1;
+        (*user).tokens -= 1;
+        let held = Held {
+            task: (*task).held,
+            user: (*user).held,
+        };
+        (*task).held = 0;
+        (*user).held = 0;
+        Some(held)
     }
-    if (*user).tokens == 0 {
-        (*user).held += 1;
-        crate::drops::bump(slot);
-        return None;
-    }
-    (*task).tokens -= 1;
-    (*user).tokens -= 1;
-    let held = Held {
-        task: (*task).held,
-        user: (*user).held,
-    };
-    (*task).held = 0;
-    (*user).held = 0;
-    Some(held)
 }
 
 /// A held count for a `u32` wire field.

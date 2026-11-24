@@ -1670,10 +1670,15 @@ mod tests {
     #[test]
     fn a_test_build_injects_the_verifier_refusal_it_is_asked_for() {
         let program = PROGRAMS[0].0;
-        std::env::set_var(
-            VERIFIER_REFUSE_ENV,
-            format!("{program}, {}", RECONF_PROGRAM.0),
-        );
+        // SAFETY: no other test of nn-linux touches NN_TEST_VERIFIER_REFUSE;
+        // its one reader, `injected_refusal`, runs in the guard's load, which
+        // no unit test reaches.
+        unsafe {
+            std::env::set_var(
+                VERIFIER_REFUSE_ENV,
+                format!("{program}, {}", RECONF_PROGRAM.0),
+            )
+        };
         let e = injected_refusal(program).expect("injected");
         let text = format!("{e:#}");
         assert!(
@@ -1688,7 +1693,8 @@ mod tests {
         for (other, _) in &PROGRAMS[1..] {
             assert!(injected_refusal(other).is_none(), "{other}");
         }
-        std::env::remove_var(VERIFIER_REFUSE_ENV);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(VERIFIER_REFUSE_ENV) };
         assert!(injected_refusal(program).is_none());
         assert!(refusal_weakens(program));
         assert!(!refusal_weakens(" , "));
@@ -1699,12 +1705,16 @@ mod tests {
     #[cfg(not(feature = "test-privileged"))]
     #[test]
     fn a_build_without_the_test_feature_injects_nothing() {
-        std::env::set_var(VERIFIER_REFUSE_ENV, PROGRAMS[0].0);
+        // SAFETY: no other test of nn-linux touches NN_TEST_VERIFIER_REFUSE;
+        // its one reader, `injected_refusal`, runs in the guard's load, which
+        // no unit test reaches.
+        unsafe { std::env::set_var(VERIFIER_REFUSE_ENV, PROGRAMS[0].0) };
         for (program, _) in PROGRAMS.iter().chain([&RECONF_PROGRAM]) {
             assert!(injected_refusal(program).is_none(), "{program}");
         }
         assert!(!refusal_weakens(PROGRAMS[0].0));
-        std::env::remove_var(VERIFIER_REFUSE_ENV);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(VERIFIER_REFUSE_ENV) };
     }
 
     fn table(text: &str) -> Vec<MountEntry> {

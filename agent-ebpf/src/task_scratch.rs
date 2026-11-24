@@ -56,16 +56,19 @@ pub(crate) static TASK_SCRATCH_ZERO: Array<[u64; ZERO_BYTES / 8]> = Array::with_
 /// The running task's key. `task` is the running task's `task_struct`.
 #[inline(always)]
 pub(crate) unsafe fn key_of(task: *const u8) -> TaskKey {
-    let mut start = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(
-        start.as_mut_ptr() as *mut c_void,
-        8,
-        task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const c_void,
-    );
-    TaskKey {
-        start_ns: start.assume_init(),
-        tid: bpf_get_current_pid_tgid() as u32,
-        _pad: 0,
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut start = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(
+            start.as_mut_ptr() as *mut c_void,
+            8,
+            task.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const c_void,
+        );
+        TaskKey {
+            start_ns: start.assume_init(),
+            tid: bpf_get_current_pid_tgid() as u32,
+            _pad: 0,
+        }
     }
 }
 
@@ -73,7 +76,10 @@ pub(crate) unsafe fn key_of(task: *const u8) -> TaskKey {
 /// arguments cannot carry it).
 #[inline(always)]
 pub(crate) unsafe fn current_key() -> TaskKey {
-    key_of(bpf_get_current_task() as *const u8)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        key_of(bpf_get_current_task() as *const u8)
+    }
 }
 
 /// The key from a global function's integer arguments.
@@ -95,10 +101,13 @@ pub(crate) fn key(tid: u64, start: u64) -> TaskKey {
 /// address later, and the address costs no read.
 #[inline(always)]
 pub(crate) unsafe fn make<K, T>(map: &HashMap<K, T>, key: &K) -> Option<*mut T> {
-    const { assert!(core::mem::size_of::<T>() <= ZERO_BYTES) };
-    let zero = TASK_SCRATCH_ZERO.get_ptr(0)?;
-    map.insert(key, &*(zero as *const T), 0).ok()?;
-    map.get_ptr_mut(key)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        const { assert!(core::mem::size_of::<T>() <= ZERO_BYTES) };
+        let zero = TASK_SCRATCH_ZERO.get_ptr(0)?;
+        map.insert(key, &*(zero as *const T), 0).ok()?;
+        map.get_ptr_mut(key)
+    }
 }
 
 /// `BPF_F_NO_PREALLOC`: a hash whose entries are allocated as they are
@@ -251,7 +260,7 @@ static SHARE_SUBUID: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(SUBUID_TR
 ///
 /// A global function (no argument): the walk up the namespaces is checked
 /// once, not on every way into its callers.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_share_key() -> u64 {
     let uid = current_uid();
@@ -280,42 +289,45 @@ pub(crate) fn share_key() -> u32 {
 /// buffer's share), whose stack the verifier holds to 512 bytes.
 #[inline(always)]
 unsafe fn outer_user_ns() -> (u32, u32, u32) {
-    let Some(o_cred) = off_opt!(TASK_STRUCT_CRED_OFFSET) else {
-        return (0, 0, 0);
-    };
-    let Some(o_ns) = off_opt!(CRED_USER_NS_OFFSET) else {
-        return (0, 0, 0);
-    };
-    let Some(o_level) = off_opt!(USER_NAMESPACE_LEVEL_OFFSET) else {
-        return (0, 0, 0);
-    };
-    let task = bpf_get_current_task() as *const u8;
-    let cred = peek_u64(task.add(o_cred)) as *const u8;
-    let mut ns = peek_u64(cred.add(o_ns)) as *const u8;
-    let level = peek_u32(ns.add(o_level));
-    if level == 0 {
-        return (0, 0, 0);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let Some(o_cred) = off_opt!(TASK_STRUCT_CRED_OFFSET) else {
+            return (0, 0, 0);
+        };
+        let Some(o_ns) = off_opt!(CRED_USER_NS_OFFSET) else {
+            return (0, 0, 0);
+        };
+        let Some(o_level) = off_opt!(USER_NAMESPACE_LEVEL_OFFSET) else {
+            return (0, 0, 0);
+        };
+        let task = bpf_get_current_task() as *const u8;
+        let cred = peek_u64(task.add(o_cred)) as *const u8;
+        let mut ns = peek_u64(cred.add(o_ns)) as *const u8;
+        let level = peek_u32(ns.add(o_level));
+        if level == 0 {
+            return (0, 0, 0);
+        }
+        let Some(o_parent) = off_opt!(USER_NAMESPACE_PARENT_OFFSET) else {
+            return (0, 0, 0);
+        };
+        let mut l = level;
+        let mut i = 0u32;
+        while i < USERNS_MAX_LEVEL && l > 1 {
+            ns = peek_u64(ns.add(o_parent)) as *const u8;
+            l = peek_u32(ns.add(o_level));
+            i += 1;
+        }
+        if l != 1 {
+            return (0, 0, 0);
+        }
+        let Some(o_owner) = off_opt!(USER_NAMESPACE_OWNER_OFFSET) else {
+            return (0, 0, 0);
+        };
+        let Some(o_inum) = off_opt!(USER_NAMESPACE_INUM_OFFSET) else {
+            return (0, 0, 0);
+        };
+        (level, peek_u32(ns.add(o_owner)), peek_u32(ns.add(o_inum)))
     }
-    let Some(o_parent) = off_opt!(USER_NAMESPACE_PARENT_OFFSET) else {
-        return (0, 0, 0);
-    };
-    let mut l = level;
-    let mut i = 0u32;
-    while i < USERNS_MAX_LEVEL && l > 1 {
-        ns = peek_u64(ns.add(o_parent)) as *const u8;
-        l = peek_u32(ns.add(o_level));
-        i += 1;
-    }
-    if l != 1 {
-        return (0, 0, 0);
-    }
-    let Some(o_owner) = off_opt!(USER_NAMESPACE_OWNER_OFFSET) else {
-        return (0, 0, 0);
-    };
-    let Some(o_inum) = off_opt!(USER_NAMESPACE_INUM_OFFSET) else {
-        return (0, 0, 0);
-    };
-    (level, peek_u32(ns.add(o_owner)), peek_u32(ns.add(o_inum)))
 }
 
 /// A kernel `u64`, 0 when unreadable, without a branch on the result: the
@@ -324,17 +336,23 @@ unsafe fn outer_user_ns() -> (u32, u32, u32) {
 /// explores past its million instructions (lot 332's lab).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// A kernel `u32`, as [`peek_u64`].
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// The real uid of the running task.

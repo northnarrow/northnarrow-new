@@ -304,7 +304,7 @@ fn floods(
     uid: u32,
     comm: &str,
     ts: u64,
-) -> impl Iterator<Item = Event> {
+) -> impl Iterator<Item = Event> + use<> {
     let h = if raw_flags & held_flags::TASK != 0 {
         u32::from(held)
     } else {

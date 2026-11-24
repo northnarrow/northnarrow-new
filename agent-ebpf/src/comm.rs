@@ -51,5 +51,8 @@ pub fn current_comm() -> Result<[u8; COMM_LEN], i64> {
 /// (the bytes after the name's NUL are not written on every kernel).
 #[inline(always)]
 pub unsafe fn comm_into(dst: *mut [u8; COMM_LEN]) {
-    let _ = generated::bpf_get_current_comm(dst as *mut c_void, COMM_LEN as u32);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let _ = generated::bpf_get_current_comm(dst as *mut c_void, COMM_LEN as u32);
+    }
 }

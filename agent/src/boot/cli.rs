@@ -1414,7 +1414,9 @@ mod tests {
         }
         let clear = || {
             for (env, _) in SWITCHES {
-                std::env::remove_var(env);
+                // SAFETY: every test that parses a command line or touches these
+                // switches holds TEST_ENV (taken above); none reads them otherwise.
+                unsafe { std::env::remove_var(env) };
             }
         };
         clear();
@@ -1435,17 +1437,21 @@ mod tests {
             ("off", false),
         ] {
             for (env, flag) in SWITCHES {
-                std::env::set_var(env, value);
+                // SAFETY: as above (TEST_ENV held).
+                unsafe { std::env::set_var(env, value) };
                 let cli = Cli::try_parse_from(["northnarrow-agent"]);
-                std::env::remove_var(env);
+                // SAFETY: as above (TEST_ENV held).
+                unsafe { std::env::remove_var(env) };
                 let cli = cli.unwrap_or_else(|e| panic!("{env}={value}: {e}"));
                 assert_eq!(get(&cli, flag), on, "{env}={value}");
             }
         }
         for (env, _) in SWITCHES {
-            std::env::set_var(env, "maybe");
+            // SAFETY: as above (TEST_ENV held).
+            unsafe { std::env::set_var(env, "maybe") };
             let r = Cli::try_parse_from(["northnarrow-agent"]);
-            std::env::remove_var(env);
+            // SAFETY: as above (TEST_ENV held).
+            unsafe { std::env::remove_var(env) };
             assert!(r.is_err(), "{env}=maybe is refused, not read as on");
         }
         clear();

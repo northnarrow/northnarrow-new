@@ -123,7 +123,7 @@ fn entries(
     dir: &Path,
     max: usize,
     host: &dyn Fn(&Path) -> PathBuf,
-) -> impl Iterator<Item = (PathBuf, std::fs::Metadata)> {
+) -> impl Iterator<Item = (PathBuf, std::fs::Metadata)> + use<> {
     let names = antitamper_bpf::kernel_roots::read_dir_max(host(dir), max).unwrap_or_default();
     let dir = dir.to_path_buf();
     let looks: Vec<(PathBuf, std::fs::Metadata)> = names

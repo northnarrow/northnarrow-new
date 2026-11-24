@@ -68,8 +68,8 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
     in_order(
         body(&g, "new_value"),
         &[
-            "generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {\n        return (false, 0);\n    }",
-            "generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {\n        return (false, 0);\n    }",
+            "generated::bpf_sysctl_get_new_value(ctx.sysctl, p, VALUE_BUF as u64) < 0 {\n            return (false, 0);\n        }",
+            "generated::bpf_strtol(p, VALUE_BUF as u64, BASE_0, &mut res) < 0 {\n            return (false, 0);\n        }",
             "(true, res as i64)",
         ],
     )
@@ -86,12 +86,12 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
     in_order(
         body(&g, "try_sysctl_guard"),
         &[
-            "if (*ctx.sysctl).write == 0 {\n        return SysctlVerdict::Allow;\n    }",
+            "if (*ctx.sysctl).write == 0 {\n            return SysctlVerdict::Allow;\n        }",
             "let kind = sysctl_of(ctx);",
-            "if kind == SYSCTL_NONE {\n        return SysctlVerdict::Allow;\n    }",
+            "if kind == SYSCTL_NONE {\n            return SysctlVerdict::Allow;\n        }",
             "off!(TASK_STRUCT_TGID_OFFSET)",
-            "let caller_may = (tgid != 0 && crate::task_kill::is_exempt_pid(tgid))\n        || crate::inode_protect::override_active();",
-            "if caller_may {\n        return SysctlVerdict::Allow;\n    }",
+            "let caller_may = (tgid != 0 && crate::task_kill::is_exempt_pid(tgid))\n            || crate::inode_protect::override_active();",
+            "if caller_may {\n            return SysctlVerdict::Allow;\n        }",
             "let (read, v) = new_value(ctx);",
             "let verdict = verdict_of(kind, false, read, v, opt_out(kind));",
             "SysctlVerdict::Refuse => record(FS_OP_SYSCTL_VALUE, kind, read, v, task, tgid, true),",
@@ -115,8 +115,8 @@ fn a_race_thread_is_judged_on_the_kernel_copy() {
         &[
             "let mut name = [0u64; 4];",
             "generated::bpf_sysctl_get_name(",
-            "SYSCTL_PATH_MAX as u64,\n        0,\n    );",
-            "if n <= 0 || n as usize >= SYSCTL_PATH_MAX {\n        return SYSCTL_NONE;\n    }",
+            "SYSCTL_PATH_MAX as u64,\n            0,\n        );",
+            "if n <= 0 || n as usize >= SYSCTL_PATH_MAX {\n            return SYSCTL_NONE;\n        }",
             "sysctl_path_kind(n as usize, name)",
         ],
     )

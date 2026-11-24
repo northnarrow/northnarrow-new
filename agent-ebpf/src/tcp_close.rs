@@ -61,179 +61,182 @@ pub fn tcp_close(ctx: FExitContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
-    // arg(0) of tcp_close(struct sock *sk, long timeout) is the
-    // sock pointer. The fexit context's arg() is unsafe — caller
-    // promises the kernel function signature matches.
-    let sk_ptr: *const u8 = ctx.arg::<*const u8>(0);
-    if sk_ptr.is_null() {
-        return Ok(());
-    }
-    let sk_key: u64 = sk_ptr as u64;
-
-    // Family — skip non-IPv4/v6 early.
-    let family: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16)
-    {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    if family != AF_INET && family != AF_INET6 {
-        return Ok(());
-    }
-
-    // Lot 275: an outbound socket whose first send never came is no longer
-    // a ClientHello candidate (the next socket at this address is not it).
-    crate::tls_hello::forget(sk_key);
-    // Review 79: only a socket the connect kprobe recorded has a flow to
-    // close on this ring. Every passive socket (listeners, accepted peers)
-    // and every connect that predates the agent missed FLOW_SOCK_MAP, and
-    // userland dropped those records ("not recorded"): sending them only let
-    // an inbound connection flood fill this ring and push out the closes of
-    // outbound flows, the ones the flow rules judge. Lot 275: an accepted
-    // socket the inbound sensor recorded has its close on its own ring
-    // (`crate::inbound`), never this one.
-    let corr: [u8; 16] = match FLOW_SOCK_MAP.get(&sk_key) {
-        Some(c) => *c,
-        None => {
-            crate::inbound::close(sk_ptr, family);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // arg(0) of tcp_close(struct sock *sk, long timeout) is the
+        // sock pointer. The fexit context's arg() is unsafe — caller
+        // promises the kernel function signature matches.
+        let sk_ptr: *const u8 = ctx.arg::<*const u8>(0);
+        if sk_ptr.is_null() {
             return Ok(());
         }
-    };
-    // Forget the socket before anything can fail: an entry left behind by
-    // a full ring would be found again by the next socket the slab puts at
-    // this address (an accepted peer, typically), and its close would pass
-    // for an outbound flow's.
-    if FLOW_SOCK_MAP.remove(&sk_key).is_ok() {
-        crate::tcp_connect::count_flow_sock(northnarrow_common::wire::flow_sock_slot::REMOVED);
-    }
+        let sk_key: u64 = sk_ptr as u64;
 
-    // Reserve a slot before the field-read avalanche; if the
-    // ringbuf is full we drop the event cheaply.
-    let mut entry = match NET_FLOW_CLOSE_EVENTS.reserve::<NetFlowCloseRaw>(0) {
-        Some(e) => e,
-        None => {
-            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TCP_CLOSE);
+        // Family — skip non-IPv4/v6 early.
+        let family: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_FAMILY_OFFSET)) as *const u16)
+        {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        if family != AF_INET && family != AF_INET6 {
             return Ok(());
         }
-    };
-    let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
-    crate::zero::zero(raw_ptr);
 
-    // Byte counters from tcp_sock (sock is the prefix; sk_ptr
-    // doubles as tcp_sock pointer).
-    let bytes_sent: u64 =
-        match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_SENT_OFFSET)) as *const u64) {
-            Ok(v) => v,
-            Err(_) => 0,
+        // Lot 275: an outbound socket whose first send never came is no longer
+        // a ClientHello candidate (the next socket at this address is not it).
+        crate::tls_hello::forget(sk_key);
+        // Review 79: only a socket the connect kprobe recorded has a flow to
+        // close on this ring. Every passive socket (listeners, accepted peers)
+        // and every connect that predates the agent missed FLOW_SOCK_MAP, and
+        // userland dropped those records ("not recorded"): sending them only let
+        // an inbound connection flood fill this ring and push out the closes of
+        // outbound flows, the ones the flow rules judge. Lot 275: an accepted
+        // socket the inbound sensor recorded has its close on its own ring
+        // (`crate::inbound`), never this one.
+        let corr: [u8; 16] = match FLOW_SOCK_MAP.get(&sk_key) {
+            Some(c) => *c,
+            None => {
+                crate::inbound::close(sk_ptr, family);
+                return Ok(());
+            }
         };
-    let bytes_recv: u64 =
-        match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_RECEIVED_OFFSET)) as *const u64) {
-            Ok(v) => v,
-            Err(_) => 0,
-        };
-
-    // Ports + addrs from sock_common.
-    let dport_be: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16)
-    {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
-    let mut sport_host: u16 =
-        match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16) {
-            Ok(v) => v,
-            Err(_) => 0,
-        };
-    // An abortive close (RST, SO_LINGER 0) has released the port by the
-    // fexit — `inet_put_port` zeroes `skc_num` — but `inet_sport` keeps
-    // it (network byte order).
-    if sport_host == 0 {
-        if let Ok(v) = bpf_probe_read_kernel(
-            sk_ptr.add(off!(INET_SOCK_INET_SPORT_OFFSET)) as *const u16,
-        ) {
-            sport_host = u16::from_be(v);
+        // Forget the socket before anything can fail: an entry left behind by
+        // a full ring would be found again by the next socket the slab puts at
+        // this address (an accepted peer, typically), and its close would pass
+        // for an outbound flow's.
+        if FLOW_SOCK_MAP.remove(&sk_key).is_ok() {
+            crate::tcp_connect::count_flow_sock(northnarrow_common::wire::flow_sock_slot::REMOVED);
         }
-    }
-    // sk_err — sign-extended i32 stored in network code as positive
-    // errno values; treat as u32 for bit math.
-    let sk_err_raw: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SK_ERR_OFFSET)) as *const u32)
-    {
-        Ok(v) => v,
-        Err(_) => 0,
-    };
-    let close_reason: u8 = (sk_err_raw & 0xFF) as u8;
 
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let uid_gid = bpf_get_current_uid_gid();
-    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+        // Reserve a slot before the field-read avalanche; if the
+        // ringbuf is full we drop the event cheaply.
+        let mut entry = match NET_FLOW_CLOSE_EVENTS.reserve::<NetFlowCloseRaw>(0) {
+            Some(e) => e,
+            None => {
+                crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TCP_CLOSE);
+                return Ok(());
+            }
+        };
+        let raw_ptr: *mut NetFlowCloseRaw = entry.as_mut_ptr();
+        crate::zero::zero(raw_ptr);
 
-    (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
-    (*raw_ptr).bytes_sent = bytes_sent;
-    (*raw_ptr).bytes_recv = bytes_recv;
-    (*raw_ptr).flow_id = corr;
-    (*raw_ptr).pid = (pid_tgid >> 32) as u32;
-    (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;
-    (*raw_ptr).family = family as u8;
-    (*raw_ptr).proto = IPPROTO_TCP;
-    (*raw_ptr).close_reason = close_reason;
-    (*raw_ptr).src_port = sport_host;
-    (*raw_ptr).dst_port = u16::from_be(dport_be);
-
-    // Addresses — v4 OR v6 per family.
-    let src_dst = (*raw_ptr).src_addr.as_mut_ptr();
-    let dst_dst = (*raw_ptr).dst_addr.as_mut_ptr();
-    if family == AF_INET {
-        let saddr: u32 =
-            match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32) {
+        // Byte counters from tcp_sock (sock is the prefix; sk_ptr
+        // doubles as tcp_sock pointer).
+        let bytes_sent: u64 =
+            match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_SENT_OFFSET)) as *const u64) {
                 Ok(v) => v,
                 Err(_) => 0,
             };
-        let daddr: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const u32)
+        let bytes_recv: u64 =
+            match bpf_probe_read_kernel(sk_ptr.add(off!(TCP_SOCK_BYTES_RECEIVED_OFFSET)) as *const u64) {
+                Ok(v) => v,
+                Err(_) => 0,
+            };
+
+        // Ports + addrs from sock_common.
+        let dport_be: u16 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16)
         {
             Ok(v) => v,
             Err(_) => 0,
         };
-        let sb = saddr.to_ne_bytes();
-        let db = daddr.to_ne_bytes();
-        let mut i = 0usize;
-        while i < 4 {
-            *src_dst.add(i) = sb[i];
-            *dst_dst.add(i) = db[i];
-            i += 1;
+        let mut sport_host: u16 =
+            match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_NUM_OFFSET)) as *const u16) {
+                Ok(v) => v,
+                Err(_) => 0,
+            };
+        // An abortive close (RST, SO_LINGER 0) has released the port by the
+        // fexit — `inet_put_port` zeroes `skc_num` — but `inet_sport` keeps
+        // it (network byte order).
+        if sport_host == 0 {
+            if let Ok(v) = bpf_probe_read_kernel(
+                sk_ptr.add(off!(INET_SOCK_INET_SPORT_OFFSET)) as *const u16,
+            ) {
+                sport_host = u16::from_be(v);
+            }
         }
-        while i < ADDR_LEN {
-            *src_dst.add(i) = 0;
-            *dst_dst.add(i) = 0;
-            i += 1;
-        }
-    } else {
-        let s6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-            sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
-        ) {
+        // sk_err — sign-extended i32 stored in network code as positive
+        // errno values; treat as u32 for bit math.
+        let sk_err_raw: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SK_ERR_OFFSET)) as *const u32)
+        {
             Ok(v) => v,
-            Err(_) => [0u8; ADDR_LEN],
+            Err(_) => 0,
         };
-        let d6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
-            sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN]
-        ) {
-            Ok(v) => v,
-            Err(_) => [0u8; ADDR_LEN],
-        };
+        let close_reason: u8 = (sk_err_raw & 0xFF) as u8;
+
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let uid_gid = bpf_get_current_uid_gid();
+        let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+
+        (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
+        (*raw_ptr).bytes_sent = bytes_sent;
+        (*raw_ptr).bytes_recv = bytes_recv;
+        (*raw_ptr).flow_id = corr;
+        (*raw_ptr).pid = (pid_tgid >> 32) as u32;
+        (*raw_ptr).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw_ptr).family = family as u8;
+        (*raw_ptr).proto = IPPROTO_TCP;
+        (*raw_ptr).close_reason = close_reason;
+        (*raw_ptr).src_port = sport_host;
+        (*raw_ptr).dst_port = u16::from_be(dport_be);
+
+        // Addresses — v4 OR v6 per family.
+        let src_dst = (*raw_ptr).src_addr.as_mut_ptr();
+        let dst_dst = (*raw_ptr).dst_addr.as_mut_ptr();
+        if family == AF_INET {
+            let saddr: u32 =
+                match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_RCV_SADDR_OFFSET)) as *const u32) {
+                    Ok(v) => v,
+                    Err(_) => 0,
+                };
+            let daddr: u32 = match bpf_probe_read_kernel(sk_ptr.add(off!(SOCK_SKC_DADDR_OFFSET)) as *const u32)
+            {
+                Ok(v) => v,
+                Err(_) => 0,
+            };
+            let sb = saddr.to_ne_bytes();
+            let db = daddr.to_ne_bytes();
+            let mut i = 0usize;
+            while i < 4 {
+                *src_dst.add(i) = sb[i];
+                *dst_dst.add(i) = db[i];
+                i += 1;
+            }
+            while i < ADDR_LEN {
+                *src_dst.add(i) = 0;
+                *dst_dst.add(i) = 0;
+                i += 1;
+            }
+        } else {
+            let s6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
+                sk_ptr.add(off!(SOCK_SKC_V6_RCV_SADDR_OFFSET)) as *const [u8; ADDR_LEN],
+            ) {
+                Ok(v) => v,
+                Err(_) => [0u8; ADDR_LEN],
+            };
+            let d6: [u8; ADDR_LEN] = match bpf_probe_read_kernel(
+                sk_ptr.add(off!(SOCK_SKC_V6_DADDR_OFFSET)) as *const [u8; ADDR_LEN]
+            ) {
+                Ok(v) => v,
+                Err(_) => [0u8; ADDR_LEN],
+            };
+            let mut i = 0usize;
+            while i < ADDR_LEN {
+                *src_dst.add(i) = s6[i];
+                *dst_dst.add(i) = d6[i];
+                i += 1;
+            }
+        }
+
+        // comm
+        let src = comm.as_ptr();
+        let cdst = (*raw_ptr).comm.as_mut_ptr();
         let mut i = 0usize;
-        while i < ADDR_LEN {
-            *src_dst.add(i) = s6[i];
-            *dst_dst.add(i) = d6[i];
+        while i < TASK_COMM_LEN {
+            *cdst.add(i) = *src.add(i);
             i += 1;
         }
-    }
 
-    // comm
-    let src = comm.as_ptr();
-    let cdst = (*raw_ptr).comm.as_mut_ptr();
-    let mut i = 0usize;
-    while i < TASK_COMM_LEN {
-        *cdst.add(i) = *src.add(i);
-        i += 1;
+        entry.submit(0);
+        Ok(())
     }
-
-    entry.submit(0);
-    Ok(())
 }

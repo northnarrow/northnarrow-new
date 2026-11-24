@@ -55,7 +55,7 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
     in_order(
         body(&c, "try_born"),
         &[
-            "if tgid == forker {\n        return;\n    }",
+            "if tgid == forker {\n            return;\n        }",
             "let _ = CGROUP_JOIN_BORN.insert(&tgid, &1, 0);",
             "found(tgid);",
         ],
@@ -65,7 +65,7 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
         body(&c, "try_fork"),
         &[
             "let Some(ptgid) = tgid_of(parent) else {",
-            "if check_birth(ptgid, child) {\n        return;\n    }",
+            "if check_birth(ptgid, child) {\n            return;\n        }",
             "let (marked, phow) = match CGROUP_JOINED.get(&ptgid) {",
         ],
     )
@@ -73,12 +73,12 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
     in_order(
         body(&c, "check_birth"),
         &[
-            "if ctgid == ptgid {\n        return false;\n    }",
+            "if ctgid == ptgid {\n            return false;\n        }",
             "let seen = CGROUP_JOIN_BORN.get(&ctgid).is_some();",
             "let _ = CGROUP_JOIN_BORN.remove(&ctgid);",
             "CGROUP_JOIN_SILENT.get(SILENT_ARMED)",
             ".unwrap_or(u64::MAX);",
-            "if !unseen_birth(armed, start, seen) {\n        return false;\n    }",
+            "if !unseen_birth(armed, start, seen) {\n            return false;\n        }",
             "lose(ctgid);",
             "CGROUP_JOIN_SILENT.get_ptr_mut(SILENT_UNSEEN)",
             "*n += 1;",
@@ -132,7 +132,7 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
 /// The bpf hook's root `cgroup/sysctl` branch, and the whole of it: the
 /// record (the program's tag, read inside the call) and the refusal.
 const ROOT_BRANCH: &str = "if root != ROOT_NO {";
-const ROOT_REFUSAL: &str = "if root != ROOT_NO {\n            emit_root_attach(attached_prog_tag(cmd, attr), arg);\n            return -EPERM;\n        }";
+const ROOT_REFUSAL: &str = "if root != ROOT_NO {\n                emit_root_attach(attached_prog_tag(cmd, attr), arg);\n                return -EPERM;\n            }";
 
 /// The bpf hook's judged `cgroup/sysctl` attach, whole: the target read,
 /// the root asked, the branch.
@@ -209,14 +209,14 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     in_order(
         h,
         &[
-            "if !observed(cmd) {\n        return 0;\n    }",
+            "if !observed(cmd) {\n            return 0;\n        }",
             "if caller_is_exempt() {",
             "BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,",
-            "if judges_attach_target(cmd, arg)\n        && !crate::inode_protect::override_active()\n        && !fresh_instance_may_load()\n    {",
+            "if judges_attach_target(cmd, arg)\n            && !crate::inode_protect::override_active()\n            && !fresh_instance_may_load()\n        {",
             "Some(off) if !attr.is_null() => {",
             "None => ROOT_UNREADABLE,",
             ROOT_REFUSAL,
-            "let foreign_handle =\n        own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
+            "let foreign_handle =\n            own_map_handle || own_prog_handle || own_link_handle || own_link_pin || own_dir_pin;",
         ],
     )
     .unwrap();
@@ -235,11 +235,11 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     in_order(
         body(&c, "fd_is_root_cgroup"),
         &[
-            "if fd >= max {\n        return Ok(false);\n    }",
+            "if fd >= max {\n            return Ok(false);\n        }",
             "off!(FILE_F_INODE_OFFSET)",
             "off!(INODE_I_SB_OFFSET)",
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
-            "if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {\n        return Ok(false);\n    }",
+            "if !matches!(special_fs(magic), Some(SpecialFs::Cgroup2)) {\n            return Ok(false);\n        }",
             "off!(INODE_I_INO_OFFSET)",
             "Ok(ino == ROOT_CGROUP_INO)",
         ],

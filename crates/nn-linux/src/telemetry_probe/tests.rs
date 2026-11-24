@@ -1009,14 +1009,19 @@ fn probe_datagram_stays_on_loopback_and_carries_the_name() {
 
 #[test]
 fn interval_env_zero_disables() {
-    std::env::set_var(INTERVAL_ENV, "0");
+    // SAFETY: no other test of nn-linux writes NN_TELEMETRY_PROBE_SECS;
+    // the crate reads the environment through std::env only, whose lock
+    // orders this write against those reads.
+    unsafe { std::env::set_var(INTERVAL_ENV, "0") };
     assert!(interval_from_env().is_none());
-    std::env::set_var(INTERVAL_ENV, "3");
+    // SAFETY: as above.
+    unsafe { std::env::set_var(INTERVAL_ENV, "3") };
     assert_eq!(
         interval_from_env(),
         Some(Duration::from_secs(DEADLINE_SECS + 1))
     );
-    std::env::remove_var(INTERVAL_ENV);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(INTERVAL_ENV) };
     assert_eq!(
         interval_from_env(),
         Some(Duration::from_secs(DEFAULT_INTERVAL_SECS))

@@ -377,19 +377,19 @@ impl Controller {
             self.txns.sample();
         }
         let want = desired();
-        let gen = self.kernel.write_gen();
+        let write_gen = self.kernel.write_gen();
         let stamp = db_stamp();
         let due = match &self.last {
             None => true,
             Some((at, g, d, s)) => {
-                at.elapsed() >= FULL_EVERY || *g != gen || *d != want || *s != stamp
+                at.elapsed() >= FULL_EVERY || *g != write_gen || *d != want || *s != stamp
             }
         };
         if !due {
             return;
         }
         self.look(&want, stamp);
-        self.last = Some((Instant::now(), gen, want, stamp));
+        self.last = Some((Instant::now(), write_gen, want, stamp));
     }
 
     fn look(&mut self, want: &Desired, stamp: Option<SystemTime>) {

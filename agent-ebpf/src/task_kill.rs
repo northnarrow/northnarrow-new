@@ -152,33 +152,36 @@ fn stops_or_ends(sig: c_int) -> bool {
 /// the kernel; a shell's builtin `kill`, which no exec shows, is seen here.
 #[inline(always)]
 unsafe fn observe_defender(target_tgid: u32, sig: c_int) {
-    if !stops_or_ends(sig) || DEFENDER_PIDS.get(&target_tgid).is_none() {
-        return;
-    }
-    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if caller == 1
-        || caller == target_tgid
-        || DEFENDER_PIDS.get(&caller).is_some()
-        || is_exempt_pid(caller)
-    {
-        return;
-    }
-    let key = (u64::from(caller) << 32) | u64::from(target_tgid);
-    let now = bpf_ktime_get_ns();
-    if let Some(last) = DEFENDER_SEEN.get(&key) {
-        if now.saturating_sub(*last) < 1_000_000_000 {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !stops_or_ends(sig) || DEFENDER_PIDS.get(&target_tgid).is_none() {
             return;
         }
+        let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if caller == 1
+            || caller == target_tgid
+            || DEFENDER_PIDS.get(&caller).is_some()
+            || is_exempt_pid(caller)
+        {
+            return;
+        }
+        let key = (u64::from(caller) << 32) | u64::from(target_tgid);
+        let now = bpf_ktime_get_ns();
+        if let Some(last) = DEFENDER_SEEN.get(&key) {
+            if now.saturating_sub(*last) < 1_000_000_000 {
+                return;
+            }
+        }
+        let _ = DEFENDER_SEEN.insert(&key, &now, 0);
+        let _ = crate::open_sensor::nn_open_emit(
+            u64::from(northnarrow_common::wire::open_sensor::open_reason::DEFENDER_SIGNAL)
+                | (u64::from(sig as u32) << 32),
+            0,
+            0,
+            0,
+            u64::from(target_tgid),
+        );
     }
-    let _ = DEFENDER_SEEN.insert(&key, &now, 0);
-    let _ = crate::open_sensor::nn_open_emit(
-        u64::from(northnarrow_common::wire::open_sensor::open_reason::DEFENDER_SIGNAL)
-            | (u64::from(sig as u32) << 32),
-        0,
-        0,
-        0,
-        u64::from(target_tgid),
-    );
 }
 
 #[lsm(hook = "task_kill")]
@@ -188,103 +191,106 @@ pub fn task_kill(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
-    // No prev-retval read on this kernel. Aya 0.13 documents a
-    // "phony retval at arg(N)" convention, but on Ubuntu 6.8's
-    // BPF-LSM trampoline that slot is not reliably zero-initialised
-    // — file_ioctl was silently early-returning because of garbage
-    // at arg(3) (see 2026-05-12 diagnosis). The kernel's
-    // call_int_hook macro short-circuits the LSM chain on the first
-    // non-zero verdict anyway, so we are only ever invoked when all
-    // prior LSMs returned 0; the prev-retval read is dead code.
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // No prev-retval read on this kernel. Aya 0.13 documents a
+        // "phony retval at arg(N)" convention, but on Ubuntu 6.8's
+        // BPF-LSM trampoline that slot is not reliably zero-initialised
+        // — file_ioctl was silently early-returning because of garbage
+        // at arg(3) (see 2026-05-12 diagnosis). The kernel's
+        // call_int_hook macro short-circuits the LSM chain on the first
+        // non-zero verdict anyway, so we are only ever invoked when all
+        // prior LSMs returned 0; the prev-retval read is dead code.
 
-    // Policy (audit `task-kill-signals-1`, 2026-10-08): towards a
-    // PROTECTED target, DENY EVERY signal except an explicit allowlist.
-    // The previous "only SIGKILL + SIGTERM" rule left the agent's own
-    // shutdown handlers reachable by any root shell: SIGINT / SIGHUP
-    // are graceful-stop signals in main.rs, SIGQUIT's default action
-    // terminates, SIGSTOP freezes the process (ptrace is denied, stop
-    // was not), SIGSEGV/SIGABRT/SIGBUS abort it. `kill -INT <agent>`
-    // from root stopped the agent cleanly — the exact "even root can't
-    // stop it" guarantee Tappa 7 promises. Note this hook only sees
-    // USERSPACE-originated signals (kill/tkill/rt_sigqueueinfo):
-    // kernel-generated SIGCHLD/SIGPIPE/faults never reach
-    // security_task_kill, so no allowlist entry is needed for them.
-    //
-    // Allowed regardless of target:
-    //   - sig 0: existence probe (the watchdog's `kill -0`, nn-admin).
-    // Allowed by CALLER (checked after the protected-target lookup):
-    //   - caller == target: the process signalling itself (raise,
-    //     tgkill between its own threads).
-    //   - caller is itself in PROTECTED_PIDS: the watchdog's
-    //     stuck-recovery SIGINT→SIGKILL and the agent↔watchdog pair.
-    //   - caller is PID 1 under a live grant, or PID 1 as
-    //     systemd-shutdown (below).
-    let sig: c_int = ctx.arg(2);
-    if sig == 0 {
-        return 0;
-    }
-
-    let target: *const c_void = ctx.arg(0);
-    if target.is_null() {
-        return 0;
-    }
-
-    // Read `target->tgid` via the probe helper. With LSM + BTF the
-    // pointer is a kernel-trusted `PTR_TO_BTF_ID`, but we use the
-    // explicit helper so the verifier accepts the read without a
-    // CO-RE relocation we don't yet emit from Rust.
-    let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
-    let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
-        Ok(v) => v,
-        Err(_) => {
-            // Lab PR 215: the target cannot be told; the signal goes
-            // through undecided, and is counted.
-            crate::fail_open::bump(northnarrow_common::fail_open::hook::TASK_KILL);
+        // Policy (audit `task-kill-signals-1`, 2026-10-08): towards a
+        // PROTECTED target, DENY EVERY signal except an explicit allowlist.
+        // The previous "only SIGKILL + SIGTERM" rule left the agent's own
+        // shutdown handlers reachable by any root shell: SIGINT / SIGHUP
+        // are graceful-stop signals in main.rs, SIGQUIT's default action
+        // terminates, SIGSTOP freezes the process (ptrace is denied, stop
+        // was not), SIGSEGV/SIGABRT/SIGBUS abort it. `kill -INT <agent>`
+        // from root stopped the agent cleanly — the exact "even root can't
+        // stop it" guarantee Tappa 7 promises. Note this hook only sees
+        // USERSPACE-originated signals (kill/tkill/rt_sigqueueinfo):
+        // kernel-generated SIGCHLD/SIGPIPE/faults never reach
+        // security_task_kill, so no allowlist entry is needed for them.
+        //
+        // Allowed regardless of target:
+        //   - sig 0: existence probe (the watchdog's `kill -0`, nn-admin).
+        // Allowed by CALLER (checked after the protected-target lookup):
+        //   - caller == target: the process signalling itself (raise,
+        //     tgkill between its own threads).
+        //   - caller is itself in PROTECTED_PIDS: the watchdog's
+        //     stuck-recovery SIGINT→SIGKILL and the agent↔watchdog pair.
+        //   - caller is PID 1 under a live grant, or PID 1 as
+        //     systemd-shutdown (below).
+        let sig: c_int = ctx.arg(2);
+        if sig == 0 {
             return 0;
         }
-    };
 
-    // Multi-PID lookup. `HashMap::get` in aya-ebpf returns a raw
-    // pointer to the value; we only care about presence, so the
-    // is_some() check collapses to a single bpf_map_lookup_elem
-    // call. Marked unsafe because the returned reference can be
-    // invalidated if the map mutates concurrently — we don't deref
-    // it, so the invalidation window is irrelevant here.
-    // R14a: a worker is protected as a target, as the agent and the
-    // watchdog are.
-    let is_protected = is_protected_pid(target_tgid);
-    if !is_protected {
-        // Lab PR 225: a stop or kill of another security tool, reported.
-        observe_defender(target_tgid, sig);
-        return 0;
+        let target: *const c_void = ctx.arg(0);
+        if target.is_null() {
+            return 0;
+        }
+
+        // Read `target->tgid` via the probe helper. With LSM + BTF the
+        // pointer is a kernel-trusted `PTR_TO_BTF_ID`, but we use the
+        // explicit helper so the verifier accepts the read without a
+        // CO-RE relocation we don't yet emit from Rust.
+        let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
+        let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
+            Ok(v) => v,
+            Err(_) => {
+                // Lab PR 215: the target cannot be told; the signal goes
+                // through undecided, and is counted.
+                crate::fail_open::bump(northnarrow_common::fail_open::hook::TASK_KILL);
+                return 0;
+            }
+        };
+
+        // Multi-PID lookup. `HashMap::get` in aya-ebpf returns a raw
+        // pointer to the value; we only care about presence, so the
+        // is_some() check collapses to a single bpf_map_lookup_elem
+        // call. Marked unsafe because the returned reference can be
+        // invalidated if the map mutates concurrently — we don't deref
+        // it, so the invalidation window is irrelevant here.
+        // R14a: a worker is protected as a target, as the agent and the
+        // watchdog are.
+        let is_protected = is_protected_pid(target_tgid);
+        if !is_protected {
+            // Lab PR 225: a stop or kill of another security tool, reported.
+            observe_defender(target_tgid, sig);
+            return 0;
+        }
+
+        let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        // Self-signal, or an exempt process signalling a protected one (the
+        // watchdog's stuck recovery, the agent's own supervision of the
+        // watchdog and of its workers). An attacker's shell is in neither set;
+        // R14a: a worker is protected, not exempt — it may not signal the
+        // agent, the watchdog or another worker.
+        if caller_tgid == target_tgid || is_exempt_pid(caller_tgid) {
+            return 0;
+        }
+
+        // External audit EBPF-001: PID 1 (systemd) signals a protected
+        // process only (a) under a live grant — written for a signed
+        // trusted-installer window, for the stop signals, until the window
+        // ends, under this boot's session nonce — or (b) as
+        // `systemd-shutdown`, the final stage of a shutdown, past which the
+        // machine halts: the units are not stopped by the shutdown
+        // transaction (no `Conflicts=shutdown.target`) and end here.
+        // `systemctl stop`/`kill`/`restart` outside a window is refused like
+        // a root shell's `kill`: systemd only relays root's request.
+        if caller_tgid == 1 && (pid1_granted(sig) || pid1_is_final_shutdown()) {
+            return 0;
+        }
+
+        // Evidence: a refused signal is an attempt on the agent (rate-limited).
+        crate::inode_protect::emit_task_denial(FS_OP_SIGNAL, sig as u64, target_tgid);
+        -EPERM
     }
-
-    let caller_tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    // Self-signal, or an exempt process signalling a protected one (the
-    // watchdog's stuck recovery, the agent's own supervision of the
-    // watchdog and of its workers). An attacker's shell is in neither set;
-    // R14a: a worker is protected, not exempt — it may not signal the
-    // agent, the watchdog or another worker.
-    if caller_tgid == target_tgid || is_exempt_pid(caller_tgid) {
-        return 0;
-    }
-
-    // External audit EBPF-001: PID 1 (systemd) signals a protected
-    // process only (a) under a live grant — written for a signed
-    // trusted-installer window, for the stop signals, until the window
-    // ends, under this boot's session nonce — or (b) as
-    // `systemd-shutdown`, the final stage of a shutdown, past which the
-    // machine halts: the units are not stopped by the shutdown
-    // transaction (no `Conflicts=shutdown.target`) and end here.
-    // `systemctl stop`/`kill`/`restart` outside a window is refused like
-    // a root shell's `kill`: systemd only relays root's request.
-    if caller_tgid == 1 && (pid1_granted(sig) || pid1_is_final_shutdown()) {
-        return 0;
-    }
-
-    // Evidence: a refused signal is an attempt on the agent (rate-limited).
-    crate::inode_protect::emit_task_denial(FS_OP_SIGNAL, sig as u64, target_tgid);
-    -EPERM
 }
 
 #[inline(always)]

@@ -200,3 +200,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 # parallel); until then the lint stays off for this crate only.
 [lints.clippy]
 manual_is_multiple_of = "allow"
+# Lot 396: the workspace's exception (`[workspace.lints.clippy]` in
+# Cargo.toml: let chains, edition 2024).
+collapsible_if = "allow"

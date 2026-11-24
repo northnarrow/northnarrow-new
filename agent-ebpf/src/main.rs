@@ -11,10 +11,44 @@
 //!
 //! Layout MUST stay in sync with `northnarrow_common::wire`. The
 //! struct is consumed by userland via `bytemuck::Pod`.
+//!
+//! ## Unsafe code (lot 396, edition 2024)
+//!
+//! Since edition 2024 the body of an `unsafe fn` is no longer an unsafe
+//! context by itself (`unsafe_op_in_unsafe_fn`). Each `unsafe fn` of this
+//! crate wraps its whole body in one explicit `unsafe {}` block: the
+//! context the body had under 2021, so the migration moved no code. Every
+//! such block's `// SAFETY:` line points here; the argument is the same
+//! for all of them:
+//! - the kernel's verifier checks every memory access of this object at
+//!   load, and refuses a program that could fault or reach out of bounds;
+//! - kernel and user memory is read through the `bpf_probe_read_*`
+//!   helpers, which return an error instead of faulting;
+//! - a map value is reached through aya's accessors, which check the
+//!   lookup's pointer for null (as the verifier requires) before any use.
+//!
+//! The crate has no `static mut` (aya 0.2's maps are plain statics), so
+//! the former crate-wide `allow(static_mut_refs)` is gone.
+//!
+//! ## Edition 2024 and the verifier (lot 396)
+//!
+//! Edition 2024 ends an `if let` scrutinee's temporaries in each arm, and
+//! a block's tail temporaries before its locals. LLVM lays out the code it
+//! gets from those scopes differently, and the verifier's count of some
+//! small programs moved by up to 18 % against rc15's (the five lab
+//! kernels). In the paths of the programs that grew by more than 1 % on one
+//! of them (`census_links`, `census_progs`, `dns_nss_resolve`,
+//! `epg_sys_exit`, `bpf_prog_guard` through `nn_calibrate` and
+//! `nn_scan_chunk`, `fork_parent_record`, `fim_file_open_observe`,
+//! `fim_file_open_sensor`) and of the FIM observers that share their
+//! helpers, 22 `if let`s are `match`es, whose temporaries end once, after
+//! the arms, as 2021's did, and two map keys are bound before their
+//! lookup: those programs' instructions are 2021's again. Such a `match`
+//! goes back to an `if let` only with `nn-lab.sh verifier-check` run on
+//! the five kernels.
 
 #![no_std]
 #![no_main]
-#![allow(static_mut_refs)]
 
 #[macro_use]
 mod btf_offsets;
@@ -430,6 +464,6 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-#[link_section = "license"]
-#[no_mangle]
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";

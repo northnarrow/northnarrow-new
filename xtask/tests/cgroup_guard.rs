@@ -57,7 +57,7 @@ fn the_move_guard_records_only_a_refusable_move_and_refuses_its_check() {
             "args.add(CGROUP_MOVE_RET_ARG)",
             "task >= 0u64.wrapping_sub(MAX_ERRNO)",
             "off!(TASK_STRUCT_TGID_OFFSET)",
-            "if !crate::task_kill::is_protected_pid(tgid)\n        || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)\n        || crate::inode_protect::override_active()\n    {\n        return;\n    }",
+            "if !crate::task_kill::is_protected_pid(tgid)\n            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)\n            || crate::inode_protect::override_active()\n        {\n            return;\n        }",
             "if CGROUP_MOVES.insert(&pid_tgid, &rec, 0).is_err() {",
             "crate::fail_open::bump(hook::CGROUP_PROCS_WRITE_START);",
         ],
@@ -70,16 +70,16 @@ fn the_move_guard_records_only_a_refusable_move_and_refuses_its_check() {
         deny,
         &[
             "let mask: c_int = ctx.arg(1);",
-            "if mask & MAY_WRITE == 0 {\n        return 0;\n    }",
+            "if mask & MAY_WRITE == 0 {\n            return 0;\n        }",
             "CGROUP_MOVES.get(&pid_tgid)",
             // lot 273b: consumed only by a migration's check
-            "if !is_cgroup2_members_file(ctx.arg(0)) {\n        return 0;\n    }",
+            "if !is_cgroup2_members_file(ctx.arg(0)) {\n            return 0;\n        }",
             "let _ = CGROUP_MOVES.remove(&pid_tgid);",
             // lot 273b (the review's R11, R12): whole conditions, not
             // their substrings
-            "if bpf_ktime_get_ns().wrapping_sub(rec[1]) >= STASH_TTL_NS {\n        return 0;\n    }",
-            "if crate::inode_protect::override_active()\n        || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)\n    {\n        return 0;\n    }",
-            "crate::inode_protect::emit_task_denial(FS_OP_CGROUP_MOVE, 0, rec[0] as u32);\n    -EPERM\n}",
+            "if bpf_ktime_get_ns().wrapping_sub(rec[1]) >= STASH_TTL_NS {\n            return 0;\n        }",
+            "if crate::inode_protect::override_active()\n            || crate::task_kill::is_exempt_pid((pid_tgid >> 32) as u32)\n        {\n            return 0;\n        }",
+            "crate::inode_protect::emit_task_denial(FS_OP_CGROUP_MOVE, 0, rec[0] as u32);\n        -EPERM\n    }",
         ],
     )
     .unwrap();
@@ -124,8 +124,8 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "if let Some((op, key)) = protected_verdict(FS_OP_WRITE, inode, hook::FILE_OPEN) {",
             // lot 293 (BUG37): signed behind the attempt budget
-            "if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {\n            emit_attempt(op, key);\n            return -EPERM;\n        }",
-            "\n    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {",
+            "if !fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32) {\n                emit_attempt(op, key);\n                return -EPERM;\n            }",
+            "\n        if crate::cgroup_files::refuse_write(file, inode, hook::FILE_OPEN, crate::cgroup_files::Phase::Open) {",
             "return -EPERM;",
         ],
     )
@@ -134,13 +134,13 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     in_order(
         body(&i, "try_protected_write_deny"),
         &[
-            "if mask & MAY_WRITE == 0 {\n        return 0;\n    }",
+            "if mask & MAY_WRITE == 0 {\n            return 0;\n        }",
             "off!(FILE_F_INODE_OFFSET)",
             "protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION)",
             "let thaw = fs_protect_init_may_open(op, (bpf_get_current_pid_tgid() >> 32) as u32)",
             "Some(v) if same_value(&v, &fs_protect_thaw_value())",
-            "if !thaw {\n            emit_limited(op, key);\n            return -EPERM;\n        }",
-            "\n    if crate::cgroup_files::refuse_write(file, inode, hook::FILE_PERMISSION, crate::cgroup_files::Phase::Write) {",
+            "if !thaw {\n                emit_limited(op, key);\n                return -EPERM;\n            }",
+            "\n        if crate::cgroup_files::refuse_write(file, inode, hook::FILE_PERMISSION, crate::cgroup_files::Phase::Write) {",
             "return -EPERM;",
         ],
     )
@@ -157,7 +157,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "off!(SUPER_BLOCK_S_MAGIC_OFFSET)",
             "Ok(m) => m,",
             // lot 280b: and the switches of debugfs and securityfs
-            "match special_fs(magic) {\n        Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n        Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n        Some(SpecialFs::Proc) => {\n            refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n        }\n        Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),\n        None => false,\n    }",
+            "match special_fs(magic) {\n            Some(SpecialFs::Cgroup2) => refuse_limit(file, inode, hook, phase),\n            Some(SpecialFs::CgroupV1) => refuse_v1(inode, hook, phase),\n            Some(SpecialFs::Proc) => {\n                refuse_sysctl(file, inode, hook, phase) || refuse_oom_adj(file, inode, phase)\n            }\n            Some(fs @ (SpecialFs::Debugfs | SpecialFs::Securityfs)) => refuse_switch(file, inode, fs, phase),\n            None => false,\n        }",
         ],
     )
     .unwrap();
@@ -173,10 +173,10 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&c, "refuse_switch"),
         &[
             "let op = switch_file_op(fs, name, parent);",
-            "if op == 0 {\n        return false;\n    }",
-            "if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {\n        return false;\n    }",
+            "if op == 0 {\n            return false;\n        }",
+            "if caller_may((bpf_get_current_pid_tgid() >> 32) as u32) {\n            return false;\n        }",
             "read_inode_key(inode).unwrap_or(InodeKey { dev: 0, ino: 0 });",
-            "sign(phase, op, key);\n    true",
+            "sign(phase, op, key);\n        true",
         ],
     )
     .unwrap();
@@ -195,7 +195,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "let task = generated::bpf_get_current_task_btf();",
             "off!(TASK_STRUCT_FLAGS_OFFSET)",
             ".ok()?;",
-            "if !regs_are_the_writes(flags) {\n        return None;\n    }",
+            "if !regs_are_the_writes(flags) {\n            return None;\n        }",
             "generated::bpf_task_pt_regs(task)",
         ],
     )
@@ -203,13 +203,13 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     in_order(
         body(&c, "refuse_sysctl"),
         &[
-            "if phase == Phase::Open {\n        return false;\n    }",
+            "if phase == Phase::Open {\n            return false;\n        }",
             "let kind = sysctl_kind(len, words);",
-            "if kind == SYSCTL_NONE {\n        return false;\n    }",
+            "if kind == SYSCTL_NONE {\n            return false;\n        }",
             // R1: the shared verdict, the caller's identity passed in (the
             // agent's own restore), the bytes read only through it — lot
             // 280a: with the signed opt-out (xtask/tests/sysctl_cgroup.rs)
-            "let (verdict, v) = sysctl_write_verdict(\n        kind,\n        caller_may(caller),",
+            "let (verdict, v) = sysctl_write_verdict(\n            kind,\n            caller_may(caller),",
             "|| written_value(),",
             "SysctlVerdict::Allow => return false,",
             "SysctlVerdict::Refuse => {}",
@@ -231,7 +231,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
             "off_opt!(KERNFS_NODE_ID_OFFSET)",
             "return Node::NoOffsets;",
             "bpf_probe_read_kernel_str(w.as_mut_ptr() as *mut c_void, 24, name as *const c_void)",
-            "if len > LIMIT_NAME_MAX {\n        return Node::NotALimit;\n    }",
+            "if len > LIMIT_NAME_MAX {\n            return Node::NotALimit;\n        }",
             "kn.add(parent_off)",
             "parent.add(id_off)",
             "Ok(id) => Node::Read(len, w, id),",
@@ -242,7 +242,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&c, "dentry_name_and_dir"),
         &[
             "let kind = limit_kind(len, words);",
-            "if kind == LIMIT_NONE {\n        return None;\n    }",
+            "if kind == LIMIT_NONE {\n            return None;\n        }",
             "off!(DENTRY_D_PARENT_OFFSET)",
             "Some((kind, dir_key))",
         ],
@@ -252,12 +252,12 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&c, "refuse_limit"),
         &[
             "let registered = LIMIT_VALUES.get(&key).copied();",
-            "Node::Read(len, words, dir_ino) => (\n            limit_kind(len, words),\n            InodeKey {\n                dev: key.dev,\n                ino: dir_ino,\n            },\n        ),",
+            "Node::Read(len, words, dir_ino) => (\n                limit_kind(len, words),\n                InodeKey {\n                    dev: key.dev,\n                    ino: dir_ino,\n                },\n            ),",
             "Node::NoOffsets => match dentry_name_and_dir(file, hook) {",
-            "Node::Unreadable => {\n            crate::fail_open::bump(hook);",
-            "if registered.is_none() {\n        if kind == LIMIT_NONE {\n            return false;\n        }",
+            "Node::Unreadable => {\n                crate::fail_open::bump(hook);",
+            "if registered.is_none() {\n            if kind == LIMIT_NONE {\n                return false;\n            }",
             "Some(f) if *f & FS_PROTECT_LIMIT_DIR != 0 => {}",
-            "if caller_may(caller) {\n        return false;\n    }",
+            "if caller_may(caller) {\n            return false;\n        }",
             "if caller == 1 {",
             "sign(phase, FS_OP_CGROUP_LIMIT, key);",
             "true",
@@ -284,7 +284,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     in_order(
         body(&c, "written_bytes"),
         &[
-            "if nr != NR_WRITE && nr != NR_PWRITE64 {\n        return None;\n    }",
+            "if nr != NR_WRITE && nr != NR_PWRITE64 {\n            return None;\n        }",
             "if count == 0 || count > LIMIT_TEXT_MAX as u64 + 1 {",
             "bpf_probe_read_user(",
             "Some((value, n))",
@@ -299,7 +299,7 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         body(&c, "refuse_v1"),
         &[
             "Some(p) if *p & CGROUP_POLICY_V1_REFUSE != 0 => {}",
-            "if caller_may(caller) {\n        return false;\n    }",
+            "if caller_may(caller) {\n            return false;\n        }",
             "sign(phase, FS_OP_CGROUP_V1, key);",
         ],
     )
@@ -309,9 +309,9 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
         &[
             "name_words(b\"oom_score_adj\")",
             "name_words(b\"oom_adj\")",
-            "if !named {\n        return false;\n    }",
-            "if !crate::task_kill::is_protected_pid(tgid) {\n        return false;\n    }",
-            "if caller_may(caller) {\n        return false;\n    }",
+            "if !named {\n            return false;\n        }",
+            "if !crate::task_kill::is_protected_pid(tgid) {\n            return false;\n        }",
+            "if caller_may(caller) {\n            return false;\n        }",
             "emit_task_denial(FS_OP_OOM_ADJ, 0, tgid);",
         ],
     )
@@ -543,8 +543,8 @@ fn the_task_settings_denies_refuse_another_processs_change() {
         &[
             "off!(TASK_STRUCT_TGID_OFFSET)",
             "crate::fail_open::bump(hook);",
-            "if !crate::task_kill::is_protected_pid(tgid)\n        && !crate::bpf_defense::task_runs_own_binary(task as *const u8)\n    {\n        return false;\n    }",
-            "if caller == tgid\n        || crate::task_kill::is_exempt_pid(caller)\n        || crate::inode_protect::override_active()\n    {\n        return false;\n    }",
+            "if !crate::task_kill::is_protected_pid(tgid)\n            && !crate::bpf_defense::task_runs_own_binary(task as *const u8)\n        {\n            return false;\n        }",
+            "if caller == tgid\n            || crate::task_kill::is_exempt_pid(caller)\n            || crate::inode_protect::override_active()\n        {\n            return false;\n        }",
             "crate::inode_protect::emit_task_denial(op, detail, tgid);",
             "true",
         ],
@@ -603,8 +603,8 @@ fn the_task_settings_denies_refuse_another_processs_change() {
         body(&p, "try_ptrace_access_check"),
         &[
             "let init_attach = target_tgid == 1 && mode & PTRACE_MODE_ATTACH != 0;",
-            "if !init_attach && !target_is_protected(target_tgid, target as *const u8) {\n        return 0;\n    }",
-            "if caller_may_access(caller_tgid, init_attach) {\n        return 0;\n    }",
+            "if !init_attach && !target_is_protected(target_tgid, target as *const u8) {\n            return 0;\n        }",
+            "if caller_may_access(caller_tgid, init_attach) {\n            return 0;\n        }",
             "-EPERM",
         ],
     )
@@ -629,7 +629,7 @@ fn the_task_settings_denies_refuse_another_processs_change() {
         body(&i, "try_protected_write_deny"),
         &[
             "off!(INODE_I_MODE_OFFSET)",
-            "if mode & S_IFMT != S_IFREG {\n                return 0;\n            }",
+            "if mode & S_IFMT != S_IFREG {\n                    return 0;\n                }",
             "protected_verdict(FS_OP_WRITE, inode, hook::FILE_PERMISSION)",
         ],
     )
@@ -640,9 +640,9 @@ fn the_task_settings_denies_refuse_another_processs_change() {
         body(&c, "refuse_v1"),
         &[
             "Some(p) if *p & CGROUP_POLICY_V1_REFUSE != 0 => {}",
-            "if caller_may(caller) {\n        return false;\n    }",
-            "if v1_binds_a_controller(inode) == Some(false) {\n        return false;\n    }",
-            "if v1_moves_or_freezes(inode) == Some(false) {\n        return false;\n    }",
+            "if caller_may(caller) {\n            return false;\n        }",
+            "if v1_binds_a_controller(inode) == Some(false) {\n            return false;\n        }",
+            "if v1_moves_or_freezes(inode) == Some(false) {\n            return false;\n        }",
             "sign(phase, FS_OP_CGROUP_V1, key);",
         ],
     )

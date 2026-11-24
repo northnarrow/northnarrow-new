@@ -156,7 +156,7 @@ fn the_environment_is_read_to_its_end() {
     ] {
         assert!(
             flat(&pol).contains(&format!(
-                "#[no_mangle] #[inline(never)] pub extern \"C\" fn {f}("
+                "#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn {f}("
             )),
             "{f} is a global function"
         );
@@ -985,7 +985,8 @@ fn the_environment_has_its_own_program() {
     // recorded whenever the judgment acts (refuses, would, records)
     assert!(flat(body(&pol, "try_exec_env_lsm")).contains("if env_act != 0 { nn_env_report("));
     // the record, its path walked, checked once (a global function)
-    assert!(flat(&pol).contains("#[no_mangle] #[inline(never)] pub extern \"C\" fn nn_env_report("));
+    assert!(flat(&pol)
+        .contains("#[unsafe(no_mangle)] #[inline(never)] pub extern \"C\" fn nn_env_report("));
     assert!(body(&pol, "nn_env_report").contains("report_env_pass("));
     let op = body(&pol, "on_pass");
     for not in ["nn_exec_env(", "env_deny_rule", "EXECPOL_ENV_SEEN"] {

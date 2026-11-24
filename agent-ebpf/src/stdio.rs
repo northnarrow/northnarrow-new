@@ -50,29 +50,38 @@ const AF_INET6: u16 = 10;
 
 #[inline(always)]
 unsafe fn peek_u64(src: u64) -> u64 {
-    let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: u64) -> u32 {
-    let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u32>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: u64) -> u16 {
-    let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
-    v.assume_init()
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u16>::uninit();
+        let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+        v.assume_init()
+    }
 }
 
 /// Fill [`STDIO_SCRATCH`] slot `slot` (0 or 1) with the standard streams
 /// of `task` (a `struct task_struct *`); returns the flags written (0 =
 /// not read). A global function: the verifier checks it once, on its own.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_stdio_probe(task: u64, slot: u64) -> u64 {
     unsafe { stdio_probe(task, (slot & 1) as u32) }
@@ -80,107 +89,110 @@ pub extern "C" fn nn_stdio_probe(task: u64, slot: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn stdio_probe(task: u64, slot: u32) -> u64 {
-    let out = match STDIO_SCRATCH.get_ptr_mut(slot) {
-        Some(p) => p as *mut u8,
-        None => return 0,
-    };
-    // 24 bytes, three words: the slot holds the previous exec's answer.
-    // Volatile: three plain zero stores became a `memset` call (rule 9).
-    core::ptr::write_volatile(out as *mut u64, 0);
-    core::ptr::write_volatile(out.add(8) as *mut u64, 0);
-    core::ptr::write_volatile(out.add(16) as *mut u64, 0);
-    if task == 0 {
-        return 0;
-    }
-    let o_files = match off_opt!(TASK_STRUCT_FILES_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_fdt = match off_opt!(FILES_STRUCT_FDT_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_max = match off_opt!(FDTABLE_MAX_FDS_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_fd = match off_opt!(FDTABLE_FD_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_priv = match off_opt!(FILE_PRIVATE_DATA_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_sk = match off_opt!(SOCKET_SK_OFFSET) {
-        Some(o) => o as u64,
-        None => return 0,
-    };
-    let o_inode = off!(FILE_F_INODE_OFFSET) as u64;
-    let o_mode = off!(INODE_I_MODE_OFFSET) as u64;
-    let o_family = off!(SOCK_SKC_FAMILY_OFFSET) as u64;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let out = match STDIO_SCRATCH.get_ptr_mut(slot) {
+            Some(p) => p as *mut u8,
+            None => return 0,
+        };
+        // 24 bytes, three words: the slot holds the previous exec's answer.
+        // Volatile: three plain zero stores became a `memset` call (rule 9).
+        core::ptr::write_volatile(out as *mut u64, 0);
+        core::ptr::write_volatile(out.add(8) as *mut u64, 0);
+        core::ptr::write_volatile(out.add(16) as *mut u64, 0);
+        if task == 0 {
+            return 0;
+        }
+        let o_files = match off_opt!(TASK_STRUCT_FILES_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_fdt = match off_opt!(FILES_STRUCT_FDT_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_max = match off_opt!(FDTABLE_MAX_FDS_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_fd = match off_opt!(FDTABLE_FD_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_priv = match off_opt!(FILE_PRIVATE_DATA_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_sk = match off_opt!(SOCKET_SK_OFFSET) {
+            Some(o) => o as u64,
+            None => return 0,
+        };
+        let o_inode = off!(FILE_F_INODE_OFFSET) as u64;
+        let o_mode = off!(INODE_I_MODE_OFFSET) as u64;
+        let o_family = off!(SOCK_SKC_FAMILY_OFFSET) as u64;
 
-    let files = peek_u64(task + o_files);
-    if files == 0 {
-        return 0;
-    }
-    let fdt = peek_u64(files + o_fdt);
-    if fdt == 0 {
-        return 0;
-    }
-    let max = peek_u32(fdt + o_max) as u64;
-    let arr = peek_u64(fdt + o_fd);
-    if arr == 0 {
-        return 0;
-    }
-    let mut flags: u8 = stdio_flags::READ;
-    let mut first: u64 = 0;
-    let mut first_family: u16 = 0;
-    let mut fd: u64 = 0;
-    while fd < 3 {
-        if fd < max {
-            let file = peek_u64(arr + 8 * fd);
-            let inode = if file != 0 {
-                peek_u64(file + o_inode)
-            } else {
-                0
-            };
-            let mode = if inode != 0 {
-                peek_u16(inode + o_mode)
-            } else {
-                0
-            };
-            if mode & S_IFMT == S_IFSOCK {
-                let sock = peek_u64(file + o_priv);
-                let sk = if sock != 0 { peek_u64(sock + o_sk) } else { 0 };
-                let family = if sk != 0 { peek_u16(sk + o_family) } else { 0 };
-                if family == AF_INET || family == AF_INET6 {
-                    flags |= stdio_flags::FD0_INET << fd;
-                    if first == 0 {
-                        first = sk;
-                        first_family = family;
-                    }
-                    if crate::tcp_connect::FLOW_SOCK_MAP.get(&sk).is_some() {
-                        flags |= stdio_flags::OUTBOUND;
+        let files = peek_u64(task + o_files);
+        if files == 0 {
+            return 0;
+        }
+        let fdt = peek_u64(files + o_fdt);
+        if fdt == 0 {
+            return 0;
+        }
+        let max = peek_u32(fdt + o_max) as u64;
+        let arr = peek_u64(fdt + o_fd);
+        if arr == 0 {
+            return 0;
+        }
+        let mut flags: u8 = stdio_flags::READ;
+        let mut first: u64 = 0;
+        let mut first_family: u16 = 0;
+        let mut fd: u64 = 0;
+        while fd < 3 {
+            if fd < max {
+                let file = peek_u64(arr + 8 * fd);
+                let inode = if file != 0 {
+                    peek_u64(file + o_inode)
+                } else {
+                    0
+                };
+                let mode = if inode != 0 {
+                    peek_u16(inode + o_mode)
+                } else {
+                    0
+                };
+                if mode & S_IFMT == S_IFSOCK {
+                    let sock = peek_u64(file + o_priv);
+                    let sk = if sock != 0 { peek_u64(sock + o_sk) } else { 0 };
+                    let family = if sk != 0 { peek_u16(sk + o_family) } else { 0 };
+                    if family == AF_INET || family == AF_INET6 {
+                        flags |= stdio_flags::FD0_INET << fd;
+                        if first == 0 {
+                            first = sk;
+                            first_family = family;
+                        }
+                        if crate::tcp_connect::FLOW_SOCK_MAP.get(&sk).is_some() {
+                            flags |= stdio_flags::OUTBOUND;
+                        }
                     }
                 }
             }
+            fd += 1;
         }
-        fd += 1;
-    }
-    *out = flags;
-    if first != 0 {
-        *out.add(1) = first_family as u8;
-        *(out.add(2) as *mut u16) =
-            u16::from_be(peek_u16(first + off!(SOCK_SKC_DPORT_OFFSET) as u64));
-        *out.add(4) = peek_u16(first + off!(SOCK_SK_PROTOCOL_OFFSET) as u64) as u8;
-        if first_family == AF_INET {
-            *(out.add(8) as *mut u32) = peek_u32(first + off!(SOCK_SKC_DADDR_OFFSET) as u64);
-        } else {
-            let a = first + off!(SOCK_SKC_V6_DADDR_OFFSET) as u64;
-            *(out.add(8) as *mut u64) = peek_u64(a);
-            *(out.add(16) as *mut u64) = peek_u64(a + 8);
+        *out = flags;
+        if first != 0 {
+            *out.add(1) = first_family as u8;
+            *(out.add(2) as *mut u16) =
+                u16::from_be(peek_u16(first + off!(SOCK_SKC_DPORT_OFFSET) as u64));
+            *out.add(4) = peek_u16(first + off!(SOCK_SK_PROTOCOL_OFFSET) as u64) as u8;
+            if first_family == AF_INET {
+                *(out.add(8) as *mut u32) = peek_u32(first + off!(SOCK_SKC_DADDR_OFFSET) as u64);
+            } else {
+                let a = first + off!(SOCK_SKC_V6_DADDR_OFFSET) as u64;
+                *(out.add(8) as *mut u64) = peek_u64(a);
+                *(out.add(16) as *mut u64) = peek_u64(a + 8);
+            }
         }
+        flags as u64
     }
-    flags as u64
 }

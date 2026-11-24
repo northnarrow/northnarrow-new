@@ -67,7 +67,10 @@ static EPG_LITE_TASKS: LruHashMap<u64, LiteState> =
 /// `task->start_time` (`CLOCK_MONOTONIC` ns at fork).
 #[inline(always)]
 unsafe fn start_time(c: &GuardConfig, task: u64) -> Option<u64> {
-    rd::<u64>(task + o(c.task_start_time))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        rd::<u64>(task + o(c.task_start_time))
+    }
 }
 
 /// The record of the task at `task` that started at `start`, when it is
@@ -76,37 +79,46 @@ unsafe fn start_time(c: &GuardConfig, task: u64) -> Option<u64> {
 /// went back to its leader's) it is, and follows the new start time.
 #[inline(always)]
 unsafe fn lookup(task: u64, start: u64) -> Option<*mut LiteState> {
-    let s = EPG_LITE_TASKS.get_ptr_mut(&task)?;
-    match epg::lite_entry((*s).start_time, start) {
-        LiteEntry::Current => Some(s),
-        LiteEntry::ThreadExec => {
-            (*s).start_time = start;
-            Some(s)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let s = EPG_LITE_TASKS.get_ptr_mut(&task)?;
+        match epg::lite_entry((*s).start_time, start) {
+            LiteEntry::Current => Some(s),
+            LiteEntry::ThreadExec => {
+                (*s).start_time = start;
+                Some(s)
+            }
+            LiteEntry::Stale => None,
         }
-        LiteEntry::Stale => None,
     }
 }
 
 /// `task->real_cred` (an address for reads).
 #[inline(always)]
 unsafe fn real_cred(c: &GuardConfig, task: u64) -> Option<u64> {
-    rd::<u64>(task + o(c.task_real_cred))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        rd::<u64>(task + o(c.task_real_cred))
+    }
 }
 
 /// The call the current task (`task`) is in: `(abi, nr, in_syscall)`.
 #[inline(always)]
 unsafe fn current_call(c: &GuardConfig, task: u64) -> (u8, u32, bool) {
-    let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
-    if regs == 0 {
-        return (abi::NONE, NO_SYSCALL, false);
-    }
-    let Some(orig_ax) = rd::<u64>(regs + epg::PT_REGS_ORIG_AX as u64) else {
-        return (abi::NONE, NO_SYSCALL, false);
-    };
-    let compat = crate::epg::compat(c, task);
-    match epg::syscall_of(orig_ax, compat) {
-        Some((a, n)) => (a, n, true),
-        None => (abi::NONE, NO_SYSCALL, false),
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
+        if regs == 0 {
+            return (abi::NONE, NO_SYSCALL, false);
+        }
+        let Some(orig_ax) = rd::<u64>(regs + epg::PT_REGS_ORIG_AX as u64) else {
+            return (abi::NONE, NO_SYSCALL, false);
+        };
+        let compat = crate::epg::compat(c, task);
+        match epg::syscall_of(orig_ax, compat) {
+            Some((a, n)) => (a, n, true),
+            None => (abi::NONE, NO_SYSCALL, false),
+        }
     }
 }
 
@@ -127,34 +139,37 @@ unsafe fn report(
     flags: u8,
     pt: u8,
 ) {
-    let act = respond(c);
-    if (*s).reports >= epg::REPORTS_PER_TASK {
-        count(counter::REPORTS_HELD);
-    } else {
-        (*s).reports += 1;
-        let flags = if (*s).flags & lf::REBASELINED != 0 {
-            flags | evf::REBASELINED
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let act = respond(c);
+        if (*s).reports >= epg::REPORTS_PER_TASK {
+            count(counter::REPORTS_HELD);
         } else {
-            flags
-        };
-        emit_change(
-            c,
-            kind_,
-            act,
-            call,
-            flags,
-            pt,
-            core::ptr::addr_of!((*s).id),
-            (*s).nsproxy,
-            now,
-            ns_now,
-        );
-    }
-    if c.mode == cfg::MODE_ENFORCE {
-        (*s).flags |= lf::TAINTED;
-    } else {
-        (*s).id = *now;
-        (*s).nsproxy = ns_now;
+            (*s).reports += 1;
+            let flags = if (*s).flags & lf::REBASELINED != 0 {
+                flags | evf::REBASELINED
+            } else {
+                flags
+            };
+            emit_change(
+                c,
+                kind_,
+                act,
+                call,
+                flags,
+                pt,
+                core::ptr::addr_of!((*s).id),
+                (*s).nsproxy,
+                now,
+                ns_now,
+            );
+        }
+        if c.mode == cfg::MODE_ENFORCE {
+            (*s).flags |= lf::TAINTED;
+        } else {
+            (*s).id = *now;
+            (*s).nsproxy = ns_now;
+        }
     }
 }
 
@@ -186,28 +201,31 @@ unsafe fn state_or_baseline(
     ns_now: u64,
     pt: u8,
 ) -> Option<(*mut LiteState, bool)> {
-    if let Some(s) = found {
-        if (*s).flags & lf::VALID != 0 {
-            return Some((s, false));
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if let Some(s) = found {
+            if (*s).flags & lf::VALID != 0 {
+                return Some((s, false));
+            }
         }
+        let task_flags = peek::<u32>(task + o(c.task_flags));
+        let lost = epg::baseline_lost(start, task_flags, c.armed_at_ns);
+        let mut init = fresh(*now, cred, ns_now, start);
+        if lost {
+            init.flags |= lf::REBASELINED;
+        }
+        if EPG_LITE_TASKS.insert(&task, &init, ANY).is_err() {
+            return None;
+        }
+        let s = EPG_LITE_TASKS.get_ptr_mut(&task)?;
+        if lost {
+            count(counter::BASELINES_LOST);
+            rebaselined(c, s, task, now, ns_now, pt);
+        } else {
+            count(counter::LAZY_BASELINES);
+        }
+        Some((s, true))
     }
-    let task_flags = peek::<u32>(task + o(c.task_flags));
-    let lost = epg::baseline_lost(start, task_flags, c.armed_at_ns);
-    let mut init = fresh(*now, cred, ns_now, start);
-    if lost {
-        init.flags |= lf::REBASELINED;
-    }
-    if EPG_LITE_TASKS.insert(&task, &init, ANY).is_err() {
-        return None;
-    }
-    let s = EPG_LITE_TASKS.get_ptr_mut(&task)?;
-    if lost {
-        count(counter::BASELINES_LOST);
-        rebaselined(c, s, task, now, ns_now, pt);
-    } else {
-        count(counter::LAZY_BASELINES);
-    }
-    Some((s, true))
 }
 
 /// Degraded evidence: the record of a task started after arming was gone,
@@ -228,36 +246,42 @@ unsafe fn rebaselined(
     ns_now: u64,
     pt: u8,
 ) {
-    if !epg::holds_privilege(now) {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        if !epg::holds_privilege(now) {
+            return;
+        }
+        if (*s).reports >= epg::REPORTS_PER_TASK {
+            count(counter::REPORTS_HELD);
+            return;
+        }
+        (*s).reports += 1;
+        let (a, n, _) = current_call(c, task);
+        emit_held(
+            c,
+            kind::CRED_NO_MECHANISM,
+            action::RECORDED,
+            (a, n),
+            evf::BASELINE_LOST | evf::REBASELINED,
+            pt,
+            now,
+            ns_now,
+        );
     }
-    if (*s).reports >= epg::REPORTS_PER_TASK {
-        count(counter::REPORTS_HELD);
-        return;
-    }
-    (*s).reports += 1;
-    let (a, n, _) = current_call(c, task);
-    emit_held(
-        c,
-        kind::CRED_NO_MECHANISM,
-        action::RECORDED,
-        (a, n),
-        evf::BASELINE_LOST | evf::REBASELINED,
-        pt,
-        now,
-        ns_now,
-    );
 }
 
 /// A use of a privilege. 0 lets it proceed; `-EPERM` refuses it (enforce).
 #[inline(always)]
 unsafe fn use_point(c: &GuardConfig, pt: u8) -> i32 {
-    let task = bpf_get_current_task();
-    let Some(start) = start_time(c, task) else {
-        return 0;
-    };
-    let found = lookup(task, start);
-    use_point_found(c, pt, task, start, found)
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let Some(start) = start_time(c, task) else {
+            return 0;
+        };
+        let found = lookup(task, start);
+        use_point_found(c, pt, task, start, found)
+    }
 }
 
 /// [`use_point`] once the task's record was looked up (`found`).
@@ -269,62 +293,65 @@ unsafe fn use_point_found(
     start: u64,
     found: Option<*mut LiteState>,
 ) -> i32 {
-    // Fast path: a fully privileged committed credential has nothing to gain.
-    if let Some(s) = found {
-        if (*s).flags & (lf::VALID | lf::TAINTED) == lf::VALID
-            && c.inject_comm_lo == 0
-            && epg::lite_skips(&(*s).id, c.full_cap_mask)
-        {
-            return 0;
-        }
-    }
-    count(counter::USE_CHECKS);
-    let Some(cred) = real_cred(c, task) else {
-        return 0;
-    };
-    let Some(now) = read_identity(c, cred) else {
-        return 0;
-    };
-    let ns_now = nsproxy_of(c, task);
-    let Some((s, new)) = state_or_baseline(c, found, task, start, &now, cred, ns_now, pt) else {
-        return 0;
-    };
-    if (*s).flags & lf::TAINTED != 0 && c.mode == cfg::MODE_ENFORCE {
-        // Already found: every further use is refused.
-        let _ = generated::bpf_send_signal(SIGKILL);
-        count(counter::DENIED);
-        return -EPERM;
-    }
-    let verdict = if c.inject_comm_lo != 0 && (*s).flags & lf::INJECTED == 0 && injected_comm(c) {
-        (*s).flags |= lf::INJECTED;
-        Some((kind::CRED_NO_MECHANISM, evf::INJECTED))
-    } else if new {
-        None
-    } else {
-        match epg::judge_use(&(*s).id, &now, (*s).nsproxy, ns_now) {
-            Some(k) => {
-                let mut fl = 0u8;
-                if cred != (*s).cred {
-                    fl |= evf::CRED_REPLACED;
-                }
-                if ns_now != (*s).nsproxy {
-                    fl |= evf::NS_CHANGED;
-                }
-                Some((k, fl))
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        // Fast path: a fully privileged committed credential has nothing to gain.
+        if let Some(s) = found {
+            if (*s).flags & (lf::VALID | lf::TAINTED) == lf::VALID
+                && c.inject_comm_lo == 0
+                && epg::lite_skips(&(*s).id, c.full_cap_mask)
+            {
+                return 0;
             }
-            None => None,
         }
-    };
-    let Some((k, fl)) = verdict else {
-        return 0;
-    };
-    let (a, n, _) = current_call(c, task);
-    report(c, s, k, (a, n), &now, ns_now, fl, pt);
-    if c.mode == cfg::MODE_ENFORCE {
-        count(counter::DENIED);
-        return -EPERM;
+        count(counter::USE_CHECKS);
+        let Some(cred) = real_cred(c, task) else {
+            return 0;
+        };
+        let Some(now) = read_identity(c, cred) else {
+            return 0;
+        };
+        let ns_now = nsproxy_of(c, task);
+        let Some((s, new)) = state_or_baseline(c, found, task, start, &now, cred, ns_now, pt) else {
+            return 0;
+        };
+        if (*s).flags & lf::TAINTED != 0 && c.mode == cfg::MODE_ENFORCE {
+            // Already found: every further use is refused.
+            let _ = generated::bpf_send_signal(SIGKILL);
+            count(counter::DENIED);
+            return -EPERM;
+        }
+        let verdict = if c.inject_comm_lo != 0 && (*s).flags & lf::INJECTED == 0 && injected_comm(c) {
+            (*s).flags |= lf::INJECTED;
+            Some((kind::CRED_NO_MECHANISM, evf::INJECTED))
+        } else if new {
+            None
+        } else {
+            match epg::judge_use(&(*s).id, &now, (*s).nsproxy, ns_now) {
+                Some(k) => {
+                    let mut fl = 0u8;
+                    if cred != (*s).cred {
+                        fl |= evf::CRED_REPLACED;
+                    }
+                    if ns_now != (*s).nsproxy {
+                        fl |= evf::NS_CHANGED;
+                    }
+                    Some((k, fl))
+                }
+                None => None,
+            }
+        };
+        let Some((k, fl)) = verdict else {
+            return 0;
+        };
+        let (a, n, _) = current_call(c, task);
+        report(c, s, k, (a, n), &now, ns_now, fl, pt);
+        if c.mode == cfg::MODE_ENFORCE {
+            count(counter::DENIED);
+            return -EPERM;
+        }
+        0
     }
-    0
 }
 
 // ── use points ──────────────────────────────────────────────────────────
@@ -366,34 +393,37 @@ pub fn epg_lite_file_open(ctx: LsmContext) -> i32 {
 /// KERNEL_COMPATIBILITY "Older verifiers", rule 10).
 #[inline(always)]
 unsafe fn try_file_open(c: &GuardConfig, ctx: &LsmContext) -> i32 {
-    let task = bpf_get_current_task();
-    let Some(start) = start_time(c, task) else {
-        return 0;
-    };
-    let found = lookup(task, start);
-    let mut tainted = false;
-    if let Some(s) = found {
-        let f = (*s).flags;
-        if f & (lf::VALID | lf::TAINTED) == lf::VALID && epg::lite_skips(&(*s).id, c.full_cap_mask) {
-            return 0;
-        }
-        tainted = f & lf::TAINTED != 0;
-    }
-    if !(tainted && c.mode == cfg::MODE_ENFORCE) {
-        let file: u64 = ctx.arg::<u64>(0);
-        let Some(inode) = rd::<u64>(file + o(c.file_inode)) else {
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let Some(start) = start_time(c, task) else {
             return 0;
         };
-        if inode == 0 {
-            return 0;
+        let found = lookup(task, start);
+        let mut tainted = false;
+        if let Some(s) = found {
+            let f = (*s).flags;
+            if f & (lf::VALID | lf::TAINTED) == lf::VALID && epg::lite_skips(&(*s).id, c.full_cap_mask) {
+                return 0;
+            }
+            tainted = f & lf::TAINTED != 0;
         }
-        let mode = rd::<u16>(inode + o(c.inode_mode)).unwrap_or(0o777);
-        let owner = rd::<u32>(inode + o(c.inode_uid)).unwrap_or(u32::MAX);
-        if !epg::file_open_is_guarded(owner, mode) {
-            return 0;
+        if !(tainted && c.mode == cfg::MODE_ENFORCE) {
+            let file: u64 = ctx.arg::<u64>(0);
+            let Some(inode) = rd::<u64>(file + o(c.file_inode)) else {
+                return 0;
+            };
+            if inode == 0 {
+                return 0;
+            }
+            let mode = rd::<u16>(inode + o(c.inode_mode)).unwrap_or(0o777);
+            let owner = rd::<u32>(inode + o(c.inode_uid)).unwrap_or(u32::MAX);
+            if !epg::file_open_is_guarded(owner, mode) {
+                return 0;
+            }
         }
+        use_point_found(c, point::FILE_OPEN, task, start, found)
     }
-    use_point_found(c, point::FILE_OPEN, task, start, found)
 }
 
 // ── baselines and mechanisms ────────────────────────────────────────────
@@ -423,21 +453,24 @@ pub fn epg_lite_fork(ctx: BtfTracePointContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fork(c: &GuardConfig, ctx: &BtfTracePointContext) {
-    let child = ctx.arg::<*const task_struct>(1) as u64;
-    if child == 0 {
-        return;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let child = ctx.arg::<*const task_struct>(1) as u64;
+        if child == 0 {
+            return;
+        }
+        let Some(start) = start_time(c, child) else {
+            return;
+        };
+        let Some(cred) = real_cred(c, child) else {
+            return;
+        };
+        let Some(id) = read_identity(c, cred) else {
+            return;
+        };
+        let init = fresh(id, cred, nsproxy_of(c, child), start);
+        let _ = EPG_LITE_TASKS.insert(&child, &init, ANY);
     }
-    let Some(start) = start_time(c, child) else {
-        return;
-    };
-    let Some(cred) = real_cred(c, child) else {
-        return;
-    };
-    let Some(id) = read_identity(c, cred) else {
-        return;
-    };
-    let init = fresh(id, cred, nsproxy_of(c, child), start);
-    let _ = EPG_LITE_TASKS.insert(&child, &init, ANY);
 }
 
 /// `int commit_creds(struct cred *new)`: judge the call it runs for, check
@@ -454,55 +487,58 @@ pub fn epg_lite_commit_creds(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_commit_creds(c: &GuardConfig, ctx: &FEntryContext) {
-    let task = bpf_get_current_task();
-    let Some(start) = start_time(c, task) else {
-        return;
-    };
-    let new = ctx.arg::<u64>(0);
-    let Some(after) = read_identity(c, new) else {
-        return;
-    };
-    let Some(old_cred) = real_cred(c, task) else {
-        return;
-    };
-    let Some(old) = read_identity(c, old_cred) else {
-        return;
-    };
-    let ns_now = nsproxy_of(c, task);
-    let found = lookup(task, start);
-    let Some((s, new_state)) = state_or_baseline(
-        c,
-        found,
-        task,
-        start,
-        &old,
-        old_cred,
-        ns_now,
-        point::COMMIT_CREDS,
-    ) else {
-        return;
-    };
-    count(counter::COMMITS);
-    if !new_state && !epg::lite_skips(&(*s).id, c.full_cap_mask) {
-        if let Some(k) = epg::judge_use(&(*s).id, &old, (*s).nsproxy, ns_now) {
-            let (a, n, _) = current_call(c, task);
-            report(c, s, k, (a, n), &old, ns_now, 0, point::COMMIT_CREDS);
-        }
-    }
-    if !epg::fully_privileged(old.ids[epg::id::UID], old.cap_effective, c.full_cap_mask) {
-        let gain = epg::cred_gain(&old, &after);
-        if gain != 0 {
-            let (a, n, in_sys) = current_call(c, task);
-            if let Some(k) = epg::judge_commit(gain, a, n, in_sys) {
-                // `before` is the credential being replaced.
-                (*s).id = old;
-                report(c, s, k, (a, n), &after, ns_now, evf::CRED_REPLACED, point::COMMIT_CREDS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let Some(start) = start_time(c, task) else {
+            return;
+        };
+        let new = ctx.arg::<u64>(0);
+        let Some(after) = read_identity(c, new) else {
+            return;
+        };
+        let Some(old_cred) = real_cred(c, task) else {
+            return;
+        };
+        let Some(old) = read_identity(c, old_cred) else {
+            return;
+        };
+        let ns_now = nsproxy_of(c, task);
+        let found = lookup(task, start);
+        let Some((s, new_state)) = state_or_baseline(
+            c,
+            found,
+            task,
+            start,
+            &old,
+            old_cred,
+            ns_now,
+            point::COMMIT_CREDS,
+        ) else {
+            return;
+        };
+        count(counter::COMMITS);
+        if !new_state && !epg::lite_skips(&(*s).id, c.full_cap_mask) {
+            if let Some(k) = epg::judge_use(&(*s).id, &old, (*s).nsproxy, ns_now) {
+                let (a, n, _) = current_call(c, task);
+                report(c, s, k, (a, n), &old, ns_now, 0, point::COMMIT_CREDS);
             }
         }
+        if !epg::fully_privileged(old.ids[epg::id::UID], old.cap_effective, c.full_cap_mask) {
+            let gain = epg::cred_gain(&old, &after);
+            if gain != 0 {
+                let (a, n, in_sys) = current_call(c, task);
+                if let Some(k) = epg::judge_commit(gain, a, n, in_sys) {
+                    // `before` is the credential being replaced.
+                    (*s).id = old;
+                    report(c, s, k, (a, n), &after, ns_now, evf::CRED_REPLACED, point::COMMIT_CREDS);
+                }
+            }
+        }
+        (*s).id = after;
+        (*s).cred = new;
+        (*s).flags |= lf::VALID;
     }
-    (*s).id = after;
-    (*s).cred = new;
-    (*s).flags |= lf::VALID;
 }
 
 /// `void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)`.
@@ -516,42 +552,45 @@ pub fn epg_lite_switch_ns(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_switch_ns(c: &GuardConfig, ctx: &FEntryContext) {
-    let task = bpf_get_current_task();
-    let p = ctx.arg::<u64>(0);
-    let new = ctx.arg::<u64>(1);
-    if p != task || new == 0 {
-        return;
-    }
-    let Some(start) = start_time(c, task) else {
-        return;
-    };
-    let Some(cred) = real_cred(c, task) else {
-        return;
-    };
-    let Some(now) = read_identity(c, cred) else {
-        return;
-    };
-    let ns_now = nsproxy_of(c, task);
-    let found = lookup(task, start);
-    let Some((s, _)) = state_or_baseline(
-        c,
-        found,
-        task,
-        start,
-        &now,
-        cred,
-        ns_now,
-        point::SWITCH_NS,
-    ) else {
-        return;
-    };
-    if !epg::lite_skips(&(*s).id, c.full_cap_mask) {
-        let (a, n, in_sys) = current_call(c, task);
-        if let Some(k) = epg::judge_switch_ns(a, n, in_sys) {
-            report(c, s, k, (a, n), &now, new, evf::NS_CHANGED, point::SWITCH_NS);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let p = ctx.arg::<u64>(0);
+        let new = ctx.arg::<u64>(1);
+        if p != task || new == 0 {
+            return;
         }
+        let Some(start) = start_time(c, task) else {
+            return;
+        };
+        let Some(cred) = real_cred(c, task) else {
+            return;
+        };
+        let Some(now) = read_identity(c, cred) else {
+            return;
+        };
+        let ns_now = nsproxy_of(c, task);
+        let found = lookup(task, start);
+        let Some((s, _)) = state_or_baseline(
+            c,
+            found,
+            task,
+            start,
+            &now,
+            cred,
+            ns_now,
+            point::SWITCH_NS,
+        ) else {
+            return;
+        };
+        if !epg::lite_skips(&(*s).id, c.full_cap_mask) {
+            let (a, n, in_sys) = current_call(c, task);
+            if let Some(k) = epg::judge_switch_ns(a, n, in_sys) {
+                report(c, s, k, (a, n), &now, new, evf::NS_CHANGED, point::SWITCH_NS);
+            }
+        }
+        (*s).nsproxy = new;
     }
-    (*s).nsproxy = new;
 }
 
 /// `void set_fs_root(struct fs_struct *fs, const struct path *path)`.
@@ -565,22 +604,25 @@ pub fn epg_lite_set_fs_root(ctx: FEntryContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_set_fs_root(c: &GuardConfig, ctx: &FEntryContext) {
-    let task = bpf_get_current_task();
-    let fs = ctx.arg::<u64>(0);
-    let my_fs = peek::<u64>(task + o(c.task_fs));
-    if fs == 0 || fs != my_fs {
-        return;
-    }
-    let Some(s) = start_time(c, task).and_then(|start| lookup(task, start)) else {
-        return;
-    };
-    if (*s).flags & lf::VALID == 0 || epg::lite_skips(&(*s).id, c.full_cap_mask) {
-        return;
-    }
-    let (a, n, in_sys) = current_call(c, task);
-    if let Some(k) = epg::judge_set_fs_root(a, n, in_sys) {
-        let now = (*s).id;
-        let ns_now = (*s).nsproxy;
-        report(c, s, k, (a, n), &now, ns_now, evf::ROOT_CHANGED, point::SET_FS_ROOT);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let task = bpf_get_current_task();
+        let fs = ctx.arg::<u64>(0);
+        let my_fs = peek::<u64>(task + o(c.task_fs));
+        if fs == 0 || fs != my_fs {
+            return;
+        }
+        let Some(s) = start_time(c, task).and_then(|start| lookup(task, start)) else {
+            return;
+        };
+        if (*s).flags & lf::VALID == 0 || epg::lite_skips(&(*s).id, c.full_cap_mask) {
+            return;
+        }
+        let (a, n, in_sys) = current_call(c, task);
+        if let Some(k) = epg::judge_set_fs_root(a, n, in_sys) {
+            let now = (*s).id;
+            let ns_now = (*s).nsproxy;
+            report(c, s, k, (a, n), &now, ns_now, evf::ROOT_CHANGED, point::SET_FS_ROOT);
+        }
     }
 }

@@ -6,7 +6,7 @@
 name = "northnarrow-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -31,6 +31,9 @@ tempfile = "3"
 libc = "0.2"
 
 [workspace]
+# Lot 396: edition 2024 would make this workspace's resolver "3"; it
+# stays "2", as the root workspace's, so no resolution changes.
+resolver = "2"
 
 [profile.release]
 debug = 1

@@ -207,16 +207,19 @@ pub fn io_uring_exit(_ctx: TracePointContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_exit() {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let tgid = (pid_tgid >> 32) as u32;
-    if IOURING_STATE.get(&tgid).is_none() && IOURING_TASK_BUDGET.get(&tgid).is_none() {
-        return;
-    }
-    if group_dead().unwrap_or(tgid == pid_tgid as u32) {
-        let _ = IOURING_STATE.remove(&tgid);
-        // Lot 318's mini-hunt: the ring creations' budget too — a pid
-        // reused by another process started with what was left of it
-        let _ = IOURING_TASK_BUDGET.remove(&tgid);
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let pid_tgid = bpf_get_current_pid_tgid();
+        let tgid = (pid_tgid >> 32) as u32;
+        if IOURING_STATE.get(&tgid).is_none() && IOURING_TASK_BUDGET.get(&tgid).is_none() {
+            return;
+        }
+        if group_dead().unwrap_or(tgid == pid_tgid as u32) {
+            let _ = IOURING_STATE.remove(&tgid);
+            // Lot 318's mini-hunt: the ring creations' budget too — a pid
+            // reused by another process started with what was left of it
+            let _ = IOURING_TASK_BUDGET.remove(&tgid);
+        }
     }
 }
 
@@ -225,15 +228,18 @@ unsafe fn try_exit() {
 /// rule 3).
 #[inline(always)]
 unsafe fn group_dead() -> Option<bool> {
-    let o_signal = off_opt!(TASK_STRUCT_SIGNAL_OFFSET)? & 0xffff;
-    let o_live = off_opt!(SIGNAL_STRUCT_LIVE_OFFSET)? & 0xffff;
-    let task = bpf_get_current_task() as *const u8;
-    let signal = bpf_probe_read_kernel::<u64>(task.add(o_signal) as *const u64).ok()?;
-    if signal == 0 {
-        return None;
+    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    unsafe {
+        let o_signal = off_opt!(TASK_STRUCT_SIGNAL_OFFSET)? & 0xffff;
+        let o_live = off_opt!(SIGNAL_STRUCT_LIVE_OFFSET)? & 0xffff;
+        let task = bpf_get_current_task() as *const u8;
+        let signal = bpf_probe_read_kernel::<u64>(task.add(o_signal) as *const u64).ok()?;
+        if signal == 0 {
+            return None;
+        }
+        let live = bpf_probe_read_kernel::<u32>((signal as *const u8).add(o_live) as *const u32).ok()?;
+        Some(live == 0)
     }
-    let live = bpf_probe_read_kernel::<u32>((signal as *const u8).add(o_live) as *const u32).ok()?;
-    Some(live == 0)
 }
 
 #[inline(always)]

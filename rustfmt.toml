@@ -1,0 +1,3 @@
+# Lot 396 (#605): the code is edition 2024; this commit keeps the 2021
+# style, the next one moves to 2024.
+style_edition = "2021"
