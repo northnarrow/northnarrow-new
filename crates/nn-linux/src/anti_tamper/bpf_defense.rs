@@ -657,7 +657,7 @@ fn arm_content_at_handle(
             .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
         let mut conf: Array<&mut MapData, u32> =
             Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
-        conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)
+        conf.set(CONTENT_LOCKDOWN_SLOT, v, 0)
             .map_err(|e| format!("{CONTENT_CONF_MAP} slot {CONTENT_LOCKDOWN_SLOT}: {e}"))?;
     }
     let write_user_note = match &write_user {
@@ -760,7 +760,7 @@ fn clear_seen(ebpf: &mut Ebpf) -> std::result::Result<(), String> {
     let mut a: Array<&mut MapData, u32> =
         Array::try_from(m).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
     for i in 0..common::bpf_prog_class::CALIB_MAX_INSNS {
-        a.set(i, 0, 0).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
+        a.set(i, &0, 0).map_err(|e| format!("{SEEN_MAP}: {e}"))?;
     }
     Ok(())
 }
@@ -781,7 +781,7 @@ fn set_calibration(ebpf: &mut Ebpf, kind: u32) -> std::result::Result<(), String
         .ok_or_else(|| format!("{CALIB_MAP} missing from the eBPF object"))?;
     let mut a: Array<&mut MapData, u32> =
         Array::try_from(m).map_err(|e| format!("{CALIB_MAP}: {e}"))?;
-    a.set(0, kind, 0).map_err(|e| format!("{CALIB_MAP}: {e}"))
+    a.set(0, &kind, 0).map_err(|e| format!("{CALIB_MAP}: {e}"))
 }
 
 /// Load calibration program `name` (the hook reads it at the load) and
@@ -808,15 +808,15 @@ fn write_content_judge(
         .ok_or_else(|| format!("{CONTENT_CONF_MAP} missing from the eBPF object"))?;
     let mut conf: Array<&mut MapData, u32> =
         Array::try_from(m).map_err(|e| format!("{CONTENT_CONF_MAP}: {e}"))?;
-    conf.set(0, judge.stage, 0)
+    conf.set(0, &judge.stage, 0)
         .map_err(|e| format!("{CONTENT_CONF_MAP} slot 0: {e}"))?;
     for (i, t) in judge.targets.iter().enumerate() {
-        conf.set(i as u32 + 1, *t, 0)
+        conf.set(i as u32 + 1, t, 0)
             .map_err(|e| format!("{CONTENT_CONF_MAP} slot {}: {e}", i + 1))?;
     }
     // the review of #553 (F1): the kfuncs read in a load of every type
     let every = common::bpf_prog_class::CONTENT_EVERY_TYPE_SLOT;
-    conf.set(every, judge.every_type, 0)
+    conf.set(every, &judge.every_type, 0)
         .map_err(|e| format!("{CONTENT_CONF_MAP} slot {every}: {e}"))?;
     // the keys the hook looks each instruction up in (the CI of #553)
     {
@@ -826,7 +826,7 @@ fn write_content_judge(
         let mut keys: HashMap<&mut MapData, u64, u32> =
             HashMap::try_from(m).map_err(|e| format!("{CONTENT_KEYS_MAP}: {e}"))?;
         for (key, slot) in judge.keys() {
-            keys.insert(key, slot, 0)
+            keys.insert(&key, &slot, 0)
                 .map_err(|e| format!("{CONTENT_KEYS_MAP}: {e}"))?;
         }
     }
@@ -897,7 +897,7 @@ fn claim_agent_role(guard: &BpfGuard, ebpf: &mut Ebpf, pin_root: Option<&Path>) 
     let mut roles: Array<&mut MapData, u32> =
         Array::try_from(map).context("ROLE_TGIDS is not an Array<u32>")?;
     roles
-        .set(antitamper_bpf::ROLE_SLOT_AGENT, std::process::id(), 0)
+        .set(antitamper_bpf::ROLE_SLOT_AGENT, &std::process::id(), 0)
         .context("recording the agent in ROLE_TGIDS")?;
     Ok(())
 }
@@ -1131,11 +1131,11 @@ pub(crate) fn register_own_objects(
     let mut own: HashMap<&mut MapData, u64, u8> =
         HashMap::try_from(own).context("OWN_BPF_IDS is not a HashMap<u64, u8>")?;
     for id in &map_ids {
-        own.insert(own_key(KIND_MAP, *id), KIND_MAP, 0)
+        own.insert(&own_key(KIND_MAP, *id), &KIND_MAP, 0)
             .with_context(|| format!("registering own map id {id}"))?;
     }
     for id in &prog_ids {
-        own.insert(own_key(KIND_PROG, *id), KIND_PROG, 0)
+        own.insert(&own_key(KIND_PROG, *id), &KIND_PROG, 0)
             .with_context(|| format!("registering own program id {id}"))?;
     }
     // Links: every link the agent holds whose program is ours (the sensors,
@@ -1153,7 +1153,7 @@ pub(crate) fn register_own_objects(
     let pins = split_pins(&walk, &own_maps, &own_progs);
     let link_ids = own_links_of(held_objects(), &pins, &own_progs);
     for id in &link_ids {
-        own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
+        own.insert(&own_key(KIND_LINK, *id), &KIND_LINK, 0)
             .with_context(|| format!("registering own link id {id}"))?;
     }
     for (dir, ids) in pins.links_by_dir() {
@@ -1197,7 +1197,7 @@ pub(crate) fn register_own_objects(
             HashMap::try_from(names).context("OWN_PIN_NAMES is not a HashMap<u64, u8>")?;
         for key in &pin_names {
             names
-                .insert(key, KIND_LINK, 0)
+                .insert(key, &KIND_LINK, 0)
                 .context("registering own link pin name")?;
         }
     }
@@ -1220,7 +1220,7 @@ pub(crate) fn register_own_objects(
             HashMap::try_from(exe_map).context("OWN_EXE_INODES is not a HashMap<InodeKey, u8>")?;
         for (k, role) in &exe_keys {
             exe_map
-                .insert(crate::anti_tamper::filesystem::AyaInodeKey(*k), *role, 0)
+                .insert(&crate::anti_tamper::filesystem::AyaInodeKey(*k), role, 0)
                 .with_context(|| format!("registering own exe inode {}:{}", k.dev, k.ino))?;
         }
     }
@@ -1239,7 +1239,7 @@ pub(crate) fn register_own_objects(
         .with_context(|| format!("{MODE_MAP} missing from the eBPF object"))?;
     let mut mode: Array<&mut MapData, u32> =
         Array::try_from(mode).context("BPF_DEFENSE_MODE is not an Array<u32>")?;
-    mode.set(0, if enforce { 1 } else { 0 }, 0)
+    mode.set(0, if enforce { &1 } else { &0 }, 0)
         .context("arming BPF_DEFENSE_MODE")?;
     // Lot 290: the signed per-loader opt-outs in force (a policy applied
     // before the load wrote nothing to the kernel yet).
@@ -1499,7 +1499,7 @@ fn write_loader_opt_outs_to<M: std::borrow::BorrowMut<MapData> + std::borrow::Bo
             .map_err(|e| format!("removing a stale opt-out: {e}"))?;
     }
     for o in &want {
-        map.insert(AyaInodeKey(o.key), o.mask, 0)
+        map.insert(&AyaInodeKey(o.key), &o.mask, 0)
             .map_err(|e| format!("{}: {e}", o.path))?;
     }
     Ok(want.len())
@@ -1561,11 +1561,11 @@ pub fn register_late_objects(guard: &BpfGuard, ebpf: &mut Ebpf) -> Result<usize>
     let mut own: HashMap<&mut MapData, u64, u8> =
         HashMap::try_from(own).context("OWN_BPF_IDS is not a HashMap<u64, u8>")?;
     for id in &prog_ids {
-        own.insert(own_key(KIND_PROG, *id), KIND_PROG, 0)
+        own.insert(&own_key(KIND_PROG, *id), &KIND_PROG, 0)
             .with_context(|| format!("registering own program id {id}"))?;
     }
     for id in &link_ids {
-        own.insert(own_key(KIND_LINK, *id), KIND_LINK, 0)
+        own.insert(&own_key(KIND_LINK, *id), &KIND_LINK, 0)
             .with_context(|| format!("registering own link id {id}"))?;
     }
     Ok(prog_ids.len() + link_ids.len())

@@ -28,7 +28,7 @@ exclude = ["agent-ebpf", "fuzz"]
 [workspace.package]
 version = "0.1.0-alpha"
 # Lot 396 (#605): edition 2024 (rustc 1.85 or later; `rust-version` below
-# stays 1.89). `resolver` above stays "2": edition 2024 would default to
+# stayed 1.89 then). `resolver` above stays "2": edition 2024 would default to
 # "3", the rust-version-aware one, and this lot changes no dependency
 # resolution.
 edition = "2024"
@@ -39,8 +39,9 @@ edition = "2024"
 # the `msrv` CI job (`cargo +<this> check --workspace --all-targets
 # --locked`) and by xtask/tests/supply_chain.rs (not below the highest
 # `rust-version` of the locked dependencies, not above rust-toolchain.toml).
-# A dependency bump that needs a newer rustc raises it in the same PR.
-rust-version = "1.89"
+# A dependency bump that needs a newer rustc raises it in the same PR:
+# lot 400's aya 0.16 and aya-obj 0.6 declare 1.98 (1.89 was uuid's).
+rust-version = "1.98"
 # External audit SUP-019: the licence of NorthNarrow's own code, the one of
 # `LICENSE`; every member inherits it, and agent-ebpf/Cargo.toml and the .rpm
 # (`License:`) say the same. NOTICES.md says which files are under which
@@ -75,7 +76,7 @@ clap = { version = "4", features = ["derive", "env"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 # eBPF userland
-aya = "0.14"
+aya = "0.16"
 
 # Wave 4 restructure, R00 (lab PR 239): the lint levels the members share.
 # The Kani proofs live behind cfg(kani) (Tappa 10.8) and move with their

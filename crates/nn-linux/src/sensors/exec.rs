@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use aya::{Ebpf, EbpfLoader, maps::ring_buf::RingBuf, programs::TracePoint};
+use aya::{Ebpf, maps::ring_buf::RingBuf, programs::TracePoint};
 use common::wire::ProcessSpawnRaw;
 use nn_model::Event;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -54,13 +54,8 @@ impl ExecSensor {
             );
         }
 
-        // Pass `btf(None)` explicitly: bpf-linker 0.10 does not emit a
-        // `.BTF` section for Rust-built objects, and aya's default of
-        // pulling /sys/kernel/btf/vmlinux is fine for kernel-side
-        // verification but must be allowed to be absent on the program
-        // itself, otherwise loading fails with "error parsing ELF data".
-        let mut ebpf = EbpfLoader::new()
-            .btf(None)
+        // No target BTF (`object_loader`: aya 0.14's `btf(None)`).
+        let mut ebpf = crate::sensors::ebpf_object::object_loader()
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
 

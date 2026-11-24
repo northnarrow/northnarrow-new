@@ -740,8 +740,8 @@ fn write_epoch<M: std::borrow::BorrowMut<MapData>>(arr: &mut Array<M, u64>) -> R
         clock_ns(libc::CLOCK_MONOTONIC)?,
         clock_ns(libc::CLOCK_BOOTTIME)?,
     );
-    arr.set(1, boot, 0).map_err(|e| e.to_string())?;
-    arr.set(0, mono, 0).map_err(|e| e.to_string())
+    arr.set(1, &boot, 0).map_err(|e| e.to_string())?;
+    arr.set(0, &mono, 0).map_err(|e| e.to_string())
 }
 
 /// Lot 280b: the fork's check of the fentry armed at this instant
@@ -752,7 +752,7 @@ fn arm_silent(ebpf: &mut Ebpf) -> Result<(), String> {
         .map_mut(SILENT_MAP)
         .ok_or_else(|| format!("map {SILENT_MAP} missing from the eBPF object"))?;
     let mut arr: Array<&mut MapData, u64> = Array::try_from(map).map_err(|e| e.to_string())?;
-    arr.set(SILENT_ARMED, clock_ns(libc::CLOCK_MONOTONIC)?, 0)
+    arr.set(SILENT_ARMED, &clock_ns(libc::CLOCK_MONOTONIC)?, 0)
         .map_err(|e| e.to_string())
 }
 
@@ -1826,7 +1826,7 @@ pub fn pinned_writes(root: &Path) -> Result<Vec<(&'static str, String)>, String>
             let mut map =
                 Joined::try_from(aya::maps::Map::HashMap(md)).map_err(|e| e.to_string())?;
             let probe = u32::MAX - 1;
-            match map.insert(probe, [0, 0], 0) {
+            match map.insert(&probe, &[0, 0], 0) {
                 Ok(()) => {
                     let _ = map.remove(&probe);
                     None
@@ -1836,11 +1836,11 @@ pub fn pinned_writes(root: &Path) -> Result<Vec<(&'static str, String)>, String>
         } else if name == LOST_MAP {
             let mut map = Lost::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
             let v = map.get(&0, 0).map_err(|e| e.to_string())?;
-            map.set(0, v, 0).err().map(|e| with_sources(&e))
+            map.set(0, &v, 0).err().map(|e| with_sources(&e))
         } else {
             let mut map = Stats::try_from(aya::maps::Map::Array(md)).map_err(|e| e.to_string())?;
             let v = map.get(&0, 0).map_err(|e| e.to_string())?;
-            map.set(0, v, 0).err().map(|e| with_sources(&e))
+            map.set(0, &v, 0).err().map(|e| with_sources(&e))
         };
         match refused {
             Some(e) => out.push((name, e)),

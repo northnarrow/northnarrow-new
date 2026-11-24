@@ -227,7 +227,7 @@ jobs:
         if: steps.kvm.outputs.available == 'true'
         timeout-minutes: 25
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install nightly-2026-08-05 --profile minimal --component rust-src
           rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
           cargo install bpf-linker --version 0.10.3 --locked
 

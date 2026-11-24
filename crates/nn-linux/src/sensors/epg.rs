@@ -426,7 +426,7 @@ fn parse_cap_last_cap(s: &str) -> Result<u32, String> {
 }
 
 fn write_config(map: &mut Array<MapData, AyaGuardConfig>, c: GuardConfig) -> Result<(), String> {
-    map.set(0, AyaGuardConfig(c), 0)
+    map.set(0, &AyaGuardConfig(c), 0)
         .map_err(|e| format!("writing {CONFIG_MAP}: {e}"))
 }
 

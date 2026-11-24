@@ -101,9 +101,9 @@ pub fn write_conf(ebpf: &mut Ebpf, mode: u64, classes: u32, heartbeat_max_ns: u6
         .map_mut("EXECQ_CONF")
         .ok_or_else(|| anyhow!("EXECQ_CONF missing from the eBPF object"))?;
     let mut arr: Array<&mut MapData, u64> = Array::try_from(map).context("EXECQ_CONF")?;
-    arr.set(conf_slot::CLASSES, u64::from(classes), 0)?;
-    arr.set(conf_slot::HEARTBEAT_MAX_NS, heartbeat_max_ns, 0)?;
-    arr.set(conf_slot::MODE, mode, 0)?;
+    arr.set(conf_slot::CLASSES, &u64::from(classes), 0)?;
+    arr.set(conf_slot::HEARTBEAT_MAX_NS, &heartbeat_max_ns, 0)?;
+    arr.set(conf_slot::MODE, &mode, 0)?;
     let map = ebpf
         .map("EXECQ_CONF")
         .ok_or_else(|| anyhow!("EXECQ_CONF missing from the eBPF object"))?;
@@ -159,7 +159,7 @@ impl Kernel {
             (common::wire::execq::OVERFLOW_ROW, overflow),
             (common::wire::execq::TOTAL_ROW, total),
         ] {
-            if self.cand_overflow.set(row, n, 0).is_err() {
+            if self.cand_overflow.set(row, &n, 0).is_err() {
                 r.failed += 1;
             }
         }
@@ -246,14 +246,14 @@ impl Kernel {
             start_ns,
             stop_ns: KILL_OWED,
         });
-        if let Err(e) = self.stopped.insert(pid, v, 0) {
+        if let Err(e) = self.stopped.insert(&pid, &v, 0) {
             tracing::warn!(pid, error = %e, "exec quarantine: the owed kill could not be marked in the map");
         }
     }
 
     /// The heartbeat a stop needs (0: the kernel stops nothing).
     pub fn beat(&mut self, ns: u64) {
-        let _ = self.alive.set(0, ns, 0);
+        let _ = self.alive.set(0, &ns, 0);
     }
 
     /// The per-CPU counters summed, `counter::*` order.
@@ -322,7 +322,7 @@ impl RootsMap for HashMap<MapData, AyaKey, u32> {
         HashMap::remove(self, &AyaKey(*key)).is_ok()
     }
     fn insert(&mut self, key: ExecqKey, value: u32) -> bool {
-        HashMap::insert(self, AyaKey(key), value, 0).is_ok()
+        HashMap::insert(self, &AyaKey(key), &value, 0).is_ok()
     }
 }
 

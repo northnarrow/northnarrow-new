@@ -243,7 +243,7 @@ pub fn attach_nss(ebpf: &mut Ebpf, points: &AttachPoints) {
     let mut attached = Vec::new();
     for lib in &libs {
         for sym in NSS_SYMBOLS {
-            match prog.attach(*sym, lib, aya::programs::uprobe::UProbeScope::AllProcesses) {
+            match prog.attach([*sym], lib, aya::programs::uprobe::UProbeScope::AllProcesses) {
                 Ok(_) => attached.push(format!("{}:{sym}", lib.display())),
                 Err(e) => warn!(
                     library = %lib.display(),
@@ -332,7 +332,7 @@ fn exempt_resolvers(ebpf: &mut Ebpf) {
             }
         };
         for uid in &uids {
-            if let Err(e) = exempt.insert(uid, 1, 0) {
+            if let Err(e) = exempt.insert(uid, &1, 0) {
                 warn!(uid, error = %e, "DNS budget: could not exempt a resolver user");
             }
         }

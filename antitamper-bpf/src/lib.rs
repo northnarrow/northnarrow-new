@@ -169,7 +169,7 @@ pub fn claim_role(bpffs_root: &Path, slot: u32, tgid: u32) -> Result<()> {
     })?;
     let mut arr: AyaArray<MapData, u32> = AyaArray::try_from(AyaMap::Array(map_data))
         .with_context(|| format!("{ROLE_TGIDS_MAP_NAME} is not an Array<u32>"))?;
-    arr.set(slot, tgid, 0)
+    arr.set(slot, &tgid, 0)
         .with_context(|| format!("setting {ROLE_TGIDS_MAP_NAME}[{slot}] = {tgid}"))?;
     Ok(())
 }
@@ -452,7 +452,7 @@ pub fn protect_for_role(
     for k in stale {
         let _ = roles.remove(&k);
     }
-    roles.insert(PodInodeKey(key), role, 0).with_context(|| {
+    roles.insert(&PodInodeKey(key), &role, 0).with_context(|| {
         format!(
             "registering {} in {ROLE_WRITE_INODES_MAP_NAME}",
             path.display()
@@ -460,8 +460,8 @@ pub fn protect_for_role(
     })?;
     open(cgroup_guard::PROTECTED_INODES_MAP_NAME)?
         .insert(
-            PodInodeKey(key),
-            common::wire::FS_PROTECT_MUTATE | common::wire::FS_PROTECT_WRITE,
+            &PodInodeKey(key),
+            &(common::wire::FS_PROTECT_MUTATE | common::wire::FS_PROTECT_WRITE),
             0,
         )
         .with_context(|| {
@@ -1104,7 +1104,7 @@ where
             return Err(anyhow!("role {role:#x} is not a PROTECTED_PIDS role"));
         }
         self.map
-            .insert(pid, role, 0)
+            .insert(&pid, &role, 0)
             .with_context(|| format!("inserting PID {pid} into {PROTECTED_PIDS_MAP_NAME}"))?;
         Ok(())
     }
@@ -1235,7 +1235,7 @@ where
     /// to call repeatedly for the same PID.
     pub fn insert(&mut self, pid: u32) -> Result<()> {
         self.map
-            .insert(pid, 1u8, 0)
+            .insert(&pid, &1u8, 0)
             .with_context(|| format!("inserting PID {pid} into {PROTECTED_OBSERVERS_MAP_NAME}"))?;
         Ok(())
     }

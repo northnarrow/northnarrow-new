@@ -84,8 +84,8 @@ static EXECUTOR_IDS: HashMap<InodeKey, u32> = HashMap::with_max_entries(EXECUTOR
 /// `fork`/`clone`, also with `CLONE_PARENT`, whose `real_parent` is not it).
 #[btf_tracepoint(function = "sched_process_fork")]
 pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
-    let parent: *const u8 = unsafe { ctx.arg(0) };
-    let child: *const u8 = unsafe { ctx.arg(1) };
+    let parent: *const u8 = ctx.arg(0);
+    let child: *const u8 = ctx.arg(1);
     if parent.is_null() || child.is_null() {
         return 0;
     }

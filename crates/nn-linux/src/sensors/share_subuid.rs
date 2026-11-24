@@ -331,7 +331,7 @@ impl SubuidTrie for LpmTrie<MapData, [u8; 4], u32> {
         Ok(LpmTrie::insert(
             self,
             &Key::new(len, base.to_be_bytes()),
-            value,
+            &value,
             0,
         )?)
     }

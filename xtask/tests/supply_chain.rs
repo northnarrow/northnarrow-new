@@ -989,6 +989,80 @@ fn the_toolchain_is_pinned_and_the_msrv_is_checked() {
     );
 }
 
+/// The dated nightlies `nightly-YYYY-MM-DD` that `line` names.
+fn dated_nightlies(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = line[from..].find("nightly-") {
+        let start = from + at;
+        let date = line[start + "nightly-".len()..].as_bytes();
+        let dated = date.len() >= 10
+            && date[..10].iter().enumerate().all(|(i, b)| match i {
+                4 | 7 => *b == b'-',
+                _ => b.is_ascii_digit(),
+            });
+        if dated {
+            out.push(&line[start..start + "nightly-".len() + 10]);
+        }
+        from = start + "nightly-".len();
+    }
+    out
+}
+
+/// Lot 400: the eBPF crate's nightly is one channel, the one of
+/// `agent-ebpf/rust-toolchain.toml`: the ebpf-build, release and lab VM
+/// jobs install it, and the fuzz job builds the agent with it (one
+/// download serves both). aya-ebpf 0.3 and aya 0.16 moved it from
+/// nightly-2025-12-01 (1.93) to a 1.99 one; a workflow left on the old date
+/// would fail its build (`requires rustc 1.98`) or, worse, build the object
+/// with another compiler than the one the lab measured. Every dated nightly
+/// the workflows, the CI scripts and the fuzz README name is that channel.
+#[test]
+fn every_dated_nightly_is_the_ebpf_crates_channel() {
+    let root = repo_root();
+    let channel = toml_string(
+        &read(&root.join("agent-ebpf/rust-toolchain.toml")),
+        "toolchain",
+        "channel",
+    )
+    .expect("agent-ebpf/rust-toolchain.toml [toolchain] channel");
+    assert_eq!(
+        dated_nightlies(&channel),
+        vec![channel.as_str()],
+        "the eBPF crate's channel is a dated nightly: {channel}"
+    );
+    let mut files = workflow_files();
+    files.extend(files_under(&root.join(".github/scripts"), &[".sh"], &[]));
+    files.push(root.join("fuzz/README.md"));
+    let mut named = 0;
+    let mut bad = Vec::new();
+    for f in &files {
+        for (i, line) in read(f).lines().enumerate() {
+            for n in dated_nightlies(line) {
+                named += 1;
+                if n != channel {
+                    bad.push(format!("{}:{}: {n}", rel(f), i + 1));
+                }
+            }
+        }
+    }
+    // ci.yml's ebpf-build and fuzz jobs, release.yml, lab-vm.yml
+    assert!(
+        named >= 4,
+        "only {named} dated nightlies found in the workflows"
+    );
+    assert!(
+        bad.is_empty(),
+        "nightlies other than agent-ebpf/rust-toolchain.toml's {channel}:\n{}",
+        bad.join("\n")
+    );
+    // the reader itself
+    assert_eq!(
+        dated_nightlies("cargo +nightly-2025-12-01 fuzz build # nightly, nightly-2026"),
+        vec!["nightly-2025-12-01"]
+    );
+}
+
 /// Lab PR 237: a grouped patch/minor bump that moves only the root
 /// Cargo.lock leaves fuzz/Cargo.lock behind on the security crates, and
 /// `security_crates_are_locked_alike_for_the_fuzzer` goes red (#413). The

@@ -264,12 +264,14 @@ jobs:
       # used to be installed here was never used. Keep the version
       # PINNED: 0.11.0 dropped the proxy and needs a system LLVM 21+
       # (`-lLLVM` link failure on ubuntu-24.04, which ships LLVM 18).
-      # 0.10.3 is also the version the reference lab runs.
+      # 0.10.3 is also the version the reference lab runs. Lot 400: the
+      # nightly is the last with LLVM 22 (agent-ebpf/rust-toolchain.toml);
+      # a nightly with LLVM 23 needs a bpf-linker without the proxy.
       - name: Install nightly Rust + rust-src for build-std
         # Same channel as agent-ebpf/rust-toolchain.toml, so rustup
         # does not have to download it again at build time.
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install nightly-2026-08-05 --profile minimal --component rust-src
           rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
 
       - name: Install bpf-linker (pinned)
@@ -353,7 +355,7 @@ jobs:
       # SUP-005: cargo-fuzz pinned (the version runs resolved on 2026-10-15).
       - name: Install nightly toolchain + cargo-fuzz (pinned)
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal
+          rustup toolchain install nightly-2026-08-05 --profile minimal
           rustup toolchain install   # the pinned release builds cargo-fuzz (rust-toolchain.toml)
           cargo install cargo-fuzz --version 0.13.2 --locked
 
@@ -377,7 +379,7 @@ jobs:
       # harness's manifest (and the agent's, which it builds) first, and
       # must be unchanged after the build (external audit SUP-016).
       - name: fuzz/Cargo.lock is authoritative
-        run: cd fuzz && cargo +nightly-2025-12-01 fetch --locked
+        run: cd fuzz && cargo +nightly-2026-08-05 fetch --locked
 
       # External audit SUP-018: the working corpus carries over between
       # runs, saved under this run's id and restored from the latest one.
@@ -402,12 +404,12 @@ jobs:
       - name: Build, replay the committed inputs, smoke every fuzz target
         run: |
           set -euo pipefail
-          cargo +nightly-2025-12-01 fuzz build
+          cargo +nightly-2026-08-05 fuzz build
           # Run the built binaries directly: `cargo fuzz run` re-invokes
           # cargo for every run.
           bin=fuzz/target/x86_64-unknown-linux-gnu/release
           failed=""
-          for t in $(cargo +nightly-2025-12-01 fuzz list); do
+          for t in $(cargo +nightly-2026-08-05 fuzz list); do
             echo "::group::$t"
             mkdir -p "fuzz/corpus/$t" "fuzz/artifacts/$t"
             if [ ! -d "fuzz/seeds/$t" ]; then

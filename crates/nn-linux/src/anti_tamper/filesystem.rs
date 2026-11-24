@@ -1218,7 +1218,7 @@ fn set_read_protected(ebpf: &mut Ebpf, inos: &[u64]) -> Result<()> {
         .with_context(|| format!("{READ_PROTECTED_INOS_MAP} is not an Array<u64>"))?;
     for slot in 0..READ_PROTECTED_SLOTS {
         let ino = inos.get(slot as usize).copied().unwrap_or(0);
-        array.set(slot, ino, 0)?;
+        array.set(slot, &ino, 0)?;
     }
     Ok(())
 }
@@ -2317,7 +2317,7 @@ fn register_role_inode(ebpf: &mut Ebpf, key: &InodeKey, role: u8) -> Result<()> 
     for k in stale {
         let _ = map.remove(&k);
     }
-    map.insert(AyaInodeKey(*key), role, 0)?;
+    map.insert(&AyaInodeKey(*key), &role, 0)?;
     Ok(())
 }
 
@@ -2327,7 +2327,7 @@ fn insert_inode(ebpf: &mut Ebpf, key: &InodeKey, flags: u8) -> Result<()> {
         .ok_or_else(|| anyhow!("map {PROTECTED_INODES_MAP} missing from eBPF object"))?;
     let mut map: AyaHashMap<&mut MapData, AyaInodeKey, u8> = AyaHashMap::try_from(map)
         .with_context(|| format!("{PROTECTED_INODES_MAP} is not a HashMap<InodeKey, u8>"))?;
-    map.insert(AyaInodeKey(*key), flags, 0)?;
+    map.insert(&AyaInodeKey(*key), &flags, 0)?;
     Ok(())
 }
 
@@ -2509,7 +2509,7 @@ impl ProtectedInodesHandle {
 
     pub fn register(&mut self, key: InodeKey, flags: u8) -> Result<()> {
         self.map
-            .insert(AyaInodeKey(key), flags, 0)
+            .insert(&AyaInodeKey(key), &flags, 0)
             .with_context(|| {
                 format!(
                     "registering (dev={}, ino={}) in {PROTECTED_INODES_MAP}",

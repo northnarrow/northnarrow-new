@@ -94,7 +94,7 @@ impl KernelIo for kernel::Kernel {
     fn remember(&mut self, key: ExecqKey, v: ExecqKnown) {
         let _ = self
             .known
-            .insert(kernel::AyaKey(key), kernel::AyaKnown(v), 0);
+            .insert(&kernel::AyaKey(key), &kernel::AyaKnown(v), 0);
     }
     fn unstop(&mut self, pid: u32, start_ns: u64) {
         kernel::Kernel::unstop(self, pid, start_ns)

@@ -66,23 +66,23 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
 impl Kernel {
     pub fn set_mode(&mut self, mode: u64) -> Result<()> {
         self.conf
-            .set(conf_slot::MODE, mode, 0)
+            .set(conf_slot::MODE, &mode, 0)
             .context("MODULE_CONF mode")
     }
 
     pub fn set_tree(&mut self, tree: InodeKey) -> Result<()> {
         // the inode first: the kernel reads the device as "set"
         self.conf
-            .set(conf_slot::TREE_INO, tree.ino, 0)
+            .set(conf_slot::TREE_INO, &tree.ino, 0)
             .context("MODULE_CONF tree")?;
         self.conf
-            .set(conf_slot::TREE_DEV, tree.dev, 0)
+            .set(conf_slot::TREE_DEV, &tree.dev, 0)
             .context("MODULE_CONF tree")
     }
 
     pub fn put(&mut self, key: InodeKey, t: ModuleTrust) -> Result<()> {
         self.trust
-            .insert(AyaKey(key), AyaTrust(t), 0)
+            .insert(&AyaKey(key), &AyaTrust(t), 0)
             .context("MODULE_TRUST insert")
     }
 
@@ -99,7 +99,7 @@ impl Kernel {
             }
         }
         for k in keys {
-            let _ = self.pkg_images.insert(AyaKey(*k), 1, 0);
+            let _ = self.pkg_images.insert(&AyaKey(*k), &1, 0);
         }
     }
 
@@ -113,7 +113,7 @@ impl Kernel {
             }
         }
         for (k, bit) in locks {
-            let _ = self.pkg_locks.insert(AyaKey(*k), *bit, 0);
+            let _ = self.pkg_locks.insert(&AyaKey(*k), bit, 0);
         }
     }
 
@@ -121,7 +121,7 @@ impl Kernel {
     /// the history names a lineage's package manager without its lock.
     pub fn set_locks_unobserved(&mut self) -> Result<()> {
         self.conf
-            .set(conf_slot::LOCKS_UNOBSERVED, 1, 0)
+            .set(conf_slot::LOCKS_UNOBSERVED, &1, 0)
             .context("MODULE_CONF locks")
     }
 

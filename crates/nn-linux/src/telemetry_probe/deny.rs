@@ -631,7 +631,7 @@ pub struct SelfTestMark(Arc<Mutex<Array<MapData, u32>>>);
 impl SelfTestMark {
     /// Write `tgid` (0: none); `false` when the kernel refused.
     pub fn set(&self, tgid: u32) -> bool {
-        self.0.lock().set(0, tgid, 0).is_ok()
+        self.0.lock().set(0, &tgid, 0).is_ok()
     }
 }
 

@@ -50,7 +50,7 @@ The CI runs the same checks on Linux x86_64. A red PR is not merged.
 - Toolchain (SUP-015): `rust-toolchain.toml` pins one Rust release (rustup
   installs it on the first `cargo`); Dependabot proposes the next one in a
   PR of its own. `rust-version` in `Cargo.toml` is the real MSRV (today
-  1.89, set by `uuid`): the `msrv` job compiles with that version, and
+  1.98, set by `aya` and `aya-obj`): the `msrv` job compiles with that version, and
   `xtask/tests/supply_chain.rs` fails if a dependency in the lockfile asks
   for a higher one. Whoever updates such a dependency raises
   `rust-version` in the same PR.

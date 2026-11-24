@@ -268,7 +268,7 @@ pub extern "C" fn nn_share_key() -> u64 {
     // through `bpf_probe_read_kernel` (0 when unreadable).
     let (level, owner, inum) = unsafe { outer_user_ns() };
     let sub = match share_account(uid, level, owner) {
-        Some(account) => SHARE_SUBUID.get(Key::new(32, account.to_be_bytes())).copied(),
+        Some(account) => SHARE_SUBUID.get(&Key::new(32, account.to_be_bytes())).copied(),
         None => None,
     };
     u64::from(northnarrow_common::wire::execq::share_key(uid, level, owner, inum, sub))

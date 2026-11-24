@@ -712,7 +712,7 @@ fn write_fs_grant(bpffs_root: Option<&Path>, grant: FsGrant) -> Result<()> {
     })?;
     let mut arr: AyaArray<_, AyaFsGrant> = AyaArray::try_from(AyaMap::Array(map_data))
         .with_context(|| format!("{FS_GRANT_MAP_NAME} is not an Array<FsGrant>"))?;
-    arr.set(0, AyaFsGrant(grant), 0)
+    arr.set(0, &AyaFsGrant(grant), 0)
         .with_context(|| format!("setting {FS_GRANT_MAP_NAME}[0]"))?;
     Ok(())
 }
@@ -741,7 +741,7 @@ fn write_kill_grant(bpffs_root: Option<&Path>, grant: KillGrant) -> Result<()> {
     })?;
     let mut arr: AyaArray<_, AyaKillGrant> = AyaArray::try_from(AyaMap::Array(map_data))
         .with_context(|| format!("{KILL_GRANT_MAP_NAME} is not an Array<KillGrant>"))?;
-    arr.set(0, AyaKillGrant(grant), 0)
+    arr.set(0, &AyaKillGrant(grant), 0)
         .with_context(|| format!("setting {KILL_GRANT_MAP_NAME}[0]"))?;
     Ok(())
 }

@@ -429,7 +429,7 @@ fn set_judge_flag(ebpf: &mut Ebpf, v: u32) -> Result<(), String> {
         .map_mut(JUDGE_MAP)
         .ok_or_else(|| format!("map {JUDGE_MAP} missing from the eBPF object"))?;
     let mut a: Array<&mut MapData, u32> = Array::try_from(map).map_err(|e| e.to_string())?;
-    a.set(0, v, 0).map_err(|e| e.to_string())?;
+    a.set(0, &v, 0).map_err(|e| e.to_string())?;
     if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, JUDGE_MAP) {
         warn!(error = %e, "sysctl judge: the judge flag's map NOT frozen");
     }
@@ -452,7 +452,7 @@ fn write_slots<M: std::borrow::BorrowMut<MapData>>(
     session: u32,
 ) -> Result<(), String> {
     for (slot, v) in slot_values(list, session).into_iter().enumerate() {
-        map.set(slot as u32, AyaOptOut(v), 0)
+        map.set(slot as u32, &AyaOptOut(v), 0)
             .map_err(|e| format!("{OPTOUT_MAP}[{slot}]: {e}"))?;
     }
     Ok(())

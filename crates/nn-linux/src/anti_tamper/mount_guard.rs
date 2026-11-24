@@ -876,11 +876,11 @@ fn write_maps(
     }
     for ((dev, ino), flags, path) in &merged {
         map.insert(
-            AyaInodeKey(InodeKey {
+            &AyaInodeKey(InodeKey {
                 dev: *dev,
                 ino: *ino,
             }),
-            *flags,
+            flags,
             0,
         )
         .with_context(|| format!("registering {path}"))?;
@@ -921,8 +921,8 @@ fn write_maps(
         .ok_or_else(|| anyhow!("map {CONF_MAP} missing from the eBPF object"))?;
     let mut conf: AyaArray<&mut MapData, u64> =
         AyaArray::try_from(conf).with_context(|| format!("{CONF_MAP} is not an Array<u64>"))?;
-    conf.set(1, ns.1, 0)?;
-    conf.set(0, ns.0, 0)?;
+    conf.set(1, &ns.1, 0)?;
+    conf.set(0, &ns.0, 0)?;
     Ok(())
 }
 
@@ -933,7 +933,7 @@ where
     T: std::borrow::Borrow<MapData> + std::borrow::BorrowMut<MapData>,
 {
     for (k, v) in &h.entries {
-        hm.insert(AyaInodeKey(*k), *v, 0)
+        hm.insert(&AyaInodeKey(*k), v, 0)
             .with_context(|| format!("registering a held mount ({:#x})", k.dev))?;
     }
     let keep: HashSet<(u64, u64)> = h.entries.iter().map(|(k, _)| (k.dev, k.ino)).collect();
@@ -959,7 +959,7 @@ where
     let bit = 1u8 << guard;
     for g in groups {
         let have = gm.get(g, 0).unwrap_or(0);
-        gm.insert(*g, have | bit, 0)
+        gm.insert(g, &(have | bit), 0)
             .with_context(|| format!("registering the peer group {g}"))?;
     }
     let stale: Vec<(u32, u8)> = gm
@@ -971,7 +971,7 @@ where
         if v & !bit == 0 {
             let _ = gm.remove(&g);
         } else {
-            let _ = gm.insert(g, v & !bit, 0);
+            let _ = gm.insert(&g, &(v & !bit), 0);
         }
     }
     Ok(())
@@ -983,7 +983,7 @@ fn set_guarded<T>(nm: &mut AyaHashMap<T, u64, u8>, inum: u64, guard: u8) -> Resu
 where
     T: std::borrow::Borrow<MapData> + std::borrow::BorrowMut<MapData>,
 {
-    nm.insert(inum, guard, 0)
+    nm.insert(&inum, &guard, 0)
         .with_context(|| format!("guarding the mount namespace {inum}"))?;
     let stale: Vec<u64> = nm
         .iter()
@@ -1275,7 +1275,7 @@ pub(crate) fn guard_own_namespace(ebpf: &mut Ebpf) -> Option<String> {
                 .map_mut(CONF_MAP)
                 .ok_or_else(|| anyhow!("map {CONF_MAP} missing from the eBPF object"))?;
             let mut conf: AyaArray<&mut MapData, u64> = AyaArray::try_from(conf)?;
-            conf.set(CONF_AGENT_NS, inum, 0)?;
+            conf.set(CONF_AGENT_NS, &inum, 0)?;
         }
         let nm = ebpf
             .map_mut(NS_MAP)
@@ -1328,7 +1328,7 @@ pub fn refresh(bpffs_root: &Path) -> Result<usize> {
             let k = AyaInodeKey(InodeKey { dev: *sb, ino: 0 });
             let have = pm.get(&k, 0).unwrap_or(0);
             if have & MG_SB == 0 {
-                pm.insert(k, have | MG_SB, 0)?;
+                pm.insert(&k, &(have | MG_SB), 0)?;
             }
         }
         n += h.entries.len();
@@ -1385,7 +1385,7 @@ pub fn wake_refresh(bpffs_root: &Path) -> Result<()> {
     let data = MapData::from_pin(&path).with_context(|| format!("opening pinned {CONF_MAP}"))?;
     let mut conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(data))?;
     let n = conf.get(&CONF_REGROUP, 0)?;
-    conf.set(CONF_REGROUP, n.wrapping_add(1), 0)?;
+    conf.set(CONF_REGROUP, &n.wrapping_add(1), 0)?;
     Ok(())
 }
 
@@ -1468,12 +1468,12 @@ pub fn guard_watchdog(bpffs_root: &Path, pid: u32) -> Result<WatchdogGuard> {
         let k = AyaInodeKey(InodeKey { dev: *sb, ino: 0 });
         let have = pm.get(&k, 0).unwrap_or(0);
         if have & MG_SB == 0 {
-            pm.insert(k, have | MG_SB, 0)?;
+            pm.insert(&k, &(have | MG_SB), 0)?;
         }
     }
     let mut conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(open(CONF_MAP)?))?;
     let mut nm: AyaHashMap<MapData, u64, u8> = AyaHashMap::try_from(Map::HashMap(open(NS_MAP)?))?;
-    conf.set(CONF_WATCHDOG_NS, inum, 0)?;
+    conf.set(CONF_WATCHDOG_NS, &inum, 0)?;
     set_guarded(&mut nm, inum, GUARD_WATCHDOG)?;
     Ok(WatchdogGuard {
         mnt_ns: inum,

@@ -412,7 +412,7 @@ pub fn populate_watched_paths(
             .ok()
             .filter(|m| m.is_file() && m.ino() == key.ino)
             .map(|m| m.len());
-        match hmap.insert(AyaInodeKey(key), 1u8, 0) {
+        match hmap.insert(&AyaInodeKey(key), &1u8, 0) {
             Ok(()) => {
                 inserted += 1;
                 registered.insert(key);
@@ -450,7 +450,7 @@ pub fn populate_watched_paths(
         }
         let mut hops = Vec::new();
         for (hop, hop_key) in &plan.hops {
-            match hmap.insert(AyaInodeKey(*hop_key), 1u8, 0) {
+            match hmap.insert(&AyaInodeKey(*hop_key), &1u8, 0) {
                 Ok(()) => {
                     registered.insert(*hop_key);
                     inode_map.insert_as(*hop_key, path_str.clone(), WatchClass::ChainHop);
@@ -615,7 +615,7 @@ impl WatchedPathsHandle {
     /// refusal.
     pub fn enroll(&mut self, key: InodeKey) -> bool {
         match &mut self.map {
-            WatchedPathsBacking::Kernel(m) => m.insert(AyaInodeKey(key), 1u8, 0).is_ok(),
+            WatchedPathsBacking::Kernel(m) => m.insert(&AyaInodeKey(key), &1u8, 0).is_ok(),
             #[cfg(any(test, feature = "test-util"))]
             WatchedPathsBacking::Fake { keys, capacity } => {
                 keys.contains(&key) || (keys.len() < *capacity && keys.insert(key))

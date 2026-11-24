@@ -6,7 +6,7 @@
 # because only the latest stable gets fixes and to meet its lints before
 # code written under them lands; it also moves Cargo's build-dir layout,
 # hence the toolchain in CI's target cache keys. The floor the workspace
-# supports is `rust-version` in Cargo.toml (1.89), checked by the `msrv` CI
+# supports is `rust-version` in Cargo.toml (1.98), checked by the `msrv` CI
 # job; `agent-ebpf/` pins its own nightly. rustup installs this channel on
 # first use (`rustup toolchain install` with no argument reads this file).
 [toolchain]

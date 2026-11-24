@@ -41,6 +41,31 @@ use tracing::info;
 pub(crate) static EBPF_BYTES: &[u8] =
     include_bytes_aligned!(concat!(env!("OUT_DIR"), "/northnarrow-agent-ebpf"));
 
+/// The loader every load of [`EBPF_BYTES`] starts from: aya's
+/// `EbpfLoader` with no target BTF to relocate against.
+///
+/// Lot 400 (aya 0.16): aya 0.14's `btf(None)` is gone. 0.16 reads the
+/// target BTF only for an object with CO-RE relocations or typed kernel
+/// symbols, from `/sys/kernel/btf/vmlinux` by path unless told where; ours
+/// has neither (`the_object_needs_no_target_btf`), and this source refuses
+/// to read one, so the load is the one `btf(None)` made — no relocation,
+/// no extern resolved against a kernel BTF — and aya never walks `/sys`
+/// (a view the agent reads beneath its anchored roots only). An object
+/// that one day needs a target BTF fails to load here, with this message,
+/// instead of loading unrelocated. The kernel offsets the programs read
+/// come from this kernel's BTF through `btf_revalidate`, as before.
+pub(crate) fn object_loader<'a>() -> aya::EbpfLoader<'a> {
+    let mut loader = aya::EbpfLoader::new();
+    loader.btf_source(|_| {
+        Err(aya::EbpfError::BtfSourceError(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the agent loads its eBPF object with no target BTF: the object has CO-RE \
+             relocations or typed kernel symbols it is not built with",
+        )))
+    });
+    loader
+}
+
 /// `"1"` iff `build.rs` embedded a real, staleness-verified object.
 const EMBEDDED: &str = env!("NN_EBPF_EMBEDDED");
 /// SHA-256 (hex) of the embedded object bytes, as recorded at build.
@@ -130,14 +155,16 @@ mod tests {
     /// fails on a build that embeds none.
     const REQUIRE_OBJECT_ENV: &str = "NN_REQUIRE_EBPF_OBJECT";
 
-    /// The map types aya 0.14.0's loader turns into a `Map` it can hand
-    /// out: `parse_map` in aya-0.14.0/src/bpf.rs (29 types; aya 0.13.1 had
-    /// 20). Any other type fails `EbpfLoader::load` for the WHOLE object
-    /// ("Unsupported map type found N") after the kernel created the map,
-    /// unless `allow_unsupported_maps` is set, which the agent does not do.
+    /// The map types aya 0.16.0's loader turns into a `Map` it can hand
+    /// out: `parse_map` in aya-0.16.0/src/bpf.rs (29 types, the same 29 as
+    /// aya 0.14.0's; aya 0.13.1 had 20). Any other type — among them
+    /// `BPF_MAP_TYPE_TASK_STORAGE` (29), still a `Map::Unsupported` in
+    /// 0.16 — fails `EbpfLoader::load` for the WHOLE object ("Unsupported
+    /// map type found N") after the kernel created the map, unless
+    /// `allow_unsupported_maps` is set, which the agent does not do.
     /// Re-derive the list from that function when aya is upgraded
     /// ([`aya_is_the_version_the_list_was_read_from`]).
-    const AYA_0_14_MAP_TYPES: &[aya_obj::generated::bpf_map_type] = {
+    const AYA_0_16_MAP_TYPES: &[aya_obj::generated::bpf_map_type] = {
         use aya_obj::generated::bpf_map_type::*;
         &[
             BPF_MAP_TYPE_ARRAY,
@@ -175,8 +202,8 @@ mod tests {
     /// The class of lab PR 219's boot failure (Debian 12: "loading eBPF
     /// object (BTF, maps, programs) / map error: Unsupported map type found
     /// 29", a hand-declared task-storage map): every map of the embedded
-    /// object — `#[map]`, BTF `.maps`, global data — read by aya-obj 0.3.0,
-    /// the parser aya 0.14.0 itself runs, must have a type aya 0.14 hands
+    /// object — `#[map]`, BTF `.maps`, global data — read by aya-obj 0.6.0,
+    /// the parser aya 0.16.0 itself runs, must have a type aya 0.16 hands
     /// out. Parsing alone is not enough: aya-obj accepts any type the
     /// kernel knows.
     ///
@@ -204,7 +231,7 @@ mod tests {
         for (name, map) in &obj.maps {
             let t = map.map_type();
             match aya_obj::generated::bpf_map_type::try_from(t) {
-                Ok(ty) if AYA_0_14_MAP_TYPES.contains(&ty) => {}
+                Ok(ty) if AYA_0_16_MAP_TYPES.contains(&ty) => {}
                 Ok(ty) => refused.push(format!("{name}: {ty:?} ({t})")),
                 Err(_) => refused.push(format!("{name}: unknown map type {t}")),
             }
@@ -212,7 +239,33 @@ mod tests {
         refused.sort();
         assert!(
             refused.is_empty(),
-            "maps aya 0.14 cannot load — the agent would refuse to start on every kernel: {refused:?}"
+            "maps aya 0.16 cannot load — the agent would refuse to start on every kernel: {refused:?}"
+        );
+    }
+
+    /// Lot 400: [`object_loader`] gives aya no target BTF, as aya 0.14's
+    /// `btf(None)` did — the same load only while the object carries no
+    /// CO-RE relocation and no typed kernel symbol, the two things aya 0.16
+    /// reads a target BTF for (`EbpfLoader::load`). An object that gained
+    /// either would fail every load with the loader's refusal: this names
+    /// the cause at build time instead.
+    #[test]
+    fn the_object_needs_no_target_btf() {
+        if EMBEDDED != "1" || EBPF_BYTES.is_empty() {
+            assert!(
+                std::env::var_os(REQUIRE_OBJECT_ENV).is_none(),
+                "{REQUIRE_OBJECT_ENV} is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(EBPF_BYTES).expect("the eBPF object parses");
+        assert!(
+            !obj.has_btf_relocations(),
+            "the eBPF object carries CO-RE relocations: object_loader gives aya no target BTF"
+        );
+        assert!(
+            !obj.has_typed_ksyms(),
+            "the eBPF object carries typed kernel symbols: object_loader gives aya no target BTF"
         );
     }
 
@@ -435,7 +488,7 @@ mod tests {
         assert!(fallthrough_back_edges(&dag).is_empty());
     }
 
-    /// [`AYA_0_14_MAP_TYPES`] was read from aya 0.14.0: an upgrade of the
+    /// [`AYA_0_16_MAP_TYPES`] was read from aya 0.16.0: an upgrade of the
     /// agent's aya must re-read it (a newer aya may load more types).
     #[test]
     fn aya_is_the_version_the_list_was_read_from() {
@@ -447,8 +500,8 @@ mod tests {
             .find(|p| p.contains("\nname = \"aya\"\n"))
             .expect("aya in Cargo.lock");
         assert!(
-            aya.contains("\nversion = \"0.14.0\"\n"),
-            "aya changed: re-derive AYA_0_14_MAP_TYPES from its src/bpf.rs parse_map: {aya}"
+            aya.contains("\nversion = \"0.16.0\"\n"),
+            "aya changed: re-derive AYA_0_16_MAP_TYPES from its src/bpf.rs parse_map: {aya}"
         );
     }
 }

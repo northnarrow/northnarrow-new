@@ -37,7 +37,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::{FExit, KProbe, Lsm, ProgramError, ProgramInfo};
-use aya::{Btf, Ebpf, EbpfLoader};
+use aya::{Btf, Ebpf};
 use common::wire::InodeKey;
 use common::wire::sensor_probe::{
     PROBE_DETAIL_LEN, PROBE_KIND_ANCESTOR, PROBE_KIND_DIR, PROBE_KIND_DNS4, PROBE_KIND_DNS6,
@@ -286,8 +286,7 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
 
     let btf = antitamper_bpf::kernel_roots::vmlinux_btf().context("loading the vmlinux BTF")?;
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
-    let mut ebpf = EbpfLoader::new()
-        .btf(None)
+    let mut ebpf = crate::sensors::ebpf_object::object_loader()
         .default_map_pin_directory(PIN_DIR)
         .load(EBPF_BYTES)
         .context("loading the eBPF object (is the installed agent still running? stop it first)")?;
