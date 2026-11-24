@@ -2140,6 +2140,36 @@ pub fn describe() -> String {
 mod tests {
     use super::*;
 
+    /// Lot 400 (aya 0.16, the mini-hunt of the adoption's size): an
+    /// adoption verifies the pinned maps against [`layout`]; aya 0.16 then
+    /// takes a pin only when it is the object's map exactly (type, key and
+    /// value sizes, entries, flags) and fails the whole load otherwise —
+    /// aya 0.14 took any. [`layout`] is the embedded object's definition of
+    /// each map adopted, so a layout an adoption accepts is one aya takes
+    /// (the marks' entries are sized at the load: [`Plan::entries`]).
+    #[test]
+    fn the_layout_an_adoption_verifies_is_the_object_s() {
+        let bytes = crate::sensors::ebpf_object::EBPF_BYTES;
+        if bytes.is_empty() {
+            assert!(
+                std::env::var_os("NN_REQUIRE_EBPF_OBJECT").is_none(),
+                "NN_REQUIRE_EBPF_OBJECT is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(bytes).expect("the eBPF object parses");
+        for name in PINNED_MAPS {
+            let m = obj.maps.get(name).unwrap_or_else(|| panic!("{name} not in the object"));
+            let (kind, key, value, entries, flags) = layout(name).expect("a tracker map");
+            assert_eq!(m.map_type(), kind as u32, "{name}: type");
+            assert_eq!((m.key_size(), m.value_size()), (key, value), "{name}: key, value");
+            assert_eq!(m.map_flags(), flags, "{name}: flags");
+            if let Some(n) = entries {
+                assert_eq!(m.max_entries(), n, "{name}: entries");
+            }
+        }
+    }
+
     /// The re-review of #494, R2: the tracker's directories beside the pin
     /// root are found by name (another layout's, an older version's), the
     /// current one kept; a purge takes the links first, then the rest and

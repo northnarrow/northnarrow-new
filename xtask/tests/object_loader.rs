@@ -119,11 +119,11 @@ fn the_rules_catch_a_planted_loader() {
     for (needle, _) in FORBIDDEN {
         let planted = format!("fn f() {{ let _ = {needle}x); }}");
         assert_eq!(
-            violations("agent/src/x.rs", &planted).len(),
+            violations("agent/src/main.rs", &planted).len(),
             1,
             "{needle} not caught"
         );
         assert!(violations(LOADER, &planted).is_empty());
     }
-    assert!(violations("agent/src/x.rs", "fn f() { object_loader().load(b) }").is_empty());
+    assert!(violations("agent/src/main.rs", "fn f() { object_loader().load(b) }").is_empty());
 }
