@@ -2,12 +2,14 @@
 # this tree (CI, release, lab, a developer host) uses the same compiler and
 # a new stable — its lints under `-D warnings`, its codegen — arrives in a
 # reviewed PR of its own. Dependabot (`rust-toolchain`, monthly) proposes
-# the bump. 1.99.1 is the stable the last green CI on main used
-# (2026-10-16). The floor the workspace supports is `rust-version` in
-# Cargo.toml, checked by the `msrv` CI job; `agent-ebpf/` pins its own
-# nightly. rustup installs this channel on first use (`rustup toolchain
-# install` with no argument reads this file).
+# the bump. 1.100.0 is the stable released on 2026-11-12 (lot 397), taken
+# because only the latest stable gets fixes and to meet its lints before
+# code written under them lands; it also moves Cargo's build-dir layout,
+# hence the toolchain in CI's target cache keys. The floor the workspace
+# supports is `rust-version` in Cargo.toml (1.89), checked by the `msrv` CI
+# job; `agent-ebpf/` pins its own nightly. rustup installs this channel on
+# first use (`rustup toolchain install` with no argument reads this file).
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

@@ -637,10 +637,13 @@ fn debug_entries() -> Option<u32> {
 /// resets the marks (the privileged test of the epoch). Never in a release.
 fn debug_reset() -> bool {
     #[cfg(feature = "debug-trigger")]
-    if std::env::var("NN_DEBUG_CGROUP_JOIN_RESET").as_deref() == Ok("1") {
-        return true;
+    {
+        std::env::var("NN_DEBUG_CGROUP_JOIN_RESET").as_deref() == Ok("1")
     }
-    false
+    #[cfg(not(feature = "debug-trigger"))]
+    {
+        false
+    }
 }
 
 /// The tracker's pin directory this boot, once [`attach`] pinned in it
