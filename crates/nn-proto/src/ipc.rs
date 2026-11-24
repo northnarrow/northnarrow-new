@@ -695,8 +695,9 @@ pub struct Expected {
     pub kernel_landlock_abi: u8,
 }
 
-/// The newest Landlock ABI a worker's build asks for (the `landlock`
-/// crate's): a kernel above it gives no more.
+/// The newest Landlock ABI a worker's build asks for (`nn-linux`'s
+/// `LANDLOCK_ASK`, held equal at build time; lot 399: below the `landlock`
+/// crate's newest, 10): a kernel above it gives no more.
 pub const LANDLOCK_ABI_KNOWN: u8 = 9;
 
 /// The core's check of a worker's hello (plan §3.5: the version handshake;

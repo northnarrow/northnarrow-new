@@ -495,6 +495,38 @@ fn the_level_declares_what_the_kernel_gave() {
     }
 }
 
+/// Lot 399: `landlock` 0.4.8 knows ABI 10 (UDP) and reports it as the
+/// effective ABI on such a kernel; the workers still ask for 9's rights,
+/// and the level declares no more than they asked — the ABI the core's
+/// check of the hello expects there (`check_hello`: the kernel's, capped at
+/// `LANDLOCK_ABI_KNOWN`). Declared as the crate gives it, every worker on a
+/// kernel with ABI 10 or above would be refused.
+#[test]
+fn a_kernel_above_the_rights_asked_declares_the_rights_asked() {
+    use landlock::LandlockStatus::{Available, NotEnabled, NotImplemented};
+    let at = |effective_abi, kernel_abi| {
+        declared_abi(Available {
+            effective_abi,
+            kernel_abi,
+        })
+    };
+    for (kernel, status) in [(10u8, at(ABI::V10, None)), (12, at(ABI::V10, Some(12)))] {
+        assert_eq!(status, 9, "a kernel with ABI {kernel}: the rights asked");
+        assert_eq!(
+            status,
+            kernel.min(LANDLOCK_ABI_KNOWN),
+            "what the core expects"
+        );
+    }
+    // at or below the rights asked: the kernel's own, as before
+    assert_eq!(at(ABI::V9, None), 9);
+    assert_eq!(at(ABI::V6, None), 6);
+    assert_eq!(at(ABI::V4, None), 4);
+    assert_eq!(at(ABI::V1, None), 1);
+    assert_eq!(declared_abi(NotEnabled), 0);
+    assert_eq!(declared_abi(NotImplemented), 0);
+}
+
 #[test]
 fn the_measure_reads_this_process() {
     let level = measure().unwrap();
