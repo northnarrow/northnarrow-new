@@ -6,7 +6,7 @@
 
 use nn_model::posture_types::PostureKind;
 use nn_proto::admin_protocol::{AdminMessage, AdminResult, StatusResponse};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::fixtures;
 use crate::harness::{Case, Put, Special};
@@ -1094,12 +1094,29 @@ pub fn verbs() -> Vec<Verb> {
     };
     let mut set = verb(
         "config-overlay-set",
-        &format!("config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b {SIGNED}"),
+        &format!(
+            "config overlay set process-comm-allowlist --file overlay.local --cosign-key key-b {SIGNED}"
+        ),
         vec![
-            ("stored", overlay_set(true, "process-comm-allowlist.local stored; loaded at the next start")),
-            ("refused-by-the-agent", overlay_set(false, "the floor refuses an overlay signed before 1750000000")),
+            (
+                "stored",
+                overlay_set(
+                    true,
+                    "process-comm-allowlist.local stored; loaded at the next start",
+                ),
+            ),
+            (
+                "refused-by-the-agent",
+                overlay_set(
+                    false,
+                    "the floor refuses an overlay signed before 1750000000",
+                ),
+            ),
         ],
-        with("ConfigOverlaySetResponse", json!({"stored": false, "message": "refused by the mock"})),
+        with(
+            "ConfigOverlaySetResponse",
+            json!({"stored": false, "message": "refused by the mock"}),
+        ),
     );
     set.put.push(Put::file(
         "overlay.local",
@@ -1150,35 +1167,211 @@ fn variants() -> Vec<(&'static str, String, AdminMessage, Vec<Put>)> {
         json!({"CanaryDeployResponse": {"result": "Success", "canary_id": "c0ffee0123456789"}}),
     );
     let mut v = vec![
-        ("force-posture.observing", format!("force-posture observing {SIGNED}"), ok("ForcePostureResult"), vec![]),
-        ("force-posture.alerted", format!("force-posture alerted {SIGNED}"), ok("ForcePostureResult"), vec![]),
-        ("force-posture.combat", format!("force-posture combat {SIGNED}"), ok("ForcePostureResult"), vec![]),
-        ("canary-deploy.process", format!("canary deploy --name decoy-proc {SIGNED} process --path /usr/local/bin/backupd --fake-arg0 backupd"), deployed.clone(), vec![]),
-        ("canary-deploy.network", format!("canary deploy --name decoy-port {SIGNED} network --bind-addr 0.0.0.0 --bind-port 2222"), deployed.clone(), vec![]),
-        ("canary-deploy.credential", format!("canary deploy --name aws-creds {SIGNED} credential --path /root/.aws/credentials --cred-family aws"), deployed, vec![]),
-        ("trusted-installer-grant.default-window", format!("trusted-installer-grant {SIGNED}"), ok("TrustedInstallerGrantResult"), vec![]),
-        ("trusted-installer-grant.clamped-up", format!("trusted-installer-grant --window-secs 0 {SIGNED}"), ok("TrustedInstallerGrantResult"), vec![]),
-        ("trusted-installer-grant.clamped-down", format!("trusted-installer-grant --window-secs 3600 {SIGNED}"), ok("TrustedInstallerGrantResult"), vec![]),
-        ("shutdown.default-grace", format!("shutdown --cosign-key key-b {SIGNED}"), ok("ShutdownResult"), vec![]),
-        ("shutdown.same-key-twice", format!("shutdown --cosign-key key-a {SIGNED}"), msg(json!({"ShutdownResult": {"QuorumNotMet": {"required": 2, "provided": 1}}})), vec![]),
-        ("shutdown.grace-over-cap", format!("shutdown --cosign-key key-b --grace-secs 301 {SIGNED}"), ok("ShutdownResult"), vec![]),
-        ("rotate-keys-add.default-roles", format!("rotate-keys add --new-pubkey {} --cosign-key key-b {SIGNED}", fixtures::pub_hex(&fixtures::admin("key-c"))), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-add.all-roles", format!("rotate-keys add --new-pubkey {} --new-roles all --cosign-key key-b {SIGNED}", fixtures::pub_hex(&fixtures::admin("key-c"))), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-add.unknown-role", format!("rotate-keys add --new-pubkey {} --new-roles unlock,root --cosign-key key-b {SIGNED}", fixtures::pub_hex(&fixtures::admin("key-c"))), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-add.empty-role", format!("rotate-keys add --new-pubkey {} --new-roles unlock,,audit-read --cosign-key key-b {SIGNED}", fixtures::pub_hex(&fixtures::admin("key-c"))), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-add.short-pubkey", format!("rotate-keys add --new-pubkey abcd --cosign-key key-b {SIGNED}"), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-add.pubkey-not-hex", format!("rotate-keys add --new-pubkey {} --cosign-key key-b {SIGNED}", "zz".repeat(32)), ok("RotateKeysAddResult"), vec![]),
-        ("rotate-keys-revoke.short-fingerprint", format!("rotate-keys revoke --fingerprint abc --cosign-key key-b {SIGNED}"), ok("RotateKeysRevokeResult"), vec![]),
-        ("rotate-keys-revoke.fingerprint-not-hex", format!("rotate-keys revoke --fingerprint zzzzzzzz --cosign-key key-b {SIGNED}"), ok("RotateKeysRevokeResult"), vec![]),
-        ("detection-set-status.no-note", format!("detection-set-status --id 7 --status false-positive {SIGNED}"), msg(json!({"DetectionSetStatusResponse": {"result": "Success", "id": 7, "new_status": "false-positive", "persist_failed": false}})), vec![]),
-        ("response-restore.original-path", format!("response restore --vault-id {} {SIGNED}", "1b".repeat(16)), msg(json!({"ResponseRestoreResponse": {"result": "Success", "restored": true, "path": "/tmp/dropper", "message": "restored"}})), vec![]),
-        ("remediate-ransomware.since-not-a-time", format!("remediate ransomware --since yesterday {SIGNED}"), remediated(), vec![]),
-        ("remediate-ransomware.neither-pid-nor-since", format!("remediate ransomware --dry-run {SIGNED}"), remediated(), vec![]),
-        ("net-flows.no-since", format!("net flows {SIGNED}"), msg(json!({"NetFlowsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
-        ("fim-report.no-since", format!("fim report {SIGNED}"), msg(json!({"FimReportResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
-        ("detections.limit-zero", format!("detections --limit 0 {SIGNED}"), msg(json!({"DetectionsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}})), vec![]),
+        (
+            "force-posture.observing",
+            format!("force-posture observing {SIGNED}"),
+            ok("ForcePostureResult"),
+            vec![],
+        ),
+        (
+            "force-posture.alerted",
+            format!("force-posture alerted {SIGNED}"),
+            ok("ForcePostureResult"),
+            vec![],
+        ),
+        (
+            "force-posture.combat",
+            format!("force-posture combat {SIGNED}"),
+            ok("ForcePostureResult"),
+            vec![],
+        ),
+        (
+            "canary-deploy.process",
+            format!(
+                "canary deploy --name decoy-proc {SIGNED} process --path /usr/local/bin/backupd --fake-arg0 backupd"
+            ),
+            deployed.clone(),
+            vec![],
+        ),
+        (
+            "canary-deploy.network",
+            format!(
+                "canary deploy --name decoy-port {SIGNED} network --bind-addr 0.0.0.0 --bind-port 2222"
+            ),
+            deployed.clone(),
+            vec![],
+        ),
+        (
+            "canary-deploy.credential",
+            format!(
+                "canary deploy --name aws-creds {SIGNED} credential --path /root/.aws/credentials --cred-family aws"
+            ),
+            deployed,
+            vec![],
+        ),
+        (
+            "trusted-installer-grant.default-window",
+            format!("trusted-installer-grant {SIGNED}"),
+            ok("TrustedInstallerGrantResult"),
+            vec![],
+        ),
+        (
+            "trusted-installer-grant.clamped-up",
+            format!("trusted-installer-grant --window-secs 0 {SIGNED}"),
+            ok("TrustedInstallerGrantResult"),
+            vec![],
+        ),
+        (
+            "trusted-installer-grant.clamped-down",
+            format!("trusted-installer-grant --window-secs 3600 {SIGNED}"),
+            ok("TrustedInstallerGrantResult"),
+            vec![],
+        ),
+        (
+            "shutdown.default-grace",
+            format!("shutdown --cosign-key key-b {SIGNED}"),
+            ok("ShutdownResult"),
+            vec![],
+        ),
+        (
+            "shutdown.same-key-twice",
+            format!("shutdown --cosign-key key-a {SIGNED}"),
+            msg(json!({"ShutdownResult": {"QuorumNotMet": {"required": 2, "provided": 1}}})),
+            vec![],
+        ),
+        (
+            "shutdown.grace-over-cap",
+            format!("shutdown --cosign-key key-b --grace-secs 301 {SIGNED}"),
+            ok("ShutdownResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.default-roles",
+            format!(
+                "rotate-keys add --new-pubkey {} --cosign-key key-b {SIGNED}",
+                fixtures::pub_hex(&fixtures::admin("key-c"))
+            ),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.all-roles",
+            format!(
+                "rotate-keys add --new-pubkey {} --new-roles all --cosign-key key-b {SIGNED}",
+                fixtures::pub_hex(&fixtures::admin("key-c"))
+            ),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.unknown-role",
+            format!(
+                "rotate-keys add --new-pubkey {} --new-roles unlock,root --cosign-key key-b {SIGNED}",
+                fixtures::pub_hex(&fixtures::admin("key-c"))
+            ),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.empty-role",
+            format!(
+                "rotate-keys add --new-pubkey {} --new-roles unlock,,audit-read --cosign-key key-b {SIGNED}",
+                fixtures::pub_hex(&fixtures::admin("key-c"))
+            ),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.short-pubkey",
+            format!("rotate-keys add --new-pubkey abcd --cosign-key key-b {SIGNED}"),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-add.pubkey-not-hex",
+            format!(
+                "rotate-keys add --new-pubkey {} --cosign-key key-b {SIGNED}",
+                "zz".repeat(32)
+            ),
+            ok("RotateKeysAddResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-revoke.short-fingerprint",
+            format!("rotate-keys revoke --fingerprint abc --cosign-key key-b {SIGNED}"),
+            ok("RotateKeysRevokeResult"),
+            vec![],
+        ),
+        (
+            "rotate-keys-revoke.fingerprint-not-hex",
+            format!("rotate-keys revoke --fingerprint zzzzzzzz --cosign-key key-b {SIGNED}"),
+            ok("RotateKeysRevokeResult"),
+            vec![],
+        ),
+        (
+            "detection-set-status.no-note",
+            format!("detection-set-status --id 7 --status false-positive {SIGNED}"),
+            msg(
+                json!({"DetectionSetStatusResponse": {"result": "Success", "id": 7, "new_status": "false-positive", "persist_failed": false}}),
+            ),
+            vec![],
+        ),
+        (
+            "response-restore.original-path",
+            format!("response restore --vault-id {} {SIGNED}", "1b".repeat(16)),
+            msg(
+                json!({"ResponseRestoreResponse": {"result": "Success", "restored": true, "path": "/tmp/dropper", "message": "restored"}}),
+            ),
+            vec![],
+        ),
+        (
+            "remediate-ransomware.since-not-a-time",
+            format!("remediate ransomware --since yesterday {SIGNED}"),
+            remediated(),
+            vec![],
+        ),
+        (
+            "remediate-ransomware.neither-pid-nor-since",
+            format!("remediate ransomware --dry-run {SIGNED}"),
+            remediated(),
+            vec![],
+        ),
+        (
+            "net-flows.no-since",
+            format!("net flows {SIGNED}"),
+            msg(
+                json!({"NetFlowsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}}),
+            ),
+            vec![],
+        ),
+        (
+            "fim-report.no-since",
+            format!("fim report {SIGNED}"),
+            msg(
+                json!({"FimReportResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}}),
+            ),
+            vec![],
+        ),
+        (
+            "detections.limit-zero",
+            format!("detections --limit 0 {SIGNED}"),
+            msg(
+                json!({"DetectionsResponse": {"result": "Success", "entries_jsonl": "", "entries_count": 0, "entries_truncated": false}}),
+            ),
+            vec![],
+        ),
         // lot 379: a note past its bound (refused before any request)
-        ("integrity-acknowledge.note-too-long", format!("integrity acknowledge --through 1 --note {} {SIGNED}", "n".repeat(513)), msg(json!({"IntegrityAcknowledgeResponse": {"result": "Success", "acknowledged": 1, "still_held": 0, "message": "unreached"}})), vec![]),
+        (
+            "integrity-acknowledge.note-too-long",
+            format!(
+                "integrity acknowledge --through 1 --note {} {SIGNED}",
+                "n".repeat(513)
+            ),
+            msg(
+                json!({"IntegrityAcknowledgeResponse": {"result": "Success", "acknowledged": 1, "still_held": 0, "message": "unreached"}}),
+            ),
+            vec![],
+        ),
     ];
     // config overlay set: every kind, a comment-only overlay (the loader's
     // parse decides), and an unknown kind.

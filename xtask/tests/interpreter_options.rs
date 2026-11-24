@@ -618,12 +618,24 @@ fn the_ratchet_fails_on_planted_violations() {
             "fn a(c: &[u8]) -> bool { c.split(|b| *b == 0).nth(1).is_some() }\nfn b(cmdline: &[u8]) \
              -> bool { cmdline.split(|b| *b == 0).nth(1).is_some() }",
         ),
-        ("eval", "fn a(s: &str) -> bool { s.starts_with(\"--eval=\") }"),
+        (
+            "eval",
+            "fn a(s: &str) -> bool { s.starts_with(\"--eval=\") }",
+        ),
         ("ec", "fn a(s: &str) -> bool { s == \"-ec\" }"),
         ("require", "fn a(s: &str) -> bool { s == \"--require\" }"),
-        ("idx", "fn a(cmd: &[String], idx: usize) -> Option<&String> { cmd.get(idx + 1) }"),
-        ("norc", "fn a(argv: &[String]) -> bool { argv.iter().any(|x| x == \"-norc\") }"),
-        ("pos", "fn a(argv: &[String]) -> Option<usize> { argv.iter().position(|a| a == \"-c\") }"),
+        (
+            "idx",
+            "fn a(cmd: &[String], idx: usize) -> Option<&String> { cmd.get(idx + 1) }",
+        ),
+        (
+            "norc",
+            "fn a(argv: &[String]) -> bool { argv.iter().any(|x| x == \"-norc\") }",
+        ),
+        (
+            "pos",
+            "fn a(argv: &[String]) -> Option<usize> { argv.iter().position(|a| a == \"-c\") }",
+        ),
     ];
     for (name, body) in planted {
         code.insert(
@@ -648,12 +660,14 @@ fn the_ratchet_fails_on_planted_violations() {
     let v = violations(&code);
     let new: Vec<&String> = v.iter().filter(|x| x.contains("/twin_")).collect();
     assert_eq!(new.len(), planted.len(), "{v:#?}");
-    assert!(v
-        .iter()
-        .any(|x| x.contains("impair/mod.rs") && x.contains("a new one")));
-    assert!(v
-        .iter()
-        .any(|x| x.contains("lineage.rs") && x.contains("lower the pin")));
+    assert!(
+        v.iter()
+            .any(|x| x.contains("impair/mod.rs") && x.contains("a new one"))
+    );
+    assert!(
+        v.iter()
+            .any(|x| x.contains("lineage.rs") && x.contains("lower the pin"))
+    );
     assert_eq!(v.len(), planted.len() + 2, "{v:#?}");
     // a file named `tests.rs` is test-only by its parent's `#[cfg(test)]`
     assert!(support::test_only_file(
@@ -687,9 +701,10 @@ fn the_system_tools_options_stay_in_their_tables() {
     assert!(v.iter().any(|x| x.contains("impair/mod.rs")
         && x.contains("--kill-whom")
         && x.contains("a new one")));
-    assert!(v
-        .iter()
-        .any(|x| x.contains("new_tool_rule.rs") && x.contains("--policy")));
+    assert!(
+        v.iter()
+            .any(|x| x.contains("new_tool_rule.rs") && x.contains("--policy"))
+    );
     let tables = &code["crates/nn-core/src/impair/tool_options.rs"];
     assert_eq!(
         string_literals(tables)

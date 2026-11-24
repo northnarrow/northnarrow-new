@@ -7,7 +7,7 @@
 
 use std::sync::Mutex;
 
-use nn_export::jsonl::{JsonlSink, ACTIVE};
+use nn_export::jsonl::{ACTIVE, JsonlSink};
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 

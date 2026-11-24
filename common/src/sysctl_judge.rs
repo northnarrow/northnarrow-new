@@ -23,10 +23,10 @@
 //! that would otherwise be refused is recorded.
 
 use crate::cgroup_limits::{
-    sysctl_refuses_every_write, sysctl_value_harmful, SYSCTL_FTRACE_ENABLED,
-    SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_MAX_MAP_COUNT, SYSCTL_NONE,
-    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
-    SYSCTL_SCHED_RT_PERIOD, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    SYSCTL_FTRACE_ENABLED, SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION,
+    SYSCTL_MAX_MAP_COUNT, SYSCTL_NONE, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
+    SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_PERIOD, SYSCTL_SCHED_RT_RUNTIME,
+    SYSCTL_THREADS_MAX, sysctl_refuses_every_write, sysctl_value_harmful,
 };
 
 /// The guarded sysctls by the name `bpf_sysctl_get_name` gives without
@@ -385,7 +385,7 @@ pub const fn record_of(target_dev: u64, target_ino: u64) -> (u8, Option<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cgroup_limits::{limit_value, SYSCTL_FILES};
+    use crate::cgroup_limits::{SYSCTL_FILES, limit_value};
 
     fn k(path: &str) -> u8 {
         sysctl_path_kind(path.len(), path_words(path.as_bytes()))

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use northnarrow_agent::audit::{read_signing_key, AgentSigningKey};
+use northnarrow_agent::audit::{AgentSigningKey, read_signing_key};
 use northnarrow_agent::chainlog::{
-    line_is_genuine, NoProtection, RotatingChainLog, RotationConfig,
+    NoProtection, RotatingChainLog, RotationConfig, line_is_genuine,
 };
 use northnarrow_agent::response::journal::{ActionIntent, ActionRecord, ActionRow};
 

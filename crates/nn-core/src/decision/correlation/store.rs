@@ -1412,9 +1412,10 @@ mod tests {
         // reads processed before it: no second record.
         let mut s = CorrelationStore::new();
         s.record_for_pid(77, PrecursorKind::CredRead, 10 * SEC);
-        assert!(s
-            .chain_age_for_pid(77, PrecursorKind::CredRead, 400 * SEC)
-            .is_some());
+        assert!(
+            s.chain_age_for_pid(77, PrecursorKind::CredRead, 400 * SEC)
+                .is_some()
+        );
         s.observe_spawn(77, 1, 9 * SEC);
         assert_eq!(
             s.chain_age_for_pid(77, PrecursorKind::CredRead, 410 * SEC),
@@ -1461,9 +1462,10 @@ mod tests {
         assert!(s.has_precursor_in_lineage(42, 20 * 60 * SEC));
         assert!(s.has_precursor_in_lineage(43, 20 * 60 * SEC), "a child too");
         assert!(!s.has_precursor_in_lineage(42, 10 * SEC + LONG_RETENTION_NS + SEC));
-        assert!(s
-            .chain_age_for_pid(42, PrecursorKind::CredRead, 20 * 60 * SEC)
-            .is_some());
+        assert!(
+            s.chain_age_for_pid(42, PrecursorKind::CredRead, 20 * 60 * SEC)
+                .is_some()
+        );
         assert!(
             !s.has_precursor_in_lineage(42, 20 * 60 * SEC + SEC),
             "reported"
@@ -1911,15 +1913,17 @@ mod tests {
             !s.egress.contains_key(&ProcKey::unresolved(9825)),
             "emptied, removed"
         );
-        assert!(s
-            .claim_egress_after(key(9825, 7), 99 * SEC, W)
-            .is_some_and(|n| n.start_ns == 101 * SEC));
+        assert!(
+            s.claim_egress_after(key(9825, 7), 99 * SEC, W)
+                .is_some_and(|n| n.start_ns == 101 * SEC)
+        );
         // Bug hunt 1.3, BUG75: CHAIN-007's late read needs the sequence's
         // first step, a staging exec before it.
         s.record(ProcKey::unresolved(9826), PrecursorKind::TmpExec, 98 * SEC);
-        assert!(s
-            .answer_sequence_after(ProcKey::unresolved(9826), 99 * SEC, W)
-            .is_some());
+        assert!(
+            s.answer_sequence_after(ProcKey::unresolved(9826), 99 * SEC, W)
+                .is_some()
+        );
     }
 
     // ── External audit NETR-004: a hard cap, O(1) per insert ─────────
@@ -2359,9 +2363,10 @@ mod tests {
         }
         s.record(k, PrecursorKind::TmpExec, 50 * SEC);
         s.record(k, PrecursorKind::CanaryTrip, 60 * SEC);
-        assert!(s.per_proc.get(&k).is_some_and(|q| q
-            .iter()
-            .all(|p| p.kind != PrecursorKind::CanaryTrip || p.ts_ns > 100 * SEC)));
+        assert!(s.per_proc.get(&k).is_some_and(|q| {
+            q.iter()
+                .all(|p| p.kind != PrecursorKind::CanaryTrip || p.ts_ns > 100 * SEC)
+        }));
         assert!(s.has_sequence(
             k,
             &[PrecursorKind::TmpExec, PrecursorKind::CanaryTrip],

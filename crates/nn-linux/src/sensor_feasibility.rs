@@ -30,24 +30,24 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::{FExit, KProbe, Lsm, ProgramError, ProgramInfo};
 use aya::{Btf, Ebpf, EbpfLoader};
-use common::wire::sensor_probe::{
-    probe_slot, SensorProbeRaw, PROBE_DETAIL_LEN, PROBE_KIND_ANCESTOR, PROBE_KIND_DIR,
-    PROBE_KIND_DNS4, PROBE_KIND_DNS6, PROBE_KIND_EXEC, PROBE_KIND_MASS_WRITE, PROBE_KIND_NAME,
-    PROBE_KIND_UDP_SEND_SKB, PROBE_MASS_WRITE_MIN, PROBE_OFFSETS_MAGIC, PROBE_PATH_SLOTS,
-    PROBE_PATH_SLOT_LEN,
-};
 use common::wire::InodeKey;
+use common::wire::sensor_probe::{
+    PROBE_DETAIL_LEN, PROBE_KIND_ANCESTOR, PROBE_KIND_DIR, PROBE_KIND_DNS4, PROBE_KIND_DNS6,
+    PROBE_KIND_EXEC, PROBE_KIND_MASS_WRITE, PROBE_KIND_NAME, PROBE_KIND_UDP_SEND_SKB,
+    PROBE_MASS_WRITE_MIN, PROBE_OFFSETS_MAGIC, PROBE_PATH_SLOT_LEN, PROBE_PATH_SLOTS,
+    SensorProbeRaw, probe_slot,
+};
 
 use crate::anti_tamper::btf_revalidate::{self, RefuseReason, ResolveOutcome};
-use crate::anti_tamper::filesystem::{stat_dev_to_kernel_dev, AyaInodeKey};
+use crate::anti_tamper::filesystem::{AyaInodeKey, stat_dev_to_kernel_dev};
 use crate::sensors::ebpf_object::EBPF_BYTES;
 use crate::telemetry_probe::dns_probe_packet;
 
@@ -136,11 +136,7 @@ pub fn run() -> i32 {
         rep.check("the run completed", true, false, format!("{e:#}"));
     }
     rep.print();
-    if rep.passed() {
-        0
-    } else {
-        1
-    }
+    if rep.passed() { 0 } else { 1 }
 }
 
 /// The fixtures' directory, fresh and private: `<base>/nn-feasibility.XXXXXX`.
@@ -1655,7 +1651,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn euid() -> u32 {
         unsafe { libc::geteuid() }

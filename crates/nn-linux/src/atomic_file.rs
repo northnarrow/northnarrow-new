@@ -74,10 +74,12 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &pidfile).unwrap();
         write_pidfile(&pidfile, pid).unwrap();
         assert_eq!(fs::read_to_string(&victim).unwrap(), "CHAIN");
-        assert!(fs::symlink_metadata(&pidfile)
-            .unwrap()
-            .file_type()
-            .is_file());
+        assert!(
+            fs::symlink_metadata(&pidfile)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
         // A missing directory is still an error (a misconfigured --pid-file).
         assert!(write_pidfile(&dir.path().join("nope/agent.pid"), pid).is_err());
     }

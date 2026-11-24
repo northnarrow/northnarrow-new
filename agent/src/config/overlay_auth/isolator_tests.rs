@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::anti_tamper::network_isolate::{
-    validate_ruleset, NetworkIsolator, BUILTIN_ALLOW, BUILTIN_RULES_V4, BUILTIN_RULES_V6,
+    BUILTIN_ALLOW, BUILTIN_RULES_V4, BUILTIN_RULES_V6, NetworkIsolator, validate_ruleset,
 };
 
 /// Absolute path to `configs/combat-rules.v4` in the repo. Tests

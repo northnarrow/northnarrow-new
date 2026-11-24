@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nn_core::contract::manifest::{
-    class_entries, fallbacks_and_missing, source_entries, SourceFacts,
+    SourceFacts, class_entries, fallbacks_and_missing, source_entries,
 };
 use nn_evidence::heartbeat::BeatManifest;
 use parking_lot::Mutex;
@@ -61,7 +61,7 @@ pub const CHANGE_ROW_EVERY: Duration = Duration::from_secs(60);
 /// The manifest's types, nn-core's since R13 (the plan's
 /// `contract::CapabilityManifest`).
 pub use nn_core::contract::manifest::{
-    CapabilityManifest, DenyHooks, HostCheck, SensorEntry, Took, MANIFEST_VERSION,
+    CapabilityManifest, DenyHooks, HostCheck, MANIFEST_VERSION, SensorEntry, Took,
 };
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the sensors'

@@ -493,11 +493,7 @@ pub fn tunnel_zone(name: &str) -> &str {
         return rest;
     }
     let zone = registrable_domain(name);
-    if zone.len() < name.len() {
-        zone
-    } else {
-        rest
-    }
+    if zone.len() < name.len() { zone } else { rest }
 }
 
 #[cfg(test)]

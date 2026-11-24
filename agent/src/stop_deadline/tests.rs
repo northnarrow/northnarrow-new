@@ -153,8 +153,10 @@ fn a_note_that_blocks_does_not_hold_the_exit() {
     let at = Instant::now();
     stop.begin(
         "sigterm",
-        Box::new(|_: &Expired| loop {
-            std::thread::park();
+        Box::new(|_: &Expired| {
+            loop {
+                std::thread::park();
+            }
         }),
     );
     let (status, exited) = first_exit(&exits, SHORT.total + SLACK).expect("the deadline exits");

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use northnarrow_agent::admin_socket;
 use northnarrow_agent::agent_id;
-use northnarrow_agent::boot::{checks, BootPhase, BootSequence, BootStep};
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep, checks};
 use northnarrow_agent::detection_report;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;

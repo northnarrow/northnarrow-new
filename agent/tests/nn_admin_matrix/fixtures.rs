@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use nn_proto::admin_signed_payload::{sign, verify, OverlayKind, SignedPayload};
+use nn_proto::admin_signed_payload::{OverlayKind, SignedPayload, sign, verify};
 
 use crate::harness::Put;
 

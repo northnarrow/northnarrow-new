@@ -88,8 +88,8 @@ pub(crate) mod workers;
 /// LSM gate among them; lab PR 265: the start's continuity — its
 /// directories not mounted over, its signing identity kept.
 pub use nn_linux::boot::{
-    boots_since, checks, continuity, degradation, lsm, BootOrderError, BootPhase, BootSequence,
-    BootStep, IntegrityVerified,
+    BootOrderError, BootPhase, BootSequence, BootStep, IntegrityVerified, boots_since, checks,
+    continuity, degradation, lsm,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
@@ -1190,13 +1190,18 @@ mod tests {
             );
         }
         assert_eq!(sources.matches("KeyStore::decided(").count(), 1);
-        assert!(function(PHASES[1].1, PHASES[1].2)
-            .contains("let signing_key = northnarrow_agent::keys::KeyStore::decided(decision);"));
+        assert!(
+            function(PHASES[1].1, PHASES[1].2).contains(
+                "let signing_key = northnarrow_agent::keys::KeyStore::decided(decision);"
+            )
+        );
         assert_eq!(sources.matches("signing_key.load()").count(), 1);
         assert!(function(PHASES[2].1, PHASES[2].2).contains("signing_key.load()"));
         // the one decision is the check's
-        assert!(function(PHASES[1].1, PHASES[1].2)
-            .contains("checks::KeyVerdict::Decided(decision) => decision,"));
+        assert!(
+            function(PHASES[1].1, PHASES[1].2)
+                .contains("checks::KeyVerdict::Decided(decision) => decision,")
+        );
         // each phase that signs takes copies of the one key (the network
         // phase through a closure it calls for each of its two logs)
         // R12c (lab PR 270): the stores' third copy signs the actions chain
@@ -1364,8 +1369,10 @@ mod tests {
         let policy = function(src, head);
         assert!(policy.contains("rp::PolicyHandle::new(policy)"));
         assert!(policy.contains(".with_policy(rule_policy.clone())"));
-        assert!(policy
-            .contains("        rule_policy,\n        ja3_entries,\n        engine,\n    }\n}"));
+        assert!(
+            policy
+                .contains("        rule_policy,\n        ja3_entries,\n        engine,\n    }\n}")
+        );
         let posture = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/posture.rs"));
         assert_eq!(
             posture

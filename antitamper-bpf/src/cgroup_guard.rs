@@ -48,10 +48,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use aya::maps::{HashMap as AyaHashMap, Map as AyaMap, MapData};
-use common::cgroup_limits::{limit_value, LimitValue, LIMIT_FILES};
+use common::cgroup_limits::{LIMIT_FILES, LimitValue, limit_value};
 use common::wire::{
-    InodeKey, FS_PROTECT_CGROUP_FREEZE, FS_PROTECT_CGROUP_KILL, FS_PROTECT_INIT_RMDIR,
-    FS_PROTECT_LIMIT_DIR, FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_WRITE,
+    FS_PROTECT_CGROUP_FREEZE, FS_PROTECT_CGROUP_KILL, FS_PROTECT_INIT_RMDIR, FS_PROTECT_LIMIT_DIR,
+    FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_WRITE, InodeKey,
 };
 
 /// Name of the pinned `PROTECTED_INODES` map (mirrors the `#[map]` in
@@ -218,7 +218,7 @@ pub fn unit_cgroup_of(pid: u32) -> UnitCgroup {
         Err(e) => {
             return UnitCgroup::Unavailable {
                 why: format!("/proc/{pid}/cgroup: {e}"),
-            }
+            };
         }
     };
     let Some(cgroup) = v2_path(&text) else {
@@ -243,7 +243,7 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
         Err(_) => {
             return UnitCgroup::NotAService {
                 cgroup: cgroup.to_string(),
-            }
+            };
         }
     };
     let mut entries = Vec::new();
@@ -274,7 +274,7 @@ pub fn unit_cgroup_at(root: &Path, cgroup: &str) -> UnitCgroup {
             Ok(None) => {
                 return UnitCgroup::Unavailable {
                     why: format!("{} is gone", dir.display()),
-                }
+                };
             }
             Err(why) => return UnitCgroup::Unavailable { why },
         }
@@ -563,7 +563,9 @@ mod tests {
             Some("/system.slice/northnarrow-agent.service")
         );
         assert_eq!(
-            v2_path("12:freezer:/x\n1:name=systemd:/system.slice/a.service\n0::/system.slice/a.service\n"),
+            v2_path(
+                "12:freezer:/x\n1:name=systemd:/system.slice/a.service\n0::/system.slice/a.service\n"
+            ),
             Some("/system.slice/a.service")
         );
         assert_eq!(v2_path("1:name=systemd:/system.slice/a.service\n"), None);
@@ -748,9 +750,11 @@ mod tests {
         std::fs::create_dir_all(&lu).unwrap();
         std::fs::write(root.join("big"), b"max\n").unwrap();
         std::os::unix::fs::symlink(root.join("big"), lu.join("memory.max")).unwrap();
-        assert!(unit_cgroup_at(root, "/system.slice/l.service")
-            .values()
-            .is_empty());
+        assert!(
+            unit_cgroup_at(root, "/system.slice/l.service")
+                .values()
+                .is_empty()
+        );
         // a link where a control file is: refused, not followed
         let unit = root.join("system.slice/a.service");
         std::fs::create_dir_all(&unit).unwrap();
@@ -766,9 +770,9 @@ mod tests {
     #[test]
     fn the_entry_flags_are_the_protection_the_table_states() {
         use common::wire::{
-            fs_protect_denied_op, fs_protect_init_may, fs_protect_required, FS_OP_CGROUP_FREEZE,
-            FS_OP_CGROUP_KILL, FS_OP_MKDIR, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_WRITE,
-            FS_PROTECT_LIMIT_DIR,
+            FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_KILL, FS_OP_MKDIR, FS_OP_RMDIR, FS_OP_SETATTR,
+            FS_OP_WRITE, FS_PROTECT_LIMIT_DIR, fs_protect_denied_op, fs_protect_init_may,
+            fs_protect_required,
         };
         let refused = |op: u8, flags: u8| flags & fs_protect_required(op) != 0;
         // the unit's directory: no rmdir but PID 1's, no child, no chown

@@ -34,8 +34,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use common::module_judge::{
-    module_file_name, module_name_of, safe_owner, trust_flag, written_by_package, FileFacts,
-    NAME_TAIL,
+    FileFacts, NAME_TAIL, module_file_name, module_name_of, safe_owner, trust_flag,
+    written_by_package,
 };
 use common::wire::InodeKey;
 
@@ -173,11 +173,7 @@ pub fn vouched_by(
     let registered = in_dkms_dir(inputs.tree, &f.path)
         && module_name_of(name)
             .is_some_and(|m| dkms_registered(inputs.dkms_registry, inputs.release, &m, &f.path));
-    if registered {
-        trust_flag::DKMS
-    } else {
-        0
-    }
+    if registered { trust_flag::DKMS } else { 0 }
 }
 
 /// The trust flags of `f` (`common::module_judge::trust_flag`), or why it
@@ -351,7 +347,7 @@ pub fn rpm_digest_matches(file: &Path, algo: u32, want: &str) -> bool {
 mod tests {
     use super::*;
     use common::module_judge::{
-        finit_verdict, mode, trust_flag, verdict, write_flag, write_step, ModuleTrust,
+        ModuleTrust, finit_verdict, mode, trust_flag, verdict, write_flag, write_step,
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -703,7 +699,7 @@ mod tests {
     #[test]
     fn a_module_write_is_a_transactions_only_while_it_holds_its_lock() {
         use super::super::{judged_history, txn::Txns};
-        use common::module_judge::{history_step, Txn};
+        use common::module_judge::{Txn, history_step};
         let fx = fixture();
         let dkms = fx.tree.join("updates/dkms/vboxdrv.ko.zst");
         put(&dkms, b"vbox");
@@ -789,7 +785,7 @@ mod tests {
     fn a_short_transactions_module_file_is_trusted_by_its_lock_at_the_write() {
         use super::super::{judged_history, txn::Txns};
         use common::module_judge::{
-            history_step_raw, holds_lock, lock_kind, locker_step, ModuleWrite, PkgLocker, Txn,
+            ModuleWrite, PkgLocker, Txn, history_step_raw, holds_lock, lock_kind, locker_step,
         };
         let fx = fixture();
         let dkms = fx.tree.join("updates/dkms/vboxdrv.ko.zst");

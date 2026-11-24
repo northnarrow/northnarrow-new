@@ -8,10 +8,10 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use nn_proto::admin_quorum::{parse_admin_pub, AdminKey};
-use nn_proto::shutdown_marker::{verify, Authorised, Expectation, Rejection, ShutdownMarker};
+use nn_proto::admin_quorum::{AdminKey, parse_admin_pub};
+use nn_proto::shutdown_marker::{Authorised, Expectation, Rejection, ShutdownMarker, verify};
 
-use crate::install_manifest::{check_with, parse_manifest, InstallManifest, IntegrityOutcome};
+use crate::install_manifest::{InstallManifest, IntegrityOutcome, check_with, parse_manifest};
 
 /// Parse a BTF blob and resolve every offset/enumerator the agent needs.
 /// Returns whether the blob parsed; the resolution outcome is discarded.
@@ -46,11 +46,7 @@ pub fn elf_audit_read(data: &[u8]) -> (Option<bool>, usize) {
 pub const ELF_AUDIT_READ_BOUND: usize = {
     let table = nn_linux::sensors::elf_audit::MAX_PHDRS * 56;
     let chunk = nn_linux::sensors::elf_audit::CHUNK as usize;
-    if table > chunk {
-        table
-    } else {
-        chunk
-    }
+    if table > chunk { table } else { chunk }
 };
 
 /// Chain-log terminator line parser (JSON line → entry hash).
@@ -270,7 +266,7 @@ mod tests {
     /// [`SHUTDOWN_FIXTURE_SIGNED`] entry (Ed25519 signs deterministically).
     fn signed_marker(nonce: [u8; 32], ts: u64, grace: u32) -> String {
         use ed25519_dalek::SigningKey;
-        use nn_proto::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_signed_payload::{SignedPayload, sign};
         let payload = SignedPayload::new_shutdown(nonce, ts, SHUTDOWN_FIXTURE_AGENT_ID, grace);
         let sigs: Vec<[u8; 64]> = [1u8, 2]
             .iter()
@@ -372,7 +368,7 @@ mod tests {
 
     #[test]
     fn install_manifest_seeds_reach_the_hash_comparison() {
-        use crate::install_manifest::{sha256_file, UNKNOWN_NAME};
+        use crate::install_manifest::{UNKNOWN_NAME, sha256_file};
         let dir = tempfile::tempdir().unwrap();
         write_install_manifest_fixture(dir.path()).unwrap();
         let sha = |n: &str| sha256_file(&dir.path().join(n)).unwrap();
@@ -451,9 +447,9 @@ mod tests {
     #[test]
     fn admin_frame_seeds_decode() {
         use nn_proto::admin_protocol::{
-            decode_frame, decode_versioned_frame, encode_frame, encode_versioned_frame,
             AdminMessage, ChallengeRequest, KeyedSignature, ShutdownRequest, StatusRequest,
-            VersionedAdminMessage,
+            VersionedAdminMessage, decode_frame, decode_versioned_frame, encode_frame,
+            encode_versioned_frame,
         };
         use nn_proto::admin_signed_payload::SignedPayload;
         let v1 =
@@ -494,11 +490,11 @@ mod tests {
     #[test]
     fn ipc_check_seeds_are_accepted_and_the_f1_input_refused() {
         use nn_proto::ipc::{
-            check_hello, check_response, decode, encode, Answer, Expected, ExportAddr, ExportChain,
-            ExportRow, ExportRows, ExportRowsOut, ExportSetup, ExportSetupOut, ExportSink,
-            FileSetup, FromWorker, LandlockEnforced, QnameForm, QnameIn, QnameOut, Request,
-            Response, RowPos, SandboxLevel, SinkState, SniOut, SyslogSetup, TlsOut, WorkerHello,
-            WorkerKind, EXPORT_DIR_RULE, IPC_VERSION,
+            Answer, EXPORT_DIR_RULE, Expected, ExportAddr, ExportChain, ExportRow, ExportRows,
+            ExportRowsOut, ExportSetup, ExportSetupOut, ExportSink, FileSetup, FromWorker,
+            IPC_VERSION, LandlockEnforced, QnameForm, QnameIn, QnameOut, Request, Response, RowPos,
+            SandboxLevel, SinkState, SniOut, SyslogSetup, TlsOut, WorkerHello, WorkerKind,
+            check_hello, check_response, decode, encode,
         };
         let packet = |sel: u8, m: &FromWorker| {
             let mut v = vec![sel];
@@ -807,7 +803,7 @@ mod tests {
         }
         assert!(v4 > 0 && v6 > 0, "v4 {v4}, v6 {v6}");
         // canary_template: one template per family, each renders
-        use crate::canary::templates::{render, CredFamily};
+        use crate::canary::templates::{CredFamily, render};
         let families = ["aws", "azure", "gcp", "docker", "generic"];
         let mut rendered = std::collections::BTreeSet::new();
         for (name, bytes) in inputs("seeds", "canary_template") {

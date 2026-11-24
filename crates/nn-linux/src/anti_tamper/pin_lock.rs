@@ -361,7 +361,7 @@ pub fn step(pin_root: &Path) -> Outcome {
             Ok(now) => {
                 return Outcome::Failed(format!(
                     "PID 1's mount namespace entered, yet this one is {now} (PID 1's: {host})"
-                ))
+                ));
             }
             Err(e) => return Outcome::Failed(format!("/proc/self/ns/mnt: {e}")),
         }
@@ -568,13 +568,15 @@ impl Keeper {
     /// status has nothing to keep.
     pub fn status_line(&self) -> StatusLine {
         match &self.last {
-            Some((kind, _)) => {
-                StatusLine::NotInPlace(format!(
+            Some((kind, _)) => StatusLine::NotInPlace(format!(
                 "the lock of the pin directory {}: the integrity round could not make it again \
                  ({ABSENT_EFFECT}); signed as {kind}, asked for again at the next attempts",
-                if *kind == MISSING { "is missing" } else { "changed" },
-            ))
-            }
+                if *kind == MISSING {
+                    "is missing"
+                } else {
+                    "changed"
+                },
+            )),
             None if self.seen => StatusLine::InPlace,
             None => StatusLine::Unwatched,
         }
@@ -879,17 +881,19 @@ mod tests {
     fn a_lost_or_changed_lock_is_a_finding_and_made_again() {
         let root = Path::new(ROOT);
         let mut asked = 0;
-        assert!(Keeper::default()
-            .round(
-                &with(&lock_line("unbindable")),
-                root,
-                || {
-                    asked += 1;
-                    Outcome::Made(1)
-                },
-                |_| {}
-            )
-            .is_none());
+        assert!(
+            Keeper::default()
+                .round(
+                    &with(&lock_line("unbindable")),
+                    root,
+                    || {
+                        asked += 1;
+                        Outcome::Made(1)
+                    },
+                    |_| {}
+                )
+                .is_none()
+        );
         assert_eq!(asked, 0);
         let (kind, detail) = Keeper::default()
             .round(BASE.as_bytes(), root, || Outcome::Made(95), |_| {})
@@ -953,14 +957,15 @@ mod tests {
             "{detail}"
         );
         // in place at the next round: nothing, and nothing asked
-        assert!(k
-            .round(
+        assert!(
+            k.round(
                 &with(&lock_line("unbindable")),
                 root,
                 || unreachable!(),
                 |_| {}
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     /// Named test (the review of #569, F5): a round whose attempts all fail
@@ -1027,9 +1032,10 @@ mod tests {
         // found in place after failed rounds: the back-off is gone too
         let mut k = Keeper::default();
         k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
-        assert!(k
-            .round(&with(&lock_line("unbindable")), root, fail, |_| {})
-            .is_none());
+        assert!(
+            k.round(&with(&lock_line("unbindable")), root, fail, |_| {})
+                .is_none()
+        );
         let after = k
             .round(BASE.as_bytes(), root, || Outcome::Made(99), |_| {})
             .unwrap();
@@ -1079,9 +1085,10 @@ mod tests {
         let mut k = Keeper::default();
         k.round(BASE.as_bytes(), root, fail, |_| {}).unwrap();
         assert!(matches!(k.status_line(), StatusLine::NotInPlace(_)));
-        assert!(k
-            .round(&with(&lock_line("unbindable")), root, fail, |_| {})
-            .is_none());
+        assert!(
+            k.round(&with(&lock_line("unbindable")), root, fail, |_| {})
+                .is_none()
+        );
         assert_eq!(k.status_line(), StatusLine::InPlace);
         // lost and made again in one round: a finding, no line
         let mut k = Keeper::default();
@@ -1136,7 +1143,7 @@ mod tests {
     /// lock in place bindable again (a repair included).
     #[test]
     fn the_step_makes_the_lock_unbindable_alone_never_private() {
-        use common::mount_guard::{lock_step, MS_PRIVATE, MS_UNBINDABLE};
+        use common::mount_guard::{MS_PRIVATE, MS_UNBINDABLE, lock_step};
         assert_eq!(LOCK_FLAGS, MS_UNBINDABLE);
         assert!(lock_step(LOCK_FLAGS));
         let src = include_str!("pin_lock.rs");

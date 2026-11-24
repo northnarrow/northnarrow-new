@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 // detector that reads them; this module keeps what reads the host — its
 // interface addresses, its TCP listeners — and the deploy check.
 use nn_core::canary::network::as_connected;
-pub use nn_core::canary::network::{connect_destination, CanaryAddr};
+pub use nn_core::canary::network::{CanaryAddr, connect_destination};
 
 /// How long the interface addresses read for a wildcard canary are reused.
 const LOCAL_ADDRS_TTL: Duration = Duration::from_secs(1);
@@ -297,9 +297,11 @@ mod tests {
         ] {
             assert!(check(addr, port).is_ok(), "{addr}:{port}");
         }
-        assert!(check("db.internal", 4444)
-            .unwrap_err()
-            .contains("not an IP"));
+        assert!(
+            check("db.internal", 4444)
+                .unwrap_err()
+                .contains("not an IP")
+        );
         assert!(check("100.64.0.9", 0).unwrap_err().contains("port 0"));
     }
 

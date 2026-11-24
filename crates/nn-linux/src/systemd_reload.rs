@@ -23,8 +23,8 @@
 //! for polkit without `CAP_SYS_ADMIN`), from a thread of its own.
 
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;

@@ -293,8 +293,10 @@ fn the_write_deny_judges_the_cgroup_files_in_order() {
     .unwrap();
     assert!(c.contains("const NR_WRITE: u64 = 1;\nconst NR_PWRITE64: u64 = 18;"));
     // systemd's newline cleared before the compare
-    assert!(body(&c, "written_value")
-        .contains("written_bytes().map(|(v, n)| strip_newline(v, n as usize))"));
+    assert!(
+        body(&c, "written_value")
+            .contains("written_bytes().map(|(v, n)| strip_newline(v, n as usize))")
+    );
     in_order(
         body(&c, "refuse_v1"),
         &[
@@ -527,8 +529,10 @@ fn every_registration_of_the_cgroups_goes_through_the_shared_code() {
         ],
     )
     .unwrap();
-    assert!(code("watchdog/src/lib.rs")
-        .contains("antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid)"));
+    assert!(
+        code("watchdog/src/lib.rs")
+            .contains("antitamper_bpf::cgroup_guard::protect_unit_cgroup(bpffs_root, own_pid)")
+    );
 }
 
 /// Lot 273c (the review of #490): another process's change of a protected
@@ -752,8 +756,8 @@ fn a_controller_change_s_scheduling_check_is_the_writer_thread_s_only() {
         })
         .collect();
     assert_eq!(ebpf_users.len(), 2, "{ebpf_users:?}"); // its definition's file, the deny's
-                                                       // attached after the program that drops the marks, and its pins purged
-                                                       // wherever it is not attached
+    // attached after the program that drops the marks, and its pins purged
+    // wherever it is not attached
     let u = code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs");
     let attach = body(&u, "attach_move_guard");
     in_order(
@@ -937,15 +941,17 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     // (`kernel_roots::open`), `O_PATH`, then reopened read-only
     assert_eq!(cr.matches("kernel_roots::open(").count(), 2);
     assert!(!cr.contains("O_WRONLY") && !cr.contains("O_RDWR") && !cr.contains("O_CREAT"));
-    assert!(in_order(
-        cr,
-        &[
-            "crate::kernel_roots::open(path, libc::O_PATH)",
-            "crate::kernel_roots::open(",
-            "libc::O_RDONLY",
-        ]
-    )
-    .is_ok());
+    assert!(
+        in_order(
+            cr,
+            &[
+                "crate::kernel_roots::open(path, libc::O_PATH)",
+                "crate::kernel_roots::open(",
+                "libc::O_RDONLY",
+            ]
+        )
+        .is_ok()
+    );
     assert!(!si.contains("Reason::Quarantined") && !si.contains("dropin_quarantine"));
     // Lot 273d: the watchdog reads systemd's copy before each respawn (a
     // reload unless a harmful host drop-in withholds it), and the agent
@@ -971,8 +977,10 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
-    assert!(code("agent/src/boot/mod.rs")
-        .contains("northnarrow_agent::anti_tamper::cgroup_guard::back_to_configured("));
+    assert!(
+        code("agent/src/boot/mod.rs")
+            .contains("northnarrow_agent::anti_tamper::cgroup_guard::back_to_configured(")
+    );
     in_order(
         body(
             &code("crates/nn-linux/src/anti_tamper/cgroup_guard.rs"),
@@ -1098,8 +1106,10 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
-    assert!(body(&od, "under_env_dir")
-        .contains("matches!(c, Component::RootDir | Component::Normal(_))"));
+    assert!(
+        body(&od, "under_env_dir")
+            .contains("matches!(c, Component::RootDir | Component::Normal(_))")
+    );
     // the re-review of #497 (RR2): the round judges only what changed
     // since the agent's install — an operator's drop-in from before it is
     // never moved by the round; (RR1) the ones it keeps are protected
@@ -1150,8 +1160,10 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
     .unwrap();
     assert!(!body(&od, "install_time").contains("mtime"));
     assert!(body(&si, "round").contains("self.own_dropins_round(at_boot);"));
-    assert!(code("agent/src/boot/evidence.rs")
-        .contains("Some(northnarrow_agent::self_integrity::OwnDropinGuard {"));
+    assert!(
+        code("agent/src/boot/evidence.rs")
+            .contains("Some(northnarrow_agent::self_integrity::OwnDropinGuard {")
+    );
     // Lot 273d: the guarded sysctls checked by the round (put back when harmful)
     in_order(
         body(&si, "collect_round"),
@@ -1167,7 +1179,9 @@ fn the_reloads_and_the_floors_are_asked_where_they_must_be() {
         ],
     )
     .unwrap();
-    assert!(code("agent/src/boot/ready.rs").contains("proc_root: std::path::PathBuf::from(\"/\"),"));
+    assert!(
+        code("agent/src/boot/ready.rs").contains("proc_root: std::path::PathBuf::from(\"/\"),")
+    );
     let ab = code("antitamper-bpf/src/cgroup_guard.rs");
     in_order(
         body(&ab, "protect_unit_cgroup"),

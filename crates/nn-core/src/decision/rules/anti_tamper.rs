@@ -16,7 +16,7 @@
 use nn_model::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 pub struct NnLAt001AntiTamperDenial;
 
@@ -308,7 +308,12 @@ impl Rule for NnLAt001AntiTamperDenial {
                 if common::bpf_prog_class::root_prog_known_of(*target_dev).is_some() =>
             {
                 return Some(known_root_program_verdict(
-                    self, event, *pid, comm, *target_dev, *target_ino,
+                    self,
+                    event,
+                    *pid,
+                    comm,
+                    *target_dev,
+                    *target_ino,
                 ));
             }
             FsProtectOperation::SysctlRootProg => {
@@ -373,7 +378,12 @@ impl Rule for NnLAt001AntiTamperDenial {
                 if common::bpf_prog_class::known_probe_of(*target_dev, *target_ino).is_some() =>
             {
                 return Some(known_probe_verdict(
-                    self, event, *pid, comm, *target_dev, *target_ino,
+                    self,
+                    event,
+                    *pid,
+                    comm,
+                    *target_dev,
+                    *target_ino,
                 ));
             }
             // Lot 345 (the re-check of #550, N2 and point 1 (ii)): the
@@ -415,11 +425,24 @@ impl Rule for NnLAt001AntiTamperDenial {
                 // Lot 304: a baseline program proven a known system
                 // program (its loader the record's pid and uid): Low.
                 if let Some(v) = known_baseline_verdict(
-                    self, event, *operation, *pid, comm, *target_dev, *target_ino,
+                    self,
+                    event,
+                    *operation,
+                    *pid,
+                    comm,
+                    *target_dev,
+                    *target_ino,
                 ) {
                     return Some(v);
                 }
-                return Some(crossview_verdict(self, event, *operation, comm, *target_dev, *target_ino));
+                return Some(crossview_verdict(
+                    self,
+                    event,
+                    *operation,
+                    comm,
+                    *target_dev,
+                    *target_ino,
+                ));
             }
             // Lot 293 (external bug hunt BUG14): the kernel delivers it
             // without `task_kill`; the process named is the one whose I/O
@@ -446,7 +469,13 @@ impl Rule for NnLAt001AntiTamperDenial {
             // Lot 349 (pre-alpha R001): not refused — the agent's own CPU
             // watch (`nn_linux::own_cpus`), read by the kernel-state round.
             FsProtectOperation::CpuConfined => {
-                return Some(cpu_confined_verdict(self, event, comm, *target_dev, *target_ino));
+                return Some(cpu_confined_verdict(
+                    self,
+                    event,
+                    comm,
+                    *target_dev,
+                    *target_ino,
+                ));
             }
             // Lot 349 (the review of #558, F1): a window's load of a program
             // the content judge refuses outside one — let through, held.
@@ -493,7 +522,12 @@ impl Rule for NnLAt001AntiTamperDenial {
             // The review of #565 (F2): not a refusal — the kernel-state
             // round's findings past its quota, counted
             FsProtectOperation::SoleTraceSummary => {
-                return Some(sole_trace_summary_verdict(self, event, *target_dev, *target_ino));
+                return Some(sole_trace_summary_verdict(
+                    self,
+                    event,
+                    *target_dev,
+                    *target_ino,
+                ));
             }
             // Lot 357: the mount guard, in PID 1's mount namespace.
             FsProtectOperation::Mount => mount_text(*target_dev, *target_ino),
@@ -537,9 +571,7 @@ impl Rule for NnLAt001AntiTamperDenial {
             // cgroups (its metadata reads of the agent's log lines, all day).
             // Lot 367 (F3b-1): the open of a memory view, refused at the
             // open (a real denial), apart from the hook's own verdict.
-            FsProtectOperation::PtraceRead
-                if *target_dev & common::ptrace_read::VIEW_OPEN != 0 =>
-            {
+            FsProtectOperation::PtraceRead if *target_dev & common::ptrace_read::VIEW_OPEN != 0 => {
                 let reasoning = format!(
                     "`{comm}` (pid {pid}) was refused the open of a memory view of the agent's \
                      process {target_ino} (/proc/<pid>/environ, auxv, maps, smaps, smaps_rollup, \
@@ -697,8 +729,8 @@ fn cpu_confined_verdict(
     target_ino: u64,
 ) -> Verdict {
     use common::wire::{
-        cpu_confined_of, CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
-        CPU_CAUSE_PARTITION, CPU_CAUSE_UNJUDGED,
+        CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE, CPU_CAUSE_PARTITION,
+        CPU_CAUSE_UNJUDGED, cpu_confined_of,
     };
     let (cause, left, expected, threads) = cpu_confined_of(target_dev);
     let cpus: Vec<String> = (0..64u32)
@@ -756,7 +788,7 @@ fn cpu_confined_verdict(
 /// its type and what its content does (`common::wire::bpf_held_of`).
 fn held_program_text(target_dev: u64) -> String {
     use common::bpf_prog_class::{
-        call_target_name, content_refusal, prog_type_name, ContentRefusal,
+        ContentRefusal, call_target_name, content_refusal, prog_type_name,
     };
     let (_, why, ty) = common::wire::bpf_held_of(target_dev);
     let program = if ty != 0 {
@@ -829,7 +861,7 @@ fn held_use_text(target_dev: u64, target_ino: u64) -> String {
 
 fn content_refusal_text(target_dev: u64, target_ino: u64) -> String {
     use common::bpf_prog_class::{
-        call_target_name, content_refusal, prog_type_name, ContentRefusal,
+        ContentRefusal, call_target_name, content_refusal, prog_type_name,
     };
     let program = match u32::try_from(target_ino) {
         Ok(t) if t != 0 => format!("a `{}` BPF program", prog_type_name(t)),
@@ -871,7 +903,7 @@ fn known_probe_verdict(
     target_dev: u64,
     prog_type: u64,
 ) -> Verdict {
-    use common::bpf_prog_class::{known_probe_of, prog_type_name, KNOWN_SYSTEM_PROBES};
+    use common::bpf_prog_class::{KNOWN_SYSTEM_PROBES, known_probe_of, prog_type_name};
     let k = KNOWN_SYSTEM_PROBES[known_probe_of(target_dev, prog_type).unwrap_or(0)];
     let reasoning = format!(
         "A known system program's BPF load, refused: `{comm}` (pid {pid}) loaded a `{}` \
@@ -899,7 +931,7 @@ fn known_reattach_verdict(
     tag: u64,
     target_ino: u64,
 ) -> Verdict {
-    use common::bpf_prog_class::{root_reattach_known_of, tag_hex, KNOWN_SYSTEM_PROGRAMS};
+    use common::bpf_prog_class::{KNOWN_SYSTEM_PROGRAMS, root_reattach_known_of, tag_hex};
     let entry = root_reattach_known_of(target_ino).unwrap_or(0);
     let k = KNOWN_SYSTEM_PROGRAMS[entry];
     let reasoning = format!(
@@ -932,7 +964,7 @@ fn known_root_program_verdict(
     target_dev: u64,
     id: u64,
 ) -> Verdict {
-    use common::bpf_prog_class::{root_prog_known_of, KNOWN_SYSTEM_PROGRAMS};
+    use common::bpf_prog_class::{KNOWN_SYSTEM_PROGRAMS, root_prog_known_of};
     let (entry, seen, link) = root_prog_known_of(target_dev).unwrap_or((0, false, 0));
     let k = KNOWN_SYSTEM_PROGRAMS[entry];
     let when = if seen {
@@ -1096,7 +1128,7 @@ pub fn injection_severity(injector_uid: u32, interactive_admin: Option<bool>) ->
 /// was, in words.
 fn access_words(detail: u64) -> String {
     use common::cgroup_join::{
-        inject_detail_parts, PTRACE_MODE_FSCREDS, SYS_OPEN, SYS_OPENAT, SYS_OPENAT2,
+        PTRACE_MODE_FSCREDS, SYS_OPEN, SYS_OPENAT, SYS_OPENAT2, inject_detail_parts,
     };
     let (mode, nr) = inject_detail_parts(detail);
     let what = match nr {
@@ -1246,7 +1278,7 @@ mod tests {
     #[test]
     fn a_refused_mount_names_what_it_would_have_hidden() {
         use common::mount_guard::{
-            record_dev, MG_OP_MOUNT, MG_OP_UMOUNT, MG_WHY_BELOW_VIEW, MG_WHY_UMOUNT,
+            MG_OP_MOUNT, MG_OP_UMOUNT, MG_WHY_BELOW_VIEW, MG_WHY_UMOUNT, record_dev,
         };
         let mut e = denial(FsProtectOperation::Mount);
         if let Event::FsProtectDenial { target_dev, .. } = &mut e {
@@ -1281,8 +1313,8 @@ mod tests {
     #[test]
     fn a_mount_in_the_agents_namespace_and_a_noted_unmount_say_what_they_are() {
         use common::mount_guard::{
-            record_dev, MG_OP_REMOUNT, MG_OP_UMOUNT, MG_WHY_REMOUNT_SB, MG_WHY_UMOUNT_NOTED,
-            REACH_AGENT_NS,
+            MG_OP_REMOUNT, MG_OP_UMOUNT, MG_WHY_REMOUNT_SB, MG_WHY_UMOUNT_NOTED, REACH_AGENT_NS,
+            record_dev,
         };
         let mut e = denial(FsProtectOperation::Mount);
         if let Event::FsProtectDenial { target_dev, .. } = &mut e {
@@ -1452,12 +1484,14 @@ mod tests {
             "{}",
             v.reasoning
         );
-        assert!(v
-            .reasoning
-            .contains("Raised by the I/O of `bash` (pid 4242)"));
-        assert!(v
-            .reasoning
-            .contains("not necessarily the process that armed the file"));
+        assert!(
+            v.reasoning
+                .contains("Raised by the I/O of `bash` (pid 4242)")
+        );
+        assert!(
+            v.reasoning
+                .contains("not necessarily the process that armed the file")
+        );
         let mut e = denial(FsProtectOperation::Sigio);
         if let Event::FsProtectDenial { pid, .. } = &mut e {
             *pid = 1;
@@ -1657,8 +1691,8 @@ mod tests {
     #[test]
     fn the_agent_confined_to_fewer_cpus_is_high_and_names_the_cause() {
         use common::wire::{
-            cpu_confined_dev, CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
-            CPU_CAUSE_PARTITION,
+            CPU_CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE,
+            CPU_CAUSE_PARTITION, cpu_confined_dev,
         };
         let confined = |dev: u64, mask: u64, comm: &str| Event::FsProtectDenial {
             pid: 0,
@@ -1717,7 +1751,7 @@ mod tests {
     /// as a confinement told nor as a refusal.
     #[test]
     fn a_cpu_watch_that_could_not_judge_is_high_and_says_so() {
-        use common::wire::{cpu_confined_dev, CPU_CAUSE_UNJUDGED};
+        use common::wire::{CPU_CAUSE_UNJUDGED, cpu_confined_dev};
         let v = NnLAt001AntiTamperDenial
             .evaluate(&Event::FsProtectDenial {
                 pid: 0,
@@ -1842,14 +1876,17 @@ mod tests {
         let mem = common::cgroup_join::inject_detail(0x0a, Some(257));
         let v = exempt_injection(&ev(0, mem), "unit x.service", None).unwrap();
         assert_eq!(v.severity, Severity::Critical);
-        assert!(v
-            .reasoning
-            .contains("a write handle on its /proc/<pid>/mem"));
+        assert!(
+            v.reasoning
+                .contains("a write handle on its /proc/<pid>/mem")
+        );
         let w = common::cgroup_join::inject_detail(0x12, Some(311));
-        assert!(exempt_injection(&ev(0, w), "e", None)
-            .unwrap()
-            .reasoning
-            .contains("process_vm_writev"));
+        assert!(
+            exempt_injection(&ev(0, w), "e", None)
+                .unwrap()
+                .reasoning
+                .contains("process_vm_writev")
+        );
         // another operation is not this verdict
         assert!(exempt_injection(&denial(FsProtectOperation::Ptrace), "e", None).is_none());
         // the rule alone (no exemption context): severity by uid only
@@ -1909,7 +1946,7 @@ mod tests {
     /// no root entry, stays High with the tag the hook read.
     #[test]
     fn a_proven_networkd_monitor_reattach_is_low_and_any_other_high() {
-        use common::bpf_prog_class::{root_reattach_known_ino, ROOT_REATTACH_KNOWN_BIT};
+        use common::bpf_prog_class::{ROOT_REATTACH_KNOWN_BIT, root_reattach_known_ino};
         let ev_tag = |tag, ino| Event::FsProtectDenial {
             pid: 1204,
             uid: 998,
@@ -1975,7 +2012,7 @@ mod tests {
     /// (0), or with a proof naming no entry of the table, stays High.
     #[test]
     fn a_known_root_program_is_low_with_its_proof_and_any_other_high() {
-        use common::bpf_prog_class::{root_prog_known_dev, ROOT_PROG_KNOWN_BIT};
+        use common::bpf_prog_class::{ROOT_PROG_KNOWN_BIT, root_prog_known_dev};
         let ev = |pid, uid, comm: &str, dev| Event::FsProtectDenial {
             pid,
             uid,
@@ -2044,7 +2081,7 @@ mod tests {
     /// program).
     #[test]
     fn a_known_baseline_program_is_low_and_any_other_weighed_as_before() {
-        use common::bpf_prog_class::{crossview_ino, object_comm, CROSSVIEW_KNOWN_BIT};
+        use common::bpf_prog_class::{CROSSVIEW_KNOWN_BIT, crossview_ino, object_comm};
         let ev = |op, pid, comm: &str, ino| Event::FsProtectDenial {
             pid,
             uid: 0,
@@ -2152,7 +2189,7 @@ mod tests {
     #[test]
     fn a_proven_known_system_probe_is_low_and_every_other_load_keeps_high() {
         use common::bpf_prog_class::{
-            known_probe_dev, KNOWN_PROBE_BIT, PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_TRACEPOINT,
+            KNOWN_PROBE_BIT, PROG_TYPE_KPROBE, PROG_TYPE_LSM, PROG_TYPE_TRACEPOINT, known_probe_dev,
         };
         let ev = |comm: &str, dev, ty: u32| Event::FsProtectDenial {
             pid: 868,
@@ -2279,7 +2316,7 @@ mod tests {
     #[test]
     fn a_held_program_s_load_and_uses_are_named_and_high() {
         use common::bpf_prog_class::CONTENT_CALL;
-        use common::wire::{bpf_held_dev, BPF_HELD_FULL, BPF_HELD_SET_BPF};
+        use common::wire::{BPF_HELD_FULL, BPF_HELD_SET_BPF, bpf_held_dev};
         let ev = |op, dev, ino| Event::FsProtectDenial {
             pid: 4242,
             uid: 0,
@@ -2347,7 +2384,7 @@ mod tests {
     /// prog array, is High, and does not name a program it never read.
     #[test]
     fn a_tail_call_slot_whose_value_cannot_be_read_is_a_refusal_named() {
-        use common::wire::{bpf_held_dev, BPF_HELD_SLOT_UNREAD};
+        use common::wire::{BPF_HELD_SLOT_UNREAD, bpf_held_dev};
         let e = Event::FsProtectDenial {
             pid: 4242,
             uid: 0,
@@ -2376,7 +2413,7 @@ mod tests {
     #[test]
     fn a_held_program_that_outlives_its_window_is_high_and_named() {
         use common::bpf_prog_class::CONTENT_CALL;
-        use common::wire::{bpf_held_dev, BPF_HELD_OUTLIVED};
+        use common::wire::{BPF_HELD_OUTLIVED, bpf_held_dev};
         let verdict = (u64::from(CONTENT_CALL + 2) << 32) | 2;
         let e = Event::FsProtectDenial {
             pid: 0,
@@ -2608,12 +2645,16 @@ mod tests {
             Severity::Low,
             "a link: its program is weighed"
         );
-        assert!(b(15, false)
-            .reasoning
-            .contains("while the agent was not running"));
-        assert!(b(29, false)
-            .reasoning
-            .contains("refuses outside a trusted-installer window"));
+        assert!(
+            b(15, false)
+                .reasoning
+                .contains("while the agent was not running")
+        );
+        assert!(
+            b(29, false)
+                .reasoning
+                .contains("refuses outside a trusted-installer window")
+        );
         assert_eq!(
             crossview_severity(FsProtectOperation::BpfUnseen, true, false, 0),
             Severity::High

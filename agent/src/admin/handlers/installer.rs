@@ -9,9 +9,9 @@ use tracing::{info, warn};
 
 use nn_proto::admin_protocol::{AdminResult, TrustedInstallerGrantRequest};
 
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
-use crate::anti_tamper::trusted_installer::{installer_of_requester, TrustedInstallerOverride};
+use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, installer_of_requester};
 
 /// FIM-009 self-upgrade (§15.1) — handle one
 /// [`TrustedInstallerGrantRequest`]. Verifies the signed grant (M=1

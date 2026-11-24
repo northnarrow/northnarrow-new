@@ -89,9 +89,9 @@ pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 pub const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 pub use common::wire::{
-    cpu_confined_of as of_target_dev, CPU_CAUSE_AFFINITY as CAUSE_AFFINITY,
-    CPU_CAUSE_CGROUP_CPUSET as CAUSE_CGROUP_CPUSET, CPU_CAUSE_CGROUP_MOVE as CAUSE_CGROUP_MOVE,
-    CPU_CAUSE_PARTITION as CAUSE_PARTITION, CPU_CAUSE_UNJUDGED as CAUSE_UNJUDGED,
+    CPU_CAUSE_AFFINITY as CAUSE_AFFINITY, CPU_CAUSE_CGROUP_CPUSET as CAUSE_CGROUP_CPUSET,
+    CPU_CAUSE_CGROUP_MOVE as CAUSE_CGROUP_MOVE, CPU_CAUSE_PARTITION as CAUSE_PARTITION,
+    CPU_CAUSE_UNJUDGED as CAUSE_UNJUDGED, cpu_confined_of as of_target_dev,
 };
 
 /// Why the agent runs on fewer CPUs than it should.
@@ -1870,9 +1870,11 @@ mod tests {
         let mut last = Step::Same;
         for _ in 0..UNJUDGED_ROUNDS {
             let at = fifo.clone();
-            assert!(reader
-                .run("/proc/sys/kernel/tainted", move || std::fs::read(&at))
-                .is_err());
+            assert!(
+                reader
+                    .run("/proc/sys/kernel/tainted", move || std::fs::read(&at))
+                    .is_err()
+            );
             let mut r = reading(&all(), &[&all()]);
             unjudged_by_stall(&mut r, reader.take_stall());
             assert!(r.unjudged.is_some(), "the round is unjudged");
@@ -1923,10 +1925,11 @@ mod tests {
         );
         assert_eq!(of_target_dev(c.target_dev()), (CAUSE_UNJUDGED, 1, 4, 3));
         assert_eq!(c.target_ino(), 1, "the CPUs every thread may run on");
-        assert!(c
-            .cause
-            .subject()
-            .starts_with("a mount over /northnarrow.slice"));
+        assert!(
+            c.cause
+                .subject()
+                .starts_with("a mount over /northnarrow.slice")
+        );
         assert!(
             c.line()
                 .contains("could not judge them for 3 rounds in a row"),

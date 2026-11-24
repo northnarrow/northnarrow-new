@@ -361,9 +361,11 @@ fn an_outcome_carries_its_intent() {
         outcome["unmapped"]["northnarrow"]["intent_raw"],
         fixtures()[10].1.as_str()
     );
-    assert!(intent["unmapped"]["northnarrow"]
-        .get("intent_raw")
-        .is_none());
+    assert!(
+        intent["unmapped"]["northnarrow"]
+            .get("intent_raw")
+            .is_none()
+    );
     assert_eq!(intent["status_id"], 99);
     // the detection's facts
     let det = &all[0].2[0];
@@ -610,9 +612,11 @@ fn an_inbound_flow_is_inbound_with_its_traffic_from_the_peer() {
             json!({"bytes_in": 300, "bytes_out": 4000, "bytes": 4300})
         );
     }
-    assert!(map(&body(""))["unmapped"]["northnarrow"]
-        .get("inbound")
-        .is_none());
+    assert!(
+        map(&body(""))["unmapped"]["northnarrow"]
+            .get("inbound")
+            .is_none()
+    );
 }
 
 /// The interrupted row an agent before lot 298 wrote (`Journal::start_run`:
@@ -697,9 +701,11 @@ fn interrupted_row_as_journal_writes_it_is_its_intents_class() {
         ),
         (Some(7001), Some(0))
     );
-    assert!(alone[0]["unmapped"]["northnarrow"]
-        .get("intent_raw")
-        .is_none());
+    assert!(
+        alone[0]["unmapped"]["northnarrow"]
+            .get("intent_raw")
+            .is_none()
+    );
 }
 
 /// Lot 298 (BUG19): the interrupted row the journal writes since lot 298

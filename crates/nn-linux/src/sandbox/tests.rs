@@ -4,7 +4,7 @@
 //! (`agent/tests/privileged_worker_harness.rs`) runs it as
 //! `northnarrow-worker`.
 
-use super::seccomp::{program, Allowlist};
+use super::seccomp::{Allowlist, program};
 use super::*;
 
 /// Run `body` in a forked child after `setup` (both before any allocation
@@ -1048,9 +1048,11 @@ fn a_worker_with_a_second_thread_is_refused_before_anything_changes() {
         nofile_before,
         "limits untouched"
     );
-    assert!(SandboxError::Threaded(n)
-        .to_string()
-        .contains(&format!("{n} threads")));
+    assert!(
+        SandboxError::Threaded(n)
+            .to_string()
+            .contains(&format!("{n} threads"))
+    );
     drop(stop);
     other.join().unwrap();
 }
@@ -1163,7 +1165,9 @@ fn the_export_worker_s_stat_never_follows_a_link() {
             Arg::Eq(3, libc::AT_SYMLINK_NOFOLLOW as u64),
         ]
     );
-    assert!(!Allowlist::parse_worker(3, 1)
-        .names()
-        .contains(&"newfstatat"));
+    assert!(
+        !Allowlist::parse_worker(3, 1)
+            .names()
+            .contains(&"newfstatat")
+    );
 }

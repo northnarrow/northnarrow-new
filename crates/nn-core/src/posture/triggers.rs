@@ -25,13 +25,13 @@
 //!   pipeline syntax.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::wire::exe::exe_flags;
 use common::wire::open_sensor::{open_reason, own_data};
-use nn_model::posture_types::{EvidenceClass, TriggerType};
 use nn_model::Event;
+use nn_model::posture_types::{EvidenceClass, TriggerType};
 
 use super::corroboration::Scope;
 use super::daemon_data::DaemonData;
@@ -2921,7 +2921,7 @@ pub mod testutil {
 mod tests {
     use super::testutil::*;
 
-    use crate::posture::host::testing::{TestHost, TEST_OWNER};
+    use crate::posture::host::testing::{TEST_OWNER, TestHost};
 
     /// R08a (lab PR 250): the detector on the portable test host.
     type TriggerDetector = super::TriggerDetector<TestHost>;
@@ -3661,8 +3661,8 @@ mod tests {
     #[test]
     fn the_sd_pam_of_a_manager_older_than_the_agent_is_told_by_its_cgroup() {
         use super::super::lineage::AuthSessionTracker;
-        use crate::posture::host::testing::{symlink, IdTestHost};
         use crate::posture::host::PostureHost;
+        use crate::posture::host::testing::{IdTestHost, symlink};
         const STAT_DEV: u64 = 64769;
         const KDEV: u64 = common::wire::exe::kernel_dev(STAT_DEV);
         let (executor, systemd) = (
@@ -4576,9 +4576,10 @@ mod tests {
         if let Event::FileOpen { comm, .. } = &mut focal {
             *comm = "cat".into();
         }
-        assert!(det
-            .detect(&focal, &[])
-            .contains(&TriggerType::SensitiveFileAccess));
+        assert!(
+            det.detect(&focal, &[])
+                .contains(&TriggerType::SensitiveFileAccess)
+        );
         assert_eq!(
             event_subject(&focal),
             EventSubject {
@@ -4873,9 +4874,10 @@ mod tests {
             exe.path = "/tmp/go-build1/b001/calc.test".into();
             exe.flags |= exe_flags::KNOWN | exe_flags::DELETED;
         }
-        assert!(det
-            .detect(&gone, &[])
-            .contains(&TriggerType::ConfirmedIntrusion));
+        assert!(
+            det.detect(&gone, &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        );
     }
 
     /// Named test (the review of #555, F1): a `go` at the toolchain's path
@@ -5388,9 +5390,10 @@ mod tests {
             operation,
             timestamp_ns: 1,
         };
-        assert!(det
-            .detect(&ev(nn_model::FsProtectOperation::SysctlOptOut), &[])
-            .is_empty());
+        assert!(
+            det.detect(&ev(nn_model::FsProtectOperation::SysctlOptOut), &[])
+                .is_empty()
+        );
         assert_eq!(
             det.detect(&ev(nn_model::FsProtectOperation::SysctlValue), &[]),
             vec![TriggerType::DefenseImpairment]
@@ -5442,7 +5445,7 @@ mod tests {
     /// no root entry, impairs as before (ENGAGED).
     #[test]
     fn a_proven_monitor_reattach_raises_nothing_and_any_other_impairs() {
-        use common::bpf_prog_class::{root_reattach_known_ino, ROOT_REATTACH_KNOWN_BIT};
+        use common::bpf_prog_class::{ROOT_REATTACH_KNOWN_BIT, root_reattach_known_ino};
         let det = TriggerDetector::new();
         let ev = |pid, tag, ino| Event::FsProtectDenial {
             pid,
@@ -5453,9 +5456,10 @@ mod tests {
             operation: nn_model::FsProtectOperation::SysctlRootAttach,
             timestamp_ns: 1,
         };
-        assert!(det
-            .detect(&ev(1204, 0x7f3a, root_reattach_known_ino(0)), &[])
-            .is_empty());
+        assert!(
+            det.detect(&ev(1204, 0x7f3a, root_reattach_known_ino(0)), &[])
+                .is_empty()
+        );
         for (tag, ino) in [
             (0x7f3a, 18),
             (0, 18),
@@ -6530,9 +6534,10 @@ mod tests {
         // two processes' halves, in no cgroup (or the root's)
         assert!(!det.detect(&mass_write(630, false, 10), &[]).contains(&ci));
         assert!(!det.detect(&destroyed(640, 11), &[]).contains(&ci));
-        assert!(!det
-            .detect(&mass_write_in(630, 1, false, false, 20), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(630, 1, false, false, 20), &[])
+                .contains(&ci)
+        );
         assert!(!det.detect(&destroyed_in(640, 1, 21), &[]).contains(&ci));
         // a rename burst is the ransomware tracker's (NN-L-IMP-002), not a half
         let renames = Event::FileBurst {
@@ -6572,42 +6577,49 @@ mod tests {
         let ci = TriggerType::ConfirmedIntrusion;
         let w = MASS_WRITE_WINDOW_NS;
         // the encryptor's copies, then a separate deleter: same cgroup
-        assert!(!det
-            .detect(&mass_write_in(700, 9001, false, false, 10), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(700, 9001, false, false, 10), &[])
+                .contains(&ci)
+        );
         assert!(det.detect(&destroyed_in(701, 9001, 20), &[]).contains(&ci));
         // the deleter first
         assert!(!det.detect(&destroyed_in(711, 9002, 10), &[]).contains(&ci));
-        assert!(det
-            .detect(&mass_write_in(710, 9002, false, false, 30), &[])
-            .contains(&ci));
+        assert!(
+            det.detect(&mass_write_in(710, 9002, false, false, 30), &[])
+                .contains(&ci)
+        );
         // other cgroups
-        assert!(!det
-            .detect(&mass_write_in(720, 9003, false, false, 10), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(720, 9003, false, false, 10), &[])
+                .contains(&ci)
+        );
         assert!(!det.detect(&destroyed_in(721, 9004, 20), &[]).contains(&ci));
         // the deletion past the window
-        assert!(!det
-            .detect(&mass_write_in(740, 9005, false, false, 10), &[])
-            .contains(&ci));
-        assert!(!det
-            .detect(&destroyed_in(741, 9005, 11 + w), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(740, 9005, false, false, 10), &[])
+                .contains(&ci)
+        );
+        assert!(
+            !det.detect(&destroyed_in(741, 9005, 11 + w), &[])
+                .contains(&ci)
+        );
         // a package transaction's extraction beside an rm of its cgroup
         let _ = det.detect(&spawn_with_exe_by(0, 750, 1, "/usr/bin/dpkg", 2), &[]);
         let _ = det.detect(&spawn_with_exe_by(0, 751, 1, "/usr/bin/rm", 2), &[]);
-        assert!(!det
-            .detect(&mass_write_in(750, 9006, false, false, 10), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(750, 9006, false, false, 10), &[])
+                .contains(&ci)
+        );
         assert!(!det.detect(&destroyed_in(751, 9006, 20), &[]).contains(&ci));
         // a session's new files beside a daemon's deletions of its cgroup
         let _ = det.detect(&spawn_with_exe(760, 1, "/usr/sbin/sshd", 2), &[]);
         let _ = det.detect(&spawn_with_exe(761, 760, "/usr/bin/bash", 3), &[]);
         let _ = det.detect(&spawn_with_exe(762, 761, "/usr/bin/tar", 4), &[]);
         let _ = det.detect(&spawn_with_exe(763, 1, "/srv/app/cleaner", 5), &[]);
-        assert!(!det
-            .detect(&mass_write_in(762, 9007, false, false, 10), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(762, 9007, false, false, 10), &[])
+                .contains(&ci)
+        );
         assert!(!det.detect(&destroyed_in(763, 9007, 20), &[]).contains(&ci));
     }
 
@@ -6622,19 +6634,22 @@ mod tests {
         let det = detector_with_empty_proc();
         let ci = TriggerType::ConfirmedIntrusion;
         let _ = det.detect(&spawn_with_exe(800, 1, "/srv/app/worker", 1), &[]);
-        assert!(det
-            .detect(&mass_write_in(800, 0, true, true, 10), &[])
-            .contains(&ci));
+        assert!(
+            det.detect(&mass_write_in(800, 0, true, true, 10), &[])
+                .contains(&ci)
+        );
         let _ = det.detect(&spawn_with_exe(200, 1, "/usr/sbin/sshd", 1), &[]);
         let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/bash", 2), &[]);
         let _ = det.detect(&spawn_with_exe(400, 300, "/usr/bin/cargo", 3), &[]);
-        assert!(!det
-            .detect(&mass_write_in(400, 0, true, true, 10), &[])
-            .contains(&ci));
+        assert!(
+            !det.detect(&mass_write_in(400, 0, true, true, 10), &[])
+                .contains(&ci)
+        );
         // the same process's files of 4 KiB or more, later in the window
-        assert!(det
-            .detect(&mass_write_in(400, 0, true, false, 11), &[])
-            .contains(&ci));
+        assert!(
+            det.detect(&mass_write_in(400, 0, true, false, 11), &[])
+                .contains(&ci)
+        );
     }
 
     /// Lot 282: every shape of the arm is file-system evidence — the
@@ -6676,9 +6691,10 @@ mod tests {
         let recent: Vec<Event> = (0..200u64)
             .map(|i| file_open(800, 0, db, 2, i + 10))
             .collect();
-        assert!(!det
-            .detect(&file_open(800, 0, db, 2, 300), &recent)
-            .contains(&ci));
+        assert!(
+            !det.detect(&file_open(800, 0, db, 2, 300), &recent)
+                .contains(&ci)
+        );
         let burst = |flags: u32| {
             let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
                 .map(|i| file_open(800, 0, &format!("/srv/app/out/{i}"), flags, i + 10))
@@ -6696,18 +6712,20 @@ mod tests {
             .map(|i| file_open(800, 0, &format!("/srv/app/o2/{i}"), 2, i + 10))
             .chain([file_open(800, 0, "/srv/app/o2/0", 2, 40)])
             .collect();
-        assert!(!det
-            .detect(&file_open(800, 0, "/srv/app/o2/1", 2, 41), &recent)
-            .contains(&ci));
+        assert!(
+            !det.detect(&file_open(800, 0, "/srv/app/o2/1", 2, 41), &recent)
+                .contains(&ci)
+        );
         // nineteen files and a twentieth in the focal open: twenty
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe(801, 1, "/srv/app/worker", 1), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64 - 1))
             .map(|i| file_open(801, 0, &format!("/srv/app/o3/{i}"), 2, i + 10))
             .collect();
-        assert!(det
-            .detect(&file_open(801, 0, "/srv/app/o3/x", 2, 41), &recent)
-            .contains(&ci));
+        assert!(
+            det.detect(&file_open(801, 0, "/srv/app/o3/x", 2, 41), &recent)
+                .contains(&ci)
+        );
     }
 
     /// Lot 282: past 1,024 pids the replacement halves are pruned of those
@@ -6722,9 +6740,10 @@ mod tests {
         assert!(r.record(1, None, Half::Destroyed, 3 * w, false).is_none());
         // 1,100 other pids, a little later: the map is pruned on each record
         for pid in 1000..2100u32 {
-            assert!(r
-                .record(pid, None, Half::Created, 3 * w + 2, false)
-                .is_none());
+            assert!(
+                r.record(pid, None, Half::Created, 3 * w + 2, false)
+                    .is_none()
+            );
         }
         // pid 1's recent destruction is still there to pair with
         assert_eq!(
@@ -6983,7 +7002,7 @@ mod tests {
     /// refusal (any other loader) still raises DefenseImpairment.
     #[test]
     fn a_proven_known_system_probe_raises_no_posture() {
-        use common::bpf_prog_class::{known_probe_dev, PROG_TYPE_KPROBE, PROG_TYPE_TRACEPOINT};
+        use common::bpf_prog_class::{PROG_TYPE_KPROBE, PROG_TYPE_TRACEPOINT, known_probe_dev};
         let refused = |pid: u32, dev: u64, ty: u32| Event::FsProtectDenial {
             pid,
             uid: 998,
@@ -7319,9 +7338,10 @@ mod tests {
             &[],
         );
         let docs = "/home/u/Documents/a.pdf";
-        assert!(det
-            .detect(&mass_write_at(7706, docs, true, false, 10), &[])
-            .contains(&ci));
+        assert!(
+            det.detect(&mass_write_at(7706, docs, true, false, 10), &[])
+                .contains(&ci)
+        );
     }
 
     /// Named test (the review of #555, F2): yarn, pnpm and bun load a
@@ -8385,7 +8405,7 @@ mod tests {
     #[test]
     fn a_refused_carveout_leaves_the_mass_write_arm_on() {
         use super::super::mass_write_overlay::{
-            load_mass_write_carveout_extras, DEFAULT_MASS_WRITE_OVERLAY,
+            DEFAULT_MASS_WRITE_OVERLAY, load_mass_write_carveout_extras,
         };
         let extras =
             load_mass_write_carveout_extras(&crate::config::overlay_auth::Verified::Content {
@@ -8620,9 +8640,10 @@ mod tests {
             0,
             open_reason::SENSITIVE,
         );
-        assert!(!det
-            .detect(&passwd, &[])
-            .contains(&TriggerType::SensitiveFileAccess));
+        assert!(
+            !det.detect(&passwd, &[])
+                .contains(&TriggerType::SensitiveFileAccess)
+        );
         let shadow = classed_open(
             4242,
             1000,
@@ -8630,9 +8651,10 @@ mod tests {
             0,
             open_reason::SENSITIVE,
         );
-        assert!(det
-            .detect(&shadow, &[])
-            .contains(&TriggerType::SensitiveFileAccess));
+        assert!(
+            det.detect(&shadow, &[])
+                .contains(&TriggerType::SensitiveFileAccess)
+        );
     }
 
     /// External audit EBPF-011: the cgroup window's crossing (fork workers
@@ -8666,9 +8688,10 @@ mod tests {
         if let Event::MassWrite { pid, .. } = &mut e {
             *pid = 700;
         }
-        assert!(!det
-            .detect(&e, &[])
-            .contains(&TriggerType::ConfirmedIntrusion));
+        assert!(
+            !det.detect(&e, &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        );
     }
 
     // ─── Lot 283c — a server doing its normal job (own data) ────────
@@ -8790,14 +8813,16 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        assert!(!h
-            .det
-            .detect(&created, &[])
-            .contains(&TriggerType::ConfirmedIntrusion));
-        assert!(!h
-            .det
-            .detect(&gone, &[])
-            .contains(&TriggerType::ConfirmedIntrusion));
+        assert!(
+            !h.det
+                .detect(&created, &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        );
+        assert!(
+            !h.det
+                .detect(&gone, &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        );
     }
 
     /// Lot 369 (the soak of rc5: ConfirmedIntrusion → ENGAGED at pgbench's
@@ -8816,7 +8841,7 @@ mod tests {
     fn a_service_writer_gone_before_its_crossing_is_judged_is_told_by_its_cgroup() {
         use super::super::exempt::ExemptPids;
         use super::super::lineage::AuthSessionTracker;
-        use crate::posture::host::{testing::TestHost, PostureHost};
+        use crate::posture::host::{PostureHost, testing::TestHost};
         let procs = tempfile::tempdir().unwrap();
         let cg = tempfile::tempdir().unwrap();
         // the host's id of each unit's directory (the portable host's
@@ -8960,14 +8985,16 @@ mod tests {
         }
         // the same writers outside the account's own data, or as a person
         let docs = "/home/alice/Documents/report.docx";
-        assert!(h
-            .det
-            .detect(&own_burst(520, 113, docs, own_data::NONE, 20), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(521, 1000, pg, own_data::SERVICE, 21), &[])
-            .contains(&ci));
+        assert!(
+            h.det
+                .detect(&own_burst(520, 113, docs, own_data::NONE, 20), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(521, 1000, pg, own_data::SERVICE, 21), &[])
+                .contains(&ci)
+        );
         // a copy in a home, no image, a postgres the session runs, another
         // version's postgres under initdb 16
         run(rooted(spawn_with_exe_by(
@@ -9052,21 +9079,24 @@ mod tests {
         let h = own_host();
         let ci = TriggerType::ConfirmedIntrusion;
         let docs = "/home/alice/Documents/report.docx";
-        assert!(h
-            .det
-            .detect(&own_burst(PG_SERVICE, 113, docs, own_data::NONE, 10), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(
-                &own_burst(PG_SERVICE, 1000, docs, own_data::SERVICE, 11),
-                &[]
-            )
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(PG_SERVICE, 0, docs, own_data::SERVICE, 12), &[])
-            .contains(&ci));
+        assert!(
+            h.det
+                .detect(&own_burst(PG_SERVICE, 113, docs, own_data::NONE, 10), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(
+                    &own_burst(PG_SERVICE, 1000, docs, own_data::SERVICE, 11),
+                    &[]
+                )
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(PG_SERVICE, 0, docs, own_data::SERVICE, 12), &[])
+                .contains(&ci)
+        );
     }
 
     /// Lot 283c, decision 2: containerd replacing its own state under
@@ -9080,31 +9110,36 @@ mod tests {
         let code = unit_code(&h.det, "/var/lib/containerd/");
         let docker = unit_code(&h.det, "/var/lib/docker/");
         let f = "/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db";
-        assert!(!h
-            .det
-            .detect(&own_burst(CONTAINERD, 0, f, code, 10), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(OTHER_UNIT, 0, f, code, 11), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(CONTAINERD_SUBGROUP, 0, f, code, 12), &[])
-            .contains(&ci));
+        assert!(
+            !h.det
+                .detect(&own_burst(CONTAINERD, 0, f, code, 10), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(OTHER_UNIT, 0, f, code, 11), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(CONTAINERD_SUBGROUP, 0, f, code, 12), &[])
+                .contains(&ci)
+        );
         let d = "/var/lib/docker/overlay2/x/diff/a";
-        assert!(h
-            .det
-            .detect(&own_burst(CONTAINERD, 0, d, docker, 13), &[])
-            .contains(&ci));
+        assert!(
+            h.det
+                .detect(&own_burst(CONTAINERD, 0, d, docker, 13), &[])
+                .contains(&ci)
+        );
         // a code no listed directory has
-        assert!(h
-            .det
-            .detect(
-                &own_burst(CONTAINERD, 0, f, own_data::UNIT_BASE + 200, 14),
-                &[]
-            )
-            .contains(&ci));
+        assert!(
+            h.det
+                .detect(
+                    &own_burst(CONTAINERD, 0, f, own_data::UNIT_BASE + 200, 14),
+                    &[]
+                )
+                .contains(&ci)
+        );
     }
 
     /// Lot 283c, decision 2: a replacement (new files, originals destroyed
@@ -9225,18 +9260,21 @@ mod tests {
         let h = own_host();
         let ci = TriggerType::ConfirmedIntrusion;
         let f = "/home/alice/.cache/go-build/3f/3f0a-d";
-        assert!(!h
-            .det
-            .detect(&own_burst(ALICE, 1000, f, own_data::CACHE, 10), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(ALICE, 113, f, own_data::CACHE, 11), &[])
-            .contains(&ci));
-        assert!(h
-            .det
-            .detect(&own_burst(ALICE, 0, f, own_data::CACHE, 12), &[])
-            .contains(&ci));
+        assert!(
+            !h.det
+                .detect(&own_burst(ALICE, 1000, f, own_data::CACHE, 10), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(ALICE, 113, f, own_data::CACHE, 11), &[])
+                .contains(&ci)
+        );
+        assert!(
+            h.det
+                .detect(&own_burst(ALICE, 0, f, own_data::CACHE, 12), &[])
+                .contains(&ci)
+        );
     }
 
     /// Lot 283c, decision 4: a person's tree rewritten or replaced in a
@@ -9259,9 +9297,10 @@ mod tests {
     fn without_the_daemons_list_a_daemon_burst_counts() {
         let det = detector_with_empty_proc();
         let f = "/var/lib/containerd/meta.db";
-        assert!(det
-            .detect(&own_burst(1, 0, f, own_data::UNIT_BASE, 10), &[])
-            .contains(&TriggerType::ConfirmedIntrusion));
+        assert!(
+            det.detect(&own_burst(1, 0, f, own_data::UNIT_BASE, 10), &[])
+                .contains(&TriggerType::ConfirmedIntrusion)
+        );
     }
 
     // ── Bug hunt 1.3 (editions 1.2/1.3): BUG40, BUG41, BUG50, BUG51 ───
@@ -9283,9 +9322,10 @@ mod tests {
             "2 distinct ports raised Reconnaissance: {hits:?}"
         );
         let focal = tcp_v4(42, [127, 0, 0, 1], 22, 300);
-        assert!(det
-            .detect(&focal, &recent)
-            .contains(&TriggerType::Reconnaissance));
+        assert!(
+            det.detect(&focal, &recent)
+                .contains(&TriggerType::Reconnaissance)
+        );
     }
 
     /// BUG50: nine distinct ports (1..=9) and a focal back on port 9 are
@@ -9306,17 +9346,20 @@ mod tests {
             "9 distinct ports raised HeavyReconnaissance: {hits:?}"
         );
         let tenth = tcp_v4(42, [127, 0, 0, 1], 10, 10 * SEC);
-        assert!(det
-            .detect(&tenth, &recent)
-            .contains(&TriggerType::HeavyReconnaissance));
+        assert!(
+            det.detect(&tenth, &recent)
+                .contains(&TriggerType::HeavyReconnaissance)
+        );
         let other_pid = tcp_v4(43, [127, 0, 0, 1], 10, 10 * SEC);
-        assert!(!det
-            .detect(&other_pid, &recent)
-            .contains(&TriggerType::HeavyReconnaissance));
+        assert!(
+            !det.detect(&other_pid, &recent)
+                .contains(&TriggerType::HeavyReconnaissance)
+        );
         let past_the_hour = tcp_v4(42, [127, 0, 0, 1], 10, 3_602 * SEC);
-        assert!(!det
-            .detect(&past_the_hour, &recent)
-            .contains(&TriggerType::HeavyReconnaissance));
+        assert!(
+            !det.detect(&past_the_hour, &recent)
+                .contains(&TriggerType::HeavyReconnaissance)
+        );
     }
 
     /// BUG41: twenty connects from one pid to a loopback, unspecified,
@@ -9396,21 +9439,24 @@ mod tests {
             .collect();
         recent.extend((10..20u64).map(|i| tcp_v4_comm(7, "app", [127, 0, 0, 1], 443, i * SEC)));
         let focal = tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, 20 * SEC);
-        assert!(!det
-            .detect(&focal, &recent)
-            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(
+            !det.detect(&focal, &recent)
+                .contains(&TriggerType::ExfiltrationPattern)
+        );
         // nineteen public connects, then a loopback one judged: not the
         // twentieth (the public twentieth raises it)
         let public: Vec<Event> = (1..20u64)
             .map(|i| tcp_v4_comm(7, "app", [203, 0, 113, 9], 443, i * SEC))
             .collect();
         let lo = tcp_v4_comm(7, "app", [127, 0, 0, 1], 443, 20 * SEC);
-        assert!(!det
-            .detect(&lo, &public)
-            .contains(&TriggerType::ExfiltrationPattern));
-        assert!(det
-            .detect(&focal, &public)
-            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(
+            !det.detect(&lo, &public)
+                .contains(&TriggerType::ExfiltrationPattern)
+        );
+        assert!(
+            det.detect(&focal, &public)
+                .contains(&TriggerType::ExfiltrationPattern)
+        );
         // a connect of another family (not inet) does not count either
         let mut other_family = recent.clone();
         other_family.extend((10..20u64).map(|i| {
@@ -9429,13 +9475,15 @@ mod tests {
             }
             e
         }));
-        assert!(!det
-            .detect(&focal, &other_family)
-            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(
+            !det.detect(&focal, &other_family)
+                .contains(&TriggerType::ExfiltrationPattern)
+        );
         recent.extend((10..20u64).map(|i| tcp_v4_comm(7, "app", [100, 64, 1, 2], 80, i * SEC)));
-        assert!(det
-            .detect(&focal, &recent)
-            .contains(&TriggerType::ExfiltrationPattern));
+        assert!(
+            det.detect(&focal, &recent)
+                .contains(&TriggerType::ExfiltrationPattern)
+        );
     }
 
     /// BUG51: pid 7 ran curl, then python3; the parent of the shell is
@@ -9459,9 +9507,10 @@ mod tests {
         assert!(det.detect(&between, &recent).contains(&TriggerType::Lolbas));
         let reversed: Vec<Event> = recent.iter().rev().cloned().collect();
         assert!(!det.detect(&focal, &reversed).contains(&TriggerType::Lolbas));
-        assert!(det
-            .detect(&between, &reversed)
-            .contains(&TriggerType::Lolbas));
+        assert!(
+            det.detect(&between, &reversed)
+                .contains(&TriggerType::Lolbas)
+        );
         // two execs stamped alike: the one recorded last is the latest
         let tie = vec![
             spawn(7, 1, "curl", "/usr/bin/curl", 3),

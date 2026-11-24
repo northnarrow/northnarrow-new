@@ -53,8 +53,8 @@
 use nn_model::{CanaryAccessKind, CanaryTypeTag, Event, ResponseAction, Severity, Verdict};
 
 use crate::canary::readers::CanaryReaders;
-use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::Rule;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::posture::host::PostureHost;
 
 // ── helpers ────────────────────────────────────────────────────────

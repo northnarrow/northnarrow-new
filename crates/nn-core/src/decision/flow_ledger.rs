@@ -56,8 +56,8 @@
 
 use std::collections::HashMap;
 
-use nn_model::telemetry::{FlowPhase, NetFlowEvent};
 use nn_model::Verdict;
+use nn_model::telemetry::{FlowPhase, NetFlowEvent};
 
 use super::bounded::LazyLru;
 use super::combine::{Applied, RuleMatch};
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn an_off_or_exempt_match_answers_nothing() {
         use super::super::combine::apply_policy;
-        use super::super::rule_policy::{parse, Exempt};
+        use super::super::rule_policy::{Exempt, parse};
         use nn_model::{ResponseAction, Severity};
         let m = |policy: &str, action: ResponseAction, exempt: Option<Exempt>| {
             let v = Verdict {

@@ -4271,7 +4271,7 @@ mod tests {
     /// note included.
     #[test]
     fn roundtrip_integrity_acknowledge() {
-        use crate::wire::admin_signed_payload::{SignedPayload, INTEGRITY_ACK_NOTE_MAX};
+        use crate::wire::admin_signed_payload::{INTEGRITY_ACK_NOTE_MAX, SignedPayload};
         roundtrip(AdminMessage::IntegrityAcknowledgeRequest(
             IntegrityAcknowledgeRequest {
                 payload: SignedPayload::new_integrity_acknowledge(

@@ -107,9 +107,11 @@ mod tests {
             error: "iptables: exit 4".to_string(),
         });
         assert_eq!(d.result, "failed");
-        assert!(d.extra["detail"]
-            .as_str()
-            .unwrap()
-            .contains("iptables: exit 4"));
+        assert!(
+            d.extra["detail"]
+                .as_str()
+                .unwrap()
+                .contains("iptables: exit 4")
+        );
     }
 }

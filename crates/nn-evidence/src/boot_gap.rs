@@ -221,7 +221,7 @@ pub fn judge(
         Err(why) => {
             return BootContinuity::Unknown {
                 why: format!("the journal's boot list could not be read: {why}"),
-            }
+            };
         }
     };
     judge_list(&previous, &current, &boots)

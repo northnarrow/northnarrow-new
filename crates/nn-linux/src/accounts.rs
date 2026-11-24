@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use nn_core::decision::host::{classify_account, AccountKind, DEFAULT_UID_MIN};
+use nn_core::decision::host::{AccountKind, DEFAULT_UID_MIN, classify_account};
 use parking_lot::Mutex;
 
 const LOGIN_DEFS: &str = "/etc/login.defs";

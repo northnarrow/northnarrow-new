@@ -121,22 +121,22 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
+    Btf, Ebpf,
     maps::{Array as AyaArray, HashMap as AyaHashMap, Map as AyaMap, MapData},
     programs::{
-        links::{FdLink, PinnedLink},
         FEntry, FExit, Lsm,
+        links::{FdLink, PinnedLink},
     },
-    Btf, Ebpf,
 };
-pub use common::wire::pid_role;
 /// Lot 374: `ROLE_TGIDS`' value for a role whose holder exited this boot.
 pub use common::wire::ROLE_VACATED;
+pub use common::wire::pid_role;
 /// The review of #582 (F4, F6): what the kernel recorded of each role's
 /// holders' exits this boot.
 pub use common::wire::{
-    ROLE_EXITS_MAP_NAME, ROLE_MARKS_MAP_NAME, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED,
+    ROLE_EXITS_MAP_NAME, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_MARKS_MAP_NAME,
 };
 use tracing::{error, info, warn};
 

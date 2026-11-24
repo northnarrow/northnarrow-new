@@ -309,10 +309,14 @@ fn the_judge_is_linked_to_the_root_cgroup_multi() {
     assert!(body(&d, "pinned_objects").contains("own_pin_dirs(pin_root)"));
     assert!(body(&d, "kept_program").contains("crate::sysctl_cgroup::is_kept_program(name)"));
     // the manifest's note, the verifier check
-    assert!(code("crates/nn-linux/src/sensors/multiplexer.rs")
-        .contains("self.attach_points.note(\"sysctl_judge\", &note, took);"));
-    assert!(code("crates/nn-linux/src/verifier_check.rs")
-        .contains("Program::CgroupSysctl(p) => p.load(),"));
+    assert!(
+        code("crates/nn-linux/src/sensors/multiplexer.rs")
+            .contains("self.attach_points.note(\"sysctl_judge\", &note, took);")
+    );
+    assert!(
+        code("crates/nn-linux/src/verifier_check.rs")
+            .contains("Program::CgroupSysctl(p) => p.load(),")
+    );
 }
 
 /// The opt-out reaches the kernel only signed: the start passes the gate's

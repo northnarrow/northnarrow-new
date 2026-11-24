@@ -12,7 +12,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// One-shot scheduling tool comms (design §7.1).

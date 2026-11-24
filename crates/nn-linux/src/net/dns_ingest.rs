@@ -8,8 +8,8 @@
 //! ([`DnsIngest`]); the pump marks its passes on it, the net drain waits on
 //! it, as before.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;

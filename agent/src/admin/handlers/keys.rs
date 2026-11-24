@@ -11,7 +11,7 @@ use ed25519_dalek::VerifyingKey;
 use nn_proto::admin_protocol::{AdminResult, RotateKeysAddRequest, RotateKeysRevokeRequest};
 use nn_proto::admin_signed_payload::Role;
 
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 
 /// at-authz-1 verify-item 1: re-register the rotated admin.pub inode in

@@ -100,7 +100,7 @@ pub const PRELOAD_FIX: &str = "remove the entry that names a library (or the fil
 /// one naming a path this user could not look at (a directory it cannot
 /// search) is `n/a`, `cannot check: run as root`.
 fn preload(root: &Path) -> Check {
-    use antitamper_bpf::preload::{judge_in, Verdict, PRELOAD_PATH};
+    use antitamper_bpf::preload::{PRELOAD_PATH, Verdict, judge_in};
     let (status, value) = match judge_in(root, Path::new(PRELOAD_PATH)) {
         Verdict::Absent => (Status::Ok, "absent".to_string()),
         Verdict::Inert { names: 0 } => (Status::Ok, "present, loads nothing (empty)".to_string()),
@@ -929,7 +929,7 @@ fn kexec_load_disabled(root: &Path) -> Check {
 /// /sys/fs/bpf) and each lock stacked on it that is private and
 /// unbindable too. None when the lock is not in place.
 fn own_pin_lock(text: &[u8], pin_root: &Path) -> Vec<u64> {
-    use crate::anti_tamper::pin_lock::{is_lock, propagation_is_locked, state_in, State};
+    use crate::anti_tamper::pin_lock::{State, is_lock, propagation_is_locked, state_in};
     let State::InPlace(first) = state_in(text, pin_root) else {
         return Vec::new();
     };

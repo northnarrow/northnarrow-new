@@ -22,13 +22,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
-    maps::{ring_buf::RingBuf, MapData},
-    programs::{FEntry, FExit},
     Btf, Ebpf,
+    maps::{MapData, ring_buf::RingBuf},
+    programs::{FEntry, FExit},
 };
-use common::wire::{answer_flags, held_flags, tls_flags, DnsAnswerRaw, TlsHelloRaw};
+use common::wire::{DnsAnswerRaw, TlsHelloRaw, answer_flags, held_flags, tls_flags};
 use nn_model::telemetry::{DnsAnswerEvent, TlsFingerprint, TlsHelloEvent, TlsHelloOutcome};
 use nn_model::{Event, FloodSource};
 use nn_proto::ipc::{DnsAnswersOut, DnsRecordOut, SniOut, TlsOut};
@@ -41,7 +41,7 @@ use crate::net::flow_tracker::FlowTracker;
 use crate::net::resolved::{Answer, Record, ResolvedTable};
 use crate::posture::lineage::AuthSessionTracker;
 use crate::sensors::bus::BusSender;
-use crate::sensors::pump::{PumpThread, POLL_MS};
+use crate::sensors::pump::{POLL_MS, PumpThread};
 use crate::sensors::reject::RejectThrottle;
 use crate::worker::parse::ParseClient;
 
@@ -139,7 +139,9 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, points: &AttachPoints) -> Attached {
             points.note("net_inbound", &format!("not attached: {why}"), Took::Absent);
             crate::boot::degradation::report(
                 "net_inbound",
-                &format!("the inbound connection sensor is not attached ({why}): accepted connections are not observed"),
+                &format!(
+                    "the inbound connection sensor is not attached ({why}): accepted connections are not observed"
+                ),
             );
         }
     }
@@ -170,7 +172,9 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, points: &AttachPoints) -> Attached {
             points.note("dns_answer", &format!("not attached: {why}"), Took::Absent);
             crate::boot::degradation::report(
                 "dns_answer",
-                &format!("the DNS response sensor is not attached ({why}): no response is observed, NN-L-NET-028 judges every connect unknown"),
+                &format!(
+                    "the DNS response sensor is not attached ({why}): no response is observed, NN-L-NET-028 judges every connect unknown"
+                ),
             );
         }
     }
@@ -186,7 +190,9 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, points: &AttachPoints) -> Attached {
             points.note("tls_hello", &format!("not attached: {why}"), Took::Absent);
             crate::boot::degradation::report(
                 "tls_hello",
-                &format!("the TLS ClientHello sensor is not attached ({why}): no fingerprint is produced, NN-L-NET-003 cannot match"),
+                &format!(
+                    "the TLS ClientHello sensor is not attached ({why}): no fingerprint is produced, NN-L-NET-003 cannot match"
+                ),
             );
         }
     }
@@ -814,12 +820,16 @@ mod tests {
         assert_eq!(variant_for("udp_recvmsg", 3), None);
         assert_eq!(variant_for("tcp_sendmsg", 3), None);
         assert_eq!(other_arity("dns_answer_v4_ret6", Some(6)), None);
-        assert!(other_arity("dns_answer_v4_ret6", Some(5))
-            .unwrap()
-            .contains("has 5"));
-        assert!(other_arity("inbound_accept_ret2", None)
-            .unwrap()
-            .contains("no inet_csk_accept"));
+        assert!(
+            other_arity("dns_answer_v4_ret6", Some(5))
+                .unwrap()
+                .contains("has 5")
+        );
+        assert!(
+            other_arity("inbound_accept_ret2", None)
+                .unwrap()
+                .contains("no inet_csk_accept")
+        );
         assert_eq!(other_arity("tcp_close", Some(2)), None, "not a variant");
         // the variants are the eBPF object's programs, each with the slot of
         // its return value after its parameters
@@ -847,9 +857,11 @@ mod tests {
         assert_eq!(variant_for("udp_recvmsg", 4), Some("dns_answer_v4_ret4"));
         assert_eq!(variant_for("udpv6_recvmsg", 4), Some("dns_answer_v6_ret4"));
         assert_eq!(other_arity("dns_answer_v4_ret4", Some(4)), None);
-        assert!(other_arity("dns_answer_v4_ret5", Some(4))
-            .unwrap()
-            .contains("this kernel's has 4"));
+        assert!(
+            other_arity("dns_answer_v4_ret5", Some(4))
+                .unwrap()
+                .contains("this kernel's has 4")
+        );
         for f in ["udp_recvmsg", "udpv6_recvmsg"] {
             for n in [4, 5, 6] {
                 let p = variant_for(f, n).unwrap_or_else(|| panic!("{f} with {n}"));
@@ -1006,11 +1018,13 @@ mod tests {
         assert!(matches!(evs.as_slice(), [Event::DnsAnswer(_)]));
         assert_eq!(t.check(42, 1, c2, 11 * S, Vec::new), DnsResolution::Lineage);
         assert_eq!((stats.records, stats.decoded), (1, 1));
-        assert!(stats
-            .last
-            .as_deref()
-            .unwrap()
-            .starts_with("c2.example -> 1"));
+        assert!(
+            stats
+                .last
+                .as_deref()
+                .unwrap()
+                .starts_with("c2.example -> 1")
+        );
         // no DNS response: nothing changes
         let t = ResolvedTable::default();
         ingest_answer(&raw, Some(None), None, false, &t, &mut stats);

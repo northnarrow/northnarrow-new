@@ -24,7 +24,7 @@ use common::wire::execq::class;
 use nn_proto::execq::Reason;
 
 use crate::elf::{
-    Elf, ElfError, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,
+    ET_DYN, ET_EXEC, Elf, ElfError, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,
     SHF_EXECINSTR, SHT_NOBITS, SHT_SYMTAB,
 };
 

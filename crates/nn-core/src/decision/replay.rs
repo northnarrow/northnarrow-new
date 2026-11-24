@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::decision::host::DecisionHost;
 use nn_model::Event;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::attack::mitre_of;
 use super::combine::Decision;
@@ -21,7 +21,7 @@ use super::rule_policy::{PolicyHandle, RulePolicy};
 use super::rules::{epg, net::NetRuleConfig, net_fanout::FanoutConfig};
 use super::{Rule, RuleEngine};
 use crate::config::comm_allowlist::{
-    load_comm_allowlist, NETFLOW_COMM_ALLOWLIST_SHIPPED, PROCESS_COMM_ALLOWLIST_SHIPPED,
+    NETFLOW_COMM_ALLOWLIST_SHIPPED, PROCESS_COMM_ALLOWLIST_SHIPPED, load_comm_allowlist,
 };
 use crate::config::overlay_auth::Verified;
 use crate::impact::RansomTracker;

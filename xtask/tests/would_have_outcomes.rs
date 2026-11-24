@@ -491,15 +491,39 @@ fn each_rule_fails_on_the_shape_it_forbids() {
             "1",
         ),
         // the would-have first
-        ("matches!(o, X::WouldExecute { pid } | X::Blocked { pid })", "1"),
-        ("match o { NeutralizeOutcome::WouldHaveContained | NeutralizeOutcome::Contained => {} }", "1"),
-        ("match c { Containment::Contained | Containment::WouldHave => true, _ => false }", "1"),
-        ("match r { OutcomeResult::Success | OutcomeResult::WouldHave => \"success\" }", "1"),
+        (
+            "matches!(o, X::WouldExecute { pid } | X::Blocked { pid })",
+            "1",
+        ),
+        (
+            "match o { NeutralizeOutcome::WouldHaveContained | NeutralizeOutcome::Contained => {} }",
+            "1",
+        ),
+        (
+            "match c { Containment::Contained | Containment::WouldHave => true, _ => false }",
+            "1",
+        ),
+        (
+            "match r { OutcomeResult::Success | OutcomeResult::WouldHave => \"success\" }",
+            "1",
+        ),
         // arms
-        ("ExecutionOutcome::WouldExecute { .. } => (R::Success, None),", "2"),
-        ("ExecutionOutcome::WouldExecute { .. } => SoftBlock::Blocked,", "2"),
-        ("O::WouldExecute { .. } if dry => Containment::Contained,", "2"),
-        ("NeutralizeOutcome::WouldHaveContained => { success = true; ActionResult::Success }", "2"),
+        (
+            "ExecutionOutcome::WouldExecute { .. } => (R::Success, None),",
+            "2",
+        ),
+        (
+            "ExecutionOutcome::WouldExecute { .. } => SoftBlock::Blocked,",
+            "2",
+        ),
+        (
+            "O::WouldExecute { .. } if dry => Containment::Contained,",
+            "2",
+        ),
+        (
+            "NeutralizeOutcome::WouldHaveContained => { success = true; ActionResult::Success }",
+            "2",
+        ),
         ("OutcomeResult::WouldHave => \"success\".to_string(),", "2"),
     ];
     for (code, rule) in planted {

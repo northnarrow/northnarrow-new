@@ -24,8 +24,8 @@
 
 use std::io;
 use std::panic::AssertUnwindSafe;
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;

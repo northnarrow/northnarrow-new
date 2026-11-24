@@ -51,18 +51,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn_model::telemetry::FlowPhase;
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::bounded::{LazyLru, LossCounter};
 use crate::decision::correlation::CorrelationStore;
 use crate::decision::response_policy::{self, PolicySwitch};
-use crate::decision::Rule;
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::AuthSessionTracker;
 
@@ -855,19 +855,21 @@ mod tests {
     fn slow_fan_out_and_one_host_bursts_are_not_scans() {
         let r = NnLNet026ScanFanOut::new(ctx(FanoutConfig::default()));
         for i in 0..64u32 {
-            assert!(r
-                .evaluate(&connect(
+            assert!(
+                r.evaluate(&connect(
                     400,
                     [10, 0, 0, i as u8],
                     443,
                     S + u64::from(i) * 2 * S
                 ))
-                .is_none());
+                .is_none()
+            );
         }
         for i in 0..400u64 {
-            assert!(r
-                .evaluate(&connect(401, [192, 0, 2, 80], 443, S + i))
-                .is_none());
+            assert!(
+                r.evaluate(&connect(401, [192, 0, 2, 80], 443, S + i))
+                    .is_none()
+            );
         }
     }
 
@@ -935,9 +937,10 @@ mod tests {
         // Not an auth port: nothing.
         let r = NnLNet027OutboundAuthBruteforce::new(ctx(FanoutConfig::default()));
         for i in 0..50u64 {
-            assert!(r
-                .evaluate(&connect(501, [127, 0, 0, 1], 443, S + i))
-                .is_none());
+            assert!(
+                r.evaluate(&connect(501, [127, 0, 0, 1], 443, S + i))
+                    .is_none()
+            );
         }
     }
 

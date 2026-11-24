@@ -3,8 +3,8 @@
 
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nn_model::posture_types::PostureKind;
 use nn_model::telemetry::FlowPhase;
@@ -19,9 +19,9 @@ use super::posture_floor;
 use super::response_policy;
 use super::rule_policy::{self, ActorFacts, PolicyHandle};
 
+use super::Rule;
 use super::rules::net::DnsBurstWindow;
 use super::rules::{default_rules, default_rules_with_net};
-use super::Rule;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 use crate::posture::host::PostureAgent;

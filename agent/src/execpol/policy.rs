@@ -404,7 +404,7 @@ pub fn parse(text: &str, default_profile: Profile) -> Result<Table, String> {
                     other => {
                         return Err(err(format!(
                             "unknown exec action `{other}` (allow, audit, quarantine, deny)"
-                        )))
+                        )));
                     }
                 };
                 let cm = parse_class(c).map_err(err)?;
@@ -424,7 +424,7 @@ pub fn parse(text: &str, default_profile: Profile) -> Result<Table, String> {
                     other => {
                         return Err(err(format!(
                             "unknown preload action `{other}` (allow, record, deny, deny-root)"
-                        )))
+                        )));
                     }
                 };
                 for ti in parse_tier(tr).map_err(err)? {
@@ -439,7 +439,7 @@ pub fn parse(text: &str, default_profile: Profile) -> Result<Table, String> {
                     other => {
                         return Err(err(format!(
                             "unknown map action `{other}` (allow, record, deny)"
-                        )))
+                        )));
                     }
                 };
                 let cm = parse_class(c).map_err(err)?;
@@ -463,7 +463,7 @@ pub fn parse(text: &str, default_profile: Profile) -> Result<Table, String> {
                 return Err(err(format!(
                     "`{}` is not an exec, audit, preload, map, exempt or profile line",
                     nn_model::log_escape::Escaped(line)
-                )))
+                )));
             }
         }
     }
@@ -591,12 +591,14 @@ exempt /opt/x/y
         assert_eq!(t.class_audit, class::DEV_SHM);
         assert_eq!(t.env[T::SESSION as usize], EnvRule::Deny);
         assert!(t.map.iter().all(|row| row[4] == MapCell::Deny));
-        assert!(t
-            .exempt
-            .contains(&(PathBuf::from("/opt/rt/bin/runtime"), class::MEMFD)));
-        assert!(t
-            .exempt
-            .contains(&(PathBuf::from("/opt/x/y"), EXEMPT_DEFAULT_CLASSES)));
+        assert!(
+            t.exempt
+                .contains(&(PathBuf::from("/opt/rt/bin/runtime"), class::MEMFD))
+        );
+        assert!(
+            t.exempt
+                .contains(&(PathBuf::from("/opt/x/y"), EXEMPT_DEFAULT_CLASSES))
+        );
         let w = t.encode(mode::ENFORCE, true, true, true);
         assert_eq!(w[conf_slot::CLASS_AUDIT as usize] as u32, class::DEV_SHM);
         // empty text: the default profile, untouched

@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use common::cgroup_limits::{
-    limit_kind_of, limit_value, LimitValue, LIMIT_CPU_LIST, LIMIT_CPU_MAX, LIMIT_FILES, LIMIT_FLAG,
-    LIMIT_IO_MAX, LIMIT_IO_PRIO_CLASS, LIMIT_IO_WEIGHT, LIMIT_NICE, LIMIT_PARTITION,
-    LIMIT_UNSIGNED_MAX, LIMIT_WEIGHT,
+    LIMIT_CPU_LIST, LIMIT_CPU_MAX, LIMIT_FILES, LIMIT_FLAG, LIMIT_IO_MAX, LIMIT_IO_PRIO_CLASS,
+    LIMIT_IO_WEIGHT, LIMIT_NICE, LIMIT_PARTITION, LIMIT_UNSIGNED_MAX, LIMIT_WEIGHT, LimitValue,
+    limit_kind_of, limit_value,
 };
 use common::wire::InodeKey;
 
@@ -711,9 +711,10 @@ mod tests {
             std::fs::read_to_string(unit.join("cpu.idle")).unwrap(),
             "1\n"
         );
-        assert!(r[0]
-            .detail()
-            .contains("NOT restored: registering the floor: map full"));
+        assert!(
+            r[0].detail()
+                .contains("NOT restored: registering the floor: map full")
+        );
     }
 
     #[test]

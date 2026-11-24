@@ -8,12 +8,12 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
 
 use nn_proto::execq::{
-    decode, decode_config, encode, FromScanner, ToScanner, MAX_CONFIG_BYTES, MAX_PACKET,
-    PROTOCOL_VERSION,
+    FromScanner, MAX_CONFIG_BYTES, MAX_PACKET, PROTOCOL_VERSION, ToScanner, decode, decode_config,
+    encode,
 };
 use northnarrow_scan::engine::Engine;
 use northnarrow_scan::ipc::{self, FdFile};
-use northnarrow_scan::{harden, seccomp, SOCKET_FD};
+use northnarrow_scan::{SOCKET_FD, harden, seccomp};
 
 fn fail(why: impl std::fmt::Display) -> ExitCode {
     eprintln!("northnarrow-scan: {why}");
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
         Ok(ToScanner::Configure { version, .. }) => {
             return fail(format!(
                 "protocol {version}, this scanner speaks {PROTOCOL_VERSION}"
-            ))
+            ));
         }
         Ok(_) => return fail("the first message must configure"),
         Err(e) => return fail(format!("decode: {e}")),

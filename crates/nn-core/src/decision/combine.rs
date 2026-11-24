@@ -576,10 +576,11 @@ mod tests {
         assert_eq!(d.verdict.action, KillProcessTree);
         assert_eq!(d.verdict.severity, Critical);
         assert_eq!(d.verdict.rule_id, "CRIT-LOG");
-        assert!(d
-            .verdict
-            .reasoning
-            .ends_with("[also matched: LOW-KILL (KillProcessTree, Medium)]"));
+        assert!(
+            d.verdict
+                .reasoning
+                .ends_with("[also matched: LOW-KILL (KillProcessTree, Medium)]")
+        );
     }
 
     /// Equal severity: the stronger action is primary.
@@ -685,10 +686,11 @@ mod tests {
         assert_eq!(d.verdict.severity, Low);
         assert!(!d.audit_only());
         assert!(d.verdict.reasoning.contains("AUDIT (Log, Critical, audit)"));
-        assert!(d
-            .verdict
-            .reasoning
-            .contains("EXEMPT (Log, Critical, exempt)"));
+        assert!(
+            d.verdict
+                .reasoning
+                .contains("EXEMPT (Log, Critical, exempt)")
+        );
         let d = combine(vec![audit, ex]).unwrap();
         assert!(d.audit_only());
         assert_eq!(d.primary().rule_id, "AUDIT");
@@ -738,10 +740,11 @@ mod tests {
         let m = apply_policy(0, R020, A1, out, held, &p, |_| None);
         assert_eq!(m.applied, Applied::Enforce);
         assert_eq!(m.verdict.action, KillProcessTree);
-        assert!(m
-            .verdict
-            .reasoning
-            .starts_with("R020_ShellWithSocketStdio fired [enforced"));
+        assert!(
+            m.verdict
+                .reasoning
+                .starts_with("R020_ShellWithSocketStdio fired [enforced")
+        );
         assert!(!m.verdict.reasoning.contains("[held back: "));
         assert_eq!(m.held, None);
         assert!(m.acts());

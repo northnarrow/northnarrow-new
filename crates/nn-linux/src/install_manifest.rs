@@ -198,13 +198,13 @@ pub fn check(manifest_path: &Path, own_exe: &Path, ebpf_object_sha: &str) -> Int
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return IntegrityOutcome::NoManifest {
                 path: manifest_path.to_path_buf(),
-            }
+            };
         }
         Err(e) => {
             return IntegrityOutcome::Unreadable {
                 path: manifest_path.to_path_buf(),
                 reason: e.to_string(),
-            }
+            };
         }
     };
     let manifest = match parse_manifest(&text) {
@@ -213,7 +213,7 @@ pub fn check(manifest_path: &Path, own_exe: &Path, ebpf_object_sha: &str) -> Int
             return IntegrityOutcome::Unreadable {
                 path: manifest_path.to_path_buf(),
                 reason,
-            }
+            };
         }
     };
     check_with(&manifest, own_exe, ebpf_object_sha)

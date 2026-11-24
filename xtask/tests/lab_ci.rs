@@ -396,12 +396,13 @@ fn lab_vm_matrix_two_ubuntu_kernels_on_prs_five_guests_nightly() {
             .map(|b| b.len()),
         Some(1)
     );
-    assert!(wf
-        .get("on")
-        .unwrap()
-        .get("schedule")
-        .and_then(|s| s.as_sequence())
-        .is_some_and(|s| s.iter().any(|e| str_of(e, "cron").is_some())));
+    assert!(
+        wf.get("on")
+            .unwrap()
+            .get("schedule")
+            .and_then(|s| s.as_sequence())
+            .is_some_and(|s| s.iter().any(|e| str_of(e, "cron").is_some()))
+    );
     let j = job();
     assert_eq!(str_of(&j, "runs-on"), Some("ubuntu-24.04"));
     assert_eq!(
@@ -637,12 +638,10 @@ fn lab_vm_informs_on_pull_requests_and_gates_the_nightly() {
     }
     let wf = workflow();
     let on = wf.get("on").and_then(|o| o.as_mapping()).expect("on:");
-    assert!(on.keys().all(|k| k.as_str().is_some_and(|k| [
-        "pull_request",
-        "schedule",
-        "workflow_dispatch"
-    ]
-    .contains(&k))));
+    assert!(on.keys().all(|k| {
+        k.as_str()
+            .is_some_and(|k| ["pull_request", "schedule", "workflow_dispatch"].contains(&k))
+    }));
     let steps = steps();
     let kvm = step_running(&steps, "/etc/udev/rules.d/99-kvm4all.rules");
     assert_eq!(str_of(&steps[kvm], "id"), Some("kvm"));
@@ -823,9 +822,11 @@ fn lab_vm_runs_the_gate_in_order_and_keeps_its_evidence() {
     let u = &steps[upload[0]];
     assert_eq!(str_of(u, "if"), Some("always()"));
     let with = u.get("with").unwrap();
-    assert!(str_of(with, "name")
-        .unwrap()
-        .contains("${{ matrix.distro }}"));
+    assert!(
+        str_of(with, "name")
+            .unwrap()
+            .contains("${{ matrix.distro }}")
+    );
     assert_eq!(str_of(with, "path"), Some("${{ env.GATE_OUT }}/"));
     // the guest's user-data and seed (its private host key) stay on the runner
     for (i, st) in steps.iter().enumerate() {
@@ -883,8 +884,11 @@ fn lab_vm_gates_the_verifier_headroom_of_every_program() {
     let vc_src = read("crates/nn-linux/src/verifier_headroom.rs");
     assert!(vc_src.contains("pub const HEADROOM_BUDGET: u32 = 900_000;"));
     assert!(vc_src.contains("\"== verifier headroom {kernel}: FAIL — {}\""));
-    assert!(vc_src
-        .contains("\"== verifier headroom {kernel}: OK — every program within {} ({highest})\""));
+    assert!(
+        vc_src.contains(
+            "\"== verifier headroom {kernel}: OK — every program within {} ({highest})\""
+        )
+    );
     let check = read("crates/nn-linux/src/verifier_check.rs");
     assert!(check.contains("Ok(failures.is_empty() && verdict.passes())"));
     // the gate judges every loaded program the agent needs (the probes and

@@ -36,7 +36,7 @@ use crate::chain_host_linux::LinuxHost;
 use crate::response::journal::{ActionIntent, ActionJournal, ActionResult, Intent};
 use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
-use crate::response::{block_outbound, ExecutionOutcome, ExecutionReport, Executor};
+use crate::response::{ExecutionOutcome, ExecutionReport, Executor, block_outbound};
 
 /// Production actuator: real executor + optional network isolator.
 ///
@@ -765,11 +765,13 @@ mod tests {
         );
         assert_eq!(crate::response::executed_line(&tree), "EXECUTED");
         // the actions chain: each one approved, none done
-        assert!(journal
-            .rows()
-            .iter()
-            .filter_map(|r| r.outcome.as_ref())
-            .all(|out| out.result == ActionResult::WouldExecute));
+        assert!(
+            journal
+                .rows()
+                .iter()
+                .filter_map(|r| r.outcome.as_ref())
+                .all(|out| out.result == ActionResult::WouldExecute)
+        );
     }
 
     /// Lot 317 (BUG-124's family): the stand-down releases the soft egress
@@ -999,16 +1001,20 @@ mod tests {
             SystemActuator::quarantine_text(7, &in_place(E::MadeUnusable)),
             "partially quarantined: D (re-exec prevention degraded)"
         );
-        assert!(SystemActuator::quarantine_text(7, &in_place(E::Unchanged))
-            .starts_with("NOT quarantined:"));
-        assert!(SystemActuator::quarantine_text(
-            7,
-            &ExecutionOutcome::QuarantineRefused {
-                pid: 7,
-                detail: "owner uid 0".into()
-            }
-        )
-        .starts_with("NOT quarantined:"));
+        assert!(
+            SystemActuator::quarantine_text(7, &in_place(E::Unchanged))
+                .starts_with("NOT quarantined:")
+        );
+        assert!(
+            SystemActuator::quarantine_text(
+                7,
+                &ExecutionOutcome::QuarantineRefused {
+                    pid: 7,
+                    detail: "owner uid 0".into()
+                }
+            )
+            .starts_with("NOT quarantined:")
+        );
         assert!(!NO_BINARY.contains("no binary on disk"));
     }
 }

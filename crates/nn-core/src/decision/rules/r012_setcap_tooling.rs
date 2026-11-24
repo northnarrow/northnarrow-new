@@ -34,7 +34,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 pub struct R012SetcapTooling<H: PostureHost> {
@@ -348,9 +348,11 @@ mod tests {
 
     #[test]
     fn ignores_non_setcap() {
-        assert!(rule()
-            .evaluate(&spawn("getcap", "/usr/sbin/getcap"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("getcap", "/usr/sbin/getcap"))
+                .is_none()
+        );
         assert!(rule().evaluate(&spawn("ls", "/usr/bin/ls")).is_none());
     }
 

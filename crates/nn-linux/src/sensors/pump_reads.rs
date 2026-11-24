@@ -1383,11 +1383,12 @@ mod tests {
         for uid in [1000, 1001] {
             let (tx, rx) = channel::<()>();
             releases.push(tx);
-            assert!(r
-                .run(uid, "test", move || {
+            assert!(
+                r.run(uid, "test", move || {
                     let _ = rx.recv();
                 })
-                .is_err());
+                .is_err()
+            );
         }
         assert!(r.held_signed(1002), "the users' share signed held");
         let t0 = Instant::now();
@@ -1420,11 +1421,12 @@ mod tests {
         let mut releases = Vec::new();
         let (tx, rx) = channel::<()>();
         releases.push(tx);
-        assert!(r
-            .run(1000, "test", move || {
+        assert!(
+            r.run(1000, "test", move || {
                 let _ = rx.recv();
             })
-            .is_err());
+            .is_err()
+        );
         let t0 = Instant::now();
         let (tx, rx) = channel::<()>();
         releases.push(tx);
@@ -1493,9 +1495,10 @@ mod tests {
         );
         let other = std::thread::spawn(move || r2.run(0, "test", f));
         std::thread::sleep(Duration::from_millis(20));
-        assert!(r
-            .run(0, "test", read(Arc::clone(&at_once), Arc::clone(&most)))
-            .is_ok());
+        assert!(
+            r.run(0, "test", read(Arc::clone(&at_once), Arc::clone(&most)))
+                .is_ok()
+        );
         assert!(other.join().unwrap().is_ok());
         assert_eq!(most.load(Ordering::SeqCst), 2, "root's beside each other");
     }
@@ -1564,9 +1567,10 @@ mod tests {
             );
             assert_eq!(r.run(4322, "test", || ()), Ok(()));
         }
-        assert!(r
-            .slow_signed(4321)
-            .is_some_and(|d| d.starts_with("user 4321:")));
+        assert!(
+            r.slow_signed(4321)
+                .is_some_and(|d| d.starts_with("user 4321:"))
+        );
         assert!(r.slow_signed(4322).is_none(), "fast reads add nothing");
     }
 
@@ -1686,11 +1690,12 @@ mod tests {
         for uid in [1000, 1001] {
             let (tx, rx) = channel::<()>();
             releases.push(tx);
-            assert!(fast
-                .run(uid, "test", move || {
+            assert!(
+                fast.run(uid, "test", move || {
                     let _ = rx.recv();
                 })
-                .is_err());
+                .is_err()
+            );
         }
         let lines = deg::snapshot();
         assert!(
@@ -2063,11 +2068,7 @@ mod tests {
                 2
             } else {
                 std::thread::sleep(REFRESH_MIN + Duration::from_millis(100));
-                if judge_of(&m).trusts(&id) {
-                    0
-                } else {
-                    3
-                }
+                if judge_of(&m).trusts(&id) { 0 } else { 3 }
             };
             // SAFETY: as above.
             unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
@@ -2089,11 +2090,7 @@ mod tests {
                     drop(fuse);
                     // SAFETY: as above.
                     unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
-                    if trusted {
-                        4
-                    } else {
-                        0
-                    }
+                    if trusted { 4 } else { 0 }
                 }
                 None => 0,
             };
@@ -2203,11 +2200,12 @@ mod tests {
         let r = ExecReader::new(Duration::from_millis(100));
         let (tx, rx) = channel::<()>();
         let t0 = Instant::now();
-        assert!(r
-            .run(1000, "nfs", move || {
+        assert!(
+            r.run(1000, "nfs", move || {
                 let _ = rx.recv();
             })
-            .is_err());
+            .is_err()
+        );
         assert!(t0.elapsed() < Duration::from_secs(2), "the deadline");
         assert!(r.not_waited_now(), "signed");
         drop(tx);

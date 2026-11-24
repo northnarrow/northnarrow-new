@@ -84,34 +84,34 @@ use nn_model::posture_types::TriggerType;
 use nn_model::{Event, ResponseAction};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::clock::Clock;
 use super::escalation_allow::EscalationAllowList;
 use super::state::PostureState;
 use super::{
-    transitions, triggers, AuthSessionTracker, CombatEntry, ExemptPids, PostureMachine,
-    ReleaseScope,
+    AuthSessionTracker, CombatEntry, ExemptPids, PostureMachine, ReleaseScope, transitions,
+    triggers,
 };
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport, UnlockToken};
 use crate::anti_tamper::trusted_installer::{
-    TrustedInstallerOverride, MAX_TRUSTED_INSTALLER_WINDOW_SECS,
+    MAX_TRUSTED_INSTALLER_WINDOW_SECS, TrustedInstallerOverride,
 };
 use crate::audit::{AgentSigningKey, AuditEntry, AuditLog, AuditStamps};
 use crate::chain_host_linux::LinuxHost;
-use crate::combat::actuator::{SystemActuator, DETECT_ONLY_ISOLATE, NO_BINARY};
+use crate::combat::actuator::{DETECT_ONLY_ISOLATE, NO_BINARY, SystemActuator};
 use crate::combat::{
     AuditEvidence, CombatActuator, CombatLadder, IsolateOutcome, LadderConfig, NeutralizeReport,
     OffenderOutcome, ProcFacts, ProcRef, ProtectedProcs, SoftBlock, SystemProtectedProcs,
 };
-use crate::config::comm_allowlist::{load_comm_allowlist, PROCESS_COMM_ALLOWLIST_SHIPPED};
+use crate::config::comm_allowlist::{PROCESS_COMM_ALLOWLIST_SHIPPED, load_comm_allowlist};
 use crate::config::overlay_auth::Verified;
 use crate::correlation::CorrelationBuffer;
 use crate::decision::rule_policy::{self, PolicyHandle, RulePolicy};
+use crate::impact::RansomTracker;
 use crate::impact::entropy::{Sample, Sampler};
 use crate::impact::trust::ProgramOwners;
-use crate::impact::RansomTracker;
 use crate::impair::{DefenseDetector, SecurityTools};
 use crate::response::{ExecutionOutcome, ExecutionReport};
 

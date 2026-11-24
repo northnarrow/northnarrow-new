@@ -13,7 +13,7 @@ use northnarrow_agent::sensors::SensorMultiplexer;
 use tracing::{error, info, warn};
 
 use super::cli::Cli;
-use super::evidence::{attest_degraded, AuditHandle};
+use super::evidence::{AuditHandle, attest_degraded};
 
 /// What [`load`] loaded.
 pub(crate) struct Policy {
@@ -87,7 +87,7 @@ pub(crate) fn load(
     // blocklisted destination, before the late programs are registered as
     // the agent's own (below). A failure leaves it off: NN-L-NET-001 still
     // kills at the connect. Detect-only never arms it (review A.1).
-    use northnarrow_agent::sensors::connect_deny::{arming, Arming};
+    use northnarrow_agent::sensors::connect_deny::{Arming, arming};
     let connect_deny = arming(cli.net_connect_deny, detect_only);
     if connect_deny == Arming::DetectOnly {
         warn!(

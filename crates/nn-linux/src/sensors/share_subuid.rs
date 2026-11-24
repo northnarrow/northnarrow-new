@@ -53,11 +53,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::MapData;
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
-use common::wire::execq::{subuid_row, OVERFLOW_SHARE, SUBUID_TRIE_MAX};
+use aya::maps::MapData;
+use aya::maps::lpm_trie::{Key, LpmTrie};
+use common::wire::execq::{OVERFLOW_SHARE, SUBUID_TRIE_MAX, subuid_row};
 use tracing::{info, warn};
 
 /// The trie (`agent-ebpf/src/task_scratch.rs`).
@@ -506,7 +506,7 @@ pub fn ensure(ebpf: &mut Ebpf) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::execq::{global_cap, share_admits, share_floor, share_key, ROOT_SUBID_SHARE};
+    use common::wire::execq::{ROOT_SUBID_SHARE, global_cap, share_admits, share_floor, share_key};
 
     const PASSWD_TEXT: &str = "root:x:0:0:root:/root:/bin/bash\n\
         www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\

@@ -156,10 +156,11 @@ fn a_valid_window_sanctions_a_stop_or_restart_of_the_agents_own_units() {
     if let Event::ProcessSpawn { timestamp_ns, .. } = &mut e {
         *timestamp_ns = 100 * S + 600;
     }
-    assert!(h
-        .det
-        .sanction_of(&e)
-        .is_some_and(|w| w.contains("c2e8f3da")));
+    assert!(
+        h.det
+            .sanction_of(&e)
+            .is_some_and(|w| w.contains("c2e8f3da"))
+    );
 }
 
 /// Case 2: a window past its deadline (or never armed) sanctions nothing:

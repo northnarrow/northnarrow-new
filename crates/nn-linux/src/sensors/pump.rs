@@ -25,14 +25,14 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tracing::error;
 
-use crate::sensors::bus::{BusSender, SendError, BATCH_MAX};
+use crate::sensors::bus::{BATCH_MAX, BusSender, SendError};
 use crate::sensors::reject::RejectThrottle;
 
 /// How long a pump's `poll(2)` waits before it looks at its stop flag: the

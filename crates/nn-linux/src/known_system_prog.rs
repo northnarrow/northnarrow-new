@@ -44,7 +44,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use common::bpf_prog_class::{
-    known_system_program, KnownLink, SeenLoad, ATTACH_LSM_MAC, KNOWN_SYSTEM_PROGRAMS,
+    ATTACH_LSM_MAC, KNOWN_SYSTEM_PROGRAMS, KnownLink, SeenLoad, known_system_program,
 };
 
 use crate::posture::lineage::{AsOf, AuthSessionTracker};
@@ -357,7 +357,7 @@ pub fn known_probe(
     pid: u32,
     prog_type: u32,
 ) -> Result<usize, String> {
-    use common::bpf_prog_class::{known_system_probe, KNOWN_SYSTEM_PROBES};
+    use common::bpf_prog_class::{KNOWN_SYSTEM_PROBES, known_system_probe};
     let image = image.ok_or_else(|| {
         format!("pid {pid}: no exec of it recorded with its image as of the load")
     })?;
@@ -1025,39 +1025,45 @@ mod tests {
         assert!(known_reattach(&good, &refs, &|_: &str| None, &accounts).is_err());
         assert!(known_reattach(&good, &refs, &packaged, &|_: &str| None).is_err());
         // no image recorded and no packaged file: never equal
-        assert!(known_reattach(
-            &ReattachFacts {
-                image: None,
-                ..good.clone()
-            },
-            &refs,
-            &|_: &str| None,
-            &accounts
-        )
-        .is_err());
+        assert!(
+            known_reattach(
+                &ReattachFacts {
+                    image: None,
+                    ..good.clone()
+                },
+                &refs,
+                &|_: &str| None,
+                &accounts
+            )
+            .is_err()
+        );
         // a reference of tag 0 (none is kept) proves no unread program
-        assert!(known_reattach(
-            &ReattachFacts {
-                tag: 0,
-                ..good.clone()
-            },
-            &[(0, 0)],
-            &packaged,
-            &accounts
-        )
-        .is_err());
+        assert!(
+            known_reattach(
+                &ReattachFacts {
+                    tag: 0,
+                    ..good.clone()
+                },
+                &[(0, 0)],
+                &packaged,
+                &accounts
+            )
+            .is_err()
+        );
         // a reference naming an entry not of the root's slot (PID 1's) proves
         // nothing
-        assert!(known_reattach(
-            &ReattachFacts {
-                tag: 0x1111,
-                ..good.clone()
-            },
-            &[(1, 0x1111)],
-            &packaged,
-            &accounts
-        )
-        .is_err());
+        assert!(
+            known_reattach(
+                &ReattachFacts {
+                    tag: 0x1111,
+                    ..good.clone()
+                },
+                &[(1, 0x1111)],
+                &packaged,
+                &accounts
+            )
+            .is_err()
+        );
         // PID 1's entry is no root program's, whatever facts match it (its
         // loader, its account, an empty unit)
         let pid1 = ReattachFacts {
@@ -1394,24 +1400,28 @@ mod tests {
         // the file at the path is not the one it ran (replaced, a copy
         // bind-mounted over it in its namespace)
         let other = |_: &str| Some((0x801, 999));
-        assert!(bpftool_listing(
-            Some(tool),
-            Some(IMG),
-            Some(0),
-            &argv_of(&["bpftool", "prog", "show"]),
-            &other,
-            (2, 48)
-        )
-        .is_err());
-        assert!(bpftool_listing(
-            None,
-            Some(IMG),
-            Some(0),
-            &argv_of(&["bpftool", "prog", "show"]),
-            &packaged,
-            (2, 48)
-        )
-        .is_err());
+        assert!(
+            bpftool_listing(
+                Some(tool),
+                Some(IMG),
+                Some(0),
+                &argv_of(&["bpftool", "prog", "show"]),
+                &other,
+                (2, 48)
+            )
+            .is_err()
+        );
+        assert!(
+            bpftool_listing(
+                None,
+                Some(IMG),
+                Some(0),
+                &argv_of(&["bpftool", "prog", "show"]),
+                &packaged,
+                (2, 48)
+            )
+            .is_err()
+        );
         assert!(is_bpftool_path(
             "/usr/lib/linux-tools/6.8.0-149-generic/bpftool"
         ));
@@ -1623,16 +1633,18 @@ mod tests {
         // loaded at the agent's very start: not before it
         assert!(ok(&[networkd(631, 7 * S)], &monitor(20 * S), None).is_err());
         // the agent's start unknown: nothing is before it
-        assert!(judge(
-            35,
-            ROOT,
-            Some(&monitor(8 * S)),
-            &[networkd(631, 7 * S)],
-            &pkg,
-            None,
-            None
-        )
-        .is_err());
+        assert!(
+            judge(
+                35,
+                ROOT,
+                Some(&monitor(8 * S)),
+                &[networkd(631, 7 * S)],
+                &pkg,
+                None,
+                None
+            )
+            .is_err()
+        );
         // a seen load by another process, before the start: still not known
         assert!(ok(&[networkd(631, 7 * S)], &monitor(8 * S), Some(&seen_by(42))).is_err());
         // another name, another type, no record
@@ -1640,24 +1652,28 @@ mod tests {
             name: "sysctl_monitox".into(),
             ..monitor(8 * S)
         };
-        assert!(ok(&[networkd(631, 7 * S)], &renamed, None)
-            .unwrap_err()
-            .contains("is no known system program"));
+        assert!(
+            ok(&[networkd(631, 7 * S)], &renamed, None)
+                .unwrap_err()
+                .contains("is no known system program")
+        );
         let skb = Program {
             prog_type: 8,
             ..monitor(8 * S)
         };
         assert!(ok(&[networkd(631, 7 * S)], &skb, None).is_err());
-        assert!(judge(
-            35,
-            ROOT,
-            None,
-            &[networkd(631, 7 * S)],
-            &pkg,
-            Some(20 * S),
-            None
-        )
-        .is_err());
+        assert!(
+            judge(
+                35,
+                ROOT,
+                None,
+                &[networkd(631, 7 * S)],
+                &pkg,
+                Some(20 * S),
+                None
+            )
+            .is_err()
+        );
         // the LSM entry: another attach function, the root's link kind, a
         // holder that is not PID 1's packaged systemd
         let elsewhere = Program {
@@ -1690,14 +1706,16 @@ mod tests {
         .unwrap_err();
         assert!(e.contains("is no known system program"), "{e}");
         assert!(judge_on_host(u32::MAX, ROOT, Some(&monitor(1)), Some(u64::MAX), None).is_err());
-        assert!(judge_on_host(
-            u32::MAX,
-            KnownLink::Lsm,
-            Some(&restrict_fs(1)),
-            Some(u64::MAX),
-            None
-        )
-        .is_err());
+        assert!(
+            judge_on_host(
+                u32::MAX,
+                KnownLink::Lsm,
+                Some(&restrict_fs(1)),
+                Some(u64::MAX),
+                None
+            )
+            .is_err()
+        );
         let e = judge_on_host(u32::MAX, ROOT, None, Some(u64::MAX), None).unwrap_err();
         assert!(e.contains("not in the BPF enumeration"), "{e}");
         assert!(agent_start_ns().is_some());
@@ -2107,15 +2125,16 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("is no known system program"), "{e}");
         // the LSM kind: no such link there
-        assert!(host
-            .judge(
+        assert!(
+            host.judge(
                 35,
                 KnownLink::Lsm,
                 Some(&restrict_fs(8 * S)),
                 Some(20 * S),
                 None
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     /// Lot 311 (N6): a loader whose `comm` is not UTF-8 has its real uid

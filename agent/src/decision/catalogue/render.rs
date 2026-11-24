@@ -14,11 +14,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{RuleDoc, FAMILIES};
-use crate::decision::attack::{AttackRef, Tactic, ATTACK_IDS_FILE, ATTACK_VERSION};
-use crate::decision::{rules, Rule};
+use super::{FAMILIES, RuleDoc};
+use crate::decision::attack::{ATTACK_IDS_FILE, ATTACK_VERSION, AttackRef, Tactic};
+use crate::decision::{Rule, rules};
 use crate::detection_payload::Sensor;
 
 /// The generated documents, relative to the repository root.

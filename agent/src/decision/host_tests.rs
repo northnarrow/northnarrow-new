@@ -9,8 +9,8 @@
 
 use nn_model::{Event, ResponseAction};
 
-use super::rules::testutil::spawn_as;
 use super::RuleEngine;
+use super::rules::testutil::spawn_as;
 
 const SEC: u64 = 1_000_000_000;
 
@@ -225,8 +225,8 @@ mod installer_window {
 
     use nn_model::{Event, ResponseAction, Severity, Verdict};
 
-    use crate::decision::rules::evasion::evasion_rules;
     use crate::decision::Rule;
+    use crate::decision::rules::evasion::evasion_rules;
     use crate::impair::{DefenseDetector, SecurityTools};
     use crate::posture::lineage::AuthSessionTracker;
 

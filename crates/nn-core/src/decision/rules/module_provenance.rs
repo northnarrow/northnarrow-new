@@ -465,9 +465,11 @@ mod tests {
         )
         .unwrap();
         let owners = ModuleOwners::new(d.path());
-        assert!(owners
-            .read_dpkg_module_paths()
-            .contains("/lib/modules/6.8.0/kernel/drivers/x.ko.zst"));
+        assert!(
+            owners
+                .read_dpkg_module_paths()
+                .contains("/lib/modules/6.8.0/kernel/drivers/x.ko.zst")
+        );
     }
 }
 

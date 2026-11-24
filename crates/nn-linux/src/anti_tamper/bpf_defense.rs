@@ -351,7 +351,11 @@ pub(crate) fn attach(
             }
             Err(e) => {
                 dump_verifier_log(PROG_LOAD_GUARD_PROGRAM, &e);
-                warn!(program = PROG_LOAD_GUARD_PROGRAM, error = format!("{e:#}"), "BPF self-defence: content judge at the load NOT attached — judged at the handle instead");
+                warn!(
+                    program = PROG_LOAD_GUARD_PROGRAM,
+                    error = format!("{e:#}"),
+                    "BPF self-defence: content judge at the load NOT attached — judged at the handle instead"
+                );
                 health
                     .observe_failures
                     .push((PROG_LOAD_GUARD_PROGRAM, format!("{e:#}")));
@@ -395,7 +399,12 @@ pub(crate) fn attach(
         ),
         Err(e) => {
             dump_verifier_log(OBSERVE_PROGRAM, &e);
-            warn!(program = OBSERVE_PROGRAM, hook = OBSERVE_HOOK, error = format!("{e:#}"), "BPF self-defence: bpf() observer attach FAILED — foreign BPF activity not reported");
+            warn!(
+                program = OBSERVE_PROGRAM,
+                hook = OBSERVE_HOOK,
+                error = format!("{e:#}"),
+                "BPF self-defence: bpf() observer attach FAILED — foreign BPF activity not reported"
+            );
             health
                 .observe_failures
                 .push((OBSERVE_PROGRAM, format!("{e:#}")));
@@ -422,7 +431,12 @@ pub(crate) fn attach(
         ),
         Err(e) => {
             dump_verifier_log(PROG_GUARD_PROGRAM, &e);
-            warn!(program = PROG_GUARD_PROGRAM, hook = PROG_GUARD_HOOK, error = format!("{e:#}"), "BPF self-defence: program-handle guard attach FAILED — handles on the agent's programs not refused, loads not seen");
+            warn!(
+                program = PROG_GUARD_PROGRAM,
+                hook = PROG_GUARD_HOOK,
+                error = format!("{e:#}"),
+                "BPF self-defence: program-handle guard attach FAILED — handles on the agent's programs not refused, loads not seen"
+            );
             health
                 .observe_failures
                 .push((PROG_GUARD_PROGRAM, format!("{e:#}")));
@@ -595,8 +609,7 @@ impl ContentJudge {
 
 /// The review of #553 (F4): what a content judge that is not armed costs —
 /// said in its observe failure (a signed degradation).
-pub const OPT_OUTS_SUSPENDED: &str =
-    "the bpf-loader-allow opt-outs are suspended: their types are \
+pub const OPT_OUTS_SUSPENDED: &str = "the bpf-loader-allow opt-outs are suspended: their types are \
      refused to every loader outside a window again, until a start arms the judge";
 
 /// Lot 345 (before 6.9): calibrate the content judge — load each of the
@@ -1084,7 +1097,7 @@ pub(crate) fn register_own_objects(
             Err(aya::programs::ProgramError::NotLoaded) => {}
             Err(e) => {
                 return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("reading own program {name}"))
+                    .with_context(|| format!("reading own program {name}"));
             }
         }
     }
@@ -1321,7 +1334,7 @@ pub fn freeze_named(ebpf: &Ebpf, name: &str) -> std::result::Result<bool, String
 /// says it is frozen already (a frozen map answers `EPERM`, not `EBUSY`:
 /// lot 281's lab). `Ok(true)` frozen now, `Ok(false)` it was.
 pub fn freeze_map(map: &MapData) -> std::result::Result<bool, String> {
-    use crate::cgroup_join::{fdinfo_frozen, freeze_outcome, Freeze};
+    use crate::cgroup_join::{Freeze, fdinfo_frozen, freeze_outcome};
     const MAP_FREEZE: libc::c_long = common::bpf_cmd::BPF_MAP_FREEZE as libc::c_long;
     #[repr(C)]
     struct FreezeAttr {
@@ -1520,7 +1533,7 @@ pub fn register_late_objects(guard: &BpfGuard, ebpf: &mut Ebpf) -> Result<usize>
             Err(aya::programs::ProgramError::NotLoaded) => {}
             Err(e) => {
                 return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("reading own program {name}"))
+                    .with_context(|| format!("reading own program {name}"));
             }
         }
     }
@@ -1582,7 +1595,7 @@ pub fn write_own_prog_ids(ebpf: &Ebpf, path: &Path) -> Result<usize> {
             Err(aya::programs::ProgramError::NotLoaded) => {}
             Err(e) => {
                 return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("reading own program {name}"))
+                    .with_context(|| format!("reading own program {name}"));
             }
         }
     }
@@ -2129,10 +2142,10 @@ impl BpfGuard {
                         continue;
                     }
                     error!(
-                    link_id = id,
-                    "ANTI-TAMPER: one of the agent's own BPF links is GONE — an LSM hook or sensor was \
+                        link_id = id,
+                        "ANTI-TAMPER: one of the agent's own BPF links is GONE — an LSM hook or sensor was \
                      detached from outside the agent"
-                );
+                    );
                     if let Some(log) = &audit_log {
                         let draft = AuditEntryDraft {
                             op: LINK_MISSING_AUDIT_OP.to_string(),
@@ -2262,15 +2275,21 @@ mod tests {
         let own: HashSet<u32> = [7u32, 9].into_iter().collect();
         let maps: HashSet<u32> = [4u32].into_iter().collect();
         assert_eq!(pinned_owner(&Ok(BpfObj::Link(3, 7)), &maps, &own), Ok(()));
-        assert!(pinned_owner(&Err("not a BPF link".into()), &maps, &own)
-            .unwrap_err()
-            .contains("not a BPF link"));
-        assert!(pinned_owner(&Ok(BpfObj::Link(3, 0)), &maps, &own)
-            .unwrap_err()
-            .contains("detached"));
-        assert!(pinned_owner(&Ok(BpfObj::Link(3, 8)), &maps, &own)
-            .unwrap_err()
-            .contains("program 8, not one of the agent's"));
+        assert!(
+            pinned_owner(&Err("not a BPF link".into()), &maps, &own)
+                .unwrap_err()
+                .contains("not a BPF link")
+        );
+        assert!(
+            pinned_owner(&Ok(BpfObj::Link(3, 0)), &maps, &own)
+                .unwrap_err()
+                .contains("detached")
+        );
+        assert!(
+            pinned_owner(&Ok(BpfObj::Link(3, 8)), &maps, &own)
+                .unwrap_err()
+                .contains("program 8, not one of the agent's")
+        );
 
         let bpffs = tempfile::tempdir().unwrap();
         let root = bpffs.path().join("northnarrow");
@@ -2285,15 +2304,18 @@ mod tests {
         assert!(pins.links.is_empty(), "no planted entry is registered");
         assert!(pins.names.is_empty(), "no planted name is registered");
         assert_eq!(pins.foreign.len(), 72, "{:?}", pins.foreign);
-        assert!(pins
-            .foreign
-            .iter()
-            .any(|f| f.contains("link_x: not openable as a BPF object")));
+        assert!(
+            pins.foreign
+                .iter()
+                .any(|f| f.contains("link_x: not openable as a BPF object"))
+        );
         assert!(pins.foreign.iter().any(|f| f.contains("prog_task_kill")));
         assert!(!pins.foreign.iter().any(|f| f.contains("link_dir")));
-        assert!(split_pins(&PinWalk::default(), &maps, &own)
-            .foreign
-            .is_empty());
+        assert!(
+            split_pins(&PinWalk::default(), &maps, &own)
+                .foreign
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2502,11 +2524,13 @@ mod tests {
         let walk = walk_pins(&own_pin_dirs(&root), &open);
         let paths: Vec<&PathBuf> = walk.entries.iter().map(|e| &e.path).collect();
         assert_eq!(paths, [&root.join("a/b/c/d/at_four"), &deep], "{paths:?}");
-        assert!(walk.entries[1]
-            .obj
-            .as_ref()
-            .unwrap_err()
-            .contains("not walked"));
+        assert!(
+            walk.entries[1]
+                .obj
+                .as_ref()
+                .unwrap_err()
+                .contains("not walked")
+        );
         let flood = bpffs.path().join("northnarrow-flood");
         std::fs::create_dir(&flood).unwrap();
         for i in 0..=PIN_WALK_MAX {
@@ -2521,9 +2545,11 @@ mod tests {
 
     #[test]
     fn observe_is_a_deny_shortfall_in_production_builds() {
-        assert!(observe_shortfall(false, false)
-            .unwrap()
-            .contains("observe mode"));
+        assert!(
+            observe_shortfall(false, false)
+                .unwrap()
+                .contains("observe mode")
+        );
         assert_eq!(
             observe_shortfall(false, true),
             None,
@@ -2677,9 +2703,11 @@ mod tests {
     fn every_own_link_pin_name_is_matched_in_every_spelling() {
         let names = own_link_pin_names();
         assert!(names.len() >= 40, "only {} names read", names.len());
-        assert!(names
-            .iter()
-            .any(|n| n == "link_cgroup_subtree_control_write"));
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "link_cgroup_subtree_control_write")
+        );
         assert!(names.iter().any(|n| n.len() > PIN_NAME_LEN));
         let mut keys = std::collections::HashMap::new();
         for name in &names {
@@ -2750,10 +2778,12 @@ mod tests {
             crate::cgroup_join::is_kept_program,
         );
         let mut lines = body.lines();
-        assert!(lines
-            .next()
-            .unwrap()
-            .starts_with("# northnarrow-agent pid 4242"));
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("# northnarrow-agent pid 4242")
+        );
         let ids: Vec<u32> = body
             .lines()
             .filter_map(|l| l.split_whitespace().next())

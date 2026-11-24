@@ -38,19 +38,19 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nn_proto::ipc::{
-    check_hello, check_response, decode, encode, Answer, Expected, FromWorker, Request,
-    SandboxLevel, ToWorker, Violation, WorkerHello, WorkerKind, MAX_FRAME,
+    Answer, Expected, FromWorker, MAX_FRAME, Request, SandboxLevel, ToWorker, Violation,
+    WorkerHello, WorkerKind, check_hello, check_response, decode, encode,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use super::serve::{EXIT_PROTOCOL, EXIT_SANDBOX, EXIT_USAGE};
-use super::spawn::{spawn, Spawned};
+use super::spawn::{Spawned, spawn};
 use super::transport::{self, Recv};
 use super::{SelfImage, WorkerAccount};
 
@@ -739,7 +739,7 @@ impl Workers {
                 let hello = match decode::<FromWorker>(&s.buf[..n]) {
                     Ok(FromWorker::Hello(h)) => h,
                     Ok(FromWorker::Response(_)) => {
-                        return self.violation(kind, s, Violation::Hello("not first".into()))
+                        return self.violation(kind, s, Violation::Hello("not first".into()));
                     }
                     Err(v) => return self.violation(kind, s, v),
                 };
@@ -794,7 +794,7 @@ impl Workers {
             Ok(Recv::Packet(_)) => return self.violation(kind, s, Violation::Unsolicited),
             Ok(Recv::Refused(v)) => return self.violation(kind, s, v),
             Ok(Recv::Closed) | Err(_) => {
-                return self.fail(kind, s, Fault::Died, "closed its channel")
+                return self.fail(kind, s, Fault::Died, "closed its channel");
             }
         }
         if s.ready_at.is_some_and(|t| now.duration_since(t) >= STABLE) && s.failures > 0 {
@@ -1514,11 +1514,7 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
 fn clock_ticks() -> f64 {
     // SAFETY: sysconf has no preconditions.
     let t = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if t > 0 {
-        t as f64
-    } else {
-        100.0
-    }
+    if t > 0 { t as f64 } else { 100.0 }
 }
 
 /// An exit status in words, with the worker's own codes named.

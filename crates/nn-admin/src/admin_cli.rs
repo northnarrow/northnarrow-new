@@ -22,17 +22,17 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use nn_model::posture_types::PostureKind;
 use nn_proto::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
-    CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
-    ShutdownRequest, StatusRequest,
+    AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest, CanaryListRequest,
+    CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature, ShutdownRequest,
+    StatusRequest, decode_frame, encode_frame,
 };
-use nn_proto::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
+use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload, sign};
 
 use crate::agent_id::{self, AGENT_ID_LEN};
 use crate::host::{AdminHost, Chains};
@@ -3371,9 +3371,9 @@ pub fn read_overlay_for_signing<H: AdminHost>(
 }
 
 fn sign_all(payload: &SignedPayload, key: &Path, cosign: Option<&Path>) -> Result<Vec<[u8; 64]>> {
-    let mut out =
-        vec![sign(payload, &read_priv_key(key)?)
-            .map_err(|e| anyhow!("signing overlay payload: {e}"))?];
+    let mut out = vec![
+        sign(payload, &read_priv_key(key)?).map_err(|e| anyhow!("signing overlay payload: {e}"))?,
+    ];
     if let Some(c) = cosign {
         out.push(
             sign(payload, &read_priv_key(c)?)
@@ -3709,7 +3709,7 @@ mod tests {
     #[test]
     fn cli_unlock_happy_path() {
         use nn_proto::admin_protocol::SignedUnlockResponse;
-        use nn_proto::admin_signed_payload::{verify, OperationCode};
+        use nn_proto::admin_signed_payload::{OperationCode, verify};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
@@ -3858,7 +3858,7 @@ mod tests {
     /// the signature + the signed window.
     #[test]
     fn cli_trusted_installer_grant_happy_path() {
-        use nn_proto::admin_signed_payload::{signing_digest, OperationExtra};
+        use nn_proto::admin_signed_payload::{OperationExtra, signing_digest};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
@@ -4832,12 +4832,16 @@ mod tests {
         assert!(!line.contains("NOT"), "{line}");
         // another key: said so
         let other = SigningKey::from_bytes(&[6; 32]).verifying_key();
-        assert!(last_refused_start(&log, Some(&other))
-            .unwrap()
-            .contains("does NOT verify"));
-        assert!(last_refused_start(&log, None)
-            .unwrap()
-            .contains("not checked"));
+        assert!(
+            last_refused_start(&log, Some(&other))
+                .unwrap()
+                .contains("does NOT verify")
+        );
+        assert!(
+            last_refused_start(&log, None)
+                .unwrap()
+                .contains("not checked")
+        );
         // a later row that is no start does not hide it
         std::fs::write(
             &log,
@@ -4933,9 +4937,11 @@ mod tests {
             line.contains("its signature verifies") && line.contains("NOT linked"),
             "{line}"
         );
-        assert!(last_refused_start(&log, None)
-            .unwrap()
-            .contains("NOT linked"));
+        assert!(
+            last_refused_start(&log, None)
+                .unwrap()
+                .contains("NOT linked")
+        );
         let c = chained(
             &k,
             &[

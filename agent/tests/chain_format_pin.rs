@@ -28,17 +28,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use northnarrow_agent::audit::{
-    read_signing_key, verify_chain_file, verify_entry, AgentSigningKey, AuditEntry,
-    AuditEntryDraft, AuditLog,
+    AgentSigningKey, AuditEntry, AuditEntryDraft, AuditLog, read_signing_key, verify_chain_file,
+    verify_entry,
 };
 use northnarrow_agent::chain_anchor::{
-    is_canonical, AnchoredHead, FileHead, HeadsSnapshot, HeadsStore,
+    AnchoredHead, FileHead, HeadsSnapshot, HeadsStore, is_canonical,
 };
 use northnarrow_agent::chainlog::{
-    verify_log_set, ChainPayload, NoProtection, RotatingChainLog, RotationConfig,
+    ChainPayload, NoProtection, RotatingChainLog, RotationConfig, verify_log_set,
 };
 use serde::{Deserialize, Serialize};
 

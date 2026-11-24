@@ -8,8 +8,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
 use nn_proto::execq::{
-    decode, encode, encode_config, FromScanner, HashEntry, ScanConfig, ScanRequest, ScanVerdict,
-    ToScanner, MAX_PACKET, PROTOCOL_VERSION,
+    FromScanner, HashEntry, MAX_PACKET, PROTOCOL_VERSION, ScanConfig, ScanRequest, ScanVerdict,
+    ToScanner, decode, encode, encode_config,
 };
 use northnarrow_scan::ipc;
 use sha2::{Digest, Sha256};

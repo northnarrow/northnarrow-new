@@ -451,10 +451,12 @@ fn our_lsm_names_are_the_ebpf_objects_as_the_kernel_keeps_them() {
     let names = common::our_bpf::lsm_names();
     assert!(names.len() >= 55, "{names:?}");
     assert!(names.contains("task_kill") && names.contains("mount_guard_sb_"));
-    assert!(names
-        .iter()
-        .all(|n| n.len() <= common::our_bpf::KERNEL_NAME_LEN
-            && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')));
+    assert!(
+        names
+            .iter()
+            .all(|n| n.len() <= common::our_bpf::KERNEL_NAME_LEN
+                && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    );
     assert!(!names.contains("restrict_filesy"));
 }
 

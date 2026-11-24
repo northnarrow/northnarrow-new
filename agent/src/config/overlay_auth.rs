@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, OverlayKind, Role};
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
@@ -46,10 +46,10 @@ use crate::chain_host_linux::LinuxHost;
 // nn-admin writes the file (`config overlay sign`) and reads the decision
 // (`config overlay status`, `policy show`) without naming the agent.
 pub use nn_core::config::overlay_auth::{
-    content_sha256, read_overlay, sig_path, Decision, OverlaySignature, Verified,
-    ALLOW_UNSIGNED_ENV, MAX_OVERLAY_BYTES, SIG_SUFFIX,
+    ALLOW_UNSIGNED_ENV, Decision, MAX_OVERLAY_BYTES, OverlaySignature, SIG_SUFFIX, Verified,
+    content_sha256, read_overlay, sig_path,
 };
-use nn_core::config::overlay_auth::{hex, Vouch};
+use nn_core::config::overlay_auth::{Vouch, hex};
 
 /// Audit op of an overlay accepted at boot with a content not yet in the chain.
 pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
@@ -271,7 +271,7 @@ impl OverlayGate {
         let bytes = match read_overlay::<LinuxHost>(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (Decision::Absent, Read::Missing)
+                return (Decision::Absent, Read::Missing);
             }
             Err(e) => {
                 let refused = Decision::Refused {
@@ -322,11 +322,11 @@ impl OverlayGate {
                     return refuse(format!(
                         "malformed signature file {}: {e}",
                         sig_file.display()
-                    ))
+                    ));
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return refuse(format!("no signature file {}", sig_file.display()))
+                return refuse(format!("no signature file {}", sig_file.display()));
             }
             Err(e) => return refuse(format!("signature file unreadable: {e}")),
         };
@@ -756,7 +756,7 @@ mod tests {
     /// signed text the export cannot use failed (refused at `set` already).
     #[test]
     fn the_export_loads_only_a_verified_text() {
-        use crate::export::{load_from, Loaded};
+        use crate::export::{Loaded, load_from};
         let (dir, key, admin_pub) = setup("config-manage");
         let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
         let none = dir.path().join(OverlayKind::Export.file_name());
@@ -1125,11 +1125,13 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("line 1") && e.contains("/0"), "{e}");
-        assert!(validate_content(
-            OverlayKind::EscalationAllow,
-            "exfil * 140.82.112.0/20 443\n"
-        )
-        .is_ok());
+        assert!(
+            validate_content(
+                OverlayKind::EscalationAllow,
+                "exfil * 140.82.112.0/20 443\n"
+            )
+            .is_ok()
+        );
         assert!(
             validate_content(OverlayKind::ProcessCommAllowlist, "# comment\n+backupd\n").is_ok()
         );
@@ -1145,8 +1147,8 @@ mod tests {
     fn the_sysctl_opt_out_is_honoured_only_with_a_valid_signature() {
         use crate::decision::rule_policy::boot_policy;
         use common::cgroup_limits::SYSCTL_SCHED_RT_RUNTIME as RT;
-        use common::sysctl_judge::{sysctl_kernel_verdict, SysctlVerdict};
-        use nn_linux::sysctl_cgroup::{opt_out_for, opt_outs_of, set_opt_outs, Applied};
+        use common::sysctl_judge::{SysctlVerdict, sysctl_kernel_verdict};
+        use nn_linux::sysctl_cgroup::{Applied, opt_out_for, opt_outs_of, set_opt_outs};
         let body = "sysctl-allow kernel.sched_rt_runtime_us -1\nenforce R020\n";
         // what the start does: the gate's text, and whether it signs it
         let start = |gate: &OverlayGate, p: &Path| match gate.verified(OverlayKind::RulePolicy, p) {
@@ -1205,7 +1207,7 @@ mod tests {
     /// with a degradation.
     #[test]
     fn the_rule_policy_is_signed_like_every_overlay() {
-        use crate::decision::rule_policy::{boot_policy, Mode};
+        use crate::decision::rule_policy::{Mode, boot_policy};
         const IMP: &str = "NN-L-IMP-001_RansomwareEncryption";
         let body = "enforce NN-L-IMP-001\nexempt R020 uid 998\n";
         let boot = |gate: &OverlayGate, p: &Path| match gate.verified(OverlayKind::RulePolicy, p) {

@@ -12,9 +12,9 @@
 //! built where the posture decides: the episode opens with its cause and
 //! its offender, and every row names them.
 
-use nn_model::posture_types::{Confidence, EvidenceClass, TriggerType};
 use nn_model::Event;
-use serde_json::{json, Value};
+use nn_model::posture_types::{Confidence, EvidenceClass, TriggerType};
+use serde_json::{Value, json};
 
 use super::triggers;
 

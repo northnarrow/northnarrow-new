@@ -264,7 +264,7 @@ pub const CREDENTIAL_CONSUMER_EXES: &[&str] = &["/usr/sbin/exim4", "/usr/sbin/ex
 /// component) is a reader tool's ([`READER_TOOL_EXES`]), a shell's or an
 /// interpreter's (a version suffix allowed), busybox's (`busybox.static`).
 fn names_a_reader_tool(base: &str) -> bool {
-    use crate::decision::rules::program_identity::{program_is, INTERPRETERS, SHELLS};
+    use crate::decision::rules::program_identity::{INTERPRETERS, SHELLS, program_is};
     READER_TOOL_EXES.contains(&base)
         || base.starts_with("busybox")
         || SHELLS
@@ -2771,7 +2771,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             match found {
                 None => found = Some(e),
                 Some(f) if f.runs != e.runs || f.js_pm != e.js_pm || f.encrypts != e.encrypts => {
-                    return None
+                    return None;
                 }
                 Some(_) => {}
             }
@@ -4431,7 +4431,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                      authenticating above it: pid {child}, its child, is not the process it \
                      elevated (a program it runs as the user, as sudo -A's askpass, or \
                      before the credential check)"
-                ))
+                ));
             }
             // the review of #560 (A)
             (_, Some(Passed::RanByRoot(elevation))) => {
@@ -4439,7 +4439,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     "the sudo or su in its lineage (pid {elevation}) was run by a process \
                      already root (real uid 0, or its caller not known): no credential check \
                      stopped it, and no sudo or su above it elevated the session"
-                ))
+                ));
             }
             // the re-check 1 of #560 (H(b))
             (_, Some(Passed::NotHostImage(elevation))) => {
@@ -4448,7 +4448,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                      host's root-only directory in PID 1's mount namespace (a chroot's or a \
                      namespace's file at that path, or its image not known), and no sudo or su \
                      above it elevated the session"
-                ))
+                ));
             }
             (Some(WalkEnd::Root), None) => return Some("no sudo or su in its lineage".to_string()),
             (Some(WalkEnd::Cut), None) => {
@@ -4456,7 +4456,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
                     "its lineage is cut below any sudo or su (a parent started after its \
                      child, or the depth cap)"
                         .to_string(),
-                )
+                );
             }
             (None, None) => {
                 let lost = self.first_unread_hop(pid, as_of);
@@ -5816,7 +5816,7 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             Forked::Unconfirmed(e)
                 if self.staged_image_as(pid, as_of, &e.exe.to_string_lossy()) =>
             {
-                return Some(e.exe.to_string_lossy().into_owned())
+                return Some(e.exe.to_string_lossy().into_owned());
             }
             Forked::Unconfirmed(_) | Forked::No => {}
         }
@@ -6475,7 +6475,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use crate::posture::host::testing::{symlink, TestHost as H, TEST_OWNER};
+    use crate::posture::host::testing::{TEST_OWNER, TestHost as H, symlink};
 
     /// R08a (lab PR 250): the tracker on the portable test host.
     type AuthSessionTracker = super::AuthSessionTracker<H>;
@@ -8818,7 +8818,9 @@ mod tests {
         let py = ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3", "-c", "x"]));
         assert_eq!(py.runs, Runs::Code);
         assert!(!py.is_client(&["python3"]));
-        assert!(ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3"])).is_client(&["python3"]));
+        assert!(
+            ExecIdentity::of_exec("/usr/bin/python3", &a(&["python3"])).is_client(&["python3"])
+        );
         assert!(ExecIdentity::of_exec("/usr/bin/aws", &a(&["aws", "s3"])).is_client(&["aws"]));
     }
 
@@ -10896,7 +10898,9 @@ mod tests {
     fn an_installed_program_is_the_trees_exe_and_script() {
         let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a));
         assert!(id("/usr/sbin/nginx", &["nginx"]).is_installed_program());
-        assert!(id("/usr/bin/python3.12", &["python3", "/usr/bin/gunicorn"]).is_installed_program());
+        assert!(
+            id("/usr/bin/python3.12", &["python3", "/usr/bin/gunicorn"]).is_installed_program()
+        );
         for (exe, a) in [
             ("/tmp/backdoor", &["backdoor"][..]),
             (
@@ -11333,11 +11337,13 @@ mod tests {
         }
         assert_eq!(id("/usr/bin/bash", &["bash"]).runs, Runs::Inline);
         // a script `-e` names is installed only from a system tree
-        assert!(id(
-            "/bin/sh",
-            &["/bin/sh", "-e", "/usr/lib/dpkg/info/foo.postinst"]
-        )
-        .is_installed_program());
+        assert!(
+            id(
+                "/bin/sh",
+                &["/bin/sh", "-e", "/usr/lib/dpkg/info/foo.postinst"]
+            )
+            .is_installed_program()
+        );
         assert!(!id("/usr/bin/bash", &["bash", "-e", "/tmp/enc.sh"]).is_client(&["bash"]));
     }
 

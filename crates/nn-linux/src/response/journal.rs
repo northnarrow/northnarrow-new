@@ -48,8 +48,8 @@
 //! actuator is given no capability for it.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::{Mutex, MutexGuard};
@@ -57,8 +57,8 @@ use rand::Rng;
 use tracing::{error, warn};
 
 pub use nn_evidence::action_payload::{
-    unanswered_intents, ActionIntent, ActionOutcome, ActionOverflow, ActionRecord, ActionResult,
-    ActionRow, OVERFLOW_SAMPLES,
+    ActionIntent, ActionOutcome, ActionOverflow, ActionRecord, ActionResult, ActionRow,
+    OVERFLOW_SAMPLES, unanswered_intents,
 };
 use nn_evidence::clock::{Clock, SystemClock};
 use nn_model::log_escape::Escaped;

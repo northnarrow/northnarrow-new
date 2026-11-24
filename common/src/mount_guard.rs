@@ -1418,7 +1418,9 @@ pub const fn reach_of(target_dev: u64) -> u8 {
 /// The reach's words in a record.
 pub const fn reach_name(reach: u8) -> &'static str {
     match reach {
-        REACH_OTHER_NS => "made in another mount namespace whose change reaches PID 1's, the agent's or the watchdog's (a peer or a master of one of its mounts, or more peers or slaves than the hook reads)",
+        REACH_OTHER_NS => {
+            "made in another mount namespace whose change reaches PID 1's, the agent's or the watchdog's (a peer or a master of one of its mounts, or more peers or slaves than the hook reads)"
+        }
         REACH_AGENT_NS => "made in the agent's own mount namespace",
         REACH_WATCHDOG_NS => "made in the watchdog's own mount namespace",
         _ => "made in PID 1's mount namespace",
@@ -1445,9 +1447,13 @@ pub const fn op_name(op: u8) -> &'static str {
         MG_OP_MOVE_MOUNT => "move_mount(2)",
         MG_OP_UMOUNT => "umount(2)",
         MG_OP_PIVOT => "pivot_root(2)",
-        MG_OP_REMOUNT => "remount of a super block (mount(2) MS_REMOUNT, or fsconfig(2) FSCONFIG_CMD_RECONFIGURE)",
+        MG_OP_REMOUNT => {
+            "remount of a super block (mount(2) MS_REMOUNT, or fsconfig(2) FSCONFIG_CMD_RECONFIGURE)"
+        }
         MG_OP_REMOUNT_BIND => "mount(2) -o remount,bind",
-        MG_OP_PROPAGATE => "a change of propagation (mount(2) MS_SHARED, MS_PRIVATE, MS_SLAVE or MS_UNBINDABLE)",
+        MG_OP_PROPAGATE => {
+            "a change of propagation (mount(2) MS_SHARED, MS_PRIVATE, MS_SLAVE or MS_UNBINDABLE)"
+        }
         _ => "mount operation",
     }
 }
@@ -1455,17 +1461,29 @@ pub const fn op_name(op: u8) -> &'static str {
 /// The reason's words in a record.
 pub const fn why_name(why: u8) -> &'static str {
     match why {
-        MG_WHY_ON => "on or over a protected point (a kernel view, the agent's directories, binaries or units, or a directory above them)",
+        MG_WHY_ON => {
+            "on or over a protected point (a kernel view, the agent's directories, binaries or units, or a directory above them)"
+        }
         MG_WHY_BELOW_OWN => "below one of the agent's own directories",
-        MG_WHY_BELOW_VIEW => "below a kernel view (/proc, /sys, the cgroup root, the bpffs), and not the kernel's own pseudo-filesystem at its canonical point",
-        MG_WHY_MOVE_OLD => "a move through mount(2)'s MS_MOVE in the host's namespace, whose source the kernel hook sees only as the caller's string (move_mount(2) is judged by the mount itself)",
+        MG_WHY_BELOW_VIEW => {
+            "below a kernel view (/proc, /sys, the cgroup root, the bpffs), and not the kernel's own pseudo-filesystem at its canonical point"
+        }
+        MG_WHY_MOVE_OLD => {
+            "a move through mount(2)'s MS_MOVE in the host's namespace, whose source the kernel hook sees only as the caller's string (move_mount(2) is judged by the mount itself)"
+        }
         MG_WHY_MOVE_AWAY => "a protected mount moved away",
         MG_WHY_UMOUNT => "a protected mount unmounted",
         MG_WHY_PIVOT => "the root pivoted in the host's namespace",
-        MG_WHY_REMOUNT_SB => "the super block of a kernel view or of a file system the agent's paths are on, reconfigured (proc's subset=pid or hidepid hide what the agent reads; a read-only state file system refuses its writes)",
+        MG_WHY_REMOUNT_SB => {
+            "the super block of a kernel view or of a file system the agent's paths are on, reconfigured (proc's subset=pid or hidepid hide what the agent reads; a read-only state file system refuses its writes)"
+        }
         MG_WHY_REMOUNT_RESTRICT => "a mount that holds the agent's paths made read-only or noexec",
-        MG_WHY_UMOUNT_NOTED => "an unmount of a kernel file system the agent reads (the tracefs, debugfs or securityfs), let through and recorded",
-        MG_WHY_LOCK => "the lock of the agent's pin directory (its self-bind, private and unbindable, under the host's bpffs) changed: only its maker's own steps pass",
+        MG_WHY_UMOUNT_NOTED => {
+            "an unmount of a kernel file system the agent reads (the tracefs, debugfs or securityfs), let through and recorded"
+        }
+        MG_WHY_LOCK => {
+            "the lock of the agent's pin directory (its self-bind, private and unbindable, under the host's bpffs) changed: only its maker's own steps pass"
+        }
         _ => "a mount refused",
     }
 }
@@ -2159,12 +2177,12 @@ mod tests {
         let mut cut = [0u8; 16];
         cut[..15].copy_from_slice(b"0123456789abcde");
         assert!(!a.matches(&NameKey::from_parts(16, &cut)));
-        assert!(ALLOWED_KERNEL_MOUNTS
-            .iter()
-            .all(|a| a.fstype.len <= NAME_MAX
+        assert!(ALLOWED_KERNEL_MOUNTS.iter().all(|a| {
+            a.fstype.len <= NAME_MAX
                 && a.names
                     .iter()
-                    .all(|n| n.len <= NAME_MAX || n.len >= NAME_ANY)));
+                    .all(|n| n.len <= NAME_MAX || n.len >= NAME_ANY)
+        }));
         // the list's own names never collide with each other
         let mut keys: Vec<u64> = ALLOWED_KERNEL_MOUNT_TYPES
             .iter()
@@ -2864,9 +2882,10 @@ mod tests {
         f.like = vec![root, sys];
         // what the hook judged on its own: the top, at /mnt/s under `/`'s
         // group — no held mount there
-        assert!(!f
-            .places
-            .contains(&(f.m[f.m[mnt_s].parent].group, f.m[mnt_s].place)));
+        assert!(
+            !f.places
+                .contains(&(f.m[f.m[mnt_s].parent].group, f.m[mnt_s].place))
+        );
         assert_eq!(umount_below(&f, mnt_s), Below::Takes);
         assert!(below_takes_held(umount_below(&f, mnt_s), false));
         // the copy of /sys's own children read in the kernel's order: the

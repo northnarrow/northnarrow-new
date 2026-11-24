@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use aya::maps::{HashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::bpf_prog_class::{
-    attach_type_name, link_type_name, prog_type_name, tag_word, text, LinkRecord, ProgRecord,
-    SeenLoad, ATTACH_TRACE_ITER,
+    ATTACH_TRACE_ITER, LinkRecord, ProgRecord, SeenLoad, attach_type_name, link_type_name,
+    prog_type_name, tag_word, text,
 };
 
 /// The program iterator's program in the eBPF object.
@@ -993,9 +993,11 @@ mod tests {
                 .0
                 .is_empty()
         );
-        assert!(judge(&mut w, vec![], &en(vec![], Some(vec![])), &own)
-            .0
-            .is_empty());
+        assert!(
+            judge(&mut w, vec![], &en(vec![], Some(vec![])), &own)
+                .0
+                .is_empty()
+        );
         let kp = prog(60, 2, "kp");
         let links = vec![
             LinkRecord {
@@ -1076,9 +1078,11 @@ mod tests {
         );
         // the re-check of #565 (R2): a later round named it (carried)
         w.quota_round([found[1].object()], []);
-        assert!(render_status(&w, &foreign)
-            .lines()
-            .any(|l| l.starts_with("prog 11 socket_filter") && l.ends_with(" unseen")));
+        assert!(
+            render_status(&w, &foreign)
+                .lines()
+                .any(|l| l.starts_with("prog 11 socket_filter") && l.ends_with(" unseen"))
+        );
         w.quota_round([], [found[1].object()]);
         // gone from the enumeration: forgotten
         let (_, foreign) = judge(&mut w, vec![], &en(vec![prog(10, 1, "f10")], None), &own);

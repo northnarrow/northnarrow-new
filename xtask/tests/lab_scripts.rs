@@ -159,7 +159,9 @@ fn nn_lab_refuses_an_unknown_lockdown_mode() {
         ("yes", false),
     ] {
         let out = bash(
-            &format!("unset NN_LAB_DISTRO NN_LAB_ACCEL; NN_LAB_LOCKDOWN='{mode}' exec bash {NN_LAB} help"),
+            &format!(
+                "unset NN_LAB_DISTRO NN_LAB_ACCEL; NN_LAB_LOCKDOWN='{mode}' exec bash {NN_LAB} help"
+            ),
             &env,
         );
         assert_eq!(out.status.success(), ok, "NN_LAB_LOCKDOWN={mode:?}");

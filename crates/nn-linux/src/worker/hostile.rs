@@ -34,8 +34,8 @@
 use std::os::fd::RawFd;
 
 use nn_proto::ipc::{
-    decode, encode, Answer, FromWorker, QnameOut, Request, Response, ToWorker, WorkerHello,
-    IPC_VERSION, MAX_FRAME,
+    Answer, FromWorker, IPC_VERSION, MAX_FRAME, QnameOut, Request, Response, ToWorker, WorkerHello,
+    decode, encode,
 };
 
 use super::serve::{Args, EXIT_SANDBOX, EXIT_USAGE};
@@ -115,8 +115,10 @@ pub fn run(a: &Args, attack: &str) -> i32 {
     let (name, arg) = attack.split_once(':').unwrap_or((attack, ""));
     if name == THREADED {
         // parked for the worker's whole life: the sandbox must see it
-        std::thread::spawn(|| loop {
-            std::thread::park();
+        std::thread::spawn(|| {
+            loop {
+                std::thread::park();
+            }
         });
     }
     let profile = sandbox::Profile::parse(a.ipc_fd);
@@ -445,11 +447,7 @@ fn syscall_attack(name: &str, arg: &str) -> Result<(), i32> {
                     -1,
                     0,
                 );
-                if m == -1 {
-                    Err(errno())
-                } else {
-                    Ok(())
-                }
+                if m == -1 { Err(errno()) } else { Ok(()) }
             }
             _ => Err(libc::EINVAL),
         }

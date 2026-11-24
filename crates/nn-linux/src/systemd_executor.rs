@@ -328,7 +328,7 @@ fn held_by_user_managers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     /// The test's uid: its tree's files are "root's" here.
     fn me() -> u32 {

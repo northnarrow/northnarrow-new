@@ -53,9 +53,9 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ pub fn symlink_chain(path: &Path) -> Result<Vec<PathBuf>> {
             Ok(m) => m,
             // the last link points at nothing
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !chain.is_empty() => {
-                return Ok(chain)
+                return Ok(chain);
             }
             Err(e) => return Err(anyhow!(e)).with_context(|| format!("lstat {}", cur.display())),
         };

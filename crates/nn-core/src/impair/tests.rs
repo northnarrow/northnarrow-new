@@ -241,29 +241,35 @@ fn service_manager_forms() {
             "{argv:?}"
         );
     }
-    assert!(h
-        .run(331, 200, "/usr/sbin/service", &["service", "ufw", "status"])
-        .is_none());
+    assert!(
+        h.run(331, 200, "/usr/sbin/service", &["service", "ufw", "status"])
+            .is_none()
+    );
 }
 
 #[test]
 fn switch_off_commands_need_their_arguments() {
     let h = host();
-    assert!(h
-        .run(340, 200, "/usr/sbin/auditctl", &["auditctl", "-l"])
-        .is_none());
-    assert!(h
-        .run(341, 200, "/usr/sbin/auditctl", &["auditctl", "-e", "1"])
-        .is_none());
-    assert!(h
-        .run(342, 200, "/usr/sbin/auditctl", &["auditctl", "-D"])
-        .is_some());
-    assert!(h
-        .run(343, 200, "/usr/sbin/nft", &["nft", "flush", "ruleset"])
-        .is_some());
-    assert!(h
-        .run(344, 200, "/usr/sbin/nft", &["nft", "list", "ruleset"])
-        .is_none());
+    assert!(
+        h.run(340, 200, "/usr/sbin/auditctl", &["auditctl", "-l"])
+            .is_none()
+    );
+    assert!(
+        h.run(341, 200, "/usr/sbin/auditctl", &["auditctl", "-e", "1"])
+            .is_none()
+    );
+    assert!(
+        h.run(342, 200, "/usr/sbin/auditctl", &["auditctl", "-D"])
+            .is_some()
+    );
+    assert!(
+        h.run(343, 200, "/usr/sbin/nft", &["nft", "flush", "ruleset"])
+            .is_some()
+    );
+    assert!(
+        h.run(344, 200, "/usr/sbin/nft", &["nft", "list", "ruleset"])
+            .is_none()
+    );
     // iptables is xtables-nft-multi: named by argv[0].
     let f = h
         .run(345, 200, "/usr/sbin/xtables-nft-multi", &["iptables", "-F"])
@@ -301,29 +307,33 @@ fn switch_off_commands_need_their_arguments() {
     }
     // the other listed commands are unchanged: an operand after a run that
     // is no flush of iptables still matches (`nft flush ruleset ip`)
-    assert!(h
-        .run(
+    assert!(
+        h.run(
             354,
             200,
             "/usr/sbin/nft",
             &["nft", "flush", "ruleset", "ip"]
         )
-        .is_some());
+        .is_some()
+    );
     // a policy run in full
-    assert!(h
-        .run(
+    assert!(
+        h.run(
             353,
             200,
             "/usr/sbin/xtables-nft-multi",
             &["iptables", "-P", "INPUT", "ACCEPT"]
         )
-        .is_some());
-    assert!(h
-        .run(346, 200, "/usr/sbin/setenforce", &["setenforce", "0"])
-        .is_some());
-    assert!(h
-        .run(347, 200, "/usr/sbin/aa-teardown", &["aa-teardown"])
-        .is_some());
+        .is_some()
+    );
+    assert!(
+        h.run(346, 200, "/usr/sbin/setenforce", &["setenforce", "0"])
+            .is_some()
+    );
+    assert!(
+        h.run(347, 200, "/usr/sbin/aa-teardown", &["aa-teardown"])
+            .is_some()
+    );
 }
 
 /// Lot 282 (Tappa Prove P0; lab 04/11 on main: podman's CNI plugin's
@@ -471,12 +481,14 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
         run(4001, 311, &cni).is_none(),
         "CNI chain by the CNI plugin"
     );
-    assert!(run(
-        4002,
-        311,
-        &["ip6tables", "-t", "nat", "--flush", "CNI-DN-0a1b2c"]
-    )
-    .is_none());
+    assert!(
+        run(
+            4002,
+            311,
+            &["ip6tables", "-t", "nat", "--flush", "CNI-DN-0a1b2c"]
+        )
+        .is_none()
+    );
     assert!(
         run(
             4003,
@@ -564,8 +576,8 @@ fn a_runtime_flushing_its_own_chain_is_no_switch_off() {
 #[test]
 fn a_script_tool_is_registered_whatever_its_options() {
     let h = host();
-    assert!(h
-        .run(
+    assert!(
+        h.run(
             4960,
             1,
             "/usr/bin/python3.12",
@@ -577,15 +589,17 @@ fn a_script_tool_is_registered_whatever_its_options() {
                 "start"
             ],
         )
-        .is_none());
-    assert!(h
-        .run(
+        .is_none()
+    );
+    assert!(
+        h.run(
             4961,
             1,
             "/usr/bin/python3.12",
             &["/usr/bin/python3", "-Z", "/usr/bin/fail2ban-server"],
         )
-        .is_none());
+        .is_none()
+    );
     let d = h.det.defenders.lock();
     assert_eq!(d.get(&4960).map(|(t, _)| t.as_str()), Some("fail2ban"));
     assert_eq!(d.get(&4961).map(|(t, _)| t.as_str()), Some("fail2ban"));
@@ -595,19 +609,22 @@ fn a_script_tool_is_registered_whatever_its_options() {
 fn kills_of_a_tools_process() {
     let h = host();
     // auditd running as pid 77: registered from its exec.
-    assert!(h
-        .run(77, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-        .is_none());
+    assert!(
+        h.run(77, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none()
+    );
     let f = h
         .run(350, 200, "/usr/bin/kill", &["kill", "-9", "77"])
         .expect("kill -9 <auditd>");
     assert_eq!((f.rule, f.tool.as_str()), (EvaRule::Killed, "auditd"));
-    assert!(h
-        .run(351, 200, "/usr/bin/kill", &["kill", "-0", "77"])
-        .is_none());
-    assert!(h
-        .run(352, 200, "/usr/bin/kill", &["kill", "-9", "78"])
-        .is_none());
+    assert!(
+        h.run(351, 200, "/usr/bin/kill", &["kill", "-0", "77"])
+            .is_none()
+    );
+    assert!(
+        h.run(352, 200, "/usr/bin/kill", &["kill", "-9", "78"])
+            .is_none()
+    );
     let f = h
         .run(353, 200, "/usr/bin/pkill", &["pkill", "-9", "rsyslogd"])
         .unwrap();
@@ -647,9 +664,10 @@ fn a_forking_daemons_own_pid_is_registered_after_its_exec() {
     let h = host();
     let t0 = Instant::now();
     assert!(!h.det.rescan_due(t0));
-    assert!(h
-        .run(4954, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-        .is_none());
+    assert!(
+        h.run(4954, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+            .is_none()
+    );
     assert!(h.det.defenders.lock().contains_key(&4954));
     // The daemon, forked (no exec): only /proc names it.
     let d = h._proc.path().join("4955");
@@ -754,14 +772,16 @@ fn config_changes_are_findings_and_paths_are_watched() {
         (f.rule, f.tool.as_str()),
         (EvaRule::ConfigChanged, "auditd")
     );
-    assert!(h
-        .det
-        .assess(&fe("/etc/ufw/user.rules", FimOp::Deleted))
-        .is_some());
-    assert!(h
-        .det
-        .assess(&fe("/etc/audit/auditd.conf", FimOp::Opened))
-        .is_none());
+    assert!(
+        h.det
+            .assess(&fe("/etc/ufw/user.rules", FimOp::Deleted))
+            .is_some()
+    );
+    assert!(
+        h.det
+            .assess(&fe("/etc/audit/auditd.conf", FimOp::Opened))
+            .is_none()
+    );
     assert!(h.det.assess(&fe("/etc/hosts", FimOp::Modified)).is_none());
 
     let t = TempDir::new().unwrap();
@@ -1021,14 +1041,15 @@ mod bug86 {
     #[test]
     fn bug86_guard_the_tools_own_process_is_registered() {
         let h = host();
-        assert!(h
-            .run(
+        assert!(
+            h.run(
                 380,
                 1,
                 "/usr/local/qcloud/YunJing/YDEyes/YDService",
                 &["YDService"]
             )
-            .is_none());
+            .is_none()
+        );
         assert_eq!(h.det.counts().defenders, 1);
     }
 }
@@ -1571,9 +1592,10 @@ mod lot316_variants {
     #[test]
     fn kill_probes_capsules_and_comm() {
         let h = host();
-        assert!(h
-            .run(7600, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(7600, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         for (k, argv) in [
             &["kill", "-l", "9", "7600"][..],
             &["kill", "-CONT", "7600"],
@@ -2081,9 +2103,10 @@ mod rev548 {
     #[test]
     fn kill_pids_paths_and_pkills_name() {
         let h = host();
-        assert!(h
-            .run(9300, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9300, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         for (k, argv) in [
             &["kill", "-s", "KILL", "-0", "9300"][..],
             &["kill", "-9", " 9300"],
@@ -2182,14 +2205,16 @@ mod rev548 {
         let h = host();
         // rsyslogd catches HUP and USR1 (bits 0 and 9); auditd catches none
         a_process(&h, 9400, 4400, "0000000180014203");
-        assert!(h
-            .run(9400, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
-            .is_none());
+        assert!(
+            h.run(9400, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
+                .is_none()
+        );
         a_unit(&h, "rsyslog.service", &[9400]);
         a_process(&h, 9401, 4401, "0000000000000000");
-        assert!(h
-            .run(9401, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9401, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         a_unit(&h, "auditd.service", &[9401]);
         let low = |pid: u32, exe: &str, argv: &[&str]| {
             let f = h
@@ -2278,9 +2303,10 @@ mod rev548_recheck {
     /// rsyslogd (9710, catching HUP) registered, alone in its unit.
     fn rsyslog(h: &Host) {
         a_process(h, 9710, 4710, "0000000180014203");
-        assert!(h
-            .run(9710, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
-            .is_none());
+        assert!(
+            h.run(9710, 1, "/usr/sbin/rsyslogd", &["/usr/sbin/rsyslogd", "-n"])
+                .is_none()
+        );
         a_unit(h, "rsyslog.service", &[9710]);
     }
 
@@ -2421,19 +2447,21 @@ mod rev548_recheck {
         let h = host();
         // auditd catches HUP and USR1 (bits 0 and 9)
         a_process(&h, 9740, 4740, "0000000000004a03");
-        assert!(h
-            .run(9740, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9740, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         a_unit(&h, "auditd.service", &[9740]);
         a_process(&h, 9741, 4741, "0000000000004a03");
-        assert!(h
-            .run(
+        assert!(
+            h.run(
                 9741,
                 1,
                 "/usr/bin/fail2ban-server",
                 &["/usr/bin/fail2ban-server", "-xf"]
             )
-            .is_none());
+            .is_none()
+        );
         a_unit(&h, "fail2ban.service", &[9741]);
         for (k, (exe, argv)) in [
             (KILL, &["kill", "-USR1", "9740"][..]),
@@ -2518,9 +2546,10 @@ mod rev548_recheck {
             None
         );
         a_process(&h, 9775, 4775, "0000000000000001");
-        assert!(h
-            .run(9775, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9775, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         a_unit(&h, "auditd.service", &[9775]);
         let both = ["systemctl", "-s", "HUP", "kill", "rsyslog", "auditd"];
         assert!(sanction(&h, 9776, SC, &both).is_some());
@@ -2529,9 +2558,10 @@ mod rev548_recheck {
         assert_eq!(sanction(&h, 9777, SC, &both), None);
         // `kill` of rsyslogd and of auditd, which does not catch it
         a_process(&h, 9771, 4771, "0000000000000000");
-        assert!(h
-            .run(9771, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9771, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         assert_eq!(
             sanction(&h, 9772, KILL, &["kill", "-HUP", "9710", "9771"]),
             None
@@ -2540,9 +2570,10 @@ mod rev548_recheck {
         // `kill` of rsyslogd and of a tool's process whose entry is gone:
         // still the tool's (the finding), no longer one whose catch is known
         a_process(&h, 9778, 4778, "0000000000000001");
-        assert!(h
-            .run(9778, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
-            .is_none());
+        assert!(
+            h.run(9778, 1, "/usr/sbin/auditd", &["/sbin/auditd"])
+                .is_none()
+        );
         std::fs::remove_dir_all(h._proc.path().join("9778")).unwrap();
         assert_eq!(
             sanction(&h, 9779, KILL, &["kill", "-HUP", "9710", "9778"]),

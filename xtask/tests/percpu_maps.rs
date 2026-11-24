@@ -401,13 +401,19 @@ fn the_exec_guards_buffers_are_the_running_task_s_own() {
         ],
     )
     .unwrap();
-    assert!(body(&lsm, "nn_exe_walk")
-        .contains("EXEC_SCRATCH.get_ptr_mut(&crate::task_scratch::key(tid, start))"));
-    assert!(body(&q, "nn_execq_classify")
-        .contains("EXEC_SCRATCH.get_ptr(&crate::task_scratch::key(tid, start))"));
+    assert!(
+        body(&lsm, "nn_exe_walk")
+            .contains("EXEC_SCRATCH.get_ptr_mut(&crate::task_scratch::key(tid, start))")
+    );
+    assert!(
+        body(&q, "nn_execq_classify")
+            .contains("EXEC_SCRATCH.get_ptr(&crate::task_scratch::key(tid, start))")
+    );
     // a walk gone is classed as one that could not place the file
-    assert!(body(&q, "nn_execq_classify")
-        .contains("None => u64::from(class::TMP | class::VAR_TMP | class::HOME),"));
+    assert!(
+        body(&q, "nn_execq_classify")
+            .contains("None => u64::from(class::TMP | class::VAR_TMP | class::HOME),")
+    );
     in_order(
         body(&pol, "exec_unwalked"),
         &[
@@ -680,8 +686,10 @@ fn the_exec_environment_is_read_by_the_exec_s_own_lsm_run() {
     // entry. An entry gone under the judgment (lot 322: it counted as
     // staging) stops the scan unfinished — `TRUNCATED`, refused at a
     // protected or set-id target — never a clean environment.
-    assert!(body(&pol, "nn_env_pending")
-        .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);"));
+    assert!(
+        body(&pol, "nn_env_pending")
+            .contains("nn_env_judge(nn_env_var(ptr, tid, start, 0), ptr, tid, start, 0);")
+    );
     in_order(
         body(&pol, "nn_env_pending"),
         &[

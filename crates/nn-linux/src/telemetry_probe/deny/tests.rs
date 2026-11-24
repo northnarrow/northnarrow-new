@@ -113,9 +113,11 @@ fn every_deny_hook_has_an_attempt_or_a_declared_attach_check() {
         .iter()
         .position(|h| matches!(h.check, Check::AttachOnly { .. }))
         .unwrap();
-    assert!(HOOKS[first_check..]
-        .iter()
-        .all(|h| matches!(h.check, Check::AttachOnly { .. })));
+    assert!(
+        HOOKS[first_check..]
+            .iter()
+            .all(|h| matches!(h.check, Check::AttachOnly { .. }))
+    );
     // never the agent: no attempt's record names the agent
     for i in attempts() {
         if let Check::Attempt { expect, errno, .. } = HOOKS[i].check {
@@ -286,16 +288,20 @@ fn a_hook_that_cannot_be_attempted_here_is_not_exercised() {
             p[i]
         );
     }
-    assert!(p[slot_of("inode_set_acl").unwrap()]
-        .as_ref()
-        .unwrap_err()
-        .contains("not on this kernel"));
-    let observe = plan_hooks(Some(&links), false, true, true);
-    for h in ["bpf_map", "bpf_prog"] {
-        assert!(observe[slot_of(h).unwrap()]
+    assert!(
+        p[slot_of("inode_set_acl").unwrap()]
             .as_ref()
             .unwrap_err()
-            .contains("observes"));
+            .contains("not on this kernel")
+    );
+    let observe = plan_hooks(Some(&links), false, true, true);
+    for h in ["bpf_map", "bpf_prog"] {
+        assert!(
+            observe[slot_of(h).unwrap()]
+                .as_ref()
+                .unwrap_err()
+                .contains("observes")
+        );
     }
     assert!(
         observe[slot_of("bpf").unwrap()].is_ok(),
@@ -459,9 +465,11 @@ fn a_hook_detached_gives_the_degradation_then_the_alert() {
         .collect();
     assert_eq!(degraded.len(), 1);
     assert_eq!(degraded[0]["extra"]["source"], DEGRADATION_SOURCE);
-    assert!(crate::boot::degradation::snapshot()
-        .iter()
-        .any(|l| l.starts_with("deny_selftest: deny hook inode_mknod")));
+    assert!(
+        crate::boot::degradation::snapshot()
+            .iter()
+            .any(|l| l.starts_with("deny_selftest: deny hook inode_mknod"))
+    );
     let n = round(&mut st, false);
     assert!(
         matches!(&n[..], [Note::Alert { slot, .. }] if *slot == i),
@@ -487,12 +495,16 @@ fn a_hook_detached_gives_the_degradation_then_the_alert() {
         matches!(&n[..], [Note::Restored { rounds: 3, .. }]),
         "{n:?}"
     );
-    assert!(rows()
-        .iter()
-        .any(|r| r["op"] == AUDIT_OP_RESTORED && r["extra"]["hook"] == "inode_mknod"));
-    assert!(!crate::boot::degradation::snapshot()
-        .iter()
-        .any(|l| l.starts_with("deny_selftest")));
+    assert!(
+        rows()
+            .iter()
+            .any(|r| r["op"] == AUDIT_OP_RESTORED && r["extra"]["hook"] == "inode_mknod")
+    );
+    assert!(
+        !crate::boot::degradation::snapshot()
+            .iter()
+            .any(|l| l.starts_with("deny_selftest"))
+    );
     // not exercised after a miss keeps it open, once in the journal
     let mut st = State::default();
     let mut o: Vec<Outcome> = (0..HOOK_COUNT).map(|_| Outcome::Seen).collect();

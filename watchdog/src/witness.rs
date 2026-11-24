@@ -19,10 +19,10 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nn_proto::witness::{
-    judge_chain, key_record, line_hash, Judged, Row, WitnessKey, CHAIN_FILE, CHAIN_MAX_BYTES,
-    KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_CHAIN_TORN, KIND_OPENED, ROW_VERSION,
+    CHAIN_FILE, CHAIN_MAX_BYTES, Judged, KEY_MEMFD_NAME, KIND_CHAIN_CUT, KIND_CHAIN_TORN,
+    KIND_OPENED, ROW_VERSION, Row, WitnessKey, judge_chain, key_record, line_hash,
 };
 use tracing::{error, info, warn};
 
@@ -322,7 +322,7 @@ impl Witness {
         let text = match antitamper_bpf::kernel_roots::read(&self.path, CHAIN_MAX_BYTES) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Some("the file is gone".to_string())
+                return Some("the file is gone".to_string());
             }
             Err(e) => return Some(format!("the file cannot be read: {e}")),
         };
@@ -1242,7 +1242,7 @@ mod tests {
     /// successor writes or leaves out.
     #[test]
     fn the_witness_signs_the_vacancy_and_the_successor_in_one_chain() {
-        use nn_proto::witness::{to_import, Imported, KIND_SUCCEEDED, KIND_VACATED};
+        use nn_proto::witness::{Imported, KIND_SUCCEEDED, KIND_VACATED, to_import};
         let dir = tempfile::tempdir().unwrap();
         let me = std::process::id();
         let mut w = Witness::open(dir.path(), me).unwrap();
@@ -1263,10 +1263,11 @@ mod tests {
         assert!(t.broken.is_none() && !t.position_lost, "{t:?}");
         let kinds: Vec<&str> = t.rows.iter().map(|(r, _, _)| r.kind.as_str()).collect();
         assert_eq!(kinds, [KIND_OPENED, KIND_VACATED, KIND_SUCCEEDED]);
-        assert!(t
-            .rows
-            .iter()
-            .all(|(r, _, ok)| *ok && r.tgid == me && r.key == w.key_hex()));
+        assert!(
+            t.rows
+                .iter()
+                .all(|(r, _, ok)| *ok && r.tgid == me && r.key == w.key_hex())
+        );
         assert!(t.rows[1].0.detail.contains("signal 9"));
         // another key's rows are the claim of a key no agent certified
         let other = Imported::default();
@@ -1332,7 +1333,7 @@ mod tests {
     /// left as written is never cut.
     #[test]
     fn a_tail_cut_while_the_watchdog_lives_is_detected_and_signed() {
-        use nn_proto::witness::{to_import, Imported, KIND_SUCCEEDED, KIND_VACATED};
+        use nn_proto::witness::{Imported, KIND_SUCCEEDED, KIND_VACATED, to_import};
         let dir = tempfile::tempdir().unwrap();
         let me = std::process::id();
         let mut w = Witness::open(dir.path(), me).unwrap();
@@ -1690,8 +1691,10 @@ mod tests {
         }
         assert_eq!(chain_end(&text), Ok((3, prev)));
         assert_eq!(chain_end(""), Ok((0, String::new())));
-        assert!(chain_end(&format!("{text}garbage\n"))
-            .unwrap_err()
-            .contains("line 4"));
+        assert!(
+            chain_end(&format!("{text}garbage\n"))
+                .unwrap_err()
+                .contains("line 4")
+        );
     }
 }

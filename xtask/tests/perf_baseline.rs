@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PERF_RUN: &str = "deploy/lab/perf/perf-run.sh";
 const PERF_LIB: &str = "deploy/lab/perf/perf_lib.py";

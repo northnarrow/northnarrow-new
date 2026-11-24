@@ -73,24 +73,51 @@ fn show() -> Vec<Case> {
     };
     let mut out = vec![
         c("absent", vec![]),
-        c("signed", signed("# matrix\nenforce NN-L-IMP-001\nalert R020\n", &["key-a"], AGENT_ID)),
-        c("signed-every-mode", signed(
-            "enforce NN-L-IMP-001\nalert R020\naudit NN-L-FIM-004\noff NN-L-NET-026\nexempt R020 uid 33\n",
-            &["key-a"],
-            AGENT_ID,
-        )),
-        c("signed-but-refused-exempts-uid-0", signed("enforce R020\nexempt R020 uid 0\n", &["key-a"], AGENT_ID)),
-        c("signed-for-another-install", signed("enforce NN-L-IMP-001\n", &["key-a"], [0x22; 16])),
-        c("signed-by-key-b", signed("enforce NN-L-IMP-001\n", &["key-b"], AGENT_ID)),
-        c("unsigned", vec![Put::file("rule-policy.local", "enforce NN-L-IMP-001\n", 0o644)]),
         c(
-            "content-changed",
-            {
-                let mut p = signed("enforce NN-L-IMP-001\n", &["key-a"], AGENT_ID);
-                p[0] = Put::file("rule-policy.local", "enforce NN-L-IMP-001\nenforce R020\n", 0o644);
-                p
-            },
+            "signed",
+            signed(
+                "# matrix\nenforce NN-L-IMP-001\nalert R020\n",
+                &["key-a"],
+                AGENT_ID,
+            ),
         ),
+        c(
+            "signed-every-mode",
+            signed(
+                "enforce NN-L-IMP-001\nalert R020\naudit NN-L-FIM-004\noff NN-L-NET-026\nexempt R020 uid 33\n",
+                &["key-a"],
+                AGENT_ID,
+            ),
+        ),
+        c(
+            "signed-but-refused-exempts-uid-0",
+            signed("enforce R020\nexempt R020 uid 0\n", &["key-a"], AGENT_ID),
+        ),
+        c(
+            "signed-for-another-install",
+            signed("enforce NN-L-IMP-001\n", &["key-a"], [0x22; 16]),
+        ),
+        c(
+            "signed-by-key-b",
+            signed("enforce NN-L-IMP-001\n", &["key-b"], AGENT_ID),
+        ),
+        c(
+            "unsigned",
+            vec![Put::file(
+                "rule-policy.local",
+                "enforce NN-L-IMP-001\n",
+                0o644,
+            )],
+        ),
+        c("content-changed", {
+            let mut p = signed("enforce NN-L-IMP-001\n", &["key-a"], AGENT_ID);
+            p[0] = Put::file(
+                "rule-policy.local",
+                "enforce NN-L-IMP-001\nenforce R020\n",
+                0o644,
+            );
+            p
+        }),
     ];
     out.push(
         Case::args_owned("policy", "policy-show.agent-id-missing", {

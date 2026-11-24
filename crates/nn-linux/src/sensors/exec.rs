@@ -10,8 +10,8 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use aya::{maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
+use anyhow::{Context, Result, anyhow, bail};
+use aya::{Ebpf, EbpfLoader, maps::ring_buf::RingBuf, programs::TracePoint};
 use common::wire::ProcessSpawnRaw;
 use nn_model::Event;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -72,8 +72,8 @@ impl ExecSensor {
         // process; with no BTF the constants apply.
         {
             use crate::anti_tamper::btf_revalidate::{
-                arm_btf_offsets, publish_resolved, resolve_offsets, resolve_tracepoint_fields,
-                resolved, ResolveOutcome,
+                ResolveOutcome, arm_btf_offsets, publish_resolved, resolve_offsets,
+                resolve_tracepoint_fields, resolved,
             };
             if resolved().is_none() {
                 if let ResolveOutcome::Resolved(mut r) = resolve_offsets() {
@@ -188,7 +188,7 @@ fn decode_event(buf: &[u8]) -> Result<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
+    use common::wire::{FILENAME_LEN, ProcessSpawnRaw, TASK_COMM_LEN};
 
     fn make_raw(pid: u32, comm: &str, filename: &str) -> ProcessSpawnRaw {
         let mut raw = ProcessSpawnRaw::zeroed();

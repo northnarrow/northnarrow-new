@@ -299,7 +299,7 @@ fn plain_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn me() -> u32 {
         // SAFETY: geteuid has no preconditions.
@@ -452,17 +452,21 @@ mod tests {
             "the next system directory's copy"
         );
         exe(&r.join("usr/sbin/rpm"), 0o644);
-        assert!(lookup
-            .resolve("rpm")
-            .unwrap_err()
-            .to_string()
-            .contains("not executable"));
+        assert!(
+            lookup
+                .resolve("rpm")
+                .unwrap_err()
+                .to_string()
+                .contains("not executable")
+        );
         fs::create_dir(r.join("usr/sbin/iptables")).unwrap();
-        assert!(lookup
-            .resolve("iptables")
-            .unwrap_err()
-            .to_string()
-            .contains("not a regular file"));
+        assert!(
+            lookup
+                .resolve("iptables")
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
         // a directory others can write: the file could be swapped
         exe(&r.join("usr/sbin/ip6tables"), 0o755);
         fs::set_permissions(r.join("usr/sbin"), fs::Permissions::from_mode(0o777)).unwrap();
@@ -471,11 +475,13 @@ mod tests {
         assert!(err.to_string().contains("usr/sbin is writable"), "{err}");
         // another owner
         let other = Lookup::new(r, me().wrapping_add(1));
-        assert!(other
-            .resolve("ip6tables")
-            .unwrap_err()
-            .to_string()
-            .contains("is owned by uid"));
+        assert!(
+            other
+                .resolve("ip6tables")
+                .unwrap_err()
+                .to_string()
+                .contains("is owned by uid")
+        );
         // not a plain name
         for bad in [
             "",

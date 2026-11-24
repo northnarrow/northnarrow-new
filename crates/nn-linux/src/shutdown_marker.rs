@@ -34,7 +34,7 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 pub use nn_proto::shutdown_marker::ShutdownMarker;
 
@@ -71,7 +71,7 @@ pub fn write_marker(path: &Path, marker: &ShutdownMarker) -> Result<()> {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(anyhow!(e)).with_context(|| format!("removing {}", tmp_path.display()))
+            return Err(anyhow!(e)).with_context(|| format!("removing {}", tmp_path.display()));
         }
     }
     {
@@ -181,9 +181,11 @@ mod tests {
     #[test]
     fn read_marker_returns_none_when_path_absent() {
         let (_dir, path) = fresh_path();
-        assert!(read_marker(&path)
-            .expect("absent is not an error")
-            .is_none());
+        assert!(
+            read_marker(&path)
+                .expect("absent is not an error")
+                .is_none()
+        );
     }
 
     /// Every corruption shape, and the pre-WDG-001 marker, is an error

@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 /// Default path of the overlay.
 pub const COW_GUARD_LOCAL: &str = "/etc/northnarrow/cow-guard.local";
@@ -314,7 +314,7 @@ impl CowConfig {
                         "unknown key `{other}` (enabled, scope, copy_cap, event_budget_ms, \
                          retention_hours, eviction_floor_minutes, min_free_percent, \
                          auto_restore, trusted_writer, max_dir_marks, copiers)"
-                    )))
+                    )));
                 }
             }
         }

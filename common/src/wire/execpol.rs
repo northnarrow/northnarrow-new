@@ -16,9 +16,9 @@
 //!
 //! Every struct is `#[repr(C)]` with explicit padding; strict append-only.
 
+use super::TASK_COMM_LEN;
 use super::exe::ExeIdentityRaw;
 pub use super::exe::TaskKey;
-use super::TASK_COMM_LEN;
 
 /// Lineage tiers of the exec'ing task (`ExecPolRaw::tier`, low byte).
 pub mod tier {

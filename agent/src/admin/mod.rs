@@ -62,8 +62,8 @@ pub(crate) use audit::AuditClient;
 pub use handlers::canary::canary_path;
 pub use handlers::net::DEFAULT_NETFLOW_JSONL_PATH;
 pub use transport::{
-    serve, serve_with_audit_log, serve_with_canary_state, serve_with_fim_state,
-    serve_with_marker_path, unlink_socket, FOREIGN_PEER_KIND,
+    FOREIGN_PEER_KIND, serve, serve_with_audit_log, serve_with_canary_state, serve_with_fim_state,
+    serve_with_marker_path, unlink_socket,
 };
 
 /// External audit WDG-007: the socket's identity and its watch.

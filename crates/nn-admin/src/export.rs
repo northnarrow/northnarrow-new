@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 
 use ed25519_dalek::VerifyingKey;
-use nn_evidence::row_verify::{verify_row, RowFault};
+use nn_evidence::row_verify::{RowFault, verify_row};
 use serde::Serialize;
 
 /// A row's place: its file and line.
@@ -1026,9 +1026,11 @@ mod tests {
         let r = verify(with(None).as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 11, "{r:#?}");
         assert_eq!(r.chains[0].unlinked_rotations, 1);
-        assert!(r.chains[0].breaks[0]
-            .why
-            .starts_with("a rotation without its terminator"));
+        assert!(
+            r.chains[0].breaks[0]
+                .why
+                .starts_with("a rotation without its terminator")
+        );
         // the review's case: file 1's last row dropped and the next file's
         // first record stripped of its terminator — no longer OK
         let rows3 = chain_of(&k, 3);
@@ -1048,9 +1050,11 @@ mod tests {
         let elsewhere = terminator(&k, "detections", &hash(&rows[0]));
         let r = verify(with(Some(&elsewhere)).as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 13, "{r:#?}");
-        assert!(r.tampered[0]
-            .1
-            .contains("`rotate` is not the terminator its row follows"));
+        assert!(
+            r.tampered[0]
+                .1
+                .contains("`rotate` is not the terminator its row follows")
+        );
         // the next file's first row follows its terminator, the terminator
         // does not follow the last row before it
         let next2 = row(&k, "detections", 3, &hash(&elsewhere));
@@ -1074,9 +1078,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.exit_code(), 13, "{r:#?}");
-        assert!(r.tampered[0]
-            .1
-            .contains("`rotate` is not the terminator its row follows"));
+        assert!(
+            r.tampered[0]
+                .1
+                .contains("`rotate` is not the terminator its row follows")
+        );
         // a terminator signed by another key
         let other = SigningKey::from_bytes(&[6; 32]);
         let forged = terminator(&other, "detections", &hash(&rows[1]));
@@ -1240,10 +1246,12 @@ mod tests {
         // (b) the head cut: the outcome alone, rewritten
         let r = verify(forged.to_string().as_bytes(), &k.verifying_key()).unwrap();
         assert_eq!(r.exit_code(), 13, "{:?}", report_lines(&r));
-        assert!(report_lines(&r)
-            .last()
-            .unwrap()
-            .starts_with("TAMPERED: a record's fields are not its row's mapping"));
+        assert!(
+            report_lines(&r)
+                .last()
+                .unwrap()
+                .starts_with("TAMPERED: a record's fields are not its row's mapping")
+        );
     }
 
     /// The intent row an outcome carries: rewritten inside, another
@@ -1749,9 +1757,11 @@ mod tests {
             "{:?}",
             report_lines(&r)
         );
-        assert!(r.notices[0]
-            .1
-            .contains("intent not attached: action 7 of run r1"));
+        assert!(
+            r.notices[0]
+                .1
+                .contains("intent not attached: action 7 of run r1")
+        );
         // an intent's row attached to a row that carries its own intent: not
         // the worker's mapping
         let own = format!(

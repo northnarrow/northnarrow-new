@@ -164,8 +164,10 @@ fn the_start_signs_an_unsigned_downgrade_to_alpha() {
             .as_str()
     };
     let evidence = at("agent/src/boot/evidence.rs");
-    assert!(signature(evidence, "attest")
-        .contains("profile: &nn_core::response::profile::ResolvedProfile,"));
+    assert!(
+        signature(evidence, "attest")
+            .contains("profile: &nn_core::response::profile::ResolvedProfile,")
+    );
     let attest = body(evidence, "attest");
     let probe = attest
         .find("match log.boot_probe_profiled(")

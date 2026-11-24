@@ -11,7 +11,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use nn_model::netaddr::{canonical, AF_INET, AF_INET6};
+use nn_model::netaddr::{AF_INET, AF_INET6, canonical};
 
 /// The address side of a network canary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

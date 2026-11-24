@@ -30,13 +30,13 @@
 //! most [`STOP_WAIT`]; what is left is answered "not run: the agent
 //! stopped" and counted in a last `overflow` row.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use nn_core::response::dispatch::{
-    lane_of, severity_name, DispatchJob, DispatchStats, ResponseQueue, Submitted, LANES,
-    RESPONSE_QUEUE_CAP,
+    DispatchJob, DispatchStats, LANES, RESPONSE_QUEUE_CAP, ResponseQueue, Submitted, lane_of,
+    severity_name,
 };
 use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity};

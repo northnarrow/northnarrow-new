@@ -1032,7 +1032,7 @@ impl Cli {
     /// Lab PR 223: the guard's configuration for this boot; a detect-only
     /// agent observes.
     pub(crate) fn execq_config(&self, detect_only: bool) -> northnarrow_agent::execq::Config {
-        use northnarrow_agent::execq::{policy, Config, Mode, Policy};
+        use northnarrow_agent::execq::{Config, Mode, Policy, policy};
         let mode = match self.exec_quarantine {
             Mode::Enforce if detect_only => Mode::Observe,
             m => m,
@@ -1342,9 +1342,10 @@ mod tests {
             link.as_os_str(),
         ])
         .expect("a test's command line");
-        assert!(cli
-            .refuse_one_binary_in_both_roles(&cli.own_exes())
-            .is_err());
+        assert!(
+            cli.refuse_one_binary_in_both_roles(&cli.own_exes())
+                .is_err()
+        );
         // CONTROL: another file
         let wd = dir.path().join("northnarrow-watchdog-elsewhere");
         std::fs::write(&wd, b"a watchdog").unwrap();

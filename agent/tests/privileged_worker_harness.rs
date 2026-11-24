@@ -54,11 +54,11 @@ use std::time::{Duration, Instant};
 use nn_linux::worker::hostile::{DENIED, FAILED, SUCCEEDED};
 use nn_linux::worker::spawn::spawn;
 use nn_linux::worker::supervisor::{Config, ImageLauncher, NoPidRoles, SUPERVISOR_THREAD};
-use nn_linux::worker::{Health, SelfImage, WorkerAccount, WorkerError, Workers, WORKER_USER};
+use nn_linux::worker::{Health, SelfImage, WORKER_USER, WorkerAccount, WorkerError, Workers};
 use nn_proto::ipc::{QnameIn, Request, WorkerKind};
 
 mod common;
-use common::agent_state::{ensure_worker_account, InstalledAgent};
+use common::agent_state::{InstalledAgent, ensure_worker_account};
 
 /// The installed agent's signing key, when this host has one: read by
 /// the attack, never written.
@@ -257,11 +257,13 @@ fn every_forbidden_call_is_killed_by_the_seccomp_filter() {
         assert!(sigsys(st), "{what} ({attack}): {st:?}, not SIGSYS");
     }
     assert!(!h.dir.join("created").exists());
-    assert!(!Path::new(&format!(
-        "/tmp/nn-worker-harness-{}.out",
-        std::process::id()
-    ))
-    .exists());
+    assert!(
+        !Path::new(&format!(
+            "/tmp/nn-worker-harness-{}.out",
+            std::process::id()
+        ))
+        .exists()
+    );
 }
 
 /// Lot 277: a worker that finds a second thread at its sandbox's door

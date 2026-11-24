@@ -727,11 +727,15 @@ fn an_upgrade_of_units_the_boot_would_not_start_is_refused() {
         .unwrap();
         let r = host.install("full", true, Some("key-role"));
         assert_eq!(r.status, 1, "{case}: {r:#?}");
-        assert!(r.stderr.contains(&format!("REFUSED — {want}")), "{case}: {r:#?}");
+        assert!(
+            r.stderr.contains(&format!("REFUSED — {want}")),
+            "{case}: {r:#?}"
+        );
         assert!(r.stderr.contains("Nothing was changed."), "{case}: {r:#?}");
         assert!(
-            r.stderr
-                .contains("install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog\n"),
+            r.stderr.contains(
+                "install.sh:   systemctl enable northnarrow-agent northnarrow-watchdog\n"
+            ),
             "{case}: the exact command to run: {r:#?}"
         );
         assert_eq!(r.called(GRANT), 0, "{case}: {r:#?}");
@@ -803,8 +807,12 @@ exit 0"#
     assert_eq!(r.status, 1, "{r:#?}");
     assert!(r.index(GRANT) < r.index(CHECK), "{r:#?}");
     for want in [
-        &format!("install.sh:   {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0"),
-        &format!("install.sh:   {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside"),
+        &format!(
+            "install.sh:   {d}/10-pin.conf: found by the installer's check, sets CPUAffinity=0"
+        ),
+        &format!(
+            "install.sh:   {d}/override.conf: found by the installer's check, EnvironmentFile=/etc/default/northnarrow-agent lies outside"
+        ),
         "REFUSED — remove them",
         "--accept-dropin-quarantine",
         "Nothing was changed (the trusted-installer window this run opened ends at its deadline).",
@@ -2952,10 +2960,12 @@ fn an_unattested_release_is_refused_unless_allowed_and_the_flag_is_logged() {
     assert_eq!(m["provenance"], "checksums");
     assert_eq!(m["verify_override"], "--allow-unverified");
     assert_eq!(m["attestation"]["verified"], false);
-    assert!(m["attestation"]["failure"]
-        .as_str()
-        .unwrap()
-        .starts_with("no attestation verifier"));
+    assert!(
+        m["attestation"]["failure"]
+            .as_str()
+            .unwrap()
+            .starts_with("no attestation verifier")
+    );
     assert!(
         r.stderr.contains(
             "WARNING: --allow-unverified — the release's provenance attestation did not verify"
@@ -3494,8 +3504,10 @@ fn install_pins_the_committed_release_key() {
         )),
         "mk-tarball.sh does not ship the release key"
     );
-    assert!(read("deploy/install.sh")
-        .contains(&format!("RELEASE_KEY=\"$REPO_ROOT/{RELEASE_KEY_REL}\"")));
+    assert!(
+        read("deploy/install.sh")
+            .contains(&format!("RELEASE_KEY=\"$REPO_ROOT/{RELEASE_KEY_REL}\""))
+    );
 }
 
 /// The lab's path: a build from source (no MANIFEST.sha256) installs with
@@ -3607,7 +3619,9 @@ fn the_package_configure_step_warns_of_the_drop_ins_the_agent_judges_harmful() {
     assert_eq!(r.status, 0, "the hook never fails on it: {r:#?}");
     for want in [
         "install.sh: WARNING: the drop-in directories of the agent's own units hold drop-ins",
-        &format!("install.sh:   {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn"),
+        &format!(
+            "install.sh:   {d}/60-env.conf: found by the installer's check, EnvironmentFile=/etc/default/nn"
+        ),
         "UPGRADE_NOTES_WAVE4.md section 9",
     ] {
         assert!(r.stderr.contains(want), "{want}: {r:#?}");
@@ -3642,9 +3656,10 @@ fn the_package_configure_step_fails_on_an_unhealthy_upgrade() {
     assert_eq!(r.status, 1, "{r:#?}");
     assert!(r.stderr.contains("did not pass its health check"), "{r:#?}");
     assert!(r.stderr.contains("§6.2"), "{r:#?}");
-    assert!(lab
-        .logged()
-        .contains("-p auth.err -t northnarrow-pkg -- the upgraded NorthNarrow did not pass"));
+    assert!(
+        lab.logged()
+            .contains("-p auth.err -t northnarrow-pkg -- the upgraded NorthNarrow did not pass")
+    );
     assert!(
         lab.root.join("pkg-restart").exists(),
         "kept for the next attempt"
@@ -4793,10 +4808,11 @@ fn uninstall_finishes_a_wedged_agent_s_removal_at_the_next_boot() {
         r.stderr.contains("did not come up for the window"),
         "{r:#?}"
     );
-    assert!(host
-        .dir
-        .join("units/northnarrow-uninstall.service")
-        .exists());
+    assert!(
+        host.dir
+            .join("units/northnarrow-uninstall.service")
+            .exists()
+    );
     // a disable that does not take: the mask named, nothing else changed
     let host = Host::new("uninstall-wedged-nodisable", &both, true, true);
     fs::write(host.dir.join("wedged"), "").unwrap();
@@ -4805,10 +4821,12 @@ fn uninstall_finishes_a_wedged_agent_s_removal_at_the_next_boot() {
     let r = host.uninstall(false, None);
     assert_eq!(r.status, 1, "{r:#?}");
     assert!(r.stderr.contains("systemd.mask="), "{r:#?}");
-    assert!(!host
-        .dir
-        .join("units/northnarrow-uninstall.service")
-        .exists());
+    assert!(
+        !host
+            .dir
+            .join("units/northnarrow-uninstall.service")
+            .exists()
+    );
     assert!(!host.dir.join("finish").exists());
     // --purge reaches the boot-time run
     let host = Host::new("uninstall-wedged-purge", &both, true, true);
@@ -4827,10 +4845,12 @@ fn uninstall_finishes_a_wedged_agent_s_removal_at_the_next_boot() {
         !r.calls.iter().any(|c| c.starts_with("systemctl disable")),
         "{r:#?}"
     );
-    assert!(!host
-        .dir
-        .join("units/northnarrow-uninstall.service")
-        .exists());
+    assert!(
+        !host
+            .dir
+            .join("units/northnarrow-uninstall.service")
+            .exists()
+    );
 }
 
 /// Named (lot 341): the boot-time run removes its own one-shot and copy at
@@ -5189,9 +5209,11 @@ fn allow_bpf_tools_signs_no_hand_made_line_that_opens_lsm_struct_ops_or_ext() {
     let (status, out, err) = bpf_loader_allow(&dir, &vars, &body);
     assert_eq!(status, 0, "{err}");
     assert!(out.ends_with("allowed=/bin/sh\n"), "{out}");
-    assert!(fs::read_to_string(dir.join("calls"))
-        .unwrap()
-        .contains("policy set --file"));
+    assert!(
+        fs::read_to_string(dir.join("calls"))
+            .unwrap()
+            .contains("policy set --file")
+    );
 }
 
 /// Named (lot 345; the re-check of #550, point 1 and N5): `--help` and the
@@ -5965,8 +5987,11 @@ fn uninstall_removes_the_journal_runtime_dir_and_the_export_parent() {
         conf < varlink && varlink < runtime && runtime < purge,
         "order"
     );
-    assert!(text
-        .contains("JOURNALD_NS_RUNTIME=${JOURNALD_NS_RUNTIME:-/run/systemd/journal.northnarrow}"));
+    assert!(
+        text.contains(
+            "JOURNALD_NS_RUNTIME=${JOURNALD_NS_RUNTIME:-/run/systemd/journal.northnarrow}"
+        )
+    );
     // the purge's removal of the export's parent, run on a fixture (the
     // export itself removed, as the purge's loop above it does)
     for (case, other, gone) in [
@@ -6204,11 +6229,13 @@ fn install_refuses_a_loadable_preload_list_and_notes_an_inert_one() {
     // a list that is no regular file, or too large: refused, not waited on
     let dir = case_dir("preload-fifo");
     let fifo = dir.join("ld.so.preload");
-    assert!(Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let script = format!(
         "set -euo pipefail\nHOST_PRELOAD='{}'\n{}\npreload_check\n",
         fifo.display(),

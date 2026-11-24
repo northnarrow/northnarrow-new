@@ -92,7 +92,7 @@ fn agent_mounts_decided(
             return Ok(Verdict::Refused(format!(
                 "{}: {why} — the mounts over the agent's directories cannot be checked",
                 continuity::OWN_MOUNTINFO
-            )))
+            )));
         }
     };
     if !table
@@ -678,7 +678,7 @@ fn open_audit_log(
         Err(crate::keys::NoKey::Closed(why)) if closed_by_previous_hooks => {
             return AuditOpen::Deferred(format!(
                 "{why} (the previous agent's hooks close it to an unregistered process)"
-            ))
+            ));
         }
         Err(e) => return AuditOpen::NoKey(e.to_string()),
     };
@@ -1807,10 +1807,12 @@ mod tests {
             planted.verifying_key(),
             "the file at the link's end changed"
         );
-        assert!(std::fs::symlink_metadata(&paths.signing_key)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&paths.signing_key)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     /// The review of #473, B3: a first install whose earlier mint died before

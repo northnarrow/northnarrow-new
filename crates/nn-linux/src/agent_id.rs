@@ -67,9 +67,9 @@ use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use rand::rngs::SysRng;
+use anyhow::{Context, Result, anyhow};
 use rand::TryRng;
+use rand::rngs::SysRng;
 use tracing::{error, info};
 
 /// Default location of the persisted agent install UUID. Mirrors the

@@ -9,8 +9,8 @@ use nn_proto::admin_protocol::{
 };
 
 use super::read::read_tail_jsonl;
-use crate::admin::verify::{signed, Verified};
 use crate::admin::AdminReadPaths;
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 
 // ── Tappa 10 N7 — net admin dispatches ────────────────────────────

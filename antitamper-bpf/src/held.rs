@@ -32,9 +32,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use anyhow::{anyhow, bail, Context, Result};
-use aya::programs::links::{FdLink, PinnedLink};
+use anyhow::{Context, Result, anyhow, bail};
 use aya::programs::ProgramFd;
+use aya::programs::links::{FdLink, PinnedLink};
 use tracing::warn;
 
 /// What a held descriptor is.

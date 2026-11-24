@@ -40,7 +40,7 @@ use nn_model::{Event, ModuleLoadMethod, ModuleLoadVerdict, ResponseAction, Sever
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
 use crate::decision::rules::module_provenance::{ModuleOwners, Provenance};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 /// Standard kernel-module locations. A `.ko` loaded from anywhere else
 /// (`/tmp`, `/dev/shm`, `/home`, `/run`, …) is the near-certain rootkit
@@ -345,7 +345,7 @@ mod tests {
     type ModuleOwners = crate::decision::rules::module_provenance::ModuleOwners<H>;
     type R018KernelModuleLoad = super::R018KernelModuleLoad<H>;
     use common::module_judge::{trust_flag, verdict as kv};
-    use common::wire::{ModuleLoadRaw, MODULE_LOAD_FINIT, MODULE_LOAD_INIT};
+    use common::wire::{MODULE_LOAD_FINIT, MODULE_LOAD_INIT, ModuleLoadRaw};
 
     /// The rule on a host with no package database (provenance unknown).
     fn rule() -> R018KernelModuleLoad {
@@ -411,9 +411,10 @@ mod tests {
         }
         let packaged = ["/", "lib", "modules", "6.8.0", "kernel", "fs", "foo.ko"];
         for loader in ["modprobe", "systemd-udevd"] {
-            assert!(r
-                .evaluate(&ev(&raw(MODULE_LOAD_FINIT, loader, "bash", 0, &packaged)))
-                .is_none());
+            assert!(
+                r.evaluate(&ev(&raw(MODULE_LOAD_FINIT, loader, "bash", 0, &packaged)))
+                    .is_none()
+            );
         }
     }
 
@@ -464,15 +465,16 @@ mod tests {
             "extra",
             "vendor-storage-ctrl-hb.ko.zst",
         ];
-        assert!(r
-            .evaluate(&ev(&raw(
+        assert!(
+            r.evaluate(&ev(&raw(
                 MODULE_LOAD_FINIT,
                 "modprobe",
                 "bash",
                 0,
                 &packaged
             )))
-            .is_none());
+            .is_none()
+        );
         let staged = ["/", "tmp", "vendor-storage-controller-hb.ko.backdoor"];
         let v = r
             .evaluate(&ev(&raw(MODULE_LOAD_FINIT, "insmod", "bash", 0, &staged)))
@@ -646,7 +648,9 @@ mod tests {
         match e {
             Event::ModuleLoad { ref path, .. } => assert_eq!(
                 path.as_deref(),
-                Some("/usr/lib/modules/6.8.0-124-generic/kernel/drivers/net/can/spi/mcp251xfd/mcp251xfd.ko.zst")
+                Some(
+                    "/usr/lib/modules/6.8.0-124-generic/kernel/drivers/net/can/spi/mcp251xfd/mcp251xfd.ko.zst"
+                )
             ),
             _ => panic!("not ModuleLoad"),
         }
@@ -1062,8 +1066,10 @@ mod tests {
     #[test]
     fn non_module_event_is_ignored() {
         use crate::decision::rules::testutil::spawn;
-        assert!(rule()
-            .evaluate(&spawn("insmod", "/usr/sbin/insmod"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn("insmod", "/usr/sbin/insmod"))
+                .is_none()
+        );
     }
 }

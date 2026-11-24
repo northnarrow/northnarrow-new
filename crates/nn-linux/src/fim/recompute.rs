@@ -46,7 +46,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::fim::baseline::{compute_baseline, BaselineCache, BaselineDb};
+use crate::fim::baseline::{BaselineCache, BaselineDb, compute_baseline};
 use crate::fim::drain::InodePathMap;
 
 /// Bounded queue depth for the recompute channel. A pending op

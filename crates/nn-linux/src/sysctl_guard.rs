@@ -45,10 +45,10 @@
 use std::path::Path;
 
 use common::cgroup_limits::{
-    limit_value, rt_throttling_off, sysctl_blinds, sysctl_write_harmful, SYSCTL_FTRACE_ENABLED,
-    SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION, SYSCTL_MAX_MAP_COUNT,
-    SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY, SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX,
-    SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    SYSCTL_FTRACE_ENABLED, SYSCTL_KPROBES_ENABLED, SYSCTL_KPROBES_OPTIMIZATION,
+    SYSCTL_MAX_MAP_COUNT, SYSCTL_OVERCOMMIT_KBYTES, SYSCTL_OVERCOMMIT_MEMORY,
+    SYSCTL_OVERCOMMIT_RATIO, SYSCTL_PID_MAX, SYSCTL_SCHED_RT_RUNTIME, SYSCTL_THREADS_MAX,
+    limit_value, rt_throttling_off, sysctl_blinds, sysctl_write_harmful,
 };
 
 /// The guarded files, their kinds and the safe value put back (`None`:

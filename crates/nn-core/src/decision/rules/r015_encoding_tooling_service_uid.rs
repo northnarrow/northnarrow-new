@@ -25,7 +25,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Encoding / encryption tool comms (design §7.1).
@@ -197,9 +197,11 @@ mod tests {
     #[test]
     fn ignores_root_or_human_uid() {
         // Root encoder use is too common to flag here.
-        assert!(rule()
-            .evaluate(&spawn_as(0, "base64", "/usr/bin/base64"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn_as(0, "base64", "/usr/bin/base64"))
+                .is_none()
+        );
         // Human user (uid >= 1000) likewise, and a rootless container's
         // sub-uid (PROC-012: the range's owner's standing).
         for uid in [1000, 60_000, 100_000, 100_032] {
@@ -211,9 +213,11 @@ mod tests {
             );
         }
         // Non-encoder by a service uid is not R015's concern.
-        assert!(rule()
-            .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            rule()
+                .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -221,12 +225,14 @@ mod tests {
         let r = R015EncodingToolingServiceUid::new(Arc::new(CommAllowlist::from_iter_owned([
             "openssl".to_string(),
         ])));
-        assert!(r
-            .evaluate(&spawn_as(33, "openssl", "/usr/bin/openssl"))
-            .is_none());
+        assert!(
+            r.evaluate(&spawn_as(33, "openssl", "/usr/bin/openssl"))
+                .is_none()
+        );
         // A non-allowlisted encoder by a service uid still fires.
-        assert!(r
-            .evaluate(&spawn_as(33, "base64", "/usr/bin/base64"))
-            .is_some());
+        assert!(
+            r.evaluate(&spawn_as(33, "base64", "/usr/bin/base64"))
+                .is_some()
+        );
     }
 }

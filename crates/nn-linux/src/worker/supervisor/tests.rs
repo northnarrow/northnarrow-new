@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicU32;
 
 use nn_proto::ipc::{
-    LandlockEnforced, QnameIn, QnameOut, Response, ToWorker, WorkerHello, IPC_VERSION,
+    IPC_VERSION, LandlockEnforced, QnameIn, QnameOut, Response, ToWorker, WorkerHello,
 };
 
 use super::*;
@@ -389,10 +389,11 @@ fn a_request_out_of_bounds_is_refused_before_it_is_sent() {
     assert_eq!((st.violations, st.deaths), (0, 0), "{st:?}");
     assert_eq!(st.health, Health::Ready);
     // and the worker serves the next one
-    assert!(f
-        .workers
-        .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
-        .is_ok());
+    assert!(
+        f.workers
+            .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
+            .is_ok()
+    );
 }
 
 /// Review of #481 (R14b-2, RB1): a batch of names waits at most
@@ -402,7 +403,7 @@ fn a_request_out_of_bounds_is_refused_before_it_is_sent() {
 /// connects' wait.
 #[test]
 fn a_slow_worker_is_a_hang_well_before_the_connects_wait() {
-    use crate::worker::parse::{ParseClient, ANSWER_TIMEOUT, NAMES_TIMEOUT};
+    use crate::worker::parse::{ANSWER_TIMEOUT, NAMES_TIMEOUT, ParseClient};
     assert!(
         NAMES_TIMEOUT * 4 < crate::net::dns_ingest::INGEST_WAIT,
         "{NAMES_TIMEOUT:?}"
@@ -583,19 +584,21 @@ fn a_flood_of_answers_nobody_asked_for_is_caught() {
     let f = fixture(Script::Unsolicited);
     assert!(tick_until(&f.workers, Health::Ready));
     // the first answer is good; the second is waiting
-    assert!(f
-        .workers
-        .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
-        .is_ok());
+    assert!(
+        f.workers
+            .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
+            .is_ok()
+    );
     std::thread::sleep(Duration::from_millis(50));
     f.workers.tick(Instant::now());
     let st = &f.workers.status()[0];
     assert_eq!(st.violations, 1);
-    assert!(f
-        .reports
-        .lock()
-        .iter()
-        .any(|(_, d)| d.contains("no request asked for")));
+    assert!(
+        f.reports
+            .lock()
+            .iter()
+            .any(|(_, d)| d.contains("no request asked for"))
+    );
 }
 
 /// The flood's extra answer is found by the next request too, before it is
@@ -605,10 +608,11 @@ fn a_flood_of_answers_nobody_asked_for_is_caught() {
 fn a_left_answer_is_caught_by_the_next_request() {
     let f = fixture(Script::Unsolicited);
     assert!(tick_until(&f.workers, Health::Ready));
-    assert!(f
-        .workers
-        .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
-        .is_ok());
+    assert!(
+        f.workers
+            .request(WorkerKind::Parse, &names(), Duration::from_secs(2))
+            .is_ok()
+    );
     std::thread::sleep(Duration::from_millis(50));
     let got = f
         .workers
@@ -805,11 +809,12 @@ fn failures_in_a_row_back_off_then_disable_then_a_stable_worker_enables() {
     let st = &f.workers.status()[0];
     assert_eq!(st.health, Health::Disabled);
     assert!(st.why.contains("failures in a row"));
-    assert!(f
-        .reports
-        .lock()
-        .iter()
-        .any(|(_, d)| d.starts_with("disabled:")));
+    assert!(
+        f.reports
+            .lock()
+            .iter()
+            .any(|(_, d)| d.starts_with("disabled:"))
+    );
     // disabled: refused at once, whatever runs
     f.workers.tick(Instant::now() + MAX_BACKOFF);
     assert!(matches!(

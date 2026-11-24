@@ -6,7 +6,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 #[derive(Debug, Default)]
 pub struct R002ExecFromDevShm {
@@ -107,22 +107,28 @@ mod tests {
 
     #[test]
     fn ignores_other_paths() {
-        assert!(R002ExecFromDevShm::default()
-            .evaluate(&spawn("bash", "/bin/bash"))
-            .is_none());
+        assert!(
+            R002ExecFromDevShm::default()
+                .evaluate(&spawn("bash", "/bin/bash"))
+                .is_none()
+        );
     }
 
     #[test]
     fn does_not_match_dev_or_dev_shm_root() {
         // /dev/something else
-        assert!(R002ExecFromDevShm::default()
-            .evaluate(&spawn("x", "/dev/null"))
-            .is_none());
+        assert!(
+            R002ExecFromDevShm::default()
+                .evaluate(&spawn("x", "/dev/null"))
+                .is_none()
+        );
         // The bare directory itself is not a binary — the kernel won't
         // emit an exec event for it, but we still don't want to match
         // pseudo-paths missing the trailing slash.
-        assert!(R002ExecFromDevShm::default()
-            .evaluate(&spawn("x", "/dev/shmcurious"))
-            .is_none());
+        assert!(
+            R002ExecFromDevShm::default()
+                .evaluate(&spawn("x", "/dev/shmcurious"))
+                .is_none()
+        );
     }
 }

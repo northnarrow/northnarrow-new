@@ -318,7 +318,7 @@ pub mod net {
     pub mod dns_cache {
         pub use nn_core::net::dns_cache::*;
 
-        pub use crate::net::dns_ingest::{monotonic_ns, DnsIngest, IngestClaim, INGEST_WAIT};
+        pub use crate::net::dns_ingest::{DnsIngest, INGEST_WAIT, IngestClaim, monotonic_ns};
 
         /// [`nn_core::net::dns_cache::DnsCache`] with the DNS pump's ingest.
         pub type DnsCache = nn_core::net::dns_cache::DnsCache<DnsIngest>;

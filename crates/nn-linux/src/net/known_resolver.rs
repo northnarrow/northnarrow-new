@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::decision::rules::net::sender_is_forwarder;
-use crate::posture::lineage::{in_system_tree, AsOf, AuthSessionTracker};
+use crate::posture::lineage::{AsOf, AuthSessionTracker, in_system_tree};
 
 /// The image CoreDNS runs in its container.
 pub const COREDNS_IMAGE_PATH: &str = "/coredns";

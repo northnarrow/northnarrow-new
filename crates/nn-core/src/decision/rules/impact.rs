@@ -20,10 +20,10 @@ use std::sync::Arc;
 
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
 use crate::decision::response_policy::{self, PolicySwitch};
-use crate::decision::Rule;
 use crate::impact::RansomTracker;
 
 /// ATT&CK v20 technique of both rules.
@@ -277,9 +277,11 @@ mod tests {
         assert!(v.reasoning.contains("T1486"), "{}", v.reasoning);
         assert!(v.reasoning.contains("ransom-sim.py"), "{}", v.reasoning);
         // IMP-002 stays quiet on a decisive event.
-        assert!(NnLImp002RenameExtensionBurst::new(tr)
-            .evaluate(&e)
-            .is_none());
+        assert!(
+            NnLImp002RenameExtensionBurst::new(tr)
+                .evaluate(&e)
+                .is_none()
+        );
     }
 
     /// One shape alone: the rename burst is recorded (Log High), no kill;
@@ -305,9 +307,11 @@ mod tests {
             Arc::new(Plain),
         ));
         let e = renames(10 * S);
-        assert!(NnLImp001RansomwareEncryption::new(Arc::clone(&tr))
-            .evaluate(&e)
-            .is_none());
+        assert!(
+            NnLImp001RansomwareEncryption::new(Arc::clone(&tr))
+                .evaluate(&e)
+                .is_none()
+        );
         let v = NnLImp002RenameExtensionBurst::new(Arc::clone(&tr))
             .evaluate(&e)
             .expect("a record");

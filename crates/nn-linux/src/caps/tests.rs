@@ -389,9 +389,11 @@ fn the_decision_thread_reads_the_kernel_s_views_under_its_filter() {
             want_names
         );
         // its own status through procfs's link of names (`thread-self`)
-        assert!(kr::read_text("/proc/thread-self/status")
-            .unwrap()
-            .contains("Seccomp:\t2"));
+        assert!(
+            kr::read_text("/proc/thread-self/status")
+                .unwrap()
+                .contains("Seccomp:\t2")
+        );
         assert!(kr::metadata("/sys/kernel").unwrap().is_dir());
         // through them still no file opened for writing (the filter's
         // `openat` rule refuses the walk's open)
@@ -694,12 +696,14 @@ fn an_incomplete_or_failed_role_is_a_signed_degradation() {
     let name = "nn-rc3-incomplete";
     assert!(report_entered(name, Role::Writer, Ok(incomplete)).is_some());
     let failed = "nn-rc3-failed";
-    assert!(report_entered(
-        failed,
-        Role::Writer,
-        Err(io::Error::other("capset refused"))
-    )
-    .is_none());
+    assert!(
+        report_entered(
+            failed,
+            Role::Writer,
+            Err(io::Error::other("capset refused"))
+        )
+        .is_none()
+    );
     let rows = crate::boot::degradation::entries();
     for who in [name, failed] {
         assert!(

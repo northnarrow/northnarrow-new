@@ -13,7 +13,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 /// Dot-prefixed user directories whose binaries are legitimately
 /// executed (language toolchains, package managers, the tools that
@@ -201,9 +201,11 @@ mod tests {
     /// External audit PROC-013: autostart holds `.desktop` files.
     #[test]
     fn autostart_dir_is_never_exempt() {
-        assert!(R008HiddenHomeBinary
-            .evaluate(&spawn("x", "/home/alice/.config/autostart/x"))
-            .is_some());
+        assert!(
+            R008HiddenHomeBinary
+                .evaluate(&spawn("x", "/home/alice/.config/autostart/x"))
+                .is_some()
+        );
     }
 
     /// The rule judges the file the kernel executed: a caller's string
@@ -221,17 +223,23 @@ mod tests {
 
     #[test]
     fn ignores_non_home_and_non_dot_paths() {
-        assert!(R008HiddenHomeBinary
-            .evaluate(&spawn("ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            R008HiddenHomeBinary
+                .evaluate(&spawn("ls", "/usr/bin/ls"))
+                .is_none()
+        );
         // Visible (non-dot) home subdir.
-        assert!(R008HiddenHomeBinary
-            .evaluate(&spawn("hello", "/home/alice/projects/hello"))
-            .is_none());
+        assert!(
+            R008HiddenHomeBinary
+                .evaluate(&spawn("hello", "/home/alice/projects/hello"))
+                .is_none()
+        );
         // /root/.foo/ is not /home/<user>/ — out of scope (R009 covers
         // privileged-from-user-path; root exec from /root is normal).
-        assert!(R008HiddenHomeBinary
-            .evaluate(&spawn("x", "/root/.evil/x"))
-            .is_none());
+        assert!(
+            R008HiddenHomeBinary
+                .evaluate(&spawn("x", "/root/.evil/x"))
+                .is_none()
+        );
     }
 }

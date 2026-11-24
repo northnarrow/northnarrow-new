@@ -9,12 +9,12 @@ use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
 use crate::wire::{
-    ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
-    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_JOIN, FS_OP_CGROUP_KILL,
-    FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC,
-    FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME,
-    FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE,
-    FS_OP_XATTR,
+    ADDR_LEN, ExecCheckRaw, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CGROUP_FREEZE, FS_OP_CGROUP_JOIN,
+    FS_OP_CGROUP_KILL, FS_OP_CGROUP_LIMIT, FS_OP_CGROUP_MOVE, FS_OP_CGROUP_V1, FS_OP_CREATE,
+    FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_OOM_ADJ, FS_OP_PTRACE,
+    FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL, FS_OP_SYMLINK,
+    FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw,
+    TcpConnectRaw,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -2317,7 +2317,7 @@ mod tests {
             );
         }
     }
-    use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
+    use crate::wire::{FILENAME_LEN, ProcessSpawnRaw, TASK_COMM_LEN};
 
     #[test]
     fn file_open_raw_to_event() {

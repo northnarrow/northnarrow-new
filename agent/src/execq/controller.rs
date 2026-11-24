@@ -13,13 +13,13 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::wire::exe::exe_flags;
 use common::wire::execq::{
-    class_names, counter, stop_flags, ExecqKey, ExecqKnown, ExecqStopRaw, ExecqStopped,
+    ExecqKey, ExecqKnown, ExecqStopRaw, ExecqStopped, class_names, counter, stop_flags,
 };
 use nn_model::{Event, ExeIdentity};
 use nn_proto::execq::{ScanRequest, ScanResult, ScanVerdict};
@@ -27,9 +27,9 @@ use northnarrow_scan::supervisor::{ScannerEvent, Supervisor};
 use tracing::{debug, info, warn};
 
 use super::pkgtrust::{PackageTrust, PkgOutcome};
-use super::policy::{decide, Action, Basis, Gate, Next, Outcome, Policy};
-use super::record::{evidence, ExecqRecord};
-use super::{kernel, SpawnLedger, AUDIT_OP, COUNTERS, HEARTBEAT_EVERY};
+use super::policy::{Action, Basis, Gate, Next, Outcome, Policy, decide};
+use super::record::{ExecqRecord, evidence};
+use super::{AUDIT_OP, COUNTERS, HEARTBEAT_EVERY, SpawnLedger, kernel};
 use crate::response::config::ExecutorConfig;
 use crate::response::proc_ref::{Liveness, ProcRef};
 

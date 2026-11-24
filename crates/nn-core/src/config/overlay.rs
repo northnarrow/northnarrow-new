@@ -34,10 +34,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::{error, info, warn};
 
-use crate::config::overlay_auth::{content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV};
+use crate::config::overlay_auth::{ALLOW_UNSIGNED_ENV, Verified, content_sha256, read_overlay};
 use crate::content_host::ContentHost;
 
 /// Validates a single entry AFTER directive stripping. Returns a

@@ -27,7 +27,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// The variable the agent's golden tests read (`decision::golden::UPDATE_ENV`,
 /// `posture::golden::UPDATE_ENV`).

@@ -53,16 +53,16 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::admin_cli::{
-    load_audit_pubkey, run_audit_read, run_audit_verify_expecting, run_canary_burn,
-    run_canary_deploy, run_canary_list, run_canary_refresh, run_chain_verify, run_fim_baseline,
-    run_fim_report, run_fim_status, run_force_posture, run_init, run_rotate_keys_add,
-    run_rotate_keys_revoke, run_shutdown, run_status, run_trusted_installer_grant,
-    run_trusted_installer_grant_for_installer, run_unlock, run_verify_keys, AuditVerifyOutcome,
-    CanaryBurnOutcome, CanaryDeployOutcome, CanaryDeploySpec, CanaryListOutcome,
-    CanaryRefreshOutcome, DetectionSetStatusOutcome, ExpectedHead, FimBaselineOutcome,
-    FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome, NetResolveOutcome,
-    RotateKeysOutcome, ShutdownOutcome, StatusOutcome, TrustedInstallerGrantOutcome, UnlockOutcome,
-    VerifyKeysOutcome, AUDIT_READ_SKIPS_LISTED,
+    AUDIT_READ_SKIPS_LISTED, AuditVerifyOutcome, CanaryBurnOutcome, CanaryDeployOutcome,
+    CanaryDeploySpec, CanaryListOutcome, CanaryRefreshOutcome, DetectionSetStatusOutcome,
+    ExpectedHead, FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome,
+    NetJsonlOutcome, NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
+    TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome, load_audit_pubkey,
+    run_audit_read, run_audit_verify_expecting, run_canary_burn, run_canary_deploy,
+    run_canary_list, run_canary_refresh, run_chain_verify, run_fim_baseline, run_fim_report,
+    run_fim_status, run_force_posture, run_init, run_rotate_keys_add, run_rotate_keys_revoke,
+    run_shutdown, run_status, run_trusted_installer_grant,
+    run_trusted_installer_grant_for_installer, run_unlock, run_verify_keys,
 };
 use crate::host::{AdminHost, HostChecks as _, OverlayGate as _, RollbackFloor as _};
 
@@ -3205,7 +3205,9 @@ fn response_mode_line(out: &StatusOutcome, tty: bool) -> String {
             source.as_deref().unwrap_or("source not reported")
         ),
         (Some(false), _) => format!("response mode     : {}", colorize("enforcing", "32", tty)),
-        (None, _) => "response mode     : (not reported: the agent has no response executor)".to_string(),
+        (None, _) => {
+            "response mode     : (not reported: the agent has no response executor)".to_string()
+        }
     }
 }
 
@@ -4977,7 +4979,7 @@ fn exit_from_admin_result(op: &str, r: nn_proto::admin_protocol::AdminResult) ->
 /// version, 7 role).
 fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
     use crate::admin_cli::{
-        run_response_release, run_response_restore, run_response_status, ResponseActionOutcome,
+        ResponseActionOutcome, run_response_release, run_response_restore, run_response_status,
     };
     use nn_proto::admin_protocol::AdminResult;
     let finish = |op: &str, r: anyhow::Result<ResponseActionOutcome>| match r {
@@ -6763,9 +6765,11 @@ mod flow_sock_line_tests {
         for none in [Some(vec![]), None] {
             o.advisories = none;
             assert!(super::advisory_lines(&o).is_empty());
-            assert!(!summary_lines(&o, false)
-                .iter()
-                .any(|l| l.starts_with("advisories")));
+            assert!(
+                !summary_lines(&o, false)
+                    .iter()
+                    .any(|l| l.starts_with("advisories"))
+            );
         }
     }
 
@@ -7621,7 +7625,7 @@ mod help_text_tests {
 /// be reached, wherever in the chain the refusal sits.
 #[cfg(test)]
 mod permission_tests {
-    use super::{exit_from_request_error, permission_denied, EXIT_PERMISSION_DENIED};
+    use super::{EXIT_PERMISSION_DENIED, exit_from_request_error, permission_denied};
     use anyhow::Context as _;
     use std::process::ExitCode;
 
@@ -7693,7 +7697,7 @@ mod permission_tests {
 /// `xtask/tests/documented_commands.rs`).
 #[cfg(test)]
 mod audit_verify_source_tests {
-    use super::{audit_verify_source_in, Cli};
+    use super::{Cli, audit_verify_source_in};
     use clap::Parser as _;
 
     /// `audit verify` without `--from` reads the agent's audit log; a

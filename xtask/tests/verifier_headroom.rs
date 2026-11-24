@@ -138,8 +138,11 @@ fn the_fim_sensor_past_the_watch_is_global_functions() {
     // parent and its inode go to the last through the buffer, written
     // before they are read
     let class = body(&open, "nn_open_class");
-    assert!(class
-        .contains("let cls = dir_class(&pkey, parent as *const u8, parent_inode as *const u8);"));
+    assert!(
+        class.contains(
+            "let cls = dir_class(&pkey, parent as *const u8, parent_inode as *const u8);"
+        )
+    );
     assert!(
         !class.contains("buffer_of(") && !class.contains("OPEN_TASK"),
         "{class}"

@@ -325,7 +325,7 @@ pub fn through_proc_link(path: &str) -> bool {
 
 /// The review of #578 (N1): the one reading of such a name's parts, for the
 /// exec pump to open it in the process's own view.
-pub use crate::posture::proc_link::{view_link, Hop, ViewLink, Who};
+pub use crate::posture::proc_link::{Hop, ViewLink, Who, view_link};
 
 /// The re-check of #578 (R1-2): where the exec pump found a file the loader
 /// was given by a name NOT through a link of `/proc` — an absolute or a
@@ -1401,7 +1401,7 @@ mod tests {
     /// four were silent in every profile.
     #[test]
     fn a_loader_operand_through_a_proc_view_link_is_judged_as_a_direct_exec() {
-        use super::program_identity::{keep_loader_files, LoaderFile};
+        use super::program_identity::{LoaderFile, keep_loader_files};
         use nn_model::{ResponseAction::*, Severity};
         let ld = "/lib64/ld-linux-x86-64.so.2";
         let placed = |key: u32, text: &str, path: &str, memfd: bool, deleted: bool| {
@@ -1692,9 +1692,11 @@ mod tests {
             exe.path = "/home/u/ld-musl-x86_64.so.1".into();
             *filename = exe.path.clone();
         }
-        assert!(staging_verdicts(&named, false)
-            .iter()
-            .all(|v| v.1 == KillProcessTree));
+        assert!(
+            staging_verdicts(&named, false)
+                .iter()
+                .all(|v| v.1 == KillProcessTree)
+        );
     }
 
     /// The re-check of #578 (R1-1, named; its probe on glibc 2.39): glibc's
@@ -1997,7 +1999,7 @@ mod tests {
     /// `ld.so /usr/tmp/x` was silent.
     #[test]
     fn a_loader_operand_through_a_symbolic_link_is_judged_where_the_pump_found_it() {
-        use super::program_identity::{keep_loader_files, LoaderFile};
+        use super::program_identity::{LoaderFile, keep_loader_files};
         use nn_model::{ResponseAction::*, Severity};
         let ld = "/lib64/ld-linux-x86-64.so.2";
         let placed_at = |key: u32, text: &str, path: &str| {

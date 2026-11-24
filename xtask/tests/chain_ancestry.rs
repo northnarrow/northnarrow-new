@@ -199,12 +199,14 @@ fn the_ratchet_sees_a_hop_wrapper_and_an_entry_outside_observe_lineage() {
         ),
         ["observe_exec"]
     );
-    assert!(misplaced_edges(
-        CHAIN,
-        "fn observe_lineage<H>(store: &mut S) { store.observe_exec(1, 2, 3, 4, 5, 6); \
+    assert!(
+        misplaced_edges(
+            CHAIN,
+            "fn observe_lineage<H>(store: &mut S) { store.observe_exec(1, 2, 3, 4, 5, 6); \
          store.observe_fork(1, 2, 3, 4, 5); }"
-    )
-    .is_empty());
+        )
+        .is_empty()
+    );
     assert!(misplaced_edges(
         STORE,
         "pub fn observe_exec(&mut self) { self.observe_fork_hop(1, 2, 3); self.observe_spawn(1, 2, 3); }\n\

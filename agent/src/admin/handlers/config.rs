@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use nn_proto::admin_protocol::{AdminResult, ConfigOverlaySetRequest, ConfigOverlaySetResponse};
 
-use crate::admin::verify::{signed, Verified};
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::decision::rule_policy::PolicyHandle;
 

@@ -10,7 +10,7 @@ use northnarrow_agent::sensors::SensorMultiplexer;
 use tracing::{error, info, warn};
 
 use super::cli::Cli;
-use super::evidence::{drain_ended, AuditHandle};
+use super::evidence::{AuditHandle, drain_ended};
 
 /// The network drain (Tappa 10 N9): the netflow and listener logs (one that
 /// cannot be opened is a signed degradation and the drain runs without it:
@@ -62,7 +62,7 @@ pub(crate) fn start(
     // verifier-side ringbuf drop counter ticks; NN-L-NET-001..009
     // see zero events but the agent stays up.
     {
-        use northnarrow_agent::net::drain::{drain_loop, NetFlowDb, NetListenerDb};
+        use northnarrow_agent::net::drain::{NetFlowDb, NetListenerDb, drain_loop};
 
         // The review of #468, R4: copies of the start's one key, no load of
         // their own.

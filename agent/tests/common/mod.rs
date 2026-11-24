@@ -1236,7 +1236,7 @@ pub fn restore_path(path: &Path, state: &PathState) -> Result<(), String> {
             return Err(format!(
                 "{shown} is a directory now ({} expected): not removed",
                 state.describe()
-            ))
+            ));
         }
         PathState::Other(_) => {
             std::fs::remove_file(path).map_err(|e| format!("{shown}: removing {now:?}: {e}"))?

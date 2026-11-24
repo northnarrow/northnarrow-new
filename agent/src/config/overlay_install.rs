@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tracing::warn;
 
-use super::overlay_auth::{sig_path, OverlaySignature};
+use super::overlay_auth::{OverlaySignature, sig_path};
 
 /// Store an overlay and its signature (`nn-admin config overlay set`,
 /// after the request was verified): both written to a temporary file in

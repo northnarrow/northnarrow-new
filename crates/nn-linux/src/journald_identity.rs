@@ -243,7 +243,7 @@ mod tests {
         file(&new_file);
         std::fs::rename(&new_file, &exe).unwrap();
         let ino = std::fs::metadata(&exe).unwrap().ino();
-        assert_eq!(quiet_under(r, Some(cg.path()), me(), &no_db)[0].0 .1, ino);
+        assert_eq!(quiet_under(r, Some(cg.path()), me(), &no_db)[0].0.1, ino);
         assert_ne!(ino, md.ino());
         // a file named so elsewhere is never looked at
         let opt = r.join("opt/x/systemd-journald");

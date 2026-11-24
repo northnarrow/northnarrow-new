@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use nn_model::{Event, FileBurstKind};
@@ -555,8 +555,8 @@ fn one_event_is_assessed_once() {
     assert!(Arc::ptr_eq(&a, &b));
     assert_eq!(sampler.calls.load(Ordering::Relaxed), 1);
     assert_eq!(t.counts().decisive, 1);
-    assert!(t
-        .assess(&Event::Fim(nn_model::telemetry::FimEvent {
+    assert!(
+        t.assess(&Event::Fim(nn_model::telemetry::FimEvent {
             timestamp_ns: 0,
             path: "/x".into(),
             op: nn_model::telemetry::FimOp::Modified,
@@ -584,7 +584,8 @@ fn one_event_is_assessed_once() {
             renamed_away: false,
             modifier_start: 0,
         }))
-        .is_none());
+        .is_none()
+    );
 }
 
 /// Lot 283c, decision 5: NN-L-IMP-001 judges a service account that

@@ -57,7 +57,7 @@ use crate::posture::lineage::AuthSessionTracker;
 use config::CowConfig;
 use guard::Runtime;
 use restore::Selector;
-use store::{now_ms, RestoreBy, RestoreReport, Store};
+use store::{RestoreBy, RestoreReport, Store, now_ms};
 use trust::ProcId;
 
 /// Lot 353 (the review of #563, F2): the start of process `pid`, its

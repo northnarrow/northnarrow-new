@@ -71,9 +71,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,7 @@ use tracing::{error, warn};
 
 use crate::audit::GENESIS_PREV_HASH;
 use crate::chain_host::{ChainHost, ChainSigner, Open, StdHost};
-use crate::clock::{stamp, Clock, SystemClock};
+use crate::clock::{Clock, SystemClock, stamp};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
 /// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
@@ -2627,7 +2627,7 @@ pub fn repair_torn_tail<H: ChainHost>(
             return Err(anyhow!(
                 "{}: a symbolic link, not a chain file — not followed, left untouched",
                 path.display()
-            ))
+            ));
         }
         Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
     };
@@ -2811,7 +2811,7 @@ fn recover_tail<H: ChainHost>(
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TailRecovery::empty()),
         Err(e) => {
-            return Err(anyhow!(e).context(format!("opening {} for tail recovery", path.display())))
+            return Err(anyhow!(e).context(format!("opening {} for tail recovery", path.display())));
         }
     };
     let size = f.metadata()?.len();
@@ -3719,7 +3719,7 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
                 lines: 0,
                 bytes: 0,
                 whole_file: true,
-            })
+            });
         }
         Err(e) => return Err(unreadable(e.to_string())),
     };
@@ -3796,7 +3796,7 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
                         reason: format!("not JSON: {e}"),
                     },
                     before,
-                ))
+                ));
             }
         };
         let ok = match verify_active_line::<P>(line, pubkey) {
@@ -3814,23 +3814,23 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
                     pos(Some(&value)),
                     LineBreak::ContentAltered { recomputed, stored },
                     before,
-                ))
+                ));
             }
             Err(LineFault::NonCanonical) => {
-                return Err(broken(pos(Some(&value)), LineBreak::NotCanonical, before))
+                return Err(broken(pos(Some(&value)), LineBreak::NotCanonical, before));
             }
             Err(LineFault::Malformed(reason) | LineFault::SigMalformed(reason)) => {
                 return Err(broken(
                     pos(Some(&value)),
                     LineBreak::Malformed { reason },
                     before,
-                ))
+                ));
             }
         };
         match ok.pre_image {
             PreImage::V3 => seen_v3 = true,
             PreImage::Legacy if seen_v3 => {
-                return Err(broken(pos(Some(&value)), LineBreak::LegacyAfterV3, before))
+                return Err(broken(pos(Some(&value)), LineBreak::LegacyAfterV3, before));
             }
             PreImage::Legacy => {}
         }
@@ -3954,7 +3954,7 @@ fn verify_one_file<P: Serialize + DeserializeOwned + ChainPayload>(
                 file,
                 idx: 0,
                 reason: e.to_string(),
-            })
+            });
         }
     };
 
@@ -4080,7 +4080,7 @@ fn verify_manifest(
                 file,
                 idx: 0,
                 reason: e.to_string(),
-            })
+            });
         }
     };
     let mut expected = GENESIS_PREV_HASH.to_string();
@@ -4560,9 +4560,11 @@ mod tests {
         for (path, existed) in &released {
             assert!(existed, "{} released after its removal", path.display());
             assert!(!path.exists(), "{} released but kept", path.display());
-            assert!(retained
-                .iter()
-                .all(|&seq| archive_path(&active, seq) != *path));
+            assert!(
+                retained
+                    .iter()
+                    .all(|&seq| archive_path(&active, seq) != *path)
+            );
         }
         assert_eq!(
             released.len() + retained.len(),
@@ -5388,9 +5390,11 @@ mod tests {
         }
         drop(open_log(&b, &kp, 1 << 30));
         assert_eq!(data_lines(&b), MAX_TAIL_REJECTS + 2);
-        assert!(manifest_events(&b)
-            .iter()
-            .any(|e| matches!(e, ManifestEvent::TailUnverified { .. })));
+        assert!(
+            manifest_events(&b)
+                .iter()
+                .any(|e| matches!(e, ManifestEvent::TailUnverified { .. }))
+        );
         // A file of nothing but such lines is never emptied.
         let c = dir.path().join("c.jsonl");
         fs::write(&c, forged(0) + &forged(1)).unwrap();
@@ -5494,9 +5498,11 @@ mod tests {
             let mut log = open_log(&active, &kp, 1 << 30);
             log.append(payload(0)).expect("appends must keep working");
             drop(log);
-            assert!(manifest_events(&active)
-                .iter()
-                .any(|e| matches!(e, ManifestEvent::ForeignArchive { seq: 1, .. })));
+            assert!(
+                manifest_events(&active)
+                    .iter()
+                    .any(|e| matches!(e, ManifestEvent::ForeignArchive { seq: 1, .. }))
+            );
         }
     }
 
@@ -6938,8 +6944,7 @@ mod tests {
         TestKey::load_or_bootstrap(&p).unwrap()
     }
 
-    const FROZEN_ROW: &str =
-        "{\"ts\":\"2026-10-09T00:00:00.000000Z\",\"seq\":7,\"data\":\"caf\u{e9} \\\"q\\\" \\\\ \\n\"";
+    const FROZEN_ROW: &str = "{\"ts\":\"2026-10-09T00:00:00.000000Z\",\"seq\":7,\"data\":\"caf\u{e9} \\\"q\\\" \\\\ \\n\"";
 
     /// Frozen vectors. A v2 line built by hand, as the 0.0.1 writer did
     /// (`SHA-256(prev ‖ json)`, untagged), verifies byte for byte; a v3
@@ -7661,9 +7666,11 @@ mod tests {
             r.as_ref().is_ok_and(|r| r.total_records == failed + 3),
             "the seal written twice: {r:?}"
         );
-        assert!(manifest_events(&active)
-            .iter()
-            .any(|e| matches!(e, ManifestEvent::Rotated { seq: 1, .. })));
+        assert!(
+            manifest_events(&active)
+                .iter()
+                .any(|e| matches!(e, ManifestEvent::Rotated { seq: 1, .. }))
+        );
     }
 
     /// A seal cut short (a full disk): its fragment is cut and attested, and
@@ -8564,7 +8571,7 @@ mod tests {
     /// ARCHIVE, the archive before it newer: read on there too.
     #[test]
     fn a_backdated_archive_head_with_a_newer_older_archive_reads_on() {
-        use crate::chain_tail::{read_chain_tail, TailQuery};
+        use crate::chain_tail::{TailQuery, read_chain_tail};
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("log.jsonl");
         let line = |ts: &str, n: u64| format!("{{\"ts\":\"{ts}\",\"n\":{n}}}\n");

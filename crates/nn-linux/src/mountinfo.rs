@@ -370,7 +370,9 @@ mod tests {
 
     #[test]
     fn a_kernel_line_is_read_field_by_field() {
-        let t = line("566 539 252:1 /etc/northnarrow /etc/northnarrow rw,nosuid,relatime shared:276 master:1 - ext4 /dev/vda1 rw,discard\n");
+        let t = line(
+            "566 539 252:1 /etc/northnarrow /etc/northnarrow rw,nosuid,relatime shared:276 master:1 - ext4 /dev/vda1 rw,discard\n",
+        );
         assert!(t.malformed.is_empty(), "{:?}", t.malformed);
         let m = &t.entries[0];
         assert_eq!((m.id, m.parent, m.major, m.minor), (566, 539, 252, 1));

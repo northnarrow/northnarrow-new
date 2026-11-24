@@ -23,14 +23,14 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
+    Ebpf,
     maps::{
-        lpm_trie::{Key, LpmTrie},
         Array, MapData,
+        lpm_trie::{Key, LpmTrie},
     },
     programs::Lsm,
-    Ebpf,
 };
 use common::wire::NET_BLOCK_MAX_ENTRIES;
 

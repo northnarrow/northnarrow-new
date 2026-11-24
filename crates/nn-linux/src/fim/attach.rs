@@ -37,8 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use antitamper_bpf::attach_transient;
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{ring_buf::RingBuf, HashMap as AyaHashMap, MapData};
+use anyhow::{Context, Result, anyhow};
+use aya::maps::{HashMap as AyaHashMap, MapData, ring_buf::RingBuf};
 use aya::{Btf, Ebpf};
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -752,12 +752,16 @@ mod tests {
     /// External audit FIMP-011.
     #[test]
     fn a_fim_that_sees_nothing_says_so() {
-        assert!(coverage_shortfall(0, 10, 0, 125)
-            .unwrap()
-            .contains("0/10 observe programs"));
-        assert!(coverage_shortfall(10, 10, 0, 125)
-            .unwrap()
-            .contains("none of the 125 configured paths"));
+        assert!(
+            coverage_shortfall(0, 10, 0, 125)
+                .unwrap()
+                .contains("0/10 observe programs")
+        );
+        assert!(
+            coverage_shortfall(10, 10, 0, 125)
+                .unwrap()
+                .contains("none of the 125 configured paths")
+        );
         assert!(coverage_shortfall(7, 10, 90, 125).unwrap().contains("7/10"));
         assert_eq!(coverage_shortfall(10, 10, 90, 125), None);
         // an empty list was attested where it was loaded (FIMR-001)

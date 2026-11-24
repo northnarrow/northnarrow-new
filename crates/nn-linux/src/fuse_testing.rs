@@ -11,8 +11,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `body`'s exit code, run in a forked child in a user and mount namespace
 /// of its own (`/` made private), uid and gid 0 mapped to the caller's;

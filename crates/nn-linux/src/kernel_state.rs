@@ -253,7 +253,7 @@ const RANK_KNOWN: u8 = common::bpf_prog_class::REACH_FILTER + 1;
 /// program last. Within a rank, the round's order (the carried first).
 pub fn rank(f: &Finding) -> u8 {
     use crate::bpf_crossview::Finding as B;
-    use common::bpf_prog_class::{reach, REACH_KERNEL, REACH_SIGNAL_OR_WRITE};
+    use common::bpf_prog_class::{REACH_KERNEL, REACH_SIGNAL_OR_WRITE, reach};
     match f {
         Finding::Bpf(B::Unseen(o) | B::Baseline(o) | B::HeldOutlived(o, _)) => {
             if o.known.is_some() {
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn a_known_baseline_program_carries_its_loader() {
         use crate::bpf_crossview::{Finding as B, Object};
-        use common::bpf_prog_class::{crossview_ino, KnownLink, CROSSVIEW_KNOWN_BIT};
+        use common::bpf_prog_class::{CROSSVIEW_KNOWN_BIT, KnownLink, crossview_ino};
         let o = |id: u32, is_link: bool| Object {
             is_link,
             id,
@@ -1278,7 +1278,7 @@ mod tests {
     /// and counts in `target_dev`, the CPUs left in `target_ino`.
     #[test]
     fn a_cpu_confinement_is_signed_as_cpu_confined() {
-        use crate::own_cpus::{Cause, Confinement, CAUSE_PARTITION};
+        use crate::own_cpus::{CAUSE_PARTITION, Cause, Confinement};
         let c = Confinement {
             left: vec![0],
             expected: vec![0, 1, 2, 3],
@@ -1515,9 +1515,11 @@ mod tests {
         found.extend((4_001..=4_100).map(|id| unseen(id, 1)));
         let (signed, held_back) = one_round(found);
         assert_eq!(held_back.len(), 100 - ROUND_QUOTA);
-        assert!(held_back
-            .iter()
-            .all(|f| matches!(f, Finding::Bpf(B::Unseen(o)) if o.held.is_none())));
+        assert!(
+            held_back
+                .iter()
+                .all(|f| matches!(f, Finding::Bpf(B::Unseen(o)) if o.held.is_none()))
+        );
         assert_eq!(ids(&signed).len(), 1_000 + 100 + 100 + ROUND_QUOTA);
         for f in [
             Finding::Bpf(B::HeldOutlived(object(9, 2), 0)),
@@ -1534,7 +1536,7 @@ mod tests {
     /// links and the programs not held are left as they are.
     #[test]
     fn the_cross_view_marks_a_held_program_s_findings_held() {
-        use crate::bpf_crossview::{mark_held, Finding as B, Object};
+        use crate::bpf_crossview::{Finding as B, Object, mark_held};
         let mut found = vec![
             B::Unseen(object(5, 1)),
             B::Baseline(object(6, 2)),
@@ -1564,8 +1566,8 @@ mod tests {
         use crate::bpf_crossview::Finding as B;
         let mut found: Vec<Finding> = (1..=1_000).map(|id| unseen(id, 1)).collect();
         found.push(unseen(5_000, 2)); // BPF_PROG_TYPE_KPROBE
-                                      // a link (type 1, raw_tracepoint) whose program is hidden: named
-                                      // for being a link, whatever its type
+        // a link (type 1, raw_tracepoint) whose program is hidden: named
+        // for being a link, whatever its type
         found.push(Finding::Bpf(B::Unseen(crate::bpf_crossview::Object {
             is_link: true,
             ..object(6_000, 1)
@@ -1625,9 +1627,11 @@ mod tests {
             "the XDP held back: {:?}",
             ids(&signed)
         );
-        assert!(!held
-            .iter()
-            .any(|f| matches!(f, Finding::Bpf(b) if b.object() == (false, 5_000))));
+        assert!(
+            !held
+                .iter()
+                .any(|f| matches!(f, Finding::Bpf(b) if b.object() == (false, 5_000)))
+        );
         // each type of wide reach among a thousand socket filters and
         // cgroup_skb programs (the rank is the type's, the id last)
         let wide = [

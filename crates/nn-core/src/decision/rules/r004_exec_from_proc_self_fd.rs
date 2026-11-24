@@ -181,7 +181,7 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::rules::program_identity::{self, ProgramKind};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Lot 347: what [`R004ExecFromProcSelfFd::runtime_self_clone`] found of a
@@ -1030,69 +1030,76 @@ mod tests {
             nn_model::ExeIdentity { dev, ino, ..exe }
         };
         // LSM mode, the image unlinked by an upgrade: the agent's own
-        assert!(rule
-            .evaluate(&launch(
+        assert!(
+            rule.evaluate(&launch(
                 900,
                 990,
                 "/proc/self/fd/64",
                 &argv,
                 deleted(2049, 77)
             ))
-            .is_none());
+            .is_none()
+        );
         // tracepoint mode: on the facts
-        assert!(rule
-            .evaluate(&launch(
+        assert!(
+            rule.evaluate(&launch(
                 900,
                 990,
                 "/proc/self/fd/64",
                 &argv,
                 Default::default()
             ))
-            .is_none());
+            .is_none()
+        );
         // lot 276: the export worker, as its own account — and only so: as
         // the parse worker's account, or the parse worker as the export's,
         // fileless as ever
         let export = ["northnarrow-agent", "--worker", "export", "--ipc-fd", "3"];
-        assert!(rule
-            .evaluate(&launch(
+        assert!(
+            rule.evaluate(&launch(
                 900,
                 989,
                 "/proc/self/fd/64",
                 &export,
                 Default::default()
             ))
-            .is_none());
-        assert!(rule
-            .evaluate(&launch(
+            .is_none()
+        );
+        assert!(
+            rule.evaluate(&launch(
                 900,
                 990,
                 "/proc/self/fd/64",
                 &export,
                 Default::default()
             ))
-            .is_some());
-        assert!(rule
-            .evaluate(&launch(
+            .is_some()
+        );
+        assert!(
+            rule.evaluate(&launch(
                 900,
                 989,
                 "/proc/self/fd/64",
                 &argv,
                 Default::default()
             ))
-            .is_some());
+            .is_some()
+        );
         let no_export = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
             export_uid: None,
             ..own.clone()
         }));
-        assert!(no_export
-            .evaluate(&launch(
-                900,
-                989,
-                "/proc/self/fd/64",
-                &export,
-                Default::default()
-            ))
-            .is_some());
+        assert!(
+            no_export
+                .evaluate(&launch(
+                    900,
+                    989,
+                    "/proc/self/fd/64",
+                    &export,
+                    Default::default()
+                ))
+                .is_some()
+        );
         // any fact off: fileless as ever
         for (what, e) in [
             (
@@ -1156,44 +1163,48 @@ mod tests {
             assert!(rule.evaluate(&e).is_some(), "{what}");
         }
         // without the facts (no worker), the same launch is fileless
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&launch(
-                900,
-                990,
-                "/proc/self/fd/64",
-                &argv,
-                deleted(2049, 77)
-            ))
-            .is_some());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&launch(
+                    900,
+                    990,
+                    "/proc/self/fd/64",
+                    &argv,
+                    deleted(2049, 77)
+                ))
+                .is_some()
+        );
         // facts that would name root (an account lookup refuses root: never
         // built so) never exempt a root exec
         let root = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
             uid: 0,
             ..own.clone()
         }));
-        assert!(root
-            .evaluate(&launch(
+        assert!(
+            root.evaluate(&launch(
                 900,
                 0,
                 "/proc/self/fd/64",
                 &argv,
                 Default::default()
             ))
-            .is_some());
+            .is_some()
+        );
         // and an agent pid of 0 never matches
         let zero = R004ExecFromProcSelfFd::default().with_own_launch(Some(OwnWorkerLaunch {
             agent_pid: 0,
             ..own
         }));
-        assert!(zero
-            .evaluate(&launch(
+        assert!(
+            zero.evaluate(&launch(
                 0,
                 990,
                 "/proc/self/fd/64",
                 &argv,
                 Default::default()
             ))
-            .is_some());
+            .is_some()
+        );
     }
 
     #[test]
@@ -1207,35 +1218,47 @@ mod tests {
 
     #[test]
     fn ignores_normal_paths() {
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("ls", "/usr/bin/ls"))
-            .is_none());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("ls", "/usr/bin/ls"))
+                .is_none()
+        );
         // /proc/<pid>/status is not an exec target.
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("x", "/proc/123/status"))
-            .is_none());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("x", "/proc/123/status"))
+                .is_none()
+        );
     }
 
     #[test]
     fn matches_proc_pid_fd_form_too() {
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("x", "/proc/4242/fd/7"))
-            .is_some());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("x", "/proc/4242/fd/7"))
+                .is_some()
+        );
         // Empty fd number does not count.
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("x", "/proc/self/fd/"))
-            .is_none());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("x", "/proc/self/fd/"))
+                .is_none()
+        );
         // Lot 310: the posture's one reader of a `/proc` link reads any
         // second segment (`self`, `thread-self`, a pid): this assertion
         // said a non-numeric one does not count. No `/proc` entry has
         // such a name, so `/proc/abc/fd/3` is never executed, and the
         // per-thread names (`thread-self`) are what it missed (BUG-88).
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("x", "/proc/abc/fd/3"))
-            .is_some());
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&spawn("x", "/proc/thread-self/fd/3"))
-            .is_some());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("x", "/proc/abc/fd/3"))
+                .is_some()
+        );
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&spawn("x", "/proc/thread-self/fd/3"))
+                .is_some()
+        );
     }
 
     // ── Tappa 10.6.5 — systemd-executor exemption ──────────────────────
@@ -1387,23 +1410,27 @@ mod tests {
         assert!(r.evaluate(&upgraded(1, (2049, 1001))).is_some());
         // fileless: a memfd (whatever argv[0] and parent claim), or an
         // unlinked file reached through an fd (O_TMPFILE)
-        assert!(r
-            .evaluate(&ev("/proc/self/fd/3", "/memfd:x (deleted)", MEMFD))
-            .is_some());
-        assert!(r
-            .evaluate(&ev("/proc/self/fd/3", "/tmp/#1234 (deleted)", DELETED))
-            .is_some());
-        assert!(r
-            .evaluate(&ev(
+        assert!(
+            r.evaluate(&ev("/proc/self/fd/3", "/memfd:x (deleted)", MEMFD))
+                .is_some()
+        );
+        assert!(
+            r.evaluate(&ev("/proc/self/fd/3", "/tmp/#1234 (deleted)", DELETED))
+                .is_some()
+        );
+        assert!(
+            r.evaluate(&ev(
                 "/proc/self/fd/3",
                 "/tmp/systemd-executor (deleted)",
                 DELETED
             ))
-            .is_some());
+            .is_some()
+        );
         // a real file through an fd is judged on its path by the other rules
-        assert!(r
-            .evaluate(&ev("/proc/self/fd/3", "/tmp/payload", 0))
-            .is_none());
+        assert!(
+            r.evaluate(&ev("/proc/self/fd/3", "/tmp/payload", 0))
+                .is_none()
+        );
     }
 
     /// `bash exec -a foo /proc/self/fd/3` from an arbitrary user shell:
@@ -1499,9 +1526,11 @@ mod tests {
             "systemd",
             &["/usr/lib/systemd/systemd-executor"],
         );
-        assert!(R004ExecFromProcSelfFd::default()
-            .evaluate(&with_proc_exe(ev, common::wire::exe::exe_flags::DELETED))
-            .is_some());
+        assert!(
+            R004ExecFromProcSelfFd::default()
+                .evaluate(&with_proc_exe(ev, common::wire::exe::exe_flags::DELETED))
+                .is_some()
+        );
     }
 }
 
@@ -1749,15 +1778,16 @@ mod lot310 {
         lineage.ingest_spawn_event(&parent(8888, (2049, 999)));
         let r = R004::new(lineage);
         // the child runs the parent's image, unlinked since
-        assert!(r
-            .evaluate(&exec(
+        assert!(
+            r.evaluate(&exec(
                 1000,
                 7777,
                 "/proc/self/exe",
                 "/opt/google/chrome/chrome",
                 DELETED
             ))
-            .is_none());
+            .is_none()
+        );
         // another image than its parent's
         assert!(kills(r.evaluate(&exec(
             1000,
@@ -2027,7 +2057,7 @@ mod lot310 {
     #[test]
     fn a_runtimes_sealed_copy_of_itself_under_its_manager_is_not_fileless() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         let copy = |image: (u64, u64)| RuntimeClone {
             image,
@@ -2154,11 +2184,13 @@ mod lot310 {
             r.evaluate(&e)
         };
         assert!(podman(memfd_exec(34_742, 34_741, 0, 400), seen(conmon, 34_740)).is_none());
-        assert!(podman(
-            memfd_exec(34_743, 34_741, 34_741, 400),
-            seen(conmon, 34_740)
-        )
-        .is_none());
+        assert!(
+            podman(
+                memfd_exec(34_743, 34_741, 34_741, 400),
+                seen(conmon, 34_740)
+            )
+            .is_none()
+        );
         // a forker the lineage holds an exec of, from no root-only
         // directory (a user's file whose inode number a removed conmon had):
         // the pump's sight of it does not count
@@ -2235,7 +2267,7 @@ mod lot310 {
     #[test]
     fn a_rootless_runtime_s_copy_under_a_manager_of_its_own_mount_namespace_is_not_fileless() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         use crate::posture::host::testing::IdTestHost;
         const STAT_DEV: u64 = 64769;
@@ -2377,7 +2409,7 @@ mod lot310 {
     #[test]
     fn a_runtime_copy_sealed_only_after_the_exec_is_fileless() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         use common::wire::exe::exe_flags::MEMFD_SEALED;
         let (runc, shim) = ((0x0fd0_0556, 556_001), (0x0fd0_0556, 556_002));
@@ -2438,7 +2470,7 @@ mod lot310 {
     #[test]
     fn an_uncompared_runtime_copy_is_recorded_never_killed() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         let (runc, shim, bash) = (
             (0x0fd0_0556, 556_011),
@@ -2518,7 +2550,7 @@ mod lot310 {
     #[test]
     fn a_users_uncompared_memfd_past_its_own_share_stays_critical() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         let (runc, conmon) = ((0x0fd0_0556, 556_021), (0x0fd0_0556, 556_022));
         for (id, path, kind) in [
@@ -2609,7 +2641,7 @@ mod lot310 {
     #[test]
     fn a_runc_clone_gone_before_the_read_is_high_for_root_and_critical_for_a_user() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, InstalledImage, RuntimeClone,
+            InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         let (runc, conmon, bash) = (
             (0x0fd0_0381, 381_001),
@@ -2758,7 +2790,7 @@ mod lot310 {
     #[test]
     fn the_first_uncompared_copy_of_an_episode_names_who_spent_the_budget() {
         use crate::decision::rules::program_identity::{
-            keep_runtime_clone, record_installed, BudgetEpisode, InstalledImage, RuntimeClone,
+            BudgetEpisode, InstalledImage, RuntimeClone, keep_runtime_clone, record_installed,
         };
         let (runc, shim) = ((0x0fd0_0578, 578_031), (0x0fd0_0578, 578_032));
         for (id, path, kind) in [

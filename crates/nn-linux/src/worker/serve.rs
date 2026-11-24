@@ -16,9 +16,9 @@
 use std::os::fd::RawFd;
 
 use nn_proto::ipc::{
-    alpn_display, decode, encode, Answer, FromWorker, QnameForm, QnameIn, QnameOut, Refusal,
-    Request, Response, SniOut, TlsOut, ToWorker, WorkerHello, WorkerKind, IPC_VERSION, MAX_ALPN,
-    MAX_FRAME,
+    Answer, FromWorker, IPC_VERSION, MAX_ALPN, MAX_FRAME, QnameForm, QnameIn, QnameOut, Refusal,
+    Request, Response, SniOut, TlsOut, ToWorker, WorkerHello, WorkerKind, alpn_display, decode,
+    encode,
 };
 
 use super::transport::{self, Recv};
@@ -368,11 +368,13 @@ mod tests {
                         addr: [192, 0, 2, 7]
                     }]
                 );
-                assert!(nn_proto::ipc::check_response(
-                    &Request::DnsAnswers(m.clone()),
-                    &Answer::DnsAnswers(Some(out))
-                )
-                .is_ok());
+                assert!(
+                    nn_proto::ipc::check_response(
+                        &Request::DnsAnswers(m.clone()),
+                        &Answer::DnsAnswers(Some(out))
+                    )
+                    .is_ok()
+                );
             }
             other => panic!("{other:?}"),
         }

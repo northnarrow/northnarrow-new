@@ -471,10 +471,12 @@ fn a_partial_block_is_signed_partial() {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(rows[0]["result"], "partial");
     assert_eq!(rows[0]["extra"]["sockets_before_the_move"], 2);
-    assert!(rows[0]["extra"]["why"]
-        .as_str()
-        .unwrap()
-        .starts_with("new connections blocked; 2 inet socket(s)"));
+    assert!(
+        rows[0]["extra"]["why"]
+            .as_str()
+            .unwrap()
+            .starts_with("new connections blocked; 2 inet socket(s)")
+    );
     assert_eq!(rows[1]["result"], "success");
 }
 

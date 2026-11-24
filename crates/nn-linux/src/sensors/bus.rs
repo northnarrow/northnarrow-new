@@ -56,9 +56,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use nn_core::bus::{
-    self as core_bus, CapKey, CapSample, ClassQueues, DecisionDelay, Envelope, FloodCap, FloodKind,
-    LatencyHistogram, Priority, QueueSpec, QueueStats, SourceId, WhenFull, DECISION_BUDGET_NS,
-    QUEUES, SPECS,
+    self as core_bus, CapKey, CapSample, ClassQueues, DECISION_BUDGET_NS, DecisionDelay, Envelope,
+    FloodCap, FloodKind, LatencyHistogram, Priority, QUEUES, QueueSpec, QueueStats, SPECS,
+    SourceId, WhenFull,
 };
 use nn_model::Event;
 use parking_lot::Mutex;
@@ -2831,8 +2831,8 @@ mod tests {
             }
             tx.send(at(10, 2, 2_000)).await.unwrap(); // another process
             tx.send(at(9, 3, 2_000)).await.unwrap(); // another inode
-                                                     // third review, C4: the window is one second — 0.9 s after the
-                                                     // queued one a repeat is counted, 1.1 s after it is queued
+            // third review, C4: the window is one second — 0.9 s after the
+            // queued one a repeat is counted, 1.1 s after it is queued
             tx.send(at(9, 2, 1_000 + 900_000_000)).await.unwrap();
             tx.send(at(9, 2, 1_000 + 1_100_000_000)).await.unwrap();
             let queued: Vec<(u32, u64, u64)> = std::iter::from_fn(|| rx.try_recv())

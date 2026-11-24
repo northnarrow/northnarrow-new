@@ -759,7 +759,7 @@ mod tests {
     /// overwriting it.
     #[test]
     fn rewrite_after_later_copy() {
-        use super::super::restore::{decide, pick, Context, Current, Plan, Selector};
+        use super::super::restore::{Context, Current, Plan, Selector, decide, pick};
         let mut ix = JournalIndex::new(&[1000], 60 * MIN, 0);
         let mk = |ix: &mut JournalIndex, pid: u32, at: u64| {
             let (r, _) = ix.reserve(0, 10, at).unwrap();

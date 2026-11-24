@@ -144,11 +144,7 @@ pub const fn denied_by_default(prog_type: u32) -> bool {
 /// bit 31, which no opt-out names).
 #[inline(always)]
 pub const fn type_bit(prog_type: u32) -> u32 {
-    if prog_type < 32 {
-        1u32 << prog_type
-    } else {
-        0
-    }
+    if prog_type < 32 { 1u32 << prog_type } else { 0 }
 }
 
 /// Lot 345: `BPF_MODIFY_RETURN` (`enum bpf_attach_type`): an fmod_ret
@@ -1731,9 +1727,11 @@ mod tests {
         );
         let r = content_response(CONTENT_FMOD_RET as u64).unwrap();
         assert!(r.contains("BPF_MODIFY_RETURN"), "{r}");
-        assert!(content_response(CONTENT_UNJUDGED as u64)
-            .unwrap()
-            .contains("could not read whole"));
+        assert!(
+            content_response(CONTENT_UNJUDGED as u64)
+                .unwrap()
+                .contains("could not read whole")
+        );
         assert_eq!(call_target_name(4), FORBIDDEN_KFUNCS[0]);
         assert_eq!(call_target_name(4), "bpf_send_signal_task");
         assert_eq!(call_target_name(5), "bpf_task_work_schedule_signal");

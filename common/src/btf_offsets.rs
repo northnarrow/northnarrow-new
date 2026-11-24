@@ -3130,9 +3130,11 @@ mod tests {
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[1].0, ENUM_VALUES[1].name);
         // enum slots must not collide with offset slots
-        assert!(ENUM_SLOT_TABLE
-            .iter()
-            .all(|(_, s)| *s > REVALIDATE.len() as u32));
+        assert!(
+            ENUM_SLOT_TABLE
+                .iter()
+                .all(|(_, s)| *s > REVALIDATE.len() as u32)
+        );
         assert_eq!(slot::TASK_STRUCT_TGID_OFFSET, 1);
         // lab PR 238: appended, no earlier slot moved
         assert_eq!(slot::TASK_STRUCT_GROUP_LEADER_OFFSET, 100);
@@ -3271,8 +3273,10 @@ mod tests {
         assert!((CGROUP_MOVE_RET_ARG as u32) < HOOK_ARG_MAX);
         assert_eq!(FEXIT_TARGETS.len(), 1);
         assert_eq!(NO_ARG_TARGETS, &["cgroup_file_write"]);
-        assert!(FEXIT_TARGETS
-            .iter()
-            .all(|t| !t.func.starts_with("bpf_lsm_")));
+        assert!(
+            FEXIT_TARGETS
+                .iter()
+                .all(|t| !t.func.starts_with("bpf_lsm_"))
+        );
     }
 }

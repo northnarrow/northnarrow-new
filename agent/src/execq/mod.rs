@@ -28,8 +28,8 @@ pub mod record;
 use std::collections::{HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::wire::execq::{class, mode};
@@ -220,7 +220,7 @@ pub fn fail(why: String) {
 /// Whether the ctime offsets resolved on this kernel (the identity cache
 /// works).
 pub fn ctime_resolved() -> bool {
-    use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
+    use common::btf_offsets::{BTF_OFFSETS_ABSENT, slot};
     let Some(r) = crate::anti_tamper::btf_revalidate::resolved() else {
         return true; // unarmed: the compiled 6.8 offsets apply
     };

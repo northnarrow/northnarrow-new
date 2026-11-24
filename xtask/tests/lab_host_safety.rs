@@ -679,8 +679,16 @@ fn a_wrong_host_key_is_told_apart_from_a_guest_not_up() {
     let path = format!("{}:/usr/sbin:/usr/bin:/sbin:/bin", bin.display());
     for (says, rc, want) in [
         ("", "0", "probe=0"),
-        ("ssh: connect to host 127.0.0.1 port 2322: Connection refused", "255", "probe=1"),
-        ("kex_exchange_identification: read: Connection reset by peer", "255", "probe=1"),
+        (
+            "ssh: connect to host 127.0.0.1 port 2322: Connection refused",
+            "255",
+            "probe=1",
+        ),
+        (
+            "kex_exchange_identification: read: Connection reset by peer",
+            "255",
+            "probe=1",
+        ),
         ("Host key verification failed.", "255", "probe=2"),
         (
             "Unable to negotiate with 127.0.0.1 port 2322: no matching host key type found. Their offer: rsa-sha2-512",
@@ -694,7 +702,11 @@ fn a_wrong_host_key_is_told_apart_from_a_guest_not_up() {
             &dir.join("none.pid"),
             "p=0; guest_probe || p=$?; echo \"probe=$p\"",
         );
-        let out = bash(&script, &[], &[("PATH", &path), ("SSH_SAYS", says), ("SSH_RC", rc)]);
+        let out = bash(
+            &script,
+            &[],
+            &[("PATH", &path), ("SSH_SAYS", says), ("SSH_RC", rc)],
+        );
         assert!(text(&out).contains(want), "{says:?}: {}", text(&out));
     }
 }
@@ -961,7 +973,10 @@ fn wait_ssh_returns_only_after_the_provisioning_boot() {
 
     // the reboot never comes, bpf never appears, the guest never answers
     for (seq, says) in [
-        (vec![before.clone()], "is still on its provisioning boot after 2s: cloud-init's power_state reboot did not happen"),
+        (
+            vec![before.clone()],
+            "is still on its provisioning boot after 2s: cloud-init's power_state reboot did not happen",
+        ),
         (
             vec![facts(NEXT_BOOT, Some(FIRST_BOOT), UBUNTU_FIRST_LSM, none)],
             "bpf is not among its active LSMs (/sys/kernel/security/lsm) after 2s",
@@ -974,8 +989,14 @@ fn wait_ssh_returns_only_after_the_provisioning_boot() {
         let t = text(&out);
         assert!(!out.status.success(), "{says}: {t}");
         assert!(!t.contains("WAIT-OK"), "{says}: {t}");
-        assert!(t.contains("nn-lab: ERROR: ") && t.contains(says), "{says}: {t}");
-        assert!(t.contains("; see ") && t.contains("serial.log"), "{says}: {t}");
+        assert!(
+            t.contains("nn-lab: ERROR: ") && t.contains(says),
+            "{says}: {t}"
+        );
+        assert!(
+            t.contains("; see ") && t.contains("serial.log"),
+            "{says}: {t}"
+        );
     }
 }
 
@@ -1011,8 +1032,7 @@ fn the_guests_boot_facts_are_its_own() {
 /// as its last runcmd, before the power_state reboot; none `touch`es it.
 #[test]
 fn every_guest_template_records_its_provisioning_boot() {
-    let write =
-        "  - >-\n    cat /proc/sys/kernel/random/boot_id > /var/lib/nn-lab-provisioned.new\n    \
+    let write = "  - >-\n    cat /proc/sys/kernel/random/boot_id > /var/lib/nn-lab-provisioned.new\n    \
                  && mv -f /var/lib/nn-lab-provisioned.new /var/lib/nn-lab-provisioned\n";
     for t in templates() {
         let text = fs::read_to_string(&t).unwrap();
@@ -1650,12 +1670,15 @@ fn open_sensor_check_uses_the_fixture_block() {
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .collect();
-    assert!(!code
-        .iter()
-        .any(|l| l.contains("rm -rf") && l.contains(".aws")));
-    assert!(code
-        .iter()
-        .any(|l| l.contains("aws_fixture_setup \"$H\" \"$U\"")));
+    assert!(
+        !code
+            .iter()
+            .any(|l| l.contains("rm -rf") && l.contains(".aws"))
+    );
+    assert!(
+        code.iter()
+            .any(|l| l.contains("aws_fixture_setup \"$H\" \"$U\""))
+    );
     assert!(code.iter().any(|l| l.starts_with("aws_fixture_restore ||")));
     let guard = text.find("if ! aws_fixture_allowed; then").unwrap();
     let first_cmd = text.find("DET=").unwrap();
@@ -1948,9 +1971,10 @@ fn range_bootstrap_checks_first_and_records_what_it_installed() {
         !code.iter().any(|l| l.contains("bash -lc")),
         "login profiles"
     );
-    assert!(code
-        .iter()
-        .any(|l| l.contains("env -i HOME=\"$BUILD_HOME\"")));
+    assert!(
+        code.iter()
+            .any(|l| l.contains("env -i HOME=\"$BUILD_HOME\""))
+    );
     let check = text
         .find("range_tree_check \"$NN_REPO_DIR\" \"$BUILD_USER\"")
         .expect("the tree check is called");
@@ -1972,8 +1996,10 @@ fn range_bootstrap_checks_first_and_records_what_it_installed() {
     ] {
         assert!(record.contains(want), "no `{want}` in the provenance step");
     }
-    assert!(read("deploy/adversarial/00_config.sh")
-        .contains(": \"${RANGE_PROVENANCE:=/root/range-provenance.txt}\""));
+    assert!(
+        read("deploy/adversarial/00_config.sh")
+            .contains(": \"${RANGE_PROVENANCE:=/root/range-provenance.txt}\"")
+    );
 }
 
 // ── Lot 303: a unit that does not start says why (nn-lab.sh install) ──────

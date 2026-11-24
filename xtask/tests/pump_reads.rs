@@ -537,7 +537,8 @@ fn a_lock_held_across_a_read_fails_the_ratchet() {
         code.insert(file.to_string(), more);
         let v = lock_violations(&code);
         assert!(
-            v.iter().any(|m| m.starts_with(file) && m.contains("`planted`")),
+            v.iter()
+                .any(|m| m.starts_with(file) && m.contains("`planted`")),
             "{plant} in {file}: {v:#?}"
         );
     }

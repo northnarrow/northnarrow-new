@@ -28,13 +28,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
-    maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
     Btf, Ebpf,
+    maps::{HashMap as AyaHashMap, Map as AyaMap, MapData},
 };
 use common::wire::{
-    InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_READ, FS_PROTECT_WRITE,
+    FS_PROTECT_MUTATE, FS_PROTECT_NOCREATE, FS_PROTECT_READ, FS_PROTECT_WRITE, InodeKey,
     READ_PROTECTED_SLOTS,
 };
 
@@ -2094,7 +2094,7 @@ pub fn refuse_linked_state_dir(dir: &Path) -> Result<()> {
         Err(e) => return Err(anyhow!(e).context(format!("lstat {}", dir.display()))),
         Ok(m) if m.file_type().is_symlink() => link_at(dir).into_iter().collect(),
         Ok(m) if !m.is_dir() => {
-            return Err(anyhow!("{} exists and is not a directory", dir.display()))
+            return Err(anyhow!("{} exists and is not a directory", dir.display()));
         }
         Ok(_) => state_dir_own_entries()
             .iter()

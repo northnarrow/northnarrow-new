@@ -8,7 +8,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 /// Filenames inside `/tmp/` that are NOT considered suspicious.
 /// Empty for now; the slot exists so legit tooling (build systems
@@ -284,11 +284,15 @@ mod tests {
     fn does_not_match_path_named_like_tmp_elsewhere() {
         // `/var/tmp/...` is R003's job, not R001's. `/tmpfoo/...`
         // (no trailing slash) is unrelated.
-        assert!(R001ExecFromTmp::default()
-            .evaluate(&spawn("x", "/var/tmp/x"))
-            .is_none());
-        assert!(R001ExecFromTmp::default()
-            .evaluate(&spawn("tmpfoo", "/tmpfoo/payload"))
-            .is_none());
+        assert!(
+            R001ExecFromTmp::default()
+                .evaluate(&spawn("x", "/var/tmp/x"))
+                .is_none()
+        );
+        assert!(
+            R001ExecFromTmp::default()
+                .evaluate(&spawn("tmpfoo", "/tmpfoo/payload"))
+                .is_none()
+        );
     }
 }

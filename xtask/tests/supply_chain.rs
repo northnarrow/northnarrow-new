@@ -235,8 +235,11 @@ fn repository_default_target_cpu_is_portable() {
     );
     // The release keeps its explicit override and its ISA check.
     let release = read(&root.join(".github/workflows/release.yml"));
-    assert!(release
-        .contains(r#"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2""#));
+    assert!(
+        release.contains(
+            r#"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-cpu=x86-64-v2""#
+        )
+    );
     assert!(release.contains("qemu-x86_64 -cpu Nehalem"));
 }
 
@@ -1110,9 +1113,11 @@ fn prune_script_fails_closed() {
         let (ok, stdout, target) = run(case, stub);
         assert!(!ok, "{case}: the prune step must fail; stdout: {stdout}");
         assert!(!stdout.contains("pruned"), "{case}: {stdout}");
-        assert!(target
-            .join("debug/.fingerprint/northnarrow-agent-0123")
-            .exists());
+        assert!(
+            target
+                .join("debug/.fingerprint/northnarrow-agent-0123")
+                .exists()
+        );
     }
 
     let (ok, stdout, target) = run(
@@ -1609,9 +1614,27 @@ fn advisory_exceptions_expire_in_ci() {
     };
     let ok_body = entry("    # Expires: 2027-01-20\n");
     for (case, body, today, want_ok, needle) in [
-        ("valid", ok_body.as_str(), "2026-12-31", true, "1 exception(s)"),
-        ("last-day", ok_body.as_str(), "2027-01-20", true, "1 exception(s)"),
-        ("expired", ok_body.as_str(), "2027-01-21", false, "expired on 2027-01-20"),
+        (
+            "valid",
+            ok_body.as_str(),
+            "2026-12-31",
+            true,
+            "1 exception(s)",
+        ),
+        (
+            "last-day",
+            ok_body.as_str(),
+            "2027-01-20",
+            true,
+            "1 exception(s)",
+        ),
+        (
+            "expired",
+            ok_body.as_str(),
+            "2027-01-21",
+            false,
+            "expired on 2027-01-20",
+        ),
         ("no-expiry", &entry(""), "2026-12-31", false, "no Expires:"),
         (
             "bad-date",
@@ -1641,8 +1664,20 @@ fn advisory_exceptions_expire_in_ci() {
             false,
             "not one quoted RUSTSEC id",
         ),
-        ("empty", "[advisories]\nignore = []\n", "2026-12-31", true, "0 exception(s)"),
-        ("none", "[output]\nquiet = false\n", "2026-12-31", true, "0 exception(s)"),
+        (
+            "empty",
+            "[advisories]\nignore = []\n",
+            "2026-12-31",
+            true,
+            "0 exception(s)",
+        ),
+        (
+            "none",
+            "[output]\nquiet = false\n",
+            "2026-12-31",
+            true,
+            "0 exception(s)",
+        ),
     ] {
         let (ok, text) = run(&fixture(case, body), today);
         assert_eq!(ok, want_ok, "{case}: {text}");
@@ -2233,8 +2268,10 @@ fn the_release_scripts_refuse_a_lab_build() {
             rel(&file)
         );
     }
-    assert!(read(&repo_root().join("deploy/lab/pkg/pkg-check.sh"))
-        .contains("NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt"));
+    assert!(
+        read(&repo_root().join("deploy/lab/pkg/pkg-check.sh"))
+            .contains("NN_PKG_LAB_FEATURES=1 NN_PKG_FORMATS=$fmt")
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -57,8 +57,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// `PROC_SUPER_MAGIC` (`include/uapi/linux/magic.h`).
@@ -1815,7 +1815,7 @@ pub fn walk_root(path: &Path) -> io::Result<(WalkDir, Vec<OsString>)> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("{}: a `..` on the way — not walked", path.display()),
-                ))
+                ));
             }
         }
     }
@@ -2577,20 +2577,26 @@ mod tests {
         }
         let with = |extra: &str| format!("{base}{extra}");
         let tmpfs = with("900 27 0:91 / /sys/fs/cgroup rw shared:500 - tmpfs tmpfs rw\n");
-        assert!(shadowed(&tmpfs, "/sys/fs/cgroup")
-            .unwrap()
-            .contains("tmpfs mounted over the cgroup2"));
+        assert!(
+            shadowed(&tmpfs, "/sys/fs/cgroup")
+                .unwrap()
+                .contains("tmpfs mounted over the cgroup2")
+        );
         let subtree =
             with("901 27 0:26 /user.slice /sys/fs/cgroup rw shared:501 - cgroup2 cgroup2 rw\n");
-        assert!(shadowed(&subtree, "/sys/fs/cgroup")
-            .unwrap()
-            .contains("source root /user.slice"));
+        assert!(
+            shadowed(&subtree, "/sys/fs/cgroup")
+                .unwrap()
+                .contains("source root /user.slice")
+        );
         let procsys = with("903 26 0:23 /sys /proc rw shared:503 - proc proc rw\n");
         assert!(shadowed(&procsys, "/proc").is_some());
         let other_proc = with("904 26 0:95 / /proc rw shared:504 - proc proc rw\n");
-        assert!(shadowed(&other_proc, "/proc")
-            .unwrap()
-            .contains("proc mounted over the proc"));
+        assert!(
+            shadowed(&other_proc, "/proc")
+                .unwrap()
+                .contains("proc mounted over the proc")
+        );
         let self_bind = with("905 27 0:26 / /sys/fs/cgroup ro shared:505 - cgroup2 cgroup2 rw\n");
         assert_eq!(
             shadowed(&self_bind, "/sys/fs/cgroup"),
@@ -3328,7 +3334,7 @@ mod tests {
     /// refused. What the walk reached is the kernel's own identity of it.
     #[test]
     fn a_walk_judged_asks_nothing_of_a_file_system_it_refuses() {
-        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
         let t = tempfile::tempdir().unwrap();
         let r = t.path();
         std::fs::create_dir_all(r.join("a/b")).unwrap();

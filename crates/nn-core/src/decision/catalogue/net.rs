@@ -296,7 +296,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
         how_to_test: "With a listener on port 21 of the lab host, connect from `python3`: \
                       `python3 -c 'import socket; socket.create_connection((\"<peer>\", 21), \
                       timeout=3)'`.",
-        tests: &["crates/nn-core/src/decision/rules/net.rs::net_011_fires_on_plaintext_port_non_allowlist"],
+        tests: &[
+            "crates/nn-core/src/decision/rules/net.rs::net_011_fires_on_plaintext_port_non_allowlist",
+        ],
         attack_note: "The rule's concern is credentials in clear, which ATT&CK does not name as \
                       a host behaviour. FTP is mapped as an application-layer C2 protocol \
                       (T1071.002), Telnet as a remote service (T1021, which has no Telnet \

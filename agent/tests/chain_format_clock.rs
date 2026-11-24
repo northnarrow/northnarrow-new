@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use northnarrow_agent::audit::{read_signing_key, AgentSigningKey, AuditEntryDraft, AuditLog};
+use northnarrow_agent::audit::{AgentSigningKey, AuditEntryDraft, AuditLog, read_signing_key};
 use northnarrow_agent::audit::{AuditStamps, GENESIS_PREV_HASH};
 use northnarrow_agent::chainlog::{ChainPayload, NoProtection, RotatingChainLog, RotationConfig};
 use serde::{Deserialize, Serialize};

@@ -36,7 +36,7 @@ use antitamper_bpf::unit_props::LoadedView;
 // Lot 377: the list read and split by one rule with `nn-admin host-check`
 // and install.sh's preflight (moved to antitamper-bpf).
 pub use antitamper_bpf::preload::{
-    candidates, preload_names, PRELOAD_MAX, PRELOAD_PATH, SEARCH_DIRS,
+    PRELOAD_MAX, PRELOAD_PATH, SEARCH_DIRS, candidates, preload_names,
 };
 
 /// The drop-in directives that change the code a start of our units runs
@@ -300,7 +300,10 @@ impl Baseline {
             if self.entries.is_empty() {
                 String::new()
             } else {
-                format!(" ({loadable} of {} named paths present)", self.entries.len())
+                format!(
+                    " ({loadable} of {} named paths present)",
+                    self.entries.len()
+                )
             },
             self.harms.len(),
             match &self.loaded {
@@ -717,9 +720,11 @@ mod tests {
             "",
             Kind::Harmful,
         );
-        assert!(j(&base, &Preload::Absent, &[other.clone(), unread.clone()])
-            .hold
-            .is_some());
+        assert!(
+            j(&base, &Preload::Absent, &[other.clone(), unread.clone()])
+                .hold
+                .is_some()
+        );
         let changed = Harm {
             value: "x".into(),
             ..other
@@ -885,10 +890,11 @@ mod tests {
             false,
             |p| p != b,
         );
-        assert!(gone
-            .hold
-            .unwrap()
-            .contains("no longer on disk: /etc/systemd/system/service.d/zz.conf"));
+        assert!(
+            gone.hold
+                .unwrap()
+                .contains("no longer on disk: /etc/systemd/system/service.d/zz.conf")
+        );
         let gone_old = judge_with(
             &base,
             &with(view(&[a], &["RUST_LOG=info"], true)),

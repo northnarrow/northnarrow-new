@@ -337,11 +337,7 @@ impl SandboxLevel {
 }
 
 fn on_off(b: bool) -> &'static str {
-    if b {
-        "on"
-    } else {
-        "off"
-    }
+    if b { "on" } else { "off" }
 }
 
 /// The worker's first packet.
@@ -936,15 +932,15 @@ pub fn check_response(req: &Request, answer: &Answer) -> Result<(), Violation> {
                 match o.end {
                     None => {}
                     Some(_) if i.form != QnameForm::WireFindEnd => {
-                        return Err(Violation::Bounds("dns_names: an end not asked for"))
+                        return Err(Violation::Bounds("dns_names: an end not asked for"));
                     }
                     Some(e) if usize::from(e) > i.bytes.len() || e == 0 => {
-                        return Err(Violation::Bounds("dns_names: end past the bytes"))
+                        return Err(Violation::Bounds("dns_names: end past the bytes"));
                     }
                     // review of #481 (R14b-1): a name ends just past its
                     // root label, a zero byte
                     Some(e) if i.bytes.get(usize::from(e) - 1) != Some(&0) => {
-                        return Err(Violation::Bounds("dns_names: an end not past a root label"))
+                        return Err(Violation::Bounds("dns_names: an end not past a root label"));
                     }
                     Some(_) => {}
                 }
@@ -1244,27 +1240,35 @@ mod tests {
     #[test]
     fn requests_out_of_bounds_are_refused() {
         assert!(Request::DnsNames(vec![]).check().is_err());
-        assert!(Request::DnsNames(vec![
-            QnameIn {
-                bytes: vec![],
+        assert!(
+            Request::DnsNames(vec![
+                QnameIn {
+                    bytes: vec![],
+                    form: QnameForm::Wire
+                };
+                MAX_BATCH + 1
+            ])
+            .check()
+            .is_err()
+        );
+        assert!(
+            Request::DnsNames(vec![QnameIn {
+                bytes: vec![1; MAX_QNAME_IN + 1],
                 form: QnameForm::Wire
-            };
-            MAX_BATCH + 1
-        ])
-        .check()
-        .is_err());
-        assert!(Request::DnsNames(vec![QnameIn {
-            bytes: vec![1; MAX_QNAME_IN + 1],
-            form: QnameForm::Wire
-        }])
-        .check()
-        .is_err());
-        assert!(Request::TlsClientHello(vec![0; MAX_TLS_IN + 1])
+            }])
             .check()
-            .is_err());
-        assert!(Request::DnsAnswers(vec![0; MAX_DNS_ANSWER_IN + 1])
-            .check()
-            .is_err());
+            .is_err()
+        );
+        assert!(
+            Request::TlsClientHello(vec![0; MAX_TLS_IN + 1])
+                .check()
+                .is_err()
+        );
+        assert!(
+            Request::DnsAnswers(vec![0; MAX_DNS_ANSWER_IN + 1])
+                .check()
+                .is_err()
+        );
         assert!(Request::TlsClientHello(vec![0; MAX_TLS_IN]).check().is_ok());
         assert!(Request::Ping.check().is_ok());
     }
@@ -1294,27 +1298,35 @@ mod tests {
         assert_eq!(check_response(&req, &ok), Ok(()));
         let bad = |a: Answer| check_response(&req, &a);
         assert!(bad(Answer::DnsNames(vec![name("abc", Some(5))])).is_err());
-        assert!(bad(Answer::DnsNames(vec![
-            name("abc", Some(8)),
-            name("a", None)
-        ]))
-        .is_err());
-        assert!(bad(Answer::DnsNames(vec![
-            name("abc", Some(0)),
-            name("a", None)
-        ]))
-        .is_err());
-        assert!(bad(Answer::DnsNames(vec![
-            name("abc", None),
-            name("a", Some(1))
-        ]))
-        .is_err());
+        assert!(
+            bad(Answer::DnsNames(vec![
+                name("abc", Some(8)),
+                name("a", None)
+            ]))
+            .is_err()
+        );
+        assert!(
+            bad(Answer::DnsNames(vec![
+                name("abc", Some(0)),
+                name("a", None)
+            ]))
+            .is_err()
+        );
+        assert!(
+            bad(Answer::DnsNames(vec![
+                name("abc", None),
+                name("a", Some(1))
+            ]))
+            .is_err()
+        );
         assert!(bad(Answer::DnsNames(vec![name("ab\nc", None), name("a", None)])).is_err());
-        assert!(bad(Answer::DnsNames(vec![
-            name("abc", None),
-            name("a\u{7f}", None)
-        ]))
-        .is_err());
+        assert!(
+            bad(Answer::DnsNames(vec![
+                name("abc", None),
+                name("a\u{7f}", None)
+            ]))
+            .is_err()
+        );
         assert!(bad(Answer::DnsNames(vec![name("…a", None), name("a", None)])).is_err());
         let long = "x".repeat(max_qname_out(2) + 1);
         assert!(bad(Answer::DnsNames(vec![name("abc", None), name(&long, None)])).is_err());
@@ -1358,55 +1370,79 @@ mod tests {
             f(&mut t);
             check_response(&req, &Answer::Tls(t))
         };
-        assert!(with(|t| if let TlsOut::Complete { ja3, .. } = t {
-            *ja3 = "0123456789ABCDEF0123456789abcdef".into()
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { ja3, .. } = t {
-            ja3.push('0')
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { ja4, .. } = t {
-            *ja4 = "t13d1516h2_8daaf6152771".into()
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { ja4, .. } = t {
-            *ja4 = "t13d1516h2_8daaf615277X_e5627efa2ab1".into()
-        })
-        .is_err());
+        assert!(
+            with(|t| if let TlsOut::Complete { ja3, .. } = t {
+                *ja3 = "0123456789ABCDEF0123456789abcdef".into()
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { ja3, .. } = t {
+                ja3.push('0')
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { ja4, .. } = t {
+                *ja4 = "t13d1516h2_8daaf6152771".into()
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { ja4, .. } = t {
+                *ja4 = "t13d1516h2_8daaf615277X_e5627efa2ab1".into()
+            })
+            .is_err()
+        );
         // the ALPN pair is any two ASCII bytes, `_` included
-        assert!(with(|t| if let TlsOut::Complete { ja4, .. } = t {
-            *ja4 = "t13d1516___8daaf6152771_e5627efa2ab1".into()
-        })
-        .is_ok());
-        assert!(with(|t| if let TlsOut::Complete { ja4, .. } = t {
-            *ja4 = "t13d1516h\u{7f}8daaf6152771_e5627efa2ab1".into()
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { ja4, .. } = t {
-            *ja4 = "t13x1516h2_8daaf6152771_e5627efa2ab1".into()
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { sni, .. } = t {
-            *sni = SniOut::Host("Example.com".into())
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { sni, .. } = t {
-            *sni = SniOut::Host("a..b".into())
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { sni, .. } = t {
-            *sni = SniOut::Host("x".repeat(254))
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { alpn, .. } = t {
-            alpn.push(String::new())
-        })
-        .is_err());
-        assert!(with(|t| if let TlsOut::Complete { alpn, .. } = t {
-            *alpn = vec!["h2".into(); MAX_ALPN + 1]
-        })
-        .is_err());
+        assert!(
+            with(|t| if let TlsOut::Complete { ja4, .. } = t {
+                *ja4 = "t13d1516___8daaf6152771_e5627efa2ab1".into()
+            })
+            .is_ok()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { ja4, .. } = t {
+                *ja4 = "t13d1516h\u{7f}8daaf6152771_e5627efa2ab1".into()
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { ja4, .. } = t {
+                *ja4 = "t13x1516h2_8daaf6152771_e5627efa2ab1".into()
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { sni, .. } = t {
+                *sni = SniOut::Host("Example.com".into())
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { sni, .. } = t {
+                *sni = SniOut::Host("a..b".into())
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { sni, .. } = t {
+                *sni = SniOut::Host("x".repeat(254))
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { alpn, .. } = t {
+                alpn.push(String::new())
+            })
+            .is_err()
+        );
+        assert!(
+            with(|t| if let TlsOut::Complete { alpn, .. } = t {
+                *alpn = vec!["h2".into(); MAX_ALPN + 1]
+            })
+            .is_err()
+        );
         assert!(check_response(&req, &Answer::Pong).is_err());
     }
 
@@ -1755,14 +1791,16 @@ mod tests {
             check_response(&req, &Answer::Pong),
             Err(Violation::WrongKind("export_rows"))
         ));
-        assert!(check_response(
-            &req,
-            &Answer::ExportRows(ExportRowsOut {
-                committed: Some(RowPos { file: 1, line: 2 }),
-                ..out
-            })
-        )
-        .is_err());
+        assert!(
+            check_response(
+                &req,
+                &Answer::ExportRows(ExportRowsOut {
+                    committed: Some(RowPos { file: 1, line: 2 }),
+                    ..out
+                })
+            )
+            .is_err()
+        );
         let zero = Request::ExportRows(ExportRows {
             sink: ExportSink::File,
             chain: ExportChain::Detections,

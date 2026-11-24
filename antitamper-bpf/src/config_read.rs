@@ -140,9 +140,11 @@ mod tests {
         assert_eq!(t.len() as u64, MAX_CONFIG_BYTES);
         let latin1 = d.path().join("l.conf");
         std::fs::write(&latin1, b"# r\xe9glage\nLD_PRELOAD=/tmp/x.so\n").unwrap();
-        assert!(read_config(&latin1)
-            .text()
-            .is_some_and(|t| t.contains("LD_PRELOAD")));
+        assert!(
+            read_config(&latin1)
+                .text()
+                .is_some_and(|t| t.contains("LD_PRELOAD"))
+        );
         assert_eq!(read_config(&d.path().join("none")), Config::Absent);
     }
 

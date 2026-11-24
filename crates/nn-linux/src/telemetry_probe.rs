@@ -103,14 +103,14 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nn_model::Event;
 use parking_lot::Mutex;
-use rand::rngs::SysRng;
 use rand::TryRng;
+use rand::rngs::SysRng;
 use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
@@ -907,7 +907,11 @@ impl TelemetryProbe {
         let ok = match crate::fim::attach::key_for_path(Path::new(PROBE_DIR)) {
             Ok(key) => watch.watch(key, PROBE_DIR, crate::fim::drain::WatchClass::Configured),
             Err(e) => {
-                warn!(error = format!("{e:#}"), dir = PROBE_DIR, "sensor self-test: the probe directory cannot be watched — the FIM step is not exercised");
+                warn!(
+                    error = format!("{e:#}"),
+                    dir = PROBE_DIR,
+                    "sensor self-test: the probe directory cannot be watched — the FIM step is not exercised"
+                );
                 false
             }
         };
@@ -2122,9 +2126,7 @@ fn sign(notes: &[Note], nonce: &str, open: &[String], audit_log: Option<&Arc<Mut
             }
             Note::StillSilent { sensor, rounds } => error!(
                 sensor = sensor.name(),
-                rounds,
-                nonce,
-                "sensor self-test: the sensor is still silent"
+                rounds, nonce, "sensor self-test: the sensor is still silent"
             ),
             Note::Restored { sensor, rounds } => {
                 info!(
@@ -2430,8 +2432,8 @@ fn bpf_step() -> String {
     attr[1] = 4; // key_size
     attr[2] = 4; // value_size
     attr[3] = 1; // max_entries
-                 // SAFETY: bpf(BPF_MAP_CREATE, attr, size): a fully initialised attr of
-                 // the size passed; the fd it returns is closed below.
+    // SAFETY: bpf(BPF_MAP_CREATE, attr, size): a fully initialised attr of
+    // the size passed; the fd it returns is closed below.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_bpf,

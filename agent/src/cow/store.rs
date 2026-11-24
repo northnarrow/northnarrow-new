@@ -6,8 +6,8 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -17,8 +17,8 @@ use super::config::CowConfig;
 use super::copy::sha256_fd;
 use super::identity::FileId;
 use super::index::{Entry, FileState, JournalIndex, Method, PostWrite, Refusal, Reservation};
-use super::journal::{host_view, Journal, Record};
-use super::restore::{beside_name, decide, pick, Context, Current, Plan, Selector};
+use super::journal::{Journal, Record, host_view};
+use super::restore::{Context, Current, Plan, Selector, beside_name, decide, pick};
 use super::trust::ProcId;
 use crate::audit::{AuditEntryDraft, AuditLog};
 
@@ -644,7 +644,7 @@ impl Store {
                     row,
                     "refused",
                     format!("its directory cannot be reached without a link ({err})"),
-                )
+                );
             }
         };
         let Some(jm) = self.journal(e.scope) else {
@@ -1225,10 +1225,11 @@ mod tests {
             assert!(!l.scope.join(format!("{name}.locked")).exists(), "{i}");
         }
         assert!(rep.rows.iter().filter(|r| r.evidence.is_some()).count() == 3);
-        assert!(rep
-            .rows
-            .iter()
-            .all(|r| r.sha256_after.as_deref() == Some(r.sha256_original.as_str())));
+        assert!(
+            rep.rows
+                .iter()
+                .all(|r| r.sha256_after.as_deref() == Some(r.sha256_original.as_str()))
+        );
         // a second restore finds the originals in place
         let again = l.store.restore(&sel(), false, &by());
         assert_eq!(again.unchanged, 6, "{:?}", again.rows);
@@ -1271,9 +1272,11 @@ mod tests {
             rep.rows[0].beside.as_deref(),
             Some(beside.to_str().unwrap())
         );
-        assert!(rep.rows[0]
-            .detail
-            .contains("trusted writer /usr/bin/vim.basic"));
+        assert!(
+            rep.rows[0]
+                .detail
+                .contains("trusted writer /usr/bin/vim.basic")
+        );
     }
 
     #[test]

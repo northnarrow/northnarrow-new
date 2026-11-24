@@ -11,20 +11,20 @@
 //! (or the thread's end) stops the loop here; the thread is joined before
 //! the bus is stopped and the stop reported.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
-use northnarrow_agent::sensors::bus::{BusReceiver, Recv};
 use northnarrow_agent::sensors::SensorMultiplexer;
+use northnarrow_agent::sensors::bus::{BusReceiver, Recv};
 use tracing::{error, info, warn};
 
 use crate::boot::cli::Cli;
-use crate::boot::evidence::{attest_degraded_at, AuditHandle};
+use crate::boot::evidence::{AuditHandle, attest_degraded_at};
 use crate::boot::posture::Combat;
 use crate::boot::ready::Armed;
 use crate::boot::tasks::Signals;
@@ -32,7 +32,7 @@ use crate::pipeline::dispatch::{Dispatcher, STOP_WAIT};
 use crate::pipeline::pid1_is_systemd_shutdown;
 use crate::pipeline::process_event::process_event;
 use crate::pipeline::slow::SlowWork;
-use crate::stop_deadline::{audit_note, StopDeadline};
+use crate::stop_deadline::{StopDeadline, audit_note};
 
 /// Why the event loop ended (the signed `agent_stop`), and when it began.
 pub(crate) struct Stopped {

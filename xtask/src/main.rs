@@ -11,7 +11,7 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 mod attack;
@@ -606,7 +606,7 @@ fn agent_command(agent_bin: &Path, no_sudo: bool, extra: &[String]) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_command, lock_if, scrubbed, Cli, Cmd};
+    use super::{Cli, Cmd, agent_command, lock_if, scrubbed};
     use clap::Parser;
     use std::ffi::OsStr;
     use std::path::Path;

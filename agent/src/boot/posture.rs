@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 use super::cli::Cli;
 use super::evidence::AuditHandle;
 use super::tasks::{
-    spawn_mount_guard_regroup_watch, spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh,
-    MountGuardRefresh, WatchdogAudit,
+    MountGuardRefresh, WatchdogAudit, spawn_mount_guard_regroup_watch, spawn_shutdown_exe_refresh,
+    spawn_watchdog_exempt_refresh,
 };
-use crate::pipeline::{systemd_watch, HostStopping, SystemdSnapshot};
+use crate::pipeline::{HostStopping, SystemdSnapshot, systemd_watch};
 
 /// What [`machine`] built.
 pub(crate) struct Posture {
@@ -614,7 +614,7 @@ pub(crate) fn audit_combat_reconcile(
     protection: &dyn northnarrow_agent::chainlog::ProtectionManager,
     rules_removed: usize,
 ) {
-    use northnarrow_agent::combat::reconcile::{record_line, CAP_BYTES, LOG_PATH};
+    use northnarrow_agent::combat::reconcile::{CAP_BYTES, LOG_PATH, record_line};
     // BUG-026 B-cap: combat-audit is the lone UNSIGNED / unchained
     // best-effort log (BUG-028). `/var/lib/northnarrow` is `chattr +i`, so
     // a rename-based rotate is a blocked dir-entry op — capped by

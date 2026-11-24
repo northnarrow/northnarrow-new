@@ -234,10 +234,12 @@ fn a_cursor_at_the_end_reads_only_what_follows() {
     let end = initial::<TestHost>(&s, false).unwrap();
     assert_eq!(end.file, chainlog::current_generation(&active));
     assert!(end.line > 0 && !end.hash.is_empty());
-    assert!(read_after::<TestHost>(&s, &end, true, ALL, &pk())
-        .unwrap()
-        .rows
-        .is_empty());
+    assert!(
+        read_after::<TestHost>(&s, &end, true, ALL, &pk())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
     write(&active, 12, 15, 1000, 64);
     assert_eq!(
         ns(&read_after::<TestHost>(&s, &end, true, ALL, &pk()).unwrap()),
@@ -453,7 +455,7 @@ fn cursors_are_saved_atomically_and_read_back() {
 /// then passes the protocol's check of an honest worker's answer.
 #[test]
 fn a_read_inside_the_rotation_window_waits_for_the_rename() {
-    use nn_proto::ipc::{check_rows_out, ExportRows, ExportRowsOut, ExportSink, SinkState};
+    use nn_proto::ipc::{ExportRows, ExportRowsOut, ExportSink, SinkState, check_rows_out};
     let d = tempfile::tempdir().unwrap();
     let active = d.path().join("detections.jsonl");
     write(&active, 0, 30, 1000, 64);
@@ -498,10 +500,11 @@ fn a_read_inside_the_rotation_window_waits_for_the_rename() {
         hash: all.hashes[j].clone(),
     };
     let b = read_after::<TestHost>(&s, &from, false, ALL, &pk()).unwrap();
-    assert!(b
-        .rows
-        .iter()
-        .all(|r| r.file == archived && r.line > from.line));
+    assert!(
+        b.rows
+            .iter()
+            .all(|r| r.file == archived && r.line > from.line)
+    );
     assert_eq!(b.rows.last().map(|r| r.pos()), Some(last.pos()));
     assert!(b.notes.is_empty());
     // the rename done: the next file's first row, with its terminator

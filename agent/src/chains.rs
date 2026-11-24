@@ -17,8 +17,8 @@ use tracing::{error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::chain_anchor::{
-    canonical_rows, flat_rows, full_audit, non_canonical_note, numbered_summary, Anchor,
-    ChainFinding, ChainKind, ChainTarget, ANCHOR_SECS, BOOT_VERIFY_BYTES, CHAIN_VERIFY_OP,
+    ANCHOR_SECS, Anchor, BOOT_VERIFY_BYTES, CHAIN_VERIFY_OP, ChainFinding, ChainKind, ChainTarget,
+    canonical_rows, flat_rows, full_audit, non_canonical_note, numbered_summary,
 };
 use crate::chain_host_linux::LinuxHost;
 
@@ -361,7 +361,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::audit::AgentSigningKey;
-    use crate::chain_anchor::{boot_check, read_file_head, HEADS_FILE_NAME};
+    use crate::chain_anchor::{HEADS_FILE_NAME, boot_check, read_file_head};
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
@@ -542,9 +542,11 @@ mod tests {
         log.append(anchor.take_marker().expect("first snapshot written"))
             .unwrap();
         assert!(anchor.take_marker().is_none());
-        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // cut the last rows; the chain that is left verifies
         let body = std::fs::read_to_string(&p.audit).unwrap();
         let full = body.clone();
@@ -582,14 +584,18 @@ mod tests {
         let pk = key(&dir).verifying_key();
         let p = paths(&dir);
         let heads = dir.path().join(HEADS_FILE_NAME);
-        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // legacy rows only, no anchor yet: the upgrade itself
         std::fs::write(&p.audit, "").unwrap();
-        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
     }
 
     /// External audit NN-AUD-174: before lab PR 160 a canary access log cut
@@ -702,9 +708,11 @@ mod tests {
         assert_eq!(drift[0]["extra"]["kind"], "chain_truncated");
         assert_eq!(drift[0]["extra"]["chain"], "canary_access");
         assert_eq!(drift[0]["extra"]["at_boot"], false);
-        assert!(boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // the stop's snapshot (forced) after a cut since the last tick:
         // signed first, as at the tick
         cut(&paths.canary_access, 2);
@@ -715,9 +723,11 @@ mod tests {
             .filter(|l| l.contains("\"integrity_drift\""))
             .count();
         assert_eq!(drift, 2);
-        assert!(boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&paths.targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // the stop's snapshot is written even when nothing moved; the tick's
         // only when a head did
         let counter = || match crate::chain_anchor::HeadsStore::read::<LinuxHost>(&heads, &pk) {

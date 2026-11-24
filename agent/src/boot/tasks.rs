@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use nn_proto::admin_signed_payload::OverlayKind;
 use northnarrow_agent::posture::{
-    resolve_verified_watchdog_pid, ExemptPids, PostureMachine, WatchdogResolution,
+    ExemptPids, PostureMachine, WatchdogResolution, resolve_verified_watchdog_pid,
 };
 use northnarrow_agent::response::ExecutorConfig;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, error, info, warn};
 
-use super::evidence::{attest_degraded, AuditHandle};
+use super::evidence::{AuditHandle, attest_degraded};
 
 /// SIGINT, SIGTERM and SIGHUP, registered before the event loop.
 pub(crate) struct Signals {
@@ -281,7 +281,7 @@ pub(crate) fn spawn_mount_guard_regroup_watch(mount_refresh: MountGuardRefresh) 
         return;
     };
     tokio::spawn(async move {
-        use northnarrow_agent::anti_tamper::mount_guard::{refresh_now, RegroupWatch};
+        use northnarrow_agent::anti_tamper::mount_guard::{RegroupWatch, refresh_now};
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut watch: Option<RegroupWatch> = None;
         loop {
@@ -631,7 +631,9 @@ pub(crate) fn spawn_watchdog_exempt_refresh(
                     // watchdog, a degradation as the watchdog's own
                     northnarrow_agent::boot::degradation::report(
                         northnarrow_agent::self_integrity::PIN_HANDLE_FAILED,
-                        &format!("the agent's register of the verified watchdog {p} in PROTECTED_PIDS: {e:#}"),
+                        &format!(
+                            "the agent's register of the verified watchdog {p} in PROTECTED_PIDS: {e:#}"
+                        ),
                     );
                 }
                 // External audit EBPF-002: the verified watchdog is the

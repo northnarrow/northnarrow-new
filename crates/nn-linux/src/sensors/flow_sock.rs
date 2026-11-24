@@ -21,9 +21,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use aya::maps::{MapData, PerCpuArray};
 use aya::Ebpf;
-use common::wire::{flow_sock_slot, FLOW_SOCK_COUNT_SLOTS, FLOW_SOCK_MAP_MAX_ENTRIES};
+use aya::maps::{MapData, PerCpuArray};
+use common::wire::{FLOW_SOCK_COUNT_SLOTS, FLOW_SOCK_MAP_MAX_ENTRIES, flow_sock_slot};
 use tracing::{info, warn};
 
 /// Map name in the eBPF object (`agent-ebpf/src/tcp_connect.rs`).

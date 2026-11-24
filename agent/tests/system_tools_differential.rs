@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use nn_model::{Event, ExeIdentity};
 use northnarrow_agent::impair::{
-    DefenseDetector, EvaRule, SecurityTools, BUILTIN_SECURITY_TOOLS_V1,
+    BUILTIN_SECURITY_TOOLS_V1, DefenseDetector, EvaRule, SecurityTools,
 };
 use northnarrow_agent::posture::lineage::AuthSessionTracker;
 

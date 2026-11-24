@@ -55,9 +55,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1088,7 +1088,7 @@ fn check_anchored<H: ChainHost>(
                             &archive,
                             g,
                             &format!("the head anchored at {anchored_at}"),
-                        ))
+                        ));
                     }
                     Holder::RolledBack { now } => {
                         return Anchored::Lost(ChainFinding::new(
@@ -1100,7 +1100,7 @@ fn check_anchored<H: ChainHost>(
                                  only {} archive(s) are on disk: the newest archives were removed",
                                 now.saturating_sub(1)
                             ),
-                        ))
+                        ));
                     }
                 }
             }
@@ -1537,8 +1537,8 @@ pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> Audi
 /// chains and the FIM baseline keep theirs in the agent).
 #[doc(hidden)]
 pub mod small_order {
-    use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
     use ed25519_dalek::{Signature, VerifyingKey};
 
     pub fn key() -> VerifyingKey {
@@ -2044,9 +2044,11 @@ mod tests {
         .refresh(true, false)
         .unwrap();
         let t = || vec![rotating_target(&active)];
-        assert!(boot_check::<PortableHost>(&t(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<PortableHost>(&t(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // agent down: the active file and every archive deleted
         for s in 1..=4u64 {
             std::fs::remove_file(crate::chainlog::archive_path_for(&active, s)).unwrap();
@@ -2265,7 +2267,7 @@ mod tests {
             append_raw(&path, b"\"}\n");
         }
         anchor.refresh(true, false).unwrap(); // the snapshot at stop
-                                              // agent down: forged lines and the last two genuine rows removed
+        // agent down: forged lines and the last two genuine rows removed
         let body = std::fs::read(&path).unwrap();
         std::fs::write(&path, &body[..genuine_len as usize]).unwrap();
         cut_last_rows(&path, 2);
@@ -2406,9 +2408,11 @@ mod tests {
             );
         }
         assert!(crate::chainlog::current_generation(&active) > 4);
-        assert!(boot_check::<PortableHost>(&targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<PortableHost>(&targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
     }
 
     /// BUG25: the running anchor's finding is signed before the head is
@@ -2452,9 +2456,11 @@ mod tests {
             last["entry_hash"].as_str().unwrap(),
             "the snapshot anchors the finding's row"
         );
-        assert!(boot_check::<PortableHost>(&targets(), &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<PortableHost>(&targets(), &heads, &pk)
+                .findings
+                .is_empty()
+        );
         // the finding's row cut while the agent is down: found
         cut_last_rows(&audit_path, 1);
         let found = boot_check::<PortableHost>(&targets(), &heads, &pk);
@@ -2663,10 +2669,12 @@ mod tests {
             matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::InvalidData),
             "{read:?}"
         );
-        assert!(anchor
-            .refresh_attesting(true, false, &mut |f| panic!("{f:?}"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            anchor
+                .refresh_attesting(true, false, &mut |f| panic!("{f:?}"))
+                .unwrap()
+                .is_empty()
+        );
         let body = std::fs::read(&path).unwrap();
         let genuine = body.len() - junk.len();
         std::fs::write(&path, &body[..genuine]).unwrap();

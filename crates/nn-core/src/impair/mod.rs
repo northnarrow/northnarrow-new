@@ -41,13 +41,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-use nn_model::telemetry::FimOp;
+use anyhow::{Result, anyhow};
 use nn_model::Event;
+use nn_model::telemetry::FimOp;
 use parking_lot::Mutex;
 
 use crate::anti_tamper::combat_allow::COMBAT_CHAIN;
@@ -58,7 +58,7 @@ use crate::decision::host::DecisionHost;
 use crate::posture::host::PostureHost;
 use crate::posture::lineage::{AsOf, AuthSessionTracker, ExecIdentity};
 use crate::posture::script_args::Parsed;
-use tool_options::{read_listed, Program, SystemTool};
+use tool_options::{Program, SystemTool, read_listed};
 use unit_glob::fnmatch;
 
 /// Deploy location of the list.
@@ -213,7 +213,7 @@ impl SecurityTools {
                                 }
                             }
                             other => {
-                                return Err(anyhow!("line {}: unknown field `{other}`", n + 1))
+                                return Err(anyhow!("line {}: unknown field `{other}`", n + 1));
                             }
                         }
                     }

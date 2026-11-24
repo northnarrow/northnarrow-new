@@ -70,9 +70,9 @@ use aya::programs::links::FdLink;
 use aya::programs::{BtfTracePoint, FEntry, FExit, Lsm};
 use aya::{Btf, Ebpf, EbpfLoader};
 use common::cgroup_join::{
-    fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack, EPOCH_SLOTS, HOW_INJECTED, HOW_PLACE,
-    HOW_TAINT, LOST_BYTES, LOST_SLOTS, NAME_CGROUP, NAME_UNIT, PIN_SCHEMA, SILENT_ARMED,
-    SILENT_UNSEEN, STAT_INJECTED, STAT_INTO_EXEMPT, STAT_LOST, STAT_ROOTS, STAT_SLOTS,
+    EPOCH_SLOTS, HOW_INJECTED, HOW_PLACE, HOW_TAINT, LOST_BYTES, LOST_SLOTS, NAME_CGROUP,
+    NAME_UNIT, PIN_SCHEMA, SILENT_ARMED, SILENT_UNSEEN, STAT_INJECTED, STAT_INTO_EXEMPT, STAT_LOST,
+    STAT_ROOTS, STAT_SLOTS, fnv, is_pin_dir_of, lost_slot, parse_pin_dir, unpack,
 };
 use nn_core::decision::rule_policy::{Exemption, Injected, RulePolicy};
 use parking_lot::Mutex;
@@ -146,8 +146,7 @@ pub fn is_kept_program(name: &str) -> bool {
 }
 
 /// What a kernel without the tracker loses.
-pub const ABSENT_EFFECT: &str =
-    "the start-in-cgroup tracker is not attached: every exemption by executable, cgroup or unit \
+pub const ABSENT_EFFECT: &str = "the start-in-cgroup tracker is not attached: every exemption by executable, cgroup or unit \
      of the per-rule policy is refused (a process moved into an exempt service's cgroup could not \
      be told from the service, nor one code was injected into from the program it runs)";
 
@@ -420,12 +419,12 @@ pub fn plan(
             return next(Some(format!(
                 "marks reset: the tracker's maps of schema v{schema} ({dir}) are not migrated to \
                  v{PIN_SCHEMA} (no migration from v{schema})"
-            )))
+            )));
         }
         None => {
             return next(Some(format!(
                 "marks reset: the registered {dir} is not a tracker directory"
-            )))
+            )));
         }
     }
     if !dirs.contains(&st.dir) {
@@ -438,7 +437,7 @@ pub fn plan(
         Err(why) => {
             return next(Some(format!(
                 "marks reset: the registered {dir} does not hold the maps registered ({why})"
-            )))
+            )));
         }
     };
     if let Some(n) = debug_entries.filter(|n| *n != entries) {
@@ -1118,7 +1117,9 @@ pub fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> (Tracker, 
                     Vec::new(),
                 );
             }
-            warn!("cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs");
+            warn!(
+                "cgroup exemptions: tracker attached WITHOUT pin (no bpffs): not kept while no agent runs"
+            );
         }
     }
     // Lot 280b: the fork's check of the fentry armed now that this start's
@@ -2141,9 +2142,11 @@ mod tests {
             vec![old.clone(), other.clone()]
         );
         assert_eq!(other_pin_dirs(&root, None).len(), 3);
-        assert!(pinned_dir(&root)
-            .unwrap_err()
-            .contains("3 tracker pin directories"));
+        assert!(
+            pinned_dir(&root)
+                .unwrap_err()
+                .contains("3 tracker pin directories")
+        );
         for f in [
             "link_cgroup_join_mark",
             "prog_cgroup_join_mark",
@@ -2160,9 +2163,11 @@ mod tests {
         assert_eq!(other_pin_dirs(&root, Some(&cur)), Vec::<PathBuf>::new());
         assert_eq!(pinned_dir(&root).unwrap(), cur);
         std::fs::remove_dir(&cur).unwrap();
-        assert!(pinned_dir(&root)
-            .unwrap_err()
-            .contains("no tracker pin directory"));
+        assert!(
+            pinned_dir(&root)
+                .unwrap_err()
+                .contains("no tracker pin directory")
+        );
         // the legacy pins in the root itself (before R2) go
         let (prog, link) = pin_paths(&root, "cgroup_join_exit");
         std::fs::write(&prog, "").unwrap();
@@ -2223,16 +2228,20 @@ mod tests {
         );
         assert!(verify_map(&seen(7, MapType::Array, 4, 8, LOST_SLOTS, 0), &l).is_err());
         // an array registered at another size than this schema's is not one
-        assert!(verify_map(
-            &seen(7, MapType::Array, 4, 64, 64, 0),
-            &reg(LOST_MAP, 7, 64)
-        )
-        .is_err());
-        assert!(verify_map(
-            &seen(9, MapType::Array, 4, 8, EPOCH_SLOTS, 0),
-            &reg(EPOCH_MAP, 9, EPOCH_SLOTS)
-        )
-        .is_ok());
+        assert!(
+            verify_map(
+                &seen(7, MapType::Array, 4, 64, 64, 0),
+                &reg(LOST_MAP, 7, 64)
+            )
+            .is_err()
+        );
+        assert!(
+            verify_map(
+                &seen(9, MapType::Array, 4, 8, EPOCH_SLOTS, 0),
+                &reg(EPOCH_MAP, 9, EPOCH_SLOTS)
+            )
+            .is_ok()
+        );
         assert!(verify_map(&seen(1, MapType::Array, 4, 8, 4, 0), &reg("OTHER", 1, 4)).is_err());
     }
 
@@ -2290,10 +2299,11 @@ mod tests {
             |_: &PinState| Err::<u32, String>("CGROUP_JOINED: a Some(LruHash) map".to_string());
         let p = plan(root, "B", Some(&s0), &[d(0)], &bad, 1000, None);
         assert!(!p.adopt && p.dir == d(1));
-        assert!(p
-            .reset
-            .unwrap()
-            .contains("does not hold the maps registered (CGROUP_JOINED: a Some(LruHash)"));
+        assert!(
+            p.reset
+                .unwrap()
+                .contains("does not hold the maps registered (CGROUP_JOINED: a Some(LruHash)")
+        );
         // the registered directory gone between two agents (point 3)
         let p = plan(root, "B", Some(&st(d(2))), &[], &ok(1), 1000, None);
         assert_eq!(p.dir, d(3));
@@ -2302,10 +2312,11 @@ mod tests {
         // use, or of a start that could not register: never adopted
         let p = plan(root, "B", None, &[d(0)], &ok(1), 1000, None);
         assert!(!p.adopt && p.dir == d(1));
-        assert!(p
-            .reset
-            .unwrap()
-            .contains("no start of this boot registered"));
+        assert!(
+            p.reset
+                .unwrap()
+                .contains("no start of this boot registered")
+        );
         let legacy = PathBuf::from("/b/northnarrow-cgroup-join-v1-63222");
         let p = plan(
             root,
@@ -2697,9 +2708,11 @@ mod tests {
             PROGRAMS.len(),
             common::btf_offsets::CGROUP_JOIN_TARGETS.len() + 1 + lsm.len()
         );
-        assert!(PROGRAMS
-            .iter()
-            .all(|(n, _, _)| n.starts_with("cgroup_join_")));
+        assert!(
+            PROGRAMS
+                .iter()
+                .all(|(n, _, _)| n.starts_with("cgroup_join_"))
+        );
         for t in common::btf_offsets::CGROUP_JOIN_TARGETS {
             assert!(
                 PROGRAMS.iter().any(|(_, _, target)| *target == t.name),

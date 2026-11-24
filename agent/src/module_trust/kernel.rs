@@ -2,10 +2,10 @@
 //! trust map, the package managers' images, the write history — taken from
 //! the loaded object for the controller ([`super::start`]).
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{Array, HashMap, MapData};
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
-use common::module_judge::{conf_slot, ModuleTrust, ModuleWrite};
+use aya::maps::{Array, HashMap, MapData};
+use common::module_judge::{ModuleTrust, ModuleWrite, conf_slot};
 use common::wire::InodeKey;
 
 /// `InodeKey` for aya (its own `Pod` marker; the orphan rule forbids

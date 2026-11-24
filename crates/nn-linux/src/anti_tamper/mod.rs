@@ -74,10 +74,10 @@ pub fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
 
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::{
-    maps::{Array as AyaArray, MapData},
     Ebpf,
+    maps::{Array as AyaArray, MapData},
 };
 use common::wire::{FsGrant, InodeKey, KillGrant};
 use rand::Rng;
@@ -93,9 +93,9 @@ use tracing::{debug, error, info, warn};
 // link without an identity check — and `fresh_attach_and_pin`, its only
 // user, are gone; `reattach_fresh` is the one pinned LSM attach.
 pub use antitamper_bpf::{
-    attach_transient, lsm_pin_paths, pin_root_refusal, prepare_pin_root, purge_stale_pin,
-    read_proc_comm, read_self_comm, reattach_fresh, DEFAULT_BPFFS_ROOT,
-    PROTECTED_OBSERVERS_MAP_NAME, PROTECTED_PIDS_MAP_NAME,
+    DEFAULT_BPFFS_ROOT, PROTECTED_OBSERVERS_MAP_NAME, PROTECTED_PIDS_MAP_NAME, attach_transient,
+    lsm_pin_paths, pin_root_refusal, prepare_pin_root, purge_stale_pin, read_proc_comm,
+    read_self_comm, reattach_fresh,
 };
 
 // Watchdog W1: PROTECTED_PIDS userspace manipulation now goes
@@ -701,7 +701,10 @@ fn attach_reporting(
             }
         }
         Err(e) => {
-            warn!(error = format!("{e:#}"), "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect");
+            warn!(
+                error = format!("{e:#}"),
+                "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect"
+            );
             // External audit ATP-016: a guard with no own object to
             // recognise refuses nothing — the `bpf_map` deny is missing,
             // like an observing one (ATP-009), and counted once.
@@ -2156,9 +2159,11 @@ mod tests {
             16,
             "the eBPF map value and the userland view must agree"
         );
-        assert!(SHUTDOWN_EXE_PATHS
-            .iter()
-            .all(|p| p.ends_with("/systemd-shutdown")));
+        assert!(
+            SHUTDOWN_EXE_PATHS
+                .iter()
+                .all(|p| p.ends_with("/systemd-shutdown"))
+        );
     }
 
     /// Cross-crate consistency anchor: WATCHDOG_COMM must match

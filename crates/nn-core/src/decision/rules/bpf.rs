@@ -27,14 +27,14 @@ use common::bpf_cmd::{
     BPF_RAW_TRACEPOINT_OPEN,
 };
 use common::wire::{
-    bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
-    BPF_CMD_LISTING_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD,
+    BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, BPF_CMD_FRESH_INSTANCE_GET_FD,
+    BPF_CMD_LISTING_GET_FD, BPF_CMD_VACATED_ROLE_GET_FD, bpf_cmd_name,
 };
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 /// Programs that legitimately drive BPF on a server, matched on the
@@ -607,12 +607,14 @@ mod tests {
             "{}",
             v.reasoning
         );
-        assert!(r1
-            .evaluate(&ev("systemd", BPF_RAW_TRACEPOINT_OPEN, 5))
-            .is_none());
-        assert!(r2
-            .evaluate(&ev("implant", BPF_RAW_TRACEPOINT_OPEN, 5))
-            .is_none());
+        assert!(
+            r1.evaluate(&ev("systemd", BPF_RAW_TRACEPOINT_OPEN, 5))
+                .is_none()
+        );
+        assert!(
+            r2.evaluate(&ev("implant", BPF_RAW_TRACEPOINT_OPEN, 5))
+                .is_none()
+        );
     }
 
     /// The review of #554 (named, F2): a fresh instance of the agent or the
@@ -641,9 +643,10 @@ mod tests {
             .evaluate(&ev("northnarrow-wat", BPF_CMD_FOREIGN_GET_FD, 9))
             .expect("fires");
         assert_eq!(f.severity, Severity::High);
-        assert!(r1
-            .evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
-            .is_none());
+        assert!(
+            r1.evaluate(&ev("northnarrow-wat", BPF_CMD_FRESH_INSTANCE_GET_FD, 9))
+                .is_none()
+        );
     }
 
     /// Lot 370 (F10-4): a role taken after its holder exited this boot is
@@ -667,9 +670,10 @@ mod tests {
             v.reasoning
         );
         assert!(v.reasoning.contains("(id 9)"), "{}", v.reasoning);
-        assert!(r1
-            .evaluate(&ev("northnarrow-age", BPF_CMD_VACATED_ROLE_GET_FD, 9))
-            .is_none());
+        assert!(
+            r1.evaluate(&ev("northnarrow-age", BPF_CMD_VACATED_ROLE_GET_FD, 9))
+                .is_none()
+        );
     }
 
     /// #554's KVM suites: the signed detection record carries no reasoning,
@@ -713,14 +717,16 @@ mod tests {
         assert_eq!(v.rule_id, "NN-L-BPF-002_BpfForeignHandleOrDetach");
         assert_eq!(v.severity, Severity::High);
         assert!(v.reasoning.contains("id 42"));
-        assert!(r2
-            .evaluate(&ev("bpftool", BPF_CMD_FOREIGN_MAP_WRITE, 9))
-            .is_some());
+        assert!(
+            r2.evaluate(&ev("bpftool", BPF_CMD_FOREIGN_MAP_WRITE, 9))
+                .is_some()
+        );
         // detach by unlisted: fires; by known/allowlisted: exempt
         assert!(r2.evaluate(&ev("bpftool", BPF_LINK_DETACH, 0)).is_some());
-        assert!(r2
-            .evaluate(&ev("cilium-agent", BPF_LINK_DETACH, 0))
-            .is_none());
+        assert!(
+            r2.evaluate(&ev("cilium-agent", BPF_LINK_DETACH, 0))
+                .is_none()
+        );
         assert!(r2.evaluate(&ev("myobs", BPF_PROG_DETACH, 0)).is_none());
         // a plain load is not this rule's business
         assert!(r2.evaluate(&ev("bpftool", BPF_PROG_LOAD, 7)).is_none());
@@ -773,12 +779,14 @@ mod tests {
             .expect("a loader named systemd that is not systemd fires");
         assert!(v.reasoning.contains("named 'systemd'"), "{}", v.reasoning);
         assert!(r1.evaluate(&by(701, "systemd", BPF_PROG_LOAD)).is_none());
-        assert!(r1
-            .evaluate(&by(702, "systemd-udevd", BPF_PROG_LOAD))
-            .is_none());
-        assert!(r1
-            .evaluate(&by(703, "systemd-network", BPF_PROG_LOAD))
-            .is_none());
+        assert!(
+            r1.evaluate(&by(702, "systemd-udevd", BPF_PROG_LOAD))
+                .is_none()
+        );
+        assert!(
+            r1.evaluate(&by(703, "systemd-network", BPF_PROG_LOAD))
+                .is_none()
+        );
         assert!(r1.evaluate(&by(704, "myobs", BPF_LINK_CREATE)).is_none());
         assert!(r1.evaluate(&by(705, "myobs", BPF_LINK_CREATE)).is_some());
         // a detach by the impostor fires, by the real tool it does not

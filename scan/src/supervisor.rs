@@ -13,8 +13,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nn_proto::execq::{
-    decode, encode, FromScanner, ScanRequest, ScanResult, ScannerHello, ToScanner, MAX_PACKET,
-    PROTOCOL_VERSION,
+    FromScanner, MAX_PACKET, PROTOCOL_VERSION, ScanRequest, ScanResult, ScannerHello, ToScanner,
+    decode, encode,
 };
 
 use crate::ipc;

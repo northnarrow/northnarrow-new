@@ -7,12 +7,12 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nn_proto::admin_protocol::{decode_frame, encode_frame, AdminMessage, MAX_FRAME_BODY};
+use nn_proto::admin_protocol::{AdminMessage, MAX_FRAME_BODY, decode_frame, encode_frame};
 use nn_proto::admin_signed_payload::SignedPayload;
 
 use crate::fixtures;

@@ -111,12 +111,12 @@ use nn_model::telemetry::FlowPhase;
 use nn_model::{CanaryAccessKind, Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::correlation::{
-    retention_ns, ChainAge, CorrelationStore, EgressChain, EgressNote, PrecursorKind, ProcKey,
-    CORRELATION_WINDOW_NS,
+    CORRELATION_WINDOW_NS, ChainAge, CorrelationStore, EgressChain, EgressNote, PrecursorKind,
+    ProcKey, retention_ns,
 };
-use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
 use crate::net::resolvers::HostResolvers;
 use crate::posture::host::PostureHost;
@@ -379,7 +379,7 @@ impl<H: PostureHost> Rule for NnLChain001CredReadThenEgress<H> {
                             PrecursorKind::CredRead,
                             "Process accessed a credential store",
                             "T1555 → T1041",
-                        ))
+                        ));
                     }
                 }
                 // Review 70: completed in order; no late precursor may reuse
@@ -1527,9 +1527,10 @@ mod tests {
         );
         let r = chain001();
         r.evaluate(&cred_fim(43, 10 * SEC));
-        assert!(r
-            .evaluate(&flow(43, 443, 10 * SEC + 31 * 60 * SEC))
-            .is_none());
+        assert!(
+            r.evaluate(&flow(43, 443, 10 * SEC + 31 * 60 * SEC))
+                .is_none()
+        );
     }
 
     /// External audit NETR-014: the triage's pin — a credential read at t0
@@ -1844,14 +1845,16 @@ mod tests {
             "{}",
             v.reasoning
         );
-        assert!(r
-            .evaluate(&flow(42, 443, 10 * SEC + 13 * 60 * SEC))
-            .is_none());
+        assert!(
+            r.evaluate(&flow(42, 443, 10 * SEC + 13 * 60 * SEC))
+                .is_none()
+        );
         let r = chain003();
         r.evaluate(&canary_trip(42, 10 * SEC));
-        assert!(r
-            .evaluate(&flow(42, 443, 10 * SEC + 31 * 60 * SEC))
-            .is_none());
+        assert!(
+            r.evaluate(&flow(42, 443, 10 * SEC + 31 * 60 * SEC))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3206,10 +3209,11 @@ mod tests {
     fn chain_rule_set_puts_only_chain008_in_the_tail() {
         let set = chain_rule_set();
         assert_eq!(set.head.len(), 7);
-        assert!(set
-            .head
-            .iter()
-            .all(|r| r.id() != "NN-L-CHAIN-008_CrossPidPrivEscExfil"));
+        assert!(
+            set.head
+                .iter()
+                .all(|r| r.id() != "NN-L-CHAIN-008_CrossPidPrivEscExfil")
+        );
         let tail: Vec<&str> = set.tail.iter().map(|r| r.id()).collect();
         assert_eq!(tail, vec!["NN-L-CHAIN-008_CrossPidPrivEscExfil"]);
     }

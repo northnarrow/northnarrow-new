@@ -36,24 +36,24 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tracing::{debug, error, info, warn};
 
 use super::config::MarkKind;
-use super::copy::{snapshot, Snapshot};
+use super::copy::{Snapshot, snapshot};
 use super::fanotify::{
-    btime, fd_path, fstat, is_own_thread, parse_events, read_open_intent, tgid_of, Group,
-    OpenIntent, RawEvent,
+    Group, OpenIntent, RawEvent, btime, fd_path, fstat, is_own_thread, parse_events,
+    read_open_intent, tgid_of,
 };
 use super::identity::FileId;
 use super::index::{FileState, Method, PostWrite, Refusal, Reservation};
-use super::journal::{host_view, Journal};
-use super::store::{now_ms, Stats, Store};
+use super::journal::{Journal, host_view};
+use super::store::{Stats, Store, now_ms};
 use super::trust::{ProcId, TrustFilter, WriterInfo};
 use crate::posture::lineage::AuthSessionTracker;
 
@@ -572,7 +572,10 @@ impl Runtime {
             }
             if let Some(why) = bad {
                 // An event we cannot read is an open we cannot answer.
-                error!(why, "copy on first write: unreadable fanotify record — closing the group (every open allowed)");
+                error!(
+                    why,
+                    "copy on first write: unreadable fanotify record — closing the group (every open allowed)"
+                );
                 return;
             }
         }
@@ -726,7 +729,7 @@ impl Runtime {
                 return self.allow_fast(fd, read_at, &s.skipped_budget_full);
             }
             Err(Refusal::LargerThanBudget) => {
-                return self.allow_fast(fd, read_at, &s.skipped_larger_than_budget)
+                return self.allow_fast(fd, read_at, &s.skipped_larger_than_budget);
             }
             Err(Refusal::UnknownScope) => return self.allow_fast(fd, read_at, &s.skipped_failed),
         };

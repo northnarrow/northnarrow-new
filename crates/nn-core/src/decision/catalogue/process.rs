@@ -526,7 +526,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
         false_positives: "Administrators schedule one-shot jobs routinely; every one is \
                           recorded, none acted on. `process-comm-allowlist` silences it.",
         how_to_test: "`echo true | at now + 1 minute` (the `at` package installed).",
-        tests: &["crates/nn-core/src/decision/rules/r014_at_batch_scheduling.rs::fires_on_scheduling_tool"],
+        tests: &[
+            "crates/nn-core/src/decision/rules/r014_at_batch_scheduling.rs::fires_on_scheduling_tool",
+        ],
         attack_note: "Execution and Persistence, the two tactics of T1053.002 a one-shot job \
                       serves; the job's own run later is an ordinary exec.",
     },

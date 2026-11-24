@@ -79,8 +79,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use nn_model::posture_types::TriggerType;
 use nn_model::Event;
+use nn_model::posture_types::TriggerType;
 
 use crate::anti_tamper::network_isolate::FamilyOutcome;
 use crate::posture::{CombatCause, CombatEntry};
@@ -564,11 +564,7 @@ impl<H: CombatHost> CombatLadder<H> {
     /// read back in place (lab PR 217).
     pub fn current_stage(&self) -> Option<CombatStage> {
         let s = self.inner.state.lock();
-        if s.engaged {
-            Some(s.stage)
-        } else {
-            None
-        }
+        if s.engaged { Some(s.stage) } else { None }
     }
 
     /// External audit CMB-027: the stage transitions the signed audit log
@@ -682,7 +678,7 @@ impl<H: CombatHost> CombatLadder<H> {
         // may name a new process by now — attributed afresh, in its place.
         let reused = match s.offenders.get(&pid) {
             Some(known) if self.inner.actuator.same_process(&known.proc, start_ns) => {
-                return Ok(None)
+                return Ok(None);
             }
             known => known.is_some(),
         };
@@ -1959,7 +1955,7 @@ fn neutralize_outcome(
 /// External audit NET-001: `::ffff:127.0.0.1` (a dual-stack socket) is
 /// loopback too.
 fn is_loopback(family: u8, addr: &[u8]) -> bool {
-    use nn_model::netaddr::{canonical_ip, AF_INET, AF_INET6};
+    use nn_model::netaddr::{AF_INET, AF_INET6, canonical_ip};
     if family != AF_INET && family != AF_INET6 {
         return false;
     }

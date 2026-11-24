@@ -366,10 +366,14 @@ fn the_cross_view_runs_in_the_kernel_state_round() {
     )
     .unwrap();
     let u = code("crates/nn-linux/src/anti_tamper/bpf_defense.rs");
-    assert!(body(&u, "register_own_objects")
-        .contains("guard.0.own_progs.lock().extend(prog_ids.iter().copied());"));
-    assert!(body(&u, "register_late_objects")
-        .contains("guard.0.own_progs.lock().extend(prog_ids.iter().copied());"));
+    assert!(
+        body(&u, "register_own_objects")
+            .contains("guard.0.own_progs.lock().extend(prog_ids.iter().copied());")
+    );
+    assert!(
+        body(&u, "register_late_objects")
+            .contains("guard.0.own_progs.lock().extend(prog_ids.iter().copied());")
+    );
     let x = code("crates/nn-linux/src/bpf_crossview.rs");
     in_order(
         body(&x, "round"),
@@ -446,10 +450,14 @@ fn the_configuration_maps_are_frozen_and_the_opt_out_is_applied() {
         ],
     )
     .unwrap();
-    assert!(code("agent/src/boot/policy.rs")
-        .contains("nn_linux::anti_tamper::bpf_defense::apply_loader_policy(&policy, signed)"));
-    assert!(code("agent/src/admin/handlers/config.rs")
-        .contains("nn_linux::anti_tamper::bpf_defense::apply_loader_policy("));
+    assert!(
+        code("agent/src/boot/policy.rs")
+            .contains("nn_linux::anti_tamper::bpf_defense::apply_loader_policy(&policy, signed)")
+    );
+    assert!(
+        code("agent/src/admin/handlers/config.rs")
+            .contains("nn_linux::anti_tamper::bpf_defense::apply_loader_policy(")
+    );
 }
 
 /// Named (lot 290, the lab's first start): `OWN_BPF_IDS` holds every map,
@@ -819,7 +827,9 @@ fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
         ],
     )
     .unwrap();
-    assert!(body(&c, "every_type_armed").contains("PROG_CONTENT_CONF.get(CONTENT_EVERY_TYPE_SLOT)"));
+    assert!(
+        body(&c, "every_type_armed").contains("PROG_CONTENT_CONF.get(CONTENT_EVERY_TYPE_SLOT)")
+    );
     let refusal = body(&c, "content_refusal");
     assert!(refusal.contains("let kfuncs_only = !denied_by_default(ty);"));
     assert!(refusal.contains("if (kfuncs_only && !every_type)"));

@@ -24,7 +24,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use nn_proto::ipc::{ExportChain, MAX_CA_PEM};
 
 /// The chains exported when the configuration names none: the detections
@@ -285,7 +285,7 @@ impl ExportConfig {
                         "unknown key `{other}` (enabled, chain, start, file, file_max_bytes, \
                          file_max_files, syslog, syslog_server_name, syslog_ca, \
                          syslog_ca_sha256, syslog_facility)"
-                    )))
+                    )));
                 }
             }
         }
@@ -487,9 +487,10 @@ mod tests {
         assert_eq!(s.server_name, "siem.example.org");
         assert_eq!(s.facility, 10);
         assert_eq!(hex::encode(s.ca_sha256), SHA);
-        assert!(c
-            .summary()
-            .contains("syslog 10.0.0.5:6514 (siem.example.org)"));
+        assert!(
+            c.summary()
+                .contains("syslog 10.0.0.5:6514 (siem.example.org)")
+        );
         // the server name defaults to the IP; v6 in brackets
         let c = ExportConfig::parse(&format!(
             "enabled = true\nsyslog = [2001:db8::1]:6514\nsyslog_ca = /a.pem\nsyslog_ca_sha256 = {SHA}"
@@ -579,10 +580,12 @@ mod tests {
         std::fs::write(&p, b"-----BEGIN CERTIFICATE-----\n").unwrap();
         let good: [u8; 32] = Sha256::digest(b"-----BEGIN CERTIFICATE-----\n").into();
         assert!(read_ca(&p, &good).is_ok());
-        assert!(read_ca(&p, &[0; 32])
-            .unwrap_err()
-            .to_string()
-            .contains("pins"));
+        assert!(
+            read_ca(&p, &[0; 32])
+                .unwrap_err()
+                .to_string()
+                .contains("pins")
+        );
         std::fs::write(&p, vec![b'a'; MAX_CA_PEM + 1]).unwrap();
         assert!(read_ca(&p, &good).is_err());
         assert!(read_ca(&dir.path().join("none"), &good).is_err());

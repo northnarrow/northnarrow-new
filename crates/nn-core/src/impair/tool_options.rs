@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crate::posture::script_args::{read_tool, Dash, Getopt, Long, Opt, Parsed, Permute, Table};
+use crate::posture::script_args::{Dash, Getopt, Long, Opt, Parsed, Permute, Table, read_tool};
 
 /// The fields every system tool's table shares.
 const GETOPT: Table = Table {

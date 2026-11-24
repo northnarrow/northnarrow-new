@@ -38,10 +38,10 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use antitamper_bpf::ProtectedPidsHandle;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nn_proto::admin_protocol::{
-    decode_loop_progress, decode_status_liveness, encode_frame, AdminMessage, LoopProgressRequest,
-    StatusRequest, MAX_FRAME_BODY,
+    AdminMessage, LoopProgressRequest, MAX_FRAME_BODY, StatusRequest, decode_loop_progress,
+    decode_status_liveness, encode_frame,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -1902,7 +1902,7 @@ pub fn record_floor_restores(hold_path: &Path, agent_pid: u32) {
 /// a WARN and a record at `hold_path` the agent signs. Returns its detail,
 /// `None` when the copy is within the floors (or systemd cannot be asked).
 pub fn check_systemds_copy(hold_path: &Path, agent_pid: u32) -> Option<String> {
-    use antitamper_bpf::unit_props::{below_floors, Below};
+    use antitamper_bpf::unit_props::{Below, below_floors};
     let socket = Path::new(antitamper_bpf::systemd_bus::PRIVATE_SOCKET);
     if !socket.exists() {
         return None;
@@ -2129,7 +2129,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
                 c,
                 &raw,
                 format!("{}: no valid admin key", c.admin_pub.display()),
-            )
+            );
         }
         Err(e) => return refuse(c, &raw, format!("{}: {e}", c.admin_pub.display())),
     };
@@ -3080,7 +3080,7 @@ pub async fn ping_agent(
                         | std::io::ErrorKind::BrokenPipe
                 ) =>
             {
-                return Ok(LoopProgress::Unreported)
+                return Ok(LoopProgress::Unreported);
             }
             Err(e) => return Err(e).context("reading the loop progress reply header"),
         }
@@ -3240,14 +3240,14 @@ pub async fn stuck_recovery_with(
         Ok(Ok(guard)) => drop(guard),
         Ok(Err(e)) => {
             return Err(anyhow::Error::from(e))
-                .context("awaiting post-SIGKILL pidfd POLLIN; the agent keeps its protection")
+                .context("awaiting post-SIGKILL pidfd POLLIN; the agent keeps its protection");
         }
         Err(_) => {
             return Err(anyhow!(
                 "agent pid {agent_pid} has not exited {} s after SIGKILL (uninterruptible \
                  sleep?); it keeps its protection and stays supervised",
                 reap_timeout.as_secs()
-            ))
+            ));
         }
     }
 
@@ -4281,7 +4281,7 @@ mod tests {
     /// refused (the agent relaunched after an authorised stop).
     #[test]
     fn a_latin1_comment_in_admin_pub_does_not_refuse_a_signed_marker() {
-        use nn_proto::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_signed_payload::{SignedPayload, sign};
         use nn_proto::shutdown_marker::ShutdownMarker;
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("agent.shutdown_authorised");
@@ -4337,7 +4337,7 @@ mod tests {
     /// for the agent and removed; a genuine authorisation is honoured once.
     #[test]
     fn only_a_quorum_signed_marker_stands_the_watchdog_down() {
-        use nn_proto::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_signed_payload::{SignedPayload, sign};
         use nn_proto::shutdown_marker::ShutdownMarker;
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("agent.shutdown_authorised");
@@ -4645,7 +4645,9 @@ mod tests {
         let out = "ActiveState=failed\nSubState=failed\nResult=exit-code\nConditionResult=yes\nAssertResult=yes\n";
         assert_eq!(
             unit_state_from_show(out).as_deref(),
-            Some("ActiveState=failed SubState=failed Result=exit-code ConditionResult=yes AssertResult=yes")
+            Some(
+                "ActiveState=failed SubState=failed Result=exit-code ConditionResult=yes AssertResult=yes"
+            )
         );
         assert_eq!(unit_state_from_show("\n\n"), None);
         let long = format!("Result={}\n", "é".repeat(300));
@@ -4818,9 +4820,10 @@ mod tests {
             nn_proto::watchdog_hold::REASON_PIN_HANDLE_FAILED
         );
         assert_eq!(rec.agent_pid, 812);
-        assert!(rec
-            .detail
-            .starts_with("evict_dead_agent: opening pinned PROTECTED_PIDS"));
+        assert!(
+            rec.detail
+                .starts_with("evict_dead_agent: opening pinned PROTECTED_PIDS")
+        );
         assert!(PIN_HANDLES.contains(&"evict_dead_agent"));
         // every handle the review named is one of them
         for h in ["register_self_pid", "claim_role", "reinsert_new_agent_pid"] {
@@ -4830,7 +4833,7 @@ mod tests {
 
     #[test]
     fn record_hold_appends_one_line_per_hold() {
-        use nn_proto::watchdog_hold::{HoldRecord, HOLD_PATH};
+        use nn_proto::watchdog_hold::{HOLD_PATH, HoldRecord};
         assert_eq!(
             hold_record_path(Path::new(nn_proto::shutdown_marker::MARKER_PATH)),
             Path::new(HOLD_PATH)
@@ -5631,7 +5634,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_ping_does_not_depend_on_the_status_fields() {
         use nn_model::posture_types::PostureKind;
-        use nn_proto::admin_protocol::{StatusResponse, STATUS_RESPONSE_INDEX};
+        use nn_proto::admin_protocol::{STATUS_RESPONSE_INDEX, StatusResponse};
         // The first agents' reply, as postcard writes it: the variant, then
         // posture Combat (3), isolation engaged (1), last admin action
         // Some(4) — and nothing after.

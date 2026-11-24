@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};

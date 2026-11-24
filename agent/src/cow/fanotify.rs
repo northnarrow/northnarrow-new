@@ -286,7 +286,7 @@ pub fn classify_syscall_line(line: &str) -> OpenIntent {
     match regs[..] {
         [Some(sp), Some(pc)] if sp != 0 && pc != 0 => {}
         [Some(_), Some(_)] => {
-            return OpenIntent::Unknown("no user registers: a thread the kernel made")
+            return OpenIntent::Unknown("no user registers: a thread the kernel made");
         }
         _ => return OpenIntent::Unknown("unreadable user registers"),
     }

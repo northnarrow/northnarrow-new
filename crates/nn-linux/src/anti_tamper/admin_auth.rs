@@ -42,9 +42,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::{Signature, VerifyingKey};
-use nn_proto::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecision};
+use nn_proto::admin_quorum::{self, QuorumDecision, distinct_matches, quorum_decision};
 use nn_proto::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use parking_lot::RwLock;
 use rand::Rng;
@@ -52,7 +52,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use super::network_isolate::{mint_unlock_token, UnlockToken};
+use super::network_isolate::{UnlockToken, mint_unlock_token};
 use crate::os_rng::OsRng;
 
 /// External audit NN-AUD-079: failed signature checks one admin-socket
@@ -2771,7 +2771,7 @@ mod tests {
     #[test]
     fn verify_signed_payload_quorum_returns_matched_fingerprints() {
         use nn_proto::admin_signed_payload::{
-            sign as sign_payload, signing_digest, OperationCode, SignedPayload,
+            OperationCode, SignedPayload, sign as sign_payload, signing_digest,
         };
         // Build a 2-of-N auth with both keys carrying Shutdown
         // role + a stable agent_id we can pass to the payload.
@@ -2975,7 +2975,7 @@ mod tests {
     #[test]
     fn verify_signed_payload_quorum_rejects_op_extra_mismatch() {
         use nn_proto::admin_signed_payload::{
-            sign as sign_payload, OperationCode, OperationExtra, UnlockExtra,
+            OperationCode, OperationExtra, UnlockExtra, sign as sign_payload,
         };
         const T: u64 = 1_700_000_000;
         let agent_id = [0x5a; 16];
@@ -3027,7 +3027,7 @@ mod tests {
     /// it verifies. No test of the core reached the nonce check before.
     #[test]
     fn verify_signed_payload_quorum_rejects_another_challenges_nonce() {
-        use nn_proto::admin_signed_payload::{sign as sign_payload, OperationCode};
+        use nn_proto::admin_signed_payload::{OperationCode, sign as sign_payload};
         const T: u64 = 1_700_000_000;
         let agent_id = [0x5c; 16];
         let (auth, sks) = shutdown_pair(agent_id);
@@ -3071,7 +3071,7 @@ mod tests {
     /// The same on the nonce-only quorum and the stored-payload paths.
     #[test]
     fn verify_quorum_rejects_submission_over_signature_cap() {
-        use nn_proto::admin_signed_payload::{sign as sign_payload, OperationCode};
+        use nn_proto::admin_signed_payload::{OperationCode, sign as sign_payload};
         const T: u64 = 1_700_000_000;
         let cap = admin_quorum::MAX_SUBMITTED_SIGNATURES;
         let agent_id = [0x5b; 16];

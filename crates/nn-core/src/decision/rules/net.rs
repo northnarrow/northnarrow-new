@@ -65,10 +65,10 @@ use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::bounded::{LazyLru, LossCounter};
 use crate::decision::host::DecisionHost;
-use crate::decision::Rule;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 use crate::net::dns_cache::DnsCache;
 use crate::posture::host::PostureHost;
@@ -1227,7 +1227,7 @@ impl DnsTunnelCorroboration {
                 self.seen.remove(&victim.0);
                 if victim.1 && self.lost.bump() {
                     tracing::warn!(
-                        pid = victim.0 .0,
+                        pid = victim.0.0,
                         evicted = self.lost.count(),
                         cap = DNS_TUNNEL_MAX_PAIRS,
                         "NN-L-NET-014 corroboration full: evicted a process/domain \
@@ -3447,8 +3447,8 @@ mod tests {
     type NnLNet018Rfc1918LateralPort = super::NnLNet018Rfc1918LateralPort<H>;
     type NnLNet019WildcardListener = super::NnLNet019WildcardListener<H>;
     type NnLNet014DnsTunnelEntropy = super::NnLNet014DnsTunnelEntropy<H>;
-    use nn_model::telemetry::{NetFlowEvent, NetListenerEvent, TlsFingerprint};
     use nn_model::ResponseAction;
+    use nn_model::telemetry::{NetFlowEvent, NetListenerEvent, TlsFingerprint};
     use std::net::{Ipv4Addr, Ipv6Addr};
     fn net_rules_empty() -> Vec<Box<dyn Rule>> {
         super::net_rules_empty::<H>()
@@ -3859,18 +3859,21 @@ mod tests {
         let other = NnLNet003BadJa3::new(Arc::new(Ja3Blocklist::from_entries([
             "t13d1516h2_8daaf6152771_000000000000",
         ])));
-        assert!(other
-            .evaluate(&hello(Some(&"cc".repeat(16)), "chrome"))
-            .is_none());
+        assert!(
+            other
+                .evaluate(&hello(Some(&"cc".repeat(16)), "chrome"))
+                .is_none()
+        );
     }
 
     #[test]
     fn net_003_does_not_fire_on_unknown_ja3() {
         let bl = Arc::new(Ja3Blocklist::from_entries(["aa".repeat(16)]));
         let rule = NnLNet003BadJa3::new(bl);
-        assert!(rule
-            .evaluate(&hello(Some(&"bb".repeat(16)), "curl"))
-            .is_none());
+        assert!(
+            rule.evaluate(&hello(Some(&"bb".repeat(16)), "curl"))
+                .is_none()
+        );
         // an incomplete hello has no fingerprint
         assert!(rule.evaluate(&hello(None, "curl")).is_none());
     }
@@ -4056,9 +4059,10 @@ mod tests {
     fn net_014_ignores_short_label() {
         let rule = net_014();
         // High-entropy but under the 25-char minimum.
-        assert!(rule
-            .evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1))
-            .is_none());
+        assert!(
+            rule.evaluate(&dns_event(7, "a1b2c3d4e5.example.com", 1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4074,9 +4078,10 @@ mod tests {
         let rule = net_014();
         // Ordinary hostnames have short, low-entropy first labels.
         assert!(rule.evaluate(&dns_event(7, "www.example.com", 1)).is_none());
-        assert!(rule
-            .evaluate(&dns_event(7, "api.northnarrow.io", 1))
-            .is_none());
+        assert!(
+            rule.evaluate(&dns_event(7, "api.northnarrow.io", 1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4615,13 +4620,15 @@ mod tests {
     #[test]
     fn net_007_does_not_fire_on_public_destination() {
         let rule = NnLNet007Rfc1918FromUnusualProc::new(al());
-        assert!(rule
-            .evaluate(&flow(v4(8, 8, 8, 8), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(8, 8, 8, 8), 443, "evilbin"))
+                .is_none()
+        );
         // IPv6 loopback is not internal address space.
-        assert!(rule
-            .evaluate(&flow(IpAddr::V6(Ipv6Addr::LOCALHOST), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(IpAddr::V6(Ipv6Addr::LOCALHOST), 443, "evilbin"))
+                .is_none()
+        );
     }
 
     // ── external audit NETR-007 — IPv6 internal space ──
@@ -4640,9 +4647,10 @@ mod tests {
             assert_eq!(v.action, ResponseAction::KillProcess);
         }
         // a global IPv6 peer is not internal
-        assert!(rule
-            .evaluate(&flow("2606:4700::1".parse().unwrap(), 445, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow("2606:4700::1".parse().unwrap(), 445, "evilbin"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -4652,13 +4660,15 @@ mod tests {
             .evaluate(&flow("fe80::1".parse().unwrap(), 443, "evilbin"))
             .expect("link-local is internal");
         assert_eq!(v.severity, Severity::Medium);
-        assert!(rule
-            .evaluate(&flow("fd12:3456::7".parse().unwrap(), 8080, "evilbin"))
-            .is_some());
+        assert!(
+            rule.evaluate(&flow("fd12:3456::7".parse().unwrap(), 8080, "evilbin"))
+                .is_some()
+        );
         // CGNAT stays out (NET-011)
-        assert!(rule
-            .evaluate(&flow(v4(100, 64, 0, 1), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(100, 64, 0, 1), 443, "evilbin"))
+                .is_none()
+        );
     }
 
     // ── NN-L-NET-008 ─────────────────────────────────────────────
@@ -4792,9 +4802,10 @@ mod tests {
             Some("/dev/shm/dropper (deleted)"),
             "the pump's read names it"
         );
-        assert!(rule
-            .evaluate(&flow_from(Some("/dev/shm/dropper (deleted)"), 4244, 8080))
-            .is_some_and(|v| v.action == ResponseAction::KillProcess));
+        assert!(
+            rule.evaluate(&flow_from(Some("/dev/shm/dropper (deleted)"), 4244, 8080))
+                .is_some_and(|v| v.action == ResponseAction::KillProcess)
+        );
         assert!(
             rule.evaluate(&flow_from(None, 4244, 8080)).is_none(),
             "inside the judgement: not known, no /proc"
@@ -4979,9 +4990,10 @@ mod tests {
         }
         assert_eq!(fired, 1, "once per window");
         // Another destination of the same process starts from zero.
-        assert!(rule
-            .evaluate(&udp_row(77, 9998, "evilbin", mib, 20 * SEC_NS))
-            .is_none());
+        assert!(
+            rule.evaluate(&udp_row(77, 9998, "evilbin", mib, 20 * SEC_NS))
+                .is_none()
+        );
     }
 
     fn dns_flood(pid: u32, uid: u32, held: u32, uid_level: bool, ts: u64) -> Event {
@@ -5004,9 +5016,10 @@ mod tests {
         let rule = NnLNet020DnsQueryFlood::new();
         assert!(rule.evaluate(&dns_flood(10, 1000, 200, false, 0)).is_none());
         // Another process of the same user has its own sum.
-        assert!(rule
-            .evaluate(&dns_flood(11, 1000, 200, false, SEC))
-            .is_none());
+        assert!(
+            rule.evaluate(&dns_flood(11, 1000, 200, false, SEC))
+                .is_none()
+        );
         let v = rule
             .evaluate(&dns_flood(10, 1000, 100, false, 2 * SEC))
             .expect("300 held within 10 s");
@@ -5015,16 +5028,19 @@ mod tests {
         assert_eq!(v.event_pid, 10);
         assert!(v.reasoning.contains("300"));
         // Once per window.
-        assert!(rule
-            .evaluate(&dns_flood(10, 1000, 500, false, 3 * SEC))
-            .is_none());
+        assert!(
+            rule.evaluate(&dns_flood(10, 1000, 500, false, 3 * SEC))
+                .is_none()
+        );
         // A new window starts over.
-        assert!(rule
-            .evaluate(&dns_flood(10, 1000, 100, false, 12 * SEC))
-            .is_none());
-        assert!(rule
-            .evaluate(&dns_flood(10, 1000, 200, false, 13 * SEC))
-            .is_some());
+        assert!(
+            rule.evaluate(&dns_flood(10, 1000, 100, false, 12 * SEC))
+                .is_none()
+        );
+        assert!(
+            rule.evaluate(&dns_flood(10, 1000, 200, false, 13 * SEC))
+                .is_some()
+        );
     }
 
     fn sensor_flood(
@@ -5055,9 +5071,10 @@ mod tests {
         use nn_model::FloodSource::Listen;
         const SEC: u64 = 1_000_000_000;
         let rule = NnLNet021SensorRecordFlood::new();
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 30, 1000, 200, false, 0))
-            .is_none());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 30, 1000, 200, false, 0))
+                .is_none()
+        );
         let v = rule
             .evaluate(&sensor_flood(Listen, 30, 1000, 100, false, SEC))
             .expect("300 held within 10 s");
@@ -5066,17 +5083,20 @@ mod tests {
         assert_eq!(v.event_pid, 30);
         assert!(v.reasoning.contains("300 listen() calls"));
         assert!(v.reasoning.contains("its own"));
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 30, 1000, 500, false, 2 * SEC))
-            .is_none());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 30, 1000, 500, false, 2 * SEC))
+                .is_none()
+        );
         // A new window starts over.
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 30, 1000, 300, false, 12 * SEC))
-            .is_some());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 30, 1000, 300, false, 12 * SEC))
+                .is_some()
+        );
         // The rule ignores DNS floods (NN-L-NET-020's) and records.
-        assert!(rule
-            .evaluate(&dns_flood(30, 1000, 10_000, false, 13 * SEC))
-            .is_none());
+        assert!(
+            rule.evaluate(&dns_flood(30, 1000, 10_000, false, 13 * SEC))
+                .is_none()
+        );
     }
 
     /// The two sensors are summed apart, and the user's budget per user.
@@ -5084,26 +5104,30 @@ mod tests {
     fn net_021_sums_per_sensor_and_user() {
         use nn_model::FloodSource::{IoUringCreate, Listen};
         let rule = NnLNet021SensorRecordFlood::new();
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 40, 1000, 200, false, 0))
-            .is_none());
-        assert!(rule
-            .evaluate(&sensor_flood(IoUringCreate, 40, 1000, 200, false, 1))
-            .is_none());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 40, 1000, 200, false, 0))
+                .is_none()
+        );
+        assert!(
+            rule.evaluate(&sensor_flood(IoUringCreate, 40, 1000, 200, false, 1))
+                .is_none()
+        );
         let v = rule
             .evaluate(&sensor_flood(IoUringCreate, 40, 1000, 100, false, 2))
             .expect("300 ring creations held");
         assert!(v.reasoning.contains("io_uring_setup()"));
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 41, 1000, 150, true, 3))
-            .is_none());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 41, 1000, 150, true, 3))
+                .is_none()
+        );
         let v = rule
             .evaluate(&sensor_flood(Listen, 42, 1000, 150, true, 4))
             .expect("300 held by the user's processes");
         assert!(v.reasoning.contains("its user's"));
-        assert!(rule
-            .evaluate(&sensor_flood(Listen, 43, 1001, 150, true, 5))
-            .is_none());
+        assert!(
+            rule.evaluate(&sensor_flood(Listen, 43, 1001, 150, true, 5))
+                .is_none()
+        );
     }
 
     /// The user's budget is summed per user, whichever process reports it.
@@ -5124,16 +5148,19 @@ mod tests {
         let rule = NnLNet009ByteAnomaly::new(al());
         let mib = 1024 * 1024;
         // 60 MiB, then 60 MiB more 11 minutes later: two windows, no fire.
-        assert!(rule
-            .evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 0))
-            .is_none());
-        assert!(rule
-            .evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 660 * SEC_NS))
-            .is_none());
+        assert!(
+            rule.evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 0))
+                .is_none()
+        );
+        assert!(
+            rule.evaluate(&udp_row(5, 4000, "evilbin", 60 * mib, 660 * SEC_NS))
+                .is_none()
+        );
         // An allowlisted comm is never summed.
-        assert!(rule
-            .evaluate(&udp_row(6, 4000, "rsync", 200 * mib, 0))
-            .is_none());
+        assert!(
+            rule.evaluate(&udp_row(6, 4000, "rsync", 200 * mib, 0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -5291,9 +5318,10 @@ mod tests {
     fn net_010_does_not_fire_on_common_port_or_allowlist() {
         let rule = NnLNet010OutboundToHighRiskC2Port::new(al());
         // 443 is not a high-risk port.
-        assert!(rule
-            .evaluate(&flow(v4(8, 8, 8, 8), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(8, 8, 8, 8), 443, "evilbin"))
+                .is_none()
+        );
         // 4444 but allowlisted comm (curl is in the default union).
         assert!(rule.evaluate(&flow(v4(8, 8, 8, 8), 4444, "curl")).is_none());
     }
@@ -5315,12 +5343,14 @@ mod tests {
     #[test]
     fn net_011_does_not_fire_on_non_plaintext_or_allowlist() {
         let rule = NnLNet011PlaintextCredService::new(al());
-        assert!(rule
-            .evaluate(&flow(v4(203, 0, 113, 5), 443, "evilbin"))
-            .is_none());
-        assert!(rule
-            .evaluate(&flow(v4(203, 0, 113, 5), 21, "ssh"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(203, 0, 113, 5), 443, "evilbin"))
+                .is_none()
+        );
+        assert!(
+            rule.evaluate(&flow(v4(203, 0, 113, 5), 21, "ssh"))
+                .is_none()
+        );
     }
 
     // ── NN-L-NET-018 — RFC1918 lateral-movement port ────────────────
@@ -5341,17 +5371,20 @@ mod tests {
     fn net_018_does_not_fire_on_public_dst_or_nonlateral_or_allowlist() {
         let rule = NnLNet018Rfc1918LateralPort::new(al());
         // Public dst on a lateral port — not internal, so -018 abstains.
-        assert!(rule
-            .evaluate(&flow(v4(8, 8, 8, 8), 445, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(8, 8, 8, 8), 445, "evilbin"))
+                .is_none()
+        );
         // RFC1918 but a non-lateral port.
-        assert!(rule
-            .evaluate(&flow(v4(10, 0, 0, 9), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(10, 0, 0, 9), 443, "evilbin"))
+                .is_none()
+        );
         // RFC1918 lateral port but allowlisted comm.
-        assert!(rule
-            .evaluate(&flow(v4(10, 0, 0, 9), 445, "rsync"))
-            .is_none());
+        assert!(
+            rule.evaluate(&flow(v4(10, 0, 0, 9), 445, "rsync"))
+                .is_none()
+        );
     }
 
     // ── NN-L-NET-019 — wildcard-bind listener ───────────────────────
@@ -5365,13 +5398,14 @@ mod tests {
         assert_eq!(v.severity, Severity::Medium);
         assert_eq!(v.action, ResponseAction::Log);
         // IPv6 wildcard also matches.
-        assert!(rule
-            .evaluate(&listener_bind(
+        assert!(
+            rule.evaluate(&listener_bind(
                 IpAddr::V6(Ipv6Addr::UNSPECIFIED),
                 4444,
                 "evilbin"
             ))
-            .is_some());
+            .is_some()
+        );
     }
 
     /// Lot 376 (named, the rc9 soak: NN-L-NET-019 and NN-L-NET-006 Medium,
@@ -5723,17 +5757,20 @@ mod tests {
         let rule = NnLNet019WildcardListener::new(al());
         // Loopback bind is not wildcard-exposed — -019 abstains (-006
         // handles the non-wildcard uncommon-port case).
-        assert!(rule
-            .evaluate(&listener_bind(v4(127, 0, 0, 1), 4444, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&listener_bind(v4(127, 0, 0, 1), 4444, "evilbin"))
+                .is_none()
+        );
         // Wildcard but common port.
-        assert!(rule
-            .evaluate(&listener_bind(v4(0, 0, 0, 0), 443, "evilbin"))
-            .is_none());
+        assert!(
+            rule.evaluate(&listener_bind(v4(0, 0, 0, 0), 443, "evilbin"))
+                .is_none()
+        );
         // Wildcard uncommon port but allowlisted comm.
-        assert!(rule
-            .evaluate(&listener_bind(v4(0, 0, 0, 0), 4444, "nginx"))
-            .is_none());
+        assert!(
+            rule.evaluate(&listener_bind(v4(0, 0, 0, 0), 4444, "nginx"))
+                .is_none()
+        );
     }
 
     // ── External audit NETR-015 — the common-port exemption ─────────
@@ -6173,9 +6210,10 @@ mod tests {
         let dst = v4(203, 0, 113, 7);
         // Only 3 flows (< BEACON_MIN_SAMPLES) — never enough to judge.
         for i in 0..3u64 {
-            assert!(rule
-                .evaluate(&flow_pid(4242, dst, 443, "evilbin", i * 60 * SEC))
-                .is_none());
+            assert!(
+                rule.evaluate(&flow_pid(4242, dst, 443, "evilbin", i * 60 * SEC))
+                    .is_none()
+            );
         }
     }
 
@@ -6455,9 +6493,10 @@ mod tests {
         // chronyd is a legitimate periodic client — allowlisted, so
         // even a perfectly periodic pattern never fires.
         for i in 0..6u64 {
-            assert!(rule
-                .evaluate(&flow_pid(4242, dst, 443, "chronyd", i * 60 * SEC))
-                .is_none());
+            assert!(
+                rule.evaluate(&flow_pid(4242, dst, 443, "chronyd", i * 60 * SEC))
+                    .is_none()
+            );
         }
     }
     #[test]
@@ -6642,9 +6681,11 @@ mod tests {
             Some(&ResponseAction::KillProcess),
             "{actions:?}"
         );
-        assert!(actions[..DNS_TUNNEL_DISTINCT_LABELS - 1]
-            .iter()
-            .all(|a| *a == ResponseAction::Log));
+        assert!(
+            actions[..DNS_TUNNEL_DISTINCT_LABELS - 1]
+                .iter()
+                .all(|a| *a == ResponseAction::Log)
+        );
     }
 
     // ── external audit NET-010 (NN-AUD-006) — allowlist by exec identity ──
@@ -6683,9 +6724,11 @@ mod tests {
             .evaluate(&with_pid(listener(31337, "nginx"), 500))
             .expect("a listener named nginx that is not nginx fires");
         assert!(v.reasoning.contains("named 'nginx'"), "{}", v.reasoning);
-        assert!(listen
-            .evaluate(&with_pid(listener(31337, "nginx"), 501))
-            .is_none());
+        assert!(
+            listen
+                .evaluate(&with_pid(listener(31337, "nginx"), 501))
+                .is_none()
+        );
 
         // NN-L-NET-010 (KillProcess): never seen → recorded, not acted on
         let c2 = NnLNet010OutboundToHighRiskC2Port::new(Arc::clone(&al));

@@ -39,8 +39,8 @@ use aya::maps::{Array, MapData, PerCpuArray, RingBuf};
 use aya::programs::{BtfTracePoint, FEntry, Lsm, RawTracePoint};
 use aya::util::KernelVersion;
 use aya::{Btf, Ebpf};
-use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
-use common::epg::{self, cfg, counter, variant, GuardConfig, ResolvedLayout};
+use common::btf_offsets::{BTF_OFFSETS_ABSENT, slot};
+use common::epg::{self, GuardConfig, ResolvedLayout, cfg, counter, variant};
 use tracing::{info, warn};
 
 use crate::late_audit::{AuditHandle, LateAudit};

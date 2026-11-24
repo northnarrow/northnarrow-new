@@ -13,11 +13,11 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
-use common::wire::{InodeKey, FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+use anyhow::{Result, anyhow};
+use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE, InodeKey};
 
 use super::journal::Journal;
-use crate::anti_tamper::filesystem::{ProtectedInodesHandle, PROTECTED_DIR_FLAGS};
+use crate::anti_tamper::filesystem::{PROTECTED_DIR_FLAGS, ProtectedInodesHandle};
 
 /// Register the journal's directories and index in the maps under
 /// `pin_root`, the bpffs pin root the agent's anti-tamper maps live under

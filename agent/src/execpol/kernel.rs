@@ -6,9 +6,9 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
+use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
+use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 use common::wire::execpol::{conf_slot, counter, image_role, slice_slot};
 use common::wire::execq::ExecqKey;
 
@@ -93,8 +93,8 @@ pub fn take(ebpf: &mut Ebpf, take_roots: bool) -> Result<Kernel> {
 pub(crate) mod debug_fill {
     use std::os::fd::AsFd;
 
-    use aya::maps::{HashMap, Map, MapData};
     use aya::Ebpf;
+    use aya::maps::{HashMap, Map, MapData};
     use common::wire::exe::ExeIdentityRaw;
     use common::wire::execpol::ENV_ENTRY_BYTES;
 
@@ -408,9 +408,10 @@ mod tests {
             assert_eq!(trusted_image_key(&f), None);
             let mut skipped = Vec::new();
             let e = image_entries(&[(f.clone(), 1)], d.path(), &mut skipped);
-            assert!(e
-                .iter()
-                .all(|(_, v)| *v & 1 == 0 || *v & image_role::ELEVATION != 0));
+            assert!(
+                e.iter()
+                    .all(|(_, v)| *v & 1 == 0 || *v & image_role::ELEVATION != 0)
+            );
             assert_eq!(skipped.len(), 1, "{skipped:?}");
         }
         assert_eq!(trusted_image_key(&d.path().join("missing")), None);

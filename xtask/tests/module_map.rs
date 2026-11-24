@@ -26,7 +26,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use support::{module_map, repo_root, rs_files, ModuleMap};
+use support::{ModuleMap, module_map, repo_root, rs_files};
 
 /// The source trees the map covers: (map key, directory, extern crate
 /// name others use for it).

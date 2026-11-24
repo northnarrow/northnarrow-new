@@ -15,8 +15,8 @@
 //!
 //! Every struct is `#[repr(C)]` with explicit padding; strict append-only.
 
-use super::exe::ExeIdentityRaw;
 use super::TASK_COMM_LEN;
+use super::exe::ExeIdentityRaw;
 
 /// `EXECQ_CONF` slots (an `Array<u64>`, written once by the agent before
 /// the programs attach, then frozen).

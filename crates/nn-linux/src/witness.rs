@@ -24,9 +24,9 @@
 use std::path::{Path, PathBuf};
 
 use nn_proto::witness::{
-    parse_key_record, to_import, Imported, CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE,
-    KEY_MEMFD_NAME, KIND_CHAIN_TORN, KIND_GATE_REFERENCE, KIND_OPENED, KIND_RELEASED,
-    KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
+    CHAIN_FILE, CHAIN_MAX_BYTES, IMPORTED_FILE, Imported, KEY_MEMFD_NAME, KIND_CHAIN_TORN,
+    KIND_GATE_REFERENCE, KIND_OPENED, KIND_RELEASED, KIND_RELEASED_IN_WINDOW, KIND_SUCCEEDED,
+    parse_key_record, to_import,
 };
 
 /// A finding of this module signed as a note ([`WITNESS_OP`]): the
@@ -277,7 +277,7 @@ impl WitnessReader {
                         detail: format!("the witness chain {}: {e}", path.display()),
                     }],
                     None,
-                )
+                );
             }
         };
         let mut t = to_import(&text, self.position());
@@ -638,7 +638,7 @@ mod tests {
     /// watchdog gone — and the bookkeeping notes are not among them.
     #[test]
     fn the_held_deaths_are_the_witness_s_and_the_round_s_kinds() {
-        use nn_evidence::held::{hold_of, Hold, DEATH_KINDS};
+        use nn_evidence::held::{DEATH_KINDS, Hold, hold_of};
         let gone = crate::self_integrity::watchdog_exit_finding(
             812,
             &crate::posture::exempt::WatchdogResolution::NotPresent,
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(row_kind(nn_proto::witness::KIND_OPENED), WITNESS_NOTE);
     }
     use nn_proto::witness::{
-        line_hash, Row, WitnessKey, KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION,
+        KIND_SUCCEEDED, KIND_VACATED, ROW_VERSION, Row, WitnessKey, line_hash,
     };
 
     fn unit() -> Identity {
@@ -1105,7 +1105,7 @@ mod tests {
     /// held until acknowledged, the new watchdog's `witness_opened` too.
     #[test]
     fn an_uncertified_row_is_held_by_its_declared_kind() {
-        use nn_evidence::held::{hold_of, Hold};
+        use nn_evidence::held::{Hold, hold_of};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(IMPORTED_FILE), b"").unwrap();
         let k = WitnessKey::from_seed([6; 32]);

@@ -664,7 +664,9 @@ fn the_option_tables_agree_with_the_real_interpreters() {
         report.insert(i.exe, (cases.len(), judged, unknown));
     }
     for (exe, (n, judged, unknown)) in &report {
-        eprintln!("{exe}: {n} argvs, {judged} judged, {unknown} not judged (Unknown, or Code with no program text)");
+        eprintln!(
+            "{exe}: {n} argvs, {judged} judged, {unknown} not judged (Unknown, or Code with no program text)"
+        );
     }
     assert!(!report.is_empty(), "no interpreter found");
     assert!(

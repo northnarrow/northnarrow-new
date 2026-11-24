@@ -23,7 +23,7 @@ use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::Instant;
 
-use nn_proto::ipc::{Violation, MAX_FRAME};
+use nn_proto::ipc::{MAX_FRAME, Violation};
 
 fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc < 0 {

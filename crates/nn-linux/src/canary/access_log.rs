@@ -44,9 +44,9 @@ use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use nn_model::{CanaryAccessKind, CanaryTypeTag};
@@ -875,10 +875,11 @@ mod tests {
         std::fs::write(&log_path, format!("{}\n{forged}\n", lines[0])).unwrap();
         let (key, _) = fresh_signing_key(&dir);
         let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
-        assert!(db
-            .take_chain_findings()
-            .iter()
-            .any(|f| f.kind == "chain_lines_unverified"));
+        assert!(
+            db.take_chain_findings()
+                .iter()
+                .any(|f| f.kind == "chain_lines_unverified")
+        );
         assert_eq!(db.last_hash(), first.entry_hash);
     }
 
@@ -923,14 +924,18 @@ mod tests {
         let other: BTreeSet<String> = ["canary_id_2".to_string()].into();
         let rows = first_trip_rows(&log_path, &pk, &other).unwrap();
         assert_eq!(rows.iter().map(|r| r.row).collect::<Vec<_>>(), [2]);
-        assert!(first_trip_rows(&dir.path().join("absent"), &pk, &ids)
-            .unwrap()
-            .is_empty());
+        assert!(
+            first_trip_rows(&dir.path().join("absent"), &pk, &ids)
+                .unwrap()
+                .is_empty()
+        );
         // another key signed nothing here
         let (_, other_pk) = fresh_signing_key(&TempDir::new().unwrap());
-        assert!(first_trip_rows(&log_path, &other_pk, &ids)
-            .unwrap()
-            .is_empty());
+        assert!(
+            first_trip_rows(&log_path, &other_pk, &ids)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Rows written before row numbers (lab PR 160) take their line: they

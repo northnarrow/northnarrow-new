@@ -6,8 +6,8 @@ use std::io;
 use std::time::Instant;
 
 use nn_proto::execq::{
-    Reason, ScanConfig, ScanRequest, ScanResult, ScanVerdict, ScannerHello, DEFAULT_MAX_HASH_BYTES,
-    DEFAULT_MAX_READ_BYTES, DEFAULT_SUSPICIOUS_THRESHOLD, PROTOCOL_VERSION,
+    DEFAULT_MAX_HASH_BYTES, DEFAULT_MAX_READ_BYTES, DEFAULT_SUSPICIOUS_THRESHOLD, PROTOCOL_VERSION,
+    Reason, ScanConfig, ScanRequest, ScanResult, ScanVerdict, ScannerHello,
 };
 use sha2::{Digest, Sha256};
 

@@ -117,7 +117,7 @@ pub fn classify(status: Option<i32>) -> SelfTestOutcome {
 /// The child's side: signal the parent, exit with what `kill(2)` said.
 pub fn run_child() -> i32 {
     use nix::errno::Errno;
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     let parent = nix::unistd::getppid();
     if parent.as_raw() <= 1 {
         return EXIT_NO_TARGET;
@@ -256,7 +256,7 @@ fn run_command(mut cmd: Command, what: &str) -> (SelfTestOutcome, ExpectedDenial
             return (
                 SelfTestOutcome::Inconclusive(format!("cannot spawn {what} {SELFTEST_FLAG}: {e}")),
                 ExpectedDenial::default(),
-            )
+            );
         }
     };
     let child_pid = child.id();

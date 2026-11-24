@@ -671,15 +671,18 @@ fn the_rules_fail_on_planted_violations() {
     lineage.replace_range(i..i + 1, " ");
     let v = ratchet_violations(&code);
     assert_eq!(v.len(), 3, "{v:#?}");
-    assert!(v
-        .iter()
-        .any(|m| m.contains("new_rule.rs") && m.contains("new")));
-    assert!(v
-        .iter()
-        .any(|m| m.contains("triggers.rs") && m.contains("a new one")));
-    assert!(v
-        .iter()
-        .any(|m| m.contains("lineage.rs") && m.contains("lower the pin")));
+    assert!(
+        v.iter()
+            .any(|m| m.contains("new_rule.rs") && m.contains("new"))
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("triggers.rs") && m.contains("a new one"))
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.contains("lineage.rs") && m.contains("lower the pin"))
+    );
 }
 
 /// Lot 279: the exec pump reads what R011 judges an exec of a module tool

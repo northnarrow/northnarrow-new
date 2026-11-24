@@ -800,9 +800,11 @@ mod tests {
         r.failed(&e);
         assert!(r.failing());
         assert_eq!(has(), 1);
-        assert!(crate::boot::degradation::entries()
-            .iter()
-            .any(|d| d.source == "lot311_test_reader" && d.detail == r.detail()));
+        assert!(
+            crate::boot::degradation::entries()
+                .iter()
+                .any(|d| d.source == "lot311_test_reader" && d.detail == r.detail())
+        );
         r.ok();
         assert!(!r.failing());
         assert_eq!(has(), 0);

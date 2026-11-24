@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::late_audit::{AuditHandle, LateAudit};
 
-use aya::maps::{MapData, PerCpuArray};
 use aya::Ebpf;
+use aya::maps::{MapData, PerCpuArray};
 use common::fail_open::{FAIL_OPEN_HOOKS, FAIL_OPEN_SLOTS};
 use tracing::{debug, info, warn};
 

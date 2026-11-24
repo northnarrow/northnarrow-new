@@ -283,8 +283,10 @@ fn the_attempt_refusals_have_a_budget_of_their_own() {
     .unwrap();
     assert!(!open.contains("emit_denial("));
     let c = code("agent-ebpf/src/cgroup_files.rs");
-    assert!(body(&c, "sign")
-        .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),"));
+    assert!(
+        body(&c, "sign")
+            .contains("Phase::Open => crate::inode_protect::emit_attempt(operation, key),")
+    );
     // no other inode refusal writes the ring without a budget (lot 356:
     // but the sole traces' writer, `emit_sole_trace` — a window's held load
     // alone, which `kernel_halves.rs` keeps to `hold`; the re-check 2 of
@@ -600,7 +602,9 @@ fn the_memory_views_are_refused_at_their_open_with_the_hooks_decisions() {
     let p = code("agent-ebpf/src/ptrace_check.rs");
     let hook = body(&p, "try_ptrace_access_check");
     assert!(!hook.contains("VIEW_OPEN"));
-    assert!(hook.contains("crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);"));
+    assert!(
+        hook.contains("crate::inode_protect::emit_task_read_denial(mode as u64, target_tgid);")
+    );
     // the record's words: the shared module's, for every read-mode record
     let e = code("agent/src/pipeline/process_event.rs");
     in_order(

@@ -25,11 +25,11 @@ use std::sync::Arc;
 
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::host::DecisionHost;
 use crate::decision::response_policy::{self, PolicySwitch};
-use crate::decision::Rule;
-use crate::impair::{DefenseDetector, EvaRule, Finding, SWITCHED_OFF_RULE_ID, SWITCH_OFF_COALESCE};
+use crate::impair::{DefenseDetector, EvaRule, Finding, SWITCH_OFF_COALESCE, SWITCHED_OFF_RULE_ID};
 
 struct EvaSpec {
     id: &'static str,
@@ -290,16 +290,18 @@ mod tests {
             );
             assert!(v.reasoning.contains(attack), "{}", v.reasoning);
         }
-        assert!(first(
-            &rules,
-            &spawn(
-                305,
-                200,
-                "/usr/bin/systemctl",
-                &["systemctl", "restart", "auditd"]
+        assert!(
+            first(
+                &rules,
+                &spawn(
+                    305,
+                    200,
+                    "/usr/bin/systemctl",
+                    &["systemctl", "restart", "auditd"]
+                )
             )
-        )
-        .is_none());
+            .is_none()
+        );
     }
 
     /// Lab PR 225: `ufw disable` runs `ufw-init`, which flushes and resets

@@ -532,7 +532,7 @@ mod tests {
         write_name(&mut p, qname);
         p.extend_from_slice(&1u16.to_be_bytes()); // qtype=A
         p.extend_from_slice(&1u16.to_be_bytes()); // qclass=IN
-                                                  // Answer
+        // Answer
         write_name(&mut p, qname);
         p.extend_from_slice(&1u16.to_be_bytes()); // type=A
         p.extend_from_slice(&1u16.to_be_bytes()); // class=IN

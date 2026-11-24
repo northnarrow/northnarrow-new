@@ -3,9 +3,9 @@
 use nn_model::EventClass;
 
 use super::manifest::{
-    class_entries, fallbacks_and_missing, source_entries, AttachedOn, CapabilityManifest,
-    DenyHooks, Evidence, HostCheck, ProbeState, SensorEntry, SourceFacts, SourceState, Took,
-    WorkerEntry, WorkerState, MANIFEST_VERSION,
+    AttachedOn, CapabilityManifest, DenyHooks, Evidence, HostCheck, MANIFEST_VERSION, ProbeState,
+    SensorEntry, SourceFacts, SourceState, Took, WorkerEntry, WorkerState, class_entries,
+    fallbacks_and_missing, source_entries,
 };
 use super::*;
 
@@ -280,12 +280,15 @@ fn each_class_has_its_contract_from_its_sources_and_the_bus() {
     assert_eq!(file.decision_budget_ms, 1000);
     assert_eq!(file.sources, ["open_sensor", "file_open"]);
     assert_eq!(file.on_failure, Some(FailureMode::Blind), "the worst");
-    assert!(file
-        .loss_counters
-        .contains(&LossStage::BusQueue(EventClass::File)));
-    assert!(!file
-        .loss_counters
-        .contains(&LossStage::BusQueue(EventClass::Tamper)));
+    assert!(
+        file.loss_counters
+            .contains(&LossStage::BusQueue(EventClass::File))
+    );
+    assert!(
+        !file
+            .loss_counters
+            .contains(&LossStage::BusQueue(EventClass::Tamper))
+    );
     let tamper = &c[0];
     assert_eq!(tamper.queue, "P0");
     assert_eq!(tamper.decision_budget_ms, 100);
@@ -375,9 +378,11 @@ fn the_check_names_what_has_no_entry() {
         equivalent: true,
         lost: &[EventKind::MassWrite],
     }];
-    assert!(check(&[liar])
-        .iter()
-        .any(|x| x.contains("is equivalent and loses events")));
+    assert!(
+        check(&[liar])
+            .iter()
+            .any(|x| x.contains("is equivalent and loses events"))
+    );
     let mut stranger = LSM_SOURCE;
     stranger.fallbacks = &[Fallback {
         attach: OPEN_TP,
@@ -386,14 +391,18 @@ fn the_check_names_what_has_no_entry() {
         equivalent: false,
         lost: &[EventKind::NetFlow],
     }];
-    assert!(check(&[stranger])
-        .iter()
-        .any(|x| x.contains("loses a kind the source does not send")));
+    assert!(
+        check(&[stranger])
+            .iter()
+            .any(|x| x.contains("loses a kind the source does not send"))
+    );
     let mut part = DNS;
     part.lsm_part = Some("x");
-    assert!(check(&[part])
-        .iter()
-        .any(|x| x.contains("part of it without the BPF LSM")));
+    assert!(
+        check(&[part])
+            .iter()
+            .any(|x| x.contains("part of it without the BPF LSM"))
+    );
 }
 
 /// On a healthy boot every source is on its attach point and ok, the
@@ -662,8 +671,10 @@ fn without_the_bpf_lsm_the_lsm_sources_are_not_invoked() {
     assert_eq!(t.state, SourceState::Partial);
     assert_eq!(
         t.why,
-        ["the opt-in --net-connect-deny is configured and does not run: bpf is not in the active \
-          LSM list (capability,apparmor)"]
+        [
+            "the opt-in --net-connect-deny is configured and does not run: bpf is not in the active \
+          LSM list (capability,apparmor)"
+        ]
     );
     // configured, with the BPF LSM running: nothing to say
     let mut f = healthy();
@@ -790,9 +801,11 @@ fn a_missed_round_is_unknown_two_are_not_invoked_and_an_attach_check_says_so() {
     let missed = manifest_of(&f);
     assert!(missed.worsens_from(&before), "one round missed is worse");
     assert!(!before.worsens_from(&missed), "its end is better");
-    assert!(missed
-        .changes_from(&before)
-        .contains(&"source dns_query: sensor self-test seen → missed".to_string()));
+    assert!(
+        missed
+            .changes_from(&before)
+            .contains(&"source dns_query: sensor self-test seen → missed".to_string())
+    );
     // a source already not known for another reason: the miss alone is
     // worse (its word), though its state stays
     let mut u = healthy();
@@ -861,9 +874,11 @@ fn a_missed_round_is_unknown_two_are_not_invoked_and_an_attach_check_says_so() {
     // an attach check needs its word
     let mut bad = guard;
     bad.probe = None;
-    assert!(check(&[bad])
-        .iter()
-        .any(|p| p.contains("an attach check without the self-test's word")));
+    assert!(
+        check(&[bad])
+            .iter()
+            .any(|p| p.contains("an attach check without the self-test's word"))
+    );
 }
 
 /// A source on its attach point whose pump or drain the start did not
@@ -1138,18 +1153,21 @@ fn a_change_is_named_line_by_line() {
         |l| l.starts_with("source open_sensor: ok on its attach point")
             && l.contains("→ partial on a fallback")
     ));
-    assert!(lines
-        .iter()
-        .any(|l| l.starts_with("source file_open: standby on nothing")));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("source file_open: standby on nothing"))
+    );
     assert!(lines.contains(&"degradation + dns_sensor: x".to_string()));
     assert!(lines.contains(&"content + netflow-blocklist: built-in".to_string()));
     assert!(lines.contains(&"trust level L3 → L2".to_string()));
     assert!(before.changes_from(&before).is_empty());
     let mut back = before.clone();
     back.degradations.clear();
-    assert!(back
-        .changes_from(&before)
-        .contains(&"degradation - a".to_string()));
+    assert!(
+        back.changes_from(&before)
+            .contains(&"degradation - a".to_string())
+    );
     let mut other = before.clone();
     other.btf_offsets_absent.push("x".into());
     assert_eq!(
@@ -1158,9 +1176,11 @@ fn a_change_is_named_line_by_line() {
     );
     let mut stale = healthy();
     stale.probe[1].1 = ProbeState::Stale;
-    assert!(manifest_of(&stale)
-        .changes_from(&before)
-        .contains(&"source dns_query: sensor self-test seen → stale".to_string()));
+    assert!(
+        manifest_of(&stale)
+            .changes_from(&before)
+            .contains(&"source dns_query: sensor self-test seen → stale".to_string())
+    );
 }
 
 /// The manifest's JSON reads back (the agent's signed row is it).
@@ -1309,15 +1329,18 @@ fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
     assert!(WorkerState::Unavailable.rank() > WorkerState::Disabled.rank());
     // gone: worse and named; new and not ready: worse
     assert!(base.worsens_from(&ready));
-    assert!(base
-        .changes_from(&ready)
-        .contains(&"worker parse: gone".to_string()));
+    assert!(
+        base.changes_from(&ready)
+            .contains(&"worker parse: gone".to_string())
+    );
     let new_down = with_worker(&base, WorkerState::Unavailable, None);
     assert!(new_down.worsens_from(&base));
-    assert!(new_down
-        .changes_from(&base)
-        .iter()
-        .any(|l| l == "worker parse: new (unavailable)"));
+    assert!(
+        new_down
+            .changes_from(&base)
+            .iter()
+            .any(|l| l == "worker parse: new (unavailable)")
+    );
     assert!(!ready.worsens_from(&base), "a new ready worker is no loss");
     // the same state, less sandbox: worse, named
     for weaker in [
@@ -1340,10 +1363,11 @@ fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
     ] {
         let w = with_worker(&base, WorkerState::Ready, Some(weaker));
         assert!(w.worsens_from(&ready), "{w:?}");
-        assert!(w
-            .changes_from(&ready)
-            .iter()
-            .any(|l| l.starts_with("worker parse: sandbox ")));
+        assert!(
+            w.changes_from(&ready)
+                .iter()
+                .any(|l| l.starts_with("worker parse: sandbox "))
+        );
     }
     // a lower ABI alone (the same flags: 4 and 5 deny the same) is worse
     let five = with_worker(&base, WorkerState::Ready, Some(level(5)));
@@ -1355,10 +1379,11 @@ fn a_worker_worse_or_gone_or_less_sandboxed_is_worse_and_named() {
     // the why is shown with the state
     let mut d = with_worker(&base, WorkerState::Disabled, Some(level(4)));
     d.workers[0].why = "5 failures in a row".into();
-    assert!(d
-        .changes_from(&ready)
-        .iter()
-        .any(|l| l.ends_with("(5 failures in a row)")));
+    assert!(
+        d.changes_from(&ready)
+            .iter()
+            .any(|l| l.ends_with("(5 failures in a row)"))
+    );
 }
 
 /// Lot 280b (named): the manifest's kernel code — a taint flag more, a

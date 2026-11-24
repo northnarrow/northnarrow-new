@@ -678,11 +678,13 @@ mod tests {
         );
         assert!(!pin_dir("/sys/fs/bpf/northnarrow", 3).starts_with("/sys/fs/bpf/northnarrow/"));
         // bpffs refuses a name with a dot (EPERM)
-        assert!(!pin_dir("/sys/fs/bpf/northnarrow", 7)
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .contains('.'));
+        assert!(
+            !pin_dir("/sys/fs/bpf/northnarrow", 7)
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .contains('.')
+        );
         for (name, want) in [
             ("northnarrow-cgroup-join-v1_0", (1, Some(0))),
             ("northnarrow-cgroup-join-v2_17", (2, Some(17))),

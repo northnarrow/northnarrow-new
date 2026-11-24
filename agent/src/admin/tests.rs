@@ -27,14 +27,14 @@ use anyhow::Result;
 use parking_lot::Mutex;
 
 use nn_proto::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, CanaryBurnRequest, CanaryDeployRequest,
-    CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
-    DetectionSetStatusRequest, DetectionsRequest, FimReportRequest, FimReportResponse,
-    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
-    NetFlowsResponse, NetListenersRequest, NetResolveRequest, NetResolveResponse,
-    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest, ResponseStatusRequest,
-    RotateKeysAddRequest, SignedUnlockRequest, StatusResponse, TelemetryStatusRequest,
-    TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult,
+    AdminMessage, CanaryBurnRequest, CanaryDeployRequest, CanaryDeployResponse, CanaryListRequest,
+    CanaryListResponse, CanaryRefreshRequest, Challenge, DetectionSetStatusRequest,
+    DetectionsRequest, FimReportRequest, FimReportResponse, ForcePostureRequest,
+    NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
+    NetListenersRequest, NetResolveRequest, NetResolveResponse, ResponseReleaseRequest,
+    ResponseReleaseResponse, ResponseRestoreRequest, ResponseStatusRequest, RotateKeysAddRequest,
+    SignedUnlockRequest, StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse,
+    TrustedInstallerGrantRequest, UnlockResult, decode_frame, encode_frame,
 };
 use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 
@@ -362,7 +362,7 @@ fn verify_keys_helper_compiles_and_runs() {
 // ── A7: signed shutdown — mock-server e2e ──────────────────────
 
 use nn_proto::admin_protocol::{AdminResult, KeyedSignature, ShutdownRequest};
-use nn_proto::admin_signed_payload::{sign, SignedPayload};
+use nn_proto::admin_signed_payload::{SignedPayload, sign};
 
 /// Spin up a [`serve_with_marker_path`] task plus two
 /// admin keypairs, both holding `Role::Shutdown` so the
@@ -542,7 +542,7 @@ async fn shutdown_request_writes_marker_and_replies_success() {
         // External audit TST-003: the watchdog's half of the contract.
         // The marker verifies against the admin keys, and the same
         // marker with its signatures replaced does not.
-        use nn_proto::shutdown_marker::{verify, Expectation, Rejection};
+        use nn_proto::shutdown_marker::{Expectation, Rejection, verify};
         let keys: Vec<nn_proto::admin_quorum::AdminKey> = [&signing_a, &signing_b]
             .iter()
             .map(|sk| nn_proto::admin_quorum::AdminKey {
@@ -2426,7 +2426,7 @@ fn dispatch_response_status_needs_a_read_role() {
 /// COMBAT stage.
 #[test]
 fn dispatch_response_status_lists_contained_and_quarantined() {
-    use crate::response::containment::{record, Contained};
+    use crate::response::containment::{Contained, record};
     let signing = SigningKey::generate(&mut OsRng);
     let agent_id = [0x17; 16];
     let dir = TempDir::new().unwrap();
@@ -3246,7 +3246,7 @@ fn signed_set_status_req(
     status: &str,
 ) -> DetectionSetStatusRequest {
     use nn_proto::admin_protocol::KeyedSignature;
-    use nn_proto::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::admin_signed_payload::{SignedPayload, sign};
     let payload = SignedPayload::new_detection_set_status(
         nonce,
         now_unix_secs(),
@@ -3539,7 +3539,7 @@ fn signed_grant_req(
     ts: u64,
 ) -> TrustedInstallerGrantRequest {
     use nn_proto::admin_protocol::KeyedSignature;
-    use nn_proto::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::admin_signed_payload::{SignedPayload, sign};
     let payload = SignedPayload::new_trusted_installer_grant(nonce, ts, agent_id, window_secs);
     let sig: [u8; 64] = sign(&payload, signing).unwrap();
     TrustedInstallerGrantRequest {
@@ -5189,7 +5189,7 @@ fn a_force_posture_out_of_combat_whose_release_fails_is_a_failure() {
 #[test]
 fn dispatch_shutdown_refuses_an_extra_that_is_not_a_shutdown() {
     use nn_proto::admin_protocol::{KeyedSignature, ShutdownRequest};
-    use nn_proto::admin_signed_payload::{sign, SignedPayload, UnlockExtra};
+    use nn_proto::admin_signed_payload::{SignedPayload, UnlockExtra, sign};
     let agent_id = [0xc4; 16];
     let sks = [
         SigningKey::from_bytes(&[0x31; 32]),

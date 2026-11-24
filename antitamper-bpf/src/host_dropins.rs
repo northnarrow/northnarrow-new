@@ -34,8 +34,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cgroup_floors::{below_floor, floor_on, FloorRole};
-use crate::config_read::{read_config, Config};
+use crate::cgroup_floors::{FloorRole, below_floor, floor_on};
+use crate::config_read::{Config, read_config};
 use common::cgroup_limits::limit_kind_of;
 
 /// The unit search path, highest precedence first: where the drop-ins and
@@ -1086,12 +1086,16 @@ mod tests {
         }
         // an allow list is one, whatever it names (merged into the agent's
         // deny list, its calls are denied to the agent)
-        assert!(b("SystemCallFilter=@system-service")
-            .unwrap()
-            .contains("an allow list"));
-        assert!(b("SystemCallFilter=read write")
-            .unwrap()
-            .contains("an allow list"));
+        assert!(
+            b("SystemCallFilter=@system-service")
+                .unwrap()
+                .contains("an allow list")
+        );
+        assert!(
+            b("SystemCallFilter=read write")
+                .unwrap()
+                .contains("an allow list")
+        );
         for kv in [
             "SystemCallFilter=~@obsolete @swap",
             "SystemCallFilter=",
@@ -1290,9 +1294,10 @@ mod tests {
             (r[0].directive.as_str(), r[0].value.as_str()),
             ("MemoryMax", "4K")
         );
-        assert!(r[0]
-            .detail()
-            .contains("for every slice, the units' northnarrow.slice among them"));
+        assert!(
+            r[0].detail()
+                .contains("for every slice, the units' northnarrow.slice among them")
+        );
         assert!(r[0].detail().contains("left in place"));
         let after: Vec<_> = [&nofile, &scf, &mem]
             .iter()

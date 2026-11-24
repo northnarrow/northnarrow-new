@@ -62,11 +62,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use nn_linux::cgroup_join::{pinned_lost, pinned_mark, Mark};
+use nn_linux::cgroup_join::{Mark, pinned_lost, pinned_mark};
 
 mod common;
 use common::agent_state::{AgentState, InstalledAgent, Launch};
-use common::{install_to_priv_bin, InstalledBin};
+use common::{InstalledBin, install_to_priv_bin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const LOG_POLL_TIMEOUT: Duration = Duration::from_secs(30);

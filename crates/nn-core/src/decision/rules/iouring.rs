@@ -40,7 +40,7 @@ use parking_lot::Mutex;
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::bounded::OncePerProcess;
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 use crate::posture::host::PostureHost;
 
 const FILE_CLASSES: u32 = IOURING_CLASS_FILE_OPEN | IOURING_CLASS_FILE_RW;
@@ -283,9 +283,10 @@ mod tests {
     fn file_and_network_fires_once_on_the_completing_record() {
         let (_, r2) = rules();
         // file only: no
-        assert!(r2
-            .evaluate(&ev(false, "evil", IOURING_CLASS_FILE_RW, 22))
-            .is_none());
+        assert!(
+            r2.evaluate(&ev(false, "evil", IOURING_CLASS_FILE_RW, 22))
+                .is_none()
+        );
         // file + net, completed by CONNECT (16): yes, High, Log
         let both = IOURING_CLASS_FILE_RW | IOURING_CLASS_NET_CONNECT;
         let v = r2.evaluate(&ev(false, "evil", both, 16)).expect("fires");
@@ -343,12 +344,14 @@ mod tests {
         assert!(r1.evaluate(&by(800, true, "nginx", 0, 0)).is_some());
         assert!(r2.evaluate(&by(801, false, "nginx", both, 16)).is_none());
         // the 15-character comm the kernel shows for the longer names
-        assert!(r1
-            .evaluate(&by(802, true, "qemu-system-x86", 0, 0))
-            .is_none());
-        assert!(r1
-            .evaluate(&by(803, true, "systemd-journal", 0, 0))
-            .is_none());
+        assert!(
+            r1.evaluate(&by(802, true, "qemu-system-x86", 0, 0))
+                .is_none()
+        );
+        assert!(
+            r1.evaluate(&by(803, true, "systemd-journal", 0, 0))
+                .is_none()
+        );
         // a known runtime is known whatever script it runs
         assert!(r2.evaluate(&by(804, false, "node", both, 16)).is_none());
     }
@@ -434,7 +437,7 @@ mod bug83 {
 #[cfg(test)]
 mod model {
     use super::*;
-    use crate::model_check::{check, Rng, SEQUENCES};
+    use crate::model_check::{Rng, SEQUENCES, check};
     use crate::posture::host::testing::TestHost as H;
     use common::wire::{
         IOURING_CLASS_FILE_OPEN as FO, IOURING_CLASS_FILE_RW as FRW,

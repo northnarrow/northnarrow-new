@@ -143,8 +143,11 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     )
     .unwrap();
     assert!(body(&j, "found").contains("unsafe { core::ptr::write_volatile(b, 0) };"));
-    assert!(body(&j, "is_lost")
-        .contains("lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)"));
+    assert!(
+        body(&j, "is_lost").contains(
+            "lost_byte(tgid).is_some_and(|b| unsafe { core::ptr::read_volatile(b) } != 0)"
+        )
+    );
     // the source of a self-move, cleared for every write
     in_order(
         body(&j, "try_src"),
@@ -597,8 +600,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
     assert!(
         code("agent/src/boot/policy.rs").contains("nn_linux::cgroup_join::sync_names(&policy);")
     );
-    assert!(code("agent/src/admin/handlers/config.rs")
-        .contains("nn_linux::cgroup_join::sync_names(&rule_policy.current());"));
+    assert!(
+        code("agent/src/admin/handlers/config.rs")
+            .contains("nn_linux::cgroup_join::sync_names(&rule_policy.current());")
+    );
     // a cgroup_join record raises no tamper trigger, and is signed as such
     let tr = code("crates/nn-core/src/posture/triggers.rs");
     // (lot 280a: nor a write the signed per-sysctl opt-out let through;

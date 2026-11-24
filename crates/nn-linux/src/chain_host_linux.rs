@@ -366,11 +366,11 @@ pub fn early_eviction_line(
 mod tests {
     use super::*;
     use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
-    use crate::chain_anchor::{HeadsSnapshot, HeadsStore, HEADS_FILE_NAME};
-    use crate::chain_tail::{read_chain_tail, ChainTail, TailQuery};
+    use crate::chain_anchor::{HEADS_FILE_NAME, HeadsSnapshot, HeadsStore};
+    use crate::chain_tail::{ChainTail, TailQuery, read_chain_tail};
     use crate::chainlog::{
-        archive_path_for, manifest_path, ChainPayload, ManifestEvent, NoProtection,
-        RotatingChainLog, RotationConfig,
+        ChainPayload, ManifestEvent, NoProtection, RotatingChainLog, RotationConfig,
+        archive_path_for, manifest_path,
     };
     use std::fs::{self, OpenOptions};
     use std::io::Write;
@@ -763,10 +763,12 @@ mod tests {
         let mut log = open();
         log.append(p(99)).unwrap();
         drop(log);
-        assert!(fs::symlink_metadata(&sealed)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&sealed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(&victim).unwrap(), b"victim");
         let archived = archive_path_for(&active, 2);
         assert_eq!(
@@ -1379,9 +1381,11 @@ mod tests {
         let mut want: Vec<String> = (0..4).map(|i| d(i).display().to_string()).collect();
         want.sort();
         assert_eq!(files, want, "{audit:?}");
-        assert!(audit
-            .iter()
-            .all(|v| v["extra"]["detail"].as_str().unwrap().contains("(40 bytes")));
+        assert!(
+            audit
+                .iter()
+                .all(|v| v["extra"]["detail"].as_str().unwrap().contains("(40 bytes"))
+        );
     }
 
     // ── Lot 296 (external bug hunt BUG27): a real failed fsync ──

@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use common::wire::exe::exe_flags;
 use nn_core::impair::reads_posixly_correct;
-use nn_core::posture::lineage::{in_system_tree, ExecIdentity, Runs};
+use nn_core::posture::lineage::{ExecIdentity, Runs, in_system_tree};
 use nn_core::posture::script_args::{node_options_load, reads_a_program};
 use nn_model::Event;
 
@@ -368,7 +368,7 @@ fn stdin_is_a_program(dir: &Path) -> bool {
 mod tests {
     use super::*;
     use common::wire::exe::kernel_dev;
-    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     fn spawn(pid: u32, exe: nn_model::ExeIdentity, filename: &str, argv: &[&str]) -> Event {
         Event::ProcessSpawn {

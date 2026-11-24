@@ -38,21 +38,21 @@ use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
-    held_by_id, held_by_place, held_under, NameKey, BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT,
-    GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE,
-    MG_NOTE, MG_ON, MG_OWN, MG_SB, MG_VIEW, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC,
-    TMPFS_MAGIC,
+    BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT,
+    HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB, MG_VIEW, NameKey,
+    PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC, TMPFS_MAGIC, held_by_id, held_by_place,
+    held_under,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
 
 use super::filesystem::{
-    stat_dev_to_kernel_dev, AyaInodeKey, BINARY_AND_UNIT_PATHS, CONFIG_DIR, NOCREATE_UNIT_DIRS,
-    STATE_DIR,
+    AyaInodeKey, BINARY_AND_UNIT_PATHS, CONFIG_DIR, NOCREATE_UNIT_DIRS, STATE_DIR,
+    stat_dev_to_kernel_dev,
 };
 use crate::mountinfo::MountEntry;
 use std::os::unix::ffi::OsStrExt;
@@ -803,7 +803,9 @@ pub fn not_canonical_in(
                 && !self_bind
                 && !image_overlay(m)
             {
-                Some("a memory or stacking file system over a directory that holds the agent's paths")
+                Some(
+                    "a memory or stacking file system over a directory that holds the agent's paths",
+                )
             } else if !whole && !self_bind && !SUBVOLUME_TYPES.iter().any(|t| t.as_bytes() == ty) {
                 Some("a bind of another directory over one that holds the agent's paths")
             } else {
@@ -1785,10 +1787,11 @@ mod tests {
         groups.sort_unstable();
         assert_eq!(groups, vec![1, 2, 3, 4, 5, 6, 7, 12]);
         // each entry says its namespace
-        assert!(h
-            .entries
-            .iter()
-            .all(|(_, f)| f >> HELD_NS_SHIFT == GUARD_HOST));
+        assert!(
+            h.entries
+                .iter()
+                .all(|(_, f)| f >> HELD_NS_SHIFT == GUARD_HOST)
+        );
         // the super blocks of the held ones, a copy's none of its own
         let mut sbs = h.sbs.clone();
         sbs.sort_unstable();
@@ -1845,17 +1848,20 @@ mod tests {
         assert!(ids(&u, HELD_REFUSE).contains(&302));
         // the agent's namespace, the same table: its own tag
         let a = held_in(&t, &points(), GUARD_AGENT, &g, &|_| None);
-        assert!(a
-            .entries
-            .iter()
-            .all(|(_, f)| f >> HELD_NS_SHIFT == GUARD_AGENT));
+        assert!(
+            a.entries
+                .iter()
+                .all(|(_, f)| f >> HELD_NS_SHIFT == GUARD_AGENT)
+        );
         assert_eq!(ids(&a, HELD_REFUSE), vec![1, 22, 23, 24, 25, 26]);
     }
 
     /// A FUSE on the way is held by its id, but never read for its root.
     #[test]
     fn a_fuse_on_the_way_is_never_read() {
-        let t = table(&format!("{HOST}50 1 0:50 / /var rw shared:9 - fuse.x x rw\n51 50 8:5 / /var/lib rw shared:10 - ext4 /dev/sda5 rw\n"));
+        let t = table(&format!(
+            "{HOST}50 1 0:50 / /var rw shared:9 - fuse.x x rw\n51 50 8:5 / /var/lib rw shared:10 - ext4 /dev/sda5 rw\n"
+        ));
         let read = std::cell::RefCell::new(Vec::new());
         let h = held_in(&t, &points(), GUARD_HOST, &groups_of(b""), &|d| {
             read.borrow_mut().push(d.to_path_buf());

@@ -6,7 +6,7 @@
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{Rule, rules::build_verdict};
 
 const WEBROOTS: &[&str] = &[
     "/var/www/",
@@ -80,24 +80,32 @@ mod tests {
 
     #[test]
     fn ignores_non_webroot_paths() {
-        assert!(R010BinaryInWebroot
-            .evaluate(&spawn("ls", "/usr/bin/ls"))
-            .is_none());
-        assert!(R010BinaryInWebroot
-            .evaluate(&spawn("php", "/usr/bin/php"))
-            .is_none());
+        assert!(
+            R010BinaryInWebroot
+                .evaluate(&spawn("ls", "/usr/bin/ls"))
+                .is_none()
+        );
+        assert!(
+            R010BinaryInWebroot
+                .evaluate(&spawn("php", "/usr/bin/php"))
+                .is_none()
+        );
     }
 
     #[test]
     fn does_not_match_lookalike_prefixes() {
         // "/var/wwwfoo/..." should not match.
-        assert!(R010BinaryInWebroot
-            .evaluate(&spawn("x", "/var/wwwfoo/x"))
-            .is_none());
+        assert!(
+            R010BinaryInWebroot
+                .evaluate(&spawn("x", "/var/wwwfoo/x"))
+                .is_none()
+        );
         // The directory itself without a binary is not an exec target,
         // but we still don't want a "false-prefix" match.
-        assert!(R010BinaryInWebroot
-            .evaluate(&spawn("x", "/var/www"))
-            .is_none());
+        assert!(
+            R010BinaryInWebroot
+                .evaluate(&spawn("x", "/var/www"))
+                .is_none()
+        );
     }
 }

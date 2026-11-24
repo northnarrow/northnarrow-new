@@ -9,8 +9,8 @@ use nn_proto::admin_protocol::{
     ResponseStatusRequest, ResponseStatusResponse,
 };
 
-use crate::admin::verify::{signed, Verified};
 use crate::admin::ResponseAdminState;
+use crate::admin::verify::{Verified, signed};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::posture::PostureMachine;
 
@@ -54,7 +54,7 @@ fn response_status(
     state: Option<&ResponseAdminState>,
 ) -> ResponseStatusResponse {
     use nn_proto::admin_protocol::{
-        ContainedProcessWire, QuarantinedFileWire, MAX_RESPONSE_STATUS_ROWS,
+        ContainedProcessWire, MAX_RESPONSE_STATUS_ROWS, QuarantinedFileWire,
     };
     let Some(state) = state else {
         warn!("response-status: agent boot did not wire ResponseAdminState");
@@ -378,7 +378,10 @@ fn remediate_ransomware(
         report.refused,
         report.skipped,
         if rows.len() < total {
-            format!(" ({} listed; every file is in the signed audit log)", rows.len())
+            format!(
+                " ({} listed; every file is in the signed audit log)",
+                rows.len()
+            )
         } else {
             String::new()
         }

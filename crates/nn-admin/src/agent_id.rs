@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// Width of the raw agent_id in bytes (with the identity types, the audit
 /// chain's since R04a, lab PR 241).

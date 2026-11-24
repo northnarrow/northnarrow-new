@@ -101,8 +101,10 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
         ],
     )
     .unwrap();
-    assert!(body(&l, "arm_silent")
-        .contains("arr.set(SILENT_ARMED, clock_ns(libc::CLOCK_MONOTONIC)?, 0)"));
+    assert!(
+        body(&l, "arm_silent")
+            .contains("arr.set(SILENT_ARMED, clock_ns(libc::CLOCK_MONOTONIC)?, 0)")
+    );
     // and the manifest's build watches the marks right after ftrace's read
     let m = code("agent/src/boot/manifest.rs");
     in_order(
@@ -247,8 +249,10 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
     .unwrap();
     assert!(c.contains("const ROOT_CGROUP_INO: u64 = 1;"));
     // lot 386: the record's response, the host-tested words
-    assert!(code("agent/src/pipeline/process_event.rs")
-        .contains("common::bpf_prog_class::root_attach_response(*target_ino)"));
+    assert!(
+        code("agent/src/pipeline/process_event.rs")
+            .contains("common::bpf_prog_class::root_attach_response(*target_ino)")
+    );
     // lot 386: the record's writer, behind the BPF guard's budget
     in_order(
         body(&c, "emit_root_attach"),
@@ -296,8 +300,11 @@ fn the_bpf_hook_refuses_a_cgroup_sysctl_attach_to_the_root() {
 #[test]
 fn the_switch_files_and_the_kernel_code_are_wired() {
     let m = code("agent/src/boot/manifest.rs");
-    assert!(body(&m, "build")
-        .contains("m.kernel_code = Some(nn_linux::kernel_state::kernel_code(&inputs.proc_root));"));
+    assert!(
+        body(&m, "build").contains(
+            "m.kernel_code = Some(nn_linux::kernel_state::kernel_code(&inputs.proc_root));"
+        )
+    );
     let g = code("crates/nn-linux/src/sysctl_guard.rs");
     assert!(g.contains("(KPROBES_ENABLED, SYSCTL_KPROBES_ENABLED, Some(\"1\")),"));
     assert!(g.contains(

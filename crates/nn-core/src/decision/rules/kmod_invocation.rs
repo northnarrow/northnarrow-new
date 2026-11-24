@@ -127,7 +127,7 @@ pub fn tool_of(image: &str, argv: &[String]) -> Result<Tool, String> {
             None => {
                 return Err(format!(
                     "argv[0] '{arg0}' names no mode of kmod (it exits with an error)"
-                ))
+                ));
             }
         },
     })
@@ -333,10 +333,10 @@ fn parse_modprobe(args: &[String]) -> Result<(Vec<&str>, usize), String> {
                 }
                 match (takes, inline) {
                     (true, None) if it.next().is_none() => {
-                        return kill(format!("--{name} has no argument (the tool refuses it)"))
+                        return kill(format!("--{name} has no argument (the tool refuses it)"));
                     }
                     (false, Some(_)) => {
-                        return kill(format!("--{name} takes no argument (the tool refuses it)"))
+                        return kill(format!("--{name} takes no argument (the tool refuses it)"));
                     }
                     _ => {}
                 }

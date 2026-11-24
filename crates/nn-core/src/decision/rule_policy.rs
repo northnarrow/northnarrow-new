@@ -704,7 +704,7 @@ fn parse_as(
                             "exe takes a path and its digest: `exe <path> sha256 <hex>` (a path \
                              alone is never an exemption)"
                                 .to_string(),
-                        ))
+                        ));
                     }
                     ("cgroup", [path]) => {
                         valid_cgroup(path).map_err(err)?;
@@ -728,12 +728,12 @@ fn parse_as(
                             "an exemption by {kind} is refused: any user can give a process \
                              any name — exempt an executable with its digest, a unit, a cgroup \
                              or a uid"
-                        )))
+                        )));
                     }
                     (k, _) => {
                         return Err(err(format!(
                             "exemption `{k}`: one of uid, exe, cgroup, unit, with its value"
-                        )))
+                        )));
                     }
                 };
                 let list = p.exemptions.entry(id).or_default();
@@ -750,7 +750,7 @@ fn parse_as(
             ["exempt", ..] => {
                 return Err(err(
                     "`exempt <rule> uid|exe|cgroup|unit <value>`".to_string()
-                ))
+                ));
             }
             // Lot 280a: the signed per-sysctl opt-out
             ["sysctl-allow", name, value] => {
@@ -781,7 +781,7 @@ fn parse_as(
                 return Err(err(
                     "`sysctl-allow <sysctl> <value>` or `sysctl-allow <sysctl> <min>..<max>`"
                         .to_string(),
-                ))
+                ));
             }
             // Lot 285: the signed per-module opt-out
             ["module-allow", name] => {
@@ -816,7 +816,7 @@ fn parse_as(
                     "`bpf-loader-allow <absolute executable path> <type>[,<type>…]` (types: \
                      {})",
                     common::bpf_prog_class::mask_names(common::bpf_prog_class::DENIED_MASK)
-                )))
+                )));
             }
             ["combat-without-corroboration", rule] => {
                 let id = resolve_rule(rule).map_err(err)?;
@@ -834,7 +834,7 @@ fn parse_as(
                 return Err(err(format!(
                     "unknown directive `{kw}`: enforce, alert, audit, off, exempt, \
                      combat-without-corroboration, sysctl-allow, module-allow, bpf-loader-allow"
-                )))
+                )));
             }
             [] => unreachable!("empty content skipped"),
         }
@@ -1377,12 +1377,14 @@ mod tests {
             ]
         );
         assert_eq!(parse(&p.render()).unwrap(), p);
-        assert!(p
-            .render()
-            .contains("sysctl-allow kernel.sched_rt_runtime_us -1\n"));
-        assert!(p
-            .render()
-            .contains("sysctl-allow kernel.pid_max 4096..32767\n"));
+        assert!(
+            p.render()
+                .contains("sysctl-allow kernel.sched_rt_runtime_us -1\n")
+        );
+        assert!(
+            p.render()
+                .contains("sysctl-allow kernel.pid_max 4096..32767\n")
+        );
         assert!(
             p.summary().ends_with(", 2 sysctl opt-outs"),
             "{}",
@@ -1395,15 +1397,19 @@ mod tests {
             [("kernel.pid_max", SYSCTL_PID_MAX, 4096, 4096)]
         );
         assert_eq!(one.render(), "sysctl-allow kernel.pid_max 4096\n");
-        assert!(parse("sysctl-allow kernel.pid_max 4096\n")
-            .unwrap()
-            .summary()
-            .ends_with(", 1 sysctl opt-out"));
+        assert!(
+            parse("sysctl-allow kernel.pid_max 4096\n")
+                .unwrap()
+                .summary()
+                .ends_with(", 1 sysctl opt-out")
+        );
         // without one, the summary is the one before lot 280a
-        assert!(parse("enforce R020\n")
-            .unwrap()
-            .summary()
-            .ends_with("ransomware COMBAT without corroboration off"));
+        assert!(
+            parse("enforce R020\n")
+                .unwrap()
+                .summary()
+                .ends_with("ransomware COMBAT without corroboration off")
+        );
         let shown = show(&p);
         assert!(
             shown.contains("sysctl-allow kernel.sched_rt_runtime_us -1 (outside a window too; honoured only signed)"),
@@ -1445,12 +1451,16 @@ mod tests {
             let e = refused(text);
             assert!(e.why.contains(what), "{text:?}: {e}");
         }
-        assert!(refused("sysctl-allow kernel.printk 4\n")
-            .why
-            .contains("kernel.sched_rt_runtime_us"));
-        assert!(!refused("sysctl-allow kernel.printk 4\n")
-            .why
-            .contains("kernel.ftrace_enabled,"));
+        assert!(
+            refused("sysctl-allow kernel.printk 4\n")
+                .why
+                .contains("kernel.sched_rt_runtime_us")
+        );
+        assert!(
+            !refused("sysctl-allow kernel.printk 4\n")
+                .why
+                .contains("kernel.ftrace_enabled,")
+        );
     }
 
     #[test]
@@ -1484,7 +1494,11 @@ mod tests {
                 1,
                 "absolute",
             ),
-            ("exempt R020 exe /usr/bin/x sha256 abcd\n", 1, "64 hexadecimal"),
+            (
+                "exempt R020 exe /usr/bin/x sha256 abcd\n",
+                1,
+                "64 hexadecimal",
+            ),
             ("exempt R020 cgroup /system.slice\n", 1, "names no .service"),
             ("exempt R020 cgroup /\n", 1, "names no .service"),
             ("exempt R020 cgroup system.slice/a.service\n", 1, "absolute"),
@@ -1507,7 +1521,11 @@ mod tests {
             ),
             ("enforce R020\x07\n", 1, "control character"),
             // R6 (lot 275): a fingerprint alone is not an identity
-            ("enforce NN-L-NET-003\n", 1, "enforce NN-L-NET-003_BadJa3 is refused"),
+            (
+                "enforce NN-L-NET-003\n",
+                1,
+                "enforce NN-L-NET-003_BadJa3 is refused",
+            ),
             (
                 "alert R020\nenforce NN-L-NET-003_BadJa3\n",
                 2,
@@ -1678,16 +1696,18 @@ mod tests {
             }
             // a uid or exe exemption is the actor's, wherever it started
             assert!(exempt(&[Exemption::Uid(998)], 42, None, &f).is_some());
-            assert!(exempt(
-                &[Exemption::Exe {
-                    path: "/usr/bin/backup".into(),
-                    sha256: [7; 32],
-                }],
-                42,
-                None,
-                &f
-            )
-            .is_some());
+            assert!(
+                exempt(
+                    &[Exemption::Exe {
+                        path: "/usr/bin/backup".into(),
+                        sha256: [7; 32],
+                    }],
+                    42,
+                    None,
+                    &f
+                )
+                .is_some()
+            );
         }
         // a moved process exempt by its uid still is, and says so
         let moved = Facts {
@@ -2112,10 +2132,11 @@ mod tests {
             b.policy.mode(resolve_rule("R008").unwrap()),
             Some(Mode::Off)
         );
-        assert!(b
-            .demoted
-            .unwrap()
-            .contains("line 1: enforce NN-L-NET-028_ConnectWithoutDns refused, applied as alert"));
+        assert!(
+            b.demoted.unwrap().contains(
+                "line 1: enforce NN-L-NET-028_ConnectWithoutDns refused, applied as alert"
+            )
+        );
         assert_eq!(
             ENFORCE_REFUSED.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
             vec![NET_003, "NN-L-NET-028_ConnectWithoutDns"]
@@ -2181,10 +2202,12 @@ mod tests {
         let many: String = (0..=MAX_MODULE_OPT_OUTS)
             .map(|i| format!("module-allow m{i}\n"))
             .collect();
-        assert!(parse(&many)
-            .unwrap_err()
-            .to_string()
-            .contains("module-allow lines"));
+        assert!(
+            parse(&many)
+                .unwrap_err()
+                .to_string()
+                .contains("module-allow lines")
+        );
     }
 
     /// Lot 299 (external bug hunt, edition 1.3: BUG-78): every name the

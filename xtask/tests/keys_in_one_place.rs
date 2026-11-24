@@ -229,14 +229,24 @@ fn a_planted_key_outside_the_store_is_found() {
             "type C = aes_gcm::AesGcm<aes_gcm::aes::Aes256, U12>;",
             "AesGcm",
         ),
-        ("type C = aes_gcm::AesGcm<aes_gcm::aes::Aes256, U12>;", "Aes256"),
+        (
+            "type C = aes_gcm::AesGcm<aes_gcm::aes::Aes256, U12>;",
+            "Aes256",
+        ),
         (
             "fn f() { let v = crate::keys::Vault::at(Path::new(\"/etc/northnarrow/master.key\")); }",
             "Vault::at",
         ),
-        ("fn f() { let m = hmac::Hmac::<sha2::Sha256>::new_from_slice(k); }", "Hmac"),
+        (
+            "fn f() { let m = hmac::Hmac::<sha2::Sha256>::new_from_slice(k); }",
+            "Hmac",
+        ),
     ] {
-        assert_eq!(names(&production(&strip_comments(planted)), name), 1, "{planted}");
+        assert_eq!(
+            names(&production(&strip_comments(planted)), name),
+            1,
+            "{planted}"
+        );
     }
     assert_eq!(names("Aes256Gcm", "Aes256"), 0);
     assert_eq!(names("ExpandedSecretKey", "SecretKey"), 0);

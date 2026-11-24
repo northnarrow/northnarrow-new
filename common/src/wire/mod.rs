@@ -1319,11 +1319,7 @@ pub const CPU_CAUSE_UNJUDGED: u64 = 5;
 /// capped at 0xffff).
 pub const fn cpu_confined_dev(cause: u64, left: u64, expected: u64, threads: u64) -> u64 {
     const fn cap(v: u64) -> u64 {
-        if v > 0xffff {
-            0xffff
-        } else {
-            v
-        }
+        if v > 0xffff { 0xffff } else { v }
     }
     (cause & 0xff) | cap(left) << 8 | cap(expected) << 24 | cap(threads) << 40
 }
@@ -1348,11 +1344,7 @@ pub const SIGIO: i32 = 29;
 /// delivers as SIGIO. The hook judges, and the record carries, this one.
 #[inline(always)]
 pub const fn sigio_signal(sig: i32) -> i32 {
-    if sig == 0 {
-        SIGIO
-    } else {
-        sig
-    }
+    if sig == 0 { SIGIO } else { sig }
 }
 
 /// Lot 349 (the review of #558, F1): NOT a refusal — a program loaded
@@ -2528,7 +2520,7 @@ mod tests {
     /// apart, neither ever a slot's value.
     #[test]
     fn an_exit_s_mark_says_vacated_and_whether_inside_a_window() {
-        use super::{role_exit_mark, ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED};
+        use super::{ROLE_MARK_IN_WINDOW, ROLE_MARK_VACATED, ROLE_VACATED, role_exit_mark};
         assert_eq!(role_exit_mark(false), ROLE_MARK_VACATED);
         assert_eq!(
             role_exit_mark(true),
@@ -2543,7 +2535,7 @@ mod tests {
     /// little-endian words; slot 0 the watchdog's unit, slot 1 the agent's.
     #[test]
     fn a_role_unit_s_name_is_compared_as_the_kernel_s_string_read_gives_it() {
-        use super::{kn_name_words, role_unit_words, AGENT_UNIT, OUR_SLICE, WATCHDOG_UNIT};
+        use super::{AGENT_UNIT, OUR_SLICE, WATCHDOG_UNIT, kn_name_words, role_unit_words};
         let words = |w: [u64; 4]| {
             let mut b = [0u8; 32];
             for (i, x) in w.iter().enumerate() {
@@ -2581,7 +2573,7 @@ mod tests {
     /// unmarked.
     #[test]
     fn an_argv_block_the_sensor_cannot_read_whole_is_marked_cut() {
-        use super::{argv_read, ARGV_LEN};
+        use super::{ARGV_LEN, argv_read};
         assert_eq!(argv_read(0), (0, false));
         assert_eq!(argv_read(1), (1, false));
         assert_eq!(argv_read(ARGV_LEN - 1), (ARGV_LEN - 1, false));
@@ -2954,7 +2946,7 @@ mod tests {
     /// enumeration `BPF_LINK_GET_NEXT_ID` was named as the handle).
     #[test]
     fn bpf_cmd_names_follow_the_uapi_names() {
-        use crate::bpf_cmd::{observed, UAPI};
+        use crate::bpf_cmd::{UAPI, observed};
         for (name, value) in UAPI {
             let want = name.trim_start_matches("BPF_").to_ascii_lowercase();
             if observed(value) {

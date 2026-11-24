@@ -11,8 +11,8 @@ use nn_model::ResponseAction;
 use tracing::warn;
 
 use super::{
-    block_outbound, journal::Intent, kill, proc_ref::ProcRef, quarantine, throttle,
-    ExecutionOutcome, ExecutionReport, ExecutorConfig,
+    ExecutionOutcome, ExecutionReport, ExecutorConfig, block_outbound, journal::Intent, kill,
+    proc_ref::ProcRef, quarantine, throttle,
 };
 
 /// Hard floor on PIDs we're willing to touch. Anything below this is
@@ -579,8 +579,7 @@ impl Executor {
 
 /// Why [`ResponseAction::FullNetworkIsolation`] is refused (external audit
 /// CMB-006).
-pub const ISOLATION_IS_THE_LADDERS: &str =
-    "host-wide isolation is the COMBAT ladder's (locked COMBAT, management carve-out, signed release)";
+pub const ISOLATION_IS_THE_LADDERS: &str = "host-wide isolation is the COMBAT ladder's (locked COMBAT, management carve-out, signed release)";
 
 impl Default for Executor {
     fn default() -> Self {

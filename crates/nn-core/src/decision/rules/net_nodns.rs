@@ -46,9 +46,9 @@ use nn_model::telemetry::{DnsResolution, FlowPhase, NetFlowEvent};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::decision::Rule;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::bounded::LazyLru;
-use crate::decision::Rule;
 use crate::net::resolvers::HostResolvers;
 
 /// The rule's id.
@@ -369,9 +369,11 @@ mod tests {
             DnsResolution::Unknown,
             DnsResolution::NotJudged,
         ] {
-            assert!(rule()
-                .evaluate(&flow(C2, 6, FlowPhase::Connect, res))
-                .is_none());
+            assert!(
+                rule()
+                    .evaluate(&flow(C2, 6, FlowPhase::Connect, res))
+                    .is_none()
+            );
         }
     }
 
@@ -380,12 +382,16 @@ mod tests {
     #[test]
     fn udp_and_ipv6_are_judged_the_other_phases_are_not() {
         let v6 = IpAddr::V6("2001:db8::5".parse::<Ipv6Addr>().unwrap());
-        assert!(rule()
-            .evaluate(&flow(C2, 17, FlowPhase::Closed, DnsResolution::Unresolved))
-            .is_some());
-        assert!(rule()
-            .evaluate(&flow(v6, 6, FlowPhase::Connect, DnsResolution::Unresolved))
-            .is_some());
+        assert!(
+            rule()
+                .evaluate(&flow(C2, 17, FlowPhase::Closed, DnsResolution::Unresolved))
+                .is_some()
+        );
+        assert!(
+            rule()
+                .evaluate(&flow(v6, 6, FlowPhase::Connect, DnsResolution::Unresolved))
+                .is_some()
+        );
         for (proto, phase) in [
             (6, FlowPhase::Closed),
             (6, FlowPhase::Snapshot),
@@ -432,14 +438,15 @@ mod tests {
             HostResolvers::fixed([resolver]),
             Arc::new(NoDnsAllowlist::parse("198.51.100.0/24\n2001:db8:1::/48 # mirror\n").unwrap()),
         );
-        assert!(r
-            .evaluate(&flow(
+        assert!(
+            r.evaluate(&flow(
                 resolver,
                 6,
                 FlowPhase::Connect,
                 DnsResolution::Unresolved
             ))
-            .is_none());
+            .is_none()
+        );
         for a in ["198.51.100.77", "2001:db8:1::9"] {
             assert!(
                 r.evaluate(&flow(
@@ -453,9 +460,10 @@ mod tests {
             );
         }
         // outside the blocks: judged
-        assert!(r
-            .evaluate(&flow(C2, 6, FlowPhase::Connect, DnsResolution::Unresolved))
-            .is_some());
+        assert!(
+            r.evaluate(&flow(C2, 6, FlowPhase::Connect, DnsResolution::Unresolved))
+                .is_some()
+        );
     }
 
     /// Once per process and destination per window.
@@ -481,9 +489,10 @@ mod tests {
             r.evaluate(&mk(101 * SEC, other, 1)).is_some(),
             "another destination"
         );
-        assert!(r
-            .evaluate(&mk((100 + DEDUP_SECS - 1) * SEC, C2, 1))
-            .is_none());
+        assert!(
+            r.evaluate(&mk((100 + DEDUP_SECS - 1) * SEC, C2, 1))
+                .is_none()
+        );
         assert!(r.evaluate(&mk((100 + DEDUP_SECS) * SEC, C2, 1)).is_some());
     }
 

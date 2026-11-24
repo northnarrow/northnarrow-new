@@ -724,9 +724,10 @@ mod tests {
         let c = DnsCache::default();
         let q = "high-entropy-label.attacker.net";
         c.on_dns_query(673, q.into(), 1, UPSTREAM, 5 * ONE_SEC_NS);
-        assert!(c
-            .originator_for(q, 5 * ONE_SEC_NS + 1_000, 2 * ONE_SEC_NS, 673)
-            .is_none());
+        assert!(
+            c.originator_for(q, 5 * ONE_SEC_NS + 1_000, 2 * ONE_SEC_NS, 673)
+                .is_none()
+        );
     }
 
     /// FP-3 #3 — the tight window rejects a stale same-qname entry. An
