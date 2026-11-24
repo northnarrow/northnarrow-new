@@ -78,7 +78,7 @@ hex = "0.4"
 # Landlock ruleset builder with its ABI probing (`LandlockStatus`): the
 # rights the running kernel's ABI handles are enforced and declared, never
 # assumed (plan §5 risk 8; ABI 1 on 5.15, 2 on 6.1, 4 on 6.8, 6 on 6.12).
-landlock = "=0.4.7"
+landlock = "=0.4.8"
 # seccompiler (Apache-2.0 OR BSD-3-Clause; rust-vmm, Firecracker's filter
 # compiler; deps libc only, its `json` feature off): the workers' allowlist
 # compiled to classic BPF, with argument conditions (mmap without PROT_EXEC,
