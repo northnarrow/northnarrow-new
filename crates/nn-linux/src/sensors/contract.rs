@@ -45,6 +45,10 @@ pub mod attach {
         "tracepoint:sched/sched_process_exec (no standard-stream probes: R020 off)";
     pub const EXEC_LSM: &str = "lsm:bprm_check_security";
     pub const EXEC_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_execve (user memory)";
+    /// Lot 324: [`EXEC_TRACEPOINT`]'s own fallback, where the boot's
+    /// every-CPU self-test saw the syscall tracepoint miss a CPU
+    /// (`sensors::exec::every_cpu`).
+    pub const EXEC_RAW_TP: &str = "raw_tp:sys_enter (execve, user memory)";
     pub const TCP_CONNECT: &str = "kprobe:tcp_v4_connect+tcp_v6_connect";
     pub const DNS_SKB: &str = "kprobe:udp_send_skb+udp_v6_send_skb";
     /// Part of [`DNS_SKB`]: `udp_v6_send_skb` not attached.
@@ -74,7 +78,14 @@ pub mod attach {
     /// Lot 275: an outbound flow's first send when it is a ClientHello.
     pub const TLS_HELLO: &str = "fentry:tcp_sendmsg (the sender's buffer, a flow's first send)";
     pub const OPEN_TRACEPOINT: &str = "tracepoint:syscalls/sys_enter_openat (user memory)";
+    /// Lot 324: [`OPEN_TRACEPOINT`]'s own fallback, as [`EXEC_RAW_TP`].
+    pub const OPEN_RAW_TP: &str = "raw_tp:sys_enter (openat, user memory)";
 }
+
+/// Lot 324: when the every-CPU fallbacks are taken.
+const RAW_TP_WHEN: &str = "on the syscall tracepoint, the boot's every-CPU self-test (one call \
+     from a thread pinned to each online CPU) did not see it run on every CPU, and the fallback \
+     saw every CPU the tracepoint did (Ubuntu 26.04's 7.0: CPU 0 alone)";
 
 /// The file-open sensor's notes: the LSM sensor's and the tracepoint's.
 pub const OPEN_LSM_NOTE: &str = attach::OPEN_LSM;
@@ -259,8 +270,10 @@ pub const SOURCES: [SourceContract; 16] = [
         opt_in: None,
         on_failure: FailureMode::Blind,
         on_failure_detail: "attached at every start and inert while the LSM file-open sensor \
-             runs; its attach failing refuses the start (signed); its pump ending stops the agent \
-             within 5 s (signed)",
+             runs; its attach failing refuses the start (signed); (lot 324) where it runs and the \
+             boot's self-test does not see it on every online CPU, the raw sys_enter fallback \
+             (the same records, the same ring), signed (file_open_sensor); its pump ending stops \
+             the agent within 5 s (signed)",
         kernel_budgets: &[],
         overhead: &[],
         truncations: &[
@@ -286,16 +299,28 @@ pub const SOURCES: [SourceContract; 16] = [
         also: &[],
         needs_bpf_lsm: true,
         lsm_part: None,
-        fallbacks: &[Fallback {
-            attach: attach::EXEC_TRACEPOINT,
-            when: "--exec-sensor tracepoint, a linux_binprm offset missing, the LSM program \
+        fallbacks: &[
+            Fallback {
+                attach: attach::EXEC_TRACEPOINT,
+                when: "--exec-sensor tracepoint, a linux_binprm offset missing, the LSM program \
                    refused, or bpf not in the active LSM list",
-            costs: "the executed path read from the caller's memory (it can differ from the file \
+                costs: "the executed path read from the caller's memory (it can differ from the file \
                     the kernel runs); no executable identity; the exec quarantine and the exec \
                     policy have no kernel half",
-            equivalent: false,
-            lost: &[],
-        }],
+                equivalent: false,
+                lost: &[],
+            },
+            Fallback {
+                attach: attach::EXEC_RAW_TP,
+                when: RAW_TP_WHEN,
+                costs: "the executed path read from the caller's memory (it can differ from the file \
+                    the kernel runs); no executable identity; the exec quarantine and the exec \
+                    policy have no kernel half; and a filter on the number of every system call \
+                    of the host (the raw sys_enter tracepoint runs for each)",
+                equivalent: false,
+                lost: &[],
+            },
+        ],
         sync_verdict: SyncVerdict::None,
         opt_in: Some(OptIn {
             verdict: SyncVerdict::KernelDeny {
@@ -307,8 +332,10 @@ pub const SOURCES: [SourceContract; 16] = [
         }),
         on_failure: FailureMode::Blind,
         on_failure_detail: "the LSM program refused or not runnable: sys_enter_execve, signed \
-             (exec_sensor); that attach failing too refuses the start; its pump ending stops the \
-             agent within 5 s (signed)",
+             (exec_sensor); that attach failing too refuses the start; (lot 324) the tracepoint \
+             not seen on every online CPU by the boot's self-test: the raw sys_enter fallback, \
+             signed (exec_sensor), or the tracepoint kept with the CPUs it misses signed; its \
+             pump ending stops the agent within 5 s (signed)",
         kernel_budgets: &[],
         overhead: &[],
         truncations: &[
@@ -644,16 +671,28 @@ pub const SOURCES: [SourceContract; 16] = [
         also: &[],
         needs_bpf_lsm: true,
         lsm_part: None,
-        fallbacks: &[Fallback {
-            attach: attach::OPEN_TRACEPOINT,
-            when: "--file-open-sensor tracepoint, its FIM observer, maps, ring, pump or arming \
+        fallbacks: &[
+            Fallback {
+                attach: attach::OPEN_TRACEPOINT,
+                when: "--file-open-sensor tracepoint, its FIM observer, maps, ring, pump or arming \
                    failing, or bpf not in the active LSM list",
-            costs: "every open reaches userland with its path read from the caller's memory \
+                costs: "every open reaches userland with its path read from the caller's memory \
                     (the file_open source); mass writes, rename and unlink bursts, signals to \
                     security tools and FIM Opened records are not produced",
-            equivalent: false,
-            lost: &[K::MassWrite, K::FileBurst, K::DefenderSignal],
-        }],
+                equivalent: false,
+                lost: &[K::MassWrite, K::FileBurst, K::DefenderSignal],
+            },
+            Fallback {
+                attach: attach::OPEN_RAW_TP,
+                when: RAW_TP_WHEN,
+                costs: "the tracepoint's (every open reaches userland with its path read from the \
+                    caller's memory; mass writes, rename and unlink bursts, signals to security \
+                    tools and FIM Opened records are not produced), and a filter on the number \
+                    of every system call of the host",
+                equivalent: false,
+                lost: &[K::MassWrite, K::FileBurst, K::DefenderSignal],
+            },
+        ],
         sync_verdict: SyncVerdict::None,
         opt_in: None,
         on_failure: FailureMode::Blind,

@@ -78,6 +78,7 @@ use aya_ebpf::{
     macros::{lsm, map},
     maps::{HashMap, LruHashMap, RingBuf},
     programs::LsmContext,
+    EbpfContext,
 };
 use northnarrow_common::wire::open_sensor::{OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN};
 use northnarrow_common::wire::{
@@ -253,7 +254,9 @@ pub static FIM_DIRTY_INODES: HashMap<InodeKey, DirtyMeta> =
 /// kernel pointer read.
 #[inline(always)]
 unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the one read is `bpf_probe_read_kernel` of the dentry's
+    // `d_inode` slot (a failed read is `None`): `dentry` is offset, never
+    // dereferenced, so any value is safe here (main.rs, "Unsafe code").
     unsafe {
         if dentry.is_null() {
             return None;
@@ -274,7 +277,9 @@ unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
 /// — both sides agree on the `(dev, ino)` key bytes (review 55).
 #[inline(always)]
 unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `i_sb`, `s_dev` and `i_ino` are read with
+    // `bpf_probe_read_kernel` (a failed read is `None`), and `stat_dev` reads
+    // the same way: no pointer is dereferenced (main.rs, "Unsafe code").
     unsafe {
         if inode.is_null() {
             return None;
@@ -299,7 +304,8 @@ unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
 /// `true` if `key` is in [`WATCHED_PATHS`].
 #[inline(always)]
 unsafe fn is_watched(key: &InodeKey) -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: aya's `HashMap::get` is unsafe because another CPU may change
+    // the value under the reader; only the entry's presence is used here.
     unsafe {
         WATCHED_PATHS.get(key).is_some()
     }
@@ -345,7 +351,9 @@ pub(crate) fn emit_drift_opened(key: InodeKey) {
 /// since its fork ([`crate::fork_parent::unexecuted_forks`]) into `raw`.
 #[inline(always)]
 unsafe fn fill_forks(raw: *mut FimDriftRaw) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `raw` is the caller's ring entry (`emit_drift_*`, `emit_link`),
+    // reserved, `FimDriftRaw`-sized and theirs until their submit: four of
+    // its fields are written, nothing outside it.
     unsafe {
         let (own, forker) = crate::fork_parent::unexecuted_forks();
         if let Some(f) = own {
@@ -395,12 +403,11 @@ fn emit_drift_raw(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8, forks: bo
         }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    // SAFETY: `raw_ptr` is the ring entry reserved above, aligned,
+    // `FimDriftRaw`-sized and ours alone until the submit below: every write
+    // stays inside it (main.rs, "Unsafe code"). Zeroed first so the trailing
+    // `_pad` bytes (and the dest pair, for `NO_DEST`) stay deterministic.
     unsafe {
-        // SAFETY: ringbuf reservation gives us exclusive write
-        // access to a properly aligned region the size of
-        // FimDriftRaw. Zero first so the trailing _pad bytes
-        // (and dest pair, when dest_key is None) stay
-        // deterministic.
         crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
         let pid_tgid = bpf_get_current_pid_tgid();
@@ -443,6 +450,10 @@ fn emit_drift_with_dest_leaf(op: u8, key: InodeKey, dest: InodeKey, new_dentry: 
         }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    // SAFETY: `raw_ptr` is the ring entry reserved above, aligned,
+    // `FimDriftRaw`-sized and ours alone until the submit below: every write
+    // stays inside it; a child leaf is copied by `read_child_leaf`, bounded by
+    // the field (main.rs, "Unsafe code").
     unsafe {
         crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
@@ -480,6 +491,10 @@ fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
         }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    // SAFETY: `raw_ptr` is the ring entry reserved above, aligned,
+    // `FimDriftRaw`-sized and ours alone until the submit below: every write
+    // stays inside it; a child leaf is copied by `read_child_leaf`, bounded by
+    // the field (main.rs, "Unsafe code").
     unsafe {
         crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
@@ -511,6 +526,10 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
         }
     };
     let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    // SAFETY: `raw_ptr` is the ring entry reserved above, aligned,
+    // `FimDriftRaw`-sized and ours alone until the submit below: every write
+    // stays inside it; a child leaf is copied by `read_child_leaf`, bounded by
+    // the field (main.rs, "Unsafe code").
     unsafe {
         crate::zero::zero(raw_ptr);
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
@@ -547,7 +566,9 @@ fn emit_drift_close(key: InodeKey, meta: DirtyMeta) {
 /// `true` means "emit"; `false` means "skip silently".
 #[inline(always)]
 unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `inode_key` reads through `target` with `bpf_probe_read_kernel`
+    // only, so `target` may be any value; the watch lookup reads no value
+    // (main.rs, "Unsafe code").
     unsafe {
         let key = inode_key(target)?;
         if !is_watched(&key) {
@@ -566,7 +587,9 @@ unsafe fn should_emit(target: *const c_void) -> Option<InodeKey> {
 /// hooks. `None` on null / probe failure.
 #[inline(always)]
 unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the one read is `bpf_probe_read_kernel` of the file's `f_inode`
+    // slot (a failed read is `None`): `file` is offset, never dereferenced
+    // (main.rs, "Unsafe code").
     unsafe {
         if file.is_null() {
             return None;
@@ -588,7 +611,10 @@ unsafe fn inode_from_file(file: *const c_void) -> Option<*const c_void> {
 /// (userland keeps the bare-dir path) rather than emitting garbage.
 #[inline(always)]
 unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_NAME_LEN]) -> u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the dentry's name pointer and length are read with
+    // `bpf_probe_read_kernel`, the name with `bpf_probe_read_kernel_str_bytes`
+    // into `dst`, bounded by its `FIM_CHILD_NAME_LEN` (a failed read leaves
+    // `dst` as the caller zeroed it); `child_dentry` is never dereferenced.
     unsafe {
         if child_dentry.is_null() {
             return 0;
@@ -629,12 +655,16 @@ unsafe fn read_child_leaf(child_dentry: *const c_void, dst: &mut [u8; FIM_CHILD_
 /// the decision engine.
 #[lsm(hook = "inode_setattr")]
 pub fn fim_setattr_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_setattr_observe(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the dentry and the `iattr` are the hook's arguments at the
+    // positions resolved for this kernel (`inode_protect::setattr_*`); every
+    // read through them is `bpf_probe_read_kernel` (`inode_from_dentry`, the
+    // `ia_valid` word, the open sensor's mark).
     unsafe {
         // `(dentry, iattr)` up to 6.8, `(idmap, dentry, iattr)` from 6.9: the
         // dentry's position comes from the running kernel (lab PR 164), as
@@ -687,6 +717,9 @@ fn truncated_by_another(key: InodeKey) {
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let start = crate::fork_parent::current_start();
+    // SAFETY: `m` is a map value's pointer, checked for null by
+    // `get_ptr_mut`; a write racing this update can drop the bit (said
+    // above), never fault.
     unsafe {
         if (*m).pid != pid || (*m).start != start {
             (*m).flags |= u32::from(FIM_WRITE_TRUNCATED_BY_ANOTHER);
@@ -702,12 +735,15 @@ fn truncated_by_another(key: InodeKey) {
 /// when `/usr/local/bin/` is in WATCHED_PATHS.
 #[lsm(hook = "inode_create")]
 pub fn fim_create_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_create_observe(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_fim_create_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's arguments, which the verifier types
+    // for `inode_create`; `should_emit` and the child's leaf read through them
+    // with `bpf_probe_read_kernel` only (main.rs, "Unsafe code").
     unsafe {
         // Kernel signature: (dir, dentry, mode). The DIR (arg 0)
         // is the parent inode we watch; the dentry (arg 1) is the
@@ -726,34 +762,84 @@ unsafe fn try_fim_create_observe(ctx: &LsmContext) -> i32 {
     }
 }
 
+/// Argument `i` of the hook as a plain value (lot 1.3), for the global
+/// functions, which take no BTF pointer (5.15 refuses one): read from the
+/// context's argument array with `bpf_probe_read_kernel`, which zeroes its
+/// destination when it fails, so no result is kept beside the value — each
+/// kept result was a slot of the program's own frame, on its longest call
+/// chain (`open_sensor::raw_arg` reads the same value and keeps it).
+#[inline(always)]
+unsafe fn arg_value(ctx: &LsmContext, i: usize) -> u64 {
+    // SAFETY: the helper reads 8 bytes at the context's argument `i` (every
+    // caller's `i` is below the hook's argument count) into `v`, and writes
+    // all 8 bytes — the value, or zeroes on a failed read.
+    unsafe {
+        let mut v = core::mem::MaybeUninit::<u64>::uninit();
+        let _ = aya_ebpf::helpers::generated::bpf_probe_read_kernel(
+            v.as_mut_ptr() as *mut c_void,
+            8,
+            (ctx.as_ptr() as *const u64).add(i) as *const c_void,
+        );
+        v.assume_init()
+    }
+}
+
 /// `inode_unlink` observation — fires on `rm` of a watched
 /// inode. Mapped to `FimOp::Deleted`. NN-L-FIM-005 (log
 /// truncation) and NN-L-FIM-003 (sensitive config) both
 /// consume this op to detect attacker cover-tracks behaviour.
 #[lsm(hook = "inode_unlink")]
 pub fn fim_unlink_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_unlink_observe(&ctx) }
 }
 
+/// Lot 1.3 (S1, the stack gate of 448 bytes): the program keeps only the
+/// calls — its FIM records in [`nn_fim_unlink`], the unlink burst in
+/// `open_sensor` — so its own frame holds no more than the values that
+/// cross them, and the longest call chain (into the unlink burst's walk)
+/// is 448 of the verifier's 512 bytes instead of 480. The order is the
+/// one the body had inline: the records, the burst, the walk's buffers.
 #[inline(always)]
 unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `arg_value` reads the hook's argument array with
+    // `bpf_probe_read_kernel` (a failed read is 0); the global functions take
+    // the arguments as plain values and read through them with the same
+    // helper (main.rs, "Unsafe code").
     unsafe {
         // Kernel signature: (parent dir, target dentry).
-        // Either the parent dir OR the target inode being in
-        // WATCHED_PATHS is a hit — `rm` of a watched file fires
-        // both if both are registered; the C4 drain dedups by
-        // (target_dev, target_ino, timestamp_ns) before chaining
-        // into fim_drift.jsonl.
-        let parent: *const c_void = ctx.arg(0);
-        match should_emit(parent) {
+        let dentry = arg_value(ctx, 1);
+        let _ = nn_fim_unlink(arg_value(ctx, 0), dentry);
+        // Lab PR 225: every unlink counts toward its process's unlink burst
+        // (the deletion of originals after an encrypted copy was written).
+        let _ = crate::open_sensor::nn_unlink_burst(dentry);
+        // Lot 322: the walk's per-task buffers, if it made them.
+        crate::open_sensor::forget_task();
+        0
+    }
+}
+
+/// The unlink's FIM records (lot 1.3: a global function, verified once and
+/// off the program's chain into the unlink burst). Either the parent dir OR
+/// the target inode being in WATCHED_PATHS is a hit — `rm` of a watched
+/// file fires both if both are registered; the C4 drain dedups by
+/// (target_dev, target_ino, timestamp_ns) before chaining into
+/// fim_drift.jsonl. `parent`, `dentry`: the hook's arguments, as values
+/// (a global function takes no BTF pointer: 5.15 refuses one).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_fim_unlink(parent: u64, dentry: u64) -> u64 {
+    // SAFETY: `should_emit` and `inode_from_dentry` read the kernel's objects
+    // through `bpf_probe_read_kernel` only, so a value that is no object is
+    // a failed read, never a fault (main.rs, "Unsafe code").
+    unsafe {
+        match should_emit(parent as *const c_void) {
             Some(key) => {
                 emit_drift(FIM_OP_DELETED, key);
             }
             _ => {}
         }
-        let dentry: *const c_void = ctx.arg(1);
-        if let Some(target_inode) = inode_from_dentry(dentry) {
+        if let Some(target_inode) = inode_from_dentry(dentry as *const c_void) {
             match should_emit(target_inode) {
                 Some(key) => {
                     emit_drift(FIM_OP_DELETED, key);
@@ -761,13 +847,8 @@ unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
                 _ => {}
             }
         }
-        // Lab PR 225: every unlink counts toward its process's unlink burst
-        // (the deletion of originals after an encrypted copy was written).
-        let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 1));
-        // Lot 322: the walk's per-task buffers, if it made them.
-        crate::open_sensor::forget_task();
-        0
     }
+    0
 }
 
 /// `inode_rename` observation — fires on `mv` involving a
@@ -776,29 +857,65 @@ unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
 /// rename events on the destination side.
 #[lsm(hook = "inode_rename")]
 pub fn fim_rename_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_rename_observe(&ctx) }
 }
 
+/// Lot 1.3 (S1, the stack gate of 448 bytes): as the unlink's — the FIM
+/// records and the open sensor's cache in [`nn_fim_rename`], then the two
+/// bursts and the walk's buffers, in the order the body had inline. The
+/// longest chain (into the unlink burst's walk) is 448 bytes instead of
+/// the verifier's whole 512.
 #[inline(always)]
 unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `arg_value` reads the hook's argument array with
+    // `bpf_probe_read_kernel` (a failed read is 0); the global functions take
+    // the arguments as plain values and read through them with the same
+    // helper (main.rs, "Unsafe code").
     unsafe {
-        // Kernel signature: (old_dir, old_dentry, new_dir,
-        // new_dentry). Four inodes to check — userland C4 dedups
-        // by (target_dev, target_ino, timestamp_ns) so duplicate
-        // emissions for the same rename don't flood the drift
-        // chain.
-        //
-        // Polish #3 — when the OLD dentry's inode is watched, emit
-        // a single combined event with `dest_dev` + `dest_ino` set
-        // to the NEW dir's inode key. Userland's drain resolves the
-        // dest key via InodePathMap so NN-L-FIM-010 can match the
-        // ransomware extension on the destination side. The OTHER
-        // three inode-checks (old_dir / new_dir / new_dentry) keep
-        // the C8 single-event emit path — dedup by
-        // (target_dev, target_ino, timestamp_ns) in userland.
-        let old_dentry: *const c_void = ctx.arg(1);
-        let new_dir: *const c_void = ctx.arg(2);
+        // Kernel signature: (old_dir, old_dentry, new_dir, new_dentry).
+        let old_dentry = arg_value(ctx, 1);
+        let new_dentry = arg_value(ctx, 3);
+        let _ = nn_fim_rename(arg_value(ctx, 0), old_dentry, arg_value(ctx, 2), new_dentry);
+        // Lot 282: a rename onto the name of an existing regular file destroys
+        // that file — an original replaced, counted as its unlink is (a name
+        // that did not exist has a negative dentry, and counts nothing).
+        let _ = crate::open_sensor::nn_unlink_burst(new_dentry);
+        // Lab PR 225: every rename counts toward its process's burst of
+        // renames to a new extension, wherever the file is.
+        let _ = crate::open_sensor::nn_rename_burst(old_dentry, new_dentry);
+        // Lot 322: the walk's per-task buffers, if the unlink burst made them.
+        crate::open_sensor::forget_task();
+        0
+    }
+}
+
+/// The rename's FIM records and the file-open sensor's directory-class
+/// cache (lot 1.3: a global function, off the program's chain into the
+/// bursts). Four inodes to check — userland C4 dedups by (target_dev,
+/// target_ino, timestamp_ns) so duplicate emissions for the same rename
+/// don't flood the drift chain.
+///
+/// Polish #3 — when the OLD dentry's inode is watched, emit a single
+/// combined event with `dest_dev` + `dest_ino` set to the NEW dir's inode
+/// key. Userland's drain resolves the dest key via InodePathMap so
+/// NN-L-FIM-010 can match the ransomware extension on the destination
+/// side. The OTHER three inode-checks (old_dir / new_dir / new_dentry) keep
+/// the C8 single-event emit path — dedup by (target_dev, target_ino,
+/// timestamp_ns) in userland. The arguments are the hook's, as values (a
+/// global function takes no BTF pointer: 5.15 refuses one).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_fim_rename(old_dir: u64, old_dentry: u64, new_dir: u64, new_dentry: u64) -> u64 {
+    // SAFETY: every read through the four values is `bpf_probe_read_kernel`
+    // (`inode_key`, `inode_from_dentry`, `should_emit`, the leaves' reads in
+    // the emitters), so a value that is no object is a failed read, never a
+    // fault; the ring's entries are written only between their reserve and
+    // their submit (main.rs, "Unsafe code").
+    unsafe {
+        let old_dentry = old_dentry as *const c_void;
+        let new_dir = new_dir as *const c_void;
+        let new_dentry = new_dentry as *const c_void;
         let new_dir_key = inode_key(new_dir).unwrap_or(NO_DEST);
         let old_inode_opt = inode_from_dentry(old_dentry);
         // Tappa 10.9 step 1: a moved directory invalidates the file-open
@@ -810,13 +927,10 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
             if let Some(key) = should_emit(old_inode) {
                 // Lab PR 225: with the new leaf, so userland names the file's
                 // new path, not the directory's.
-                let new_dentry_leaf: *const c_void = ctx.arg(3);
-                emit_drift_with_dest_leaf(FIM_OP_RENAMED, key, new_dir_key, new_dentry_leaf);
+                emit_drift_with_dest_leaf(FIM_OP_RENAMED, key, new_dir_key, new_dentry);
             }
         }
-
-        let old_dir: *const c_void = ctx.arg(0);
-        match should_emit(old_dir) {
+        match should_emit(old_dir as *const c_void) {
             Some(key) => {
                 emit_drift(FIM_OP_RENAMED, key);
             }
@@ -827,12 +941,10 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
                 // BUG-022 — a rename INTO a watched dir is a drop; carry the
                 // dest leaf (new_dentry, arg 3) so userland reconstructs the
                 // child path and normalizes this to a Created against it.
-                let new_dentry_for_child: *const c_void = ctx.arg(3);
-                emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry_for_child);
+                emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry);
             }
             _ => {}
         }
-        let new_dentry: *const c_void = ctx.arg(3);
         if let Some(new_inode) = inode_from_dentry(new_dentry) {
             match should_emit(new_inode) {
                 Some(key) => {
@@ -843,20 +955,8 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
                 _ => {}
             }
         }
-        // Lot 282: a rename onto the name of an existing regular file destroys
-        // that file — an original replaced, counted as its unlink is (a name
-        // that did not exist has a negative dentry, and counts nothing).
-        let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 3));
-        // Lab PR 225: every rename counts toward its process's burst of
-        // renames to a new extension, wherever the file is.
-        let _ = crate::open_sensor::nn_rename_burst(
-            crate::open_sensor::raw_arg(ctx, 1),
-            crate::open_sensor::raw_arg(ctx, 3),
-        );
-        // Lot 322: the walk's per-task buffers, if the unlink burst made them.
-        crate::open_sensor::forget_task();
-        0
     }
+    0
 }
 
 /// `inode_link` observation — fires on hardlink creation
@@ -869,12 +969,15 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
 /// new-link path (user-writable directories trip Critical).
 #[lsm(hook = "inode_link")]
 pub fn fim_link_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_link_observe(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's arguments, which the verifier types
+    // for `inode_link`; every read through them is `bpf_probe_read_kernel`
+    // (`inode_from_dentry`, `should_emit`, `emit_link`'s walk).
     unsafe {
         // Kernel signature: (old_dentry, new_dir, new_dentry).
         // The OLD dentry points at the source inode (the watched
@@ -917,7 +1020,11 @@ unsafe fn try_fim_link_observe(ctx: &LsmContext) -> i32 {
 /// ring drops it, counted as the drift records are.
 #[inline(always)]
 unsafe fn emit_link(key: InodeKey, new_dentry: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `raw` is the ring entry reserved below, `FimLinkRaw`-sized and
+    // ours until its submit: the path's slots are written at
+    // `i * OPEN_PATH_SLOT_LEN` for `i < OPEN_PATH_SLOTS`, inside its `path`.
+    // The dentries are read with `bpf_probe_read_kernel` (`read_ptr`,
+    // `key_of`), the names with the kernel string helper, a slot at most.
     unsafe {
         let mut entry = match FS_FIM_EVENTS.reserve::<FimLinkRaw>(0) {
             Some(e) => e,
@@ -987,6 +1094,7 @@ unsafe fn emit_link(key: InodeKey, new_dentry: *const u8) {
 /// constant remains checked in for future read/write-tier rules.
 #[lsm(hook = "file_open")]
 pub fn fim_file_open_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_file_open(&ctx) }
 }
 
@@ -997,6 +1105,8 @@ pub fn fim_file_open_observe(ctx: LsmContext) -> i32 {
 /// `sys_enter_openat` stays: FIM never depends on the sensor loading.
 #[lsm(hook = "file_open")]
 pub fn fim_file_open_sensor(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx.arg(0)` is the hook's `struct file *`, checked for null;
+    // the open sensor reads through it with the kernel's read helpers only.
     unsafe {
         let file: *const c_void = ctx.arg(0);
         if !file.is_null() {
@@ -1008,7 +1118,8 @@ pub fn fim_file_open_sensor(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg(0)` is the hook's `struct file *`; `observe_open_plain`
+    // reads through it with `bpf_probe_read_kernel` only.
     unsafe {
         // Kernel signature: (file).
         let file: *const u8 = ctx.arg(0);
@@ -1022,7 +1133,9 @@ unsafe fn try_fim_file_open(ctx: &LsmContext) -> i32 {
 /// falls back to it when it cannot read its windows.
 #[inline(always)]
 pub(crate) unsafe fn observe_open_plain(file: *const u8) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `f_inode` and `f_mode` are read with `bpf_probe_read_kernel` (an
+    // unreadable `f_mode` counts as a write, which reports); the key is
+    // looked up in the maps, nothing is written through `file`.
     unsafe {
         if let Some(inode) = inode_from_file(file as *const c_void) {
             match should_emit(inode) {
@@ -1052,12 +1165,15 @@ pub(crate) unsafe fn observe_open_plain(file: *const u8) {
 /// never fires (the BUG-023 root cause).
 #[lsm(hook = "file_permission")]
 pub fn fim_write_intent_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_write_intent_observe(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's `(file, mask)`; `f_inode` and
+    // `f_flags` are read with `bpf_probe_read_kernel`; the marker is a value
+    // copied out of the map (`get`) and inserted whole, never written in place.
     unsafe {
         // Kernel signature: (file, mask). Skip reads BEFORE any
         // kernel-pointer work — file_permission is a hot path.
@@ -1160,12 +1276,15 @@ unsafe fn try_fim_write_intent_observe(ctx: &LsmContext) -> i32 {
 /// attach point — the emit body ([`emit_drift_close`]) is reused.
 #[lsm(hook = "file_free_security")]
 pub fn fim_close_emit_observe(ctx: LsmContext) -> i32 {
+    // SAFETY: `ctx` is this program's own context, valid for the call.
     unsafe { try_fim_close_emit_observe(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_fim_close_emit_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg(0)` is the hook's `struct file *`, read through with
+    // `bpf_probe_read_kernel` only; the marker is copied out before it is
+    // removed, so no map value is used after its delete.
     unsafe {
         // Kernel signature: (file).
         let file: *const c_void = ctx.arg(0);
