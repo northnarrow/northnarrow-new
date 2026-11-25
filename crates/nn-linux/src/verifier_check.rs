@@ -88,7 +88,7 @@ const LAB_PROBE_PREFIX: &str = "probe_";
 const OBJECT_ENV: &str = "NN_VERIFIER_CHECK_OBJECT";
 const ONLY_ENV: &str = "NN_VERIFIER_CHECK_ONLY";
 /// The verifier's limit on the stack of a call chain (`MAX_BPF_STACK`).
-const MAX_BPF_STACK: u32 = 512;
+const MAX_BPF_STACK: u32 = verifier_headroom::STACK_LIMIT;
 
 /// Run the check and print the report; the process exit code.
 pub fn run() -> i32 {
@@ -378,11 +378,16 @@ fn execute() -> Result<bool> {
         .filter(|r| r.optional.is_none())
         .filter_map(|r| match &r.outcome {
             Outcome::Loaded {
-                verified, kprobe, ..
+                verified,
+                kprobe,
+                stack,
+                ..
             } => Some(Measured {
                 name: r.name.clone(),
                 info: *verified,
                 kprobe: *kprobe,
+                // lot 1.3 (F6): the stack gate reads the deepest chain
+                stack: stack.as_ref().map(|s| s.chain),
             }),
             _ => None,
         })
@@ -588,9 +593,21 @@ fn optional_reason(name: &str, section: &str, outcome: &Outcome) -> Option<Strin
 
 fn print_table(rows: &[Row]) {
     println!();
-    println!("| program | section | result | insns | processed | stack frame / chain | note |");
-    println!("|---|---|---|---:|---:|---|---|");
+    // lot 1.3 (F6): each program's share of the 900k gate, last (the
+    // columns before it keep their places)
+    println!(
+        "| program | section | result | insns | processed | stack frame / chain | note | of the 900k gate |"
+    );
+    println!("|---|---|---|---:|---:|---|---|---:|");
     for r in rows {
+        let share = match &r.outcome {
+            Outcome::Loaded {
+                verified, kprobe, ..
+            } => verified
+                .or(*kprobe)
+                .map_or_else(|| "n/a".to_string(), verifier_headroom::share_of_gate),
+            _ => "-".to_string(),
+        };
         let (insns, verified, stack, note) = match &r.outcome {
             Outcome::Loaded {
                 insns,
@@ -641,14 +658,15 @@ fn print_table(rows: &[Row]) {
             Outcome::Error(e) => ("-".into(), "-".into(), "-".into(), e.clone()),
         };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             r.name,
             r.section,
             r.verdict(),
             insns,
             verified,
             stack,
-            note.replace('|', "/")
+            note.replace('|', "/"),
+            share
         );
     }
 }
