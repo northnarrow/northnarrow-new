@@ -56,7 +56,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -765,7 +764,7 @@ fn build_signed_entry(
     agent_id: &[u8; 16],
     prev_hash: &str,
 ) -> Result<BaselineEntry> {
-    let ts = format_ts(Utc::now());
+    let ts = nn_evidence::time::now_micros();
     let mut entry = BaselineEntry {
         ts,
         path: draft.path.clone(),
@@ -811,10 +810,6 @@ fn compute_entry_hash(entry: &BaselineEntry) -> Result<[u8; 32]> {
     hasher.update(&body);
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(digest)
-}
-
-fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 // ── off-host verifier ───────────────────────────────────────────────

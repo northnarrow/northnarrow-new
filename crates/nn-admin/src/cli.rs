@@ -5120,9 +5120,7 @@ fn parse_since(s: &str) -> Option<u64> {
     if let Ok(n) = s.trim().parse::<u64>() {
         return Some(n);
     }
-    chrono::DateTime::parse_from_rfc3339(s.trim())
-        .ok()
-        .and_then(|t| u64::try_from(t.timestamp()).ok())
+    nn_evidence::time::parse_rfc3339(s.trim()).and_then(|t| u64::try_from(t.unix_seconds()).ok())
 }
 
 fn run_remediate_cmd(sub: RemediateCmd) -> ExitCode {

@@ -36,6 +36,10 @@
 # (xtask/tests/export_in_the_worker.rs: one rustls-webpki, rustls' own).
 # RUSTSEC-2023-0071 (Marvin): rsa 0.10.0 is its patched release.
 # RUSTSEC-2026-0387: crypto-bigint 0.7.11, patched from 0.7.6.
+#
+# Lot 1.6 (F11): RUSTSEC-2026-0543 (chrono 0.4.45, unmaintained; recorded
+# 2026-11-17) was dropped: chrono left all three lockfiles, its timestamps
+# went to jiff (crates/nn-evidence/src/time.rs, the text byte for byte).
 
 [advisories]
 ignore = [
@@ -62,22 +66,6 @@ ignore = [
     # Recorded: 2026-11-03
     # Expires: 2027-05-03
     "RUSTSEC-2024-0436",
-    # RUSTSEC-2026-0543: chrono 0.4.45, unmaintained. Found by this policy
-    #   (the advisory appeared on 2026-11-17, during the pre-alpha checks).
-    # Why: an unmaintained notice, not a vulnerability: no advisory names a
-    #   flaw in the locked version. It is used only to format and parse the
-    #   UTC timestamps of our own records and logs (default features off;
-    #   serde, std and clock), never to parse time strings from outside the
-    #   agent's own signed files. A replacement (jiff or time) changes the
-    #   evidence formats' timestamp code and is not safe to do before the
-    #   alpha.
-    # Owner: the maintainer.
-    # Re-check: the move to a maintained date crate after the alpha (a lot
-    #   of its own, with the golden evidence files compared byte for byte),
-    #   or any chrono advisory of kind vulnerability, which reopens it at once.
-    # Recorded: 2026-11-17
-    # Expires: 2027-02-17
-    "RUSTSEC-2026-0543",
 ]
 
 [output]

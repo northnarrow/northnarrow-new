@@ -187,9 +187,7 @@ fn net_resolve(
     let newest = body.lines().next().and_then(netflow_row_view);
     let qname = newest.as_ref().and_then(|r| r.resolved_hostname.clone());
     let queried_at_unix_ts = newest.as_ref().and_then(|r| {
-        chrono::DateTime::parse_from_rfc3339(&r.ts)
-            .ok()
-            .and_then(|t| u64::try_from(t.timestamp()).ok())
+        nn_evidence::time::parse_rfc3339(&r.ts).and_then(|t| u64::try_from(t.unix_seconds()).ok())
     });
     info!(
         target: "admin.net_resolve",

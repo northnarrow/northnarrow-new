@@ -146,10 +146,10 @@ fn a_refused_transition_is_written_late_in_order_with_its_time() {
 }
 
 /// Lab PR 249: a clock that stays where it is put.
-struct Held(Mutex<chrono::DateTime<chrono::Utc>>);
+struct Held(Mutex<nn_evidence::time::Timestamp>);
 
 impl nn_evidence::clock::Clock for Held {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+    fn now(&self) -> nn_evidence::time::Timestamp {
         *self.0.lock()
     }
 }
@@ -161,11 +161,7 @@ impl nn_evidence::clock::Clock for Held {
 /// (`ts`), each the clock's, and every row names the replayed agent.
 #[test]
 fn a_late_row_names_the_clocks_times_and_the_logs_pid() {
-    let at = |s: &str| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
-    };
+    let at = |s: &str| nn_evidence::time::parse_timestamp(s).unwrap();
     let clock = Arc::new(Held(Mutex::new(at("2026-01-01T00:05:02Z"))));
     let lab = Lab::stamped(crate::audit::AuditStamps {
         clock: clock.clone(),

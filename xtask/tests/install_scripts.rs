@@ -1499,7 +1499,7 @@ fn install_bait_dates_the_file_by_its_write_and_skips_an_unchanged_one() {
         let template = fs::read_to_string(&src).unwrap();
         assert!(template.lines().any(|l| l == "last_modified="), "{name}");
         let dst = case.join(name);
-        let before = chrono::Utc::now().timestamp();
+        let before = jiff::Timestamp::now().as_second();
         let (rc, out) = install_bait(&case, &src, &dst);
         assert_eq!(rc, 0, "{out}");
         assert!(out.contains("writing control-surface file"), "{out}");
@@ -1509,12 +1509,12 @@ fn install_bait_dates_the_file_by_its_write_and_skips_an_unchanged_one() {
             .find_map(|l| l.strip_prefix("last_modified="))
             .unwrap()
             .to_string();
-        let dated = chrono::DateTime::parse_from_rfc3339(&stamp)
-            .unwrap_or_else(|e| panic!("{name}: {stamp:?}: {e}"))
-            .timestamp();
+        let dated = nn_evidence::time::parse_rfc3339(&stamp)
+            .unwrap_or_else(|| panic!("{name}: {stamp:?}: not an RFC 3339 time"))
+            .unix_seconds();
         assert!(stamp.ends_with('Z') && stamp.len() == 20, "{stamp}");
         assert_eq!(dated, mtime_secs(&dst), "{name}: the date is the mtime");
-        assert!(dated >= before && dated <= chrono::Utc::now().timestamp());
+        assert!(dated >= before && dated <= jiff::Timestamp::now().as_second());
         let undated = |t: &str| {
             t.lines()
                 .filter(|l| !l.starts_with("last_modified="))
@@ -1767,7 +1767,7 @@ fn append(path: &Path, line: &str) {
 
 /// mtime `secs` seconds ago.
 fn age(p: &Path, secs: i64) {
-    let at = chrono::Utc::now().timestamp() - secs;
+    let at = jiff::Timestamp::now().as_second() - secs;
     let ok = Command::new("touch")
         .arg("-m")
         .arg("-d")

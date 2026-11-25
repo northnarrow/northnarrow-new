@@ -673,7 +673,7 @@ mod tests {
             Ok(&raw),
             &pk,
             None,
-            chrono::Utc::now(),
+            nn_evidence::time::Timestamp::now(),
             &nn_evidence::heartbeat::WatchConfig::default(),
         );
         assert!(r.alerts.is_empty(), "{r:?}");

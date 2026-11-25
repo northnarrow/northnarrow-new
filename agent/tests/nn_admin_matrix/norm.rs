@@ -344,8 +344,8 @@ pub fn times(s: &str, lo: u64, hi: u64) -> String {
         // An RFC 3339 time: 2026-10-29T12:34:56[.ffffff]Z
         if b[i].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
             if let Some(n) = rfc3339_at(&s[i..]) {
-                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&s[i..i + n]) {
-                    let secs = t.timestamp();
+                if let Some(t) = nn_evidence::time::parse_rfc3339(&s[i..i + n]) {
+                    let secs = t.unix_seconds();
                     if secs >= 0 && (lo..=hi).contains(&(secs as u64)) {
                         out.push_str("<now>");
                         i += n;

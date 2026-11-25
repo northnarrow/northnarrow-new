@@ -11,7 +11,9 @@ paths-ignore:
   - agent/tests
   - cli/tests
   - common/tests
+  - crates/nn-evidence/tests
   - crates/nn-export/tests
+  - crates/nn-proto/tests
   - scan/tests
   - watchdog/tests
   - xtask/tests

@@ -1942,7 +1942,7 @@ mod tests {
     }
 
     /// Lab PR 249: the head anchor's snapshot carries its clock's time —
-    /// the host's by default (between two readings of `Utc::now`), a clock
+    /// the host's by default (between two readings of `Timestamp::now`), a clock
     /// of the caller's with `with_clock` — and the snapshot verifies.
     #[test]
     fn the_head_snapshot_is_stamped_by_the_anchor_s_clock() {
@@ -1972,7 +1972,7 @@ mod tests {
         .unwrap();
         assert_eq!(read(&fixed).ts, "2026-01-01T00:00:42.000007Z");
         let host = dir.path().join("host_heads.json");
-        let before = crate::audit::format_ts(chrono::Utc::now());
+        let before = crate::audit::format_ts(crate::time::Timestamp::now());
         Anchor::new(
             host.clone(),
             key(&dir),
@@ -1983,7 +1983,7 @@ mod tests {
         )
         .refresh(true, false)
         .unwrap();
-        let after = crate::audit::format_ts(chrono::Utc::now());
+        let after = crate::audit::format_ts(crate::time::Timestamp::now());
         let ts = read(&host).ts;
         assert!(before <= ts && ts <= after, "{before} <= {ts} <= {after}");
     }

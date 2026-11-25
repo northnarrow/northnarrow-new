@@ -45,7 +45,7 @@ pub const CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// mode); one over `cap` bytes is truncated in place first.
 pub fn append_line(path: &Path, rules_removed: usize, cap: u64) -> std::io::Result<()> {
     let line = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": nn_evidence::time::format_rfc3339_offset(nn_evidence::time::Timestamp::now()),
         "event": "combat_reconcile",
         "reason": "stale_reconcile",
         "rules_torn_down": rules_removed,

@@ -149,10 +149,10 @@ serde = { version = "1", features = ["derive"] }
 # check (`chainlog::tests::every_shipped_payload_type_round_trips_byte_exactly`).
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
-# chrono: the evidence logs' UTC timestamps; clap: the command lines;
-# parking_lot: the agent's locks. (They came with Tappa 6, the on-host LLM
-# advisor removed in Wave 4, lab PR 214, and stayed with the rest.)
-chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+# clap: the command lines; parking_lot: the agent's locks. (They came with
+# Tappa 6, the on-host LLM advisor removed in Wave 4, lab PR 214, and stayed
+# with the rest.) The evidence logs' UTC timestamps, chrono's then, are
+# nn-evidence's `time` (jiff) since lot 1.6.
 clap = { workspace = true }
 parking_lot = "0.13"
 

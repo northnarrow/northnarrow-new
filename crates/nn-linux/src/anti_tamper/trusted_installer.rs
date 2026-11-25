@@ -345,18 +345,19 @@ impl TrustedInstallerOverride {
         // lie in the past: a test of an expired window).
         let deadline = now + window;
         let mono_now = self.clock.now();
-        let wall_now = chrono::DateTime::<chrono::Utc>::from(self.clock.wall());
+        let wall_now = nn_evidence::time::from_system_time(self.clock.wall());
+        let span = |d: Duration| nn_evidence::time::SignedDuration::try_from(d).unwrap_or_default();
         let wall = if deadline >= mono_now {
-            wall_now + chrono::Duration::from_std(deadline - mono_now).unwrap_or_default()
+            wall_now + span(deadline - mono_now)
         } else {
-            wall_now - chrono::Duration::from_std(mono_now - deadline).unwrap_or_default()
+            wall_now - span(mono_now - deadline)
         };
         {
             let mut inner = self.inner.lock();
             inner.deadline = Some(deadline);
             inner.grant = Some(WindowGrant {
                 key_id: key_id.to_string(),
-                expires_at: wall.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                expires_at: nn_evidence::time::format_secs(wall),
                 grantee: grantee.map(|(pid, start_ticks)| WindowGrantee {
                     pid,
                     start_ticks,

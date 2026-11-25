@@ -218,9 +218,7 @@ impl SinkRun {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-        .to_string()
+    nn_evidence::time::now_micros()
 }
 
 /// The host's name for RFC 5424 and OCSF's `device` (`-` if none fits).

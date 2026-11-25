@@ -60,5 +60,8 @@ pub mod os_rng;
 /// Lot 276: one signed row verified from its bytes alone (the export's
 /// receivers hold rows, not their types).
 pub mod row_verify;
+/// Lot 1.6 (F11): the wall-clock time and its text (jiff; chrono's text,
+/// byte for byte), for every crate that writes or reads a time.
+pub mod time;
 /// The full verifiers' bounded line reader (was the agent's `verify_lines`).
 pub mod verify_lines;

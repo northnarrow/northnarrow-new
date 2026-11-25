@@ -29,7 +29,12 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+# Lot 1.6 (F11): the wall-clock time and its text (`time`), chrono's
+# before (RUSTSEC-2026-0543, unmaintained). The only crate of the product
+# that names jiff: the others take its types from `nn_evidence::time`. No
+# default features: no time zone database, no OS time zone lookup (every
+# time here is UTC); `std` for `Timestamp::now` and `SystemTime`.
+jiff = { version = "1", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
 # R10 (lab PR 259): `os_rng`, the OS CSPRNG (rand 0.10's `SysRng`,
 # getrandom: portable, no OS crate named here), moved from nn-linux; the

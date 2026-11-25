@@ -116,9 +116,12 @@ about = "the backend (evidence gateway, then Director/TUF/SIEM); never linked in
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence"]
 planned = true
 
+# Lot 1.6: nn-evidence for xtask's tests only (a dev-dependency): they read
+# RFC 3339 times (security.txt, the install stamps) with the product's
+# reader, `nn_evidence::time`.
 [crates.xtask]
 about = "the workspace's task runner"
-allowed = ["ebpf-guard"]
+allowed = ["ebpf-guard", "nn-evidence"]
 planned = false
 
 [crates.northnarrow-cli]
@@ -257,7 +260,8 @@ planned = false
 # constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
 # Lot 341: today's records, counted by the detection store's writer (its
-# own crate's; chrono, nn-model, nn-proto, nn-core only).
+# own crate's; nn-evidence's time (lot 1.6, chrono's before), nn-model,
+# nn-proto, nn-core only).
 "records_today" = "nn-linux"
 # post-plan (lab PR 254, R09b): the exec guards' kernel configuration the
 # eBPF loader writes (nn-linux's `sensors::multiplexer::ExecGuards`), cut

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use nn_evidence::time::{Timestamp, civil, format_date, format_secs, from_utc, utc};
 use nn_model::Severity;
 use nn_proto::admin_protocol::RecordsToday;
 
@@ -18,8 +18,8 @@ use nn_core::response::profile::WOULD_HAVE_PREFIX;
 /// The counts of one UTC day.
 #[derive(Debug, Clone)]
 pub struct TodayCounts {
-    day: NaiveDate,
-    since: DateTime<Utc>,
+    day: civil::Date,
+    since: Timestamp,
     by_severity: [u64; 4],
     would_have: BTreeMap<String, u64>,
 }
@@ -50,9 +50,9 @@ pub fn would_have_action(response: &str) -> Option<&str> {
 
 impl TodayCounts {
     /// Counting from `start` (the agent's start).
-    pub fn new(start: DateTime<Utc>) -> Self {
+    pub fn new(start: Timestamp) -> Self {
         Self {
-            day: start.date_naive(),
+            day: utc(start).date(),
             since: start,
             by_severity: [0; 4],
             would_have: BTreeMap::new(),
@@ -60,21 +60,18 @@ impl TodayCounts {
     }
 
     /// A new UTC day starts the count again, from its midnight.
-    fn roll(&mut self, now: DateTime<Utc>) {
-        let today = now.date_naive();
+    fn roll(&mut self, now: Timestamp) {
+        let today = utc(now).date();
         if today != self.day {
             self.day = today;
-            self.since = today
-                .and_hms_opt(0, 0, 0)
-                .map(|t| t.and_utc())
-                .unwrap_or(now);
+            self.since = from_utc(today.at(0, 0, 0, 0)).unwrap_or(now);
             self.by_severity = [0; 4];
             self.would_have.clear();
         }
     }
 
     /// One record appended at `now`.
-    pub fn note(&mut self, now: DateTime<Utc>, severity: Severity, response: &str) {
+    pub fn note(&mut self, now: Timestamp, severity: Severity, response: &str) {
         self.roll(now);
         self.by_severity[slot(severity)] += 1;
         if let Some(action) = would_have_action(response) {
@@ -83,7 +80,7 @@ impl TodayCounts {
     }
 
     /// What `nn-admin status` shows, as of `now`.
-    pub fn snapshot(&mut self, now: DateTime<Utc>) -> RecordsToday {
+    pub fn snapshot(&mut self, now: Timestamp) -> RecordsToday {
         self.roll(now);
         let mut would_have: Vec<(String, u64)> = self
             .would_have
@@ -93,8 +90,8 @@ impl TodayCounts {
         // most first, then by name
         would_have.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         RecordsToday {
-            day: self.day.format("%Y-%m-%d").to_string(),
-            since: self.since.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            day: format_date(self.day),
+            since: format_secs(self.since),
             by_severity: SEVERITIES
                 .iter()
                 .zip(self.by_severity)
@@ -109,10 +106,13 @@ impl TodayCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn at(h: u32, m: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 13, h, m, 0).unwrap()
+    fn on(day: i8, h: i8, m: i8) -> Timestamp {
+        from_utc(civil::date(2026, 11, day).at(h, m, 0, 0)).unwrap()
+    }
+
+    fn at(h: i8, m: i8) -> Timestamp {
+        on(13, h, m)
     }
 
     /// Named (lot 341): today's records by severity, highest first, and the
@@ -153,7 +153,7 @@ mod tests {
     fn a_new_day_starts_the_count_again() {
         let mut c = TodayCounts::new(at(23, 0));
         c.note(at(23, 10), Severity::High, "would have: Quarantine");
-        let next = Utc.with_ymd_and_hms(2026, 11, 14, 0, 5, 0).unwrap();
+        let next = on(14, 0, 5);
         let s = c.snapshot(next);
         assert_eq!(s.day, "2026-11-14");
         assert_eq!(s.since, "2026-11-14T00:00:00Z");

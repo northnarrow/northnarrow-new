@@ -564,7 +564,9 @@ pub fn evaluate(inputs: &Inputs, log: Option<&str>, expected: &[ExpectedEntry]) 
         kernel: inputs.kernel.trim().to_string(),
         commit: inputs.commit.clone(),
         run_url: inputs.run_url.clone(),
-        generated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        generated_at: jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
         verdict: if reasons.is_empty() { "pass" } else { "fail" }.to_string(),
         reasons,
         exit_status: inputs.exit_status,
