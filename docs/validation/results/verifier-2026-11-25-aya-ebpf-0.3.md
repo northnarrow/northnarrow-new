@@ -322,6 +322,33 @@ No other chain crosses 448. The largest change below it is
 `execmap_check`, 384 → 416. Bringing the five under 448 is not this lot's:
 after the review of #618 the coordinator gave them to lots 1.3 and 1.4.
 
+## After the review of #618
+
+The review's fixes change two things in the object (sha256 `340d3f62…`):
+
+- `opaque::lsm_ret` fails closed. A positive verdict, which no path of
+  `exec_check_lsm` returns, came out as 0, an allow; it is now `-EACCES`,
+  the hook's refusal. 0 and `-EACCES` come out as before, and every value
+  comes out in `[-4095, 0]`
+  (`xtask/tests/ebpf_barriers.rs::lsm_ret_allows_only_zero_and_fails_closed`
+  runs the helper's own source on the host).
+- `nn_cgroup_exempt_walk` takes no argument instead of an unused one,
+  whose register the caller never set.
+
+`nn-lab.sh verifier-check synced` with this object, the same guests and
+agent build as above:
+
+| kernel | OK | failing | processed, all programs (branch above → after the review) | `exec_check_lsm` | `cgroup_join_mark` |
+|---|---:|---:|---|---|---|
+| 5.15 (`5.15.0-204-generic`) | 121 | 0 | 4,103,678 → 4,109,024 (+0.13 %) | 148,012 → 153,358 (17.0 % of the gate; frame 152 → 160 bytes, chain 384) | 72,225, unchanged |
+| 6.12 (`6.12.118+deb13-cloud-amd64`) | 124 | 0 | 2,429,817 → 2,429,454 (−0.01 %) | 106,751 → 106,388 (the exit range check passes) | 36,145, unchanged |
+
+No other program changes on either kernel: the totals move by exactly
+`exec_check_lsm`'s difference. The highest program is still
+`module_read_file_observe`, at 56.6 % of the gate on 5.15. 6.12 is one of
+the kernels that check an LSM program's exit range (the refusal this lot
+fixed on 6.8, 6.12 and 7.0); 6.1, 6.8 and 7.0 were not run again.
+
 ## The eBPF object as a CI artefact (F16)
 
 - ci.yml's `ebpf-build` job, after the build and its checks (map types,

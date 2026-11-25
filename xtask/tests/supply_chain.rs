@@ -1348,6 +1348,11 @@ fn the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own() {
     }
 }
 
+/// A shell's two quotes, double and single, the double one spelled as its
+/// code point: `path_liveness.rs` reads this file's string literals by
+/// their double quotes, and a bare one in a char literal shifts them.
+const QUOTES: [char; 2] = ['\u{22}', '\''];
+
 /// The lines of a workflow or script as the shell reads them: a trailing
 /// `\` joins the next line; a `#` comment (a `#` that starts a word,
 /// outside quotes) and a YAML step's `name:` are dropped.
@@ -1357,7 +1362,7 @@ fn shell_lines(text: &str) -> Vec<String> {
         for (at, c) in line.char_indices() {
             match (quote, c) {
                 (None, '#') if prev.is_whitespace() => return line[..at].to_string(),
-                (None, '"' | '\'') => quote = Some(c),
+                (None, c) if QUOTES.contains(&c) => quote = Some(c),
                 (Some(q), _) if c == q => quote = None,
                 _ => {}
             }
@@ -1395,7 +1400,7 @@ fn shell_lines(text: &str) -> Vec<String> {
 
 /// `tok` names the crate `krate`: `krate` or `krate@<version>`, quoted or not.
 fn names_crate(tok: &str, krate: &str) -> bool {
-    let t = tok.trim_matches(|c| c == '"' || c == '\'');
+    let t = tok.trim_matches(QUOTES);
     t == krate || t.starts_with(&format!("{krate}@"))
 }
 
@@ -1403,7 +1408,7 @@ fn names_crate(tok: &str, krate: &str) -> bool {
 /// +<toolchain> install` and a path to cargo too), unquoted, each to the
 /// shell's next operator.
 fn cargo_installs(line: &str) -> Vec<Vec<String>> {
-    let unquote = |t: &str| t.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let unquote = |t: &str| t.trim_matches(QUOTES).to_string();
     let toks: Vec<&str> = line.split_whitespace().collect();
     let mut out = Vec::new();
     let mut i = 0;
