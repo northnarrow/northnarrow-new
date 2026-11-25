@@ -82,6 +82,7 @@ mod inode_protect;
 mod io_uring;
 mod module_load;
 mod mount_guard;
+mod mount_setattr;
 mod open_sensor;
 mod ptrace_check;
 mod read_repeat;
