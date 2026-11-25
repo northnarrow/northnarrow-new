@@ -41,7 +41,10 @@ module_lock_observe
 module_read_file_observe
 module_write_observe
 mount_guard_move_mount
+mount_guard_move_mount_point
 mount_guard_sb_mount
+mount_guard_sb_mount_point
+mount_guard_sb_mount_propagate
 mount_guard_sb_pivotroot
 mount_guard_sb_remount
 mount_guard_sb_umount
