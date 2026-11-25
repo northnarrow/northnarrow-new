@@ -995,14 +995,27 @@ mod tests {
                 .expect("a finding");
             details.push(detail);
         }
-        assert!(details[0].contains("its re-creation 1 in this run"), "{}", details[0]);
-        assert!(details[1].contains("its re-creation 2 in this run"), "{}", details[1]);
+        assert!(
+            details[0].contains("its re-creation 1 in this run"),
+            "{}",
+            details[0]
+        );
+        assert!(
+            details[1].contains("its re-creation 2 in this run"),
+            "{}",
+            details[1]
+        );
         assert_ne!(details[0], details[1]);
         // a round that finds it in place keeps the count: the next one is
         // the third
         assert!(
-            k.round(&with(&lock_line("unbindable")), root, || unreachable!(), |_| {})
-                .is_none()
+            k.round(
+                &with(&lock_line("unbindable")),
+                root,
+                || unreachable!(),
+                |_| {}
+            )
+            .is_none()
         );
         let (_, third) = k
             .round(gone, root, || Outcome::Made(97), |_| {})

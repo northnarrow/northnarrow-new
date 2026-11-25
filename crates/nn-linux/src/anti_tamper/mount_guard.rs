@@ -79,7 +79,12 @@ const RECONF_PROGRAM: (&str, &str) = ("mount_guard_reconfigure", "reconfigure_su
 /// kernel refuses leaves its hook unattached (a signed degradation), never
 /// an entry that would let through what the stage judges.
 pub(crate) const STAGES: [(&str, &str, &str, u32); 3] = [
-    ("mount_guard_sb_mount_point", "sb_mount", SB_STAGES_MAP, STAGE_POINT),
+    (
+        "mount_guard_sb_mount_point",
+        "sb_mount",
+        SB_STAGES_MAP,
+        STAGE_POINT,
+    ),
     (
         "mount_guard_sb_mount_propagate",
         "sb_mount",
@@ -1380,9 +1385,9 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
         pin_root,
     ) {
         warn!(error = %format!("{e:#}"), "anti-tamper mount guard: propagation changes not counted at once");
-        health.degraded.push(format!(
-            "mount guard: {PROPAGATION_ABSENT_EFFECT} ({e:#})"
-        ));
+        health
+            .degraded
+            .push(format!("mount guard: {PROPAGATION_ABSENT_EFFECT} ({e:#})"));
     }
     if missing.is_empty() {
         info!(
@@ -2002,9 +2007,13 @@ mod tests {
 300 299 8:1 / / ro,relatime shared:90 master:1 - ext4 /dev/sda1 rw
 301 300 0:22 / /run rw,nosuid master:5 - tmpfs tmpfs rw
 ";
-        let u = held_in(&table(unit), &points(), GUARD_AGENT, &groups_of(unit.as_bytes()), &|d| {
-            Some((0x801, d.as_os_str().len() as u64))
-        });
+        let u = held_in(
+            &table(unit),
+            &points(),
+            GUARD_AGENT,
+            &groups_of(unit.as_bytes()),
+            &|d| Some((0x801, d.as_os_str().len() as u64)),
+        );
         let has = |group: u32, at: &str| {
             let (d, i) = held_root(group, 0x801, at.len() as u64);
             u.entries.iter().any(|(k, _)| (k.dev, k.ino) == (d, i))
@@ -2039,7 +2048,10 @@ mod tests {
         let mut slots = std::collections::HashSet::new();
         for (program, hook, array, slot) in STAGES {
             assert!(HOOKS.contains(&hook), "{program}");
-            assert!(program.starts_with(&format!("mount_guard_{hook}_")), "{program}");
+            assert!(
+                program.starts_with(&format!("mount_guard_{hook}_")),
+                "{program}"
+            );
             assert_eq!(stages_of(hook), Some(array), "{program}");
             assert!(slot < common::mount_guard::STAGE_SLOTS);
             assert!(slots.insert((array, slot)), "{array}[{slot}] twice");

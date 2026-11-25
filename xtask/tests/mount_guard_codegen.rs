@@ -151,9 +151,7 @@ fn the_lock_judge_reads_the_namespace_before_a_private_change_and_the_makers_ste
     // lot 1.1 (F8b-1): the maker and the shutdown asked of their global
     // functions (`nn_mount_lock_maker`, `nn_mount_shutdown_stage`)
     assert!(body.contains("lock_step_at(flags, on_lock, guard) && nn_mount_lock_maker() != 0"));
-    assert!(
-        body.contains("lock_shutdown_step(flags, on_lock) && nn_mount_shutdown_stage() != 0")
-    );
+    assert!(body.contains("lock_shutdown_step(flags, on_lock) && nn_mount_shutdown_stage() != 0"));
     assert!(
         !body.contains("lock_step(flags)"),
         "the maker's step anywhere"
@@ -285,9 +283,15 @@ fn the_split_hooks_judge_in_their_stages() {
             );
         }
         for judge in landing.iter().chain(judges) {
-            assert!(!b.contains(judge), "{entry} judges ({judge}): its stage does");
+            assert!(
+                !b.contains(judge),
+                "{entry} judges ({judge}): its stage does"
+            );
         }
-        assert!(b.contains("lands_guarded(o, "), "{entry}: the walk to the target");
+        assert!(
+            b.contains("lands_guarded(o, "),
+            "{entry}: the walk to the target"
+        );
     }
     for stage in [
         "unsafe fn try_sb_mount_point(",
@@ -303,7 +307,9 @@ fn the_split_hooks_judge_in_their_stages() {
         ("mount_guard_move_mount_point", "move_mount"),
     ] {
         assert!(
-            e.contains(&format!("#[lsm(hook = \"{hook}\")]\npub fn {program}(ctx: LsmContext)")),
+            e.contains(&format!(
+                "#[lsm(hook = \"{hook}\")]\npub fn {program}(ctx: LsmContext)"
+            )),
             "{program}"
         );
     }
@@ -321,11 +327,18 @@ fn the_split_hooks_judge_in_their_stages() {
         ("mount_guard_sb_mount_propagate", ()),
         ("mount_guard_move_mount_point", ()),
     ] {
-        assert!(u.contains(&format!("\"{program}\"")), "{program} not loaded");
+        assert!(
+            u.contains(&format!("\"{program}\"")),
+            "{program} not loaded"
+        );
     }
     let attach = &u[u.find("pub(crate) fn attach(").expect("attach")..];
-    let stages = attach.find("load_stages(ebpf, hook, btf)").expect("the stages loaded");
-    let entry = attach.find("load_lsm(ebpf, program, hook, btf, pin_root)").expect("the entry");
+    let stages = attach
+        .find("load_stages(ebpf, hook, btf)")
+        .expect("the stages loaded");
+    let entry = attach
+        .find("load_lsm(ebpf, program, hook, btf, pin_root)")
+        .expect("the entry");
     assert!(stages < entry, "an entry attached before its stages");
 }
 
@@ -342,14 +355,21 @@ fn a_roles_namespace_never_takes_pid_1s_entry() {
     ] {
         let b = &u[u.find(f).unwrap_or_else(|| panic!("{f} is gone"))..];
         let b = &b[..b.find("\n}\n").expect("its end")];
-        let ask = b.find("guards_own_namespace(inum, ").unwrap_or_else(|| panic!("{f} does not ask"));
-        let set = b.find("set_guarded(&mut nm, inum, ").unwrap_or_else(|| panic!("{f} sets nothing"));
+        let ask = b
+            .find("guards_own_namespace(inum, ")
+            .unwrap_or_else(|| panic!("{f} does not ask"));
+        let set = b
+            .find("set_guarded(&mut nm, inum, ")
+            .unwrap_or_else(|| panic!("{f} sets nothing"));
         assert!(ask < set, "{f}: set before asked");
     }
     let e = source("agent-ebpf/src/mount_guard.rs");
     let v = &e[e.find("pub(crate) fn vacate(").expect("vacate")..];
     let v = &v[..v.find("\n}\n").unwrap()];
-    assert!(v.contains("if vacates(inum, host) {"), "vacate drops any namespace");
+    assert!(
+        v.contains("if vacates(inum, host) {"),
+        "vacate drops any namespace"
+    );
 }
 
 /// Lot 1.1 (F8b-1): every hook decides with its operation a constant of
@@ -376,7 +396,10 @@ fn the_hooks_decide_with_their_operation_a_constant() {
             }
             let rest = &e[at + call.len()..];
             let op = &rest[..rest.find(',').expect("its operation")];
-            assert!(op.starts_with("MG_OP_"), "{call}{op}, …): not a literal operation");
+            assert!(
+                op.starts_with("MG_OP_"),
+                "{call}{op}, …): not a literal operation"
+            );
             // the function it is in made its query with that operation
             let start = e[..at]
                 .rfind("\nunsafe fn ")
@@ -393,7 +416,10 @@ fn the_hooks_decide_with_their_operation_a_constant() {
     assert!(n >= 8, "{n} decisions");
     let a = &e[e.find("fn answer_parts(").expect("answer_parts")..];
     let a = &a[..a.find("\n}\n").unwrap()];
-    assert!(a.starts_with("fn answer_parts(code: u16,"), "an answer from a Verdict");
+    assert!(
+        a.starts_with("fn answer_parts(code: u16,"),
+        "an answer from a Verdict"
+    );
     let c = source("common/src/mount_guard.rs");
     assert!(c.contains("pub fn decide(q: &Query) -> Verdict {\n    decide_as(q.op, q)\n}"));
 }
