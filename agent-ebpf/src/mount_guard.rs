@@ -532,7 +532,10 @@ pub extern "C" fn nn_mount_lock_maker() -> u64 {
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn nn_mount_emit(operation: u64, dev: u64, ino: u64) -> u64 {
-    crate::inode_protect::emit_attempt(operation as u8, InodeKey { dev, ino });
+    // the operation by name (the budgets' ratchet, `kernel_halves.rs`):
+    // this parameter, whose callers pass a named `FS_OP_*`
+    let operation = operation as u8;
+    crate::inode_protect::emit_attempt(operation, InodeKey { dev, ino });
     0
 }
 
@@ -1071,8 +1074,9 @@ fn answer_parts(code: u16, op: u8, key: InodeKey, view: u8, stack: u8) -> i32 {
         CODE_WINDOW => (FS_OP_MOUNT_WINDOW, 0),
         _ => (FS_OP_MOUNT_NOTED, 0),
     };
+    let operation = operation as u64;
     nn_mount_emit(
-        operation as u64,
+        operation,
         record_dev(key.dev, op, (code & 0xff) as u8, view, stack),
         key.ino,
     );

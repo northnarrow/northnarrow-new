@@ -103,7 +103,8 @@ pub(crate) const STAGES: [(&str, &str, &str, u32); 3] = [
 /// from 6.11 a tracing program tail-calls only a program of its own kernel
 /// function), pinned at each start after the entries (a program array is
 /// emptied when its last user reference goes) and held for the agent's
-/// life ([`hold_stages`]).
+/// life by the eBPF object's own descriptor of each (the sensor
+/// multiplexer owns the object, [`pin_stages`]).
 const SB_STAGES_MAP: &str = "MOUNT_SB_STAGES";
 const MOVE_STAGES_MAP: &str = "MOUNT_MOVE_STAGES";
 
@@ -1113,28 +1114,18 @@ fn stages_of(hook: &str) -> Option<&'static str> {
     STAGES.iter().find(|s| s.1 == hook).map(|s| s.2)
 }
 
-/// Lot 1.1: descriptors of the stages' program arrays, held for the
-/// agent's life — a program array is emptied when its last user reference
-/// goes (its pin removed or hidden, the bpffs's last mount gone), and an
-/// entry's tail call then finds no stage.
-static HELD_STAGES: std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = std::sync::Mutex::new(Vec::new());
-
-/// Lot 1.1: `array` held ([`HELD_STAGES`]) and, with a pin root, pinned
-/// there in place of a prior start's — after this start's entry is
-/// attached, whose purge retired the prior entry that used the prior array.
-fn hold_stages(ebpf: &mut Ebpf, array: &str, pin_root: Option<&Path>) -> Result<()> {
-    use std::os::fd::AsFd;
+/// Lot 1.1: `array`, with a pin root, pinned there in place of a prior
+/// start's — after this start's entry is attached, whose purge retired the
+/// prior entry that used the prior array. A program array is emptied when
+/// its last user reference goes (its pin removed or hidden, the bpffs's
+/// last mount gone), and an entry's tail call then finds no stage: while
+/// the agent runs, the eBPF object (`ebpf`, the sensor multiplexer's, kept
+/// for the agent's life) holds its own descriptor of the array, a user
+/// reference of its own — an explicit handle, no process-wide copy.
+fn pin_stages(ebpf: &mut Ebpf, array: &str, pin_root: Option<&Path>) -> Result<()> {
     let map = ebpf
         .map_mut(array)
         .ok_or_else(|| anyhow!("map {array} missing from the eBPF object"))?;
-    let own = super::bpf_defense::map_data(map)
-        .fd()
-        .as_fd()
-        .try_clone_to_owned()
-        .with_context(|| format!("holding {array}"))?;
-    if let Ok(mut h) = HELD_STAGES.lock() {
-        h.push(own);
-    }
     if let Some(root) = pin_root {
         let path = root.join(array);
         antitamper_bpf::purge_stale_pin(&path);
@@ -1339,11 +1330,11 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
         match loaded.and_then(|array| {
             load_lsm(ebpf, program, hook, btf, pin_root)?;
             if let Some(array) = array {
-                if let Err(e) = hold_stages(ebpf, array, pin_root) {
+                if let Err(e) = pin_stages(ebpf, array, pin_root) {
                     health.degraded.push(format!(
-                        "mount guard: {hook}'s stages are not pinned or held — after the \
-                         agent's exit its entry finds no stage and lets the mounts through, \
-                         counted ({e:#})"
+                        "mount guard: {hook}'s stages are not pinned — after the agent's \
+                         exit its entry finds no stage and lets the mounts through, counted \
+                         ({e:#})"
                     ));
                 }
             }
