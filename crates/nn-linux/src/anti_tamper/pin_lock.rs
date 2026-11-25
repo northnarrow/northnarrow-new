@@ -540,6 +540,10 @@ pub struct Keeper {
     skip: u32,
     /// The last failed round's finding, signed again while waiting.
     last: Option<(&'static str, String)>,
+    /// Lot 1.1 (the re-check 1 of #569, (b)): the re-creations made in this
+    /// run — named in each one's finding, so that each is a High of its
+    /// own (the same text within NN-AUD-114's 600 s would be held back).
+    remade: u32,
 }
 
 impl Keeper {
@@ -598,6 +602,7 @@ impl Keeper {
             State::InPlace(_) => {
                 *self = Keeper {
                     seen: true,
+                    remade: self.remade,
                     ..Keeper::default()
                 };
                 return None;
@@ -621,12 +626,14 @@ impl Keeper {
             pause(REMAKE_PAUSE * tries);
         };
         let outcome = if out.in_place() {
+            let remade = self.remade.saturating_add(1);
             *self = Keeper {
                 seen: true,
+                remade,
                 ..Keeper::default()
             };
             format!(
-                "made again: {} (attempt {tries} of {REMAKE_TRIES})",
+                "made again: {} (attempt {tries} of {REMAKE_TRIES}), its re-creation {remade} in this run",
                 out.line()
             )
         } else {
@@ -966,6 +973,34 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Named test (lot 1.1, the re-check 1 of #569, (b)): each re-creation
+    /// of the lock in a run is a finding of its own text — its count in the
+    /// run — so a second loss and remake within NN-AUD-114's 600 s is a
+    /// High of its own, not one held back as the same. Failed on main: the
+    /// two details were the same text.
+    #[test]
+    fn each_re_creation_of_the_lock_is_a_finding_of_its_own() {
+        let root = Path::new(ROOT);
+        let gone = BASE.as_bytes();
+        let mut k = Keeper {
+            seen: true,
+            ..Keeper::default()
+        };
+        let mut details = Vec::new();
+        for _ in 0..2 {
+            let (_, detail) = k
+                .round(gone, root, || Outcome::Made(96), |_| {})
+                .expect("a finding");
+            details.push(detail);
+        }
+        assert!(details[0].contains("its re-creation 1 in this run"), "{}", details[0]);
+        assert!(details[1].contains("its re-creation 2 in this run"), "{}", details[1]);
+        assert_ne!(details[0], details[1]);
+        // a round that finds it in place keeps the count
+        let _ = k.round(gone, root, || Outcome::Made(97), |_| {});
+        assert_eq!(k.remade, 3);
     }
 
     /// Named test (the review of #569, F5): a round whose attempts all fail

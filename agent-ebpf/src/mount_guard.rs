@@ -214,7 +214,8 @@ pub(crate) fn vacate(role_slot: u32) {
 /// helper writes zeros on a fault; see `task_scratch::peek_u64`).
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the helper writes all 8 bytes of `v` (the value, or zeros on a fault) before
+    // `assume_init`; `src` may be any kernel address
     unsafe {
         let mut v = core::mem::MaybeUninit::<u64>::uninit();
         let _ =
@@ -225,7 +226,8 @@ unsafe fn peek_u64(src: *const u8) -> u64 {
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the helper writes all 4 bytes of `v` (the value, or zeros on a fault) before
+    // `assume_init`; `src` may be any kernel address
     unsafe {
         let mut v = core::mem::MaybeUninit::<u32>::uninit();
         let _ =
@@ -236,7 +238,8 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
 
 #[inline(always)]
 unsafe fn peek_ptr(src: *const u8) -> *const u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: a read through `peek_u64`; the address is only ever passed back to
+    // `bpf_probe_read_kernel`, never dereferenced
     unsafe {
         peek_u64(src) as *const u8
     }
@@ -353,7 +356,9 @@ struct Caller {
 /// (the agent attaches the hooks only with every one resolved).
 #[inline(always)]
 unsafe fn caller(hook: u32) -> Option<Caller> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the current task, its `nsproxy`, `mnt_ns`, `cred` and `user_ns` are every kernel
+    // address is read through `bpf_probe_read_kernel`, which copies from any address and writes
+    // zeros on a fault (never a trap); the map values are valid for the program's run
     unsafe {
         let host_mnt = *MOUNT_GUARD_CONF.get(0)?;
         if host_mnt == 0 {
@@ -409,7 +414,8 @@ unsafe fn caller(hook: u32) -> Option<Caller> {
 /// parent is not PID 1 running it).
 #[inline(always)]
 unsafe fn shutdown_stage() -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the current task and its parent are read through `bpf_probe_read_kernel` (a fault
+    // reads zeros: not the shutdown); the map value is valid for the run
     unsafe {
         let task = bpf_get_current_task() as *const u8;
         let leader = if (bpf_get_current_pid_tgid() >> 32) == 1 {
@@ -447,7 +453,8 @@ unsafe fn shutdown_stage() -> bool {
 /// steps.
 #[inline(always)]
 unsafe fn lock_maker_now() -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the current task, its parent and start time are read through
+    // `bpf_probe_read_kernel` (a fault reads zeros: not the maker)
     unsafe {
         let pid_tgid = bpf_get_current_pid_tgid();
         let tgid = (pid_tgid >> 32) as u32;
@@ -472,7 +479,8 @@ unsafe fn lock_maker_now() -> bool {
 /// A kernel thread (`PF_KTHREAD`): the emergency remount of `SysRq-u`.
 #[inline(always)]
 unsafe fn kernel_thread() -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the current task's flags are read through `bpf_probe_read_kernel` (a fault reads
+    // zeros: not a kernel thread)
     unsafe {
         let task = bpf_get_current_task() as *const u8;
         peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET))) & PF_KTHREAD != 0
@@ -486,7 +494,8 @@ unsafe fn kernel_thread() -> bool {
 /// namespace) — `GUARD_HOST`, `GUARD_AGENT`, `GUARD_WATCHDOG`, or 0.
 #[inline(always)]
 unsafe fn guard_of(o: &Offs, real: *const u8) -> u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the mount's namespace and its number are read through `bpf_probe_read_kernel` (a
+    // fault reads 0, a number no namespace has)
     unsafe {
         let inum = peek_u32(peek_ptr(real.add(o.mnt_ns as usize)).add(o.mnt_ns_inum as usize)) as u64;
         match MOUNT_GUARD_NS.get(&inum) {
@@ -702,7 +711,8 @@ fn subtree_takes(o: &Offs, real: *const u8) -> u64 {
 /// bytes of stack).
 #[inline(never)]
 unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the place's dentries are read through `bpf_probe_read_kernel` (`place_key`); the
+    // map look-up takes the key by value
     unsafe {
         let (dev, ino) = place_key(o, m, group);
         MOUNT_HELD.get(&InodeKey { dev, ino }).is_some() as u64
@@ -713,7 +723,8 @@ unsafe fn held_at(o: &Offs, m: *const u8, group: u32) -> u64 {
 /// parent directory and name) under the peer group `group`.
 #[inline(always)]
 unsafe fn place_key(o: &Offs, m: *const u8, group: u32) -> (u64, u64) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the mountpoint, its parent and its name are read through `bpf_probe_read_kernel`
+    // (a fault reads zeros: a key no place has)
     unsafe {
         let place = peek_ptr(m.add(o.mnt_mountpoint as usize));
         let dir = key_of(o, peek_ptr(place.add(o.d_parent as usize)));
@@ -729,7 +740,8 @@ unsafe fn place_key(o: &Offs, m: *const u8, group: u32) -> (u64, u64) {
 /// own sysfs at `$T/sys`.
 #[inline(always)]
 unsafe fn parent_held_like(o: &Offs, m: *const u8) -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the parent link is read through `bpf_probe_read_kernel`; a NULL or self parent is
+    // the namespace's root
     unsafe {
         let up = peek_ptr(m.add(o.mnt_parent as usize));
         if up.is_null() || up == m {
@@ -742,7 +754,8 @@ unsafe fn parent_held_like(o: &Offs, m: *const u8) -> bool {
 /// The `MOUNT_HELD` flags of a mount (a `struct mount`) by its id.
 #[inline(always)]
 unsafe fn held_flags(o: &Offs, real: *const u8) -> u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the mount id is read through `bpf_probe_read_kernel`; the map value is copied out
+    // while valid
     unsafe {
         let (dev, ino) = held_by_id(peek_u32(real.add(o.mnt_id as usize)));
         match MOUNT_HELD.get(&InodeKey { dev, ino }) {
@@ -757,7 +770,10 @@ unsafe fn held_flags(o: &Offs, real: *const u8) -> u8 {
 /// (0, 0), which no point has.
 #[inline(always)]
 unsafe fn key_of(o: &Offs, dentry: *const u8) -> InodeKey {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the inode, its super block, device, number and btrfs root are every kernel
+    // address is read through `bpf_probe_read_kernel`, which copies from any address and writes
+    // zeros on a fault (never a trap); an unreadable dentry is the key (0, 0), which no point
+    // has
     unsafe {
         let inode = peek_ptr(dentry.add(o.d_inode as usize));
         let sb = peek_ptr(inode.add(o.i_sb as usize));
@@ -783,7 +799,7 @@ unsafe fn key_of(o: &Offs, dentry: *const u8) -> InodeKey {
 /// The protected flags of a dentry (0 for none or unreadable).
 #[inline(always)]
 unsafe fn flags_at(key: &InodeKey) -> u8 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the map value is copied out while valid for the program's run
     unsafe {
         match MOUNT_PROTECTED.get(key) {
             Some(f) => *f,
@@ -795,7 +811,8 @@ unsafe fn flags_at(key: &InodeKey) -> u8 {
 /// The magic of a dentry's file system (0 when unreadable).
 #[inline(always)]
 unsafe fn magic_of(o: &Offs, dentry: *const u8) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the inode and its super block are read through `bpf_probe_read_kernel` (a fault
+    // reads 0, no file system's magic)
     unsafe {
         let inode = peek_ptr(dentry.add(o.d_inode as usize));
         let sb = peek_ptr(inode.add(o.i_sb as usize));
@@ -808,7 +825,9 @@ unsafe fn magic_of(o: &Offs, dentry: *const u8) -> u64 {
 /// into a zeroed 16-byte buffer (it stops at the name's NUL).
 #[inline(always)]
 unsafe fn name_of(o: &Offs, dentry: *const u8, out: &mut NameKey) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the name's length and pointer are read through `bpf_probe_read_kernel`; the
+    // string copy writes at most 16 bytes into the zeroed `words` (its size), whose bytes are
+    // then read as `[u8; 16]`
     unsafe {
         let qstr = dentry.add(o.d_name as usize);
         out.len = peek_u32(qstr.add(o.qstr_len as usize));
@@ -831,7 +850,8 @@ unsafe fn name_of(o: &Offs, dentry: *const u8, out: &mut NameKey) {
 /// into `out`, as [`name_of`] reads a name; its length the copy's.
 #[inline(always)]
 unsafe fn string_key(s: *const u8, out: &mut NameKey) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the string copy writes at most 16 bytes into `buf` (its size) from any kernel
+    // address, a fault an error
     unsafe {
         *out = NameKey::NONE;
         if s.is_null() {
@@ -854,7 +874,8 @@ unsafe fn string_key(s: *const u8, out: &mut NameKey) {
 /// `out`.
 #[inline(always)]
 unsafe fn fstype_of(o: &Offs, dentry: *const u8, out: &mut NameKey) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the super block, its type and the type's name pointer are read through
+    // `bpf_probe_read_kernel`; the name is copied by `string_key`
     unsafe {
         let (Some(o_type), Some(o_name)) = (
             off_opt!(SUPER_BLOCK_S_TYPE_OFFSET),
@@ -886,7 +907,10 @@ unsafe fn point_of(
     q: &mut Query,
     out: &mut InodeKey,
 ) -> bool {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the path, the mounts stacked at its dentry, the dentries up to their file
+    // system's root and their names are every kernel address is read through
+    // `bpf_probe_read_kernel`, which copies from any address and writes zeros on a fault (never
+    // a trap); each walk is bounded (`MAX_STACK`, `MAX_WALK`)
     unsafe {
         let host = q.host;
         let p = &mut q.point;
@@ -977,7 +1001,8 @@ unsafe fn point_of(
 /// that root's key.
 #[inline(always)]
 unsafe fn mount_root_flags(o: &Offs, mnt: *const u8) -> (u8, InodeKey) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the mount's root dentry is read through `bpf_probe_read_kernel`; its key by
+    // `key_of`
     unsafe {
         let root = peek_ptr(mnt.add(o.mnt_root as usize));
         let key = key_of(o, root);
@@ -1301,7 +1326,9 @@ pub(crate) fn propagation_change(m: *const u8) {
 /// slaves, a guarded one among them, to another master).
 #[inline(always)]
 unsafe fn note_propagation_change(ctx: &LsmContext) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the path, its mount and the
+    // propagation links are every kernel address is read through `bpf_probe_read_kernel`, which
+    // copies from any address and writes zeros on a fault (never a trap)
     unsafe {
         let Some(o) = Offs::load() else {
             return;
@@ -1344,7 +1371,9 @@ fn lock_propagation(path: *const u8, flags: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the path, its mount, root and parent are every kernel address is read through
+    // `bpf_probe_read_kernel`, which copies from any address and writes zeros on a fault (never
+    // a trap); the task reads are `lock_maker_now`'s and `shutdown_stage`'s
     unsafe {
         let Some(c) = caller(hook::SB_MOUNT) else {
             return 0;
@@ -1428,7 +1457,8 @@ const LOCK_WINDOW: u64 = 2;
 /// out-of-line judge's chain at 5.15's and 6.8's 512 bytes of stack.
 #[inline(always)]
 unsafe fn lock_answer(path: *const u8, r: u64) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the path's mount and root are read through `bpf_probe_read_kernel`; the record is
+    // signed from the stack
     unsafe {
         let Some(o) = Offs::load() else {
             return 0;
@@ -1641,7 +1671,9 @@ pub fn mount_guard_sb_umount(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the mount, its parent, root
+    // and subtree are every kernel address is read through `bpf_probe_read_kernel`, which
+    // copies from any address and writes zeros on a fault (never a trap)
     unsafe {
         let Some(c) = caller(hook::SB_UMOUNT) else {
             return 0;
@@ -1757,7 +1789,8 @@ pub fn mount_guard_sb_pivotroot(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the new root's dentry is read
+    // through `bpf_probe_read_kernel`
     unsafe {
         let Some(c) = caller(hook::SB_PIVOTROOT) else {
             return 0;
@@ -1820,7 +1853,9 @@ pub fn mount_guard_sb_remount(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_sb_remount(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the super block's device and
+    // magic are read through `bpf_probe_read_kernel`; the reconfigure's entry is copied out
+    // while valid
     unsafe {
         let Some(c) = caller(hook::SB_REMOUNT) else {
             return 0;
