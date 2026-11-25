@@ -334,6 +334,44 @@ fn a_fallback_that_never_runs_is_not_taken_on_the_tracepoint_s_marks() {
     assert!(old.seen.is_empty());
 }
 
+/// The boot's order, fail-safe (the review of #625): a test of one CPU
+/// alone stops at "not proven" before any fallback is armed (P2-2); the
+/// fallback is probed in its own row (P2-1); the switch to it is made
+/// before the tracepoint is retired, and a switch that fails keeps the
+/// tracepoint — the only attach point that records is never the one
+/// removed (P3-5).
+#[test]
+fn the_boot_switches_before_it_retires_and_never_on_one_cpu() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("NN_REPO_ROOT"))
+            .join("crates/nn-linux/src/sensors/exec/every_cpu.rs"),
+    )
+    .unwrap();
+    let body = program_body(&src, "on_every_cpu");
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("on_every_cpu: {needle}"))
+    };
+    let first = at("probe(ebpf, sensor, Point::Tracepoint, &cpus, ROUND_TRACEPOINT)");
+    let not_proven = at("Verdict::NotProven => {");
+    let stop = at("return Taken::NotProven;");
+    let arm = at("attach_fallback(ebpf, sensor)");
+    let second = at("probe(ebpf, sensor, Point::Fallback, &cpus, ROUND_FALLBACK)");
+    let switch = at("if let Err(e) = set_emitter(ebpf, sensor, Point::Fallback) {");
+    let kept = at("return Taken::Partial;");
+    let retire = at("retire_tracepoint(ebpf, guard, tp)");
+    assert!(
+        first < not_proven && not_proven < stop && stop < arm && arm < second,
+        "{first} {not_proven} {stop} {arm} {second}"
+    );
+    assert!(
+        second < switch && switch < kept && kept < retire,
+        "{second} {switch} {kept} {retire}"
+    );
+    assert_eq!(body.matches("retire_tracepoint(").count(), 1);
+    assert_eq!(body.matches("set_emitter(").count(), 1);
+}
+
 /// Four attach points, four rows, each inside the map; two emitter slots.
 #[test]
 fn every_attach_point_has_its_own_row() {
