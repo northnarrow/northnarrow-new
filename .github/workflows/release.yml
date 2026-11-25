@@ -198,8 +198,9 @@ jobs:
       # lockfiles) at the same checkout path, and two clean builds of one
       # tree give one sha256: the two are expected equal. Not compared here:
       # this job compiles the dependency tree and holds no token that reads
-      # another run's artefacts (SUP-003). Comparing them is the
-      # maintainer's step before tagging.
+      # another run's artefacts (SUP-003). Comparing them by hand before a
+      # tag is not yet a step of CONTRIBUTING.md's release procedure (docs
+      # lot 1.9).
       - name: eBPF object sha256 (compare with ci.yml's ebpf-object)
         run: |
           sha=$(sha256sum agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf | cut -d' ' -f1)

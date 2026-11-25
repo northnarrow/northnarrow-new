@@ -237,6 +237,8 @@ jobs:
       # second holds agent-ebpf/Cargo.lock (SUP-016). Lot 1.2 (F16): the
       # object's sha256 goes into the evidence, comparable with ci.yml's
       # artefact `ebpf-object` of the same commit (the object CI tested).
+      # This job builds its own and compares nothing: loading the artefact
+      # here, and checking its sha256, is lot 1.10's.
       - name: Build the eBPF object and xtask on the host
         if: steps.kvm.outputs.available == 'true'
         id: host

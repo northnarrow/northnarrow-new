@@ -84,9 +84,10 @@ static EXECUTOR_IDS: HashMap<InodeKey, u32> = HashMap::with_max_entries(EXECUTOR
 /// `fork`/`clone`, also with `CLONE_PARENT`, whose `real_parent` is not it).
 #[btf_tracepoint(function = "sched_process_fork")]
 pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
-    // aya-ebpf 0.3: `ctx.arg` is a safe read of the tracepoint's argument
-    // array; the two pointers are only dereferenced through
-    // `bpf_probe_read_kernel` below.
+    // `ctx.arg` is a safe read of the tracepoint's argument array (in
+    // aya-ebpf 0.2.1 already: the `unsafe` blocks here were unused); the
+    // two pointers are only dereferenced through `bpf_probe_read_kernel`
+    // below.
     let parent: *const u8 = ctx.arg(0);
     let child: *const u8 = ctx.arg(1);
     if parent.is_null() || child.is_null() {

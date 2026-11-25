@@ -5,8 +5,10 @@ Lot 1.2 (stage S1, the old 400b) builds the eBPF programs with aya-ebpf
 aya-build 0.2.1 instead of 0.2.1 and 0.2.0. Both need rustc 1.98, so the
 eBPF crate's nightly moves from `nightly-2025-12-01` (rustc 1.93, LLVM
 21.1.5) to `nightly-2026-08-05` (rustc 1.99, LLVM 22.1.8), with the same
-bpf-linker 0.10.3. The source changes for aya-ebpf 0.3 are two (a map key
-by reference, `ctx.arg` no longer `unsafe`); the code LLVM 22 generates from
+bpf-linker 0.10.3. The source change for aya-ebpf 0.3 is one: a map key
+by reference. `fork_parent.rs` also drops two `unsafe` blocks around
+`ctx.arg`, which was a safe function in aya-ebpf 0.2.1 already (they were
+the build's two `unused_unsafe` warnings). The code LLVM 22 generates from
 the same source is not the same, and four programs no longer loaded. This
 file is the evidence that the new object keeps the rules of
 [`KERNEL_COMPATIBILITY.md`](../../operator/KERNEL_COMPATIBILITY.md)
@@ -46,7 +48,7 @@ budget after #617's split.
 |---|---|---|---|---|
 | `sched_process_exec`, `sched_process_exec_nostdio` (`main.rs`) | all five | `R1 min value is outside of the allowed memory range` (a 65,535-byte read into a 256-byte field) | the clamp of the filename's length tested on the whole `__data_loc` word (`data_loc > 0x100ffff`), the size shifted out of another copy | the length through `opaque::opaque`, then the clamp: the test is on the register the size is taken from |
 | `exec_check_lsm`, `execmap_check` (`execq::level_name`) | all five (`exec_check_lsm`: 5.15, 6.1) | `math between map_value pointer and register with unbounded min value` | the callers' `levels` in 2..=64 tested on a copy (`levels - 2 > 62`), and the `& 63` / `& 15` masks dropped as redundant | `level` through `opaque::opaque`: both masks stay, on the register of the slot's offset |
-| `exec_check_lsm` (`exec_lsm.rs`) | 6.8, 6.12, 7.0 | `At program exit the register R0 has smax=… should have been in [-4095, 0]` | the policy's verdict folded into `-(deny & 1) & -EACCES`, which 6.12's verifier reads as any value | the verdict through `opaque::lsm_ret`: clamped to `[-4095, 0]` on the register returned (0 and `-EACCES` come out as they went in) |
+| `exec_check_lsm` (`exec_lsm.rs`) | 6.8, 6.12, 7.0 | `At program exit the register R0 has smax=… should have been in [-4095, 0]` | the policy's verdict folded into `-(deny & 1) & -EACCES`, which 6.12's verifier reads as any value | the verdict through `opaque::lsm_ret`: brought into `[-4095, 0]` on the register returned (0 and `-EACCES` come out as they went in), failing closed: a positive value, which no path returns, is `-EACCES` (it was 0 before the review of #618) |
 | `cgroup_join_mark` (`cgroup_join::exempt_destination`) | 5.15 | 987,382 instructions, over the 900,000 budget (207,446 on `main`) | each of a byte's three ways through the path walk laid out with its own copy of the loop's bound test, the last component's lookup moved into the loop's exit | the walk is a global function, `nn_cgroup_exempt_walk` (rule 6), checked once on its own; its verdict comes back through the buffer's first 8 bytes, so a hash of 0 stays a hash |
 | `common::mount_guard::allowed_kernel_mount`, `umount_below` | 5.15, 6.1 (`check_cfg`) | a fall-through back-edge (`no_function_has_a_back_edge_the_5_15_verifier_rejects`) | the loop's latch laid out above the header it fell through into | the list walked from its end, and the bound's test closing the loop: the same verdicts |
 
@@ -304,7 +306,7 @@ the growth as a share of the 900k gate.
   more than 1.6 % of the gate on any of the five kernels.
 - On 6.12, `cgroup_join_mark` grows from 25,555 to 36,145. That is the
   walk's own check, once, over all 256 bytes, counted with the program. On
-  5.15 the same change takes it from 207,446 to 72,701.
+  5.15 the same change takes it from 207,446 to 72,225.
 
 ## Stack
 
@@ -317,18 +319,27 @@ five programs, on every kernel. The branch has the same five:
   both. `tcp_close`'s own frame is 440 → 448 bytes; the chain is the same.
 
 No other chain crosses 448. The largest change below it is
-`execmap_check`, 384 → 416. Bringing the five under 448 is the work of the
-lots that own those files.
+`execmap_check`, 384 → 416. Bringing the five under 448 is not this lot's:
+after the review of #618 the coordinator gave them to lots 1.3 and 1.4.
 
 ## The eBPF object as a CI artefact (F16)
 
 - ci.yml's `ebpf-build` job, after the build and its checks (map types,
   back-edges), writes `northnarrow-agent-ebpf.sha256` and uploads the
   object, its `.buildhash` stamp and the sha256 as the artefact
-  `ebpf-object`. The lab and a reviewer load that object instead of
-  building one by hand:
-  `gh run download <run> -n ebpf-object -D agent-ebpf/target/bpfel-unknown-none/release`,
-  then `nn-lab.sh verifier-check synced` (this file's method).
+  `ebpf-object` (`gh run download <run> -n ebpf-object`): the object CI
+  tested, by its sha256.
+- The lab does not load that artefact yet. `nn-lab.sh sync` runs
+  `cargo xtask build-ebpf` on the host before it copies the tree to the
+  guest, so cargo can rebuild over a downloaded object (a fresh tree,
+  changed sources), and `verifier-check synced` loads the guest's synced
+  copy. Each report names the sha256 of the object it loaded; this file's
+  method copied `main`'s object over the synced one by hand. The branch's
+  object measured here (`d9f2ae7e…`, built in the lot's worktree) is not
+  byte for byte CI's: the checkout path is in its `.rodata` and debug
+  info, and the review of #618 found the instructions otherwise the same.
+  Loading the artefact in the lab, and checking its sha256 where it is
+  used, belongs to lot 1.10 (`nn-lab.sh`, lab-vm.yml).
 - release.yml's `package` job prints the sha256 of the object it embeds.
   lab-vm.yml's guest job keeps the sha256 of the object its guest loads in
   its evidence (`ebpf-object.sha256`).
@@ -336,11 +347,14 @@ lots that own those files.
   clean builds of `main`'s tree at one path give one sha256 (`4be2def0…`
   both times). CI and the release share the checkout path and every pin:
   the nightly, bpf-linker and both lockfiles. So the two sha256s are
-  expected to be equal. Nothing compares them but the maintainer before a
-  tag: the `package` job compiles the dependency tree and holds no token
-  that reads another run's artefacts (SUP-003). lab-vm.yml still builds its
-  own object. Reusing the artefact there needs `nn-lab.sh sync` to accept a
-  prebuilt object.
+  expected to be equal, and on this lot's PR they were: the release dry
+  run embedded `a9de2b0a…`, the sha256 of CI's artefact, built on another
+  runner. Nothing compares them automatically: the `package` job compiles
+  the dependency tree and holds no token that reads another run's
+  artefacts (SUP-003), and the comparison by hand before a tag is not yet
+  in CONTRIBUTING.md's release procedure (docs lot 1.9). lab-vm.yml still
+  builds its own object. Reusing the artefact there needs `nn-lab.sh sync`
+  to accept a prebuilt object (lot 1.10).
 - `xtask/tests/supply_chain.rs::the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own`
   holds all of this, and one bpf-linker version in every workflow.
 

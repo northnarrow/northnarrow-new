@@ -12,6 +12,11 @@
 
 mod support;
 
+// The helpers' own source, built for the host: `lsm_ret`'s verdicts are run,
+// not only read (the review of #618).
+#[path = "../../agent-ebpf/src/opaque.rs"]
+mod opaque;
+
 use std::fs;
 
 use support::{matching_brace, repo_root, strip_comments};
@@ -55,14 +60,80 @@ fn the_barrier_and_the_lsm_verdict_clamp() {
         "the barrier is a volatile read of the local"
     );
     assert!(o.contains("const MAX_ERRNO: i64 = 4095;"));
+    assert!(o.contains("const EACCES: i32 = 13;"));
     in_order(
         body(&o, "lsm_ret"),
         &[
             "let v = opaque(i64::from(v));",
-            "if v > 0 {\n        0\n    } else if v < -MAX_ERRNO {\n        -(MAX_ERRNO as i32)\n    } else {\n        v as i32\n    }",
+            "if v > 0 {\n        -EACCES\n    } else if v < -MAX_ERRNO {\n        -(MAX_ERRNO as i32)\n    } else {\n        v as i32\n    }",
         ],
     )
     .unwrap();
+}
+
+/// The review of #618 (P3-2): `lsm_ret` fails closed. A positive verdict,
+/// which no deny hook returns, came out as 0, an allow; it is the hook's
+/// refusal, `-EACCES`. Every verdict comes out in `[-4095, 0]`, the range
+/// the verifier allows at an LSM program's exit, and only 0 allows. The
+/// helper's own source, run on the host.
+#[test]
+fn lsm_ret_allows_only_zero_and_fails_closed() {
+    use opaque::lsm_ret;
+    // what the hook returns: 0 and its refusal, unchanged
+    assert_eq!(lsm_ret(0), 0);
+    assert_eq!(lsm_ret(-13), -13);
+    // any other -errno, unchanged
+    for v in [-1, -2, -4094, -4095] {
+        assert_eq!(lsm_ret(v), v, "{v}");
+    }
+    // positive: no deny hook returns one; the hook's refusal, never 0
+    for v in [1, 2, 13, 4095, 4096, i32::MAX] {
+        assert_eq!(lsm_ret(v), -13, "{v}");
+    }
+    // below -MAX_ERRNO: -MAX_ERRNO, a refusal still
+    for v in [-4096, -100_000, i32::MIN + 1, i32::MIN] {
+        assert_eq!(lsm_ret(v), -4095, "{v}");
+    }
+    // every value: in the exit range, and 0 only from 0
+    for v in (-10_000..=10_000).chain([i32::MIN, i32::MAX]) {
+        let r = lsm_ret(v);
+        assert!((-4095..=0).contains(&r), "{v} -> {r}");
+        assert_eq!(r == 0, v == 0, "{v} -> {r}");
+    }
+}
+
+/// `lsm_ret`'s refusal is `exec_check_lsm`'s: its one caller is that hook,
+/// whose refusals (the exec policy's, the quarantine's) are `-EACCES`. A
+/// deny hook with another errno returning through it would turn an
+/// impossible positive verdict into the wrong errno: it gets its own.
+#[test]
+fn lsm_ret_is_the_exec_hooks_and_its_refusal_is_that_hooks_errno() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    support::rs_files(&root.join("agent-ebpf/src"), &mut files);
+    let mut calls = Vec::new();
+    for f in &files {
+        let rel = f
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let n = code(&rel).matches("lsm_ret(").count();
+        if rel != "agent-ebpf/src/opaque.rs" && n > 0 {
+            calls.push((rel, n));
+        }
+    }
+    assert_eq!(
+        calls,
+        vec![("agent-ebpf/src/exec_lsm.rs".to_string(), 1)],
+        "lsm_ret's one caller is exec_check_lsm"
+    );
+    for f in ["agent-ebpf/src/execpol.rs", "agent-ebpf/src/execq.rs"] {
+        assert!(
+            code(f).contains("const EACCES: i32 = 13;"),
+            "{f}: the exec hook's refusal is -EACCES"
+        );
+    }
 }
 
 /// The three sites LLVM 22 broke, each with its barrier before the test

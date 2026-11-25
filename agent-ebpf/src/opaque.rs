@@ -31,17 +31,25 @@ pub(crate) fn opaque<T: Copy>(v: T) -> T {
 /// `errno` at most this.
 const MAX_ERRNO: i64 = 4095;
 
-/// The verdict an LSM program returns, in the range the verifier allows
-/// at its exit, `[-MAX_ERRNO, 0]`, tested on the register returned. The
-/// programs return 0 or a `-errno` of `aya_ebpf::bindings` (EACCES, EPERM):
-/// those come out as they went in. The clamp is never reached by them; it
-/// is there for the verifier, to which a verdict computed without branches
-/// (`-(deny & 1) & -EACCES`) is any value.
+/// The refusal of the deny hook that returns through [`lsm_ret`],
+/// `exec_check_lsm`: the exec policy's and the quarantine's `-EACCES`
+/// (`execpol.rs`, `execq.rs`, each its own local constant, as here).
+const EACCES: i32 = 13;
+
+/// The verdict a deny hook's LSM program returns, in the range the
+/// verifier allows at its exit, `[-MAX_ERRNO, 0]`, tested on the register
+/// returned. The hook returns 0 or its refusal, `-EACCES`: those come out
+/// as they went in. The other two branches are never reached by them; they
+/// are there for the verifier, to which a verdict computed without
+/// branches (`-(deny & 1) & -EACCES`) is any value, and they fail closed
+/// (the review of #618): a positive value, which no deny hook returns, is
+/// the hook's refusal, not an allow, and one below `-MAX_ERRNO` is
+/// `-MAX_ERRNO`, a refusal still. Only 0 allows.
 #[inline(always)]
 pub(crate) fn lsm_ret(v: i32) -> i32 {
     let v = opaque(i64::from(v));
     if v > 0 {
-        0
+        -EACCES
     } else if v < -MAX_ERRNO {
         -(MAX_ERRNO as i32)
     } else {

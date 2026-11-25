@@ -18,8 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Lab PR 233: aya-ebpf 0.2 (helpers::generated, RetProbeContext::ret -> T).
-# Lot 1.2 (400b): aya-ebpf 0.3 (map lookups take the key by reference,
-# `ctx.arg` is safe) and its build dependency aya-build 0.2.1, both rustc
+# Lot 1.2 (400b): aya-ebpf 0.3 (map lookups take the key by reference)
+# and its build dependency aya-build 0.2.1, both rustc
 # 1.98: the nightly of rust-toolchain.toml moved with them (1.99, still
 # LLVM 22 for bpf-linker 0.10.3).
 aya-ebpf = "0.3"

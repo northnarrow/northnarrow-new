@@ -550,7 +550,7 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
         // budget), 6.12's from +65 %. The walk's verdict is the same; it
         // comes back through the buffer's first 8 bytes, so a hash of 0
         // stays a hash.
-        if nn_cgroup_exempt_walk(0) == 0 {
+        if nn_cgroup_exempt_walk() == 0 {
             return None;
         }
         Some(u64::from_le_bytes(core::ptr::read_volatile(
@@ -562,14 +562,18 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
 /// [`exempt_destination`]'s walk over the path in [`CGROUP_JOIN_PATH`]
 /// (read whole, its NUL inside the buffer): 1 when a name matches, its hash
 /// then written over the buffer's first 8 bytes, 0 otherwise. A global
-/// function with an integer argument (`KERNEL_COMPATIBILITY` "Older
-/// verifiers", rule 6): the 5.15 verifier checks the loop once, apart from
-/// the program's states. The loop keeps no counter and branches on no value
-/// it knows: its states stay a few per byte (lot 277's lab: a component
-/// length counted per byte took it past a million instructions).
+/// function with no argument (`KERNEL_COMPATIBILITY` "Older verifiers",
+/// rule 6; `task_scratch::nn_share_key` is another): the 5.15 verifier
+/// checks the loop once, apart from the program's states. No argument
+/// rather than an unused one (the review of #618): the compiler does not
+/// set an unused argument's register, and a pointer the caller left in it
+/// is not the scalar the verifier checks it for ("R1 is not a scalar", rule
+/// 6). The loop keeps no counter and branches on no value it knows: its
+/// states stay a few per byte (lot 277's lab: a component length counted
+/// per byte took it past a million instructions).
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn nn_cgroup_exempt_walk(_slot: u64) -> u64 {
+pub extern "C" fn nn_cgroup_exempt_walk() -> u64 {
     // SAFETY: the per-CPU buffer this CPU's program just filled (the
     // program is not preempted between the read and this call: the
     // tracepoint runs with preemption off, `xtask/tests/percpu_maps.rs`);

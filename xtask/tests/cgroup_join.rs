@@ -202,12 +202,12 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
             "CGROUP_EXEMPT_NAMES.get(&0).is_some()",
             "bpf_probe_read_kernel_str(",
             "match path_read(n) {\n            PathRead::Unread | PathRead::Cut => return Some(0),\n            PathRead::Whole => {}\n        }",
-            "if nn_cgroup_exempt_walk(0) == 0 {\n            return None;\n        }",
+            "if nn_cgroup_exempt_walk() == 0 {\n            return None;\n        }",
             "Some(u64::from_le_bytes(core::ptr::read_volatile(\n            buf as *const [u8; 8],\n        )))",
         ],
     )
     .unwrap();
-    assert!(j.contains("#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn nn_cgroup_exempt_walk(_slot: u64) -> u64 {"));
+    assert!(j.contains("#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn nn_cgroup_exempt_walk() -> u64 {"));
     in_order(
         body(&j, "nn_cgroup_exempt_walk"),
         &[
