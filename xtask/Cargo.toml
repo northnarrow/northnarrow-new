@@ -41,6 +41,16 @@ serde_yaml_ng = "0.10"
 # install stamps) with the product's own reader, `nn_evidence::time`
 # (chrono's grammar, which they used before).
 nn-evidence = { workspace = true }
+# Lot 1.7a (S1, item F12): the ratchets read the sources as Rust, parsed
+# (`tests/support/ast.rs`), not as text: a rustfmt line break, a value held
+# in a `const` or a variable, parentheses, an array, an import alias or a
+# macro's body no longer hides a site. All three are in Cargo.lock already
+# (syn 3 for bytemuck's derive, proc-macro2 and quote under both syns), the
+# versions the lock holds; `span-locations` gives a site its line (a test
+# build's own feature: the product's proc macros are built apart).
+syn = { version = "3", default-features = false, features = ["full", "visit", "visit-mut", "parsing", "printing", "clone-impls", "extra-traits"] }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+quote = { version = "1", default-features = false }
 
 [lints]
 workspace = true
