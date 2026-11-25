@@ -84,11 +84,17 @@ static EXECUTOR_IDS: HashMap<InodeKey, u32> = HashMap::with_max_entries(EXECUTOR
 /// `fork`/`clone`, also with `CLONE_PARENT`, whose `real_parent` is not it).
 #[btf_tracepoint(function = "sched_process_fork")]
 pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
-    let parent: *const u8 = unsafe { ctx.arg(0) };
-    let child: *const u8 = unsafe { ctx.arg(1) };
+    // `ctx.arg` is a safe read of the tracepoint's argument array (in
+    // aya-ebpf 0.2.1 already: the `unsafe` blocks here were unused); the
+    // two pointers are only dereferenced through `bpf_probe_read_kernel`
+    // below.
+    let parent: *const u8 = ctx.arg(0);
+    let child: *const u8 = ctx.arg(1);
     if parent.is_null() || child.is_null() {
         return 0;
     }
+    // SAFETY (the reads below): `bpf_probe_read_kernel` of a task's field at
+    // an offset of the live BTF; a fault reads nothing and returns early.
     let Ok(parent_tgid) = (unsafe {
         bpf_probe_read_kernel::<u32>(parent.add(off!(TASK_STRUCT_TGID_OFFSET)) as *const _)
     }) else {
@@ -121,6 +127,8 @@ pub fn fork_parent_record(ctx: BtfTracePointContext) -> i32 {
     let own = if leader.is_null() {
         None
     } else {
+        // SAFETY: the map's value, copied out at once (an LRU entry may be
+        // evicted after the lookup; the copy is what is read).
         unsafe { FORK_PARENTS.get(&(leader as u64)).map(|r| (r.start, r.used != 0, r.anchor)) }
     };
     let rec = ForkParent {

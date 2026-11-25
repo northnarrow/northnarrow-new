@@ -159,8 +159,8 @@ fn the_fim_sensor_past_the_watch_is_global_functions() {
     );
 }
 
-/// 2. Every global function of the eBPF object: `u64` arguments, a `u64`
-///    back.
+/// 2. Every global function of the eBPF object: `u64` arguments, each
+///    used, a `u64` back.
 #[test]
 fn every_global_function_takes_and_returns_plain_values() {
     let mut files = Vec::new();
@@ -183,7 +183,9 @@ fn every_global_function_takes_and_returns_plain_values() {
                 .split(',')
                 .map(str::trim)
                 .filter(|a| !a.is_empty())
-                .all(|a| a.ends_with(": u64"))
+                // an unused argument (`_x: u64`) is a register the caller
+                // never sets (the review of #618): none, rather
+                .all(|a| a.ends_with(": u64") && !a.starts_with('_'))
                 && ret.trim() == "-> u64";
             if !plain {
                 bad.push(format!("{}: {name}({params}){ret}", p.display()));
@@ -194,7 +196,7 @@ fn every_global_function_takes_and_returns_plain_values() {
     assert!(seen >= 20, "{seen} global functions found");
     assert!(
         bad.is_empty(),
-        "global functions with other than u64:\n{}",
+        "global functions with other than used u64 arguments and a u64 back:\n{}",
         bad.join("\n")
     );
 }

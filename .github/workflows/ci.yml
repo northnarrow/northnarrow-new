@@ -264,12 +264,15 @@ jobs:
       # used to be installed here was never used. Keep the version
       # PINNED: 0.11.0 dropped the proxy and needs a system LLVM 21+
       # (`-lLLVM` link failure on ubuntu-24.04, which ships LLVM 18).
-      # 0.10.3 is also the version the reference lab runs.
+      # 0.10.3 is also the version the reference lab runs. Lot 1.2: the
+      # nightly is the last with LLVM 22 (agent-ebpf/rust-toolchain.toml),
+      # whose LLVM the proxy's `rust-llvm-22` loads; a nightly with LLVM 23
+      # needs a bpf-linker without the proxy and a system LLVM 23.
       - name: Install nightly Rust + rust-src for build-std
         # Same channel as agent-ebpf/rust-toolchain.toml, so rustup
         # does not have to download it again at build time.
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install nightly-2026-08-05 --profile minimal --component rust-src
           rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
 
       - name: Install bpf-linker (pinned)
@@ -329,6 +332,37 @@ jobs:
           out=$(cargo test --locked -p nn-linux --lib sensors::ebpf_object::tests -- --exact sensors::ebpf_object::tests::no_function_has_a_back_edge_the_5_15_verifier_rejects sensors::ebpf_object::tests::the_back_edge_emulation_tells_a_fallthrough_from_a_jump 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           grep -q '^test result: ok\. 2 passed; 0 failed' <<< "$out" || { echo "::error::the 2 check_cfg tests did not both run"; exit 1; }
+
+      # Lot 1.2 (F16): the object this job built and checked is kept, with
+      # its build stamp and its sha256 (`gh run download <run> -n
+      # ebpf-object`), so every other build of it can be compared with the
+      # one CI tested. What happens today: release.yml rebuilds the object
+      # and prints the sha256 of the one it embeds (on lot 1.2's dry run it
+      # was this artefact's, byte for byte). The lab rebuilds too:
+      # `nn-lab.sh sync` builds the object on the host before it copies it
+      # to the guest, `verifier-check synced` loads that copy, and the
+      # report and lab-vm.yml's evidence record its sha256. Nothing loads
+      # this artefact in the lab or checks its sha256 where it is used: that
+      # is lot 1.10's (nn-lab.sh, lab-vm.yml). Same pins, same checkout
+      # path: the build is reproducible (two clean builds of a tree give one
+      # sha256).
+      - name: eBPF object sha256
+        run: |
+          cd agent-ebpf/target/bpfel-unknown-none/release
+          sha256sum northnarrow-agent-ebpf > northnarrow-agent-ebpf.sha256
+          cat northnarrow-agent-ebpf.sha256
+          echo "eBPF object: \`$(cut -d' ' -f1 northnarrow-agent-ebpf.sha256)\` (artefact \`ebpf-object\`)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the eBPF object (artefact ebpf-object)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ebpf-object
+          path: |
+            agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
+            agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.buildhash
+            agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.sha256
+          if-no-files-found: error
+          retention-days: 30
 
   fuzz:
     name: fuzz (smoke, nightly)

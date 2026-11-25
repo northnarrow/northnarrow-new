@@ -1,7 +1,19 @@
 # The eBPF program needs nightly because the bpfel-unknown-none target
 # is tier-3 and ships no prebuilt artifacts; we build core/alloc from
 # source via -Zbuild-std. Userland (parent workspace) stays on stable.
+#
+# Lot 1.2 (400b): aya-ebpf 0.3 (and aya-build 0.2.1, its build dependency)
+# need rustc 1.98. nightly-2026-08-05 is rustc 1.99.0-nightly (1ed2df61a
+# 2026-08-04) with LLVM 22.1.8: the last nightly before rustc moved to
+# LLVM 23 (rust-lang/rust#158734, merged 2026-08-05), so bpf-linker 0.10.3
+# still links with rustc's own LLVM through its `rust-llvm-22` proxy: no
+# system LLVM, on the runners or in the lab, and the one bpf-linker every
+# workflow already installs. A nightly with LLVM 23 needs bpf-linker 0.11
+# or later and a system LLVM 23 (apt.llvm.org on the runners: a third
+# party's packages in every build), and its codegen measured on the five
+# kernels again: a lot of its own. The fuzz job builds with this nightly
+# too (lot 400a).
 [toolchain]
-channel = "nightly-2025-12-01"
+channel = "nightly-2026-08-05"
 components = ["rust-src", "rustfmt", "clippy"]
 profile = "minimal"

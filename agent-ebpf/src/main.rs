@@ -83,6 +83,7 @@ mod io_uring;
 mod module_load;
 mod mount_guard;
 mod mount_setattr;
+mod opaque;
 mod open_sensor;
 mod ptrace_check;
 mod read_repeat;
@@ -215,7 +216,13 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
         Err(_) => 0,
     };
     let f_off = (data_loc & 0xFFFF) as usize;
-    let mut f_len = ((data_loc >> 16) & 0xFFFF) as usize;
+    // Lot 1.2: the length goes through the stack, so the clamp below is a
+    // test on the register the read's size is taken from. LLVM 22 tested
+    // the whole `__data_loc` word instead (`data_loc > 0x100ffff`) and
+    // shifted another copy for the size: the verifier saw a size of up to
+    // 65,535 bytes and refused both exec programs on 5.15 and 6.12 (`R1
+    // min value is outside of the allowed memory range`).
+    let mut f_len = crate::opaque::opaque((data_loc >> 16) & 0xFFFF) as usize;
     if f_len > FILENAME_LEN {
         f_len = FILENAME_LEN;
         // External audit EBPF-021: the string (with its NUL) did not fit;
@@ -223,9 +230,11 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
         unsafe { (*raw_ptr).trunc_flags |= spawn_trunc::FILENAME };
     }
     if f_off != 0 && f_len != 0 {
-        // SAFETY: the tracepoint context pointer is valid kernel memory
-        // for the lifetime of this callback; bpf_probe_read_kernel_buf
-        // is the verified way to read from it.
+        // SAFETY: `f_len` is at most FILENAME_LEN (the clamp above, on the
+        // register the size is taken from), the destination the record's
+        // `filename` of FILENAME_LEN bytes; the source, at the tracepoint's
+        // `__data_loc` offset, is read through bpf_probe_read_kernel_buf
+        // (a fault reads nothing, the zeroed field stays).
         let base = ctx.as_ptr() as *const u8;
         let src = unsafe { base.add(f_off) };
         // Read straight into the (already zeroed) ring-buffer entry: a

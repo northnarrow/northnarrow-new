@@ -150,6 +150,44 @@ fn every_action_is_pinned_by_full_commit_sha() {
     );
 }
 
+/// SUP-005, one install: its own words name `--version` and `--locked`.
+fn install_is_pinned_and_locked(args: &[String]) -> bool {
+    let version = args.iter().enumerate().any(|(n, a)| {
+        (a == "--version" && args.get(n + 1).is_some_and(|v| !v.starts_with('-')))
+            || a.strip_prefix("--version=").is_some_and(|v| !v.is_empty())
+    });
+    version && args.iter().any(|a| a == "--locked")
+}
+
+/// The review of #618's mini-hunt: SUP-005 read a line from its first
+/// `cargo install` to its end, so a second install's flags pinned the first.
+#[test]
+fn every_cargo_install_on_a_line_is_judged_by_its_own_flags() {
+    let judge = |line: &str| -> Vec<bool> {
+        shell_lines(line)
+            .iter()
+            .flat_map(|l| cargo_installs(l))
+            .map(|a| install_is_pinned_and_locked(&a))
+            .collect()
+    };
+    assert_eq!(judge("cargo install foo --version 1.2.3 --locked"), [true]);
+    assert_eq!(judge("cargo install --locked --version=1.2.3 foo"), [true]);
+    assert_eq!(
+        judge("cargo install foo && cargo install bar --version 1.2.3 --locked"),
+        [false, true]
+    );
+    assert_eq!(
+        judge("cargo install foo --version 1.2.3; cargo install bar --locked"),
+        [false, false]
+    );
+    assert_eq!(
+        judge("cargo install --locked \\\n  foo --version 1.2.3\n"),
+        [true]
+    );
+    assert_eq!(judge("cargo install --version --locked foo"), [false]);
+    assert_eq!(judge("cargo +nightly install foo --locked"), [false]);
+}
+
 /// SUP-005: `cargo install` without `--version` takes whatever crates.io
 /// serves that day; `--locked` pins the tool's own dependencies.
 #[test]
@@ -173,6 +211,19 @@ fn every_cargo_install_names_a_version_and_is_locked() {
                 || !cmd.contains("--locked")
             {
                 bad.push(format!("{}:{}: {}", rel(&file), n + 1, line.trim()));
+            }
+        }
+        // and each install by its own words (the review of #618's
+        // mini-hunt): a second install on the line lent the first its
+        // flags, and a continued line was read in halves
+        for line in shell_lines(&read(&file)) {
+            for args in cargo_installs(&line) {
+                if args.first().is_some_and(|a| a == "--list") {
+                    continue;
+                }
+                if !install_is_pinned_and_locked(&args) {
+                    bad.push(format!("{}: {}", rel(&file), line.trim()));
+                }
             }
         }
     }
@@ -1036,9 +1087,11 @@ fn job_lines<'a>(text: &'a str, name: &str) -> Vec<(usize, &'a str)> {
 /// VM jobs install it, so the object CI and the release build is the one
 /// the lab measured with that compiler; a job left on another date builds
 /// another object. The fuzz job's own: its harness builds the agent, whose
-/// aya 0.16 and aya-obj 0.6 need rustc 1.98, above the eBPF nightly's 1.93
-/// — lot 400a moved the fuzz job alone, the eBPF crate's nightly moves with
-/// aya-ebpf 0.3 (lot 400b). Every dated nightly of the fuzz job (install,
+/// aya 0.16 and aya-obj 0.6 need rustc 1.98 — lot 400a moved the fuzz job
+/// alone, from the eBPF nightly's 1.93; lot 1.2 (400b) moved the eBPF
+/// crate's with aya-ebpf 0.3, to the same date (one download serves both
+/// on a runner), and the two may move apart again. Every dated nightly of
+/// the fuzz job (install,
 /// lockfile check, build, list) is the fuzz channel, and the fuzz README
 /// names that one; every other dated nightly of the workflows and the CI
 /// scripts is the eBPF crate's.
@@ -1147,6 +1200,377 @@ fn every_dated_nightly_is_its_jobs_channel() {
     assert_eq!(
         rows("jobs:\n  fuzz:\n    y: 1\nenv:\n  fuzz: 2\n"),
         vec![1, 2]
+    );
+}
+
+/// Lot 1.2 (F16): the eBPF object CI tests is kept, and every other build
+/// of it names its own. ci.yml's ebpf-build job writes the object's sha256
+/// after the build and its checks, and uploads the object with its build
+/// stamp and that sha256 (artefact `ebpf-object`), the one CI tested.
+/// release.yml's package job rebuilds the object and prints the sha256 of
+/// the one it embeds, and lab-vm.yml's guest job keeps the sha256 of the
+/// one its guest loads in its evidence. The lab does not load the
+/// artefact: `nn-lab.sh sync` rebuilds the object on the host and
+/// `verifier-check synced` loads the guest's synced copy (its report names
+/// the sha256). Loading the artefact there and checking its sha256 is lot
+/// 1.10's. All three build it alike: the nightly is one channel
+/// (`every_dated_nightly_is_its_jobs_channel`), and every `cargo install
+/// bpf-linker` of the workflows pins one version, the one xtask's and the
+/// lab's hints name. The gap, documented in release.yml: the release
+/// rebuilds the object (a build is reproducible: two clean builds of one
+/// tree at one path give one sha256), and nothing compares its sha256 with
+/// the artefact's but a maintainer by hand — the package job holds no
+/// token that reads another run's artefacts (SUP-003).
+#[test]
+fn the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own() {
+    const OBJ: &str = "agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf";
+    let root = repo_root();
+    let job = |file: &str, name: &str| -> Vec<serde_yaml_ng::Value> {
+        let wf = workflow_yaml(&root.join(".github/workflows").join(file));
+        let (_, j) = jobs(&wf)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{file}: no job {name}"));
+        steps(&j)
+    };
+    let run = |s: &serde_yaml_ng::Value| str_of(s, "run").unwrap_or("").to_string();
+    let at =
+        |steps: &[serde_yaml_ng::Value], what: &str, f: &dyn Fn(&serde_yaml_ng::Value) -> bool| {
+            steps
+                .iter()
+                .position(f)
+                .unwrap_or_else(|| panic!("no step that {what}"))
+        };
+
+    // ci.yml's ebpf-build: the build, its checks, the sha256, the upload
+    let ci = job("ci.yml", "ebpf-build");
+    let build = at(&ci, "builds the object", &|s| {
+        run(s).contains("xtask build-ebpf --locked")
+    });
+    let checks = at(&ci, "checks the back-edges", &|s| {
+        run(s).contains("no_function_has_a_back_edge_the_5_15_verifier_rejects")
+    });
+    let sha = at(&ci, "writes the sha256", &|s| {
+        run(s).contains("sha256sum northnarrow-agent-ebpf > northnarrow-agent-ebpf.sha256")
+    });
+    assert!(
+        run(&ci[sha]).starts_with("cd agent-ebpf/target/bpfel-unknown-none/release\n")
+            && run(&ci[sha]).contains("$GITHUB_STEP_SUMMARY"),
+        "the sha256 written next to the object and named in the job summary"
+    );
+    let up = at(&ci, "uploads it", &|s| {
+        str_of(s, "uses").is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+    });
+    assert!(
+        build < checks && checks < sha && sha < up,
+        "built, checked, hashed, uploaded: {build} {checks} {sha} {up}"
+    );
+    let with = ci[up].get("with").expect("the upload's `with`");
+    assert_eq!(str_of(with, "name"), Some("ebpf-object"));
+    assert_eq!(str_of(with, "if-no-files-found"), Some("error"));
+    let paths: Vec<String> = str_of(with, "path")
+        .unwrap_or("")
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            OBJ.to_string(),
+            format!("{OBJ}.buildhash"),
+            format!("{OBJ}.sha256")
+        ],
+        "the object, its build stamp and its sha256"
+    );
+
+    // the release's package job: built, then the embedded object's sha256
+    let pkg = job("release.yml", "package");
+    let built = at(&pkg, "builds the release", &|s| {
+        run(s).contains("xtask build --release --locked")
+    });
+    let named = at(&pkg, "prints the object's sha256", &|s| {
+        run(s).contains(&format!("sha256sum {OBJ}")) && run(s).contains("$GITHUB_STEP_SUMMARY")
+    });
+    assert!(built < named);
+
+    // lab-vm.yml's guest: the object built on the host, its sha256 kept
+    let guest = job("lab-vm.yml", "guest");
+    let host = at(&guest, "builds the object on the host", &|s| {
+        run(s).contains("cargo --locked xtask build-ebpf --locked")
+    });
+    assert!(
+        run(&guest[host]).contains(&format!(
+            "sha256sum {OBJ} | tee \"$GATE_OUT/ebpf-object.sha256\""
+        )),
+        "the guest's evidence names the object it loads"
+    );
+
+    // one bpf-linker: every install in the workflows, whatever the order of
+    // its flags (the review of #618), and the hints
+    let mut versions = std::collections::BTreeSet::new();
+    let mut installs = 0;
+    for f in workflow_files() {
+        for line in shell_lines(&read(&f)) {
+            if !line.contains("bpf-linker") {
+                continue;
+            }
+            // a line that names bpf-linker and does not `cargo install` it
+            // (binstall, a download) would be one more bpf-linker
+            let pins = cargo_install_pins_on(&line, "bpf-linker");
+            assert!(
+                !pins.is_empty(),
+                "{}: bpf-linker outside a `cargo install` of it: {}",
+                rel(&f),
+                line.trim()
+            );
+            installs += pins.len();
+            versions.extend(pins);
+        }
+    }
+    assert!(installs >= 3, "ci.yml, release.yml, lab-vm.yml: {installs}");
+    assert_eq!(
+        versions.len(),
+        1,
+        "one bpf-linker in the workflows: {versions:?}"
+    );
+    let v = versions.into_iter().next().unwrap();
+    assert!(
+        v.split('.').count() == 3 && v.split('.').all(|n| n.parse::<u32>().is_ok()),
+        "bpf-linker pinned to one exact version: {v}"
+    );
+    for hint in ["xtask/src/main.rs", "deploy/lab/nn-lab.sh"] {
+        assert!(
+            read(&root.join(hint))
+                .contains(&format!("cargo install bpf-linker --version {v} --locked")),
+            "{hint} names bpf-linker {v}"
+        );
+    }
+}
+
+/// A shell's two quotes, double and single, the double one spelled as its
+/// code point: `path_liveness.rs` reads this file's string literals by
+/// their double quotes, and a bare one in a char literal shifts them.
+const QUOTES: [char; 2] = ['\u{22}', '\''];
+
+/// The lines of a workflow or script as the shell reads them: a trailing
+/// `\` joins the next line; a `#` comment (a `#` that starts a word,
+/// outside quotes) and a YAML step's `name:` are dropped.
+fn shell_lines(text: &str) -> Vec<String> {
+    let uncommented = |line: &str| -> String {
+        let (mut quote, mut prev) = (None, ' ');
+        for (at, c) in line.char_indices() {
+            match (quote, c) {
+                (None, '#') if prev.is_whitespace() => return line[..at].to_string(),
+                (None, c) if QUOTES.contains(&c) => quote = Some(c),
+                (Some(q), _) if c == q => quote = None,
+                _ => {}
+            }
+            prev = c;
+        }
+        line.to_string()
+    };
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for raw in text.lines() {
+        let line = uncommented(raw);
+        if line
+            .trim_start()
+            .trim_start_matches("- ")
+            .starts_with("name:")
+        {
+            continue;
+        }
+        match line.trim_end().strip_suffix('\\') {
+            Some(head) => {
+                cur.push_str(head);
+                cur.push(' ');
+            }
+            None => {
+                cur.push_str(&line);
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// `tok` names the crate `krate`: `krate` or `krate@<version>`, quoted or not.
+fn names_crate(tok: &str, krate: &str) -> bool {
+    let t = tok.trim_matches(QUOTES);
+    t == krate || t.starts_with(&format!("{krate}@"))
+}
+
+/// The arguments of each `cargo install` on one shell line (`cargo
+/// +<toolchain> install` and a path to cargo too), unquoted, each to the
+/// shell's next operator.
+fn cargo_installs(line: &str) -> Vec<Vec<String>> {
+    let unquote = |t: &str| t.trim_matches(QUOTES).to_string();
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let is_cargo = toks[i] == "cargo" || toks[i].ends_with("/cargo");
+        let mut j = i + 1;
+        if is_cargo && toks.get(j).is_some_and(|t| t.starts_with('+')) {
+            j += 1;
+        }
+        if !(is_cargo && toks.get(j) == Some(&"install")) {
+            i += 1;
+            continue;
+        }
+        let mut args = Vec::new();
+        let mut k = j + 1;
+        while k < toks.len() {
+            let t = toks[k];
+            if matches!(t, "&&" | "||" | ";" | "|") {
+                break;
+            }
+            k += 1;
+            if let Some(last) = t.strip_suffix(';') {
+                args.push(unquote(last));
+                break;
+            }
+            args.push(unquote(t));
+        }
+        out.push(args);
+        i = k;
+    }
+    out
+}
+
+/// The version each `cargo install` of `krate` on one shell line pins,
+/// whatever the order of its flags: `--version X`, `--version=X`, `--vers
+/// X`, `--vers=X` or `krate@X`. One without is `"unpinned"`; one from
+/// `--git` or `--path` (not crates.io) is `"--git"`/`"--path"`.
+fn cargo_install_pins_on(line: &str, krate: &str) -> Vec<String> {
+    let mut pins = Vec::new();
+    for args in cargo_installs(line) {
+        if !args.iter().any(|a| names_crate(a, krate)) {
+            continue;
+        }
+        let (mut pin, mut source) = (None, None);
+        for (n, a) in args.iter().enumerate() {
+            if let Some(v) = a.strip_prefix(&format!("{krate}@")) {
+                pin = Some(v.to_string());
+            } else if a == "--version" || a == "--vers" {
+                pin = args.get(n + 1).cloned();
+            } else if let Some(v) = a
+                .strip_prefix("--version=")
+                .or_else(|| a.strip_prefix("--vers="))
+            {
+                pin = Some(v.to_string());
+            } else if a == "--git" || a.starts_with("--git=") {
+                source = Some("--git");
+            } else if a == "--path" || a.starts_with("--path=") {
+                source = Some("--path");
+            }
+        }
+        pins.push(match (source, pin) {
+            (Some(s), _) => s.to_string(),
+            (None, Some(v)) => v,
+            (None, None) => "unpinned".to_string(),
+        });
+    }
+    pins
+}
+
+/// [`cargo_install_pins_on`] over every shell line of `text`.
+fn cargo_install_pins(text: &str, krate: &str) -> Vec<String> {
+    shell_lines(text)
+        .iter()
+        .flat_map(|l| cargo_install_pins_on(l, krate))
+        .collect()
+}
+
+/// The review of #618 (P3-1): the one-bpf-linker ratchet read only
+/// `cargo install bpf-linker --version X`; `cargo install --locked
+/// bpf-linker --version 0.11.0` next to it passed. Every spelling cargo
+/// takes reads the same.
+#[test]
+fn a_cargo_install_pin_reads_alike_in_any_flag_order() {
+    let pins = |t: &str| cargo_install_pins(t, "bpf-linker");
+    // the workflows' own spelling
+    assert_eq!(
+        pins("cargo install bpf-linker --version 0.10.3 --locked"),
+        ["0.10.3"]
+    );
+    // the review's probe: the flags in another order
+    assert_eq!(
+        pins("  cargo install --locked bpf-linker --version 0.11.0 --force"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("cargo install --version 0.11.0 --locked bpf-linker"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("cargo install --locked --version=0.11.0 bpf-linker"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("cargo install --vers 0.11.0 --locked bpf-linker"),
+        ["0.11.0"]
+    );
+    assert_eq!(pins("cargo install --locked bpf-linker@0.11.0"), ["0.11.0"]);
+    assert_eq!(
+        pins("cargo install --locked 'bpf-linker@0.11.0'"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("cargo install --version \"0.11.0\" --locked bpf-linker"),
+        ["0.11.0"]
+    );
+    // a toolchain, a path to cargo, a command after another
+    assert_eq!(
+        pins("cargo +nightly install --locked bpf-linker --version 0.11.0"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("~/.cargo/bin/cargo install bpf-linker --version 0.11.0 --locked"),
+        ["0.11.0"]
+    );
+    assert_eq!(
+        pins("rustup show && cargo install --locked bpf-linker --version 0.11.0; echo ok"),
+        ["0.11.0"]
+    );
+    // one line continued on the next
+    assert_eq!(
+        pins("cargo install --locked \\\n    bpf-linker \\\n    --version 0.11.0\n"),
+        ["0.11.0"]
+    );
+    // two installs on one line, another crate's version not taken
+    assert_eq!(
+        pins(
+            "cargo install cargo-cyclonedx --version 0.5.7 --locked && cargo install --locked bpf-linker --version 0.11.0"
+        ),
+        ["0.11.0"]
+    );
+    // no version, or not from crates.io
+    assert_eq!(pins("cargo install --locked bpf-linker"), ["unpinned"]);
+    assert_eq!(
+        pins("cargo install --git https://github.com/aya-rs/bpf-linker --locked bpf-linker"),
+        ["--git"]
+    );
+    assert_eq!(
+        pins("cargo install --path ./bpf-linker-src --locked bpf-linker"),
+        ["--path"]
+    );
+    // not an install of it: another crate, a comment, a step's name, a list
+    assert!(pins("cargo install cargo-cyclonedx --version 0.5.7 --locked").is_empty());
+    assert!(pins("# cargo install --locked bpf-linker --version 0.11.0").is_empty());
+    assert!(pins("echo hi # cargo install bpf-linker --version 0.11.0").is_empty());
+    assert!(pins("- name: cargo install bpf-linker --version 0.11.0").is_empty());
+    assert!(pins("cargo install --list").is_empty());
+    // not a cargo install: the caller refuses the line (it names bpf-linker)
+    assert!(pins("cargo binstall bpf-linker --version 0.11.0").is_empty());
+    // a `#` inside quotes is not a comment: the install after it is read
+    assert_eq!(
+        pins("echo \" #\"; cargo install --locked bpf-linker@0.11.0"),
+        ["0.11.0"]
     );
 }
 

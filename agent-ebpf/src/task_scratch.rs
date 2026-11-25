@@ -267,8 +267,10 @@ pub extern "C" fn nn_share_key() -> u64 {
     // SAFETY: reads of the running task's credentials and namespaces, each
     // through `bpf_probe_read_kernel` (0 when unreadable).
     let (level, owner, inum) = unsafe { outer_user_ns() };
+    // aya-ebpf 0.3: the trie's key by reference; the value copied out at
+    // once (`copied`), read by nothing else.
     let sub = match share_account(uid, level, owner) {
-        Some(account) => SHARE_SUBUID.get(Key::new(32, account.to_be_bytes())).copied(),
+        Some(account) => SHARE_SUBUID.get(&Key::new(32, account.to_be_bytes())).copied(),
         None => None,
     };
     u64::from(northnarrow_common::wire::execq::share_key(uid, level, owner, inum, sub))

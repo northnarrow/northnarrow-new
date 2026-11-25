@@ -158,7 +158,7 @@ jobs:
       # (external audit SUP-015), not whatever `stable` is that day.
       - name: Install nightly Rust + rust-src for build-std
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install nightly-2026-08-05 --profile minimal --component rust-src
           rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
           rustup show active-toolchain
 
@@ -190,6 +190,22 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
         run: cargo --locked xtask build --release --locked
+
+      # Lot 1.2 (F16): the eBPF object the agent embeds, by its sha256, next
+      # to the one ci.yml's ebpf-build job tested (its artefact
+      # `ebpf-object`, the same commit). Both are built with the same pins
+      # (the nightly of agent-ebpf/rust-toolchain.toml, bpf-linker, both
+      # lockfiles) at the same checkout path, and two clean builds of one
+      # tree give one sha256: the two are expected equal. Not compared here:
+      # this job compiles the dependency tree and holds no token that reads
+      # another run's artefacts (SUP-003). Comparing them by hand before a
+      # tag is not yet a step of CONTRIBUTING.md's release procedure (docs
+      # lot 1.9).
+      - name: eBPF object sha256 (compare with ci.yml's ebpf-object)
+        run: |
+          sha=$(sha256sum agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf | cut -d' ' -f1)
+          echo "eBPF object embedded: $sha"
+          echo "eBPF object embedded: \`$sha\` (ci.yml's artefact \`ebpf-object\` of $GITHUB_SHA names the one CI tested)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Assemble tarball + SBOM + checksums
         run: deploy/release/mk-tarball.sh dist

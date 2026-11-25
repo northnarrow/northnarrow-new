@@ -276,6 +276,16 @@ const SITES: &[(&str, &str, usize, Route)] = &[
         Gated("the exec quarantine: observe mode under the gate (execq_config)"),
     ),
     (
+        "opaque.rs",
+        "lsm_ret",
+        1,
+        Gated(
+            "exec_check_lsm's verdict (the exec policy's and the quarantine's, each gated above) \
+             in the LSM exit range: its -EACCES answers only a positive verdict, which neither \
+             returns in any mode (fail-closed, the review of #618)",
+        ),
+    ),
+    (
         "inode_protect.rs",
         "try_inode_unlink",
         2,

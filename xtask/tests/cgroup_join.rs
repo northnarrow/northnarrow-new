@@ -193,20 +193,32 @@ fn the_tracker_marks_every_start_outside_its_cgroup_and_what_it_forks() {
     // the destination's names: the whole path and each component, as
     // `common::cgroup_join::match_destination` walks them (unit-tested
     // there); a path unread or cut (a full buffer: the review of #494, D1)
-    // is "any"; no counter
+    // is "any"; no counter. Lot 1.2: the walk is a global function (the
+    // 5.15 verifier's budget under LLVM 22), its verdict handed back in the
+    // buffer's first 8 bytes: 0 is no name, a hash of 0 stays a hash.
     in_order(
         body(&j, "exempt_destination"),
         &[
             "CGROUP_EXEMPT_NAMES.get(&0).is_some()",
             "bpf_probe_read_kernel_str(",
             "match path_read(n) {\n            PathRead::Unread | PathRead::Cut => return Some(0),\n            PathRead::Whole => {}\n        }",
+            "if nn_cgroup_exempt_walk() == 0 {\n            return None;\n        }",
+            "Some(u64::from_le_bytes(core::ptr::read_volatile(\n            buf as *const [u8; 8],\n        )))",
+        ],
+    )
+    .unwrap();
+    assert!(j.contains("#[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn nn_cgroup_exempt_walk() -> u64 {"));
+    in_order(
+        body(&j, "nn_cgroup_exempt_walk"),
+        &[
+            "let Some(buf) = CGROUP_JOIN_PATH.get_ptr_mut(0) else {\n            return 0;\n        };",
             "for i in 0..PATH_READ {",
             "if b == 0 {\n                break;\n            }",
             "full = fnv_step(full, b);",
             "if b == b'/' {\n                if is_name(comp, NAME_UNIT) {\n                    hit = comp;\n                }\n                comp = FNV_OFFSET;\n            } else {\n                comp = fnv_step(comp, b);\n            }",
             "if is_name(comp, NAME_UNIT) {\n            hit = comp;\n        }",
-            "if is_name(full, NAME_CGROUP) {\n            return Some(full);\n        }",
-            "(hit != 0).then_some(hit)",
+            "let found = if is_name(full, NAME_CGROUP) {\n            full\n        } else if hit != 0 {\n            hit\n        } else {\n            return 0;\n        };",
+            "core::ptr::write_volatile(buf as *mut [u8; 8], found.to_le_bytes());\n        1",
         ],
     )
     .unwrap();
