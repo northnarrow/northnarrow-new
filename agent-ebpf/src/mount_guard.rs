@@ -143,7 +143,8 @@ pub static MOUNT_RECONF: LruHashMap<u64, u64> = LruHashMap::pinned(1024, 0);
 /// watchdog's (the keys [`vacate`] drops from [`MOUNT_GUARD_NS`]), slot 4
 /// ([`CONF_REGROUP`]): the propagation changes counted, slot 5 (lot 1.1,
 /// `common::mount_guard::CONF_PROPAGATED`): the propagation changes the
-/// kernel made on a guarded mount (`crate::mount_setattr`). 0 in slot 0:
+/// kernel made on a guarded mount (`crate::mount_setattr`; reserved, no
+/// reader yet). 0 in slot 0:
 /// not armed, every hook lets through. Pinned.
 #[map]
 pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(CONF_SLOTS, 0);
@@ -369,9 +370,9 @@ struct Caller {
 /// (the agent attaches the hooks only with every one resolved).
 #[inline(always)]
 unsafe fn caller(hook: u32) -> Option<Caller> {
-    // SAFETY: the current task, its `nsproxy`, `mnt_ns`, `cred` and `user_ns` are every kernel
-    // address is read through `bpf_probe_read_kernel`, which copies from any address and writes
-    // zeros on a fault (never a trap); the map values are valid for the program's run
+    // SAFETY: the current task, its `nsproxy`, `mnt_ns`, `cred` and `user_ns` are each
+    // read through `bpf_probe_read_kernel`, which copies from any address and writes zeros on
+    // a fault (never a trap); the map values are valid for the program's run
     unsafe {
         let host_mnt = *MOUNT_GUARD_CONF.get(0)?;
         if host_mnt == 0 {
@@ -822,10 +823,9 @@ unsafe fn held_flags(o: &Offs, real: *const u8) -> u8 {
 /// (0, 0), which no point has.
 #[inline(always)]
 unsafe fn key_of(o: &Offs, dentry: *const u8) -> InodeKey {
-    // SAFETY: the inode, its super block, device, number and btrfs root are every kernel
-    // address is read through `bpf_probe_read_kernel`, which copies from any address and writes
-    // zeros on a fault (never a trap); an unreadable dentry is the key (0, 0), which no point
-    // has
+    // SAFETY: the inode, its super block, device, number and btrfs root are each
+    // read through `bpf_probe_read_kernel`, which copies from any address and writes zeros on
+    // a fault (never a trap); an unreadable dentry is the key (0, 0), which no point has
     unsafe {
         let inode = peek_ptr(dentry.add(o.d_inode as usize));
         let sb = peek_ptr(inode.add(o.i_sb as usize));
@@ -953,7 +953,7 @@ unsafe fn point_of(
     out: &mut InodeKey,
 ) -> bool {
     // SAFETY: the path, the mounts stacked at its dentry, the dentries up to their file
-    // system's root and their names are every kernel address is read through
+    // system's root and their names are each read through
     // `bpf_probe_read_kernel`, which copies from any address and writes zeros on a fault (never
     // a trap); each walk is bounded (`MAX_STACK`, `MAX_WALK`)
     unsafe {
@@ -1336,7 +1336,7 @@ unsafe fn try_sb_mount_propagate(ctx: &LsmContext) -> i32 {
 /// the mount is in a guarded namespace, in a peer group [`MOUNT_GROUPS`]
 /// holds, or is the pin directory's lock or a copy of it ([`MG_LOCK`] at
 /// its root): the refresh woken ([`note_regroup`]) and the change counted
-/// for the agent (`CONF_PROPAGATED`).
+/// (`CONF_PROPAGATED`, reserved: no reader yet).
 #[inline(always)]
 pub(crate) fn propagation_change(m: *const u8) {
     match MOUNT_GUARD_CONF.get(0) {
@@ -1378,7 +1378,7 @@ pub(crate) fn propagation_change(m: *const u8) {
 #[inline(always)]
 unsafe fn note_propagation_change(ctx: &LsmContext) {
     // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the path, its mount and the
-    // propagation links are every kernel address is read through `bpf_probe_read_kernel`, which
+    // propagation links are each read through `bpf_probe_read_kernel`, which
     // copies from any address and writes zeros on a fault (never a trap)
     unsafe {
         let Some(o) = Offs::load() else {
@@ -1422,7 +1422,7 @@ fn lock_propagation(path: *const u8, flags: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
-    // SAFETY: the path, its mount, root and parent are every kernel address is read through
+    // SAFETY: the path, its mount, root and parent are each read through
     // `bpf_probe_read_kernel`, which copies from any address and writes zeros on a fault (never
     // a trap); the task reads are `lock_maker_now`'s and `shutdown_stage`'s
     unsafe {
@@ -1592,10 +1592,11 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 );
             }
         }
-        // Lot 1.1 (the review of #569, F2): or a peer copy of a held mount —
-        // its own group and its root a held mount's (`HELD_ROOT`), in any
-        // namespace: a raw namespace's copy of `/sys` moved under a private
-        // mount, then unmounted there, takes the host's bpffs and its lock
+        // Lot 1.1 (the review of #569, F2): or an attached peer copy of a
+        // held mount — its own group and its root a held mount's
+        // (`HELD_ROOT`) — moved, in any namespace: refused and signed
+        // (`MG_WHY_MOVE_COPY`); let through recorded in the trusted
+        // installer's window, and let through at the end of a shutdown
         let group = Kernel(o).group(real);
         if attached && group != 0 {
             let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
@@ -1729,7 +1730,7 @@ pub fn mount_guard_sb_umount(ctx: LsmContext) -> i32 {
 #[inline(always)]
 unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
     // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the mount, its parent, root
-    // and subtree are every kernel address is read through `bpf_probe_read_kernel`, which
+    // and subtree are each read through `bpf_probe_read_kernel`, which
     // copies from any address and writes zeros on a fault (never a trap)
     unsafe {
         let Some(c) = caller(hook::SB_UMOUNT) else {

@@ -122,6 +122,13 @@ fn the_lock_judge_is_out_of_line_and_signs_nothing() {
     let hook = &hook[..hook.find("\n}\n").unwrap()];
     assert!(hook.contains("let r = lock_propagation(path, flags);"));
     assert!(hook.contains("lock_answer(path, r)"));
+    // the review of #617 (P3-7): the stage's answer is the lock's, as main's
+    // `return lock_answer(path, r);` pinned — its tail expression, never a
+    // call whose result is thrown away
+    assert!(
+        hook.ends_with("\n        lock_answer(path, r)\n    }"),
+        "the propagation stage does not return the lock's answer"
+    );
 }
 
 /// The review of #569 (F1a, F1c): the lock's judge in `sb_mount` reads the
@@ -372,6 +379,193 @@ fn a_roles_namespace_never_takes_pid_1s_entry() {
     );
 }
 
+/// The review of #617 (P2-1): the text of `code` — a function from its
+/// signature to a point of its body, `//` comments dropped — still in
+/// scope at its end (each block closed before it left out), and the blocks
+/// left out.
+fn in_scope(code: &str) -> (String, Vec<String>) {
+    let code = code
+        .lines()
+        .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut live = String::new();
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut closed = Vec::new();
+    for (i, ch) in code.char_indices() {
+        match ch {
+            '{' => {
+                open.push((live.len(), i));
+                live.push(ch);
+            }
+            '}' => match open.pop() {
+                Some((kept, from)) => {
+                    live.truncate(kept);
+                    closed.push(code[from..=i].to_string());
+                }
+                None => live.push(ch),
+            },
+            _ => live.push(ch),
+        }
+    }
+    (live, closed)
+}
+
+/// The operation the query `q` has at the end of `code` (as [`in_scope`]
+/// takes it): its nearest binding in scope — `q = query(MG_OP_…, ` (a
+/// `let` or not) or `q.op = MG_OP_…;`. A block closed before the end that
+/// sets `q.op` must return after it: a fall-through would leave the end's
+/// operation another than the text's.
+fn bound_op(code: &str) -> Result<String, String> {
+    let (live, closed) = in_scope(code);
+    for b in &closed {
+        if let Some(at) = b.rfind("q.op = ") {
+            if !b[at..].contains("return ") {
+                return Err(format!("a block sets q.op and falls through: {b}"));
+            }
+        }
+    }
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut best: Option<(usize, String)> = None;
+    for pat in ["q = query(", "q.op = "] {
+        let mut from = 0;
+        while let Some(at) = live[from..].find(pat) {
+            let at = from + at;
+            from = at + 1;
+            if live[..at].chars().next_back().is_some_and(ident) {
+                continue;
+            }
+            let rest = &live[at + pat.len()..];
+            let op = &rest[..rest.find(|c: char| !ident(c)).unwrap_or(rest.len())];
+            if best.as_ref().is_none_or(|(b, _)| at > *b) {
+                best = Some((at, op.to_string()));
+            }
+        }
+    }
+    best.map(|(_, op)| op)
+        .ok_or_else(|| "no query `q` bound in scope".to_string())
+}
+
+#[test]
+fn the_query_a_decision_reads_is_its_nearest_binding_in_scope() {
+    // `sb_mount`'s point stage, its shape: each decision reads the query
+    // of its own branch
+    let stage = "unsafe fn f(ctx: &C) -> i32 {
+    unsafe {
+        if op == MG_OP_REMOUNT_BIND {
+            let mut q = query(MG_OP_REMOUNT_BIND, &c, guard);
+            q.held = true;
+            return answer(decide_out_of_line(MG_OP_REMOUNT_BIND, &q));
+        }
+        let mut q = query(MG_OP_MOUNT, &c, guard);
+        if op == MG_OP_MOVE_OLD && guard != 0 {
+            q.op = MG_OP_MOVE_OLD;
+            let key = InodeKey { dev: 0, ino: 0 };
+            return answer(decide_out_of_line(MG_OP_MOVE_OLD, &q));
+        }
+        let mut key = InodeKey { dev: 0, ino: 0 };
+        // q.op = MG_OP_PIVOT; (a comment)
+        ";
+    assert_eq!(bound_op(stage).as_deref(), Ok("MG_OP_MOUNT"));
+    let remount = &stage[..stage.find("            q.held = true;").unwrap()];
+    assert_eq!(bound_op(remount).as_deref(), Ok("MG_OP_REMOUNT_BIND"));
+    let moved = &stage[..stage.find("            let key = InodeKey").unwrap()];
+    assert_eq!(bound_op(moved).as_deref(), Ok("MG_OP_MOVE_OLD"));
+    // planted: a branch that sets the operation and falls through
+    let through = "unsafe fn f() {
+        let mut q = query(MG_OP_MOUNT, &c, guard);
+        if op == MG_OP_MOVE_OLD {
+            q.op = MG_OP_MOVE_OLD;
+        }
+        ";
+    assert!(bound_op(through).is_err());
+    // planted: no query, or another variable's
+    assert!(bound_op("fn f() {\n    let mut rq = query(MG_OP_MOUNT, &c, 0);\n").is_err());
+}
+
+/// Lot 1.1 (the review of #617, P2-1): `move_mount`'s entry judges the
+/// source of a move before where it lands — an attached mount (its parent,
+/// read from `mnt_parent`, neither NULL nor itself) whose own peer group
+/// and root are a held mount's (`held_root`'s key found in `MOUNT_HELD`)
+/// is answered with `copy_move_verdict`'s code as a `MG_OP_MOVE_MOUNT`,
+/// and only that verdict's `Allow` lets it through there. Each line is
+/// matched whole, each group of lines in a row and the groups in order: a
+/// condition never true (`&& false`), a key or a check dropped, or a
+/// verdict not signed, fails.
+#[test]
+fn a_moved_peer_copy_is_judged_by_its_source_before_where_it_lands() {
+    let e = source("agent-ebpf/src/mount_guard.rs");
+    let at = e
+        .find("unsafe fn try_move_mount(")
+        .expect("try_move_mount is gone");
+    let b = &e[at..];
+    let b = &b[..b.find("\n}\n").expect("its end")];
+    let lines: Vec<&str> = b
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect();
+    let land = lines
+        .iter()
+        .position(|l| *l == "if lands_guarded(o, to_real) == 0 {")
+        .expect("where it lands");
+    let groups: [&[&str]; 3] = [
+        &[
+            "let real = real_mount(o, from_mnt);",
+            "let parent = peek_ptr(real.add(o.mnt_parent as usize));",
+            "let attached = !parent.is_null() && parent != real;",
+        ],
+        &[
+            "let group = Kernel(o).group(real);",
+            "if attached && group != 0 {",
+            "let root = peek_ptr(from_mnt.add(o.mnt_root as usize));",
+            "let rk = key_of(o, root);",
+            "let (dev, ino) = held_root(group, rk.dev, rk.ino);",
+            "let hit = MOUNT_HELD.get(&InodeKey { dev, ino }).is_some();",
+            "if moves_held_copy(attached, group, hit) {",
+        ],
+        &[
+            "let v = copy_move_verdict(",
+            "true,",
+            "nn_mount_shutdown_stage() != 0,",
+            "crate::inode_protect::override_active(),",
+            ");",
+            "if v == CopyMove::Allow {",
+            "return 0;",
+            "}",
+            "return answer_parts(",
+            "v.code(),",
+            "MG_OP_MOVE_MOUNT,",
+            "rk,",
+        ],
+    ];
+    let mut from = 0;
+    let mut spans = Vec::new();
+    for g in groups {
+        let i = (from..land)
+            .find(|&i| lines[i..].starts_with(g))
+            .unwrap_or_else(|| panic!("try_move_mount: {g:?} not in a row before where it lands"));
+        spans.push((i, i + g.len()));
+        from = i + g.len();
+    }
+    // nothing between the copy's check and its verdict returns
+    let gap = &lines[spans[1].1..spans[2].0];
+    assert!(
+        !gap.iter().any(|l| l.contains("return")),
+        "try_move_mount: a return before the copy's verdict: {gap:?}"
+    );
+    // the source's facts are bound once
+    for name in ["attached", "group", "hit"] {
+        let binds = lines
+            .iter()
+            .filter(|l| {
+                l.starts_with(&format!("let {name} ")) || l.starts_with(&format!("{name} ="))
+            })
+            .count();
+        assert_eq!(binds, 1, "try_move_mount: `{name}` bound {binds} times");
+    }
+}
+
 /// Lot 1.1 (F8b-1): every hook decides with its operation a constant of
 /// its own (`decide_code(MG_OP_…, &q)`, or `decide_out_of_line(MG_OP_…,
 /// &q)` in `sb_mount`'s point stage — the literal its query was made
@@ -409,6 +603,21 @@ fn the_hooks_decide_with_their_operation_a_constant() {
             assert!(
                 body.contains(&format!("query({op}, ")) || body.contains(&format!("q.op = {op};")),
                 "{call}{op}, …) in a function whose query is another operation's"
+            );
+            // the review of #617 (P2-1): and the query it decides is bound
+            // with that operation where it is decided — the nearest binding
+            // of `q` in scope, not any of the function's (`sb_mount`'s point
+            // stage makes a `REMOUNT_BIND` query and a `MOUNT` one: its
+            // mount decided as the other would let a mount over the lock
+            // through)
+            assert!(
+                rest[op.len()..].starts_with(", &q)"),
+                "{call}{op}, …): not the hook's query `q`"
+            );
+            let bound = bound_op(body).unwrap_or_else(|why| panic!("{call}{op}, …): {why}"));
+            assert_eq!(
+                bound, op,
+                "{call}{op}, …) decides a query bound as {bound} where it is decided"
             );
             n += 1;
         }

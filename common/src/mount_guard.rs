@@ -208,10 +208,8 @@ pub const fn held_under(
 /// its own peer group (`shared:N`) and its root (the root dentry's key, as
 /// `stat(2)` gives it): `(HELD_ROOT | group, mix(root))`. Peers share
 /// their group and their root dentry, so a mount with that group and that
-/// root is a peer copy of the held mount — a raw namespace's copy of
-/// `/sys`, whose unmount the kernel propagates to the host's — in whatever
-/// namespace it is. A slave (`master:N` only) is not one: what is done to
-/// it never reaches its master.
+/// root is a peer copy of the held mount, in whatever namespace it is. A
+/// slave (`master:N` only) is not one.
 ///
 /// Its tag is bit 61 alone: a key of every other kind has bit 62
 /// ([`HELD_BY_ID`]) or bit 63 ([`HELD_BY_PLACE`], [`HELD_UNDER`]).
@@ -227,9 +225,9 @@ pub const fn held_root(group: u32, root_dev: u64, root_ino: u64) -> (u64, u64) {
 /// copy of a held mount — an attached mount (`attached`: not a detached
 /// tree being attached, which is judged where it lands) in a peer group
 /// (`group`), whose group and root are a held mount's ([`HELD_ROOT`]'s key
-/// found: `root_held`). Its source is judged, not only where it lands: a
-/// copy moved under a private mount, then unmounted there, takes the held
-/// mount it is a peer of with it, behind the unmount walk's bound.
+/// found: `root_held`). Its source is judged, not only where it lands:
+/// refused in any namespace ([`copy_move_verdict`]), signed as
+/// [`MG_WHY_MOVE_COPY`].
 pub const fn moves_held_copy(attached: bool, group: u32, root_held: bool) -> bool {
     attached && group != 0 && root_held
 }
@@ -371,7 +369,11 @@ pub const fn sb_mount_route(flags: u64) -> SbRoute {
 /// makes on a mount of a guarded namespace, of a peer group `MOUNT_GROUPS`
 /// holds, or on the pin directory's lock (or a copy of it): counted by the
 /// `change_mnt_propagation()` fentry — `mount_setattr(2)`'s changes, which
-/// no LSM hook sees, among them — as the change is made.
+/// no LSM hook sees, among them — as the change is made. Reserved: no
+/// reader yet (the agent's `RegroupWatch::propagated` has no caller until
+/// the follow-up that wakes the integrity round on it); until then the
+/// round signs such a change at its next pass, and the refresh is woken
+/// through the regroup slot (`MOUNT_GUARD_CONF`'s slot 4).
 pub const CONF_PROPAGATED: u32 = 5;
 /// `MOUNT_GUARD_CONF`'s entries.
 pub const CONF_SLOTS: u32 = 6;

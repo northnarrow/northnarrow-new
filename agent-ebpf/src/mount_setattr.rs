@@ -16,8 +16,9 @@
 //! directory's lock or a copy of it, it counts the change
 //! (`common::mount_guard::propagation_counts`): the mount guard's refresh
 //! is woken within a second (`MOUNT_GUARD_CONF`'s regroup slot) and the
-//! agent sees that the change was made (`CONF_PROPAGATED`), where the
-//! integrity round signs it (the lock's flags, `mount_attrs_changed`). A
+//! change is counted (`CONF_PROPAGATED`, reserved for a follow-up: no
+//! reader yet); the integrity round signs it at its next pass (the lock's
+//! flags, `mount_attrs_changed`). A
 //! mount `umount_tree()` takes has no namespace any more: not counted.
 //! Per-mount flags (`MOUNT_ATTR_RDONLY`, `NOEXEC`, `NOSUID`…) do not go
 //! through this function: the integrity round's comparison signs them.

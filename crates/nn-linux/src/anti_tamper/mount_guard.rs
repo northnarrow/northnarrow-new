@@ -1539,7 +1539,8 @@ impl RegroupWatch {
     /// hook refuses (the `change_mnt_propagation()` fentry's count,
     /// [`CONF_PROPAGATED`]): what the integrity round compares (the lock's
     /// flags, the mounts' attributes) is worth reading now rather than at
-    /// its next round.
+    /// its next round. No caller yet: reserved for the follow-up that wakes
+    /// the integrity round on it.
     pub fn propagated(&mut self) -> bool {
         match self.conf.get(&CONF_PROPAGATED, 0) {
             Ok(n) if n != self.seen_made => {
