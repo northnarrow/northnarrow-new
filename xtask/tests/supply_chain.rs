@@ -4132,7 +4132,10 @@ fn panicking_draws(rel: &str, code: &str) -> Vec<String> {
 /// alone, which turns a failed draw into the handshake's error; no
 /// production code of the worker draws with a generator that panics (the
 /// release profile aborts the worker on a panic), and none draws a secret
-/// another way.
+/// another way. The CI of #616: every random of the TLS provider (the
+/// hello's too) comes from `tls::Os`, the one draw of getrandom's `SysRng`,
+/// which the unit tests fail on any kernel by an injection compiled out of
+/// the worker.
 #[test]
 fn the_export_worker_draws_without_a_panic() {
     let code = export_worker_code();
@@ -4186,8 +4189,35 @@ fn the_export_worker_draws_without_a_panic() {
     );
     let start = body("fn start(&self)");
     assert!(
-        start.contains("ephemeral_secret(&mut getrandom::SysRng)?"),
-        "the X25519 group's start draws through ephemeral_secret: {start}"
+        start.contains("ephemeral_secret(&mut Os)?"),
+        "the X25519 group's start draws through ephemeral_secret, from Os: {start}"
+    );
+    // the CI of #616: every random of the provider from `Os` (the hello's
+    // too), getrandom's `SysRng` drawn there alone, and the unit tests'
+    // injection into it compiled out of the worker
+    let provider = body("pub fn provider()");
+    assert!(
+        provider.contains("p.secure_random = &OsRandom;"),
+        "the hello's randoms from Os: {provider}"
+    );
+    let random = body("impl rustls::crypto::SecureRandom for OsRandom");
+    assert!(random.contains("Os.try_fill_bytes(bytes)"), "{random}");
+    let sys: Vec<String> = code
+        .iter()
+        .flat_map(|(rel, c)| {
+            c.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("SysRng"))
+                .map(move |(i, l)| format!("{rel}:{}: {}", i + 1, l.trim()))
+        })
+        .collect();
+    assert!(
+        sys.len() == 1 && sys[0].ends_with(": getrandom::SysRng.try_fill_bytes(dst)"),
+        "the OS generator drawn in Os alone: {sys:?}"
+    );
+    assert!(
+        !tls.contains("GENERATOR_DOWN"),
+        "the tests' injection into Os is #[cfg(test)]"
     );
 }
 
@@ -4200,7 +4230,7 @@ fn the_draw_scanner_catches_its_patterns() {
         "let k = SigningKey::generate(&mut OsRng);\n",
         "let n: u64 = rand::rng().random();\n",
         "let s = x25519_dalek::EphemeralSecret::random();\n",
-        "let secret = ephemeral_secret(&mut getrandom::SysRng)?;\n",
+        "let secret = ephemeral_secret(&mut Os)?;\n",
     );
     let found = panicking_draws("x.rs", planted);
     for line in 1..=4 {
