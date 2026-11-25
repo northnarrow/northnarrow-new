@@ -252,7 +252,14 @@ fn the_split_hooks_judge_in_their_stages() {
             "MOUNT_SB_STAGES",
             "SB_MOUNT",
             &["STAGE_PROPAGATE", "STAGE_POINT"][..],
-            &["decide(", "decide_as(", "answer(", "lock_propagation("][..],
+            &[
+                "decide(",
+                "decide_as(",
+                "decide_code(",
+                "decide_out_of_line(",
+                "answer(",
+                "lock_propagation(",
+            ][..],
         ),
         (
             "unsafe fn try_move_mount(",
@@ -345,32 +352,48 @@ fn a_roles_namespace_never_takes_pid_1s_entry() {
     assert!(v.contains("if vacates(inum, host) {"), "vacate drops any namespace");
 }
 
-/// Lot 1.1 (F8b-1): every hook decides with its operation in a register
-/// (`decide_as(MG_OP_…, &q)`, the literal its query was made with), never
-/// through `decide(&q)`, whose `q.op` 5.15's verifier reads as any byte and
-/// explores every arm for.
+/// Lot 1.1 (F8b-1): every hook decides with its operation a constant of
+/// its own (`decide_code(MG_OP_…, &q)`, or `decide_out_of_line(MG_OP_…,
+/// &q)` in `sb_mount`'s point stage — the literal its query was made
+/// with), never through `decide(&q)`, whose `q.op` 5.15's verifier reads as
+/// any byte and explores every arm for; and every answer is signed from a
+/// number (`verdict_code`), never a `Verdict` whose `Allow` has an
+/// undefined payload byte.
 #[test]
-fn the_hooks_decide_with_their_operation_in_a_register() {
+fn the_hooks_decide_with_their_operation_a_constant() {
     let e = source("agent-ebpf/src/mount_guard.rs");
     assert!(!e.contains("decide(&q)"), "a hook decides through q.op");
+    assert!(!e.contains("decide_as("), "a Verdict through the hook");
     let mut n = 0;
-    let mut from = 0;
-    while let Some(at) = e[from..].find("decide_as(") {
-        let at = from + at;
-        let rest = &e[at + "decide_as(".len()..];
-        let op = &rest[..rest.find(',').expect("its operation")];
-        assert!(op.starts_with("MG_OP_"), "decide_as({op}, …): not a literal operation");
-        // the function it is in made its query with that operation
-        let start = e[..at].rfind("\nunsafe fn ").or(e[..at].rfind("\nfn ")).expect("its function");
-        let body = &e[start..at];
-        assert!(
-            body.contains(&format!("query({op}, ")) || body.contains(&format!("q.op = {op};")),
-            "decide_as({op}, …) in a function whose query is another operation's"
-        );
-        n += 1;
-        from = at + 1;
+    for call in ["decide_code(", "decide_out_of_line("] {
+        let mut from = 0;
+        while let Some(at) = e[from..].find(call) {
+            let at = from + at;
+            from = at + 1;
+            // the definition, and the out-of-line wrapper's own call
+            if e[..at].ends_with("fn ") || e[at..].starts_with("decide_code(op, q)") {
+                continue;
+            }
+            let rest = &e[at + call.len()..];
+            let op = &rest[..rest.find(',').expect("its operation")];
+            assert!(op.starts_with("MG_OP_"), "{call}{op}, …): not a literal operation");
+            // the function it is in made its query with that operation
+            let start = e[..at]
+                .rfind("\nunsafe fn ")
+                .max(e[..at].rfind("\nfn "))
+                .expect("its function");
+            let body = &e[start..at];
+            assert!(
+                body.contains(&format!("query({op}, ")) || body.contains(&format!("q.op = {op};")),
+                "{call}{op}, …) in a function whose query is another operation's"
+            );
+            n += 1;
+        }
     }
     assert!(n >= 8, "{n} decisions");
+    let a = &e[e.find("fn answer_parts(").expect("answer_parts")..];
+    let a = &a[..a.find("\n}\n").unwrap()];
+    assert!(a.starts_with("fn answer_parts(code: u16,"), "an answer from a Verdict");
     let c = source("common/src/mount_guard.rs");
     assert!(c.contains("pub fn decide(q: &Query) -> Verdict {\n    decide_as(q.op, q)\n}"));
 }

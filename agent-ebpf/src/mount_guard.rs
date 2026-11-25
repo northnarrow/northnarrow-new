@@ -47,7 +47,7 @@ use aya_ebpf::{
 };
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::mount_guard::{
-    decide_as, fnv16, held_by_id, held_by_place, inode_key, is_view_magic, mount_op,
+    decide_code, fnv16, held_by_id, CODE_REFUSE, CODE_WINDOW, held_by_place, inode_key, is_view_magic, mount_op,
     reach_in, record_dev, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
     BTRFS_SUPER_MAGIC, DEPTH_DEEPER, GUARD_HOST, HELD_REFUSE, MAX_STACK, MAX_WALK, MG_HOLD,
     MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
@@ -1052,34 +1052,41 @@ unsafe fn mount_root_flags(o: &Offs, mnt: *const u8) -> (u8, InodeKey) {
     }
 }
 
-/// Sign the verdict and return the hook's answer.
+/// Sign the decision (`common::mount_guard::verdict_code`: `kind << 8 |
+/// reason`, 0 to let through) and return the hook's answer.
 #[inline(always)]
-fn answer(verdict: Verdict, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 {
-    answer_parts(
-        verdict,
-        op,
-        key,
-        view_of(p.magic),
-        (p.stack & 0xf) | reach << 4,
-    )
+fn answer(code: u16, op: u8, key: InodeKey, p: &Point, reach: u8) -> i32 {
+    answer_parts(code, op, key, view_of(p.magic), (p.stack & 0xf) | reach << 4)
 }
 
 /// [`answer`] by its parts: the view and the record's `stack` byte (the
-/// mounts covered, the reach in its high nibble).
+/// mounts covered, the reach in its high nibble). Lot 1.1: from a number
+/// whose every bit is defined, never a `Verdict`'s tag and payload (5.15
+/// refused the read of `Allow`'s undefined payload byte).
 #[inline(always)]
-fn answer_parts(verdict: Verdict, op: u8, key: InodeKey, view: u8, stack: u8) -> i32 {
-    let (operation, why, ret) = match verdict {
-        Verdict::Allow => return 0,
-        Verdict::Refuse(w) => (FS_OP_MOUNT, w, -EPERM),
-        Verdict::Window(w) => (FS_OP_MOUNT_WINDOW, w, 0),
-        Verdict::Noted(w) => (FS_OP_MOUNT_NOTED, w, 0),
+fn answer_parts(code: u16, op: u8, key: InodeKey, view: u8, stack: u8) -> i32 {
+    let (operation, ret) = match code & 0xff00 {
+        0 => return 0,
+        CODE_REFUSE => (FS_OP_MOUNT, -EPERM),
+        CODE_WINDOW => (FS_OP_MOUNT_WINDOW, 0),
+        _ => (FS_OP_MOUNT_NOTED, 0),
     };
     nn_mount_emit(
         operation as u64,
-        record_dev(key.dev, op, why, view, stack),
+        record_dev(key.dev, op, (code & 0xff) as u8, view, stack),
         key.ino,
     );
     ret
+}
+
+/// Lot 1.1 (F8b-1): [`decide_code`] out of line, for `sb_mount`'s point
+/// stage — as measured on 5.15, a BPF-to-BPF call there (424,054
+/// instructions) costs less than the decision inlined into the stage
+/// (667,536), and the other way round in `move_mount`'s stage (more than
+/// the million out of line, 477,090 inlined).
+#[inline(never)]
+fn decide_out_of_line(op: u8, q: &Query) -> u64 {
+    decide_code(op, q) as u64
 }
 
 /// A query with nothing read but the caller and where its target is
@@ -1262,7 +1269,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             q.held = true;
             q.restrict = true;
             q.shutdown = nn_mount_shutdown_stage() != 0;
-            return answer(decide_as(MG_OP_REMOUNT_BIND, &q), MG_OP_REMOUNT_BIND, key, &q.point, reach);
+            return answer(decide_out_of_line(MG_OP_REMOUNT_BIND, &q) as u16, MG_OP_REMOUNT_BIND, key, &q.point, reach);
         }
         // One decision shape for the verifier: a bind, and an old-API move
         // made elsewhere (judged where it lands), are a mount whose type is not
@@ -1274,7 +1281,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             q.op = MG_OP_MOVE_OLD;
             q.shutdown = nn_mount_shutdown_stage() != 0;
             let key = key_of(o, peek_ptr(path.add(o.path_dentry as usize)));
-            return answer(decide_as(MG_OP_MOVE_OLD, &q), op, key, &q.point, reach);
+            return answer(decide_out_of_line(MG_OP_MOVE_OLD, &q) as u16, op, key, &q.point, reach);
         }
         let mut key = InodeKey { dev: 0, ino: 0 };
         if !point_of(o, path, hook::SB_MOUNT, &mut q, &mut key) {
@@ -1284,7 +1291,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             let ty: *const u8 = ctx.arg(2);
             string_key(ty, &mut q.fstype);
         }
-        answer(decide_as(MG_OP_MOUNT, &q), op, key, &q.point, reach)
+        answer(decide_out_of_line(MG_OP_MOUNT, &q) as u16, op, key, &q.point, reach)
     }
 }
 
@@ -1505,13 +1512,13 @@ unsafe fn lock_answer(path: *const u8, r: u64) -> i32 {
         };
         let mnt = peek_ptr(path.add(o.path_mnt as usize));
         let key = key_of(o, peek_ptr(mnt.add(o.mnt_root as usize)));
-        let why = northnarrow_common::mount_guard::MG_WHY_LOCK;
-        let v = if r & 3 == LOCK_WINDOW {
-            Verdict::Window(why)
+        let why = northnarrow_common::mount_guard::MG_WHY_LOCK as u16;
+        let code = if r & 3 == LOCK_WINDOW {
+            CODE_WINDOW | why
         } else {
-            Verdict::Refuse(why)
+            CODE_REFUSE | why
         };
-        answer_parts(v, MG_OP_PROPAGATE, key, (r >> 8) as u8, (r >> 16) as u8)
+        answer_parts(code, MG_OP_PROPAGATE, key, (r >> 8) as u8, (r >> 16) as u8)
     }
 }
 
@@ -1573,7 +1580,7 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 q.held = true;
                 q.shutdown = nn_mount_shutdown_stage() != 0;
                 return answer(
-                    decide_as(MG_OP_MOVE_MOUNT, &q),
+                    decide_code(MG_OP_MOVE_MOUNT, &q),
                     MG_OP_MOVE_MOUNT,
                     key,
                     &q.point,
@@ -1606,7 +1613,7 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                     return 0;
                 }
                 return answer_parts(
-                    v.verdict(),
+                    v.code(),
                     MG_OP_MOVE_MOUNT,
                     rk,
                     view_of(magic_of(o, root) as u32),
@@ -1704,7 +1711,7 @@ unsafe fn try_move_mount_point(ctx: &LsmContext) -> i32 {
             });
             q.lock_maker = q.lock_step && nn_mount_lock_maker() != 0;
         }
-        answer(decide_as(MG_OP_MOVE_MOUNT, &q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
+        answer(decide_code(MG_OP_MOVE_MOUNT, &q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
     }
 }
 
@@ -1822,7 +1829,7 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
         // `shutdown`.
         q.init = q.init && guard == GUARD_HOST && flags & MG_OWN == 0;
         q.shutdown = nn_mount_shutdown_stage() != 0;
-        answer(decide_as(MG_OP_UMOUNT, &q), MG_OP_UMOUNT, key, &q.point, reach)
+        answer(decide_code(MG_OP_UMOUNT, &q), MG_OP_UMOUNT, key, &q.point, reach)
     }
 }
 
@@ -1857,7 +1864,7 @@ unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
         };
         let mut q = query(MG_OP_PIVOT, &c, c.guard);
         q.shutdown = nn_mount_shutdown_stage() != 0;
-        answer(decide_as(MG_OP_PIVOT, &q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
+        answer(decide_code(MG_OP_PIVOT, &q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
     }
 }
 
@@ -1940,6 +1947,7 @@ unsafe fn try_sb_remount(ctx: &LsmContext) -> i32 {
         };
         // the view the super block is, for the record
         q.point.magic = peek_u64(sb.add(o.s_magic as usize)) as u32;
-        answer(decide_as(MG_OP_REMOUNT, &q), MG_OP_REMOUNT, key, &q.point, reach_of_caller(&c))
+        answer(decide_code(MG_OP_REMOUNT, &q), MG_OP_REMOUNT, key, &q.point, reach_of_caller(&c))
     }
 }
+

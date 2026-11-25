@@ -267,6 +267,56 @@ impl CopyMove {
             CopyMove::Window => Verdict::Window(MG_WHY_MOVE_COPY),
         }
     }
+
+    /// The hook's [`verdict_code`] of it.
+    pub const fn code(self) -> u16 {
+        match self {
+            CopyMove::Allow => 0,
+            CopyMove::Refuse => CODE_REFUSE | MG_WHY_MOVE_COPY as u16,
+            CopyMove::Window => CODE_WINDOW | MG_WHY_MOVE_COPY as u16,
+        }
+    }
+}
+
+// ── The verdict as a number (lot 1.1, F8b-1) ──────────────────────────────
+
+/// [`verdict_code`]'s kinds, in its high byte (the reason in the low one).
+pub const CODE_REFUSE: u16 = 1 << 8;
+pub const CODE_WINDOW: u16 = 2 << 8;
+pub const CODE_NOTED: u16 = 3 << 8;
+
+/// Lot 1.1 (F8b-1): a [`Verdict`] as the hooks carry it — a number whose
+/// every bit is defined: `kind << 8 | reason`, 0 to let through. A
+/// `Verdict` through a hook's stack, or merged from several of
+/// [`decide_as`]'s returns, is a tag and a payload byte, and `Allow`'s
+/// payload is undefined: 5.15's verifier refused the read of that byte
+/// (`invalid read from stack`, `R3 !read_ok`) where the compiler moved it
+/// above the tag's test.
+pub const fn verdict_code(v: Verdict) -> u16 {
+    match v {
+        Verdict::Allow => 0,
+        Verdict::Refuse(w) => CODE_REFUSE | w as u16,
+        Verdict::Window(w) => CODE_WINDOW | w as u16,
+        Verdict::Noted(w) => CODE_NOTED | w as u16,
+    }
+}
+
+/// [`verdict_code`] read back.
+pub const fn verdict_of_code(code: u16) -> Verdict {
+    let w = (code & 0xff) as u8;
+    match code & 0xff00 {
+        CODE_REFUSE => Verdict::Refuse(w),
+        CODE_WINDOW => Verdict::Window(w),
+        CODE_NOTED => Verdict::Noted(w),
+        _ => Verdict::Allow,
+    }
+}
+
+/// Lot 1.1 (F8b-1): [`decide_as`]'s [`verdict_code`] — the decision the
+/// hooks take (inlined: its operation a constant of the hook's).
+#[inline(always)]
+pub fn decide_code(op: u8, q: &Query) -> u16 {
+    verdict_code(decide_as(op, q))
 }
 
 // ── The split hooks (lot 1.1, F8b-1) ──────────────────────────────────────
@@ -1445,6 +1495,7 @@ pub fn decide(q: &Query) -> Verdict {
 /// verified in each state (the allow-list check three times), and
 /// `move_mount`'s stage processed more than the million instructions.
 /// `decide(q)` is `decide_as(q.op, q)`: one decision.
+#[inline(always)]
 pub fn decide_as(op: u8, q: &Query) -> Verdict {
     // lot 359: a change of propagation that reaches the lock
     if op == MG_OP_PROPAGATE {
@@ -3906,6 +3957,76 @@ mod tests {
         const {
             assert!(STAGE_POINT != STAGE_PROPAGATE);
             assert!(STAGE_POINT < STAGE_SLOTS && STAGE_PROPAGATE < STAGE_SLOTS);
+        }
+    }
+
+    /// Named test (lot 1.1, F8b-1): the hooks' decision as a number is the
+    /// decision — [`decide_code`] read back is [`decide`] for every
+    /// operation over every combination of the query's flags and points
+    /// (on, below the agent's, below a view, elsewhere), and the copy's
+    /// move's code is its verdict's.
+    #[test]
+    fn the_decision_as_a_number_is_the_decision() {
+        let points = [
+            Point {
+                flags: MG_OWN,
+                ..Point::EMPTY
+            },
+            Point {
+                below: MG_OWN,
+                ..Point::EMPTY
+            },
+            Point {
+                below: MG_VIEW,
+                magic: SYSFS_MAGIC,
+                ..Point::EMPTY
+            },
+            Point::EMPTY,
+        ];
+        let ops = [
+            MG_OP_PASS,
+            MG_OP_MOUNT,
+            MG_OP_BIND,
+            MG_OP_MOVE_OLD,
+            MG_OP_MOVE_MOUNT,
+            MG_OP_UMOUNT,
+            MG_OP_PIVOT,
+            MG_OP_REMOUNT,
+            MG_OP_REMOUNT_BIND,
+            MG_OP_PROPAGATE,
+        ];
+        let mut n = 0;
+        for op in ops {
+            for point in points {
+                for bits in 0u32..(1 << 12) {
+                    let b = |i: u32| bits & (1 << i) != 0;
+                    let q = Query {
+                        op,
+                        host: b(0),
+                        reaches: b(1),
+                        privileged: b(2),
+                        init: b(3),
+                        window: b(4),
+                        held: b(5),
+                        noted: b(6),
+                        shutdown: b(7),
+                        kernel: b(8),
+                        restrict: b(9),
+                        lock_maker: b(10),
+                        lock_step: b(11),
+                        ..host(op, point, "")
+                    };
+                    let v = decide(&q);
+                    assert_eq!(verdict_of_code(decide_code(op, &q)), v, "{q:?}");
+                    assert_eq!(verdict_of_code(verdict_code(v)), v);
+                    assert_eq!(verdict_code(v) == 0, v == Verdict::Allow);
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 100_000);
+        for c in [CopyMove::Allow, CopyMove::Refuse, CopyMove::Window] {
+            assert_eq!(c.code(), verdict_code(c.verdict()));
         }
     }
 
