@@ -1728,7 +1728,7 @@ pub fn watch_marks(ftrace_off: Option<&str>) {
     let Some(Tracker::Attached(marks)) = tracker() else {
         return;
     };
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = nn_evidence::time::format_secs(nn_evidence::time::Timestamp::now());
     let mut w = MARKS_WATCH.lock();
     let before = w.clone();
     match marks_step(&mut w, ftrace_off, marks.unseen_births(), &now) {

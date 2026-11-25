@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use nn_evidence::time::Timestamp;
 use nn_proto::admin_signed_payload::{OverlayKind, SignedPayload, sign, verify};
 
 use crate::harness::Put;
@@ -156,20 +156,20 @@ pub fn pin_heads() -> Vec<u8> {
 // ── chains written with a fixed clock ─────────────────────────────────────
 
 /// A clock that answers one second after another from [`FIXTURE_TS`].
-struct Ticks(Mutex<VecDeque<DateTime<Utc>>>);
+struct Ticks(Mutex<VecDeque<Timestamp>>);
 
 impl Ticks {
     fn new(n: usize) -> Arc<Self> {
         Arc::new(Ticks(Mutex::new(
             (0..n)
-                .map(|i| DateTime::from_timestamp((FIXTURE_TS + i as u64) as i64, 0).unwrap())
+                .map(|i| Timestamp::from_second((FIXTURE_TS + i as u64) as i64).unwrap())
                 .collect(),
         )))
     }
 }
 
 impl nn_evidence::clock::Clock for Ticks {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         self.0
             .lock()
             .unwrap()

@@ -45,7 +45,6 @@ use anyhow::{Context, Result, anyhow};
 use aya::maps::{MapData, ring_buf::RingBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use chrono::{DateTime, Utc};
 use common::wire::{NetFlowCloseRaw, NetListenRaw};
 use nn_model::Event;
 use nn_model::telemetry::{NetFlowEvent, NetListenerEvent};
@@ -255,7 +254,7 @@ impl NetFlowDb {
 
     fn append_row(&mut self, ev: &NetFlowEvent, skipped: bool, inbound: bool) -> Result<String> {
         let payload = NetFlowPayload {
-            ts: format_ts(Utc::now()),
+            ts: nn_evidence::time::now_micros(),
             flow_id: ev.flow_id.clone(),
             start_ns: ev.start_ns,
             end_ns: ev.end_ns,
@@ -376,7 +375,7 @@ impl NetListenerDb {
             self.last_hash = last_hash;
         }
         let mut entry = NetListenerEntry {
-            ts: format_ts(Utc::now()),
+            ts: nn_evidence::time::now_micros(),
             timestamp_ns: ev.timestamp_ns,
             family: ev.family,
             bind_addr: ev.bind_addr.to_string(),
@@ -1112,10 +1111,6 @@ fn compute_listener_entry_hash(entry: &NetListenerEntry) -> Result<[u8; 32]> {
     hasher.update(&prev_bytes);
     hasher.update(&body);
     Ok(hasher.finalize().into())
-}
-
-fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 #[cfg(test)]

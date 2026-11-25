@@ -41,16 +41,14 @@ const LAST_TS: &str = "9999-12-31T23:59:59";
 
 /// `since` as the rows' `ts` prefix, compared as text. Lot 319 (the
 /// mini-hunt of BUG12's partial): `unix_ts as i64` — a `since` of 2^63 or
-/// more turned negative, a time before 1970, and one past year 9999 was
-/// beyond chrono's range or formatted `+10000-…`, which sorts before every
-/// row; both answered with every row instead of none. A `since` past the
-/// last time a row can carry keeps no row.
+/// more turned negative, a time before 1970, and one past year 9999 is
+/// formatted `+10000-…`, which sorts before every row; both answered with
+/// every row instead of none. A `since` past the last time a row can carry
+/// keeps no row.
 fn format_iso8601_unix(unix_ts: u64) -> String {
-    use chrono::TimeZone;
     i64::try_from(unix_ts)
         .ok()
-        .and_then(|t| chrono::Utc.timestamp_opt(t, 0).single())
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .map(nn_evidence::time::format_unix_date_time)
         .filter(|s| s.len() == LAST_TS.len() && s.as_str() <= LAST_TS)
         .unwrap_or_else(|| LAST_TS.to_string())
 }

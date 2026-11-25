@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use nn_evidence::time::{Rfc3339, SignedDuration, Timestamp, parse_rfc3339};
 
 mod support;
 
@@ -270,7 +270,7 @@ fn security_txt_fields(text: &str) -> Vec<(String, String)> {
 }
 
 /// RFC 9116 checks; `now` is a parameter so the test below can move it.
-fn security_txt_problems(text: &str, policy: &str, now: DateTime<Utc>) -> Vec<String> {
+fn security_txt_problems(text: &str, policy: &str, now: Timestamp) -> Vec<String> {
     const KNOWN: [&str; 9] = [
         "acknowledgments",
         "canonical",
@@ -320,16 +320,15 @@ fn security_txt_problems(text: &str, policy: &str, now: DateTime<Utc>) -> Vec<St
         ));
     }
     if let Some(e) = expires.first() {
-        match DateTime::parse_from_rfc3339(e) {
-            Err(err) => bad.push(format!("Expires `{e}`: not RFC 3339 ({err})")),
-            Ok(t) => {
-                let t = t.with_timezone(&Utc);
-                if t <= now {
+        match parse_rfc3339(e) {
+            None => bad.push(format!("Expires `{e}`: not RFC 3339")),
+            Some(t) => {
+                if t <= Rfc3339::from(now) {
                     bad.push(format!(
                         "Expires {e} has passed: renew it (less than a year ahead) in .well-known/security.txt"
                     ));
                 }
-                if t > now + Duration::days(366) {
+                if t > Rfc3339::from(now + SignedDuration::from_hours(366 * 24)) {
                     bad.push(format!(
                         "Expires {e} is more than a year ahead (RFC 9116 §2.5.5)"
                     ));
@@ -353,7 +352,7 @@ fn security_txt_follows_rfc_9116_and_names_the_policy_channel() {
     let bad = security_txt_problems(
         &read(".well-known/security.txt"),
         &read("SECURITY.md"),
-        Utc::now(),
+        Timestamp::now(),
     );
     assert!(
         bad.is_empty(),
@@ -366,10 +365,13 @@ fn security_txt_follows_rfc_9116_and_names_the_policy_channel() {
 fn the_security_txt_check_refuses_an_expired_or_foreign_file() {
     let policy = read("SECURITY.md");
     let good = read(".well-known/security.txt");
-    let now = Utc::now();
+    let now = Timestamp::now();
     assert!(security_txt_problems(&good, &policy, now).is_empty());
     // A year and a day later the same file is stale.
-    assert!(!security_txt_problems(&good, &policy, now + Duration::days(367)).is_empty());
+    assert!(
+        !security_txt_problems(&good, &policy, now + SignedDuration::from_hours(367 * 24))
+            .is_empty()
+    );
     let foreign = format!(
         "Contact: mailto:someone@example.invalid\nContact: {ADVISORIES}\nExpires: 2999-01-01T00:00:00Z\nPolicy: {POLICY_URL}\nFoo: bar\n"
     );

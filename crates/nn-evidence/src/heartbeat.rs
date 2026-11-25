@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use crate::time::{Rfc3339, Timestamp, parse_rfc3339};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 
@@ -596,10 +596,9 @@ struct Line {
     beat: Option<HeartbeatRecord>,
 }
 
-fn parse_ts(ts: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
+/// A beat's or the state's time (RFC 3339, chrono's grammar: lot 1.6).
+fn parse_ts(ts: &str) -> Option<Rfc3339> {
+    parse_rfc3339(ts)
 }
 
 /// The beats' period the agent takes (`NN_HEARTBEAT_SECS`): 5 to 300 s.
@@ -650,9 +649,10 @@ pub fn check(
     lines: Result<&[Vec<u8>], &str>,
     pk: &VerifyingKey,
     last: Option<&WatchState>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     cfg: &WatchConfig,
 ) -> CheckResult {
+    let now = Rfc3339::from(now);
     let mut out = CheckResult {
         alerts: Vec::new(),
         state: last.cloned(),
@@ -665,7 +665,7 @@ pub fn check(
         if let Some(l) = last {
             let bound = silence_bound(cfg, l.interval_secs);
             if let Some(t) = parse_ts(&l.seen_at).or_else(|| parse_ts(&l.ts)) {
-                let age = (now - t).num_seconds();
+                let age = now.whole_seconds_since(t);
                 out.age_secs = Some(age);
                 if past(age, bound) {
                     out.alerts.push(Alert::Silent(format!(
@@ -763,9 +763,9 @@ pub fn check(
         // Lot 319 (BUG12's partial): the bound compared without a cast —
         // `u64::MAX as i64` is -1, and a beat stamped this very second read
         // as a clock ahead.
-        Some(t) if past((t - now).num_seconds(), cfg.max_skew_secs) => clock.push(format!(
+        Some(t) if past(t.whole_seconds_since(now), cfg.max_skew_secs) => clock.push(format!(
             "the agent's clock is {} s ahead of the verifier's (beat {}; bound {} s)",
-            (t - now).num_seconds(),
+            t.whole_seconds_since(now),
             newest.seq,
             cfg.max_skew_secs
         )),
@@ -795,7 +795,7 @@ pub fn check(
                     "the agent's clock went back: beat {} is stamped {} s before beat {} seen \
                      (its numbers and links in order)",
                     newest.seq,
-                    (lt - nt).num_seconds(),
+                    lt.whole_seconds_since(nt),
                     l.seq
                 ));
             }
@@ -856,7 +856,7 @@ pub fn check(
         Some(l) if newest.seq == l.seq => parse_ts(&l.seen_at).unwrap_or(now),
         _ => now,
     };
-    let age = (now - seen_at).num_seconds();
+    let age = now.whole_seconds_since(seen_at);
     out.age_secs = Some(age);
     let bound = silence_bound(cfg, newest.interval_secs);
     if newest.kind == BeatKind::Stop {
@@ -1189,7 +1189,7 @@ pub fn check(
         heads,
         heads_gone,
         stopped: newest.kind == BeatKind::Stop,
-        seen_at: crate::audit::format_ts(seen_at),
+        seen_at: seen_at.format_micros(),
         uptime_ms: newest.uptime_ms,
         manifest_hash,
         manifest_revision,

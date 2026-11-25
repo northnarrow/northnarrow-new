@@ -7140,10 +7140,10 @@ mod tests {
         )
         .unwrap();
         for i in 0..12 {
-            clock.advance(chrono::TimeDelta::milliseconds(250));
+            clock.advance(crate::time::SignedDuration::from_millis(250));
             log.append(payload(i)).unwrap();
         }
-        clock.advance(chrono::TimeDelta::seconds(1));
+        clock.advance(crate::time::SignedDuration::from_secs(1));
         log.checkpoint().unwrap();
         drop(log);
         let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
@@ -7230,7 +7230,7 @@ mod tests {
     fn open_stamps_with_the_host_clock() {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("host.jsonl");
-        let before = crate::audit::format_ts(chrono::Utc::now());
+        let before = crate::audit::format_ts(crate::time::Timestamp::now());
         let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             key(),
@@ -7243,7 +7243,7 @@ mod tests {
         }
         log.checkpoint().unwrap();
         drop(log);
-        let after = crate::audit::format_ts(chrono::Utc::now());
+        let after = crate::audit::format_ts(crate::time::Timestamp::now());
         let manifest = fs::read_to_string(manifest_path_for(&active)).unwrap();
         let mut n = 0;
         for line in manifest.lines() {

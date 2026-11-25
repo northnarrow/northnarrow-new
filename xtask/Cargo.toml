@@ -22,20 +22,25 @@ aya-obj = "0.6"
 # computed identically (see ebpf-guard crate docs).
 ebpf-guard = { path = "../ebpf-guard" }
 # `cargo xtask gate-summary` / `gate-report` (lab PR 227): gate-summary.json
-# written and read back, with the time it was made. All three were already
-# in Cargo.lock (the agent's); no new crate.
+# written and read back, with the time it was made. All three are in
+# Cargo.lock for the product too (jiff, nn-evidence's, the same version and
+# features: lot 1.6, chrono's before).
 serde = { workspace = true }
 serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The tests' own parser of the committed workflow files (YAML); JSON and
 # the clock come from the dependencies above (the lab records' fixtures,
-# the dates of the advisory exceptions, of security.txt and of the install
-# stamps).
+# the dates of the advisory exceptions, the clock of security.txt's and
+# of the install stamps' checks).
 # serde_yaml (dtolnay) was archived 2024-11; serde_yaml_ng is the
 # actively-maintained drop-in fork (owner ruling, 2026-05-17).
 serde_yaml_ng = "0.10"
+# Lot 1.6: the RFC 3339 times the tests read (security.txt's `Expires`, the
+# install stamps) with the product's own reader, `nn_evidence::time`
+# (chrono's grammar, which they used before).
+nn-evidence = { workspace = true }
 
 [lints]
 workspace = true

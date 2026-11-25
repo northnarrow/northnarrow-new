@@ -83,7 +83,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
@@ -370,7 +369,7 @@ pub struct AuditStamps {
 
 impl AuditStamps {
     /// The writing process's own: the host's clock ([`SystemClock`],
-    /// `Utc::now`) and its pid (`std::process::id`).
+    /// `Timestamp::now`) and its pid (`std::process::id`).
     pub fn host() -> Self {
         Self {
             clock: Arc::new(SystemClock),
@@ -1822,7 +1821,7 @@ fn read_tail<H: ChainHost>(path: &Path, pk: Option<&VerifyingKey>) -> Result<Tai
 /// same bytes for cross-check.
 ///
 /// Lab PR 249: the row's time is `clock`'s (the log's, the host's
-/// `Utc::now` unless it was opened with another).
+/// `Timestamp::now` unless it was opened with another).
 fn build_signed_entry<K: ChainSigner>(
     draft: &AuditEntryDraft,
     key: &K,
@@ -1890,8 +1889,10 @@ pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
     })
 }
 
-pub fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+/// The chains' stamp of `t` (`2026-01-01T00:00:00.123456Z`):
+/// [`crate::time::format_micros`].
+pub fn format_ts(t: crate::time::Timestamp) -> String {
+    crate::time::format_micros(t)
 }
 
 // ── off-host verifier ───────────────────────────────────────────────
@@ -2925,9 +2926,9 @@ mod tests {
         let mut log = open();
         log.boot_probe(None, "verified", "source-tree", &test_build())
             .unwrap();
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         log.stop_entry("sigterm", 42).unwrap();
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         let mut log = open();
         assert!(matches!(log.previous_run(), PreviousRun::Clean { .. }));
         let refused = log
@@ -2943,7 +2944,7 @@ mod tests {
             (refused.op.as_str(), refused.result.as_str()),
             ("agent_boot", "refused")
         );
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         let mut log = open();
         let boot = log
             .boot_probe(None, "verified", "source-tree", &test_build())
@@ -2955,9 +2956,9 @@ mod tests {
         );
         assert_eq!(boot.extra["previous_run"]["reason"], "sigterm");
         // that run killed in turn: its own boot and last row
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         let last = log.append(sample_draft(1)).unwrap();
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         let log = open();
         assert_eq!(
             log.previous_run(),
@@ -2988,16 +2989,16 @@ mod tests {
         let boot = log
             .boot_probe(None, "verified", "source-tree", &test_build())
             .unwrap();
-        clock.advance(chrono::TimeDelta::seconds(5));
+        clock.advance(crate::time::SignedDuration::from_secs(5));
         let last = log.append(sample_draft(1)).unwrap();
         // killed: no stop row; the next start, a minute later, is refused
-        clock.advance(chrono::TimeDelta::seconds(60));
+        clock.advance(crate::time::SignedDuration::from_secs(60));
         let mut log = open();
         let refused = log
             .boot_refused_by("bpf_lsm", "verified", "source-tree", "no", &test_build())
             .unwrap();
         assert!(refused.ts > last.ts && last.ts > boot.ts);
-        clock.advance(chrono::TimeDelta::seconds(60));
+        clock.advance(crate::time::SignedDuration::from_secs(60));
         let log = open();
         match log.previous_run() {
             PreviousRun::Abrupt {
@@ -4303,7 +4304,7 @@ mod tests {
             stamps(&cc),
         )
         .unwrap();
-        cc.advance(chrono::TimeDelta::seconds(3));
+        cc.advance(crate::time::SignedDuration::from_secs(3));
         assert_eq!(
             log.append(sample_draft(2)).unwrap().ts,
             "2026-01-01T00:10:03.250000Z"
@@ -4311,7 +4312,7 @@ mod tests {
         assert_eq!(log.self_pid(), 4_200_000);
     }
 
-    /// Lab PR 249: `open` stamps as before — the host's clock (`Utc::now`,
+    /// Lab PR 249: `open` stamps as before — the host's clock (`Timestamp::now`,
     /// the row's time between two readings of it) and the writing process's
     /// pid on the rows about itself.
     #[test]
@@ -4320,9 +4321,9 @@ mod tests {
         let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         assert_eq!(log.self_pid(), std::process::id());
-        let before = format_ts(Utc::now());
+        let before = format_ts(crate::time::Timestamp::now());
         let e = log.stop_entry("sigterm", 1).unwrap();
-        let after = format_ts(Utc::now());
+        let after = format_ts(crate::time::Timestamp::now());
         assert!(
             before <= e.ts && e.ts <= after,
             "{before} <= {} <= {after}",

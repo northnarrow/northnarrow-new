@@ -10,7 +10,7 @@
 //! could only be verified: the writers read `Utc::now`.
 //!
 //! The writers read the time through `nn_evidence::clock::Clock` now (the
-//! host's, `Utc::now`, by default). This test gives them a clock that
+//! host's, `Timestamp::now`, by default). This test gives them a clock that
 //! answers, in order, the times `main` wrote in the fixture, writes the
 //! fixture's inputs with the fixture's key the way
 //! `regenerate_chain_pin_fixtures` wrote them — and gets `main`'s files
@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use nn_evidence::time::{Timestamp, parse_timestamp};
 use northnarrow_agent::audit::{AgentSigningKey, AuditEntryDraft, AuditLog, read_signing_key};
 use northnarrow_agent::audit::{AuditStamps, GENESIS_PREV_HASH};
 use northnarrow_agent::chainlog::{ChainPayload, NoProtection, RotatingChainLog, RotationConfig};
@@ -49,15 +49,12 @@ fn key() -> AgentSigningKey {
 }
 
 /// A clock that answers the given times, in order, once each.
-struct Script(Mutex<VecDeque<DateTime<Utc>>>);
+struct Script(Mutex<VecDeque<Timestamp>>);
 
 impl Script {
     fn of(stamps: &[String]) -> Arc<Self> {
         Arc::new(Self(Mutex::new(
-            stamps
-                .iter()
-                .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
-                .collect(),
+            stamps.iter().map(|s| parse_timestamp(s).unwrap()).collect(),
         )))
     }
 
@@ -67,7 +64,7 @@ impl Script {
 }
 
 impl nn_evidence::clock::Clock for Script {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         self.0
             .lock()
             .unwrap()

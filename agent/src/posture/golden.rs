@@ -371,8 +371,8 @@ impl Clock for ReplayClock {
 /// Lab PR 249: the audit log's clock — its rows are stamped with the
 /// replay's wall clock, as the posture's records are.
 impl nn_evidence::clock::Clock for ReplayClock {
-    fn now(&self) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from(Clock::wall(self))
+    fn now(&self) -> nn_evidence::time::Timestamp {
+        nn_evidence::time::from_system_time(Clock::wall(self))
     }
 }
 

@@ -325,7 +325,7 @@ fn write_state(path: &Path, s: &WatchState) -> std::io::Result<()> {
 
 /// One check: fetch, verify, print, keep the state. Returns its result.
 pub fn check_once(w: &Watch) -> Result<CheckResult, String> {
-    let now = nn_evidence::audit::format_ts(chrono::Utc::now());
+    let now = nn_evidence::time::now_micros();
     let last = match read_state(&w.state) {
         Ok(s) => s,
         Err(why) if w.reanchor => {
@@ -342,7 +342,13 @@ pub fn check_once(w: &Watch) -> Result<CheckResult, String> {
     };
     let fetched = fetch(&w.source);
     let lines = fetched.as_deref().map_err(String::as_str);
-    let r = check(lines, &w.pubkey, last.as_ref(), chrono::Utc::now(), &w.cfg);
+    let r = check(
+        lines,
+        &w.pubkey,
+        last.as_ref(),
+        nn_evidence::time::Timestamp::now(),
+        &w.cfg,
+    );
     if r.alerts.is_empty() {
         let s = r.state.as_ref();
         println!(
