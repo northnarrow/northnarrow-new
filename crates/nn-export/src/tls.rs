@@ -47,9 +47,10 @@ pub fn provider() -> CryptoProvider {
 /// all zeros — the peer's key of small order, the secret then known to
 /// anyone — ends the handshake (the review of #499, D7: the provider's
 /// group does not check it, nor does rustls). The same crates as the
-/// provider's (x25519-dalek 3, getrandom's OS generator `SysRng`; a
-/// failing generator panics, as the provider's own group does and as
-/// rand_core 0.6's `OsRng` did before lot 398).
+/// provider's (x25519-dalek 3, getrandom's OS generator `SysRng`). Lot 1.8
+/// (the review of #610): a failing generator is the handshake's error
+/// ([`ephemeral_secret`]), not a panic — the provider's own group panics,
+/// and the agent's release profile aborts on one.
 #[derive(Debug)]
 struct X25519Contributory;
 
@@ -59,11 +60,69 @@ impl SupportedKxGroup for X25519Contributory {
     }
 
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
-        let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);
-        let secret = x25519_dalek::EphemeralSecret::random_from_rng(&mut rng);
+        let secret = ephemeral_secret(&mut getrandom::SysRng)?;
         let public = x25519_dalek::PublicKey::from(&secret);
         Ok(Box::new(X25519Active { secret, public }))
     }
+}
+
+/// An X25519 secret from the OS generator `os`, or
+/// [`rustls::Error::FailedToGetRandomBytes`] when one of its draws failed:
+/// rustls ends the connection's start with it (the sink's fault, signed by
+/// the core with the sink's state), and the secret, whose bytes are then
+/// not all the generator's, is dropped before any public key is computed
+/// from it. Fail closed: never a weak or zero key, never a panic.
+fn ephemeral_secret<R>(os: &mut R) -> Result<x25519_dalek::EphemeralSecret, rustls::Error>
+where
+    R: getrandom::rand_core::TryCryptoRng + ?Sized,
+{
+    let mut draw = Checked { os, failed: false };
+    let secret = x25519_dalek::EphemeralSecret::random_from_rng(&mut draw);
+    if draw.failed {
+        drop(secret);
+        return Err(rustls::Error::FailedToGetRandomBytes);
+    }
+    Ok(secret)
+}
+
+/// The OS generator as the infallible one x25519-dalek asks for, its
+/// failure kept: any draw that fails marks it, for good, and the caller
+/// ([`ephemeral_secret`]) discards what was made from it.
+struct Checked<'a, R: ?Sized> {
+    os: &'a mut R,
+    failed: bool,
+}
+
+impl<R> getrandom::rand_core::TryRng for Checked<'_, R>
+where
+    R: getrandom::rand_core::TryCryptoRng + ?Sized,
+{
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        if self.os.try_fill_bytes(dst).is_err() {
+            self.failed = true;
+        }
+        Ok(())
+    }
+}
+
+// A cryptographic generator's draws, or a mark that discards them.
+impl<R> getrandom::rand_core::TryCryptoRng for Checked<'_, R> where
+    R: getrandom::rand_core::TryCryptoRng + ?Sized
+{
 }
 
 struct X25519Active {
@@ -251,6 +310,247 @@ pub(crate) mod tests {
         // `with_protocol_versions(TLS13)`, the suites' retain); the
         // receiver's chain checked: `net::tests`' handshakes against
         // another CA's certificate and another name's
+    }
+
+    /// The tests' generator error.
+    #[derive(Debug)]
+    struct Down;
+
+    impl core::fmt::Display for Down {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("the generator is down")
+        }
+    }
+
+    impl core::error::Error for Down {}
+
+    /// A generator that hands out `byte`s (`0x42` unless told), records
+    /// the length of each draw, and fails the draws whose index `fail_at`
+    /// lists.
+    struct Scripted {
+        byte: u8,
+        draws: Vec<usize>,
+        fail_at: &'static [usize],
+    }
+
+    impl Scripted {
+        fn failing_at(fail_at: &'static [usize]) -> Self {
+            Self {
+                byte: 0x42,
+                draws: Vec::new(),
+                fail_at,
+            }
+        }
+
+        fn of(byte: u8) -> Self {
+            Self {
+                byte,
+                ..Self::failing_at(&[])
+            }
+        }
+    }
+
+    impl getrandom::rand_core::TryRng for Scripted {
+        type Error = Down;
+
+        fn try_next_u32(&mut self) -> Result<u32, Down> {
+            let mut b = [0u8; 4];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Down> {
+            let mut b = [0u8; 8];
+            self.try_fill_bytes(&mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Down> {
+            let n = self.draws.len();
+            self.draws.push(dst.len());
+            if self.fail_at.contains(&n) {
+                return Err(Down);
+            }
+            dst.fill(self.byte);
+            Ok(())
+        }
+    }
+
+    impl getrandom::rand_core::TryCryptoRng for Scripted {}
+
+    /// Named (lot 1.8, the review of #610): the key exchange's secret is
+    /// the OS generator's draw, or the handshake's error when a draw failed
+    /// — never a panic, never a secret made of what a failed draw left.
+    #[test]
+    fn a_failed_draw_is_the_key_exchanges_error_not_a_panic() {
+        use getrandom::rand_core::TryRng;
+        assert!(matches!(
+            ephemeral_secret(&mut Scripted::failing_at(&[0])),
+            Err(rustls::Error::FailedToGetRandomBytes)
+        ));
+        // a good draw: the secret is made of its 32 bytes, in one draw —
+        // x25519-dalek 3.0.0 (pinned exactly) makes a secret of one
+        // `fill_bytes` — the same bytes the same key, others another
+        let public = |byte: u8| {
+            let mut os = Scripted::of(byte);
+            let secret = ephemeral_secret(&mut os).unwrap();
+            assert_eq!(os.draws, vec![32]);
+            x25519_dalek::PublicKey::from(&secret)
+        };
+        assert_eq!(public(0x42), public(0x42));
+        assert_ne!(public(0x42), public(0x43));
+        // the mark: set by a failed draw of any kind, kept by the good draws
+        // after it
+        let mut os = Scripted::failing_at(&[2]);
+        let mut c = Checked {
+            os: &mut os,
+            failed: false,
+        };
+        assert_eq!(c.try_next_u32(), Ok(0x4242_4242));
+        assert_eq!(c.try_next_u64(), Ok(0x4242_4242_4242_4242));
+        assert!(!c.failed);
+        let mut b = [0u8; 3];
+        assert_eq!(c.try_fill_bytes(&mut b), Ok(()));
+        assert!(c.failed, "draw 2 failed");
+        assert_eq!(c.try_fill_bytes(&mut b), Ok(()));
+        assert_eq!(b, [0x42; 3]);
+        assert!(c.failed, "kept after a good draw");
+        assert_eq!(os.draws, vec![4, 8, 3, 3]);
+        let draws: [fn(&mut Checked<'_, Scripted>); 3] = [
+            |c| {
+                let _ = c.try_next_u32();
+            },
+            |c| {
+                let _ = c.try_next_u64();
+            },
+            |c| {
+                let _ = c.try_fill_bytes(&mut [0u8; 32]);
+            },
+        ];
+        for draw in draws {
+            let mut os = Scripted::failing_at(&[0]);
+            let mut c = Checked {
+                os: &mut os,
+                failed: false,
+            };
+            draw(&mut c);
+            assert!(c.failed);
+        }
+        // the OS generator itself: two secrets, two public keys
+        let a = ephemeral_secret(&mut getrandom::SysRng).unwrap();
+        let b = ephemeral_secret(&mut getrandom::SysRng).unwrap();
+        assert_ne!(
+            x25519_dalek::PublicKey::from(&a),
+            x25519_dalek::PublicKey::from(&b)
+        );
+    }
+
+    /// Makes `getrandom(2)` fail with `errno` on the calling thread, for
+    /// good (a seccomp filter without TSYNC: the test's other threads keep
+    /// theirs).
+    #[cfg(target_os = "linux")]
+    fn fail_getrandom_on_this_thread(errno: u32) {
+        let insn = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        };
+        let filter = [
+            // seccomp_data.nr
+            insn(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+            insn(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                0,
+                1,
+                libc::SYS_getrandom as u32,
+            ),
+            insn(
+                libc::BPF_RET | libc::BPF_K,
+                0,
+                0,
+                libc::SECCOMP_RET_ERRNO | errno,
+            ),
+            insn(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+        ];
+        let prog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        // SAFETY: prctl with integer arguments, then with a pointer to a
+        // filter program that outlives the call (the kernel copies it).
+        unsafe {
+            let (one, zero): (libc::c_ulong, libc::c_ulong) = (1, 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, one, zero, zero, zero),
+                0
+            );
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                    &prog as *const libc::sock_fprog,
+                ),
+                0,
+                "seccomp filter"
+            );
+        }
+    }
+
+    /// Named (lot 1.8, the review of #610): `getrandom(2)` failing (EIO,
+    /// injected by a seccomp filter on the sink's thread) is the syslog
+    /// sink's fault, answered like any other — the thread does not panic
+    /// (the release profile would abort the export worker), and no session
+    /// starts: the key exchange's start, the client's start and a request's
+    /// rows all report it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_getrandom_is_a_sink_fault_not_a_panic() {
+        use crate::net::{Framed, SyslogSink};
+        use nn_proto::ipc::{ExportChain, SinkState};
+        use std::time::{Duration, Instant};
+        // a receiver's port: the kernel completes the TCP handshake
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got = std::thread::spawn(move || {
+            // what draws before the fault: std's hash keys of this thread,
+            // getrandom's choice of its system call, the sink and config
+            let _ = std::collections::hash_map::RandomState::new();
+            getrandom::fill(&mut [0u8; 1]).unwrap();
+            let mut sink = SyslogSink::new(addr, "receiver.lab", CA_PEM.as_bytes()).unwrap();
+            let config = client_config(CA_PEM.as_bytes()).unwrap();
+            fail_getrandom_on_this_thread(libc::EIO as u32);
+            let injected = getrandom::fill(&mut [0u8; 1]).is_err();
+            let kx = provider().kx_groups[0].start().err();
+            let client =
+                rustls::ClientConnection::new(config, server_name("receiver.lab").unwrap()).err();
+            let rows = sink.rows(
+                ExportChain::Detections,
+                &[1u64, 2],
+                |r| (0, *r),
+                |_| Framed {
+                    frames: vec![b"<13>1 - receiver.lab nn - - - x".to_vec()],
+                    records: 1,
+                    verified: true,
+                },
+                Instant::now() + Duration::from_secs(2),
+            );
+            (injected, kx, client, rows, sink.stats)
+        })
+        .join()
+        .expect("a failing generator panicked the sink's thread");
+        let (injected, kx, client, rows, stats) = got;
+        assert!(injected, "the filter fails getrandom");
+        assert_eq!(kx, Some(rustls::Error::FailedToGetRandomBytes));
+        assert_eq!(client, Some(rustls::Error::FailedToGetRandomBytes));
+        // the sink's answer: a fault (net.rs names a session that cannot
+        // start `BadTrust`), nothing delivered, down with a backoff
+        assert_eq!(rows.fault, Some(SinkFault::BadTrust));
+        assert_eq!((rows.acked, rows.committed, rows.records), (None, None, 0));
+        assert_eq!(rows.state, SinkState::Down);
+        assert!(rows.retry_ms > 0);
+        assert_eq!((stats.connects, stats.sessions), (1, 0));
+        drop(listener);
     }
 
     /// Lot 398 (rustls-rustcrypto 0.0.2-alpha to 0.1.0-pre.0): the
