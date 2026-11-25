@@ -37,6 +37,21 @@
 //! — `MSG_TRUNC` makes the return value the datagram's length, longer than
 //! the buffer (N1) — and a datagram longer than what was read is
 //! `TRUNCATED`.
+//!
+//! Lot 1.4 (plan S1, F8): the port filter comes first, and it reads no
+//! helper. A connected socket (its peer's port set) receives only from its
+//! peer: one connected to another port than 53 is no DNS client, and its
+//! datagrams are left at the return value's test and the peer port's
+//! (`skc_dport`). Both the peer port and `msg->msg_name` are loads from
+//! the hook's own arguments, typed by the kernel's BTF (`struct sock *`,
+//! `struct msghdr *`), at the offsets the agent resolved: the verifier
+//! checks the field each one reads, and a kernel whose layout differs
+//! from the compiled one takes the probe helper, as before. A datagram
+//! from port 53 is read as before, and the same answers are recorded; the
+//! one left out is a datagram from port 53 that a socket queued before it
+//! connected to another port and received with its address — the same
+//! datagram received without the address was already left out (its source
+//! was read from the socket's peer).
 
 use aya_ebpf::{
     cty::c_void,
@@ -161,11 +176,7 @@ enum Src {
 unsafe fn source_from_name(msg_ptr: *const u8) -> Src {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
-        let name: *const u8 =
-            match bpf_probe_read_kernel::<*const u8>(msg_ptr.add(off!(MSGHDR_NAME_OFFSET)) as *const *const u8) {
-                Ok(p) => p,
-                Err(_) => return Src::NoName,
-            };
+        let name = msg_name(msg_ptr);
         if name.is_null() {
             return Src::NoName;
         }
@@ -207,18 +218,16 @@ unsafe fn source_from_name(msg_ptr: *const u8) -> Src {
 }
 
 /// The connected socket's peer (`recv()` on a connected socket: no
-/// `msg_name`): its family and port first, its address only for port 53.
+/// `msg_name`), its port `port_be` read first ([`peer_port`]): its family,
+/// and its address only for port 53.
 #[inline(always)]
-unsafe fn source_from_sock(sk_ptr: *const u8) -> Src {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+unsafe fn source_from_sock(sk_ptr: *const u8, port_be: u16) -> Src {
+    // SAFETY: `sk_ptr` is the hook's socket; its fields are read through
+    // `bpf_probe_read_kernel` only (a fault is `NoName`), nothing is written.
     unsafe {
         if sk_ptr.is_null() {
             return Src::NoName;
         }
-        let port_be: u16 = match bpf_probe_read_kernel::<u16>(sk_ptr.add(off!(SOCK_SKC_DPORT_OFFSET)) as *const u16) {
-            Ok(v) => v,
-            Err(_) => return Src::NoName,
-        };
         if port_be != DNS_PORT_BE {
             return Src::NotDns;
         }
@@ -258,6 +267,47 @@ unsafe fn source_from_sock(sk_ptr: *const u8) -> Src {
     }
 }
 
+/// Lot 1.4 (F8): the socket's peer port (`sk->__sk_common.skc_dport`,
+/// network byte order; 0 when it has no peer, or when it cannot be read).
+/// `sk_ptr` is the hook's first argument, a `struct sock *` the kernel's
+/// BTF types: at the compiled offset (the agent's resolved one on every
+/// kernel the lab runs) a plain load, which the verifier checks against
+/// that field and the JIT makes fault-safe; at another, the probe helper.
+#[inline(always)]
+unsafe fn peer_port(sk_ptr: *const u8) -> u16 {
+    // SAFETY: `sk_ptr` is the hook's own `struct sock *` (the verifier's
+    // PTR_TO_BTF_ID): the load at the compiled offset is one the verifier
+    // allows only on that field, and a fault reads 0; otherwise the probe
+    // helper reads it (a fault is 0). Nothing is written through it.
+    unsafe {
+        if sk_ptr.is_null() {
+            return 0;
+        }
+        let at = off!(SOCK_SKC_DPORT_OFFSET);
+        if at == SOCK_SKC_DPORT_OFFSET {
+            core::ptr::read_volatile(sk_ptr.add(SOCK_SKC_DPORT_OFFSET) as *const u16)
+        } else {
+            bpf_probe_read_kernel::<u16>(sk_ptr.add(at) as *const u16).unwrap_or(0)
+        }
+    }
+}
+
+/// Lot 1.4 (F8): `msg->msg_name` (null when the caller asked for no
+/// address, or when it cannot be read), the same way as [`peer_port`]:
+/// `msg_ptr` is the hook's `struct msghdr *`.
+#[inline(always)]
+unsafe fn msg_name(msg_ptr: *const u8) -> *const u8 {
+    // SAFETY: as [`peer_port`]'s, on the hook's `struct msghdr *`.
+    unsafe {
+        let at = off!(MSGHDR_NAME_OFFSET);
+        if at == MSGHDR_NAME_OFFSET {
+            core::ptr::read_volatile(msg_ptr.add(MSGHDR_NAME_OFFSET) as *const *const u8)
+        } else {
+            bpf_probe_read_kernel::<*const u8>(msg_ptr.add(at) as *const *const u8).unwrap_or(core::ptr::null())
+        }
+    }
+}
+
 #[inline(always)]
 fn sat16(n: u64) -> u16 {
     if n > 0xFFFF {
@@ -281,10 +331,16 @@ unsafe fn try_answer(ctx: &FExitContext, ret: i32) {
         if msg_ptr.is_null() {
             return;
         }
+        // Lot 1.4 (F8): the port filter — a socket connected to another port
+        // than 53 receives no response.
+        let peer = peer_port(sk_ptr);
+        if peer != 0 && peer != DNS_PORT_BE {
+            return;
+        }
         let src = match source_from_name(msg_ptr) {
             Src::Dns(s) => s,
             Src::NotDns => return,
-            Src::NoName => match source_from_sock(sk_ptr) {
+            Src::NoName => match source_from_sock(sk_ptr, peer) {
                 Src::Dns(s) => s,
                 _ => return,
             },

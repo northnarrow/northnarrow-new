@@ -162,7 +162,7 @@ static OPEN_HAD_DATA: LruHashMap<InodeKey, u64> = LruHashMap::with_max_entries(4
 /// Review 75: the last read-only report per (task, inode)
 /// ([`crate::read_repeat`]).
 #[map]
-static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
+pub(crate) static OPEN_READ_SEEN: LruHashMap<ReadSeenKey, u64> = LruHashMap::with_max_entries(8192, 0);
 /// Bulk windows, each read in one call: `struct file` at [0, FILE_WIN) and
 /// the opened inode at [FILE_WIN, FILE_WIN + INODE_WIN). A kernel read
 /// costs about 70 ns on the lab; one window replaces four field reads
@@ -289,6 +289,18 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
         }
     }
 }
+
+/// Lot 1.4b: the running task's buffers if it has them — its [`OPEN_TASK`]
+/// entry, else this run's own — never made here ([`task_buffer`] makes
+/// them). The walk's: the making's functions stay off its call chain.
+#[inline(always)]
+fn held_buffer(task: u64) -> Option<*mut OpenTask> {
+    match OPEN_TASK.get_ptr_mut(&task) {
+        Some(p) => Some(p),
+        None => OPEN_TASK_RUN.get_ptr_mut(&task),
+    }
+}
+
 /// The re-check of #547 (G5): the running task's [`OPEN_TASK`] entry made
 /// (zeroed), within its share ([`OPEN_TASK_PER_SHARE`]; the row it is
 /// counted in kept in the entry). 1: made; 0: the share taken or the map
@@ -405,25 +417,38 @@ unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
 /// `(dev, ino)` of `inode` as `stat()` reports it (review 55); dev 0 /
 /// ino 0 when unreadable — a plain value, never an `Option` across the
 /// inlined calls (5.15 rule 3).
+///
+/// Lot 1.4: the two words start from [`crate::opaque::opaque`]'s zero, a
+/// value LLVM knows nothing about, and the key is built whole at the end.
+/// From a literal 0, the paths that read nothing stored two constant zeros,
+/// which LLVM 22 merged into a call of the `memset` subprogram — one the
+/// 5.15 and 6.1 verifiers cross without their precision marks
+/// (KERNEL_COMPATIBILITY "Older verifiers", rule 9):
+/// `module_read_file_observe` processed 11 % more instructions. The values
+/// are the same: 0 where nothing was read. [`InodeKey`] is two `u64`s, no
+/// padding: every byte of the key the maps and userland see is one of the
+/// two written.
 #[inline(always)]
 pub(crate) unsafe fn key_of(inode: *const u8) -> InodeKey {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `inode` and its superblock are read only through
+    // `bpf_probe_read_kernel` (a fault is an `Err`, never a load through the
+    // pointer); a null pointer is tested before any read past it.
     unsafe {
-        let mut key = InodeKey { dev: 0, ino: 0 };
-        if inode.is_null() {
-            return key;
+        let zero = crate::opaque::opaque(0u64);
+        let mut dev = zero;
+        let mut ino = zero;
+        if !inode.is_null() {
+            let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
+            if !sb.is_null() {
+                if let Ok(d) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
+                    dev = crate::inode_dev::stat_dev(inode, sb, d) as u64;
+                }
+                if let Ok(i) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
+                    ino = i;
+                }
+            }
         }
-        let sb = read_ptr(inode.add(off!(INODE_I_SB_OFFSET)));
-        if sb.is_null() {
-            return key;
-        }
-        if let Ok(dev) = bpf_probe_read_kernel::<u32>(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)) as *const u32) {
-            key.dev = crate::inode_dev::stat_dev(inode, sb, dev) as u64;
-        }
-        if let Ok(ino) = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_INO_OFFSET)) as *const u64) {
-            key.ino = ino;
-        }
-        key
+        InodeKey { dev, ino }
     }
 }
 
@@ -513,6 +538,14 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
             }
             _ => {}
         }
+        // Lot 1.4b (stack): the running task's buffers the walk uses are made
+        // here — an unlink's or a rename's first (an open's are `on_open`'s:
+        // found) — and the walk only looks them up ([`held_buffer`]). Made in
+        // the walk, the share's functions ([`nn_open_task_make`]) were on its
+        // chain: `fim_file_open_sensor` at 480 of the verifier's 512 bytes.
+        // No room: the walk finds none and is lost, as before (counted twice,
+        // as before: the entry's loss here, the sensor's drop in the walk).
+        let _ = task_buffer(bpf_get_current_task());
         let r = nn_open_walk(dkey.dev, dkey.ino, dir as u64, dir_inode as u64);
         let c = DirClass {
             bits: r as u32 | CLASSIFIED,
@@ -616,11 +649,11 @@ pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> 
 unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
-        // The running task's buffers: [`on_open`]'s, or made here for an
-        // unlink or a rename (`forget_task` removes them).
+        // The running task's buffers: [`on_open`]'s, or made by [`dir_class`]
+        // for an unlink or a rename (`forget_task` removes them).
         let task = bpf_get_current_task();
-        let scratch = match task_buffer(task) {
-            Some((p, _)) => (*p).names.as_mut_ptr(),
+        let scratch = match held_buffer(task) {
+            Some(p) => (*p).names.as_mut_ptr(),
             None => {
                 crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
                 // Lot 325 (R3): lost, never cached ([`dir_class`]).
@@ -1032,7 +1065,9 @@ unsafe fn on_open_in(file: *const u8, t: *mut OpenTask, task: u64, live: bool) {
                 return;
             }
             // Review 75: a read-only repeat by the same task is dropped.
-            if mode & FMODE_WRITE != 0 || !crate::read_repeat::repeat(&crate::fim_watch::FIM_READ_SEEN, &key) {
+            if mode & FMODE_WRITE != 0
+                || crate::read_repeat::nn_read_repeat(crate::read_repeat::SEEN_FIM, key.dev, key.ino) == 0
+            {
                 crate::fim_watch::emit_drift_opened(key);
             }
         }
@@ -1271,7 +1306,10 @@ unsafe fn observe(
         }
         // Review 75: a read-only repeat by the same task is dropped (the
         // telemetry probe excepted: each of its opens is a check).
-        if !write && reason & open_reason::PROBE == 0 && crate::read_repeat::repeat(&OPEN_READ_SEEN, key) {
+        if !write
+            && reason & open_reason::PROBE == 0
+            && crate::read_repeat::nn_read_repeat(crate::read_repeat::SEEN_OPEN, key.dev, key.ino) != 0
+        {
             return;
         }
         emit(reason, key, dentry, flags, mode, 0);
