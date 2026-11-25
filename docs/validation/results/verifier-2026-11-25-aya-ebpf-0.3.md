@@ -375,8 +375,8 @@ fixed on 6.8, 6.12 and 7.0); 6.1, 6.8 and 7.0 were not run again.
   both times). CI and the release share the checkout path and every pin:
   the nightly, bpf-linker and both lockfiles. So the two sha256s are
   expected to be equal, and on this lot's PR they were: the release dry
-  run embedded `a9de2b0a…`, the sha256 of CI's artefact, built on another
-  runner. Nothing compares them automatically: the `package` job compiles
+  run embedded `ca356605…`, the sha256 of CI's artefact, built on another
+  runner (at the head after the review's fixes; `a9de2b0a…` before them). Nothing compares them automatically: the `package` job compiles
   the dependency tree and holds no token that reads another run's
   artefacts (SUP-003), and the comparison by hand before a tag is not yet
   in CONTRIBUTING.md's release procedure (docs lot 1.9). lab-vm.yml still
