@@ -12,3 +12,16 @@ the chain signed sha256WithRSAEncryption, the handshake RSA-PSS),
 `*-srv.key` PKCS#8. The test
 `every_signature_family_completes_a_handshake` (`nn_export::tls`) uses
 them.
+
+Lot 1.8 (the review of #610): each private key (`srv.key`, `*-srv.key`)
+starts with a few lines saying it is a test-only key, not a secret (PEM
+readers skip the text before `-----BEGIN`), and
+`.github/secret_scanning.yml` keeps GitHub's secret scanning off this
+directory. They stay committed rather than made at test time: no
+certificate builder is in the lockfiles (rcgen signs with ring or aws-lc-rs,
+C code the export's TLS-in-Rust-only rule keeps out, and RustCrypto's
+`x509-cert` builder is not locked), and an RSA-2048 key made on every run
+costs seconds in a debug build. `xtask/tests/supply_chain.rs`
+(`private_keys_are_test_keys_out_of_secret_scanning`) holds it: a tracked
+PEM private key lives here only, with that header, and the exclusion names
+this directory alone.

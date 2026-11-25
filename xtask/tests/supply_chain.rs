@@ -2053,6 +2053,12 @@ fn security_crates_are_locked_alike_for_the_fuzzer() {
         // dev-dependency the fuzz lockfile does not lock)
         "libc",
         "nix",
+        // lot 1.8: nn-admin's safe system calls — the effective uid of the
+        // private key's owner check (AUT-002) and `heartbeat watch`'s poll —
+        // and its raw Linux backend's numbers and layouts (RUSTSEC-2026-0486
+        // was rustix's, in both lockfiles: lot 305)
+        "rustix",
+        "linux-raw-sys",
         "aya",
         "aya-obj",
         "object",
@@ -4078,4 +4084,246 @@ fn glibc_baseline_check_refuses_a_binary_that_needs_above_2_34() {
     ] {
         assert!(text.contains(line), "missing `{line}`:\n{text}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lot 1.8 (the reviews of #610): the export worker's OS generator, and the
+// test PKI's private keys.
+
+/// The export worker's production code: nn-export's sources and the
+/// worker's life in the agent.
+fn export_worker_code() -> Vec<(String, String)> {
+    support::product_code(&repo_root())
+        .into_iter()
+        .filter(|(rel, _)| {
+            rel.starts_with("crates/nn-export/src/") || rel == "agent/src/export/worker.rs"
+        })
+        .collect()
+}
+
+/// What the export worker may not draw with: a generator that panics on a
+/// failed draw (rand_core's `UnwrapErr`, the agent's `OsRng`), one of
+/// userland, or x25519-dalek's own draw (`expect`s getrandom).
+const PANICKING_DRAWS: &[&str] = &[
+    "UnwrapErr",
+    "OsRng",
+    "rand::rng(",
+    "thread_rng",
+    "EphemeralSecret::random(",
+    "StaticSecret::random(",
+    "ReusableSecret::random(",
+];
+
+/// The needles of [`PANICKING_DRAWS`] in `code`, as `path:line: needle`.
+fn panicking_draws(rel: &str, code: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    for (i, line) in code.lines().enumerate() {
+        for n in PANICKING_DRAWS {
+            if line.contains(n) {
+                bad.push(format!("{rel}:{}: `{n}`", i + 1));
+            }
+        }
+    }
+    bad
+}
+
+/// Named (lot 1.8, the review of #610): the export worker's key exchange
+/// draws its secret from the OS generator through `tls::ephemeral_secret`
+/// alone, which turns a failed draw into the handshake's error; no
+/// production code of the worker draws with a generator that panics (the
+/// release profile aborts the worker on a panic), and none draws a secret
+/// another way. The CI of #616: every random of the TLS provider (the
+/// hello's too) comes from `tls::Os`, the one draw of getrandom's `SysRng`,
+/// which the unit tests fail on any kernel by an injection compiled out of
+/// the worker.
+#[test]
+fn the_export_worker_draws_without_a_panic() {
+    let code = export_worker_code();
+    assert!(
+        code.len() >= 10,
+        "{} files of the export worker",
+        code.len()
+    );
+    let bad: Vec<String> = code
+        .iter()
+        .flat_map(|(rel, c)| panicking_draws(rel, c))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "a draw that panics on a failed getrandom in the export worker (use \
+         nn_export::tls::ephemeral_secret's way: a checked draw, its failure an error):\n{}",
+        bad.join("\n")
+    );
+    let draws: Vec<String> = code
+        .iter()
+        .flat_map(|(rel, c)| {
+            c.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("random_from_rng(") || l.contains("from_rng("))
+                .map(move |(i, _)| format!("{rel}:{}", i + 1))
+        })
+        .collect();
+    assert_eq!(
+        draws.len(),
+        1,
+        "one secret drawn, in ephemeral_secret: {draws:?}"
+    );
+    let tls = &code
+        .iter()
+        .find(|(rel, _)| rel == "crates/nn-export/src/tls.rs")
+        .expect("nn-export's TLS client moved: update this test")
+        .1;
+    let body = |sig: &str| {
+        let at = tls
+            .find(sig)
+            .unwrap_or_else(|| panic!("tls.rs: no `{sig}`"));
+        let rest = &tls[at..];
+        rest[..support::matching_brace(rest)].to_string()
+    };
+    let drawer = body("fn ephemeral_secret<");
+    assert!(drawer.contains("random_from_rng(&mut draw)"), "{drawer}");
+    assert!(
+        drawer.contains("if draw.failed")
+            && drawer.contains("return Err(rustls::Error::FailedToGetRandomBytes)"),
+        "{drawer}"
+    );
+    let start = body("fn start(&self)");
+    assert!(
+        start.contains("ephemeral_secret(&mut Os)?"),
+        "the X25519 group's start draws through ephemeral_secret, from Os: {start}"
+    );
+    // the CI of #616: every random of the provider from `Os` (the hello's
+    // too), getrandom's `SysRng` drawn there alone, and the unit tests'
+    // injection into it compiled out of the worker
+    let provider = body("pub fn provider()");
+    assert!(
+        provider.contains("p.secure_random = &OsRandom;"),
+        "the hello's randoms from Os: {provider}"
+    );
+    let random = body("impl rustls::crypto::SecureRandom for OsRandom");
+    assert!(random.contains("Os.try_fill_bytes(bytes)"), "{random}");
+    let sys: Vec<String> = code
+        .iter()
+        .flat_map(|(rel, c)| {
+            c.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("SysRng"))
+                .map(move |(i, l)| format!("{rel}:{}: {}", i + 1, l.trim()))
+        })
+        .collect();
+    assert!(
+        sys.len() == 1 && sys[0].ends_with(": getrandom::SysRng.try_fill_bytes(dst)"),
+        "the OS generator drawn in Os alone: {sys:?}"
+    );
+    assert!(
+        !tls.contains("GENERATOR_DOWN"),
+        "the tests' injection into Os is #[cfg(test)]"
+    );
+}
+
+/// The scanner of the export worker's draws catches a planted copy of each
+/// pattern, and leaves the checked draw.
+#[test]
+fn the_draw_scanner_catches_its_patterns() {
+    let planted = concat!(
+        "let mut rng = getrandom::rand_core::UnwrapErr(getrandom::SysRng);\n",
+        "let k = SigningKey::generate(&mut OsRng);\n",
+        "let n: u64 = rand::rng().random();\n",
+        "let s = x25519_dalek::EphemeralSecret::random();\n",
+        "let secret = ephemeral_secret(&mut Os)?;\n",
+    );
+    let found = panicking_draws("x.rs", planted);
+    for line in 1..=4 {
+        assert!(
+            found
+                .iter()
+                .any(|f| f.starts_with(&format!("x.rs:{line}:"))),
+            "line {line}: {found:?}"
+        );
+    }
+    assert!(!found.iter().any(|f| f.starts_with("x.rs:5:")), "{found:?}");
+}
+
+/// The test PKI's directory, and the first words of each key's header.
+const TEST_PKI: &str = "crates/nn-export/tests/pki/";
+const TEST_KEY_HEADER: &str = "TEST-ONLY KEY, NOT A SECRET.";
+
+/// A PEM private key's first line (`-----BEGIN [RSA |EC |OPENSSH |…]PRIVATE
+/// KEY-----`, PKCS#8's `ENCRYPTED PRIVATE KEY` too), at the start of a line.
+fn begins_a_private_key(line: &str) -> bool {
+    let l = line.trim_end();
+    l.starts_with("-----BEGIN ") && l.ends_with("PRIVATE KEY-----")
+}
+
+/// Named (lot 1.8, the review of #610): the repository's PEM private keys
+/// are nn-export's test keys, and nothing else: each tracked file that holds
+/// one lies in the test PKI's directory and starts with the header saying it
+/// is a test-only key; GitHub's secret scanning skips that directory and no
+/// other (`.github/secret_scanning.yml`); `.gitignore` lets keys in there
+/// alone.
+#[test]
+fn private_keys_are_test_keys_out_of_secret_scanning() {
+    let root = repo_root();
+    let mut keys = Vec::new();
+    let mut bad = Vec::new();
+    for rel in support::tracked_files() {
+        let Ok(text) = fs::read_to_string(root.join(&rel)) else {
+            continue;
+        };
+        if !text.lines().any(begins_a_private_key) {
+            continue;
+        }
+        if !rel.starts_with(TEST_PKI) {
+            bad.push(format!("{rel}: a PEM private key outside {TEST_PKI}"));
+        } else if !text.starts_with(TEST_KEY_HEADER) {
+            bad.push(format!("{rel}: no `{TEST_KEY_HEADER}` header"));
+        }
+        keys.push(rel);
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let mut names: Vec<&str> = keys.iter().map(|k| &k[TEST_PKI.len()..]).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["ed25519-srv.key", "p384-srv.key", "rsa-srv.key", "srv.key"],
+        "the test PKI's keys (README.md there)"
+    );
+    // the exclusion: that directory, nothing else
+    let cfg: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&read(&root.join(".github/secret_scanning.yml")))
+            .expect(".github/secret_scanning.yml parses");
+    let ignored: Vec<&str> = cfg
+        .get("paths-ignore")
+        .and_then(|v| v.as_sequence())
+        .expect("secret_scanning.yml: a `paths-ignore` list")
+        .iter()
+        .map(|v| v.as_str().expect("a path"))
+        .collect();
+    assert_eq!(ignored, [format!("{TEST_PKI}**")]);
+    assert_eq!(
+        cfg.as_mapping().map(|m| m.len()),
+        Some(1),
+        "secret_scanning.yml: paths-ignore alone"
+    );
+    // .gitignore ignores keys, and lets them in under the test PKI only
+    let gitignore = read(&root.join(".gitignore"));
+    let lines: Vec<&str> = gitignore.lines().map(str::trim).collect();
+    assert!(lines.contains(&"*.key") && lines.contains(&"*.pem"));
+    for l in lines.iter().filter(|l| l.starts_with('!')) {
+        if l.ends_with(".key") || l.ends_with(".pem") {
+            assert!(l.starts_with(&format!("!{TEST_PKI}")), ".gitignore: {l}");
+        }
+    }
+    // the scanner: a key's first line, not a template's quoted one
+    assert!(begins_a_private_key("-----BEGIN PRIVATE KEY-----"));
+    assert!(begins_a_private_key(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\r"
+    ));
+    assert!(begins_a_private_key(
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----"
+    ));
+    assert!(!begins_a_private_key(
+        "  \"private_key\": \"-----BEGIN PRIVATE KEY-----\\n{{body}}\\n-----END PRIVATE KEY-----\\n\","
+    ));
+    assert!(!begins_a_private_key("-----BEGIN CERTIFICATE-----"));
 }
