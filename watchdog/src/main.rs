@@ -47,15 +47,15 @@ use northnarrow_watchdog::{
     wait_for_agent_death, write_pidfile_atomic,
 };
 use northnarrow_watchdog::{
-    CoveringFuse, FUSE_CONNECTIONS, RestartLoop, abort_fuse, covering_fuse, fuse_aborted_record,
-    fuse_waiting, leave_stuck_marker, restart_loop_record, stuck_marker_path,
-    stuck_unresponsive_record, unanswered_pings,
-};
-use northnarrow_watchdog::{
     ExitAs, ExitReason, Failure, HOLD_REMIND_EVERY, HOLD_STATUS_EVERY, HoldRetry, LoopProgress,
     StuckVerdict, event_loop_stalled_record, exit_record, hold_status_line, pidfd_wait_failed,
     ping_agent, read_pid_from_file, stuck_recovery_failed_record, stuck_verdict,
     unit_failure_record, unix_now,
+};
+use northnarrow_watchdog::{
+    FUSE_CONNECTIONS, RestartLoop, abort_fuse, covering_in, fuse_aborted_record, fuse_waiting,
+    leave_stuck_marker, restart_loop_record, stuck_marker_path, stuck_unresponsive_record,
+    unanswered_pings,
 };
 use northnarrow_watchdog::{
     PingFailure, Reaped, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
@@ -1059,24 +1059,14 @@ fn recovery_failed(cli: &Cli, agent_pid: u32, error: &str) {
 /// (`fuse_aborted`). Returns how many were aborted.
 fn abort_holding_fuse(holds: &std::path::Path, agent_pid: u32) -> usize {
     let connections = std::path::Path::new(FUSE_CONNECTIONS);
-    // the agent's mount table and PID 1's, beneath the anchored /proc root
-    let tables = || -> Vec<String> {
-        [
-            format!("/proc/{agent_pid}/mountinfo"),
-            "/proc/1/mountinfo".to_string(),
-        ]
-        .iter()
-        .filter_map(|t| antitamper_bpf::kernel_roots::read_to_string(t).ok())
-        .collect()
-    };
-    let mut found: Vec<CoveringFuse> = Vec::new();
-    for text in tables() {
-        for f in covering_fuse(&text) {
-            if !found.iter().any(|x| x.conn == f.conn) {
-                found.push(f);
-            }
-        }
-    }
+    // the agent's mount table and PID 1's, beneath the anchored /proc root,
+    // as bytes (lot 1.7a)
+    let paths = [
+        format!("/proc/{agent_pid}/mountinfo"),
+        "/proc/1/mountinfo".to_string(),
+    ];
+    let tables = || northnarrow_watchdog::mount_tables(&paths);
+    let found = covering_in(&tables());
     let mut aborted = 0;
     for f in found {
         let Some(waiting) = fuse_waiting(connections, f.conn).filter(|w| *w > 0) else {

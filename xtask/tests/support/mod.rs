@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+/// Lot 1.7a: the sources read as Rust (the AST ratchets' reader).
+pub mod ast;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;

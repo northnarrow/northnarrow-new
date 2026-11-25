@@ -2267,9 +2267,12 @@ dependencies = [
  "ebpf-guard",
  "jiff",
  "nn-evidence",
+ "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "syn 3.0.10",
 ]
 
 [[package]]
