@@ -57,7 +57,12 @@ pub fn tcp_close(ctx: FExitContext) -> u32 {
 
 #[inline(always)]
 unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the socket is the hook's argument, read only through the probe
+    // helper (a fault is 0, as each field's default); the flow id is two
+    // aligned words of the map's value, copied before the entry is removed;
+    // the record is this run's reserved ring entry, zeroed before any field is
+    // written, the addresses and the `comm` written into it by the helpers
+    // (which zero what they fail to read).
     unsafe {
         // arg(0) of tcp_close(struct sock *sk, long timeout) is the
         // sock pointer. The fexit context's arg() is unsafe — caller

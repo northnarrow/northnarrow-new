@@ -1791,7 +1791,12 @@ pub extern "C" fn nn_loader_opted_out(prog_type: u64) -> u64 {
 
 #[inline(always)]
 unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the hook's arguments are its context's slots; `attr` (the
+    // kernel's copy of the `bpf_attr`) is tested for null and read only
+    // through `bpf_probe_read_kernel`, at offsets within the union (an
+    // unreadable value is counted as a fail-open where it decides); the
+    // handles and descriptors go to the global functions as plain values;
+    // nothing is written through either.
     unsafe {
         let cmd = ctx.arg::<c_int>(0) as u32;
         let attr: *const c_void = ctx.arg(1);

@@ -174,7 +174,9 @@ enum Src {
 /// place in the two families); the address only for port 53.
 #[inline(always)]
 unsafe fn source_from_name(msg_ptr: *const u8) -> Src {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the address's pointer is a load of the hook's typed `msghdr`
+    // ([`msg_name`]); the address itself is read only through
+    // `bpf_probe_read_kernel` (a fault is `NoName`).
     unsafe {
         let name = msg_name(msg_ptr);
         if name.is_null() {
@@ -319,7 +321,12 @@ fn sat16(n: u64) -> u16 {
 
 #[inline(always)]
 unsafe fn try_answer(ctx: &FExitContext, ret: i32) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: the hook's arguments are its context's slots; the socket and the
+    // message are read through [`peer_port`] / [`msg_name`] (typed loads or
+    // the probe helper) and the probe helper; the payload is read from the
+    // receiver's buffer by `bpf_probe_read_user` into this run's reserved,
+    // zeroed ring entry, at most `DNS_ANSWER_CAP` bytes (the size masked
+    // on the register the helper takes).
     unsafe {
         // A DNS message is at least its header; an error is negative. The
         // function returns an `int`: only the slot's low 32 bits are its value.
