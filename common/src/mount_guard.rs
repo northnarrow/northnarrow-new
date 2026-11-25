@@ -204,6 +204,131 @@ pub const fn held_under(
     (HELD_UNDER | parent_mnt_id as u64, h)
 }
 
+/// Lot 1.1 (the review of #569, F2): `MOUNT_HELD`'s key of a held mount by
+/// its own peer group (`shared:N`) and its root (the root dentry's key, as
+/// `stat(2)` gives it): `(HELD_ROOT | group, mix(root))`. Peers share
+/// their group and their root dentry, so a mount with that group and that
+/// root is a peer copy of the held mount — a raw namespace's copy of
+/// `/sys`, whose unmount the kernel propagates to the host's — in whatever
+/// namespace it is. A slave (`master:N` only) is not one: what is done to
+/// it never reaches its master.
+///
+/// Its tag is bit 61 alone: a key of every other kind has bit 62
+/// ([`HELD_BY_ID`]) or bit 63 ([`HELD_BY_PLACE`], [`HELD_UNDER`]).
+pub const HELD_ROOT: u64 = 1 << 61;
+
+/// [`HELD_ROOT`]'s key of a peer group and a root.
+pub const fn held_root(group: u32, root_dev: u64, root_ino: u64) -> (u64, u64) {
+    let (_, h) = held_by_place(group, root_dev, root_ino, &NameKey::NONE);
+    (HELD_ROOT | group as u64, h)
+}
+
+/// Lot 1.1 (the review of #569, F2): a `move_mount(2)` takes away a peer
+/// copy of a held mount — an attached mount (`attached`: not a detached
+/// tree being attached, which is judged where it lands) in a peer group
+/// (`group`), whose group and root are a held mount's ([`HELD_ROOT`]'s key
+/// found: `root_held`). Its source is judged, not only where it lands: a
+/// copy moved under a private mount, then unmounted there, takes the held
+/// mount it is a peer of with it, behind the unmount walk's bound.
+pub const fn moves_held_copy(attached: bool, group: u32, root_held: bool) -> bool {
+    attached && group != 0 && root_held
+}
+
+/// [`moves_held_copy`]'s verdict: refused (outside the trusted-installer
+/// window, which lets it through recorded), never at the end of a shutdown
+/// (`systemd-shutdown` moves what it unmounts last).
+pub const fn copy_move_verdict(held_copy: bool, shutdown: bool, window: bool) -> Verdict {
+    if !held_copy || shutdown {
+        Verdict::Allow
+    } else if window {
+        Verdict::Window(MG_WHY_MOVE_COPY)
+    } else {
+        Verdict::Refuse(MG_WHY_MOVE_COPY)
+    }
+}
+
+// ── The split hooks (lot 1.1, F8b-1) ──────────────────────────────────────
+
+/// Lot 1.1 (F8b-1): `sb_mount` and `move_mount` are each an entry program
+/// (the hook) and stages it tail-calls through a program array of its own
+/// — the entry reads what is cheap and where the target lands (the
+/// propagation walk), the stage what lands there (the point's names and
+/// ancestors) and decides. Each program is verified on its own: the
+/// states the walk leaves never multiply the point's (5.15 processed
+/// 830,908 instructions of `sb_mount`, 92.3 % of the 900k gate). The
+/// stage judging where a mount lands: slot 0 of each array.
+pub const STAGE_POINT: u32 = 0;
+/// `sb_mount`'s stage judging a change of propagation that reaches the pin
+/// directory's lock (`MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`,
+/// `MS_UNBINDABLE`): slot 1 of its array.
+pub const STAGE_PROPAGATE: u32 = 1;
+/// The slots of each hook's program array.
+pub const STAGE_SLOTS: u32 = 2;
+
+/// Where `sb_mount`'s entry sends a `mount(2)` by its flags alone, before
+/// it reads anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SbRoute {
+    /// Nothing the guard judges (a plain remount, which `sb_remount`
+    /// judges): let through unread.
+    Pass,
+    /// A change of propagation: counted for the refresh, and judged by
+    /// [`STAGE_PROPAGATE`] where it reaches the lock.
+    Propagate,
+    /// A new mount, a bind, a move, a bind remount: judged by
+    /// [`STAGE_POINT`] once the entry found the target reaching a guarded
+    /// namespace.
+    Point,
+}
+
+/// [`SbRoute`] of `mount(2)`'s `flags` — [`mount_op`]'s and [`regroups`]'
+/// order, the kernel's (`path_mount()`).
+pub const fn sb_mount_route(flags: u64) -> SbRoute {
+    if mount_op(flags) != MG_OP_PASS {
+        SbRoute::Point
+    } else if regroups(flags) {
+        SbRoute::Propagate
+    } else {
+        SbRoute::Pass
+    }
+}
+
+// ── `MOUNT_GUARD_CONF`'s slots shared with the agent (lot 1.1) ───────────
+
+/// `MOUNT_GUARD_CONF`'s slot counting the propagation changes the kernel
+/// makes on a mount of a guarded namespace, of a peer group `MOUNT_GROUPS`
+/// holds, or on the pin directory's lock (or a copy of it): counted by the
+/// `change_mnt_propagation()` fentry — `mount_setattr(2)`'s changes, which
+/// no LSM hook sees, among them — as the change is made.
+pub const CONF_PROPAGATED: u32 = 5;
+/// `MOUNT_GUARD_CONF`'s entries.
+pub const CONF_SLOTS: u32 = 6;
+
+/// Lot 1.1 (the change_mnt_propagation fentry): a propagation change the
+/// kernel makes on a mount counts — the mount is still in a namespace
+/// (`in_ns`: `umount_tree()` makes every mount it takes private after
+/// clearing its namespace, an unmount the hooks judged), and it is in a
+/// guarded one (`guard`), in a peer group `MOUNT_GROUPS` holds
+/// (`group_known`), or it is the pin directory's lock or a copy of it
+/// (`lock`: [`MG_LOCK`] at its root).
+pub const fn propagation_counts(in_ns: bool, guard: u8, group_known: bool, lock: bool) -> bool {
+    in_ns && (guard != 0 || group_known || lock)
+}
+
+/// Lot 1.1 (the re-check 2 of #569, N3): the agent's or the watchdog's own
+/// mount namespace (`inum`) is judged as theirs — never when it is PID 1's
+/// (`host`: an agent or a watchdog run by hand there), whose entry stays
+/// [`GUARD_HOST`] and which the role's exit never drops ([`vacates`]).
+pub const fn guards_own_namespace(inum: u64, host: u64) -> bool {
+    inum != 0 && inum != host
+}
+
+/// Lot 1.1 (N3): the role's exit drops its namespace's entry — never PID
+/// 1's (`host`), whatever the role's slot holds.
+pub const fn vacates(inum: u64, host: u64) -> bool {
+    inum != 0 && inum != host
+}
+
 // ── Propagation: where a change made elsewhere lands (re-check N1) ───────
 
 /// How many mounts of a peer group's propagation [`spread`] reads: the
@@ -677,6 +802,9 @@ pub const MG_WHY_UMOUNT_NOTED: u8 = 10;
 /// Lot 359: the pin directory's lock changed — its propagation, or a mount
 /// of it that is not its maker's own step.
 pub const MG_WHY_LOCK: u8 = 11;
+/// Lot 1.1 (the review of #569, F2): a peer copy of a held mount moved
+/// ([`moves_held_copy`]).
+pub const MG_WHY_MOVE_COPY: u8 = 12;
 
 /// A dentry name or a file-system type as the hook compares it: its length
 /// and a 64-bit FNV-1a hash of its first 15 bytes, zero-padded to 16 (the
@@ -1483,6 +1611,9 @@ pub const fn why_name(why: u8) -> &'static str {
         }
         MG_WHY_LOCK => {
             "the lock of the agent's pin directory (its self-bind, private and unbindable, under the host's bpffs) changed: only its maker's own steps pass"
+        }
+        MG_WHY_MOVE_COPY => {
+            "a peer copy of a protected mount moved away (its unmount propagates to the protected mount it is a peer of)"
         }
         _ => "a mount refused",
     }
@@ -3633,5 +3764,148 @@ mod tests {
             assert!(MG_LOCK_ABOVE & (MG_ON | MG_OWN | MG_VIEW | MG_HOLD | MG_SB | MG_LOCK) == 0);
             assert!(MS_PROPAGATION == MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
         }
+    }
+
+    /// Named test (lot 1.1, the review of #569, F2): a `move_mount(2)` of
+    /// an attached peer copy of a held mount — its group and its root a
+    /// held mount's — is refused in any namespace (a raw `unshare -m`'s
+    /// copy of `/sys` included), let through recorded in the window, and at
+    /// the end of a shutdown. Failed on main: only the target was judged
+    /// outside a guarded namespace.
+    #[test]
+    fn a_move_of_a_peer_copy_of_a_held_mount_is_refused_in_any_namespace() {
+        // the held /sys of PID 1's namespace, in shared:7, root (0x15, 1)
+        let held = held_root(7, 0x15, 1);
+        // its raw namespace's copy: the same group, the same root dentry
+        assert_eq!(held_root(7, 0x15, 1), held);
+        let hit = |group: u32, dev: u64, ino: u64| held_root(group, dev, ino) == held;
+        assert!(moves_held_copy(true, 7, hit(7, 0x15, 1)));
+        assert_eq!(
+            copy_move_verdict(moves_held_copy(true, 7, hit(7, 0x15, 1)), false, false),
+            Verdict::Refuse(MG_WHY_MOVE_COPY)
+        );
+        assert_eq!(
+            copy_move_verdict(true, false, true),
+            Verdict::Window(MG_WHY_MOVE_COPY)
+        );
+        assert_eq!(copy_move_verdict(true, true, false), Verdict::Allow);
+        // a bind of /usr in the same group (another root), or a mount of
+        // another group with the same root, is not a copy of it
+        assert!(!moves_held_copy(true, 7, hit(7, 0x15, 2)));
+        assert!(!moves_held_copy(true, 7, hit(8, 0x15, 1)));
+        assert!(!moves_held_copy(true, 7, hit(7, 0x16, 1)));
+        assert_eq!(copy_move_verdict(false, false, false), Verdict::Allow);
+        // the key never meets another `MOUNT_HELD` key's
+        let (dev, _) = held;
+        assert_eq!(dev >> 61, HELD_ROOT >> 61);
+        for other in [
+            held_by_id(7).0,
+            held_by_id(u32::MAX).0,
+            held_by_place(7, 0x15, 1, &NameKey::NONE).0,
+            held_under(7, 0x15, 1, &NameKey::NONE).0,
+        ] {
+            assert_ne!(other >> 61, dev >> 61, "{other:#x}");
+        }
+        assert!(why_name(MG_WHY_MOVE_COPY).contains("peer copy"));
+    }
+
+    /// Named test (lot 1.1, F2): a detached tree being attached (judged
+    /// where it lands) and a mount in no peer group — a slave, a private
+    /// copy, whose changes never reach the held mount — are not a held
+    /// copy moved away.
+    #[test]
+    fn a_detached_tree_or_a_mount_in_no_group_is_judged_where_it_lands() {
+        assert!(!moves_held_copy(false, 7, true));
+        assert!(!moves_held_copy(true, 0, true));
+        assert!(!moves_held_copy(true, 7, false));
+    }
+
+    /// Named test (lot 1.1, F8b-1): `sb_mount`'s entry sends to a stage
+    /// every `mount(2)` the guard can refuse — every operation `decide`
+    /// weighs to the point stage, every change of propagation that can
+    /// reach the lock to the propagation stage — over every combination of
+    /// the flags the guard reads.
+    #[test]
+    fn sb_mount_routes_every_judged_operation_to_its_stage() {
+        let bits = [
+            MS_RDONLY,
+            MS_NOEXEC,
+            MS_REMOUNT,
+            MS_BIND,
+            MS_MOVE,
+            MS_REC,
+            MS_UNBINDABLE,
+            MS_PRIVATE,
+            MS_SLAVE,
+            MS_SHARED,
+            1 << 15, // MS_SILENT
+        ];
+        for mask in 0u32..(1 << bits.len()) {
+            let mut flags = 0u64;
+            for (i, b) in bits.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    flags |= b;
+                }
+            }
+            let route = sb_mount_route(flags);
+            let op = mount_op(flags);
+            assert_eq!(route == SbRoute::Point, op != MG_OP_PASS, "{flags:#x}");
+            // a change of propagation in the kernel's sense (not a remount
+            // that carries a propagation bit): the lock's judge sees it
+            assert_eq!(
+                route == SbRoute::Propagate,
+                op == MG_OP_PASS && regroups(flags),
+                "{flags:#x}"
+            );
+            if route == SbRoute::Pass {
+                for guard in [0, GUARD_HOST, GUARD_AGENT, GUARD_WATCHDOG] {
+                    // nothing let through unread is one the lock's judge
+                    // would weigh as a change of propagation
+                    assert!(
+                        !(regroups(flags) && lock_touched(flags, true, true, guard)),
+                        "{flags:#x} guard {guard}"
+                    );
+                }
+            }
+        }
+        // the slots are distinct, within the arrays
+        const {
+            assert!(STAGE_POINT != STAGE_PROPAGATE);
+            assert!(STAGE_POINT < STAGE_SLOTS && STAGE_PROPAGATE < STAGE_SLOTS);
+        }
+    }
+
+    /// Named test (lot 1.1, the change_mnt_propagation fentry): a change
+    /// counts on a mount of a guarded namespace, of a held group, or on the
+    /// lock or a copy of it — never on a mount `umount_tree()` takes (its
+    /// namespace already cleared), nor on a container's own mount.
+    #[test]
+    fn a_propagation_change_counts_on_a_guarded_or_held_mount_or_the_lock() {
+        assert!(propagation_counts(true, GUARD_HOST, false, false));
+        assert!(propagation_counts(true, GUARD_AGENT, false, false));
+        assert!(propagation_counts(true, 0, true, false));
+        assert!(propagation_counts(true, 0, false, true));
+        assert!(!propagation_counts(true, 0, false, false));
+        for (g, k, l) in [(GUARD_HOST, true, true), (0, true, false), (0, false, true)] {
+            assert!(!propagation_counts(false, g, k, l));
+        }
+        const {
+            assert!(CONF_PROPAGATED < CONF_SLOTS);
+        }
+    }
+
+    /// Named test (lot 1.1, the re-check 2 of #569, N3): an agent or a
+    /// watchdog run by hand in PID 1's mount namespace never takes PID 1's
+    /// entry as its own, and its exit never drops it. Failed on main: the
+    /// entry became `GUARD_AGENT` and was removed at the agent's exit.
+    #[test]
+    fn pid_1s_namespace_is_never_taken_or_dropped_as_a_roles_own() {
+        let host = 4_026_531_841;
+        assert!(!guards_own_namespace(host, host));
+        assert!(!vacates(host, host));
+        assert!(guards_own_namespace(4_026_532_300, host));
+        assert!(vacates(4_026_532_300, host));
+        assert!(!guards_own_namespace(0, host));
+        assert!(!vacates(0, host));
     }
 }

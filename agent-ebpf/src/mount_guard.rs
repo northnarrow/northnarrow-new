@@ -35,13 +35,13 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns, generated},
     macros::{fentry, lsm, map},
-    maps::{Array, HashMap, LruHashMap},
+    maps::{Array, HashMap, LruHashMap, ProgramArray},
     programs::{FEntryContext, LsmContext},
 };
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::mount_guard::{
     decide, fnv16, held_by_id, held_by_place, inode_key, is_view_magic, mount_op,
-    reach_in, record_dev, regroups, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
+    reach_in, record_dev, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
     BTRFS_SUPER_MAGIC, DEPTH_DEEPER, GUARD_HOST, HELD_REFUSE, MAX_STACK, MAX_WALK, MG_HOLD,
     MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
     MG_OP_REMOUNT_BIND, MG_OP_UMOUNT, MG_OWN, MG_SB, MG_VIEW, MS_NOEXEC, MS_RDONLY,
@@ -49,6 +49,9 @@ use northnarrow_common::mount_guard::{
     below_of, below_takes_held, umount_below, Tree,
     lock_bind, lock_maker, lock_shutdown_step, lock_step_at, lock_touched, lock_verdict,
     BindShape, MG_LOCK, MG_LOCK_ABOVE, MG_OP_PROPAGATE,
+    copy_move_verdict, held_root, moves_held_copy, propagation_counts, sb_mount_route, vacates,
+    SbRoute, CONF_PROPAGATED, CONF_SLOTS,
+    STAGE_POINT, STAGE_PROPAGATE, STAGE_SLOTS,
 };
 use northnarrow_common::wire::{InodeKey, FS_OP_MOUNT, FS_OP_MOUNT_NOTED, FS_OP_MOUNT_WINDOW};
 
@@ -131,10 +134,31 @@ pub static MOUNT_RECONF: LruHashMap<u64, u64> = LruHashMap::pinned(1024, 0);
 /// Slot 0: PID 1's mount namespace (its `ns.inum`), slot 1: PID 1's user
 /// namespace, slot 2: the agent's mount namespace, slot 3: the
 /// watchdog's (the keys [`vacate`] drops from [`MOUNT_GUARD_NS`]), slot 4
-/// ([`CONF_REGROUP`]): the propagation changes counted. 0 in slot 0: not
-/// armed, every hook lets through. Pinned.
+/// ([`CONF_REGROUP`]): the propagation changes counted, slot 5 (lot 1.1,
+/// `common::mount_guard::CONF_PROPAGATED`): the propagation changes the
+/// kernel made on a guarded mount (`crate::mount_setattr`). 0 in slot 0:
+/// not armed, every hook lets through. Pinned.
 #[map]
-pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(5, 0);
+pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(CONF_SLOTS, 0);
+
+/// Lot 1.1 (F8b-1): `sb_mount`'s stages, tail-called by its entry
+/// ([`mount_guard_sb_mount`]): [`STAGE_POINT`] judges where a mount lands
+/// ([`mount_guard_sb_mount_point`]), [`STAGE_PROPAGATE`] a change of
+/// propagation that reaches the pin directory's lock
+/// ([`mount_guard_sb_mount_propagate`]). Loaded for the hook, never
+/// attached; filled by the agent before the entry is attached, and pinned
+/// with it (a program array is emptied when its last user reference goes:
+/// the pin carries the stages across the agent's restart). An empty slot
+/// lets the operation through, counted (`DENY_FAIL_OPEN`).
+#[map]
+pub static MOUNT_SB_STAGES: ProgramArray = ProgramArray::with_max_entries(STAGE_SLOTS, 0);
+
+/// Lot 1.1 (F8b-1): `move_mount`'s stage ([`STAGE_POINT`]:
+/// [`mount_guard_move_mount_point`]) — an array of its own: from 6.11 a
+/// tracing program tail-calls only a program attached to the same kernel
+/// function (the array's first program's).
+#[map]
+pub static MOUNT_MOVE_STAGES: ProgramArray = ProgramArray::with_max_entries(STAGE_SLOTS, 0);
 
 /// The re-check of #567 (N1): [`MOUNT_GUARD_CONF`]'s slot counting the
 /// propagation changes that may give a guarded namespace's mount a peer
@@ -144,13 +168,15 @@ pub static MOUNT_GUARD_CONF: Array<u64> = Array::pinned(5, 0);
 /// namespace of a mount in a peer group (`MOVE_MOUNT_SET_GROUP` among
 /// them). The hook runs before the change (the new group has no number
 /// yet): the agent reads the count each second and refreshes the map when
-/// it moved. `mount_setattr(2)` has no hook: the walk and the 30 s round.
-const CONF_REGROUP: u32 = 4;
+/// it moved. `mount_setattr(2)` has no hook: lot 1.1's fentry on the
+/// kernel's `change_mnt_propagation()` counts its changes (`crate::
+/// mount_setattr`).
+pub(crate) const CONF_REGROUP: u32 = 4;
 
 /// A propagation change counted ([`CONF_REGROUP`]; two at once may count
 /// one: any change of the count wakes the refresh).
 #[inline(always)]
-fn note_regroup() {
+pub(crate) fn note_regroup() {
     if let Some(v) = MOUNT_GUARD_CONF.get_ptr_mut(CONF_REGROUP) {
         unsafe { *v = (*v).wrapping_add(1) };
     }
@@ -161,14 +187,24 @@ fn note_regroup() {
 /// namespace is no longer judged as PID 1's. Called by `role_exit`, at
 /// `sched_process_exit`, before the kernel drops the exiting task's
 /// namespaces (`exit_task_namespaces`): the number cannot have been freed
-/// for another namespace yet.
+/// for another namespace yet. Lot 1.1 (the re-check 2 of #569, N3): never
+/// PID 1's (`common::mount_guard::vacates`) — a role run by hand there.
 #[inline(always)]
 pub(crate) fn vacate(role_slot: u32) {
     let conf_slot = if role_slot == 1 { 2 } else { 3 };
+    let host = match MOUNT_GUARD_CONF.get(0) {
+        Some(h) => *h,
+        None => 0,
+    };
     if let Some(v) = MOUNT_GUARD_CONF.get_ptr_mut(conf_slot) {
+        // SAFETY: `v` is the map's own slot, valid for the program's run;
+        // a concurrent write by the agent is a whole `u64`
         let inum = unsafe { *v };
-        if inum != 0 {
+        if vacates(inum, host) {
             let _ = MOUNT_GUARD_NS.remove(&inum);
+        }
+        if inum != 0 {
+            // SAFETY: as above
             unsafe { *v = 0 };
         }
     }
@@ -1017,33 +1053,112 @@ fn reach_of_caller(c: &Caller) -> u8 {
     }
 }
 
+/// Lot 1.1 (F8b-1): the target lands in a guarded namespace, or its change
+/// propagates into one (`common::mount_guard::target_reach`): 1, else 0.
+/// Out of line, a BPF-to-BPF call: the walk's states end with its frame,
+/// and the entry tail-calls its stage right after it.
+#[inline(never)]
+fn lands_guarded(o: &Offs, real: *const u8) -> u64 {
+    // SAFETY: `target_of` reads the kernel's objects through
+    // `bpf_probe_read_kernel` only (a fault reads zeros, never a trap)
+    unsafe { target_of(o, real) }.is_some() as u64
+}
+
+/// The guard and the reach of a target the entry found landing in a
+/// guarded namespace or propagating into one ([`lands_guarded`]), as its
+/// stage reads them again without the walk: the namespace that owns the
+/// target, or — none guarded — a propagation into one.
+#[inline(always)]
+unsafe fn landed(o: &Offs, real: *const u8) -> (u8, u8) {
+    // SAFETY: `guard_of` reads through `bpf_probe_read_kernel` only
+    let guard = unsafe { guard_of(o, real) };
+    if guard != 0 {
+        (guard, reach_in(guard))
+    } else {
+        (0, REACH_OTHER_NS)
+    }
+}
+
 /// `int sb_mount(const char *dev_name, const struct path *path, const char
 /// *type, unsigned long flags, void *data)`: `mount(2)` (a new mount, a
 /// bind, a move, a remount, a propagation change). `path` is the target as
 /// the kernel resolved it, `type` the kernel's copy of the type string.
+///
+/// Lot 1.1 (F8b-1): the entry — what is cheap, then where the target lands
+/// (the walk); the judge is a stage it tail-calls ([`MOUNT_SB_STAGES`]),
+/// each program verified on its own.
 #[lsm(hook = "sb_mount")]
 pub fn mount_guard_sb_mount(ctx: LsmContext) -> i32 {
+    // SAFETY: the context is the hook's; every kernel read goes through
+    // `bpf_probe_read_kernel`, and a tail call never returns on success
     unsafe { try_sb_mount(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the trampoline's argument slots, which the
+    // verifier bounds by the hook's prototype; the pointers read are only
+    // passed to `bpf_probe_read_kernel`
+    unsafe {
+        let flags: u64 = ctx.arg(3);
+        match sb_mount_route(flags) {
+            SbRoute::Pass => return 0,
+            SbRoute::Propagate => {
+                MOUNT_SB_STAGES.tail_call(ctx, STAGE_PROPAGATE);
+                // the stage is not in its slot: let through, counted
+                crate::fail_open::bump(hook::SB_MOUNT);
+                return 0;
+            }
+            SbRoute::Point => {}
+        }
+        let Some(c) = caller(hook::SB_MOUNT) else {
+            return 0;
+        };
+        if !c.privileged {
+            return 0;
+        }
+        let Some(o) = Offs::load() else {
+            crate::fail_open::bump(hook::SB_MOUNT);
+            return 0;
+        };
+        let path: *const u8 = ctx.arg(1);
+        if path.is_null() {
+            crate::fail_open::bump(hook::SB_MOUNT);
+            return 0;
+        }
+        let mnt = peek_ptr(path.add(o.path_mnt as usize));
+        if mnt.is_null() {
+            crate::fail_open::bump(hook::SB_MOUNT);
+            return 0;
+        }
+        // the namespace that owns the target, not the caller's
+        if lands_guarded(o, real_mount(o, mnt)) == 0 {
+            return 0;
+        }
+        MOUNT_SB_STAGES.tail_call(ctx, STAGE_POINT);
+        crate::fail_open::bump(hook::SB_MOUNT);
+        0
+    }
+}
+
+/// Lot 1.1 (F8b-1): `sb_mount`'s stage judging where a mount lands —
+/// tail-called by [`mount_guard_sb_mount`] once the target lands in a
+/// guarded namespace or propagates into one; never attached.
+#[lsm(hook = "sb_mount")]
+pub fn mount_guard_sb_mount_point(ctx: LsmContext) -> i32 {
+    // SAFETY: as the entry's
+    unsafe { try_sb_mount_point(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; every
+    // kernel pointer is read through `bpf_probe_read_kernel` (a fault reads
+    // zeros); the map pointers are valid for the program's run
     unsafe {
         let flags: u64 = ctx.arg(3);
         let op = mount_op(flags);
         if op == MG_OP_PASS {
-            if regroups(flags) {
-                note_propagation_change(ctx);
-                // lot 359 (the re-check 3 of #567, N4): one that reaches the pin
-                // directory's lock is judged
-                let path: *const u8 = ctx.arg(1);
-                let r = lock_propagation(path, flags);
-                if r == 0 {
-                    return 0;
-                }
-                return lock_answer(path, r);
-            }
             return 0;
         }
         let Some(c) = caller(hook::SB_MOUNT) else {
@@ -1067,10 +1182,7 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
             return 0;
         }
         let real = real_mount(o, mnt);
-        // the namespace that owns the target, not the caller's
-        let Some((guard, reach)) = target_of(o, real) else {
-            return 0;
-        };
+        let (guard, reach) = landed(o, real);
         if op == MG_OP_REMOUNT_BIND {
             // the review of #567 (F3): one mount's flags, in its own namespace
             // only (they never propagate)
@@ -1108,6 +1220,78 @@ unsafe fn try_sb_mount(ctx: &LsmContext) -> i32 {
             string_key(ty, &mut q.fstype);
         }
         answer(decide(&q), op, key, &q.point, reach)
+    }
+}
+
+/// Lot 1.1 (F8b-1): `sb_mount`'s stage for a change of propagation
+/// (`MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`, `MS_UNBINDABLE`) — counted for
+/// the refresh, and judged where it reaches the pin directory's lock;
+/// tail-called by [`mount_guard_sb_mount`], never attached.
+#[lsm(hook = "sb_mount")]
+pub fn mount_guard_sb_mount_propagate(ctx: LsmContext) -> i32 {
+    // SAFETY: as the entry's
+    unsafe { try_sb_mount_propagate(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_sb_mount_propagate(ctx: &LsmContext) -> i32 {
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; the path
+    // is only read through `bpf_probe_read_kernel`
+    unsafe {
+        let flags: u64 = ctx.arg(3);
+        if sb_mount_route(flags) != SbRoute::Propagate {
+            return 0;
+        }
+        note_propagation_change(ctx);
+        // lot 359 (the re-check 3 of #567, N4): one that reaches the pin
+        // directory's lock is judged
+        let path: *const u8 = ctx.arg(1);
+        let r = lock_propagation(path, flags);
+        if r == 0 {
+            return 0;
+        }
+        lock_answer(path, r)
+    }
+}
+
+/// Lot 1.1: a propagation change the kernel makes on the mount `m` (a
+/// `struct mount`), from `crate::mount_setattr`'s fentry — counted
+/// (`common::mount_guard::propagation_counts`) when the guard is armed and
+/// the mount is in a guarded namespace, in a peer group [`MOUNT_GROUPS`]
+/// holds, or is the pin directory's lock or a copy of it ([`MG_LOCK`] at
+/// its root): the refresh woken ([`note_regroup`]) and the change counted
+/// for the agent (`CONF_PROPAGATED`).
+#[inline(always)]
+pub(crate) fn propagation_change(m: *const u8) {
+    match MOUNT_GUARD_CONF.get(0) {
+        Some(h) if *h != 0 => {}
+        _ => return,
+    }
+    let Some(o) = Offs::load() else {
+        return;
+    };
+    // SAFETY: `m` is the kernel's `struct mount` the traced function was
+    // given; every read goes through `bpf_probe_read_kernel` (a fault reads
+    // zeros: no namespace, no group, no flags)
+    let (in_ns, guard, known, lock) = unsafe {
+        let ns = peek_ptr(m.add(o.mnt_ns as usize));
+        let k = Kernel(o);
+        let group = k.group(m);
+        let mnt = (m as usize).wrapping_add(o.mount_mnt as usize) as *const u8;
+        (
+            !ns.is_null(),
+            guard_of(o, m),
+            group != 0 && k.known(group),
+            mount_root_flags(o, mnt).0 & MG_LOCK != 0,
+        )
+    };
+    if propagation_counts(in_ns, guard, known, lock) {
+        note_regroup();
+        if let Some(v) = MOUNT_GUARD_CONF.get_ptr_mut(CONF_PROPAGATED) {
+            // SAFETY: the map's own slot, valid for the program's run (two
+            // changes at once may count one: any move of the count wakes)
+            unsafe { *v = (*v).wrapping_add(1) };
+        }
     }
 }
 
@@ -1264,14 +1448,22 @@ unsafe fn lock_answer(path: *const u8, r: u64) -> i32 {
 /// `int move_mount(const struct path *from_path, const struct path
 /// *to_path)`: `move_mount(2)` — a detached mount (`fsmount`, `open_tree`)
 /// attached at `to_path`, or an attached one moved there.
+///
+/// Lot 1.1 (F8b-1): the entry — the source (a held mount, or a peer copy of
+/// one, moved away), then where the target lands (the walk); the judge of
+/// the landing point is a stage it tail-calls ([`MOUNT_MOVE_STAGES`]).
 #[lsm(hook = "move_mount")]
 pub fn mount_guard_move_mount(ctx: LsmContext) -> i32 {
+    // SAFETY: the context is the hook's; every kernel read goes through
+    // `bpf_probe_read_kernel`, and a tail call never returns on success
     unsafe { try_move_mount(&ctx) }
 }
 
 #[inline(always)]
 unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; every
+    // kernel pointer is read through `bpf_probe_read_kernel` (a fault reads
+    // zeros); the map pointers are valid for the program's run
     unsafe {
         let Some(c) = caller(hook::MOVE_MOUNT) else {
             return 0;
@@ -1302,8 +1494,9 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
         // guarded namespace's own moves take a held mount away)
         let real = real_mount(o, from_mnt);
         let parent = peek_ptr(real.add(o.mnt_parent as usize));
+        let attached = !parent.is_null() && parent != real;
         let from_guard = guard_of(o, real);
-        if from_guard != 0 && !parent.is_null() && parent != real {
+        if from_guard != 0 && attached {
             let key = key_of(o, from_dentry);
             if held_flags(o, real) & HELD_REFUSE != 0 && flags_at(&key) & MG_HOLD != 0 {
                 let mut q = query(MG_OP_MOVE_MOUNT, &c, from_guard);
@@ -1318,16 +1511,93 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 );
             }
         }
+        // Lot 1.1 (the review of #569, F2): or a peer copy of a held mount —
+        // its own group and its root a held mount's (`HELD_ROOT`), in any
+        // namespace: a raw namespace's copy of `/sys` moved under a private
+        // mount, then unmounted there, takes the host's bpffs and its lock
+        let group = Kernel(o).group(real);
+        if attached && group != 0 {
+            let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
+            let rk = key_of(o, root);
+            let (dev, ino) = held_root(group, rk.dev, rk.ino);
+            let hit = MOUNT_HELD.get(&InodeKey { dev, ino }).is_some();
+            if moves_held_copy(attached, group, hit) {
+                let reach = if from_guard != 0 {
+                    reach_in(from_guard)
+                } else {
+                    REACH_OTHER_NS
+                };
+                return answer_parts(
+                    copy_move_verdict(
+                        true,
+                        shutdown_stage(),
+                        crate::inode_protect::override_active(),
+                    ),
+                    MG_OP_MOVE_MOUNT,
+                    rk,
+                    view_of(magic_of(o, root) as u32),
+                    reach << 4,
+                );
+            }
+        }
         // where it lands: the namespace that owns the target
-        let Some((guard, reach)) = target_of(o, real_mount(o, to_mnt)) else {
+        let to_real = real_mount(o, to_mnt);
+        if lands_guarded(o, to_real) == 0 {
             return 0;
-        };
+        }
         // re-check N1: a mount in a peer group moved into a guarded namespace,
         // or its group given to one there (`MOVE_MOUNT_SET_GROUP`, the same
         // hook): the refresh woken
-        if guard != 0 && Kernel(o).group(real) != 0 {
+        if guard_of(o, to_real) != 0 && group != 0 {
             note_regroup();
         }
+        MOUNT_MOVE_STAGES.tail_call(ctx, STAGE_POINT);
+        crate::fail_open::bump(hook::MOVE_MOUNT);
+        0
+    }
+}
+
+/// Lot 1.1 (F8b-1): `move_mount`'s stage judging where the mount lands —
+/// tail-called by [`mount_guard_move_mount`] once the target lands in a
+/// guarded namespace or propagates into one; never attached.
+#[lsm(hook = "move_mount")]
+pub fn mount_guard_move_mount_point(ctx: LsmContext) -> i32 {
+    // SAFETY: as the entry's
+    unsafe { try_move_mount_point(&ctx) }
+}
+
+#[inline(always)]
+unsafe fn try_move_mount_point(ctx: &LsmContext) -> i32 {
+    // SAFETY: `ctx.arg` reads the hook's bounded argument slots; every
+    // kernel pointer is read through `bpf_probe_read_kernel` (a fault reads
+    // zeros); the map pointers are valid for the program's run
+    unsafe {
+        let Some(c) = caller(hook::MOVE_MOUNT) else {
+            return 0;
+        };
+        if !c.privileged {
+            return 0;
+        }
+        let Some(o) = Offs::load() else {
+            crate::fail_open::bump(hook::MOVE_MOUNT);
+            return 0;
+        };
+        let from: *const u8 = ctx.arg(0);
+        let to: *const u8 = ctx.arg(1);
+        if from.is_null() || to.is_null() {
+            crate::fail_open::bump(hook::MOVE_MOUNT);
+            return 0;
+        }
+        let from_mnt = peek_ptr(from.add(o.path_mnt as usize));
+        let from_dentry = peek_ptr(from.add(o.path_dentry as usize));
+        let to_mnt = peek_ptr(to.add(o.path_mnt as usize));
+        if from_mnt.is_null() || from_dentry.is_null() || to_mnt.is_null() {
+            crate::fail_open::bump(hook::MOVE_MOUNT);
+            return 0;
+        }
+        let real = real_mount(o, from_mnt);
+        let parent = peek_ptr(real.add(o.mnt_parent as usize));
+        let (guard, reach) = landed(o, real_mount(o, to_mnt));
         let mut q = query(MG_OP_MOVE_MOUNT, &c, guard);
         let mut key = InodeKey { dev: 0, ino: 0 };
         if !point_of(o, to, hook::MOVE_MOUNT, &mut q, &mut key) {
