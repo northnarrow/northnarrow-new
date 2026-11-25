@@ -252,7 +252,7 @@ fn the_split_hooks_judge_in_their_stages() {
             "MOUNT_SB_STAGES",
             "SB_MOUNT",
             &["STAGE_PROPAGATE", "STAGE_POINT"][..],
-            &["decide(", "answer(", "lock_propagation("][..],
+            &["decide(", "decide_as(", "answer(", "lock_propagation("][..],
         ),
         (
             "unsafe fn try_move_mount(",
@@ -343,4 +343,34 @@ fn a_roles_namespace_never_takes_pid_1s_entry() {
     let v = &e[e.find("pub(crate) fn vacate(").expect("vacate")..];
     let v = &v[..v.find("\n}\n").unwrap()];
     assert!(v.contains("if vacates(inum, host) {"), "vacate drops any namespace");
+}
+
+/// Lot 1.1 (F8b-1): every hook decides with its operation in a register
+/// (`decide_as(MG_OP_…, &q)`, the literal its query was made with), never
+/// through `decide(&q)`, whose `q.op` 5.15's verifier reads as any byte and
+/// explores every arm for.
+#[test]
+fn the_hooks_decide_with_their_operation_in_a_register() {
+    let e = source("agent-ebpf/src/mount_guard.rs");
+    assert!(!e.contains("decide(&q)"), "a hook decides through q.op");
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(at) = e[from..].find("decide_as(") {
+        let at = from + at;
+        let rest = &e[at + "decide_as(".len()..];
+        let op = &rest[..rest.find(',').expect("its operation")];
+        assert!(op.starts_with("MG_OP_"), "decide_as({op}, …): not a literal operation");
+        // the function it is in made its query with that operation
+        let start = e[..at].rfind("\nunsafe fn ").or(e[..at].rfind("\nfn ")).expect("its function");
+        let body = &e[start..at];
+        assert!(
+            body.contains(&format!("query({op}, ")) || body.contains(&format!("q.op = {op};")),
+            "decide_as({op}, …) in a function whose query is another operation's"
+        );
+        n += 1;
+        from = at + 1;
+    }
+    assert!(n >= 8, "{n} decisions");
+    let c = source("common/src/mount_guard.rs");
+    assert!(c.contains("pub fn decide(q: &Query) -> Verdict {\n    decide_as(q.op, q)\n}"));
 }

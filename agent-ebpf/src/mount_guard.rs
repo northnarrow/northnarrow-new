@@ -47,7 +47,7 @@ use aya_ebpf::{
 };
 use northnarrow_common::fail_open::hook;
 use northnarrow_common::mount_guard::{
-    decide, fnv16, held_by_id, held_by_place, inode_key, is_view_magic, mount_op,
+    decide_as, fnv16, held_by_id, held_by_place, inode_key, is_view_magic, mount_op,
     reach_in, record_dev, target_reach, view_of, Mounts, NameKey, Point, Query, Verdict,
     BTRFS_SUPER_MAGIC, DEPTH_DEEPER, GUARD_HOST, HELD_REFUSE, MAX_STACK, MAX_WALK, MG_HOLD,
     MG_NOTE, MG_OP_MOUNT, MG_OP_MOVE_MOUNT, MG_OP_MOVE_OLD, MG_OP_PASS, MG_OP_PIVOT, MG_OP_REMOUNT,
@@ -56,7 +56,7 @@ use northnarrow_common::mount_guard::{
     below_of, below_takes_held, umount_below, Tree,
     lock_bind, lock_maker, lock_shutdown_step, lock_step_at, lock_touched, lock_verdict,
     BindShape, MG_LOCK, MG_LOCK_ABOVE, MG_OP_PROPAGATE,
-    copy_move_verdict, held_root, moves_held_copy, propagation_counts, sb_mount_route, vacates,
+    copy_move_verdict, held_root, moves_held_copy, CopyMove, propagation_counts, sb_mount_route, vacates,
     SbRoute, CONF_PROPAGATED, CONF_SLOTS,
     STAGE_POINT, STAGE_PROPAGATE, STAGE_SLOTS,
 };
@@ -1262,7 +1262,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             q.held = true;
             q.restrict = true;
             q.shutdown = nn_mount_shutdown_stage() != 0;
-            return answer(decide(&q), MG_OP_REMOUNT_BIND, key, &q.point, reach);
+            return answer(decide_as(MG_OP_REMOUNT_BIND, &q), MG_OP_REMOUNT_BIND, key, &q.point, reach);
         }
         // One decision shape for the verifier: a bind, and an old-API move
         // made elsewhere (judged where it lands), are a mount whose type is not
@@ -1274,7 +1274,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             q.op = MG_OP_MOVE_OLD;
             q.shutdown = nn_mount_shutdown_stage() != 0;
             let key = key_of(o, peek_ptr(path.add(o.path_dentry as usize)));
-            return answer(decide(&q), op, key, &q.point, reach);
+            return answer(decide_as(MG_OP_MOVE_OLD, &q), op, key, &q.point, reach);
         }
         let mut key = InodeKey { dev: 0, ino: 0 };
         if !point_of(o, path, hook::SB_MOUNT, &mut q, &mut key) {
@@ -1284,7 +1284,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             let ty: *const u8 = ctx.arg(2);
             string_key(ty, &mut q.fstype);
         }
-        answer(decide(&q), op, key, &q.point, reach)
+        answer(decide_as(MG_OP_MOUNT, &q), op, key, &q.point, reach)
     }
 }
 
@@ -1573,7 +1573,7 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 q.held = true;
                 q.shutdown = nn_mount_shutdown_stage() != 0;
                 return answer(
-                    decide(&q),
+                    decide_as(MG_OP_MOVE_MOUNT, &q),
                     MG_OP_MOVE_MOUNT,
                     key,
                     &q.point,
@@ -1597,12 +1597,16 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 } else {
                     REACH_OTHER_NS
                 };
+                let v = copy_move_verdict(
+                    true,
+                    nn_mount_shutdown_stage() != 0,
+                    crate::inode_protect::override_active(),
+                );
+                if v == CopyMove::Allow {
+                    return 0;
+                }
                 return answer_parts(
-                    copy_move_verdict(
-                        true,
-                        nn_mount_shutdown_stage() != 0,
-                        crate::inode_protect::override_active(),
-                    ),
+                    v.verdict(),
                     MG_OP_MOVE_MOUNT,
                     rk,
                     view_of(magic_of(o, root) as u32),
@@ -1700,7 +1704,7 @@ unsafe fn try_move_mount_point(ctx: &LsmContext) -> i32 {
             });
             q.lock_maker = q.lock_step && nn_mount_lock_maker() != 0;
         }
-        answer(decide(&q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
+        answer(decide_as(MG_OP_MOVE_MOUNT, &q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
     }
 }
 
@@ -1818,7 +1822,7 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
         // `shutdown`.
         q.init = q.init && guard == GUARD_HOST && flags & MG_OWN == 0;
         q.shutdown = nn_mount_shutdown_stage() != 0;
-        answer(decide(&q), MG_OP_UMOUNT, key, &q.point, reach)
+        answer(decide_as(MG_OP_UMOUNT, &q), MG_OP_UMOUNT, key, &q.point, reach)
     }
 }
 
@@ -1853,7 +1857,7 @@ unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
         };
         let mut q = query(MG_OP_PIVOT, &c, c.guard);
         q.shutdown = nn_mount_shutdown_stage() != 0;
-        answer(decide(&q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
+        answer(decide_as(MG_OP_PIVOT, &q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
     }
 }
 
@@ -1936,6 +1940,6 @@ unsafe fn try_sb_remount(ctx: &LsmContext) -> i32 {
         };
         // the view the super block is, for the record
         q.point.magic = peek_u64(sb.add(o.s_magic as usize)) as u32;
-        answer(decide(&q), MG_OP_REMOUNT, key, &q.point, reach_of_caller(&c))
+        answer(decide_as(MG_OP_REMOUNT, &q), MG_OP_REMOUNT, key, &q.point, reach_of_caller(&c))
     }
 }

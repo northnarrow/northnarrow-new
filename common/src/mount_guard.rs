@@ -234,16 +234,38 @@ pub const fn moves_held_copy(attached: bool, group: u32, root_held: bool) -> boo
     attached && group != 0 && root_held
 }
 
-/// [`moves_held_copy`]'s verdict: refused (outside the trusted-installer
-/// window, which lets it through recorded), never at the end of a shutdown
-/// (`systemd-shutdown` moves what it unmounts last).
-pub const fn copy_move_verdict(held_copy: bool, shutdown: bool, window: bool) -> Verdict {
+/// [`moves_held_copy`]'s verdict, [`MG_WHY_MOVE_COPY`]'s: refused
+/// (outside the trusted-installer window, which lets it through
+/// recorded), never at the end of a shutdown (`systemd-shutdown` moves
+/// what it unmounts last). A tag without a payload: a [`Verdict::Allow`]
+/// through the stack is a byte 5.15's verifier refuses to read
+/// uninitialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyMove {
+    Allow,
+    Refuse,
+    Window,
+}
+
+/// [`CopyMove`] of a move ([`moves_held_copy`]'s answer `held_copy`).
+pub const fn copy_move_verdict(held_copy: bool, shutdown: bool, window: bool) -> CopyMove {
     if !held_copy || shutdown {
-        Verdict::Allow
+        CopyMove::Allow
     } else if window {
-        Verdict::Window(MG_WHY_MOVE_COPY)
+        CopyMove::Window
     } else {
-        Verdict::Refuse(MG_WHY_MOVE_COPY)
+        CopyMove::Refuse
+    }
+}
+
+impl CopyMove {
+    /// The hook's verdict of it.
+    pub const fn verdict(self) -> Verdict {
+        match self {
+            CopyMove::Allow => Verdict::Allow,
+            CopyMove::Refuse => Verdict::Refuse(MG_WHY_MOVE_COPY),
+            CopyMove::Window => Verdict::Window(MG_WHY_MOVE_COPY),
+        }
     }
 }
 
@@ -1413,8 +1435,19 @@ pub enum Verdict {
 /// by where it lands. A super block's reconfigure is judged in every
 /// namespace: the super block is the same one.
 pub fn decide(q: &Query) -> Verdict {
+    decide_as(q.op, q)
+}
+
+/// Lot 1.1 (F8b-1): [`decide`] with the operation given apart, in a
+/// register — the hooks pass the operation they judge as a constant
+/// (`q.op`'s). A field of the query is read from the stack, where 5.15's
+/// verifier keeps no value of a byte: through `q.op` every arm was
+/// verified in each state (the allow-list check three times), and
+/// `move_mount`'s stage processed more than the million instructions.
+/// `decide(q)` is `decide_as(q.op, q)`: one decision.
+pub fn decide_as(op: u8, q: &Query) -> Verdict {
     // lot 359: a change of propagation that reaches the lock
-    if q.op == MG_OP_PROPAGATE {
+    if op == MG_OP_PROPAGATE {
         return lock_verdict(
             q.privileged,
             q.host,
@@ -1426,7 +1459,7 @@ pub fn decide(q: &Query) -> Verdict {
     if !q.privileged {
         return Verdict::Allow;
     }
-    let why = if q.op == MG_OP_REMOUNT {
+    let why = if op == MG_OP_REMOUNT {
         // a view's super block: any option (proc's subset=pid, hidepid);
         // the file system of the agent's paths: made read-only, or options
         // not read (`restrict`: the hook could not tell) — finalrd's
@@ -1439,7 +1472,7 @@ pub fn decide(q: &Query) -> Verdict {
     } else if !(q.host || q.reaches) {
         None
     } else {
-        match q.op {
+        match op {
             MG_OP_PIVOT if !q.host => None,
             MG_OP_MOVE_OLD if !q.host => point_refusal(&q.point, &NameKey::NONE, false, false),
             // systemd-shutdown's switch to /run/initramfs (dracut)
@@ -3781,20 +3814,21 @@ mod tests {
         let hit = |group: u32, dev: u64, ino: u64| held_root(group, dev, ino) == held;
         assert!(moves_held_copy(true, 7, hit(7, 0x15, 1)));
         assert_eq!(
-            copy_move_verdict(moves_held_copy(true, 7, hit(7, 0x15, 1)), false, false),
+            copy_move_verdict(moves_held_copy(true, 7, hit(7, 0x15, 1)), false, false).verdict(),
             Verdict::Refuse(MG_WHY_MOVE_COPY)
         );
         assert_eq!(
-            copy_move_verdict(true, false, true),
+            copy_move_verdict(true, false, true).verdict(),
             Verdict::Window(MG_WHY_MOVE_COPY)
         );
-        assert_eq!(copy_move_verdict(true, true, false), Verdict::Allow);
+        assert_eq!(copy_move_verdict(true, true, false), CopyMove::Allow);
+        assert_eq!(CopyMove::Allow.verdict(), Verdict::Allow);
         // a bind of /usr in the same group (another root), or a mount of
         // another group with the same root, is not a copy of it
         assert!(!moves_held_copy(true, 7, hit(7, 0x15, 2)));
         assert!(!moves_held_copy(true, 7, hit(8, 0x15, 1)));
         assert!(!moves_held_copy(true, 7, hit(7, 0x16, 1)));
-        assert_eq!(copy_move_verdict(false, false, false), Verdict::Allow);
+        assert_eq!(copy_move_verdict(false, false, false), CopyMove::Allow);
         // the key never meets another `MOUNT_HELD` key's
         let (dev, _) = held;
         assert_eq!(dev >> 61, HELD_ROOT >> 61);
