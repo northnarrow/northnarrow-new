@@ -290,17 +290,6 @@ unsafe fn task_buffer(task: u64) -> Option<(*mut OpenTask, bool)> {
     }
 }
 
-/// Lot 1.4b: the running task's buffers if it has them — its [`OPEN_TASK`]
-/// entry, else this run's own — never made here ([`task_buffer`] makes
-/// them). The walk's: the making's functions stay off its call chain.
-#[inline(always)]
-fn held_buffer(task: u64) -> Option<*mut OpenTask> {
-    match OPEN_TASK.get_ptr_mut(&task) {
-        Some(p) => Some(p),
-        None => OPEN_TASK_RUN.get_ptr_mut(&task),
-    }
-}
-
 /// The re-check of #547 (G5): the running task's [`OPEN_TASK`] entry made
 /// (zeroed), within its share ([`OPEN_TASK_PER_SHARE`]; the row it is
 /// counted in kept in the entry). 1: made; 0: the share taken or the map
@@ -538,14 +527,6 @@ unsafe fn dir_class(dkey: &InodeKey, dir: *const u8, dir_inode: *const u8) -> Di
             }
             _ => {}
         }
-        // Lot 1.4b (stack): the running task's buffers the walk uses are made
-        // here — an unlink's or a rename's first (an open's are `on_open`'s:
-        // found) — and the walk only looks them up ([`held_buffer`]). Made in
-        // the walk, the share's functions ([`nn_open_task_make`]) were on its
-        // chain: `fim_file_open_sensor` at 480 of the verifier's 512 bytes.
-        // No room: the walk finds none and is lost, as before (counted twice,
-        // as before: the entry's loss here, the sensor's drop in the walk).
-        let _ = task_buffer(bpf_get_current_task());
         let r = nn_open_walk(dkey.dev, dkey.ino, dir as u64, dir_inode as u64);
         let c = DirClass {
             bits: r as u32 | CLASSIFIED,
@@ -649,11 +630,11 @@ pub extern "C" fn nn_open_walk(dev: u64, ino: u64, dir: u64, dir_inode: u64) -> 
 unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
     // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
     unsafe {
-        // The running task's buffers: [`on_open`]'s, or made by [`dir_class`]
-        // for an unlink or a rename (`forget_task` removes them).
+        // The running task's buffers: [`on_open`]'s, or made here for an
+        // unlink or a rename (`forget_task` removes them).
         let task = bpf_get_current_task();
-        let scratch = match held_buffer(task) {
-            Some(p) => (*p).names.as_mut_ptr(),
+        let scratch = match task_buffer(task) {
+            Some((p, _)) => (*p).names.as_mut_ptr(),
             None => {
                 crate::drops::bump(northnarrow_common::ring_drops::ring_slot::OPEN_SENSOR);
                 // Lot 325 (R3): lost, never cached ([`dir_class`]).
@@ -703,7 +684,7 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
             let up_inode = peek_u64(up.add(o_inode)) as *const u8;
             let up_key = InodeKey {
                 dev: if btrfs {
-                    crate::inode_dev::stat_dev(up_inode, sb, s_dev) as u64
+                    nn_open_btrfs_dev(up_inode as u64, sb as u64, u64::from(s_dev))
                 } else {
                     s_dev as u64
                 },
@@ -740,6 +721,22 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         }
         (u64::from(uid) << 32) | u64::from(bits | capped)
     }
+}
+
+/// Lot 1.4b (stack): a btrfs subvolume's device for the walk's level
+/// (`crate::inode_dev::stat_dev` of `inode` on superblock `sb`, whose
+/// `s_dev` is `s_dev`), as a global BPF function. Inline in each level of
+/// the walk, its three offsets and two reads were kept across the level's
+/// helper calls: the walk's frame was 192 bytes, on the deepest call chain
+/// of `fim_file_open_sensor` (480 of the verifier's 512). Every argument
+/// is a plain value, read only through the probe helper, so any value is
+/// safe; the verifier checks it once.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_open_btrfs_dev(inode: u64, sb: u64, s_dev: u64) -> u64 {
+    // SAFETY: `stat_dev` reads `inode` and `sb` only through
+    // `bpf_probe_read_kernel` (a fault leaves `s_dev`) and writes nothing.
+    u64::from(unsafe { crate::inode_dev::stat_dev(inode as *const u8, sb as *const u8, s_dev as u32) })
 }
 
 /// The writer's login uid, or `u32::MAX` (never a runtime dir's owner)
