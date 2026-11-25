@@ -10,8 +10,12 @@
 //!   `matches!` becomes the `match` it stands for, `vec![…]` an array, and
 //!   any other macro whose body is a list of expressions (`format!`,
 //!   `assert!`, `write!`, a log macro's arguments, `concat!`) a call of
-//!   `__macro__<name>` with those expressions; a body that is no list of
-//!   expressions stays a macro, and its literals are still read;
+//!   `__macro__<name>` with those expressions; a macro of a grammar of its
+//!   own ([`GRAMMARS`]: tracing's fields, `json!`) is read part by part, a
+//!   `macro_rules!` as the Rust of its rules, and any other macro whose
+//!   body is not read — `cfg_if!` among them, or one in a type or a
+//!   pattern — fails the walker by its name (only the macros that quote
+//!   tokens, [`OPAQUE`], are left as they are, their literals still read);
 //! - drops what only a test build compiles ([`production`]): an item, a
 //!   statement, a field, an arm or a field value under a `cfg` that is false
 //!   without `test` (`cfg(test)`, `cfg(all(test, …))`, `cfg(not(not(test)))`
@@ -67,7 +71,25 @@ pub fn parse(rel: &str, text: &str) -> File {
             e.span().start().line
         )
     });
-    Expand.visit_file_mut(&mut file);
+    let mut expand = Expand::default();
+    expand.visit_file_mut(&mut file);
+    let mut left = Unread::default();
+    left.visit_file(&file);
+    let mut unread = expand.unread;
+    let reported: Vec<usize> = unread.iter().map(|(l, _, _)| *l).collect();
+    unread.extend(left.0.into_iter().filter(|(l, _, _)| !reported.contains(l)));
+    unread.sort();
+    unread.dedup();
+    assert!(
+        unread.is_empty(),
+        "{rel}: a macro this reader does not read as Rust — read it in support::ast, or list \
+         its name with the reason in GRAMMARS (a body read part by part) or OPAQUE (no code): \
+         {:#?}",
+        unread
+            .iter()
+            .map(|(l, name, why)| format!("{rel}:{l} `{name}`: {why}"))
+            .collect::<Vec<_>>()
+    );
     file
 }
 
@@ -167,32 +189,104 @@ pub fn pat_variant(pat: &Pat) -> Option<String> {
 
 // ── macros read as Rust ─────────────────────────────────────────────────
 
-/// Macros whose bodies are no code to read (they quote tokens, or name
-/// them).
-const OPAQUE: &[&str] = &[
-    "stringify",
-    "quote",
-    "quote_spanned",
-    "parse_quote",
-    "parse_quote_spanned",
-    "format_ident",
-    "macro_rules",
-    "concat_idents",
-    "include",
-    "cfg_if",
+/// Macros whose bodies are no code to read, each with why: they quote
+/// tokens or name them. Lot 1.7a (the review of #624): `macro_rules!` is
+/// read ([`macro_rules_item`]) and `cfg_if!` fails the walker
+/// ([`NOT_READ`]) — neither hides code.
+const OPAQUE: &[(&str, &str)] = &[
+    ("stringify", "its body is text, never run"),
+    ("quote", "tokens a proc macro writes out, never run here"),
+    (
+        "quote_spanned",
+        "tokens a proc macro writes out, never run here",
+    ),
+    ("parse_quote", "tokens a proc macro parses, never run here"),
+    (
+        "parse_quote_spanned",
+        "tokens a proc macro parses, never run here",
+    ),
+    ("format_ident", "an identifier made, no code"),
+    ("concat_idents", "an identifier made, no code"),
+    (
+        "include",
+        "the file it names is read as a file of its own (the one use: a watchdog test \
+         including agent/tests/common/agent_state.rs, a scanned file)",
+    ),
 ];
+
+/// Lot 1.7a (the review of #624): macros whose body is code under
+/// conditions this reader does not read — the walker fails on each use.
+const NOT_READ: &[(&str, &str)] = &[(
+    "cfg_if",
+    "its branches are items under `cfg`s this reader does not weigh: write them as \
+     `#[cfg]` items",
+)];
+
+/// Lot 1.7a (the review of #624): macros whose body is no list of
+/// expressions, each with its grammar — read part by part
+/// ([`body_exprs`]: every expression it holds, the literals around them).
+/// Any other macro whose body does not parse fails the walker.
+const GRAMMARS: &[(&str, &str)] = &[
+    ("trace", "tracing's fields (`target:`, `k = %v`, `?v`)"),
+    ("debug", "tracing's fields (`target:`, `k = %v`, `?v`)"),
+    ("info", "tracing's fields (`target:`, `k = %v`, `?v`)"),
+    ("warn", "tracing's fields (`target:`, `k = %v`, `?v`)"),
+    ("error", "tracing's fields (`target:`, `k = %v`, `?v`)"),
+    ("json", "serde_json's object syntax (`{ \"k\": v }`)"),
+    ("select", "tokio's arms (`pat = future => body`)"),
+    (
+        "signed_verbs",
+        "agent/src/admin/verify.rs's table of the signed verbs (`Request: Op(Extra), quorum, \
+         roles, \"name\";`); its rules are read at its `macro_rules!`",
+    ),
+    (
+        "event_kinds",
+        "nn-core's contract table of the event kinds (`Kind => class,`); its rules are read at \
+         its `macro_rules!`",
+    ),
+    (
+        "steps",
+        "common/src/cgroup_limits.rs's unrolled parse (`p; 0 1 2 …`); its rule is read at its \
+         `macro_rules!`",
+    ),
+];
+
+fn listed(list: &[(&str, &str)], name: &str) -> bool {
+    list.iter().any(|(n, _)| *n == name)
+}
+
+/// The line of a macro's name.
+fn mac_line(mac: &Macro) -> usize {
+    line(
+        mac.path
+            .segments
+            .last()
+            .map_or_else(Span::call_site, |s| s.ident.span()),
+    )
+}
 
 /// The body of `mac` read as an expression: `matches!` a `match`, `vec!`
 /// an array, any other a call of `__macro__<name>` with the expressions
-/// its body holds ([`body_exprs`]).
-fn macro_expr(mac: &Macro) -> Option<Expr> {
+/// its body holds — a list of expressions, or, for a macro of
+/// [`GRAMMARS`], its parts ([`body_exprs`]). `Ok(None)`: an [`OPAQUE`]
+/// macro, left as it is (its literals are read). `Err`: why the body is
+/// not read.
+fn macro_expr(mac: &Macro) -> Result<Option<Expr>, String> {
     let name = last(&mac.path);
-    if OPAQUE.contains(&name.as_str()) {
-        return None;
+    if listed(OPAQUE, &name) {
+        return Ok(None);
     }
-    let read = match name.as_str() {
-        "matches" => mac
-            .parse_body_with(|input: ParseStream| {
+    if let Some((_, why)) = NOT_READ.iter().find(|(n, _)| *n == name) {
+        return Err((*why).to_string());
+    }
+    let special = |t: syn::Result<TokenStream>| -> Result<Option<Expr>, String> {
+        t.and_then(syn::parse2)
+            .map(Some)
+            .map_err(|e| format!("its body is no `{name}!`: {e}"))
+    };
+    match name.as_str() {
+        "matches" => {
+            return special(mac.parse_body_with(|input: ParseStream| {
                 let e: Expr = input.parse()?;
                 input.parse::<Token![,]>()?;
                 let pat = Pat::parse_multi_with_leading_vert(input)?;
@@ -207,38 +301,39 @@ fn macro_expr(mac: &Macro) -> Option<Expr> {
                     Some(g) => quote::quote!(match (#e) { #pat if #g => true, _ => false }),
                     None => quote::quote!(match (#e) { #pat => true, _ => false }),
                 })
-            })
-            .ok()
-            .and_then(|t| syn::parse2(t).ok()),
-        "vec" => mac
-            .parse_body_with(|input: ParseStream| {
-                let e: Expr = input.parse()?;
-                input.parse::<Token![;]>()?;
-                let n: Expr = input.parse()?;
-                Ok(quote::quote!([#e; #n]))
-            })
-            .or_else(|_| {
-                mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-                    .map(|elems| quote::quote!([#elems]))
-            })
-            .ok()
-            .and_then(|t| syn::parse2(t).ok()),
-        _ => None,
-    };
-    if read.is_some() {
-        return read;
+            }));
+        }
+        "vec" => {
+            return special(
+                mac.parse_body_with(|input: ParseStream| {
+                    let e: Expr = input.parse()?;
+                    input.parse::<Token![;]>()?;
+                    let n: Expr = input.parse()?;
+                    Ok(quote::quote!([#e; #n]))
+                })
+                .or_else(|_| {
+                    mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                        .map(|elems| quote::quote!([#elems]))
+                }),
+            );
+        }
+        _ => {}
     }
-    let args: Vec<Expr> = mac
-        .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-        .map(|p| p.into_iter().collect())
-        .unwrap_or_else(|_| body_exprs(mac.tokens.clone()));
+    let args: Vec<Expr> = match mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+    {
+        Ok(p) => p.into_iter().collect(),
+        Err(_) if listed(GRAMMARS, &name) => body_exprs(mac.tokens.clone()),
+        Err(e) => return Err(format!("its body is no list of expressions: {e}")),
+    };
     let span = mac
         .path
         .segments
         .last()
         .map_or_else(Span::call_site, |s| s.ident.span());
     let f = syn::Ident::new(&format!("{MACRO}{name}"), span);
-    syn::parse2(quote::quote!(#f(#(#args),*))).ok()
+    syn::parse2(quote::quote!(#f(#(#args),*)))
+        .map(Some)
+        .map_err(|e| format!("its expressions as a call: {e}"))
 }
 
 /// Every expression a macro's body holds, whatever its grammar (a log
@@ -296,13 +391,32 @@ pub fn body_exprs(ts: TokenStream) -> Vec<Expr> {
 /// Reads the macros' bodies as Rust, nested ones too: an expression's or a
 /// statement's macro becomes an expression ([`macro_expr`]), an item's
 /// (`thread_local!`) the items it declares, or a function
-/// `__macro__<name>` of its expressions.
-struct Expand;
+/// `__macro__<name>` of its expressions; a `macro_rules!` a module of its
+/// rules ([`macro_rules_item`]). Lot 1.7a (the review of #624): a macro
+/// whose body is not read is in `unread` (line, name, why), which fails
+/// the walker.
+#[derive(Default)]
+struct Expand {
+    unread: Vec<(usize, String, String)>,
+}
+
+impl Expand {
+    fn read(&mut self, mac: &Macro) -> Option<Expr> {
+        match macro_expr(mac) {
+            Ok(e) => e,
+            Err(why) => {
+                self.unread
+                    .push((mac_line(mac), format!("{}!", last(&mac.path)), why));
+                None
+            }
+        }
+    }
+}
 
 impl VisitMut for Expand {
     fn visit_expr_mut(&mut self, e: &mut Expr) {
         if let Expr::Macro(m) = e {
-            if let Some(new) = macro_expr(&m.mac) {
+            if let Some(new) = self.read(&m.mac) {
                 *e = new;
             }
         }
@@ -311,7 +425,7 @@ impl VisitMut for Expand {
 
     fn visit_stmt_mut(&mut self, s: &mut Stmt) {
         let new = match s {
-            Stmt::Macro(m) => macro_expr(&m.mac).map(|e| {
+            Stmt::Macro(m) => self.read(&m.mac).map(|e| {
                 let e = match e {
                     Expr::Call(mut c) => {
                         c.attrs = m.attrs.clone();
@@ -331,11 +445,25 @@ impl VisitMut for Expand {
 
     fn visit_item_mut(&mut self, i: &mut Item) {
         let new = match i {
-            Item::Macro(m)
-                if m.ident.is_none() && !OPAQUE.contains(&last(&m.mac.path).as_str()) =>
-            {
+            Item::Macro(m) if last(&m.mac.path) == "macro_rules" => {
+                let name = m
+                    .ident
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                match macro_rules_item(&name, &m.attrs, m.mac.tokens.clone()) {
+                    Ok(item) => Some(item),
+                    Err(why) => {
+                        self.unread
+                            .push((mac_line(&m.mac), format!("macro_rules! {name}"), why));
+                        None
+                    }
+                }
+            }
+            Item::Macro(m) if m.ident.is_none() && !listed(OPAQUE, &last(&m.mac.path)) => {
+                let mac_name = last(&m.mac.path);
                 let name = syn::Ident::new(
-                    &format!("{MACRO}{}", last(&m.mac.path)),
+                    &format!("{MACRO}{mac_name}"),
                     m.mac
                         .path
                         .segments
@@ -343,14 +471,33 @@ impl VisitMut for Expand {
                         .map_or_else(Span::call_site, |s| s.ident.span()),
                 );
                 let attrs = &m.attrs;
-                let tokens = if let Ok(f) = syn::parse2::<File>(m.mac.tokens.clone()) {
+                let exprs = m
+                    .mac
+                    .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                    .map(|p| p.into_iter().collect::<Vec<_>>());
+                let tokens = if let Some((_, why)) = NOT_READ.iter().find(|(n, _)| *n == mac_name) {
+                    Err((*why).to_string())
+                } else if let Ok(f) = syn::parse2::<File>(m.mac.tokens.clone()) {
                     let items = &f.items;
-                    quote::quote!(#(#attrs)* mod #name { #(#items)* })
-                } else {
+                    Ok(quote::quote!(#(#attrs)* mod #name { #(#items)* }))
+                } else if let Ok(exprs) = exprs {
+                    Ok(quote::quote!(#(#attrs)* fn #name() { #(#exprs;)* }))
+                } else if listed(GRAMMARS, &mac_name) {
                     let exprs = body_exprs(m.mac.tokens.clone());
-                    quote::quote!(#(#attrs)* fn #name() { #(#exprs;)* })
+                    Ok(quote::quote!(#(#attrs)* fn #name() { #(#exprs;)* }))
+                } else {
+                    Err("its body is no items and no list of expressions".to_string())
                 };
-                syn::parse2::<Item>(tokens).ok()
+                match tokens.and_then(|t| {
+                    syn::parse2::<Item>(t).map_err(|e| format!("its body as an item: {e}"))
+                }) {
+                    Ok(item) => Some(item),
+                    Err(why) => {
+                        self.unread
+                            .push((mac_line(&m.mac), format!("{mac_name}!"), why));
+                        None
+                    }
+                }
             }
             _ => None,
         };
@@ -359,6 +506,119 @@ impl VisitMut for Expand {
         }
         visit_mut::visit_item_mut(self, i);
     }
+}
+
+/// Lot 1.7a (the review of #624): the macros left in a file once
+/// [`Expand`] read it that are not [`OPAQUE`] — one in a place it does not
+/// read (a type's, a pattern's, an impl's item), or one whose body it could
+/// not read: each fails the walker.
+#[derive(Default)]
+struct Unread(Vec<(usize, String, String)>);
+
+impl<'a> Visit<'a> for Unread {
+    fn visit_macro(&mut self, m: &'a Macro) {
+        let name = last(&m.path);
+        if !listed(OPAQUE, &name) {
+            self.0.push((
+                mac_line(m),
+                format!("{name}!"),
+                "not read as Rust (a macro in a type, a pattern or an impl's items, or a body \
+                 not read)"
+                    .to_string(),
+            ));
+        }
+    }
+}
+
+/// Lot 1.7a (the review of #624): a `macro_rules!` read as Rust — the
+/// module `__macro__rules_<name>` holding, for each rule, the items its
+/// transcriber declares or a function `__rule<n>` of its statements, each
+/// metavariable (`$x`) a name (`__mv_x`), `$crate` the crate, a repetition
+/// (`$(…),*`) its body once. `Err`: a rule whose transcriber is no Rust so
+/// read.
+fn macro_rules_item(name: &str, attrs: &[Attribute], tokens: TokenStream) -> Result<Item, String> {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut items: Vec<TokenStream> = Vec::new();
+    let (mut i, mut rule) = (0, 0);
+    while i < trees.len() {
+        let arrow = matches!(
+            (trees.get(i + 1), trees.get(i + 2)),
+            (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                if a.as_char() == '=' && b.as_char() == '>'
+        );
+        let (TokenTree::Group(_), true, Some(TokenTree::Group(body))) =
+            (&trees[i], arrow, trees.get(i + 3))
+        else {
+            return Err(format!("rule {rule}: no `(matcher) => {{transcriber}}`"));
+        };
+        let ts = metavariables(body.stream());
+        let f = syn::Ident::new(&format!("__rule{rule}"), Span::call_site());
+        if let Ok(file) = syn::parse2::<File>(ts.clone()) {
+            let its = &file.items;
+            items.push(quote::quote!(#(#its)*));
+        } else {
+            match Block::parse_within.parse2(ts) {
+                Ok(stmts) => items.push(quote::quote!(fn #f() { #(#stmts)* })),
+                Err(e) => {
+                    return Err(format!(
+                        "rule {rule}: its transcriber is no items and no statements once its \
+                         metavariables are names: {e}"
+                    ));
+                }
+            }
+        }
+        i += 4;
+        if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == ';') {
+            i += 1;
+        }
+        rule += 1;
+    }
+    let m = syn::Ident::new(&format!("{MACRO}rules_{name}"), Span::call_site());
+    syn::parse2::<Item>(quote::quote!(#(#attrs)* mod #m { #(#items)* }))
+        .map_err(|e| format!("its rules as a module: {e}"))
+}
+
+/// A transcriber's tokens with each metavariable (`$x`) a name (`__mv_x`),
+/// `$crate` the crate, and each repetition (`$(…)sep*`) its body once.
+fn metavariables(ts: TokenStream) -> TokenStream {
+    let trees: Vec<TokenTree> = ts.into_iter().collect();
+    let op = |t: Option<&TokenTree>| matches!(t, Some(TokenTree::Punct(q)) if matches!(q.as_char(), '*' | '+' | '?'));
+    let mut out: Vec<TokenTree> = Vec::new();
+    let mut i = 0;
+    while i < trees.len() {
+        match (&trees[i], trees.get(i + 1)) {
+            (TokenTree::Punct(p), Some(TokenTree::Ident(id))) if p.as_char() == '$' => {
+                out.push(TokenTree::Ident(if id == "crate" {
+                    id.clone()
+                } else {
+                    proc_macro2::Ident::new(&format!("__mv_{id}"), id.span())
+                }));
+                i += 2;
+            }
+            (TokenTree::Punct(p), Some(TokenTree::Group(g)))
+                if p.as_char() == '$' && g.delimiter() == proc_macro2::Delimiter::Parenthesis =>
+            {
+                out.extend(metavariables(g.stream()));
+                i += 2;
+                if op(trees.get(i)) {
+                    i += 1;
+                } else if op(trees.get(i + 1)) {
+                    i += 2;
+                }
+            }
+            (TokenTree::Group(g), _) => {
+                let mut new = proc_macro2::Group::new(g.delimiter(), metavariables(g.stream()));
+                new.set_span(g.span());
+                out.push(TokenTree::Group(new));
+                i += 1;
+            }
+            (t, _) => {
+                out.push(t.clone());
+                i += 1;
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 // ── what only a test build compiles ─────────────────────────────────────

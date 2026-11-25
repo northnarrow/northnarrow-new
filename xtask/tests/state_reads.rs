@@ -910,7 +910,8 @@ const KNOWN: &[(&str, &str, &str)] = &[
     ),
     // lot 353: the agent's and PID 1's mount tables, searched for a FUSE
     // holding a stuck agent: unreadable, none is found and none aborted
-    ("watchdog/src/main.rs", "read_to_string(t)", PROC),
+    // (lot 1.7a: read as bytes, `mount_tables`)
+    ("watchdog/src/lib.rs", "read_all(p)", PROC),
     // lot 353: the watchdog's stuck marker, read at a SIGINT: unreadable,
     // the stop is an operator's `sigint` (the hold record still names the
     // recovery, signed at the next start)
@@ -1619,20 +1620,14 @@ fn no_process_entry_is_read_as_strict_text() {
     assert!(sources.len() > 300, "scanned {} files", sources.len());
     let parsed = ast::parse_all(&sources, true);
     let c = Corpus::of(&sources, &parsed);
-    let mut used = vec![false; STRICT_DEBT.len()];
-    let mut found = Vec::new();
-    for f in sources.keys() {
-        for (l, item, v) in strict_sites(&c, f) {
-            match STRICT_DEBT
-                .iter()
-                .enumerate()
-                .position(|(n, (df, di, _))| !used[n] && df == f && *di == item)
-            {
-                Some(n) => used[n] = true,
-                None => found.push(format!("{f}:{l} `{item}` reads {v:?}")),
-            }
-        }
-    }
+    let found: Vec<String> = sources
+        .keys()
+        .flat_map(|f| {
+            strict_sites(&c, f)
+                .into_iter()
+                .map(move |(l, item, v)| format!("{f}:{l} `{item}` reads {v:?}"))
+        })
+        .collect();
     assert!(
         found.is_empty(),
         "a process's /proc entry read with read_to_string (a comm, a cgroup, a mount \
@@ -1640,36 +1635,7 @@ fn no_process_entry_is_read_as_strict_text() {
          nn_linux::state_read::read_state, the host's read_state or nn_linux::mountinfo — \
          {found:#?}"
     );
-    for ((f, item, owner), u) in STRICT_DEBT.iter().zip(&used) {
-        assert!(
-            *u,
-            "{f}: `{item}` in STRICT_DEBT, no such site any more — remove the entry"
-        );
-        assert!(owner.len() > 3, "{f}: who removes it");
-    }
 }
-
-/// Lot 1.7a: rule 1's sites today the AST scan finds and the lexical one
-/// did not (a path in an array iterated; a path beneath a directory read
-/// into a strict decode): `(file, function, the lot or stage that removes
-/// it)` — one entry per site, never a pattern to follow; each a mount table
-/// a user's FUSE mount can make unreadable (BUG-98's class), reported.
-const STRICT_DEBT: &[(&str, &str, &str)] = &[
-    (
-        "watchdog/src/main.rs",
-        "abort_holding_fuse",
-        "stage S2, lot 2.5 (watchdog/src/*): the agent's and PID 1's mount tables read with \
-         `kernel_roots::read_to_string` — one not UTF-8 is dropped by the `filter_map`, and the \
-         FUSE connections it shows are not aborted",
-    ),
-    (
-        "antitamper-bpf/src/kernel_roots.rs",
-        "own_mounts",
-        "stage S2 (no lot owns antitamper-bpf/src/kernel_roots.rs yet; the nearest is 2.6, the \
-         integrity round): the views' own mount table decoded with `String::from_utf8` — one \
-         not UTF-8 is no table, and the views' shadow check and the cgroup view go without it",
-    ),
-];
 
 #[test]
 fn reads_that_default_on_failure_are_known() {
@@ -1771,6 +1737,48 @@ fn c() -> io::Result<MountTable> {
     let (t, f) = fixture(clean);
     let c = Corpus::new([("fixture.rs", t.as_str(), &f)]);
     assert!(strict_proc_reads(&c, "fixture.rs").is_empty());
+}
+
+/// Lot 1.7a (the review of #624): the reader reads a `macro_rules!`'s
+/// rules as Rust — a strict read in a transcriber is a site of rule 1 —
+/// and a macro of a grammar of its own part by part; it fails the walker,
+/// naming it, on a macro it does not read: a body of no grammar it knows,
+/// `cfg_if!`, a macro in a type, a transcriber that is no Rust, a
+/// `matches!` that is none.
+#[test]
+fn every_macro_is_read_or_fails_the_walker() {
+    let planted = r#"
+macro_rules! status {
+    ($pid:expr) => {
+        std::fs::read_to_string(format!("/proc/{}/status", $pid))
+    };
+}
+fn a() {
+    tracing::warn!(target: "x", t = %std::fs::read_to_string("/proc/self/mountinfo").unwrap(), "m");
+}
+"#;
+    let (t, f) = fixture(planted);
+    let c = Corpus::new([("fixture.rs", t.as_str(), &f)]);
+    assert_eq!(strict_proc_reads(&c, "fixture.rs"), vec![4, 8]);
+    for (name, text) in [
+        ("m!", "fn a() { m!(a => b); }"),
+        ("m!", "m! { a => b }"),
+        (
+            "cfg_if!",
+            "cfg_if::cfg_if! { if #[cfg(unix)] { fn a() {} } }",
+        ),
+        (
+            "cfg_if!",
+            "fn a() { cfg_if::cfg_if! { if #[cfg(unix)] { b(); } } }",
+        ),
+        ("m!", "fn a() { let x: m!() = 1; }"),
+        ("macro_rules! m", "macro_rules! m { () => { => }; }"),
+        ("matches!", "fn a() -> bool { matches!(x) }"),
+    ] {
+        let e = std::panic::catch_unwind(|| ast::parse("fixture.rs", text)).expect_err(text);
+        let m = e.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(m.contains(&format!("`{name}`")), "{text}: {m}");
+    }
 }
 
 /// Rule 2 fails on every default the review of #538 (F4) planted — the

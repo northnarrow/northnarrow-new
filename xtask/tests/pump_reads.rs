@@ -484,7 +484,7 @@ fn lock_violations(c: &Corpus<'_>) -> Vec<String> {
             if locks.contains(&k) && reading.contains(&k) {
                 if let Some(n) = LOCK_KNOWN
                     .iter()
-                    .position(|(kf, kn, _)| kf == file && *kn == f.item)
+                    .position(|(kf, kn, _, _)| kf == file && *kn == f.item)
                 {
                     known_used.insert(n);
                     continue;
@@ -506,7 +506,11 @@ fn lock_violations(c: &Corpus<'_>) -> Vec<String> {
             }
         }
     }
-    for (n, (file, item, _)) in LOCK_KNOWN.iter().enumerate() {
+    for (n, (file, item, _, owner)) in LOCK_KNOWN.iter().enumerate() {
+        assert!(
+            owner.len() > 3,
+            "{file}: `{item}` in LOCK_KNOWN, who owns it"
+        );
         if c.files.contains_key(*file) && !known_used.contains(&n) {
             out.push(format!(
                 "{file}: `{item}` in LOCK_KNOWN, no such site any more"
@@ -517,14 +521,15 @@ fn lock_violations(c: &Corpus<'_>) -> Vec<String> {
 }
 
 /// Lot 1.7a: the functions the AST scan finds holding a once's lock across
-/// a read, and why no other pump waits on it: `(file, function, why)` —
-/// one entry per function, a new one fails.
-const LOCK_KNOWN: &[(&str, &str, &str)] = &[(
+/// a read, and why no other pump waits on it: `(file, function, why, the
+/// code that owns it)` — one entry per function, a new one fails.
+const LOCK_KNOWN: &[(&str, &str, &str, &str)] = &[(
     DOORS,
     "Judge::process_table",
     "the process's own mount table, read once into the judge's own `OnceLock` — a fresh one \
      per `Judge::of_process` (a walk through one process's `/proc` entry, on the exec pumps' \
      reader): no other judgment shares it, so no other pump waits on its initialisation",
+    "nn-linux sensors::pump_reads (the exec pumps' judge)",
 )];
 
 /// The corpus of `sources` parsed (production code).

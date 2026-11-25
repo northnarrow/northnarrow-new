@@ -3397,10 +3397,14 @@ pub fn leave_stuck_marker(path: &Path, record: &nn_proto::watchdog_hold::HoldRec
 /// them, never `/`) — and its connection's id (`/sys/fs/fuse/connections`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveringFuse {
+    /// The mount point, as text (what is not UTF-8 replaced, U+FFFD).
     pub mount_point: String,
     pub fstype: String,
     pub source: String,
     pub conn: u32,
+    /// Lot 1.7a: the mount point's bytes as the kernel wrote them, its
+    /// escapes undone — what [`still_covering`] compares.
+    point: Vec<u8>,
 }
 
 /// The agent's own directories a FUSE must not cover.
@@ -3410,9 +3414,10 @@ const OWN_DIRS: &[&str] = &[
     "/run/northnarrow",
 ];
 
-/// A mount table's octal escapes (`\040`) undone.
-fn unescape_mount(field: &str) -> String {
-    let b = field.as_bytes();
+/// A mount table's octal escapes (`\040`) undone, as bytes; a backslash
+/// not followed by three octal digits of a byte is kept.
+fn unescape_mount(field: &[u8]) -> Vec<u8> {
+    let b = field;
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -3420,24 +3425,45 @@ fn unescape_mount(field: &str) -> String {
             && i + 3 < b.len()
             && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
         {
-            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
+            let v = b[i + 1..i + 4]
+                .iter()
+                .fold(0u32, |a, d| a * 8 + u32::from(d - b'0'));
+            if let Ok(byte) = u8::try_from(v) {
+                out.push(byte);
+                i += 4;
+                continue;
+            }
         }
+        out.push(b[i]);
+        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
-/// Lot 353: the FUSE mounts of a `mountinfo` text that cover a path the
+/// Lot 1.7a: the lines of a mount table as `str::lines` cuts them (at
+/// `\n`, a `\r` before it dropped, a last line without its newline read),
+/// whatever bytes they hold.
+fn table_lines(table: &[u8]) -> impl Iterator<Item = &[u8]> {
+    table
+        .split_inclusive(|b| *b == b'\n')
+        .map(|l| match l.strip_suffix(b"\n") {
+            Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
+            None => l,
+        })
+}
+
+/// Lot 353: the FUSE mounts of a `mountinfo` table that cover a path the
 /// agent depends on ([`CoveringFuse`]); a user's FUSE elsewhere (a home, a
-/// `/run/user` mount, `/var/lib/lxcfs`) is not one.
-pub fn covering_fuse(mountinfo: &str) -> Vec<CoveringFuse> {
+/// `/run/user` mount, `/var/lib/lxcfs`) is not one. Lot 1.7a: the table is
+/// read as bytes, cut at `\n` and at ASCII spaces only — any byte
+/// tolerated, a line without a mount's shape skipped on its own, never the
+/// table.
+pub fn covering_fuse(mountinfo: impl AsRef<[u8]>) -> Vec<CoveringFuse> {
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     let mut out: Vec<CoveringFuse> = Vec::new();
-    for line in mountinfo.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        let Some(dash) = f.iter().position(|x| *x == "-") else {
+    for line in table_lines(mountinfo.as_ref()) {
+        let f: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+        let Some(dash) = f.iter().position(|x| *x == b"-") else {
             continue;
         };
         let (Some(dev), Some(mp), Some(fstype), Some(source)) =
@@ -3445,32 +3471,72 @@ pub fn covering_fuse(mountinfo: &str) -> Vec<CoveringFuse> {
         else {
             continue;
         };
-        if !(*fstype == "fuse" || *fstype == "fuseblk" || fstype.starts_with("fuse.")) {
+        if !(*fstype == b"fuse" || *fstype == b"fuseblk" || fstype.starts_with(b"fuse.")) {
             continue;
         }
-        let mp = unescape_mount(mp);
-        let below = |v: &str| mp == v || mp.starts_with(&format!("{v}/"));
-        let above = |d: &str| mp != "/" && (d == mp || d.starts_with(&format!("{mp}/")));
+        let point = unescape_mount(mp);
+        let mp = point.as_slice();
+        let under =
+            |a: &[u8], b: &[u8]| a.len() > b.len() && a.starts_with(b) && a[b.len()] == b'/';
+        let below = |v: &str| mp == v.as_bytes() || under(mp, v.as_bytes());
+        let above = |d: &str| mp != b"/" && (d.as_bytes() == mp || under(d.as_bytes(), mp));
         if !(below("/proc") || below("/sys") || OWN_DIRS.iter().any(|d| below(d) || above(d))) {
             continue;
         }
-        let Some(("0", minor)) = dev.split_once(':') else {
+        let Some((major, minor)) = dev
+            .iter()
+            .position(|b| *b == b':')
+            .map(|c| (&dev[..c], &dev[c + 1..]))
+        else {
             continue;
         };
-        let Ok(conn) = minor.parse::<u32>() else {
+        if major != b"0" {
+            continue;
+        }
+        let Some(conn) = std::str::from_utf8(minor)
+            .ok()
+            .and_then(|m| m.parse::<u32>().ok())
+        else {
             continue;
         };
         if out.iter().any(|c| c.conn == conn) {
             continue;
         }
         out.push(CoveringFuse {
-            mount_point: mp,
-            fstype: fstype.to_string(),
-            source: unescape_mount(source),
+            mount_point: text(mp),
+            fstype: text(fstype),
+            source: text(&unescape_mount(source)),
             conn,
+            point,
         });
     }
     out
+}
+
+/// Lot 353: the covering FUSE mounts of the mount tables `tables`
+/// ([`covering_fuse`]), each connection once.
+pub fn covering_in<S: AsRef<[u8]>>(tables: &[S]) -> Vec<CoveringFuse> {
+    let mut found: Vec<CoveringFuse> = Vec::new();
+    for t in tables {
+        for f in covering_fuse(t) {
+            if !found.iter().any(|x| x.conn == f.conn) {
+                found.push(f);
+            }
+        }
+    }
+    found
+}
+
+/// Lot 1.7a: the mount tables at `paths` (the agent's and PID 1's
+/// `mountinfo`), each read as bytes beneath the anchored `/proc` root
+/// (`kernel_roots::read_all`): the kernel writes a path's bytes as they
+/// are, so a table is never refused for its encoding; one that cannot be
+/// read is left out.
+pub fn mount_tables<P: AsRef<Path>>(paths: &[P]) -> Vec<Vec<u8>> {
+    paths
+        .iter()
+        .filter_map(|p| antitamper_bpf::kernel_roots::read_all(p).ok())
+        .collect()
 }
 
 /// Lot 353 (the review of #563, F6): whether the covering FUSE `f` is
@@ -3480,12 +3546,13 @@ pub fn covering_fuse(mountinfo: &str) -> Vec<CoveringFuse> {
 /// next FUSE mounted once this one is gone (the lowest free): a FUSE
 /// unmounted since, its minor reused by a user's FUSE elsewhere, is not in
 /// the tables at that point — that connection is not aborted. Left: the
-/// moments between this read and the abort's write.
-pub fn still_covering<S: AsRef<str>>(tables: &[S], f: &CoveringFuse) -> bool {
+/// moments between this read and the abort's write. Lot 1.7a: the point
+/// compared byte for byte.
+pub fn still_covering<S: AsRef<[u8]>>(tables: &[S], f: &CoveringFuse) -> bool {
     tables.iter().any(|t| {
-        covering_fuse(t.as_ref())
+        covering_fuse(t)
             .iter()
-            .any(|x| x.conn == f.conn && x.mount_point == f.mount_point)
+            .any(|x| x.conn == f.conn && x.point == f.point)
     })
 }
 
@@ -6192,6 +6259,94 @@ mod tests {
         assert!(
             !still_covering(&[elsewhere], &f),
             "the minor reused by another covering FUSE: not the mount read"
+        );
+    }
+
+    /// Lot 1.7a (named, found by the AST ratchet of state reads): the
+    /// agent's and PID 1's mount tables are read as bytes. A fixture table
+    /// with entries that are not UTF-8 (a mount at `/home/u/\xff`, a
+    /// covering one at `/run/northnarrow/\xfe`), read from a file as the
+    /// watchdog reads them, is kept whole, and every covering FUSE in it is
+    /// found, the other table's too; a line with no mount's shape is
+    /// skipped on its own, and an escape that is no byte (`\777`) is kept
+    /// as written. Read as strict text, the whole table was left out.
+    #[test]
+    fn a_mount_table_with_an_entry_not_utf8_keeps_every_covering_fuse() {
+        let mut agent = b"24 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            900 26 0:91 / /proc/sys/kernel rw - fuse.a a rw\n"
+            .to_vec();
+        agent.extend_from_slice(b"901 24 0:92 / /home/u/\xff rw - fuse.sshfs u@h:/ rw\n");
+        agent.extend_from_slice(b"\xff\xfe\n");
+        agent.extend_from_slice(b"902 24 0:93 / /run/northnarrow/\xfe rw - fuse.b \xfe rw\n");
+        agent.extend_from_slice(b"903 24 0:94 / /sys/fs/cgroup rw - fuse.c c rw\n");
+        agent.extend_from_slice(b"906 24 0:96 / /etc/northnarrow/\\777 rw - fuse.e e rw\n");
+        let pid1 = b"904 24 0:95 / /var/lib/northnarrow rw - fuse.d d rw\n".to_vec();
+        assert!(std::str::from_utf8(&agent).is_err(), "the fixture");
+        let d = tempfile::tempdir().unwrap();
+        let (a, p, gone) = (
+            d.path().join("agent"),
+            d.path().join("pid1"),
+            d.path().join("gone"),
+        );
+        std::fs::write(&a, &agent).unwrap();
+        std::fs::write(&p, &pid1).unwrap();
+        let tables = mount_tables(&[&a, &gone, &p]);
+        assert_eq!(
+            tables,
+            [agent.clone(), pid1.clone()],
+            "every byte kept, the table that cannot be read left out"
+        );
+        let found = covering_in(&tables);
+        let points: Vec<(&str, u32)> = found
+            .iter()
+            .map(|f| (f.mount_point.as_str(), f.conn))
+            .collect();
+        assert_eq!(
+            points,
+            [
+                ("/proc/sys/kernel", 91),
+                ("/run/northnarrow/\u{fffd}", 93),
+                ("/sys/fs/cgroup", 94),
+                ("/etc/northnarrow/\\777", 96),
+                ("/var/lib/northnarrow", 95),
+            ]
+        );
+        assert_eq!(found[1].source, "\u{fffd}");
+        // the point that is not UTF-8 compared as the kernel wrote it
+        assert!(still_covering(&tables, &found[1]));
+        let other: &[u8] = b"905 24 0:93 / /run/northnarrow/\xfd rw - fuse.b x rw\n";
+        assert!(
+            !still_covering(&[other], &found[1]),
+            "another point, the same text"
+        );
+    }
+
+    /// Lot 1.7a: on a valid table the bytes are cut as `str::lines` and
+    /// `split(' ')` cut the text — a `\r` before `\n` dropped, a last
+    /// line's kept, a last line without its newline read, a U+00A0 in a
+    /// name part of its field — so the covering FUSE mounts are the same.
+    #[test]
+    fn covering_fuse_from_bytes_reads_a_valid_table_as_text_did() {
+        let table = "24 1 8:1 / / rw - ext4 /dev/sda1 rw\r\n\
+                     900 26 0:91 / /proc/a\u{a0}b rw - fuse.a a rw\r\n\
+                     \n\
+                     901 24 0:92 / /proc/c rw - fuse.c c\r\n\
+                     902 24 0:93 / /sys/x rw - fuse.x x\r";
+        let lines: Vec<&[u8]> = table_lines(table.as_bytes()).collect();
+        let text: Vec<&[u8]> = table.lines().map(str::as_bytes).collect();
+        assert_eq!(lines, text);
+        let points: Vec<(String, String, u32)> = covering_fuse(table)
+            .into_iter()
+            .map(|f| (f.mount_point, f.source, f.conn))
+            .collect();
+        assert_eq!(
+            points,
+            [
+                ("/proc/a\u{a0}b".to_string(), "a".to_string(), 91),
+                ("/proc/c".to_string(), "c".to_string(), 92),
+                ("/sys/x".to_string(), "x\r".to_string(), 93),
+            ],
+            "a `\\r` before `\\n` dropped, the last line's kept"
         );
     }
 

@@ -545,15 +545,44 @@ const EXEC_ONLY_COPIES: &[&str] = &[
 /// reads the link of, never runs), or as a fixture root's module tool the
 /// code under test only judges — the AST reader sees them (a direct link,
 /// the program passed to a helper), the lexical one did not. Listed one by
-/// one: a new link of a program to another name fails.
-const LINK_FIXTURES: &[&str] = &[
-    "crates/nn-core/src/posture/lineage.rs: a link of sleep named exe",
-    "crates/nn-linux/src/sensors/exec_facts.rs: a link of env named exe",
-    "crates/nn-linux/src/sensors/kmod_exec.rs: a link of env named exe",
-    "crates/nn-linux/src/sensors/kmod_exec.rs: a link of sleep named exe",
-    "crates/nn-linux/src/sensors/kmod_exec.rs: a link of true named exe",
-    "crates/nn-linux/src/sensors/kmod_exec.rs: a link of true named ?",
-    "crates/nn-linux/src/sensors/ring_drops.rs: a link of cat named exe",
+/// one, `(site, why it is never run, the tests that own it)`: a new link
+/// of a program to another name fails.
+const LINK_FIXTURES: &[(&str, &str, &str)] = &[
+    (
+        "crates/nn-core/src/posture/lineage.rs: a link of sleep named exe",
+        "a fake /proc/<pid>/exe, read as a link by the lineage, never run",
+        "nn-core posture::lineage's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/exec_facts.rs: a link of env named exe",
+        "a fake /proc/<pid>/exe, read as a link by the exec facts, never run",
+        "nn-linux sensors::exec_facts's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs: a link of env named exe",
+        "a fake /proc/<pid>/exe, read as a link by the module-load judge, never run",
+        "nn-linux sensors::kmod_exec's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs: a link of sleep named exe",
+        "a fake /proc/<pid>/exe, read as a link by the module-load judge, never run",
+        "nn-linux sensors::kmod_exec's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs: a link of true named exe",
+        "a fake /proc/<pid>/exe, read as a link by the module-load judge, never run",
+        "nn-linux sensors::kmod_exec's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/kmod_exec.rs: a link of true named ?",
+        "a fixture root's usr/bin/kmod, judged by its path and its link, never run",
+        "nn-linux sensors::kmod_exec's tests",
+    ),
+    (
+        "crates/nn-linux/src/sensors/ring_drops.rs: a link of cat named exe",
+        "a fake /proc/<pid>/exe, read as a link by the ring's drop account, never run",
+        "nn-linux sensors::ring_drops's tests",
+    ),
 ];
 
 /// Lot 344 (named, item 9: #549's CI failure, its root cause): no test runs
@@ -630,7 +659,8 @@ fn no_test_runs_a_coreutils_copy_under_another_name() {
     for rel in sources.keys() {
         for (n, kind, util, leaf) in renamed_copies(&c, rel) {
             let entry = format!("{rel}: a {kind} of {util} named {leaf}");
-            if EXEC_ONLY_COPIES.contains(&entry.as_str()) || LINK_FIXTURES.contains(&entry.as_str())
+            if EXEC_ONLY_COPIES.contains(&entry.as_str())
+                || LINK_FIXTURES.iter().any(|(e, _, _)| *e == entry)
             {
                 seen.insert(entry);
             } else {
@@ -646,10 +676,16 @@ fn no_test_runs_a_coreutils_copy_under_another_name() {
     // lot 1.7a: the lists shrink with the sites they name
     let stale: Vec<_> = EXEC_ONLY_COPIES
         .iter()
-        .chain(LINK_FIXTURES)
+        .chain(LINK_FIXTURES.iter().map(|(e, _, _)| e))
         .filter(|k| !seen.contains(**k))
         .collect();
     assert!(stale.is_empty(), "listed sites no longer there: {stale:#?}");
+    for (e, why, owner) in LINK_FIXTURES {
+        assert!(
+            why.len() > 10 && owner.len() > 3,
+            "{e}: why it is never run, and its owner"
+        );
+    }
 }
 
 /// Lot 1.7a: the spellings that passed the lexical reader — the re-check

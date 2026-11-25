@@ -359,8 +359,11 @@ impl Views {
 }
 
 /// Lot 353 (the review of #563, F3): the mount table of this process
-/// (`/proc/self/mountinfo`), read beneath the `/proc` root `proc`.
-fn own_mounts(proc: &File) -> Option<String> {
+/// (`/proc/self/mountinfo`), read beneath the `/proc` root `proc`. Lot
+/// 1.7a: its bytes as they are — the kernel writes a path's bytes
+/// unchanged, valid UTF-8 or not, so a table is never refused whole for
+/// its encoding; [`mount_lines`] reads it line by line.
+fn own_mounts(proc: &File) -> Option<Vec<u8>> {
     let f = openat2(
         proc,
         Path::new("self/mountinfo"),
@@ -368,16 +371,36 @@ fn own_mounts(proc: &File) -> Option<String> {
         NO_CROSSING,
     )
     .ok()?;
-    String::from_utf8(read_file_bounded(&f, STATE_MAX).ok()?).ok()
+    read_file_bounded(&f, STATE_MAX).ok()
+}
+
+/// One line of a mount table, as bytes: (id, parent, `major:minor`, root,
+/// mount point, file system type).
+type MountLine<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+/// Lot 1.7a: the lines of the mount table `table` that have a mount's
+/// shape ([`mount_line`]), as `str::lines` cuts them (at `\n`, a `\r`
+/// before it dropped, a last line without its newline read) — any byte
+/// tolerated, a line without that shape skipped on its own, never the
+/// table.
+fn mount_lines(table: &[u8]) -> impl Iterator<Item = MountLine<'_>> {
+    table
+        .split_inclusive(|b| *b == b'\n')
+        .map(|l| match l.strip_suffix(b"\n") {
+            Some(l) => l.strip_suffix(b"\r").unwrap_or(l),
+            None => l,
+        })
+        .filter_map(mount_line)
 }
 
 /// One line of a mount table: (id, parent, `major:minor`, root, mount
-/// point, file system type).
-fn mount_line(l: &str) -> Option<(&str, &str, &str, &str, &str, &str)> {
-    let (left, right) = l.split_once(" - ")?;
-    let mut f = left.split(' ');
+/// point, file system type), cut at ASCII spaces only.
+fn mount_line(l: &[u8]) -> Option<MountLine<'_>> {
+    let sep = l.windows(3).position(|w| w == b" - ")?;
+    let (left, right) = (&l[..sep], &l[sep + 3..]);
+    let mut f = left.split(|b| *b == b' ');
     let (id, parent, dev, root, point) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
-    let fstype = right.split(' ').next()?;
+    let fstype = right.split(|b| *b == b' ').next()?;
     Some((id, parent, dev, root, point, fstype))
 }
 
@@ -388,25 +411,27 @@ fn mount_line(l: &str) -> Option<(&str, &str, &str, &str, &str, &str)> {
 /// `/proc`), or a file system stacked over another mounted at the same
 /// point (a tmpfs over the cgroup2 root, another proc over `/proc`) — a
 /// bind of the same mount onto itself is the same view.
-pub fn shadowed(table: &str, point: &str) -> Option<String> {
-    let at: Vec<_> = table
-        .lines()
-        .filter_map(mount_line)
-        .filter(|m| m.4 == point)
+pub fn shadowed(table: impl AsRef<[u8]>, point: &str) -> Option<String> {
+    let at: Vec<_> = mount_lines(table.as_ref())
+        .filter(|m| m.4 == point.as_bytes())
         .collect();
     let top = at.last()?;
     let (_, parent, dev, root, _, fstype) = *top;
-    if root != "/" {
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    if root != b"/" {
         return Some(format!(
-            "{point}: the mount there is a directory of a {fstype} (source root {root}) bound \
-             over the view's root — a mount over it"
+            "{point}: the mount there is a directory of a {} (source root {}) bound over the \
+             view's root — a mount over it",
+            text(fstype),
+            text(root)
         ));
     }
     let below = at.iter().rev().skip(1).find(|m| m.0 == parent)?;
     (below.2 != dev || below.3 != root).then(|| {
         format!(
-            "{point}: a {fstype} mounted over the {} there — a mount over it",
-            below.5
+            "{point}: a {} mounted over the {} there — a mount over it",
+            text(fstype),
+            text(below.5)
         )
     })
 }
@@ -448,7 +473,7 @@ pub fn unified_hierarchy_only(text: &str) -> bool {
 /// mount table `table`), and a tmpfs there with no `unified` below it on a
 /// host whose processes are in the cgroup2 hierarchy alone
 /// (`unified_only`): a mount over its cgroup2 root.
-fn cgroup_view(table: Option<&str>, unified_only: bool) -> Option<View> {
+fn cgroup_view(table: Option<&[u8]>, unified_only: bool) -> Option<View> {
     let at = Path::new("/sys/fs/cgroup");
     let refused = |why: String| {
         Some(View {
@@ -530,7 +555,7 @@ fn bpf_view() -> Option<View> {
 /// own, anchored at the start (a path beneath the bpffs root would cross
 /// the lock's mount: `EXDEV`, then a walk on a helper thread for each pin).
 /// `None` without the lock (the bpffs view's, as before).
-fn pin_view(table: Option<&str>) -> Option<View> {
+fn pin_view(table: Option<&[u8]>) -> Option<View> {
     let at = Path::new(crate::DEFAULT_BPFFS_ROOT);
     if !table.is_some_and(|t| pin_locked(t, crate::DEFAULT_BPFFS_ROOT)) {
         return None;
@@ -545,29 +570,29 @@ fn pin_view(table: Option<&str>) -> Option<View> {
 /// Lot 359: the mount on top at `pin_root` in the mount table `table` is
 /// the pin directory's lock: a bpffs whose root is that directory, on a
 /// mount of the same bpffs at [`BPF_ROOT`] (or on another lock, stacked).
-pub fn pin_locked(table: &str, pin_root: &str) -> bool {
-    let lines: Vec<_> = table.lines().filter_map(mount_line).collect();
+pub fn pin_locked(table: impl AsRef<[u8]>, pin_root: &str) -> bool {
+    let lines: Vec<_> = mount_lines(table.as_ref()).collect();
     let Some(name) = Path::new(pin_root).file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let want_root = format!("/{name}");
-    let Some(top) = lines.iter().rev().find(|m| m.4 == pin_root) else {
+    let Some(top) = lines.iter().rev().find(|m| m.4 == pin_root.as_bytes()) else {
         return false;
     };
     let mut cur = *top;
     for _ in 0..lines.len() {
         let (_, parent, dev, root, point, fstype) = cur;
-        if fstype != "bpf" || root != want_root || point != pin_root {
+        if fstype != b"bpf" || root != want_root.as_bytes() || point != pin_root.as_bytes() {
             return false;
         }
         let Some(below) = lines.iter().rev().find(|m| m.0 == parent) else {
             return false;
         };
-        if below.2 != dev || below.5 != "bpf" {
+        if below.2 != dev || below.5 != b"bpf" {
             return false;
         }
-        if below.4 == BPF_ROOT {
-            return below.3 == "/";
+        if below.4 == BPF_ROOT.as_bytes() {
+            return below.3 == b"/";
         }
         cur = *below;
     }
@@ -2558,6 +2583,124 @@ mod tests {
         assert!(anchor(Path::new("/proc"), &[PROC_SUPER_MAGIC]).is_ok());
     }
 
+    /// Lot 1.7a (named, found by the AST ratchet of state reads): the
+    /// views' own mount table is read as bytes. A fixture table with an
+    /// entry that is not UTF-8 (a directory named `\xff\xfe`), read beneath
+    /// a `/proc` root as the start reads it, comes back whole, and every
+    /// other entry is still seen: the bind over `/proc`, the tmpfs over the
+    /// cgroup2 root (its source not UTF-8 itself), the pin directory's
+    /// lock; a line with no mount's shape is skipped on its own. Decoded as
+    /// strict UTF-8, the table was none.
+    #[test]
+    fn a_mount_table_with_an_entry_not_utf8_keeps_every_other_entry() {
+        const ROOT: &str = "/sys/fs/bpf/northnarrow";
+        let mut table = b"24 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            25 24 0:22 / /sys rw - sysfs sysfs rw\n\
+            26 24 0:23 / /proc rw - proc proc rw\n\
+            27 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+            .to_vec();
+        table.extend_from_slice(b"40 24 0:60 / /home/u/\xff\xfe rw - fuse.x x rw,user_id=1000\n");
+        table.extend_from_slice(b"\xff\xfe not a mount\n");
+        table.extend_from_slice(b"41 26 0:23 /sys /proc rw - proc proc rw\n");
+        table.extend_from_slice(b"42 27 0:91 / /sys/fs/cgroup rw - tmpfs \xff rw\n");
+        table.extend_from_slice(b"30 25 0:30 / /sys/fs/bpf rw - bpf bpf rw\n");
+        table.extend_from_slice(
+            format!("90 30 0:30 /northnarrow {ROOT} rw unbindable - bpf bpf rw\n").as_bytes(),
+        );
+        assert!(std::str::from_utf8(&table).is_err(), "the fixture");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("self")).unwrap();
+        std::fs::write(d.path().join("self/mountinfo"), &table).unwrap();
+        let read = own_mounts(&File::open(d.path()).unwrap()).expect("the table read");
+        assert_eq!(read, table, "every byte kept");
+        assert!(
+            shadowed(&read, "/proc")
+                .unwrap()
+                .contains("source root /sys"),
+            "the bind over /proc"
+        );
+        assert!(
+            shadowed(&read, "/sys/fs/cgroup")
+                .unwrap()
+                .contains("tmpfs mounted over the cgroup2"),
+            "the tmpfs over the cgroup2 root"
+        );
+        assert_eq!(shadowed(&read, "/sys"), None);
+        assert!(pin_locked(&read, ROOT), "the lock");
+        let lines: Vec<_> = mount_lines(&read).map(|m| m.4).collect();
+        assert_eq!(lines.len(), 9, "every line with a mount's shape");
+        assert!(lines.contains(&&b"/home/u/\xff\xfe"[..]));
+    }
+
+    /// Lot 1.7a: the mount lines read from bytes are the lines `str::lines`
+    /// gave on a valid table — cut at `\n`, a `\r` before it dropped, a
+    /// last line without its newline read, cut at ASCII spaces only (a
+    /// U+00A0 in a name stays in its field).
+    #[test]
+    fn mount_lines_from_bytes_are_the_text_lines_of_a_valid_table() {
+        const ROOT: &str = "/sys/fs/bpf/northnarrow";
+        let table = format!(
+            "1 0 252:1 / / rw - ext4 /dev/vda1 rw\r\n\
+             20 1 0:20 / /sys rw shared:7 - sysfs sysfs rw\n\
+             \n\
+             30 20 0:30 / /sys/fs/bpf rw shared:9 - bpf bpf rw,mode=700\n\
+             31 1 0:31 / /mnt/a\u{a0}b rw - tmpfs tmpfs rw\n\
+             no shape here\n\
+             90 30 0:30 /northnarrow {ROOT} rw unbindable - bpf\r\n\
+             91 90 0:30 /northnarrow {ROOT} rw unbindable - bpf\r"
+        );
+        let old: Vec<(&str, &str, &str, &str, &str, &str)> = table
+            .lines()
+            .filter_map(|l| {
+                let (left, right) = l.split_once(" - ")?;
+                let mut f = left.split(' ');
+                Some((
+                    f.next()?,
+                    f.next()?,
+                    f.next()?,
+                    f.next()?,
+                    f.next()?,
+                    right.split(' ').next()?,
+                ))
+            })
+            .collect();
+        let text = |b: &[u8]| std::str::from_utf8(b).unwrap().to_string();
+        let new: Vec<_> = mount_lines(table.as_bytes())
+            .map(|m| {
+                (
+                    text(m.0),
+                    text(m.1),
+                    text(m.2),
+                    text(m.3),
+                    text(m.4),
+                    text(m.5),
+                )
+            })
+            .collect();
+        assert_eq!(old.len(), 6);
+        assert_eq!(
+            new,
+            old.iter()
+                .map(|m| (
+                    m.0.to_string(),
+                    m.1.to_string(),
+                    m.2.to_string(),
+                    m.3.to_string(),
+                    m.4.to_string(),
+                    m.5.to_string()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            new[5].5, "bpf\r",
+            "a last line's `\\r` kept, as `lines` keeps it"
+        );
+        assert!(!pin_locked(&table, ROOT), "on top, a type `bpf\\r`");
+        let lock = format!("{}\n", table.rsplit_once('\n').unwrap().0);
+        assert!(pin_locked(&lock, ROOT), "a `\\r` before `\\n` dropped");
+        assert_eq!(new[3].4, "/mnt/a\u{a0}b");
+    }
+
     /// Lot 353 (the review of #563, F3, its probe's tables): the mount on
     /// top at a view point that is not the view — a tmpfs stacked over the
     /// cgroup2 root, a cgroup2 subtree bound over it, `/proc/sys` bound
@@ -2663,7 +2806,7 @@ mod tests {
                     return 99;
                 }
                 // the kernel's word on the hierarchies alone refuses it
-                let Some(alone) = cgroup_view(Some(&before), true) else {
+                let Some(alone) = cgroup_view(Some(before.as_bytes()), true) else {
                     return 10; // taken for a cgroup v1 host
                 };
                 match alone.refused() {
@@ -2777,7 +2920,7 @@ mod tests {
                 format!("90 30 0:30 / {ROOT} rw - bpf bpf rw\n"),
             ),
         ] {
-            assert!(!pin_locked(&format!("{base}{line}"), ROOT), "{what}");
+            assert!(!pin_locked(format!("{base}{line}"), ROOT), "{what}");
         }
         let over = format!("{lock}91 90 0:93 / {ROOT} rw - tmpfs tmpfs rw\n");
         assert!(!pin_locked(&over, ROOT), "a tmpfs over the lock");
