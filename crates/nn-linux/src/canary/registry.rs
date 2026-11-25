@@ -94,7 +94,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use chrono::{DateTime, Utc};
 use common::wire::InodeKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
@@ -1047,7 +1046,7 @@ fn build_signed_entry(
     prev_hash: &str,
     seq: u64,
 ) -> Result<CanaryToken> {
-    let ts = format_ts(Utc::now());
+    let ts = nn_evidence::time::now_micros();
     let mut entry = CanaryToken {
         ts,
         action,
@@ -1154,10 +1153,6 @@ fn compute_canary_id(name: &str, deployed_at_unix: u64) -> String {
     h.update(deployed_at_unix.to_le_bytes());
     let digest = h.finalize();
     hex::encode(&digest[..16])
-}
-
-fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 fn now_unix() -> u64 {

@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::VerifyingKey;
 
 use super::*;
@@ -13,11 +12,8 @@ use crate::chainlog::{NoProtection, RotatingChainLog, RotationConfig};
 
 const T0: &str = "2026-11-01T10:00:00.000000Z";
 
-fn at(s: i64) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(T0)
-        .unwrap()
-        .with_timezone(&Utc)
-        + Duration::seconds(s)
+fn at(s: i64) -> Timestamp {
+    crate::time::parse_timestamp(T0).unwrap() + crate::time::SignedDuration::from_secs(s)
 }
 
 fn beat(seq: u64, s: i64) -> HeartbeatRecord {
@@ -2060,4 +2056,33 @@ fn a_cut_named_by_every_later_beat_is_said_once_per_head() {
     assert_eq!(kinds(&r), ["REPLAY", "REPLAY"], "{r:?}");
     assert!(r.alerts[0].detail().contains("(beat 2)"), "{r:?}");
     assert!(r.alerts[1].detail().contains("(beat 4)"), "{r:?}");
+}
+
+/// Lot 1.6 (chrono → jiff): the verifier's arithmetic to the second — the
+/// time it first saw a beat is its own clock's, written in the chains'
+/// format; the clock's lead, the silence and the age are whole seconds
+/// truncated toward zero, as chrono's `num_seconds` counted them; a beat
+/// half a second ahead is 0 s ahead.
+#[test]
+fn the_verifiers_seconds_are_exact() {
+    let mut c = Chain::new();
+    c.push(beat(1, 31));
+    let r = check(Ok(&c.lines()), &c.pk, None, at(0), &cfg());
+    assert!(
+        r.alerts[0]
+            .detail()
+            .contains("the agent's clock is 31 s ahead of the verifier's (beat 1; bound 30 s)"),
+        "{r:?}"
+    );
+    let s = r.state.unwrap();
+    assert_eq!(s.seen_at, "2026-11-01T10:00:00.000000Z");
+    // 76.5 s after it first saw the beat: an age of 76 s
+    let half = crate::time::SignedDuration::from_millis(500);
+    let r = check(Ok(&c.lines()), &c.pk, Some(&s), at(76) + half, &cfg());
+    assert_eq!(r.age_secs, Some(76), "{r:?}");
+    let mut c = Chain::new();
+    c.push(beat(1, 0));
+    let r = check(Ok(&c.lines()), &c.pk, None, at(0) - half, &cfg());
+    assert!(r.alerts.is_empty(), "half a second ahead is 0 s: {r:?}");
+    assert_eq!(r.state.unwrap().seen_at, "2026-11-01T09:59:59.500000Z");
 }

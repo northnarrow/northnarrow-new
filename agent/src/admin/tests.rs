@@ -2827,11 +2827,9 @@ fn row_ts(i: u64) -> String {
 }
 
 fn row_unix(i: u64) -> u64 {
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(2026, 10, 15, 10, 0, 0)
+    nn_evidence::time::parse_rfc3339("2026-10-15T10:00:00Z")
         .unwrap()
-        .timestamp() as u64
+        .unix_seconds() as u64
         + i
 }
 

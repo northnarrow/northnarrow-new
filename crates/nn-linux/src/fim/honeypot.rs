@@ -48,7 +48,7 @@ const LAST_MODIFIED: &str = "last_modified=";
 /// the file's mtime. The other lines are kept byte for byte, as
 /// `deploy/install.sh` (`install_bait`) keeps them.
 pub fn render_bait(template: &str, at: SystemTime) -> String {
-    let stamp = chrono::DateTime::<chrono::Utc>::from(at).format("%Y-%m-%dT%H:%M:%SZ");
+    let stamp = nn_evidence::time::format_secs(nn_evidence::time::from_system_time(at));
     template
         .split_inclusive('\n')
         .map(|line| {
@@ -568,9 +568,9 @@ mod tests {
                 .lines()
                 .find_map(|l| l.strip_prefix(LAST_MODIFIED))
                 .unwrap();
-            let dated: SystemTime = chrono::DateTime::parse_from_rfc3339(stamp)
-                .unwrap_or_else(|e| panic!("{path}: {stamp:?}: {e}"))
-                .into();
+            let dated: SystemTime = nn_evidence::time::parse_timestamp(stamp)
+                .and_then(|t| SystemTime::try_from(t).ok())
+                .unwrap_or_else(|| panic!("{path}: {stamp:?}: not an RFC 3339 time"));
             let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
             assert_eq!(dated, mtime, "{path}: the date it gives is its mtime");
             let floor = UNIX_EPOCH

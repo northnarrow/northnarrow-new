@@ -6,8 +6,9 @@
 //! manifest rows ([`crate::chainlog::RotatingChainLog`]), the head anchor's
 //! snapshot ([`crate::chain_anchor::Anchor`]). The hash covers it, and the
 //! signature the hash, so a chain written twice from the same inputs was
-//! two chains: the writers read `Utc::now` where they stamped. They read it
-//! through a [`Clock`] now. [`SystemClock`] is that same `Utc::now`, the
+//! two chains: the writers read the host's clock where they stamped. They
+//! read it through a [`Clock`] now. [`SystemClock`] is that same clock
+//! (`Timestamp::now`; chrono's `Utc::now` before lot 1.6), the
 //! writers' default — the agent's chains are stamped as before; a replay or
 //! a test gives a clock of its own and writes the same bytes every run (the
 //! posture golden's signed rows, `agent/src/posture/golden.rs`).
@@ -17,21 +18,22 @@
 //! Timers (the rotating log's time-based checkpoint) stay on the monotonic
 //! clock: they choose when a row is written, they are not written in it.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 /// Where a chain writer reads the time it stamps on a row.
 pub trait Clock: Send + Sync {
     /// The wall clock now.
-    fn now(&self) -> DateTime<Utc>;
+    fn now(&self) -> Timestamp;
 }
 
-/// The host's clock (`Utc::now`): every writer's unless it is given another.
+/// The host's clock (`Timestamp::now`): every writer's unless it is given
+/// another.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 
@@ -46,30 +48,27 @@ pub fn stamp(clock: &dyn Clock) -> String {
 pub(crate) mod testing {
     use std::sync::Mutex;
 
-    use chrono::{DateTime, TimeDelta, Utc};
-
     use super::Clock;
+    use crate::time::{SignedDuration, Timestamp, parse_timestamp};
 
     /// Starts at `at`; [`Self::advance`] moves it.
-    pub(crate) struct FixedClock(Mutex<DateTime<Utc>>);
+    pub(crate) struct FixedClock(Mutex<Timestamp>);
 
     impl FixedClock {
         pub(crate) fn at(rfc3339: &str) -> Self {
             Self(Mutex::new(
-                DateTime::parse_from_rfc3339(rfc3339)
-                    .expect("an RFC 3339 time")
-                    .with_timezone(&Utc),
+                parse_timestamp(rfc3339).expect("an RFC 3339 time"),
             ))
         }
 
-        pub(crate) fn advance(&self, by: TimeDelta) {
+        pub(crate) fn advance(&self, by: SignedDuration) {
             let mut t = self.0.lock().unwrap();
             *t += by;
         }
     }
 
     impl Clock for FixedClock {
-        fn now(&self) -> DateTime<Utc> {
+        fn now(&self) -> Timestamp {
             *self.0.lock().unwrap()
         }
     }
@@ -80,20 +79,20 @@ mod tests {
     use super::*;
 
     /// The default clock is the host's: a stamp falls between two readings
-    /// of `Utc::now`, in the chains' format.
+    /// of `Timestamp::now`, in the chains' format.
     #[test]
     fn the_system_clock_is_utc_now() {
-        let before = Utc::now();
+        let before = Timestamp::now();
         let t = SystemClock.now();
         let s = stamp(&SystemClock);
-        let after = Utc::now();
+        let after = Timestamp::now();
         assert!(before <= t && t <= after, "{before} <= {t} <= {after}");
         assert_eq!(s.len(), "2026-01-01T00:00:00.000000Z".len(), "{s}");
         assert!(s.ends_with('Z'), "{s}");
         // The stamp keeps microseconds: it is at most 1 µs before `before`.
-        let stamped = DateTime::parse_from_rfc3339(&s).unwrap();
+        let stamped = crate::time::parse_timestamp(&s).unwrap();
         assert!(
-            stamped >= before - chrono::TimeDelta::microseconds(1),
+            stamped >= before - crate::time::SignedDuration::from_micros(1),
             "{s}"
         );
         assert!(stamped <= after, "{s}");
@@ -105,7 +104,7 @@ mod tests {
     fn a_stamp_is_the_clocks_time() {
         let c = testing::FixedClock::at("2026-01-01T00:02:00.123456789Z");
         assert_eq!(stamp(&c), "2026-01-01T00:02:00.123456Z");
-        c.advance(chrono::TimeDelta::microseconds(5));
+        c.advance(crate::time::SignedDuration::from_micros(5));
         assert_eq!(stamp(&c), "2026-01-01T00:02:00.123461Z");
     }
 }

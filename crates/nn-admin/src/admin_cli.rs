@@ -2430,7 +2430,7 @@ fn read_frame(stream: &mut UnixStream) -> Result<AdminMessage> {
 }
 
 fn current_utc_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    nn_evidence::time::format_secs(nn_evidence::time::Timestamp::now())
 }
 
 // ── Tappa 10 N7 — nn-admin net subcommands ─────────────────────────

@@ -75,7 +75,6 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
 use common::wire::{
     FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED,
     FIM_RENAMED_AWAY, FIM_SETATTR_SIZE, FIM_WRITE_APPEND_ONLY, FIM_WRITE_ONE_WRITER,
@@ -700,7 +699,7 @@ impl FimDriftDb {
     /// log at the size cap). Returns the new line's `entry_hash` hex.
     pub fn append(&mut self, draft: FimDriftDraft) -> Result<String> {
         let payload = FimDriftPayload {
-            ts: format_ts(Utc::now()),
+            ts: nn_evidence::time::now_micros(),
             path: draft.path,
             op: draft.op,
             baseline_sha256: draft.baseline_sha256,
@@ -733,7 +732,7 @@ fn build_signed_drift_entry(
     agent_id: &[u8; 16],
     prev_hash: &str,
 ) -> Result<FimDriftEntry> {
-    let ts = format_ts(Utc::now());
+    let ts = nn_evidence::time::now_micros();
     let mut entry = FimDriftEntry {
         ts,
         path: draft.path.clone(),
@@ -771,10 +770,6 @@ fn compute_entry_hash(entry: &FimDriftEntry) -> Result<[u8; 32]> {
     hasher.update(&body);
     let digest: [u8; 32] = hasher.finalize().into();
     Ok(digest)
-}
-
-fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 /// BUG-022 — rebuild a watched directory's child path from the bare

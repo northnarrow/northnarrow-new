@@ -1653,12 +1653,11 @@ fn every_advisory_exception_is_reasoned_and_dated() {
         if field("Why").is_some_and(|w| w.len() < 60) {
             bad.push(format!("{id}: `Why:` is too short to be a reason"));
         }
-        let date = |name: &str| {
-            field(name).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-        };
+        let date =
+            |name: &str| field(name).and_then(|d| jiff::civil::Date::strptime("%Y-%m-%d", d).ok());
         match (date("Recorded"), date("Expires")) {
             (Some(from), Some(until)) => {
-                let days = (until - from).num_days();
+                let days = until.duration_since(from).as_hours() / 24;
                 if !(0..=MAX_EXCEPTION_DAYS).contains(&days) {
                     bad.push(format!(
                         "{id}: accepted for {days} days ({from} to {until}); at most \
@@ -1849,11 +1848,11 @@ fn advisory_exceptions_expire_in_ci() {
     // and on the day the first expires; refused the day after.
     let real = root.join(".cargo/audit.toml");
     let entries = advisory_exceptions(&fs::read_to_string(&real).unwrap_or_default());
-    let dates = |name: &str| -> Vec<chrono::NaiveDate> {
+    let dates = |name: &str| -> Vec<jiff::civil::Date> {
         entries
             .iter()
             .filter_map(|e| e.fields.iter().find(|(k, _)| k == name))
-            .filter_map(|(_, v)| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok())
+            .filter_map(|(_, v)| jiff::civil::Date::strptime("%Y-%m-%d", v).ok())
             .collect()
     };
     if let (Some(first), Some(last)) = (
@@ -1868,7 +1867,7 @@ fn advisory_exceptions_expire_in_ci() {
                 "{text}"
             );
         }
-        let after = last.succ_opt().unwrap();
+        let after = last.tomorrow().unwrap();
         let (ok, text) = run(&real, &after.to_string());
         assert!(!ok, "{after} is after an expiry: {text}");
         assert!(text.contains(&format!("expired on {last}")), "{text}");

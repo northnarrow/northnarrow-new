@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use nn_evidence::time::Timestamp;
 use nn_model::posture_types::PostureKind;
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
@@ -606,7 +606,7 @@ impl DetectionSink {
     /// Lot 341: today's records in the chain by severity, and the responses
     /// the no-enforcement gate suppressed.
     pub fn records_today(&self) -> nn_proto::admin_protocol::RecordsToday {
-        self.inner.today.lock().snapshot(Utc::now())
+        self.inner.today.lock().snapshot(Timestamp::now())
     }
 
     /// R12c (lab PR 270): stage 7's counts.
@@ -884,7 +884,7 @@ impl SinkInner {
             append_failed: AtomicU64::new(0),
             defense,
             exe_resolver: std::sync::OnceLock::new(),
-            today: Mutex::new(crate::records_today::TodayCounts::new(Utc::now())),
+            today: Mutex::new(crate::records_today::TodayCounts::new(Timestamp::now())),
         }
     }
 }
@@ -893,7 +893,7 @@ impl SinkInner {
 /// to stamp [`DetectionRecord`]s (the sink) and [`StatusEvent`]s (the
 /// 9.0.c set-status dispatch).
 pub fn now_ts() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    nn_evidence::time::now_micros()
 }
 
 /// Open the detection chainlog at `active_path`, seed the id counter
@@ -1003,7 +1003,7 @@ fn spawn_writer(
                 } else {
                     inner.written.fetch_add(1, Ordering::Relaxed);
                     inner.today.lock().note(
-                        Utc::now(),
+                        Timestamp::now(),
                         severity,
                         would_have.as_deref().unwrap_or(""),
                     );
@@ -1175,9 +1175,7 @@ impl DetectionStatus {
 /// unparseable `ts` is not excluded) rather than silently dropping a
 /// detection an operator might need to see.
 fn ts_to_unix(ts: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(ts)
-        .ok()
-        .map(|dt| dt.timestamp())
+    nn_evidence::time::parse_rfc3339(ts).map(|t| t.unix_seconds())
 }
 
 impl DetectionRecord {

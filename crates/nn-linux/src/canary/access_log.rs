@@ -47,7 +47,6 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use nn_model::{CanaryAccessKind, CanaryTypeTag};
 use serde::{Deserialize, Serialize};
@@ -356,7 +355,7 @@ fn build_signed_entry(
     prev_hash: &str,
     seq: u64,
 ) -> Result<CanaryAccessEntry> {
-    let ts = format_ts(Utc::now());
+    let ts = nn_evidence::time::now_micros();
     let mut entry = CanaryAccessEntry {
         ts,
         canary_id: draft.canary_id.clone(),
@@ -503,10 +502,6 @@ pub fn first_trip_rows(
         found.push(FirstTripRow { row, entry });
     }
     Ok(found)
-}
-
-fn format_ts(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 // ── off-host verifier ───────────────────────────────────────────────
