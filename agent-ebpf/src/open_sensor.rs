@@ -72,8 +72,6 @@ const FMODE_WRITE: u32 = 0x2;
 /// created the file. Set before `security_file_open` runs.
 const FMODE_CREATED: u32 = 0x10_0000;
 
-/// `BTRFS_SUPER_MAGIC`, include/uapi/linux/magic.h.
-const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
 const S_IFMT: u16 = 0o170_000;
 const S_IFREG: u16 = 0o100_000;
 const S_IFDIR: u16 = 0o040_000;
@@ -678,8 +676,16 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         if carveout_magic(magic) {
             bits |= TREE_CARVEOUT;
         }
-        let btrfs = magic == BTRFS_SUPER_MAGIC;
         let s_dev = peek_u32(sb.add(off!(SUPER_BLOCK_S_DEV_OFFSET)));
+        // Lot 1.4b (stack): the superblock's btrfs facts read once
+        // (`inode_dev::SbDev`, lot 318's walk form of `stat_dev`, the same
+        // device): `stat_dev` in each level looked its three offsets up again
+        // and kept them across the level's helper calls — the walk's frame
+        // was 192 bytes, on `fim_file_open_sensor`'s deepest chain (480 of the
+        // verifier's 512); 160 now. No call is added to the loop: a
+        // subprogram call there would cost the 5.15 verifier its precision
+        // marks (KERNEL_COMPATIBILITY "Older verifiers", rule 9).
+        let devs = crate::inode_dev::SbDev::of(sb, s_dev);
         let mut d = dir;
         let mut key = start;
         let mut capped = DEPTH_CAPPED;
@@ -705,11 +711,7 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
             peek_name(d, o_name, scratch);
             let up_inode = peek_u64(up.add(o_inode)) as *const u8;
             let up_key = InodeKey {
-                dev: if btrfs {
-                    nn_open_btrfs_dev(up_inode as u64, sb as u64, u64::from(s_dev))
-                } else {
-                    s_dev as u64
-                },
+                dev: devs.dev(up_inode) as u64,
                 ino: peek_u64(up_inode.add(o_ino)),
             };
             let ck = scratch.add(64);
@@ -743,22 +745,6 @@ unsafe fn walk(start: InodeKey, dir: *const u8, dir_inode: *const u8) -> u64 {
         }
         (u64::from(uid) << 32) | u64::from(bits | capped)
     }
-}
-
-/// Lot 1.4b (stack): a btrfs subvolume's device for the walk's level
-/// (`crate::inode_dev::stat_dev` of `inode` on superblock `sb`, whose
-/// `s_dev` is `s_dev`), as a global BPF function. Inline in each level of
-/// the walk, its three offsets and two reads were kept across the level's
-/// helper calls: the walk's frame was 192 bytes, on the deepest call chain
-/// of `fim_file_open_sensor` (480 of the verifier's 512). Every argument
-/// is a plain value, read only through the probe helper, so any value is
-/// safe; the verifier checks it once.
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub extern "C" fn nn_open_btrfs_dev(inode: u64, sb: u64, s_dev: u64) -> u64 {
-    // SAFETY: `stat_dev` reads `inode` and `sb` only through
-    // `bpf_probe_read_kernel` (a fault leaves `s_dev`) and writes nothing.
-    u64::from(unsafe { crate::inode_dev::stat_dev(inode as *const u8, sb as *const u8, s_dev as u32) })
 }
 
 /// The writer's login uid, or `u32::MAX` (never a runtime dir's owner)
