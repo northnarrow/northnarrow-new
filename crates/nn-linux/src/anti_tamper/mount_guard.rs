@@ -42,10 +42,10 @@ use anyhow::{Context, Result, anyhow};
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::{Btf, Ebpf};
 use common::mount_guard::{
-    BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG, HELD_NS_SHIFT,
-    HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB, MG_VIEW, NameKey,
-    PLACE_ANY_GROUP, PROC_SUPER_MAGIC, SYSFS_MAGIC, TMPFS_MAGIC, held_by_id, held_by_place,
-    held_under,
+    BPF_FS_MAGIC, CGROUP2_SUPER_MAGIC, CONF_PROPAGATED, GUARD_AGENT, GUARD_HOST, GUARD_WATCHDOG,
+    HELD_NS_SHIFT, HELD_REFUSE, MG_HOLD, MG_LOCK, MG_LOCK_ABOVE, MG_NOTE, MG_ON, MG_OWN, MG_SB,
+    MG_VIEW, NameKey, PLACE_ANY_GROUP, PROC_SUPER_MAGIC, STAGE_POINT, STAGE_PROPAGATE, SYSFS_MAGIC,
+    TMPFS_MAGIC, guards_own_namespace, held_by_id, held_by_place, held_root, held_under,
 };
 use common::wire::InodeKey;
 use tracing::{info, warn};
@@ -72,6 +72,54 @@ pub(crate) const PROGRAMS: [(&str, &str); 5] = [
 /// flags for `sb_remount` (finalrd's `remount,exec /run` at shutdown is not
 /// a read-only remount), pinned with the hooks.
 const RECONF_PROGRAM: (&str, &str) = ("mount_guard_reconfigure", "reconfigure_super");
+
+/// Lot 1.1 (F8b-1): the stages the split hooks' entries tail-call, by
+/// `(program, hook, program array, slot)` — loaded for their hook, never
+/// attached, each in its slot before the entry is attached. A stage the
+/// kernel refuses leaves its hook unattached (a signed degradation), never
+/// an entry that would let through what the stage judges.
+pub(crate) const STAGES: [(&str, &str, &str, u32); 3] = [
+    (
+        "mount_guard_sb_mount_point",
+        "sb_mount",
+        SB_STAGES_MAP,
+        STAGE_POINT,
+    ),
+    (
+        "mount_guard_sb_mount_propagate",
+        "sb_mount",
+        SB_STAGES_MAP,
+        STAGE_PROPAGATE,
+    ),
+    (
+        "mount_guard_move_mount_point",
+        "move_mount",
+        MOVE_STAGES_MAP,
+        STAGE_POINT,
+    ),
+];
+
+/// Lot 1.1: `sb_mount`'s and `move_mount`'s program arrays (one per hook:
+/// from 6.11 a tracing program tail-calls only a program of its own kernel
+/// function), pinned at each start after the entries (a program array is
+/// emptied when its last user reference goes) and held for the agent's
+/// life by the eBPF object's own descriptor of each (the sensor
+/// multiplexer owns the object, [`pin_stages`]).
+const SB_STAGES_MAP: &str = "MOUNT_SB_STAGES";
+const MOVE_STAGES_MAP: &str = "MOUNT_MOVE_STAGES";
+
+/// Lot 1.1 (the review of #569, F1b): the `fentry` on the kernel's
+/// `change_mnt_propagation()` that counts a propagation change of a
+/// guarded mount as it is made — `mount_setattr(2)`'s, which no LSM hook
+/// sees, among them (`agent-ebpf/src/mount_setattr.rs`); pinned with the
+/// hooks.
+const PROPAGATION_PROGRAM: (&str, &str) = ("mount_guard_propagation", "change_mnt_propagation");
+
+/// What a start without [`PROPAGATION_PROGRAM`] lacks, for the signed
+/// degradation.
+pub const PROPAGATION_ABSENT_EFFECT: &str = "a change of propagation made through \
+     mount_setattr(2) on a mount the guard holds is followed at the next refresh and signed at the \
+     next integrity round (about 30 s), not at once";
 
 /// The guard's hooks (each with its `DENY_FAIL_OPEN` slot).
 pub const HOOKS: [&str; 5] = [
@@ -618,6 +666,19 @@ pub(crate) fn held_in(
                 }
             }
         }
+        // lot 1.1 (the review of #569, F2): and by its own peer group and
+        // its root (`held_root`) — a peer copy of it moved away, in any
+        // namespace, is refused (never read below a FUSE)
+        let (own_group, _) = groups.get(&m.id).copied().unwrap_or((0, 0));
+        if own_group != 0 && !crate::mountinfo::is_fuse(&m.fstype) {
+            if let Some((rdev, rino)) = dir_key(&m.mount_point) {
+                let (dev, ino) = held_root(own_group, rdev, rino);
+                let k = InodeKey { dev, ino };
+                if !out.entries.iter().any(|(e, _)| *e == k) {
+                    out.entries.push((k, HELD_REFUSE | tag));
+                }
+            }
+        }
         if !out.sbs.contains(&m.kernel_dev()) {
             out.sbs.push(m.kernel_dev());
         }
@@ -1001,12 +1062,77 @@ where
 /// an older program must not stay attached with points no one refreshes.
 fn purge_pins(pin_root: Option<&Path>) {
     if let Some(root) = pin_root {
-        for (_, hook) in PROGRAMS.iter().chain([&RECONF_PROGRAM]) {
+        for (_, hook) in PROGRAMS
+            .iter()
+            .chain([&RECONF_PROGRAM, &PROPAGATION_PROGRAM])
+        {
             let (prog, link) = antitamper_bpf::lsm_pin_paths(root, hook);
             antitamper_bpf::purge_stale_pin(&link);
             antitamper_bpf::purge_stale_pin(&prog);
         }
+        // lot 1.1: and the stages' arrays (emptied once no one holds them)
+        for array in [SB_STAGES_MAP, MOVE_STAGES_MAP] {
+            antitamper_bpf::purge_stale_pin(&root.join(array));
+        }
     }
+}
+
+/// Lot 1.1 (F8b-1): `hook`'s stages ([`STAGES`]) loaded and put in their
+/// program array's slots — before its entry is attached. An error: the
+/// entry must not be attached (it would let through what a stage judges).
+fn load_stages(ebpf: &mut Ebpf, hook: &str, btf: &Btf) -> Result<()> {
+    use aya::maps::ProgramArray;
+    use aya::programs::Lsm;
+    for (program, h, array, slot) in STAGES.iter().filter(|s| s.1 == hook) {
+        if let Some(e) = injected_refusal(program) {
+            return Err(e);
+        }
+        let prog: &mut Lsm = ebpf
+            .program_mut(program)
+            .ok_or_else(|| anyhow!("program {program} missing from the eBPF object"))?
+            .try_into()
+            .with_context(|| format!("program {program} is not an LSM program"))?;
+        prog.load(h, btf)
+            .with_context(|| format!("verifier rejected LSM program `{program}`"))?;
+        let fd = prog
+            .fd()
+            .map_err(anyhow::Error::from)
+            .and_then(|f| f.try_clone().map_err(anyhow::Error::from))
+            .with_context(|| format!("the descriptor of `{program}`"))?;
+        let map = ebpf
+            .map_mut(array)
+            .ok_or_else(|| anyhow!("map {array} missing from the eBPF object"))?;
+        let mut pa: ProgramArray<&mut MapData> = ProgramArray::try_from(map)?;
+        pa.set(*slot, &fd, 0)
+            .with_context(|| format!("`{program}` into {array}[{slot}]"))?;
+    }
+    Ok(())
+}
+
+/// The program array of `hook`'s stages, if it has any.
+fn stages_of(hook: &str) -> Option<&'static str> {
+    STAGES.iter().find(|s| s.1 == hook).map(|s| s.2)
+}
+
+/// Lot 1.1: `array`, with a pin root, pinned there in place of a prior
+/// start's — after this start's entry is attached, whose purge retired the
+/// prior entry that used the prior array. A program array is emptied when
+/// its last user reference goes (its pin removed or hidden, the bpffs's
+/// last mount gone), and an entry's tail call then finds no stage: while
+/// the agent runs, the eBPF object (`ebpf`, the sensor multiplexer's, kept
+/// for the agent's life) holds its own descriptor of the array, a user
+/// reference of its own — an explicit handle, no process-wide copy.
+fn pin_stages(ebpf: &mut Ebpf, array: &str, pin_root: Option<&Path>) -> Result<()> {
+    let map = ebpf
+        .map_mut(array)
+        .ok_or_else(|| anyhow!("map {array} missing from the eBPF object"))?;
+    if let Some(root) = pin_root {
+        let path = root.join(array);
+        antitamper_bpf::purge_stale_pin(&path);
+        map.pin(&path)
+            .with_context(|| format!("pinning {array} to {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// The maps the watchdog refresh opens, pinned at this start's objects
@@ -1195,7 +1321,25 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
     health.points = keys.len();
     let mut missing = Vec::new();
     for (program, hook) in PROGRAMS {
-        match load_lsm(ebpf, program, hook, btf, pin_root) {
+        // lot 1.1 (F8b-1): a split hook's stages first, in their slots; the
+        // entry attached only with every one (then their array pinned)
+        let loaded = match stages_of(hook) {
+            Some(array) => load_stages(ebpf, hook, btf).map(|()| Some(array)),
+            None => Ok(None),
+        };
+        match loaded.and_then(|array| {
+            load_lsm(ebpf, program, hook, btf, pin_root)?;
+            if let Some(array) = array {
+                if let Err(e) = pin_stages(ebpf, array, pin_root) {
+                    health.degraded.push(format!(
+                        "mount guard: {hook}'s stages are not pinned — after the agent's \
+                         exit its entry finds no stage and lets the mounts through, counted \
+                         ({e:#})"
+                    ));
+                }
+            }
+            Ok(())
+        }) {
             Ok(()) => health.attached += 1,
             Err(e) => {
                 let why = if super::filesystem::lsm_hook_absent(&e, hook) {
@@ -1221,6 +1365,20 @@ pub(crate) fn attach(ebpf: &mut Ebpf, btf: &Btf, pin_root: Option<&Path>) -> Hea
             "mount guard: a remount's new flags are not read ({e:#}): every remount of the file \
              systems the agent's paths are on is refused, a writable one too"
         ));
+    }
+    // lot 1.1 (the review of #569, F1b): a propagation change counted as
+    // the kernel makes it — mount_setattr(2)'s among them
+    if let Err(e) = load_fentry(
+        ebpf,
+        PROPAGATION_PROGRAM.0,
+        PROPAGATION_PROGRAM.1,
+        btf,
+        pin_root,
+    ) {
+        warn!(error = %format!("{e:#}"), "anti-tamper mount guard: propagation changes not counted at once");
+        health
+            .degraded
+            .push(format!("mount guard: {PROPAGATION_ABSENT_EFFECT} ({e:#})"));
     }
     if missing.is_empty() {
         info!(
@@ -1270,18 +1428,25 @@ pub(crate) fn guard_own_namespace(ebpf: &mut Ebpf) -> Option<String> {
     }
     let r = (|| -> Result<u64> {
         let inum = mnt_ns_of("self")?;
-        {
+        let own = {
             let conf = ebpf
                 .map_mut(CONF_MAP)
                 .ok_or_else(|| anyhow!("map {CONF_MAP} missing from the eBPF object"))?;
             let mut conf: AyaArray<&mut MapData, u64> = AyaArray::try_from(conf)?;
-            conf.set(CONF_AGENT_NS, &inum, 0)?;
+            // lot 1.1 (the re-check 2 of #569, N3): an agent run by hand in
+            // PID 1's namespace never takes PID 1's entry as its own (nor
+            // hands it to `vacate` at its exit)
+            let own = guards_own_namespace(inum, conf.get(&0, 0)?);
+            conf.set(CONF_AGENT_NS, &(if own { inum } else { 0 }), 0)?;
+            own
+        };
+        if own {
+            let nm = ebpf
+                .map_mut(NS_MAP)
+                .ok_or_else(|| anyhow!("map {NS_MAP} missing from the eBPF object"))?;
+            let mut nm: AyaHashMap<&mut MapData, u64, u8> = AyaHashMap::try_from(nm)?;
+            set_guarded(&mut nm, inum, GUARD_AGENT)?;
         }
-        let nm = ebpf
-            .map_mut(NS_MAP)
-            .ok_or_else(|| anyhow!("map {NS_MAP} missing from the eBPF object"))?;
-        let mut nm: AyaHashMap<&mut MapData, u64, u8> = AyaHashMap::try_from(nm)?;
-        set_guarded(&mut nm, inum, GUARD_AGENT)?;
         Ok(inum)
     })();
     match r {
@@ -1347,6 +1512,8 @@ pub fn refresh(bpffs_root: &Path) -> Result<usize> {
 pub struct RegroupWatch {
     conf: AyaArray<MapData, u64>,
     seen: u64,
+    /// Lot 1.1: [`CONF_PROPAGATED`] at the last look.
+    seen_made: u64,
 }
 
 impl RegroupWatch {
@@ -1358,7 +1525,30 @@ impl RegroupWatch {
             MapData::from_pin(&path).with_context(|| format!("opening pinned {CONF_MAP}"))?;
         let conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(data))?;
         let seen = conf.get(&CONF_REGROUP, 0)?;
-        Ok(RegroupWatch { conf, seen })
+        let seen_made = conf.get(&CONF_PROPAGATED, 0).unwrap_or(0);
+        Ok(RegroupWatch {
+            conf,
+            seen,
+            seen_made,
+        })
+    }
+
+    /// Lot 1.1 (the review of #569, F1b): a propagation change was made on
+    /// a mount the guard holds, of a held group, or on the pin directory's
+    /// lock, since the last look — `mount_setattr(2)`'s among them, which no
+    /// hook refuses (the `change_mnt_propagation()` fentry's count,
+    /// [`CONF_PROPAGATED`]): what the integrity round compares (the lock's
+    /// flags, the mounts' attributes) is worth reading now rather than at
+    /// its next round. No caller yet: reserved for the follow-up that wakes
+    /// the integrity round on it.
+    pub fn propagated(&mut self) -> bool {
+        match self.conf.get(&CONF_PROPAGATED, 0) {
+            Ok(n) if n != self.seen_made => {
+                self.seen_made = n;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The count moved since the last look (an unreadable slot: not).
@@ -1473,8 +1663,14 @@ pub fn guard_watchdog(bpffs_root: &Path, pid: u32) -> Result<WatchdogGuard> {
     }
     let mut conf: AyaArray<MapData, u64> = AyaArray::try_from(Map::Array(open(CONF_MAP)?))?;
     let mut nm: AyaHashMap<MapData, u64, u8> = AyaHashMap::try_from(Map::HashMap(open(NS_MAP)?))?;
-    conf.set(CONF_WATCHDOG_NS, &inum, 0)?;
-    set_guarded(&mut nm, inum, GUARD_WATCHDOG)?;
+    // lot 1.1 (the re-check 2 of #569, N3): a watchdog run by hand in PID
+    // 1's namespace is judged there as PID 1's: its entry kept
+    if guards_own_namespace(inum, conf.get(&0, 0)?) {
+        conf.set(CONF_WATCHDOG_NS, &inum, 0)?;
+        set_guarded(&mut nm, inum, GUARD_WATCHDOG)?;
+    } else {
+        conf.set(CONF_WATCHDOG_NS, &0, 0)?;
+    }
     Ok(WatchdogGuard {
         mnt_ns: inum,
         not_canonical: watchdog_not_canonical(&t, &points),
@@ -1695,6 +1891,11 @@ mod tests {
         for (other, _) in &PROGRAMS[1..] {
             assert!(injected_refusal(other).is_none(), "{other}");
         }
+        // lot 1.1: a stage, and the propagation fentry, are refused alike
+        for (stage, ..) in STAGES {
+            assert!(injected_refusal(stage).is_none(), "{stage}");
+        }
+        assert!(injected_refusal(PROPAGATION_PROGRAM.0).is_none());
         // SAFETY: as above.
         unsafe { std::env::remove_var(VERIFIER_REFUSE_ENV) };
         assert!(injected_refusal(program).is_none());
@@ -1756,6 +1957,101 @@ mod tests {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// Named test (lot 1.1, the review of #569, F2): each held mount in a
+    /// peer group is keyed by its own group and its root (`held_root`) —
+    /// the key a peer copy of it has in any namespace (the chroot's copy of
+    /// `/sys` at `/srv/chroot/sys`: the same group, the same root dentry),
+    /// so the move of that copy is refused; a slave-only mount has no such
+    /// key, nor a group no held mount is in. Failed on main: no such key.
+    #[test]
+    fn a_held_mount_is_keyed_by_its_group_and_its_root() {
+        let t = table(HOST);
+        let g = groups_of(HOST.as_bytes());
+        // the root's key read where the mount point resolves
+        let h = held_in(&t, &points(), GUARD_HOST, &g, &|d| {
+            Some((0x801, d.as_os_str().len() as u64))
+        });
+        let root = |group: u32, at: &str| {
+            let (d, i) = held_root(group, 0x801, at.len() as u64);
+            h.entries
+                .iter()
+                .any(|(k, f)| (k.dev, k.ino) == (d, i) && f & HELD_REFUSE != 0)
+        };
+        for (group, at) in [
+            (1, "/"),
+            (5, "/run"),
+            (12, "/proc"),
+            (2, "/sys"),
+            (3, "/sys/fs/cgroup"),
+            (4, "/sys/fs/bpf"),
+        ] {
+            assert!(root(group, at), "{at} in shared:{group}");
+        }
+        // the tracefs is not held, a group no held mount is in has no key
+        assert!(!root(6, "/sys/kernel/tracing"));
+        assert!(!root(1, "/run"));
+        // the agent's unit's namespace: each of its mounts a slave of the
+        // host's and shared again — keyed by its own group only (a change
+        // made in a slave never reaches its master)
+        let unit = "\
+300 299 8:1 / / ro,relatime shared:90 master:1 - ext4 /dev/sda1 rw
+301 300 0:22 / /run rw,nosuid master:5 - tmpfs tmpfs rw
+";
+        let u = held_in(
+            &table(unit),
+            &points(),
+            GUARD_AGENT,
+            &groups_of(unit.as_bytes()),
+            &|d| Some((0x801, d.as_os_str().len() as u64)),
+        );
+        let has = |group: u32, at: &str| {
+            let (d, i) = held_root(group, 0x801, at.len() as u64);
+            u.entries.iter().any(|(k, _)| (k.dev, k.ino) == (d, i))
+        };
+        assert!(has(90, "/"));
+        assert!(!has(1, "/"));
+        assert!(!has(5, "/run"));
+        // a mount in no peer group of its own (`/run` here) has no such key,
+        // under no group either
+        assert!(
+            !u.entries
+                .iter()
+                .any(|(k, _)| k.dev == common::mount_guard::HELD_ROOT),
+            "a key under group 0"
+        );
+        // a mount whose root cannot be read has no such key
+        let none = held_in(&t, &points(), GUARD_HOST, &g, &|_| None);
+        assert!(
+            !none
+                .entries
+                .iter()
+                .any(|(k, _)| k.dev & common::mount_guard::HELD_ROOT
+                    == common::mount_guard::HELD_ROOT)
+        );
+    }
+
+    /// Named test (lot 1.1, F8b-1): the split hooks' stages — each in a
+    /// slot of its own hook's array (an array per hook), and only for the
+    /// two split hooks.
+    #[test]
+    fn each_split_hooks_stages_are_in_its_own_array() {
+        let mut slots = std::collections::HashSet::new();
+        for (program, hook, array, slot) in STAGES {
+            assert!(HOOKS.contains(&hook), "{program}");
+            assert!(
+                program.starts_with(&format!("mount_guard_{hook}_")),
+                "{program}"
+            );
+            assert_eq!(stages_of(hook), Some(array), "{program}");
+            assert!(slot < common::mount_guard::STAGE_SLOTS);
+            assert!(slots.insert((array, slot)), "{array}[{slot}] twice");
+        }
+        assert_ne!(stages_of("sb_mount"), stages_of("move_mount"));
+        for hook in ["sb_umount", "sb_pivotroot", "sb_remount"] {
+            assert_eq!(stages_of(hook), None);
+        }
     }
 
     /// The review of #567 (F1): the mounts held are those the protected

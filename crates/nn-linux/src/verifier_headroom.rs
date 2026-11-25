@@ -261,10 +261,13 @@ pub fn judge(programs: &[Measured], budget: u32) -> Verdict {
     }
 }
 
-/// `n` as a share of the verifier's limit, one decimal (`82.1%`).
-pub fn share_of_limit(n: u32) -> String {
+/// `n` as a share of the gate ([`HEADROOM_BUDGET`], 900,000), one decimal
+/// (`92.3%`) — lot 1.1 (F8b-1, P3): the gate the nightly fails above, not
+/// the kernel's million (`830,908` read 83.1 % of the limit, and was 92.3 %
+/// of the gate).
+pub fn share_of_gate(n: u32) -> String {
     let tenths =
-        (u64::from(n) * 1000 + u64::from(VERIFIER_INSN_LIMIT) / 2) / u64::from(VERIFIER_INSN_LIMIT);
+        (u64::from(n) * 1000 + u64::from(HEADROOM_BUDGET) / 2) / u64::from(HEADROOM_BUDGET);
     format!("{}.{}%", tenths / 10, tenths % 10)
 }
 
@@ -306,13 +309,13 @@ pub fn report(kernel: &str, v: &Verdict) -> Vec<String> {
     out.push(String::new());
     out.push(format!("top {TOP} by instructions processed:"));
     out.push(String::new());
-    out.push("| # | program | processed | of the limit | source |".into());
+    out.push("| # | program | processed | of the 900k gate | source |".into());
     out.push("|---:|---|---:|---:|---|".into());
     for (i, (name, n, s)) in v.ranked.iter().take(TOP).enumerate() {
         out.push(format!(
             "| {} | {name} | {n} | {} | {} |",
             i + 1,
-            share_of_limit(*n),
+            share_of_gate(*n),
             s.label()
         ));
     }
@@ -325,7 +328,7 @@ pub fn report(kernel: &str, v: &Verdict) -> Vec<String> {
 pub fn verdict_line(kernel: &str, v: &Verdict) -> String {
     let highest = v.ranked.first().map_or_else(
         || "no program measured".to_string(),
-        |(n, c, _)| format!("highest {n} {c} ({})", share_of_limit(*c)),
+        |(n, c, _)| format!("highest {n} {c} ({} of the 900k gate)", share_of_gate(*c)),
     );
     if v.passes() {
         return format!(
@@ -549,11 +552,22 @@ mod tests {
         let rows: Vec<&String> = r.iter().filter(|l| l.starts_with("| ")).collect();
         // header + 10 rows
         assert_eq!(rows.len(), 1 + TOP, "{r:#?}");
-        assert!(rows[1].starts_with("| 1 | p12 | 12000 | 1.2% | program info |"));
+        assert!(rows[1].starts_with("| 1 | p12 | 12000 | 1.3% | program info |"));
         assert!(rows[10].starts_with("| 10 | p03 | 3000 |"));
         assert_eq!(r.last().unwrap(), &verdict_line("6.8", &v));
-        assert_eq!(share_of_limit(821_228), "82.1%");
-        assert_eq!(share_of_limit(1_000_000), "100.0%");
-        assert_eq!(share_of_limit(0), "0.0%");
+        // lot 1.1 (F8b-1, P3): the share of the 900k gate, not of the
+        // kernel's million — 5.15's sb_mount at rc4 read 83.1 % of the limit
+        assert_eq!(share_of_gate(830_908), "92.3%");
+        assert_eq!(share_of_gate(900_000), "100.0%");
+        assert_eq!(share_of_gate(1_000_000), "111.1%");
+        assert_eq!(share_of_gate(0), "0.0%");
+        // rounded to the nearest tenth, not cut: 5.15's move_mount stage at
+        // lot 1.1 is 51.075 % of the gate
+        assert_eq!(share_of_gate(459_673), "51.1%");
+        assert_eq!(share_of_gate(449_955), "50.0%");
+        assert!(
+            r.iter().any(|l| l.contains("| of the 900k gate |")),
+            "{r:#?}"
+        );
     }
 }
