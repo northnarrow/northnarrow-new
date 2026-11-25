@@ -150,6 +150,44 @@ fn every_action_is_pinned_by_full_commit_sha() {
     );
 }
 
+/// SUP-005, one install: its own words name `--version` and `--locked`.
+fn install_is_pinned_and_locked(args: &[String]) -> bool {
+    let version = args.iter().enumerate().any(|(n, a)| {
+        (a == "--version" && args.get(n + 1).is_some_and(|v| !v.starts_with('-')))
+            || a.strip_prefix("--version=").is_some_and(|v| !v.is_empty())
+    });
+    version && args.iter().any(|a| a == "--locked")
+}
+
+/// The review of #618's mini-hunt: SUP-005 read a line from its first
+/// `cargo install` to its end, so a second install's flags pinned the first.
+#[test]
+fn every_cargo_install_on_a_line_is_judged_by_its_own_flags() {
+    let judge = |line: &str| -> Vec<bool> {
+        shell_lines(line)
+            .iter()
+            .flat_map(|l| cargo_installs(l))
+            .map(|a| install_is_pinned_and_locked(&a))
+            .collect()
+    };
+    assert_eq!(judge("cargo install foo --version 1.2.3 --locked"), [true]);
+    assert_eq!(judge("cargo install --locked --version=1.2.3 foo"), [true]);
+    assert_eq!(
+        judge("cargo install foo && cargo install bar --version 1.2.3 --locked"),
+        [false, true]
+    );
+    assert_eq!(
+        judge("cargo install foo --version 1.2.3; cargo install bar --locked"),
+        [false, false]
+    );
+    assert_eq!(
+        judge("cargo install --locked \\\n  foo --version 1.2.3\n"),
+        [true]
+    );
+    assert_eq!(judge("cargo install --version --locked foo"), [false]);
+    assert_eq!(judge("cargo +nightly install foo --locked"), [false]);
+}
+
 /// SUP-005: `cargo install` without `--version` takes whatever crates.io
 /// serves that day; `--locked` pins the tool's own dependencies.
 #[test]
@@ -173,6 +211,19 @@ fn every_cargo_install_names_a_version_and_is_locked() {
                 || !cmd.contains("--locked")
             {
                 bad.push(format!("{}:{}: {}", rel(&file), n + 1, line.trim()));
+            }
+        }
+        // and each install by its own words (the review of #618's
+        // mini-hunt): a second install on the line lent the first its
+        // flags, and a continued line was read in halves
+        for line in shell_lines(&read(&file)) {
+            for args in cargo_installs(&line) {
+                if args.first().is_some_and(|a| a == "--list") {
+                    continue;
+                }
+                if !install_is_pinned_and_locked(&args) {
+                    bad.push(format!("{}: {}", rel(&file), line.trim()));
+                }
             }
         }
     }
@@ -1348,26 +1399,24 @@ fn names_crate(tok: &str, krate: &str) -> bool {
     t == krate || t.starts_with(&format!("{krate}@"))
 }
 
-/// The version each `cargo install` of `krate` on one shell line pins,
-/// whatever the order of its flags: `--version X`, `--version=X`, `--vers
-/// X`, `--vers=X` or `krate@X`. One without is `"unpinned"`; one from
-/// `--git` or `--path` (not crates.io) is `"--git"`/`"--path"`.
-fn cargo_install_pins_on(line: &str, krate: &str) -> Vec<String> {
+/// The arguments of each `cargo install` on one shell line (`cargo
+/// +<toolchain> install` and a path to cargo too), unquoted, each to the
+/// shell's next operator.
+fn cargo_installs(line: &str) -> Vec<Vec<String>> {
     let unquote = |t: &str| t.trim_matches(|c| c == '"' || c == '\'').to_string();
     let toks: Vec<&str> = line.split_whitespace().collect();
-    let mut pins = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < toks.len() {
         let is_cargo = toks[i] == "cargo" || toks[i].ends_with("/cargo");
         let mut j = i + 1;
         if is_cargo && toks.get(j).is_some_and(|t| t.starts_with('+')) {
-            j += 1; // cargo +<toolchain> install
+            j += 1;
         }
         if !(is_cargo && toks.get(j) == Some(&"install")) {
             i += 1;
             continue;
         }
-        // the command's words, to the shell's next operator
         let mut args = Vec::new();
         let mut k = j + 1;
         while k < toks.len() {
@@ -1382,7 +1431,19 @@ fn cargo_install_pins_on(line: &str, krate: &str) -> Vec<String> {
             }
             args.push(unquote(t));
         }
+        out.push(args);
         i = k;
+    }
+    out
+}
+
+/// The version each `cargo install` of `krate` on one shell line pins,
+/// whatever the order of its flags: `--version X`, `--version=X`, `--vers
+/// X`, `--vers=X` or `krate@X`. One without is `"unpinned"`; one from
+/// `--git` or `--path` (not crates.io) is `"--git"`/`"--path"`.
+fn cargo_install_pins_on(line: &str, krate: &str) -> Vec<String> {
+    let mut pins = Vec::new();
+    for args in cargo_installs(line) {
         if !args.iter().any(|a| names_crate(a, krate)) {
             continue;
         }
