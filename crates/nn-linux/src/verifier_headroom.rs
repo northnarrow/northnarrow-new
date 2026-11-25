@@ -47,14 +47,19 @@ pub const STACK_LIMIT: u32 = 512;
 pub const STACK_BUDGET: u32 = 448;
 
 /// Lot 1.3: the programs over [`STACK_BUDGET`] when the gate came, each
-/// with the chain it may not exceed. Lot 1.4 owns their code (the file-open
-/// sensor's global functions, `tcp_close`, the `bpf()` observer's) and
-/// takes them off; the S1 exit test is an empty list. A program brought
-/// under the budget leaves the list (the xtask ratchet fails on an entry
-/// that is no longer over it).
+/// with the chain it may not exceed and, above it, the lot that owns its
+/// code and takes it off; the S1 exit test is an empty list. A program
+/// brought under the budget leaves the list (the xtask ratchet fails on an
+/// entry that is no longer over it).
 pub const STACK_DEBT: &[(&str, u32)] = &[
+    // owner: S1 lot 1.4b (mini-lot) — `bpf_defense.rs`'s `bpf()` observer,
+    // in no S1 lot's files
     ("bpf_syscall_observe", 480),
+    // owner: S1 lot 1.4 — its whole chain is `open_sensor.rs`'s
+    // (`on_open` → `nn_open_class` → `nn_open_walk`), inlined into the FIM
+    // watch's program
     ("fim_file_open_sensor", 480),
+    // owner: S1 lot 1.4b (mini-lot) — `tcp_close.rs`, in no S1 lot's files
     ("tcp_close", 480),
 ];
 
@@ -593,6 +598,31 @@ mod tests {
         }
         for p in ["fim_rename_observe", "fim_unlink_observe", "exec_check_raw"] {
             assert_eq!(stack_allowed(p), STACK_BUDGET, "{p}");
+        }
+        // the review of #625 (P3-2): every entry names the lot that takes it
+        // off, in the comment right above it
+        let src = include_str!("verifier_headroom.rs");
+        let table = src
+            .split("pub const STACK_DEBT: &[(&str, u32)] = &[\n")
+            .nth(1)
+            .and_then(|r| r.split("\n];").next())
+            .unwrap();
+        let mut owner: Option<&str> = None;
+        let mut owners = Vec::new();
+        for line in table.lines().map(str::trim) {
+            if let Some(o) = line.strip_prefix("// owner: ") {
+                owner = Some(o);
+            } else if line.starts_with("(\"") {
+                let name = line.split('"').nth(1).unwrap();
+                let o = owner.take().unwrap_or_else(|| panic!("{name}: no owner"));
+                owners.push((name, o.split(" — ").next().unwrap()));
+            }
+        }
+        let names: Vec<&str> = owners.iter().map(|(n, _)| *n).collect();
+        let debt: Vec<&str> = STACK_DEBT.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, debt, "one owner per entry, in the table's order");
+        for (name, o) in &owners {
+            assert!(o.starts_with("S1 lot "), "{name}: {o}");
         }
     }
 

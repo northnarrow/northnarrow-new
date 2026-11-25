@@ -573,3 +573,43 @@ fn the_stack_estimate_adds_rounded_frames_along_the_calls() {
     // a frame that touches nothing is 32 all the same
     assert_eq!(chain_of(&[ins(0x95, 0, 0, 0, 0)], &[]).0, 32);
 }
+
+/// The review of #625 (P3-3): the stack gate runs in CI on the object CI
+/// built — ci.yml's `ebpf-build` job, after the build, with the object
+/// required (a skip is a failure), and the step fails unless the gate's
+/// test ran and passed (libtest passes a filter that matches nothing).
+#[test]
+fn the_ebpf_job_runs_the_stack_gate_on_its_object() {
+    let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
+    )
+    .unwrap();
+    let steps = ci["jobs"]["ebpf-build"]["steps"]
+        .as_sequence()
+        .expect("ci.yml has the ebpf-build job's steps");
+    let name = |s: &serde_yaml_ng::Value| s["name"].as_str().unwrap_or_default().to_string();
+    let built = steps
+        .iter()
+        .position(|s| name(s) == "cargo xtask build-ebpf")
+        .expect("the job builds the object");
+    let at = steps
+        .iter()
+        .position(|s| name(s).starts_with("eBPF object stack chains"))
+        .expect("the stack gate's step is in the eBPF job");
+    assert!(built < at, "the step runs on the object just built");
+    let step = &steps[at];
+    assert_eq!(step["env"]["NN_REQUIRE_EBPF_OBJECT"].as_str(), Some("1"));
+    in_order(
+        step["run"].as_str().unwrap(),
+        &[
+            "out=$(cargo test --locked -p xtask --test verifier_headroom 2>&1) || { echo \"$out\"; exit 1; }",
+            "grep -q '^test no_program_s_stack_chain_is_over_448_bytes \\.\\.\\. ok$' <<< \"$out\" || {",
+            "exit 1; }",
+        ],
+    );
+    // the name is this file's gate, and it panics on a missing object when
+    // the variable is set
+    let me = code("xtask/tests/verifier_headroom.rs");
+    assert!(me.contains("#[test]\nfn no_program_s_stack_chain_is_over_448_bytes() {"));
+    assert!(me.contains("std::env::var_os(\"NN_REQUIRE_EBPF_OBJECT\").is_none(),"));
+}

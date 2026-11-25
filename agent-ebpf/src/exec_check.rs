@@ -49,10 +49,19 @@ pub(crate) static EXEC_CHECK_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 102
 /// never marked seen, so the boot's self-test counts it as missed and takes
 /// the fallback.
 pub(crate) const SEEN_CPUS: u32 = 1024;
-/// Lot 324: the self-test's rows of [`SYSCALL_TP_SEEN`]: the exec sensor's
-/// and the file-open sensor's (`file_open.rs`).
-pub(crate) const SEEN_EXEC: u32 = 0;
-pub(crate) const SEEN_OPEN: u32 = 1;
+/// Lot 324: the self-test's rows of [`SYSCALL_TP_SEEN`], one per attach
+/// point: the exec sensor's and the file-open sensor's (`file_open.rs`), on
+/// the syscall tracepoint and on the raw fallback. The review of #625
+/// (P2-1): the fallback's test runs with the tracepoint still attached, and
+/// with one row per sensor the tracepoint's mark of CPU 0 read as the
+/// fallback's — a fallback that never ran was taken and the tracepoint
+/// retired.
+pub(crate) const SEEN_EXEC_TP: u32 = 0;
+pub(crate) const SEEN_OPEN_TP: u32 = 1;
+pub(crate) const SEEN_EXEC_RAW: u32 = 2;
+pub(crate) const SEEN_OPEN_RAW: u32 = 3;
+/// The rows of [`SYSCALL_TP_SEEN`].
+pub(crate) const SEEN_ROWS: u32 = 4;
 
 /// Lot 324: the boot's self-test. Slot 0: the probing thread's
 /// `pid_tgid` as `bpf_get_current_pid_tgid` reads it (thread group in the
@@ -62,10 +71,24 @@ pub(crate) const SEEN_OPEN: u32 = 1;
 #[map]
 pub(crate) static SYSCALL_TP_PROBE: Array<u64> = Array::with_max_entries(2, 0);
 
-/// Lot 324: per sensor row and CPU (`row * SEEN_CPUS + cpu`), the round of
-/// the self-test (`SYSCALL_TP_PROBE` slot 1) last seen there.
+/// Lot 324: per attach point's row and CPU (`row * SEEN_CPUS + cpu`), the
+/// round of the self-test (`SYSCALL_TP_PROBE` slot 1) last seen there.
 #[map]
-pub(crate) static SYSCALL_TP_SEEN: Array<u32> = Array::with_max_entries(2 * SEEN_CPUS, 0);
+pub(crate) static SYSCALL_TP_SEEN: Array<u32> = Array::with_max_entries(SEEN_ROWS * SEEN_CPUS, 0);
+
+/// Lot 1.3 (the review of #625, P3-5): which of a sensor's two attach
+/// points records its calls — slot [`EMIT_EXEC`] or [`EMIT_OPEN`]:
+/// [`BY_TRACEPOINT`] (0, the map's initial value) or [`BY_RAW`]. The other
+/// one marks the self-test's calls and records nothing, so the fallback is
+/// tested with the tracepoint still attached and no call of the host is
+/// recorded twice; the boot turns the slot to [`BY_RAW`] in one write once
+/// the fallback is chosen, then retires the tracepoint.
+#[map]
+pub(crate) static SYSCALL_TP_EMIT: Array<u32> = Array::with_max_entries(2, 0);
+pub(crate) const EMIT_EXEC: u32 = 0;
+pub(crate) const EMIT_OPEN: u32 = 1;
+pub(crate) const BY_TRACEPOINT: u32 = 0;
+pub(crate) const BY_RAW: u32 = 1;
 
 /// x86-64's `execve` (`arch/x86/entry/syscalls/syscall_64.tbl`). The
 /// fallback is armed only where `pt_regs.di` resolves, x86-64.
@@ -89,7 +112,7 @@ pub fn sys_enter_execve(ctx: TracePointContext) -> u32 {
     // `bpf_probe_read_kernel` at an offset tracefs gave for this kernel's
     // record (a failed read is 0: no path).
     let filename_ptr = unsafe { ctx.read_at::<u64>(off!(TP_SYS_ENTER_EXECVE_FILENAME_OFFSET)) }.unwrap_or(0);
-    record(filename_ptr);
+    record(SEEN_EXEC_TP, BY_TRACEPOINT, filename_ptr);
     0
 }
 
@@ -106,7 +129,7 @@ pub fn exec_check_raw(ctx: RawTracePointContext) -> i32 {
             return 0;
         }
         if let Some(filename_ptr) = native_arg(*args, off_opt!(PT_REGS_DI_OFFSET)) {
-            record(filename_ptr);
+            record(SEEN_EXEC_RAW, BY_RAW, filename_ptr);
         }
     }
     0
@@ -136,8 +159,8 @@ pub(crate) unsafe fn native_arg(regs: u64, reg: Option<usize>) -> Option<u64> {
 }
 
 /// Lot 324: the call is the self-test's (the thread the agent named in
-/// [`SYSCALL_TP_PROBE`]): this CPU is marked seen for `row`, and the caller
-/// emits nothing.
+/// [`SYSCALL_TP_PROBE`]): this CPU is marked seen in the attach point's
+/// `row`, and the caller emits nothing.
 #[inline(always)]
 pub(crate) fn probe_seen(row: u32, pid_tgid: u64) -> bool {
     match SYSCALL_TP_PROBE.get(0) {
@@ -157,12 +180,24 @@ pub(crate) fn probe_seen(row: u32, pid_tgid: u64) -> bool {
     true
 }
 
-/// One record for the exec whose path is at `filename_ptr` in the caller's
-/// memory (0: none), or nothing for the self-test's call.
+/// Lot 1.3: `by` ([`BY_TRACEPOINT`], [`BY_RAW`]) is the attach point that
+/// records `sensor`'s calls now ([`SYSCALL_TP_EMIT`]; a failed lookup is the
+/// tracepoint, as before the fallback existed).
 #[inline(always)]
-fn record(filename_ptr: u64) {
+pub(crate) fn emits(sensor: u32, by: u32) -> bool {
+    SYSCALL_TP_EMIT.get(sensor).map_or(BY_TRACEPOINT, |v| *v) == by
+}
+
+/// One record for the exec whose path is at `filename_ptr` in the caller's
+/// memory (0: none), or nothing: for the self-test's call (marked in the
+/// attach point's `row`), and while the other attach point (`by`) records.
+#[inline(always)]
+fn record(row: u32, by: u32, filename_ptr: u64) {
     let pid_tgid = bpf_get_current_pid_tgid();
-    if probe_seen(SEEN_EXEC, pid_tgid) {
+    if probe_seen(row, pid_tgid) {
+        return;
+    }
+    if !emits(EMIT_EXEC, by) {
         return;
     }
     let mut entry = match EXEC_CHECK_EVENTS.reserve::<ExecCheckRaw>(0) {
