@@ -518,13 +518,12 @@ unsafe fn try_mark(ctx: &BtfTracePointContext) {
 /// `common::cgroup_join::match_destination`'s walk: the whole path a
 /// `cgroup` exemption gives, else the last component a `unit` exemption
 /// gives — `Some(0)` for a path unread or cut at [`PATH_READ`] bytes while
-/// any such exemption is in force, `None` otherwise. The loop keeps no
-/// counter and branches on no value it knows: the 5.15 verifier's states
-/// stay a few per byte (lot 277's lab: a component length counted per byte
-/// took it past a million instructions).
+/// any such exemption is in force, `None` otherwise.
 #[inline(always)]
 unsafe fn exempt_destination(path: u64) -> Option<u64> {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `path` (the tracepoint's `const char *`) is only read through
+    // `bpf_probe_read_kernel_str`, into this CPU's buffer of `PATH_READ`
+    // bytes; the 8 bytes read back after the walk are the buffer's first.
     unsafe {
         let any = CGROUP_EXEMPT_NAMES.get(&0).is_some();
         if !any || path == 0 {
@@ -542,6 +541,44 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
             PathRead::Unread | PathRead::Cut => return Some(0),
             PathRead::Whole => {}
         }
+        // Lot 1.2: the walk is a global function, checked once on its own.
+        // Inline, rustc 1.99's LLVM 22 laid each of a byte's three ways (a
+        // name's byte, a `/` after a unit, a `/` after another name) out
+        // with its own copy of the loop's bound test, and moved the last
+        // component's lookup into the loop's exit: the 5.15 verifier went
+        // from 207,446 instructions to 987,382 for this program (the 900k
+        // budget), 6.12's from +65 %. The walk's verdict is the same; it
+        // comes back through the buffer's first 8 bytes, so a hash of 0
+        // stays a hash.
+        if nn_cgroup_exempt_walk(0) == 0 {
+            return None;
+        }
+        Some(u64::from_le_bytes(core::ptr::read_volatile(
+            buf as *const [u8; 8],
+        )))
+    }
+}
+
+/// [`exempt_destination`]'s walk over the path in [`CGROUP_JOIN_PATH`]
+/// (read whole, its NUL inside the buffer): 1 when a name matches, its hash
+/// then written over the buffer's first 8 bytes, 0 otherwise. A global
+/// function with an integer argument (`KERNEL_COMPATIBILITY` "Older
+/// verifiers", rule 6): the 5.15 verifier checks the loop once, apart from
+/// the program's states. The loop keeps no counter and branches on no value
+/// it knows: its states stay a few per byte (lot 277's lab: a component
+/// length counted per byte took it past a million instructions).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_cgroup_exempt_walk(_slot: u64) -> u64 {
+    // SAFETY: the per-CPU buffer this CPU's program just filled (the
+    // program is not preempted between the read and this call: the
+    // tracepoint runs with preemption off, `xtask/tests/percpu_maps.rs`);
+    // every index below is a loop counter under `PATH_READ`, the buffer's
+    // length, and the 8 bytes written are the buffer's own first 8.
+    unsafe {
+        let Some(buf) = CGROUP_JOIN_PATH.get_ptr_mut(0) else {
+            return 0;
+        };
         let mut full = FNV_OFFSET;
         let mut comp = FNV_OFFSET;
         let mut hit = 0u64;
@@ -564,10 +601,15 @@ unsafe fn exempt_destination(path: u64) -> Option<u64> {
         if is_name(comp, NAME_UNIT) {
             hit = comp;
         }
-        if is_name(full, NAME_CGROUP) {
-            return Some(full);
-        }
-        (hit != 0).then_some(hit)
+        let found = if is_name(full, NAME_CGROUP) {
+            full
+        } else if hit != 0 {
+            hit
+        } else {
+            return 0;
+        };
+        core::ptr::write_volatile(buf as *mut [u8; 8], found.to_le_bytes());
+        1
     }
 }
 

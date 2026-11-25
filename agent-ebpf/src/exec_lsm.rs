@@ -106,7 +106,12 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
 #[lsm(hook = "bprm_check_security")]
 #[inline(always)]
 pub fn exec_check_lsm(ctx: LsmContext) -> i32 {
-    unsafe { try_exec_check_lsm(&ctx) }
+    // Lot 1.2: LLVM 22 folded the policy's verdict into `-(deny & 1) &
+    // -EACCES`, which 6.12's verifier reads as any value at the program's
+    // exit. The verdict clamped, on the register returned (`opaque`).
+    // SAFETY: the hook's context, read through `ctx.arg` and helpers
+    // (`try_exec_check_lsm`).
+    crate::opaque::lsm_ret(unsafe { try_exec_check_lsm(&ctx) })
 }
 
 #[inline(always)]

@@ -694,7 +694,7 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
             // the review of #551 (F1): the uid or the creator looked up in
             // the host's subordinate uid ranges first
             "match share_account(uid, level, owner) {",
-            "Some(account) => SHARE_SUBUID.get(Key::new(32, account.to_be_bytes())).copied(),",
+            "Some(account) => SHARE_SUBUID.get(&Key::new(32, account.to_be_bytes())).copied(),",
             "None => None,",
             "northnarrow_common::wire::execq::share_key(uid, level, owner, inum, sub)",
         ],

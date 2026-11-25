@@ -48,7 +48,7 @@
 use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
+        bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_kernel_str_bytes, generated,
     },
@@ -362,7 +362,10 @@ unsafe fn deny_kexec(id: c_int) -> i32 {
 /// the ring is full: the verdict never depends on the record.
 #[inline(always)]
 unsafe fn emit_module_load(method: u8, file: *const c_void, j: &Judged) {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `raw` is the ring entry just reserved, zeroed before any
+    // write (`comm_into` and the path slots rely on it) and written only at
+    // its fields; `file` and the dentries are read through
+    // `bpf_probe_read_kernel*` alone.
     unsafe {
         let mut entry = match MODULE_LOAD_EVENTS.reserve::<ModuleLoadRaw>(0) {
             Some(e) => e,
@@ -388,9 +391,11 @@ unsafe fn emit_module_load(method: u8, file: *const c_void, j: &Judged) {
         (*raw).file_mode = j.facts.mode;
         (*raw).file_size = j.facts.size;
         (*raw).trust_flags = j.trust_flags;
-        if let Ok(comm) = bpf_get_current_comm() {
-            (*raw).loader_comm = comm;
-        }
+        // Lot 1.2: straight into the record zeroed above — no `memset`
+        // subprogram (KERNEL_COMPATIBILITY "Older verifiers", rule 9): five
+        // inlined copies of it cost `module_read_file_observe` 459,242
+        // instructions on 5.15 with rustc 1.93, 560,828 with 1.99's LLVM 22.
+        crate::comm::comm_into(&mut (*raw).loader_comm);
         fill_parent(raw);
         if method == MODULE_LOAD_FINIT && !file.is_null() {
             // file → f_path.dentry (the source .ko's leaf dentry).

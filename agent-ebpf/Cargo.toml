@@ -18,10 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Lab PR 233: aya-ebpf 0.2 (helpers::generated, RetProbeContext::ret -> T).
-# Its build dependency aya-build stays at 0.2.0 in Cargo.lock: 0.2.1 needs
-# rustc 1.98 and the nightly of rust-toolchain.toml is 1.93 (the nightly
-# and bpf-linker move together, in a lot of their own).
-aya-ebpf = "0.2"
+# Lot 1.2 (400b): aya-ebpf 0.3 (map lookups take the key by reference,
+# `ctx.arg` is safe) and its build dependency aya-build 0.2.1, both rustc
+# 1.98: the nightly of rust-toolchain.toml moved with them (1.99, still
+# LLVM 22 for bpf-linker 0.10.3).
+aya-ebpf = "0.3"
 northnarrow-common = { path = "../common", default-features = false }
 
 [profile.dev]

@@ -227,19 +227,23 @@ jobs:
         if: steps.kvm.outputs.available == 'true'
         timeout-minutes: 25
         run: |
-          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install nightly-2026-08-05 --profile minimal --component rust-src
           rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
           cargo install bpf-linker --version 0.10.3 --locked
 
       # The host's share of `nn-lab.sh sync`, first: an eBPF build that
       # breaks fails here, before a guest boots, and the summary step finds
       # xtask built. The first --locked builds xtask against Cargo.lock, the
-      # second holds agent-ebpf/Cargo.lock (SUP-016).
+      # second holds agent-ebpf/Cargo.lock (SUP-016). Lot 1.2 (F16): the
+      # object's sha256 goes into the evidence, comparable with ci.yml's
+      # artefact `ebpf-object` of the same commit (the object CI tested).
       - name: Build the eBPF object and xtask on the host
         if: steps.kvm.outputs.available == 'true'
         id: host
         timeout-minutes: 40
-        run: cargo --locked xtask build-ebpf --locked
+        run: |
+          cargo --locked xtask build-ebpf --locked
+          sha256sum agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf | tee "$GATE_OUT/ebpf-object.sha256"
 
       # External audit SUP-003: whatever ran in the build above — every
       # build script and proc-macro of the dependency tree — found no
@@ -413,8 +417,8 @@ jobs:
           fi
           exit "$status"
 
-      # gate.log, gate.rc, kernel, gate-summary.json/.md, serial.log (or
-      # skipped-no-kvm.txt alone). Not the guest's user-data or seed: they
+      # gate.log, gate.rc, kernel, gate-summary.json/.md, serial.log,
+      # ebpf-object.sha256 (or skipped-no-kvm.txt alone). Not the guest's user-data or seed: they
       # hold its private host key.
       - name: Upload the gate's evidence (always)
         if: always()

@@ -39,7 +39,7 @@
 use aya_ebpf::{
     cty::{c_int, c_uint, c_void},
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+        bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
     },
     macros::{lsm, map},
@@ -693,9 +693,9 @@ fn emit_denial(operation: u8, key: InodeKey) -> bool {
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).operation = operation;
 
-        if let Ok(comm) = bpf_get_current_comm() {
-            (*raw_ptr).attacker_comm = comm;
-        }
+        // Lot 1.2: straight into the record zeroed above — no `memset`
+        // subprogram (KERNEL_COMPATIBILITY "Older verifiers", rule 9).
+        crate::comm::comm_into(&mut (*raw_ptr).attacker_comm);
     }
 
     entry.submit(0);

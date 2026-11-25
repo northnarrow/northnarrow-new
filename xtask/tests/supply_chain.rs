@@ -1036,9 +1036,11 @@ fn job_lines<'a>(text: &'a str, name: &str) -> Vec<(usize, &'a str)> {
 /// VM jobs install it, so the object CI and the release build is the one
 /// the lab measured with that compiler; a job left on another date builds
 /// another object. The fuzz job's own: its harness builds the agent, whose
-/// aya 0.16 and aya-obj 0.6 need rustc 1.98, above the eBPF nightly's 1.93
-/// — lot 400a moved the fuzz job alone, the eBPF crate's nightly moves with
-/// aya-ebpf 0.3 (lot 400b). Every dated nightly of the fuzz job (install,
+/// aya 0.16 and aya-obj 0.6 need rustc 1.98 — lot 400a moved the fuzz job
+/// alone, from the eBPF nightly's 1.93; lot 1.2 (400b) moved the eBPF
+/// crate's with aya-ebpf 0.3, to the same date (one download serves both
+/// on a runner), and the two may move apart again. Every dated nightly of
+/// the fuzz job (install,
 /// lockfile check, build, list) is the fuzz channel, and the fuzz README
 /// names that one; every other dated nightly of the workflows and the CI
 /// scripts is the eBPF crate's.
@@ -1148,6 +1150,135 @@ fn every_dated_nightly_is_its_jobs_channel() {
         rows("jobs:\n  fuzz:\n    y: 1\nenv:\n  fuzz: 2\n"),
         vec![1, 2]
     );
+}
+
+/// Lot 1.2 (F16): the eBPF object CI tests is kept, and every other build
+/// of it names its own. ci.yml's ebpf-build job writes the object's sha256
+/// after the build and its checks, and uploads the object with its build
+/// stamp and that sha256 (artefact `ebpf-object`): the lab's verifier
+/// check and a reviewer's load that one (`gh run download`, then
+/// `nn-lab.sh verifier-check synced`) instead of building one by hand.
+/// release.yml's package job prints the sha256 of the object it embeds,
+/// and lab-vm.yml's guest job keeps the sha256 of the one its guest loads
+/// in its evidence. All three build it alike: the nightly is one channel
+/// (`every_dated_nightly_is_its_jobs_channel`), and every `cargo install
+/// bpf-linker` of the workflows pins one version, the one xtask's and the
+/// lab's hints name. The gap, documented in release.yml: the release
+/// rebuilds the object (a build is reproducible: two clean builds of one
+/// tree at one path give one sha256), and nothing compares its sha256 with
+/// the artefact's but the maintainer before a tag — the package job holds
+/// no token that reads another run's artefacts (SUP-003).
+#[test]
+fn the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own() {
+    const OBJ: &str = "agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf";
+    let root = repo_root();
+    let job = |file: &str, name: &str| -> Vec<serde_yaml_ng::Value> {
+        let wf = workflow_yaml(&root.join(".github/workflows").join(file));
+        let (_, j) = jobs(&wf)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{file}: no job {name}"));
+        steps(&j)
+    };
+    let run = |s: &serde_yaml_ng::Value| str_of(s, "run").unwrap_or("").to_string();
+    let at =
+        |steps: &[serde_yaml_ng::Value], what: &str, f: &dyn Fn(&serde_yaml_ng::Value) -> bool| {
+            steps
+                .iter()
+                .position(f)
+                .unwrap_or_else(|| panic!("no step that {what}"))
+        };
+
+    // ci.yml's ebpf-build: the build, its checks, the sha256, the upload
+    let ci = job("ci.yml", "ebpf-build");
+    let build = at(&ci, "builds the object", &|s| {
+        run(s).contains("xtask build-ebpf --locked")
+    });
+    let checks = at(&ci, "checks the back-edges", &|s| {
+        run(s).contains("no_function_has_a_back_edge_the_5_15_verifier_rejects")
+    });
+    let sha = at(&ci, "writes the sha256", &|s| {
+        run(s).contains("sha256sum northnarrow-agent-ebpf > northnarrow-agent-ebpf.sha256")
+    });
+    assert!(
+        run(&ci[sha]).starts_with("cd agent-ebpf/target/bpfel-unknown-none/release\n")
+            && run(&ci[sha]).contains("$GITHUB_STEP_SUMMARY"),
+        "the sha256 written next to the object and named in the job summary"
+    );
+    let up = at(&ci, "uploads it", &|s| {
+        str_of(s, "uses").is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+    });
+    assert!(
+        build < checks && checks < sha && sha < up,
+        "built, checked, hashed, uploaded: {build} {checks} {sha} {up}"
+    );
+    let with = ci[up].get("with").expect("the upload's `with`");
+    assert_eq!(str_of(with, "name"), Some("ebpf-object"));
+    assert_eq!(str_of(with, "if-no-files-found"), Some("error"));
+    let paths: Vec<String> = str_of(with, "path")
+        .unwrap_or("")
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            OBJ.to_string(),
+            format!("{OBJ}.buildhash"),
+            format!("{OBJ}.sha256")
+        ],
+        "the object, its build stamp and its sha256"
+    );
+
+    // the release's package job: built, then the embedded object's sha256
+    let pkg = job("release.yml", "package");
+    let built = at(&pkg, "builds the release", &|s| {
+        run(s).contains("xtask build --release --locked")
+    });
+    let named = at(&pkg, "prints the object's sha256", &|s| {
+        run(s).contains(&format!("sha256sum {OBJ}")) && run(s).contains("$GITHUB_STEP_SUMMARY")
+    });
+    assert!(built < named);
+
+    // lab-vm.yml's guest: the object built on the host, its sha256 kept
+    let guest = job("lab-vm.yml", "guest");
+    let host = at(&guest, "builds the object on the host", &|s| {
+        run(s).contains("cargo --locked xtask build-ebpf --locked")
+    });
+    assert!(
+        run(&guest[host]).contains(&format!(
+            "sha256sum {OBJ} | tee \"$GATE_OUT/ebpf-object.sha256\""
+        )),
+        "the guest's evidence names the object it loads"
+    );
+
+    // one bpf-linker: every install in the workflows, and the hints
+    let mut versions = std::collections::BTreeSet::new();
+    let mut installs = 0;
+    for f in workflow_files() {
+        for line in read(&f).lines() {
+            if let Some(at) = line.find("cargo install bpf-linker --version ") {
+                installs += 1;
+                let rest = &line[at + "cargo install bpf-linker --version ".len()..];
+                versions.insert(rest.split_whitespace().next().unwrap_or("").to_string());
+            }
+        }
+    }
+    assert!(installs >= 3, "ci.yml, release.yml, lab-vm.yml: {installs}");
+    assert_eq!(
+        versions.len(),
+        1,
+        "one bpf-linker in the workflows: {versions:?}"
+    );
+    let v = versions.into_iter().next().unwrap();
+    for hint in ["xtask/src/main.rs", "deploy/lab/nn-lab.sh"] {
+        assert!(
+            read(&root.join(hint))
+                .contains(&format!("cargo install bpf-linker --version {v} --locked")),
+            "{hint} names bpf-linker {v}"
+        );
+    }
 }
 
 /// Lab PR 237: a grouped patch/minor bump that moves only the root

@@ -203,8 +203,18 @@ const MASK5: u64 = 0xff_ffff_ffff;
 /// First 8 bytes of path level `level`'s slot in the walk's scratch.
 #[inline(always)]
 unsafe fn level_name(s: *const ExeIdentityRaw, level: usize) -> u64 {
-    // SAFETY: the body's 2021 unsafe context, made explicit (main.rs, "Unsafe code").
+    // SAFETY: `s` is the task's walk entry of a map lookup; the slot is
+    // masked to 0..=15, so its 8 bytes lie inside the entry's `path`
+    // (16 slots of `EXE_PATH_SLOT_LEN`), read through
+    // `bpf_probe_read_kernel` (`peek_u64`).
     unsafe {
+        // Lot 1.2: `level` through the stack, so the two masks stay and
+        // bound the register the slot's offset is computed on. The callers'
+        // test (`levels` in 2..=64) let LLVM 22 drop both, while the test
+        // itself was made on a copy (`levels - 2 > 62`): the slot was
+        // `levels - 1` with no lower bound, refused on 5.15 (`math between
+        // map_value pointer and register with unbounded min value`).
+        let level = crate::opaque::opaque(level);
         let slot = exe_path_slot(level & 63) & 15;
         peek_u64((*s).path.as_ptr().add(slot * EXE_PATH_SLOT_LEN))
     }
