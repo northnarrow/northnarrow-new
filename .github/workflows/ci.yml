@@ -333,6 +333,21 @@ jobs:
           echo "$out"
           grep -q '^test result: ok\. 2 passed; 0 failed' <<< "$out" || { echo "::error::the 2 check_cfg tests did not both run"; exit 1; }
 
+      # Lot 1.3 (the review of #625, P3-3): the stack gate on the object
+      # just built, without a kernel — every program's deepest call chain at
+      # most 448 of the verifier's 512 bytes, save the debt
+      # crates/nn-linux/src/verifier_headroom.rs lists, each held to its
+      # own chain. The `userland` job embeds no object and the test skips
+      # there; here NN_REQUIRE_EBPF_OBJECT makes a missing object a failure,
+      # and the step fails unless the gate's test ran and passed.
+      - name: eBPF object stack chains (the 448/512 gate)
+        env:
+          NN_REQUIRE_EBPF_OBJECT: "1"
+        run: |
+          out=$(cargo test --locked -p xtask --test verifier_headroom 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          grep -q '^test no_program_s_stack_chain_is_over_448_bytes \.\.\. ok$' <<< "$out" || { echo "::error::the stack gate's test did not run"; exit 1; }
+
       # Lot 1.2 (F16): the object this job built and checked is kept, with
       # its build stamp and its sha256 (`gh run download <run> -n
       # ebpf-object`), so every other build of it can be compared with the

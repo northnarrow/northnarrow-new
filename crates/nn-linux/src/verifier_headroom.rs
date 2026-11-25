@@ -16,6 +16,16 @@
 //! This module is the judgement and its parsing, kept apart from the loader
 //! so that it is compiled and tested in every build (the verifier check
 //! itself is behind the lab feature).
+//!
+//! Lot 1.3 (plan S1, F6): the stack gate. The verifier refuses a call chain
+//! whose frames (each rounded up to 32 bytes) add up to more than 512
+//! bytes; a program at 512 is one local variable away from a refusal, on
+//! any kernel. A program the agent needs whose deepest chain is over
+//! [`STACK_BUDGET`] (448), or whose chain could not be read back, fails
+//! the kernel too — except the programs of [`STACK_DEBT`], held each to
+//! the chain it had when the gate came, until their lot brings them under
+//! it. `xtask/tests/verifier_headroom.rs` holds the same gate on the built
+//! object, without a kernel.
 
 /// The verifier's limit on the instructions it processes for one load
 /// (`BPF_COMPLEXITY_LIMIT_INSNS`, the same from 5.2 to 7.0).
@@ -28,6 +38,38 @@ pub const HEADROOM_BUDGET: u32 = 900_000;
 
 /// The programs the report lists by their count, highest first.
 pub const TOP: usize = 10;
+
+/// The verifier's limit on the stack of a call chain (`MAX_BPF_STACK`).
+pub const STACK_LIMIT: u32 = 512;
+
+/// Lot 1.3 (plan S1, F6): the stack gate, 448 of [`STACK_LIMIT`]'s 512
+/// bytes — two 32-byte frames of room on the deepest call chain.
+pub const STACK_BUDGET: u32 = 448;
+
+/// Lot 1.3: the programs over [`STACK_BUDGET`] when the gate came, each
+/// with the chain it may not exceed and, above it, the lot that owns its
+/// code and takes it off; the S1 exit test is an empty list. A program
+/// brought under the budget leaves the list (the xtask ratchet fails on an
+/// entry that is no longer over it).
+pub const STACK_DEBT: &[(&str, u32)] = &[
+    // owner: S1 lot 1.4b (mini-lot) — `bpf_defense.rs`'s `bpf()` observer,
+    // in no S1 lot's files
+    ("bpf_syscall_observe", 480),
+    // owner: S1 lot 1.4 — its whole chain is `open_sensor.rs`'s
+    // (`on_open` → `nn_open_class` → `nn_open_walk`), inlined into the FIM
+    // watch's program
+    ("fim_file_open_sensor", 480),
+    // owner: S1 lot 1.4b (mini-lot) — `tcp_close.rs`, in no S1 lot's files
+    ("tcp_close", 480),
+];
+
+/// The deepest call chain `prog` may have: its debt's, else the budget.
+pub fn stack_allowed(prog: &str) -> u32 {
+    STACK_DEBT
+        .iter()
+        .find(|(n, _)| *n == prog)
+        .map_or(STACK_BUDGET, |(_, c)| *c)
+}
 
 /// The environment variable that LOWERS the budget for one run (to see the
 /// gate fail on a kernel, or to hold a lot to a tighter target). A value
@@ -190,6 +232,10 @@ pub struct Measured {
     pub info: Option<u32>,
     /// The kprobe's count, when the probe ran and fired.
     pub kprobe: Option<u32>,
+    /// Lot 1.3: its deepest call chain in bytes (frames rounded up to 32,
+    /// as the verifier adds them), read back from the translated image;
+    /// `None` when the kernel did not hand the image out.
+    pub stack: Option<u32>,
 }
 
 impl Measured {
@@ -217,11 +263,25 @@ pub struct Verdict {
     pub disagree: Vec<(String, u32, u32)>,
     /// Programs measured both ways.
     pub cross_checked: usize,
+    /// Lot 1.3: every program's deepest call chain, deepest first (ties by
+    /// name).
+    pub stack_ranked: Vec<(String, u32)>,
+    /// The programs whose chain is over what they may have
+    /// ([`stack_allowed`]), with it.
+    pub stack_over: Vec<(String, u32)>,
+    /// The programs of [`STACK_DEBT`] over the budget and within their
+    /// debt: `(name, chain, debt)`.
+    pub stack_debt: Vec<(String, u32, u32)>,
+    /// The programs whose chain could not be read back.
+    pub stack_unmeasured: Vec<String>,
 }
 
 impl Verdict {
     pub fn passes(&self) -> bool {
-        self.over.is_empty() && self.unmeasured.is_empty()
+        self.over.is_empty()
+            && self.unmeasured.is_empty()
+            && self.stack_over.is_empty()
+            && self.stack_unmeasured.is_empty()
     }
 }
 
@@ -251,6 +311,26 @@ pub fn judge(programs: &[Measured], budget: u32) -> Verdict {
         .filter(|(_, i, k)| i != k)
         .map(|(m, i, k)| (m.name.clone(), *i, *k))
         .collect();
+    let mut stack_ranked: Vec<(String, u32)> = programs
+        .iter()
+        .filter_map(|m| Some((m.name.clone(), m.stack?)))
+        .collect();
+    stack_ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let stack_over = stack_ranked
+        .iter()
+        .filter(|(n, c)| *c > stack_allowed(n))
+        .cloned()
+        .collect();
+    let stack_debt = stack_ranked
+        .iter()
+        .filter(|(n, c)| *c > STACK_BUDGET && *c <= stack_allowed(n))
+        .map(|(n, c)| (n.clone(), *c, stack_allowed(n)))
+        .collect();
+    let stack_unmeasured = programs
+        .iter()
+        .filter(|m| m.stack.is_none())
+        .map(|m| m.name.clone())
+        .collect();
     Verdict {
         budget,
         ranked,
@@ -258,7 +338,45 @@ pub fn judge(programs: &[Measured], budget: u32) -> Verdict {
         unmeasured,
         disagree,
         cross_checked: both.len(),
+        stack_ranked,
+        stack_over,
+        stack_debt,
+        stack_unmeasured,
     }
+}
+
+/// Lot 1.3: the report's stack line — the deepest chains against the
+/// gate, and the debt held.
+pub fn stack_line(v: &Verdict) -> String {
+    let top: Vec<String> = v
+        .stack_ranked
+        .iter()
+        .take(5)
+        .map(|(n, c)| format!("{n} {c}"))
+        .collect();
+    let debt = if v.stack_debt.is_empty() {
+        "no debt over it".to_string()
+    } else {
+        format!(
+            "held to their debt: {}",
+            v.stack_debt
+                .iter()
+                .map(|(n, c, d)| format!("{n} {c} of {d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "stack: {} programs' deepest call chains read back, {} not; gate {STACK_BUDGET} of the \
+         verifier's {STACK_LIMIT} bytes, {debt}; deepest: {}",
+        v.stack_ranked.len(),
+        v.stack_unmeasured.len(),
+        if top.is_empty() {
+            "none".to_string()
+        } else {
+            top.join(", ")
+        }
+    )
 }
 
 /// `n` as a share of the gate ([`HEADROOM_BUDGET`], 900,000), one decimal
@@ -306,6 +424,7 @@ pub fn report(kernel: &str, v: &Verdict) -> Vec<String> {
             }
         ));
     }
+    out.push(stack_line(v));
     out.push(String::new());
     out.push(format!("top {TOP} by instructions processed:"));
     out.push(String::new());
@@ -330,6 +449,18 @@ pub fn verdict_line(kernel: &str, v: &Verdict) -> String {
         || "no program measured".to_string(),
         |(n, c, _)| format!("highest {n} {c} ({} of the 900k gate)", share_of_gate(*c)),
     );
+    // lot 1.3: the stack's gate in the same line
+    let highest = match v.stack_ranked.first() {
+        Some((n, c)) => format!(
+            "{highest}; stack chains within {STACK_BUDGET} of {STACK_LIMIT}{}, deepest {n} {c}",
+            if v.stack_debt.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} held to their debt)", v.stack_debt.len())
+            }
+        ),
+        None => highest,
+    };
     if v.passes() {
         return format!(
             "== verifier headroom {kernel}: OK — every program within {} ({highest})",
@@ -354,6 +485,22 @@ pub fn verdict_line(kernel: &str, v: &Verdict) -> String {
             v.unmeasured.join(", ")
         ));
     }
+    if !v.stack_over.is_empty() {
+        why.push(format!(
+            "stack chain over the gate {STACK_BUDGET} of {STACK_LIMIT} bytes (or its debt): {}",
+            v.stack_over
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !v.stack_unmeasured.is_empty() {
+        why.push(format!(
+            "stack chain not read back (the kernel did not hand out the translated image): {}",
+            v.stack_unmeasured.join(", ")
+        ));
+    }
     format!("== verifier headroom {kernel}: FAIL — {}", why.join("; "))
 }
 
@@ -366,6 +513,116 @@ mod tests {
             name: name.into(),
             info,
             kprobe,
+            stack: Some(64),
+        }
+    }
+
+    fn st(name: &str, stack: Option<u32>) -> Measured {
+        Measured {
+            stack,
+            ..m(name, Some(1000), None)
+        }
+    }
+
+    /// Lot 1.3 (plan S1, F6): `fim_rename_observe` was at 512 of 512 — a
+    /// program one local away from a refusal passed the gate, which read
+    /// the instructions only. A chain over 448 fails the kernel now, and
+    /// so does one not read back; a debt's program is held to its own
+    /// chain, never above it.
+    #[test]
+    fn the_gate_fails_a_stack_chain_over_448_or_not_read_back() {
+        let v = judge(&[st("fim_rename_observe", Some(512))], HEADROOM_BUDGET);
+        assert!(!v.passes(), "{v:?}");
+        assert_eq!(v.stack_over, vec![("fim_rename_observe".to_string(), 512)]);
+        let line = verdict_line("5.15", &v);
+        assert!(
+            line.contains("stack chain over the gate 448 of 512 bytes"),
+            "{line}"
+        );
+        assert!(line.contains("fim_rename_observe 512"), "{line}");
+
+        let v = judge(
+            &[st("a", Some(448)), st("b", Some(32)), st("c", Some(449))],
+            HEADROOM_BUDGET,
+        );
+        assert_eq!(v.stack_over, vec![("c".to_string(), 449)]);
+        assert_eq!(v.stack_ranked[0], ("c".to_string(), 449));
+        assert_eq!(v.stack_ranked[1], ("a".to_string(), 448));
+
+        let v = judge(&[st("a", Some(448))], HEADROOM_BUDGET);
+        assert!(v.passes(), "{v:?}");
+        let line = verdict_line("6.8", &v);
+        assert!(
+            line.contains("stack chains within 448 of 512, deepest a 448"),
+            "{line}"
+        );
+
+        let v = judge(&[st("a", Some(448)), st("dark", None)], HEADROOM_BUDGET);
+        assert!(!v.passes());
+        assert_eq!(v.stack_unmeasured, vec!["dark".to_string()]);
+        assert!(verdict_line("k", &v).contains("stack chain not read back"));
+
+        // the debt: within it, held and reported; above it, a failure
+        let (name, debt) = STACK_DEBT[0];
+        let v = judge(&[st(name, Some(debt))], HEADROOM_BUDGET);
+        assert!(v.passes(), "{v:?}");
+        assert_eq!(v.stack_debt, vec![(name.to_string(), debt, debt)]);
+        assert!(verdict_line("k", &v).contains("(1 held to their debt)"));
+        assert!(stack_line(&v).contains(&format!("held to their debt: {name} {debt} of {debt}")));
+        let v = judge(&[st(name, Some(debt + 32))], HEADROOM_BUDGET);
+        assert!(!v.passes());
+        assert!(v.stack_debt.is_empty());
+        // under the budget, a debt's program is no debt any more
+        let v = judge(&[st(name, Some(STACK_BUDGET))], HEADROOM_BUDGET);
+        assert!(v.passes() && v.stack_debt.is_empty());
+        assert!(stack_line(&v).contains("no debt over it"));
+    }
+
+    /// The debt only holds programs over the budget, each below the
+    /// verifier's limit, once each; the fim programs of lot 1.3 are not in
+    /// it.
+    #[test]
+    fn the_stack_debt_is_over_the_budget_and_below_the_limit() {
+        assert_eq!(STACK_BUDGET, 448);
+        assert_eq!(STACK_LIMIT, 512);
+        let mut names: Vec<&str> = STACK_DEBT.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), STACK_DEBT.len());
+        for (n, c) in STACK_DEBT {
+            assert!(
+                *c > STACK_BUDGET && *c <= STACK_LIMIT && c % 32 == 0,
+                "{n} {c}"
+            );
+            assert_eq!(stack_allowed(n), *c);
+        }
+        for p in ["fim_rename_observe", "fim_unlink_observe", "exec_check_raw"] {
+            assert_eq!(stack_allowed(p), STACK_BUDGET, "{p}");
+        }
+        // the review of #625 (P3-2): every entry names the lot that takes it
+        // off, in the comment right above it
+        let src = include_str!("verifier_headroom.rs");
+        let table = src
+            .split("pub const STACK_DEBT: &[(&str, u32)] = &[\n")
+            .nth(1)
+            .and_then(|r| r.split("\n];").next())
+            .unwrap();
+        let mut owner: Option<&str> = None;
+        let mut owners = Vec::new();
+        for line in table.lines().map(str::trim) {
+            if let Some(o) = line.strip_prefix("// owner: ") {
+                owner = Some(o);
+            } else if line.starts_with("(\"") {
+                let name = line.split('"').nth(1).unwrap();
+                let o = owner.take().unwrap_or_else(|| panic!("{name}: no owner"));
+                owners.push((name, o.split(" — ").next().unwrap()));
+            }
+        }
+        let names: Vec<&str> = owners.iter().map(|(n, _)| *n).collect();
+        let debt: Vec<&str> = STACK_DEBT.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, debt, "one owner per entry, in the table's order");
+        for (name, o) in &owners {
+            assert!(o.starts_with("S1 lot "), "{name}: {o}");
         }
     }
 
