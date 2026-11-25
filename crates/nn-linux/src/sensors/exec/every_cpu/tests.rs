@@ -173,10 +173,34 @@ fn the_self_test_s_terms_are_the_programs() {
     // the review of #625 (P2-1): each program marks its own attach point's
     // row, and records only while the emitter names it (P3-5)
     for (src, program, row, by, other) in [
-        (&exec, "sys_enter_execve", "SEEN_EXEC_TP", "BY_TRACEPOINT", "SEEN_EXEC_RAW"),
-        (&exec, "exec_check_raw", "SEEN_EXEC_RAW", "BY_RAW", "SEEN_EXEC_TP"),
-        (&open, "sys_enter_openat", "SEEN_OPEN_TP", "BY_TRACEPOINT", "SEEN_OPEN_RAW"),
-        (&open, "file_open_raw", "SEEN_OPEN_RAW", "BY_RAW", "SEEN_OPEN_TP"),
+        (
+            &exec,
+            "sys_enter_execve",
+            "SEEN_EXEC_TP",
+            "BY_TRACEPOINT",
+            "SEEN_EXEC_RAW",
+        ),
+        (
+            &exec,
+            "exec_check_raw",
+            "SEEN_EXEC_RAW",
+            "BY_RAW",
+            "SEEN_EXEC_TP",
+        ),
+        (
+            &open,
+            "sys_enter_openat",
+            "SEEN_OPEN_TP",
+            "BY_TRACEPOINT",
+            "SEEN_OPEN_RAW",
+        ),
+        (
+            &open,
+            "file_open_raw",
+            "SEEN_OPEN_RAW",
+            "BY_RAW",
+            "SEEN_OPEN_TP",
+        ),
     ] {
         let body = program_body(src, program);
         let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -219,7 +243,9 @@ fn program_body<'a>(src: &'a str, name: &str) -> &'a str {
         .find(&format!("pub fn {name}("))
         .unwrap_or_else(|| panic!("no pub fn {name}"));
     let rest = &src[at..];
-    &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("{name}: no end"))]
+    &rest[..rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("{name}: no end"))]
 }
 
 /// The review of #625 (P2-1): the fallback's test runs with the syscall
@@ -237,7 +263,10 @@ fn a_fallback_that_never_runs_is_not_taken_on_the_tracepoint_s_marks() {
     // row holds CPU 0 at the fallback's round (its mark during the
     // fallback's test), the fallback's row nothing
     let mut map = std::collections::HashMap::new();
-    map.insert(Sensor::Exec.row(Point::Tracepoint) * SEEN_CPUS, ROUND_FALLBACK);
+    map.insert(
+        Sensor::Exec.row(Point::Tracepoint) * SEEN_CPUS,
+        ROUND_FALLBACK,
+    );
     let mark = |i: u32| Some(*map.get(&i).unwrap_or(&0));
     let tp = decide(&[
         (0, Cpu::Seen),
@@ -269,7 +298,10 @@ fn a_fallback_that_never_runs_is_not_taken_on_the_tracepoint_s_marks() {
     // a live fallback is read from its own row, the other sensor's apart
     let mut live = std::collections::HashMap::new();
     for c in cpus {
-        live.insert(Sensor::Exec.row(Point::Fallback) * SEEN_CPUS + c, ROUND_FALLBACK);
+        live.insert(
+            Sensor::Exec.row(Point::Fallback) * SEEN_CPUS + c,
+            ROUND_FALLBACK,
+        );
     }
     let raw = decide(&verdicts(
         &cpus,
@@ -360,12 +392,30 @@ fn a_test_of_one_cpu_alone_proves_nothing() {
 #[test]
 fn a_cpu_the_deadline_passed_is_not_tested() {
     let cpus = [0, 1, 2, 3];
-    let mark = |i: u32| Some(if i == Sensor::Open.row(Point::Tracepoint) * SEEN_CPUS { 1 } else { 0 });
+    let mark = |i: u32| {
+        Some(if i == Sensor::Open.row(Point::Tracepoint) * SEEN_CPUS {
+            1
+        } else {
+            0
+        })
+    };
     // the thread reached CPUs 0 and 1 (1 could not be pinned), then hung
-    let v = verdicts(&cpus, &[(0, true), (1, false)], Sensor::Open, Point::Tracepoint, 1, mark);
+    let v = verdicts(
+        &cpus,
+        &[(0, true), (1, false)],
+        Sensor::Open,
+        Point::Tracepoint,
+        1,
+        mark,
+    );
     assert_eq!(
         v,
-        vec![(0, Cpu::Seen), (1, Cpu::Unpinned), (2, Cpu::Late), (3, Cpu::Late)]
+        vec![
+            (0, Cpu::Seen),
+            (1, Cpu::Unpinned),
+            (2, Cpu::Late),
+            (3, Cpu::Late)
+        ]
     );
     let tp = decide(&v);
     assert!(!tp.every());
@@ -375,18 +425,44 @@ fn a_cpu_the_deadline_passed_is_not_tested() {
         "seen on CPUs 0, not tested on CPUs 1 (the agent cannot run there), \
          not tested on CPUs 2-3 (the self-test's deadline passed first)"
     );
-    let raw = decide(&[(0, Cpu::Seen), (1, Cpu::Seen), (2, Cpu::Late), (3, Cpu::Late)]);
+    let raw = decide(&[
+        (0, Cpu::Seen),
+        (1, Cpu::Seen),
+        (2, Cpu::Late),
+        (3, Cpu::Late),
+    ]);
     assert_eq!(choose(&tp, Some(&raw)), Choice::Fallback);
     // a CPU reported twice or out of order is read once, in `cpus`' order
-    let v = verdicts(&[1, 0], &[(0, true), (1, true), (0, true)], Sensor::Open, Point::Tracepoint, 1, mark);
+    let v = verdicts(
+        &[1, 0],
+        &[(0, true), (1, true), (0, true)],
+        Sensor::Open,
+        Point::Tracepoint,
+        1,
+        mark,
+    );
     assert_eq!(v, vec![(1, Cpu::Missed), (0, Cpu::Seen)]);
     // round 0 is no round, and a CPU past the map is never seen
     assert_eq!(
-        verdicts(&[0], &[(0, true)], Sensor::Open, Point::Tracepoint, 0, |_| Some(0)),
+        verdicts(
+            &[0],
+            &[(0, true)],
+            Sensor::Open,
+            Point::Tracepoint,
+            0,
+            |_| Some(0)
+        ),
         vec![(0, Cpu::Missed)]
     );
     assert_eq!(
-        verdicts(&[SEEN_CPUS], &[(SEEN_CPUS, true)], Sensor::Exec, Point::Tracepoint, 1, |_| Some(1)),
+        verdicts(
+            &[SEEN_CPUS],
+            &[(SEEN_CPUS, true)],
+            Sensor::Exec,
+            Point::Tracepoint,
+            1,
+            |_| Some(1)
+        ),
         vec![(SEEN_CPUS, Cpu::Missed)]
     );
 }
@@ -589,7 +665,10 @@ fn live_every_cpu_self_test() {
                 "EVERY-CPU-REC {} {label} cpu={cpu} records={n}/{rounds}",
                 sensor.manifest_sensor()
             );
-            assert!(n <= rounds, "{label} cpu={cpu}: a call recorded twice ({n}/{rounds})");
+            assert!(
+                n <= rounds,
+                "{label} cpu={cpu}: a call recorded twice ({n}/{rounds})"
+            );
         }
     };
     for sensor in [Sensor::Exec, Sensor::Open] {
@@ -599,7 +678,16 @@ fn live_every_cpu_self_test() {
             tp.load().unwrap();
             tp.attach("syscalls", name).unwrap();
         }
-        let t = decide(&probe(&mut ebpf, sensor, Point::Tracepoint, &cpus, ROUND_TRACEPOINT).unwrap());
+        let t = decide(
+            &probe(
+                &mut ebpf,
+                sensor,
+                Point::Tracepoint,
+                &cpus,
+                ROUND_TRACEPOINT,
+            )
+            .unwrap(),
+        );
         println!(
             "EVERY-CPU {} tracepoint: {} ({:?})",
             sensor.manifest_sensor(),
@@ -609,7 +697,8 @@ fn live_every_cpu_self_test() {
         records(&mut ebpf, sensor, "tracepoint");
         // P2-1: the fallback's row, its program not attached, the
         // tracepoint marking the probe's calls with the fallback's round
-        let dead = decide(&probe(&mut ebpf, sensor, Point::Fallback, &cpus, ROUND_FALLBACK).unwrap());
+        let dead =
+            decide(&probe(&mut ebpf, sensor, Point::Fallback, &cpus, ROUND_FALLBACK).unwrap());
         println!(
             "EVERY-CPU {} dead-fallback: {} -> {:?}",
             sensor.manifest_sensor(),
@@ -619,7 +708,9 @@ fn live_every_cpu_self_test() {
         assert!(dead.seen.is_empty(), "{}", dead.describe());
         match attach_fallback(&mut ebpf, sensor) {
             Ok(()) => {
-                let f = decide(&probe(&mut ebpf, sensor, Point::Fallback, &cpus, ROUND_FALLBACK).unwrap());
+                let f = decide(
+                    &probe(&mut ebpf, sensor, Point::Fallback, &cpus, ROUND_FALLBACK).unwrap(),
+                );
                 println!(
                     "EVERY-CPU {} raw_tp: {}",
                     sensor.manifest_sensor(),

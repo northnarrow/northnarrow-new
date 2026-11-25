@@ -742,7 +742,14 @@ pub fn on_every_cpu(
         first.describe(),
         cpu_list(&cpus),
     );
-    let unobserved = cpu_list(&[first.missed.clone(), first.unpinned.clone(), first.late.clone()].concat());
+    let unobserved = cpu_list(
+        &[
+            first.missed.clone(),
+            first.unpinned.clone(),
+            first.late.clone(),
+        ]
+        .concat(),
+    );
     match (chosen, fallback) {
         (Choice::Fallback, Ok(f)) => {
             // the switch first, in one write: the fallback records from
@@ -795,7 +802,10 @@ pub fn on_every_cpu(
                         "; it could not be unloaded: it stays attached and records nothing"
                     };
                     if f.seen.is_empty() {
-                        format!("its fallback was seen on no CPU either ({}){left}", f.describe())
+                        format!(
+                            "its fallback was seen on no CPU either ({}){left}",
+                            f.describe()
+                        )
                     } else {
                         format!("its fallback covers less ({}){left}", f.describe())
                     }
