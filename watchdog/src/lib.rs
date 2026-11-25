@@ -6280,6 +6280,9 @@ mod tests {
         agent.extend_from_slice(b"902 24 0:93 / /run/northnarrow/\xfe rw - fuse.b \xfe rw\n");
         agent.extend_from_slice(b"903 24 0:94 / /sys/fs/cgroup rw - fuse.c c rw\n");
         agent.extend_from_slice(b"906 24 0:96 / /etc/northnarrow/\\777 rw - fuse.e e rw\n");
+        // a name beside a view or one of our directories, not over it
+        agent.extend_from_slice(b"907 24 0:97 / /proc2 rw - fuse.f f rw\n");
+        agent.extend_from_slice(b"908 24 0:98 / /run/north rw - fuse.g g rw\n");
         let pid1 = b"904 24 0:95 / /var/lib/northnarrow rw - fuse.d d rw\n".to_vec();
         assert!(std::str::from_utf8(&agent).is_err(), "the fixture");
         let d = tempfile::tempdir().unwrap();
@@ -6312,6 +6315,8 @@ mod tests {
             ]
         );
         assert_eq!(found[1].source, "\u{fffd}");
+        // the agent and PID 1 in one mount namespace: each connection once
+        assert_eq!(covering_in(&[&agent, &agent, &pid1]), found);
         // the point that is not UTF-8 compared as the kernel wrote it
         assert!(still_covering(&tables, &found[1]));
         let other: &[u8] = b"905 24 0:93 / /run/northnarrow/\xfd rw - fuse.b x rw\n";
@@ -6324,11 +6329,12 @@ mod tests {
     /// Lot 1.7a: on a valid table the bytes are cut as `str::lines` and
     /// `split(' ')` cut the text — a `\r` before `\n` dropped, a last
     /// line's kept, a last line without its newline read, a U+00A0 in a
-    /// name part of its field — so the covering FUSE mounts are the same.
+    /// name part of its field, the source's escapes undone — so the
+    /// covering FUSE mounts are the same.
     #[test]
     fn covering_fuse_from_bytes_reads_a_valid_table_as_text_did() {
         let table = "24 1 8:1 / / rw - ext4 /dev/sda1 rw\r\n\
-                     900 26 0:91 / /proc/a\u{a0}b rw - fuse.a a rw\r\n\
+                     900 26 0:91 / /proc/a\u{a0}b rw - fuse.a a\\040b rw\r\n\
                      \n\
                      901 24 0:92 / /proc/c rw - fuse.c c\r\n\
                      902 24 0:93 / /sys/x rw - fuse.x x\r";
@@ -6342,7 +6348,7 @@ mod tests {
         assert_eq!(
             points,
             [
-                ("/proc/a\u{a0}b".to_string(), "a".to_string(), 91),
+                ("/proc/a\u{a0}b".to_string(), "a b".to_string(), 91),
                 ("/proc/c".to_string(), "c".to_string(), 92),
                 ("/sys/x".to_string(), "x\r".to_string(), 93),
             ],

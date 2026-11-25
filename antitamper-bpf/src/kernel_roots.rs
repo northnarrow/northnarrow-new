@@ -2635,7 +2635,7 @@ mod tests {
     /// Lot 1.7a: the mount lines read from bytes are the lines `str::lines`
     /// gave on a valid table — cut at `\n`, a `\r` before it dropped, a
     /// last line without its newline read, cut at ASCII spaces only (a
-    /// U+00A0 in a name stays in its field).
+    /// U+00A0 in a name stays in its field), at the first ` - `.
     #[test]
     fn mount_lines_from_bytes_are_the_text_lines_of_a_valid_table() {
         const ROOT: &str = "/sys/fs/bpf/northnarrow";
@@ -2645,6 +2645,7 @@ mod tests {
              \n\
              30 20 0:30 / /sys/fs/bpf rw shared:9 - bpf bpf rw,mode=700\n\
              31 1 0:31 / /mnt/a\u{a0}b rw - tmpfs tmpfs rw\n\
+             32 1 0:32 / /mnt/d rw - fuse - rw\n\
              no shape here\n\
              90 30 0:30 /northnarrow {ROOT} rw unbindable - bpf\r\n\
              91 90 0:30 /northnarrow {ROOT} rw unbindable - bpf\r"
@@ -2677,7 +2678,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(old.len(), 6);
+        assert_eq!(old.len(), 7);
         assert_eq!(
             new,
             old.iter()
@@ -2692,7 +2693,11 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            new[5].5, "bpf\r",
+            new[4].5, "fuse",
+            "a source `-` (`fsname=-`) after the separator"
+        );
+        assert_eq!(
+            new[6].5, "bpf\r",
             "a last line's `\\r` kept, as `lines` keeps it"
         );
         assert!(!pin_locked(&table, ROOT), "on top, a type `bpf\\r`");
