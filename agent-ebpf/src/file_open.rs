@@ -70,7 +70,7 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
             ctx.read_at::<u64>(off!(TP_SYS_ENTER_OPENAT_FLAGS_OFFSET)).unwrap_or(0) as u32,
         )
     };
-    record(filename_ptr, flags);
+    record(crate::exec_check::SEEN_OPEN_TP, crate::exec_check::BY_TRACEPOINT, filename_ptr, flags);
     0
 }
 
@@ -95,7 +95,7 @@ pub fn file_open_raw(ctx: RawTracePointContext) -> i32 {
                     .unwrap_or(0) as u32,
                 None => 0,
             };
-            record(filename_ptr, flags);
+            record(crate::exec_check::SEEN_OPEN_RAW, crate::exec_check::BY_RAW, filename_ptr, flags);
         }
     }
     0
@@ -108,12 +108,16 @@ fn emitting() -> bool {
 }
 
 /// One record for the open of the path at `filename_ptr` in the caller's
-/// memory (0: none) with `flags`, or nothing for the boot's self-test's
-/// call (`exec_check::probe_seen`).
+/// memory (0: none) with `flags`, or nothing: for the boot's self-test's
+/// call (`exec_check::probe_seen`, marked in the attach point's `row`), and
+/// while the other attach point (`by`) records (`exec_check::emits`).
 #[inline(always)]
-fn record(filename_ptr: u64, flags: u32) {
+fn record(row: u32, by: u32, filename_ptr: u64, flags: u32) {
     let pid_tgid = bpf_get_current_pid_tgid();
-    if crate::exec_check::probe_seen(crate::exec_check::SEEN_OPEN, pid_tgid) {
+    if crate::exec_check::probe_seen(row, pid_tgid) {
+        return;
+    }
+    if !crate::exec_check::emits(crate::exec_check::EMIT_OPEN, by) {
         return;
     }
     let mut entry = match FILE_OPEN_EVENTS.reserve::<FileOpenRaw>(0) {

@@ -518,30 +518,76 @@ still on its syscall tracepoint:
    (`/sys/devices/system/cpu/online`), makes the sensor's call once with an
    empty path — `execve("")`, `openat(AT_FDCWD, "")` — which the kernel
    refuses with `ENOENT` before it looks anything up. The program marks the
-   CPU for that thread's calls and records nothing for them;
-2. every online CPU marked: the tracepoint stays (it costs the host's other
-   calls nothing);
+   CPU for that thread's calls, in a row of its own attach point, and
+   records nothing for them;
+2. every online CPU marked, two of them at least: the tracepoint stays (it
+   costs the host's other calls nothing). Every online CPU marked but one
+   CPU only (a host booted with CPU 0 alone online): the test cannot tell
+   a kernel that runs the tracepoint on CPU 0 alone from another — CPU 0 is
+   the perf event's own — so the tracepoint stays (it runs on CPU 0) and
+   the degradation says "not proven";
 3. otherwise the fallback on the **raw** `sys_enter` tracepoint (no perf
    event: it runs on every CPU, for every call of the host, and keeps the
    native `execve` or `openat` by its number, a 32-bit call skipped as the
    tracepoint skips it; the arguments read from the call's registers,
    `pt_regs.di`, `si`, `dx`, resolved from the kernel's BTF — x86-64) is
-   attached and tested the same way. It is kept when it saw every CPU the
-   tracepoint saw (and one at least): the tracepoint's link is retired and unloaded, the boot
-   manifest notes `raw_tp:sys_enter (execve, user memory)` or `(openat, …)`
-   as the fallback, and the degradation (`exec_sensor`, `file_open_sensor`)
-   names the CPUs each attach point was seen and missed on. A fallback that
-   cannot be armed (an offset not resolved, the verifier) or covers less
-   leaves the tracepoint, and the degradation names the CPUs whose calls
-   are not observed. A test that cannot run is signed as such.
+   attached **muted**: the tracepoint still records the host's calls, the
+   fallback only marks the test's, in its own row, so the tracepoint's
+   marks never count for it. It is kept when it saw every CPU the
+   tracepoint saw, and one at least. Then one map write
+   (`SYSCALL_TP_EMIT`) makes the fallback record and the tracepoint stop —
+   no call of the host is recorded by both — and the tracepoint's link is
+   retired and unloaded; the boot manifest notes
+   `raw_tp:sys_enter (execve, user memory)` or `(openat, …)` as the
+   fallback, and the degradation (`exec_sensor`, `file_open_sensor`) names
+   the CPUs each attach point was seen and missed on. A fallback that
+   cannot be armed (an offset not resolved, the verifier), is seen on no
+   CPU, covers less, or cannot be switched on leaves the tracepoint
+   recording, and the degradation names the CPUs whose calls are not
+   observed. A tracepoint or fallback that cannot be unloaded stays
+   attached and records nothing, and the degradation says so. A test that
+   cannot run is signed as such.
 
 A CPU the agent's CPU set leaves out is not tested ("not tested on CPUs
 …"): nothing proves the tracepoint there, and the fallback is taken. The
-fallback's records are the tracepoint's (the same ring, the same fields,
-the path read from the caller's memory); its cost is a filter on the
-number of every system call of the host. In LSM mode (the default) neither
-sensor is on its tracepoint and nothing is tested. The sensor self-test's
-exec and open steps (§5a) then see every CPU's calls again.
+same holds for the CPUs the probing thread has not reached when the test's
+5-second deadline passes (a CPU that never schedules it): the results so
+far are kept, the rest are "not tested (the self-test's deadline passed
+first)", and the thread makes no further call. The fallback's records are
+the tracepoint's (the same ring, the same fields, the path read from the
+caller's memory); its cost is a filter on the number of every system call
+of the host. In LSM mode (the default) neither sensor is on its tracepoint
+and nothing is tested. The sensor self-test's exec and open steps (§5a)
+then see every CPU's calls again.
+
+Both attach points keep the native `execve` and `openat` only, as on
+`main`: `execveat`, `openat2`, the legacy `open` and `creat`, and the ia32
+and x32 calls are outside them. An LSM sensor sees those only where `bpf`
+is in the kernel's active LSM list (`lsm=`): in the degraded mode of §6
+(no `bpf` there) the opens through `openat2`, `open` and `creat` are not
+observed, and an exec through `execveat` is seen by `process_spawn` alone
+(`sched_process_exec`, once the exec succeeded).
+
+**Residuals** (behaviour, not yet closed):
+
+- The test runs once, at the boot. A CPU brought online later (a vCPU
+  hot-added, `chcpu -e`, a boot with `maxcpus=`) is not tested: where the
+  fallback was taken it runs there too; where the tracepoint was kept on an
+  affected kernel, the calls made there are not observed, and nothing is
+  signed beyond the boot's degradation ("not proven" when the boot saw one
+  CPU) until the agent restarts. Re-running the test when the online CPUs
+  grow belongs to the kernel-state round, which already reads them
+  (`own_cpus`), not to this sensor's code.
+- On an affected kernel the BPF program runs only on the CPUs whose perf
+  list for that syscall event is not empty (lot 324's mechanism, read from
+  the upstream code, not reproduced in the lab). Another per-CPU perf
+  event open on the same event during the boot's test (`perf trace`,
+  `perf record -a -e syscalls:sys_enter_execve`, a root process holding
+  one) can make CPUs 1..N look covered: the tracepoint is kept, and those
+  CPUs go silent when that event closes.
+- The 6.1 and 6.12 kernels are checked in the stage round (S1, after lots
+  1.3 and 1.4), not in this lot's lab (7.0 and 5.15; 6.8 through CI's
+  privileged suite).
 
 ## 6. A kernel without `bpf` in `lsm=` (EXP-37)
 
