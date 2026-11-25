@@ -7,6 +7,13 @@
 //!
 //! The eBPF object is embedded via the build script: see
 //! `crates/nn-linux/build.rs`.
+//!
+//! Lot 324: [`every_cpu`] — the exec and file-open sensors' syscall
+//! tracepoints proven on every online CPU at the boot, and their fallbacks
+//! on the raw `sys_enter` tracepoint where they are not (Ubuntu 26.04's
+//! 7.0 runs a syscall tracepoint's program on CPU 0 alone).
+
+pub mod every_cpu;
 
 use std::time::Duration;
 

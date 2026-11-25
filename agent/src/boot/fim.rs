@@ -53,6 +53,33 @@ fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {
     }
 }
 
+/// Lot 324 (plan S1, F5): the exec sensor on `sys_enter_execve` and the
+/// file-open sensor on `sys_enter_openat` — whichever the start left on its
+/// syscall tracepoint, as the boot manifest noted it — proven on every
+/// online CPU, and moved to the raw `sys_enter` tracepoint where they are
+/// not (`nn_linux::sensors::exec::every_cpu`, signed). On Ubuntu 26.04's
+/// 7.0 a syscall tracepoint's program ran for CPU 0's calls only.
+fn syscall_sensors_on_every_cpu(sensor: &mut SensorMultiplexer) {
+    use northnarrow_agent::sensors::exec::every_cpu::{Sensor, on_every_cpu};
+    let points = sensor.attach_points().clone();
+    let guard = sensor.bpf_guard().clone();
+    for s in [Sensor::Exec, Sensor::Open] {
+        let on_tracepoint = points
+            .list()
+            .iter()
+            .any(|e| e.sensor == s.manifest_sensor() && e.attach == s.tracepoint_note());
+        if !on_tracepoint {
+            continue;
+        }
+        let taken = on_every_cpu(sensor.ebpf_mut(), s, &points, &guard);
+        info!(
+            sensor = s.manifest_sensor(),
+            taken = ?taken,
+            "every-CPU self-test of the syscall tracepoint done"
+        );
+    }
+}
+
 /// Tappa 10.9 step 1: switch the file-open sensor to LSM `file_open`, once
 /// the FIM observer that hosts it is attached; otherwise (or on
 /// `--file-open-sensor tracepoint`) `sys_enter_openat` stays in charge.
@@ -565,6 +592,10 @@ pub(crate) fn start(
                     audit_log.clone(),
                     posture,
                 );
+                // Lot 324: the sensors left on a syscall tracepoint, proven on
+                // every CPU (their fallbacks are registered below with the
+                // other late programs).
+                syscall_sensors_on_every_cpu(sensor);
                 // External audit ATP-013: the FIM observers and the file-open
                 // sensor were loaded after the BPF guard registered the
                 // agent's objects: their programs and links join the set.
