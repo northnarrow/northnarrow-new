@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aya::programs::{Program, ProgramError};
-use aya::{Btf, BtfError, Ebpf, EbpfLoader, VerifierLogLevel};
+use aya::{Btf, BtfError, Ebpf, VerifierLogLevel};
 use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::OPTIONAL_DENY_HOOKS;
@@ -444,8 +444,7 @@ impl Aligned {
 fn load_object(bytes: &[u8], level: VerifierLogLevel) -> Result<Ebpf> {
     let _ = fs::remove_dir_all(PIN_DIR);
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
-    let mut loader = EbpfLoader::new();
-    loader.btf(None);
+    let mut loader = crate::sensors::ebpf_object::object_loader();
     let task_maps = crate::sensors::epg::TaskMaps::default();
     loader.map_max_entries(crate::sensors::epg::STRICT_TASKS_MAP, task_maps.strict);
     loader.map_max_entries(crate::sensors::epg::LITE_TASKS_MAP, task_maps.lite);

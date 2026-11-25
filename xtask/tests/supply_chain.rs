@@ -989,6 +989,167 @@ fn the_toolchain_is_pinned_and_the_msrv_is_checked() {
     );
 }
 
+/// The dated nightlies `nightly-YYYY-MM-DD` that `line` names.
+fn dated_nightlies(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = line[from..].find("nightly-") {
+        let start = from + at;
+        let date = &line.as_bytes()[start + "nightly-".len()..];
+        let dated = date.len() >= 10
+            && date[..10].iter().enumerate().all(|(i, b)| match i {
+                4 | 7 => *b == b'-',
+                _ => b.is_ascii_digit(),
+            });
+        if dated {
+            out.push(&line[start..start + "nightly-".len() + 10]);
+        }
+        from = start + "nightly-".len();
+    }
+    out
+}
+
+/// The lines of the job `name` of a workflow's text: from its key, two
+/// spaces in under `jobs:`, to the next job's key.
+fn job_lines<'a>(text: &'a str, name: &str) -> Vec<(usize, &'a str)> {
+    let key = format!("  {name}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for (i, line) in text.lines().enumerate() {
+        let job_key = line.starts_with("  ")
+            && !line[2..].starts_with([' ', '#'])
+            && line.trim_end().ends_with(':');
+        if job_key {
+            inside = line.trim_end() == key;
+        } else if line.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            inside = false; // a top-level key after `jobs:`
+        }
+        if inside {
+            out.push((i, line));
+        }
+    }
+    out
+}
+
+/// Lot 400a: two dated nightlies, each one channel. The eBPF crate's, the
+/// one of `agent-ebpf/rust-toolchain.toml`: the ebpf-build, release and lab
+/// VM jobs install it, so the object CI and the release build is the one
+/// the lab measured with that compiler; a job left on another date builds
+/// another object. The fuzz job's own: its harness builds the agent, whose
+/// aya 0.16 and aya-obj 0.6 need rustc 1.98, above the eBPF nightly's 1.93
+/// — lot 400a moved the fuzz job alone, the eBPF crate's nightly moves with
+/// aya-ebpf 0.3 (lot 400b). Every dated nightly of the fuzz job (install,
+/// lockfile check, build, list) is the fuzz channel, and the fuzz README
+/// names that one; every other dated nightly of the workflows and the CI
+/// scripts is the eBPF crate's.
+#[test]
+fn every_dated_nightly_is_its_jobs_channel() {
+    let root = repo_root();
+    let ebpf = toml_string(
+        &read(&root.join("agent-ebpf/rust-toolchain.toml")),
+        "toolchain",
+        "channel",
+    )
+    .expect("agent-ebpf/rust-toolchain.toml [toolchain] channel");
+    assert_eq!(
+        dated_nightlies(&ebpf),
+        vec![ebpf.as_str()],
+        "the eBPF crate's channel is a dated nightly: {ebpf}"
+    );
+
+    // the fuzz job: the one ci.yml job that runs `cargo +<nightly> fuzz build`
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_text = read(&ci_path);
+    let fuzz_jobs: Vec<String> = jobs(&workflow_yaml(&ci_path))
+        .into_iter()
+        .filter(|(_, body)| {
+            steps(body)
+                .iter()
+                .filter_map(|s| str_of(s, "run"))
+                .any(|r| {
+                    r.lines()
+                        .any(|l| l.contains("cargo +") && l.contains(" fuzz build"))
+                })
+        })
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        fuzz_jobs.len(),
+        1,
+        "one ci.yml job builds the fuzz targets: {fuzz_jobs:?}"
+    );
+    let fuzz_lines = job_lines(&ci_text, &fuzz_jobs[0]);
+    let mut in_fuzz_job: Vec<&str> = fuzz_lines
+        .iter()
+        .flat_map(|(_, l)| dated_nightlies(l))
+        .collect();
+    // install, the lockfile check, build, list
+    assert!(
+        in_fuzz_job.len() >= 4,
+        "only {} dated nightlies in ci.yml's {} job",
+        in_fuzz_job.len(),
+        fuzz_jobs[0]
+    );
+    in_fuzz_job.sort_unstable();
+    in_fuzz_job.dedup();
+    assert_eq!(
+        in_fuzz_job.len(),
+        1,
+        "ci.yml's {} job names one nightly: {in_fuzz_job:?}",
+        fuzz_jobs[0]
+    );
+    let fuzz = in_fuzz_job[0].to_string();
+    let fuzz_rows: std::collections::BTreeSet<usize> = fuzz_lines.iter().map(|(i, _)| *i).collect();
+
+    let mut files = workflow_files();
+    files.extend(files_under(&root.join(".github/scripts"), &[".sh"], &[]));
+    files.push(root.join("fuzz/README.md"));
+    let mut named_ebpf = 0;
+    let mut bad = Vec::new();
+    for f in &files {
+        let fuzz_side = f.ends_with("fuzz/README.md");
+        for (i, line) in read(f).lines().enumerate() {
+            let ebpf_side = !fuzz_side && !(*f == ci_path && fuzz_rows.contains(&i));
+            let channel = if ebpf_side { &ebpf } else { &fuzz };
+            for n in dated_nightlies(line) {
+                if n != channel {
+                    bad.push(format!("{}:{}: {n} (expected {channel})", rel(f), i + 1));
+                } else if ebpf_side {
+                    named_ebpf += 1;
+                }
+            }
+        }
+    }
+    // ci.yml's ebpf-build job, release.yml, lab-vm.yml
+    assert!(
+        named_ebpf >= 3,
+        "only {named_ebpf} lines name the eBPF crate's nightly {ebpf} outside the fuzz job"
+    );
+    assert!(
+        bad.is_empty(),
+        "dated nightlies off their channel (eBPF: agent-ebpf/rust-toolchain.toml's {ebpf}; \
+         the fuzz job and fuzz/README.md: {fuzz}):\n{}",
+        bad.join("\n")
+    );
+    // the readers themselves
+    assert_eq!(
+        dated_nightlies("cargo +nightly-2025-12-01 fuzz build # nightly, nightly-2026"),
+        vec!["nightly-2025-12-01"]
+    );
+    let wf = "jobs:\n  a:\n    x: nightly-2025-12-01\n  # c:\n  fuzz:\n    y: 1\n\n    # z\n  b:\n";
+    let rows = |wf: &str| {
+        job_lines(wf, "fuzz")
+            .iter()
+            .map(|(i, _)| *i)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(wf), vec![4, 5, 6, 7]);
+    assert_eq!(
+        rows("jobs:\n  fuzz:\n    y: 1\nenv:\n  fuzz: 2\n"),
+        vec![1, 2]
+    );
+}
+
 /// Lab PR 237: a grouped patch/minor bump that moves only the root
 /// Cargo.lock leaves fuzz/Cargo.lock behind on the security crates, and
 /// `security_crates_are_locked_alike_for_the_fuzzer` goes red (#413). The

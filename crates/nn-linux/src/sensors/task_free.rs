@@ -59,7 +59,7 @@ pub fn ensure(ebpf: &mut Ebpf, btf: &Btf) -> Result<bool> {
         .map_mut(ARMED_MAP)
         .ok_or_else(|| anyhow!("{ARMED_MAP} missing from the eBPF object"))?;
     let mut arr: Array<&mut MapData, u32> = Array::try_from(map).context(ARMED_MAP)?;
-    arr.set(0, 1, 0).context("arming task_free")?;
+    arr.set(0, &1, 0).context("arming task_free")?;
     ATTACHED.store(true, std::sync::atomic::Ordering::Release);
     Ok(true)
 }
@@ -103,7 +103,7 @@ impl ShareRows for aya::maps::HashMap<MapData, u32, u64> {
             .collect())
     }
     fn put(&mut self, uid: u32, n: u64) -> Result<()> {
-        Ok(self.insert(uid, n, 0)?)
+        Ok(self.insert(&uid, &n, 0)?)
     }
     fn take_out(&mut self, uid: u32) -> Result<()> {
         match self.remove(&uid) {

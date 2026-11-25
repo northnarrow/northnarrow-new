@@ -152,7 +152,7 @@ fn publish(map: &mut Option<KernelMap>, ids: &[((u64, u64), u64)]) {
         }
     }
     for k in keys {
-        if let Err(e) = map.insert(k, 1, 0) {
+        if let Err(e) = map.insert(&k, &1, 0) {
             tracing::warn!(error = %e, dev = k[0], ino = k[1], cgroup = k[2], "PTRACE_READ_QUIET: journald's identity not written to the kernel");
         }
     }

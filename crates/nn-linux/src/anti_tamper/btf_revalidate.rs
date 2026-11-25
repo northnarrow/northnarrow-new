@@ -1064,10 +1064,10 @@ pub fn arm_btf_offsets(ebpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
     let mut arr: aya::maps::Array<_, u32> =
         aya::maps::Array::try_from(map).context("BTF_OFFSETS is not an Array<u32>")?;
     for (slot, value) in &r.values {
-        arr.set(*slot, *value, 0)
+        arr.set(*slot, value, 0)
             .with_context(|| format!("BTF_OFFSETS slot {slot} write"))?;
     }
-    arr.set(0, BTF_OFFSETS_MAGIC, 0)
+    arr.set(0, &BTF_OFFSETS_MAGIC, 0)
         .context("BTF_OFFSETS magic write")?;
     Ok(r.values.len())
 }

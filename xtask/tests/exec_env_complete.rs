@@ -833,7 +833,7 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
                 "total_of(&want);",
                 "(common::wire::execq::OVERFLOW_ROW, overflow),",
                 "(common::wire::execq::TOTAL_ROW, total),",
-                ".set(row, n, 0).is_err()",
+                ".set(row, &n, 0).is_err()",
             ],
         );
     }
@@ -862,7 +862,7 @@ fn the_fim_sensor_keeps_its_buffer_for_the_task_s_life() {
             "let loaded = ebpf.program(PROGRAM).is_some_and(|p| p.fd().is_ok());",
             "prog.attach().context(\"attaching task_free\")?;",
             "antitamper_bpf::attach_transient(ebpf, PROGRAM, HOOK, btf)?;",
-            "arr.set(0, 1, 0)",
+            "arr.set(0, &1, 0)",
             "ATTACHED.store(true, std::sync::atomic::Ordering::Release);",
         ],
     );

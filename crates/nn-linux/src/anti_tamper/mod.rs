@@ -1268,7 +1268,7 @@ fn arm_session(ebpf: &mut Ebpf) -> Result<()> {
             .ok_or_else(|| anyhow!("map {KILL_GRANT_MAP_NAME} missing from eBPF object"))?;
         let mut arr: AyaArray<_, AyaKillGrant> = AyaArray::try_from(map)
             .with_context(|| format!("{KILL_GRANT_MAP_NAME} is not an Array<KillGrant>"))?;
-        arr.set(0, AyaKillGrant(KillGrant::default()), 0)
+        arr.set(0, &AyaKillGrant(KillGrant::default()), 0)
             .with_context(|| format!("zeroing {KILL_GRANT_MAP_NAME}[0]"))?;
     }
     let shutdown = shutdown_exe_key();
@@ -1280,7 +1280,7 @@ fn arm_session(ebpf: &mut Ebpf) -> Result<()> {
             .with_context(|| format!("{SHUTDOWN_EXE_MAP_NAME} is not an Array<InodeKey>"))?;
         arr.set(
             0,
-            filesystem::AyaInodeKey(shutdown.unwrap_or(InodeKey { dev: 0, ino: 0 })),
+            &filesystem::AyaInodeKey(shutdown.unwrap_or(InodeKey { dev: 0, ino: 0 })),
             0,
         )
         .with_context(|| format!("writing {SHUTDOWN_EXE_MAP_NAME}[0]"))?;
@@ -1352,7 +1352,7 @@ pub fn refresh_shutdown_exe(bpffs_root: &Path) -> Result<Option<InodeKey>> {
     if have == Some(want) {
         return Ok(None);
     }
-    arr.set(0, filesystem::AyaInodeKey(want), 0)
+    arr.set(0, &filesystem::AyaInodeKey(want), 0)
         .with_context(|| format!("writing {SHUTDOWN_EXE_MAP_NAME}[0]"))?;
     Ok(Some(want))
 }
@@ -1391,7 +1391,7 @@ fn boot_zero_fs_grant(ebpf: &mut Ebpf) -> Result<()> {
             .ok_or_else(|| anyhow!("map {FS_GRANT_MAP_NAME} missing from eBPF object"))?;
         let mut arr: AyaArray<_, AyaFsGrant> = AyaArray::try_from(map)
             .with_context(|| format!("{FS_GRANT_MAP_NAME} is not an Array<FsGrant>"))?;
-        arr.set(0, AyaFsGrant(FsGrant::default()), 0)
+        arr.set(0, &AyaFsGrant(FsGrant::default()), 0)
             .with_context(|| format!("boot-zeroing {FS_GRANT_MAP_NAME}[0]"))?;
     }
     if let Some(root) = prepare_pin_root() {
@@ -1442,7 +1442,7 @@ fn write_array_u32(ebpf: &mut Ebpf, map_name: &str, value: u32) -> Result<()> {
         .ok_or_else(|| anyhow!("map {map_name} missing from eBPF object"))?;
     let mut arr: AyaArray<_, u32> =
         AyaArray::try_from(map).with_context(|| format!("{map_name} is not an Array<u32>"))?;
-    arr.set(0, value, 0)
+    arr.set(0, &value, 0)
         .with_context(|| format!("setting {map_name}[0] = {value}"))?;
     Ok(())
 }

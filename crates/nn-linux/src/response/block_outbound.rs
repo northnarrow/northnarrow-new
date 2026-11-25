@@ -59,7 +59,7 @@ pub(crate) struct RulesetOnce(parking_lot::Mutex<Option<u64>>);
 
 impl RulesetOnce {
     pub(crate) const fn new() -> Self {
-        Self(parking_lot::const_mutex(None))
+        Self(parking_lot::Mutex::new(None))
     }
 
     /// Run `apply` unless it already succeeded for the cgroup `id` (its

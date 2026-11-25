@@ -528,6 +528,38 @@ mod tests {
     use super::*;
     use aya::maps::MapType;
 
+    /// Lot 400a (aya 0.16, the mini-hunt of the adoption's size): an
+    /// adoption checks the pinned maps against [`layout`]; aya 0.16 then
+    /// takes a pin only when it is the object's map exactly and fails the
+    /// whole load otherwise (aya 0.14 took any). [`layout`] is the embedded
+    /// object's definition of each map adopted, flags none.
+    #[test]
+    fn the_layout_an_adoption_checks_is_the_object_s() {
+        let bytes = crate::sensors::ebpf_object::EBPF_BYTES;
+        if bytes.is_empty() {
+            assert!(
+                std::env::var_os("NN_REQUIRE_EBPF_OBJECT").is_none(),
+                "NN_REQUIRE_EBPF_OBJECT is set but this build embeds no eBPF object"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(bytes).expect("the eBPF object parses");
+        for name in PINNED_MAPS {
+            let m = obj
+                .maps
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} not in the object"));
+            let (kind, key, value, entries) = layout(name).expect("a history map");
+            assert_eq!(m.map_type(), kind as u32, "{name}: type");
+            assert_eq!(
+                (m.key_size(), m.value_size(), m.max_entries()),
+                (key, value, entries),
+                "{name}: key, value, entries"
+            );
+            assert_eq!(m.map_flags(), 0, "{name}: flags (the adoption checks none)");
+        }
+    }
+
     fn seen(id: u32, kind: MapType, key: u32, value: u32, max: u32) -> Seen {
         Seen {
             id,

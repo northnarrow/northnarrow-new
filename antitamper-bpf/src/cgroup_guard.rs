@@ -374,7 +374,7 @@ pub fn protect_unit_cgroup(bpffs_root: &Path, pid: u32) -> Result<UnitCgroup> {
     let mut map: AyaHashMap<MapData, Key, u8> = AyaHashMap::try_from(AyaMap::HashMap(data))
         .with_context(|| format!("{PROTECTED_INODES_MAP_NAME} is not a HashMap<InodeKey, u8>"))?;
     for e in unit.entries() {
-        map.insert(Key(e.key), e.flags, 0).with_context(|| {
+        map.insert(&Key(e.key), &e.flags, 0).with_context(|| {
             format!(
                 "registering {} in {PROTECTED_INODES_MAP_NAME}",
                 e.path.display()
@@ -457,7 +457,7 @@ fn write_values(bpffs_root: &Path, values: &[ValueEntry]) -> Result<()> {
     let mut map: AyaHashMap<MapData, Key, LimitValue> = AyaHashMap::try_from(AyaMap::HashMap(data))
         .with_context(|| format!("{LIMIT_VALUES_MAP_NAME} is not a HashMap<InodeKey, [u64; 4]>"))?;
     for f in values {
-        map.insert(Key(f.key), f.value, 0).with_context(|| {
+        map.insert(&Key(f.key), &f.value, 0).with_context(|| {
             format!(
                 "registering the value of {} in {LIMIT_VALUES_MAP_NAME}",
                 f.path.display()

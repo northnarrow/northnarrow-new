@@ -46,7 +46,12 @@
 //! - lot 281 (#494's N1/N2): a plant in a new generation's directory between
 //!   its making and its maps' pinning (`NN_DEBUG_CGROUP_JOIN_PLANT=1`) moves
 //!   the maps to the next generation, signed, the plant removed; no write
-//!   through a handle on a pinned map of the tracker goes through (frozen).
+//!   through a handle on a pinned map of the tracker goes through (frozen);
+//! - lot 400a (aya 0.16): a start after the host's sizing sysctl changed
+//!   (`kernel.threads-max` or `kernel.pid_max`, whichever is lower, made one
+//!   less, then put back) adopts the registered marks map at its pinned
+//!   size — aya 0.16 refuses a pin whose `max_entries` is not the object's,
+//!   and with it the whole object's load.
 //!
 //! Run (lab guest, units stopped, pins purged — `nn-lab.sh test-ignored`
 //! does both):
@@ -829,6 +834,98 @@ fn a_planted_tracker_directory_is_never_adopted() {
         "the planted directory {planted} left beside the pin root"
     );
     fx.wait_for_log("an unregistered tracker directory beside the pin root removed");
+}
+
+/// Lot 400a: one of the sysctls that size the marks map, set for a test
+/// and put back on drop.
+struct SysctlBack {
+    path: &'static str,
+    was: String,
+}
+
+impl SysctlBack {
+    fn set(path: &'static str, value: u64) -> Self {
+        let was = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+            .trim()
+            .to_string();
+        std::fs::write(path, value.to_string()).unwrap_or_else(|e| panic!("{path} = {value}: {e}"));
+        Self { path, was }
+    }
+}
+
+impl Drop for SysctlBack {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.path, &self.was);
+    }
+}
+
+fn sysctl_u64(path: &str) -> u64 {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+#[test]
+#[ignore = "requires root + bpf LSM; lab: nn-lab.sh test-ignored"]
+fn a_start_adopts_the_marks_at_their_pinned_size_after_a_sysctl_change() {
+    const PID_MAX: &str = "/proc/sys/kernel/pid_max";
+    const THREADS_MAX: &str = "/proc/sys/kernel/threads-max";
+    let joined = |st: &nn_linux::cgroup_join::PinState| {
+        st.maps
+            .iter()
+            .find(|m| m.name == nn_linux::cgroup_join::JOINED_MAP)
+            .map(|m| (m.id, m.max_entries))
+            .expect("the marks map registered")
+    };
+    // an agent first: the tracker's pins registered at the host's size.
+    // The earlier tests of this binary leave a generation of their own
+    // size (32768, their cleaning start's), which a plain start adopts:
+    // the debug build's knob at the host's size makes a new one at it (or
+    // adopts one already at it).
+    let (pid_max, threads_max) = (sysctl_u64(PID_MAX), sysctl_u64(THREADS_MAX));
+    let host = ::common::cgroup_join::joined_entries(Some(pid_max), Some(threads_max));
+    let before = {
+        let _fx = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", &host.to_string())]);
+        registered()
+    };
+    let (id, size) = joined(&before);
+    assert_eq!(
+        ::common::cgroup_join::joined_entries(Some(pid_max), Some(threads_max)),
+        size,
+        "the marks map is the host's size"
+    );
+    // the lower of the two, one less: the host now asks for another size
+    let (path, low) = if threads_max <= pid_max {
+        (THREADS_MAX, threads_max)
+    } else {
+        (PID_MAX, pid_max)
+    };
+    assert!(
+        low > u64::from(::common::cgroup_join::JOINED_ENTRIES),
+        "{path} = {low}: at the marks' floor, no smaller size to ask for"
+    );
+    let _back = SysctlBack::set(path, low - 1);
+    let now = ::common::cgroup_join::joined_entries(
+        Some(sysctl_u64(PID_MAX)),
+        Some(sysctl_u64(THREADS_MAX)),
+    );
+    assert_ne!(now, size, "{path} lowered: the host asks for {now}");
+    // the second start loads its object (the tracker attaches) and adopts
+    let fx = Fixture::setup();
+    let after = registered();
+    assert_eq!(after.dir, before.dir, "the registered pins adopted");
+    assert_eq!(
+        joined(&after),
+        (id, size),
+        "the marks map adopted at its pinned size (the host asked for {now})"
+    );
+    drop(fx);
+    // the next tests' agents: new maps with no epoch, as the other tests
+    // that change the marks' size leave them
+    let _clean = Fixture::setup_with(&[("NN_DEBUG_CGROUP_JOINED_ENTRIES", "32768")]);
 }
 
 /// Prints its pid; on each line from stdin forks a child that sleeps and

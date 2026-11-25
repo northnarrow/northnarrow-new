@@ -45,7 +45,7 @@ pub struct Contained {
 
 /// Read-modify-write of the record is serialised (the executor runs on
 /// blocking threads of its own).
-static LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The cgroup v2 path `/proc/<pid>/cgroup` shows for `pid`.
 pub fn origin_of(pid: u32) -> Option<String> {

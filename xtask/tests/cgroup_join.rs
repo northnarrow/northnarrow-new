@@ -513,7 +513,10 @@ fn the_agent_asks_the_marks_where_it_decides() {
             // lot 281 (#494's N1): the loader takes pins for an adoption
             // only; a new generation is pinned after the load
             "if p.adopt {\n            usable_dir(&p.dir)?;",
-            "if p.adopt {\n            for name in PINNED_MAPS {\n                loader.map_pin_path(name, p.dir.join(name));",
+            // lot 400a: at the registered marks map's size (aya 0.16 reuses
+            // a pin only at the object's `max_entries`)
+            "if p.adopt {\n            if let Some(n) = p.entries {",
+            "loader.map_max_entries(JOINED_MAP, n);\n            }\n            for name in PINNED_MAPS {\n                loader.map_pin_path(name, p.dir.join(name));",
         ],
     )
     .unwrap();

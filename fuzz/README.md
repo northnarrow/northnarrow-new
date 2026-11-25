@@ -68,14 +68,14 @@ rewrites them. `xtask/tests/supply_chain.rs` checks that every target has
 seeds and that CI replays them.
 
 A crash lands in `fuzz/artifacts/<target>/`; reproduce it with
-`cargo +nightly-2025-12-01 fuzz run <target> fuzz/artifacts/<target>/crash-…`,
+`cargo +nightly-2026-08-05 fuzz run <target> fuzz/artifacts/<target>/crash-…`,
 fix it, add the input to `fuzz/regressions/<target>/` under the finding's
 name and a deterministic unit test next to the parser.
 
 ```sh
 cargo install cargo-fuzz --version 0.13.2 --locked   # once
-cargo +nightly-2025-12-01 fuzz list                  # from the repository root
-cargo +nightly-2025-12-01 fuzz build                 # all targets, sanitizer on
+cargo +nightly-2026-08-05 fuzz list                  # from the repository root
+cargo +nightly-2026-08-05 fuzz build                 # all targets, sanitizer on
 # run a built binary directly (cargo fuzz run re-invokes cargo for every
 # run — slow in a loop)
 b=fuzz/target/x86_64-unknown-linux-gnu/release

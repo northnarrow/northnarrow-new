@@ -417,7 +417,9 @@ Asked: YARA rules in signed packs, with yara-x or the yara C library.
   refuses (`mmap`/`mprotect` with `PROT_EXEC` kill it), which is the line
   that keeps a parser of hostile files from becoming a code-execution
   primitive. Its Pulley interpreter (`pulley` feature) would avoid the JIT;
-  its footprint and speed are unmeasured.
+  its footprint and speed are unmeasured. (Lot 400a raised the workspace's
+  `rust-version` to 1.98 for aya 0.16: the first blocker is gone, the
+  second stands.)
 
 Shipped: the hash and heuristic engine. The `yara` cargo feature of
 `northnarrow-scan` is reserved and fails the build with the reason;

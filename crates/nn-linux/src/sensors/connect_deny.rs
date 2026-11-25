@@ -219,7 +219,7 @@ pub fn arm(ebpf: &mut Ebpf, blocklist: &NetBlocklist) -> Result<ArmReport> {
         let mut v4: LpmTrie<&mut MapData, [u8; 4], u8> =
             LpmTrie::try_from(map).with_context(|| format!("{MAP_V4} is not an LPM trie"))?;
         for (net, prefix) in &entries.v4 {
-            v4.insert(&Key::new(*prefix, *net), 1u8, 0)
+            v4.insert(&Key::new(*prefix, *net), &1u8, 0)
                 .with_context(|| format!("loading {net:?}/{prefix} into {MAP_V4}"))?;
         }
     }
@@ -230,7 +230,7 @@ pub fn arm(ebpf: &mut Ebpf, blocklist: &NetBlocklist) -> Result<ArmReport> {
         let mut v6: LpmTrie<&mut MapData, [u8; 16], u8> =
             LpmTrie::try_from(map).with_context(|| format!("{MAP_V6} is not an LPM trie"))?;
         for (net, prefix) in &entries.v6 {
-            v6.insert(&Key::new(*prefix, *net), 1u8, 0)
+            v6.insert(&Key::new(*prefix, *net), &1u8, 0)
                 .with_context(|| format!("loading {net:?}/{prefix} into {MAP_V6}"))?;
         }
     }
@@ -240,7 +240,7 @@ pub fn arm(ebpf: &mut Ebpf, blocklist: &NetBlocklist) -> Result<ArmReport> {
             .ok_or_else(|| anyhow!("{MAP_MODE} missing from the eBPF object"))?;
         let mut mode: Array<&mut MapData, u32> =
             Array::try_from(map).with_context(|| format!("{MAP_MODE} is not an array"))?;
-        mode.set(0, 1, 0).context("turning the connect deny on")?;
+        mode.set(0, &1, 0).context("turning the connect deny on")?;
     }
     // Lot 290 (item 3): set once per load — frozen
     if let Err(e) = crate::anti_tamper::bpf_defense::freeze_named(ebpf, MAP_MODE) {

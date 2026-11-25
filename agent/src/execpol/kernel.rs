@@ -47,10 +47,10 @@ pub fn write_conf(ebpf: &mut Ebpf, words: &[u64; conf_slot::SLOTS as usize]) -> 
     // Mode last: the tables are in place before anything reads them.
     for (i, w) in words.iter().enumerate() {
         if i as u32 != conf_slot::MODE {
-            arr.set(i as u32, *w, 0)?;
+            arr.set(i as u32, w, 0)?;
         }
     }
-    arr.set(conf_slot::MODE, words[conf_slot::MODE as usize], 0)?;
+    arr.set(conf_slot::MODE, &words[conf_slot::MODE as usize], 0)?;
     let map = ebpf
         .map("EXECPOL_CONF")
         .ok_or_else(|| anyhow!("EXECPOL_CONF missing from the eBPF object"))?;
@@ -141,11 +141,11 @@ pub(crate) mod debug_fill {
                 let k = key(i);
                 let mut made = false;
                 if let Some(m) = self.walk.as_mut() {
-                    made |= m.insert(k, [0u8; WALK_BYTES], 0).is_ok();
+                    made |= m.insert(&k, &[0u8; WALK_BYTES], 0).is_ok();
                 }
                 if env {
                     if let Some(m) = self.env.as_mut() {
-                        made |= m.insert(k, [0u8; ENV_ENTRY_BYTES], 0).is_ok();
+                        made |= m.insert(&k, &[0u8; ENV_ENTRY_BYTES], 0).is_ok();
                     }
                 }
                 if !made {
@@ -190,9 +190,9 @@ impl Kernel {
     }
 
     pub fn set_slices(&mut self, system: u64, user: u64, ours: u64) {
-        let _ = self.slices.set(slice_slot::SYSTEM, system, 0);
-        let _ = self.slices.set(slice_slot::USER, user, 0);
-        let _ = self.slices.set(slice_slot::OURS, ours, 0);
+        let _ = self.slices.set(slice_slot::SYSTEM, &system, 0);
+        let _ = self.slices.set(slice_slot::USER, &user, 0);
+        let _ = self.slices.set(slice_slot::OURS, &ours, 0);
     }
 
     /// Replace the image roles with `entries`.
@@ -204,7 +204,7 @@ impl Kernel {
             }
         }
         for (k, v) in entries {
-            let _ = self.images.insert(AyaKey(*k), *v, 0);
+            let _ = self.images.insert(&AyaKey(*k), v, 0);
         }
     }
 

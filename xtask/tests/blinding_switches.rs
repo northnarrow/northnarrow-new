@@ -103,7 +103,7 @@ fn the_fork_tracepoint_checks_every_birth_the_fentry_saw() {
     .unwrap();
     assert!(
         body(&l, "arm_silent")
-            .contains("arr.set(SILENT_ARMED, clock_ns(libc::CLOCK_MONOTONIC)?, 0)")
+            .contains("arr.set(SILENT_ARMED, &clock_ns(libc::CLOCK_MONOTONIC)?, 0)")
     );
     // and the manifest's build watches the marks right after ftrace's read
     let m = code("agent/src/boot/manifest.rs");

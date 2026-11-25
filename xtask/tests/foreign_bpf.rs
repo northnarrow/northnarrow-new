@@ -401,7 +401,7 @@ fn the_configuration_maps_are_frozen_and_the_opt_out_is_applied() {
     in_order(
         body(&u, "register_own_objects"),
         &[
-            "mode.set(0, if enforce { 1 } else { 0 }, 0)",
+            "mode.set(0, if enforce { &1 } else { &0 }, 0)",
             "write_loader_opt_outs_object(ebpf)",
             "for (name, outcome) in freeze_config_maps(ebpf) {",
         ],
@@ -422,7 +422,7 @@ fn the_configuration_maps_are_frozen_and_the_opt_out_is_applied() {
             &code("crates/nn-linux/src/sysctl_cgroup.rs"),
             "set_judge_flag",
         ),
-        &["a.set(0, v, 0)", "freeze_named(ebpf, JUDGE_MAP)"],
+        &["a.set(0, &v, 0)", "freeze_named(ebpf, JUDGE_MAP)"],
     )
     .unwrap();
     in_order(
@@ -431,14 +431,14 @@ fn the_configuration_maps_are_frozen_and_the_opt_out_is_applied() {
             "exempt_resolvers",
         ),
         &[
-            "exempt.insert(uid, 1, 0)",
+            "exempt.insert(uid, &1, 0)",
             "freeze_named(ebpf, \"DNS_EXEMPT_UIDS\")",
         ],
     )
     .unwrap();
     in_order(
         body(&code("crates/nn-linux/src/sensors/connect_deny.rs"), "arm"),
-        &["mode.set(0, 1, 0)", "freeze_named(ebpf, MAP_MODE)"],
+        &["mode.set(0, &1, 0)", "freeze_named(ebpf, MAP_MODE)"],
     )
     .unwrap();
     in_order(
@@ -853,7 +853,7 @@ fn a_load_of_every_type_is_read_for_the_signal_kfuncs() {
         body(&u, "write_content_judge"),
         &[
             "let every = common::bpf_prog_class::CONTENT_EVERY_TYPE_SLOT;",
-            "conf.set(every, judge.every_type, 0)",
+            "conf.set(every, &judge.every_type, 0)",
             "freeze_named(ebpf, CONTENT_CONF_MAP)?;",
         ],
     )
@@ -886,7 +886,7 @@ fn a_failed_calibration_suspends_the_opt_outs_and_keeps_the_lockdown_guard() {
         body(&u, "arm_content_at_handle"),
         &[
             "WRITE_USER_GUARD_PROGRAM,\n            WRITE_USER_GUARD_HOOK,",
-            "conf.set(CONTENT_LOCKDOWN_SLOT, *v, 0)",
+            "conf.set(CONTENT_LOCKDOWN_SLOT, v, 0)",
             "clear_seen(ebpf)?;",
             "if let Some(why) = &judge.off {\n        freeze_named(ebpf, CONTENT_CONF_MAP)?;\n        return Err(format!(\"{why} — {OPT_OUTS_SUSPENDED}{write_user_note}\"));",
         ],

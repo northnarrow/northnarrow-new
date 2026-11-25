@@ -11,7 +11,7 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
 [![Release](https://img.shields.io/github/v/release/northnarrow/northnarrow-new?include_prereleases&label=release&color=1e3a5f)](https://github.com/northnarrow/northnarrow-new/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-27ae60)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-MSRV_1.89-93450a?logo=rust)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
 [Today](#what-it-does-today-and-what-it-does-not) ·
@@ -562,7 +562,7 @@ independent validation.
 - **Pinned CI.** Every GitHub action is pinned by commit SHA, and every tool installed with
   `cargo install` is pinned by version with `--locked`; a test fails on a tag-pinned action or
   an unpinned install. Every CI and release build is `--locked`, with the Rust release pinned in
-  `rust-toolchain.toml`. The `rust-version` in `Cargo.toml` (1.89) is checked by a CI job that
+  `rust-toolchain.toml`. The `rust-version` in `Cargo.toml` (1.98) is checked by a CI job that
   builds with it. Builds target `x86-64-v2`. Workflow tokens are read-only except where the
   release publishes, and no checkout leaves the token in `.git/config`.
 - **Dependencies** are audited in CI (`cargo audit` on every lockfile, the fuzz harness and the
