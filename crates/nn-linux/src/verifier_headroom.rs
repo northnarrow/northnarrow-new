@@ -561,6 +561,10 @@ mod tests {
         assert_eq!(share_of_gate(900_000), "100.0%");
         assert_eq!(share_of_gate(1_000_000), "111.1%");
         assert_eq!(share_of_gate(0), "0.0%");
+        // rounded to the nearest tenth, not cut: 5.15's move_mount stage at
+        // lot 1.1 is 51.075 % of the gate
+        assert_eq!(share_of_gate(459_673), "51.1%");
+        assert_eq!(share_of_gate(449_955), "50.0%");
         assert!(
             r.iter().any(|l| l.contains("| of the 900k gate |")),
             "{r:#?}"

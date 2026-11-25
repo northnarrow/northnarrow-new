@@ -4028,6 +4028,14 @@ mod tests {
         for c in [CopyMove::Allow, CopyMove::Refuse, CopyMove::Window] {
             assert_eq!(c.code(), verdict_code(c.verdict()));
         }
+        // every reason byte reads back whole, not only the reasons defined
+        // today (all below 0x80): the code carries the reason's eight bits
+        for w in 0..=u8::MAX {
+            for v in [Verdict::Refuse(w), Verdict::Window(w), Verdict::Noted(w)] {
+                assert_eq!(verdict_of_code(verdict_code(v)), v, "{v:?}");
+                assert_eq!(verdict_code(v) & 0xff, u16::from(w), "{v:?}");
+            }
+        }
     }
 
     /// Named test (lot 1.1, the change_mnt_propagation fentry): a change
