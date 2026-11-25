@@ -2012,6 +2012,14 @@ mod tests {
         assert!(has(90, "/"));
         assert!(!has(1, "/"));
         assert!(!has(5, "/run"));
+        // a mount in no peer group of its own (`/run` here) has no such key,
+        // under no group either
+        assert!(
+            !u.entries
+                .iter()
+                .any(|(k, _)| k.dev == common::mount_guard::HELD_ROOT),
+            "a key under group 0"
+        );
         // a mount whose root cannot be read has no such key
         let none = held_in(&t, &points(), GUARD_HOST, &g, &|_| None);
         assert!(

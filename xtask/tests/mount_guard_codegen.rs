@@ -148,8 +148,12 @@ fn the_lock_judge_reads_the_namespace_before_a_private_change_and_the_makers_ste
         .find("lock_touched(flags, on_lock, above, guard)")
         .expect("the rule by the target's namespace");
     assert!(widest < target && target < by_ns, "the order of the rule");
-    assert!(body.contains("lock_step_at(flags, on_lock, guard) && lock_maker_now()"));
-    assert!(body.contains("lock_shutdown_step(flags, on_lock) && shutdown_stage()"));
+    // lot 1.1 (F8b-1): the maker and the shutdown asked of their global
+    // functions (`nn_mount_lock_maker`, `nn_mount_shutdown_stage`)
+    assert!(body.contains("lock_step_at(flags, on_lock, guard) && nn_mount_lock_maker() != 0"));
+    assert!(
+        body.contains("lock_shutdown_step(flags, on_lock) && nn_mount_shutdown_stage() != 0")
+    );
     assert!(
         !body.contains("lock_step(flags)"),
         "the maker's step anywhere"

@@ -13,7 +13,14 @@
 //! after this hook: a bind's source is not judged (where it lands is), and
 //! a move through `MS_MOVE` is refused in the host's namespace whatever it
 //! moves (`move_mount(2)`, which util-linux 2.39 and later uses, names the
-//! mount it moves).
+//! mount it moves: lot 1.1 judges that source in any namespace — a held
+//! mount, or a peer copy of one, is not moved away).
+//!
+//! Lot 1.1 (F8b-1): `sb_mount` and `move_mount` are each an entry and
+//! stages it tail-calls ([`MOUNT_SB_STAGES`], [`MOUNT_MOVE_STAGES`]): the
+//! entry reads what is cheap and where the target lands, the stage what
+//! lands there and decides — each program verified on its own, the
+//! decision unchanged (`common::mount_guard::sb_mount_route`).
 //!
 //! The protected points are the agent's (`MOUNT_PROTECTED`, by device and
 //! inode as `stat(2)` gives them in PID 1's root: the views, the agent's
@@ -278,6 +285,10 @@ pub struct Offs {
     /// place in the parent's list (`mnt_child`).
     mnt_mounts: u16,
     mnt_child: u16,
+    /// Lot 1.1: the super block's type and the type's name (`fstype_of`),
+    /// read with the others, not by an `off_opt!` in the stage's last part.
+    s_type: u16,
+    type_name: u16,
     /// btrfs: `(vfs_inode, root, anon_dev)`, `vfs_inode` 0 when unknown.
     btrfs_vfs: u16,
     btrfs_root: u16,
@@ -338,6 +349,8 @@ impl Offs {
         o.mnt_group_id = (off_opt!(MOUNT_MNT_GROUP_ID_OFFSET)? & 0xfff) as u16;
         o.mnt_mounts = (off_opt!(MOUNT_MNT_MOUNTS_OFFSET)? & 0xfff) as u16;
         o.mnt_child = (off_opt!(MOUNT_MNT_CHILD_OFFSET)? & 0xfff) as u16;
+        o.s_type = (off_opt!(SUPER_BLOCK_S_TYPE_OFFSET)? & 0xfff) as u16;
+        o.type_name = (off_opt!(FILE_SYSTEM_TYPE_NAME_OFFSET)? & 0xff) as u16;
         Some(o)
     }
 }
@@ -485,6 +498,42 @@ unsafe fn kernel_thread() -> bool {
         let task = bpf_get_current_task() as *const u8;
         peek_u32(task.add(off!(TASK_STRUCT_FLAGS_OFFSET))) & PF_KTHREAD != 0
     }
+}
+
+/// Lot 1.1 (F8b-1): [`shutdown_stage`] as a global BPF function — verified
+/// once per program, on its own, its answer an unknown scalar to the
+/// caller: the task reads it makes (the comm, the parent, the executable's
+/// key) never multiply the states of the hook that asks (a static call is
+/// verified again in each of its caller's states). 1: the end of a
+/// shutdown, else 0.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_mount_shutdown_stage() -> u64 {
+    // SAFETY: `shutdown_stage` reads the current task through
+    // `bpf_probe_read_kernel` only
+    unsafe { shutdown_stage() as u64 }
+}
+
+/// Lot 1.1 (F8b-1): [`lock_maker_now`] as a global BPF function (as
+/// [`nn_mount_shutdown_stage`]): 1, the caller is the pin directory's
+/// lock's maker, else 0.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_mount_lock_maker() -> u64 {
+    // SAFETY: `lock_maker_now` reads the current task through
+    // `bpf_probe_read_kernel` only
+    unsafe { lock_maker_now() as u64 }
+}
+
+/// Lot 1.1 (F8b-1): a mount guard record signed (`inode_protect::
+/// emit_attempt`: the self-test's, the minor and the attempt budgets) — a
+/// global BPF function, verified once: the budgets' branches never multiply
+/// the states of the hook that signs. Always 0.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn nn_mount_emit(operation: u64, dev: u64, ino: u64) -> u64 {
+    crate::inode_protect::emit_attempt(operation as u8, InodeKey { dev, ino });
+    0
 }
 
 /// The guarded namespace a mount (a `struct mount`) belongs to — the
@@ -874,20 +923,13 @@ unsafe fn string_key(s: *const u8, out: &mut NameKey) {
 /// `out`.
 #[inline(always)]
 unsafe fn fstype_of(o: &Offs, dentry: *const u8, out: &mut NameKey) {
-    // SAFETY: the super block, its type and the type's name pointer are read through
-    // `bpf_probe_read_kernel`; the name is copied by `string_key`
+    // SAFETY: the super block, its type and the type's name pointer are read
+    // through `bpf_probe_read_kernel`; the name is copied by `string_key`
     unsafe {
-        let (Some(o_type), Some(o_name)) = (
-            off_opt!(SUPER_BLOCK_S_TYPE_OFFSET),
-            off_opt!(FILE_SYSTEM_TYPE_NAME_OFFSET),
-        ) else {
-            *out = NameKey::NONE;
-            return;
-        };
         let inode = peek_ptr(dentry.add(o.d_inode as usize));
         let sb = peek_ptr(inode.add(o.i_sb as usize));
-        let fs_type = peek_ptr(sb.add(o_type & 0xfff));
-        string_key(peek_ptr(fs_type.add(o_name & 0xff)), out)
+        let fs_type = peek_ptr(sb.add(o.s_type as usize));
+        string_key(peek_ptr(fs_type.add(o.type_name as usize)), out)
     }
 }
 
@@ -1032,12 +1074,10 @@ fn answer_parts(verdict: Verdict, op: u8, key: InodeKey, view: u8, stack: u8) ->
         Verdict::Window(w) => (FS_OP_MOUNT_WINDOW, w, 0),
         Verdict::Noted(w) => (FS_OP_MOUNT_NOTED, w, 0),
     };
-    crate::inode_protect::emit_attempt(
-        operation,
-        InodeKey {
-            dev: record_dev(key.dev, op, why, view, stack),
-            ino: key.ino,
-        },
+    nn_mount_emit(
+        operation as u64,
+        record_dev(key.dev, op, why, view, stack),
+        key.ino,
     );
     ret
 }
@@ -1221,7 +1261,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             let mut q = query(MG_OP_REMOUNT_BIND, &c, guard);
             q.held = true;
             q.restrict = true;
-            q.shutdown = shutdown_stage();
+            q.shutdown = nn_mount_shutdown_stage() != 0;
             return answer(decide(&q), MG_OP_REMOUNT_BIND, key, &q.point, reach);
         }
         // One decision shape for the verifier: a bind, and an old-API move
@@ -1232,7 +1272,7 @@ unsafe fn try_sb_mount_point(ctx: &LsmContext) -> i32 {
             // refused whatever it moves (but systemd-shutdown's switch to
             // /run/initramfs): the target's key for the record only
             q.op = MG_OP_MOVE_OLD;
-            q.shutdown = shutdown_stage();
+            q.shutdown = nn_mount_shutdown_stage() != 0;
             let key = key_of(o, peek_ptr(path.add(o.path_dentry as usize)));
             return answer(decide(&q), op, key, &q.point, reach);
         }
@@ -1429,8 +1469,8 @@ unsafe fn try_lock_propagation(path: *const u8, flags: u64) -> u64 {
         // switch_root(); the verdict without a `Query` or `decide` (whose
         // allow-list call put this chain past 5.15's and 6.8's 512 bytes of
         // stack: the lab's first verifier check of this lot, 576)
-        let exempt = (lock_step_at(flags, on_lock, guard) && lock_maker_now())
-            || (lock_shutdown_step(flags, on_lock) && shutdown_stage());
+        let exempt = (lock_step_at(flags, on_lock, guard) && nn_mount_lock_maker() != 0)
+            || (lock_shutdown_step(flags, on_lock) && nn_mount_shutdown_stage() != 0);
         let kind = match lock_verdict(
             c.privileged,
             guard != 0,
@@ -1531,7 +1571,7 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
             if held_flags(o, real) & HELD_REFUSE != 0 && flags_at(&key) & MG_HOLD != 0 {
                 let mut q = query(MG_OP_MOVE_MOUNT, &c, from_guard);
                 q.held = true;
-                q.shutdown = shutdown_stage();
+                q.shutdown = nn_mount_shutdown_stage() != 0;
                 return answer(
                     decide(&q),
                     MG_OP_MOVE_MOUNT,
@@ -1560,7 +1600,7 @@ unsafe fn try_move_mount(ctx: &LsmContext) -> i32 {
                 return answer_parts(
                     copy_move_verdict(
                         true,
-                        shutdown_stage(),
+                        nn_mount_shutdown_stage() != 0,
                         crate::inode_protect::override_active(),
                     ),
                     MG_OP_MOVE_MOUNT,
@@ -1629,15 +1669,17 @@ unsafe fn try_move_mount_point(ctx: &LsmContext) -> i32 {
         let parent = peek_ptr(real.add(o.mnt_parent as usize));
         let (guard, reach) = landed(o, real_mount(o, to_mnt));
         let mut q = query(MG_OP_MOVE_MOUNT, &c, guard);
+        // the detached mount's own file system: the kernel's, not a string;
+        // and its root its file system's (not a clone of a subdirectory) —
+        // read before the point's walk, once (lot 1.1: after it, the name's
+        // hash was verified again in each of the walk's states)
+        fstype_of(o, from_dentry, &mut q.fstype);
+        let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
+        q.src_root = !root.is_null() && peek_ptr(root.add(o.d_parent as usize)) == root;
         let mut key = InodeKey { dev: 0, ino: 0 };
         if !point_of(o, to, hook::MOVE_MOUNT, &mut q, &mut key) {
             return 0;
         }
-        // the detached mount's own file system: the kernel's, not a string;
-        // and its root its file system's (not a clone of a subdirectory)
-        fstype_of(o, from_dentry, &mut q.fstype);
-        let root = peek_ptr(from_mnt.add(o.mnt_root as usize));
-        q.src_root = !root.is_null() && peek_ptr(root.add(o.d_parent as usize)) == root;
         // Lot 359 (the re-check 3 of #567, N4): onto the pin directory — its
         // lock's self-bind by its maker (`common::mount_guard::lock_bind`: the
         // kernel's objects compared, never a path), or the mount on the agent's
@@ -1656,7 +1698,7 @@ unsafe fn try_move_mount_point(ctx: &LsmContext) -> i32 {
                 magic: q.point.magic,
                 guard,
             });
-            q.lock_maker = q.lock_step && lock_maker_now();
+            q.lock_maker = q.lock_step && nn_mount_lock_maker() != 0;
         }
         answer(decide(&q), MG_OP_MOVE_MOUNT, key, &q.point, reach)
     }
@@ -1775,7 +1817,7 @@ unsafe fn try_sb_umount(ctx: &LsmContext) -> i32 {
         // worker and PID 1 there are judged); the end of a shutdown is
         // `shutdown`.
         q.init = q.init && guard == GUARD_HOST && flags & MG_OWN == 0;
-        q.shutdown = shutdown_stage();
+        q.shutdown = nn_mount_shutdown_stage() != 0;
         answer(decide(&q), MG_OP_UMOUNT, key, &q.point, reach)
     }
 }
@@ -1810,7 +1852,7 @@ unsafe fn try_sb_pivotroot(ctx: &LsmContext) -> i32 {
             key_of(o, peek_ptr(new_root.add(o.path_dentry as usize)))
         };
         let mut q = query(MG_OP_PIVOT, &c, c.guard);
-        q.shutdown = shutdown_stage();
+        q.shutdown = nn_mount_shutdown_stage() != 0;
         answer(decide(&q), MG_OP_PIVOT, key, &q.point, reach_in(c.guard))
     }
 }
@@ -1879,7 +1921,7 @@ unsafe fn try_sb_remount(ctx: &LsmContext) -> i32 {
         }
         let mut q = query(MG_OP_REMOUNT, &c, c.guard);
         q.held = true;
-        q.shutdown = shutdown_stage();
+        q.shutdown = nn_mount_shutdown_stage() != 0;
         q.kernel = kernel_thread();
         // made read-only — or its new flags unread (the fentry not attached):
         // taken as such
