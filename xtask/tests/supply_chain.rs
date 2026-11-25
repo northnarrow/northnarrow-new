@@ -150,6 +150,77 @@ fn every_action_is_pinned_by_full_commit_sha() {
     );
 }
 
+/// The actions pinned at more than one `<sha> # <version>` across the
+/// workflows `(file, text)`, one line each, with where each pin is.
+fn pin_drift(texts: &[(String, String)]) -> Vec<String> {
+    let mut pins: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeMap<String, Vec<String>>,
+    > = std::collections::BTreeMap::new();
+    for (file, text) in texts {
+        for (n, line) in text.lines().enumerate() {
+            let Some((value, comment)) = uses_of(line) else {
+                continue;
+            };
+            if value.starts_with("./") || value.starts_with("docker://") {
+                continue;
+            }
+            let Some((name, sha)) = value.split_once('@') else {
+                continue;
+            };
+            pins.entry(name)
+                .or_default()
+                .entry(format!("{sha} {comment}"))
+                .or_default()
+                .push(format!("{file}:{}", n + 1));
+        }
+    }
+    pins.iter()
+        .filter(|(_, at)| at.len() > 1)
+        .map(|(name, at)| format!("{name}: {at:?}"))
+        .collect()
+}
+
+/// Lot M2: an action is pinned at one commit, with one version comment, in
+/// every workflow, so that no workflow stays on an older release when
+/// another moves. Dependabot moves every file's pin of an action in one
+/// pull request; a change by hand moves them all too.
+#[test]
+fn every_action_is_pinned_alike_in_every_workflow() {
+    let texts: Vec<(String, String)> = workflow_files().iter().map(|f| (rel(f), read(f))).collect();
+    let drift = pin_drift(&texts);
+    assert!(
+        drift.is_empty(),
+        "an action pinned at two commits or versions:\n{}",
+        drift.join("\n")
+    );
+
+    // planted: scorecard.yml's upload-sarif one release behind codeql.yml's,
+    // and the same commit under another version comment
+    let sarif = "github/codeql-action/upload-sarif@";
+    let (file, text) = texts
+        .iter()
+        .find(|(f, _)| f == SCORECARD_YML)
+        .expect("scorecard.yml");
+    let line = text
+        .lines()
+        .find(|l| uses_of(l).is_some_and(|(v, _)| v.starts_with(sarif)))
+        .expect("scorecard.yml uploads its SARIF");
+    let (value, comment) = uses_of(line).expect("a uses line");
+    let older = line.replace(&value[sarif.len()..], &"0".repeat(40));
+    let renamed = line.replace(comment, "# v0.0.1");
+    assert!(older != line && renamed != line, "{line}");
+    for planted in [older, renamed] {
+        let mut copy = texts.clone();
+        copy.push((format!("{file} (planted)"), planted));
+        let drift = pin_drift(&copy);
+        assert!(
+            drift.len() == 1 && drift[0].starts_with("github/codeql-action/upload-sarif: "),
+            "{drift:?}"
+        );
+    }
+}
+
 /// SUP-005, one install: its own words name `--version` and `--locked`.
 fn install_is_pinned_and_locked(args: &[String]) -> bool {
     let version = args.iter().enumerate().any(|(n, a)| {
@@ -524,84 +595,516 @@ fn str_of<'a>(v: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
-/// SUP-004: without a `permissions:` block the token gets the repository's
-/// default, which can be read/write. Every workflow starts read-only; a
-/// job asks for more only where it publishes: release.yml's `publish`
-/// writes the release, `sign` the attestations (SUP-024: never both), and
-/// codeql.yml's `upload` the code-scanning results (lot codeql), a job that
-/// runs nothing of the tree (review of #496).
-#[test]
-fn every_workflow_token_is_read_only_unless_it_publishes() {
-    const WRITE_ALLOWED: [(&str, &str, &str); 4] = [
-        (".github/workflows/release.yml", "publish", "contents"),
-        (".github/workflows/release.yml", "sign", "id-token"),
-        (".github/workflows/release.yml", "sign", "attestations"),
-        (".github/workflows/codeql.yml", "upload", "security-events"),
-    ];
-    // Review of #496: a job that may write code-scanning results runs
-    // nothing of the tree (with that token a build script or a proc-macro
-    // could upload a SARIF or close alerts): no `run:` step, only these.
-    const UPLOAD_ONLY: [&str; 3] = [
-        "actions/checkout@",
-        "actions/download-artifact@",
-        "github/codeql-action/upload-sarif@",
-    ];
+/// The write scopes a job may hold, by workflow and job (SUP-004).
+const WRITE_ALLOWED: [(&str, &str, &str); 6] = [
+    (".github/workflows/release.yml", "publish", "contents"),
+    (".github/workflows/release.yml", "sign", "id-token"),
+    (".github/workflows/release.yml", "sign", "attestations"),
+    (".github/workflows/codeql.yml", "upload", "security-events"),
+    // Lot M2, OpenSSF Scorecard: `analysis` uploads its SARIF to code
+    // scanning, and signs the result it publishes to api.scorecard.dev
+    // (the README's badge) with the job's OIDC token: the API checks that
+    // the token was issued to this workflow of this repository.
+    (
+        ".github/workflows/scorecard.yml",
+        "analysis",
+        "security-events",
+    ),
+    (".github/workflows/scorecard.yml", "analysis", "id-token"),
+];
+
+/// Review of #496: a job that may write code-scanning results runs nothing
+/// of the tree (with that token a build script or a proc-macro could upload
+/// a SARIF or close alerts): no `run:` step, only these actions.
+const UPLOAD_ONLY: [&str; 3] = [
+    "actions/checkout@",
+    "actions/download-artifact@",
+    "github/codeql-action/upload-sarif@",
+];
+
+/// Lot M2: scorecard.yml's `analysis` also runs the Scorecard scanner, a
+/// container action that reads the checked-out files and the GitHub API and
+/// runs nothing of the tree, and keeps its SARIF as a run artifact. The
+/// Scorecard API refuses a published result whose job runs anything else.
+const SCORECARD_JOB: (&str, &str) = (".github/workflows/scorecard.yml", "analysis");
+const SCORECARD_STEPS: [&str; 2] = ["ossf/scorecard-action@", "actions/upload-artifact@"];
+
+/// The token problems of workflow `name`, one line each: a top level that is
+/// not a read-only mapping, a job's write scope that WRITE_ALLOWED does not
+/// list for that job, and a step of a code-scanning writer that is a `run:`
+/// or an action the job may not run.
+fn token_problems(name: &str, wf: &serde_yaml_ng::Value) -> Vec<String> {
     let mut bad = Vec::new();
-    for file in workflow_files() {
-        let name = rel(&file);
-        let wf = workflow_yaml(&file);
-        match wf.get("permissions").and_then(|p| p.as_mapping()) {
-            None => bad.push(format!("{name}: no top-level `permissions:` mapping")),
-            Some(m) => {
-                for (scope, level) in m {
-                    let level = level.as_str().unwrap_or("?");
-                    if level != "read" && level != "none" {
+    match wf.get("permissions").and_then(|p| p.as_mapping()) {
+        None => bad.push(format!("{name}: no top-level `permissions:` mapping")),
+        Some(m) => {
+            for (scope, level) in m {
+                let level = level.as_str().unwrap_or("?");
+                if level != "read" && level != "none" {
+                    bad.push(format!(
+                        "{name}: top-level permission {}: {level}",
+                        scope.as_str().unwrap_or("?")
+                    ));
+                }
+            }
+        }
+    }
+    for (job, body) in jobs(wf) {
+        let Some(perms) = body.get("permissions") else {
+            continue;
+        };
+        let Some(m) = perms.as_mapping() else {
+            // `write-all` / `read-all`
+            bad.push(format!("{name}: job {job}: permissions {perms:?}"));
+            continue;
+        };
+        let scorecard = (name, job.as_str()) == SCORECARD_JOB;
+        for (scope, level) in m {
+            let scope = scope.as_str().unwrap_or("?");
+            if level.as_str() == Some("write")
+                && !WRITE_ALLOWED
+                    .iter()
+                    .any(|(f, j, s)| *f == name && *j == job && *s == scope)
+            {
+                bad.push(format!("{name}: job {job}: {scope}: write"));
+            }
+            if scope == "security-events" && level.as_str() == Some("write") {
+                for step in steps(&body) {
+                    let only = str_of(&step, "uses").is_some_and(|u| {
+                        UPLOAD_ONLY.iter().any(|p| u.starts_with(p))
+                            || (scorecard && SCORECARD_STEPS.iter().any(|p| u.starts_with(p)))
+                    });
+                    if step.get("run").is_some() || !only {
                         bad.push(format!(
-                            "{name}: top-level permission {}: {level}",
-                            scope.as_str().unwrap_or("?")
+                            "{name}: job {job} may write code-scanning results and runs {step:?}"
                         ));
                     }
                 }
             }
         }
-        for (job, body) in jobs(&wf) {
-            let Some(perms) = body.get("permissions") else {
-                continue;
-            };
-            let Some(m) = perms.as_mapping() else {
-                // `write-all` / `read-all`
-                bad.push(format!("{name}: job {job}: permissions {perms:?}"));
-                continue;
-            };
-            for (scope, level) in m {
-                let scope = scope.as_str().unwrap_or("?");
-                if level.as_str() == Some("write")
-                    && !WRITE_ALLOWED
-                        .iter()
-                        .any(|(f, j, s)| *f == name && *j == job && *s == scope)
-                {
-                    bad.push(format!("{name}: job {job}: {scope}: write"));
-                }
-                if scope == "security-events" && level.as_str() == Some("write") {
-                    for step in steps(&body) {
-                        let only = str_of(&step, "uses")
-                            .is_some_and(|u| UPLOAD_ONLY.iter().any(|p| u.starts_with(p)));
-                        if step.get("run").is_some() || !only {
-                            bad.push(format!(
-                                "{name}: job {job} may write code-scanning results and runs {step:?}"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+    }
+    bad
+}
+
+/// SUP-004: without a `permissions:` block the token gets the repository's
+/// default, which can be read/write. Every workflow starts read-only; a
+/// job asks for more only where it publishes: release.yml's `publish`
+/// writes the release, `sign` the attestations (SUP-024: never both),
+/// codeql.yml's `upload` the code-scanning results (lot codeql), a job that
+/// runs nothing of the tree (review of #496), and scorecard.yml's
+/// `analysis` the Scorecard result and its SARIF (lot M2).
+#[test]
+fn every_workflow_token_is_read_only_unless_it_publishes() {
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        bad.extend(token_problems(&rel(&file), &workflow_yaml(&file)));
     }
     assert!(
         bad.is_empty(),
-        "workflow tokens must be read-only (write only where release.yml publishes and \
-         codeql.yml uploads its results):\n{}",
+        "workflow tokens must be read-only (write only where release.yml publishes, \
+         codeql.yml uploads its results and scorecard.yml publishes its own):\n{}",
         bad.join("\n")
     );
+}
+
+/// Lot M2: the Scorecard job's two write scopes and its two extra actions
+/// are its own. The same job under another workflow's name, a second job
+/// of scorecard.yml, a `run:` step or another action in it, and the
+/// scanner in codeql.yml's `upload` are each refused.
+#[test]
+fn the_token_check_keeps_the_scorecard_grants_to_its_job() {
+    const SCORECARD: &str = ".github/workflows/scorecard.yml";
+    const CODEQL: &str = ".github/workflows/codeql.yml";
+    let root = repo_root();
+    let scorecard = workflow_yaml(&root.join(SCORECARD));
+    let codeql = workflow_yaml(&root.join(CODEQL));
+    assert_eq!(token_problems(SCORECARD, &scorecard), Vec::<String>::new());
+    assert_eq!(token_problems(CODEQL, &codeql), Vec::<String>::new());
+
+    let has = |problems: &[String], needle: &str| problems.iter().any(|p| p.contains(needle));
+    let job = |wf: &serde_yaml_ng::Value, name: &str| -> serde_yaml_ng::Value {
+        wf.get("jobs")
+            .and_then(|j| j.get(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("job {name}"))
+    };
+    let with_job = |wf: &serde_yaml_ng::Value, name: &str, body: serde_yaml_ng::Value| {
+        let mut wf = wf.clone();
+        wf.get_mut("jobs")
+            .and_then(|j| j.as_mapping_mut())
+            .expect("jobs is a mapping")
+            .insert(name.into(), body);
+        wf
+    };
+    let with_step = |wf: &serde_yaml_ng::Value, name: &str, step: &str| {
+        let mut body = job(wf, name);
+        body.get_mut("steps")
+            .and_then(|s| s.as_sequence_mut())
+            .expect("steps")
+            .push(serde_yaml_ng::from_str(step).expect("a step"));
+        with_job(wf, name, body)
+    };
+
+    // the same workflow under another file name
+    let p = token_problems(".github/workflows/ci.yml", &scorecard);
+    assert!(has(&p, "job analysis: id-token: write"), "{p:?}");
+    assert!(has(&p, "job analysis: security-events: write"), "{p:?}");
+    // a second job of scorecard.yml with the same permissions
+    let p = token_problems(
+        SCORECARD,
+        &with_job(&scorecard, "other", job(&scorecard, "analysis")),
+    );
+    assert!(has(&p, "job other: id-token: write"), "{p:?}");
+    assert!(has(&p, "job other: security-events: write"), "{p:?}");
+    assert!(!has(&p, "job analysis"), "{p:?}");
+    // a `run:` step, or another action, in the Scorecard job
+    let p = token_problems(
+        SCORECARD,
+        &with_step(&scorecard, "analysis", "run: cargo build"),
+    );
+    assert!(
+        has(&p, "job analysis may write code-scanning results"),
+        "{p:?}"
+    );
+    // an allowed action that also runs a command (GitHub refuses such a
+    // step, the check does not count on it)
+    let both =
+        "{ uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, run: cargo build }";
+    let p = token_problems(SCORECARD, &with_step(&scorecard, "analysis", both));
+    assert!(
+        has(&p, "job analysis may write code-scanning results"),
+        "{p:?}"
+    );
+    let other = "uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+    let p = token_problems(SCORECARD, &with_step(&scorecard, "analysis", other));
+    assert!(
+        has(&p, "job analysis may write code-scanning results"),
+        "{p:?}"
+    );
+    // the scanner and the artifact upload stay out of codeql.yml's upload
+    for extra in SCORECARD_STEPS {
+        let step = format!("uses: {extra}23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0");
+        let p = token_problems(CODEQL, &with_step(&codeql, "upload", &step));
+        assert!(
+            has(&p, "job upload may write code-scanning results"),
+            "{p:?}"
+        );
+    }
+    // the Scorecard job's own permissions as `write-all` or `read-all`
+    for all in ["write-all", "read-all"] {
+        let mut body = job(&scorecard, "analysis");
+        body.as_mapping_mut()
+            .expect("a mapping")
+            .insert("permissions".into(), all.into());
+        let p = token_problems(SCORECARD, &with_job(&scorecard, "analysis", body));
+        assert!(has(&p, "job analysis: permissions"), "{all}: {p:?}");
+    }
+    // a top level that grants anything is refused, `read-all` included
+    // (a string, not a mapping)
+    for top in ["read-all", "write-all", "{ id-token: write }"] {
+        let mut wf = scorecard.clone();
+        wf.as_mapping_mut()
+            .expect("a mapping")
+            .insert("permissions".into(), serde_yaml_ng::from_str(top).unwrap());
+        assert!(
+            !token_problems(SCORECARD, &wf).is_empty(),
+            "top level {top}"
+        );
+    }
+}
+
+const SCORECARD_YML: &str = ".github/workflows/scorecard.yml";
+
+/// The broken rules of a Scorecard workflow, one line each.
+fn scorecard_problems(wf: &serde_yaml_ng::Value) -> Vec<String> {
+    let mut bad = Vec::new();
+
+    const EVENTS: [&str; 4] = [
+        "push",
+        "schedule",
+        "branch_protection_rule",
+        "workflow_dispatch",
+    ];
+    let on = wf
+        .get("on")
+        .and_then(|o| o.as_mapping())
+        .cloned()
+        .unwrap_or_default();
+    let events: Vec<&str> = on.keys().filter_map(|k| k.as_str()).collect();
+    for e in EVENTS {
+        if !events.contains(&e) {
+            bad.push(format!("no `on: {e}`"));
+        }
+    }
+    for e in &events {
+        if !EVENTS.contains(e) {
+            bad.push(format!(
+                "`on: {e}`: Scorecard publishes from the default branch only"
+            ));
+        }
+    }
+    let branches: Vec<&str> = on
+        .get("push")
+        .and_then(|p| p.get("branches"))
+        .and_then(|b| b.as_sequence())
+        .map(|s| s.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if branches != ["main"] {
+        bad.push(format!("on.push.branches {branches:?}, not [main]"));
+    }
+    let crons = on
+        .get("schedule")
+        .and_then(|s| s.as_sequence())
+        .map(|s| s.iter().filter(|c| str_of(c, "cron").is_some()).count())
+        .unwrap_or(0);
+    if crons == 0 {
+        bad.push("no `on.schedule` cron (the Maintained check)".to_string());
+    }
+
+    for key in ["env", "defaults"] {
+        if wf.get(key).is_some() {
+            bad.push(format!("a top-level `{key}`"));
+        }
+    }
+    // the example's: no cache for the job that holds the OIDC token
+    if str_of(wf, "cache-mode") != Some("none") {
+        bad.push("no top-level `cache-mode: none`".to_string());
+    }
+    if !wf
+        .get("permissions")
+        .and_then(|p| p.as_mapping())
+        .is_some_and(|m| m.is_empty())
+    {
+        bad.push(format!(
+            "top-level permissions {:?}, not `{{}}`",
+            wf.get("permissions")
+        ));
+    }
+
+    let jobs = jobs(wf);
+    let names: Vec<&str> = jobs.iter().map(|(n, _)| n.as_str()).collect();
+    if names != ["analysis"] {
+        bad.push(format!("jobs {names:?}, not the one `analysis`"));
+    }
+    let Some((_, job)) = jobs.iter().find(|(n, _)| n == "analysis") else {
+        return bad;
+    };
+    let perms: Vec<(String, String)> = string_pairs(job.get("permissions"));
+    if perms != pairs(&[("security-events", "write"), ("id-token", "write")]) {
+        bad.push(format!("analysis: permissions {perms:?}"));
+    }
+    for key in ["env", "defaults", "container", "services", "strategy"] {
+        if job.get(key).is_some() {
+            bad.push(format!("analysis: has `{key}`"));
+        }
+    }
+    if str_of(job, "runs-on") != Some("ubuntu-latest") {
+        bad.push(format!("analysis: runs-on {:?}", job.get("runs-on")));
+    }
+    if !str_of(job, "if")
+        .is_some_and(|c| c.contains("github.event.repository.default_branch == github.ref_name"))
+    {
+        bad.push(format!("analysis: if {:?}", job.get("if")));
+    }
+
+    const STEPS: [&str; 4] = [
+        "actions/checkout@",
+        "ossf/scorecard-action@",
+        "actions/upload-artifact@",
+        "github/codeql-action/upload-sarif@",
+    ];
+    let steps = steps(job);
+    let uses: Vec<&str> = steps.iter().filter_map(|s| str_of(s, "uses")).collect();
+    let in_order =
+        uses.len() == STEPS.len() && uses.iter().zip(STEPS).all(|(u, p)| u.starts_with(p));
+    if steps.len() != STEPS.len() || !in_order {
+        bad.push(format!("analysis: steps {uses:?}, not {STEPS:?}"));
+    }
+    for step in &steps {
+        if step.get("run").is_some() || step.get("env").is_some() {
+            bad.push(format!("analysis: a step with `run`/`env`: {step:?}"));
+        }
+    }
+    let with_of = |prefix: &str| {
+        steps
+            .iter()
+            .find(|s| str_of(s, "uses").is_some_and(|u| u.starts_with(prefix)))
+            .and_then(|s| s.get("with"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let scan = with_of("ossf/scorecard-action@");
+    let yes = |v: &serde_yaml_ng::Value, key: &str| {
+        v.get(key)
+            .is_some_and(|x| x.as_bool() == Some(true) || x.as_str() == Some("true"))
+    };
+    for key in ["publish_results", "fail_on_publish_error"] {
+        if !yes(&scan, key) {
+            bad.push(format!("scorecard-action: `{key}: true` is missing"));
+        }
+    }
+    if str_of(&scan, "results_format") != Some("sarif") {
+        bad.push("scorecard-action: `results_format: sarif` is missing".to_string());
+    }
+    let results = str_of(&scan, "results_file").unwrap_or("?");
+    if str_of(&with_of("github/codeql-action/upload-sarif@"), "sarif_file") != Some(results) {
+        bad.push(format!("upload-sarif: `sarif_file` is not {results}"));
+    }
+    if str_of(&with_of("actions/upload-artifact@"), "path") != Some(results) {
+        bad.push(format!("upload-artifact: `path` is not {results}"));
+    }
+
+    bad
+}
+
+/// Lot M2: scorecard.yml publishes the OpenSSF Scorecard result behind the
+/// README's badge. The Scorecard API accepts a result only from a workflow
+/// that keeps its rules (scorecard-action's "Workflow restrictions": no
+/// top-level env, defaults or write; one job with the OIDC token, without
+/// env, defaults, container or services, on a hosted Ubuntu runner, whose
+/// steps are approved actions only), and the job's write scopes are for that
+/// publish alone. Its triggers, its one job and the job's steps stay as they
+/// are.
+#[test]
+fn scorecard_publishes_from_one_job_that_runs_only_its_scanner() {
+    let bad = scorecard_problems(&workflow_yaml(&repo_root().join(SCORECARD_YML)));
+    assert!(
+        bad.is_empty(),
+        "{SCORECARD_YML} breaks the rules of a published Scorecard result:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// Lot M2: each rule of `scorecard_problems`, broken in a copy of
+/// scorecard.yml, is reported.
+#[test]
+fn the_scorecard_check_refuses_each_broken_rule() {
+    let text = read(&repo_root().join(SCORECARD_YML));
+    let checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1";
+    let scanner = "ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0";
+    let swapped = text
+        .replace(checkout, "\u{0}")
+        .replace(scanner, checkout)
+        .replace('\u{0}', scanner);
+    let second_job = format!(
+        "{text}  other:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: {checkout}\n"
+    );
+    let planted: Vec<(String, &str)> = vec![
+        (swapped, "analysis: steps"),
+        (second_job, "jobs [\"analysis\", \"other\"]"),
+    ];
+    let edits: [(&str, &str, &str); 21] = [
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  pull_request_target:\n",
+            "`on: pull_request_target`",
+        ),
+        ("  workflow_dispatch:\n", "", "no `on: workflow_dispatch`"),
+        (
+            "    branches: [main]\n",
+            "    branches: [main, dev]\n",
+            "on.push.branches",
+        ),
+        ("    - cron: ", "    - crom: ", "no `on.schedule` cron"),
+        (
+            "permissions: {}\n",
+            "permissions: {}\nenv:\n  A: b\n",
+            "a top-level `env`",
+        ),
+        (
+            "permissions: {}\n",
+            "permissions: {}\ndefaults:\n  run:\n    shell: bash\n",
+            "a top-level `defaults`",
+        ),
+        (
+            "permissions: {}\n",
+            "permissions: read-all\n",
+            "top-level permissions",
+        ),
+        ("cache-mode: none\n", "", "`cache-mode: none`"),
+        (
+            "permissions: {}\n",
+            "permissions:\n  contents: read\n",
+            "top-level permissions",
+        ),
+        (
+            "    timeout-minutes: 15\n",
+            "    timeout-minutes: 15\n    env:\n      A: b\n",
+            "analysis: has `env`",
+        ),
+        (
+            "    timeout-minutes: 15\n",
+            "    timeout-minutes: 15\n    container: ubuntu:24.04\n",
+            "analysis: has `container`",
+        ),
+        (
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: self-hosted\n",
+            "analysis: runs-on",
+        ),
+        (
+            "    if: ${{ github.event.repository.default_branch == github.ref_name }}\n",
+            "",
+            "analysis: if",
+        ),
+        (
+            "      id-token: write",
+            "      contents: write\n      id-token: write",
+            "analysis: permissions",
+        ),
+        (
+            "          publish_results: true\n",
+            "          publish_results: false\n",
+            "`publish_results: true` is missing",
+        ),
+        (
+            "          fail_on_publish_error: true\n",
+            "",
+            "`fail_on_publish_error: true` is missing",
+        ),
+        (
+            "          results_format: sarif\n",
+            "          results_format: json\n",
+            "`results_format: sarif` is missing",
+        ),
+        (
+            "          sarif_file: results.sarif\n",
+            "          sarif_file: other.sarif\n",
+            "upload-sarif: `sarif_file`",
+        ),
+        (
+            "          path: results.sarif\n",
+            "          path: other.sarif\n",
+            "upload-artifact: `path`",
+        ),
+        (
+            "      - name: Run analysis\n",
+            "      - run: echo planted\n      - name: Run analysis\n",
+            "a step with `run`/`env`",
+        ),
+        (
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n        env:\n          A: b\n",
+            "a step with `run`/`env`",
+        ),
+    ];
+    let mut cases = planted;
+    for (from, to, want) in edits {
+        assert_eq!(
+            text.matches(from).count(),
+            1,
+            "`{from}` once in {SCORECARD_YML}"
+        );
+        cases.push((text.replace(from, to), want));
+    }
+    for (planted, want) in &cases {
+        let wf: serde_yaml_ng::Value = serde_yaml_ng::from_str(planted).expect("planted YAML");
+        let p = scorecard_problems(&wf);
+        assert!(
+            p.iter().any(|l| l.contains(want)),
+            "`{want}` not reported: {p:?}"
+        );
+    }
 }
 
 /// SUP-004: actions/checkout writes the token into .git/config unless told

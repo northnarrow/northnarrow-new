@@ -97,6 +97,13 @@ which builds and runs nothing of the tree, uploads the results.
 - Alongside it: the dependency audit (`cargo audit` on every pull request
   and daily), Dependabot, secret scanning with push protection, the fuzz
   smoke run and the Kani proofs.
+- OpenSSF Scorecard (`.github/workflows/scorecard.yml`, on every push to
+  `main` and weekly) scores the repository's own supply-chain practices
+  (pinned dependencies, token permissions, signed releases, branch
+  protection, code review, fuzzing, static analysis, dangerous workflow
+  patterns, known vulnerabilities and more), publicly at
+  <https://scorecard.dev/viewer/?uri=github.com/northnarrow/northnarrow-new>
+  (the README's badge) and as code-scanning alerts of the tool "Scorecard".
 
 ## Scope notes
 

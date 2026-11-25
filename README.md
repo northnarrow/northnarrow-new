@@ -9,6 +9,7 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/northnarrow/northnarrow-new/badge)](https://scorecard.dev/viewer/?uri=github.com/northnarrow/northnarrow-new)
 [![Release](https://img.shields.io/github/v/release/northnarrow/northnarrow-new?include_prereleases&label=release&color=1e3a5f)](https://github.com/northnarrow/northnarrow-new/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-27ae60)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
