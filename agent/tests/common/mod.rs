@@ -295,7 +295,7 @@ fn nft_leftovers(family: &str, chain: &str) -> Result<Vec<String>, String> {
 
 /// `pid` plus every process below it (`pgrep -P`, breadth first), the
 /// root first. Best effort: a pid that exits mid-walk is simply skipped.
-fn process_tree(pid: u32) -> Vec<u32> {
+pub fn process_tree(pid: u32) -> Vec<u32> {
     let mut todo = vec![pid];
     let mut seen = Vec::new();
     while let Some(p) = todo.pop() {

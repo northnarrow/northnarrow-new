@@ -284,6 +284,44 @@ named in the entry's `unreported`. Each process is known by its pid and its
 start: a reused pid neither hides another process from the stop nor takes
 its entry out of the map.
 
+**The stop does not wait on the controller's work** (lot M4, #633). The
+controller reached its own stop only between two of its passes, and the
+agent's stop waited a fixed 2 s for it. On an rpm host each report the
+controller reads asks `rpm -qf` (the package trust, below), so a pass that
+handles a ring's worth of reports took seconds; the stop's deadline (2 s in
+all, `TimeoutStopSec` less the kernel's release) ended the agent first, and
+about a thousand processes of a burst stayed in state T on AlmaLinux 9.
+Now:
+
+- a pass handles reports for 100 ms at most, and none once the agent stops:
+  the rest wait in memory, the ring is read again only once they are
+  handled, and the stop releases those left as processes held without an
+  entry;
+- the agent's stop waits for the controller's own stop within what its
+  deadline leaves (1 s at most), then **sweeps** the kernel's map from the
+  stopping thread: the heartbeat cleared for good (a beat the controller
+  writes later is refused: the two share the map's handle and its latch),
+  the programs waited for, and every process the map names resumed — its
+  kill carried out when the map says one is owed (a signed intent, then
+  the outcome), one that cannot be captured left in the pinned map for the
+  next start. Each sweep that does anything is a signed `stopping` entry
+  with `"by": "sweep: the controller did not stop in time"` (or `"sweep
+  after the controller's stop"`), the controller's own being `"by":
+  "controller"`;
+- the stop's deadline sweeps the map too before it ends the process,
+  whichever stage blocks: there it resumes and kills nothing (a kill owed
+  stays in the pinned map for the next start), and signs nothing (the
+  audit log may be held by the stage that blocks);
+- a kill verdict known is owed in the map from the moment it is known (the
+  review of #635): in enforce mode a scan whose verdict the policy kills (a
+  block-list hit, a suspicious verdict under
+  `--exec-quarantine-on-suspicious kill`) marks the held process's kill
+  owed at once, while the rules' verdict on its exec is still awaited. The
+  sweep then kills it (signed), the deadline's exit leaves it stopped, and
+  the next start after a crash kills it: a stop the controller misses never
+  resumes a binary whose kill it knew. What has no kill verdict is resumed,
+  undecided, as before (fail-open).
+
 **A process that cannot be captured is not one that ended** (lot 317,
 BUG-124). The agent captures a held process by a pidfd (`ProcRef`); that
 capture can fail on the agent's side (`pidfd_open` out of descriptors or
@@ -458,7 +496,8 @@ counted in its ring-drop slot `execq`, signed `ringbuf_drop`); a stale
 heartbeat (a dead controller) leaves nothing to report it but the counter;
 `exec_quarantine` for `recovered_at_boot` (with `deferred`: the processes
 not captured yet, and `killed`: the kills a previous agent owed, lot 317),
-`stopping` (with `unreported`, `recaptured`, `killed` and `left`, lot 317)
+`stopping` (with `unreported`, `recaptured`, `killed` and `left`, lot 317;
+`by`, and for the stop's sweep `kills_left` and `gone`, lot M4)
 and `deferred` (a decision carried out once its process was captured, lot
 317).
 

@@ -19,7 +19,9 @@
 //!    signal the exec quarantine sends itself, the soft egress block's
 //!    release, the copy-on-write guard's automatic restore) are called only
 //!    from the files listed, each from a function that makes its ticket
-//!    first (`.intent(`) and answers it (`.finish(`).
+//!    first (`.intent(`) and answers it (`.finish(`) — unconditionally
+//!    (the review of #635, P3-1): no optional journal, no ticket made in a
+//!    closure or a branch the action is not in, no caller passing `None`.
 //! 4. **Every function that makes a ticket answers it**: in production code
 //!    each function holding `.intent(`/`.intents(` holds `finish` too (or
 //!    hands the tickets to a function that does, listed).
@@ -114,8 +116,9 @@ const UNTICKETED: &[(&str, Sites)] = &[
             // inside `kill_one`, reached only through the ticketed kills
             ("crates/nn-linux/src/response/kill.rs", None),
             // lot 317: the decision's and the owed kill's one helper (its
-            // ticket made and answered there, as in `carry_out` before)
-            ("agent/src/execq/controller.rs", Some("fn kill(")),
+            // ticket made and answered there, as in `carry_out` before);
+            // lot M4 (#633): shared by the controller and the stop's sweep
+            ("agent/src/execq/release.rs", Some("fn kill_with_intent(")),
         ],
     ),
     (
@@ -308,19 +311,96 @@ fn untick_actions(files: &[(String, String)]) -> Vec<String> {
                     Some((_, None)) => {}
                     Some((_, Some(head))) => {
                         let f = enclosing(text, at);
+                        let call_at = at - (f.as_ptr() as usize - text.as_ptr() as usize);
                         if !f.starts_with(head) {
                             out.push(format!("{rel}: `{call}` outside `{head}`"));
                         } else if !(f.contains(".intent(") && f.contains(".finish(")) {
                             out.push(format!(
                                 "{rel}: `{call}` in `{head}` without its ticket made and answered"
                             ));
+                        } else if let Some(why) = conditional_ticket(f, call_at) {
+                            out.push(format!(
+                                "{rel}: `{call}` in `{head}` with a ticket made conditionally: {why}"
+                            ));
                         }
+                    }
+                }
+            }
+        }
+        // a caller that passes no journal to a helper that makes the
+        // ticket (the review of #635: `kill_with_intent(None, ..)`)
+        for (_, head) in allowed.iter().filter_map(|(f, h)| h.map(|h| (f, h))) {
+            let name = head.trim_start_matches("fn ");
+            for (rel, text) in files {
+                for (at, _) in text.match_indices(name) {
+                    let args = text[at + name.len()..].trim_start();
+                    if args.starts_with("None") && !in_test_fn(text, at) {
+                        out.push(format!("{rel}: `{name}` called without a journal (`None`)"));
                     }
                 }
             }
         }
     }
     out
+}
+
+/// The review of #635 (P3-1): why the ticket of the function `f` (its text
+/// from its head), whose action is at byte `call_at`, is not made
+/// unconditionally before the action — `None` when it is. A journal that
+/// is an `Option` (a caller passes `None`, the action runs without its
+/// intent row), a ticket made through `.map(..)`/`.and_then(..)` or in a
+/// closure, or one made in a block deeper than the action's (a branch the
+/// action does not need).
+fn conditional_ticket(f: &str, call_at: usize) -> Option<String> {
+    let open = f.find('{').unwrap_or(f.len());
+    let optional = f.match_indices("Option<").any(|(i, _)| {
+        let rest = &f[i + "Option<".len()..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        rest[..end].contains("Journal")
+    });
+    if optional {
+        return Some("an optional journal (`Option<..Journal>`)".into());
+    }
+    let action = depth_at(f, call_at);
+    let mut made_before = false;
+    for (at, _) in f.match_indices(".intent(") {
+        if at < open {
+            continue;
+        }
+        let from = f[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+        let stmt = &f[from..at];
+        if stmt.contains(".map(") || stmt.contains(".and_then(") || stmt.contains('|') {
+            return Some(format!("made in a closure or a map: `{}`", stmt.trim()));
+        }
+        if at < call_at && depth_at(f, at) <= action {
+            made_before = true;
+        }
+    }
+    (!made_before).then(|| "not made before the action, at its depth or shallower".into())
+}
+
+/// The depth of byte `at` of `f` in braces (string and char literals
+/// skipped).
+fn depth_at(f: &str, at: usize) -> usize {
+    let b = f.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < at.min(b.len()) {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' if b.get(i + 2) == Some(&b'\'') => i += 2,
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
 }
 
 #[test]
@@ -430,14 +510,62 @@ fn the_rules_fail_on_planted_violations() {
     let mut files = acting_code();
     let execq = files
         .iter_mut()
-        .find(|(r, _)| r == "agent/src/execq/controller.rs")
+        .find(|(r, _)| r == "agent/src/execq/release.rs")
         .unwrap();
     execq
         .1
         .push_str("\nfn sneak(p: &ProcRef) { let _ = p.signal(libc::SIGKILL); }\n");
     let v = untick_actions(&files);
     assert!(
-        v.len() == 1 && v[0].contains("outside `fn kill(`"),
+        v.len() == 1 && v[0].contains("outside `fn kill_with_intent(`"),
+        "{v:#?}"
+    );
+    // 3, the review of #635 (P3-1): the kill's ticket made conditionally —
+    // an optional journal (a caller passing `None`), a ticket in a map, a
+    // ticket in a branch the kill is not in — each fails
+    let plant = |from: &str, to: &str| {
+        let mut files = acting_code();
+        let release = files
+            .iter_mut()
+            .find(|(r, _)| r == "agent/src/execq/release.rs")
+            .unwrap();
+        assert!(release.1.contains(from), "the plant's anchor: `{from}`");
+        release.1 = release.1.replacen(from, to, 1);
+        untick_actions(&files)
+    };
+    let v = plant(
+        "journal: &ActionJournal,\n    pr: &ProcRef,",
+        "journal: Option<&ActionJournal>,\n    pr: &ProcRef,",
+    );
+    assert!(
+        v.len() == 1 && v[0].contains("an optional journal"),
+        "{v:#?}"
+    );
+    let v = plant(
+        "let intent = journal.intent(",
+        "let intent = Some(journal).map(|j| j.intent(",
+    );
+    assert!(
+        v.len() == 1 && v[0].contains("in a closure or a map"),
+        "{v:#?}"
+    );
+    let v = plant(
+        "let intent = journal.intent(intent_named(\"KillProcess\", pid, path));",
+        "if held { let _t = journal.intent(intent_named(\"KillProcess\", pid, path)); }",
+    );
+    assert!(
+        v.len() == 1 && v[0].contains("not made before the action"),
+        "{v:#?}"
+    );
+    // and a caller that passes no journal (the reviewer's plant)
+    let mut files = acting_code();
+    files.push((
+        format!("agent/src/{}.rs", "no_journal"),
+        "fn h(p: &ProcRef) { let _ = kill_with_intent(None, p, 1, \"x\", true); }".to_string(),
+    ));
+    let v = untick_actions(&files);
+    assert!(
+        v.len() == 1 && v[0].contains("no_journal.rs") && v[0].contains("without a journal"),
         "{v:#?}"
     );
     // 4: a ticket made and dropped
