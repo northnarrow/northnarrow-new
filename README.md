@@ -48,6 +48,35 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 
 ---
 
+## What's new since the alpha
+
+Merged after `v0.1.0-alpha` (23 November 2026):
+
+- Rust edition 2024 and toolchain 1.100 ([#607](https://github.com/northnarrow/northnarrow-new/pull/607), [#609](https://github.com/northnarrow/northnarrow-new/pull/609)).
+- aya 0.16 in user space, and aya-ebpf 0.3 with LLVM 22 for the kernel programs, which come out up to 13% smaller ([#614](https://github.com/northnarrow/northnarrow-new/pull/614), [#618](https://github.com/northnarrow/northnarrow-new/pull/618)).
+- 0 open Dependabot alerts: moving to `rustls-rustcrypto` removed the Marvin RSA advisory and an old `rustls-webpki` ([#610](https://github.com/northnarrow/northnarrow-new/pull/610), [#612](https://github.com/northnarrow/northnarrow-new/pull/612), [#626](https://github.com/northnarrow/northnarrow-new/pull/626)); `chrono` replaced by `jiff` ([#615](https://github.com/northnarrow/northnarrow-new/pull/615)).
+- The mount guard uses 51% of the verifier budget on 5.15 (it was 92%) and now refuses the move of a peer copy ([#617](https://github.com/northnarrow/northnarrow-new/pull/617)).
+- The exec and open sensors see every CPU on 7.0, where the syscall tracepoints fired only on CPU 0 ([#625](https://github.com/northnarrow/northnarrow-new/pull/625)).
+- The DNS sensor is 27 to 54% cheaper per event ([#629](https://github.com/northnarrow/northnarrow-new/pull/629)).
+- The code ratchets read the syntax tree, not the text, so a renamed or reformatted variant no longer slips past them ([#628](https://github.com/northnarrow/northnarrow-new/pull/628)).
+- OpenSSF Scorecard 8.2, now run on every change ([#627](https://github.com/northnarrow/northnarrow-new/pull/627)); supply-chain checks tightened ([#616](https://github.com/northnarrow/northnarrow-new/pull/616)).
+
+What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+
+---
+
+<!-- working-on:start -->
+## Working on now
+
+Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+
+- [S1 Foundations](ROADMAP.md#s1): AlmaLinux 9 and the `.rpm` package tested in the lab, the lab using the exact eBPF object the CI built, then a stage-wide lab round and the docs.
+- Maintenance: the OpenSSF Scorecard findings (known-vulnerable dependencies, binary fuzz seeds).
+- Next, [S2 Self-protection after the alpha](ROADMAP.md#s2): the installer window limited to the process tree that asked, and upgrades with no protection gap.
+<!-- working-on:end -->
+
+---
+
 ## What it does today, and what it does not
 
 **Today, on each Linux host it runs on, NorthNarrow:**
@@ -480,6 +509,8 @@ lab PR, with what moved, what the lab measured and what is still open. The histo
 earlier stages is in [`ROADMAP.md`](ROADMAP.md), the goals are in [`VISION.md`](VISION.md), and
 the long-term technical vision is in [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are
 published: milestones ship in order.
+
+**After the alpha: 22 stages, S1 to S22**, in [`ROADMAP.md`](ROADMAP.md#roadmap-after-v010-alpha), each with a goal, what you will see and its status. S1 (foundations: verifier margin on every kernel, a modern toolchain, sensors on every CPU) is in progress, 8 of its 11 changes on `main`. S2 to S9 follow: self-protection after the alpha, seeing failed attempts, kernel helpers, keyed decoys, fewer false positives, bounded responses, evidence off the host, quarantine scanning. S10 to S14 (a cold kernel surface, envelopes for exposed services, code origin, native switches, shared indicators) are built in "would have denied" mode and need a maintainer decision on enforcement for their last step. S15 to S22 are the Phase 4 work below.
 
 **Done: the foundations.** eBPF sensors, the rule engine, the response engine, the adaptive
 posture, anti-tamper, the signed COMBAT release, FIM, deception, network observability and

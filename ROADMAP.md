@@ -21,6 +21,57 @@ honeypots, micro-segmentation), see VISION_TECHNICAL.md.
 That is the north star. This is the working plan.
 
 
+---
+
+## Roadmap after v0.1.0-alpha
+
+This is the plan for the stages that follow the first alpha, in the order they ship. It
+states goals and what a user can see when a stage lands. No dates are promised: a stage
+ships when its checks pass. The detailed per-change record stays in
+[`docs/roadmap/CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md).
+
+Status: ✅ done · 🔄 in progress · ⏭️ next · 🔒 the last step needs a maintainer decision on
+enforcement (everything before that step is built and runs in "would have denied" mode).
+
+| Stage | Goal | What you will see | Status |
+|---|---|---|---|
+| <a id="s1"></a>**S1 Foundations** | Margin on every supported kernel, a modern toolchain, current dependencies | Sensors on every CPU on 7.0; the mount guard at about half of the verifier budget on 5.15; lighter sensors; AST-based ratchets; a cleaner supply chain. 8 of 11 changes are on `main`, one is in progress (RPM packages and an RHEL-family guest in the nightly run), two are next (kernel census; documentation hygiene) | 🔄 |
+| <a id="s2"></a>**S2 Self-protection after the alpha** | A trusted-installer window that holds only for the process tree that opened it; upgrades with no gap | An upgrade never leaves the host without its kernel protections; the residual items accepted for the alpha are closed | ⏭️ |
+| **S3 Seeing failed attempts** | Every failed exploit attempt becomes signed evidence, attributed to the service and the peer | A record of first uses, process fork/exit/credential events, an "exposed" mark on network-facing services | ⏭️ |
+| **S4 Kernel helpers** | The kernel's own helper paths are protected and checked | Core-dump, module-loader and binary-format helpers cannot be repointed; boot-chain files are watched | ⏭️ |
+| **S5 Keyed decoys** | Decoys derived from a per-host key, tripping when used | Decoys that cannot be recognised by a copy of the source; canaries no longer kill by default | ⏭️ |
+| **S6 False positives and detection** | Fewer false alarms, behaviour-based detection of reverse shells | Cleaner records on a benign host; unknown lineages treated as unknown | ⏭️ |
+| **S7 Response and recovery** | Bounded, reversible responses | Limited restarts, freeze and slow-down of a peer; `isolate --ttl`; removal of persistence the attacker left | ⏭️ |
+| **S8 Evidence off the host** | Records that survive a compromised host | Forward-secure signing, a protected key in memory, more honest `nn-admin` verification, export with confirmation | ⏭️ |
+| **S9 Quarantine scanning** | A confined scanner with signed rules | Static triage of a quarantined file with signed YARA rules | ⏭️ |
+| **S10 Cold surface** | Rare kernel interfaces stay closed to programs that never used them | First "would have denied", then enforcement | 🔒 |
+| **S11 Envelopes** | After its first accept, an exposed service can only narrow what it may do | Per-service limits that tighten and never widen | 🔒 |
+| **S12 Origin of code** | No new executable bytes in services that do not need them | The exec policy keeps holding while the agent is stopped | 🔒 |
+| **S13 Native switches** | The agent proposes systemd hardening per unit | Reviewable drop-ins, applied on request with a canary and a rollback | 🔒 |
+| **S14 Shared indicators** | A hit on one host slows the same peer on the owner's other hosts | Cross-host reaction without a central server | 🔒 |
+| **S15 Anti-rootkit and modules** | Catch a rootkit by what it must do | Kernel versus `/proc` cross-view; module intent check; memory integrity of sshd and sudo | ⏭️ |
+| **S16 Backend and fleet** | Evidence in a server the operator runs | mTLS gateway, multi-host correlation, an independent offline verifier | ⏭️ |
+| **S17 Containers and Kubernetes** | Container and pod context in every record | Per-container policy, a DaemonSet | ⏭️ |
+| **S18 Declarative rules and content** | Rules and content outside the binary | Signed Sigma-compatible rules, signed update channels, a per-rule switch | ⏭️ |
+| **S19 Platforms** | More distributions, then ARM64, then Windows and macOS | Packages for more Linux families first | ⏭️ |
+| **S20 Identity, cloud and network** | Login, cloud-metadata and protocol events | PAM/sshd/sudo events; DNS over TCP, TLS and HTTPS | ⏭️ |
+| **S21 Anchor and attestation** | Proof from outside the host, even against root | A small anchor outside the guest; TPM attestation | ⏭️ |
+| **S22 Detonation lab and memory** | Sovereign analysis of suspect samples | A throwaway analysis VM, never on the protected host | ⏭️ |
+
+The stages S1 to S9 need no
+maintainer decision. S10 to S14 are built in "would have denied" mode first; only their
+final activation step waits for a maintainer decision on enforcement. S15 to S22 are
+planned in detail when they start, because the code will have moved by then.
+
+---
+
+## Earlier roadmap (historical)
+
+Everything below this line is the plan as it was written before and during the alpha. It is
+kept as history. Where it disagrees with the section above or with
+`docs/roadmap/CAPABILITY_PROGRAM.md`, those are current.
+
+
 ## Progress (updated on 16 October 2026)
 
 | Tappa | State | Reference |
