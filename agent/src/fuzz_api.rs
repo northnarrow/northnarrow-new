@@ -49,6 +49,50 @@ pub const ELF_AUDIT_READ_BOUND: usize = {
     if table > chunk { table } else { chunk }
 };
 
+/// The first line of a committed fuzz input in text form ([`text_seed`]).
+#[doc(hidden)]
+pub const TEXT_SEED_HEADER: &str = "# nn-fuzz-seed hex";
+
+/// The bytes a committed fuzz input in text form spells, or `None` when
+/// `data` is not one (lot M3: OpenSSF Scorecard's Binary-Artifacts counts
+/// a committed ELF file, as the `elf_audit` seeds were). The form: the
+/// first line [`TEXT_SEED_HEADER`], then hex digit pairs, whitespace
+/// between pairs, `#` to the end of a line a comment. Anything else (a
+/// lone digit, a pair split by a space, a byte that is not a hex digit)
+/// is not one. The target decodes what libFuzzer gives it, so a seed
+/// replayed from `fuzz/seeds/` reaches it as the bytes it was before.
+#[doc(hidden)]
+pub fn text_seed(data: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(data).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != TEXT_SEED_HEADER {
+        return None;
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let digits = line.split_once('#').map_or(line, |(d, _)| d);
+        for pairs in digits.split_ascii_whitespace() {
+            if pairs.len() % 2 != 0 || !pairs.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            for i in (0..pairs.len()).step_by(2) {
+                out.push(u8::from_str_radix(&pairs[i..i + 2], 16).ok()?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// What a target with seeds in text form checks: `data` as it is, and when
+/// it is a text seed ([`text_seed`]), the bytes it spells too.
+#[doc(hidden)]
+pub fn raw_and_decoded(data: &[u8], mut check: impl FnMut(&[u8])) {
+    check(data);
+    if let Some(bytes) = text_seed(data) {
+        check(&bytes);
+    }
+}
+
 /// Chain-log terminator line parser (JSON line → entry hash).
 #[doc(hidden)]
 pub fn chainlog_terminator_entry_hash(line: &str) -> Option<String> {
@@ -208,17 +252,23 @@ mod tests {
         Path::new(env!("NN_REPO_ROOT")).join("fuzz")
     }
 
-    /// Every file of `fuzz/<kind>/<target>/`, sorted.
+    /// Every file of `fuzz/<kind>/<target>/`, sorted: its bytes, or for a
+    /// `.hex` file the bytes it spells ([`text_seed`], what the target
+    /// decodes; one that spells none fails the test).
     fn inputs(kind: &str, target: &str) -> Vec<(String, Vec<u8>)> {
         let dir = fuzz_dir().join(kind).join(target);
         let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
             .map(|e| {
                 let p = e.unwrap().path();
-                (
-                    p.file_name().unwrap().to_string_lossy().into_owned(),
-                    std::fs::read(&p).unwrap(),
-                )
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                let raw = std::fs::read(&p).unwrap();
+                let bytes = if name.ends_with(".hex") {
+                    text_seed(&raw).unwrap_or_else(|| panic!("{}: not a text seed", p.display()))
+                } else {
+                    raw
+                };
+                (name, bytes)
             })
             .collect();
         out.sort();
@@ -845,11 +895,21 @@ mod tests {
                 "{name}"
             );
         }
+        // elf_audit: both answers, each from an ELF the reader reads whole
+        let mut answers = Vec::new();
         for (name, bytes) in inputs("seeds", "elf_audit") {
             let (found, most) = elf_audit_read(&bytes);
             assert!(found.is_some(), "{name}");
             assert!(most <= ELF_AUDIT_READ_BOUND, "{name}");
+            answers.push((name, found));
         }
+        assert_eq!(
+            answers,
+            [
+                ("names-auditor.elf.hex".to_string(), Some(true)),
+                ("names-none.elf.hex".to_string(), Some(false)),
+            ]
+        );
         for (name, bytes) in inputs("seeds", "role_list") {
             assert!(
                 crate::anti_tamper::admin_auth::parse_role_list(text(&bytes)).is_ok(),
@@ -862,5 +922,85 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Lot M3 (OpenSSF Scorecard, Binary-Artifacts): the `elf_audit` seeds
+    /// are text now, and spell byte for byte the two ELF files committed
+    /// before (`names-auditor.elf`, `names-none.elf`, lot 370 fix round 3:
+    /// the sha256 of each, as committed).
+    #[test]
+    fn the_text_seeds_spell_the_elf_seeds_they_replace() {
+        use sha2::{Digest, Sha256};
+        let got: Vec<(String, usize, String)> = inputs("seeds", "elf_audit")
+            .into_iter()
+            .map(|(name, bytes)| (name, bytes.len(), hex::encode(Sha256::digest(&bytes))))
+            .collect();
+        let want = [
+            (
+                "names-auditor.elf.hex",
+                1280,
+                "d624b49429b127bee4e5bc63608ea9a71600d46c332f39dd19ab949871265d53",
+            ),
+            (
+                "names-none.elf.hex",
+                1280,
+                "78a3cb5920c2f0db6990cb682a76fb2545708ccc7ea8a7d2f00c453b3128058f",
+            ),
+        ]
+        .map(|(n, l, h)| (n.to_string(), l, h.to_string()));
+        assert_eq!(got, want);
+    }
+
+    /// What [`text_seed`] reads, and what it refuses: a file without the
+    /// header is an input as it is (the target reads it raw, as any other).
+    #[test]
+    fn a_text_seed_is_hex_pairs_under_its_header() {
+        let seed = |s: &str| text_seed(s.as_bytes());
+        assert_eq!(
+            seed("# nn-fuzz-seed hex\n7f454c46 0201  # e_ident\r\n# a comment\n\nFFfe\n"),
+            Some(vec![0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0xff, 0xfe])
+        );
+        assert_eq!(seed("# nn-fuzz-seed hex\n"), Some(vec![]));
+        assert_eq!(seed("# nn-fuzz-seed hex"), Some(vec![]));
+        for not_one in [
+            "",
+            "7f454c46\n",
+            "# nn-fuzz-seed hex \n00\n",
+            " # nn-fuzz-seed hex\n00\n",
+            "# nn-fuzz-seed base64\n00\n",
+            "\n# nn-fuzz-seed hex\n00\n",
+            "# nn-fuzz-seed hex\n0\n",
+            "# nn-fuzz-seed hex\n000\n",
+            "# nn-fuzz-seed hex\n0 0\n",
+            "# nn-fuzz-seed hex\n0g\n",
+            "# nn-fuzz-seed hex\n0x7f\n",
+            "# nn-fuzz-seed hex\n+7f\n",
+            "# nn-fuzz-seed hex\n+7\n",
+            "# nn-fuzz-seed hex\n\u{20ac}0\n",
+            "# nn-fuzz-seed hex\n7f,45\n",
+            "# nn-fuzz-seed hex\n\u{e9}\u{e9}\n",
+        ] {
+            assert_eq!(seed(not_one), None, "{not_one:?}");
+        }
+        assert_eq!(text_seed(b"# nn-fuzz-seed hex\n\xff\xfe\n"), None);
+        assert_eq!(text_seed(b"\x7fELF\x02\x01\x01\0"), None);
+    }
+
+    /// A target reads a text seed twice, as it is and decoded; any other
+    /// input once.
+    #[test]
+    fn a_target_reads_a_text_seed_as_given_and_decoded() {
+        let seen = |data: &[u8]| {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            raw_and_decoded(data, |b| out.push(b.to_vec()));
+            out
+        };
+        let text = b"# nn-fuzz-seed hex\n7f45 4c46\n";
+        assert_eq!(seen(text), [text.to_vec(), b"\x7fELF".to_vec()]);
+        assert_eq!(seen(b"\x7fELF"), [b"\x7fELF".to_vec()]);
+        assert_eq!(
+            seen(b"# nn-fuzz-seed hex\n7\n"),
+            [b"# nn-fuzz-seed hex\n7\n".to_vec()]
+        );
     }
 }

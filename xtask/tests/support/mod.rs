@@ -9,6 +9,8 @@
 
 /// Lot 1.7a: the sources read as Rust (the AST ratchets' reader).
 pub mod ast;
+/// Lot M3: the committed YAML read as a tree (serde-saphyr, safe Rust).
+pub mod yaml;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
