@@ -45,6 +45,16 @@ at exit — WDG-R09).
 - `fuzz/seeds/<target>/` — valid inputs, at least one per target, made to
   reach what the target asserts (a CIDR that validates, a template per
   family, a marker the fixture admins signed, a manifest that verifies).
+  An executable or object file goes in text form (lot M3: OpenSSF
+  Scorecard's Binary-Artifacts counts a committed one): a `.hex` file whose
+  first line is `# nn-fuzz-seed hex`, then hex digit pairs (`#` to the end
+  of a line a comment), which the target reads both as it is and decoded
+  (`fuzz_api::raw_and_decoded`, through `fuzz_api::text_seed`). The
+  `elf_audit` seeds are two ELF files in that form
+  (`names-auditor.elf.hex`, `names-none.elf.hex`); `fuzz_api::tests`
+  checks that they spell the files they replace (their sha256), and
+  `xtask/tests/supply_chain.rs` that no tracked file is an executable and
+  that a target with a text input decodes it.
 - `fuzz/regressions/<target>/` — inputs of fixed bugs, each named by its
   finding; with the fix reverted, the target fails on it:
   `install_manifest` (WDG-R05: a relative alias of the agent, `/dev/zero`,

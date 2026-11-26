@@ -34,9 +34,13 @@ jiff = { version = "1", default-features = false, features = ["std"] }
 # the clock come from the dependencies above (the lab records' fixtures,
 # the dates of the advisory exceptions, the clock of security.txt's and
 # of the install stamps' checks).
-# serde_yaml (dtolnay) was archived 2024-11; serde_yaml_ng is the
-# actively-maintained drop-in fork (owner ruling, 2026-05-17).
-serde_yaml_ng = "0.10"
+# Lot M3 (OpenSSF Scorecard, Vulnerabilities): serde-saphyr, a YAML parser
+# in safe Rust, read through `tests/support/yaml.rs`. serde_yaml_ng 0.10
+# (owner ruling, 2026-05-17) read it before, through unsafe-libyaml 0.2.11
+# (unsafe Rust machine-translated from libyaml's C, archived upstream:
+# RUSTSEC-2024-0449). Without its default features: no comments kept, and
+# what `deserialize` and `serialize` need, nothing more.
+serde-saphyr = { version = "2.2", default-features = false, features = ["deserialize", "serialize"] }
 # Lot 1.6: the RFC 3339 times the tests read (security.txt's `Expires`, the
 # install stamps) with the product's own reader, `nn_evidence::time`
 # (chrono's grammar, which they used before).

@@ -580,14 +580,14 @@ fn the_stack_estimate_adds_rounded_frames_along_the_calls() {
 /// test ran and passed (libtest passes a filter that matches nothing).
 #[test]
 fn the_ebpf_job_runs_the_stack_gate_on_its_object() {
-    let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+    let ci: support::yaml::Value = support::yaml::from_str(
         &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
     )
     .unwrap();
     let steps = ci["jobs"]["ebpf-build"]["steps"]
         .as_sequence()
         .expect("ci.yml has the ebpf-build job's steps");
-    let name = |s: &serde_yaml_ng::Value| s["name"].as_str().unwrap_or_default().to_string();
+    let name = |s: &support::yaml::Value| s["name"].as_str().unwrap_or_default().to_string();
     let built = steps
         .iter()
         .position(|s| name(s) == "cargo xtask build-ebpf")
