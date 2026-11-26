@@ -7,6 +7,8 @@
 **Sovereign endpoint defence for Linux.**<br/>
 Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic on the host · verified in a lab you can rerun.
 
+🆕 **Since the alpha:** Rust 2024 and a new eBPF toolchain, 0 open Dependabot alerts, sensors on every CPU on Linux 7.0, lighter sensors. [What's new →](#whats-new-since-the-alpha)
+
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Nightly lab VM gate](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml/badge.svg?event=schedule)](https://github.com/northnarrow/northnarrow-new/actions/workflows/lab-vm.yml?query=event%3Aschedule)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/northnarrow/northnarrow-new/badge)](https://scorecard.dev/viewer/?uri=github.com/northnarrow/northnarrow-new)
@@ -15,6 +17,8 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 [![Rust](https://img.shields.io/badge/Rust-MSRV_1.98-93450a?logo=rust)](Cargo.toml)
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-1f6feb)](docs/operator/KERNEL_COMPATIBILITY.md)
 
+[What's new](#whats-new-since-the-alpha) ·
+[Working on now](#working-on-now) ·
 [Today](#what-it-does-today-and-what-it-does-not) ·
 [Architecture](#architecture) ·
 [Defence in depth](#defence-in-depth) ·
@@ -45,6 +49,35 @@ Rust end to end · enforced in the kernel with eBPF and BPF-LSM · deterministic
 > - **Self-assessed.** Nothing here has been validated by a third party. Every number below
 >   points to the file or the CI run it comes from, and
 >   [`KNOWN_LIMITATIONS.md`](docs/operator/KNOWN_LIMITATIONS.md) lists what does not work yet.
+
+---
+
+## What's new since the alpha
+
+Merged after `v0.1.0-alpha` (23 November 2026):
+
+- Rust edition 2024 and toolchain 1.100 ([#607](https://github.com/northnarrow/northnarrow-new/pull/607), [#609](https://github.com/northnarrow/northnarrow-new/pull/609)).
+- aya 0.16 in user space, and aya-ebpf 0.3 with LLVM 22 for the kernel programs, which come out up to 13% smaller ([#614](https://github.com/northnarrow/northnarrow-new/pull/614), [#618](https://github.com/northnarrow/northnarrow-new/pull/618)).
+- 0 open Dependabot alerts: moving to `rustls-rustcrypto` removed the Marvin RSA advisory and an old `rustls-webpki` ([#610](https://github.com/northnarrow/northnarrow-new/pull/610), [#612](https://github.com/northnarrow/northnarrow-new/pull/612), [#626](https://github.com/northnarrow/northnarrow-new/pull/626)); `chrono` replaced by `jiff` ([#615](https://github.com/northnarrow/northnarrow-new/pull/615)).
+- The mount guard uses 51% of the verifier budget on 5.15 (it was 92%) and now refuses the move of a peer copy ([#617](https://github.com/northnarrow/northnarrow-new/pull/617)).
+- The exec and open sensors see every CPU on 7.0, where the syscall tracepoints fired only on CPU 0 ([#625](https://github.com/northnarrow/northnarrow-new/pull/625)).
+- The DNS sensor is 27 to 54% cheaper per event ([#629](https://github.com/northnarrow/northnarrow-new/pull/629)).
+- The code ratchets read the syntax tree, not the text, so a renamed or reformatted variant no longer slips past them ([#628](https://github.com/northnarrow/northnarrow-new/pull/628)).
+- OpenSSF Scorecard 8.2, now run on every change ([#627](https://github.com/northnarrow/northnarrow-new/pull/627)); supply-chain checks tightened ([#616](https://github.com/northnarrow/northnarrow-new/pull/616)).
+
+What comes next, stage by stage, is in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+
+---
+
+<!-- working-on:start -->
+## Working on now
+
+Refreshed as work lands. Stages are in the [roadmap after the alpha](ROADMAP.md#roadmap-after-v010-alpha).
+
+- [S1 Foundations](ROADMAP.md#s1): AlmaLinux 9 and the `.rpm` package tested in the lab, the lab using the exact eBPF object the CI built, then a stage-wide lab round and the docs.
+- Maintenance: the OpenSSF Scorecard findings (known-vulnerable dependencies, binary fuzz seeds).
+- Next, [S2 Self-protection after the alpha](ROADMAP.md#s2): the installer window limited to the process tree that asked, and upgrades with no protection gap.
+<!-- working-on:end -->
 
 ---
 
@@ -238,7 +271,7 @@ against it on every `cargo test` by
 | Rules | **95** rules the agent can record: 87 in the engine, 8 issued outside it (anti-tamper, exploit guard, exec policy and its environment checks, exec quarantine). Strongest test per rule: an end-to-end test or a lab script for 35, unit tests only for 55, no proof yet for 5 (the experimental exec-policy and quarantine records) | [`RULE_CATALOGUE.md`](docs/detection/RULE_CATALOGUE.md) |
 | ATT&CK mapping | 95 of 95 rules mapped to 66 techniques and sub-techniques under 12 of 15 Enterprise tactics (ATT&CK 20.0, pinned). This is a mapping, not a coverage claim: **0 rules have campaign proof** | [`ATTACK_COVERAGE.md`](docs/detection/ATTACK_COVERAGE.md) |
 | Kernel enforcement | **22** BPF-LSM deny hooks on every supported kernel, plus up to 6 optional deny programs (the two ACL hooks, `file_ioctl_compat`, the cgroup move guard's three): 28 on 6.8, 6.12 and 7.0, 26 on 5.15 and 6.1 (the ACL hooks start in 6.2), 28 on AlmaLinux 9's 5.14 el9, which backports them. The eBPF object holds **130** programs; on the five lab kernels (5.15, 6.1, 6.8, 6.12, 7.0) the verifier rejected none of the 124 of the latest pre-alpha release candidate (November 2026), the mount guard's six included, and the nightly fails any above 900,000 processed instructions | [`CAPABILITY_PROGRAM.md`](docs/roadmap/CAPABILITY_PROGRAM.md), C23 |
-| Host tests | more than **6,300** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
+| Host tests | more than **6,500** test functions in the workspace (`#[test]` and `#[tokio::test]`). `cargo test --workspace` runs the unprivileged ones on every pull request; the privileged ones (feature `test-privileged`, or `#[ignore]`) run as root in the KVM guests below | [`ci.yml`](.github/workflows/ci.yml) |
 | Privileged suites | run as root in 5 KVM guests every night; every run is public on the workflow's page. Scheduled runs on `main` from 7 to 22 Nov 2026: 7 of 16 green | [`lab-vm.yml`](.github/workflows/lab-vm.yml) |
 | Anti-tamper lab | 104 adversarial cases, 100 as expected on Ubuntu 24.04. The other four are named: two known gaps (an unsigned module without lockdown, a vacuum of the agent's journal), one recorded deviation and one case not run | [`anti-tamper.sh`](deploy/lab/adversarial/anti-tamper.sh) |
 | Event bus | in the lab's file-open flood (EXP-13), anti-tamper denials lost: 3,699 before the priority bus, **0** after | [`EVENT_BUS.md`](docs/architecture/EVENT_BUS.md) |
@@ -480,6 +513,8 @@ lab PR, with what moved, what the lab measured and what is still open. The histo
 earlier stages is in [`ROADMAP.md`](ROADMAP.md), the goals are in [`VISION.md`](VISION.md), and
 the long-term technical vision is in [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md). No dates are
 published: milestones ship in order.
+
+**After the alpha: 22 stages, S1 to S22**, in [`ROADMAP.md`](ROADMAP.md#roadmap-after-v010-alpha), each with a goal, what you will see and its status. S1 (foundations: verifier margin on every kernel, a modern toolchain, sensors on every CPU) is in progress, 8 of its 11 changes on `main`. S2 to S9 follow: self-protection after the alpha, seeing failed attempts, kernel helpers, keyed decoys, fewer false positives, bounded responses, evidence off the host, quarantine scanning. S10 to S14 (a cold kernel surface, envelopes for exposed services, code origin, native switches, shared indicators) are built in "would have denied" mode and need a maintainer decision on enforcement for their last step. S15 to S22 are the Phase 4 work below.
 
 **Done: the foundations.** eBPF sensors, the rule engine, the response engine, the adaptive
 posture, anti-tamper, the signed COMBAT release, FIM, deception, network observability and

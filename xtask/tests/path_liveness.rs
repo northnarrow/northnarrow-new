@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use serde_yaml_ng::Value as Yaml;
+use support::yaml::Value as Yaml;
 use support::{members, repo_root, rs_files, tracked_files};
 
 fn read(rel: &str) -> String {
@@ -41,7 +41,7 @@ fn workflows() -> Vec<(String, Yaml)> {
                 ".github/workflows/{}",
                 p.file_name().unwrap().to_string_lossy()
             );
-            let y = serde_yaml_ng::from_str(&fs::read_to_string(&p).unwrap())
+            let y = support::yaml::from_str(&fs::read_to_string(&p).unwrap())
                 .unwrap_or_else(|e| panic!("{rel}: {e}"));
             (rel, y)
         })

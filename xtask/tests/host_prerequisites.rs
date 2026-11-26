@@ -5,6 +5,8 @@
 //! depend on nftables, `install.sh` refuses a host without it unless told,
 //! and every lab guest installs it. Each test reads committed files only.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,7 +66,7 @@ fn every_lab_guest_installs_nftables() {
     templates.sort();
     assert!(templates.len() >= 3, "{templates:?}");
     for t in templates {
-        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&t).unwrap())
+        let doc: support::yaml::Value = support::yaml::from_str(&fs::read_to_string(&t).unwrap())
             .unwrap_or_else(|e| panic!("{}: {e}", t.display()));
         let packages = doc
             .get("packages")

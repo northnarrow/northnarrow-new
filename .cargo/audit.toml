@@ -40,27 +40,21 @@
 # Lot 1.6 (F11): RUSTSEC-2026-0543 (chrono 0.4.45, unmaintained; recorded
 # 2026-11-17) was dropped: chrono left all three lockfiles, its timestamps
 # went to jiff (crates/nn-evidence/src/time.rs, the text byte for byte).
+#
+# Lot M3 (OpenSSF Scorecard, Vulnerabilities): RUSTSEC-2024-0449
+# (unsafe-libyaml 0.2.11, unmaintained; recorded 2026-10-20) was dropped:
+# the xtask tests read YAML with serde-saphyr, a parser in safe Rust
+# (xtask/tests/support/yaml.rs), and unsafe-libyaml left Cargo.lock with
+# serde_yaml_ng (xtask/tests/supply_chain.rs keeps it out of all three).
 
 [advisories]
 ignore = [
-    # RUSTSEC-2024-0449: unsafe-libyaml 0.2.11, unmaintained. Found by this
-    #   policy (advisory published 2026-10-12, after the Wave 3 triage).
-    # Why: archived upstream, no fixed release exists. Its only dependent is
-    #   serde_yaml_ng 0.10.0, a dependency of xtask alone (`publish = false`;
-    #   not in the agent, the CLI, the watchdog or any release asset:
-    #   `cargo tree -i unsafe-libyaml`); since Wave 4 (lab PR 214, which
-    #   removed `cargo xtask rag-kb` and its Sigma parsing) a dev-dependency
-    #   of the xtask tests only, which parse the committed workflow files
-    #   with it, never input chosen at run time.
-    # Owner: the maintainer.
-    # Re-check: before any new YAML input reaches xtask, and at the move of
-    #   xtask to a YAML parser in safe Rust (serde-saphyr, as the advisory
-    #   suggests; follow-up), which drops the entry.
-    # Recorded: 2026-10-20
-    # Expires: 2027-01-20
-    "RUSTSEC-2024-0449",
     # RUSTSEC-2024-0436: paste 1.0.15, unmaintained.
     # Why: archived upstream, no fixed release; a procedural macro of rustls-rustcrypto 0.1.0-pre.0, as of 0.0.2-alpha before lot 398 (its suites' and verifiers' boilerplate): it runs at compile time only and is in no binary (it left with candle in Wave 4, lab PR 214; lot 276's TLS provider brings it back).
+    #   Upstream declined pastey, the fork the advisory names, as a
+    #   supply-chain risk of its own (RustCrypto/rustls-rustcrypto#101 and
+    #   #104, closed; lot M3, 2026-11-26): 0.1.0-pre.0, the latest release,
+    #   uses it. OpenSSF Scorecard counts it (Vulnerabilities, OSV) until then.
     # Owner: the maintainer.
     # Re-check: a rustls-rustcrypto release without it
     # Recorded: 2026-11-03

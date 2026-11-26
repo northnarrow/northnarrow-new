@@ -457,10 +457,10 @@ fn every_attestation_check_is_bound_to_a_release_tag() {
 fn rpm_is_signed_on_tags_by_its_own_job() {
     let root = repo_root();
     let text = read(&root.join(".github/workflows/release.yml"));
-    let wf: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).expect("release.yml parses");
+    let wf: support::yaml::Value = support::yaml::from_str(&text).expect("release.yml parses");
     let jobs = wf.get("jobs").expect("release.yml has jobs");
     let job_text = |name: &str| {
-        serde_yaml_ng::to_string(jobs.get(name).unwrap_or_else(|| panic!("job {name}"))).unwrap()
+        support::yaml::to_string(jobs.get(name).unwrap_or_else(|| panic!("job {name}"))).unwrap()
     };
 
     let rpm_sign = jobs
@@ -556,8 +556,8 @@ fn rpm_is_signed_on_tags_by_its_own_job() {
 #[test]
 fn workflows_parse_as_yaml() {
     for file in workflow_files() {
-        let wf: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(&read(&file)).unwrap_or_else(|e| panic!("{}: {e}", rel(&file)));
+        let wf: support::yaml::Value =
+            support::yaml::from_str(&read(&file)).unwrap_or_else(|e| panic!("{}: {e}", rel(&file)));
         assert!(
             wf.get("jobs")
                 .and_then(|j| j.as_mapping())
@@ -568,12 +568,12 @@ fn workflows_parse_as_yaml() {
     }
 }
 
-fn workflow_yaml(file: &Path) -> serde_yaml_ng::Value {
-    serde_yaml_ng::from_str(&read(file)).unwrap_or_else(|e| panic!("{}: {e}", rel(file)))
+fn workflow_yaml(file: &Path) -> support::yaml::Value {
+    support::yaml::from_str(&read(file)).unwrap_or_else(|e| panic!("{}: {e}", rel(file)))
 }
 
 /// The jobs of a workflow, by name.
-fn jobs(wf: &serde_yaml_ng::Value) -> Vec<(String, serde_yaml_ng::Value)> {
+fn jobs(wf: &support::yaml::Value) -> Vec<(String, support::yaml::Value)> {
     wf.get("jobs")
         .and_then(|j| j.as_mapping())
         .map(|m| {
@@ -584,14 +584,14 @@ fn jobs(wf: &serde_yaml_ng::Value) -> Vec<(String, serde_yaml_ng::Value)> {
         .unwrap_or_default()
 }
 
-fn steps(job: &serde_yaml_ng::Value) -> Vec<serde_yaml_ng::Value> {
+fn steps(job: &support::yaml::Value) -> Vec<support::yaml::Value> {
     job.get("steps")
         .and_then(|s| s.as_sequence())
         .cloned()
         .unwrap_or_default()
 }
 
-fn str_of<'a>(v: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a str> {
+fn str_of<'a>(v: &'a support::yaml::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
@@ -633,7 +633,7 @@ const SCORECARD_STEPS: [&str; 2] = ["ossf/scorecard-action@", "actions/upload-ar
 /// not a read-only mapping, a job's write scope that WRITE_ALLOWED does not
 /// list for that job, and a step of a code-scanning writer that is a `run:`
 /// or an action the job may not run.
-fn token_problems(name: &str, wf: &serde_yaml_ng::Value) -> Vec<String> {
+fn token_problems(name: &str, wf: &support::yaml::Value) -> Vec<String> {
     let mut bad = Vec::new();
     match wf.get("permissions").and_then(|p| p.as_mapping()) {
         None => bad.push(format!("{name}: no top-level `permissions:` mapping")),
@@ -722,13 +722,13 @@ fn the_token_check_keeps_the_scorecard_grants_to_its_job() {
     assert_eq!(token_problems(CODEQL, &codeql), Vec::<String>::new());
 
     let has = |problems: &[String], needle: &str| problems.iter().any(|p| p.contains(needle));
-    let job = |wf: &serde_yaml_ng::Value, name: &str| -> serde_yaml_ng::Value {
+    let job = |wf: &support::yaml::Value, name: &str| -> support::yaml::Value {
         wf.get("jobs")
             .and_then(|j| j.get(name))
             .cloned()
             .unwrap_or_else(|| panic!("job {name}"))
     };
-    let with_job = |wf: &serde_yaml_ng::Value, name: &str, body: serde_yaml_ng::Value| {
+    let with_job = |wf: &support::yaml::Value, name: &str, body: support::yaml::Value| {
         let mut wf = wf.clone();
         wf.get_mut("jobs")
             .and_then(|j| j.as_mapping_mut())
@@ -736,12 +736,12 @@ fn the_token_check_keeps_the_scorecard_grants_to_its_job() {
             .insert(name.into(), body);
         wf
     };
-    let with_step = |wf: &serde_yaml_ng::Value, name: &str, step: &str| {
+    let with_step = |wf: &support::yaml::Value, name: &str, step: &str| {
         let mut body = job(wf, name);
         body.get_mut("steps")
             .and_then(|s| s.as_sequence_mut())
             .expect("steps")
-            .push(serde_yaml_ng::from_str(step).expect("a step"));
+            .push(support::yaml::from_str(step).expect("a step"));
         with_job(wf, name, body)
     };
 
@@ -805,7 +805,7 @@ fn the_token_check_keeps_the_scorecard_grants_to_its_job() {
         let mut wf = scorecard.clone();
         wf.as_mapping_mut()
             .expect("a mapping")
-            .insert("permissions".into(), serde_yaml_ng::from_str(top).unwrap());
+            .insert("permissions".into(), support::yaml::from_str(top).unwrap());
         assert!(
             !token_problems(SCORECARD, &wf).is_empty(),
             "top level {top}"
@@ -816,7 +816,7 @@ fn the_token_check_keeps_the_scorecard_grants_to_its_job() {
 const SCORECARD_YML: &str = ".github/workflows/scorecard.yml";
 
 /// The broken rules of a Scorecard workflow, one line each.
-fn scorecard_problems(wf: &serde_yaml_ng::Value) -> Vec<String> {
+fn scorecard_problems(wf: &support::yaml::Value) -> Vec<String> {
     let mut bad = Vec::new();
 
     const EVENTS: [&str; 4] = [
@@ -934,7 +934,7 @@ fn scorecard_problems(wf: &serde_yaml_ng::Value) -> Vec<String> {
             .unwrap_or_default()
     };
     let scan = with_of("ossf/scorecard-action@");
-    let yes = |v: &serde_yaml_ng::Value, key: &str| {
+    let yes = |v: &support::yaml::Value, key: &str| {
         v.get(key)
             .is_some_and(|x| x.as_bool() == Some(true) || x.as_str() == Some("true"))
     };
@@ -1098,7 +1098,7 @@ fn the_scorecard_check_refuses_each_broken_rule() {
         cases.push((text.replace(from, to), want));
     }
     for (planted, want) in &cases {
-        let wf: serde_yaml_ng::Value = serde_yaml_ng::from_str(planted).expect("planted YAML");
+        let wf: support::yaml::Value = support::yaml::from_str(planted).expect("planted YAML");
         let p = scorecard_problems(&wf);
         assert!(
             p.iter().any(|l| l.contains(want)),
@@ -1526,8 +1526,8 @@ fn the_toolchain_is_pinned_and_the_msrv_is_checked() {
          `cargo +<it> check --workspace --locked`"
     );
 
-    let dependabot: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
+    let dependabot: support::yaml::Value =
+        support::yaml::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
     let toolchain_updates = dependabot
         .get("updates")
         .and_then(|u| u.as_sequence())
@@ -1729,7 +1729,7 @@ fn every_dated_nightly_is_its_jobs_channel() {
 fn the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own() {
     const OBJ: &str = "agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf";
     let root = repo_root();
-    let job = |file: &str, name: &str| -> Vec<serde_yaml_ng::Value> {
+    let job = |file: &str, name: &str| -> Vec<support::yaml::Value> {
         let wf = workflow_yaml(&root.join(".github/workflows").join(file));
         let (_, j) = jobs(&wf)
             .into_iter()
@@ -1737,9 +1737,9 @@ fn the_ebpf_object_ci_tests_is_kept_and_every_build_names_its_own() {
             .unwrap_or_else(|| panic!("{file}: no job {name}"));
         steps(&j)
     };
-    let run = |s: &serde_yaml_ng::Value| str_of(s, "run").unwrap_or("").to_string();
+    let run = |s: &support::yaml::Value| str_of(s, "run").unwrap_or("").to_string();
     let at =
-        |steps: &[serde_yaml_ng::Value], what: &str, f: &dyn Fn(&serde_yaml_ng::Value) -> bool| {
+        |steps: &[support::yaml::Value], what: &str, f: &dyn Fn(&support::yaml::Value) -> bool| {
             steps
                 .iter()
                 .position(f)
@@ -2085,13 +2085,13 @@ fn a_cargo_install_pin_reads_alike_in_any_flag_order() {
 #[test]
 fn dependabot_moves_the_fuzz_lockfile_with_the_root_one() {
     let root = repo_root();
-    let dependabot: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
+    let dependabot: support::yaml::Value =
+        support::yaml::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
     let updates = dependabot
         .get("updates")
         .and_then(|u| u.as_sequence())
         .expect(".github/dependabot.yml has an `updates` list");
-    let dirs = |e: &serde_yaml_ng::Value| -> Vec<String> {
+    let dirs = |e: &support::yaml::Value| -> Vec<String> {
         let mut out: Vec<String> = e
             .get("directories")
             .and_then(|d| d.as_sequence())
@@ -2107,7 +2107,7 @@ fn dependabot_moves_the_fuzz_lockfile_with_the_root_one() {
         }
         out
     };
-    let grouped: Vec<&serde_yaml_ng::Value> = updates
+    let grouped: Vec<&support::yaml::Value> = updates
         .iter()
         .filter(|e| {
             str_of(e, "package-ecosystem") == Some("cargo")
@@ -2601,6 +2601,60 @@ fn every_advisory_exception_is_reasoned_and_dated() {
     assert!(
         bad.is_empty(),
         "advisory exceptions in .cargo/audit.toml (format at the top of that file):\n{}",
+        bad.join("\n")
+    );
+}
+
+/// Lot M3 (OpenSSF Scorecard, Vulnerabilities): unsafe-libyaml, unsafe
+/// Rust machine-translated from libyaml's C and archived upstream
+/// (RUSTSEC-2024-0449), was in Cargo.lock under serde_yaml_ng, the xtask
+/// tests' YAML reader, with an exception in .cargo/audit.toml; they read
+/// YAML with serde-saphyr, in safe Rust (`support/yaml.rs`), now. No
+/// lockfile holds it again, nor the readers built on it or on its forks
+/// (libyml, RUSTSEC-2025-0067; unsafe-libyaml-norway).
+#[test]
+fn no_lockfile_holds_a_yaml_reader_translated_from_c() {
+    const TRANSLATED: [&str; 7] = [
+        "unsafe-libyaml",
+        "unsafe-libyaml-norway",
+        "libyml",
+        "serde_yaml",
+        "serde_yaml_ng",
+        "serde_yml",
+        "serde_norway",
+    ];
+    let found = |lock: &str, locked: &std::collections::BTreeMap<String, Vec<String>>| {
+        TRANSLATED
+            .iter()
+            .filter_map(|name| Some(format!("{lock}: {name} {}", locked.get(*name)?.join(", "))))
+            .collect::<Vec<_>>()
+    };
+    // the check, on main's Cargo.lock before lot M3
+    let before: std::collections::BTreeMap<String, Vec<String>> = [
+        ("serde_yaml_ng", "0.10.0"),
+        ("unsafe-libyaml", "0.2.11"),
+        ("serde", "1.0.229"),
+    ]
+    .map(|(n, v)| (n.to_string(), vec![v.to_string()]))
+    .into();
+    assert_eq!(
+        found("Cargo.lock", &before),
+        [
+            "Cargo.lock: unsafe-libyaml 0.2.11",
+            "Cargo.lock: serde_yaml_ng 0.10.0"
+        ]
+    );
+    let root = repo_root();
+    let mut bad = Vec::new();
+    for lock in LOCKFILES {
+        let locked = locked_versions(&root.join(lock));
+        assert!(locked.len() > 20, "{lock}: {} packages", locked.len());
+        bad.extend(found(lock, &locked));
+    }
+    assert!(
+        bad.is_empty(),
+        "a YAML reader in unsafe Rust translated from libyaml's C is locked again \
+         (read YAML with xtask/tests/support/yaml.rs):\n{}",
         bad.join("\n")
     );
 }
@@ -3186,6 +3240,193 @@ fn every_fuzz_target_has_seeds_and_the_ci_replays_them() {
     );
 }
 
+/// Lot M3 (OpenSSF Scorecard, Binary-Artifacts): Scorecard counts a
+/// committed executable or object file (by its magic bytes, or by a name
+/// it gives them), and two `elf_audit` seeds were ELF files. They are
+/// text now (`fuzz_api::text_seed`); no tracked file is one again.
+/// Why Scorecard would count a file as a binary (`rel`, its first 4 KiB),
+/// if it would.
+fn binary_artifact(rel: &str, head: &[u8]) -> Option<&'static str> {
+    // Scorecard's list of binary file names (checks/raw/binary_artifact.go)
+    const NAMES: [&str; 27] = [
+        "crx", "deb", "dex", "dey", "elf", "o", "a", "so", "macho", "iso", "class", "jar",
+        "bundle", "dylib", "lib", "msi", "dll", "drv", "efi", "exe", "ocx", "pyc", "pyo", "par",
+        "rpm", "wasm", "whl",
+    ];
+    // ELF; Mach-O (32, 64, either byte order) and fat Mach-O or a Java
+    // class; WebAssembly; an ar archive (`.a`, `.deb`, `.lib`); Dalvik;
+    // an rpm; a Chrome extension
+    const MAGIC: [&[u8]; 11] = [
+        b"\x7fELF",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\0asm",
+        b"!<arch>\n",
+        b"dex\n",
+        b"\xed\xab\xee\xdb",
+        b"Cr24",
+    ];
+    // a PE file: `MZ`, and at the offset it gives, `PE\0\0`
+    let pe = head.starts_with(b"MZ")
+        && head
+            .get(0x3c..0x40)
+            .map(|o| u32::from_le_bytes(o.try_into().unwrap()) as usize)
+            .and_then(|o| head.get(o..o.checked_add(4)?))
+            == Some(b"PE\0\0".as_slice());
+    let ext = Path::new(rel)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if ext.is_some_and(|e| NAMES.contains(&e.as_str())) {
+        Some("a binary file's name")
+    } else if pe || MAGIC.iter().any(|m| head.starts_with(m)) {
+        Some("an executable's or object file's magic bytes")
+    } else {
+        None
+    }
+}
+
+/// Lot M3 (OpenSSF Scorecard, Binary-Artifacts): Scorecard counts a
+/// committed executable or object file (by its magic bytes, or by a name
+/// it gives them), and two `elf_audit` seeds were ELF files. They are
+/// text now (`fuzz_api::text_seed`); no tracked file is one again.
+#[test]
+fn no_committed_file_is_an_executable_or_an_object_file() {
+    use std::io::Read;
+    // the check itself, on what it must and must not count
+    let mut pe = b"MZ".to_vec();
+    pe.resize(0x80, 0);
+    pe[0x3c] = 0x40;
+    pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+    let mut mz_text = pe.clone();
+    mz_text[0x40..0x44].copy_from_slice(b"PEX\0");
+    for (rel, head, counted) in [
+        ("x/names-none.elf", b"# nn-fuzz-seed hex\n".as_slice(), true),
+        ("x/lib.so", b"text".as_slice(), true),
+        ("x/A.CLASS", b"text".as_slice(), true),
+        ("x/seed.bin", b"\x7fELF\x02\x01\x01\0".as_slice(), true),
+        (
+            "x/seed.bin",
+            b"\xcf\xfa\xed\xfe\x07\0\0\x01".as_slice(),
+            true,
+        ),
+        ("x/seed.bin", b"\0asm\x01\0\0\0".as_slice(), true),
+        ("x/seed.bin", b"!<arch>\ndebian-binary".as_slice(), true),
+        ("x/seed.bin", pe.as_slice(), true),
+        ("x/seed.bin", mz_text.as_slice(), false),
+        ("x/seed.bin", b"MZ".as_slice(), false),
+        (
+            "x/names-none.elf.hex",
+            b"# nn-fuzz-seed hex\n7f454c46".as_slice(),
+            false,
+        ),
+        ("x/ELF.md", b"ELF files".as_slice(), false),
+        ("x/seed.bin", b"\x16\x03\x01\x02\0\x01".as_slice(), false),
+    ] {
+        assert_eq!(
+            binary_artifact(rel, head).is_some(),
+            counted,
+            "{rel} {head:?}"
+        );
+    }
+
+    let root = repo_root();
+    let mut bad = Vec::new();
+    let mut read = 0;
+    for rel in support::tracked_files() {
+        let Ok(f) = fs::File::open(root.join(&rel)) else {
+            continue;
+        };
+        let mut head = Vec::new();
+        if f.take(4096).read_to_end(&mut head).is_err() {
+            continue;
+        }
+        read += 1;
+        if let Some(why) = binary_artifact(&rel, &head) {
+            bad.push(format!("{rel}: {why}"));
+        }
+    }
+    assert!(read > 500, "{read} files read");
+    assert!(
+        bad.is_empty(),
+        "committed binaries (a fuzz seed goes in text form, `# nn-fuzz-seed hex`: \
+         fuzz/README.md):\n{}",
+        bad.join("\n")
+    );
+}
+
+/// Lot M3: a fuzz input in text form (`*.hex` under `fuzz/seeds/<target>/`
+/// or `fuzz/regressions/<target>/`) is one (`fuzz_api::text_seed`'s
+/// header first), and its target decodes it (`fuzz_api::raw_and_decoded`):
+/// libFuzzer gives the target the file as it is, and a target that does
+/// not decode it fuzzes text; and no longer than the CI smoke's `-max_len`.
+#[test]
+fn a_text_seed_is_decoded_by_its_target() {
+    let root = repo_root();
+    let header = "# nn-fuzz-seed hex";
+    let api = read(&root.join("agent/src/fuzz_api.rs"));
+    assert!(
+        api.contains(&format!("pub const TEXT_SEED_HEADER: &str = \"{header}\";")),
+        "fuzz_api's TEXT_SEED_HEADER is not `{header}`"
+    );
+    // the smoke truncates an input to its `-max_len`: a text seed longer
+    // decodes to nothing, and the smoke fuzzes text
+    let ci = read(&root.join(".github/workflows/ci.yml"));
+    let max_len: Vec<usize> = ci
+        .split("-max_len=")
+        .skip(1)
+        .map(|r| {
+            let digits: String = r.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().expect("-max_len=<bytes>")
+        })
+        .collect();
+    let max_len = *max_len
+        .iter()
+        .min()
+        .expect("ci.yml fuzz: the smoke's -max_len");
+    let mut seen = 0;
+    let mut bad = Vec::new();
+    for kind in ["seeds", "regressions"] {
+        for target in subdirs(&root.join("fuzz").join(kind)) {
+            let dir = root.join("fuzz").join(kind).join(&target);
+            let mut texts: Vec<PathBuf> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "hex"))
+                .collect();
+            texts.sort();
+            if texts.is_empty() {
+                continue;
+            }
+            let src = read(&root.join(format!("fuzz/fuzz_targets/{target}.rs")));
+            let code = support::strip_comments(&src);
+            if !code.contains("raw_and_decoded(data,") {
+                bad.push(format!(
+                    "fuzz/fuzz_targets/{target}.rs: does not decode its text inputs \
+                     (`fuzz_api::raw_and_decoded(data, …)`)"
+                ));
+            }
+            for p in texts {
+                seen += 1;
+                if read(&p).lines().next() != Some(header) {
+                    bad.push(format!("{}: its first line is not `{header}`", rel(&p)));
+                }
+                let len = fs::metadata(&p).unwrap().len() as usize;
+                if len > max_len {
+                    bad.push(format!(
+                        "{}: {len} bytes, over the smoke's -max_len={max_len}",
+                        rel(&p)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(seen >= 2, "{seen} text inputs");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// SUP-023 (NN-AUD-407): the proofs ran weekly and on demand, so a PR that
 /// weakened a proved bound merged with the proof red until the next
 /// Monday. kani.yml runs on the pull requests that touch a file holding a
@@ -3618,7 +3859,7 @@ fn btf_matrix_sends_no_token_on_a_command_line() {
     let wf = workflow_yaml(&root.join(".github/workflows/btf-matrix.yml"));
     for (job, body) in jobs(&wf) {
         for step in steps(&body) {
-            let env = serde_yaml_ng::to_string(&step.get("env").cloned().unwrap_or_default())
+            let env = support::yaml::to_string(&step.get("env").cloned().unwrap_or_default())
                 .unwrap_or_default();
             assert!(
                 !env.contains("GITHUB_TOKEN") && !env.contains("GH_TOKEN"),
@@ -3716,17 +3957,17 @@ fn btf_matrix_script_passes_its_offline_tests() {
 // ---------------------------------------------------------------------------
 // SUP-024: release governance.
 
-fn release_jobs() -> serde_yaml_ng::Value {
+fn release_jobs() -> support::yaml::Value {
     workflow_yaml(&repo_root().join(".github/workflows/release.yml"))
         .get("jobs")
         .cloned()
         .expect("release.yml has jobs")
 }
 
-fn needs_of(job: &serde_yaml_ng::Value) -> Vec<String> {
+fn needs_of(job: &support::yaml::Value) -> Vec<String> {
     match job.get("needs") {
-        Some(serde_yaml_ng::Value::String(s)) => vec![s.clone()],
-        Some(serde_yaml_ng::Value::Sequence(v)) => v
+        Some(support::yaml::Value::String(s)) => vec![s.clone()],
+        Some(support::yaml::Value::Sequence(v)) => v
             .iter()
             .filter_map(|x| x.as_str().map(str::to_string))
             .collect(),
@@ -3734,7 +3975,7 @@ fn needs_of(job: &serde_yaml_ng::Value) -> Vec<String> {
     }
 }
 
-fn job_runs(job: &serde_yaml_ng::Value) -> String {
+fn job_runs(job: &support::yaml::Value) -> String {
     steps(job)
         .iter()
         .filter_map(|s| str_of(s, "run").map(str::to_string))
@@ -3811,7 +4052,7 @@ fn tag_signature_is_verified_before_package() {
                 continue;
             }
             stack.extend(needs_of(
-                jobs.get(n.as_str()).unwrap_or(&serde_yaml_ng::Value::Null),
+                jobs.get(n.as_str()).unwrap_or(&support::yaml::Value::Null),
             ));
             seen.push(n);
         }
@@ -4195,11 +4436,11 @@ fn the_codeql_language_of_a_file() {
 
 /// The `key: value` mapping of `v` as (key, value) strings, in order (a
 /// number or a boolean as YAML writes it).
-fn string_pairs(v: Option<&serde_yaml_ng::Value>) -> Vec<(String, String)> {
-    let scalar = |v: &serde_yaml_ng::Value| match v {
-        serde_yaml_ng::Value::String(s) => s.clone(),
-        serde_yaml_ng::Value::Number(n) => n.to_string(),
-        serde_yaml_ng::Value::Bool(b) => b.to_string(),
+fn string_pairs(v: Option<&support::yaml::Value>) -> Vec<(String, String)> {
+    let scalar = |v: &support::yaml::Value| match v {
+        support::yaml::Value::String(s) => s.clone(),
+        support::yaml::Value::Number(n) => n.to_string(),
+        support::yaml::Value::Bool(b) => b.to_string(),
         other => format!("{other:?}"),
     };
     v.and_then(|m| m.as_mapping())
@@ -4434,7 +4675,7 @@ fn codeql_scans_every_language_of_the_tree() {
     // How: checkout, init, analyze (kept), the artifact last; one pin for
     // every codeql-action step.
     let job_steps = steps(job);
-    let uses_in = |all: &[serde_yaml_ng::Value], prefix: &str| -> usize {
+    let uses_in = |all: &[support::yaml::Value], prefix: &str| -> usize {
         let found: Vec<usize> = all
             .iter()
             .enumerate()
@@ -4457,7 +4698,7 @@ fn codeql_scans_every_language_of_the_tree() {
         &job_steps[analyze_at],
         &job_steps[keep_at],
     );
-    let pin = |s: &serde_yaml_ng::Value| {
+    let pin = |s: &support::yaml::Value| {
         str_of(s, "uses")
             .and_then(|u| u.split_once('@'))
             .map(|(_, r)| r.to_string())
@@ -4467,7 +4708,7 @@ fn codeql_scans_every_language_of_the_tree() {
         pin(analyze),
         "{FILE}: init and analyze at one commit"
     );
-    let with = |s: &serde_yaml_ng::Value| string_pairs(s.get("with"));
+    let with = |s: &support::yaml::Value| string_pairs(s.get("with"));
     assert_eq!(
         with(init),
         pairs(&[
@@ -4544,7 +4785,7 @@ fn codeql_scans_every_language_of_the_tree() {
     }
 
     // Rust: the pinned toolchains, every lockfile fetched and left as it was.
-    let rust_only = |s: &serde_yaml_ng::Value| str_of(s, "if") == Some("matrix.language == 'rust'");
+    let rust_only = |s: &support::yaml::Value| str_of(s, "if") == Some("matrix.language == 'rust'");
     let lockfiles: Vec<String> = tracked
         .iter()
         .filter(|f| *f == "Cargo.lock" || f.ends_with("/Cargo.lock"))
@@ -5217,8 +5458,8 @@ fn private_keys_are_test_keys_out_of_secret_scanning() {
         "the test PKI's keys (README.md there)"
     );
     // the exclusion: that directory, nothing else
-    let cfg: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&read(&root.join(".github/secret_scanning.yml")))
+    let cfg: support::yaml::Value =
+        support::yaml::from_str(&read(&root.join(".github/secret_scanning.yml")))
             .expect(".github/secret_scanning.yml parses");
     let ignored: Vec<&str> = cfg
         .get("paths-ignore")
