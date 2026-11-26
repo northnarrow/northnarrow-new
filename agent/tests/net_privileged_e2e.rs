@@ -1287,12 +1287,93 @@ fn dns_response(query: &[u8], addr: [u8; 4]) -> Vec<u8> {
     r
 }
 
+/// An address no answer of the tests' DNS server names: a resolving
+/// client's second connect ([`ResolvingClient::connect_unresolved`]).
+const UNNAMED_ADDR: &str = "198.51.100.214";
+
+/// A client of the test's DNS server (127.0.0.2:53), held after it read
+/// the answer and connected to the address the answer named (port 9).
+///
+/// Review of #629 (P2): that connect drawing no NN-L-NET-028 record does
+/// not prove the agent read the answer: a query seen with its answer lost
+/// leaves every connect of the process `Unknown` for the unseen window,
+/// as silent as `Lineage`. Released by
+/// [`connect_unresolved`](Self::connect_unresolved), the client connects to
+/// [`UNNAMED_ADDR`]: `Unresolved`, so recorded, only once the agent saw
+/// its question answered; still `Unknown`, and silent, with the answer lost.
+struct ResolvingClient {
+    pid: u64,
+    child: Child,
+}
+
+impl ResolvingClient {
+    /// `qname`: the question's name in wire form, as a Python bytes
+    /// literal's body; `ask`: Python lines that send the query `q` on the
+    /// UDP socket `u` and set `a` to the response's bytes; `answer`: the
+    /// address the server answers with.
+    fn spawn(id: u16, qname: &str, ask: &str, answer: &str) -> Self {
+        use std::io::BufRead as _;
+        let script = format!(
+            r#"
+import os, socket, struct, sys
+q = struct.pack(">HHHHHH", {id}, 0x0100, 1, 0, 0, 0)
+q += b"{qname}" + struct.pack(">HH", 1, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+{ask}
+ip = ".".join(str(b) for b in a[-4:])
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect((ip, 9))
+except Exception:
+    pass
+print(os.getpid(), ip, flush=True)
+dst = sys.stdin.readline().strip()
+if dst:
+    t = socket.socket()
+    t.settimeout(1)
+    try:
+        t.connect((dst, 9))
+    except Exception:
+        pass
+"#
+        );
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn a resolving client");
+        let mut line = String::new();
+        // its stdin closes with `child` on a panic: the client then exits
+        std::io::BufReader::new(child.stdout.take().expect("its stdout"))
+            .read_line(&mut line)
+            .expect("its first line");
+        let mut parts = line.split_whitespace();
+        let pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
+        assert_eq!(parts.next(), Some(answer), "the answer read: {line}");
+        Self { pid, child }
+    }
+
+    /// The client connects to [`UNNAMED_ADDR`], then exits.
+    fn connect_unresolved(mut self) {
+        let mut stdin = self.child.stdin.take().expect("its stdin");
+        writeln!(stdin, "{UNNAMED_ADDR}").expect("release the client");
+        drop(stdin);
+        let status = self.child.wait().expect("the client's exit");
+        assert!(status.success(), "the resolving client: {status}");
+    }
+}
+
 /// Lot 275 — NN-L-NET-028: a process that asked a name (a DNS server of
 /// the test's own on 127.0.0.2:53 answers it with a documentation
 /// address) and connects to the address is not recorded; a process that
 /// connects to a documentation address with no lookup is (Medium, its kill
 /// held: `Log`). The addresses route nowhere: the connects fail, the
-/// connect hook has seen them.
+/// connect hook has seen them. The resolved process's later connect to an
+/// address no answer named is recorded: the agent saw its answer.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn net_connect_without_dns_is_recorded_and_a_resolved_one_is_not() {
@@ -1311,38 +1392,16 @@ fn net_connect_without_dns_is_recorded_and_a_resolved_one_is_not() {
             }
         }
     });
-    // the resolved client: asks, receives the answer, connects to it
-    let resolved = r#"
-import os, socket, struct, sys
-q = struct.pack(">HHHHHH", 0x4e42, 0x0100, 1, 0, 0, 0)
-q += b"\x08resolved\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-u.settimeout(5)
-u.sendto(q, ("127.0.0.2", 53))
-a, _ = u.recvfrom(512)
-ip = ".".join(str(b) for b in a[-4:])
-print(os.getpid(), ip, flush=True)
-s = socket.socket()
-s.settimeout(1)
-try:
-    s.connect((ip, 9))
-except Exception:
-    pass
-"#;
-    let out = Command::new("python3")
-        .arg("-c")
-        .arg(resolved)
-        .output()
-        .expect("spawn the resolved client");
-    let _ = server_thread.join();
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let mut parts = text.split_whitespace();
-    let resolved_pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
-    assert_eq!(
-        parts.next(),
-        Some("198.51.100.210"),
-        "the answer read: {text}"
+    // the resolved client: asks, receives the answer, connects to it (held
+    // there: its second connect comes after the judgement below)
+    let resolved = ResolvingClient::spawn(
+        0x4e42,
+        r"\x08resolved\x0fnorthnarrow-e2e\x07invalid\x00",
+        "u.sendto(q, (\"127.0.0.2\", 53))\na, _ = u.recvfrom(512)",
+        "198.51.100.210",
     );
+    let _ = server_thread.join();
+    let resolved_pid = resolved.pid;
     // the literal client
     let literal = r#"
 import os, socket
@@ -1389,6 +1448,22 @@ except Exception:
         "the resolved connect drew NN-L-NET-028: {:?}",
         mine(resolved_pid)
     );
+    // Review of #629 (P2, the same gap): the silence above holds with the
+    // answer lost too; a connect of the client to an address no answer
+    // named is recorded only when the agent saw its answer
+    resolved.connect_unresolved();
+    let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
+    while mine(resolved_pid).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let rec = mine(resolved_pid);
+    assert_eq!(
+        rec.len(),
+        1,
+        "the resolved client's connect to {UNNAMED_ADDR} drew no NN-L-NET-028 record: \
+         the agent did not see its question answered"
+    );
+    assert_eq!(rec[0]["severity"], "Medium", "unresolved: {}", rec[0]);
 }
 
 /// Lot 1.4 (plan S1, F8): the DNS response program's port filter leaves a
@@ -1398,7 +1473,10 @@ except Exception:
 /// with `recv` (no address: the source is the socket's peer), one with
 /// `recvfrom` (the datagram's address), and each connects to the address it
 /// read: neither connect is NN-L-NET-028's. A literal connect after them is
-/// (the pump has judged theirs by then).
+/// (the pump has judged theirs by then). Each client then connects to an
+/// address no answer named, which is recorded only when the agent saw that
+/// client's answer (review of #629: an answer lost leaves the first connect
+/// silent too).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn net_a_name_resolved_on_a_connected_socket_is_seen() {
@@ -1419,41 +1497,15 @@ fn net_a_name_resolved_on_a_connected_socket_is_seen() {
             }
         }
     });
-    let client = |read: &str| -> u64 {
-        let script = format!(
-            r#"
-import os, socket, struct
-q = struct.pack(">HHHHHH", 0x4e43, 0x0100, 1, 0, 0, 0)
-q += b"\x09connected\x0fnorthnarrow-e2e\x07invalid\x00" + struct.pack(">HH", 1, 1)
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-u.settimeout(5)
-u.connect(("127.0.0.2", 53))
-u.send(q)
-a = {read}
-ip = ".".join(str(b) for b in a[-4:])
-print(os.getpid(), ip, flush=True)
-s = socket.socket()
-s.settimeout(1)
-try:
-    s.connect((ip, 9))
-except Exception:
-    pass
-"#
-        );
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .expect("spawn a connected client");
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let mut parts = text.split_whitespace();
-        let pid: u64 = parts.next().and_then(|p| p.parse().ok()).expect("its pid");
-        assert_eq!(
-            parts.next(),
-            Some("198.51.100.212"),
-            "the answer read: {text}"
-        );
-        pid
+    // each client held after its connect to the address it read (its second
+    // connect comes after the judgement below)
+    let client = |read: &str| {
+        ResolvingClient::spawn(
+            0x4e43,
+            r"\x09connected\x0fnorthnarrow-e2e\x07invalid\x00",
+            &format!("u.connect((\"127.0.0.2\", 53))\nu.send(q)\na = {read}"),
+            "198.51.100.212",
+        )
     };
     let by_recv = client("u.recv(512)");
     let by_recvfrom = client("u.recvfrom(512)[0]");
@@ -1492,7 +1544,7 @@ except Exception:
         1,
         "the literal connect's NN-L-NET-028 record"
     );
-    for (how, pid) in [("recv", by_recv), ("recvfrom", by_recvfrom)] {
+    for (how, pid) in [("recv", by_recv.pid), ("recvfrom", by_recvfrom.pid)] {
         assert!(
             mine(pid).is_empty(),
             "the connect after an answer read with {how} on a connected socket drew \
@@ -1500,21 +1552,24 @@ except Exception:
             mine(pid)
         );
     }
-    // Review of #629 (P2): a query seen with its answer lost leaves
-    // NN-L-NET-028 silent too, so the absence above does not prove the
-    // answer was read. The flow rows must say the address came from this
-    // client's own resolution.
-    for (how, pid) in [("recv", by_recv), ("recvfrom", by_recvfrom)] {
-        let rows = fx.wait_netflow_matching(1, |r| {
-            r["pid"].as_u64() == Some(pid)
-                && r["dst_addr"].as_str() == Some("198.51.100.212")
-                && r["dst_port"].as_u64() == Some(9)
-        });
-        assert!(
-            rows.iter()
-                .any(|r| r["dns_resolution"].as_str() == Some("lineage")),
-            "the connect after an answer read with {how} on a connected socket \
-             must be judged resolved by its own lineage: {rows:?}"
+    // Review of #629 (P2): a query seen with its answer lost leaves those
+    // connects silent too; each client's connect to an address no answer
+    // named is recorded only when the agent saw its own answer
+    let clients = [("recv", by_recv.pid), ("recvfrom", by_recvfrom.pid)];
+    by_recv.connect_unresolved();
+    by_recvfrom.connect_unresolved();
+    let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
+    while clients.iter().any(|(_, pid)| mine(*pid).is_empty()) && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    for (how, pid) in clients {
+        let rec = mine(pid);
+        assert_eq!(
+            rec.len(),
+            1,
+            "the client reading its answer with {how} on a connected socket: its connect to \
+             {UNNAMED_ADDR} drew no NN-L-NET-028 record, so the agent did not see the answer"
         );
+        assert_eq!(rec[0]["severity"], "Medium", "unresolved: {}", rec[0]);
     }
 }
