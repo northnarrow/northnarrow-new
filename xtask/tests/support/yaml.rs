@@ -425,13 +425,13 @@ impl Serialize for Value {
 
 /// How the committed YAML is read (the module's head says why).
 pub fn options() -> serde_saphyr::Options {
-    serde_saphyr::options! {
-        strict_booleans: true,
-        leading_zero_numbers_as_strings: true,
-        underscored_numbers_as_strings: true,
-        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
-        merge_keys: serde_saphyr::MergeKeyPolicy::Error,
-    }
+    let mut o = serde_saphyr::Options::default();
+    o.strict_booleans = true;
+    o.leading_zero_numbers_as_strings = true;
+    o.underscored_numbers_as_strings = true;
+    o.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    o.merge_keys = serde_saphyr::MergeKeyPolicy::Error;
+    o
 }
 
 /// One YAML document as a tree.

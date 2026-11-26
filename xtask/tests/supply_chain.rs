@@ -3295,7 +3295,7 @@ fn no_committed_file_is_an_executable_or_an_object_file() {
     let mut mz_text = pe.clone();
     mz_text[0x40..0x44].copy_from_slice(b"PEX\0");
     for (rel, head, counted) in [
-        ("fuzz/seeds/elf_audit/names-none.elf", b"# nn-fuzz-seed hex\n".as_slice(), true),
+        ("x/names-none.elf", b"# nn-fuzz-seed hex\n".as_slice(), true),
         ("x/lib.so", b"text".as_slice(), true),
         ("x/A.CLASS", b"text".as_slice(), true),
         ("x/seed.bin", b"\x7fELF\x02\x01\x01\0".as_slice(), true),
@@ -3305,7 +3305,7 @@ fn no_committed_file_is_an_executable_or_an_object_file() {
         ("x/seed.bin", pe.as_slice(), true),
         ("x/seed.bin", mz_text.as_slice(), false),
         ("x/seed.bin", b"MZ".as_slice(), false),
-        ("fuzz/seeds/elf_audit/names-none.elf.hex", b"# nn-fuzz-seed hex\n7f454c46".as_slice(), false),
+        ("x/names-none.elf.hex", b"# nn-fuzz-seed hex\n7f454c46".as_slice(), false),
         ("x/ELF.md", b"ELF files".as_slice(), false),
         ("x/seed.bin", b"\x16\x03\x01\x02\0\x01".as_slice(), false),
     ] {
