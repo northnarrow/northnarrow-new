@@ -73,10 +73,10 @@ fn have(tool: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-type Yaml = serde_yaml_ng::Value;
+type Yaml = support::yaml::Value;
 
 fn workflow() -> Yaml {
-    serde_yaml_ng::from_str(&read(WORKFLOW)).unwrap_or_else(|e| panic!("{WORKFLOW}: {e}"))
+    support::yaml::from_str(&read(WORKFLOW)).unwrap_or_else(|e| panic!("{WORKFLOW}: {e}"))
 }
 
 fn str_of<'a>(v: &'a Yaml, key: &str) -> Option<&'a str> {

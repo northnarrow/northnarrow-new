@@ -22,7 +22,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use serde_yaml_ng::Value as Yaml;
+use support::yaml::Value as Yaml;
 use support::{cargo_metadata, members, module_map, repo_root, rs_files};
 
 /// What no pure crate may depend on directly: the OS interfaces and the
@@ -288,7 +288,7 @@ fn portable_core_checks_every_pure_crate_for_the_other_targets() {
         .filter(|m| map.crates[&m.name].pure)
         .map(|m| m.name)
         .collect();
-    let wf: Yaml = serde_yaml_ng::from_str(
+    let wf: Yaml = support::yaml::from_str(
         &fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap(),
     )
     .unwrap();
