@@ -19,11 +19,12 @@
 # Matrix: a pull request that touches a tree the privileged suites are built
 # or run from (paths below) gets Ubuntu 24.04 (6.8) and Ubuntu 22.04 (5.15);
 # the nightly schedule and a manual dispatch run the lab's four guests (and
-# Debian 12, 6.1; Debian 13, 6.12) and Ubuntu 26.04 (7.0, uutils coreutils;
-# lab PR 229). AlmaLinux 9, the lockdown guests, the
+# Debian 12, 6.1; Debian 13, 6.12), Ubuntu 26.04 (7.0, uutils coreutils;
+# lab PR 229) and AlmaLinux 9 (5.14 el9, SELinux enforcing; lot 1.10: the
+# RHEL family re-verified every night). The lockdown guests, the
 # nightly's other steps (test-e2e's counts, the security checks, respawn,
-# upgrade, uninstall) and the soak stay in the self-hosted lab
-# (docs/integration-test-runbook.md, "The CI VM gate").
+# upgrade, uninstall, the .rpm's lifecycle) and the soak stay in the
+# self-hosted lab (docs/integration-test-runbook.md, "The CI VM gate").
 #
 # Policy. On a pull request the job is informational: it is not a required
 # check, and `continue-on-error` keeps a red guest from failing the run
@@ -84,7 +85,7 @@ on:
       - .cargo/**
       - .github/workflows/lab-vm.yml
   schedule:
-    - cron: "17 1 * * *" # 01:17 UTC every night: all five guests
+    - cron: "17 1 * * *" # 01:17 UTC every night: all six guests
   workflow_dispatch:
 
 # A newer push to a pull request supersedes its run; the nightly and a
@@ -114,14 +115,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pull_request: the two Ubuntu kernels; schedule, workflow_dispatch: the lab's four guests and Ubuntu 26.04
-        distro: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu2404", "ubuntu2204"]' || '["ubuntu2404", "ubuntu2204", "debian12", "debian13", "ubuntu2604"]') }}
+        # pull_request: the two Ubuntu kernels; schedule, workflow_dispatch: the lab's four guests, Ubuntu 26.04 and AlmaLinux 9
+        distro: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu2404", "ubuntu2204"]' || '["ubuntu2404", "ubuntu2204", "debian12", "debian13", "ubuntu2604", "alma9"]') }}
     env:
       NN_LAB_CI: "1"
       NN_LAB_ACCEL: kvm
       NN_LAB_DISTRO: ${{ matrix.distro }}
       # The runner of a public repository has 4 vCPUs and 16 GB. The lab's
-      # guests have 8 GiB; the fat-LTO links of the test build get headroom.
+      # guests have 8 GiB; this one 12 GiB, for the links of the test build
+      # (thin LTO and, in CI mode, cargo's 4 jobs: nn-lab.sh's NN_LAB_LTO and
+      # NN_LAB_JOBS, the same for every cargo run in the guest since lot 1.10).
       NN_LAB_CPUS: "4"
       NN_LAB_MEM: "12288"
       NN_LAB_BOOT_TIMEOUT: "1200"
@@ -236,9 +239,14 @@ jobs:
       # xtask built. The first --locked builds xtask against Cargo.lock, the
       # second holds agent-ebpf/Cargo.lock (SUP-016). Lot 1.2 (F16): the
       # object's sha256 goes into the evidence, comparable with ci.yml's
-      # artefact `ebpf-object` of the same commit (the object CI tested).
-      # This job builds its own and compares nothing: loading the artefact
-      # here, and checking its sha256, is lot 1.10's.
+      # artefact `ebpf-object` of the same commit (the object CI tested; same
+      # checkout path and pins, so the same bytes). Lot 1.10: `sync` below
+      # sends this object to the guest through nn-lab.sh's artefact check
+      # (NN_LAB_EBPF_ARTIFACT, NN_LAB_EBPF_SHA256), with no second build,
+      # and refuses it unless its sha256, its build stamp and the guest's
+      # copy are the one recorded here. ci.yml's artefact itself is not
+      # downloaded: that needs a token that reads another run's artefacts,
+      # and this job holds `contents: read` and nothing else (SUP-004).
       - name: Build the eBPF object and xtask on the host
         if: steps.kvm.outputs.available == 'true'
         id: host
@@ -262,12 +270,12 @@ jobs:
           echo "no credential in the build job"
 
       # Ubuntu's image-signing key, fetched once from keyserver.ubuntu.com
-      # and kept only when its primary fingerprint is the one pinned in
-      # verify-download.sh; a list counts only with a good signature by that
-      # key, cached or not. Keyed by the file that pins it. (Debian signs no
-      # cloud image list.)
+      # (AlmaLinux's from repo.almalinux.org), and kept only when its primary
+      # fingerprint is the one pinned in verify-download.sh; a list counts
+      # only with a good signature by that key, cached or not. Keyed by the
+      # file that pins it. (Debian signs no cloud image list.)
       - name: Cache the pinned image-signing key
-        if: steps.kvm.outputs.available == 'true' && startsWith(matrix.distro, 'ubuntu')
+        if: steps.kvm.outputs.available == 'true' && (startsWith(matrix.distro, 'ubuntu') || matrix.distro == 'alma9')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.NN_LAB_DIR }}/keys
@@ -321,7 +329,10 @@ jobs:
         if: steps.kvm.outputs.available == 'true'
         id: sync
         timeout-minutes: 20
-        run: deploy/lab/nn-lab.sh sync
+        run: |
+          NN_LAB_EBPF_ARTIFACT="$GITHUB_WORKSPACE/agent-ebpf/target/bpfel-unknown-none/release" \
+          NN_LAB_EBPF_SHA256=$(cut -d' ' -f1 "$GATE_OUT/ebpf-object.sha256") \
+            deploy/lab/nn-lab.sh sync
 
       - name: nn-lab.sh build (release, test-privileged + debug-trigger, in the guest)
         if: steps.kvm.outputs.available == 'true'

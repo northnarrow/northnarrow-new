@@ -52,7 +52,7 @@ present) and the user in the `kvm` group.
 sudo apt install qemu-system-x86 qemu-utils cloud-image-utils   # host, once
 deploy/lab/nn-lab.sh up            # download + provision + boot (~5-10 min first time)
 deploy/lab/nn-lab.sh check         # kernel / lsm has bpf / bpffs / iptables / cargo
-deploy/lab/nn-lab.sh sync          # cargo xtask build-ebpf on host, rsync repo (+ eBPF object) into the guest
+deploy/lab/nn-lab.sh sync          # cargo xtask build-ebpf on host (or CI's object: below), rsync repo (+ eBPF object) into the guest
 deploy/lab/nn-lab.sh build         # guest-side cargo build --release --features test-privileged,debug-trigger
 deploy/lab/nn-lab.sh test-e2e      # the "Run" section below, as root, single-threaded
 deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test in the workspace
@@ -65,6 +65,61 @@ The eBPF object is built on the **host** (nightly + bpf-linker 0.10.3)
 and shipped with its provenance stamp; the guest only builds userland,
 so the staleness guard of `crates/nn-linux/build.rs` still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
+
+**The eBPF object CI tested, in the lab** (lot 1.10). Instead of building
+the object on the host, `sync` can send the one a CI run built and tested:
+ci.yml's artefact `ebpf-object` (the object, its `.buildhash` stamp and its
+`.sha256`). The recipe, for the commit the guest's tree is at:
+
+```sh
+run=$(gh run list --workflow ci.yml --commit <sha> --json databaseId -q '.[0].databaseId')
+gh run download "$run" -n ebpf-object -D /tmp/ebpf-<sha>
+# the sha256 the run printed: its summary ("eBPF object: `<sha256>` (artefact `ebpf-object`)"),
+# or the ebpf-build job's log line "xtask: build stamp … object <sha256>"
+sha=<that sha256>
+NN_LAB_EBPF_ARTIFACT=/tmp/ebpf-<sha> NN_LAB_EBPF_SHA256=$sha deploy/lab/nn-lab.sh sync
+deploy/lab/nn-lab.sh build                    # the agent embeds that object (its stamp must match the tree)
+deploy/lab/nn-lab.sh verifier-check synced    # loads the guest's copy, checked against the same sha256
+```
+
+The sha256 comes from the run, not from the artefact: the `.sha256` file
+travels with the object, so it names it but cannot vouch for it. `sync`
+refuses the artefact (exit 1, nothing sent, before the guest is looked
+at) without `NN_LAB_EBPF_SHA256`, or when the object's sha256, its
+`.sha256` line or its build stamp's object line is another; then it sends
+the tree without any `target/`, sends the object and its stamp on their
+own, checks the guest's copy against the sha256 and records it in
+`~/.cache/nn-lab/<guest>/synced-ebpf`. Without the artefact it builds the
+object on the host as before, and records that one's sha256 the same way.
+`verifier-check synced` checks the guest's copy against
+`NN_LAB_EBPF_SHA256`, or else that record, before it stops or loads
+anything, and fails when the report's `object: …, sha256 …` line names
+another object. The CI gate (lab-vm.yml) sends its own host build through
+the same check: it holds no token that reads another run's artefacts, and
+its build, at the same path with the same pins, is the same bytes as
+ci.yml's.
+
+**The guests' health** (lot 1.10, 26/11). This PC runs at most two guests
+at a time: the lab's lease script defaults to a cap of 2, and a raised cap
+must carry its end date. Every cargo run in a guest — `build`, the test
+builds of `test-e2e`, `test-ignored` and `test-one`, the perf build — goes
+through one place with one release LTO and a bounded number of jobs:
+`NN_LAB_LTO` (`thin`, the default; `fat` is production's, for a guest with
+the memory; `off`) and `NN_LAB_JOBS` (half the guest's vCPUs in the lab, all
+of them in CI mode), with the lab user's `CARGO_HOME` and `RUSTUP_HOME`
+named for the privileged runs under `sudo -E`. Before, the test builds used
+the release profile's fat LTO while `build` used thin: two release trees on
+the guest's disk, and fat-LTO links of several test binaries at once, which
+left a 24.04 guest's ssh unanswered; and on AlmaLinux, whose sudo sets
+`HOME=/root`, root's test build installed a second toolchain and rebuilt
+the workspace on its own. `build` first checks the guest's free space in its home:
+under `NN_LAB_MIN_FREE_GB` (8) it removes what no lab command reuses (other
+profiles' trees of `target/`, stale verifier-check logs, cargo's extracted
+registry sources, the package cache, the journal beyond 200 MB), then the
+release tree (with `sudo`: the privileged runs leave root's files in it),
+and refuses the build when the guest is still short. `nn-lab.sh grow-disk
++10G` grows a powered-off guest's disk; the cloud images grow their root
+file system at the next boot, and `check` prints the free space.
 
 **Base images are verified** (external audit LAB-009,
 `deploy/lab/lib/verify-download.sh`). `up` downloads an image only
@@ -145,7 +200,7 @@ own disk, seed, ssh port and reports under `~/.cache/nn-lab/<distro>/`
 | `debian13` | 6.12 | 2722 | first guest from 6.9 (`inode_setattr` takes `mnt_idmap` first); `nftables` installed; `perf_event_paranoid=3` drop-in |
 | `ubuntu2204` | 5.15 | 2522 | older verifier, sudo 1.9.9, systemd 249 |
 | `ubuntu2604` | 7.0 | 2822 | lab PR 229: the hosted CI runners' release; coreutils are the uutils multi-call binary, which picks its utility from the name it is run by (a copy of `true` or `sleep` keeps its name, in a directory of its own); systemd 259; `sudo` is sudo-rs; in `malsim-exec-check` the two NN-L-EXECENV-002 cases draw no record there (a follow-up) |
-| `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header; `kernel.io_uring_disabled=2` (no ring, not even for root); sudo's `secure_path` has no `/usr/local/bin`, so call `/usr/local/bin/nn-admin` |
+| `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header; `kernel.io_uring_disabled=2` (no ring, not even for root); sudo's `secure_path` has no `/usr/local/bin`, so call `/usr/local/bin/nn-admin`; in the nightly since lot 1.10; the `lsm=` line is set with `grubby` by its template (el9's built-in list already ends in `bpf`) |
 
 `install` builds the tree already on the guest: run `sync` first
 (`sync && install`), or the guest builds what it had. On a guest whose
@@ -297,12 +352,16 @@ succeeded, at least one suite ran, nothing failed to build, every cargo run
 finished, every test binary that failed printed its libtest summary (a
 crash, a kill or a timeout does not), and every failed test is an expected
 one. `deploy/lab/expected-failures.tsv` lists those: one line per recorded
-follow-up, for one distro (`distro`, `suite`, `test`, the follow-up). Today
-it holds none: its one line — on Debian 13,
+follow-up, for one distro (`distro`, `suite`, `test`, the follow-up). Its
+first line — on Debian 13,
 `net_privileged_e2e::net_outbound_connect_records_flow_with_dns_attribution`
 failed (the guest resolves through `nss-resolve`, a follow-up since lab PR
 164) — went with lab PR 229, which attributes the names asked through
-systemd-resolved's NSS module. An expected failure is never hidden: it is counted in
+systemd-resolved's NSS module. Today it holds one, on AlmaLinux 9 (lot
+1.10): `detection_rules_at_scale_privileged_e2e::r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options`,
+whose R018 record of a load from a staged module tree is High, not Critical
+(el9's kmod decompresses the `.ko.xz` itself and loads it with
+`init_module`: the kernel sees no file). An expected failure is never hidden: it is counted in
 `failed`, given its own column and listed with its outcome and follow-up;
 it fails the run when it passes (the follow-up is fixed: remove its line)
 or does not run, and it does not excuse the same test on another guest.
@@ -329,19 +388,20 @@ The same tool reads a lab run:
 `deploy/lab/nn-lab.sh test-ignored 2>&1 | tee gate.log; rc=${PIPESTATUS[0]}`, then
 `cargo xtask gate-summary --log gate.log --distro <distro> --rc "$rc" --kernel "$(deploy/lab/nn-lab.sh ssh uname -r)"`.
 
-**What stays in the self-hosted lab.** AlmaLinux 9; the lockdown guests
+**What stays in the self-hosted lab.** The lockdown guests
 (anti-tamper C27); `test-e2e`'s per-suite counts; the nightly's security
 checks (tamper-check, pkgmgr-, open-sensor-, fim-reuse-, btrfs-,
 overlay-check), respawn-, upgrade- and uninstall-check; `release-check`,
 `pkg-check`, the sensor checks, the overhead and the soak; the before/after
 probes of a lab PR. A lab PR's evidence is still its lab run; the CI gate
 gives every relevant pull request an informational run of the privileged
-suites on two kernels, and gates them every night on four.
+suites on two kernels, and gates them every night on six (AlmaLinux 9
+among them since lot 1.10).
 
 **Time.** Expected 1.5–3 h per job (an estimate until the first runs: the
 host build ~5 min, the boot with cloud-init ~5–10 min, two release builds
-in a 4-vCPU guest — the test build has the release profile's fat LTO — then
-the suites); the job stops at 330 minutes, under GitHub's 6 h ceiling, and
+in a 4-vCPU guest — thin LTO for both since lot 1.10, the test build had
+the release profile's fat LTO before — then the suites); the job stops at 330 minutes, under GitHub's 6 h ceiling, and
 `test-ignored` at 200. The first real runs measure it.
 
 ### Soak test (hours of synthetic load)
@@ -424,6 +484,44 @@ trusted-installer key is refused with the agent untouched, removes,
 purges, and does a fresh install whose install manifest says
 `"provenance": "package"`. It puts the lab layout back with `install` at
 the end.
+
+**The release `.rpm`** (lot 1.10, #604), on an RPM guest (`alma9`):
+
+```
+gh release download v0.1.0-alpha -D /tmp/rel-from -p '*.rpm' -p 'RPM-GPG-KEY-northnarrow.asc' -p 'SHA256SUMS*'
+gh run download <release.yml run of the build> -D /tmp/rel-new       # its .rpm and SHA256SUMS
+NN_LAB_DISTRO=alma9 deploy/lab/nn-lab.sh rpm-release-check /tmp/rel-from /tmp/rel-new
+```
+
+`rpm-release-check` checks on the host first, and sends nothing when one
+check fails: the release's key is `deploy/release/RPM-GPG-KEY-northnarrow.asc`
+byte for byte, its `SHA256SUMS` carries a good signature by the release key
+`install.sh` pins, and each package is the one its list names. On the guest
+(`deploy/lab/pkg/release-rpm-check.sh`), after purging the lab's layout:
+- the key's fingerprint, then `rpm --import`;
+- `rpm -K`: the released package is signed ("digests signatures OK"), a
+  copy altered after signing is refused by `dnf --setopt=localpkg_gpgcheck=1`,
+  and the build under test is reported signed or unsigned (a branch build
+  is signed on a tag only);
+- the released package installed with that `dnf`. Nothing starts until the
+  units are enabled as §1 of the operator guide says, and then both run;
+- the build under test over it in place with `rpm -U --replacepkgs` (the
+  same version-release until the next release). It is refused without
+  `NN_GRANT_KEY`; with it the units restart, the keys and `agent_id` stay,
+  the binary is the new package's, `rpm -V` is clean, and the agent verifies
+  its binaries against the package manifest;
+- a cold boot, after which both units and the pin root are back;
+- `rpm -e`, refused without the key, then `uninstall.sh --package --purge`.
+  Nothing named NorthNarrow is left against the inventory taken first: no
+  unit, pin, BPF program, nft table or iptables chain. Only the imported
+  `gpg-pubkey` package stays (the operator's to remove);
+- no SELinux AVC denial logged since the round began.
+
+The lab's layout is put back at the end. First run on AlmaLinux 9.9,
+2026-11-26: the `v0.1.0-alpha` package and the release dry run of `main`
+`ffd9632b` (release.yml run 45769222051), every step passed. The
+attestation (§5 of the operator guide) is checked off the guest, with
+`gh` 2.49 or later.
 
 ### Overhead (agent off vs on)
 

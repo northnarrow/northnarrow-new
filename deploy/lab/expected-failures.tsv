@@ -15,8 +15,14 @@
 # xtask/tests/lab_ci.rs checks that every distro is a guest of nn-lab.sh and
 # every test exists in its suite.
 #
-# None today. The one line the gate started with — Debian 13's DNS
-# attribution under nss-resolve (lab PR 164) — was removed when lab PR 229
-# fixed it (the uprobe on systemd-resolved's NSS module).
+# The one line the gate started with — Debian 13's DNS attribution under
+# nss-resolve (lab PR 164) — was removed when lab PR 229 fixed it (the
+# uprobe on systemd-resolved's NSS module).
+#
+# AlmaLinux 9 (lot 1.10, the guest's first nightly): el9's kmod decompresses
+# a .ko.xz in user space and loads it with init_module, so the kernel sees no
+# file and R018 rates a load from a staged module tree High, not Critical
+# (R011 still kills modprobe; measured twice on 5.14.0-741 el9_9).
 #
 # distro	suite	test	follow-up
+alma9	detection_rules_at_scale_privileged_e2e	r011_records_a_name_and_kills_a_moved_tree_or_modprobe_options	lab PR lot 1.10: R018 on el9 sees no file for an init_module load (kmod decompresses .ko.xz itself): a staged-tree load is High, not Critical

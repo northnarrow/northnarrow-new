@@ -756,7 +756,12 @@ fn guest_of(distro: &str) -> Option<String> {
     let mut words = distro.split_whitespace();
     let name = words.next()?.to_lowercase();
     let version = words.next()?.replace('.', "");
-    matches!(name.as_str(), "ubuntu" | "debian").then(|| format!("{name}{version}"))
+    match name.as_str() {
+        "ubuntu" | "debian" => Some(format!("{name}{version}")),
+        // lot 1.10: nn-lab.sh's alma9
+        "almalinux" => Some(format!("alma{version}")),
+        _ => None,
+    }
 }
 
 /// The lab workflow's guests: (those of a pull request, those of the
@@ -787,7 +792,7 @@ fn lab_guests() -> (Vec<String>, Vec<String>) {
 /// gates are the lab's (the nightly's and the pull requests' guests, the
 /// verified matrix's kernels), and its deny-hook figures are the code's:
 /// the mandatory hooks plus the optional ones, the two ACL hooks only
-/// from 6.2.
+/// from 6.2 (or on RHEL 9's 5.14, which backports them).
 #[test]
 fn the_readme_kernel_table_is_the_lab_s_and_the_code_s() {
     let readme = read("README.md");
@@ -833,15 +838,20 @@ fn the_readme_kernel_table_is_the_lab_s_and_the_code_s() {
             nightly_rows.push(guest.clone());
         }
         let short = distro.trim_end_matches(" LTS");
+        // "5.14 (el9)": the version, without the vendor's note
+        let version = kernel.split_whitespace().next().unwrap_or(kernel);
         assert!(
             compat.lines().any(|l| l.starts_with(&format!("| {short}"))
-                && cells(l)
-                    .get(1)
-                    .is_some_and(|k| k.starts_with(kernel.as_str()))),
+                && cells(l).get(1).is_some_and(|k| k.starts_with(version))),
             "{distro} {kernel}: not a row of KERNEL_COMPATIBILITY.md's verified matrix"
         );
         let (major, minor) = kernel.split_once('.').expect("a kernel x.y");
-        let from_6_2 = (major.parse::<u32>().unwrap(), minor.parse::<u32>().unwrap()) >= (6, 2);
+        // "5.14 (el9)": a vendor kernel's suffix after the minor
+        let minor: String = minor.chars().take_while(char::is_ascii_digit).collect();
+        // RHEL 9's 5.14 backports the ACL hooks: 28 of 28 deny hooks
+        // attached on 5.14.0-741 el9_9 (lot 1.10's round)
+        let from_6_2 = (major.parse::<u32>().unwrap(), minor.parse::<u32>().unwrap()) >= (6, 2)
+            || kernel.ends_with("(el9)");
         let want = c.deny + c.optional - if from_6_2 { 0 } else { acl };
         assert_eq!(
             hooks.parse::<usize>().ok(),
