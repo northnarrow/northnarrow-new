@@ -17,7 +17,9 @@
 //! `/var/tmp/nn-feasibility.XXXXXX` made by `mkdtemp(3)` (mode 0700, a name
 //! no one can predict); `NN_FEASIBILITY_BASE=<dir>` puts it under `<dir>`
 //! instead, to run the file checks on another filesystem. The tmpfs exec
-//! case copies `/usr/bin/true` into another such directory under `/dev/shm`.
+//! case copies `/usr/bin/true` into another such directory under `/dev/shm`;
+//! the system binary's case runs the file `/usr/bin/true` resolves to (a
+//! symlink on Ubuntu 26.04, lot 1.5).
 //! The runner runs as root: it never creates, removes or executes a file at
 //! a fixed name in a world-writable directory (external audit SNS-003).
 
@@ -1149,15 +1151,30 @@ struct ExecCase<'a> {
     tmpfs: bool,
 }
 
+/// Lot 1.5 (the kernel census): the file a system binary's name resolves
+/// to, and its own metadata (`lstat` of the resolved path). Ubuntu 26.04's
+/// `/usr/bin/true` (uutils coreutils) is a symlink to `gnutrue`, which
+/// [`vet_exec_target`] refuses as not a regular file: the case of the
+/// system binary failed there without being run. It now runs the file the
+/// name resolves to, by that file's own name, so the record's filename,
+/// inode and link count are that file's, and the vetting still sees a
+/// regular file (a symlink given to it is still refused).
+fn system_binary(name: &Path) -> Result<(PathBuf, fs::Metadata)> {
+    let path = fs::canonicalize(name).with_context(|| format!("resolving {}", name.display()))?;
+    let m = fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    Ok((path, m))
+}
+
 fn exercise_exec(p: &mut Probes, rep: &mut Report, fx: &Fixtures) -> Result<()> {
     let me = std::process::id();
     let mut cases = Vec::new();
-    let m = fs::metadata(TRUE_BIN)?;
+    let (bin, m) = system_binary(Path::new(TRUE_BIN))?;
+    let name = bin.to_string_lossy().into_owned();
     cases.push(ExecCase {
-        label: "/usr/bin/true",
-        launch: Launch::Path(TRUE_BIN.into()),
-        target: ExecTarget::Path(TRUE_BIN.into()),
-        filename: TRUE_BIN.into(),
+        label: "/usr/bin/true (the file it names)",
+        launch: Launch::Path(name.clone()),
+        target: ExecTarget::Path(bin),
+        filename: name,
         expect_ino: m.ino(),
         expect_dev: stat_dev_to_kernel_dev(m.dev()),
         deleted: false,
@@ -1709,6 +1726,44 @@ mod tests {
         assert!(b.path().is_dir(), "another run's directory kept");
         assert_eq!(fs::read(old_work.join("plain")).unwrap(), b"planted");
         assert_eq!(fs::read(&old_shm).unwrap(), b"planted");
+    }
+
+    /// Lot 1.5 (the kernel census, Ubuntu 26.04's 7.0): `/usr/bin/true` is
+    /// a symlink there (uutils coreutils: `true -> gnutrue`), and the exec
+    /// case of the system binary was refused before it ran ("not a regular
+    /// file": the report's one FAIL on that guest). The case runs the file
+    /// the name resolves to; a symlink itself is still refused.
+    #[test]
+    fn a_system_binary_behind_a_symlink_runs_as_the_file_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("gnutrue");
+        drop(create_private(&real, 0o755).unwrap());
+        let link = dir.path().join("true");
+        symlink("gnutrue", &link).unwrap();
+        assert!(
+            vet_exec_target(&ExecTarget::Path(link.clone()), euid(), 1).is_err(),
+            "a symlink is still refused by the vetting"
+        );
+        let (bin, m) = system_binary(&link).unwrap();
+        assert_eq!(
+            bin,
+            fs::canonicalize(&real).unwrap(),
+            "the file the name resolves to"
+        );
+        assert_eq!(m.ino(), fs::symlink_metadata(&real).unwrap().ino());
+        assert!(m.file_type().is_file());
+        assert_eq!(
+            vet_exec_target(&ExecTarget::Path(bin), euid(), 1),
+            Ok(()),
+            "the resolved file passes the vetting the exec case runs"
+        );
+        // A plain file resolves to itself (every other guest's /usr/bin/true).
+        assert_eq!(
+            system_binary(&real).unwrap().0,
+            fs::canonicalize(&real).unwrap()
+        );
+        // A name that resolves to nothing is an error, not a case.
+        assert!(system_binary(&dir.path().join("missing")).is_err());
     }
 
     #[test]
