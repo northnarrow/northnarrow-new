@@ -24,12 +24,13 @@ pub mod kernel;
 pub mod pkgtrust;
 pub mod policy;
 pub mod record;
+pub mod release;
 
 use std::collections::{HashSet, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use common::wire::execq::{class, mode};
@@ -433,8 +434,51 @@ pub struct StartDeps {
 
 /// The running controller.
 pub struct Handle {
-    thread: std::thread::JoinHandle<()>,
+    /// `None` once [`shutdown`] has stopped it.
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Lot M4 (#633): the stop's release of what the kernel holds, on the
+    /// stopping thread.
+    sweeper: Arc<Sweeper>,
 }
+
+/// Lot M4: what a handle dropped without [`shutdown`] waits for the
+/// controller's own stop (a start that failed after the guard started: the
+/// agent leaves with no stop and no deadline).
+const DROP_WAIT: Duration = Duration::from_millis(500);
+
+impl Drop for Handle {
+    /// Lot M4 (#633): the agent leaves without its stop (a later step of
+    /// the start failed): the controller is told to stop all the same, and
+    /// what the kernel holds is released — never left stopped for a next
+    /// start that may not come.
+    fn drop(&mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ =
+                release::stop_then_sweep(&STOPPING, wake_controller, t, &self.sweeper, DROP_WAIT);
+            ACTIVE.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Wake the controller's poll (its stop is due).
+fn wake_controller() {
+    if let Some(fd) = LEDGER.wake_fd() {
+        let one: u64 = 1;
+        // SAFETY: an 8-byte write to our eventfd.
+        unsafe { libc::write(fd, &one as *const u64 as *const _, 8) };
+    }
+}
+
+/// The production sweep, over the kernel's maps.
+pub type Sweeper = release::Sweeper<kernel::KernelMaps>;
+
+/// Lot M4: the sweep the stop deadline's exit runs ([`release_at_exit`]).
+static EXIT_SWEEPER: OnceLock<Arc<Sweeper>> = OnceLock::new();
+
+/// Lot M4 (#633): how long the stop waits for the controller's own stop at
+/// most — the stop's deadline bounds it further (`drain_bound`); then the
+/// stop's sweep releases what the kernel still holds.
+pub const STOP_WAIT: Duration = Duration::from_secs(1);
 
 /// Start the controller thread on the configuration `cfg` and the kernel
 /// objects [`install`] took (`kernel`). `Err`: the guard does not run — the
@@ -481,10 +525,20 @@ pub fn start(
     let enforce = cfg.mode == Mode::Enforce;
     let mut policy = cfg.policy;
     policy.enforce = enforce;
+    // lot M4 (#633): the maps and the recorder shared with the stop's sweep
+    let recorder = release::SharedRecorder::new(deps.recorder);
+    let sweeper = Arc::new(Sweeper::new(
+        Arc::clone(&k.held),
+        Box::new(crate::response::proc_ref::ProcRef::open_started_at),
+        enforce,
+        Some(deps.journal.clone()),
+        Some(recorder.clone()),
+    ));
+    let _ = EXIT_SWEEPER.set(Arc::clone(&sweeper));
     let ctl = controller::Controller::new(
         k,
         sup,
-        deps.recorder,
+        Box::new(recorder),
         controller::Settings {
             policy,
             budget: cfg.budget,
@@ -505,36 +559,57 @@ pub fn start(
             ctl.run(&STOPPING)
         })
         .map_err(|e| format!("controller thread: {e}"))?;
-    Ok(Handle { thread })
+    Ok(Handle {
+        thread: Some(thread),
+        sweeper,
+    })
 }
 
-/// Stop the controller: every held process is resumed, the heartbeat is
-/// cleared (the kernel holds nothing more), the scanner is stopped.
-pub fn shutdown(handle: Option<Handle>) {
-    STOPPING.store(true, Ordering::Relaxed);
-    if let Some(fd) = LEDGER.wake_fd() {
-        let one: u64 = 1;
-        // SAFETY: an 8-byte write to our eventfd.
-        unsafe { libc::write(fd, &one as *const u64 as *const _, 8) };
-    }
-    if let Some(h) = handle {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !h.thread.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+/// Stop the controller: every held process is resumed (or its owed kill
+/// carried out), the heartbeat is cleared (the kernel holds nothing more),
+/// the scanner is stopped.
+///
+/// Lot M4 (#633): the controller's own stop is waited for `wait` at most
+/// (the stop's deadline gives it: [`STOP_WAIT`] or less), then the stop's
+/// sweep releases what the kernel's map still names — everything, when the
+/// controller is still in a pass (an rpm host's package lookups), the
+/// processes it could not capture otherwise. The process never ends its
+/// stop with processes held for a decision that will not come.
+pub fn shutdown(handle: Option<Handle>, wait: Duration) {
+    match handle.and_then(|mut h| Some((h.thread.take()?, Arc::clone(&h.sweeper)))) {
+        Some((thread, sweeper)) => {
+            // a controller still in its pass is let go: the exit ends it
+            let _ = release::stop_then_sweep(&STOPPING, wake_controller, thread, &sweeper, wait);
         }
-        if h.thread.is_finished() {
-            let _ = h.thread.join();
-        } else {
-            // lot 317 (review F8): the stop's budget is 2 s in all
-            // (stop_deadline: the unit's 5 s less the kernel's release)
-            warn!(
-                "exec quarantine controller did not stop within 2 s — the processes it holds stay \
-                 stopped, in the pinned map: the next start resumes them (or kills those whose \
-                 kill is owed)"
-            );
+        None => {
+            STOPPING.store(true, Ordering::Relaxed);
+            wake_controller();
         }
     }
     ACTIVE.store(false, Ordering::Relaxed);
+}
+
+/// Lot M4 (#633): the stop's deadline ends the process — whatever stage
+/// blocks, the processes the kernel holds are released first (resumed; a
+/// kill owed stays in the pinned map for the next start). Bounded; signs
+/// nothing (the audit log may be held by the stage that blocks).
+pub fn release_at_exit() {
+    let Some(s) = EXIT_SWEEPER.get() else {
+        return;
+    };
+    match s.sweep_at_exit() {
+        Some(swept) if swept != release::Swept::default() => warn!(
+            resumed = swept.resumed.len(),
+            left = swept.left.len(),
+            kills_left = swept.kills_left.len(),
+            "exec quarantine: the stop's deadline released the processes the kernel held"
+        ),
+        Some(_) => {}
+        None => warn!(
+            "exec quarantine: the stop's deadline could not take the kernel's maps — held \
+             processes stay in the pinned map for the next start"
+        ),
+    }
 }
 
 /// Lab PR 221's typed mapping (ATT&CK Enterprise 20.0) of NN-L-EXECQ-001:

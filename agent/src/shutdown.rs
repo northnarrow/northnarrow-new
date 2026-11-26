@@ -51,9 +51,14 @@ pub(crate) fn stop(
     // parent-death signal), their pids out of PROTECTED_PIDS first.
     deadline.stage("workers");
     workers.stop();
-    // Lab PR 223: nothing stays held by an agent that stops.
+    // Lab PR 223: nothing stays held by an agent that stops. Lot M4 (#633):
+    // the controller's own stop waited for within what the deadline leaves,
+    // then the stop's sweep releases what the kernel still holds.
     deadline.stage("guards");
-    northnarrow_agent::execq::shutdown(execq_handle);
+    northnarrow_agent::execq::shutdown(
+        execq_handle,
+        deadline.drain_bound(northnarrow_agent::execq::STOP_WAIT),
+    );
     // Lab PR 226: the kernel keeps the policy until its programs detach.
     northnarrow_agent::execpol::shutdown(execpol_handle);
     // The links go with the agent from here on: the self-check stops

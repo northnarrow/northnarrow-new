@@ -130,6 +130,13 @@ const STATICS: &[Kept] = &[
     ),
     kept(
         "agent/src/execq/mod.rs",
+        "EXIT_SWEEPER",
+        Kernel,
+        "lot M4 (#633): the release of what the one eBPF object's exec quarantine holds, for \
+         the stop deadline's exit (a thread of the process's own, past any stage that blocks)",
+    ),
+    kept(
+        "agent/src/execq/mod.rs",
         "COUNTERS",
         Telemetry,
         "the exec quarantine's counters in `status --key`",

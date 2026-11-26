@@ -114,8 +114,9 @@ const UNTICKETED: &[(&str, Sites)] = &[
             // inside `kill_one`, reached only through the ticketed kills
             ("crates/nn-linux/src/response/kill.rs", None),
             // lot 317: the decision's and the owed kill's one helper (its
-            // ticket made and answered there, as in `carry_out` before)
-            ("agent/src/execq/controller.rs", Some("fn kill(")),
+            // ticket made and answered there, as in `carry_out` before);
+            // lot M4 (#633): shared by the controller and the stop's sweep
+            ("agent/src/execq/release.rs", Some("fn kill_with_intent(")),
         ],
     ),
     (
@@ -430,14 +431,14 @@ fn the_rules_fail_on_planted_violations() {
     let mut files = acting_code();
     let execq = files
         .iter_mut()
-        .find(|(r, _)| r == "agent/src/execq/controller.rs")
+        .find(|(r, _)| r == "agent/src/execq/release.rs")
         .unwrap();
     execq
         .1
         .push_str("\nfn sneak(p: &ProcRef) { let _ = p.signal(libc::SIGKILL); }\n");
     let v = untick_actions(&files);
     assert!(
-        v.len() == 1 && v[0].contains("outside `fn kill(`"),
+        v.len() == 1 && v[0].contains("outside `fn kill_with_intent(`"),
         "{v:#?}"
     );
     // 4: a ticket made and dropped

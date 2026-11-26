@@ -20,7 +20,9 @@
 //! that no process on the host is left in state T that was not before, and
 //! that the test's cgroup is not frozen. The signed `stopping` entry of the
 //! agent's audit chain must name resumed processes: the stop did happen
-//! with execs held.
+//! with execs held. Lot M4 (#633): a case kills the agent instead (SIGKILL,
+//! as the OOM killer does) and starts it again: the next start resumes what
+//! the killed one held, signed (`recovered_at_boot`).
 //!
 //! Needs root, this build's eBPF object and `bpf` in the kernel's LSM list
 //! (the exec quarantine's stop is on LSM): `sudo -E cargo test -p
@@ -221,7 +223,7 @@ impl Drop for Burst {
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
-    burst_and_stop("plain", &[]);
+    burst_and_stop("plain", &[], StopBy::Signed);
 }
 
 /// Lot 317 (the review of #541, F6): the window of BUG-118 held open — a
@@ -234,7 +236,11 @@ fn a_stop_in_the_middle_of_an_exec_burst_leaves_no_process_stopped() {
 #[test]
 #[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
 fn a_stop_with_reports_left_unread_resumes_them() {
-    let unreported = burst_and_stop("unread", &[("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE)]);
+    let unreported = burst_and_stop(
+        "unread",
+        &[("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE)],
+        StopBy::Signed,
+    );
     assert!(
         unreported > 0,
         "no process held without an entry: the window was not held open"
@@ -254,6 +260,7 @@ fn the_map_alone_names_what_the_stop_resumes() {
             ("NN_DEBUG_EXECQ_PAUSE_READS", PAUSE),
             ("NN_DEBUG_EXECQ_STOP_NO_LAST_READ", "1"),
         ],
+        StopBy::Signed,
     );
     assert!(
         unreported > 0,
@@ -261,11 +268,89 @@ fn the_map_alone_names_what_the_stop_resumes() {
     );
 }
 
-/// The production pin root, wiped before each agent of this file starts:
-/// the three cases start one agent each in one run, and an agent refuses a
-/// start whose protected directories differ from those its predecessor's
-/// pins recorded (lab: the first run on a fresh guest). As the canary and
-/// FIM suites do.
+/// Lot M4 (#633): the agent stops while its controller is in a pass that
+/// does not end — on AlmaLinux 9 each report asked `rpm -qf`, a ring's
+/// worth took seconds, the stop's deadline ended the agent before the
+/// controller's own stop and about a thousand held processes stayed in
+/// state T. A `debug-trigger` build's agent blocks in the handling of a
+/// report while `NN_DEBUG_EXECQ_STALL`'s file exists (created 300 ms before
+/// the stop is asked, never removed): the controller never gets to its own
+/// stop, and the stop's sweep releases every process the kernel holds (the
+/// signed `stopping` entry `"by": "sweep: …"`).
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
+fn a_stop_while_the_controller_is_stuck_releases_every_held_process() {
+    let unreported = burst_and_stop("stuck", &[("NN_DEBUG_EXECQ_STALL", STALL)], StopBy::Signed);
+    assert!(
+        unreported > 0,
+        "the stop's sweep resumed nothing: the controller was not stuck at the stop"
+    );
+}
+
+/// Lot M4 (#633): the agent killed in the middle of the burst, as the OOM
+/// killer kills it (SIGKILL: no stop of its own, no sweep). The processes
+/// it held stay stopped in the pinned map; the next start of the agent
+/// resumes every one of them before its first heartbeat, signed
+/// (`recovered_at_boot`), and nothing is left in state T.
+#[test]
+#[ignore = "requires root, this build's eBPF object and bpf in the LSM list; lab: nn-lab.sh test-ignored"]
+fn the_next_start_releases_what_a_killed_agent_held() {
+    let recovered = burst_and_stop("killed", &[], StopBy::KillThenRestart);
+    assert!(
+        recovered > 0,
+        "the next start's signed `recovered_at_boot` resumed nothing: the killed agent left \
+         nothing held"
+    );
+}
+
+/// How a case's agent stops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopBy {
+    /// The operator's signed `nn-admin shutdown`.
+    Signed,
+    /// Lot M4: SIGKILL ([`kill_agent`]), then the next start of the agent,
+    /// stopped the operator's way.
+    KillThenRestart,
+}
+
+/// Longer than the kernel's heartbeat bound (1.5 s): past it, the kernel
+/// of a killed agent holds nothing more.
+const HEARTBEAT_STALE: Duration = Duration::from_secs(2);
+
+/// Lot M4: the agent killed as the OOM killer kills it — SIGKILL, no stop
+/// of its own. Its tree is evicted from `PROTECTED_PIDS` first (the
+/// task_kill hook refuses the signal otherwise), every process below sudo
+/// is killed (the scanner with the agent), then sudo is reaped.
+fn kill_agent(c: &mut Child) -> Result<(), String> {
+    let tree = common::process_tree(c.id());
+    common::unprotect_pids(&tree)?;
+    for &p in tree.iter().skip(1) {
+        // SAFETY: plain kill(2); a process that has gone answers ESRCH.
+        unsafe { libc::kill(p as i32, libc::SIGKILL) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match c.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                return Err(format!(
+                    "sudo pid {} did not exit after its agent's kill (tree {tree:?})",
+                    c.id()
+                ));
+            }
+            Err(e) => return Err(format!("waiting for sudo pid {}: {e}", c.id())),
+        }
+    }
+}
+
+/// The production pin root, wiped before each case of this file starts:
+/// the cases start their agents in one run, and an agent refuses a start
+/// whose protected directories differ from those its predecessor's pins
+/// recorded (lab: the first run on a fresh guest). As the canary and FIM
+/// suites do. Lot M4: the kill case's second start is not wiped for — it
+/// starts on its killed predecessor's pins, the held map among them.
 const BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
 
 fn wipe_pin_tree() {
@@ -281,11 +366,15 @@ fn wipe_pin_tree() {
 /// The placeholder of `NN_DEBUG_EXECQ_PAUSE_READS`'s value: the test's
 /// pause file, created 300 ms before the stop is asked.
 const PAUSE: &str = "@pause@";
+/// Lot M4: the placeholder of `NN_DEBUG_EXECQ_STALL`'s value: the test's
+/// stall file, created 300 ms before the stop is asked.
+const STALL: &str = "@stall@";
 
-/// A burst, a signed stop in its middle, the checks; `env`: the agent's
+/// A burst, a stop in its middle (`by`), the checks; `env`: the agent's
 /// extra variables (`PAUSE`: the pause file). Returns how many processes
-/// the stop resumed without an entry (`unreported`).
-fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
+/// the stop resumed without an entry (`unreported`) — after a kill, how
+/// many the next start resumed (`recovered_at_boot`).
+fn burst_and_stop(case: &str, env: &[(&str, &str)], by: StopBy) -> usize {
     common::require_root("run the exec quarantine's stop e2e");
     common::require_disposable_host("run the exec quarantine's stop e2e");
     common::refuse_if_northnarrow_running("run the exec quarantine's stop e2e");
@@ -337,43 +426,68 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
 
     let stopped_before = stopped_processes();
     let log = dir.join("agent.log");
-    let out = std::fs::File::create(&log).unwrap();
-    let err = out.try_clone().unwrap();
     let pause = dir.join("nn-execq-pause-reads");
     let pause_s = pause.display().to_string();
+    let stall = dir.join("nn-execq-stall");
+    let stall_s = stall.display().to_string();
     let mut agent_env = vec![("NO_COLOR", "1")];
     for (k, v) in env {
-        agent_env.push((k, if *v == PAUSE { pause_s.as_str() } else { v }));
+        let v = match *v {
+            PAUSE => pause_s.as_str(),
+            STALL => stall_s.as_str(),
+            v => v,
+        };
+        agent_env.push((k, v));
     }
     let pausing = env.iter().any(|(_, v)| *v == PAUSE);
-    let child = installed_agent
-        .command(&state, Launch::Sudo, &agent_env)
-        .arg("--combat-rules")
-        .arg(&rules)
-        .args(["--exec-quarantine", "enforce"])
-        .args(["--exec-quarantine-budget-ms", BUDGET_MS])
-        .arg("--exec-quarantine-scanner")
-        .arg(&scanner.path)
-        .args(["--exec-quarantine-scan-user", "nobody"])
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .expect("spawn the agent");
-    let mut agent = Agent(Some(child));
+    let stalling = env.iter().any(|(_, v)| *v == STALL);
+    // the agent's start (lot M4: again after a kill, its log appended to)
+    let spawn_agent = || {
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let err = out.try_clone().unwrap();
+        installed_agent
+            .command(&state, Launch::Sudo, &agent_env)
+            .arg("--combat-rules")
+            .arg(&rules)
+            .args(["--exec-quarantine", "enforce"])
+            .args(["--exec-quarantine-budget-ms", BUDGET_MS])
+            .arg("--exec-quarantine-scanner")
+            .arg(&scanner.path)
+            .args(["--exec-quarantine-scan-user", "nobody"])
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("spawn the agent")
+    };
+    let mut agent = Agent(Some(spawn_agent()));
     let tail = || {
         let text = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
         let lines: Vec<&str> = text.lines().collect();
         lines[lines.len().saturating_sub(40)..].join("\n")
     };
-    let ready = common::wait_until(Duration::from_secs(30), || {
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
-        (state.admin_socket().exists()
-            && state.pid_file().exists()
-            && text.contains("exec quarantine: starting its controller and scanner"))
-        .then_some(())
-    });
+    // the `n`th start of the agent has started its exec quarantine (lot
+    // M4: after a kill, the socket answers again — its file outlived the
+    // killed agent)
+    let started = |n: usize| {
+        common::wait_until(Duration::from_secs(30), || {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            (state.admin_socket().exists()
+                && state.pid_file().exists()
+                && text
+                    .matches("exec quarantine: starting its controller and scanner")
+                    .count()
+                    >= n
+                && (n == 1
+                    || std::os::unix::net::UnixStream::connect(state.admin_socket()).is_ok()))
+            .then_some(())
+        })
+    };
     assert!(
-        ready.is_some(),
+        started(1).is_some(),
         "the agent did not start its exec quarantine\n{}",
         tail()
     );
@@ -413,32 +527,75 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     // before the stop is asked (the kernel goes on stopping)
     if pausing {
         std::fs::write(&pause, b"").unwrap();
+    }
+    // lot M4: the controller stuck in its pass from here (never undone)
+    if stalling {
+        std::fs::write(&stall, b"").unwrap();
+    }
+    if pausing || stalling {
         std::thread::sleep(Duration::from_millis(300));
     }
-    // the operator's stop, the burst going on
-    let mut c = agent.0.take().unwrap();
-    let stopped = common::shutdown_signed(
-        &mut c,
-        &common::SignedShutdown {
-            nn_admin: &nn_admin.path,
-            key: &key_a,
-            cosign_key: &key_b,
-            agent_id_file: &state.agent_id_file(),
-            socket: &state.admin_socket(),
-        },
-        Duration::from_secs(30),
-    );
-    if let Err(e) = stopped {
-        agent.0 = Some(c);
-        panic!(
-            "the signed shutdown did not stop the agent: {e}\n{}",
-            tail()
+    // the operator's stop
+    let stop_signed = |agent: &mut Agent| {
+        let mut c = agent.0.take().unwrap();
+        let stopped = common::shutdown_signed(
+            &mut c,
+            &common::SignedShutdown {
+                nn_admin: &nn_admin.path,
+                key: &key_a,
+                cosign_key: &key_b,
+                agent_id_file: &state.agent_id_file(),
+                socket: &state.admin_socket(),
+            },
+            Duration::from_secs(30),
         );
+        if let Err(e) = stopped {
+            agent.0 = Some(c);
+            panic!(
+                "the signed shutdown did not stop the agent: {e}\n{}",
+                tail()
+            );
+        }
+    };
+    // the stop, the burst going on
+    match by {
+        StopBy::Signed => stop_signed(&mut agent),
+        StopBy::KillThenRestart => {
+            let mut c = agent.0.take().unwrap();
+            if let Err(e) = kill_agent(&mut c) {
+                agent.0 = Some(c);
+                panic!("the agent could not be killed: {e}\n{}", tail());
+            }
+            std::thread::sleep(HEARTBEAT_STALE);
+        }
     }
     std::thread::sleep(BURST_AFTER_STOP);
     halt.store(true, Ordering::Relaxed);
     for s in spawners {
         s.join().expect("a spawner thread");
+    }
+    // lot M4: the killed agent's held processes stay stopped; the next start
+    // resumes them, then is stopped the operator's way
+    let mut left_by_kill = 0;
+    if by == StopBy::KillThenRestart {
+        left_by_kill = children
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| proc_state(c.id()) == Some(b'T'))
+            .count();
+        assert!(
+            left_by_kill > 0,
+            "the killed agent left no process of the burst stopped: the case tests nothing\n{}",
+            tail()
+        );
+        agent.0 = Some(spawn_agent());
+        assert!(
+            started(2).is_some(),
+            "the agent did not start again after its kill\n{}",
+            tail()
+        );
+        stop_signed(&mut agent);
     }
 
     // every process of the burst runs to its end
@@ -486,10 +643,19 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
     };
     let (resumed, unreported, left_in_map) = (count("resumed"), count("unreported"), count("left"));
     let recaptured = count("recaptured");
-    // the controller's stop cut by the 2 s the agent's stop gives it (its
-    // processes then stay in the pinned map for the next start)
+    // lot M4: what the start after a kill resumed (and could not capture)
+    let recovery = audit_objects(&state.audit_log(), "recovered_at_boot");
+    let in_recovery = |field: &str| -> usize {
+        recovery
+            .iter()
+            .filter_map(|s| s.get(field).and_then(|r| r.as_array()).map(Vec::len))
+            .sum()
+    };
+    let (recovered, deferred) = (in_recovery("resumed"), in_recovery("deferred"));
+    // lot M4: the controller's stop cut by the wait the agent's stop gives
+    // it (the stop's sweep then releases what the kernel holds)
     let overran = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default())
-        .contains("exec quarantine controller did not stop within");
+        .contains("exec quarantine controller did not stop in time");
     // a process left stopped: what the agent's log says of its pid
     let named: Vec<String> = {
         let text = common::strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
@@ -515,7 +681,9 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
             std::io::stderr().lock(),
             "execq stop e2e [{case}]: {total} execs, {held_at_stop} held 1.5 s into the burst; the signed \
              stopping entries: {} — resumed {resumed}, of which {unreported} without an entry \
-             and {recaptured} captured again, {left_in_map} left in the map; after the stop {} of \
+             and {recaptured} captured again, {left_in_map} left in the map; {left_by_kill} left \
+             stopped by a kill, of which the next start resumed {recovered} ({deferred} deferred); \
+             after the stop {} of \
              the burst still running, {} not exit 0, {} new process(es) in state T, cgroup frozen \
              {frozen:?}; the controller's stop overran its wait: {overran}; the agent's log on them: \
              {named:?}",
@@ -544,16 +712,28 @@ fn burst_and_stop(case: &str, env: &[(&str, &str)]) -> usize {
         failed.is_empty(),
         "processes of the burst that did not exit 0 (killed?): {failed:?}"
     );
-    assert!(
-        resumed > 0,
-        "the signed `stopping` entry names no resumed process ({stopping:?}): the stop did not \
-         find the burst held\n{}",
-        tail()
-    );
+    match by {
+        StopBy::Signed => assert!(
+            resumed > 0,
+            "the signed `stopping` entry names no resumed process ({stopping:?}): the stop did \
+             not find the burst held\n{}",
+            tail()
+        ),
+        // lot M4: the start after the kill resumed them, signed
+        StopBy::KillThenRestart => assert!(
+            recovered > 0 && deferred == 0,
+            "the next start's signed `recovered_at_boot` ({recovery:?}) did not resume what the \
+             killed agent held ({left_by_kill} stopped)\n{}",
+            tail()
+        ),
+    }
     assert_eq!(left_in_map, 0, "{stopping:?}");
     drop(scanner);
     drop(nn_admin);
     drop(installed_agent);
     drop(burst_dir);
-    unreported
+    match by {
+        StopBy::Signed => unreported,
+        StopBy::KillThenRestart => recovered,
+    }
 }

@@ -126,9 +126,17 @@ struct State {
 }
 
 impl StopDeadline {
-    /// The agent's: [`BUDGET`], and the process ends with `_exit`.
+    /// The agent's: [`BUDGET`], and the process ends with `_exit` — once
+    /// the processes the exec quarantine holds are released (lot M4, #633:
+    /// a stage that blocks never leaves them stopped).
     pub(crate) fn start() -> Self {
-        Self::start_with(BUDGET, Arc::new(exit_now))
+        Self::start_with(
+            BUDGET,
+            Arc::new(|status| {
+                northnarrow_agent::execq::release_at_exit();
+                exit_now(status)
+            }),
+        )
     }
 
     /// The deadline's thread, idle until [`Self::begin`].

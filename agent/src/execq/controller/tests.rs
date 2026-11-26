@@ -110,8 +110,43 @@ impl KernelIo for FakeKernel {
     }
 }
 
+/// Lot M4 (#633): the same fake map, as the stop's sweep reads it.
+impl super::super::release::HeldMaps for FakeKernel {
+    fn set_beat(&mut self, ns: u64) {
+        KernelIo::beat(self, ns)
+    }
+    fn entries(&self) -> Vec<(u32, ExecqStopped)> {
+        KernelIo::stopped(self)
+    }
+    fn entry(&self, pid: u32) -> Option<ExecqStopped> {
+        let st = self.0.lock();
+        st.left.iter().find(|(p, _)| *p == pid).map(|(_, v)| *v)
+    }
+    fn remove(&mut self, pid: u32) {
+        let mut st = self.0.lock();
+        st.unstopped.push(pid);
+        st.left.retain(|(p, _)| *p != pid);
+    }
+    fn put(&mut self, pid: u32, v: ExecqStopped) -> Result<(), String> {
+        let mut st = self.0.lock();
+        match st.left.iter_mut().find(|(p, _)| *p == pid) {
+            Some(e) => e.1 = v,
+            None => st.left.push((pid, v)),
+        }
+        Ok(())
+    }
+    fn quiesce(&mut self) {
+        KernelIo::quiesce(self)
+    }
+}
+
 #[derive(Default)]
 struct BState {
+    /// Lot M4 (#633): the scanner's tick blocks while set (a pass of the
+    /// controller that does not end — an rpm host's `rpm -qf` per report);
+    /// `in_stall` says the controller is in it.
+    stall: bool,
+    in_stall: bool,
     ready: bool,
     /// Requests held, unanswered (a slow scanner).
     hold: bool,
@@ -157,6 +192,16 @@ impl Backend for InProc {
         self.st.lock().ready.then_some(now)
     }
     fn tick(&mut self, _now: Instant) -> Vec<ScannerEvent> {
+        loop {
+            let mut st = self.st.lock();
+            if !st.stall {
+                st.in_stall = false;
+                break;
+            }
+            st.in_stall = true;
+            drop(st);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         std::mem::take(&mut self.st.lock().out)
     }
     fn send(&mut self, req: &ScanRequest, fd: RawFd) -> Result<(), ScannerEvent> {
@@ -1999,5 +2044,257 @@ fn a_kill_owed_to_an_earlier_holder_of_a_pid_leaves_its_new_process_alone() {
             }
         )],
         "the new process's entry was rewritten or removed"
+    );
+}
+
+// ── lot M4 (#633): the stop of a controller that is in a pass ──────
+
+/// A stop flag of a test's own, as the agent's `STOPPING` is.
+fn stop_flag() -> &'static AtomicBool {
+    Box::leak(Box::new(AtomicBool::new(false)))
+}
+
+/// #633: the agent stops while the controller is in a pass that does not
+/// end in time — on an rpm host each report asks `rpm -qf`, and a ring's
+/// worth took seconds; here the scanner's tick blocks. The kernel holds
+/// processes the controller has not even read about. The agent's stop
+/// waited 2 s for the controller's own stop, the stop's deadline ended the
+/// process first, and every held process stayed in state T. Now the stop's
+/// sweep, on the stopping thread, resumes every process the kernel's map
+/// names once its bounded wait is over, and signs it.
+#[test]
+fn a_stop_while_the_controller_is_in_a_pass_releases_every_held_process() {
+    let w = world(ScanConfig::default(), enforce(), 5000, true);
+    let kids: Vec<Held> = (0..3)
+        .map(|i| held_copy(w.dir.path(), &format!("nn-s{i}")))
+        .collect();
+    let World {
+        k,
+        b,
+        rec,
+        ctl,
+        dir: _dir,
+        ..
+    } = w;
+    b.st.lock().stall = true;
+    let stop = stop_flag();
+    let thread = std::thread::spawn(move || ctl.run(stop));
+    let entered = (0..1000).any(|_| {
+        std::thread::sleep(Duration::from_millis(2));
+        b.st.lock().in_stall
+    });
+    assert!(entered, "the controller never reached its pass");
+    // the kernel holds them while the controller is in its pass: named in
+    // the map, their reports on the ring
+    for h in &kids {
+        let mut st = k.0.lock();
+        st.left.push((
+            h.pid,
+            ExecqStopped {
+                start_ns: h.start_ns,
+                stop_ns: 1,
+            },
+        ));
+        st.queue.push(raw_for(h, class::HOME));
+    }
+    let held = Arc::new(super::super::release::Held::new(k.clone()));
+    let sweeper = super::super::release::Sweeper::new(
+        held,
+        Box::new(ProcRef::open_started_at),
+        true,
+        None,
+        Some(super::super::release::SharedRecorder::new(Box::new(
+            rec.clone(),
+        ))),
+    );
+    let t0 = Instant::now();
+    let running = super::super::release::stop_then_sweep(
+        stop,
+        || {},
+        thread,
+        &sweeper,
+        Duration::from_millis(150),
+    );
+    let took = t0.elapsed();
+    let states: Vec<_> = kids.iter().map(|h| (h.pid, state(h.pid))).collect();
+    let resumed = kids
+        .iter()
+        .all(|h| wait_state(h.pid, |s| s == Some('S') || s == Some('R')));
+    // the controller's pass ends: it joins, its own stop finding nothing
+    b.st.lock().stall = false;
+    let still_running = running.is_some();
+    if let Some(t) = running {
+        // bounded: a controller never told to stop would hang the test
+        let ended = (0..2500).any(|_| {
+            std::thread::sleep(Duration::from_millis(2));
+            t.is_finished()
+        });
+        assert!(
+            ended,
+            "the controller did not end after its pass: never told to stop"
+        );
+        t.join().expect("the controller thread");
+    }
+    assert!(
+        resumed,
+        "the stop returned with processes the kernel holds still stopped: {states:?} \
+         (T = SIGSTOP; the stop took {took:?})"
+    );
+    assert!(
+        still_running,
+        "the controller was not in its pass at the stop"
+    );
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(
+        *k.0.lock().beats.last().unwrap(),
+        0,
+        "the heartbeat is cleared"
+    );
+    let a = rec.audits.lock();
+    let sweep: Vec<_> = a
+        .iter()
+        .filter(|e| {
+            e["kind"] == "stopping" && e["by"] == "sweep: the controller did not stop in time"
+        })
+        .collect();
+    assert_eq!(sweep.len(), 1, "{a:?}");
+    let mut named: Vec<u64> = sweep[0]["resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    named.sort_unstable();
+    let mut want: Vec<u64> = kids.iter().map(|h| u64::from(h.pid)).collect();
+    want.sort_unstable();
+    assert_eq!(named, want, "{}", sweep[0]);
+}
+
+/// #633: once the agent stops, the controller handles no more report —
+/// those it read and had not handled go to its stop, which resumes them
+/// as processes held without an entry.
+#[test]
+fn the_reports_a_stopping_controller_has_not_handled_are_released_by_its_stop() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    let kids: Vec<Held> = (0..3)
+        .map(|i| held_copy(w.dir.path(), &format!("nn-b{i}")))
+        .collect();
+    for h in &kids {
+        w.push(raw_for(h, class::HOME));
+    }
+    let stop = stop_flag();
+    stop.store(true, Ordering::Relaxed);
+    w.ctl.stopping = Some(stop);
+    w.ctl.step(Instant::now());
+    assert!(
+        w.ctl.entries.is_empty(),
+        "a report was handled after the stop was asked"
+    );
+    assert_eq!(w.ctl.backlog.len(), 3);
+    w.ctl.stop_all();
+    for h in &kids {
+        assert!(
+            wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+            "{:?}",
+            state(h.pid)
+        );
+    }
+    let a = w.rec.audits.lock();
+    assert_eq!(a[0]["by"], "controller", "{}", a[0]);
+    assert_eq!(a[0]["unreported"].as_array().unwrap().len(), 3, "{}", a[0]);
+}
+
+/// #633: a pass handles reports for [`REPORTS_SLICE`] at most — the
+/// heartbeat, the scanner and the budgets get their turn — and the rest
+/// waits in the backlog for the next pass, which comes at once.
+#[test]
+fn a_pass_handles_reports_for_a_slice_and_the_next_comes_at_once() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    let kids: Vec<Held> = (0..3)
+        .map(|i| held_copy(w.dir.path(), &format!("nn-c{i}")))
+        .collect();
+    for h in &kids {
+        w.push(raw_for(h, class::HOME));
+    }
+    // each report takes 70 ms (a slow package lookup)
+    w.ctl.capture = Box::new(|pid, start| {
+        std::thread::sleep(Duration::from_millis(70));
+        ProcRef::open_started_at(pid, start)
+    });
+    let t = Instant::now();
+    let next = w.ctl.step(t);
+    let handled = w.ctl.entries.len();
+    assert!(
+        (1..3).contains(&handled),
+        "{handled} reports handled in one pass of a {REPORTS_SLICE:?} slice"
+    );
+    assert_eq!(w.ctl.backlog.len(), 3 - handled);
+    assert_eq!(next, t, "reports wait: the next pass is due at once");
+    // the ring is not read again while the backlog holds reports
+    let drains = |w: &World| w.k.0.lock().log.iter().filter(|l| **l == "drain").count();
+    assert_eq!(drains(&w), 1);
+    while !w.ctl.backlog.is_empty() {
+        w.ctl.step(Instant::now());
+    }
+    assert_eq!(w.ctl.entries.len(), 3);
+    assert_eq!(drains(&w), 1);
+    w.ctl.stop_all();
+}
+
+/// #633: the running controller reads the agent's stop between two
+/// reports — the one in hand is handled, the others go to its stop, which
+/// resumes them as processes held without an entry.
+#[test]
+fn a_running_controller_handles_no_report_once_the_agent_stops() {
+    let mut w = world(ScanConfig::default(), enforce(), 5000, true);
+    let kids: Vec<Held> = (0..3)
+        .map(|i| held_copy(w.dir.path(), &format!("nn-r{i}")))
+        .collect();
+    for h in &kids {
+        w.push(raw_for(h, class::HOME));
+    }
+    // each report takes 70 ms (a slow package lookup); the stop comes
+    // while the first is in hand
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c2 = Arc::clone(&calls);
+    w.ctl.capture = Box::new(move |pid, start| {
+        if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(70));
+        }
+        ProcRef::open_started_at(pid, start)
+    });
+    let World { rec, ctl, .. } = w;
+    let stop = stop_flag();
+    let thread = std::thread::spawn(move || ctl.run(stop));
+    let first = (0..2500).any(|_| {
+        std::thread::sleep(Duration::from_millis(2));
+        calls.load(Ordering::SeqCst) > 0
+    });
+    assert!(first, "the controller never handled a report");
+    stop.store(true, Ordering::Relaxed);
+    let ended = (0..2500).any(|_| {
+        std::thread::sleep(Duration::from_millis(2));
+        thread.is_finished()
+    });
+    assert!(ended, "the controller did not stop");
+    thread.join().expect("the controller thread");
+    for h in &kids {
+        assert!(
+            wait_state(h.pid, |s| s == Some('S') || s == Some('R')),
+            "{:?}",
+            state(h.pid)
+        );
+    }
+    let a = rec.audits.lock();
+    let own: Vec<_> = a
+        .iter()
+        .filter(|e| e["kind"] == "stopping" && e["by"] == "controller")
+        .collect();
+    assert_eq!(own.len(), 1, "{a:?}");
+    assert_eq!(
+        own[0]["unreported"].as_array().unwrap().len(),
+        2,
+        "a report was handled after the stop: {}",
+        own[0]
     );
 }

@@ -39,12 +39,51 @@ pub struct AyaCand(pub ExecqCandRaw);
 // SAFETY: `#[repr(C)]`, `bytemuck::Pod` in `common` (no padding).
 unsafe impl aya::Pod for AyaCand {}
 
+/// Lot M4 (#633): `EXECQ_STOPPED` and `EXECQ_ALIVE`, shared by the
+/// controller and the stop's sweep ([`super::release::Held`]).
+pub struct KernelMaps {
+    pub stopped: HashMap<MapData, u32, AyaStopped>,
+    pub alive: Array<MapData, u64>,
+}
+
+impl super::release::HeldMaps for KernelMaps {
+    fn set_beat(&mut self, ns: u64) {
+        let _ = self.alive.set(0, &ns, 0);
+    }
+    fn entries(&self) -> Vec<(u32, ExecqStopped)> {
+        self.stopped
+            .iter()
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k, v.0))
+            .collect()
+    }
+    fn entry(&self, pid: u32) -> Option<ExecqStopped> {
+        self.stopped.get(&pid, 0).ok().map(|v| v.0)
+    }
+    fn remove(&mut self, pid: u32) {
+        let _ = self.stopped.remove(&pid);
+    }
+    fn put(&mut self, pid: u32, v: ExecqStopped) -> Result<(), String> {
+        self.stopped
+            .insert(&pid, &AyaStopped(v), 0)
+            .map_err(|e| e.to_string())
+    }
+    fn quiesce(&mut self) {
+        if !quiesce() {
+            tracing::debug!(
+                "exec quarantine stop: membarrier refused — waited a fixed time instead"
+            );
+        }
+    }
+}
+
 /// What the controller holds.
 pub struct Kernel {
     pub ring: RingBuf<MapData>,
     pub known: HashMap<MapData, AyaKey, AyaKnown>,
-    pub stopped: HashMap<MapData, u32, AyaStopped>,
-    pub alive: Array<MapData, u64>,
+    /// Lot M4: the stopped map and the heartbeat, shared with the stop's
+    /// sweep.
+    pub held: std::sync::Arc<super::release::Held<KernelMaps>>,
     pub roots: HashMap<MapData, AyaKey, u32>,
     pub counters: PerCpuArray<MapData, u64>,
     /// The review of #547 (F4): the candidates (`EXECQ_CAND`) and each
@@ -122,8 +161,10 @@ pub fn take(ebpf: &mut Ebpf) -> Result<Kernel> {
     Ok(Kernel {
         ring: RingBuf::try_from(take("EXECQ_EVENTS")?).context("EXECQ_EVENTS")?,
         known: HashMap::try_from(take("EXECQ_KNOWN")?).context("EXECQ_KNOWN")?,
-        stopped: HashMap::try_from(take("EXECQ_STOPPED")?).context("EXECQ_STOPPED")?,
-        alive: Array::try_from(take("EXECQ_ALIVE")?).context("EXECQ_ALIVE")?,
+        held: std::sync::Arc::new(super::release::Held::new(KernelMaps {
+            stopped: HashMap::try_from(take("EXECQ_STOPPED")?).context("EXECQ_STOPPED")?,
+            alive: Array::try_from(take("EXECQ_ALIVE")?).context("EXECQ_ALIVE")?,
+        })),
         roots: HashMap::try_from(take("EXECQ_ROOTS")?).context("EXECQ_ROOTS")?,
         counters: PerCpuArray::try_from(take("EXECQ_COUNTERS")?).context("EXECQ_COUNTERS")?,
         cand: HashMap::try_from(take("EXECQ_CAND")?).context("EXECQ_CAND")?,
@@ -224,10 +265,7 @@ impl Kernel {
     /// the one started at `start_ns` — a later holder of the pid, which the
     /// kernel holds in its turn, keeps its own.
     pub fn unstop(&mut self, pid: u32, start_ns: u64) {
-        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
-        if entry_is_its_own(found, start_ns) {
-            let _ = self.stopped.remove(&pid);
-        }
+        self.held.unstop(pid, start_ns)
     }
 
     /// Lot 317 (review F2): mark the map's entry of process `(pid,
@@ -238,22 +276,13 @@ impl Kernel {
     /// process is not this one, and a later unstop of this one would take
     /// it out of the map.
     pub fn owe_kill(&mut self, pid: u32, start_ns: u64) {
-        let found = self.stopped.get(&pid, 0).ok().map(|v| v.0.start_ns);
-        if !entry_is_its_own(found, start_ns) {
-            return;
-        }
-        let v = AyaStopped(ExecqStopped {
-            start_ns,
-            stop_ns: KILL_OWED,
-        });
-        if let Err(e) = self.stopped.insert(&pid, &v, 0) {
-            tracing::warn!(pid, error = %e, "exec quarantine: the owed kill could not be marked in the map");
-        }
+        self.held.owe_kill(pid, start_ns)
     }
 
-    /// The heartbeat a stop needs (0: the kernel stops nothing).
+    /// The heartbeat a stop needs (0: the kernel stops nothing — for good,
+    /// lot M4: [`super::release::Held::beat`]).
     pub fn beat(&mut self, ns: u64) {
-        let _ = self.alive.set(0, &ns, 0);
+        self.held.beat(ns)
     }
 
     /// The per-CPU counters summed, `counter::*` order.

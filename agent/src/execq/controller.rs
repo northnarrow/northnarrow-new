@@ -103,11 +103,7 @@ impl KernelIo for kernel::Kernel {
         kernel::Kernel::owe_kill(self, pid, start_ns)
     }
     fn stopped(&self) -> Vec<(u32, ExecqStopped)> {
-        self.stopped
-            .iter()
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k, v.0))
-            .collect()
+        self.held.stopped()
     }
     fn set_roots(&mut self, roots: &[(ExecqKey, u32)]) -> kernel::RootsRefused {
         kernel::Kernel::set_roots(self, roots)
@@ -116,9 +112,7 @@ impl KernelIo for kernel::Kernel {
         kernel::Kernel::counters(self)
     }
     fn quiesce(&mut self) {
-        if !kernel::quiesce() {
-            debug!("exec quarantine stop: membarrier refused — waited a fixed time instead");
-        }
+        self.held.quiesce()
     }
     fn recount_shares(&mut self) {
         match kernel::Kernel::recount_shares(self) {
@@ -339,7 +333,27 @@ pub struct Controller<K: KernelIo, B: Backend> {
     /// Lot 317 (BUG-124): the decisions not carried out yet, their process
     /// not captured ([`Owed`]).
     owed: Vec<Owed>,
+    /// Lot M4 (#633): the reports read from the ring and not handled yet —
+    /// each pass handles them for [`REPORTS_SLICE`] at most, and none once
+    /// the agent stops ([`Self::stop_all`] releases them).
+    backlog: VecDeque<ExecqStopRaw>,
+    /// Lot M4: the agent stops ([`Self::run`]'s flag; `None`: a controller
+    /// stepped by a test).
+    stopping: Option<&'static AtomicBool>,
+    /// Lot M4: a `debug-trigger` build's `NN_DEBUG_EXECQ_STALL=<file>` (the
+    /// lab's privileged e2e, never a release): while that file exists the
+    /// handling of a report blocks, deaf to the stop — a package lookup
+    /// that hangs.
+    #[cfg(feature = "debug-trigger")]
+    stall: Option<std::path::PathBuf>,
 }
+
+/// Lot M4 (#633): how long a pass handles reports at most before the
+/// heartbeat, the scanner and the budgets get their turn — the rest waits
+/// in the backlog for the next pass (the ring fills meanwhile: the kernel
+/// then lets the execs run, counted). On an rpm host each report asks
+/// `rpm -qf`: a ring's worth of them took seconds.
+pub const REPORTS_SLICE: Duration = Duration::from_millis(100);
 
 /// One signed scanner degradation per cause at most this often.
 pub const DEGRADED_EVERY: Duration = Duration::from_secs(600);
@@ -389,6 +403,10 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             fail_open_at: None,
             capture: Box::new(ProcRef::open_started_at),
             owed: Vec::new(),
+            backlog: VecDeque::new(),
+            stopping: None,
+            #[cfg(feature = "debug-trigger")]
+            stall: std::env::var_os("NN_DEBUG_EXECQ_STALL").map(Into::into),
         }
     }
 
@@ -401,7 +419,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     }
 
     /// The loop, until `stopping`.
-    pub fn run(mut self, stopping: &AtomicBool) {
+    pub fn run(mut self, stopping: &'static AtomicBool) {
+        self.stopping = Some(stopping);
         self.recover();
         // The dpkg index is read on the first lookup that needs it, on this
         // thread: the guarded locations a package never uses skip it.
@@ -510,20 +529,51 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             let ev = self.b.kill("no verdict within the decision budget");
             self.on_scanner(ev, now);
         }
-        let mut raws = Vec::new();
         #[cfg(feature = "debug-trigger")]
         let read = !Self::debug_reads_paused();
         #[cfg(not(feature = "debug-trigger"))]
         let read = true;
-        if read {
+        // lot M4 (#633): the ring is read once the reports already read are
+        // handled — the ring, not the agent's memory, bounds what waits
+        if read && self.backlog.is_empty() {
+            let mut raws = Vec::new();
             self.k.drain(&mut raws);
+            self.backlog.extend(raws);
         }
-        for raw in raws {
+        // lot M4: a slice of the pass, and no report once the agent stops —
+        // the stop releases those left ([`Self::stop_all`])
+        let until = Instant::now() + REPORTS_SLICE;
+        while !self.is_stopping() && Instant::now() < until {
+            let Some(raw) = self.backlog.pop_front() else {
+                break;
+            };
+            #[cfg(feature = "debug-trigger")]
+            self.debug_stall();
             self.on_stop(raw, now);
         }
         self.dispatch(now);
         self.pay_owed(now);
-        self.progress(now)
+        let next = self.progress(now);
+        // reports still waiting: the next pass at once
+        if self.backlog.is_empty() { next } else { now }
+    }
+
+    /// Lot M4: the agent stops.
+    fn is_stopping(&self) -> bool {
+        self.stopping.is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Lot M4: while `NN_DEBUG_EXECQ_STALL`'s file exists (a minute at
+    /// most), the handling of a report blocks — deaf to the stop.
+    #[cfg(feature = "debug-trigger")]
+    fn debug_stall(&self) {
+        let Some(f) = &self.stall else {
+            return;
+        };
+        let until = Instant::now() + Duration::from_secs(60);
+        while f.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn wait(&mut self, until: Instant) {
@@ -1113,31 +1163,8 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// The kill of a captured process, with its signed intent (R12c, lab PR
     /// 270) and outcome: whether the signal was delivered, and the response.
     fn kill(&self, pr: &ProcRef, pid: u32, path: &str, held: bool) -> (bool, String) {
-        let intent = self.intent("KillProcess", pid, path);
-        match pr.signal(libc::SIGKILL) {
-            Ok(()) => {
-                COUNTERS.killed.fetch_add(1, Ordering::Relaxed);
-                let text = if held {
-                    "killed while held".to_string()
-                } else {
-                    "killed".to_string()
-                };
-                intent.finish(
-                    crate::response::journal::ActionResult::Success,
-                    text.clone(),
-                    None,
-                );
-                (true, text)
-            }
-            Err(e) => {
-                intent.finish(
-                    crate::response::journal::ActionResult::Failure,
-                    "kill failed".to_string(),
-                    Some(e.to_string()),
-                );
-                (false, format!("kill failed: {e}"))
-            }
-        }
+        // lot M4: one kill path with the stop's sweep
+        super::release::kill_with_intent(Some(&self.s.journal), pr, pid, path, held)
     }
 
     /// Lot 317 (BUG-124): the decisions owed to held processes that could
@@ -1251,19 +1278,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     /// R12c (lab PR 270): the signed intent of one of the exec quarantine's
     /// actions on `pid` (whose exec of `path` it held).
     fn intent(&self, response: &str, pid: u32, path: &str) -> crate::response::journal::Intent {
-        let mut i = crate::response::journal::ActionIntent::named("exec_quarantine", response, pid);
-        i.severity = "high".into();
-        i.why = vec![super::RULE_ID.to_string()];
-        let mut d = format!("exec of {path}");
-        if d.len() > 200 {
-            let mut cut = 200;
-            while !d.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            d.truncate(cut);
-        }
-        i.detail = Some(d);
-        self.s.journal.intent(i)
+        self.s
+            .journal
+            .intent(super::release::intent_named(response, pid, path))
     }
 
     /// The cache, the known digests, the counters and the record.
@@ -1482,7 +1499,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     fn stop_all(&mut self) {
         self.k.beat(0);
         self.k.quiesce();
-        let mut last = Vec::new();
+        // lot M4 (#633): the reports read and not handled, then the ring's
+        // last read — each a process held without an entry
+        let mut last: Vec<ExecqStopRaw> = std::mem::take(&mut self.backlog).into();
         #[cfg(feature = "debug-trigger")]
         let read_last = std::env::var("NN_DEBUG_EXECQ_STOP_NO_LAST_READ").as_deref() != Ok("1");
         #[cfg(not(feature = "debug-trigger"))]
@@ -1619,6 +1638,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             self.r.audit(
                 serde_json::json!({
                     "kind": "stopping",
+                    // lot M4: the controller's own stop (the stop's sweep signs
+                    // `"by": "sweep…"`)
+                    "by": "controller",
                     "detail": "the agent stops: held processes resumed undecided, the kills \
                                owed carried out, those not captured left stopped for the next \
                                start",
@@ -1652,7 +1674,7 @@ enum Released {
 /// The path a kill's signed intent names for a process the agent holds
 /// without an entry (its report unread, or its kill owed by a previous
 /// agent).
-const LEFT_BY_A_PREVIOUS_AGENT: &str = "(a process held without a report of this run)";
+const LEFT_BY_A_PREVIOUS_AGENT: &str = super::release::OWED_KILL_PATH;
 
 /// `SIGCONT` to a captured held process; the record's response.
 fn resume(pr: &ProcRef) -> String {
